@@ -6,30 +6,34 @@
 // bearer GET with redirects off, then the registry's redirect target without the
 // token. Callers see an ordinary `get_to_file`; the sha256 pin still decides.
 //
-// ureq 2's own defaults are `timeout_connect: Some(30s)` and `timeout_read: None`
-// (agent.rs:256). The connect half is already right, and ureq walks every resolved
-// address when one refuses (stream.rs `connect_host`), so a host whose first address
-// is unreachable still reaches a working one. The READ half is the gap: a peer that
-// completes the handshake, sends part of a body and then goes silent leaves a socket
-// that is neither closed nor readable, and with no read timeout the applet blocks in
-// `read_to_end` forever. That is not hypothetical — a `td-feed warm sources` on this
-// repo's own host took ~900 KB of a gnu.org tarball over a black-holed IPv6 path and
-// then held the entire cold build for twenty minutes, printing nothing, with
-// the kernel still reporting the connection ESTABLISHED.
+// ureq 3 sets none of the timeouts that matter here (config.rs `Timeouts`: every
+// one is `None` but `await_100`, a one-second wait for a `100 Continue` that a GET
+// never asks for), so both halves are set here. Its connect budget covers TCP and
+// the TLS handshake, and ureq walks every resolved address when one refuses or is
+// unreachable, sharing that budget between them (transport/tcp.rs
+// `try_connect_with`), so a host whose first address is unreachable still reaches
+// a working one. The READ half is the gap: a peer that completes the handshake,
+// sends part of a body and then goes silent leaves a socket that is neither closed
+// nor readable, and with no read timeout the applet blocks in `read_to_end`
+// forever. That is not hypothetical — a `td-feed warm sources` on this repo's own
+// host took ~900 KB of a gnu.org tarball over a black-holed IPv6 path and then held
+// the entire cold build for twenty minutes, printing nothing, with the kernel still
+// reporting the connection ESTABLISHED.
 //
-// `timeout_read` is a per-read deadline (`socket.set_read_timeout`), NOT a transfer
-// budget, so a multi-hundred-megabyte tarball on a slow link is unaffected: only a
-// gap between two reads trips it. A stalled attempt is then retried, because the
-// alternative to a hang must not be a cold climb that dies on one bad socket.
+// `timeout_per_read` is a per-read deadline (`socket.set_read_timeout`), NOT a
+// transfer budget, so a multi-hundred-megabyte tarball on a slow link is
+// unaffected: only a gap between two reads trips it. A stalled attempt is then
+// retried, because the alternative to a hang must not be a cold climb that dies on
+// one bad socket.
 //
 // What this does NOT close, stated so a reader does not trust a stronger property
-// than the code delivers: a peer that TRICKLES — one byte every 59
-// seconds — never trips a per-read deadline, and with no minimum-throughput floor it
-// can still hold a fetch indefinitely. Nor does either deadline cover DNS: ureq 2
-// resolves through a blocking `to_socket_addrs` outside both, so a wedged resolver is
-// its own hang. Both are real and neither is what was observed; a throughput floor is
-// a bigger change than this one, in the crate where td's only external dependencies
-// live, and belongs in its own landing.
+// than the code delivers: a peer that TRICKLES — one byte every 59 seconds — never
+// trips a per-read deadline, and with no minimum-throughput floor it can still hold
+// a fetch indefinitely. Nor does either deadline cover DNS: with no whole-request
+// deadline ureq 3 resolves through a blocking `to_socket_addrs` outside both, so a
+// wedged resolver is its own hang. Both are real and neither is what was observed;
+// a throughput floor is a bigger change than this one, in the crate where td's only
+// external dependencies live, and belongs in its own landing.
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -72,37 +76,75 @@ fn retryable_status(code: u16) -> bool {
     matches!(code, 429 | 503 | 504)
 }
 
+/// Redirects a plain GET follows: the four ureq 2's default allowed, kept.
+const FOLLOWED_REDIRECTS: u32 = 4;
+
+type Config = ureq::config::ConfigBuilder<ureq::typestate::AgentScope>;
+
+/// What every agent here shares, against ureq 3's defaults: no proxy read
+/// from the environment, every status handed back for `answered` to
+/// classify, a redirect that is not followed handed back as the 3xx itself
+/// rather than as an error, and no `Authorization` carried across one,
+/// stated rather than left to ureq's default.
+fn config(allow_redirects: bool) -> Config {
+    let config = ureq::Agent::config_builder()
+        .proxy(None)
+        .http_status_as_error(false)
+        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never);
+    if allow_redirects {
+        config.max_redirects(FOLLOWED_REDIRECTS)
+    } else {
+        config.max_redirects(0).max_redirects_will_error(false)
+    }
+}
+
+fn idle_agent(allow_redirects: bool) -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        config(allow_redirects)
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_per_read(Some(READ_TIMEOUT))
+            .timeout_per_write(Some(WRITE_TIMEOUT))
+            .build(),
+    )
+}
+
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(READ_TIMEOUT)
-        .timeout_write(WRITE_TIMEOUT)
-        .build()
+    idle_agent(true)
 }
 
 fn agent_no_redirects() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(READ_TIMEOUT)
-        .timeout_write(WRITE_TIMEOUT)
-        .redirects(0)
-        .build()
+    idle_agent(false)
 }
 
 fn agent_before(deadline: Instant, allow_redirects: bool) -> Result<ureq::Agent, String> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .ok_or_else(|| "HTTP request exceeded its absolute deadline".to_string())?;
-    let mut builder = ureq::AgentBuilder::new()
-        // ureq's global timeout covers connect, redirects, and a trickling
-        // response body. DNS uses the platform's blocking resolver and cannot
-        // be interrupted, but is checked immediately when it returns.
-        .timeout(remaining)
-        .timeout_connect(CONNECT_TIMEOUT.min(remaining));
-    if !allow_redirects {
-        builder = builder.redirects(0);
+    // ureq's global timeout covers DNS, connect, redirects, and a trickling
+    // response body. DNS runs on the platform's blocking resolver in a
+    // thread ureq stops waiting for when the deadline passes.
+    Ok(ureq::Agent::new_with_config(
+        config(allow_redirects)
+            .timeout_global(Some(remaining))
+            .timeout_connect(Some(CONNECT_TIMEOUT.min(remaining)))
+            .build(),
+    ))
+}
+
+type Response = ureq::http::Response<ureq::Body>;
+
+/// The response if its status is one the caller reads, else the attempt's
+/// failure: ureq hands back every status, and as ureq 2 did, a 4xx or 5xx
+/// is not a body.
+fn answered(resp: Response, label: &str) -> Result<Response, Attempt> {
+    let code = resp.status().as_u16();
+    if retryable_status(code) {
+        Err(Attempt::Transport(format!("{label}: status {code}")))
+    } else if code >= 400 {
+        Err(Attempt::Answered(format!("{label}: status {code}")))
+    } else {
+        Ok(resp)
     }
-    Ok(builder.build())
 }
 
 fn retry_pause(deadline: Option<Instant>) -> Result<(), String> {
@@ -132,19 +174,17 @@ enum Attempt {
 }
 
 fn get_once(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, Attempt> {
-    // ureq's Display already names the URL, so no `GET {url}:` prefix here.
-    let resp = match agent.get(url).call() {
-        Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if retryable_status(code) => {
-            return Err(Attempt::Transport(format!("{url}: status {code}")))
-        }
-        Err(e @ ureq::Error::Status(..)) => return Err(Attempt::Answered(e.to_string())),
-        Err(e) => return Err(Attempt::Transport(e.to_string())),
-    };
+    // ureq 3's Display does not name the URL, so each message does.
+    let resp = agent
+        .get(url)
+        .call()
+        .map_err(|e| Attempt::Transport(format!("{url}: {e}")))?;
+    let resp = answered(resp, url)?;
     let mut body = Vec::new();
     // A body that stops mid-transfer is a TRANSPORT failure however good the status
     // was — and it is the exact failure this module exists for.
-    resp.into_reader()
+    resp.into_body()
+        .into_reader()
         .take(MAX_IN_MEMORY_BODY_BYTES.saturating_add(1))
         .read_to_end(&mut body)
         .map_err(|e| Attempt::Transport(format!("read {url}: {e}")))?;
@@ -163,34 +203,30 @@ fn get_to_file_once(
     max_bytes: u64,
     aggregate: Option<(&AtomicU64, u64)>,
 ) -> Result<u64, Attempt> {
-    let resp = match agent.get(url).call() {
-        Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if retryable_status(code) => {
-            return Err(Attempt::Transport(format!("{url}: status {code}")))
-        }
-        Err(e @ ureq::Error::Status(..)) => return Err(Attempt::Answered(e.to_string())),
-        Err(e) => return Err(Attempt::Transport(e.to_string())),
-    };
-    stream_response(resp, url, path, max_bytes, aggregate)
+    let resp = agent
+        .get(url)
+        .call()
+        .map_err(|e| Attempt::Transport(format!("{url}: {e}")))?;
+    stream_response(answered(resp, url)?, url, path, max_bytes, aggregate)
 }
 
 fn stream_response(
-    resp: ureq::Response,
+    resp: Response,
     url: &str,
     path: &Path,
     max_bytes: u64,
     aggregate: Option<(&AtomicU64, u64)>,
 ) -> Result<u64, Attempt> {
-    if (300..400).contains(&resp.status()) {
+    if resp.status().is_redirection() {
         return Err(Attempt::Answered(format!(
             "{url}: redirect status {} is refused",
-            resp.status()
+            resp.status().as_u16()
         )));
     }
     let mut output = File::create(path).map_err(|e| {
         Attempt::Answered(format!("create streamed response {}: {e}", path.display()))
     })?;
-    let mut reader = resp.into_reader();
+    let mut reader = resp.into_body().into_reader();
     let mut buf = [0u8; 64 * 1024];
     let mut total = 0u64;
     let mut charged = 0u64;
@@ -350,17 +386,18 @@ fn registry_manifest_once(
     let token = registry_token(agent, &blob.token_url, None)?;
     let request = agent
         .get(url)
-        .set("Accept", MANIFEST_ACCEPT)
-        .set("Authorization", &format!("Bearer {token}"));
+        .header("Accept", MANIFEST_ACCEPT)
+        .header("Authorization", &format!("Bearer {token}"));
     let resp = call_labeled(request, url, false)?;
     if resp.status() != 200 {
         return Err(Attempt::Answered(format!(
             "{url}: manifest answered status {}",
-            resp.status()
+            resp.status().as_u16()
         )));
     }
     let mut body = Vec::new();
-    resp.into_reader()
+    resp.into_body()
+        .into_reader()
         .take(MAX_MANIFEST_BYTES.saturating_add(1))
         .read_to_end(&mut body)
         .map_err(|e| Attempt::Transport(format!("read {url}: {e}")))?;
@@ -391,7 +428,7 @@ fn get_registry_manifest_with(
     for attempt in 1..=ATTEMPTS {
         match registry_manifest_once(&agent_no_redirects(), url, blob) {
             Ok(body) => {
-                let got = format!("{:x}", sha2::Sha256::digest(&body));
+                let got = crate::sig::to_hex(&sha2::Sha256::digest(&body));
                 return match digest {
                     Some(want) if want != got => Err(format!(
                         "{url}: manifest hashes to sha256:{got}, not the digest asked for"
@@ -416,17 +453,17 @@ fn get_registry_manifest_with(
 /// starts a request's timeout when it is called, so a multi-hop flow on one
 /// agent would otherwise give every hop the whole budget.
 fn within_deadline(
-    request: ureq::Request,
+    request: Request,
     deadline: Option<Instant>,
     label: &str,
-) -> Result<ureq::Request, Attempt> {
+) -> Result<Request, Attempt> {
     let Some(deadline) = deadline else {
         return Ok(request);
     };
     deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
-        .map(|remaining| request.timeout(remaining))
+        .map(|remaining| request.config().timeout_global(Some(remaining)).build())
         .ok_or_else(|| {
             Attempt::Answered(format!(
                 "{label}: HTTP request exceeded its absolute deadline"
@@ -434,36 +471,23 @@ fn within_deadline(
         })
 }
 
+type Request = ureq::RequestBuilder<ureq::typestate::WithoutBody>;
+
 /// Issue one registry-flow request. A URL, header or scheme ureq cannot use is
-/// an answer: retrying cannot change it. `redact` keeps ureq's rendering of
-/// the URL out of a failure, for the CDN hop whose URL carries an expiring
-/// signature; the other hops keep ureq's full detail.
-fn call_labeled(
-    request: ureq::Request,
-    label: &str,
-    redact: bool,
-) -> Result<ureq::Response, Attempt> {
+/// an answer: retrying cannot change it. `redact` keeps the URL out of a
+/// failure, for the CDN hop whose URL carries an expiring signature: ureq 3
+/// names it only in a URL error, which is then reduced to its kind.
+fn call_labeled(request: Request, label: &str, redact: bool) -> Result<Response, Attempt> {
     match request.call() {
-        Ok(resp) => Ok(resp),
-        Err(ureq::Error::Status(code, _)) if retryable_status(code) => {
-            Err(Attempt::Transport(format!("{label}: status {code}")))
-        }
-        Err(ureq::Error::Status(code, _)) => {
-            Err(Attempt::Answered(format!("{label}: status {code}")))
-        }
-        Err(ureq::Error::Transport(e)) => {
-            let detail = if redact {
-                format!("{label}: {}", e.kind())
+        Ok(resp) => answered(resp, label),
+        Err(e @ (ureq::Error::BadUri(_) | ureq::Error::Http(_))) => {
+            Err(Attempt::Answered(if redact {
+                format!("{label}: invalid URL or header")
             } else {
-                e.to_string()
-            };
-            match e.kind() {
-                ureq::ErrorKind::InvalidUrl
-                | ureq::ErrorKind::UnknownScheme
-                | ureq::ErrorKind::BadHeader => Err(Attempt::Answered(detail)),
-                _ => Err(Attempt::Transport(detail)),
-            }
+                format!("{label}: {e}")
+            }))
         }
+        Err(e) => Err(Attempt::Transport(format!("{label}: {e}"))),
     }
 }
 
@@ -481,11 +505,12 @@ fn registry_token(
     if resp.status() != 200 {
         return Err(answered(&format!(
             "token endpoint answered status {}",
-            resp.status()
+            resp.status().as_u16()
         )));
     }
     let mut body = Vec::new();
-    resp.into_reader()
+    resp.into_body()
+        .into_reader()
         .take(MAX_TOKEN_RESPONSE_BYTES.saturating_add(1))
         .read_to_end(&mut body)
         .map_err(|e| Attempt::Transport(format!("read {token_url}: {e}")))?;
@@ -533,13 +558,15 @@ fn registry_blob_to_file_once(
     let token = registry_token(agent, &blob.token_url, deadline)?;
     let request = agent
         .get(url)
-        .set("Authorization", &format!("Bearer {token}"));
+        .header("Authorization", &format!("Bearer {token}"));
     let resp = call_labeled(within_deadline(request, deadline, url)?, url, false)?;
-    if !(300..400).contains(&resp.status()) {
+    if !resp.status().is_redirection() {
         return stream_response(resp, url, path, max_bytes, aggregate);
     }
     let location = resp
-        .header("location")
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
         .ok_or_else(|| Attempt::Answered(format!("{url}: blob redirect names no Location")))?;
     let absolute = location.starts_with("https://")
         || (!blob.require_https && location.starts_with("http://"));
@@ -747,9 +774,11 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(800));
             }
         });
-        let stalling = ureq::AgentBuilder::new()
-            .timeout_read(Duration::from_millis(300))
-            .build();
+        let stalling = ureq::Agent::new_with_config(
+            config(true)
+                .timeout_per_read(Some(Duration::from_millis(300)))
+                .build(),
+        );
         let err = get_once(&stalling, &format!("http://127.0.0.1:{port}/x"))
             .err()
             .expect("a body that never arrives must not read as success");
@@ -805,15 +834,26 @@ mod tests {
     }
 
     /// The test above proves ureq HONOURS a read timeout; this proves the applets'
-    /// own agent carries one. Both halves are needed — ureq's default `timeout_read`
-    /// is None (agent.rs:257), and that default is the hang, so the assertion on the
-    /// default is what keeps this test meaningful rather than vacuous.
+    /// own agent carries one. Both halves are needed — ureq's default
+    /// `timeout_per_read` is None (config.rs), and that default is the hang, so the
+    /// assertion on the default is what keeps this test meaningful rather than vacuous.
     #[test]
     fn the_shared_agent_sets_a_read_timeout() {
-        let ours = format!("{:?}", agent());
-        assert!(ours.contains("timeout_read: Some"), "{ours}");
-        let default = format!("{:?}", ureq::AgentBuilder::new().build());
-        assert!(default.contains("timeout_read: None"), "{default}");
+        for ours in [agent(), agent_no_redirects()] {
+            let ours = ours.config();
+            assert_eq!(ours.timeout_per_read(), Some(READ_TIMEOUT));
+            assert_eq!(ours.timeout_per_write(), Some(WRITE_TIMEOUT));
+            assert_eq!(ours.timeouts().connect, Some(CONNECT_TIMEOUT));
+            assert!(ours.proxy().is_none());
+            assert!(!ours.http_status_as_error());
+            assert_eq!(
+                ours.redirect_auth_headers(),
+                ureq::config::RedirectAuthHeaders::Never
+            );
+        }
+        let default = ureq::Agent::new_with_defaults();
+        assert_eq!(default.config().timeout_per_read(), None);
+        assert!(default.config().http_status_as_error());
     }
 
     #[test]

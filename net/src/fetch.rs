@@ -64,7 +64,7 @@ fn file_sha256(path: &Path) -> Result<(String, u64), String> {
             .ok_or_else(|| "fetch hash read exceeded its buffer".to_string())?;
         hasher.update(chunk);
     }
-    Ok((format!("{:x}", hasher.finalize()), total))
+    Ok((crate::sig::to_hex(&hasher.finalize()), total))
 }
 
 /// Reroute through the td-feed mirror when `TD_FEED_BASE` is set: rewrite an upstream
@@ -266,7 +266,7 @@ mod tests {
         let stale = dir.join(".td-fetch-download-9-9.tmp");
         std::fs::write(&out, b"already published").unwrap();
         std::fs::write(&stale, b"abandoned").unwrap();
-        let want = format!("{:x}", Sha256::digest(b"already published"));
+        let want = crate::sig::to_hex(&Sha256::digest(b"already published"));
 
         let len = fetch_verified_to("http://127.0.0.1:0/must-not-connect", &want, &out).unwrap();
 

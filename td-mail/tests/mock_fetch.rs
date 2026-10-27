@@ -183,9 +183,7 @@ fn perform(request: &Request) -> Result<Answer, String> {
             return Ok((status, reply_headers, body));
         }
         if followed >= allowed {
-            return Err(format!(
-                "{url}: Too Many Redirects: reached max redirects ({allowed})"
-            ));
+            return Err(format!("{url}: too many redirects"));
         }
         let location = reply_headers
             .iter()

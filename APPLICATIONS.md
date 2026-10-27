@@ -10520,8 +10520,9 @@ webpki-roots, and no decoder. So:
    `Accept-Encoding: identity` because the tier's closure has no
    decoder and principle 2 makes one a sign-off; and gives the whole
    exchange with the origin, redirects included, five minutes over
-   `http.rs`'s connect deadline: ureq's one deadline, which supersedes
-   its per-read and per-write timeouts. A bounded number of
+   `http.rs`'s connect deadline: ureq's whole-exchange deadline, which
+   starts when the exchange is called and bounds every read and write
+   under it. A bounded number of
    connections are served at once; the rest wait.
 
    A counted, non-public request may carry `tls-ca N`, where N is 1 to
@@ -10552,16 +10553,20 @@ webpki-roots, and no decoder. So:
    background idle reaper. ureq still keys sockets by origin and applies
    address policy when connecting. HTTP, automatic redirects, empty POST,
    public-policy and streamed requests do not reuse pooled connections.
-   This avoids ureq's pooled-header retry for a complete empty mutation;
-   a nonempty POST is not replayed after its body is sent.
+   ureq does not resend a request on a pooled connection, and an empty
+   mutation stays off one regardless; a nonempty POST is not replayed
+   after its body is sent.
 
-   ureq clears pooled socket timeouts. A wrapper below HTTPS TLS restores
-   the remaining exchange deadline before every raw read, write and flush,
-   including writes on reused connections. The service directly uses the
-   already-locked webpki-roots package to construct the same public root
-   configuration as ureq, with the existing ring provider and TLS 1.2/1.3.
-   Custom roots replace public roots. Streaming retains its separate process
-   and idle-deadline policy below. Blocking DNS remains the recorded gap.
+   ureq caps every raw read and write, the TLS handshake's included, by
+   what is left of the exchange's deadline, on a reused connection as on
+   a new one, so the deadline needs no wrapper. Public roots are ureq's
+   webpki-roots configuration, from the package td-net pins exactly,
+   over rustls with the ring provider and TLS 1.2/1.3; each agent builds
+   its rustls configuration once, so session resumption is scoped to one
+   agent. Custom roots replace public roots, each first held to rustls's
+   trust-anchor parse, since ureq would skip one it cannot parse.
+   Streaming retains its separate process and idle-deadline policy below.
+   Blocking DNS remains the recorded gap.
 
    A request may carry a `stream` line, with no value; without it the
    above is the whole protocol, unchanged. With it, the reply head ends
@@ -10579,19 +10584,20 @@ webpki-roots, and no decoder. So:
    refused: response over N bytes`.
 
    ureq cannot interrupt a read, and an origin can keep one going past
-   any deadline: a head or a chunk header a byte at a time, or a chunk
-   size line that never ends, which ureq gathers into memory without a
-   bound. So a streamed request's exchange with its origin runs in a
-   process of its own, `td-fetchd origin`, the same binary started again
-   under that name, which reads the request on its stdin and writes the
+   any deadline: a head or a chunk header a byte at a time. ureq holds a
+   chunk size line to its input buffer, but the memory bound below does
+   not rest on that. So a streamed request's exchange with its origin
+   runs in a process of its own, `td-fetchd origin`, the same binary
+   started again under that name, which reads the request on its stdin
+   and writes the
    streamed reply on its stdout for the service to relay frame by frame.
    The five minutes are replaced by three bounds. An idle deadline of
    two minutes is on every read and write against the origin, the
    handshake, the head and every redirect included: with no
-   whole-exchange deadline set, ureq leaves these to the socket's own
-   timeouts, and since it clears them on a connection it keeps for
-   reuse, the process keeps none and makes each redirect's connection
-   afresh. A total of thirty minutes is kept by the relay, which waits
+   whole-exchange deadline set, ureq sets these as the socket's own
+   timeouts before each operation, and the process keeps no connection
+   for reuse and makes each redirect's connection afresh. A total of
+   thirty minutes is kept by the relay, which waits
    on the process in slices of a quarter second and kills it at the
    total whatever it is waiting on; writing the head or a frame to the
    client is held to the total too, so a client that stops reading
@@ -10697,7 +10703,8 @@ webpki-roots, and no decoder. So:
    that answers the resolver one way now and
    another way later is defended only as far as the address it returned
    is the one connected to; and a name lookup is outside every deadline
-   of a counted request, since ureq resolves through a blocking call, so
+   of a counted request, since the address-policy resolver looks a name
+   up through a blocking call, so
    a resolver that hangs holds a worker until it answers (a streamed
    request's lookup is in its origin process, which the total ends).
    All four are recorded as gaps. §L's claim list gains the sentence:

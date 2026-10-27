@@ -280,8 +280,11 @@ fn a_streamed_request_is_refused_as_a_counted_one_is() {
             "error refused: scheme \"ftp\"".to_string(),
         ),
         (
+            // ureq's parser refuses this authority before anything is
+            // resolved; a naive split would read it as a public host.
             "method GET\nurl http://0.0.0.1:1\\@93.184.216.34/\nstream\n",
-            "error refused: unspecified address".to_string(),
+            "error transport: http://0.0.0.1:1\\@93.184.216.34/: http: invalid uri character"
+                .to_string(),
         ),
         (
             "method GET\nurl http://h/\nredirects 6\nstream\n",
@@ -426,18 +429,29 @@ fn an_origin_that_breaks_off_mid_body_ends_the_stream_in_an_error_line() {
     for (answer, received) in [
         // Ten bytes of a hundred promised, then the connection closes.
         (
-            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789"
-                .to_string(),
+            vec![
+                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789"
+                    .to_string(),
+            ],
             &b"0123456789"[..],
         ),
-        // A chunk size that is not one.
+        // A chunk size that is not one, after a chunk that was. ureq drops
+        // what it decoded in the read that met the fault, so the fault
+        // arrives in a read of its own.
         (
-            format!("{}5\r\nhello\r\nzz\r\n", chunked_head("")),
+            vec![
+                format!("{}5\r\nhello\r\n", chunked_head("")),
+                "zz\r\n".to_string(),
+            ],
             &b"hello"[..],
         ),
     ] {
         let Some((port, origin)) = scripted_origin(move |conn| {
-            let _ = conn.write_all(answer.as_bytes());
+            for part in answer {
+                let _ = conn.write_all(part.as_bytes());
+                let _ = conn.flush();
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }) else {
             return;
         };
@@ -698,11 +712,12 @@ fn a_client_that_hangs_up_while_a_write_waits_ends_the_stream() {
     let _ = origin.join();
 }
 
-/// ureq grows a chunk-size line without a bound; an origin that sends one
-/// at full speed is stopped by the origin process's memory bound, not by
-/// any deadline, and its connection goes with the process.
+/// ureq 3 holds a chunk-size line to its input buffer; an origin that
+/// sends an endless one at full speed is refused there, well inside the
+/// origin process's memory bound and before any deadline, and its
+/// connection goes with the process.
 #[test]
-fn an_endless_chunk_size_line_meets_the_memory_bound() {
+fn an_endless_chunk_size_line_is_refused_within_the_memory_bound() {
     let service = Service::start(
         "memory",
         &[
@@ -733,10 +748,7 @@ fn an_endless_chunk_size_line_meets_the_memory_bound() {
     assert_eq!(last_line(&mut reader).as_deref(), Some("stream"));
     let (body, last) = read_rest(&mut reader);
     assert!(body.is_empty());
-    assert_eq!(
-        last,
-        "error refused: the exchange with the origin passed its 32 MiB memory bound"
-    );
+    assert!(last.starts_with("error transport: read body: "), "{last}");
     assert!(
         asked.elapsed() < Duration::from_secs(10),
         "{:?}",
@@ -744,6 +756,36 @@ fn an_endless_chunk_size_line_meets_the_memory_bound() {
     );
     heard.recv_timeout(Duration::from_secs(5)).unwrap();
     let _ = origin.join();
+}
+
+/// The memory bound end to end: an origin process past it exits with its
+/// own status, and the relay names the bound. One MiB is less than the
+/// process holds from its start, so it ends at its first look, wherever the
+/// exchange has got to, and the reply carries the bound either as its error
+/// head or as the stream's last line.
+#[test]
+fn an_origin_process_past_its_memory_bound_is_refused_by_name() {
+    let service = Service::start("swollen", &["--stream-memory-mib", "1"]);
+    let Some((port, origin)) = scripted_origin(|conn| {
+        let _ = conn.write_all(chunked_head("").as_bytes());
+        let _ = conn.flush();
+        std::thread::sleep(Duration::from_secs(5));
+    }) else {
+        return;
+    };
+    let asked = Instant::now();
+    let mut reader = open_stream(&service.socket, &stream_get(port, "/"), b"");
+    let mut reply = String::new();
+    reader.read_to_string(&mut reply).unwrap();
+    let bound = "error refused: the exchange with the origin passed its 1 MiB memory bound";
+    assert!(reply.lines().any(|line| line == bound), "{reply:?}");
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        asked.elapsed()
+    );
+    // The origin may never have been reached; its thread is not waited on.
+    drop(origin);
 }
 
 /// The client's budget is for writing to it, not for the origin's wait: a

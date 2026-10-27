@@ -46,11 +46,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
-use sha2::Digest;
-use ureq::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
-use ureq::rustls::{
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
 };
+use sha2::Digest;
 
 const VALID_SECS: u64 = 24 * 60 * 60;
 /// Validity starts this far back, so a guest clock that steps

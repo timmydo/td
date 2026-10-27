@@ -53,7 +53,7 @@ fn die(msg: String) -> ! {
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::sig::to_hex(&Sha256::digest(bytes))
 }
 
 fn file_sha256(path: &Path) -> Result<String, String> {
@@ -91,7 +91,7 @@ fn file_sha256(path: &Path) -> Result<String, String> {
             .ok_or_else(|| "substitute hash read exceeded its buffer".to_string())?;
         hasher.update(bytes);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::sig::to_hex(&hasher.finalize()))
 }
 
 // ---- narinfo ----

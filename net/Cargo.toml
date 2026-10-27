@@ -24,9 +24,15 @@ path = "src/main.rs"
 [dependencies]
 # Union of the three former crates' deps. ureq + sha2 are shared by all three;
 # ring signs for td-subst and td-deploy (ed25519) and mints td-test-https's
-# P-256 test identities.
-ureq = { version = "2", default-features = false, features = ["tls"] }
-sha2 = "0.10"
+# P-256 test identities. ureq 3 no longer re-exports rustls: td-test-https
+# serves with it directly and fetchd checks custom roots with it, under the
+# features ureq's `rustls` feature already turns on (ring, never aws-lc-rs).
+# webpki-roots is the trust store ureq's `RootCerts::WebPki` reads; the exact
+# pin is the reviewed store. ureq is pinned exactly too: fetchd implements its
+# `unversioned` resolver trait, which ureq may change in a minor release.
+ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
+rustls = { version = "0.23.46", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+sha2 = "0.11"
 webpki-roots = "=1.0.11"
 ring = "0.17"
 td-engine = { path = "../engine" }

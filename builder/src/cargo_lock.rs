@@ -89,15 +89,16 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
 
     #[test]
     fn parse_lock_checksums_covers_the_real_td_net_lock() {
-        // The td-net crate-closure warm vendors ≥70 crates; the parser must see at least
-        // that many in the real net/Cargo.lock (drift guard: a lockfile-format change that
-        // blinds the parser reds here, not as a silently-cold warm).
+        // The td-net crate-closure warm vendors 44 crates since ureq 3 (73 under ureq 2);
+        // the parser must see at least 40 in the real net/Cargo.lock (drift guard: a
+        // lockfile-format change that blinds the parser reds here, not as a silently-cold
+        // warm).
         let lock =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../net/Cargo.lock"))
                 .unwrap();
         let got = parse_lock_checksums(&lock);
         assert!(
-            got.len() >= 70,
+            got.len() >= 40,
             "only {} checksummed packages parsed",
             got.len()
         );

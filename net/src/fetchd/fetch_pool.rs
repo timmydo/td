@@ -30,8 +30,9 @@ struct Key {
 impl Key {
     fn for_request(request: &Request, policy: Policy, budget: Duration) -> Option<Self> {
         // Public requests must resample local networks. Streams retain their
-        // process-owned idle deadlines. A zero-body POST must not acquire
-        // ureq's pooled-header retry path for a possibly complete mutation.
+        // process-owned idle deadlines. ureq 3 resends nothing on a pooled
+        // connection; an empty POST, possibly a complete mutation, stays off
+        // one regardless.
         if !can_reuse(request) {
             return None;
         }
@@ -50,7 +51,6 @@ impl Key {
 pub(super) struct Agent {
     pub agent: ureq::Agent,
     pub resolver: Arc<PolicyResolver>,
-    pub deadline: super::fetch_deadline::Deadline,
 }
 
 struct Cached {
@@ -102,14 +102,9 @@ impl Pool {
             if let Ok(mut entries) = self.idle.lock() {
                 entries.retain(|entry| entry.reusable(now));
                 if let Some(index) = entries.iter().rposition(|entry| entry.key == *key) {
+                    // The agent's whole-exchange deadline starts with each
+                    // call, so only the last refusal is cleared.
                     let entry = entries.swap_remove(index);
-                    entry
-                        .agent
-                        .deadline
-                        .reset(now.checked_add(budget).ok_or_else(|| {
-                            super::Fault::Transport("HTTPS deadline overflow".into())
-                        })?)
-                        .map_err(|e| super::Fault::Transport(e.to_string()))?;
                     *entry
                         .agent
                         .resolver
@@ -180,15 +175,12 @@ mod tests {
         pool.acquire(request, POLICY, Duration::from_secs(60), now, || {
             builds.set(builds.get() + 1);
             Ok(Agent {
-                agent: ureq::Agent::new(),
+                agent: ureq::Agent::new_with_defaults(),
                 resolver: Arc::new(PolicyResolver {
                     policy: POLICY,
                     public: None,
                     refusal: Mutex::new(None),
                 }),
-                deadline: super::super::fetch_deadline::Deadline::new(
-                    now + Duration::from_secs(60),
-                ),
             })
         })
         .unwrap()

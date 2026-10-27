@@ -75,7 +75,7 @@ struct SourcePin {
 }
 
 pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::sig::to_hex(&Sha256::digest(bytes))
 }
 
 fn reader_sha256_before(
@@ -109,7 +109,7 @@ fn reader_sha256_before(
     if let Some(guard) = guard {
         guard.check()?;
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::sig::to_hex(&hasher.finalize()))
 }
 
 fn file_sha256(path: &Path) -> io::Result<String> {
@@ -305,7 +305,7 @@ fn snapshot_for_serve_before(path: &Path, guard: &ResponseGuard<'_>) -> io::Resu
         }
         guard.check()?;
         snapshot.rewind()?;
-        return Ok((snapshot, format!("{:x}", hasher.finalize())));
+        return Ok((snapshot, crate::sig::to_hex(&hasher.finalize())));
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,

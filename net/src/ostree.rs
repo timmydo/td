@@ -235,8 +235,9 @@ fn normalize_repository(repository: &str) -> Result<String, String> {
     if authority.contains('@') || authority.contains('\\') {
         return Err("OSTree repository URL authority contains userinfo or a backslash".into());
     }
-    // The HTTP client percent-decodes and IDNA-maps a host; a host spelled any
-    // way but plainly could otherwise name Flathub without being recognised.
+    // An HTTP client may percent-decode or IDNA-map a host (ureq 2's URL parser
+    // did); a host spelled any way but plainly could otherwise name Flathub
+    // without being recognised.
     if !authority.bytes().all(|byte| {
         byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
     }) {

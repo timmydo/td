@@ -49,13 +49,12 @@
 // routable address among them; a name that
 // answers the resolver one way now and another way later is defended only as
 // far as the address it returned is the one connected to; and a name lookup
-// is outside every deadline, ureq's resolver being a blocking call (all four
-// are §W.8's recorded gaps).
+// is outside every deadline, td's address-policy resolver being a blocking
+// call (all four are §W.8's recorded gaps).
 //
 // Authentication is the socket's: `/run/user/<uid>` is mode 0700 and the
 // socket 0600, so only that uid connects. This crate forbids `unsafe`, so
 // peer credentials are not read; the mode is the whole of it.
-mod fetch_deadline;
 mod fetch_pool;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -103,11 +102,11 @@ const WORKERS: usize = 4;
 /// origin's to bound.
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(60);
 /// A counted exchange with the origin, connect, redirects and a trickling
-/// body included: ureq's one deadline, which supersedes its per-read and
-/// per-write timeouts, so those are not set. A counted request's worker is
-/// held by an origin no longer than this, plus `http.rs`'s connect
-/// deadline, which ureq applies on its own, and a name lookup, which no
-/// deadline reaches.
+/// body included: ureq's whole-exchange deadline, which caps every read
+/// and write by what is left of it, so no per-read or per-write timeout
+/// is set. A counted request's worker is held by an origin no longer than
+/// this, plus a name lookup, which no deadline reaches, and at most a
+/// second after a lookup that returns past it.
 const ORIGIN_TIMEOUT: Duration = Duration::from_secs(300);
 /// A streamed exchange's longest wait on the origin: every read and write,
 /// from the handshake through the head to the last body byte, is given this
@@ -137,8 +136,8 @@ const STREAM_ORIGINS: usize = 2 * WORKERS;
 /// The most an origin process may hold, resident and swapped, before it
 /// ends itself: the request body's cap and room for the binary, TLS and
 /// the frames.
-/// ureq grows a chunk-size line without a bound, so this, and not the
-/// origin's manners, is what bounds a stream's memory.
+/// This, and not ureq's input buffer or the origin's manners, is what
+/// bounds a stream's memory.
 const STREAM_MEMORY: u64 = 64 * 1024 * 1024;
 /// How often a relay waiting on its origin process, or on a write to its
 /// client, looks at the client, which may have hung up: the length of its
@@ -883,6 +882,7 @@ fn parse_header(text: &str) -> Result<(String, String), Fault> {
 /// is one such reading), and a redirect never passes through the request
 /// URL at all. A refusal is recorded so the reply can name it exactly
 /// rather than as the transport error ureq wraps it in.
+#[derive(Debug)]
 struct PolicyResolver {
     policy: Policy,
     /// For a `public` request, this machine's own addresses and networks,
@@ -891,8 +891,8 @@ struct PolicyResolver {
     refusal: Mutex<Option<String>>,
 }
 
-impl ureq::Resolver for PolicyResolver {
-    fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
+impl PolicyResolver {
+    fn resolve_netloc(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
         let addresses: Vec<SocketAddr> = netloc.to_socket_addrs()?.collect();
         if addresses.is_empty() {
             return Err(io::Error::other(format!("{netloc}: no address")));
@@ -920,12 +920,43 @@ impl ureq::Resolver for PolicyResolver {
 }
 
 /// ureq takes its resolver by value; this hands it the shared one so the
-/// request can read back the refusal afterwards.
+/// request can read back the refusal afterwards. Every address is checked;
+/// ureq connects to at most the first 16 of them. The lookup blocks, as it
+/// did under ureq 2. A whole-exchange deadline runs from the call; when a
+/// lookup returns past it, ureq gives the next operation one second
+/// (`NextTimeout::not_zero`) and then fails it, so the overrun past the
+/// lookup is at most that second.
+#[derive(Debug)]
 struct SharedResolver(Arc<PolicyResolver>);
 
-impl ureq::Resolver for SharedResolver {
-    fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
-        self.0.resolve(netloc)
+impl ureq::unversioned::resolver::Resolver for SharedResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let host = uri
+            .host()
+            .ok_or_else(|| ureq::Error::BadUri(format!("{uri} names no host")))?;
+        let port = match (uri.port_u16(), uri.scheme_str()) {
+            (Some(port), _) => port,
+            (None, Some("http")) => 80,
+            (None, Some("https")) => 443,
+            _ => return Err(ureq::Error::BadUri(format!("{uri} names no port"))),
+        };
+        let mut resolved = self.empty();
+        for address in self
+            .0
+            .resolve_netloc(&format!("{host}:{port}"))?
+            .into_iter()
+            .take(16)
+        {
+            resolved
+                .try_push(address)
+                .map_err(|_| ureq::Error::BadUri(format!("{uri}: too many addresses")))?;
+        }
+        Ok(resolved)
     }
 }
 
@@ -957,6 +988,7 @@ fn perform_with_pool(
     let ((status, headers), response) = send_origin(request, lease.agent())?;
     let mut body = Vec::new();
     response
+        .into_body()
         .into_reader()
         .take(limit.saturating_add(1))
         .read_to_end(&mut body)
@@ -972,25 +1004,32 @@ fn perform_with_pool(
     })
 }
 
-fn public_tls() -> Result<ureq::rustls::ClientConfig, Fault> {
-    let roots = ureq::rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    Ok(ureq::rustls::ClientConfig::builder_with_provider(
-        ureq::rustls::crypto::ring::default_provider().into(),
-    )
-    .with_protocol_versions(&[&ureq::rustls::version::TLS12, &ureq::rustls::version::TLS13])
-    .map_err(|e| Fault::Transport(format!("TLS configuration: {e}")))?
-    .with_root_certificates(roots)
-    .with_no_client_auth())
+/// rustls on ring, both TLS 1.2 and 1.3 (ureq's `ALL_VERSIONS`), over the
+/// given roots. Each agent builds its own rustls configuration from this
+/// once, so session resumption is scoped to one agent.
+fn tls(roots: ureq::tls::RootCerts) -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::Rustls)
+        .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .root_certs(roots)
+        .build()
 }
 
-fn custom_tls(pem: &[u8]) -> Result<ureq::rustls::ClientConfig, Fault> {
-    use ureq::rustls::pki_types::{pem::PemObject, CertificateDer};
-    let mut roots = ureq::rustls::RootCertStore::empty();
+/// The `webpki_roots::TLS_SERVER_ROOTS` td-net pins.
+fn public_tls() -> ureq::tls::TlsConfig {
+    tls(ureq::tls::RootCerts::WebPki)
+}
+
+/// ureq skips a root it cannot parse, so each is first held to rustls's own
+/// trust-anchor parse: a bundle with an unusable root is refused whole.
+fn custom_tls(pem: &[u8]) -> Result<ureq::tls::TlsConfig, Fault> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    let mut check = rustls::RootCertStore::empty();
+    let mut roots = Vec::new();
     for cert in CertificateDer::pem_slice_iter(pem) {
         let cert = cert.map_err(|e| Fault::Malformed(format!("invalid TLS CA PEM: {e}")))?;
-        roots
+        roots.push(ureq::tls::Certificate::from_der(cert.as_ref()).to_owned());
+        check
             .add(cert)
             .map_err(|e| Fault::Malformed(format!("invalid TLS CA certificate: {e}")))?;
     }
@@ -999,21 +1038,16 @@ fn custom_tls(pem: &[u8]) -> Result<ureq::rustls::ClientConfig, Fault> {
             "TLS CA bundle contains no certificates".into(),
         ));
     }
-    Ok(ureq::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth())
+    Ok(tls(ureq::tls::RootCerts::new_with_certs(&roots)))
 }
 
 /// The origin's status and the headers relayed from it.
 type OriginHead = (u16, Vec<(String, String)>);
+type Response = ureq::http::Response<ureq::Body>;
 
 /// Send the request and read the origin's head, under the address policy
 /// and the head bounds; the body is left for the caller to read.
-fn open(
-    request: Request,
-    policy: Policy,
-    timing: Timing,
-) -> Result<(OriginHead, ureq::Response), Fault> {
+fn open(request: Request, policy: Policy, timing: Timing) -> Result<(OriginHead, Response), Fault> {
     let agent = build_agent(&request, policy, timing)?;
     send_origin(request, &agent)
 }
@@ -1037,18 +1071,26 @@ fn build_agent(
         public,
         refusal: Mutex::new(None),
     });
-    let builder = ureq::AgentBuilder::new()
-        .resolver(SharedResolver(Arc::clone(&resolver)))
-        .timeout_connect(crate::http::CONNECT_TIMEOUT)
-        .redirects(ureq_redirects(match request.method {
-            Method::Get => request.redirects.unwrap_or(MAX_REDIRECTS),
-            Method::Post => 0,
-        }))
+    let followed = match request.method {
+        Method::Get => request.redirects.unwrap_or(MAX_REDIRECTS),
+        Method::Post => 0,
+    };
+    // Against ureq 3's defaults: no proxy from the environment, an error
+    // status is an answer the application reads, `redirects 0` hands the
+    // 3xx itself back, where a hop past a nonzero budget is ureq's
+    // refusal, and no `Authorization` crosses a followed redirect.
+    let builder = ureq::Agent::config_builder()
+        .proxy(None)
+        .http_status_as_error(false)
+        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
+        .timeout_connect(Some(crate::http::CONNECT_TIMEOUT))
+        .max_redirects(followed)
+        .max_redirects_will_error(followed > 0)
         .user_agent("td-fetchd/1");
     #[cfg(not(test))]
     let mut config = None;
     #[cfg(test)]
-    let mut config = tests::MAIL_TLS.get().map(Arc::clone);
+    let mut config = tests::MAIL_TLS.get().cloned();
     if let Some(pem) = request.tls_ca.as_deref() {
         if !request
             .url
@@ -1057,60 +1099,38 @@ fn build_agent(
         {
             return Err(Fault::Refused("custom TLS roots require HTTPS".into()));
         }
-        config = Some(Arc::new(custom_tls(pem)?));
+        config = Some(custom_tls(pem)?);
     }
-    let budget = match timing {
-        Timing::Whole(value) | Timing::Idle(value) => value,
-    };
-    let deadline = fetch_deadline::Deadline::new(
-        Instant::now()
-            .checked_add(budget)
-            .ok_or_else(|| Fault::Transport("HTTPS deadline overflow".into()))?,
-    );
-    let builder = match timing {
-        Timing::Whole(_) => {
-            let config = match config {
-                Some(config) => config,
-                None => Arc::new(public_tls()?),
-            };
-            builder
-                .tls_connector(Arc::new(fetch_deadline::Connector {
-                    config,
-                    deadline: deadline.clone(),
-                }))
-                .max_idle_connections(usize::from(fetch_pool::can_reuse(request)))
-                .max_idle_connections_per_host(1)
-        }
-        Timing::Idle(_) => match config {
-            Some(config) => builder.tls_config(config),
-            None => builder,
-        },
-    };
-    let agent = match timing {
-        // One deadline for the exchange: ureq applies it in place of its
-        // per-read and per-write timeouts, so setting those would do
-        // nothing. The connect deadline is applied on its own.
-        Timing::Whole(budget) => builder.timeout(budget),
-        // No deadline over the whole, so ureq leaves each socket operation
-        // these timeouts, the body's reads included. It clears them on a
-        // connection it pools, and a redirect to the same origin would read
-        // its next head there with none, so nothing is pooled.
+    let builder = builder.tls_config(config.unwrap_or_else(public_tls));
+    let config = match timing {
+        // One deadline for each exchange, started when it is called, so an
+        // agent the pool hands back starts afresh. ureq bounds every read
+        // and write by what is left of it, on a pooled connection and in
+        // the TLS handshake too. The connect deadline is applied on its own.
+        Timing::Whole(budget) => builder
+            .timeout_global(Some(budget))
+            .max_idle_connections(usize::from(fetch_pool::can_reuse(request)))
+            .max_idle_connections_per_host(1),
+        // No deadline over the whole, so ureq gives each socket operation
+        // these timeouts, the body's reads included. Nothing is pooled: a
+        // stream's process owns its one exchange.
         Timing::Idle(idle) => builder
-            .timeout_read(idle)
-            .timeout_write(idle)
+            .timeout_per_read(Some(idle))
+            .timeout_per_write(Some(idle))
             .max_idle_connections(0),
     }
     .build();
-    Ok(fetch_pool::Agent {
-        agent,
-        resolver,
-        deadline,
-    })
+    let agent = ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::new(),
+        SharedResolver(Arc::clone(&resolver)),
+    );
+    Ok(fetch_pool::Agent { agent, resolver })
 }
 fn send_origin(
     request: Request,
     owner: &fetch_pool::Agent,
-) -> Result<(OriginHead, ureq::Response), Fault> {
+) -> Result<(OriginHead, Response), Fault> {
     let agent = &owner.agent;
     let resolver = &owner.resolver;
     let Request {
@@ -1124,51 +1144,38 @@ fn send_origin(
         public: _,
         body: request_body,
     } = request;
-    let mut call = agent.request(method.as_str(), &url);
-    for (name, value) in &headers {
-        call = call.set(name, value);
-    }
-    call = call.set("accept-encoding", "identity");
     let response = match method {
-        Method::Get => call.call(),
-        Method::Post => call.send_bytes(&request_body),
+        Method::Get => with_headers(agent.get(&url), &headers).call(),
+        Method::Post => with_headers(agent.post(&url), &headers).send(&request_body[..]),
     };
     // The origin has the request body; a worker holds it or the response's,
     // never both.
     drop(request_body);
-    let response = match response {
-        Ok(response) => response,
-        // An answer is an answer: the application reads the status.
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(ureq::Error::Transport(transport)) => {
-            let refusal = resolver
-                .refusal
-                .lock()
-                .ok()
-                .and_then(|refusal| refusal.clone());
-            return Err(match refusal {
-                Some(reason) => Fault::Refused(reason),
-                None => Fault::Transport(transport.to_string()),
-            });
+    // An answer is an answer: `http_status_as_error(false)` hands every
+    // status back for the application to read.
+    let response = response.map_err(|error| {
+        let refusal = resolver
+            .refusal
+            .lock()
+            .ok()
+            .and_then(|refusal| refusal.clone());
+        match refusal {
+            Some(reason) => Fault::Refused(reason),
+            // ureq 3's Display does not name the URL, so the fault does.
+            None => Fault::Transport(format!("{url}: {error}")),
         }
-    };
-    let status = response.status();
-    // Each distinct name once, its values in order: `headers_names` repeats
-    // a name that appears twice, and asking for all of its values twice
-    // would square them.
-    let mut names: Vec<String> = Vec::new();
-    for name in response.headers_names() {
-        let lower = name.to_ascii_lowercase();
-        if !names.contains(&lower) {
-            names.push(lower);
-        }
-    }
+    })?;
+    let status = response.status().as_u16();
+    // Each distinct name once (`keys` names each once, lower-case), its
+    // values in order. A value that is not UTF-8 is dropped, as ureq 2 did.
     let mut headers = Vec::new();
-    for name in names {
-        if CONNECTION_HEADERS.contains(&name.as_str()) {
+    for name in response.headers().keys() {
+        let name = name.as_str();
+        if CONNECTION_HEADERS.contains(&name) {
             continue;
         }
-        for value in response.all(&name) {
+        let values = response.headers().get_all(name).iter();
+        for value in values.filter_map(|value| std::str::from_utf8(value.as_bytes()).ok()) {
             if headers.len() >= MAX_HEADERS {
                 return Err(Fault::Refused(format!(
                     "response over {MAX_HEADERS} headers"
@@ -1180,10 +1187,28 @@ fn send_origin(
                     "response header over {MAX_LINE} bytes"
                 )));
             }
-            headers.push((name.clone(), value.to_string()));
+            headers.push((name.to_string(), value.to_string()));
         }
     }
     Ok(((status, headers), response))
+}
+
+/// The application's headers, then identity encoding. ureq 2's `set`
+/// replaced a name given twice; ureq 3's `header` appends, so only the
+/// last value given for a name is sent.
+fn with_headers<B>(
+    mut call: ureq::RequestBuilder<B>,
+    headers: &[(String, String)],
+) -> ureq::RequestBuilder<B> {
+    for (index, (name, value)) in headers.iter().enumerate() {
+        let repeated = headers
+            .get(index.saturating_add(1)..)
+            .is_some_and(|later| later.iter().any(|(other, _)| other == name));
+        if !repeated {
+            call = call.header(name, value);
+        }
+    }
+    call.header("accept-encoding", "identity")
 }
 
 /// What a relay hears of its origin process before the body: the reply head
@@ -1276,9 +1301,8 @@ impl OriginProcess {
 }
 
 /// A streamed request. ureq gives no way to interrupt a read, and an origin
-/// can keep one going past any deadline, a byte at a time or as a chunk
-/// size line that never ends and grows without bound; so the exchange runs
-/// in a process of its own, `td-fetchd origin`, which the relay here kills
+/// can keep one going past any deadline, a byte at a time; so the exchange
+/// runs in a process of its own, `td-fetchd origin`, which the relay here kills
 /// at the total or when the client hangs up, and which ends itself at its
 /// memory bound. The process writes the streamed reply to its stdout and
 /// the relay passes it on frame by frame. The worker's place goes back once
@@ -1778,7 +1802,7 @@ fn stream_from_origin(
     head.push_str("stream\n\n");
     output.write_all(head.as_bytes())?;
     output.flush()?;
-    let mut reader = response.into_reader();
+    let mut reader = response.into_body().into_reader();
     let mut buffer = vec![0u8; MAX_CHUNK];
     let mut total = 0u64;
     let ending = loop {
@@ -1787,10 +1811,16 @@ fn stream_from_origin(
             Ok(read) => read,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                let fault = if matches!(
+                // ureq 3 reports its per-read timeout as its own error,
+                // carried inside the reader's `io::Error`.
+                let timed_out = matches!(
                     e.kind(),
                     io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) {
+                ) || e
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+                    .is_some_and(|inner| matches!(inner, ureq::Error::Timeout(_)));
+                let fault = if timed_out {
                     Fault::Transport(format!("the origin sent nothing for {idle:?}"))
                 } else {
                     Fault::Transport(format!("read body: {e}"))
@@ -1815,7 +1845,7 @@ fn stream_from_origin(
 
 /// The scheme is the one part of the URL judged here, and it is judged on
 /// the text before `://`, which no parser reads differently, in either case
-/// as the url crate reads it; a redirect to another scheme fails inside
+/// as ureq's URI parser reads it; a redirect to another scheme fails inside
 /// ureq, which speaks only these two.
 fn check_scheme(url: &str) -> Result<(), Fault> {
     let (scheme, _) = url
@@ -1963,28 +1993,71 @@ pub(crate) fn probe_within(socket: &Path, budget: Duration) -> Result<(), String
     Ok(())
 }
 
-/// ureq's `redirects` counts requests, not the redirects followed: given N
-/// it follows N - 1 and calls the Nth 3xx one too many, and given 0 it hands
-/// the 3xx back. So N followed is N + 1 asked of it, and none is none.
-fn ureq_redirects(followed: u32) -> u32 {
-    if followed == 0 {
-        0
-    } else {
-        followed.saturating_add(1)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
-    use ureq::Resolver as _;
 
+    /// What build_agent hands ureq: ureq 3 counts redirects followed, where
+    /// ureq 2 counted requests; the whole exchange is one deadline with
+    /// pooling only for a reusable request, and a stream is idle deadlines
+    /// with none.
     #[test]
     fn redirects_asked_for_are_redirects_followed() {
-        assert_eq!(ureq_redirects(0), 0);
-        assert_eq!(ureq_redirects(1), 2);
-        assert_eq!(ureq_redirects(MAX_REDIRECTS), MAX_REDIRECTS + 1);
+        let budget = Duration::from_secs(7);
+        let idle = Duration::from_secs(3);
+        for (url, line, followed) in [
+            ("http://h/", "redirects 0\n", 0),
+            ("https://h/", "redirects 0\n", 0),
+            ("http://h/", "redirects 1\n", 1),
+            ("https://h/", "", MAX_REDIRECTS),
+        ] {
+            let request = parse(&request_bytes(
+                &format!("method GET\nurl {url}\n{line}"),
+                b"",
+            ))
+            .unwrap();
+            for timing in [Timing::Whole(budget), Timing::Idle(idle)] {
+                let built = build_agent(&request, LENIENT, timing).unwrap();
+                let config = built.agent.config();
+                assert_eq!(config.max_redirects(), followed);
+                assert_eq!(config.max_redirects_will_error(), followed > 0);
+                assert!(config.proxy().is_none());
+                assert!(!config.http_status_as_error());
+                assert_eq!(
+                    config.redirect_auth_headers(),
+                    ureq::config::RedirectAuthHeaders::Never
+                );
+                assert_eq!(
+                    config.timeouts().connect,
+                    Some(crate::http::CONNECT_TIMEOUT)
+                );
+                match timing {
+                    Timing::Whole(_) => {
+                        assert_eq!(config.timeouts().global, Some(budget));
+                        assert_eq!(config.timeout_per_read(), None);
+                        assert_eq!(config.timeout_per_write(), None);
+                        assert_eq!(
+                            config.max_idle_connections(),
+                            usize::from(fetch_pool::can_reuse(&request))
+                        );
+                    }
+                    Timing::Idle(_) => {
+                        assert_eq!(config.timeouts().global, None);
+                        assert_eq!(config.timeout_per_read(), Some(idle));
+                        assert_eq!(config.timeout_per_write(), Some(idle));
+                        assert_eq!(config.max_idle_connections(), 0);
+                    }
+                }
+            }
+        }
+        // Only the HTTPS request asking for no redirects is reusable here.
+        let reusable = parse(&request_bytes(
+            "method GET\nurl https://h/\nredirects 0\n",
+            b"",
+        ))
+        .unwrap();
+        assert!(fetch_pool::can_reuse(&reusable));
     }
 
     const ACCOUNT_CA: &[u8] = include_bytes!("../tests/fixtures/account-ca/ca.pem");
@@ -2033,7 +2106,7 @@ mod tests {
         expired: bool,
         pool: &fetch_pool::Pool,
     ) -> bool {
-        use ureq::rustls::{
+        use rustls::{
             pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
             ServerConfig, ServerConnection, StreamOwned,
         };
@@ -2132,11 +2205,65 @@ mod tests {
         assert!(!account_tls_exchange(None, "localhost", false, &pool));
     }
 
+    /// What fetch_deadline's socket wrapper did under ureq 2: an exchange on
+    /// a connection the agent pooled is still bounded by its own whole
+    /// deadline, which starts when it is called.
+    #[test]
+    fn a_pooled_connection_keeps_the_whole_exchange_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            for answer in [true, false] {
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => return false,
+                        Ok(_) if line == "\r\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+                if answer {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .unwrap();
+                } else {
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+            // The second exchange used the first one's connection.
+            listener.set_nonblocking(true).unwrap();
+            listener.accept().is_err()
+        });
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .proxy(None)
+                .timeout_global(Some(Duration::from_millis(500)))
+                .max_idle_connections(1)
+                .max_idle_connections_per_host(1)
+                .build(),
+        );
+        let url = format!("http://127.0.0.1:{port}/");
+        // Each call comes after a whole budget has passed since the last.
+        std::thread::sleep(Duration::from_millis(600));
+        let body = agent.get(&url).call().unwrap().into_body().read_to_vec();
+        assert_eq!(body.unwrap(), b"ok");
+        std::thread::sleep(Duration::from_millis(600));
+        let started = Instant::now();
+        assert!(agent.get(&url).call().is_err());
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert!(server.join().unwrap());
+    }
+
     fn account_request(head: &str, body: &[u8]) -> Result<Request, String> {
         parse(&request_bytes(head, body))
     }
 
-    pub(super) static MAIL_TLS: std::sync::OnceLock<Arc<ureq::rustls::ClientConfig>> =
+    pub(super) static MAIL_TLS: std::sync::OnceLock<ureq::tls::TlsConfig> =
         std::sync::OnceLock::new();
 
     /// Runs only as an isolated child of td-mta's real-client oracle.
@@ -2144,14 +2271,10 @@ mod tests {
     #[ignore = "td-mta qualification supplies a private root and socket"]
     fn mail_read_fixture() {
         let root = std::fs::read(std::env::var_os("TD_TEST_FETCH_ROOT").unwrap()).unwrap();
-        let mut roots = ureq::rustls::RootCertStore::empty();
-        roots
-            .add(ureq::rustls::pki_types::CertificateDer::from(root))
+        let root = ureq::tls::Certificate::from_der(&root).to_owned();
+        MAIL_TLS
+            .set(tls(ureq::tls::RootCerts::new_with_certs(&[root])))
             .unwrap();
-        let config = ureq::rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        MAIL_TLS.set(Arc::new(config)).unwrap();
         let socket = std::env::var_os("TD_TEST_FETCH_SOCKET").unwrap();
         serve(
             Path::new(&socket),
@@ -2369,7 +2492,7 @@ mod tests {
             public: None,
             refusal: Mutex::new(None),
         };
-        let resolved = resolver.resolve("93.184.216.34:443").unwrap();
+        let resolved = resolver.resolve_netloc("93.184.216.34:443").unwrap();
         assert_eq!(
             resolved,
             ["93.184.216.34:443".parse::<SocketAddr>().unwrap()]
@@ -2382,7 +2505,7 @@ mod tests {
             ("0.0.0.1:80", "unspecified address"),
             ("169.254.169.254:80", "link-local address"),
         ] {
-            let err = resolver.resolve(netloc).unwrap_err().to_string();
+            let err = resolver.resolve_netloc(netloc).unwrap_err().to_string();
             assert!(err.contains(reason), "{netloc}: {err}");
             assert_eq!(
                 resolver.refusal.lock().unwrap().as_deref(),
@@ -2393,13 +2516,13 @@ mod tests {
         // A LAN's address is the grant's to reach, and not a public
         // request's: that one is judged by the relay's predicate as well,
         // embedded and translated forms included.
-        assert!(resolver.resolve("10.0.0.1:80").is_ok());
+        assert!(resolver.resolve_netloc("10.0.0.1:80").is_ok());
         let public = PolicyResolver {
             policy: STRICT,
             public: Some(crate::egress::Local::default()),
             refusal: Mutex::new(None),
         };
-        assert!(public.resolve("93.184.216.34:443").is_ok());
+        assert!(public.resolve_netloc("93.184.216.34:443").is_ok());
         for (netloc, reason) in [
             ("10.0.0.1:80", "10.0.0.1 is private (RFC 1918)"),
             ("192.168.1.1:80", "192.168.1.1 is private (RFC 1918)"),
@@ -2409,7 +2532,7 @@ mod tests {
             ("168.63.129.16:80", "platform endpoint"),
             ("127.0.0.1:80", "loopback address"),
         ] {
-            let err = public.resolve(netloc).unwrap_err().to_string();
+            let err = public.resolve_netloc(netloc).unwrap_err().to_string();
             assert!(err.contains(reason), "{netloc}: {err}");
             let refusal = public.refusal.lock().unwrap().clone().unwrap_or_default();
             assert!(refusal.contains(reason), "{netloc}: {refusal}");
@@ -2712,8 +2835,13 @@ mod tests {
         );
         assert_eq!(lines, [PROTOCOL, "error refused: response over 99 bytes"]);
         assert!(body.is_empty());
-        // A redirect is followed for GET and not for POST.
-        let (lines, body) = ask(&socket, &format!("method GET\nurl {base}/moved\n"), b"");
+        // A redirect is followed for GET and not for POST; a credential is
+        // not carried across it, even to the same origin.
+        let (lines, body) = ask(
+            &socket,
+            &format!("method GET\nurl {base}/moved\nheader authorization: Bearer hop-secret\n"),
+            b"",
+        );
         assert_eq!(lines[1], "status 200");
         assert_eq!(body, b"<rss/>");
         let (lines, _) = ask(
@@ -2775,7 +2903,7 @@ mod tests {
             b"",
         );
         assert!(
-            lines[1].starts_with("error transport: ") && lines[1].contains("Too Many Redirects"),
+            lines[1].starts_with("error transport: ") && lines[1].contains("too many redirects"),
             "{lines:?}"
         );
         // An answer over 400 is an answer.
@@ -2797,13 +2925,18 @@ mod tests {
         let (lines, _) = ask(&socket, "method GET\n", b"");
         assert_eq!(lines[1], "error malformed: no url");
         // The address policy is applied to what ureq parses: this authority
-        // reads as a public host to a naive split and as 0.0.0.1 to ureq.
+        // reads as a public host to a naive split, and ureq's parser refuses
+        // it before anything is resolved.
         let (lines, _) = ask(
             &socket,
             "method GET\nurl http://0.0.0.1:1\\@93.184.216.34/\n",
             b"",
         );
-        assert_eq!(lines[1], "error refused: unspecified address");
+        assert!(
+            lines[1].starts_with("error transport: ")
+                && lines[1].ends_with(": http: invalid uri character"),
+            "{lines:?}"
+        );
         // A connect-and-close is a liveness probe: nothing is written back
         // and the next request is served.
         drop(UnixStream::connect(&socket).unwrap());
@@ -2830,6 +2963,18 @@ mod tests {
         assert!(second.starts_with("post /post http/1.1"), "{second}");
         assert!(second.contains("content-type: text/plain"), "{second}");
         assert!(second.ends_with("hello"), "{second}");
+        let seen: Vec<String> = seen
+            .iter()
+            .map(|raw| String::from_utf8_lossy(raw).to_ascii_lowercase())
+            .collect();
+        let carried: Vec<usize> = (0..seen.len())
+            .filter(|i| seen[*i].contains("authorization: bearer hop-secret"))
+            .collect();
+        assert_eq!(carried.len(), 1, "{seen:?}");
+        assert!(seen[carried[0]].starts_with("get /moved http/1.1"));
+        let hop = &seen[carried[0] + 1];
+        assert!(hop.starts_with("get /feed http/1.1"), "{hop}");
+        assert!(!hop.contains("authorization"), "{hop}");
         // The probe never connects, even with explicit loopback permission.
         probe(&socket).unwrap();
         let _ = std::fs::remove_dir_all(&dir);

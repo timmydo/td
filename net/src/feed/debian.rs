@@ -733,7 +733,7 @@ fn tar_member<'a>(tar: &'a [u8], path: &str) -> Option<&'a [u8]> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::sig::to_hex(&Sha256::digest(bytes))
 }
 
 fn json_str<'a>(value: &'a td_engine::json::Json, key: &str) -> Option<&'a str> {
