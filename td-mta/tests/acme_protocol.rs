@@ -197,13 +197,16 @@ impl Exchange for Ca {
                 assert!(!state.key_authorization.is_empty());
                 if let Some(address) = self.challenge_address {
                     use std::io::{Read, Write};
+                    // The check runs inside the client's /challenge exchange,
+                    // so that exchange's ceiling bounds it; the production
+                    // responder keeps its own shorter limit.
                     let mut socket = std::net::TcpStream::connect_timeout(
                         &address,
-                        std::time::Duration::from_secs(2),
+                        acme::http::EXCHANGE_DURATION,
                     )
                     .unwrap();
                     socket
-                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .set_read_timeout(Some(acme::http::EXCHANGE_DURATION))
                         .unwrap();
                     write!(
                         socket,
@@ -502,6 +505,7 @@ fn issued_certificate_requires_exact_dns_identifiers() {
 
 #[test]
 fn complete_issuance_over_verified_local_https() {
+    use acme::http::{ATTEMPT_DURATION, EXCHANGE_DURATION};
     use std::{
         net::TcpListener,
         path::Path,
@@ -518,6 +522,9 @@ fn complete_issuance_over_verified_local_https() {
         tls_io::{TlsIo, TLS_WIRE_BYTES},
         transport::TcpTransport,
     };
+    // Production's allowances, not host speed, bound each step: one attempt per
+    // advance as the service makes, at most eight attempts in all.
+    const ATTEMPTS: u32 = 8;
     let (mut settings, mut state, mut store, mut ca) = setup();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -559,7 +566,7 @@ fn complete_issuance_over_verified_local_https() {
         names: vec!["localhost".into()],
         token: String::new(),
         authorization: String::new(),
-        expires: Instant::now() + Duration::from_secs(60),
+        expires: Instant::now() + ATTEMPT_DURATION * ATTEMPTS,
     }));
     store.1 = Some(current.clone());
     let stop = Arc::new(AtomicBool::new(false));
@@ -569,7 +576,7 @@ fn complete_issuance_over_verified_local_https() {
     });
     let child_stop = stop.clone();
     let worker = std::thread::spawn(move || {
-        let limit = Instant::now() + Duration::from_secs(60);
+        let limit = Instant::now() + ATTEMPT_DURATION * ATTEMPTS;
         while !child_stop.load(Ordering::Acquire) && Instant::now() < limit {
             let socket = match listener.accept() {
                 Ok((s, _)) => s,
@@ -579,7 +586,12 @@ fn complete_issuance_over_verified_local_https() {
                 }
                 Err(e) => panic!("{e}"),
             };
-            let cap = Deadline::after(clock.sample().unwrap().monotonic, 5000).unwrap();
+            // The client abandons an exchange at this ceiling; serve as long.
+            let cap = Deadline::after(
+                clock.sample().unwrap().monotonic,
+                EXCHANGE_DURATION.as_millis() as u64,
+            )
+            .unwrap();
             let mut io = TlsIo::new(
                 TcpTransport::from_stream(socket).unwrap(),
                 TlsSession::server(config.clone()).unwrap(),
@@ -668,14 +680,14 @@ fn complete_issuance_over_verified_local_https() {
         }
     }
     let guard = Stop(stop, vec![worker, http_worker]);
-    let mut https = acme::http::Https {
-        executable: Path::new(env!("CARGO_BIN_EXE_td-mta")),
-        directory: &settings.directory,
-        trust: &trust,
-        deadline: Instant::now() + Duration::from_secs(55),
-    };
     let mut now = NOW;
-    for _ in 0..8 {
+    for _ in 0..ATTEMPTS {
+        let mut https = acme::http::Https {
+            executable: Path::new(env!("CARGO_BIN_EXE_td-mta")),
+            directory: &settings.directory,
+            trust: &trust,
+            deadline: Instant::now() + ATTEMPT_DURATION,
+        };
         acme::order::advance(&settings, &mut state, &mut https, &mut store, now).unwrap();
         state = State::decode(&store.0.lock().unwrap().bytes).unwrap();
         now = now.max(state.next_ms);

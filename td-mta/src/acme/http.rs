@@ -6,6 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 use td_crypto::TrustStore;
+/// One request/response exchange's ceiling within an attempt.
+pub const EXCHANGE_DURATION: Duration = Duration::from_secs(15);
+/// The network allowance of one `order::advance` attempt.
+pub const ATTEMPT_DURATION: Duration = Duration::from_secs(100);
 pub struct Response {
     pub status: u16,
     pub nonce: Option<String>,
@@ -33,7 +37,7 @@ impl Exchange for Https<'_> {
             executable: self.executable,
             origin: self.directory,
             trust: self.trust,
-            deadline: self.deadline.min(Instant::now() + Duration::from_secs(15)),
+            deadline: self.deadline.min(Instant::now() + EXCHANGE_DURATION),
         }
         .exchange(
             outbound_http::Request {

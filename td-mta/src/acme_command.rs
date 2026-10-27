@@ -176,7 +176,7 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
                     executable: &executable,
                     directory: &options.settings.directory,
                     trust: &trust,
-                    deadline: Instant::now() + Duration::from_secs(100),
+                    deadline: Instant::now() + acme::http::ATTEMPT_DURATION,
                 };
                 let now = now()?;
                 if let Err(error) = acme::order::advance(
