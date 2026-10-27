@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 use super::*;
 use crate::backoff::tests::Scratch;
+use crate::revocation::tests::WAIT;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
@@ -100,8 +101,17 @@ impl Fixture {
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
+        let waiting = intake.pending.is_some();
         for _ in 0..4 {
             intake.tick();
+        }
+        // Admission's five seconds span its synced backoff write; no case
+        // that submits a frame is about them, so a request this accepted
+        // has `WAIT` until its acknowledgement sets production's next.
+        if !waiting {
+            if let Some(pending) = intake.pending.as_mut() {
+                pending.deadline = Some(Instant::now() + WAIT);
+            }
         }
         let mut greeting = [0; 8];
         if client.read_exact(&mut greeting).is_err() {
@@ -353,8 +363,10 @@ fn an_admitted_request_counts_at_admission_however_it_ends() {
     // Departure.
     let fixture = Fixture::new("td");
     let (mut intake, client) = queued(&fixture, "my-laptop");
+    // Only the departure may end the wait, not the request's expiry.
+    intake.pending.as_mut().unwrap().deadline = None;
     drop(client);
-    let until = Instant::now() + Duration::from_secs(2);
+    let until = Instant::now() + WAIT;
     while intake.pending.is_some() {
         assert!(Instant::now() < until);
         intake.tick();

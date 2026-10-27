@@ -3581,8 +3581,10 @@ enrolled record of version 1 or 2, and a damaged record, a damaged
 directory and an unreadable helper (any marker selectable); a refusal's
 exact `99 01`, no description, no operation, the requester's completion
 byte `00` and nothing left to select; the cache refreshed by the read;
-a deployment whose marker admits the record, refused with `99 01` well
-inside the receive when its read's budget is spent, through the selected
-update's `give_up` field, which production sets only from
-`MARKER_GIVE_UP`; and the marker read afresh through the held directory,
-never a link, a FIFO, another owner's file or one past its bound.
+a deployment whose marker admits the record, refused with `99 01` when
+its read's budget is spent and admitted with it unspent, through the
+selected update's `give_up` field, which production sets only from
+`MARKER_GIVE_UP`, whose two seconds beside the helper's keep the
+request inside the receive; and the marker read afresh through the
+held directory, never a link, a FIFO, another owner's file or one past
+its bound.

@@ -1674,17 +1674,21 @@ fn a_marker_read_past_its_budget_refuses_inside_the_channels_receive() {
     prepare(&mut session);
     // A marker this record admits, read with its budget already spent:
     // the read reads no version, and the request refuses rather than
-    // outlasting the compositor's five-second receive.
+    // outlasting the compositor's five-second receive. The refusal is the
+    // budget's, since an unspent one admits this marker; that the budgets
+    // sum inside the receive is the constants' (`MARKER_GIVE_UP`'s), not
+    // a debug build's elapsed time.
     let update = Fixture::marked(Some(&marker(&[1])));
     let (mut intake, mut requester) = queued(&update);
     hurry(&mut intake, Duration::ZERO);
     session.installations = Some(intake);
-    let started = Instant::now();
-    let answer = session.begin_install(v1).unwrap();
-    let took = started.elapsed();
-    assert_eq!(answer, [0x99, 1]);
-    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert_eq!(session.begin_install(v1).unwrap(), [0x99, 1]);
     assert_eq!(retired(&mut requester), [0]);
+    // The same marker within its budget is admitted.
+    let update = Fixture::marked(Some(&marker(&[1])));
+    let (intake, _requester) = queued(&update);
+    session.installations = Some(intake);
+    assert_eq!(session.begin_install(v1).unwrap()[0], 0x92);
     session.close_with(|_| fixture("cleanup_child")).unwrap();
 }
 

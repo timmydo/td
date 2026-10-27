@@ -3,6 +3,7 @@ use super::*;
 use crate::backoff::tests::Scratch;
 use crate::backoff::Entry;
 pub(crate) use crate::login_tier::tests::marker;
+use crate::revocation::tests::WAIT;
 use crate::set_hostname::tests::granted;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -115,8 +116,17 @@ impl Fixture {
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
+        let waiting = intake.pending.is_some();
         for _ in 0..4 {
             intake.tick();
+        }
+        // Admission's five seconds span its synced backoff write; no case
+        // that submits a frame is about them, so a request this accepted
+        // has `WAIT` until its acknowledgement sets production's next.
+        if !waiting {
+            if let Some(pending) = intake.pending.as_mut() {
+                pending.deadline = Some(Instant::now() + WAIT);
+            }
         }
         let mut greeting = [0; 8];
         if client.read_exact(&mut greeting).is_err() {
@@ -145,7 +155,7 @@ pub(crate) fn queued(fixture: &Fixture) -> (Intake, UnixStream) {
     let mut pending = Pending::new(server, fixture.owner).unwrap();
     // Admission's five seconds span its synced backoff write; no case
     // that queues an update is about them, so they last `WAIT` here.
-    pending.deadline = Some(Instant::now() + crate::revocation::tests::WAIT);
+    pending.deadline = Some(Instant::now() + WAIT);
     let backoff = fixture.backoff();
     let admission = || {
         let backoff = backoff.clone();
@@ -261,6 +271,8 @@ fn real_transport_admits_only_one_bounded_descriptor_free_frame() {
         fixture.lapse();
         let (server, mut client) = UnixStream::pair().unwrap();
         let mut pending = Pending::new(server, fixture.owner).unwrap();
+        // The transport, not admission's five seconds, is the case.
+        pending.deadline = Some(Instant::now() + WAIT);
         pending.poll(unasked).unwrap();
         let mut greeting = [0; 8];
         client.read_exact(&mut greeting).unwrap();
@@ -280,20 +292,30 @@ fn real_transport_admits_only_one_bounded_descriptor_free_frame() {
         let mut admitted = [0];
         client.read_exact(&mut admitted).unwrap();
         assert_eq!(admitted, [ADMITTED]);
+        // Only the departure or the extra byte may end the wait, not the
+        // acknowledged request's own expiry.
+        pending.deadline = None;
         if extra {
             client.write_all(b"x").unwrap();
         } else {
             client.shutdown(std::net::Shutdown::Both).unwrap();
             drop(client);
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while pending.poll(unasked).is_ok() {
+        let deadline = Instant::now() + WAIT;
+        let error = loop {
+            if let Err(error) = pending.poll(unasked) {
+                break error;
+            }
             assert!(
                 Instant::now() < deadline,
                 "requester departure or extra traffic not observed"
             );
             std::thread::sleep(Duration::from_millis(1));
-        }
+        };
+        assert_eq!(
+            error.to_string(),
+            "update requester disconnected or sent extra bytes"
+        );
     }
     let (server, mut client) = UnixStream::pair().unwrap();
     let mut pending = Pending::new(server, fixture.owner).unwrap();
@@ -341,6 +363,8 @@ fn a_delegated_connection_cannot_change_its_submitting_process() {
     let fixture = Fixture::new();
     let (server, mut client) = UnixStream::pair().unwrap();
     let mut pending = Pending::new(server, fixture.owner).unwrap();
+    // The sender check, not admission's five seconds, is the case.
+    pending.deadline = Some(Instant::now() + WAIT);
     pending.poll(unasked).unwrap();
     client.write_all(&[0, 65]).unwrap();
     pending.poll(unasked).unwrap();
@@ -357,7 +381,7 @@ fn a_delegated_connection_cannot_change_its_submitting_process() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WAIT;
     let result = loop {
         if let Err(error) = pending.poll(unasked) {
             break error.to_string();
@@ -417,7 +441,7 @@ fn commit_transfers_one_held_directory_and_completion_needs_the_child_exit() {
             })
             .is_err());
         assert_eq!(calls, 1);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT;
         let event = loop {
             let event = installation.poll().unwrap();
             if !matches!(event, Event::Waiting) {
@@ -479,8 +503,10 @@ fn the_update_queue_counts_each_admission_and_refuses_while_backing_off() {
     // One at a time: a second connection is not served while one waits.
     let (_second, answer) = fixture.submit(&mut intake, &fixture.frame());
     assert_eq!(answer, None);
+    // Only the departure may end the wait, not the request's expiry.
+    intake.pending.as_mut().unwrap().deadline = None;
     drop(first);
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + WAIT;
     while intake.pending.is_some() {
         intake.tick();
         assert!(Instant::now() < until, "requester departure not observed");

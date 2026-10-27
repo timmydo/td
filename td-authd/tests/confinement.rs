@@ -421,6 +421,12 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(installation.matches("give_up").count(), 5);
     assert_eq!(installation.matches("give_up: MARKER_GIVE_UP,").count(), 1);
     assert_eq!(installation.matches("give_up: ready.give_up,").count(), 1);
+    // Admission's five seconds, which the fixtures lengthen: DESIGN.md's
+    // "Admission expires in five seconds".
+    assert_eq!(
+        installation.matches("deadline: Some(expires(5)?),").count(),
+        1
+    );
     assert_eq!(
         installation
             .matches("const MARKER_GIVE_UP: Duration = Duration::from_secs(2);")
@@ -573,6 +579,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(fingerprint(rename), SET_HOSTNAME_FINGERPRINT);
     for pin in [
+        "deadline: Some(expires(5)?),",
         "const SOCKET: &str = \"/run/td-authd/1000/hostname\";",
         "const GREETING: &[u8; 8] = b\"TDHST01\\n\";",
         "const SAVED: &str = \"/var/lib/td/hostname\";",
