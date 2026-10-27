@@ -1286,8 +1286,9 @@ callback attempts to swallow the error. The original deadline covers setup,
 verification, callback work and final return. As with the current verified
 blob callback, callers must bound their own CPU and I/O by that deadline.
 
-Only `with_interpreted_body`, whose callback builds provisional output and
-cannot publish or admit new work, groups connection-health polling across
+`with_interpreted_body` and the qualified `with_projected_body` path, whose
+callbacks build provisional output and cannot publish or admit new work,
+group connection-health polling across
 resident pin checks and cached body reads. They share one counter: a full
 driver check occurs at least every 64 checkpoints. Every checkpoint still
 checks sticky failure and the original body/worker deadlines immediately.
@@ -2535,8 +2536,9 @@ notFound; cached headers grant neither account access nor body-pin authority.
 A hit reuses historical interpretation of the same immutable blob. It does not
 re-read chunks or detect subsequent corruption of an unrequested tail. Full
 body projections, previews, searches, raw downloads and attachment downloads
-still verify current body bytes. Cache misses preserve the existing whole-body
-precharge and verification. Hits charge bounded lookup and copy/output work
+still verify current requested bytes. Qualified MIME projections may use
+chunk verification as specified below; searches and downloads retain full
+verification. Header-cache misses preserve whole-body precharge and verification. Hits charge bounded lookup and copy/output work
 and check the original snapshot, retention and method deadlines. Cache output
 remains provisional until normal final snapshot validation and response
 publication.
@@ -7189,7 +7191,8 @@ No body chunks are read or body I/O precharged for a summary hit.
 These rows are historical interpretation evidence, like the existing memory
 cache, not current body integrity evidence. They neither create a body pin nor
 detect subsequent corruption of an unrequested attachment. Full body, preview,
-search and download paths retain current verification. Account/blob foreign
+search and download paths retain current verification; qualified body-bearing
+Email/get may use the chunk-verification contract below. Account/blob foreign
 keys and cascading deletion remove summaries when the authoritative blob is
 removed. There is no external cache service, credential cache or shared mutable
 response object.
@@ -7251,15 +7254,31 @@ For a body-bearing Email/get, the original authenticated snapshot loads at
 most one interpretation row at a time. Matching version, limits, length and
 digest, bounded format, checksum and tree extents are checked before use.
 Missing or incompatible evidence falls back to the existing MIME traversal.
-A hit still verifies the COMPLETE original body before obtaining a pin, then
-rereads entity headers at stored extents and checks their endpoints and total
-header count. Current headers supply names, MIME labels and dispositions;
-cached descriptors skip only traversal of body bytes and encoded-size counting.
-Header inconsistency after qualification fails closed. Original work bounds,
-deadline, authorization and final response checks remain in force.
-`structure_reuse` counts successful qualified table reuse. Raw downloads,
-search and integrity auditing retain their existing full-body verification.
-The stored chunk hashes do not yet authorize partial verification.
+A hit admits the private chunk-verifying pin. Each cache miss fetches only
+the chunks intersecting the requested span, at most eight 64-KiB chunks per
+batch, and verifies every returned ordinal, length and SHA-256 before exposing
+any bytes. The complete manifest binds these hashes to the selected blob's
+length and whole-body digest. Empty bodies still require the empty SHA-256.
+This trusts publication-derived interpretation evidence, not a freshly
+recomputed whole-body hash: corruption in an unrequested attachment may remain
+undetected by a text projection. The manifest checksum is not a MAC.
+
+The parser rereads entity headers at stored extents and checks their endpoints
+and aggregate count. Current headers supply names, MIME labels and dispositions;
+cached descriptors skip body traversal and encoded-size counting. Requested
+text and previews pass through the same chunk-verifying reader. Header or
+chunk inconsistency after qualification fails closed, with no retry under a
+new snapshot. Missing, malformed or incompatible evidence takes the original
+full-body verification and parsing path. The bounded chunk cache, original
+work precharges (including conservative full-body I/O credit), deadline,
+authorization and final response checks remain in force. No selected-read
+result is promoted into the fully verified header cache.
+
+`structure_reuse` counts successful qualified table reuse. `chunk_verify`
+measures requested batch SQL, framing and hash verification, distinct from
+`body_verify` for complete-body reads. Raw and attachment downloads, search
+and integrity auditing retain full-body verification. No periodic integrity
+scrub is enabled by this optimization.
 
 `summary-backfill --structure` additionally rebuilds MIME evidence under the
 same owner authority, snapshot, cursor and known-COMMIT rules as summary

@@ -452,6 +452,7 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `db_close` | Worker cleanup, including bounded Terminate/close progress; failure includes already-failed or deadline-retired sessions |
 | `db_reuse` | Zero-duration retained authentication, relay idle-read, HTTPS API-read, download authorization and SMTP attempts, including failed turns |
 | `body_verify` | Complete body chunk reads and digest verification |
+| `chunk_verify` | Qualified Email/get batch SQL, length/ordinal and SHA-256 verification before bytes become readable; resident cache hits do not repeat it. |
 | `body_replay` | Verified download callback, including chunk replay and socket output |
 | `smtp_admission` | One storage-worker admission attempt, including database readiness; retry is busy |
 | `smtp_data` | Successful DATA admission through recognition of its terminating dot, including the 354 reply, peer arrival and network scheduling; retirement or refusal before completion counts as failure |
@@ -463,7 +464,7 @@ It is not exposed over public HTTP and supplies no mutation operation.
 | `jmap_body_values` | Body-value selection, decoding and JSON output for one message requesting bodyValues; includes all selected parts. |
 | `header_reuse` | Completed copies of previously verified header projections into provisional response storage; zero-duration count, not body verification or final request success. |
 | `summary_reuse` | Persisted common-header summaries copied into provisional response storage without body verification; zero-duration count. |
-| `structure_reuse` | Qualified persisted MIME tables reused after full body verification and entity-header rechecks; zero-duration count. Included work remains inside `jmap_structure`. |
+| `structure_reuse` | Qualified persisted MIME tables reused after manifest qualification and verified entity-header rechecks; zero-duration count. Included work remains inside `jmap_structure`. |
 | `jmap_work_io`, `jmap_work_records`, `jmap_work_output`, `jmap_work_deadline`, `jmap_work_other` | Email/get projections whose shared MIME work meter stopped, split by its sticky reason; duration is the whole projection. Other storage capacity failures do not increment these counters. No message IDs or content are retained. |
 | `smtp_prepare` | Resident SMTP input validation, header preparation and digests for the complete account fanout; excludes DNS and database publication |
 | `smtp_publish` | SMTP receipt inspection and database publication; one-shot paths include connection setup and pre-effect address fallback, while retained SMTP session setup is measured by `db_connect` inside `smtp_commit`; an unknown COMMIT outcome counts as failure without changing settlement or replay policy |

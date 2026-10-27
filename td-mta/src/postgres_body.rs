@@ -341,10 +341,45 @@ fn with_pin_checks<T>(
         cache: Vec::new(),
         cache_start: 0,
         checks_left: interpreted.then_some(0),
+        chunks: None,
     };
     body.verify().map_err(Error::Read)?;
     let mut pin =
         crate::store_fs::PinnedBlob::from_verified(&mut body, metadata.blob, metadata.body)
+            .map_err(Error::Read)?;
+    let result = read(&mut pin);
+    pin.check_deadline().map_err(Error::Read)?;
+    drop(pin);
+    body.check().map_err(Error::Read)?;
+    result.map_err(Error::Read)
+}
+
+pub(crate) fn with_chunk_verified_pin<T>(
+    worker: &mut Worker,
+    metadata: BlobMetadata,
+    deadline: Instant,
+    chunks: &crate::postgres_mime_evidence::ChunkEvidence,
+    read: impl FnOnce(&mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
+) -> Result<T, Error> {
+    if !chunks.matches(metadata.body.length, &metadata.body.digest) {
+        return Err(Error::Read(ports::Error::Corrupt));
+    }
+    let mut body = Body {
+        worker,
+        metadata,
+        deadline,
+        failed: None,
+        cache: Vec::new(),
+        cache_start: 0,
+        checks_left: Some(0),
+        chunks: Some(chunks),
+    };
+    body.check().map_err(Error::Read)?;
+    if metadata.body.length == 0 {
+        body.verify().map_err(Error::Read)?;
+    }
+    let mut pin =
+        crate::store_fs::PinnedBlob::from_verified_chunks(&mut body, metadata.blob, metadata.body)
             .map_err(Error::Read)?;
     let result = read(&mut pin);
     pin.check_deadline().map_err(Error::Read)?;
@@ -447,6 +482,7 @@ fn with_pinned_blob_inner<T>(
             cache: Vec::new(),
             cache_start: 0,
             checks_left: None,
+            chunks: None,
         };
         body.verify().map_err(Error::Read)?;
         // A new primary transaction sees revocations after the body snapshot.
@@ -711,7 +747,7 @@ fn connection(error: postgres_probe::Error) -> ports::Error {
     }
 }
 
-struct Body<'a> {
+struct Body<'a, 'h> {
     worker: &'a mut Worker,
     metadata: BlobMetadata,
     deadline: Instant,
@@ -719,8 +755,9 @@ struct Body<'a> {
     cache: Vec<tokio_postgres::Row>,
     cache_start: u64,
     checks_left: Option<u8>,
+    chunks: Option<&'h crate::postgres_mime_evidence::ChunkEvidence>,
 }
-impl Body<'_> {
+impl Body<'_, '_> {
     fn check_cached(&mut self) -> Result<(), ports::Error> {
         if let Some(error) = self.failed {
             return Err(error);
@@ -761,6 +798,9 @@ impl Body<'_> {
     }
 
     fn batch(&mut self, start: u64, end: u64) -> Result<Vec<tokio_postgres::Row>, ports::Error> {
+        let timing = self
+            .chunks
+            .map(|_| crate::performance::Timer::start(crate::performance::Phase::ChunkVerify));
         self.check()?;
         if start >= end || end - start > BATCH || end > self.len().div_ceil(CHUNK) {
             return Err(ports::Error::Invalid);
@@ -782,8 +822,14 @@ impl Body<'_> {
             {
                 return Err(ports::Error::Corrupt);
             }
+            if let Some(chunks) = self.chunks {
+                chunks.verify(wanted, bytes)?;
+            }
         }
         self.check()?;
+        if let Some(timing) = timing {
+            timing.finish(crate::performance::Outcome::Success);
+        }
         Ok(rows)
     }
 
@@ -821,8 +867,13 @@ impl Body<'_> {
         }
         let start = offset / CHUNK;
         if start < self.cache_start || start >= self.cache_start + self.cache.len() as u64 {
-            let aligned = start / BATCH * BATCH;
-            let end = (aligned + BATCH).min(self.len().div_ceil(CHUNK));
+            let (aligned, end) = if self.chunks.is_some() {
+                let length = (self.len() - offset).min(output.len() as u64);
+                (start, (offset + length).div_ceil(CHUNK).min(start + BATCH))
+            } else {
+                let aligned = start / BATCH * BATCH;
+                (aligned, (aligned + BATCH).min(self.len().div_ceil(CHUNK)))
+            };
             self.cache.clear();
             self.cache = self.batch(aligned, end)?;
             self.cache_start = aligned;
@@ -848,7 +899,7 @@ impl Body<'_> {
         Ok(written)
     }
 }
-impl BlobReader for Body<'_> {
+impl BlobReader for Body<'_, '_> {
     fn len(&self) -> u64 {
         self.metadata.body.length
     }
@@ -861,7 +912,12 @@ impl BlobReader for Body<'_> {
     }
 }
 
-impl crate::store_fs::VerifiedSource for Body<'_> {
+impl crate::store_fs::VerifiedSource for Body<'_, '_> {
+    fn check(&mut self) -> Result<(), ports::Error> {
+        self.check_cached()
+    }
+}
+impl crate::store_fs::VerifiedChunkSource for Body<'_, '_> {
     fn check(&mut self) -> Result<(), ports::Error> {
         self.check_cached()
     }

@@ -635,3 +635,12 @@ Unit fixtures prove exhausted publication credit cannot obtain fresh MIME
 admission and that a decoded attachment larger than 2 MiB yields identical
 resident and streamed evidence when funded. HTTP comparisons exclude the
 wall-clock Date header; these checks add no latency pass/fail thresholds.
+
+Qualified MIME read coverage corrupts a large attachment outside the requested
+text chunk: Email/get must return the same text, while a raw download refuses.
+An incompatible manifest must fall back to full verification and refuse that
+corruption; a damaged requested chunk must refuse even with valid evidence.
+Counters assert one verified chunk batch and no whole-body verification for
+the valid small-text projection. These are correctness assertions, not latency
+thresholds. Unit coverage checks chunk lengths, final fragments, ordinals,
+digests and metadata binding.

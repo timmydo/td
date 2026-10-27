@@ -2885,14 +2885,17 @@ connection count.
 PostgreSQL body verification uses td-crypto's opaque `BulkSha256` operation
 to accelerate complete-body hashing on the storage worker. It retains one
 native digest context per active verification and updates it with each existing
-64 KiB chunk. Full length, ordinal and digest checks still precede publication
-of a verified pin; no header-only prefix substitutes for body verification.
+64 KiB chunk. Full length, ordinal and digest checks precede ordinary verified pins;
+qualified selective projections use the separate chunk-verifying pin below.
 The allocation-free digest factory remains available to other operations.
 POSTGRES.md owns the snapshot and deadline contract.
 
 Persistent MIME interpretation reuses publication-derived tree descriptors,
-as specified in POSTGRES.md, after full current body verification and entity
-header rechecks. It does not create a weaker verified pin. Publication and
+as specified in POSTGRES.md, with current entity-header rechecks. Qualified
+body-bearing Email/get verifies only requested chunks against the manifest
+before exposing their bytes; it does not claim integrity of unrequested
+chunks. The private chunk-verified pin is distinct from the full-body path
+used by raw downloads and audits. Publication and
 owner backfill use the shared MIME parser under fixed versioned limits; absent
 or incompatible evidence retains the existing verified traversal. Original
 message bytes and mutable authorization remain authoritative.

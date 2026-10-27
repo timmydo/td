@@ -28,6 +28,44 @@ pub(crate) struct Prepared {
 pub(crate) struct Evidence {
     pub(crate) parts: Vec<Part>,
     pub(crate) header_bytes: u64,
+    pub(crate) chunks: ChunkEvidence,
+}
+
+/// Constructed only by validation of the complete versioned manifest.
+pub(crate) struct ChunkEvidence {
+    length: u64,
+    body_digest: [u8; 32],
+    hashes: Vec<u8>,
+}
+impl ChunkEvidence {
+    pub(crate) fn matches(&self, length: u64, digest: &[u8; 32]) -> bool {
+        self.length == length && Provider.equal_digest(&self.body_digest, digest)
+    }
+    pub(crate) fn verify(&self, ordinal: u64, bytes: &[u8]) -> Result<(), crate::ports::Error> {
+        use crate::ports::Error;
+        let offset = ordinal
+            .checked_mul(CHUNK as u64)
+            .filter(|n| *n < self.length)
+            .ok_or(Error::Corrupt)?;
+        if bytes.len() as u64 != (self.length - offset).min(CHUNK as u64) {
+            return Err(Error::Corrupt);
+        }
+        let start = usize::try_from(ordinal)
+            .ok()
+            .and_then(|n| n.checked_mul(32))
+            .ok_or(Error::Corrupt)?;
+        let wanted: &[u8; 32] = self
+            .hashes
+            .get(start..start.checked_add(32).ok_or(Error::Corrupt)?)
+            .and_then(|v| v.try_into().ok())
+            .ok_or(Error::Corrupt)?;
+        let mut hash = BulkSha256::try_new()?;
+        hash.update(bytes)?;
+        if !Provider.equal_digest(&hash.finish()?, wanted) {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn limits() -> mime_structure::Limits {
@@ -370,7 +408,7 @@ fn manifest_digest(
 pub(crate) fn validate(
     length: u64,
     body_digest: &[u8; 32],
-    prepared: &Prepared,
+    prepared: Prepared,
 ) -> Option<Evidence> {
     if length > crate::postgres_body::MAX_BODY_BYTES
         || prepared.header_bytes > HEADER_BYTES as u64
@@ -443,6 +481,11 @@ pub(crate) fn validate(
     Some(Evidence {
         parts,
         header_bytes: prepared.header_bytes,
+        chunks: ChunkEvidence {
+            length,
+            body_digest: *body_digest,
+            hashes: prepared.chunks,
+        },
     })
 }
 
@@ -463,7 +506,7 @@ mod tests {
         let bytes = b"Subject: example\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nhello\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nYWJj\r\n--x--\r\n";
         let body = digest(bytes);
         let prepared = prepare(bytes, &body, Instant::now() + Duration::from_secs(30)).unwrap();
-        let evidence = validate(bytes.len() as u64, &body, &prepared).unwrap();
+        let evidence = validate(bytes.len() as u64, &body, prepared.clone()).unwrap();
         assert_eq!(evidence.parts.len(), 3);
         let attachment = evidence.parts.get(2).unwrap();
         assert_eq!(attachment.ordinal, 3);
@@ -480,17 +523,38 @@ mod tests {
         let bytes = b"Content-Type: text/plain\r\n\r\nbody";
         let body = digest(bytes);
         let prepared = prepare(bytes, &body, Instant::now() + Duration::from_secs(30)).unwrap();
-        assert!(validate(bytes.len() as u64, &digest(b"different"), &prepared).is_none());
-        assert!(validate(bytes.len() as u64 + 1, &body, &prepared).is_none());
+        assert!(validate(bytes.len() as u64, &digest(b"different"), prepared.clone()).is_none());
+        assert!(validate(bytes.len() as u64 + 1, &body, prepared.clone()).is_none());
         let mut damaged = prepared.clone();
         *damaged.table.first_mut().unwrap() ^= 1;
-        assert!(validate(bytes.len() as u64, &body, &damaged).is_none());
+        assert!(validate(bytes.len() as u64, &body, damaged).is_none());
         let mut damaged = prepared.clone();
         *damaged.chunks.first_mut().unwrap() ^= 1;
-        assert!(validate(bytes.len() as u64, &body, &damaged).is_none());
+        assert!(validate(bytes.len() as u64, &body, damaged).is_none());
         let mut damaged = prepared;
         damaged.table.pop();
-        assert!(validate(bytes.len() as u64, &body, &damaged).is_none());
+        assert!(validate(bytes.len() as u64, &body, damaged).is_none());
+    }
+
+    #[test]
+    fn chunk_evidence_rejects_wrong_content_lengths_ordinals_and_binding() {
+        let mut bytes = b"Content-Type: application/octet-stream\r\n\r\n".to_vec();
+        bytes.resize(CHUNK + 17, b'x');
+        let body = digest(&bytes);
+        let prepared = prepare(&bytes, &body, Instant::now() + Duration::from_secs(30)).unwrap();
+        let evidence = validate(bytes.len() as u64, &body, prepared).unwrap();
+        let chunks = evidence.chunks;
+        assert!(chunks.matches(bytes.len() as u64, &body));
+        assert!(!chunks.matches(bytes.len() as u64 + 1, &body));
+        assert!(!chunks.matches(bytes.len() as u64, &[0; 32]));
+        assert!(chunks.verify(0, bytes.get(..CHUNK).unwrap()).is_ok());
+        assert!(chunks.verify(1, bytes.get(CHUNK..).unwrap()).is_ok());
+        assert!(chunks.verify(0, bytes.get(..CHUNK - 1).unwrap()).is_err());
+        assert!(chunks.verify(1, bytes.get(CHUNK + 1..).unwrap()).is_err());
+        assert!(chunks.verify(2, &[]).is_err());
+        assert!(chunks.verify(u64::MAX, &[]).is_err());
+        *bytes.get_mut(CHUNK).unwrap() ^= 1;
+        assert!(chunks.verify(1, bytes.get(CHUNK..).unwrap()).is_err());
     }
 
     #[test]
@@ -499,7 +563,7 @@ mod tests {
         assert!(prepare(b"", &body, Instant::now()).is_none());
         let prepared = prepare(b"", &body, Instant::now() + Duration::from_secs(30)).unwrap();
         assert!(prepared.chunks.is_empty());
-        assert_eq!(validate(0, &body, &prepared).unwrap().parts.len(), 1);
+        assert_eq!(validate(0, &body, prepared).unwrap().parts.len(), 1);
     }
 
     #[test]
@@ -551,7 +615,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3600);
         let mut original = meter(&clock, deadline).unwrap();
         let publication = prepare_metered(&bytes, &body, deadline, &mut original, &clock).unwrap();
-        let evidence = validate(bytes.len() as u64, &body, &publication).unwrap();
+        let evidence = validate(bytes.len() as u64, &body, publication.clone()).unwrap();
         assert!(evidence.parts.first().unwrap().size >= 2 * 1024 * 1024);
         struct FixedClock;
         impl Clock for FixedClock {

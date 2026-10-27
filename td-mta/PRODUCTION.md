@@ -345,3 +345,10 @@ messages retain verified parsing. Compare `structure_reuse` and
 `jmap_structure` counter deltas for individual message opens. Full-body
 verification remains enabled, so this upgrade does not eliminate attachment
 reads during a message open.
+
+Selective Email/get verification uses existing schema-34 MIME evidence. Its
+binary update needs no additional schema upgrade or backfill if
+`summary-backfill --structure` has already completed. Missing evidence keeps
+the complete-body fallback. Raw downloads and owner integrity audits still
+verify the whole message; successful text views do not certify unread
+attachments. No automatic scrub schedule is installed.

@@ -7607,6 +7607,139 @@ fn exercise_http_read(
         assert_eq!(pending.drafts.operation().unwrap(), None);
         assert_eq!(pending.operation().unwrap(), None);
         assert_eq!(responses.used().unwrap(), 0);
+        use td_crypto::Digest;
+        // A large attachment must not be read to return its small sibling text.
+        let attachment = vec![b'x'; 256 * 1024];
+        let upload =
+            td_mta::postgres_uploads::prepare(binding, device, &attachment, deadline()).unwrap();
+        let uploaded = td_mta::postgres_uploads::publish(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            &upload,
+            password,
+        )
+        .unwrap();
+        let attachment_body = td_mta::compose_text::Attachment {
+            name: "large.bin",
+            content_type: "application/octet-stream",
+            description: None,
+            bytes: &attachment,
+        };
+        let mut hash = td_crypto::BulkSha256::try_new().unwrap();
+        hash.update(&attachment).unwrap();
+        let source = td_mta::postgres_drafts::AttachmentSource {
+            blob: uploaded.blob,
+            length: uploaded.length,
+            digest: hash.finish().unwrap(),
+        };
+        let message = td_mta::compose_text::Message {
+            from: td_mta::compose_text::Address {
+                name: "Sender",
+                email: "sender@example.test",
+            },
+            to: &[],
+            cc: &[],
+            bcc: &[],
+            reply_to: &[],
+            subject: "Selective read",
+            message_id: "selective@example.test",
+            in_reply_to: &[],
+            references: &[],
+            sent_at_ms: 0,
+            text: "selective text survives unrequested attachment corruption",
+        };
+        let mut work = td_mta::admission::work::Meter::new(
+            until(),
+            td_mta::admission::work::Charge {
+                io_bytes: 128 * 1024 * 1024,
+                records: 16 * 1024 * 1024,
+                output_bytes: 32 * 1024 * 1024,
+                ..Default::default()
+            },
+        );
+        let prepared = td_mta::postgres_drafts::prepare_with_attachments(
+            td_mta::postgres_drafts::DraftRequest {
+                binding,
+                device,
+                mailbox: td_mta::ids::MailboxId::from_bytes([0x33; 16]),
+                expected: None,
+            },
+            &message,
+            &[td_mta::postgres_drafts::Attachment {
+                source,
+                part: attachment_body,
+            }],
+            deadline(),
+            &mut work,
+            clock.as_ref(),
+        )
+        .unwrap();
+        let created = td_mta::postgres_drafts::publish(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            &prepared,
+            password,
+        )
+        .unwrap();
+        let mut email_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        let email = td_mta::wire::encode_id(created.email, &mut email_bytes).unwrap();
+        let get = td_json::json!({"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Email/get",{"accountId":account,"ids":[email],"properties":["id","textBody","bodyValues"],"fetchTextBodyValues":true},"selective"]]}).to_string();
+        let phase_count = |phase: &str| {
+            let mut bytes = [0; td_mta::performance::MAX_STATUS_BYTES];
+            let mut output = td_mta::bounded::TextBuffer::new(&mut bytes);
+            logger.performance_status(&mut output).unwrap();
+            td_json::parse(output.as_str().unwrap()).unwrap()["phases"][phase]["calls"]
+                .as_u64()
+                .unwrap()
+        };
+        *api_worker.borrow_mut() = None;
+        let whole_before = phase_count("body_verify");
+        let chunk_before = phase_count("chunk_verify");
+        let (result, clean) = call(&get, password, device, false, false, false);
+        result.unwrap();
+        assert!(clean.contains(message.text), "{clean}");
+        assert_eq!(phase_count("body_verify"), whole_before);
+        assert_eq!(
+            phase_count("chunk_verify") - chunk_before,
+            1,
+            "all entity headers and selected text fit in one chunk"
+        );
+        let damage = |ordinal| {
+            sql(fixture, &format!("UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,get_byte(bytes,0)#1) WHERE blob_id=decode('{}','hex') AND ordinal={ordinal}",created.blob));
+            *api_worker.borrow_mut() = None;
+        };
+        damage(2);
+        let (result, partial) = call(&get, password, device, false, false, false);
+        result.unwrap();
+        assert_eq!(response_body(&partial), response_body(&clean));
+        let mut blob_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        let blob = td_mta::wire::encode_id(created.blob, &mut blob_bytes).unwrap();
+        assert!(
+            download(blob, password, false).0.is_err(),
+            "raw download must verify the damaged attachment"
+        );
+        for invalid in [
+            "version=2",
+            "version=1,manifest_digest=set_byte(manifest_digest,0,get_byte(manifest_digest,0)#1)",
+        ] {
+            sql(fixture, &format!("UPDATE td_mta.blob_interpretations SET {invalid} WHERE blob_id=decode('{}','hex')",created.blob));
+            *api_worker.borrow_mut() = None;
+            let (result, fallback) = call(&get, password, device, false, false, false);
+            assert!(result.is_err() || !fallback.contains(message.text));
+        }
+        // Restore qualification without repairing the damaged original body.
+        sql(fixture, &format!("UPDATE td_mta.blob_interpretations SET manifest_digest=set_byte(manifest_digest,0,get_byte(manifest_digest,0)#1) WHERE blob_id=decode('{}','hex')",created.blob));
+        damage(2);
+        damage(0);
+        let (result, requested) = call(&get, password, device, false, false, false);
+        assert!(
+            result.is_err() || !requested.contains(message.text),
+            "requested corrupted bytes must never escape"
+        );
+        damage(0);
+        call(&get, password, device, false, false, false).0.unwrap();
     }
 }
 

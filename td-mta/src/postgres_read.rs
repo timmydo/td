@@ -694,7 +694,7 @@ impl Snapshot<'_> {
                 chunks: row.try_get(4).ok()?,
                 digest: row.try_get::<_, &[u8]>(5).ok()?.try_into().ok()?,
             };
-            mime::validate(metadata.body.length, &metadata.body.digest, &prepared)
+            mime::validate(metadata.body.length, &metadata.body.digest, prepared)
         })();
         self.check()?;
         Ok(evidence)
@@ -788,7 +788,7 @@ impl Snapshot<'_> {
         email: EmailId,
         read: impl FnOnce(Metadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
     ) -> Result<T, Error> {
-        self.with_body_checks(email, false, read)
+        self.with_body_checks(email, false, None, read)
     }
     /// Interpret into provisional response storage, grouping resident checks.
     /// The callback must not publish bytes or cross a fresh admission boundary.
@@ -799,12 +799,23 @@ impl Snapshot<'_> {
         email: EmailId,
         read: impl FnOnce(Metadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
     ) -> Result<T, Error> {
-        self.with_body_checks(email, true, read)
+        self.with_body_checks(email, true, None, read)
+    }
+    /// Qualified projection evidence permits per-chunk verification. This still
+    /// builds only provisional output under the current authenticated snapshot.
+    pub(crate) fn with_projected_body<T>(
+        &mut self,
+        email: EmailId,
+        chunks: Option<&crate::postgres_mime_evidence::ChunkEvidence>,
+        read: impl FnOnce(Metadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
+    ) -> Result<T, Error> {
+        self.with_body_checks(email, true, chunks, read)
     }
     fn with_body_checks<T>(
         &mut self,
         email: EmailId,
         interpreted: bool,
+        chunks: Option<&crate::postgres_mime_evidence::ChunkEvidence>,
         read: impl FnOnce(Metadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
     ) -> Result<T, Error> {
         let metadata = self
@@ -816,7 +827,15 @@ impl Snapshot<'_> {
             blob: metadata.blob,
             body: metadata.body,
         };
-        let result = if interpreted {
+        let result = if let Some(chunks) = chunks {
+            postgres_body::with_chunk_verified_pin(
+                &mut self.worker,
+                blob,
+                self.deadline,
+                chunks,
+                |body| read(metadata, body),
+            )
+        } else if interpreted {
             postgres_body::with_interpreted_pin(&mut self.worker, blob, self.deadline, |body| {
                 read(metadata, body)
             })

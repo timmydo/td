@@ -64,7 +64,7 @@ fn cleanup_temporary(
 #[cfg(test)]
 pub use pinned::with_pinned_fixture;
 pub use pinned::PinnedBlob;
-pub(crate) use pinned::VerifiedSource;
+pub(crate) use pinned::{VerifiedChunkSource, VerifiedSource};
 
 #[path = "store_fs/request_spool.rs"]
 mod request_spool;

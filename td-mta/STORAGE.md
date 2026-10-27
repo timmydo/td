@@ -16,12 +16,16 @@ runtime role and schema-qualified queries enforce the authority boundaries
 specified in POSTGRES.md. Owner administration uses separate credentials.
 
 An admitted read retains its original account, store epoch, configuration
-selection, deadline and database snapshot. Body access verifies the complete
-length and digest before granting a `PinnedBlob`; subsequent bounded reads
-retain that same snapshot. A failed pin stays failed. MIME processing cannot
-extend the original lifetime or use a later snapshot to complete an earlier
-response. The PostgreSQL body adapter implements `VerifiedSource`; the shared
-MIME code does not open a database or grant storage authority.
+selection, deadline and database snapshot. Ordinary body access verifies the
+complete length and digest through `VerifiedSource` before granting a
+`PinnedBlob`. Body-bearing Email/get may instead qualify the versioned MIME
+manifest and use `VerifiedChunkSource`, which checks each requested chunk's
+length, ordinal and SHA-256 before exposing any bytes. Unrequested chunks need
+not be read or verified; raw downloads and integrity audits still verify the
+whole body. POSTGRES.md specifies qualification and fallback. Both private
+pin constructors retain the original snapshot, sticky failures and deadline.
+MIME processing cannot extend that lifetime or combine snapshots. Shared MIME
+code does not open a database or grant storage authority.
 
 Device authentication and publication checks belong to the PostgreSQL
 transaction paths. Passive request/result structures in `store_fs::mutations`

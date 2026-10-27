@@ -10,10 +10,34 @@ use crate::{
 pub(crate) trait VerifiedSource: BlobReader {
     fn check(&mut self) -> Result<(), PolicyError>;
 }
-/// One verified immutable body retaining its original snapshot custody.
-/// Construction is private to the verified storage adapters.
+/// A qualified immutable manifest supplies each chunk digest. The adapter
+/// verifies every chunk before returning any of its bytes, in the same snapshot.
+pub(crate) trait VerifiedChunkSource: BlobReader {
+    fn check(&mut self) -> Result<(), PolicyError>;
+}
+enum PinnedSource<'a, 'c> {
+    Whole(&'a mut (dyn VerifiedSource + 'c)),
+    Chunks(&'a mut (dyn VerifiedChunkSource + 'c)),
+}
+impl PinnedSource<'_, '_> {
+    fn check(&mut self) -> Result<(), PolicyError> {
+        match self {
+            Self::Whole(source) => source.check(),
+            Self::Chunks(source) => source.check(),
+        }
+    }
+    fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, PolicyError> {
+        match self {
+            Self::Whole(source) => source.read_at(offset, output),
+            Self::Chunks(source) => source.read_at(offset, output),
+        }
+    }
+}
+/// One immutable body retaining its original snapshot custody. Every returned
+/// byte is verified, either before admission for the whole body or per chunk.
+/// Unrequested chunks need not be read by the explicitly qualified chunk path.
 pub struct PinnedBlob<'a, 'c> {
-    source: &'a mut (dyn VerifiedSource + 'c),
+    source: PinnedSource<'a, 'c>,
     id: BlobId,
     row: BlobRow,
     failed: Option<PolicyError>,
@@ -34,7 +58,23 @@ impl<'a, 'c> PinnedBlob<'a, 'c> {
             return Err(PolicyError::Corrupt);
         }
         Ok(Self {
-            source,
+            source: PinnedSource::Whole(source),
+            id,
+            row,
+            failed: None,
+        })
+    }
+    pub(crate) fn from_verified_chunks(
+        source: &'a mut (dyn VerifiedChunkSource + 'c),
+        id: BlobId,
+        row: BlobRow,
+    ) -> Result<Self, PolicyError> {
+        source.check()?;
+        if source.len() != row.length {
+            return Err(PolicyError::Corrupt);
+        }
+        Ok(Self {
+            source: PinnedSource::Chunks(source),
             id,
             row,
             failed: None,
@@ -137,7 +177,7 @@ pub fn with_pinned_fixture<'c>(
         last: 1,
     };
     run(PinnedBlob {
-        source: &mut source,
+        source: PinnedSource::Whole(&mut source),
         id: BlobId::from_bytes([0x44; 16]),
         row,
         failed: None,

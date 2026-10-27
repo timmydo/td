@@ -700,26 +700,30 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
                 None
             };
             let mut result = Err(Error::State);
-            self.with_interpreted_body(email, |verified, pin| {
-                if verified != metadata {
-                    return Err(ports::Error::Corrupt);
-                }
-                let mut tee = HeaderCapture {
-                    output,
-                    cache: cache.as_deref_mut(),
-                    capture: &mut capture,
-                };
-                result = email_get::write_with_evidence(
-                    &mut tee,
-                    pin,
-                    projection.limits,
-                    (projection.selection, projection.options),
-                    projection.clock,
-                    projection.work,
-                    evidence.as_ref(),
-                );
-                Ok(())
-            })
+            self.with_projected_body(
+                email,
+                evidence.as_ref().map(|e| &e.chunks),
+                |verified, pin| {
+                    if verified != metadata {
+                        return Err(ports::Error::Corrupt);
+                    }
+                    let mut tee = HeaderCapture {
+                        output,
+                        cache: cache.as_deref_mut(),
+                        capture: &mut capture,
+                    };
+                    result = email_get::write_with_evidence(
+                        &mut tee,
+                        pin,
+                        projection.limits,
+                        (projection.selection, projection.options),
+                        projection.clock,
+                        projection.work,
+                        evidence.as_ref(),
+                    );
+                    Ok(())
+                },
+            )
             .map_err(postgres_read_error)?;
             result?;
             if let Some(cache) = cache.as_deref_mut() {
