@@ -644,3 +644,11 @@ Counters assert one verified chunk batch and no whole-body verification for
 the valid small-text projection. These are correctness assertions, not latency
 thresholds. Unit coverage checks chunk lengths, final fragments, ordinals,
 digests and metadata binding.
+
+The native foreground-service leg includes scheduled scrub coverage: clean
+pages across accounts, fixed upper keys, missing and changed chunks, corrupt
+body continuation, invalid epochs and bounds, and durable failed completion
+through the CLI, including private locked state, interrupted writes and symlink
+refusal. Unit fixtures cover failure retention and clock observations across
+cycles. These are correctness
+checks without wall-clock performance thresholds.

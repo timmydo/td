@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PATH [--prefix PATH]
   [--mail-profile NAME ...]
+  [--scrub-connection-file OWNER_PATH --scrub-epoch HEX --scrub-state-dir PATH]
   [--certificate-profile NAME ... --connection-file PATH]
   [--tls-certificate PATH ... --openssl-bin PATH]
   [--backup-service-file PATH --backup-service NAME --backup-destination PATH
@@ -18,7 +19,8 @@ const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PA
    --postgres-bin PATH --openssl-bin PATH [--tool-library-dir PATH]]
 
 Generates independent systemd timers and Shepherd timed services, without starting
-anything. Mail, certificate and backup freshness checks run every 15 minutes;
+anything. Body scrubbing runs one bounded page per minute, starts a new cycle
+a day after completion, and has a separate freshness check. Mail, certificate and backup freshness checks run every 15 minutes;
 backups and private PostgreSQL leaf renewal run daily at 03:15 in the supervisor's local timezone. Certificate checks
 require 30 days remaining; backups must be at most two days old. PostgreSQL 17
 and protected backup credentials must already be provisioned. Backup defaults are
@@ -34,7 +36,13 @@ struct Options {
     tls: Vec<PathBuf>,
     openssl: Option<PathBuf>,
     backup: Option<Backup>,
+    scrub: Option<Scrub>,
     renewal: Option<Renewal>,
+}
+struct Scrub {
+    connection: PathBuf,
+    epoch: String,
+    state: PathBuf,
 }
 struct Renewal {
     argv: Vec<String>,
@@ -80,6 +88,9 @@ fn options(args: &[String], home: &str) -> Result<Options> {
             | "--state-dir"
             | "--connection-file"
             | "--openssl-bin"
+            | "--scrub-connection-file"
+            | "--scrub-epoch"
+            | "--scrub-state-dir"
             | "--backup-service-file"
             | "--backup-service"
             | "--backup-destination"
@@ -101,6 +112,30 @@ fn options(args: &[String], home: &str) -> Result<Options> {
     let path =
         |key| -> Result<Option<PathBuf>> { values.get(key).map(|s| absolute(s)).transpose() };
     let required = |key| -> Result<PathBuf> { path(key)?.ok_or_else(|| format!("missing {key}")) };
+    let scrub = if [
+        "--scrub-connection-file",
+        "--scrub-epoch",
+        "--scrub-state-dir",
+    ]
+    .iter()
+    .any(|key| values.contains_key(key))
+    {
+        let epoch = values.get("--scrub-epoch").ok_or("missing --scrub-epoch")?;
+        if epoch.len() != 32
+            || !epoch
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("invalid scrub epoch".into());
+        }
+        Some(Scrub {
+            connection: required("--scrub-connection-file")?,
+            epoch: (*epoch).into(),
+            state: required("--scrub-state-dir")?,
+        })
+    } else {
+        None
+    };
     let backup_keys = [
         "--backup-service-file",
         "--backup-service",
@@ -227,6 +262,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
     if mail.is_empty()
         && certificates.is_empty()
         && tls.is_empty()
+        && scrub.is_none()
         && backup.is_none()
         && renewal.is_none()
     {
@@ -241,27 +277,34 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         tls,
         openssl,
         backup,
+        scrub,
         renewal,
     })
 }
 
+#[derive(Clone, Copy)]
+enum Schedule {
+    Daily,
+    QuarterHour,
+    Minute,
+}
 struct Job {
     name: String,
     argv: Vec<String>,
     environment: Vec<String>,
-    daily: bool,
+    schedule: Schedule,
 }
 
 fn jobs(opts: &Options) -> Result<Vec<Job>> {
     let bin = opts.prefix.join("bin/td-mta");
     let helper = opts.prefix.join("bin/td-mta-operator");
     let mut jobs = Vec::new();
-    let mut add = |name: String, argv: Vec<String>, environment: Vec<String>, daily| {
+    let mut add = |name: String, argv: Vec<String>, environment: Vec<String>, schedule| {
         jobs.push(Job {
             name: format!("td-mta-maint-{name}"),
             argv,
             environment,
-            daily,
+            schedule,
         });
     };
     for profile in &opts.mail {
@@ -276,7 +319,7 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
                 text(&opts.state.join(profile).join("runtime"))?.into(),
             ],
             vec![],
-            false,
+            Schedule::QuarterHour,
         );
     }
     if let Some(connection) = &opts.connection {
@@ -295,7 +338,7 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
                     "2592000".into(),
                 ],
                 vec![],
-                false,
+                Schedule::QuarterHour,
             );
         }
     }
@@ -313,7 +356,7 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
                     "2592000".into(),
                 ],
                 vec![],
-                false,
+                Schedule::QuarterHour,
             );
         }
     }
@@ -343,7 +386,7 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
                 bounds.retain.to_string(),
             ]);
         }
-        add("backup".into(), argv, env, true);
+        add("backup".into(), argv, env, Schedule::Daily);
         add(
             "backup-status".into(),
             vec![
@@ -356,7 +399,7 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
                 "172800".into(),
             ],
             vec![],
-            false,
+            Schedule::QuarterHour,
         );
     }
     if let Some(renewal) = &opts.renewal {
@@ -366,8 +409,27 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
             "postgres-tls-renew".into(),
             argv,
             renewal.environment.clone(),
-            true,
+            Schedule::Daily,
         );
+    }
+    if let Some(scrub) = &opts.scrub {
+        let mut argv = vec![
+            text(&bin)?.into(),
+            "postgres".into(),
+            "blob-scrub".into(),
+            "--state-dir".into(),
+            text(&scrub.state)?.into(),
+            "--epoch".into(),
+            scrub.epoch.clone(),
+            "--connection-file".into(),
+            text(&scrub.connection)?.into(),
+        ];
+        add("scrub".into(), argv.clone(), vec![], Schedule::Minute);
+        argv.truncate(7);
+        if let Some(command) = argv.get_mut(2) {
+            *command = "blob-scrub-status".into();
+        }
+        add("scrub-status".into(), argv, vec![], Schedule::QuarterHour);
     }
     let mut names = BTreeSet::new();
     if jobs.iter().any(|j| !names.insert(&j.name)) {
@@ -377,7 +439,11 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
 }
 
 fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
-    let seconds = if job.daily { 2700 } else { 120 };
+    let seconds = if matches!(job.schedule, Schedule::Daily) {
+        2700
+    } else {
+        120
+    };
     let exec = job
         .argv
         .iter()
@@ -390,17 +456,17 @@ fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
         .map(|v| format!("Environment={}\n", systemd(v)))
         .collect::<String>();
     let unit = format!("[Unit]\nDescription={}\n\n[Service]\nType=oneshot\nExecStart=:{exec}\n{env}UMask=0077\nTimeoutStartSec={seconds}\nNoNewPrivileges=yes\nPrivateTmp=yes\n", job.name);
-    let schedule = if job.daily {
-        "OnCalendar=*-*-* 03:15:00\nPersistent=true\n"
-    } else {
-        "OnBootSec=2min\nOnUnitActiveSec=15min\n"
+    let schedule = match job.schedule {
+        Schedule::Daily => "OnCalendar=*-*-* 03:15:00\nPersistent=true\n",
+        Schedule::QuarterHour => "OnBootSec=2min\nOnUnitActiveSec=15min\n",
+        Schedule::Minute => "OnBootSec=2min\nOnUnitActiveSec=1min\n",
     };
     let timer = format!("[Unit]\nDescription=Schedule {}\n\n[Timer]\n{schedule}Unit={}.service\n\n[Install]\nWantedBy=timers.target\n", job.name, job.name);
-    let event = if job.daily {
-        "(calendar-event #:hours '(3) #:minutes '(15))"
-    } else {
-        "(calendar-event #:minutes '(0 15 30 45))"
-    };
+    let event = match job.schedule {
+ Schedule::Daily => "(calendar-event #:hours '(3) #:minutes '(15))",
+ Schedule::QuarterHour => "(calendar-event #:minutes '(0 15 30 45))",
+ Schedule::Minute => "(calendar-event #:minutes '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59))",
+ };
     let argv = job
         .argv
         .iter()
@@ -455,6 +521,9 @@ fn install(opts: &Options) -> Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => return Err(e.to_string()),
         }
+    }
+    if let Some(scrub) = &opts.scrub {
+        directory(&scrub.state, 0o700)?;
     }
     directory(&opts.state, 0o700)?;
     directory(&opts.state.join(".operations"), 0o700)?;
@@ -715,7 +784,7 @@ mod tests {
         .unwrap();
         let jobs = jobs(&opts).unwrap();
         assert_eq!(jobs.len(), 1);
-        assert!(jobs[0].daily);
+        assert!(matches!(jobs[0].schedule, Schedule::Daily));
         assert!(jobs[0].argv.iter().any(|v| v == "--postgres-tls-renew"));
         assert!(!jobs[0].argv.iter().any(|v| v == "--force"));
         assert!(files(&jobs[0], &opts.state).unwrap()[1]
@@ -748,5 +817,43 @@ mod tests {
         assert!(install(&opts).is_err());
         assert_eq!(fs::read_to_string(unit).unwrap(), "operator edit");
         assert!(!services.join("td-mta-maint-mail-frontend.timer").exists());
+    }
+    #[test]
+    fn scrub_has_separate_bounded_worker_and_credential_free_status() {
+        let base = args(&[
+            "--state-dir",
+            "/state",
+            "--scrub-connection-file",
+            "/private/owner",
+            "--scrub-state-dir",
+            "/private/scrub",
+            "--scrub-epoch",
+            "01010101010101010101010101010101",
+        ]);
+        let opts = options(&base, "/home/a").unwrap();
+        let jobs = jobs(&opts).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs[0].argv.iter().any(|v| v == "blob-scrub"));
+        assert!(jobs[1].argv.iter().any(|v| v == "blob-scrub-status"));
+        assert!(!jobs[1].argv.iter().any(|v| v == "--connection-file"));
+        assert_eq!(
+            jobs[1].argv.last().unwrap(),
+            "01010101010101010101010101010101"
+        );
+        let worker = files(&jobs[0], &opts.state).unwrap();
+        assert!(worker[1].1.contains("OnUnitActiveSec=1min"));
+        assert!(worker[2].1.contains("#:minutes '(0 1 2 3"));
+        assert!(files(&jobs[1], &opts.state).unwrap()[1]
+            .1
+            .contains("OnUnitActiveSec=15min"));
+        for omitted in 1..4 {
+            let input = base
+                .chunks_exact(2)
+                .enumerate()
+                .filter(|(i, _)| *i != omitted)
+                .flat_map(|(_, pair)| pair.iter().cloned())
+                .collect::<Vec<_>>();
+            assert!(options(&input, "/home/a").is_err());
+        }
     }
 }

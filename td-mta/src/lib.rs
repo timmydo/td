@@ -129,6 +129,7 @@ pub mod postgres_attempt_phases;
 pub mod postgres_attempt_recovery;
 pub mod postgres_attempts;
 pub mod postgres_blob_audit;
+pub mod postgres_blob_scrub;
 pub mod postgres_body;
 pub mod postgres_bootstrap;
 pub mod postgres_dispatch;

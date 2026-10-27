@@ -2899,3 +2899,8 @@ used by raw downloads and audits. Publication and
 owner backfill use the shared MIME parser under fixed versioned limits; absent
 or incompatible evidence retains the existing verified traversal. Original
 message bytes and mutable authorization remain authoritative.
+
+Owner-side periodic integrity scrubbing verifies complete bodies in bounded
+read-only pages, separately from interactive reads. POSTGRES.md owns its
+snapshot, progress and failure contract; DEPLOYMENT.md owns explicit schedule
+activation. It never repairs mail or enables itself during serving.

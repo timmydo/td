@@ -858,3 +858,47 @@ private operation-file path and owner connection for each command. Restart the
 affected instances after selection. Receiving aliases are separate; configure
 one explicitly if the address should also accept incoming mail. Ensure your
 outbound provider authorizes the new sender before using it.
+
+## Scheduled body integrity checks
+
+Periodic scrubbing verifies original message bytes outside the interactive
+read path. It reports corruption and never repairs or deletes mail. Generate
+its bounded worker and independent freshness check with:
+
+```text
+./install-td-mta --operations-services \
+  --prefix /home/alice/.local --state-dir /home/alice/.local/state/td-mta \
+  --scrub-connection-file /home/alice/.config/td-mta/owner-connection \
+  --scrub-epoch STORE_EPOCH_HEX \
+  --scrub-state-dir /home/alice/.local/state/td-mta-integrity
+```
+
+Use the actual epoch from `postgres schema-inspect`. The owner connection is
+for this separate operator job, never a serving process. Inspect the generated
+`td-mta-maint-scrub` and `td-mta-maint-scrub-status` definitions and activate
+both using the printed supervisor commands. For a dedicated system identity,
+apply the same user/group and private-path provisioning described above.
+The scrub directory must be dedicated, private and writable by that identity.
+
+One invocation checks up to 128 bodies / 64 MiB under a ten-second deadline.
+The minute timer resumes the next page; a new cycle starts a day after the
+previous completes. Failed reads retry without advancing. Known corruption
+advances while retaining a failed result, so it cannot starve later messages.
+The status check requires a clean completed cycle within two days; it will
+report attention until the first cycle completes. A large store may need a
+separately chosen schedule. Reduce `--limit` on manual commands if a page
+reaches its deadline; never treat incomplete pages as a successful cycle.
+
+Inspect the supervisor journal and private `state.json`, or run:
+
+```text
+/absolute/td-mta postgres blob-scrub-status \
+  --state-dir /home/alice/.local/state/td-mta-integrity --epoch STORE_EPOCH_HEX
+```
+
+A corruption report names only the first failed account/blob ID and counts;
+it does not expose message content. Preserve the report and investigate with
+`postgres blob-audit` and a known backup. Freshness and failure status are local
+checks; mailbox notifications and off-host alert delivery remain explicit.
+Do not delete progress to hide a failure. After restoring a database to a new
+epoch, retain old evidence and provision a fresh scrub directory.

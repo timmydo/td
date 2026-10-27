@@ -11,6 +11,7 @@ mod account;
 mod account_admin;
 mod audit;
 mod blob_audit;
+mod blob_scrub;
 mod configuration;
 mod device_create;
 mod device_list;
@@ -20,6 +21,8 @@ mod maintenance;
 mod material;
 mod metadata_audit;
 mod recovery;
+mod scrub;
+mod scrub_state;
 mod selection;
 mod summary_backfill;
 mod usage;
@@ -86,6 +89,15 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if command.as_deref() == Some(OsStr::new("blob-scrub")) {
+        return scrub::run(args, false);
+    }
+    if command.as_deref() == Some(OsStr::new("blob-scrub-status")) {
+        return scrub::run(args, true);
+    }
+    if command.as_deref() == Some(OsStr::new("blob-scrub-page")) {
+        return blob_scrub::run(args);
+    }
     if command.as_deref() == Some(OsStr::new("summary-backfill")) {
         return summary_backfill::run(args);
     }

@@ -7277,8 +7277,8 @@ result is promoted into the fully verified header cache.
 `structure_reuse` counts successful qualified table reuse. `chunk_verify`
 measures requested batch SQL, framing and hash verification, distinct from
 `body_verify` for complete-body reads. Raw and attachment downloads, search
-and integrity auditing retain full-body verification. No periodic integrity
-scrub is enabled by this optimization.
+and integrity auditing retain full-body verification. Periodic integrity
+scrubbing is an independently activated operator schedule described below.
 
 `summary-backfill --structure` additionally rebuilds MIME evidence under the
 same owner authority, snapshot, cursor and known-COMMIT rules as summary
@@ -7292,3 +7292,57 @@ New messages require no scheduled backfill. Cascading blob deletion removes
 both kinds of evidence, and neither changes account sequence or Email history.
 Schema-33 binaries cannot serve schema 34; use the explicit fenced upgrade
 procedure and retain a consistent pre-upgrade backup for recovery.
+
+## Scheduled whole-body integrity scrubbing
+
+`postgres blob-scrub-page` is an owner-only, read-only primary audit page.
+It takes `--connection-file`, `--epoch`, optional `--limit` (default 128,
+maximum 256), and optional `--after ACCOUNT:BLOB --through ACCOUNT:BLOB`.
+Both key components are canonical hexadecimal IDs. A continuation requires
+its retained upper key. The first page captures the greatest `(account,id)`
+blob key in its repeatable-read snapshot. Each page holds the migration lock,
+checks the actual schema owner and epoch, verifies manifests, chunk layout
+and the original whole-body SHA-256, and ends with known ROLLBACK before
+returning progress. It reads all stored blobs, including unreferenced uploads;
+it does not rely on summaries or MIME interpretation evidence.
+
+A page attempts at most 64 MiB of valid advertised body lengths, streams one
+body at a time, and retains the original ten-second operation deadline and
+bounded connection framing. Corrupt metadata or bytes increment a bounded
+failure count and advance the cursor; only the first failed identity is
+retained. An operational, deadline or transport failure returns no publishable
+cursor. A replay is read-only. These are historical per-page observations,
+not one database-wide snapshot: concurrent deletion may remove a body before
+its page, and insertion behind a cursor belongs to the next cycle. No repair,
+mail deletion, metadata-integrity certificate or credential authority follows.
+
+`postgres blob-scrub` adds `--state-dir` and runs one page with locally retained
+progress. The pre-created private directory is locked and dedicated to this
+operation. It contains only `LOCK`, `state.json` and interrupted `partial`;
+files obey the protected operator-input contract. State is bounded to 8 KiB,
+versioned and epoch-bound, published by private create, file sync, rename and
+directory sync. A crash may replay a page but cannot skip one. Restored epochs
+require a fresh directory; old progress is not reused. Unknown entries,
+symlinks, malformed state and concurrent owners refuse. This state is an
+operator progress receipt, not authoritative mail data.
+
+A completed cycle waits 86,400 seconds before the next cycle. Each page
+records totals, the cursor, first corrupt identity and operational failure.
+Completed failure counts remain visible throughout the next cycle and clear
+only after a complete clean cycle. Failures return nonzero and structured
+JSON to the supervisor; progress also has structured JSON. The status command
+`postgres blob-scrub-status --state-dir PATH --epoch HEX` needs no database
+credentials. It waits at most fifteen seconds for an overlapping bounded page
+to release the state lock. It fails on known corruption, the last operational failure,
+missing completion, completion older than 172,800 seconds or backward wall
+clock observations. Every invocation, including status and waiting, persists
+the latest observed second before reporting freshness; a lower observation
+refuses rather than making a stale cycle appear fresh again. It never claims integrity of future writes or replaces
+backup/restore drills. These operator reports use the supervisor journal and
+private progress file, not the database application-log table.
+
+The installer operations generator can schedule one page per minute and a
+separate status check every fifteen minutes on systemd or Shepherd. Each
+invocation is bounded, the directory lock excludes overlap, and a failed page
+is retried on the next tick. Schedules require explicit generation and
+activation; normal serving does not enable background scrubbing implicitly.

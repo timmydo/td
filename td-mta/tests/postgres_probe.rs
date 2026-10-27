@@ -2565,6 +2565,7 @@ mod serving_relay;
 #[test]
 #[ignore = "real local PostgreSQL tools required"]
 fn real_postgres_executable_receives_and_serves_database_profiles() {
+    blob_scrub::real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance();
     application_logs::real_postgres_logs_bound_retention_rate_wrap_and_inspection();
     acme::real_postgres_acme_fences_ownership_and_pins_complete_pairs();
     recovery::real_postgres_restore_quarantines_pending_delivery_and_changes_epoch();
@@ -13423,3 +13424,6 @@ fn real_postgres_folder_reconciliation() {
 
 #[path = "postgres_probe/audit_scaling.rs"]
 mod audit_scaling;
+
+#[path = "postgres_probe/blob_scrub.rs"]
+mod blob_scrub;
