@@ -153,8 +153,8 @@ pub fn recipe() -> Recipe {
                              -C \"user=$user,host=localhost,addr=$addr\") || exit 1; \
                          case \"$form:$user\" in sshd_config:alice) expected='{selftest} .ssh/authorized_keys';; \
                              sshd_config_enforced:alice) expected='{selftest}';; \
-                             sshd_config_server:alice) expected='{selftest} {provisioned} .ssh/authorized_keys';; \
-                             sshd_config_server_enforced:alice) expected='{selftest} {provisioned}';; \
+                             sshd_config_server:alice) expected='{selftest} {provisioned} {metadata} .ssh/authorized_keys';; \
+                             sshd_config_server_enforced:alice) expected='{selftest} {provisioned} {metadata}';; \
                              *) expected='{persistent}';; esac; \
                          printf '%s\\n' \"$policy\" | grep -q -x -F \
                              \"AuthorizedKeysFile $expected\" || \
@@ -167,6 +167,7 @@ pub fn recipe() -> Recipe {
                     selftest = super::system_x86_64::ssh_policy::SSHD_SELFTEST_AUTHORIZED_KEYS,
                     persistent = super::system_x86_64::ssh_policy::SSHD_AUTHORIZED_KEYS,
                     provisioned = super::system_x86_64::ssh_policy::SSHD_PROVISIONED_AUTHORIZED_KEYS,
+                    metadata = super::system_x86_64::ssh_policy::SSHD_METADATA_AUTHORIZED_KEYS,
                 ),
             ],
         )

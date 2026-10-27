@@ -9,6 +9,9 @@ pub const SSHD_USER_AUTHORIZED_KEYS: &str = ".ssh/authorized_keys";
 /// Root-owned keys a server image's provisioning seeds for the primary
 /// account; only a server's policy names them (td-login/TOKEN-LOGIN.md, "SSH").
 pub const SSHD_PROVISIONED_AUTHORIZED_KEYS: &str = "/var/lib/td/authorized-keys";
+/// Root-owned keys a server's instance metadata offered this boot, which
+/// `td-firstboot metadata` writes after this policy is rendered.
+pub const SSHD_METADATA_AUTHORIZED_KEYS: &str = "/run/td-metadata-authorized-keys";
 pub const OPENSSH_KEX_ALGORITHMS: &str =
     "mlkem768x25519-sha256,sntrup761x25519-sha512,curve25519-sha256";
 pub const OPENSSH_KEY_ALGORITHMS: &str = "ssh-ed25519";
@@ -31,9 +34,10 @@ pub enum Provisioned {
     /// The desktop: the self-test key and, in the ordinary form, the
     /// account's own keys.
     No,
-    /// A server: the root-owned provisioned keys too, in both forms. The
-    /// image's builder wrote them, not the account, so the enforced form's
-    /// withdrawal of owner-managed keys does not reach them.
+    /// A server: the root-owned provisioned and instance-metadata keys too,
+    /// in both forms. The image's builder and the instance's metadata wrote
+    /// them, not the account, so the enforced form's withdrawal of
+    /// owner-managed keys does not reach them.
     Server,
 }
 
@@ -41,7 +45,9 @@ pub enum Provisioned {
 pub fn config(primary_name: &str, form: Form, provisioned: Provisioned) -> String {
     let provisioned_keys = match provisioned {
         Provisioned::No => String::new(),
-        Provisioned::Server => format!(" {SSHD_PROVISIONED_AUTHORIZED_KEYS}"),
+        Provisioned::Server => {
+            format!(" {SSHD_PROVISIONED_AUTHORIZED_KEYS} {SSHD_METADATA_AUTHORIZED_KEYS}")
+        }
     };
     let allow = match form {
         Form::Ordinary => String::new(),

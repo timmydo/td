@@ -21,6 +21,9 @@ mod credentials;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
 mod cutover;
+#[path = "../../td-encoding/src/lib.rs"]
+#[allow(dead_code, reason = "td-firstboot decodes base64 alone")]
+mod encoding;
 #[path = "../../td-fido/src/fido_cbor.rs"]
 #[allow(
     dead_code,
@@ -60,6 +63,7 @@ mod login_directory;
 )]
 mod login_state;
 mod machineid;
+mod metadata;
 mod mounts;
 mod primary_home;
 mod primary_profile;
@@ -289,6 +293,7 @@ fn usage() -> String {
          {HOST_KEY}(.pub), {AUTHORIZED_KEYS}; with an application selector, a first \
          configuration under DIR/{APPLICATION_STATE_ROOT} or its validated private app home\n  \
          td-firstboot hostname prepares and activates the persistent hostname\n  \
+         td-firstboot metadata applies an attached NoCloud seed's hostname and Ed25519 keys on a server\n  \
          td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
          td-firstboot check-primary-name ROOT NAME checks a proposed human name without writing\n  \
          td-firstboot stage-primary-name ROOT NAME OUT prepares new account tables without activating them\n  \
@@ -346,6 +351,7 @@ fn run_with_primary(
         }
         Invocation::Help => return emit(&usage()).map_err(Failure::Failed),
         Invocation::Hostname => return activate_hostname(),
+        Invocation::Metadata => return apply_metadata(),
         Invocation::CheckPrincipals(root) => {
             principals::check_deployment(&root).map_err(Failure::Failed)?;
             return emit("TD-PRINCIPALS-CHECK-OK\n").map_err(Failure::Failed);
@@ -503,6 +509,7 @@ fn run_with_primary(
 enum Invocation {
     Help,
     Hostname,
+    Metadata,
     CheckPrincipals(PathBuf),
     CheckPrimaryName(PathBuf, String),
     StagePrimaryName(PathBuf, String, PathBuf),
@@ -601,6 +608,13 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
             Ok(Invocation::Hostname)
         } else {
             Err(Failure::Usage("hostname takes no operands".into()))
+        };
+    }
+    if args.first().is_some_and(|arg| arg == "metadata") {
+        return if args.len() == 1 {
+            Ok(Invocation::Metadata)
+        } else {
+            Err(Failure::Usage("metadata takes no operands".into()))
         };
     }
     if args
@@ -1174,6 +1188,51 @@ fn activate_hostname() -> Result<(), Failure> {
     emit(&format!("TD-HOSTNAME-READY {}\n", name.name())).map_err(Failure::Failed)
 }
 
+/// A server's instance metadata (td-svc/DESIGN.md §10, "Instance
+/// metadata"): an attached NoCloud seed's hostname becomes the saved name
+/// the `hostname` unit then applies, and its Ed25519 keys the root-owned
+/// file the server's sshd policy names. No seed changes nothing; a seed
+/// that does not parse changes nothing and fails the unit.
+fn apply_metadata() -> Result<(), Failure> {
+    let Some(metadata::Seed { device, meta, user }) =
+        metadata::read_nocloud().map_err(Failure::Failed)?
+    else {
+        return emit("TD-METADATA-NONE\n").map_err(Failure::Failed);
+    };
+    let request = metadata::seed_request(&meta, &user)
+        .map_err(|error| Failure::Failed(format!("NoCloud seed {device}: {error}")))?;
+    for reason in &request.skipped {
+        emit(&format!("TD-METADATA-SKIPPED {reason}\n")).map_err(Failure::Failed)?;
+    }
+    // Keys first: /run is always writable, so a name that cannot be saved
+    // does not withhold them.
+    if !request.keys.is_empty() {
+        saved::write_synced(
+            Path::new(ssh_policy::SSHD_METADATA_AUTHORIZED_KEYS),
+            &metadata::keys_file(&request.keys),
+            0o644,
+            Some((0, 0)),
+        )
+        .map_err(Failure::Failed)?;
+    }
+    if let Some(name) = &request.hostname {
+        let state = Path::new(DEFAULT_STATE_DIR);
+        let boundary = check_persistent(state)?;
+        make_dir(state, 0o755)?;
+        sync_directories(state, Some(&boundary))?;
+        saved::write_hostname(&state.join(HOSTNAME), name).map_err(Failure::Failed)?;
+    }
+    emit(&format!(
+        "TD-METADATA-APPLIED nocloud {device} hostname={} keys={}\n",
+        request
+            .hostname
+            .as_ref()
+            .map_or("-", hostname::Hostname::name),
+        request.keys.len()
+    ))
+    .map_err(Failure::Failed)
+}
+
 fn provision_machine_id(path: &Path) -> Result<Outcome, Failure> {
     match read_optional(path)? {
         Some(text) => {
@@ -1659,6 +1718,11 @@ mod hostname_tests {
             Ok(Invocation::Hostname)
         ));
         assert!(parse(&["hostname".into(), "unexpected".into()]).is_err());
+        assert!(matches!(
+            parse(&["metadata".into()]),
+            Ok(Invocation::Metadata)
+        ));
+        assert!(parse(&["metadata".into(), "unexpected".into()]).is_err());
     }
 }
 
@@ -1673,6 +1737,7 @@ mod tests {
             Invocation::Provision(config) => Ok(config),
             Invocation::Help
             | Invocation::Hostname
+            | Invocation::Metadata
             | Invocation::CheckPrincipals(_)
             | Invocation::CheckPrimaryName(_, _)
             | Invocation::PreparePrimaryProfile(_)
@@ -2373,8 +2438,9 @@ mod ssh_forms {
         }
     }
 
-    /// A server's policy adds its provisioned keys to the primary's block in
-    /// both forms and changes nothing else; the desktop never names them.
+    /// A server's policy adds its provisioned and instance-metadata keys to
+    /// the primary's block in both forms and changes nothing else; the
+    /// desktop never names them.
     #[test]
     fn only_a_server_policy_names_the_provisioned_keys() {
         use ssh_policy::{Form, Provisioned};
@@ -2382,15 +2448,21 @@ mod ssh_forms {
             for form in [Form::Ordinary, Form::Enforced] {
                 let desktop = ssh_policy::config(name, form, ssh_policy::Provisioned::No);
                 assert!(!desktop.contains(ssh_policy::SSHD_PROVISIONED_AUTHORIZED_KEYS));
+                assert!(!desktop.contains(ssh_policy::SSHD_METADATA_AUTHORIZED_KEYS));
                 let server = ssh_policy::config(name, form, Provisioned::Server);
                 assert_eq!(
                     server,
                     desktop.replace(
                         "/run/td-ssh-selftest-authorized_keys",
-                        "/run/td-ssh-selftest-authorized_keys /var/lib/td/authorized-keys"
+                        "/run/td-ssh-selftest-authorized_keys /var/lib/td/authorized-keys \
+                         /run/td-metadata-authorized-keys"
                     )
                 );
                 assert_eq!(server.matches("/var/lib/td/authorized-keys").count(), 1);
+                assert_eq!(
+                    server.matches("/run/td-metadata-authorized-keys").count(),
+                    1
+                );
                 let block = server.split_once(&format!("Match User {name}\n"));
                 assert!(block.is_some_and(|(_, block)| block.contains("authorized-keys")));
             }

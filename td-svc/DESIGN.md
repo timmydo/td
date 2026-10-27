@@ -1607,12 +1607,14 @@ reserves the primary session's identities, which the account preflight
 requires; no account holds them. Its table is the desktop's units
 restricted to what a headless machine needs: hostname, td-firstboot,
 rootcheck, the profiler and its evidence, netup, network, sshd and
-bootsuccess, plus the server's own healthwatch. Each shared unit is
-the desktop's stanza key for key, which a recipe test holds, except
-two. td-firstboot provisions the identity alone, with no application
-homes or session principals. bootsuccess requires sshd's readiness and
-the hostname instead of graphical readiness, so a candidate whose only
-way in does not listen is never acknowledged.
+bootsuccess, plus the server's own metadata and healthwatch. Each
+shared unit is the desktop's stanza key for key, which a recipe test
+holds, except three. hostname is ordered after metadata, which may
+save the name it applies ("Instance metadata" below). td-firstboot
+provisions the identity alone, with no application homes or session
+principals. bootsuccess requires sshd's readiness and the hostname
+instead of graphical readiness, so a candidate whose only way in does
+not listen is never acknowledged.
 
 The server has no greeter. No unit holds `tty=`, no console logs anyone
 in, and ttyS0 carries only boot output. Without a greeter there is no
@@ -1650,11 +1652,12 @@ disagreed on would fail it. In the second every attempt a candidate
 gets is rebooted by healthwatch, until the previous deployment is
 selected.
 
-The shape check asserts the server's start order — profiler evidence
-and sshd before bootsuccess, and healthwatch after it, plus the sysinit
-edges both profiles share. It also sweeps `/bin` for every name the
-desktop links and the server does not, a list derived from both
-profiles' staging rather than written out. The server keeps what its
+The shape check asserts the server's start order — metadata before
+hostname, profiler evidence and sshd before bootsuccess, and
+healthwatch after it, plus the sysinit edges both profiles share. It
+also sweeps `/bin` for every name the desktop links and the server
+does not, a list derived from both profiles' staging rather than
+written out. The server keeps what its
 own units and probes run (td-jail and its product configuration
 `/etc/td-app.conf`, git, ripgrep, fd and the uutils userland), the
 login-key record codec td-secret, cryptsetup and td-btrfs for the
@@ -1749,8 +1752,92 @@ defaults to 1460, and no classless static routes (option 121), which
 none of the three needs for a default route. Nothing handles the ACPI
 power button, so a cloud's stop waits out its grace period and then
 cuts power, and Hyper-V's integration services (shutdown, heartbeat,
-KVP and time sync, which need CONNECTOR) are not built. Nothing reads
-instance metadata: the account and keys are the image's own.
+KVP and time sync, which need CONNECTOR) are not built. Only a
+NoCloud seed's metadata is read ("Instance metadata"): EC2's and
+Azure's metadata services are not, so on those clouds the account,
+keys and hostname are the image's own.
+
+### Instance metadata
+
+A server's first unit, the `metadata` oneshot (`td-firstboot
+metadata`), applies the one NoCloud seed attached. A seed is an ISO
+9660 volume labelled `cidata`, in either case, on a whole disk or
+optical drive (`sr*`, `vd*`, `sd*`, `xvd*` or `nvme*n*`), as
+`cloud-localds` or `genisoimage -volid cidata -rock` writes it. The
+unit opens the device, checks its primary volume descriptor, mounts
+that descriptor's device read-only, `nodev`, `nosuid` and `noexec` at
+`/run/td-metadata-seed`, reads `meta-data` and `user-data` and
+unmounts it. The file names are Rock Ridge's: a Joliet-only or vfat
+seed is not read, since the kernel builds neither. Two seeds are
+refused rather than chosen between. The scan runs once and does not
+wait: a seed whose device appears later, as a USB stick's can, is
+missed.
+
+A file that is not UTF-8 of at most 64 KiB, such as compressed
+`user-data`, is skipped, as is a `user-data` that is not
+`#cloud-config` (a script or a MIME archive) and a file in JSON form.
+The rest is read as block YAML. When a file is a mapping whose keys
+start at the margin, as cloud-config is, only the top-level keys td
+reads are parsed: every other key is skipped unparsed, with every line
+up to the next key at the margin. A file indented throughout is parsed
+whole, and a top-level sequence asks for nothing. What is parsed must
+be in a strict subset: mappings, sequences, plain and quoted scalars,
+comments, flow sequences of scalars, one-line flow mappings, kept
+opaque, and block scalars. Anchors, aliases, tags, duplicate keys, tab
+indentation and a plain value continued on another line refuse the
+seed, as a second document does wherever it starts, and the unit
+fails having changed nothing. Two things are honoured, everything
+else is ignored, and nothing is executed:
+
+- The hostname: the first label, as cloud-init sets by default, of
+  `user-data`'s `hostname`, else of `meta-data`'s `local-hostname`,
+  lowercased; the first that meets the installed hostname grammar
+  wins, and each passed over is reported. It is saved as
+  `/var/lib/td/hostname`, which the `hostname`
+  unit then applies, so it persists through a later boot with no seed,
+  as a name an installation chose does.
+- Keys: `ssh_authorized_keys` (or `ssh-authorized-keys`) at the top
+  level and under each entry of `users`, and `meta-data`'s
+  `public-keys`, each a sequence of lines or one block of them. A
+  user entry's `name` and everything else in it are ignored: every key
+  admits the image's one primary account, whose name its volume fixed.
+  Each line must be one `ssh-ed25519` key without options whose blob
+  is exactly one Ed25519 public key; any other is skipped and counted.
+  A comment that is not printable ASCII of at most 256 bytes is
+  dropped, a key offered twice is kept once with its first comment,
+  and at most 64 are kept, the rest counted apart.
+
+The kept keys go to `/run/td-metadata-authorized-keys`, root-owned,
+mode 0644 and written through a temporary and a rename, before the
+hostname is saved, so a name that cannot be saved does not withhold
+them. A seed with neither file is reported as such. A server's SSH
+policy names it after the provisioned keys (td-login/TOKEN-LOGIN.md,
+"SSH"). `/run` is volatile, so a metadata key admits the account only
+on a boot whose seed offers it: dropping it from the seed and
+rebooting revokes it, which a provisioned key's revocation cannot do.
+The console reports `TD-METADATA-NONE`, or each skip as
+`TD-METADATA-SKIPPED` followed by `TD-METADATA-APPLIED nocloud DEVICE
+hostname=NAME keys=N`. Whoever can attach a disk can admit a key: on
+a cloud that is the instance's owner, and on hardware it is physical
+access, which can already boot a medium of its own, since the image's
+Secure Boot is off, and read a server's unencrypted volume
+(td-login/THREAT-MODEL.md §1). A live medium's keys are signed, but a
+seed attached to a live boot adds unsigned ones for the same reason.
+
+`qemu-boot-server`'s disk-image boot attaches a seed on q35's AHCI
+optical drive. Its `meta-data` names the host `td-seeded`, and its
+`user-data` offers a key made for the run, under another user's name,
+and an RSA key. The boot must report the RSA key skipped, the seed
+applied from `/dev/sr0` with one key, and `TD-HOSTNAME-READY
+td-seeded`, and the run's key must log in as the image's account.
+Every other boot attaches none and must report `TD-METADATA-NONE`, and
+each one that logs in must refuse that key.
+
+Not yet: EC2's IMDSv2, Azure's IMDS and the wireserver's ready report,
+seeds named by the kernel command line or fetched over the network,
+`vendor-data`, and every other cloud-config key, `fqdn` and
+`preserve_hostname` among them: where cloud-init would take `fqdn`'s
+label or keep the name, td takes `local-hostname`'s.
 
 ## 11. Evicting a previous supervisor's services
 

@@ -145,6 +145,7 @@ pub(crate) fn run_system(
             &initramfs,
             BootPlan {
                 disk: Some(BootDisk::new(&volume, false)),
+                seed: None,
                 mem: SYSTEM_GUEST_MEMORY_MIB,
                 target_marker: &marker,
                 kill_on_marker: cut,
@@ -387,6 +388,7 @@ pub(crate) fn run(
                         .filter(|_| name.starts_with("tpm-"))
                         .map(|path| BootDisk::new(path, *name != "tpm-seal"))
                 },
+                seed: None,
                 mem: "512",
                 target_marker: fixture::PASS,
                 kill_on_marker: false,
@@ -574,6 +576,7 @@ fn run_powercuts(
             &archive,
             BootPlan {
                 disk: Some(BootDisk::new(&disk, false)),
+                seed: None,
                 mem: "512",
                 target_marker: &marker,
                 kill_on_marker: cut,

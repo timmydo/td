@@ -114,6 +114,11 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-firstboot/src/machineid.rs"),
     ),
     (
+        "metadata",
+        include_str!("../../../td-firstboot/src/metadata.rs"),
+    ),
+    ("encoding", include_str!("../../../td-encoding/src/lib.rs")),
+    (
         "mounts",
         include_str!("../../../td-firstboot/src/mounts.rs"),
     ),
@@ -165,6 +170,7 @@ pub fn recipe() -> Recipe {
                 "tpm" => "{src}/td-secret/src/tpm.rs".into(),
                 "crypto" => "{src}/td-secret/src/crypto.rs".into(),
                 "secret_store" => "{src}/td-secret/src/store.rs".into(),
+                "encoding" => "{src}/td-encoding/src/lib.rs".into(),
                 _ => format!("{{src}}/td-firstboot/src/{name}.rs"),
             },
             content: (*source).into(),

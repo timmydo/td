@@ -114,6 +114,14 @@ the same session authority and nothing more. The account cannot change them,
 and its render refuses a keys file the account could have written. Revoking
 one takes a new persistent volume: a new image over the same volume keeps
 these keys, and anything the account added to its own `authorized_keys`.
+Keys a server's instance metadata offers (td-svc/DESIGN.md §10, "Instance
+metadata") are root-owned too, grant the same, and live in volatile `/run`,
+written each boot from the attached seed. Whoever can attach a disk can
+therefore admit one: the instance's owner on a cloud, and physical access on
+hardware, which can already boot a medium of its own (the image's Secure Boot
+is off) and read a server's unencrypted volume. That holds for a live medium
+too, whose signed provision a seed's keys join unsigned. Removing the key from
+the seed, or the seed, revokes it at the next boot.
 The boot-health login uses a fresh volatile key for the unprivileged UI account,
 but its root-owned authorization line is constrained by OpenSSH `restrict` and
 `from="127.0.0.1"`; possession of that key cannot create a network-reachable

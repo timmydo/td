@@ -604,6 +604,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             },
             BootPlan {
                 disk: Some(BootDisk::new(&volume, false)),
+                seed: None,
                 mem: SYSTEM_GUEST_MEMORY_MIB,
                 target_marker: &marker,
                 kill_on_marker: cut,

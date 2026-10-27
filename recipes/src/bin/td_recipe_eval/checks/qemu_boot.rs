@@ -39,6 +39,7 @@ mod host_login;
 pub(crate) mod install;
 pub(crate) mod live;
 pub(crate) mod media;
+mod nocloud;
 pub(crate) mod recovery_screen;
 pub(crate) mod secret;
 pub(crate) mod serial_shell;
@@ -722,6 +723,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         &initramfs,
         BootPlan {
             disk: None,
+            seed: None,
             mem: "256",
             target_marker: MARKER,
             kill_on_marker: true,
@@ -785,6 +787,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
         &initramfs,
         BootPlan {
             disk: Some(BootDisk::new(&disk, true)),
+            seed: None,
             mem: "256",
             target_marker: EROFS_MARKER,
             kill_on_marker: true,
@@ -928,6 +931,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &init_cpio,
         BootPlan {
             disk: Some(BootDisk::new(&volume, true)),
+            seed: None,
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: td_boot_protocol::SELECTED_PREVIOUS_MARKER,
             kill_on_marker: true,
@@ -1528,6 +1532,7 @@ fn boot_system_once(
         source,
         BootPlan {
             disk: Some(BootDisk::new(volume, false)),
+            seed: None,
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
@@ -1572,6 +1577,7 @@ fn boot_failed_target_once(
         init_cpio,
         BootPlan {
             disk: Some(BootDisk::new(volume, false)),
+            seed: None,
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: SYSTEM_SHUTDOWN_MARKER,
             kill_on_marker: false,
@@ -2817,6 +2823,7 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
         &init_cpio,
         BootPlan {
             disk: Some(BootDisk::new(&disk, false)),
+            seed: None,
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
@@ -2909,6 +2916,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
         &init_cpio,
         BootPlan {
             disk: Some(BootDisk::new(&disk, false)),
+            seed: None,
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
@@ -3061,6 +3069,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
         &initramfs,
         BootPlan {
             disk: None,
+            seed: None,
             mem: "512",
             target_marker: KEXEC_STAGE2_MARKER,
             kill_on_marker: true,
@@ -4679,6 +4688,9 @@ struct BootPlan<'a> {
     /// installation fixtures may select AHCI or NVMe.
     /// Probe EROFS images are read-only; system volumes allow @var writes.
     disk: Option<BootDisk<'a>>,
+    /// A NoCloud seed (`nocloud::write_seed`) on the q35 machine's AHCI
+    /// optical drive beside the disk, as `cloud-localds` media is attached.
+    seed: Option<&'a Path>,
     /// Guest RAM in MiB (qemu `-m`). Diskless/probe and standalone kexec boots use
     /// smaller fixed plans; system boots use `SYSTEM_GUEST_MEMORY_MIB` so repeated
     /// selector handoffs retain room after the deployment populates the page cache.
@@ -5498,6 +5510,14 @@ fn boot_source(
                 }
             }
         }
+    }
+    // A direct boot's PC machine has PIIX IDE, which the kernel does not
+    // drive; q35's AHCI takes the seed as its first free port.
+    if let Some(seed) = plan.seed {
+        if !matches!(source, BootSource::Firmware { .. }) {
+            return Err("a NoCloud seed needs a firmware boot's q35 AHCI".into());
+        }
+        cmd.arg("-drive").arg(media::optical_drive_arg(seed));
     }
     if let BootSource::Firmware {
         attachment:
@@ -13642,6 +13662,7 @@ mod tests {
         let script = [];
         let plan = |append: &'static str, read_only: bool| BootPlan {
             disk: Some(BootDisk::new(&medium, read_only)),
+            seed: None,
             mem: "64",
             target_marker: "never",
             kill_on_marker: false,
@@ -13726,6 +13747,7 @@ mod tests {
         for other in ["screen", "shell", "answers", "input"] {
             let plan = BootPlan {
                 disk: None,
+                seed: None,
                 mem: "64",
                 target_marker: "never",
                 kill_on_marker: false,

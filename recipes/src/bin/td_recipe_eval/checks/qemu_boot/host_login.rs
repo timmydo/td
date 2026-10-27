@@ -2,8 +2,9 @@
 //! DESIGN.md §10, "Profiles"). QEMU's user network forwards one loopback
 //! port to the guest's sshd, and the host's OpenSSH client logs in with
 //! keys made for this run: the provisioned one must be admitted as the
-//! provisioned account and refused as root, and one the server was never
-//! given must be refused.
+//! provisioned account and refused as root, one the server was never
+//! given must be refused, and one only a NoCloud seed offers must be
+//! admitted as that account on the boot the seed is attached to alone.
 
 use std::cell::{Cell, RefCell};
 use std::fs::{self, File};
@@ -18,6 +19,7 @@ use crate::checks::provisioned_account::{encoding, ProvisionedAccount};
 /// One attempt's bound: connection, key exchange and the remote command.
 const ATTEMPT_LIMIT: Duration = Duration::from_secs(60);
 const PROVISIONED_KEY: &str = "provisioned";
+const METADATA_KEY: &str = "metadata";
 const STRANGER_KEY: &str = "stranger";
 
 /// One login, in the order they run.
@@ -26,19 +28,36 @@ enum Attempt {
     /// The provisioned key as the provisioned account: the remote `id -un`
     /// prints its name.
     Provisioned,
+    /// The seed's key as that account: admitted only on a seeded boot.
+    Metadata,
     /// A key the server was never given, as that account: refused.
     Stranger,
     /// The provisioned key as root: refused, root having no SSH login.
     Root,
 }
 
-const ATTEMPTS: &[Attempt] = &[Attempt::Provisioned, Attempt::Stranger, Attempt::Root];
+const ATTEMPTS: &[Attempt] = &[
+    Attempt::Provisioned,
+    Attempt::Metadata,
+    Attempt::Stranger,
+    Attempt::Root,
+];
 
 impl Attempt {
     fn key(self) -> &'static str {
         match self {
             Attempt::Provisioned | Attempt::Root => PROVISIONED_KEY,
+            Attempt::Metadata => METADATA_KEY,
             Attempt::Stranger => STRANGER_KEY,
+        }
+    }
+
+    /// Whether sshd must admit it, given whether the boot was seeded.
+    fn admitted(self, seeded: bool) -> bool {
+        match self {
+            Attempt::Provisioned => true,
+            Attempt::Metadata => seeded,
+            Attempt::Stranger | Attempt::Root => false,
         }
     }
 
@@ -46,6 +65,7 @@ impl Attempt {
     fn label(self) -> &'static str {
         match self {
             Attempt::Provisioned => "provisioned-login",
+            Attempt::Metadata => "metadata-login",
             Attempt::Stranger => "stranger-login",
             Attempt::Root => "root-login",
         }
@@ -53,7 +73,7 @@ impl Attempt {
 
     fn user(self, account: &str) -> &str {
         match self {
-            Attempt::Provisioned | Attempt::Stranger => account,
+            Attempt::Provisioned | Attempt::Metadata | Attempt::Stranger => account,
             Attempt::Root => "root",
         }
     }
@@ -70,11 +90,13 @@ pub(crate) struct HostLogin {
     home: PathBuf,
     /// Filled by the boot that ran the attempts.
     outcome: RefCell<Option<Result<(), String>>>,
+    /// Whether the boot carries a seed offering the metadata key.
+    seeded: Cell<bool>,
 }
 
 impl HostLogin {
-    /// Makes the run's two keys under `home` (which must not exist) with the
-    /// host's `ssh-keygen`, and the account that admits only the first.
+    /// Makes the run's three keys under `home` (which must not exist) with
+    /// the host's `ssh-keygen`, and the account that admits only the first.
     pub(crate) fn prepare(home: &Path, stem: &str, name: &str) -> Result<Self, String> {
         let ssh = host_tool("ssh")?;
         let keygen = host_tool("ssh-keygen")?;
@@ -89,7 +111,7 @@ impl HostLogin {
             ));
         }
         fs::create_dir(home).map_err(|error| format!("create {}: {error}", home.display()))?;
-        for key in [PROVISIONED_KEY, STRANGER_KEY] {
+        for key in [PROVISIONED_KEY, METADATA_KEY, STRANGER_KEY] {
             let status = Command::new(&keygen)
                 .env_clear()
                 .env("HOME", home)
@@ -116,11 +138,22 @@ impl HostLogin {
             account: ProvisionedAccount::new(stem, name, &public)?,
             home: home.to_owned(),
             outcome: RefCell::new(None),
+            seeded: Cell::new(false),
         })
     }
 
     pub(crate) fn account(&self) -> &ProvisionedAccount {
         &self.account
+    }
+
+    /// The metadata key's public line, for a seed to offer; the boot's
+    /// logins then expect it admitted.
+    pub(crate) fn seed_key(&self) -> Result<String, String> {
+        let path = self.home.join(format!("{METADATA_KEY}.pub"));
+        let line = fs::read_to_string(&path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        self.seeded.set(true);
+        Ok(line.trim_end().to_owned())
     }
 
     /// The shared user network plus the one loopback forward to port 22, on
@@ -206,6 +239,7 @@ impl HostLogin {
         judge(
             attempt,
             self.account.name(),
+            attempt.admitted(self.seeded.get()),
             code,
             &read("stdout"),
             &read("stderr"),
@@ -219,15 +253,15 @@ impl HostLogin {
 fn judge(
     attempt: Attempt,
     account: &str,
+    admitted: bool,
     code: Option<i32>,
     stdout: &str,
     stderr: &str,
 ) -> Result<(), String> {
-    let passed = match attempt {
-        Attempt::Provisioned => code == Some(0) && stdout == format!("{account}\n"),
-        Attempt::Stranger | Attempt::Root => {
-            code == Some(255) && stdout.is_empty() && stderr.contains("Permission denied")
-        }
+    let passed = if admitted {
+        code == Some(0) && stdout == format!("{account}\n")
+    } else {
+        code == Some(255) && stdout.is_empty() && stderr.contains("Permission denied")
     };
     if passed {
         return Ok(());
@@ -238,9 +272,10 @@ fn judge(
          {stderr:?}",
         attempt.key(),
         attempt.user(account),
-        match attempt {
-            Attempt::Provisioned => "admitted and printed the account's name",
-            Attempt::Stranger | Attempt::Root => "refused",
+        if admitted {
+            "admitted and printed the account's name"
+        } else {
+            "refused"
         }
     ))
 }
@@ -376,7 +411,7 @@ mod tests {
     #[test]
     fn the_logins_are_judged_by_exit_and_output() {
         let denied = "ada@127.0.0.1: Permission denied (publickey).\r\n";
-        assert!(judge(Attempt::Provisioned, "ada", Some(0), "ada\n", "").is_ok());
+        assert!(judge(Attempt::Provisioned, "ada", true, Some(0), "ada\n", "").is_ok());
         for (code, stdout) in [
             (Some(0), "root\n"),
             (Some(0), "ada"),
@@ -384,10 +419,10 @@ mod tests {
             (Some(1), "ada\n"),
             (None, "ada\n"),
         ] {
-            assert!(judge(Attempt::Provisioned, "ada", code, stdout, "").is_err());
+            assert!(judge(Attempt::Provisioned, "ada", true, code, stdout, "").is_err());
         }
         for attempt in [Attempt::Stranger, Attempt::Root] {
-            assert!(judge(attempt, "ada", Some(255), "", denied).is_ok());
+            assert!(judge(attempt, "ada", false, Some(255), "", denied).is_ok());
             for (code, stdout, stderr) in [
                 (Some(0), "ada\n", ""),
                 (
@@ -400,12 +435,19 @@ mod tests {
                 (Some(1), "", denied),
                 (None, "", denied),
             ] {
-                assert!(judge(attempt, "ada", code, stdout, stderr).is_err());
+                assert!(judge(attempt, "ada", false, code, stdout, stderr).is_err());
             }
         }
         assert_eq!(Attempt::Root.user("ada"), "root");
         assert_eq!(Attempt::Root.key(), PROVISIONED_KEY);
         assert_eq!(Attempt::Stranger.key(), STRANGER_KEY);
+        assert_eq!(Attempt::Metadata.key(), METADATA_KEY);
+        assert_eq!(Attempt::Metadata.user("ada"), "ada");
+        // The seed's key is admitted on the seeded boot alone.
+        assert!(Attempt::Metadata.admitted(true));
+        assert!(!Attempt::Metadata.admitted(false));
+        assert!(Attempt::Provisioned.admitted(false));
+        assert!(!Attempt::Stranger.admitted(true) && !Attempt::Root.admitted(true));
         let labels: std::collections::BTreeSet<_> =
             ATTEMPTS.iter().map(|attempt| attempt.label()).collect();
         assert_eq!(labels.len(), ATTEMPTS.len());

@@ -2619,6 +2619,7 @@ pub(super) fn target_plan<'a>(target: &'a TargetDisk, marker: &'a str) -> BootPl
 pub(super) fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> BootPlan<'a> {
     BootPlan {
         disk: Some(BootDisk::new(path, read_only)),
+        seed: None,
         mem: "2048",
         target_marker: marker,
         kill_on_marker: true,

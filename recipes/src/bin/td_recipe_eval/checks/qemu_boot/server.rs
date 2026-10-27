@@ -17,7 +17,9 @@
 //! Then the published form: the deployment composed by `server-image` into
 //! a disk image for a provisioned account, cold-booted by UEFI firmware from
 //! its ESP with no command line injected, to the steady state and the
-//! host's SSH logins.
+//! host's SSH logins. That boot carries a NoCloud seed, whose hostname it
+//! takes and whose key admits the provisioned account; every other boot
+//! has none, and the seed's key is refused.
 //!
 //! The failing boots exercise one of healthwatch's inputs, a health
 //! transaction that ended without a record (the fail-target token). A
@@ -28,6 +30,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::host_login::HostLogin;
+use super::nocloud;
 use super::server_image::{self, Format, ImageInputs};
 use super::{
     autotest_wait_token, boot_headless, boot_source, boot_timeout, build_btrfs_tools,
@@ -63,6 +66,9 @@ const ACCOUNT: &str = "ada";
 /// carries was taken rather than an earlier volume's.
 const IMAGE_ACCOUNT: &str = "grace";
 const ISO_ACCOUNT: &str = "hedy";
+/// The hostname the disk image's seed names, not the image's default.
+const SEED_HOSTNAME: &str = "td-seeded";
+const METADATA_NONE_MARKER: &str = "TD-METADATA-NONE";
 /// A live boot's volume is half of RAM, as `qemu-boot-live` gives it.
 const LIVE_MEMORY_MIB: &str = "4096";
 
@@ -133,6 +139,7 @@ impl Boot<'_> {
             self.initramfs,
             BootPlan {
                 disk: Some(BootDisk::new(self.volume, false)),
+                seed: None,
                 mem: SYSTEM_GUEST_MEMORY_MIB,
                 target_marker: target,
                 kill_on_marker,
@@ -424,6 +431,30 @@ fn image_boot(
         )?,
         Published::Iso => server_image::compose_iso(inputs, &trust, login.account(), &dir, &disk)?,
     };
+    // As `cloud-localds` writes one: the hostname in meta-data, keys in
+    // user-data under a user whose name the baked account overrides, and
+    // a key of a type the server does not admit, which is skipped.
+    let seed = match form {
+        Published::Disk => {
+            let path = dir.join("seed.iso");
+            let user = format!(
+                "#cloud-config\n\
+                 users:\n  \
+                 - name: someone-else\n    \
+                 ssh_authorized_keys:\n      \
+                 - {}\n      \
+                 - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQ== not-ed25519\n",
+                login.seed_key()?
+            );
+            nocloud::write_seed(
+                &path,
+                &format!("instance-id: td-qemu-boot-server\nlocal-hostname: {SEED_HOSTNAME}\n"),
+                &user,
+            )?;
+            Some(path)
+        }
+        Published::Iso => None,
+    };
     let vars = dir.join("vars.fd");
     efi::copy_input(vars_template, &vars)?;
     println!(
@@ -447,6 +478,7 @@ fn image_boot(
             // The live medium is read-only optical media and its boot writes
             // to RAM; the disk image takes its own boot's writes.
             disk: Some(BootDisk::new(&disk, form == Published::Iso)),
+            seed: seed.as_deref(),
             mem,
             target_marker: HEALTH_STEADY_MARKER,
             kill_on_marker: true,
@@ -535,8 +567,55 @@ fn image_boot(
     }
     no_attempt_state(&result, label)?;
     no_desktop(&result, label)?;
+    match form {
+        Published::Disk => validate_seeded(&result, label)?,
+        Published::Iso => validate_unseeded(&result, label)?,
+    }
     login.verdict(evidence.host_key.as_deref())?;
     fs::remove_dir_all(&dir).map_err(|error| format!("remove {}: {error}", dir.display()))
+}
+
+/// The seed, the only drive on q35's AHCI, was read once, its hostname
+/// taken and applied, one key written and the RSA key skipped.
+fn validate_seeded(result: &BootResult, label: &str) -> Result<(), String> {
+    let expected = [
+        "TD-METADATA-SKIPPED 1 key(s) other than plain ssh-ed25519".to_string(),
+        format!("TD-METADATA-APPLIED nocloud /dev/sr0 hostname={SEED_HOSTNAME} keys=1"),
+        format!("TD-HOSTNAME-READY {SEED_HOSTNAME}"),
+    ];
+    let metadata: Vec<&str> = result
+        .console
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| line.starts_with("TD-METADATA-") || line.starts_with("TD-HOSTNAME-READY "))
+        .collect();
+    if metadata != expected {
+        return Err(format!(
+            "the {label} should have reported {expected:?} for its NoCloud seed, but \
+             reported {metadata:?}. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    Ok(())
+}
+
+/// No seed, so nothing applied: the metadata agent said so once.
+fn validate_unseeded(result: &BootResult, label: &str) -> Result<(), String> {
+    let metadata: Vec<&str> = result
+        .console
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| line.starts_with("TD-METADATA-"))
+        .collect();
+    if metadata != [METADATA_NONE_MARKER] {
+        return Err(format!(
+            "the {label} attached no NoCloud seed, so should have reported \
+             {METADATA_NONE_MARKER:?} alone, but reported {metadata:?}. Last serial \
+             output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    Ok(())
 }
 
 /// A boot that installed the channel's candidate and rolled the trial
@@ -576,7 +655,8 @@ fn no_attempt_state(result: &BootResult, label: &str) -> Result<(), String> {
 /// `validate_health` for a boot that selected current unambiguously.
 fn validate_healthy(result: &BootResult, identity: Identity, label: &str) -> Result<(), String> {
     validate_primary_selection(result, label)?;
-    validate_health(result, identity, label)
+    validate_health(result, identity, label)?;
+    validate_unseeded(result, label)
 }
 
 /// What a healthy server boot printed, and what it must not have.

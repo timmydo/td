@@ -756,20 +756,27 @@ statement; other documents point here.
 
 A server image (`server-x86-64`, td-svc/DESIGN.md §10, "Profiles")
 renders the same two forms with one addition. The primary's `Match`
-block also names `/var/lib/td/authorized-keys`, between the self-test
-file and `.ssh/authorized_keys`, and keeps it in the enforced form
-too. The volume's builder writes that file, or on a live medium
-td-boot's live seed stages it from the medium's signed provision. With
+block also names `/var/lib/td/authorized-keys` and then
+`/run/td-metadata-authorized-keys`, between the self-test file and
+`.ssh/authorized_keys`, and keeps both in the enforced form too. The
+volume's builder writes the first, or on a live medium td-boot's live
+seed stages it from the medium's signed provision. With
 `--provisioned-keys`, which stage 1 passes on a server only, the
 render refuses to publish any policy unless the file is absent or is
 one root-owned, singly linked, mode-0644 regular file of at most 64
 KiB under root-owned directories that no group or other may write.
 StrictModes alone would also accept a file the account owned. The
 account therefore cannot change the file, and withdrawing
-owner-managed keys on enrollment does not reach it. A server ships no
-login-key enrollment, so it stays in the ordinary form unless its
-login state is unavailable. The realized OpenSSH recipe test checks
-the server's two forms with `sshd -T` as well.
+owner-managed keys on enrollment does not reach it. The second file
+does not exist when the policy is rendered. The server's first unit,
+`td-firstboot metadata`, writes it later in the boot as root, mode
+0644 and through a rename, from instance metadata alone
+(td-svc/DESIGN.md §10, "Instance metadata"). It lives in volatile
+`/run`, so a key in it admits the account only on a boot whose
+metadata offers it. A server ships no login-key enrollment, so it
+stays in the ordinary form unless its login state is unavailable. The
+realized OpenSSH recipe test checks the server's two forms with `sshd
+-T` as well.
 
 The persistent root-owned `/etc/ssh/authorized_keys`, empty on a fresh
 install, admits no account on a td image: root is refused, every

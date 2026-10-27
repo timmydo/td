@@ -1442,6 +1442,7 @@ const TD_SVC_UNITS: &[&str] = &[
 
 /// The server's `TD_SVC_UNITS`: every unit `build_server_td_svc_conf` declares.
 const SERVER_TD_SVC_UNITS: &[&str] = &[
+    "metadata",
     "hostname",
     "td-firstboot",
     "rootcheck",
@@ -1474,6 +1475,9 @@ fn td_svc_units(sys: &SystemDef) -> &'static [&'static str] {
 mod svc_timeouts {
     /// Validate or durably initialize the saved name, set it and read it back.
     pub const HOSTNAME: u32 = 30;
+    /// A scan of the block devices, one read-only seed mount, two reads of
+    /// at most 64 KiB and two small synced writes.
+    pub const METADATA: u32 = 60;
     /// Mints the per-machine identity: ed25519 keygen, writes to /var, then sync.
     pub const FIRSTBOOT: u32 = 300;
     /// Dozens of greps over /proc/mounts, two `exec-primary` runs, and write probes.
@@ -1615,9 +1619,15 @@ fn build_server_td_svc_conf() -> String {
          # this table. Ordering lives here as a graph; `td-svc check` validates it at\n\
          # image-build time.\n\
          \n\
+         [metadata]\n\
+         type=oneshot\n\
+         exec=/bin/td-firstboot metadata\n\
+         timeout={metadata}\n\
+         \n\
          [hostname]\n\
          type=oneshot\n\
          exec=/bin/td-firstboot hostname\n\
+         after=metadata\n\
          timeout={hostname}\n\
          \n\
          [td-firstboot]\n\
@@ -1689,6 +1699,7 @@ fn build_server_td_svc_conf() -> String {
          log=/var/log/svc/sshd.log\n\
          console=yes\n\
          stop=leaf\n",
+        metadata = svc_timeouts::METADATA,
         hostname = svc_timeouts::HOSTNAME,
         firstboot = svc_timeouts::FIRSTBOOT,
         rootcheck = svc_timeouts::ROOTCHECK,
@@ -5718,7 +5729,8 @@ fn shape_check(sys: &SystemDef) -> String {
      hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); au=$(svcpos audio); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); ff=$(svcpos firefox); fe=$(svcpos firefox-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); po=$(svcpos portal); pv=$(svcpos portal-evidence); \
      @}DESKTOP@\
      @SERVER{@\
-     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); nu=$(svcpos netup); bs=$(svcpos bootsuccess); hw=$(svcpos healthwatch); sd=$(svcpos sshd); \
+     md=$(svcpos metadata); hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); nu=$(svcpos netup); bs=$(svcpos bootsuccess); hw=$(svcpos healthwatch); sd=$(svcpos sshd); \
+     [ \"$md\" -lt \"$hn\" ] || { echo 'td-svc would start hostname before metadata - a seeded name must be saved before the hostname unit applies it' >&2; exit 1; }; \
      @}SERVER@\
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
@@ -16677,7 +16689,16 @@ mod server_tests {
         let names: Vec<&str> = server.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(names, SERVER_TD_SVC_UNITS);
         for (name, keys) in &server {
-            // The server's own unit: the reboot a greeter's park would own.
+            // The server's own units: instance metadata, which the saved
+            // hostname waits for, and the reboot a greeter's park would own.
+            if name == "metadata" {
+                assert_eq!(value(keys, "type"), Some("oneshot"));
+                assert_eq!(value(keys, "exec"), Some("/bin/td-firstboot metadata"));
+                assert_eq!(value(keys, "after"), None);
+                assert_eq!(value(keys, "requires"), None);
+                assert!(!desktop.iter().any(|(unit, _)| unit == name));
+                continue;
+            }
             if name == "healthwatch" {
                 assert_eq!(value(keys, "type"), Some("oneshot"));
                 assert_eq!(value(keys, "exec"), Some("/etc/healthwatch"));
@@ -16692,6 +16713,10 @@ mod server_tests {
                 .map(|(_, keys)| keys)
                 .unwrap_or_else(|| panic!("{name} is not a desktop unit"));
             match name.as_str() {
+                "hostname" => {
+                    assert_eq!(value(keys, "after"), Some("metadata"));
+                    assert_eq!(except(keys, &["after"]), except(stock, &["after"]));
+                }
                 "td-firstboot" => {
                     assert_eq!(value(keys, "exec"), Some("/bin/td-firstboot provision"));
                     assert_eq!(except(keys, &["exec"]), except(stock, &["exec"]));
@@ -16966,8 +16991,9 @@ mod server_tests {
             ssh_policy::Provisioned::Server,
         );
         assert!(policy.contains(&format!(
-            "{SSHD_SELFTEST_AUTHORIZED_KEYS} {}",
-            ssh_policy::SSHD_PROVISIONED_AUTHORIZED_KEYS
+            "{SSHD_SELFTEST_AUTHORIZED_KEYS} {} {}",
+            ssh_policy::SSHD_PROVISIONED_AUTHORIZED_KEYS,
+            ssh_policy::SSHD_METADATA_AUTHORIZED_KEYS
         )));
         // The flag td-firstboot parses is the one the init passes.
         assert!(include_str!("../../../td-firstboot/src/main.rs")
