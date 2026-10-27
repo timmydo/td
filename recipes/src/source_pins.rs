@@ -57,10 +57,10 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "fd-source",
         aliases: &[],
-        url: "https://static.crates.io/crates/fd-find/fd-find-10.2.0.crate",
-        sha256: "de08defa195af894cc295a43bfc65ba28903e492fd5f32f7a24bf75eafd9bf34",
-        file: "fd-find-10.2.0.crate",
-        version: "10.2.0",
+        url: "https://static.crates.io/crates/fd-find/fd-find-10.5.0.crate",
+        sha256: "f35becce49c551724fd26d9824ec01d6578868cecbcc4e3d060658f9f8ad1e4d",
+        file: "fd-find-10.5.0.crate",
+        version: "10.5.0",
     },
     PinDef {
         key: "git-x86-64-source",
@@ -529,7 +529,7 @@ mod tests {
         // linux-x86-64 kernel source (separate from the 4.14 UAPI-header
         // pin, re #529) + the upstream Rust 1.99.1 rustc, rust-std, Cargo and
         // Clippy release components +
-        // coreutils-0.9.0, ripgrep 14.1.1, and fd 10.2.0 (the Rust userland
+        // coreutils-0.9.0, ripgrep 14.1.1, and fd 10.5.0 (the Rust userland
         // `.crate` sources) +
         // util-linux 2.42.4 (cryptsetup's minimal libuuid/libblkid build
         // closure) + the first reviewed
