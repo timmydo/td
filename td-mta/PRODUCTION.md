@@ -2,7 +2,7 @@
 
 This is the operator runbook for the Azure x86-64 host shared by
 `mx.timmydouglas.com`, `mx.timmyd.info` and `mx.882015.xyz`. The inventory was
-checked on 2026-10-25. Update this document when changing its paths or services.
+checked on 2026-10-27. Update this document when changing its paths or services.
 [DEPLOYMENT.md](DEPLOYMENT.md) describes installation on other hosts;
 [OBSERVABILITY.md](OBSERVABILITY.md) describes diagnostic output.
 
@@ -30,6 +30,7 @@ because its old DNS name now points here.
 | System service definitions | `/etc/systemd/system/td-mta-*.service` |
 | Deployment receipts and diagnostics | `/var/lib/td-mta/operator/` |
 | Scheduled database backups | `/var/lib/td-mta/backups/scheduled/` |
+| Whole-body integrity progress | `/var/lib/td-mta/integrity/` |
 
 Keep connection files and credentials private; no password belongs in a
 command argument, Git, or this runbook. Configuration, account records, mail,
@@ -43,6 +44,10 @@ Five processes use the selected MTA executable:
 - `td-mta-relay.service`: relay profile, including the test-domain SES route.
 - `td-mta-migadu.service`: production outbound relay profile.
 - `td-mta-acme-production.service`: certificate issuance/renewal for all three MX names.
+
+The inbound SMTP listener permits eight simultaneous sessions. DATA admission
+remains bounded to four jobs overall and two per peer. These are separate
+limits: increasing listener capacity does not remove the per-peer DATA bound.
 
 `td-mta-postgres.service` separately runs PostgreSQL 17 on loopback port 35432.
 Its cluster is `/var/lib/td-mta/mail/postgres`, its configuration is
@@ -64,7 +69,9 @@ and HTTPS 443. The private PostgreSQL TLS material has a separate generated
 `td-mta-maint-postgres-tls-renew.timer`. Certificate management and software
 updates are independent.
 
-Scheduled backups use `td-mta-maint-backup.timer`. Health checks include
+Scheduled backups use `td-mta-maint-backup.timer`, retaining at most seven
+archives within a 4 GiB total bound and a 1 GiB per-archive bound. These bounds
+are generated operations settings, not PostgreSQL storage quotas. Health checks include
 `td-mta-health.timer` and the generated `td-mta-maint-*` timers. Check the
 oneshot results, not just whether a timer is active:
 
@@ -342,13 +349,36 @@ schema-33 backup with its compatible binary. After restart, add `--structure`
 to the summary-backfill command to rebuild MIME evidence as well as headers.
 Track `structures_written` and `structures_skipped` in its reports; skipped
 messages retain verified parsing. Compare `structure_reuse` and
-`jmap_structure` counter deltas for individual message opens. Full-body
-verification remains enabled, so this upgrade does not eliminate attachment
-reads during a message open.
+`jmap_structure` counter deltas for individual message opens. MIME evidence alone does not eliminate attachment reads during a message
+open; that requires the selective verification path below.
 
 Selective Email/get verification uses existing schema-34 MIME evidence. Its
 binary update needs no additional schema upgrade or backfill if
 `summary-backfill --structure` has already completed. Missing evidence keeps
 the complete-body fallback. Raw downloads and owner integrity audits still
 verify the whole message; successful text views do not certify unread
-attachments. No automatic scrub schedule is installed.
+attachments. The independent whole-body scrub below checks those bytes.
+
+## Scheduled whole-body integrity verification
+
+`td-mta-maint-scrub.timer` runs one bounded page each minute. Each page checks
+at most 128 bodies and 64 MiB of attempted body bytes using the original
+whole-message SHA-256 and chunk layout. It neither repairs nor deletes mail.
+After completion, the next cycle starts no sooner than 24 hours later.
+Progress survives restarts in the private `/var/lib/td-mta/integrity/` directory,
+bound to the database epoch. Do not delete that directory to clear a failure.
+
+`td-mta-maint-scrub-status.timer` checks every 15 minutes. It fails when no
+clean cycle has completed within 48 hours, a cycle finds corruption, an
+operation fails, or the clock moves backward relative to retained observations.
+These are systemd/journal results, not automatic mailbox alerts.
+
+```text
+systemctl status td-mta-maint-scrub.timer td-mta-maint-scrub-status.timer
+sudo journalctl -u td-mta-maint-scrub.service -u td-mta-maint-scrub-status.service --since today
+sudo systemctl start td-mta-maint-scrub-status.service
+```
+
+Inspect the JSON progress and retained failure identifiers before taking any
+repair action. A successful selective message read does not replace this
+whole-body check; a clean scrub does not replace a backup or restore test.

@@ -2,8 +2,9 @@
 
 The executable serves receive, JMAP and relay profiles from PostgreSQL. The former
 SQLite receiver procedure and its local initialization, verification,
-backup/restore and file-configuration commands are removed. There is no
-existing deployment or SQLite data conversion requirement.
+backup/restore and file-configuration commands are removed. No SQLite
+conversion is supported; migration from an external mail server is described
+in [MIGRATION.md](MIGRATION.md).
 [POSTGRES.md](POSTGRES.md) owns database preparation and current support;
 [CONFIG.md](CONFIG.md#foreground-postgresql-service) owns foreground serving.
 Relay scheduling is active; configuration reload requires process restart.

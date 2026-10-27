@@ -1,8 +1,10 @@
-# td-mta implementation handoff
+# td-mta implementation reference and handoff
 
 [POSTGRES.md](POSTGRES.md) owns active PostgreSQL storage and configuration.
-Receive/JMAP serving is implemented. Relay process integration remains
-incomplete and is refused; there is no alternative local database backend.
+Receive, JMAP and relay serving are implemented, including account-scoped
+flows. There is no alternative local database backend. Current supported
+flows and qualification limits are in [CONFORMANCE.md](CONFORMANCE.md); live
+host administration is in [PRODUCTION.md](PRODUCTION.md).
 
 ## How to use this plan
 
@@ -10,10 +12,13 @@ Read `DESIGN.md`, root `AGENTS.md`, and `DEVELOPMENT.md` before work.
 Crypto/backend tasks also read `td-crypto/DESIGN.md` and `td-crypto/TLS.md`.
 Service-facing tasks also read `RESOURCES.md` and `ADMISSION.md`, including
 their named milestone-specific evidence. Message/query tasks read `POLICY.md`,
-`../td-mime/UNICODE.md` and `CASES.md`. Storage tasks read `STORAGE.md`.
-This plan
-describes future implementation; none of its tasks are complete merely because
-this file exists. Its scope is the personal service specified in the design.
+`../td-mime/UNICODE.md` and `CASES.md`. Durable storage tasks read
+`POSTGRES.md`; local runtime/scratch tasks read `STORAGE.md`.
+The numbered tasks retain component sequencing and evidence references, not
+a current list of unfinished work. Establish each task's present code and
+coverage before using it as a handoff. Neither a task description nor a
+milestone name proves completion. Scope remains the personal service in
+DESIGN.md.
 CONFORMANCE.md's td-mail call inventory bounds protocol work. Tasks below
 that list unused generic methods, property forms or argument combinations are
 reference backlog, not prerequisites for the client milestone. Prioritize
@@ -61,10 +66,11 @@ observations below describe delivered evidence, not requirements to repeat
 the same probe pattern on every composition. An exclusion states what a test
 did not establish; it does not automatically create the next task.
 
-The storage workstream next addresses missing mutation policy, transaction
-coordination and operational verification/backup/restore behavior. Select one
-concrete behavior and its correctness/failure tests per increment. Additional
-body-loan/account/epoch/pruning/fence resource permutations are deferred unless
+Select one concrete missing behavior or reproduced failure and its
+correctness/failure tests per increment. PostgreSQL owns the active mutation,
+transaction and operational contracts; do not infer missing behavior from
+the original milestone ordering below. Additional body-loan/account/epoch/
+pruning/fence resource permutations are deferred unless
 a production change, reproduced failure or named release question needs them.
 No further qualification-only selector is planned merely to fill a matrix.
 

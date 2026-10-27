@@ -1,34 +1,52 @@
-# PostgreSQL replacement contract
+# PostgreSQL storage and concurrency contract
 
 ## Status and precedence
 
-The serving executable and administration commands use PostgreSQL. The
-embedded database, local configuration and device registry are removed.
-STORAGE.md owns the remaining local runtime and response scratch. This
-document owns durable mail/configuration authority and database concurrency;
-protocol scope remains the flows used by td-mail. Receive and JMAP serving
-are active; relay process activation remains incomplete and is refused by
-serve. No deployed data migration or runtime integration protocol is required.
+Serving and administration use PostgreSQL as the sole durable authority.
+Receive, JMAP and relay profiles are active, with account-scoped authorization
+and several cooperating processes sharing one writable database. A cloud VM
+can receive and relay mail while a local process serves JMAP or relays through
+a configured smart host. This remains a bounded personal service, not a general
+multi-tenant platform. Peer-to-peer replication, an offline writable mail store
+and read-replica routing are outside its scope.
 
-The deployment is one personal account with several cooperating td-mta
-processes: a cloud VM can receive and relay mail while a local machine serves
-JMAP or relays through a configured smart host. Processes connect to one
-writable PostgreSQL database. No peer-to-peer replication, offline writable
-mail store, read-replica routing or general multi-tenant service is required.
-PostgreSQL is the sole authority for message and attachment bytes, metadata,
-configuration, device verifiers, TLS/ACME keys and smart-host credentials.
+PostgreSQL stores message and attachment bytes, metadata, configuration,
+device verifiers, TLS/ACME keys and smart-host credentials. The embedded
+backend, local configuration authority and file-backed device registry are
+removed. [STORAGE.md](STORAGE.md) owns local runtime and response scratch;
+[CONFORMANCE.md](CONFORMANCE.md) owns implemented td-mail flows and evidence.
 
-Support independently installed PostgreSQL, Azure Database for PostgreSQL
-Flexible Server and Amazon RDS for PostgreSQL. Aurora and database proxies
-need separate qualification; AWS support does not imply every PostgreSQL-
-compatible offering. Installation/supervision of a local PostgreSQL server is
-a later convenience. It is not a prerequisite for connecting to an existing
-installation. The user approved tokio-postgres and its transitive dependencies. The
-initial admission pins 0.7.18 with default features disabled: no Tokio runtime
-or network/time driver is selected. The lock includes private SCRAM crypto
-and string preparation; TLS remains the td-crypto boundary. This increment
-provides the inert connection probe in section 8, with no selectable backend.
-No server package is admitted here; source-build rules still apply.
+Database deployment targets include independently installed PostgreSQL,
+Azure Database for PostgreSQL Flexible Server and Amazon RDS for PostgreSQL.
+Provider qualification is separate from the native PostgreSQL fixtures;
+Aurora and database proxies require their own qualification. See
+[DEPLOYMENT.md](DEPLOYMENT.md) for provisioning and
+[PRODUCTION.md](PRODUCTION.md) for the current host's operations.
+
+The admitted driver is tokio-postgres 0.7.18 with default features disabled:
+no Tokio runtime or network/time driver is selected. Its private closure
+provides SCRAM crypto and string preparation; TLS remains the td-crypto
+boundary. Serving and owner commands use this driver; the connection probe
+in section 8 is a diagnostic, not an alternative backend. No server package
+is admitted by the driver dependency; source-build rules still apply.
+
+### Contract navigation
+
+The sections below retain their existing numbers for code and document
+references. Use these current entry points rather than treating implementation
+sequence as a backlog:
+
+| Concern | Contract |
+| --- | --- |
+| Database authority, schema and migration barrier | Sections 1–3 below |
+| Account administration and identities | [Account administration workflow](#account-administration-workflow) |
+| Account-scoped HTTP authentication | [HTTPS account selection](#https-account-selection) |
+| Incoming mail across accounts | [Transactional incoming delivery](#transactional-incoming-delivery-across-accounts) |
+| Relay scheduling and retained sessions | [Foreground relay scheduling](#foreground-relay-scheduling-across-accounts) |
+| Durable list summaries | [Persistent common-header summaries](#persistent-common-header-summaries-schema-33) |
+| MIME evidence and selective body verification | [Persistent MIME interpretation](#persistent-mime-interpretation-schema-34) |
+| Whole-body audit and progress | [Scheduled integrity scrubbing](#scheduled-whole-body-integrity-scrubbing) |
+| Backup, restore and deployment procedures | [Deployment](DEPLOYMENT.md) and [production operations](PRODUCTION.md) |
 
 ## 1. Bootstrap and profiles
 

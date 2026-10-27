@@ -20,12 +20,30 @@ requires section 15's evidence; functioning receive/JMAP service is not a
 claim that every target feature below is implemented.
 
 The SQLite backend, local-store administration and file-backed device registry
-are removed. No production cutover or data migration is required.
+are removed; there is no SQLite compatibility or conversion path. External
+server imports and cutover procedures belong to [MIGRATION.md](MIGRATION.md).
 [FORMAT.md](FORMAT.md) owns transient application encodings, [WIRE.md](WIRE.md)
 owns wire identifiers and [QUEUE.md](QUEUE.md) owns submission policy.
 Shared MIME, header, reference and recipient validation remain independent of
 storage. [RESOURCES.md](RESOURCES.md) records planning and component evidence;
 [ADMISSION.md](ADMISSION.md) records bounded work and response retention.
+
+The current contract is organized by responsibility:
+
+| Concern | Document |
+| --- | --- |
+| Service invariants, protocol scope and performance targets | This document |
+| Durable state, SQL authorization and concurrency | [POSTGRES.md](POSTGRES.md) |
+| Local scratch and retained response ownership | [STORAGE.md](STORAGE.md) |
+| Configuration and hard resource limits | [CONFIG.md](CONFIG.md) |
+| Supported flows, test evidence and performance measurement | [CONFORMANCE.md](CONFORMANCE.md) |
+| Installation, schedules and recovery | [DEPLOYMENT.md](DEPLOYMENT.md) |
+| Current Azure host updates and operations | [PRODUCTION.md](PRODUCTION.md) |
+| Logs and diagnostic counters | [OBSERVABILITY.md](OBSERVABILITY.md) |
+
+[IMPLEMENTATION.md](IMPLEMENTATION.md) retains component task sequencing and
+evidence references. It is not the current deployment status or an instruction
+to implement every historical task again.
 
 ## 2. Invariants and trust boundaries
 
