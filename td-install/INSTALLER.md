@@ -2116,14 +2116,16 @@ even when unrelated packets arrive. The daemon owns one connection at a
 time and changes neither loopback nor the other link on disconnect.
 
 The same watcher is td's Wi-Fi station wherever the kernel drives a
-wireless interface. It joins one WPA2-Personal or open network that the
-session owner names:
+wireless interface. It joins the WPA2-Personal and open networks the
+session owner names, and remembers each:
 
 ```text
 td-netd wifi scan
+td-netd wifi list
 td-netd wifi join NAME
 td-netd wifi join --open NAME
-td-netd wifi forget
+td-netd wifi forget NAME
+td-netd wifi forget --all
 ```
 
 A `--` before NAME admits a name that begins with `--`. `join` asks for
@@ -2134,8 +2136,23 @@ the join fails. While Ethernet holds the connection it saves the network
 and returns; Wi-Fi joins when the cable is unplugged. That socket is the
 owner's alone (mode 0600, in a root directory that is root's alone until
 the socket is the owner's), the owner being the account the `network`
-unit names with `--wifi-owner`. The watcher keeps the network root-only in
-`/var/lib/td-netd/wifi` and rejoins it at every boot. It is its own
+unit names with `--wifi-owner`. The watcher keeps up to 16 networks
+root-only in `/var/lib/td-netd/wifi`, one line each, in the order `join`
+last named them, so a passphrase is typed once per network; joining a
+seventeenth drops the last. `list` names them, never their keys, and `forget`
+removes one, or all with `--all`. A `join` puts its network first in the
+list before the outcome is known and, when the radio is free, attempts it
+alone, so the outcome it reports is that network's. Every later
+association, at boot or after a loss, takes the first saved network, in
+the order `join` last named them, with an access point in range that fits
+it. A network whose attempt failed sits out the next scan and then its
+own 2 to 60 second backoff while another saved network in range is
+tried, and is taken anyway when nothing else fits. Each scan also probes
+the first three saved names, fewer if the driver takes fewer in one scan,
+so a hidden network among them answers; anyone in radio range hears those
+names. A deployment from before the list reads a file of two or more
+networks as none, so rolling back to one leaves Wi-Fi to be joined again.
+It is its own
 supplicant over nl80211: the four-way and group-key handshakes run in
 td-netd, and EAPOL travels over nl80211's control port, so there is no
 wpa_supplicant and no raw socket. Ethernet keeps precedence: the radio
@@ -2151,10 +2168,10 @@ is reported as a likely wrong passphrase.
 WPA3-only, enterprise (802.1X), WPA1, non-CCMP (including mixed WPA/WPA2
 networks whose group cipher is TKIP) and management-frame-
 protection-required networks are refused with the reason in
-`td-netd status`. It keeps one network rather than a list and roams only
-by reassociating to the strongest access point after a loss. The
-passphrase is never stored; the stored PMK joins the network for whoever
-reads it, which only root can.
+`td-netd status`. It roams only by reassociating after a loss, to the
+strongest access point of the network it then chooses. The passphrase is
+never stored; a stored PMK joins its network for whoever reads it, which
+only root can.
 
 For SSH, while no hardware login key is enrolled, put the other computer's
 Ed25519 **public** key in `~/.ssh/authorized_keys` on td:

@@ -13,9 +13,10 @@
 //!   DHCP-configure it, and write resolv.conf. No usable interface is a clean
 //!   no-op (exit 2), so boot can distinguish it from a configured link.
 //! * `td-netd watch [--wifi-owner UID]` — supervise physical Ethernet carrier,
-//!   the Wi-Fi association (`wifi.rs`), DHCP and leases; UID may choose the
-//!   Wi-Fi network through `/run/td-netd/wifi`.
-//! * `td-netd wifi scan | join [--open] [--] NAME | forget` — the owner's client.
+//!   the Wi-Fi association (`wifi.rs`), DHCP and leases; UID may join, list
+//!   and forget Wi-Fi networks through `/run/td-netd/wifi`.
+//! * `td-netd wifi scan | list | join [--open] [--] NAME | forget [--] NAME |
+//!   forget --all` — the owner's client.
 //! * `td-netd status` — print the latest connection state and address.
 //! * `td-netd diagnose` — report link speed, errors and TCP configuration/counters.
 //! * `td-netd resolve NAME` — DNS A-query NAME via the configured nameserver and
@@ -1444,7 +1445,7 @@ fn cmd_reach(host: &str, port: u16) -> io::Result<()> {
 fn usage() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-netd loopback | up [IFACE] | watch [--wifi-owner UID] | wifi scan | wifi join [--open] NAME | wifi forget | status | diagnose | resolve NAME | reach HOST PORT",
+        "usage: td-netd loopback | up [IFACE] | watch [--wifi-owner UID] | wifi scan | wifi list | wifi join [--open] NAME | wifi forget NAME | wifi forget --all | status | diagnose | resolve NAME | reach HOST PORT",
     )
 }
 

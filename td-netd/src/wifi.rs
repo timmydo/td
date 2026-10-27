@@ -1,4 +1,5 @@
-//! Wi-Fi for `td-netd watch`: one WPA2-Personal (or open) network, joined
+//! Wi-Fi for `td-netd watch`: the WPA2-Personal (or open) networks the owner
+//! has joined, the one `join` named last that is in range first, each joined
 //! over nl80211 with td-netd as its own supplicant (`wpa.rs`). Ethernet keeps
 //! precedence: a new association starts only while no wired lease is held,
 //! and `watch` gives up a radio lease when a cable gains carrier. Once the
@@ -9,10 +10,11 @@
 //! association belongs to this process's socket (SOCKET_OWNER): the kernel
 //! drops it when the socket closes, and `watch` restarting reassociates.
 //!
-//! The session owner names the network through `/run/td-netd/wifi`, a socket
-//! authenticated by its mode alone (0600, owned by the account, in a root
-//! directory), as td-fetchd's is. The PMK, never the passphrase, is stored
-//! root-only in `/var/lib/td-netd/wifi`.
+//! The session owner joins, lists and forgets networks through
+//! `/run/td-netd/wifi`, a socket authenticated by its mode alone (0600, owned
+//! by the account, in a root directory), as td-fetchd's is. Each network's
+//! PMK, never its passphrase, is stored root-only in `/var/lib/td-netd/wifi`,
+//! one line per network, in the order `join` last named them.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -40,8 +42,15 @@ const O_NOFOLLOW: i32 = 0o400000;
 /// How often a frame the supplicant ignored may reach the log.
 const IGNORED_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const SCAN_DEADLINE: Duration = Duration::from_secs(25);
+/// How many networks are kept; joining another drops the least recent.
+pub const MAX_NETWORKS: usize = 16;
+/// The stored file's bound: `MAX_NETWORKS` lines of at most 130 bytes.
+const MAX_CONFIG: u64 = 4096;
+/// SSIDs one scan probes by name, the wildcard included, until the driver
+/// refuses that many.
+const PROBE_LIMIT: usize = 4;
 
-// ── The configured network ──────────────────────────────────────────────────
+// ── The saved networks ──────────────────────────────────────────────────────
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Network {
@@ -64,7 +73,8 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn from_hex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
+    // `from_str_radix` alone would take a sign.
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     text.as_bytes()
@@ -98,22 +108,40 @@ pub fn decode_network(text: &str) -> Option<Network> {
     Some(Network { ssid, pmk })
 }
 
-fn load() -> Option<Network> {
-    decode_network(&fs::read_to_string(CONFIG_PATH).ok()?)
+/// The stored list, one `encode_network` line each, most recent first. A
+/// line that does not decode, a repeated SSID and anything past
+/// `MAX_NETWORKS` are dropped rather than costing the rest.
+pub fn decode_networks(text: &str) -> Vec<Network> {
+    let mut networks: Vec<Network> = Vec::new();
+    for network in text.lines().filter_map(decode_network) {
+        if networks.len() < MAX_NETWORKS && !networks.iter().any(|n| n.ssid == network.ssid) {
+            networks.push(network);
+        }
+    }
+    networks
 }
 
-fn save(network: Option<&Network>) -> io::Result<()> {
+fn load() -> Vec<Network> {
+    let mut bytes = Vec::new();
+    match fs::File::open(CONFIG_PATH).and_then(|f| f.take(MAX_CONFIG).read_to_end(&mut bytes)) {
+        // Lossy, so a stray byte costs its own line and not the list.
+        Ok(_) => decode_networks(&String::from_utf8_lossy(&bytes)),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save(networks: &[Saved]) -> io::Result<()> {
     match fs::DirBuilder::new().mode(0o700).create(CONFIG_DIR) {
         Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
         _ => {}
     }
     fs::set_permissions(CONFIG_DIR, fs::Permissions::from_mode(0o700))?;
-    let Some(network) = network else {
+    if networks.is_empty() {
         return match fs::remove_file(CONFIG_PATH) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         };
-    };
+    }
     let temporary = format!("{CONFIG_PATH}.new");
     match fs::remove_file(&temporary) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
@@ -125,9 +153,34 @@ fn save(network: Option<&Network>) -> io::Result<()> {
         .mode(0o600)
         .custom_flags(O_NOFOLLOW)
         .open(&temporary)?;
-    writeln!(file, "{}", encode_network(network))?;
+    for saved in networks {
+        writeln!(file, "{}", encode_network(&saved.network))?;
+    }
     file.sync_all()?;
     fs::rename(&temporary, CONFIG_PATH)
+}
+
+/// A saved network and how its recent attempts went: one that failed sits
+/// out its backoff while another saved network in range is tried.
+#[derive(Clone)]
+struct Saved {
+    network: Network,
+    failures: u32,
+    rest_until: Option<Instant>,
+}
+
+impl Saved {
+    fn new(network: Network) -> Self {
+        Self {
+            network,
+            failures: 0,
+            rest_until: None,
+        }
+    }
+
+    fn resting(&self, now: Instant) -> bool {
+        self.rest_until.is_some_and(|until| now < until)
+    }
 }
 
 /// An SSID for a status line or a terminal: printable ASCII as itself,
@@ -309,7 +362,14 @@ pub struct Wifi {
     control: Option<UnixListener>,
     interface: Option<Interface>,
     nl: Option<Nl80211>,
-    network: Option<Network>,
+    networks: Vec<Saved>,
+    /// The network a `join` request named: the next attempt is its alone,
+    /// so the owner's client hears about that network.
+    pinned: Option<Vec<u8>>,
+    /// The network being joined, or joined.
+    current: Option<Vec<u8>>,
+    /// SSIDs a scan may probe by name, the wildcard included.
+    probe_limit: usize,
     phase: Phase,
     failures: u32,
     next_probe: Instant,
@@ -392,7 +452,10 @@ impl Wifi {
             control,
             interface: None,
             nl: None,
-            network: load(),
+            networks: load().into_iter().map(Saved::new).collect(),
+            pinned: None,
+            current: None,
+            probe_limit: PROBE_LIMIT,
             phase: Phase::Absent,
             failures: 0,
             next_probe: Instant::now(),
@@ -424,15 +487,34 @@ impl Wifi {
     }
 
     fn ssid(&self) -> String {
-        self.network
-            .as_ref()
-            .map_or_else(|| "\"\"".into(), |n| show_ssid(&n.ssid))
+        self.current
+            .as_deref()
+            .map_or_else(|| "\"\"".into(), show_ssid)
     }
 
-    /// Give up the association and try again after the backoff.
+    /// What a scan looks for, for its status line.
+    fn wanted(&self) -> String {
+        match (&self.pinned, self.networks.as_slice()) {
+            (Some(ssid), _) => show_ssid(ssid),
+            (None, [only]) => show_ssid(&only.network.ssid),
+            (None, saved) => format!("{} saved networks", saved.len()),
+        }
+    }
+
+    /// Give up the association and try again after the backoff. The
+    /// network that failed rests past the next scan and then for its own
+    /// backoff, and a pinned join gives way to every saved network.
     fn fail(&mut self, report: Report<'_>, message: String) {
         self.failures = self.failures.saturating_add(1);
         let wait = backoff(self.failures);
+        if let Some(ssid) = self.current.take() {
+            if let Some(saved) = self.networks.iter_mut().find(|s| s.network.ssid == ssid) {
+                saved.failures = saved.failures.saturating_add(1);
+                saved.rest_until =
+                    Some(Instant::now() + wait + SCAN_DEADLINE + backoff(saved.failures));
+            }
+        }
+        self.pinned = None;
         self.disconnect();
         self.phase = Phase::Idle {
             retry: Instant::now() + wait,
@@ -464,6 +546,10 @@ impl Wifi {
             };
         }
         self.failures = 0;
+        self.current = None;
+        // Whatever was pinned is not being followed any more; a followed
+        // join pins again after this.
+        self.pinned = None;
         self.last_status.clear();
     }
 
@@ -508,7 +594,8 @@ impl Wifi {
         }
         match &self.phase {
             Phase::Idle { retry } if now >= *retry && !wired => {
-                if self.network.is_none() {
+                self.current = None;
+                if self.networks.is_empty() {
                     let message = format!(
                         "{}: disconnected: no Wi-Fi network chosen; run `td-netd wifi join NAME`",
                         self.name()
@@ -530,7 +617,7 @@ impl Wifi {
                     }
                     return;
                 }
-                let message = format!("{}: scanning for {}", self.name(), self.ssid());
+                let message = format!("{}: scanning for {}", self.name(), self.wanted());
                 self.status(report, message);
                 // A tri-band WCN6855 scan can run past ten seconds; the
                 // scan's own completion event normally ends this earlier.
@@ -584,33 +671,61 @@ impl Wifi {
         let mac = crate::get_mac(ctl, &name)?;
         report(&format!("{name}: wireless interface ready"));
         self.interface = Some(Interface { name, index, mac });
+        self.probe_limit = PROBE_LIMIT;
         self.phase = Phase::Idle {
             retry: Instant::now(),
         };
         Ok(())
     }
 
+    /// The SSIDs a scan probes by name, so hidden networks answer: the
+    /// pinned one, or the most recent saved ones within the probe limit.
+    fn probes(&self) -> Vec<Vec<u8>> {
+        match &self.pinned {
+            Some(ssid) if self.probe_limit > 1 => vec![ssid.clone()],
+            Some(_) => Vec::new(),
+            None => self
+                .networks
+                .iter()
+                .take(self.probe_limit.saturating_sub(1))
+                .map(|s| s.network.ssid.clone())
+                .collect(),
+        }
+    }
+
     fn scan(&mut self) -> io::Result<()> {
-        let (Some(nl), Some(interface)) = (self.nl.as_mut(), self.interface.as_ref()) else {
-            return Err(io::Error::other("no wireless interface"));
-        };
-        let ssid = self
-            .network
-            .as_ref()
-            .map(|n| n.ssid.clone())
-            .unwrap_or_default();
-        let index = interface.index;
-        nl.request(genl::CMD_TRIGGER_SCAN, false, |b| {
-            b.u32(genl::ATTR_IFINDEX, index)
-                .begin(genl::ATTR_SCAN_SSIDS);
-            // The chosen SSID probed by name, so a hidden network answers,
-            // and the wildcard for everything else.
-            if !ssid.is_empty() {
-                b.bytes(1, &ssid);
+        loop {
+            let probes = self.probes();
+            let (Some(nl), Some(interface)) = (self.nl.as_mut(), self.interface.as_ref()) else {
+                return Err(io::Error::other("no wireless interface"));
+            };
+            let index = interface.index;
+            let result = nl.request(genl::CMD_TRIGGER_SCAN, false, |b| {
+                b.u32(genl::ATTR_IFINDEX, index)
+                    .begin(genl::ATTR_SCAN_SSIDS);
+                // The wildcard, last, finds everything else.
+                let mut slot = 1;
+                for ssid in &probes {
+                    b.bytes(slot, ssid);
+                    slot += 1;
+                }
+                b.bytes(slot, &[]).end();
+            });
+            match result {
+                // EINVAL: more SSIDs than the wiphy probes in one scan; ask
+                // for one fewer, down to the wildcard alone.
+                Err(e) if e.raw_os_error() == Some(22) && !probes.is_empty() => {
+                    self.probe_limit = probes.len();
+                    let _ = writeln!(
+                        io::stderr(),
+                        "td-netd: wifi: the radio refused {} SSIDs in one scan; probing {} by name from now on",
+                        probes.len() + 1,
+                        probes.len() - 1
+                    );
+                }
+                result => return result.map(|_| ()),
             }
-            b.bytes(2, &[]).end();
-        })
-        .map(|_| ())
+        }
     }
 
     fn results(&mut self) -> io::Result<Vec<genl::Bss>> {
@@ -636,19 +751,34 @@ impl Wifi {
                 return self.fail(report, message);
             }
         };
-        let Some(network) = self.network.clone() else {
+        if self.networks.is_empty() {
             self.phase = Phase::Idle {
                 retry: Instant::now(),
             };
             return;
-        };
-        let bss = match wpa::choose(&bsses, &network.ssid, network.pmk.is_some()) {
-            Ok(bss) => bss.clone(),
+        }
+        let chosen = select(
+            &bsses,
+            &self.networks,
+            self.pinned.as_deref(),
+            Instant::now(),
+        );
+        let (network, bss) = match chosen {
+            Ok((index, bss)) => match self.networks.get(index) {
+                Some(saved) => (saved.network.clone(), bss.clone()),
+                None => {
+                    self.phase = Phase::Idle {
+                        retry: Instant::now(),
+                    };
+                    return;
+                }
+            },
             Err(why) => {
-                let message = format!("{}: cannot join {}: {why}", self.name(), self.ssid());
+                let message = format!("{}: {why}", self.name());
                 return self.fail(report, message);
             }
         };
+        self.current = Some(network.ssid.clone());
         if let Err(e) = self.connect(&network, &bss) {
             let message = format!("{}: joining {} failed: {e}", self.name(), self.ssid());
             return self.fail(report, message);
@@ -964,6 +1094,13 @@ impl Wifi {
         report: Report<'_>,
     ) {
         self.failures = 0;
+        self.pinned = None;
+        if let Some(ssid) = &self.current {
+            if let Some(saved) = self.networks.iter_mut().find(|s| &s.network.ssid == ssid) {
+                saved.failures = 0;
+                saved.rest_until = None;
+            }
+        }
         self.phase = Phase::Ready { bss, supplicant };
         let message = format!(
             "{}: joined {}; requesting DHCP lease",
@@ -1003,21 +1140,23 @@ impl Wifi {
         let mut line = String::new();
         io::BufReader::new(stream.take(MAX_REQUEST)).read_line(&mut line)?;
         let line = line.trim_end_matches('\n');
-        let (verb, rest) = line.split_once(' ').unwrap_or((line, ""));
-        match verb {
-            "join" => {
-                let network = decode_network(rest).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "malformed join request")
-                })?;
-                save(Some(&network))?;
-                self.network = Some(network);
+        match parse_request(line)? {
+            Request::Join(network) => {
+                let ssid = network.ssid.clone();
+                let networks = joined(&self.networks, network);
+                save(&networks)?;
+                self.networks = networks;
                 self.restart_now();
                 // The reply names the interface whose status lines answer
                 // the join; that status is written before the reply, so the
-                // client never reads a line from an earlier attempt.
+                // client never reads a line from an earlier attempt. Only a
+                // join the client follows is pinned: a saved one is first
+                // in the list anyway.
                 match self.interface().map(str::to_owned) {
                     Some(_) if self.wired => writeln!(reply, "ok wired")?,
                     Some(name) => {
+                        self.pinned = Some(ssid.clone());
+                        self.current = Some(ssid);
                         let message = format!("{name}: joining {}", self.ssid());
                         self.status(report, message);
                         writeln!(reply, "ok {name}")?;
@@ -1025,19 +1164,26 @@ impl Wifi {
                     None => writeln!(reply, "ok")?,
                 }
             }
-            "forget" if rest.is_empty() => {
-                save(None)?;
-                self.network = None;
-                self.restart_now();
+            Request::Forget(ssid) => {
+                let networks = forgotten(&self.networks, ssid.as_deref())?;
+                save(&networks)?;
+                self.networks = networks;
+                let in_use = |held: &Option<Vec<u8>>| match (&ssid, held) {
+                    (None, _) => true,
+                    (Some(ssid), Some(held)) => ssid == held,
+                    (Some(_), None) => false,
+                };
+                if in_use(&self.current) || in_use(&self.pinned) {
+                    self.pinned = None;
+                    self.restart_now();
+                }
                 writeln!(reply, "ok")?;
             }
-            "scan" if rest.is_empty() => self.serve_scan(reply, report)?,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unknown request",
-                ))
+            Request::List => {
+                let joined = self.current.as_deref().filter(|_| self.ready());
+                reply.extend_from_slice(listing(&self.networks, joined).as_bytes());
             }
+            Request::Scan => self.serve_scan(reply, report)?,
         }
         Ok(())
     }
@@ -1105,6 +1251,125 @@ impl Wifi {
     }
 }
 
+/// A request on the owner's socket.
+enum Request {
+    Join(Network),
+    /// One network by SSID, or, for the line `forget` alone, every one.
+    Forget(Option<Vec<u8>>),
+    List,
+    Scan,
+}
+
+fn parse_request(line: &str) -> io::Result<Request> {
+    let malformed = |what: &str| io::Error::new(io::ErrorKind::InvalidInput, what.to_string());
+    let (verb, rest) = match line.split_once(' ') {
+        Some((verb, rest)) => (verb, Some(rest)),
+        None => (line, None),
+    };
+    match (verb, rest) {
+        ("join", Some(rest)) => decode_network(rest)
+            .map(Request::Join)
+            .ok_or_else(|| malformed("malformed join request")),
+        ("forget", None) => Ok(Request::Forget(None)),
+        ("forget", Some(hex)) => from_hex(hex)
+            .filter(|ssid| (1..=32).contains(&ssid.len()))
+            .map(|ssid| Request::Forget(Some(ssid)))
+            .ok_or_else(|| malformed("malformed SSID")),
+        ("list", None) => Ok(Request::List),
+        ("scan", None) => Ok(Request::Scan),
+        _ => Err(malformed("unknown request")),
+    }
+}
+
+/// The saved list after joining `network`: it first, any earlier entry for
+/// its SSID gone, the least recent dropped past `MAX_NETWORKS`.
+fn joined(saved: &[Saved], network: Network) -> Vec<Saved> {
+    let mut networks: Vec<Saved> = saved
+        .iter()
+        .filter(|s| s.network.ssid != network.ssid)
+        .cloned()
+        .collect();
+    networks.insert(0, Saved::new(network));
+    networks.truncate(MAX_NETWORKS);
+    networks
+}
+
+/// The saved list without `ssid`, or empty for every network.
+fn forgotten(saved: &[Saved], ssid: Option<&[u8]>) -> io::Result<Vec<Saved>> {
+    let Some(ssid) = ssid else {
+        return Ok(Vec::new());
+    };
+    let kept: Vec<Saved> = saved
+        .iter()
+        .filter(|s| s.network.ssid != ssid)
+        .cloned()
+        .collect();
+    if kept.len() == saved.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no saved network has that name",
+        ));
+    }
+    Ok(kept)
+}
+
+/// `list`'s reply: each saved network's security and name, never its key.
+fn listing(saved: &[Saved], joined: Option<&[u8]>) -> String {
+    let mut out = String::new();
+    for saved in saved {
+        let network = &saved.network;
+        let kind = if network.pmk.is_some() {
+            "wpa2"
+        } else {
+            "open"
+        };
+        let mark = if joined == Some(network.ssid.as_slice()) {
+            "  (joined)"
+        } else {
+            ""
+        };
+        out.push_str(&format!("{kind}  {}{mark}\n", show_ssid(&network.ssid)));
+    }
+    out
+}
+
+/// Which saved network to join, by its index, and through which BSS: the
+/// pinned network alone, or else the first in the saved order with a BSS in
+/// range that fits it, passing over one resting after a failure while
+/// another fits. Its strongest BSS, as `wpa::choose` picks it.
+fn select<'a>(
+    bsses: &'a [genl::Bss],
+    saved: &[Saved],
+    pinned: Option<&[u8]>,
+    now: Instant,
+) -> Result<(usize, &'a genl::Bss), String> {
+    let mut resting = None;
+    let mut refusals = Vec::new();
+    for (index, candidate) in saved.iter().enumerate() {
+        let network = &candidate.network;
+        if pinned.is_some_and(|ssid| ssid != network.ssid.as_slice()) {
+            continue;
+        }
+        match wpa::choose(bsses, &network.ssid, network.pmk.is_some()) {
+            Ok(bss) if !candidate.resting(now) => return Ok((index, bss)),
+            Ok(bss) => {
+                resting.get_or_insert((index, bss));
+            }
+            Err(why) => refusals.push((show_ssid(&network.ssid), why)),
+        }
+    }
+    if let Some(choice) = resting {
+        return Ok(choice);
+    }
+    // A network in range that does not fit says why, as the only network
+    // saved does; the rest are simply out of range.
+    let heard = refusals.iter().find(|(_, why)| why != "network not found");
+    match (refusals.as_slice(), heard) {
+        ([(ssid, why)], _) | (_, Some((ssid, why))) => Err(format!("cannot join {ssid}: {why}")),
+        _ => Err("no saved network is in range".into()),
+    }
+}
+
 fn mac_text(mac: &[u8; 6]) -> String {
     mac.iter()
         .map(|b| format!("{b:02x}"))
@@ -1167,7 +1432,7 @@ pub fn client(args: &[String]) -> io::Result<std::process::ExitCode> {
     let usage = || {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: td-netd wifi scan | join [--open] [--] NAME | forget",
+            "usage: td-netd wifi scan | list | join [--open] [--] NAME | forget [--] NAME | forget --all",
         )
     };
     match args {
@@ -1175,9 +1440,36 @@ pub fn client(args: &[String]) -> io::Result<std::process::ExitCode> {
             print!("{}", ask("scan", Duration::from_secs(40))?);
             Ok(std::process::ExitCode::SUCCESS)
         }
-        [verb] if verb == "forget" => {
+        [verb] if verb == "list" => {
+            let reply = ask("list", Duration::from_secs(5))?;
+            if reply.is_empty() {
+                println!("td-netd: no saved Wi-Fi networks");
+            }
+            print!("{reply}");
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        [verb, all] if verb == "forget" && all == "--all" => {
             ask("forget", Duration::from_secs(5))?;
-            println!("td-netd: Wi-Fi network forgotten");
+            println!("td-netd: every saved Wi-Fi network forgotten");
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        [verb, rest @ ..] if verb == "forget" => {
+            let name = match rest {
+                [end, name] if end == "--" => name,
+                [name] if !name.starts_with("--") => name,
+                _ => return Err(usage()),
+            };
+            if name.is_empty() || name.len() > 32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an SSID is 1 to 32 bytes",
+                ));
+            }
+            ask(
+                &format!("forget {}", to_hex(name.as_bytes())),
+                Duration::from_secs(5),
+            )?;
+            println!("td-netd: {} forgotten", show_ssid(name.as_bytes()));
             Ok(std::process::ExitCode::SUCCESS)
         }
         [verb, rest @ ..] if verb == "join" => {
@@ -1313,6 +1605,224 @@ mod tests {
         ] {
             assert!(decode_network(bad).is_none(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_saved_list_keeps_order_and_drops_what_does_not_decode() {
+        let line = |name: &[u8], pmk| {
+            encode_network(&Network {
+                ssid: name.to_vec(),
+                pmk,
+            })
+        };
+        let text = format!(
+            "{}\n{}\nnot a network\n{}\n",
+            line(b"home", Some([1; 32])),
+            line(b"cafe", None),
+            line(b"home", Some([2; 32])),
+        );
+        let networks = decode_networks(&text);
+        let names: Vec<&[u8]> = networks.iter().map(|n| n.ssid.as_slice()).collect();
+        assert_eq!(names, vec![&b"home"[..], b"cafe"]);
+        assert_eq!(networks[0].pmk, Some([1; 32]));
+        // The single-network file earlier td-netd wrote is a one-line list.
+        assert_eq!(decode_networks(&line(b"home", None)).len(), 1);
+        let many: String = (0..MAX_NETWORKS + 3)
+            .map(|n| format!("{}\n", line(format!("net{n}").as_bytes(), None)))
+            .collect();
+        assert_eq!(decode_networks(&many).len(), MAX_NETWORKS);
+        let longest = line(&[0xff; 32], Some([0xff; 32])).len() + 1;
+        assert!((MAX_NETWORKS * longest) as u64 <= MAX_CONFIG);
+    }
+
+    fn bss(last: u8, name: &[u8], protected: bool, signal: i32) -> genl::Bss {
+        let mut ies = vec![0, name.len() as u8];
+        ies.extend_from_slice(name);
+        if protected {
+            ies.extend(from_hex("30140100000fac040100000fac040100000fac020c00").unwrap());
+        }
+        genl::Bss {
+            bssid: [2, 0, 0, 0, 0, last],
+            frequency: 2412,
+            signal_mbm: signal,
+            ies,
+        }
+    }
+
+    fn saved(name: &[u8], protected: bool) -> Saved {
+        Saved::new(Network {
+            ssid: name.to_vec(),
+            pmk: protected.then_some([9; 32]),
+        })
+    }
+
+    #[test]
+    fn the_most_recent_saved_network_in_range_is_chosen() {
+        let now = Instant::now();
+        let air = [
+            bss(1, b"cafe", false, -3000),
+            bss(2, b"home", true, -7000),
+            bss(3, b"home", true, -5000),
+        ];
+        let list = [
+            saved(b"office", true),
+            saved(b"home", true),
+            saved(b"cafe", false),
+        ];
+        let (index, chosen) = select(&air, &list, None, now).unwrap();
+        assert_eq!((index, chosen.bssid[5]), (1, 3));
+        // A pin names the one network an attempt may join.
+        let (index, _) = select(&air, &list, Some(b"cafe"), now).unwrap();
+        assert_eq!(index, 2);
+        assert_eq!(
+            select(&air, &list, Some(b"office"), now).unwrap_err(),
+            "cannot join \"office\": network not found"
+        );
+        // A network resting after a failure gives way to another in range,
+        // and is still taken when nothing else fits.
+        let mut list = list;
+        list[1].rest_until = Some(now + Duration::from_secs(30));
+        assert_eq!(select(&air, &list, None, now).unwrap().0, 2);
+        assert_eq!(select(&air[1..], &list, None, now).unwrap().0, 1);
+        assert_eq!(
+            select(&air[..1], &list[..2], None, now).unwrap_err(),
+            "no saved network is in range"
+        );
+        assert!(select(&air, &[saved(b"cafe", true)], None, now)
+            .unwrap_err()
+            .contains("--open"));
+        // Among several saved, the one heard but unfit still says why.
+        let heard = select(
+            &air[..1],
+            &[saved(b"office", true), saved(b"cafe", true)],
+            None,
+            now,
+        );
+        assert!(heard.unwrap_err().starts_with("cannot join \"cafe\": "));
+    }
+
+    #[test]
+    fn a_failure_rests_the_network_that_failed_and_ends_the_pin() {
+        let mut lines = Vec::new();
+        let mut wifi = Wifi::new(None, &mut |_| {});
+        wifi.networks = vec![saved(b"a", true), saved(b"b", true)];
+        wifi.pinned = Some(b"b".to_vec());
+        wifi.current = Some(b"b".to_vec());
+        wifi.fail(&mut |line| lines.push(line.to_string()), "wifi: x".into());
+        assert!(wifi.pinned.is_none() && wifi.current.is_none());
+        assert!(wifi.networks[1].resting(Instant::now()));
+        assert!(!wifi.networks[0].resting(Instant::now()));
+        assert_eq!(lines, vec!["wifi: x; retrying in 2 seconds"]);
+        wifi.current = Some(b"b".to_vec());
+        wifi.authorized([0; 6], None, &mut |_| {});
+        assert!(!wifi.networks[1].resting(Instant::now()));
+        assert_eq!(wifi.networks[1].failures, 0);
+    }
+
+    #[test]
+    fn a_failing_network_gives_way_at_the_next_scan_however_long_it_runs() {
+        let air = [bss(1, b"home", true, -4000), bss(2, b"cafe", true, -6000)];
+        let mut wifi = Wifi::new(None, &mut |_| {});
+        wifi.networks = vec![saved(b"home", true), saved(b"cafe", true)];
+        for round in 0..6 {
+            // The next selection is the retry plus a scan, at most the
+            // scan's deadline.
+            wifi.current = Some(b"home".to_vec());
+            wifi.fail(&mut |_| {}, "wifi: x".into());
+            let next = Instant::now() + backoff(wifi.failures) + SCAN_DEADLINE;
+            let (index, _) = select(&air, &wifi.networks, None, next).unwrap();
+            assert_eq!(index, 1, "round {round}");
+            // With nothing else in range it is still taken.
+            assert_eq!(select(&air[..1], &wifi.networks, None, next).unwrap().0, 0);
+        }
+    }
+
+    #[test]
+    fn requests_parse_strictly() {
+        let pmk = "ab".repeat(32);
+        assert!(matches!(
+            parse_request(&format!("join 686f6d65 {pmk}")).unwrap(),
+            Request::Join(n) if n.ssid == b"home" && n.pmk == Some([0xab; 32])
+        ));
+        assert!(matches!(
+            parse_request("forget").unwrap(),
+            Request::Forget(None)
+        ));
+        assert!(matches!(
+            parse_request("forget 686f6d65").unwrap(),
+            Request::Forget(Some(ssid)) if ssid == b"home"
+        ));
+        assert!(matches!(parse_request("list").unwrap(), Request::List));
+        assert!(matches!(parse_request("scan").unwrap(), Request::Scan));
+        for bad in [
+            "forget ",
+            "forget zz",
+            &format!("forget {}", "61".repeat(33)),
+            "join",
+            "join 686f6d65",
+            "list ",
+            "scan now",
+            "",
+            "Forget",
+            "forget +a",
+            &format!("join +a {pmk}"),
+        ] {
+            assert!(parse_request(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn joining_forgetting_and_listing() {
+        let network = |name: &[u8], pmk| Network {
+            ssid: name.to_vec(),
+            pmk,
+        };
+        let mut list: Vec<Saved> = Vec::new();
+        for n in 0..MAX_NETWORKS {
+            list = joined(&list, network(format!("net{n}").as_bytes(), None));
+        }
+        list = joined(&list, network(b"home", Some([0x5a; 32])));
+        assert_eq!(list.len(), MAX_NETWORKS);
+        assert_eq!(list[0].network.ssid, b"home");
+        assert!(!list.iter().any(|s| s.network.ssid == b"net0"));
+        // Joining a saved network again moves it first, with its new key.
+        list = joined(&list, network(b"net5", Some([1; 32])));
+        assert_eq!(list[0].network.ssid, b"net5");
+        assert_eq!(list.iter().filter(|s| s.network.ssid == b"net5").count(), 1);
+
+        let text = listing(&list[..2], Some(b"home"));
+        assert_eq!(text, "wpa2  \"net5\"\nwpa2  \"home\"  (joined)\n");
+        assert!(!text.contains("5a5a") && !text.contains("0101"));
+
+        let kept = forgotten(&list, Some(b"home")).unwrap();
+        assert_eq!(kept.len(), list.len() - 1);
+        // No Debug for a list of keys, so `err()` rather than `unwrap_err()`.
+        assert_eq!(
+            forgotten(&kept, Some(b"home")).err().map(|e| e.kind()),
+            Some(io::ErrorKind::NotFound)
+        );
+        assert!(forgotten(&kept, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scans_probe_recent_names_within_the_limit() {
+        let mut wifi = Wifi::new(None, &mut |_| {});
+        wifi.networks = vec![
+            saved(b"a", true),
+            saved(b"b", true),
+            saved(b"c", true),
+            saved(b"d", true),
+        ];
+        let names = |wifi: &Wifi| wifi.probes().len();
+        assert_eq!(names(&wifi), PROBE_LIMIT - 1);
+        wifi.probe_limit = 2;
+        assert_eq!(wifi.probes(), vec![b"a".to_vec()]);
+        wifi.pinned = Some(b"c".to_vec());
+        assert_eq!(wifi.probes(), vec![b"c".to_vec()]);
+        wifi.probe_limit = 1;
+        assert!(wifi.probes().is_empty());
+        wifi.pinned = None;
+        assert!(wifi.probes().is_empty());
     }
 
     #[test]
