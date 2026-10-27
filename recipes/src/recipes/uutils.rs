@@ -6,25 +6,22 @@ use crate::types::Recipe;
 // ship -- the checksum tools (sha*sum/md5sum/b2sum/cksum), `factor`, `more`'s
 // pager stack, rand, and `stdbuf`, whose crates.io archive lacks src/libstdbuf
 // and embeds an empty preload library. The resulting closure is the exact
-// union required by the selected applets; notably `expr` carries its pinned
-// regex/native support rather than broadening the selection to an aggregate.
+// union required by the selected applets. Since 0.12.0 `expr` matches with
+// fancy-regex, so the selected closure compiles no C.
 //
 // Like ripgrep/fd, uutils builds as a `--auto` graph node; the read-only-root
 // system image also consumes it. `source_input`
 // wires TD_SRC from the pinned .crate; `native_inputs` name the build platform
-// (rust-toolchain for cargo/rustc, td-link to link, glibc for the headers
-// oniguruma's C compiles against with the build root's gcc; the builder
-// copies and unpacks the source itself);
+// (rust-toolchain for cargo/rustc, td-link to link, glibc for libc; the
+// builder copies and unpacks the source itself);
 // `cargo_lock` is the committed, checksum-pinned closure the `--auto` vendor gate
 // verifies against.
 pub fn recipe() -> Recipe {
-    Recipe::rust("uutils", "0.9.0")
+    Recipe::rust("uutils", "0.12.0")
         .source_input("uutils-source")
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_lock("recipes/locks/uutils/Cargo.lock")
-        // oniguruma, for `expr`.
-        .c_objects(48)
         .bins(&["coreutils"])
         .no_default_features()
         // Keep this list in sync with UUTILS_APPLETS in system-x86-64.rs.

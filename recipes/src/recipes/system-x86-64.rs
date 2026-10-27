@@ -11294,12 +11294,12 @@ mod tests {
     }
 
     /// The uutils recipe must build exactly the applets we symlink into /bin.
-    /// coreutils 0.9.0 names each applet's cargo feature after the applet, so an
+    /// coreutils 0.12.0 names each applet's cargo feature after the applet, so an
     /// applet in UUTILS_APPLETS with no matching feature would dispatch to nothing
     /// (a dead /bin symlink), and a feature we don't symlink is dead weight in the
     /// COMPILED graph. Selecting only these applets (vs the `feat_Tier1`/`unix`
     /// aggregate) trims what cargo COMPILES and links — NOT the derivation's INPUT
-    /// closure: the committed Cargo.lock still pins the full resolved set (507 crates)
+    /// closure: the committed Cargo.lock still pins the full resolved set (488 crates)
     /// and stage_verified_vendor interns every pinned `.crate` — build-time-unused cc /
     /// bindgen / clang-sys sources included — as authenticated input. So only the
     /// compiled/linked graph is the smaller, cc-free one; shrinking the interned input

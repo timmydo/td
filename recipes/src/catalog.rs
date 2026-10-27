@@ -497,7 +497,6 @@ mod tests {
             // Only these build scripts compile C, each to an exact count.
             let objects = match stem {
                 "td-net" => Some(30),
-                "uutils" => Some(48),
                 _ => None,
             };
             assert_eq!(recipe.c_objects, objects, "{stem}: build-script C objects");

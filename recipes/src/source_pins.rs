@@ -368,13 +368,13 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "uutils-source",
         aliases: &[],
-        // uutils coreutils 0.9.0 — the read-only-root Rust core userland (#547).
+        // uutils coreutils 0.12.0 — the read-only-root Rust core userland (#547).
         // The `--auto` source_input pin; the dependency closure is pinned
         // separately by the committed recipes/locks/uutils/Cargo.lock.
-        url: "https://static.crates.io/crates/coreutils/coreutils-0.9.0.crate",
-        sha256: "b92df9b821533650f3797aadae46e547f72db281c1f8a27f381f36d54284d34b",
-        file: "coreutils-0.9.0.crate",
-        version: "0.9.0",
+        url: "https://static.crates.io/crates/coreutils/coreutils-0.12.0.crate",
+        sha256: "a179dc3f3af0389cbd0a8d238ea047abbd72b47225bb49cbadb9a3824a44938e",
+        file: "coreutils-0.12.0.crate",
+        version: "0.12.0",
     },
     PinDef {
         key: "zlib-x86-64-source",
@@ -529,7 +529,7 @@ mod tests {
         // linux-x86-64 kernel source (separate from the 4.14 UAPI-header
         // pin, re #529) + the upstream Rust 1.99.1 rustc, rust-std, Cargo and
         // Clippy release components +
-        // coreutils-0.9.0, ripgrep 15.2.0, and fd 10.5.0 (the Rust userland
+        // coreutils-0.12.0, ripgrep 15.2.0, and fd 10.5.0 (the Rust userland
         // `.crate` sources) +
         // util-linux 2.42.4 (cryptsetup's minimal libuuid/libblkid build
         // closure) + the first reviewed

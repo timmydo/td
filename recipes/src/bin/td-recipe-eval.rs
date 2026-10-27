@@ -819,7 +819,7 @@ mod tests {
         assert_eq!(pin.key, "uutils-source");
         assert_eq!(
             pin.sha256,
-            "b92df9b821533650f3797aadae46e547f72db281c1f8a27f381f36d54284d34b"
+            "a179dc3f3af0389cbd0a8d238ea047abbd72b47225bb49cbadb9a3824a44938e"
         );
     }
 
