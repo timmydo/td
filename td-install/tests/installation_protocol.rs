@@ -89,6 +89,12 @@ fn requests() -> Vec<Request> {
         Request::Propose {
             destination: destination(),
             settings: settings(),
+            unencrypted: false,
+        },
+        Request::Propose {
+            destination: destination(),
+            settings: settings(),
+            unencrypted: true,
         },
         Request::Execute(plan()),
         Request::Status,
@@ -128,10 +134,13 @@ fn replies() -> Vec<Reply> {
 
 #[test]
 fn wire_bytes_are_independently_specified() {
-    assert_eq!(GREETING, b"TDINS08\n");
+    assert_eq!(GREETING, b"TDINS09\n");
     let mut propose = vec![0x02];
     propose.extend(DESTINATION);
     propose.extend(SETTINGS);
+    let mut chosen = propose.clone();
+    propose.push(0);
+    chosen.push(1);
     let mut execute = vec![0x03];
     execute.extend(plan_bytes());
     let mut withdraw = vec![0x05];
@@ -144,9 +153,10 @@ fn wire_bytes_are_independently_specified() {
     recovery.extend([7; 32]);
     let mut acknowledge = vec![0x0a];
     acknowledge.extend([7; 32]);
-    let expected: [&[u8]; 10] = [
+    let expected: [&[u8]; 11] = [
         &[0x01],
         &propose,
+        &chosen,
         &execute,
         &[0x04],
         &withdraw,
@@ -338,10 +348,25 @@ fn maximal_messages_fit_their_direction_bounds() {
     let propose = Request::Propose {
         destination: maximal(0),
         settings: settings.clone(),
+        unencrypted: true,
     };
-    // Propose carries no storage byte: the service chooses storage.
-    assert_eq!(propose.encode().len(), 1104);
+    // Propose carries the person's choice, one byte, and no storage: the
+    // service names device-bound storage only from its probes.
+    assert_eq!(propose.encode().len(), 1105);
     assert_eq!(Request::decode(&propose.encode()).unwrap(), propose);
+    let mut choice = propose.encode();
+    for code in 2..=255 {
+        if let Some(last) = choice.last_mut() {
+            *last = code;
+        }
+        assert_eq!(
+            Request::decode(&choice).unwrap_err(),
+            "invalid proposal storage choice",
+            "{code}"
+        );
+    }
+    choice.pop();
+    assert!(Request::decode(&choice).is_err());
     let plan = Plan::new(
         [255; 32],
         maximal(0),
@@ -551,8 +576,9 @@ fn directions_are_disjoint() {
 
 #[test]
 fn only_this_version_is_admitted() {
-    assert!(check_greeting(b"TDINS08\n").is_ok());
+    assert!(check_greeting(b"TDINS09\n").is_ok());
     for other in [
+        b"TDINS08\n",
         b"TDINS07\n",
         b"TDINS06\n",
         b"TDINS05\n",
@@ -561,7 +587,7 @@ fn only_this_version_is_admitted() {
         b"TDINS02\n",
         b"TDAT001\n",
         b"TDUPD01\n",
-        b"TDINS08\0",
+        b"TDINS09\0",
     ] {
         assert_eq!(
             check_greeting(other).unwrap_err(),

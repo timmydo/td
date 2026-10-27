@@ -10,7 +10,7 @@ use crate::installation_plan::{
 
 /// Sent and required by both ends before the first frame. A change to any
 /// message or its bytes changes the greeting; there is no negotiation.
-pub const GREETING: &[u8; 8] = b"TDINS08\n";
+pub const GREETING: &[u8; 8] = b"TDINS09\n";
 /// Root admits only this much from the unprivileged side.
 pub const MAX_REQUEST_BYTES: usize = 1 + MAX_BYTES;
 pub const MAX_REPLY_BYTES: usize = 1 + if MAX_CANDIDATE_BYTES > MAX_ZONE_BYTES {
@@ -395,9 +395,12 @@ pub enum Request {
     Destinations,
     /// Review one destination with these settings. The service chooses the
     /// nonce, volume UUID and authenticated source, and claims the disk.
+    /// `unencrypted` is the person's choice of unencrypted storage;
+    /// otherwise the storage is what the service's probes allow.
     Propose {
         destination: Destination,
         settings: Settings,
+        unencrypted: bool,
     },
     /// Ask the service to seek consent for the review it retains. The plan
     /// must equal that review; equality is a precondition, not consent.
@@ -444,10 +447,12 @@ impl Request {
             Self::Propose {
                 destination,
                 settings,
+                unencrypted,
             } => {
                 out.push(PROPOSE);
                 put_destination(&mut out, destination);
                 put_settings(&mut out, settings);
+                out.push(u8::from(*unencrypted));
             }
             Self::Execute(plan) => {
                 out.push(EXECUTE);
@@ -490,6 +495,11 @@ impl Request {
             PROPOSE => Self::Propose {
                 destination: read_destination(&mut reader)?,
                 settings: read_settings(&mut reader)?,
+                unencrypted: match reader.array()? {
+                    [0] => false,
+                    [1] => true,
+                    _ => return Err("invalid proposal storage choice".into()),
+                },
             },
             // The plan record checks its own version, bound and end.
             EXECUTE => return Ok(Self::Execute(Plan::decode(body)?)),

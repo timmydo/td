@@ -145,7 +145,7 @@ the saved settings and UUID. Preserve plans have the unencrypted storage and
 zero basis; these are existing-storage facts, not a new TPM probe decision.
 The private consent review appends a boolean preserve byte after storage,
 and its greeting is `TDINA03\n`. The ordinary service greeting is
-`TDINS08\n`. The mode is part of the reviewed plan and exact Execute bytes.
+`TDINS09\n`. The mode is part of the reviewed plan and exact Execute bytes.
 
 Before re-signing, the private staged manifest must hash to the deployment
 ID bound by the reviewed plan. Full staged payload verification follows under
@@ -754,8 +754,9 @@ field, including optional labels and nonce. A clone is the same
 proposal, never a fresh consent or retry. The record describes whole-
 disk erasure and automatic login, which are not caller-selectable flags,
 a basis byte recording what the service's own probes found and a
-storage byte naming the storage they choose ("Storage choice",
-"Device-bound records"); a request carries neither.
+storage byte naming the storage they allow, or unencrypted where the
+person chose it ("Storage choice", "Device-bound records"); a request
+carries neither, and a proposal only the person's choice.
 
 The public `DestinationObservation` names each unvalidated input field;
 `Destination::new` validates and copies it. Construction and decoding admit
@@ -837,7 +838,7 @@ and an ending complete, for its nonce; any other answer ends its
 connection, and with it, until an installation starts, the review and
 claim.
 
-Both ends first send and require the eight bytes `TDINS08\n`. Any change to
+Both ends first send and require the eight bytes `TDINS09\n`. Any change to
 a message or its bytes changes this greeting; there is no negotiation. Each
 message then travels in one frame: a big-endian u32 length and that many
 payload bytes. `payload_len` admits a nonzero length within the direction's
@@ -851,7 +852,9 @@ Requests carry no path, executable, mount option, source or consent:
 
 - `0x01` destinations: no body. The service observes eligible whole disks.
 - `0x02` propose: a destination, then username, hostname, keyboard and
-  timezone, in the plan's field order and bounds. The destination only
+  timezone, in the plan's field order and bounds, then one byte: 1 when
+  the person chose unencrypted storage, 0 otherwise, any other value
+  refused ("Storage choice"). The destination only
   selects: the service admits it only if it equals, field for field and
   labels included, the service's own fresh observation of an eligible
   candidate, and otherwise refuses with destination changed. The reviewed
@@ -969,13 +972,17 @@ requests take the next free tags. Increment 7's probe commit then made
 them `TDINS07` and `TDPLAN04` with the plan's basis byte ("Storage
 choice"); `TDINA03` is unchanged. `TDINS08` replaced the type-back with
 an acknowledgement that carries no digit, and retired refusal 17.
+`TDINS09` added propose's storage choice byte; the plan's bytes are
+unchanged under `TDPLAN04`, and it now admits unencrypted storage with
+any basis.
 
 - The plan gains one storage byte after the removable flag: 0 unencrypted
   or 1 device-bound, any other value refused. It is the storage the
-  plan's basis names ("Storage choice"), and a plan whose byte is not is
-  refused; a propose request carries none. The review page
-  and the consent channel's review report, which gains the same byte
-  after the deployment digest, show it.
+  plan's basis names, or unencrypted where its proposal chose that
+  ("Storage choice"); a plan naming device-bound storage its basis does
+  not is refused. The review page and the consent channel's review
+  report, which gains the same byte after the deployment digest, show
+  it.
 - Running phase 6, recovery key, follows verifying boot on a device-bound
   installation: everything but the partition table is written and
   verified, and the service holds the recovery key.
@@ -1040,15 +1047,17 @@ with both probes, as `qemu-boot-encrypted`'s wizard leg proves.
 ### Storage choice
 
 This section is ENCRYPTION.md increment 7's, and current: `serve`
-chooses storage from its own probes.
+chooses storage from its own probes, and the person may choose
+unencrypted storage where they allow device-bound.
 
 The plan carries one byte after the storage byte, the storage basis: bit
 0 set when the service's TPM probe passed and bit 1 when its
 keyboard-console probe passed (ENCRYPTION.md "Activation" defines both),
 any other bit refused. The plan's magic is `TDPLAN04`, its maximal
-record 1194 bytes, and the greeting then `TDINS07` (now `TDINS08`), the
-earlier versions refused rather than negotiated; a propose request carries no basis, as
-it carries no storage. The consent channel's review report keeps its
+record 1194 bytes, and the greeting then `TDINS07` (now `TDINS09`), the
+earlier versions refused rather than negotiated; a propose request
+carries no basis and no storage, only the person's choice of unencrypted
+storage (`TDINS09`). The consent channel's review report keeps its
 storage byte alone and its `TDINA03`. `serve` runs both probes at every
 start, once each, after admission and before its greeting, writes the
 cause of each that fails to standard error, and records them in every
@@ -1066,29 +1075,58 @@ td-authd does not wait on it, but admits no new wizard connection while
 the old service is still stopping, so a reconnect can wait that long.
 
 Every plan names device-bound storage exactly when its basis has both
-bits, and unencrypted storage otherwise (`Basis::storage`); nothing
-refuses for a missing TPM or keyboard console. The plan's storage byte
-is that storage, so it adds nothing to the basis and a plan whose
-storage byte the basis does not name is refused; the encoding and
-`TDPLAN04` are unchanged. td-authd starts the service with no storage
-operand, for there is none, and its consent summary shows the plan's
-storage ("ENCRYPTED TO THIS COMPUTER, AUTOMATIC LOGIN" or "UNENCRYPTED
-STORAGE, AUTOMATIC LOGIN"; td-authd/DESIGN.md "Immutable consent
-description prerequisite"). td-setup follows a device-bound review it
-executed through the recovery-key phase.
+bits and its proposal did not choose unencrypted storage, and
+unencrypted storage otherwise (`Basis::storage`, `Plan::unencrypted`);
+nothing refuses for a missing TPM or keyboard console. The plan's
+storage byte is that storage: a plan naming device-bound storage with a
+basis that does not is refused, and one naming unencrypted storage is
+admitted with any basis, which it keeps, so the review and the consent
+channel show what the probes found beside what was chosen. The encoding
+and `TDPLAN04` are unchanged; `TDINS09` admits the newly possible
+record. td-authd starts the service with no storage operand, for there
+is none, and its consent summary shows the plan's storage ("ENCRYPTED TO
+THIS COMPUTER, AUTOMATIC LOGIN" or "UNENCRYPTED STORAGE, AUTOMATIC
+LOGIN"; td-authd/DESIGN.md "Immutable consent description
+prerequisite"). td-setup follows a device-bound review it executed
+through the recovery-key phase.
 
 The review page shows the storage on a detail row (`Storage: encrypted
-to this computer` or `Storage: not encrypted`) above the basis, worded
-as findings (`Probes: usable TPM 2.0 found` or `not found`, `keyboard
-console found` or `not found`), and its evidence line names both
-(`storage=device-bound|unencrypted tpm=found|missing
-console=found|missing`).
+to this computer`, `Storage: not encrypted, as chosen` or `Storage: not
+encrypted`) above the basis, worded as findings (`Probes: usable TPM 2.0
+found` or `not found`, `keyboard console found` or `not found`), and its
+evidence line names both (`storage=device-bound|unencrypted
+tpm=found|missing console=found|missing`) and the disclosure set
+(`disclosure=device-bound|chosen|no-tpm|no-console|no-tpm-no-console`).
 
-The welcome page says that storage will be encrypted to
-this computer when it has a usable TPM 2.0 and a screen and keyboard its
-startup recovery prompt can use, and unencrypted otherwise, that the
-review says which, and that the account signs in automatically either
-way. An unencrypted review states that storage is unencrypted and why:
+The person chooses on the review, where the storage is disclosed, not on
+a form of its own. A fresh review naming device-bound storage says on
+its notice row, while nothing else is said there, that `u` installs
+without encryption instead; `u` withdraws that review as Escape does and
+proposes the reviewed disk and settings again with the choice. The
+review of that proposal states that storage is not encrypted, as chosen,
+so that whoever has the disk can read it, and offers `e` to propose
+again encrypted to this computer. The choice is kept for every later
+proposal until `e` takes it back. Neither key does anything once Return
+has asked to install, on a reinstall, or on a review the probes left
+unencrypted, which offers nothing: no key asks for encryption the
+service cannot provide. td-setup checks that a review of a proposal that
+chose unencrypted storage names unencrypted storage, and that one that
+did not, or a reinstall, names its basis's storage, and otherwise ends
+the connection. Either key acts only once the review has been painted
+for the 500 ms Return waits, and once a press, so a letter typed or held
+across the page change never changes what is reviewed; Shift or Caps
+Lock sends the capital the page names, which acts the same. The new
+proposal is the reviewed plan's disk and settings, not drafts edited
+since. Starting again from the welcome page forgets the choice.
+td-authd's consent summary shows the storage as it does for any review
+(`UNENCRYPTED STORAGE, AUTOMATIC LOGIN`).
+
+The welcome page says that storage will be encrypted to this computer
+when it has a usable TPM 2.0 and a screen and keyboard its startup
+recovery prompt can use, and unencrypted otherwise, that the review says
+which and lets the person choose none where encryption is possible, and
+that the account signs in automatically either way. An unencrypted
+review states that storage is unencrypted and why:
 no usable TPM 2.0, no keyboard console (a framebuffer console and a
 keyboard with Enter and the top-row digits), or both; and that the
 account signs in automatically. A device-bound review states, beside

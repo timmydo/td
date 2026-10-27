@@ -47,8 +47,9 @@ pub(crate) trait Host {
     /// it has accepted, before anything is stopped.
     fn end(&mut self, ending: Ending) -> Result<(), Refusal>;
     /// What the service's own probes found when it started; every plan
-    /// records it, and names the storage it implies (`Basis::storage`),
-    /// never a request's.
+    /// records it, and names the storage it implies (`Basis::storage`)
+    /// unless its proposal chose unencrypted storage. No request can
+    /// choose device-bound storage.
     fn basis(&self) -> Basis;
 }
 
@@ -197,7 +198,8 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             Request::Propose {
                 destination,
                 settings,
-            } => match self.propose(destination, Some(settings))? {
+                unencrypted,
+            } => match self.propose(destination, Some((settings, unencrypted)))? {
                 Ok(plan) => Reply::Reviewed(Box::new(plan)),
                 Err(refusal) => Reply::Refused(refusal),
             },
@@ -313,10 +315,12 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
         }
     }
 
+    /// A fresh installation's settings come with the person's storage
+    /// choice; a reinstall has neither and keeps unencrypted storage.
     fn propose(
         &mut self,
         destination: Destination,
-        settings: Option<Settings>,
+        fresh: Option<(Settings, bool)>,
     ) -> io::Result<Result<Plan, Refusal>> {
         match &self.held {
             // One boot installs once.
@@ -327,7 +331,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             | Held::Complete(_) => return Ok(Err(Refusal::Busy)),
             Held::Idle | Held::Failed(..) | Held::Abandoned(..) => {}
         }
-        if let Some(settings) = &settings {
+        if let Some((settings, _)) = &fresh {
             if let Err(refusal) = self.host.check_settings(settings) {
                 return Ok(Err(refusal));
             }
@@ -351,9 +355,10 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             Err(refusal) => return Ok(Err(refusal)),
         };
         let (nonce, uuid) = self.host.entropy()?;
-        let preserve = settings.is_none();
-        let (uuid, settings, basis) = match settings {
-            Some(settings) => (uuid, settings, self.host.basis()),
+        let preserve = fresh.is_none();
+        let unencrypted = fresh.as_ref().is_some_and(|(_, unencrypted)| *unencrypted);
+        let (uuid, settings, basis) = match fresh {
+            Some((settings, _)) => (uuid, settings, self.host.basis()),
             None => match self.host.existing(&mut claim) {
                 Ok((uuid, settings)) => {
                     if let Err(refusal) = self.host.check_settings(&settings) {
@@ -368,6 +373,9 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if preserve {
             plan = plan.preserving();
+        }
+        if unencrypted {
+            plan = plan.unencrypted();
         }
         // A review is only presented for a disk it fits, with the plan's own
         // volume identity sizing the selector.
@@ -1103,6 +1111,7 @@ mod tests {
         Request::Propose {
             destination: disk,
             settings: settings(),
+            unencrypted: false,
         }
     }
 
@@ -2099,6 +2108,39 @@ mod tests {
         // The three unencrypted bases are one review on the consent channel.
         assert!(reviews[..3].windows(2).all(|pair| pair[0] == pair[1]));
         assert_ne!(reviews[2], reviews[3]);
+    }
+
+    /// A proposal that chooses unencrypted storage is reviewed unencrypted
+    /// whatever the probes found, its basis kept, and its consent review
+    /// says so; nothing can ask for device-bound storage the probes did
+    /// not allow.
+    #[test]
+    fn a_proposal_may_choose_unencrypted_storage() {
+        for (tpm, console) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut fake = Fake::new();
+            fake.basis = Basis::new(tpm, console);
+            let mut service = Service::new(fake);
+            let request = Request::Propose {
+                destination: disk("vda", 1, Some("Disk")),
+                settings: settings(),
+                unencrypted: true,
+            };
+            let Reply::Reviewed(plan) = service.answer(request).unwrap() else {
+                panic!("no review");
+            };
+            assert_eq!(plan.storage(), Storage::Unencrypted);
+            assert_eq!(plan.basis(), Basis::new(tpm, console));
+            assert_eq!(
+                consent_review(&plan).unwrap().storage(),
+                consent::Storage::Unencrypted
+            );
+            // That review executes as held: past the equality check, a stale
+            // review otherwise, to this fake's missing consent channel.
+            assert_eq!(
+                service.answer(Request::Execute(*plan)).unwrap(),
+                Reply::Refused(Refusal::ConsentUnavailable)
+            );
+        }
     }
 
     /// The consent channel's review carries the plan's storage.

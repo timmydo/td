@@ -324,7 +324,8 @@ fn every_truncation_and_extension_refuses() {
 }
 
 /// Storage follows the basis: device-bound exactly when both probes
-/// passed (ENCRYPTION.md "Activation"), and nothing else names it.
+/// passed (ENCRYPTION.md "Activation"), unless the person chose
+/// unencrypted, which every basis admits and which keeps its basis.
 #[test]
 fn storage_follows_the_basis() {
     for (tpm, console, storage) in [
@@ -337,13 +338,18 @@ fn storage_follows_the_basis() {
         assert_eq!(basis.storage(), storage, "{tpm} {console}");
         let p = Plan::new([1; 32], destination(), [2; 32], uuid(), basis, settings()).unwrap();
         assert_eq!(p.storage(), storage);
+        let chosen = p.unencrypted();
+        assert_eq!(chosen.storage(), Storage::Unencrypted);
+        assert_eq!(chosen.basis(), basis);
+        assert_eq!(Plan::decode(&chosen.encode()).unwrap(), chosen);
     }
     assert_eq!(Storage::ALL, [Storage::Unencrypted, Storage::DeviceBound]);
 }
 
-/// The storage byte follows the removable flag, the storage the basis
-/// names; a storage byte the basis does not name, or no storage at all,
-/// is refused.
+/// The storage byte follows the removable flag: the storage the basis
+/// names, or unencrypted as chosen with any basis. Device-bound storage
+/// with a basis that does not name it, or no storage at all, is
+/// refused.
 #[test]
 fn storage_is_one_byte_after_the_removable_flag() {
     let unencrypted = plan();
@@ -368,19 +374,24 @@ fn storage_is_one_byte_after_the_removable_flag() {
     differs[at + 1] = 3;
     assert_eq!(differs, bytes);
     assert_eq!(Plan::decode(&bytes).unwrap(), bound);
-    // Each storage byte with a basis that names the other is refused.
-    let mut unfollowed = bytes.clone();
-    unfollowed[at] = 0;
-    assert_eq!(
-        Plan::decode(&unfollowed).unwrap_err(),
-        "plan storage does not follow its basis"
-    );
-    let mut unfollowed = unencrypted.encode();
-    unfollowed[at] = 1;
-    assert_eq!(
-        Plan::decode(&unfollowed).unwrap_err(),
-        "plan storage does not follow its basis"
-    );
+    // Unencrypted with both probes is the person's choice, kept as such;
+    // device-bound without them is refused.
+    let mut chosen = bytes.clone();
+    chosen[at] = 0;
+    let decoded = Plan::decode(&chosen).unwrap();
+    assert_eq!(decoded, bound.clone().unencrypted());
+    assert_eq!(decoded.storage(), Storage::Unencrypted);
+    assert_eq!(decoded.basis(), Basis::new(true, true));
+    assert_ne!(decoded, bound);
+    for basis in 0..=2 {
+        let mut unfollowed = bytes.clone();
+        unfollowed[at + 1] = basis;
+        assert_eq!(
+            Plan::decode(&unfollowed).unwrap_err(),
+            "plan storage does not follow its basis",
+            "basis {basis}"
+        );
+    }
     for code in 2..=255 {
         let mut other = bytes.clone();
         other[at] = code;

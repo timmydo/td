@@ -127,7 +127,7 @@ fn a_misplaced_serve_exits_without_a_byte() -> Res<()> {
     if root {
         // Admitted: it probes, whatever it finds greets, then ends when the
         // installer closes unanswered.
-        assert_eq!(sent, b"TDINS08\n");
+        assert_eq!(sent, b"TDINS09\n");
     } else {
         assert!(sent.is_empty(), "{sent:?}");
         assert!(stderr.contains("serve requires the installation authority"));

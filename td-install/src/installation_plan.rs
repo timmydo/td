@@ -308,8 +308,10 @@ impl Settings {
     }
 }
 
-/// How the installed volume is stored. It follows the plan's basis
-/// (`Basis::storage`); no request carries it.
+/// How the installed volume is stored: what the plan's basis allows
+/// (`Basis::storage`), or unencrypted where the person chose it, which
+/// any basis admits. Device-bound storage needs both probes; no request
+/// can ask for it where they failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Storage {
     Unencrypted,
@@ -341,8 +343,8 @@ impl Storage {
 
 /// What the service's own probes found when it started (ENCRYPTION.md
 /// "Activation"): a usable TPM 2.0, and a keyboard console. Every plan of
-/// that service records it, and its storage follows it; no request
-/// carries it.
+/// that service records it, and only a basis with both admits
+/// device-bound storage; no request carries it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Basis {
     tpm: bool,
@@ -366,9 +368,10 @@ impl Basis {
     pub fn keyboard_console(self) -> bool {
         self.keyboard_console
     }
-    /// The storage a plan with this basis names: device-bound exactly when
-    /// both probes passed, unencrypted otherwise (ENCRYPTION.md
-    /// "Activation"). Neither outcome refuses.
+    /// The storage a plan with this basis names unless the person chose
+    /// unencrypted: device-bound exactly when both probes passed,
+    /// unencrypted otherwise (ENCRYPTION.md "Activation"). Neither outcome
+    /// refuses.
     pub fn storage(self) -> Storage {
         if self.tpm && self.keyboard_console {
             Storage::DeviceBound
@@ -431,6 +434,7 @@ pub struct Plan {
     deployment: [u8; 32],
     volume_uuid: [u8; 16],
     basis: Basis,
+    storage: Storage,
     settings: Settings,
 }
 
@@ -458,6 +462,7 @@ impl Plan {
             deployment,
             volume_uuid,
             basis,
+            storage: basis.storage(),
             settings,
         })
     }
@@ -468,6 +473,13 @@ impl Plan {
     /// This changes review data only and grants no permission to write.
     pub fn preserving(mut self) -> Self {
         self.mode = Mode::Preserve;
+        self
+    }
+
+    /// The person chose unencrypted storage, which any basis admits; the
+    /// review discloses it as chosen (INSTALLER.md "Storage choice").
+    pub fn unencrypted(mut self) -> Self {
+        self.storage = Storage::Unencrypted;
         self
     }
 
@@ -505,9 +517,9 @@ impl Plan {
     pub fn volume_uuid(&self) -> &[u8; 16] {
         &self.volume_uuid
     }
-    /// The storage the plan's basis names.
+    /// The storage the plan's basis names, or unencrypted as chosen.
     pub fn storage(&self) -> Storage {
-        self.basis.storage()
+        self.storage
     }
     pub fn basis(&self) -> Basis {
         self.basis
@@ -548,20 +560,22 @@ impl Plan {
         let uuid = r.array()?;
         let [mode] = r.array()?;
         let mode = Mode::from_code(mode)?;
-        let (destination, basis) = read_destination_with(&mut r, |r| {
+        let (destination, (storage, basis)) = read_destination_with(&mut r, |r| {
             let [storage, basis] = r.array()?;
+            let storage = Storage::from_code(storage)?;
             let basis = Basis::from_code(basis)?;
-            // The storage byte is redundant with the basis: only the storage
-            // the basis names is admitted.
-            if Storage::from_code(storage)? != basis.storage() {
+            // Unencrypted is admitted with any basis, as chosen; device-bound
+            // only with the basis that names it.
+            if storage == Storage::DeviceBound && basis.storage() != Storage::DeviceBound {
                 return Err("plan storage does not follow its basis".into());
             }
-            Ok(basis)
+            Ok((storage, basis))
         })?;
         let settings = read_settings(&mut r)?;
         r.finish()?;
         let mut plan = Self::new(nonce, destination, deployment, uuid, basis, settings)?;
         plan.mode = mode;
+        plan.storage = storage;
         Ok(plan)
     }
 }

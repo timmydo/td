@@ -15,9 +15,9 @@ const BODY_TOP: usize = 4 * ROW;
 const BODY_ROWS: usize = 15;
 const WARNING_TOP: usize = BODY_TOP + BODY_ROWS * CELL_HEIGHT + ROW;
 /// The fixed warnings under the details. Storage follows the service's
-/// own probes, which the plan's basis records; no request chooses it, so
-/// the page says what the review carries (td-install/INSTALLER.md
-/// "Storage choice").
+/// own probes, which the plan's basis records, unless the person chose
+/// unencrypted storage; the page says what the review carries
+/// (td-install/INSTALLER.md "Storage choice").
 const LOSS: &str = "All data on the selected disk will be lost when you confirm this review.";
 const PRESERVE: &[&str] = &[
     "Personal files, account and saved settings will be kept.",
@@ -47,6 +47,15 @@ const UNENCRYPTED_NEITHER: &[&str] = &[
     "Storage is not encrypted: no usable TPM 2.0 and no keyboard console.",
     AUTOMATIC,
 ];
+const UNENCRYPTED_CHOSEN: &[&str] = &[
+    LOSS,
+    "Storage is not encrypted, as you chose: whoever has the disk can read it.",
+    AUTOMATIC,
+];
+/// What the notice row offers when nothing else is said there: the other
+/// storage, where the probes allow it.
+const OFFER_UNENCRYPTED: &str = "Press U to install without encryption instead.";
+const OFFER_ENCRYPTED: &str = "Press E to encrypt the disk to this computer instead.";
 /// The most warning rows any storage shows.
 const WARNING_ROWS: usize = 3;
 
@@ -117,23 +126,27 @@ fn push_paragraph(lines: &mut Vec<String>, paragraph: &str, columns: usize) {
     lines.extend(td_ui::text::wrap(paragraph, columns));
 }
 
-/// Which fixed disclosure set a review shows: the storage its basis names,
-/// and for unencrypted storage why. Its tag names it in the evidence line.
+/// Which fixed disclosure set a review shows: the plan's storage, and
+/// for unencrypted storage why, the person's choice included. Its tag
+/// names it in the evidence line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Disclosure {
     DeviceBound,
     NoTpm,
     NoConsole,
     Neither,
+    /// Unencrypted although the probes allowed device-bound storage.
+    Chosen,
 }
 
 impl Disclosure {
-    pub fn of(basis: Basis) -> Self {
-        match (basis.storage(), basis.tpm(), basis.keyboard_console()) {
+    pub fn of(storage: Storage, basis: Basis) -> Self {
+        match (storage, basis.tpm(), basis.keyboard_console()) {
             (Storage::DeviceBound, _, _) => Self::DeviceBound,
+            (Storage::Unencrypted, true, true) => Self::Chosen,
             (Storage::Unencrypted, false, true) => Self::NoTpm,
             (Storage::Unencrypted, true, false) => Self::NoConsole,
-            (Storage::Unencrypted, _, _) => Self::Neither,
+            (Storage::Unencrypted, false, false) => Self::Neither,
         }
     }
 
@@ -143,25 +156,41 @@ impl Disclosure {
             Self::NoTpm => "no-tpm",
             Self::NoConsole => "no-console",
             Self::Neither => "no-tpm-no-console",
+            Self::Chosen => "chosen",
+        }
+    }
+
+    /// The other storage a fresh review offers: unencrypted for a
+    /// device-bound one, device-bound again for one unencrypted by choice.
+    /// Where the probes failed there is no other.
+    fn offer(self) -> Option<&'static str> {
+        match self {
+            Self::DeviceBound => Some(OFFER_UNENCRYPTED),
+            Self::Chosen => Some(OFFER_ENCRYPTED),
+            Self::NoTpm | Self::NoConsole | Self::Neither => None,
         }
     }
 }
 
-/// The fixed warnings for the storage the plan's basis names, and why.
-fn warnings(basis: Basis) -> &'static [&'static str] {
-    match Disclosure::of(basis) {
+/// The fixed warnings for the plan's storage, and why.
+fn warnings(disclosure: Disclosure) -> &'static [&'static str] {
+    match disclosure {
         Disclosure::DeviceBound => DEVICE_BOUND,
         Disclosure::NoTpm => UNENCRYPTED_NO_TPM,
         Disclosure::NoConsole => UNENCRYPTED_NO_CONSOLE,
         Disclosure::Neither => UNENCRYPTED_NEITHER,
+        Disclosure::Chosen => UNENCRYPTED_CHOSEN,
     }
 }
 
-/// The detail row naming the storage the plan's basis names.
-fn storage_line(basis: Basis) -> String {
-    match basis.storage() {
-        Storage::DeviceBound => "Storage: encrypted to this computer".into(),
-        Storage::Unencrypted => "Storage: not encrypted".into(),
+/// The detail row naming the plan's storage.
+fn storage_line(disclosure: Disclosure) -> String {
+    match disclosure {
+        Disclosure::DeviceBound => "Storage: encrypted to this computer".into(),
+        Disclosure::Chosen => "Storage: not encrypted, as chosen".into(),
+        Disclosure::NoTpm | Disclosure::NoConsole | Disclosure::Neither => {
+            "Storage: not encrypted".into()
+        }
     }
 }
 
@@ -187,6 +216,8 @@ pub struct ReviewPage {
     status: String,
     footer: Status,
     notice: Option<&'static str>,
+    /// Said on the notice row while no notice is.
+    offer: Option<&'static str>,
     warnings: &'static [&'static str],
 }
 
@@ -203,6 +234,8 @@ impl ReviewPage {
         let columns = body
             .columns()
             .min((BLOCK_SCALARS - (BODY_ROWS - 1)) / BODY_ROWS);
+        let preserve = plan.mode() == td_install::installation_plan::Mode::Preserve;
+        let disclosure = Disclosure::of(plan.storage(), plan.basis());
         let mut lines = Vec::new();
         push_identity_lines(plan.destination(), columns, &mut lines);
         let settings = plan.settings();
@@ -223,7 +256,7 @@ impl ReviewPage {
                 format!("Time zone: {}", safe_label(settings.timezone())),
                 "| Time zone: ",
             ),
-            (storage_line(plan.basis()), "| Storage: "),
+            (storage_line(disclosure), "| Storage: "),
             (
                 if plan.mode() == td_install::installation_plan::Mode::Preserve {
                     "Mode: reinstall system, keep personal files".into()
@@ -273,10 +306,11 @@ impl ReviewPage {
             status,
             footer,
             notice: None,
-            warnings: if plan.mode() == td_install::installation_plan::Mode::Preserve {
+            offer: (!preserve).then(|| disclosure.offer()).flatten(),
+            warnings: if preserve {
                 PRESERVE
             } else {
-                warnings(plan.basis())
+                warnings(disclosure)
             },
         })
     }
@@ -355,7 +389,7 @@ impl Composition for ReviewPage {
                 sink,
             );
         }
-        if let Some(notice) = self.notice {
+        if let Some(notice) = self.notice.or(self.offer) {
             let rect = Rect {
                 y: (notice_top(self.warnings.len()) * scale.value()) as i64,
                 ..heading
@@ -515,7 +549,10 @@ mod tests {
         for index in 0..pages {
             let view = ReviewPage::new(screen, plan, index).unwrap();
             assert!(view.detail.chars().count() <= BLOCK_SCALARS);
-            assert_eq!(view.warnings, warnings(plan.basis()));
+            assert_eq!(
+                view.warnings,
+                warnings(Disclosure::of(plan.storage(), plan.basis()))
+            );
             let mut page = String::new();
             view.emit(screen.bounds(), &mut |draw| {
                 if let Primitive::Glyph { scalar, .. } = draw.primitive {
@@ -635,8 +672,9 @@ mod tests {
                 "device-bound",
             ),
         ] {
-            assert_eq!(Disclosure::of(Basis::new(tpm, console)).tag(), tag);
-            let plan = stored("SERIAL", Basis::new(tpm, console));
+            let basis = Basis::new(tpm, console);
+            assert_eq!(Disclosure::of(basis.storage(), basis).tag(), tag);
+            let plan = stored("SERIAL", basis);
             let (details, glyphs) = painted(&plan);
             assert!(details.lines().any(|line| line == storage), "{storage}");
             assert!(details.lines().any(|line| line == probes), "{probes}");
@@ -648,6 +686,65 @@ mod tests {
                 words(&details).contains(&words(KEYBOARD_CONSOLE)),
                 !console
             );
+            // Only a review the probes allow to encrypt offers unencrypted.
+            assert_eq!(glyphs.contains(OFFER_UNENCRYPTED), tpm && console);
+            assert!(!glyphs.contains(OFFER_ENCRYPTED));
         }
+    }
+
+    /// Unencrypted by choice, with both probes: said as chosen, readable
+    /// to whoever has the disk, and offering encryption again; a notice
+    /// takes the offer's row while it is said. A reinstall offers
+    /// nothing.
+    #[test]
+    fn a_review_unencrypted_by_choice_says_so_and_offers_encryption() {
+        let basis = Basis::new(true, true);
+        let plan = stored("SERIAL", basis).unencrypted();
+        assert_eq!(
+            Disclosure::of(plan.storage(), plan.basis()),
+            Disclosure::Chosen
+        );
+        assert_eq!(Disclosure::Chosen.tag(), "chosen");
+        let (details, glyphs) = painted(&plan);
+        assert!(details
+            .lines()
+            .any(|line| line == "Storage: not encrypted, as chosen"));
+        assert!(glyphs.contains("Storage is not encrypted, as you chose"));
+        assert!(glyphs.contains(OFFER_ENCRYPTED) && !glyphs.contains(OFFER_UNENCRYPTED));
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words(&details).contains(&words(WIFI_UNENCRYPTED)));
+        assert!(!words(&details).contains(&words(DEVICE_BOUND_DETAILS.first().unwrap())));
+        let screen = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
+        let noticed = ReviewPage::new(screen, &plan, 0)
+            .unwrap()
+            .with_notice(Some("Starting the confirmed installation"));
+        let mut said = String::new();
+        noticed.emit(screen.bounds(), &mut |draw| {
+            if let Primitive::Glyph { scalar, .. } = draw.primitive {
+                said.push(scalar);
+            }
+        });
+        assert!(said.contains("Starting the confirmed installation"));
+        assert!(!said.contains(OFFER_ENCRYPTED));
+        for warning in UNENCRYPTED_CHOSEN
+            .iter()
+            .chain([&OFFER_ENCRYPTED, &OFFER_UNENCRYPTED])
+        {
+            assert!(
+                warning.chars().count() <= (crate::MIN_PAGE_WIDTH - 2 * INSET) / CELL_WIDTH,
+                "{warning}"
+            );
+        }
+        let preserved = stored("SERIAL", Basis::default()).preserving();
+        let mut glyphs = String::new();
+        ReviewPage::new(screen, &preserved, 0)
+            .unwrap()
+            .emit(screen.bounds(), &mut |draw| {
+                if let Primitive::Glyph { scalar, .. } = draw.primitive {
+                    glyphs.push(scalar);
+                }
+            });
+        assert!(glyphs.contains("Personal files"));
+        assert!(!glyphs.contains(OFFER_ENCRYPTED) && !glyphs.contains(OFFER_UNENCRYPTED));
     }
 }

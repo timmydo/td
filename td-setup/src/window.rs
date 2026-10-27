@@ -208,6 +208,14 @@ const TIME_ZONE_KEYS: &[(&str, &str)] = &[
 const REVIEW_KEYS: &[(&str, &str)] = &[
     ("PageUp/PageDown", "page through the review's details"),
     ("Return", "confirm this review and start installation"),
+    (
+        "u",
+        "where offered, review the same installation without encryption",
+    ),
+    (
+        "e",
+        "where offered, review it encrypted to this computer again",
+    ),
     ("Escape", "withdraw the review and go back to the settings"),
 ];
 const CONSENT_KEYS: &[(&str, &str)] = &[("Escape", "request cancellation before writing starts")];
@@ -278,6 +286,9 @@ const POLL: u64 = 500;
 #[derive(Debug)]
 struct Wizard {
     preserve: bool,
+    /// The person chose unencrypted storage on a review; kept, as the
+    /// drafts are, for every later proposal until chosen otherwise.
+    unencrypted: bool,
     reinstall: Option<Destination>,
     page: Page,
     disks: Vec<Destination>,
@@ -337,6 +348,7 @@ impl Wizard {
     fn new() -> Self {
         Self {
             preserve: false,
+            unencrypted: false,
             reinstall: None,
             page: Page::Welcome,
             disks: Vec::new(),
@@ -370,8 +382,10 @@ impl Wizard {
 
     fn key(&mut self, chord: &str) -> Action {
         match (&self.page, chord) {
+            // A new installation starts with the probes' storage.
             (Page::Welcome, "Return") => {
                 self.preserve = false;
+                self.unencrypted = false;
                 self.page = Page::Waiting;
             }
             (Page::Welcome, "r") => {
@@ -430,6 +444,21 @@ impl Wizard {
                 if self.execute.is_none() && self.executing.is_none() {
                     self.execute = self.plan.clone();
                     self.review_notice = Some(SEEKING);
+                }
+            }
+            // The other storage, where the review offers it: the review is
+            // withdrawn as Escape withdraws it, and the installation it
+            // reviewed, not the drafts edited since, proposed again with the
+            // new choice. Shift or Caps Lock sends the capital.
+            (Page::Review, "u" | "U" | "e" | "E") => {
+                let unencrypted = chord.eq_ignore_ascii_case("u");
+                if let Some(plan) = self.plan.clone().filter(|_| self.offers(unencrypted)) {
+                    self.unencrypted = unencrypted;
+                    self.key("Escape");
+                    if !self.reviewing() {
+                        self.proposal = Some((plan.destination().clone(), plan.settings().clone()));
+                        self.notice = Some(REVIEWING);
+                    }
                 }
             }
             // Leaving the starting page withdraws the review; until that is
@@ -633,6 +662,25 @@ impl Wizard {
             self.selected = Some(index);
             self.detail = 0;
         }
+    }
+
+    /// Whether the shown review offers the other storage, `unencrypted`
+    /// or encrypted, before any execute: a fresh device-bound review
+    /// offers unencrypted, and one unencrypted by choice offers
+    /// device-bound again. Where the probes failed, nothing is offered.
+    fn offers(&self, unencrypted: bool) -> bool {
+        let Some(plan) = &self.plan else {
+            return false;
+        };
+        let chosen = crate::review::Disclosure::of(plan.storage(), plan.basis());
+        !self.preserve
+            && self.execute.is_none()
+            && self.executing.is_none()
+            && if unencrypted {
+                chosen == crate::review::Disclosure::DeviceBound
+            } else {
+                chosen == crate::review::Disclosure::Chosen
+            }
     }
 
     /// Whether a proposal is queued or its review still wanted.
@@ -1058,7 +1106,7 @@ impl Wizard {
                     field(
                         &mut state,
                         "disclosure",
-                        crate::review::Disclosure::of(basis).tag(),
+                        crate::review::Disclosure::of(plan.storage(), basis).tag(),
                     );
                 }
             }
@@ -1188,7 +1236,7 @@ impl Front {
                 }
             }
             Asked::Review => match self.wizard.proposal.take() {
-                Some((disk, settings)) => service.propose(disk, settings),
+                Some((disk, settings)) => service.propose(disk, settings, self.wizard.unencrypted),
                 None => return,
             },
             Asked::Withdraw => match self.wizard.withdraw.take() {
@@ -1644,6 +1692,19 @@ impl Window {
                     || (self.front.wizard.page == Page::Recovery(KeyStep::Kept)
                         && !self.kept_settled()))
             {
+                return Ok(false);
+            }
+            // A review's storage choice waits for the review to settle, as
+            // Return does, so a letter typed or held across the page change
+            // never changes what is reviewed, and it acts once a press.
+            if self.front.wizard.page == Page::Review
+                && matches!(chord.as_str(), "u" | "U" | "e" | "E")
+            {
+                if !self.review_confirmable() {
+                    return Ok(false);
+                }
+                self.front.key(&chord, Path::new(SOCKET));
+                self.dirty = true;
                 return Ok(false);
             }
             repeat = repeats(&chord);
@@ -2385,6 +2446,68 @@ mod tests {
         wizard.answered(Ok(Answer::Reviewed(plan)));
         assert_eq!(wizard.page, Page::Review);
         wizard
+    }
+
+    /// Where the probes allow both storages, u on the review withdraws it
+    /// and proposes the same disk and drafts unencrypted, and e on that
+    /// review goes back; where they do not, or once Return has asked to
+    /// install, neither does anything.
+    #[test]
+    fn the_review_offers_the_other_storage_where_the_probes_allow() {
+        let mut wizard = on_review();
+        for chord in ["u", "e"] {
+            wizard.key(chord);
+            assert_eq!((&wizard.page, wizard.wanted()), (&Page::Review, None));
+        }
+        assert!(!wizard.unencrypted);
+        let mut wizard = filled();
+        wizard.key("Return");
+        let (disk, settings) = wizard.proposal.take().unwrap();
+        wizard.sent(Asked::Review);
+        let bound = crate::service::tests::bound_plan(&disk, &settings);
+        wizard.answered(Ok(Answer::Reviewed(Box::new(bound.clone()))));
+        assert!(wizard.state().ends_with(" disclosure=device-bound"));
+        wizard.key("e");
+        assert_eq!((&wizard.page, wizard.wanted()), (&Page::Review, None));
+        // Shift or Caps Lock sends the capital the page names.
+        wizard.key("U");
+        assert!(wizard.unencrypted);
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.withdraw, Some(*bound.nonce()));
+        assert_eq!(wizard.proposal, Some((disk.clone(), settings.clone())));
+        // The review is released before the new proposal is sent.
+        assert_eq!(wizard.wanted(), Some(Asked::Withdraw));
+        wizard.withdraw = None;
+        wizard.withdrawing = Some(*bound.nonce());
+        wizard.sent(Asked::Withdraw);
+        wizard.answered(Ok(Answer::Withdrawn));
+        assert_eq!(wizard.wanted(), Some(Asked::Review));
+        wizard.proposal = None;
+        wizard.sent(Asked::Review);
+        let chosen = bound.clone().unencrypted();
+        wizard.answered(Ok(Answer::Reviewed(Box::new(chosen.clone()))));
+        assert_eq!(wizard.page, Page::Review);
+        assert!(wizard
+            .state()
+            .ends_with(" storage=unencrypted tpm=found console=found disclosure=chosen"));
+        // The choice stands for the next proposal until e takes it back.
+        wizard.key("u");
+        assert_eq!((&wizard.page, wizard.wanted()), (&Page::Review, None));
+        wizard.key("e");
+        assert!(!wizard.unencrypted);
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(wizard.withdraw, Some(*chosen.nonce()));
+        // Once Return asked to install, the review is what installs.
+        let mut wizard = filled();
+        wizard.key("Return");
+        let (disk, settings) = wizard.proposal.take().unwrap();
+        wizard.sent(Asked::Review);
+        let bound = crate::service::tests::bound_plan(&disk, &settings);
+        wizard.answered(Ok(Answer::Reviewed(Box::new(bound))));
+        wizard.key("Return");
+        wizard.key("u");
+        assert_eq!(wizard.page, Page::Review);
+        assert!(!wizard.unencrypted && wizard.withdraw.is_none());
     }
 
     /// Sends the queued execute, as the front end does.
@@ -3867,6 +3990,30 @@ mod tests {
             window.front.wizard.page,
             Page::Progress(Progress::Unconfirmed)
         );
+    }
+
+    /// A review's u acts only once the review has settled, once a press:
+    /// a letter typed or held across the page change neither withdraws
+    /// it nor reaches the settings drafts.
+    #[test]
+    fn the_storage_choice_waits_for_the_review_and_never_repeats() {
+        let (mut window, _peer) = window();
+        let mut wizard = filled();
+        wizard.key("Return");
+        let (disk, settings) = wizard.proposal.take().unwrap();
+        wizard.sent(Asked::Review);
+        let bound = crate::service::tests::bound_plan(&disk, &settings);
+        wizard.answered(Ok(Answer::Reviewed(Box::new(bound))));
+        window.front.wizard = wizard;
+        assert!(!window.chord("u".into()).unwrap());
+        assert_eq!(window.front.wizard.page, Page::Review);
+        window.presented(true);
+        window.clock += SETTLE;
+        // It acts, and asks for no repeat that would type into a draft;
+        // with no service here, its withdrawal finds the service gone.
+        assert!(!window.chord("u".into()).unwrap());
+        assert_ne!(window.front.wizard.page, Page::Review);
+        assert!(window.front.wizard.unencrypted);
     }
 
     /// Notes the shown page as a presented frame would, and lets it be

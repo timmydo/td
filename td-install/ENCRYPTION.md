@@ -11,7 +11,8 @@ and authenticated login. A device-bound volume upgrades to the protected
 tier by replacing protectors and its volume key, never by reinstalling.
 
 The live installer installs device-bound storage on a machine with a
-usable TPM 2.0 and a keyboard console, and unencrypted storage otherwise
+usable TPM 2.0 and a keyboard console, unless the person chooses
+unencrypted storage on the review, and unencrypted storage otherwise
 ("Activation"); the installed account logs in automatically either way.
 Device binding protects a disk read away from its machine, not a lost
 one. No increment may describe enrollment, disk confidentiality beyond
@@ -305,7 +306,9 @@ be unencrypted, and installation proceeds only under that disclosed plan.
 The service chooses for itself, with no operand: device-bound only when
 this probe passes and the live system shows a keyboard console,
 unencrypted with the disclosure otherwise, and it refuses neither
-("Activation").
+("Activation"). Where it would choose device-bound, the person may
+choose unencrypted storage instead on the review; nothing can ask for
+device-bound storage where the probes failed.
 
 Upgrading to the protected tier re-encrypts the volume to a fresh volume
 key, drops the device-bound protector and keeps the recovery key as the
@@ -328,9 +331,11 @@ device-bound system's integrity before the upgrade.
 Increment 5 formats device-bound volumes, and increment 7 makes them the
 default: `td-install serve` formats one exactly when its plan names
 device-bound storage, which follows its own probes ("Activation"). No
-review, wizard page, request or operand selects it: storage policy is not
-a caller-selectable flag. Increment 7 deleted the storage operand that
-reached this path before it.
+review, wizard page, request or operand can select it where they did not
+allow it: the one storage choice a proposal carries is the person's
+choice of unencrypted storage, which turns encryption off and never on
+(INSTALLER.md "Storage choice"). Increment 7 deleted the storage operand
+that reached this path before it.
 
 The volume is formatted with exactly these parameters, the device being a
 loop over the volume's extent (DESIGN.md "Device-bound formatting"):
@@ -820,10 +825,13 @@ outcomes in every plan (INSTALLER.md "Storage choice"):
   they never pass it.
 
 Every plan of that service names device-bound storage when both probes
-passed and unencrypted storage otherwise. Neither outcome refuses a
-start, a proposal or an execution: a machine without a usable TPM, or
-without a keyboard console, installs unencrypted under the disclosed
-plan, and one with both installs device-bound. Execution does not probe
+passed and unencrypted storage otherwise, unless its proposal chose
+unencrypted storage, which any basis admits; no request can choose
+device-bound storage. Neither outcome refuses a start, a proposal or an
+execution: a machine without a usable TPM, or without a keyboard
+console, installs unencrypted under the disclosed plan, and one with
+both installs device-bound unless the person chose otherwise on the
+review. Execution does not probe
 again; the TPM's state may change before execution, which seals under
 its own policy, as today.
 

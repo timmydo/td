@@ -249,7 +249,8 @@ medium, with all writes in RAM; see "Live boot" in [the media
 contract](td-install/MEDIA.md). It opens the graphical installer alone,
 which erases one chosen whole disk and installs td onto it, offline. Storage is
 encrypted to the machine where it has a usable TPM 2.0 and a screen and
-keyboard the startup recovery prompt can use, and unencrypted otherwise
+keyboard the startup recovery prompt can use and the person does not
+choose unencrypted storage on the review, and unencrypted otherwise
 ([the encryption contract](td-install/ENCRYPTION.md) "Activation"); either
 way the installed account logs in automatically, and root is locked,
 with no console or SSH login ([AGENTS.md](AGENTS.md) principle 7).

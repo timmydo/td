@@ -162,16 +162,25 @@ impl Service {
         self.send(Request::Destinations)
     }
 
-    /// Proposes installing to `destination` with `settings`; the service
-    /// reviews it against its own observation, or refuses.
+    /// Proposes reinstalling the system on `destination`, keeping its
+    /// saved settings and personal files.
     pub fn reinstall(&mut self, destination: Destination) -> Result<(), String> {
         self.send(Request::Reinstall(destination))
     }
 
-    pub fn propose(&mut self, destination: Destination, settings: Settings) -> Result<(), String> {
+    /// Proposes installing to `destination` with `settings`, unencrypted
+    /// where the person chose it; the service reviews it against its own
+    /// observation, or refuses.
+    pub fn propose(
+        &mut self,
+        destination: Destination,
+        settings: Settings,
+        unencrypted: bool,
+    ) -> Result<(), String> {
         self.send(Request::Propose {
             destination,
             settings,
+            unencrypted,
         })
     }
 
@@ -374,9 +383,11 @@ fn exchange(
     // that does not answer what was sent ends the connection, and with it
     // any review the service holds.
     match (request, reply) {
+        // A reinstall carries no choice, so its storage is its basis's.
         (Request::Reinstall(destination), Reply::Reviewed(plan)) => {
             if plan.destination() != destination
                 || plan.mode() != td_install::installation_plan::Mode::Preserve
+                || plan.storage() != plan.basis().storage()
             {
                 return Err("installer service changed the reinstall request".into());
             }
@@ -400,14 +411,19 @@ fn exchange(
             Request::Propose {
                 destination,
                 settings,
+                unencrypted,
             },
             Reply::Reviewed(plan),
         ) => {
-            // The storage is the service's own operand's, which no
-            // request chooses; the review page says which it is.
+            // The storage is the service's probes', or unencrypted where
+            // the person chose it; the review page says which it is, so a
+            // review unencrypted against its probes without the choice
+            // would be disclosed as a choice never made.
             if plan.destination() != destination
                 || plan.settings() != settings
                 || plan.mode() != td_install::installation_plan::Mode::Erase
+                || (*unencrypted && plan.storage() != Storage::Unencrypted)
+                || (!*unencrypted && plan.storage() != plan.basis().storage())
             {
                 return Err("installer service review does not match the proposal".into());
             }
@@ -639,6 +655,7 @@ pub(crate) mod tests {
             Request::Propose {
                 destination,
                 settings,
+                ..
             } => framed(&Reply::Reviewed(Box::new(bound_plan(
                 destination,
                 settings,
@@ -698,7 +715,16 @@ pub(crate) mod tests {
             Request::Propose {
                 destination,
                 settings,
-            } => framed(&Reply::Reviewed(Box::new(plan(destination, settings)))),
+                unencrypted,
+            } => {
+                let plan = plan(destination, settings);
+                let plan = if *unencrypted {
+                    plan.unencrypted()
+                } else {
+                    plan
+                };
+                framed(&Reply::Reviewed(Box::new(plan)))
+            }
             Request::Withdraw(nonce) => {
                 framed(&Reply::Status(State::Abandoned(*nonce, Abandon::Withdrawn)))
             }
@@ -736,11 +762,17 @@ pub(crate) mod tests {
             Request::Propose {
                 destination,
                 settings,
+                unencrypted,
             } => {
                 if held.is_some() {
                     return framed(&Reply::Refused(Refusal::Busy));
                 }
                 let plan = plan(destination, settings);
+                let plan = if *unencrypted {
+                    plan.unencrypted()
+                } else {
+                    plan
+                };
                 held = Some(ReviewNonce::new(*plan.nonce()).unwrap());
                 framed(&Reply::Reviewed(Box::new(plan)))
             }
@@ -830,6 +862,79 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_review_that_ignores_an_unencrypted_choice_ends_the_connection() {
+        let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC").unwrap();
+        // Honoured, the review is unencrypted whatever the probes found.
+        let socket = intake("chosen", usize::MAX, listing);
+        let mut service = Service::connect(&socket).unwrap();
+        service.propose(disk(), settings.clone(), true).unwrap();
+        let Ok(Answer::Reviewed(plan)) = answer(&mut service) else {
+            panic!("no review");
+        };
+        assert_eq!(plan.storage(), Storage::Unencrypted);
+        // A device-bound review of an unencrypted proposal is not it.
+        let socket = intake("ignored", usize::MAX, |request| match request {
+            Request::Propose {
+                destination,
+                settings,
+                ..
+            } => framed(&Reply::Reviewed(Box::new(bound_plan(
+                destination,
+                settings,
+            )))),
+            _ => listing(request),
+        });
+        let mut service = Service::connect(&socket).unwrap();
+        service.propose(disk(), settings.clone(), true).unwrap();
+        let ended = answer(&mut service).unwrap_err();
+        assert!(ended.contains("does not match the proposal"), "{ended}");
+        // Without the choice, the probes' storage is the review's.
+        let socket = intake("bound", usize::MAX, |request| match request {
+            Request::Propose {
+                destination,
+                settings,
+                ..
+            } => framed(&Reply::Reviewed(Box::new(bound_plan(
+                destination,
+                settings,
+            )))),
+            _ => listing(request),
+        });
+        let mut service = Service::connect(&socket).unwrap();
+        service.propose(disk(), settings.clone(), false).unwrap();
+        assert!(answer(&mut service).is_ok());
+        // Unencrypted against its probes without the choice, a review
+        // would be disclosed as a choice never made.
+        let socket = intake("unchosen", usize::MAX, |request| match request {
+            Request::Propose {
+                destination,
+                settings,
+                ..
+            } => framed(&Reply::Reviewed(Box::new(
+                bound_plan(destination, settings).unencrypted(),
+            ))),
+            _ => listing(request),
+        });
+        let mut service = Service::connect(&socket).unwrap();
+        service.propose(disk(), settings.clone(), false).unwrap();
+        let ended = answer(&mut service).unwrap_err();
+        assert!(ended.contains("does not match the proposal"), "{ended}");
+        // Nor may a reinstall, which carries no choice.
+        let socket = intake("reinstall", usize::MAX, move |request| match request {
+            Request::Reinstall(destination) => framed(&Reply::Reviewed(Box::new(
+                bound_plan(destination, &settings)
+                    .preserving()
+                    .unencrypted(),
+            ))),
+            _ => listing(request),
+        });
+        let mut service = Service::connect(&socket).unwrap();
+        service.reinstall(disk()).unwrap();
+        let ended = answer(&mut service).unwrap_err();
+        assert!(ended.contains("changed the reinstall request"), "{ended}");
+    }
+
+    #[test]
     fn the_service_lists_its_destinations_one_request_at_a_time() {
         let socket = fake("list", protocol::GREETING, usize::MAX, listing);
         let mut service = Service::connect(&socket).unwrap();
@@ -846,7 +951,7 @@ pub(crate) mod tests {
         assert!(service.destinations().is_err());
         assert_eq!(answer(&mut service), Ok(Answer::Timezones(zones())));
         let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC").unwrap();
-        service.propose(disk(), settings.clone()).unwrap();
+        service.propose(disk(), settings.clone(), false).unwrap();
         assert_eq!(
             answer(&mut service),
             Ok(Answer::Reviewed(Box::new(plan(&disk(), &settings))))
@@ -922,7 +1027,7 @@ pub(crate) mod tests {
             framed(&Reply::Reviewed(Box::new(plan(&disk(), &other))))
         });
         let mut service = Service::connect(&socket).unwrap();
-        service.propose(disk(), settings.clone()).unwrap();
+        service.propose(disk(), settings.clone(), false).unwrap();
         let refused = answer(&mut service).unwrap_err();
         assert!(refused.contains("does not match"), "{refused}");
         // A withdraw refused, answered for another review, or answered
@@ -1025,7 +1130,7 @@ pub(crate) mod tests {
         let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC").unwrap();
         let socket = intake("bound-review", usize::MAX, recovering());
         let mut service = Service::connect(&socket).unwrap();
-        service.propose(disk(), settings.clone()).unwrap();
+        service.propose(disk(), settings.clone(), false).unwrap();
         assert_eq!(
             answer(&mut service),
             Ok(Answer::Reviewed(Box::new(bound_plan(&disk(), &settings))))

@@ -1222,6 +1222,7 @@ fn review_installation(
         &Request::Propose {
             destination: destination.clone(),
             settings,
+            unencrypted: false,
         },
     )? {
         Reply::Reviewed(plan) => *plan,

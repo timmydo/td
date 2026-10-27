@@ -33,7 +33,8 @@ pub const BODY: &[&str] = &[
     "For a new installation, storage will be encrypted to this computer when it has a usable TPM 2.0 \
      and a screen and keyboard its startup recovery prompt can use. \
      Otherwise it is not encrypted, and anyone who has the disk can read its \
-     files. The review says which, and why. Either way, the account you \
+     files. The review says which, and why, and where encryption is possible \
+     it lets you choose none. Either way, the account you \
      create signs in automatically when the machine starts, with no password \
      or PIN.",
     "For a new installation, choose the disk, then a username, hostname, keyboard layout \
