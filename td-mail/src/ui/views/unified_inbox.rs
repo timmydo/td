@@ -780,6 +780,24 @@ impl View for UnifiedInboxView {
                 }
                 true
             }
+            // The account's inbox marked read from the account tree: its
+            // messages shown are read now too.
+            BackendResponse::MailboxMarkedRead {
+                mailbox_id,
+                result: Ok(()),
+                ..
+            } => {
+                let Some(part) = self.parts.get_mut(index) else {
+                    return false;
+                };
+                if part.id.as_deref() != Some(mailbox_id.as_str()) {
+                    return false;
+                }
+                for email in &mut part.emails {
+                    email.keywords.insert("$seen".to_string(), true);
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -925,6 +943,39 @@ mod tests {
         assert_eq!(labels(&view), ["Subject h1", "Subject w1", "Subject h2"]);
         assert!(view.row(1).meta.starts_with("work · "));
         assert!(view.row(1).marked);
+    }
+
+    /// An account's inbox marked read shows its messages read; the same
+    /// inbox id answered by another account, another folder of the
+    /// account, or a refusal leaves every row as it was.
+    #[test]
+    fn an_inbox_marked_read_shows_its_messages_read() {
+        let (home, _home_rx) = inbox(0, "home", vec![folder("h-in", "Inbox", Some("inbox"))]);
+        let (work, _work_rx) = inbox(1, "work", vec![folder("w-in", "INBOX", Some("inbox"))]);
+        let mut view = UnifiedInboxView::new(
+            vec![home, work],
+            50,
+            None,
+            "home".into(),
+            "me@home.test".into(),
+        );
+        view.on_account_response(0, &emails("h-in", vec![email("h1", "2026-01-01")]));
+        view.on_account_response(1, &emails("w-in", vec![email("w1", "2026-01-02")]));
+        let marked =
+            |mailbox_id: &str, result: Result<(), String>| BackendResponse::MailboxMarkedRead {
+                mailbox_id: mailbox_id.to_string(),
+                mailbox_name: "Inbox".to_string(),
+                updated: 1,
+                result,
+            };
+        assert!(!view.on_account_response(1, &marked("h-in", Ok(()))));
+        assert!(!view.on_account_response(0, &marked("h-other", Ok(()))));
+        assert!(!view.on_account_response(0, &marked("h-in", Err("refused".into()))));
+        assert!(view.row(0).marked && view.row(1).marked);
+        assert!(view.on_account_response(0, &marked("h-in", Ok(()))));
+        // Newest first: the work message, then the home one.
+        assert!(view.row(0).marked);
+        assert!(!view.row(1).marked);
     }
 
     /// Return opens the message over the list bound to its account,

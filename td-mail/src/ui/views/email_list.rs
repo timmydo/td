@@ -1355,6 +1355,19 @@ impl View for EmailListView {
                 }
                 true
             }
+            // The folder marked read from the account tree or its page: the
+            // messages shown are read now too.
+            BackendResponse::MailboxMarkedRead {
+                mailbox_id,
+                result: Ok(()),
+                ..
+            } if *mailbox_id == self.mailbox_id => {
+                let ids: Vec<String> = self.emails.iter().map(|e| e.id.clone()).collect();
+                for id in ids {
+                    self.set_email_seen_state(&id, true);
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -2022,6 +2035,28 @@ mod tests {
         assert!(!view.on_response(&foreign));
         assert!(view.emails.is_empty());
     }
+
+    /// The folder shown marked read shows every message read; another
+    /// folder's answer, or a refusal, leaves them as they were.
+    #[test]
+    fn a_folder_marked_read_shows_its_messages_read() {
+        let (mut view, _receiver) = make_view();
+        let marked =
+            |mailbox_id: &str, result: Result<(), String>| BackendResponse::MailboxMarkedRead {
+                mailbox_id: mailbox_id.to_string(),
+                mailbox_name: "Inbox".to_string(),
+                updated: 3,
+                result,
+            };
+        assert!(!view.on_response(&marked("mbox-archive", Ok(()))));
+        assert!(!view.on_response(&marked("mbox-inbox", Err("refused".into()))));
+        assert!(view.emails.iter().all(EmailListView::is_unread));
+        assert!(view.on_response(&marked("mbox-inbox", Ok(()))));
+        assert!(!view.emails.iter().any(EmailListView::is_unread));
+        assert_eq!(view.thread_counts.get("thread-A"), Some(&(0, 2)));
+        assert_eq!(view.thread_counts.get("thread-B"), Some(&(0, 1)));
+    }
+
     #[test]
     fn preview_completion_preserves_keyword_actions_and_their_results() {
         for succeed in [false, true] {

@@ -4,16 +4,28 @@
 //! account's own page (its folder list, set-up and reconnect); a folder
 //! opens that folder's mail; the unified inbox every account's inbox.
 //! The tree keeps its selection by entry, so a folder list arriving for
-//! one account does not move it.
+//! one account does not move it, and its scroll apart from it, so the
+//! wheel moves the rows shown and leaves the selection where it was.
 
 use super::views::mailbox_list::MailboxListView;
 use super::views::Row;
 use crate::jmap::types::Mailbox;
+use td_ui::chrome::List;
 
-/// The tree's width in cells, beside a window at least three times as
-/// wide; a narrower window shows the tree over the body while it has the
-/// keys, and not otherwise.
+/// The tree's width in cells until it is resized, and the window width,
+/// three of these, from which it is a column beside the views; a narrower
+/// window shows the tree over the body while it has the keys, and not
+/// otherwise.
 pub const CELLS: usize = 24;
+/// The narrowest a resized tree goes.
+pub const MIN_CELLS: usize = 12;
+
+/// The tree's width in cells in a window `columns` cells wide: `wanted`,
+/// held between `MIN_CELLS` and half the window, so the views keep at
+/// least as much as the tree.
+pub fn fit(wanted: usize, columns: usize) -> usize {
+    wanted.min(columns / 2).max(MIN_CELLS)
+}
 
 /// One entry of the tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,8 +63,16 @@ impl Account {
 pub struct Sidebar {
     accounts: Vec<Account>,
     selected: Entry,
-    /// The first entry shown, kept by the session as a list's is.
+    /// The first entry shown: moved to reveal the selection when it moves,
+    /// and by the wheel and the scrollbar without moving it.
     pub first: usize,
+    /// The selection moved since the tree was last laid out, which then
+    /// scrolls it into view.
+    follow: bool,
+    /// The rows the tree showed when last laid out.
+    rows: usize,
+    /// The width asked for, in cells; `fit` holds it to the window.
+    pub cells: usize,
     /// The tree has the keys rather than the view.
     pub focused: bool,
 }
@@ -70,13 +90,21 @@ impl Sidebar {
                 .collect(),
             selected: Entry::Account(current),
             first: 0,
+            follow: true,
+            rows: 0,
+            cells: CELLS,
             focused: false,
         }
     }
 
     /// An account's answer to a folder fetch: a listing replaces what the
-    /// tree held, a failure is noted over it.
+    /// tree held, a failure is noted over it. A selection shown before is
+    /// kept shown, though entries above it come or go.
     pub fn listed(&mut self, account: usize, result: &Result<Vec<Mailbox>, String>) {
+        let cursor = self.cursor();
+        if cursor >= self.first && cursor < self.first.saturating_add(self.rows) {
+            self.follow = true;
+        }
         let Some(held) = self.accounts.get_mut(account) else {
             return;
         };
@@ -142,6 +170,7 @@ impl Sidebar {
 
     pub fn select(&mut self, entry: Entry) {
         self.selected = entry;
+        self.follow = true;
     }
 
     /// The selection moved by `delta` entries, clamped to the tree.
@@ -151,6 +180,38 @@ impl Sidebar {
         if let Some(entry) = self.entry(to) {
             self.selected = entry;
         }
+        self.follow = true;
+    }
+
+    /// The selection brought into view at the next layout, as when the
+    /// tree takes the keys, so the cursor that says it has them is shown.
+    pub fn reveal(&mut self) {
+        self.follow = true;
+    }
+
+    /// The rows shown moved by `rows`, down when positive, the selection
+    /// left where it is.
+    pub fn scroll(&mut self, rows: isize, list: List) {
+        self.scroll_to(self.first.saturating_add_signed(rows), list);
+    }
+
+    /// The rows shown from entry `first`, as far as the last row allows.
+    pub fn scroll_to(&mut self, first: usize, list: List) {
+        self.first = first;
+        self.follow = false;
+        self.lay_out(list);
+    }
+
+    /// The first entry shown in `list`: the selection revealed when it
+    /// moved, and otherwise held where the last row shows the last entry.
+    pub fn lay_out(&mut self, list: List) {
+        let len = self.len();
+        self.rows = list.rows();
+        self.first = if std::mem::take(&mut self.follow) {
+            list.reveal(len, self.cursor(), self.first)
+        } else {
+            self.first.min(len.saturating_sub(list.rows()))
+        };
     }
 
     /// Entry `index` as a row: the unified inbox with every inbox's
@@ -205,6 +266,26 @@ impl Sidebar {
             }
             None => Row::default(),
         }
+    }
+
+    /// Entry `index` as a row of a list `columns` cells wide: a label
+    /// that would run into its count is cut short with an ellipsis a cell
+    /// before it, so the count is not read as part of the name.
+    pub fn row_within(&self, index: usize, columns: usize) -> Row {
+        let mut row = self.row(index);
+        // The label follows a cell of inset and the mark's two; the
+        // count, a cell after it, ends a cell of inset short of the edge.
+        let count = row.meta.chars().count();
+        let room = columns.saturating_sub(count + usize::from(count > 0) + 4);
+        if row.label.chars().count() > room {
+            row.label = row
+                .label
+                .chars()
+                .take(room.saturating_sub(1))
+                .chain(['\u{2026}'])
+                .collect();
+        }
+        row
     }
 }
 
@@ -277,5 +358,98 @@ mod tests {
                 id: "w1".to_string()
             }
         );
+    }
+
+    /// A name that would run into its count is cut short with an
+    /// ellipsis a cell before it; one that fits is whole.
+    #[test]
+    fn a_long_name_stops_short_of_its_count() {
+        let mut tree = Sidebar::new(&["home".to_string(), "work".to_string()], 0);
+        tree.listed(
+            0,
+            &Ok(vec![
+                folder("h1", "Inbox", Some("inbox"), 123),
+                folder("h2", "A folder named at some length", None, 7),
+            ]),
+        );
+        // Entries: All inboxes, home, Inbox, the long one.
+        let row = tree.row_within(3, 22);
+        assert_eq!(row.label, "  A folder name\u{2026}");
+        assert_eq!(row.meta, "7");
+        // A cell of inset, the mark's two, the label, a gap, the count and
+        // the inset again fill the row.
+        assert_eq!(1 + 2 + row.label.chars().count() + 1 + 1 + 1, 22);
+        assert_eq!(tree.row_within(2, 22).label, "  Inbox");
+        assert_eq!(tree.row_within(3, 4).label, "\u{2026}");
+        // With no count there is no gap to keep: a name filling the row
+        // to its inset is whole, one cell longer is cut.
+        for (name, label) in [
+            ("Sixteen cells ok", "  Sixteen cells ok"),
+            ("Seventeen cells x", "  Seventeen cells\u{2026}"),
+        ] {
+            let mut tree = Sidebar::new(&["home".to_string()], 0);
+            tree.listed(0, &Ok(vec![folder("h1", name, None, 0)]));
+            assert_eq!(tree.row_within(2, 22).label, label);
+        }
+    }
+
+    /// The wheel moves the rows shown and not the selection, held where
+    /// the last entry is on the last row; a layout keeps the scroll until
+    /// the selection moves, which brings it back into view.
+    #[test]
+    fn the_tree_scrolls_apart_from_its_selection() {
+        let mut tree = Sidebar::new(&["home".to_string(), "work".to_string()], 0);
+        let folders: Vec<_> = (0..20)
+            .map(|n| folder(&format!("h{n}"), &format!("F{n:02}"), None, 0))
+            .collect();
+        tree.listed(0, &Ok(folders));
+        assert_eq!(tree.len(), 23);
+        let surface = td_ui::raster::Surface::new(800, 600, Default::default()).unwrap();
+        let rect = td_ui::raster::Rect {
+            x: 0,
+            y: 0,
+            width: 192,
+            height: (td_ui::chrome::ROW * 5) as u32,
+        };
+        let list = List::new(surface, rect).unwrap();
+        assert_eq!(list.rows(), 5);
+        tree.lay_out(list);
+        assert_eq!(tree.first, 0);
+        tree.scroll(4, list);
+        assert_eq!(tree.first, 4);
+        assert_eq!(tree.selected(), Entry::Account(0));
+        tree.lay_out(list);
+        assert_eq!(tree.first, 4, "a layout keeps the scroll");
+        tree.scroll(100, list);
+        assert_eq!(tree.first, 18);
+        tree.scroll(-100, list);
+        assert_eq!(tree.first, 0);
+        tree.scroll_to(10, list);
+        tree.move_by(1);
+        tree.lay_out(list);
+        assert_eq!(tree.first, 2, "a moved selection is shown again");
+        tree.scroll_to(10, list);
+        tree.reveal();
+        tree.lay_out(list);
+        assert_eq!(tree.first, 2, "a revealed selection is shown again");
+
+        // A listing above a shown selection keeps it shown; one under a
+        // scrolled-away selection leaves the scroll.
+        tree.move_by(4);
+        tree.lay_out(list);
+        assert_eq!((tree.first, tree.cursor()), (2, 6));
+        let more: Vec<_> = (0..30)
+            .map(|n| folder(&format!("e{n}"), &format!("E{n:02}"), None, 0))
+            .collect();
+        let mut both = more.clone();
+        both.extend((0..20).map(|n| folder(&format!("h{n}"), &format!("F{n:02}"), None, 0)));
+        tree.listed(0, &Ok(both));
+        tree.lay_out(list);
+        assert_eq!(tree.cursor(), 36);
+        assert!((tree.first..tree.first + 5).contains(&36));
+        tree.scroll_to(0, list);
+        tree.listed(0, &Ok(more));
+        tree.lay_out(list);
+        assert_eq!(tree.first, 0);
     }
 }

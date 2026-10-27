@@ -287,6 +287,8 @@ pub const ACCOUNT_TREE: Table = Table {
             "open",
             "Open the account's page, or the folder over it",
         ),
+        ("u", "read", "Mark every message in the folder read"),
+        ("</>", "width", "Narrow or widen the tree"),
         (
             "Tab/Escape/q",
             "back",

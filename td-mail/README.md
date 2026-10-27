@@ -429,9 +429,20 @@ so `q` returns to the account's page. The account already shown keeps
 its page and what it cached; another's page starts from the folders the
 tree holds. Opening is refused while a draft is open, and the tree never
 has the keys while one is edited. The tree draws its cursor only while
-it has the keys. A window narrower than three trees shows the tree over
-the views only while it has the keys. Switching accounts connects
-nothing again; the tree's counts follow each account's folder fetches,
+it has the keys, and taking them scrolls it into view. `u` in the tree
+marks every message in the selected folder read, as `u` (Mark read) on
+an account's page does; the folder's list and the unified inbox show
+them read when the account answers. The wheel scrolls whichever side
+the pointer is over, the tree's rows without moving its selection,
+whichever side has the keys; a press on the tree's scrollbar track
+pages it and its thumb drags. The tree's right edge (its last few
+pixels, beside the scrollbar) drags to resize it, and `<` and `>` in
+the tree narrow and widen it, from 12 cells to half the window; a name
+too long for the tree is cut short with `…` a cell before its unread
+count. A window narrower than three default trees (72 cells) shows the
+tree over the views only while it has the keys, and has no width to
+change. Switching accounts connects nothing again; the tree's counts
+follow each account's folder fetches,
 and with `sync_interval` set, every idle interval asks every account,
 whatever view is shown. If an account cannot be reached
 (server down, network not up yet, placeholder credentials), td-mail lists

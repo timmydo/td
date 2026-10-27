@@ -855,7 +855,11 @@ impl Composition for Frame<'_> {
             let tree = self.sidebar;
             let total = tree.len();
             let end = total.min(tree.first.saturating_add(list.rows()));
-            let rows: Vec<_> = (tree.first..end).map(|index| tree.row(index)).collect();
+            let columns =
+                list.body().width as usize / (td_ui::CELL_WIDTH * self.surface.scale.value());
+            let rows: Vec<_> = (tree.first..end)
+                .map(|index| tree.row_within(index, columns))
+                .collect();
             list.emit(
                 rows.iter().map(|row| Item {
                     label: row.label.as_str(),

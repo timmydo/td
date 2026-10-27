@@ -48,6 +48,13 @@ const POLL_MS: u64 = 100;
 /// The most scroll keys one wheel frame becomes, so a fling is bounded.
 const WHEEL_EVENTS: usize = 64;
 
+/// The cells `<` and `>` narrow and widen the account tree by.
+const TREE_STEP: usize = 2;
+
+/// The pixels, at scale one, on each side of the tree's edge that a press
+/// takes to resize the tree.
+const EDGE_GRAB: i64 = 4;
+
 /// The most scalars of a view's title the window is given: a subject
 /// is the title, and one of any length must fit the protocol's message.
 const TITLE_SCALARS: usize = 256;
@@ -346,6 +353,15 @@ struct Chooser {
     press: Option<(Instant, usize)>,
 }
 
+/// A drag the press began on the account tree's chrome, until release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeDrag {
+    /// The edge between the tree and the views: the tree's width follows.
+    Edge,
+    /// The scrollbar's thumb, held this many pixels below its top.
+    Thumb(i64),
+}
+
 struct Session {
     setup: Setup,
     stack: ViewStack,
@@ -395,6 +411,14 @@ struct Session {
     /// Where the window last said Control is held over: the pane
     /// underlines the link a Control-press there would follow.
     hover: Option<(i64, i64)>,
+    /// Where the window last said the pointer is, no button held: the
+    /// wheel scrolls what lies under it.
+    pointer_at: Option<(i64, i64)>,
+    /// The tree's edge or thumb being dragged.
+    tree_drag: Option<TreeDrag>,
+    /// The folders the tree asked to mark read, by account and id, until
+    /// each answers.
+    marking: Vec<(usize, String)>,
     /// A view's `?` asked for the window's key list, which the window
     /// takes after the input.
     show_keys: bool,
@@ -441,6 +465,9 @@ impl Session {
             attach_folder: None,
             attach_hidden: false,
             hover: None,
+            pointer_at: None,
+            tree_drag: None,
+            marking: Vec::new(),
             show_keys: false,
         };
         // The window reads the title at binding, before any poll.
@@ -453,16 +480,18 @@ impl Session {
     }
 
     /// Where the account tree goes on `surface`: with two or more
-    /// accounts, a column beside the views in a window three trees wide,
-    /// and over the body of a narrower one while the tree has the keys,
-    /// which it never has while a draft is being edited.
+    /// accounts, a column beside the views, as wide as it was resized to,
+    /// in a window three default trees wide, and over the body of a
+    /// narrower one while the tree has the keys, which it never has while
+    /// a draft is being edited.
     fn side_on(&self, surface: Surface) -> Side {
         if self.setup.accounts.len() < 2 {
             return Side::None;
         }
-        let width = sidebar::CELLS * td_ui::CELL_WIDTH * surface.scale.value();
-        if surface.width >= 3 * width {
-            Side::Column(width as u32)
+        let cell = td_ui::CELL_WIDTH * surface.scale.value();
+        if surface.width >= 3 * sidebar::CELLS * cell {
+            let cells = sidebar::fit(self.sidebar.cells, surface.width / cell);
+            Side::Column((cells * cell) as u32)
         } else if self.sidebar.focused && !self.editing(true) {
             Side::Full
         } else {
@@ -1135,7 +1164,14 @@ impl Session {
     fn scene<'a>(&'a self, slot: &'a Slot) -> Scene<'a> {
         let mut scene = slot.view.scene();
         if self.tree_focused() {
-            scene.status = "Accounts | n/p:move RET:open Tab/Esc:back".to_string();
+            // Over the whole body the tree has no width to change; the
+            // narrow window's status row shows 48 cells of the rest.
+            let width = if self.side() == Side::Full {
+                ""
+            } else {
+                " </>:width"
+            };
+            scene.status = format!("Accounts | n/p RET:open u:mark read{width} Tab:back");
         }
         if let Some(note) = &self.note {
             scene.status = note.clone();
@@ -1308,18 +1344,111 @@ impl Session {
             .and_then(|shape| shape.layout.sidebar)
             .map_or(frame::PAGE_ROWS, |list| list.rows().max(1)) as isize;
         match key {
-            Key::Char('n' | 'j') | Key::Down | Key::ScrollDown => self.sidebar.move_by(1),
-            Key::Char('p' | 'k') | Key::Up | Key::ScrollUp => self.sidebar.move_by(-1),
+            Key::Char('n' | 'j') | Key::Down => self.sidebar.move_by(1),
+            Key::Char('p' | 'k') | Key::Up => self.sidebar.move_by(-1),
             Key::PageDown => self.sidebar.move_by(rows),
             Key::PageUp => self.sidebar.move_by(-rows),
             Key::Home => self.sidebar.move_by(isize::MIN),
             Key::End => self.sidebar.move_by(isize::MAX),
             Key::Enter | Key::Char(' ') => self.open_entry(self.sidebar.selected()),
             Key::Escape | Key::Char('q') => self.sidebar.focused = false,
+            Key::Char('<') => self.resize_tree(self.tree_cells().saturating_sub(TREE_STEP)),
+            Key::Char('>') => self.resize_tree(self.tree_cells().saturating_add(TREE_STEP)),
+            Key::Char('u') => self.mark_tree_read(),
             _ => return false,
         }
         self.redraw();
         true
+    }
+
+    /// The tree's width in cells as the window shows it.
+    fn tree_cells(&self) -> usize {
+        let cell = td_ui::CELL_WIDTH * self.surface.scale.value();
+        sidebar::fit(self.sidebar.cells, self.surface.width / cell)
+    }
+
+    /// The tree resized to `cells`, held to what the window can show; a
+    /// tree over the whole body has no width to change, and says so.
+    fn resize_tree(&mut self, cells: usize) {
+        if !matches!(self.side(), Side::Column(_)) {
+            self.note("Widen the window to resize the tree".to_string());
+            return;
+        }
+        let cell = td_ui::CELL_WIDTH * self.surface.scale.value();
+        self.sidebar.cells = sidebar::fit(cells, self.surface.width / cell);
+        self.redraw();
+    }
+
+    /// Marks every message in the folder selected in the tree read, as
+    /// `u` on its account's page does; the tree's counts follow the
+    /// answer.
+    fn mark_tree_read(&mut self) {
+        let Entry::Folder { account, id } = self.sidebar.selected() else {
+            self.note("Select a folder to mark read".to_string());
+            return;
+        };
+        let Some(folder) = self
+            .sidebar
+            .folders(account)
+            .and_then(|folders| folders.iter().find(|f| f.id == id))
+        else {
+            return;
+        };
+        let name = folder.name.replace(['\n', '\r'], " ");
+        if folder.unread_emails == 0 {
+            self.note(format!("Folder '{name}' already read"));
+            return;
+        }
+        let Some(live) = self.live.get(account) else {
+            return;
+        };
+        let sent = live.cmd_tx.send(BackendCommand::MarkMailboxRead {
+            mailbox_id: id.clone(),
+            mailbox_name: folder.name.clone(),
+        });
+        match sent {
+            Ok(()) => {
+                if !self.marking.contains(&(account, id.clone())) {
+                    self.marking.push((account, id));
+                }
+                self.note(format!("Marking folder '{name}' read..."));
+            }
+            Err(e) => self.note(format!("Mark folder read failed to send: {e}")),
+        }
+    }
+
+    /// An account's answer to a folder marked read: the tree's own asks
+    /// are said in the status row, and the account's folders are asked
+    /// for again so its counts follow, unless its page is on the stack,
+    /// which asks for them itself.
+    fn marked_read(&mut self, account: usize, response: &BackendResponse) {
+        let BackendResponse::MailboxMarkedRead {
+            mailbox_id,
+            mailbox_name,
+            updated,
+            result,
+        } = response
+        else {
+            return;
+        };
+        let asked = self.marking.len();
+        self.marking
+            .retain(|(a, id)| !(*a == account && id == mailbox_id));
+        if self.marking.len() != asked {
+            let name = mailbox_name.replace(['\n', '\r'], " ");
+            self.note(match result {
+                Ok(()) if *updated == 0 => format!("Folder '{name}' already read"),
+                Ok(()) => format!("Marked {updated} message(s) read in '{name}'"),
+                Err(e) => format!("Mark all read failed for '{name}': {e}"),
+            });
+        }
+        if result.is_ok() && self.stack.root_account() != Some(account) {
+            if let Some(live) = self.live.get(account) {
+                let _ = live.cmd_tx.send(BackendCommand::FetchMailboxes {
+                    origin: "sidebar.marked_read".to_string(),
+                });
+            }
+        }
     }
 
     /// Asks the connector for the account at `index`'s connection again,
@@ -1441,6 +1570,12 @@ impl Session {
             self.sidebar.focused = false;
             self.redraw();
         }
+        self.view_key(key);
+    }
+
+    /// A key to the top view, whichever side has the keys, as the wheel
+    /// over the views gives them.
+    fn view_key(&mut self, key: Key) {
         let page = self.page();
         match self.stack.handle_key(key, page) {
             Some(action) => self.act(action),
@@ -1477,6 +1612,9 @@ impl Session {
         if chord == "Tab" && self.setup.accounts.len() > 1 {
             self.last_user_activity = Instant::now();
             self.sidebar.focused = !self.sidebar.focused;
+            if self.sidebar.focused {
+                self.sidebar.reveal();
+            }
             self.redraw();
             return;
         }
@@ -1597,8 +1735,8 @@ impl Session {
                 phase: PointerPhase::Release,
                 ..
             } => menus::Event::Release,
-            // The session has no pointer position for the wheel; the
-            // panel's own is what the controller scrolls by.
+            // An open menu takes the wheel wherever the pointer is: the
+            // panel's own place is what the controller scrolls by.
             Input::Wheel { rows, .. } => match panel {
                 Some(panel) => menus::Event::Wheel {
                     x: panel.x,
@@ -1714,6 +1852,9 @@ impl Session {
         let Some(shape) = self.shape() else {
             return;
         };
+        if self.tree_pointer(shape, phase, x, y) {
+            return;
+        }
         // A press on the tree opens the entry under it; one anywhere else
         // gives the views the keys, a bar label being the view's.
         if let Some(row) = shape.layout.sidebar.and_then(|list| list.hit(x, y)) {
@@ -1785,18 +1926,89 @@ impl Session {
         }
     }
 
-    /// Wheel travel in rows: over a list, one scroll key per row, bounded;
-    /// over a text, the pane's scroll.
-    fn wheel(&mut self, rows: isize) {
-        if self.tree_focused() {
-            self.sidebar
-                .move_by(rows.clamp(-(WHEEL_EVENTS as isize), WHEEL_EVENTS as isize));
-            self.redraw();
-            return;
+    /// The pointer on the tree's chrome, whichever side has the keys: a
+    /// press on its edge with the views resizes it as it drags, one on its
+    /// scrollbar's thumb scrolls its rows as it drags, and one on the
+    /// track above or below the thumb pages them. Whether it took the
+    /// pointer.
+    fn tree_pointer(&mut self, shape: Shape, phase: PointerPhase, x: i64, y: i64) -> bool {
+        let Some(list) = shape.layout.sidebar else {
+            self.tree_drag = None;
+            return false;
+        };
+        let s = self.surface.scale.value() as i64;
+        let first = self.sidebar.first;
+        let bar = list.scrollbar(self.sidebar.len(), first);
+        let rect = list.rect();
+        if phase == PointerPhase::Press {
+            // A drag whose release went to a menu or the finder ends here.
+            self.tree_drag = None;
+            if self.pane.drag {
+                return false;
+            }
+            let edge = rect.x + i64::from(rect.width);
+            let beside = y >= rect.y && y < rect.y + i64::from(rect.height);
+            // The tree's side of the edge, clear of the scrollbar's track.
+            let grip = x >= edge - EDGE_GRAB * s && x <= edge;
+            if matches!(self.side(), Side::Column(_)) && beside && grip {
+                self.tree_drag = Some(TreeDrag::Edge);
+                return true;
+            }
+            if !bar.enabled() || !bar.track.contains(x, y) {
+                return false;
+            }
+            if bar.thumb.contains(x, y) {
+                self.tree_drag = Some(TreeDrag::Thumb(y - bar.thumb.y));
+            } else {
+                let page = list.rows().max(1) as isize;
+                self.sidebar
+                    .scroll(if y < bar.thumb.y { -page } else { page }, list);
+                self.redraw();
+            }
+            return true;
         }
+        let Some(drag) = self.tree_drag else {
+            return false;
+        };
+        match drag {
+            TreeDrag::Edge => {
+                let cell = (td_ui::CELL_WIDTH as i64) * s;
+                self.resize_tree(((x - rect.x + cell / 2) / cell).max(0) as usize);
+            }
+            TreeDrag::Thumb(grab) => {
+                self.sidebar
+                    .scroll_to(bar.position_at(y, grab, first), list);
+                self.redraw();
+            }
+        }
+        if phase == PointerPhase::Release {
+            self.tree_drag = None;
+        }
+        true
+    }
+
+    /// Wheel travel in rows, to what lies under the pointer: over the
+    /// tree, its rows; over a list, one scroll key per row, bounded; over
+    /// a text, the pane's scroll. With no pointer place known, the side
+    /// with the keys takes it; a tree over the whole body takes it all.
+    fn wheel(&mut self, rows: isize) {
         let Some(shape) = self.shape() else {
             return;
         };
+        self.last_user_activity = Instant::now();
+        if let Some(list) = shape.layout.sidebar {
+            let over = match self.pointer_at {
+                _ if self.side() == Side::Full => true,
+                Some((x, y)) => list.rect().contains(x, y),
+                None => self.tree_focused(),
+            };
+            if over {
+                let bound = WHEEL_EVENTS as isize;
+                self.sidebar.scroll(rows.clamp(-bound, bound), list);
+                self.redraw();
+                return;
+            }
+        }
         if shape.layout.pane.is_some() {
             if self.pane.scroll(rows) {
                 self.redraw();
@@ -1809,7 +2021,10 @@ impl Session {
             Key::ScrollDown
         };
         for _ in 0..rows.unsigned_abs().min(WHEEL_EVENTS) {
-            self.key(key);
+            if self.quitting {
+                return;
+            }
+            self.view_key(key);
         }
     }
 
@@ -1833,8 +2048,7 @@ impl Session {
         let scene = slot.view.scene();
         let layout = Layout::new(surface, &scene, side);
         if let Some(list) = layout.sidebar {
-            let tree = &mut self.sidebar;
-            tree.first = list.reveal(tree.len(), tree.cursor(), tree.first);
+            self.sidebar.lay_out(list);
         }
         match &scene.body {
             Body::List {
@@ -1927,6 +2141,10 @@ impl Handler for Session {
         std::mem::take(&mut self.show_keys)
     }
 
+    fn motion(&mut self, at: Option<(i64, i64)>) {
+        self.pointer_at = at;
+    }
+
     fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) -> Flow {
         // The note is up until the next key or press.
         let presses = matches!(
@@ -2002,7 +2220,10 @@ impl Handler for Session {
                         self.pointer(phase, x, y, extend, follow);
                     }
                 }
-                Input::CancelPointer => self.pane.cancel_pointer(),
+                Input::CancelPointer => {
+                    self.tree_drag = None;
+                    self.pane.cancel_pointer();
+                }
                 // Nothing here opens at a right press; the Folder menu
                 // opens from the action bar.
                 Input::Context { .. } => {}
@@ -2042,6 +2263,7 @@ impl Handler for Session {
                         self.redraw();
                     }
                 }
+                self.marked_read(index, &response);
                 if self.stack.handle_response(index, &response) {
                     self.redraw();
                 }
@@ -2768,6 +2990,239 @@ mod frame_tests {
         assert!(work_cmds
             .try_iter()
             .any(|command| matches!(command, BackendCommand::FetchMailboxes { .. })));
+    }
+
+    /// `two_accounts_answering`, `test` listing an inbox and 40 folders
+    /// more, more than the tree or the folder list shows at once.
+    fn two_accounts_with_many_folders() -> (
+        Session,
+        crate::testing::TempDir,
+        Receiver<BackendCommand>,
+        Receiver<BackendCommand>,
+        [Sender<BackendResponse>; 2],
+    ) {
+        let (mut session, state, test_cmds, work_cmds, answers) = two_accounts_answering();
+        let mut folders = vec![mailbox("t1", "INBOX", "inbox", 3, 1)];
+        folders.extend((0..40).map(|n| mailbox(&format!("f{n}"), &format!("F{n:02}"), "", 1, 0)));
+        answers[0]
+            .send(BackendResponse::Mailboxes(Ok(folders)))
+            .unwrap();
+        session.poll(0);
+        session.shown();
+        (session, state, test_cmds, work_cmds, answers)
+    }
+
+    fn pointer(session: &mut Session, phase: PointerPhase, x: i64, y: i64) {
+        session.input(
+            Input::Pointer {
+                phase,
+                x,
+                y,
+                extend: false,
+                follow: false,
+            },
+            &mut NoClipboard,
+        );
+    }
+
+    fn wheel(session: &mut Session, rows: isize) {
+        session.input(Input::Wheel { rows, columns: 0 }, &mut NoClipboard);
+        session.shown();
+    }
+
+    /// The top view's selected row.
+    fn view_selected(session: &Session) -> usize {
+        match session.stack.current().unwrap().scene().body {
+            Body::List { selected, .. } => selected,
+            Body::Text { .. } | Body::Edit { .. } => panic!("no list"),
+        }
+    }
+
+    /// The wheel scrolls the side under the pointer, whichever has the
+    /// keys: over the tree its rows, leaving its selection and the keys
+    /// where they were; over the views the view's list, the tree keeping
+    /// its keys. With no place known, the side with the keys takes it.
+    #[test]
+    fn the_wheel_scrolls_the_side_under_the_pointer() {
+        let (mut session, _state, _test_cmds, _work_cmds, _answers) =
+            two_accounts_with_many_folders();
+        let shape = session.shape().unwrap();
+        let tree = shape.layout.sidebar.unwrap().rect();
+        let list = shape.layout.list.unwrap().rect();
+        let selected = session.sidebar.selected();
+
+        session.motion(Some((tree.x + 8, tree.y + 8)));
+        wheel(&mut session, 3);
+        assert_eq!(session.sidebar.first, 3);
+        assert_eq!(session.sidebar.selected(), selected);
+        assert!(!session.sidebar.focused);
+        assert_eq!(view_selected(&session), 0);
+
+        // Taking the keys shows the cursor that says so: the selection,
+        // the test account's heading, is the first row again.
+        key(&mut session, "Tab");
+        session.shown();
+        assert_eq!(session.sidebar.first, 1);
+        session.motion(Some((list.x + 8, list.y + 8)));
+        wheel(&mut session, 2);
+        assert_eq!(session.sidebar.first, 1);
+        assert_eq!(view_selected(&session), 2);
+        assert!(session.tree_focused());
+
+        session.motion(None);
+        wheel(&mut session, 1);
+        assert_eq!(session.sidebar.first, 2);
+        assert_eq!(view_selected(&session), 2);
+        key(&mut session, "Tab");
+        wheel(&mut session, 1);
+        assert_eq!(session.sidebar.first, 2);
+        assert_eq!(view_selected(&session), 3);
+    }
+
+    /// A drag from the edge between the tree and the views resizes the
+    /// tree, held between 12 cells and half the window, as `<` and `>`
+    /// in the tree do; a press on the tree's scrollbar track pages its
+    /// rows and a drag of its thumb scrolls them, the keys staying where
+    /// they were; and a name too long for the tree stops short of its
+    /// count.
+    #[test]
+    fn the_trees_edge_resizes_it_and_its_scrollbar_scrolls_it() {
+        let (mut session, _state, _test_cmds, _work_cmds, _answers) =
+            two_accounts_with_many_folders();
+        let cell = td_ui::CELL_WIDTH as i64;
+        let tree = session.shape().unwrap().layout.sidebar.unwrap().rect();
+        assert_eq!(session.side(), Side::Column(24 * cell as u32));
+        let y = tree.y + 20;
+        let edge = tree.x + i64::from(tree.width);
+        // The views' side of the edge is theirs; a drag whose release
+        // went elsewhere does not outlive the next press.
+        session.tree_drag = Some(TreeDrag::Edge);
+        pointer(&mut session, PointerPhase::Press, edge + 2, y);
+        pointer(&mut session, PointerPhase::Move, 30 * cell, y);
+        pointer(&mut session, PointerPhase::Release, 30 * cell, y);
+        assert_eq!(session.tree_drag, None);
+        assert_eq!(session.side(), Side::Column(24 * cell as u32));
+        pointer(&mut session, PointerPhase::Press, edge - 1, y);
+        pointer(&mut session, PointerPhase::Move, 30 * cell + 3, y);
+        assert_eq!(session.side(), Side::Column(30 * cell as u32));
+        pointer(&mut session, PointerPhase::Move, 2000, y);
+        pointer(&mut session, PointerPhase::Release, 2000, y);
+        assert_eq!(session.side(), Side::Column(50 * cell as u32));
+        pointer(&mut session, PointerPhase::Move, 0, y);
+        assert_eq!(session.side(), Side::Column(50 * cell as u32), "released");
+        assert_eq!(session.stack.depth(), 1);
+        assert!(!session.sidebar.focused);
+
+        key(&mut session, "Tab");
+        key(&mut session, "<");
+        assert_eq!(session.side(), Side::Column(48 * cell as u32));
+        for _ in 0..30 {
+            key(&mut session, "<");
+        }
+        assert_eq!(session.side(), Side::Column(12 * cell as u32));
+        key(&mut session, ">");
+        assert_eq!(session.side(), Side::Column(14 * cell as u32));
+        assert!(session.tree_focused());
+        assert!(session
+            .shown()
+            .contains("Accounts | n/p RET:open u:mark read </>:width Tab:back"));
+        // A tree over the whole of a narrow window has no width to change,
+        // and its status row shows the whole of the rest.
+        session.surface = Surface::new(400, 600, Default::default()).unwrap();
+        assert!(session
+            .shown()
+            .contains("Accounts | n/p RET:open u:mark read Tab:back"));
+        key(&mut session, ">");
+        assert_eq!(
+            session.note.as_deref(),
+            Some("Widen the window to resize the tree")
+        );
+        session.surface = Surface::new(800, 600, Default::default()).unwrap();
+        assert_eq!(session.side(), Side::Column(14 * cell as u32));
+        key(&mut session, "Tab");
+        // At 14 cells a row holds 12 of text: the inset, the mark's two,
+        // the label, a gap, the count and the inset again.
+        let shown = session.shown();
+        assert!(shown.contains("  INB\u{2026}"), "{shown}");
+        assert!(shown.contains("  F03"), "{shown}");
+
+        let list = session.shape().unwrap().layout.sidebar.unwrap();
+        let rows = list.rows();
+        let bar = list.scrollbar(session.sidebar.len(), session.sidebar.first);
+        assert!(bar.enabled());
+        let below = bar.thumb.y + i64::from(bar.thumb.height) + 2;
+        press(&mut session, bar.track.x + 2, below);
+        assert_eq!(session.sidebar.first, rows);
+        assert_eq!(session.stack.depth(), 1);
+        assert!(!session.sidebar.focused);
+        let bar = list.scrollbar(session.sidebar.len(), session.sidebar.first);
+        let (x, top) = (bar.thumb.x + 2, bar.thumb.y + 2);
+        pointer(&mut session, PointerPhase::Press, x, top);
+        pointer(&mut session, PointerPhase::Move, x, top - 4000);
+        assert_eq!(session.sidebar.first, 0);
+        pointer(&mut session, PointerPhase::Move, x, top + 4000);
+        pointer(&mut session, PointerPhase::Release, x, top + 4000);
+        assert_eq!(session.sidebar.first, session.sidebar.len() - rows);
+        assert_eq!(session.tree_drag, None);
+    }
+
+    /// `u` in the tree marks the selected folder read on its own
+    /// account's backend, says so, and when the account answers says how
+    /// many and asks it for its folders again, its page not being on the
+    /// stack; a folder already read, or a heading, asks nothing.
+    #[test]
+    fn u_in_the_tree_marks_its_folder_read() {
+        let (mut session, _state, test_cmds, work_cmds, [_test_answer, work_answer]) =
+            two_accounts_answering();
+        while test_cmds.try_recv().is_ok() {}
+        while work_cmds.try_recv().is_ok() {}
+        // The tree: All inboxes, test, its INBOX, work, its INBOX and Projects.
+        key(&mut session, "Tab");
+        key(&mut session, "End");
+        key(&mut session, "u");
+        assert_eq!(
+            session.note.as_deref(),
+            Some("Folder 'Projects' already read")
+        );
+        key(&mut session, "p");
+        key(&mut session, "p");
+        key(&mut session, "u");
+        assert_eq!(
+            session.note.as_deref(),
+            Some("Select a folder to mark read")
+        );
+        assert!(work_cmds.try_recv().is_err());
+        assert!(session.tree_focused());
+
+        key(&mut session, "n");
+        key(&mut session, "u");
+        assert!(matches!(
+            work_cmds.try_recv(),
+            Ok(BackendCommand::MarkMailboxRead { mailbox_id, .. }) if mailbox_id == "w1"
+        ));
+        assert_eq!(
+            session.note.as_deref(),
+            Some("Marking folder 'INBOX' read...")
+        );
+        work_answer
+            .send(BackendResponse::MailboxMarkedRead {
+                mailbox_id: "w1".to_string(),
+                mailbox_name: "INBOX".to_string(),
+                updated: 2,
+                result: Ok(()),
+            })
+            .unwrap();
+        session.poll(0);
+        assert_eq!(
+            session.note.as_deref(),
+            Some("Marked 2 message(s) read in 'INBOX'")
+        );
+        assert!(session.marking.is_empty());
+        assert!(matches!(
+            work_cmds.try_recv(),
+            Ok(BackendCommand::FetchMailboxes { origin }) if origin == "sidebar.marked_read"
+        ));
+        assert!(test_cmds.try_recv().is_err());
     }
 
     /// "All inboxes" heads the tree and opens the unified inbox over
