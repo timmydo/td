@@ -85,8 +85,48 @@ The older `td-mta-backup.timer`, `td-mta-acme.service` and
 `td-mta-acme-public.service` are disabled; they are not the production workers.
 Local health results are not mailbox alerts, and a local backup is not an
 off-host copy. Neither mail alerts nor off-host backup delivery is implied by
-these timers. Inspect the retained Stalwart catch-up timer separately before
-retiring migration infrastructure.
+these timers. The Stalwart migration jobs are retired as described below.
+
+## Retired Stalwart source and recovery copies
+
+The former AWS source at `54.244.239.235` is retained for recovery, with
+`stalwart.service` disabled and stopped. Its old public mail listeners are
+closed; `td-mta-stalwart-defer.service` remains enabled on port 25 and sends
+only SMTP `421`, so a sender using a stale address must retry instead of
+leaving mail on the retired source. The precutover HTTP-01 proxy
+`td-mta-acme-precutover.service` is disabled; Azure handles public certificate
+renewal directly.
+
+On Azure, `td-mta-stalwart-catch-up.timer` is disabled and its oneshot service
+is inactive. The final fenced export, verification, inventory and import
+reports are retained under
+`/var/lib/td-mta/migration/stalwart-20261023/dns-first-catch-up/`.
+The source database, export archives, import mappings and recovery copies
+remain intact. The final source contained 32,621 messages; every source ID,
+body digest and size matched the destination's retained import mapping, with
+no missing current Email. This was a mail-preservation cutover: source
+deletions and state reconciliation were intentionally omitted. The retained
+provisional import receipts therefore do not claim full state equality.
+
+The old source's original configuration and applied network fence are retained
+under `/var/lib/td-mta/operator/cutover-preparation/`; retirement receipts are
+under `/var/lib/td-mta/operator/retirement-20261027/` on that host. Its SSH
+identity is separate from Azure's: use the old IP with its retained, verified
+host key, not the MX DNS names that now resolve to Azure. The VM has not been
+terminated. Restarting Stalwart or restoring old DNS is not a rollback of
+mail accepted by td-mta; follow [MIGRATION.md](MIGRATION.md)'s reconciliation
+requirements before reopening a source writer.
+
+The 2026-10-27 isolated restore drill used scheduled archive
+`backup-1793082157-3498609.dump`. PostgreSQL restored all tables and constraints
+successfully into a private Unix-socket-only cluster with disabled source
+login roles. It contained three accounts, 27 mailboxes, 32,758 Emails and
+32,770 bodies. Independent verification checked every body's chunk ordering,
+length and SHA-256: 751,836,999 bytes passed. No mail service ran against the
+restore, and the disposable cluster was stopped and removed. These checks cover
+this archive's database restore and body integrity; they do not activate a
+recovered service or cover mail arriving after its snapshot. [DEPLOYMENT.md](DEPLOYMENT.md#local-logical-backup-and-an-isolated-restore-drill)
+owns the repeatable drill procedure.
 
 ## Choose and build an update
 
