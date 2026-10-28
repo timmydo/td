@@ -184,6 +184,30 @@ fn read_backoff(
     }
 }
 
+fn read_only_error() -> JmapError {
+    JmapError::Api("This account is read-only; mail cannot be changed or sent".into())
+}
+fn read_only_batch(request: &JmapRequest) -> bool {
+    !request.method_calls.is_empty()
+        && request.method_calls.iter().all(|call| {
+            matches!(
+                call.0,
+                "Mailbox/get"
+                    | "Mailbox/query"
+                    | "Mailbox/changes"
+                    | "Email/get"
+                    | "Email/query"
+                    | "Email/changes"
+                    | "Thread/get"
+                    | "Thread/changes"
+                    | "Identity/get"
+                    | "EmailSubmission/get"
+                    | "EmailSubmission/query"
+                    | "EmailSubmission/changes"
+            )
+        })
+}
+
 fn read_batch(request: &JmapRequest) -> bool {
     !request.method_calls.is_empty()
         && request.method_calls.iter().all(|call| {
@@ -328,6 +352,7 @@ pub struct JmapClient {
     max_objects_in_set: usize,
     /// Whether the session lists mail submission for the account.
     submission: bool,
+    read_only: bool,
 }
 
 pub(crate) fn valid_id(id: &str) -> bool {
@@ -340,6 +365,12 @@ pub(crate) fn valid_id(id: &str) -> bool {
 
 #[cfg(test)]
 impl JmapClient {
+    pub(crate) fn read_only_for_tests() -> Self {
+        let mut client = Self::unreachable_for_tests();
+        client.read_only = true;
+        client.submission = true;
+        client
+    }
     /// A client for a server that is not there, for the paths that need
     /// one to exist and not to answer.
     pub(crate) fn unreachable_for_tests() -> Self {
@@ -354,6 +385,7 @@ impl JmapClient {
             max_size_upload: None,
             max_objects_in_set: FLAG_BATCH_MAX,
             submission: false,
+            read_only: false,
         }
     }
 }
@@ -591,6 +623,11 @@ impl JmapClient {
 
         log_info!("[JMAP] Discovery successful, account_id: {}", account_id);
 
+        let read_only = session
+            .accounts
+            .get(&account_id)
+            .ok_or_else(|| JmapError::Api("Selected mail account is absent".into()))?
+            .is_read_only;
         let submission = session.submits(&account_id);
         log_info!(
             "[JMAP] Mail submission for account {}: {}",
@@ -611,6 +648,7 @@ impl JmapClient {
                 .unwrap_or(FLAG_BATCH_MAX as u64)
                 .clamp(1, FLAG_BATCH_MAX as u64) as usize,
             submission,
+            read_only,
         };
 
         Ok((session, client))
@@ -621,6 +659,9 @@ impl JmapClient {
     }
 
     fn call(&self, request: JmapRequest) -> Result<JmapResponse, JmapError> {
+        if self.read_only && !read_only_batch(&request) {
+            return Err(read_only_error());
+        }
         if !td_fetch_client::available() {
             return Err(no_fetch_service());
         }
@@ -1538,7 +1579,19 @@ impl JmapClient {
 
     /// Whether the session lists mail submission for this account.
     pub fn can_submit(&self) -> bool {
-        self.submission
+        self.submission && !self.read_only
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub(crate) fn require_writable(&self) -> Result<(), JmapError> {
+        if self.read_only {
+            Err(read_only_error())
+        } else {
+            Ok(())
+        }
     }
 
     /// The most bytes one upload may carry: the server's ceiling when the
@@ -1591,6 +1644,7 @@ impl JmapClient {
     /// Uploads `bytes` as a blob of `content_type` at the session's upload
     /// URL and answers its blob id.
     pub fn upload_blob(&self, bytes: &[u8], content_type: &str) -> Result<String, JmapError> {
+        self.require_writable()?;
         if !td_fetch_client::available() {
             return Err(no_fetch_service());
         }
@@ -2654,6 +2708,69 @@ mod tests {
         )
         .is_err());
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn read_only_accounts_refuse_mutations_before_transport() {
+        let client = JmapClient::read_only_for_tests();
+        assert!(client.is_read_only());
+        assert!(!client.can_submit());
+        for method in [
+            "Mailbox/set",
+            "Email/set",
+            "Email/import",
+            "Email/copy",
+            "EmailSubmission/set",
+            "Unknown/get",
+        ] {
+            let request = JmapRequest {
+                using: vec![],
+                method_calls: vec![
+                    MethodCall("Email/get", json!({}), "read".into()),
+                    MethodCall(method, json!({}), "write".into()),
+                ],
+            };
+            assert!(
+                client
+                    .call(request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("read-only"),
+                "{method}"
+            );
+        }
+        assert!(client
+            .upload_blob(b"body", "text/plain")
+            .unwrap_err()
+            .to_string()
+            .contains("read-only"));
+        assert!(client
+            .mark_email_read("id")
+            .unwrap_err()
+            .to_string()
+            .contains("read-only"));
+        assert!(client
+            .create_mailbox("name")
+            .unwrap_err()
+            .to_string()
+            .contains("read-only"));
+        for method in [
+            "Email/get",
+            "Email/query",
+            "Mailbox/get",
+            "Thread/get",
+            "Identity/get",
+            "EmailSubmission/query",
+        ] {
+            assert!(read_only_batch(&JmapRequest {
+                using: vec![],
+                method_calls: vec![MethodCall(method, json!({}), "read".into())]
+            }));
+        }
+        assert!(!read_only_batch(&JmapRequest {
+            using: vec![],
+            method_calls: vec![]
+        }));
     }
 
     #[test]

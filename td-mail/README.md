@@ -567,6 +567,20 @@ properties are omitted from stored-only recovery. Thread reading uses
 `Thread/get` membership followed by those batches, without a 500-message cut. Raw spam-training fetches still require UTF-8;
 that pre-existing limitation is separate from byte-exact original export.
 
+## Read-only server accounts
+
+A connected account advertised as JMAP `isReadOnly` refuses mutation batches,
+uploads and sending before transport. Automatic filing rules do not run, new
+online mutations are not queued or projected into the cache, and previously
+queued operations remain retained without replay. Reading, search, raw messages
+and attachment downloads remain available. These client guards complement the
+server's authorization checks; they do not grant authority.
+
+This is the connected-client boundary. Read-only UI affordances, automatic
+mark-read suppression and persistence of read-only policy while disconnected
+remain required before using td-mail as the supported offline replica client.
+Use a separate configured account name/cache for a local replica.
+
 ## Development
 
 ```bash

@@ -70,6 +70,7 @@ impl EmailRecord {
 }
 
 struct MockState {
+    read_only: bool,
     mailboxes: Vec<Value>,
     mailbox_creates: Vec<String>,
     mailbox_create_refused: bool,
@@ -194,6 +195,7 @@ impl MockState {
         }
 
         Self {
+            read_only: false,
             mailboxes: json!([
                 {
                     "id": "mbox-inbox",
@@ -787,6 +789,10 @@ impl MockJmapServer {
     }
 
     #[allow(dead_code)]
+    pub fn read_only(&self) {
+        self.state.lock().unwrap().read_only = true;
+    }
+
     pub fn limit_read_batch(&self, maximum: usize) {
         self.state.lock().unwrap().read_batch_limit = Some(maximum);
     }
@@ -1053,7 +1059,7 @@ impl MockJmapServer {
         }
         let (status, response_body, content_type) =
             if method == "GET" && path.contains("/.well-known/jmap") {
-                let (s, b) = Self::handle_session(port);
+                let (s, b) = Self::handle_session(port, state.lock().unwrap().read_only);
                 (s, b, "application/json")
             } else if method == "POST" && path.contains("/api") {
                 let (s, b) = Self::handle_api(&body, state);
@@ -1131,7 +1137,7 @@ impl MockJmapServer {
         }
     }
 
-    fn handle_session(port: u16) -> (String, String) {
+    fn handle_session(port: u16, read_only: bool) -> (String, String) {
         let session = json!({
             "username": "test@example.com",
             "apiUrl": format!("http://127.0.0.1:{}/api", port),
@@ -1150,7 +1156,7 @@ impl MockJmapServer {
                 "account-001": {
                     "name": "Test Account",
                     "isPersonal": true,
-                    "isReadOnly": false,
+                    "isReadOnly": read_only,
                     "accountCapabilities": {
                         "urn:ietf:params:jmap:mail": {},
                         "urn:ietf:params:jmap:submission": { "maxDelayedSend": 0 }

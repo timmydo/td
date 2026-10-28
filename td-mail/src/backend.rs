@@ -813,6 +813,9 @@ fn process_mutation_via_queue(
     my_email_regex: &UserRegex,
     cache: Option<&Cache>,
 ) -> Result<(), String> {
+    client
+        .require_writable()
+        .map_err(|error| error.to_string())?;
     let Some(cache) = cache else {
         log_warn!(
             "[Backend] cache unavailable; executing mutation without durable queue: {:?}",
@@ -1596,6 +1599,10 @@ fn replay_queued_mutations(
     my_email_regex: &UserRegex,
     cache: &Cache,
 ) {
+    if client.is_read_only() {
+        log_info!("[Backend] read-only account: queued mutations retained without replay");
+        return;
+    }
     let queued = cache.queued_operations();
     if queued.is_empty() {
         return;
@@ -2066,8 +2073,9 @@ fn backend_loop(
                         .find(|m| m.id.as_str() == mailbox_id.as_str())
                         .map(|m| m.name.clone())
                         .unwrap_or_default();
-                    let apply_rules =
-                        !rules.is_empty() && rules_mailbox_regex.is_match(&mailbox_name);
+                    let apply_rules = !client.is_read_only()
+                        && !rules.is_empty()
+                        && rules_mailbox_regex.is_match(&mailbox_name);
                     let mut emails = if query.ids.is_empty() {
                         Ok(Vec::new())
                     } else {
@@ -3939,6 +3947,51 @@ fn received_days(received: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::cache::Cache;
+
+    #[test]
+    fn read_only_connection_does_not_queue_project_or_replay_mutations() {
+        let _env = crate::testing::env_lock();
+        let dir = td_fs::TempDir::new("mail-read-only-queue").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        let cache = Cache::open("read-only").unwrap();
+        let email =
+            Email::from_json(&td_json::json!({"id":"message","keywords":{},"mailboxIds":{}}))
+                .unwrap();
+        cache.put_emails(&[email]);
+        let client = JmapClient::read_only_for_tests();
+        let op = QueuedMutation::MarkRead {
+            op_id: 1,
+            id: "message".into(),
+        };
+        let pattern = UserRegex::compile(".*").unwrap();
+        let mut mailboxes = Vec::new();
+        assert!(process_mutation_via_queue(
+            &client,
+            &op,
+            &mut mailboxes,
+            &[],
+            &[],
+            &pattern,
+            Some(&cache)
+        )
+        .unwrap_err()
+        .contains("read-only"));
+        assert!(cache.queued_operations().is_empty());
+        assert!(!cache
+            .get_email("message")
+            .unwrap()
+            .keywords
+            .contains_key("$seen"));
+        queue_mutation(Some(&cache), &op).unwrap();
+        let before = cache.queued_operations();
+        replay_queued_mutations(&client, &mut mailboxes, &[], &[], &pattern, &cache);
+        assert_eq!(cache.queued_operations(), before);
+        assert!(!cache
+            .get_email("message")
+            .unwrap()
+            .keywords
+            .contains_key("$seen"));
+    }
 
     #[test]
     fn background_body_queue_is_bounded_and_stops_after_transport_failure() {

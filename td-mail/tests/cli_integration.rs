@@ -484,6 +484,37 @@ fn test_triage_plan_and_apply() {
 }
 
 #[test]
+fn read_only_discovery_keeps_reads_and_refuses_remote_mutations() {
+    let mut h = CliHarness::start();
+    h.server().read_only();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"get_email", "id":"email-002"}))["ok"].is_true());
+    let before = h.server().email_state("email-002");
+    for command in [
+        json!({"command":"mark_read", "id":"email-002"}),
+        json!({"command":"flag", "id":"email-002"}),
+        json!({"command":"move_email", "id":"email-002", "to_mailbox_id":"mbox-archive"}),
+        json!({"command":"create_mailbox", "name":"Refused"}),
+    ] {
+        let answer = h.send(command);
+        assert!(!answer["ok"].is_true(), "{answer}");
+        assert!(answer.to_string().contains("read-only"), "{answer}");
+    }
+    let destroyed = h.send(json!({"command":"destroy", "ids":["email-002"]}));
+    assert!(destroyed["ok"].is_true());
+    assert!(!destroyed["results"][0]["ok"].is_true());
+    assert!(destroyed["results"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("read-only"));
+    assert_eq!(h.server().email_state("email-002"), before);
+    assert!(h.server().update_calls().is_empty());
+    assert!(h.server().destroy_calls().is_empty());
+    assert!(h.server().created_mailboxes().is_empty());
+    assert!(h.send(json!({"command":"download_attachment", "blob_id":"blob-att-001", "name":"test-document.pdf", "content_type":"application/pdf"}))["ok"].is_true());
+}
+
+#[test]
 fn test_mark_read_unread() {
     let mut h = CliHarness::start();
 
