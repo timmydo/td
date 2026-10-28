@@ -20,6 +20,7 @@ const HEADER: usize = 312;
 const MIN_REPLY: usize = 305;
 const CAPACITY: usize = 65536;
 const TARGET: usize = 40;
+type TargetParameters<'a> = (u64, u64, &'a str, &'a [u8]);
 const SUSPEND: u32 = 1 << 1;
 const STATUS_TABLE: u32 = 1 << 4;
 const ACTIVE: u32 = 1 << 5;
@@ -27,6 +28,7 @@ const BUFFER_FULL: u32 = 1 << 8;
 const SKIP_LOCKFS: u32 = 1 << 10;
 const NOFLUSH: u32 = 1 << 11;
 const SECURE_DATA: u32 = 1 << 15;
+const DEFERRED_REMOVE: u32 = 1 << 17;
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -156,39 +158,130 @@ impl Packet {
         }
         Ok((start, end))
     }
+    #[cfg(test)]
     fn crypt(name: &str, length: u64, device: (u32, u32), key: &[u8; 64]) -> io::Result<Box<Self>> {
-        if length == 0 || !length.is_multiple_of(8) {
-            return Err(invalid(
-                "crypt target length must be whole 4096-byte sectors",
-            ));
+        Self::table(
+            name,
+            &[Target {
+                start: 0,
+                length,
+                device,
+                offset: 32768,
+                kind: Kind::Crypt { key, iv: 0 },
+            }],
+        )
+    }
+    fn table(name: &str, targets: &[Target<'_>]) -> io::Result<Box<Self>> {
+        if targets.is_empty() || targets.len() > 3 {
+            return Err(invalid("a table has one to three targets"));
         }
         let mut p = Self::new(name)?;
-        p.u32(20, 1)?;
-        p.u64(HEADER, 0)?;
-        p.u64(HEADER + 8, length)?;
-        p.text(HEADER + 24, 16, "crypt")?;
-        let mut at = HEADER + TARGET;
-        let prefix = b"aes-xts-plain64 ";
-        p.put(at, prefix)?;
-        at += prefix.len();
-        for byte in key {
-            let hex = b"0123456789abcdef";
-            let high = *hex
-                .get(usize::from(byte >> 4))
-                .ok_or_else(|| invalid("hex digit"))?;
-            let low = *hex
-                .get(usize::from(byte & 15))
-                .ok_or_else(|| invalid("hex digit"))?;
-            p.put(at, &[high, low])?;
-            at += 2;
+        p.u32(20, targets.len() as u32)?;
+        let mut at = HEADER;
+        let mut cursor = 0u64;
+        for target in targets {
+            if target.start != cursor
+                || target.length == 0
+                || !target.length.is_multiple_of(8)
+                || !target.offset.is_multiple_of(8)
+                || target.offset.checked_add(target.length).is_none()
+            {
+                return Err(invalid("target bounds or alignment"));
+            }
+            cursor = cursor
+                .checked_add(target.length)
+                .ok_or_else(|| invalid("table length overflow"))?;
+            p.u64(at, target.start)?;
+            p.u64(at + 8, target.length)?;
+            let mut text = at + TARGET;
+            match target.kind {
+                Kind::Linear => {
+                    p.text(at + 24, 16, "linear")?;
+                    let value =
+                        format!("{}:{} {}", target.device.0, target.device.1, target.offset);
+                    p.put(text, value.as_bytes())?;
+                    text += value.len();
+                }
+                Kind::Crypt { key, iv } => {
+                    if !iv.is_multiple_of(8) || iv.checked_add(target.length).is_none() {
+                        return Err(invalid("crypt IV bounds"));
+                    }
+                    p.text(at + 24, 16, "crypt")?;
+                    let prefix = b"aes-xts-plain64 ";
+                    p.put(text, prefix)?;
+                    text += prefix.len();
+                    for byte in key {
+                        let hex = b"0123456789abcdef";
+                        let high = *hex
+                            .get(usize::from(byte >> 4))
+                            .ok_or_else(|| invalid("hex digit"))?;
+                        let low = *hex
+                            .get(usize::from(byte & 15))
+                            .ok_or_else(|| invalid("hex digit"))?;
+                        p.put(text, &[high, low])?;
+                        text += 2;
+                    }
+                    let tail = format!(
+                        " {iv} {}:{} {} 1 sector_size:4096",
+                        target.device.0, target.device.1, target.offset
+                    );
+                    p.put(text, tail.as_bytes())?;
+                    text += tail.len();
+                }
+            }
+            let next = (text + 1 + 7) & !7;
+            p.u32(at + 20, (next - at) as u32)?;
+            at = next;
         }
-        let tail = format!(" 0 {}:{} 32768 1 sector_size:4096", device.0, device.1);
-        p.put(at, tail.as_bytes())?;
-        at += tail.len() + 1;
-        let next = (at - HEADER + 7) & !7;
-        p.u32(HEADER + 20, next as u32)?;
         Ok(p)
     }
+    fn target_params(&self, reply: bool) -> io::Result<Vec<TargetParameters<'_>>> {
+        let (base, end) = self.payload()?;
+        let count = self.get32(20)? as usize;
+        if !(1..=3).contains(&count) {
+            return Err(invalid("target count outside bound"));
+        }
+        let mut at = base;
+        let mut out = Vec::with_capacity(count);
+        for index in 0..count {
+            let start = at
+                .checked_add(TARGET)
+                .filter(|n| *n <= end)
+                .ok_or_else(|| invalid("short target"))?;
+            // The final reply next is padded while data_size ends at the
+            // parameter NUL. Never read those up-to-seven padding bytes.
+            let limit = if reply && index + 1 == count {
+                (end + 7) & !7
+            } else {
+                end
+            };
+            let next = (if reply { base } else { at })
+                .checked_add(self.get32(at + 20)? as usize)
+                .filter(|n| *n > start && *n <= limit && n.is_multiple_of(8))
+                .ok_or_else(|| invalid("bad target next offset"))?;
+            let bytes = self.get(start, next.min(end) - start)?;
+            let len = bytes
+                .iter()
+                .position(|b| *b == 0)
+                .ok_or_else(|| invalid("unterminated target parameters"))?;
+            let kind = self.string(at + 24, 16)?;
+            if !matches!(kind, "crypt" | "linear") {
+                return Err(invalid("unknown target type"));
+            }
+            out.push((
+                self.get64(at)?,
+                self.get64(at + 8)?,
+                kind,
+                bytes
+                    .get(..len)
+                    .ok_or_else(|| invalid("parameter bounds"))?,
+            ));
+            at = next;
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
     fn crypt_params(&self) -> io::Result<(&[u8], u64)> {
         let (at, end) = self.payload()?;
         if self.get32(20)? != 1 || self.get64(at)? != 0 || self.string(at + 24, 16)? != "crypt" {
@@ -234,6 +327,17 @@ fn syscall3(number: usize, fd: usize, request: usize, buffer: usize) -> isize {
     result
 }
 
+pub enum Kind<'a> {
+    Crypt { key: &'a [u8; 64], iv: u64 },
+    Linear,
+}
+pub struct Target<'a> {
+    pub start: u64,
+    pub length: u64,
+    pub device: (u32, u32),
+    pub offset: u64,
+    pub kind: Kind<'a>,
+}
 pub struct Status {
     pub device: u64,
     pub name: String,
@@ -331,37 +435,48 @@ impl Control {
         }
         (0..count).map(|i| p.get64(at + 8 + i * 8)).collect()
     }
-    pub fn remove(&self, name: &str) -> io::Result<()> {
-        self.request(Request::Remove, name).map(drop)
-    }
-    pub fn matches_crypt(
-        &self,
-        name: &str,
-        length: u64,
-        device: (u32, u32),
-        key: &[u8; 64],
-    ) -> io::Result<bool> {
+    pub fn defer_remove(&self, name: &str) -> io::Result<()> {
         if !valid_name(name) {
             return Err(invalid("invalid mapping name"));
         }
-        let expected = Packet::crypt(name, length, device, key)?;
+        let version = self.request(Request::Version, "")?;
+        if version.get32(4)? < 27 {
+            return Err(invalid("device mapper lacks deferred removal"));
+        }
+        let mut p = Packet::new(name)?;
+        p.u32(28, SECURE_DATA | DEFERRED_REMOVE)?;
+        self.invoke(Request::Remove, &mut p)
+    }
+    pub fn remove(&self, name: &str) -> io::Result<()> {
+        self.request(Request::Remove, name).map(drop)
+    }
+    pub fn matches_table(&self, name: &str, targets: &[Target<'_>]) -> io::Result<bool> {
+        if !valid_name(name) {
+            return Err(invalid("invalid mapping name"));
+        }
+        let expected = Packet::table(name, targets)?;
         let mut actual = Packet::new(name)?;
         actual.u32(28, SECURE_DATA | STATUS_TABLE)?;
         self.invoke(Request::Table, &mut actual)?;
-        Ok(actual.crypt_params()? == expected.crypt_params()?)
+        Ok(actual.target_params(true)? == expected.target_params(false)?)
     }
-    pub fn create_crypt(
+    pub fn load_table(&self, name: &str, targets: &[Target<'_>]) -> io::Result<()> {
+        if !valid_name(name) {
+            return Err(invalid("invalid mapping name"));
+        }
+        let mut table = Packet::table(name, targets)?;
+        self.invoke(Request::Load, &mut table)
+    }
+    pub fn create_table(
         &self,
         name: &str,
         uuid: &str,
-        length: u64,
-        device: (u32, u32),
-        key: &[u8; 64],
+        targets: &[Target<'_>],
     ) -> io::Result<Status> {
         if !valid_name(name) {
             return Err(invalid("invalid mapping name"));
         }
-        let mut table = Packet::crypt(name, length, device, key)?;
+        let mut table = Packet::table(name, targets)?;
         let mut create = Packet::new(name)?;
         create.text(176, 129, uuid)?;
         self.invoke(Request::Create, &mut create)?;
@@ -375,13 +490,22 @@ impl Control {
                 || status.suspended
                 || status.uuid != uuid
                 || status.name != name
-                || !self.matches_crypt(name, length, device, key)?
+                || !self.matches_table(name, targets)?
             {
-                return Err(invalid("created mapping differs from requested table"));
+                return Err(invalid("created table differs"));
             }
-            let deps = self.dependencies(name)?;
-            if deps.len() != 1 || deps.first().map(|d| device_number(*d)) != Some(device) {
-                return Err(invalid("created mapping has unexpected dependencies"));
+            let mut wanted: Vec<_> = targets.iter().map(|t| t.device).collect();
+            wanted.sort_unstable();
+            wanted.dedup();
+            let mut actual: Vec<_> = self
+                .dependencies(name)?
+                .into_iter()
+                .map(device_number)
+                .collect();
+            actual.sort_unstable();
+            actual.dedup();
+            if wanted != actual {
+                return Err(invalid("created dependencies differ"));
             }
             Ok(status)
         })();
@@ -389,12 +513,48 @@ impl Control {
             let clear = self.request(Request::Clear, name);
             let remove = self.remove(name);
             if clear.is_err() || remove.is_err() {
-                return Err(invalid(
-                    "mapping activation failed and cleanup did not complete",
-                ));
+                return Err(invalid("table failed and cleanup incomplete"));
             }
         }
         result
+    }
+    pub fn matches_crypt(
+        &self,
+        name: &str,
+        length: u64,
+        device: (u32, u32),
+        key: &[u8; 64],
+    ) -> io::Result<bool> {
+        self.matches_table(
+            name,
+            &[Target {
+                start: 0,
+                length,
+                device,
+                offset: 32768,
+                kind: Kind::Crypt { key, iv: 0 },
+            }],
+        )
+    }
+    pub fn create_crypt(
+        &self,
+        name: &str,
+        uuid: &str,
+        length: u64,
+        device: (u32, u32),
+        key: &[u8; 64],
+    ) -> io::Result<Status> {
+        self.create_table(
+            name,
+            uuid,
+            &[Target {
+                start: 0,
+                length,
+                device,
+                offset: 32768,
+                kind: Kind::Crypt { key, iv: 0 },
+            }],
+        )
     }
 }
 #[cfg(test)]
@@ -425,6 +585,109 @@ mod tests {
         assert_eq!(p.get32(HEADER + 20).unwrap() % 8, 0);
         assert!(Packet::crypt("volume", 7, (1, 1), &key).is_err());
         assert!(Packet::crypt("volume", 0, (1, 1), &key).is_err());
+    }
+
+    #[test]
+    fn multi_target_offsets_distinguish_request_and_reply_origins() {
+        let key = [0x5a; 64];
+        let targets = [
+            Target {
+                start: 0,
+                length: 8,
+                device: (253, 1),
+                offset: 32768,
+                kind: Kind::Crypt { key: &key, iv: 0 },
+            },
+            Target {
+                start: 8,
+                length: 8,
+                device: (253, 2),
+                offset: 8,
+                kind: Kind::Crypt { key: &key, iv: 8 },
+            },
+            Target {
+                start: 16,
+                length: 8,
+                device: (253, 1),
+                offset: 32784,
+                kind: Kind::Crypt { key: &key, iv: 16 },
+            },
+        ];
+        let request = Packet::table("volume", &targets).unwrap();
+        let expected = request.target_params(false).unwrap();
+        assert_eq!(
+            expected.iter().map(|t| (t.0, t.1, t.2)).collect::<Vec<_>>(),
+            vec![(0, 8, "crypt"), (8, 8, "crypt"), (16, 8, "crypt")]
+        );
+        assert!(expected[1].3.ends_with(b" 8 253:2 8 1 sector_size:4096"));
+        let mut reply = Packet::table("volume", &targets).unwrap();
+        let mut at = HEADER;
+        let mut offsets = Vec::new();
+        let mut data_end = 0;
+        for _ in 0..3 {
+            offsets.push(at);
+            let next = at + reply.get32(at + 20).unwrap() as usize;
+            let params = reply.string(at + TARGET, next - at - TARGET).unwrap();
+            data_end = at + TARGET + params.len() + 1;
+            reply.u32(at + 20, (next - HEADER) as u32).unwrap();
+            at = next;
+        }
+        reply.u32(12, data_end as u32).unwrap();
+        assert_eq!(reply.target_params(true).unwrap(), expected);
+        assert!(reply.target_params(false).is_err());
+        let last = offsets[2];
+        let good_next = reply.get32(last + 20).unwrap();
+        reply.u32(last + 20, good_next + 8).unwrap();
+        assert!(reply.target_params(true).is_err());
+        reply.u32(last + 20, good_next).unwrap();
+        reply.bytes[data_end - 1] = b'x';
+        assert!(reply.target_params(true).is_err());
+        reply.bytes[data_end - 1] = 0;
+        for bad in [0, 40, 41, u32::MAX] {
+            reply.u32(HEADER + 20, bad).unwrap();
+            assert!(reply.target_params(true).is_err());
+        }
+    }
+
+    #[test]
+    fn tables_refuse_gaps_overlap_unaligned_and_overflowing_extents() {
+        let make = |start, length, offset| Target {
+            start,
+            length,
+            offset,
+            device: (253, 0),
+            kind: Kind::Linear,
+        };
+        for targets in [
+            vec![],
+            vec![make(8, 8, 0)],
+            vec![make(0, 8, 0), make(16, 8, 8)],
+            vec![make(0, 16, 0), make(8, 8, 8)],
+            vec![make(0, 0, 0)],
+            vec![make(0, 7, 0)],
+            vec![make(0, 8, 1)],
+            vec![make(0, 8, u64::MAX - 7)],
+            vec![
+                make(0, 8, 0),
+                make(8, 8, 8),
+                make(16, 8, 16),
+                make(24, 8, 24),
+            ],
+        ] {
+            assert!(Packet::table("volume", &targets).is_err());
+        }
+        let mut target = make(0, 8, 0);
+        target.kind = Kind::Crypt {
+            key: &[0; 64],
+            iv: u64::MAX - 7,
+        };
+        assert!(Packet::table("volume", &[target]).is_err());
+        let p = Packet::table("volume", &[make(0, 8, 32768)]).unwrap();
+        assert_eq!(
+            p.target_params(false).unwrap(),
+            vec![(0, 8, "linear", b"253:0 32768" as &[u8])]
+        );
+        assert_eq!(DEFERRED_REMOVE, 0x20000);
     }
 
     #[test]

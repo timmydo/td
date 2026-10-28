@@ -234,11 +234,23 @@ Each lock is taken as cryptsetup takes it:
    when it is a symlink or no directory.
 2. Open the lock file with `O_CREAT | O_NOFOLLOW`, requesting mode 0644
    subject to umask, then
-   `flock` it, blocking.
+   `flock` it, blocking for header and mapping-name locks. The UUID
+   reencryption lock uses a nonblocking exclusive flock, as stock resume
+   does, and fails promptly if another process owns it.
 3. Check that the path still names the locked inode; if it does not,
    cryptsetup unlinked the file meanwhile, so start again.
 4. On release, take `LOCK_EX | LOCK_NB` and unlink the file if it is
    still the same inode.
+
+Reencryption acquires its UUID lock before the exclusive header lock,
+then the top, overlay and hotzone name locks in that order. An initial
+shared header read discovers the UUID; after locking, the same held device
+must still carry it. Initial discovery for open, start and resume uses a
+nonblocking shared lock, so another reencryption's exclusive header lock
+cannot queue a second operation behind its full run. Other header reads
+retain their blocking locks. Ordinary activation holds the header lock through
+CREATE. Stock init-only takes the header lock rather than the UUID lock.
+The runtime oracle pins stock resume's nonblocking exclusion.
 
 A device is opened once, before locking, and the same descriptor serves
 all header I/O. A replaced regular-file path cannot redirect an operation
@@ -435,7 +447,25 @@ Reencryption stacks devices as cryptsetup does:
 - temporary dm-crypt devices `temporary-cryptsetup-<pid>-<n>`, through
   which the data is read and rewritten.
 
-`close` removes leftover subdevices it finds through `DM_TABLE_DEPS`.
+`close` takes the UUID lock and removes at most the two expected
+subdevices found through `DM_TABLE_DEPS`, checking their exact names,
+volume-bound UUIDs and device identities. It also checks the two expected
+helper names for unreferenced orphans from partial setup or final teardown,
+admitting them bottom-up only when their dependencies reach that same
+backing device or an already verified helper. Foreign UUIDs are retained. It removes top, overlay, then
+hotzone. It refuses active reencryption rather than tearing down its stack.
+Temporary maps use deferred removal (ABI 4.27 or newer) while an O_DIRECT
+File holds each open, so process exit also releases them. A crash between
+CREATE and deferred removal may leave an orphan; a subsequent authenticated
+run removes only td-luks temporary UUIDs bound to that volume and raw
+backing device. Unrelated maps are never cleanup candidates.
+
+Opening an interrupted volume requires no existing raw-device holders.
+Starting or resuming online requires the exact authenticated top table to
+be the sole raw-device holder. An interrupted retained stack must first be
+closed, or lost on reboot; busy helpers cause refusal. A failure during a
+hotzone leaves its helper suspended and metadata recoverable. The program
+does not guess which queued application I/O can safely resume on an error.
 
 ## Reencryption
 
@@ -474,9 +504,10 @@ td-luks to cryptsetup and cryptsetup to td-luks. The interop oracle
 holds that for every resume point.
 
 Opening a header that carries the requirement is part of this increment,
-not increment C. That open verifies the reencryption digest, runs crash
-recovery, which writes data, and loads a multi-segment table. Until
-increment D lands, `open` refuses such a header.
+not increment C. That open verifies both volume keys and the reencryption
+digest, syncs the authenticated metadata, runs crash recovery, which writes
+data, and loads a multi-segment table. Explicit-slot and raw-volume-key
+opens are refused during reencryption. No runtime command ships until E.
 
 ### Metadata and digest admission
 
@@ -532,6 +563,41 @@ resilience, using dm-crypt for old/new ciphertext, and asks stock 2.8.8 to
 repair/resume each and verify all plaintext. `fixtures/METADATA.md` records
 that oracle and its boundary. Rust tests separately interrupt every
 start and final header write/sync and check the surviving header.
+
+### Runtime ordering
+
+D3b adds the command controller and device stack in `bin/reencrypt*.rs`.
+After authenticating keys and metadata it syncs the held metadata device
+before recovery writes or resilience reuse: a previous process may have
+left its last checksummed header visible but not durable. Start verifies
+the existing mapping's old key; resume verifies its clean old/new segments.
+Temporary old/new crypt maps expose aligned O_DIRECT plaintext I/O through
+safe std; raw O_DIRECT I/O reads ciphertext without copying volume keys
+into user-space cipher schedules. Plaintext uses a zeroed-on-drop 4096-byte
+aligned buffer; resilience for a new hotzone is bounded to 1 MiB.
+
+The top mapping becomes linear over an overlay. For each hotzone, load
+its new-key crypt target over the hotzone helper between any new prefix
+and old suffix, suspend overlay then hotzone, and resume the overlay.
+I/O for that zone stays blocked while other zones can continue. Capture
+old ciphertext or hashes, sync resilience and commit dirty metadata,
+rewrite through old/new crypt maps and sync the data, then commit clean
+or final metadata before releasing the hotzone. Completion reloads the
+top as one new-key crypt target, removes helpers and temporary maps, and
+runs authenticated free-space/old-slot cleanup before reporting success.
+
+Recovery streams the validated recorded hotzone, including a stock zone
+larger than td's creation limit. Journal recovery restores each old
+ciphertext sector before reading through the old map and writing through
+the new one. Checksum recovery rewrites sectors whose raw ciphertext still
+matches the saved hash; a mismatch means already rewritten, relying on
+the selected atomic-sector assumption. It syncs data before advancing the
+header. Final-zone recovery performs cleanup before publishing its mapping.
+
+`fixtures/reencryption.rs` drives the actual binary in both directions,
+including stock prefixes, concurrent I/O and live process interruption;
+`fixtures/REENCRYPTION.md` states its procedure and limits. This does not
+claim arbitrary process-killed live stacks resume without closing them.
 
 ### Start and end
 
@@ -599,11 +665,11 @@ during the end leaves unbound keyslots and no requirement.
 keyslot in U1 and U3, removes them. It also removes the stray keyslot a
 crash in cryptsetup's own start leaves.
 
-Increment D amends ENCRYPTION.md's U1 and U3 definitions, the selector's
-recovery-keyslot rule, post-commit free-area cleanup and the gap paragraph
-to match. It may do so only
-after the interop oracle shows that cryptsetup 2.8.8 accepts every
-intermediate header.
+The atomic E cutover amends ENCRYPTION.md's U1 and U3 definitions, the
+selector's recovery-keyslot rule, post-commit free-area cleanup and the gap
+paragraph together with its runner. Until then the shipped selector still
+runs cryptsetup. These amendments require the D interop evidence that stock
+accepts every intermediate header.
 
 ## Detached test
 
@@ -704,8 +770,9 @@ Each increment is one landable commit, or a short series:
     `kill-unbound` retires old normal slots, with journal cleanup and
     interruption tests. This establishes the cleanup operation required
     by the runtime; production data reencryption remains disabled.
-  - Remaining D work adds device stacks, recovery, data rewriting and
-    the bidirectional interruption oracle.
+  - **D3b.** Device stacks, authenticated recovery, online data rewriting,
+    UUID exclusion, deferred temporary-map cleanup and the bidirectional
+    runtime oracle. U1/U3 selector changes join E's atomic runner cutover.
 - **E.** The cutover, in one landing (AGENTS.md principle 4):
   - td-protector's runner and every caller switch to td-luks;
   - the image ships `/bin/td-luks` where it ships cryptsetup;

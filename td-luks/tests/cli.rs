@@ -478,3 +478,23 @@ fn replacing_the_path_cannot_redirect_a_locked_mutation() {
         .get_path(&["tokens", "0"])
         .is_some());
 }
+
+#[test]
+fn reencryption_refuses_regular_files_before_any_mutation() {
+    let disk = Disk::formatted("reencrypt-file");
+    let before = fs::read(&disk.device).unwrap();
+    for args in [
+        vec!["reencrypt", "0", "checksum", disk.arg(), "volume"],
+        vec!["reencrypt", "0", "journal", disk.arg(), "volume"],
+        vec!["reencrypt-resume", disk.arg(), "volume"],
+    ] {
+        let run = td_luks(&args, RECOVERY);
+        assert_eq!(run.code, 1, "{}", run.stderr);
+        assert!(
+            run.stderr.contains("requires a block device"),
+            "{}",
+            run.stderr
+        );
+        assert_eq!(fs::read(&disk.device).unwrap(), before);
+    }
+}

@@ -48,10 +48,20 @@ pub struct Lock {
 
 /// Open once, then lock the exact device used by the operation.
 pub fn open(device: &Path, mode: Mode, exclusive: bool) -> io::Result<(File, Lock)> {
-    open_in(Path::new(LOCK_DIR), device, mode, exclusive)
+    open_in(Path::new(LOCK_DIR), device, mode, exclusive, true)
 }
 
-fn open_in(dir: &Path, device: &Path, mode: Mode, exclusive: bool) -> io::Result<(File, Lock)> {
+pub fn discover(device: &Path) -> io::Result<(File, Lock)> {
+    open_in(Path::new(LOCK_DIR), device, Mode::Read, false, false)
+}
+
+fn open_in(
+    dir: &Path,
+    device: &Path,
+    mode: Mode,
+    exclusive: bool,
+    blocking: bool,
+) -> io::Result<(File, Lock)> {
     // O_EXCL without O_CREAT excludes a claimed block device and has no
     // effect on regular files. Prefer writable reads for NFSv4 flock.
     const O_EXCL: i32 = 0o200;
@@ -72,9 +82,13 @@ fn open_in(dir: &Path, device: &Path, mode: Mode, exclusive: bool) -> io::Result
     let meta = held.metadata()?;
     let kind = meta.file_type();
     let lock = if kind.is_block_device() {
-        resource_in(dir, meta.rdev(), mode)?
+        resource_at_mode(
+            lock_dir(dir)?.join(resource_name(meta.rdev())),
+            mode,
+            blocking,
+        )?
     } else if kind.is_file() {
-        take(&held, mode)?;
+        take(&held, mode, blocking)?;
         Lock {
             file: held.try_clone()?,
             resource: None,
@@ -90,7 +104,7 @@ fn open_in(dir: &Path, device: &Path, mode: Mode, exclusive: bool) -> io::Result
 
 #[cfg(test)]
 fn device_in(dir: &Path, device: &Path, mode: Mode) -> io::Result<Lock> {
-    open_in(dir, device, mode, false).map(|(_, lock)| lock)
+    open_in(dir, device, mode, false, true).map(|(_, lock)| lock)
 }
 
 /// Lock the resource file for the block device numbered `rdev` under
@@ -118,6 +132,29 @@ fn mapping_in(dir: &Path, name: &str) -> io::Result<Lock> {
 }
 
 fn resource_at(path: PathBuf, mode: Mode) -> io::Result<Lock> {
+    resource_at_mode(path, mode, true)
+}
+
+pub fn reencryption(uuid: &str) -> io::Result<Lock> {
+    if uuid.len() != 36
+        || !uuid.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid reencryption UUID",
+        ));
+    }
+    resource_at_mode(
+        lock_dir(Path::new(LOCK_DIR))?.join(format!("LN_LUKS2-reencryption-{uuid}")),
+        Mode::Write,
+        false,
+    )
+}
+
+fn resource_at_mode(path: PathBuf, mode: Mode, blocking: bool) -> io::Result<Lock> {
     loop {
         let file = OpenOptions::new()
             .read(true)
@@ -126,7 +163,7 @@ fn resource_at(path: PathBuf, mode: Mode) -> io::Result<Lock> {
             .mode(RESOURCE_MODE)
             .custom_flags(O_NOFOLLOW)
             .open(&path)?;
-        take(&file, mode)?;
+        take(&file, mode, blocking)?;
         let lock = Lock {
             file,
             resource: Some(path.clone()),
@@ -179,11 +216,23 @@ fn unusable(dir: &Path, error: io::Error) -> io::Error {
     )
 }
 
-fn take(file: &File, mode: Mode) -> io::Result<()> {
-    match mode {
-        Mode::Read => file.lock_shared(),
-        Mode::Write => file.lock(),
+fn take(file: &File, mode: Mode, blocking: bool) -> io::Result<()> {
+    if blocking {
+        return match mode {
+            Mode::Read => file.lock_shared(),
+            Mode::Write => file.lock(),
+        };
     }
+    match mode {
+        Mode::Read => file.try_lock_shared(),
+        Mode::Write => file.try_lock(),
+    }
+    .map_err(|error| match error {
+        fs::TryLockError::WouldBlock => {
+            io::Error::new(io::ErrorKind::WouldBlock, "resource is already locked")
+        }
+        fs::TryLockError::Error(error) => error,
+    })
 }
 
 impl Lock {

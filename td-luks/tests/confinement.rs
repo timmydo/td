@@ -16,13 +16,31 @@ fn device_mapper_is_the_only_program_syscall_surface() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     names.sort();
-    assert_eq!(names, ["dm.rs", "dm_sys.rs", "lock.rs", "main.rs"]);
+    assert_eq!(
+        names,
+        [
+            "dm.rs",
+            "dm_sys.rs",
+            "lock.rs",
+            "main.rs",
+            "reencrypt.rs",
+            "reencrypt_io.rs",
+            "reencrypt_stack.rs"
+        ]
+    );
     let main = include_str!("../bin/main.rs");
     assert!(main.contains("#![deny(unsafe_code)]"));
     assert!(main.contains("mod dm_sys;"));
     assert!(include_str!("../src/lib.rs").contains("#![forbid(unsafe_code)]"));
     assert!(include_str!("../Cargo.toml").contains("unsafe_code = \"deny\""));
-    for name in ["main.rs", "dm.rs", "lock.rs"] {
+    for name in [
+        "main.rs",
+        "dm.rs",
+        "lock.rs",
+        "reencrypt.rs",
+        "reencrypt_io.rs",
+        "reencrypt_stack.rs",
+    ] {
         let source = fs::read_to_string(root.join("bin").join(name)).unwrap();
         assert_eq!(
             source.matches("unsafe_code").count(),
@@ -42,13 +60,17 @@ fn device_mapper_is_the_only_program_syscall_surface() {
     assert!(oracle.contains("#![deny(unsafe_code)]"));
     assert_eq!(oracle.matches("unsafe_code").count(), 1);
     assert!(oracle.contains("#[path = \"../bin/dm_sys.rs\"]"));
+    let runtime_oracle = include_str!("../fixtures/reencryption.rs");
+    assert!(runtime_oracle.contains("#![deny(unsafe_code)]"));
+    assert_eq!(runtime_oracle.matches("unsafe_code").count(), 1);
+    assert!(runtime_oracle.contains("#[path = \"../bin/dm_sys.rs\"]"));
     let source = include_bytes!("../bin/dm_sys.rs");
     let hash: String = td_fido::digest(source)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
     assert_eq!(
-        hash, "bee5b5e74795da4a0e29cb24576dad60c58f59e24df1bd1414c5289e1fc411bb",
+        hash, "8c80a7ab8a55cfda32084b92cc272cab42ebbb72f8bb90fc474e360942f9109f",
         "review the complete syscall surface and amend UNSAFE.md before changing this pin"
     );
 }

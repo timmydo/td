@@ -24,6 +24,9 @@ compile_error!("td-luks program requires Linux x86-64 open flags");
 mod dm;
 mod dm_sys;
 mod lock;
+mod reencrypt;
+mod reencrypt_io;
+mod reencrypt_stack;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -53,7 +56,9 @@ const USAGE: &str = "usage: td-luks format UUID LABEL DEVICE
        td-luks open [SLOT] DEVICE NAME
        td-luks open-volume-key DEVICE NAME KEY-FILE
        td-luks close NAME
-       td-luks status NAME";
+       td-luks status NAME
+       td-luks reencrypt SLOT {checksum|journal} DEVICE NAME
+       td-luks reencrypt-resume DEVICE NAME";
 
 /// Why the program stopped, and its exit status.
 struct Failure {
@@ -67,6 +72,17 @@ impl Failure {
             code: 1,
             message: message.into(),
         }
+    }
+}
+
+impl From<io::Error> for Failure {
+    fn from(error: io::Error) -> Self {
+        Self::new(format!("I/O: {error}"))
+    }
+}
+impl From<String> for Failure {
+    fn from(error: String) -> Self {
+        Self::new(error)
     }
 }
 
@@ -95,6 +111,16 @@ impl Drop for Secret {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Verb {
+    Reencrypt {
+        slot: u8,
+        resilience: td_luks::reencrypt::Resilience,
+        device: PathBuf,
+        name: String,
+    },
+    ReencryptResume {
+        device: PathBuf,
+        name: String,
+    },
     Open {
         slot: Option<u8>,
         device: PathBuf,
@@ -208,6 +234,20 @@ fn parse(args: &[OsString]) -> Result<Verb, Failure> {
         Ok(name)
     };
     Ok(match (verb, rest) {
+        ("reencrypt", [number, resilience, device, mapping]) => Verb::Reencrypt {
+            slot: slot(number)?,
+            resilience: match resilience.to_str() {
+                Some("checksum") => td_luks::reencrypt::Resilience::Checksum,
+                Some("journal") => td_luks::reencrypt::Resilience::Journal,
+                _ => return Err(Failure::new("resilience must be checksum or journal")),
+            },
+            device: path(device),
+            name: name(mapping)?,
+        },
+        ("reencrypt-resume", [device, mapping]) => Verb::ReencryptResume {
+            device: path(device),
+            name: name(mapping)?,
+        },
         ("open", [device, mapping]) => Verb::Open {
             slot: None,
             device: path(device),
@@ -330,6 +370,19 @@ fn open(device: &Path) -> Result<File, Failure> {
 fn run(verb: Verb) -> Result<(), Failure> {
     let mut random = DevRandom;
     match verb {
+        Verb::Reencrypt {
+            slot,
+            resilience,
+            device,
+            name,
+        } => {
+            let key = stdin()?;
+            reencrypt::run(&device, &name, &key.0, Some((slot, resilience)))?;
+        }
+        Verb::ReencryptResume { device, name } => {
+            let key = stdin()?;
+            reencrypt::run(&device, &name, &key.0, None)?;
+        }
         Verb::Open { slot, device, name } => {
             let key = stdin()?;
             activate(
@@ -418,7 +471,10 @@ fn run(verb: Verb) -> Result<(), Failure> {
         Verb::Metadata { device } => {
             let json = {
                 let (mut medium, _lock) = locked(&device, Mode::Read, false)?;
-                write::metadata(&mut medium)?
+                match write::metadata(&mut medium) {
+                    Ok(json) => json,
+                    Err(_) => td_luks::reencrypt::load(&mut medium)?.0.json.to_string(),
+                }
             };
             let mut out = io::stdout().lock();
             writeln!(out, "{json}")
@@ -465,7 +521,18 @@ fn activate(
     name: &str,
     credential: write::ActivationKey<'_>,
 ) -> Result<(), Failure> {
-    let (mut file, _lock) = locked(device, Mode::Read, false)?;
+    let (mut file, initial_lock) = lock::discover(device)?;
+    let copy = td_luks::header::read_copy(&mut file)?;
+    let (json, _) = copy.json()?;
+    if json.get_path(&["config", "requirements"]).is_some() {
+        let write::ActivationKey::Passphrase { slot: None, bytes } = credential else {
+            return Err(Failure::new(
+                "reencryption activation requires a passphrase with no explicit slot",
+            ));
+        };
+        drop(initial_lock);
+        return reencrypt::open(file, copy.identity.uuid, name, bytes);
+    }
     let (header, key) = write::activation(&mut file, credential)?;
     dm::activate(&mut file, name, &header.uuid, key.bytes()).map_err(dm_failure)
 }
@@ -555,9 +622,37 @@ mod tests {
                 header: Some("/tmp/header".into()),
             }
         );
+        for (mode, resilience) in [
+            ("checksum", td_luks::reencrypt::Resilience::Checksum),
+            ("journal", td_luks::reencrypt::Resilience::Journal),
+        ] {
+            assert_eq!(
+                parse(&args(&["reencrypt", "0", mode, "/dev/sda2", "name"]))
+                    .ok()
+                    .unwrap(),
+                Verb::Reencrypt {
+                    slot: 0,
+                    resilience,
+                    device: "/dev/sda2".into(),
+                    name: "name".into()
+                }
+            );
+        }
+        assert_eq!(
+            parse(&args(&["reencrypt-resume", "/dev/sda2", "name"]))
+                .ok()
+                .unwrap(),
+            Verb::ReencryptResume {
+                device: "/dev/sda2".into(),
+                name: "name".into()
+            }
+        );
         for refused in [
             &[][..],
-            &["reencrypt", "0", "checksum", "/dev/sda2", "name"][..],
+            &["reencrypt", "0", "none", "/dev/sda2", "name"][..],
+            &["reencrypt", "32", "checksum", "/dev/sda2", "name"][..],
+            &["reencrypt", "0", "checksum", "/dev/sda2"][..],
+            &["reencrypt-resume", "/dev/sda2", "name", "extra"][..],
             &["format", "u", "l"][..],
             &["metadata", "/dev/sda2", "extra"][..],
             &["kill-slot", "32", "/dev/sda2"][..],

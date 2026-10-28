@@ -3574,7 +3574,7 @@ and the absence of every other module call, of `unsafe` blocks or functions,
 of a scoped allow and of `from_raw_fd`. Receiving a descriptor, a second send
 site or any other use of the module is an amendment here.
 
-## 24. `td-luks` — device-mapper activation
+## 24. `td-luks` — device-mapper activation and reencryption
 
 The library keeps `forbid(unsafe_code)`. Only the x86-64 Linux program
 uses `deny` with one function-scoped allowance in `bin/dm_sys.rs`:
@@ -3602,20 +3602,49 @@ header includes seven padding bytes; successful fixed-header replies
 may report only 305 bytes. Every output is bounded by the allocation,
 variable payload offsets and lengths are checked, and BUFFER_FULL is a
 refusal. Dependency lists admit at most 256 devices. Table queries must
-return one crypt target at logical sector zero. No kernel-held pointer
-outlives the call.
+return one to three crypt or linear targets. Input target `next` offsets
+are relative to each target; kernel reply offsets are relative to the
+payload base. Only the final reply may point into up to seven alignment
+padding bytes beyond data_size; the parser never reads those bytes.
+Encoded extents are contiguous from zero, positive and aligned to eight
+512-byte units, with checked offset and IV ends. Table comparisons check
+every target and parameter, and creation verifies backing dependencies.
+No kernel-held pointer outlives the call.
 
 Activation loads aes-xts-plain64, a 64-byte key, IV offset zero, data
 sector 32768 and sector_size:4096, then resumes and checks its UUID,
 name, table and backing device. Load/resume failure clears the inactive
-table and removes the created device. Suspend requests fix NOFLUSH and
-SKIP_LOCKFS. Safe std publishes `/dev/mapper/NAME` as a symlink to the
+table and removes the created device. Reencryption additionally permits
+crypt targets at validated segment offsets/IVs and linear targets over
+owned helper mappings or the raw data region. Keys still enter only the
+wiped packet. Suspend requests fix NOFLUSH and SKIP_LOCKFS. Temporary
+crypt mappings may use DM_DEV_REMOVE with DM_DEFERRED_REMOVE (0x20000),
+requiring ABI minor 27 or newer; a held safe std File keeps the mapping
+alive until its final close, including process exit. Safe std publishes `/dev/mapper/NAME` as a symlink to the
 verified devtmpfs node; names cannot contain path separators, and an
 unrelated regular file or live mapping is never replaced. Safe std's
 existing lock-file protocol serializes td-luks open/close by mapping
 name; kernel CREATE must succeed before a stale entry is unlinked,
-including when competing with stock cryptsetup. Close removes
-ordinary LUKS2 mappings; reencryption subdevice traversal belongs to D.
+including when competing with stock cryptsetup. Reencryption's UUID lock
+precedes header and mapping-name locks. Initial UUID discovery uses a
+nonblocking shared header lock, so open/start/resume refuse an active
+exclusive owner without waiting for its full operation. Close takes the UUID lock, refuses
+an active reencryption, and traverses bounded dependencies to remove at
+most the expected overlay and hotzone helpers, checking exact names,
+volume-bound UUIDs and device identities. Unreferenced helpers at those
+two names are admitted bottom-up only with matching UUIDs and dependencies
+on the same backing device or an already verified helper. Authenticated restart cleanup
+also removes orphan td-luks temporary maps with the matching volume UUID
+and raw-device dependency. Busy retained stacks require close or reboot;
+no force-remove or error target is exposed.
+
+The safe runtime uses std's O_DIRECT file opens for raw and temporary
+crypt devices, verifying block-device identities against the held device
+and created mapping. A 4096-aligned zeroed-on-drop buffer carries one
+plaintext sector. Header/resilience I/O stays on the locked buffered
+File. Recovery and resume sync authenticated metadata before modifying
+data or reusing resilience; clean/final commits follow the data sync.
+`td-luks/DESIGN.md` records the stack and crash ordering.
 
 `tests/confinement.rs` pins the complete syscall module, allowance and
 program module inventory; packet tests exercise exact encoding and
@@ -3624,6 +3653,10 @@ into a disposable QEMU oracle to inspect both programs' tables, exercise
 suspend/resume and failed-load cleanup, and verify cross-program
 activation, plaintext and removal. That helper runs control ioctls only
 as guest PID 1; host preparation adds no target input or syscall surface.
+`fixtures/reencryption.rs` also uses this pinned module only in its guest,
+covering both resilience modes, stock interruption prefixes, live process
+kills, concurrent data I/O, UUID exclusion and helper cleanup. Its host
+owns a bounded QEMU child and temporary image; it does not issue ioctls.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 
