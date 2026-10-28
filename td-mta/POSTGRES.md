@@ -7401,6 +7401,22 @@ is retried on the next tick. Schedules require explicit generation and
 activation; normal serving does not enable background scrubbing implicitly.
 
 
+## Replica source inventory windows
+
+The snapshot read adapter can enumerate account-wide Email IDs for a future
+application-level replica. REPLICATION.md owns its coverage boundary. A first
+page captures the committed sequence and greatest ID together; continuation
+queries use `id > after AND id <= upper ORDER BY id`, under the existing
+account/ID primary key, with a maximum of 256 returned IDs and one lookahead.
+Every page authenticates through its enclosing snapshot and rejects a source
+account, epoch or kind mismatch, a future starting sequence, expired history,
+or inverted bounds. Row revisions and strict ID ordering are validated before
+returning detached data, and failures latch the snapshot as other read errors
+do. The adapter creates no retained transaction or retention lease; its
+enclosing snapshot keeps its ordinary caller-owned lifetime and deadline. No
+schema change or public protocol is introduced by this adapter. Catch-up and
+deletion authority are separate synchronization work.
+
 ## Complete search-field evidence
 
 Schema 35 adds `blob_search`, keyed by `(account,blob_id)` with cascading blob

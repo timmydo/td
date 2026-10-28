@@ -17,6 +17,12 @@ use tokio_postgres::types::Type;
 #[path = "postgres_read_values.rs"]
 mod value_reads;
 
+#[path = "postgres_read_replication.rs"]
+mod replication_reads;
+pub use replication_reads::{
+    ReplicaInventoryCursor, ReplicaInventoryPage, MAX_REPLICA_INVENTORY_PAGE,
+};
+
 #[path = "postgres_read_submissions.rs"]
 mod submission_reads;
 pub use submission_reads::{

@@ -31,6 +31,9 @@ fn migration_archive_cli_preserves_and_verifies_snapshots() {
 #[path = "support/postgres_mail_client.rs"]
 mod mail_client;
 
+#[path = "postgres_probe/replication_inventory.rs"]
+mod replication_inventory;
+
 const PASSWORD: &[u8] = b"disposable-postgres-fixture-password";
 
 /// The directory of PATH's `initdb`, which must also hold `postgres`,
@@ -2508,6 +2511,7 @@ fn real_postgres_deletion_releases_last_owner_bodies_and_retains_outcomes() {
 #[test]
 #[ignore = "real PostgreSQL 17, td-mail and isolated td-fetch fixture executables required"]
 fn real_postgres_td_mail_reads_and_downloads() {
+    exercise_configuration(ConfigurationExercise::Query);
     exercise_configuration(ConfigurationExercise::Client);
 }
 
@@ -8626,6 +8630,11 @@ fn exercise_query(
         }),
         Err(read::Error::Integrity)
     );
+    sql(
+        fixture,
+        "UPDATE td_mta.emails SET changed=decode('0000000000000005','hex')",
+    );
+    replication_inventory::exercise(fixture, request, trust, binding, password);
 }
 
 fn exercise_threads(

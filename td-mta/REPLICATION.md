@@ -44,6 +44,37 @@ not silently granted local integrity authority.
 
 ## Synchronization contract
 
+### Source inventory adapter
+
+The authenticated PostgreSQL snapshot adapter provides
+`replica_inventory(cursor, maximum)` as the first implementation step. It is
+not yet exposed over HTTPS or connected to a local synchronizer. Each call
+uses the snapshot's existing authentication, account, deadline and bounded
+database worker. At most 256 IDs and one lookahead row are read. No body bytes
+or derived interpretation are returned.
+
+The initial page records the account's committed sequence and maximum Email
+ID in the same snapshot. Continuations preserve that starting state and upper
+ID and advance strictly by Email ID, never by received date or OFFSET. Each
+later page may use a fresh authenticated snapshot and requires the starting state
+to belong to the same account and epoch and remain within retained history.
+Changed dates, mailbox moves and deletion of an already visited ID cannot
+shift remaining IDs out of a page. Arrivals above the fixed upper ID cannot
+extend the scan indefinitely; arrivals behind the cursor are deliberately left
+to change catch-up. All rows, including lookahead, must have revisions no newer
+than their observed snapshot.
+
+These are passive, in-process cursor values, not frozen wire encodings or
+authorization credentials. Finishing this enumeration proves neither a
+historical snapshot nor a current full copy. Metadata/body fetching, changes
+since the starting state, cross-object reconciliation and final coverage
+validation remain required. An expired or foreign starting state refuses with
+`CannotCalculateChanges`; the synchronizer must restart reconciliation while
+preserving its last usable local view. No enumeration page grants deletion
+authority or advances a durable replica checkpoint by itself.
+
+### Remaining synchronization work
+
 First qualify the existing JMAP Email/Mailbox get and changes surfaces and raw
 downloads. Reuse those where they meet the requirements; specify and review
 any missing snapshot or digest capability before implementing an extension.

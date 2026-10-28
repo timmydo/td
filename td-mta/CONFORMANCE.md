@@ -498,6 +498,11 @@ Email/get through the client, not just stored thread IDs.
 
 This PostgreSQL fixture is part of the native gate. It does not qualify
 cloud-provider failover or managed-database deployment.
+It also runs the query adapter fixture in a separate disposable database,
+including replica inventory continuation across deletion and date changes,
+arrivals outside retained bounds, foreign or expired checkpoints, corrupt
+lookahead revisions and empty accounts. This qualifies the source read adapter,
+not a network replication protocol or replica completeness.
 The separate send and executable-service cases cover their named flows. Process and file cleanup belong to
 the fixture; no public endpoint is contacted.
 
