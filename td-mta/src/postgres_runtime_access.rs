@@ -29,9 +29,11 @@ const TABLES: &[(&str, Access)] = &[
     ("runtime_barrier", Access::Read),
     ("replica_source", Access::Read),
     ("replica_accounts", Access::Read),
-    ("replica_progress", Access::Read),
-    ("replica_pending", Access::Read),
-    ("replica_mailbox_receipts", Access::Read),
+    ("replica_email_receipts", Access::Replica),
+    ("replica_blob_identities", Access::Replica),
+    ("replica_progress", Access::Replica),
+    ("replica_pending", Access::Replica),
+    ("replica_mailbox_receipts", Access::Replica),
     ("config_materials", Access::Read),
     ("config_material_chunks", Access::Read),
     ("config_versions", Access::Read),
@@ -89,6 +91,7 @@ const TABLES: &[(&str, Access)] = &[
 
 #[derive(Clone, Copy)]
 enum Access {
+    Replica,
     Read,
     Insert,
     Selection,
@@ -160,6 +163,33 @@ pub fn inspect(
 }
 
 pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
+    qualify_role(client, false).await?;
+    if crate::postgres_replica_source::read(client)
+        .await
+        .map_err(|_| Error::Database)?
+        .is_some()
+    {
+        return Err(Error::Replica);
+    }
+    Ok(())
+}
+
+pub(crate) async fn qualify_replica(
+    client: &Client,
+    source: &crate::postgres_replica_source::Source,
+) -> Result<(), Error> {
+    qualify_role(client, true).await?;
+    let actual = crate::postgres_replica_source::read(client)
+        .await
+        .map_err(|_| Error::Database)?
+        .ok_or(Error::Replica)?;
+    if &actual != source {
+        return Err(Error::Replica);
+    }
+    Ok(())
+}
+
+async fn qualify_role(client: &Client, replica: bool) -> Result<(), Error> {
     let row = client
         .query_typed_one(ROLE, &[])
         .await
@@ -188,6 +218,13 @@ pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
         }
         let allowed = match access {
             Access::Read => !value(4)?,
+            Access::Replica => {
+                if replica {
+                    value(3)?
+                } else {
+                    !value(4)?
+                }
+            }
             Access::Insert => value(7)?,
             Access::Selection => value(6)?,
             Access::Mail => value(3)?,
@@ -209,13 +246,6 @@ pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
         || row.try_get::<_, bool>(1).map_err(|_| Error::Database)?
     {
         return Err(Error::Maintenance);
-    }
-    if crate::postgres_replica_source::read(client)
-        .await
-        .map_err(|_| Error::Database)?
-        .is_some()
-    {
-        return Err(Error::Replica);
     }
     Ok(())
 }

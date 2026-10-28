@@ -16,10 +16,13 @@ pub(super) fn exercise(
     relay: TcpListener,
     dns: std::net::UdpSocket,
     https_ipv4: TcpListener,
+    replica_only: bool,
 ) {
-    super::migration_archive::exercise();
-    super::replica_source_mode::exercise();
-    super::replica_seed::exercise();
+    if !replica_only {
+        super::migration_archive::exercise();
+        super::replica_source_mode::exercise();
+        super::replica_seed::exercise();
+    }
     let relay = super::serving_relay::Relay::new(fixture, relay, dns);
     let smtp_address = smtp.local_addr().unwrap();
     let https_address = https.local_addr().unwrap();
@@ -183,6 +186,9 @@ pub(super) fn exercise(
         .0
         .as_str();
     replica_source_reads(fixture, https_address.port(), &encoded, account, epoch);
+    if replica_only {
+        return;
+    }
     let api_body = format!(
         r#"{{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{{"accountId":"{source_account}"}},"persistent"]]}}"#
     );
@@ -954,6 +960,24 @@ fn replica_source_reads(
     assert_eq!(
         sql(fixture, "SELECT encode(digest,'hex') FROM td_mta.blobs"),
         digest
+    );
+    drop(folders_view);
+    super::replica_publish::exercise(
+        td_mta::postgres_replica_source::Source::new(&origin, epoch).unwrap(),
+        reader.inventory(None).unwrap(),
+        folders,
+        &page,
+        body,
+        || {
+            let mut fresh = Reader::connect(
+                client(),
+                &authorization,
+                Some(Binding { account, epoch }),
+                limits,
+            )
+            .unwrap();
+            fresh.body(&page, email.id).unwrap()
+        },
     );
     let missing = td_mta::ids::EmailId::from_bytes([0x42; 16]);
     let absent = reader.metadata(&[missing]).unwrap();

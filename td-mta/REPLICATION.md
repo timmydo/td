@@ -72,7 +72,8 @@ SMTP, relay, writable JMAP and ACME operations. Retained sessions hold the share
 migration lock, so initialization cannot change their mode while they run.
 The ACME executable claims its persistent profile before binding its HTTP-01
 listener; that row also prevents later replica initialization on the database.
-Read-only local runtime qualification and publication remain subsequent work.
+Read-only local serving remains subsequent work; the replica publisher has a
+separate qualification path described below.
 Owner administrative access remains trusted and is not a read-only SQL sandbox.
 
 ## Synchronization contract
@@ -329,7 +330,7 @@ the first inventory. The source Inbox role is required; no folder is invented.
 
 Schema 37 stores owner-controlled replica account limits and the initialization
 receipt separately from mutable progress. All four new tables are SELECT-only
-for the ordinary runtime role in this increment. Account creation, preserved
+for the ordinary runtime role. Account creation, preserved
 mailbox IDs and parent relationships, local change history, usage, source
 mailbox receipts and the exact first pending inventory page commit together.
 The local sequence starts at one; source sequences are never local JMAP states.
@@ -352,8 +353,7 @@ padding bits. Each effect's completion bit must commit with its local publicatio
 only all completed effects permit advancement to the page's original continuation.
 A newer per-object observation never becomes the global change checkpoint.
 
-The account initializer persists only the first page. Loading it, publishing
-Email effects, advancing pages, bounded receipt retention and restart orchestration
+The account initializer persists only the first page. Advancing pages, bounded receipt retention and restart orchestration
 remain subsequent work. Limits reserve no bodies and cannot authorize an
 unbounded writer. Exhaustion must pause a future publisher without skipping mail.
 This increment does not make a replica usable or certify copy completeness.
@@ -372,8 +372,56 @@ This library read does not contact the source, mutate progress, acquire a writer
 lease or certify a current copy. Its Email cursor remains a replay anchor during
 initial inventory. The worker must revalidate its generation/page against locked
 current rows when publishing; a historical inspection is not permission to write.
-No per-message synchronizer uses this cold owner connection. The bounded runtime
-publisher and copy command remain subsequent work.
+No per-message synchronizer uses this cold owner connection. The copy command remains subsequent work.
+
+### Transactional Email publication
+
+The library publisher applies one immutable source observation to the exact
+locked pending generation/page. Present mail requires a complete verified raw
+body matching the metadata Blob ID, size and digest. Explicit metadata notFound
+is deletion evidence; a missing download or absent inventory row is not.
+Preparation derives local MIME evidence from the verified bytes and binds all
+preserved metadata into a domain-separated receipt digest. Passive metadata
+constructors validate structure and scope but do not authenticate the source;
+the synchronizer must use the authenticated reader.
+
+Publication locks the local account and commits the body, Email, source IDs,
+thread membership, mailbox memberships, keywords, usage, local change history,
+source receipt and pending completion bit together. It never advances the
+page continuation or global source cursor. Missing mailbox dependencies pause
+publication. An existing Email cannot change its immutable body, thread or
+received timestamp. Local sequence numbers advance only when visible content
+changes. Repeating the same observation is idempotent; older observations and
+conflicting data at the same source state refuse. A newer observation with
+unchanged content updates the receipt without inventing a local change.
+
+Schema 38 adds bounded Email receipts and immutable Blob identity receipts.
+Bodies no longer referenced by Emails, leases or submissions may be collected;
+the identity receipt and core Blob-ID reservation survive. Reappearance may
+restore only the exact original length and digest under that Blob ID. Ordinary
+publication still refuses previously reserved Blob IDs. Body-byte, blob,
+Email and receipt limits are checked transactionally. Receipts currently remain
+until an explicit future retention implementation; reaching their configured
+limit pauses copying and does not discard safety evidence or mail.
+
+A purpose-specific runtime role requires write access to replica progress,
+pending work, mailbox receipts, Email receipts and Blob identities while source
+binding and account limits remain owner-only. Ordinary primary grants retain
+SELECT-only access to those control tables, and ordinary writable runtime
+qualification still refuses a bound replica. The publisher authenticates and
+fully checks one PostgreSQL connection once, retains the shared migration lock,
+and checks epoch/maintenance on each job. It admits at most 16 publication jobs
+within one 60-second connection lifetime. Each job has at most 4 MiB database
+input, 72 MiB output and 4096 protocol frames; initial qualification consumes
+the first window. Deadlines use the existing bounded import allowance, at most
+30 seconds, without extending the connection lifetime. Failed jobs retire the
+session. An unknown COMMIT remains explicitly indeterminate; a confirmed COMMIT
+remains success even if subsequent connection retirement fails.
+
+This is a library primitive, not an operator copy command or a read service.
+No resident worker, new default memory allowance, local credentials or source
+configuration is enabled. Page advancement, mailbox reconciliation, retention
+and completeness validation remain required before a usable full-copy claim.
 
 ### Remaining synchronization work
 

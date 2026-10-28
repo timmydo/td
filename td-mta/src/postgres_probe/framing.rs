@@ -60,6 +60,16 @@ impl Input {
         }
     }
 
+    pub(super) fn retained_replica() -> Self {
+        let turns = super::replica::TURNS;
+        Self {
+            window: Some(Windows::replica(turns)),
+            bytes: 4 * 1024 * 1024 * turns,
+            frames: 4096 * turns,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn retained_mutations() -> Self {
         let single = Self::mutations();
         let turns = super::mutation::TURNS;

@@ -309,3 +309,7 @@ pub mod replica_pending;
 pub mod replica_seed;
 
 pub mod postgres_replica_progress;
+
+pub mod replica_effect;
+
+pub mod postgres_replica_apply;

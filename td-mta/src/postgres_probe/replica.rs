@@ -1,0 +1,170 @@
+//! Purpose-specific retained replica publication; never general serving admission.
+use super::{
+    connect_authenticated_until,
+    retained::{Bounds, LIFETIME},
+    Error, Input, Mode, Request, Worker, MAX_DURATION,
+};
+use crate::{
+    ids::{AccountId, StoreEpoch},
+    postgres_replica_apply::{self as apply, Outcome},
+    postgres_replica_source::Source,
+    postgres_schema,
+    replica_effect::Effect,
+};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Instant,
+};
+use td_crypto::TrustStore;
+pub(super) const TURNS: usize = 16;
+pub(crate) struct ReplicaSession {
+    worker: Worker,
+    bounds: Bounds,
+    epoch: StoreEpoch,
+    source: Source,
+    account: AccountId,
+    retired: bool,
+    clean_idle: bool,
+}
+impl ReplicaSession {
+    pub(crate) fn open(
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        epoch: StoreEpoch,
+        source: Source,
+        account: AccountId,
+    ) -> Result<Self, Error> {
+        if request.mode != Mode::Runtime
+            || super::remaining(deadline)? > MAX_DURATION
+            || epoch == source.epoch()
+        {
+            return Err(Error::Invalid);
+        }
+        let bounds = Bounds::with_turns(Instant::now(), TURNS)?;
+        let mut worker = connect_authenticated_until(
+            request,
+            trust,
+            bounds.expires,
+            deadline,
+            TURNS * 72 * 1024 * 1024,
+            Input::retained_replica(),
+            LIFETIME,
+        )?;
+        worker.deadline = deadline;
+        let expected = Source::new(source.origin(), source.epoch()).map_err(|_| Error::Invalid)?;
+        worker.run(move |client| {
+            Box::pin(async move {
+                let receipt = postgres_schema::lock_and_inspect(client)
+                    .await
+                    .map_err(|_| Error::RuntimeSchema)?;
+                if receipt.store_epoch != epoch {
+                    return Err(Error::RuntimeSchema);
+                }
+                let mut timing =
+                    crate::performance::Timer::start(crate::performance::Phase::DbRuntime);
+                crate::postgres_runtime_access::qualify_replica(client, &expected)
+                    .await
+                    .map_err(|error| match error {
+                        crate::postgres_runtime_access::Error::Role => Error::RuntimeRole,
+                        crate::postgres_runtime_access::Error::Maintenance => {
+                            Error::RuntimeMaintenance
+                        }
+                        crate::postgres_runtime_access::Error::Replica => Error::RuntimeReplica,
+                        _ => Error::RuntimePrivileges,
+                    })?;
+                timing.succeeded();
+                Ok(())
+            })
+        })??;
+        Ok(Self {
+            worker,
+            bounds,
+            epoch,
+            source,
+            account,
+            retired: false,
+            clean_idle: true,
+        })
+    }
+    pub(crate) fn reusable(&self, deadline: Instant) -> bool {
+        !self.retired
+            && self.clean_idle
+            && self.worker.failed.is_none()
+            && self.bounds.reusable(deadline)
+    }
+    pub(crate) fn publish(
+        &mut self,
+        effect: Arc<Effect>,
+        deadline: Instant,
+    ) -> Result<Outcome, apply::Error> {
+        let attempted = Arc::new(AtomicBool::new(false));
+        let marker = attempted.clone();
+        let result = (|| {
+            if !self.reusable(deadline)
+                || effect.account != self.account
+                || effect.source != self.source
+            {
+                return Err(apply::Error::Source);
+            }
+            let length = effect
+                .mail
+                .as_ref()
+                .map_or(0, |mail| mail.body.bytes().len() as u64);
+            self.bounds
+                .admit_bounded(Instant::now(), deadline, super::import_duration(length))
+                .map_err(apply::Error::Connection)?;
+            self.clean_idle = false;
+            self.worker.deadline = deadline;
+            self.worker.check().map_err(apply::Error::Connection)?;
+            self.worker
+                .begin_validation_turn()
+                .map_err(apply::Error::Connection)?;
+            let epoch = self.epoch;
+            match self.worker.run(move |client|Box::pin(async move {
+                client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=30000").await.map_err(|_|apply::Error::Database)?;
+                let row=client.query_typed_one("SELECT m.store_epoch,b.blocked FROM td_mta.schema_migrations m CROSS JOIN td_mta.runtime_barrier b WHERE m.version=1 AND b.singleton=true",&[]).await.map_err(|_|apply::Error::Database)?;
+                let observed:&[u8]=row.try_get(0).map_err(|_|apply::Error::Integrity)?;
+                let blocked:bool=row.try_get(1).map_err(|_|apply::Error::Integrity)?;
+                if observed!=epoch.as_bytes().as_slice(){return Err(apply::Error::Connection(Error::RuntimeSchema));}
+                if blocked{return Err(apply::Error::Connection(Error::RuntimeMaintenance));}
+                apply::apply(client,&effect,deadline,&marker).await
+            })){
+                Ok(result)=>result,
+                Err(_) if attempted.load(Ordering::Relaxed)=>Err(apply::Error::Indeterminate),
+                Err(error)=>Err(apply::Error::Connection(error)),
+            }
+        })();
+        match result {
+            Ok(outcome) => {
+                let finish = self
+                    .worker
+                    .check_deadline()
+                    .and_then(|()| self.worker.check())
+                    .and_then(|()| self.worker.finish_validation_turn());
+                if finish.is_ok() {
+                    self.clean_idle = true;
+                } else {
+                    self.retired = true;
+                }
+                // Preserve confirmed COMMIT even when subsequent retirement fails.
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.retired = true;
+                Err(error)
+            }
+        }
+    }
+}
+impl Drop for ReplicaSession {
+    fn drop(&mut self) {
+        if self.bounds.owner != thread::current().id() {
+            self.worker.failed = Some(Error::Database);
+        }
+    }
+}

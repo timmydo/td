@@ -14,7 +14,7 @@ use crate::{
 };
 use std::time::Instant;
 use td_crypto::TrustStore;
-use tokio_postgres::{types::Type, Row};
+use tokio_postgres::{types::Type, Client, Row};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -66,28 +66,9 @@ pub fn inspect(
             postgres_maintenance::owner(client).await.map_err(|_| Error::Owner)?;
             let source = postgres_replica_source::read(client).await.map_err(|_|Error::Source)?.ok_or(Error::Source)?;
             if source.epoch() == epoch { return Err(Error::Integrity); }
-            let row = client.query_typed_opt("SELECT a.seed_digest,a.body_limit,a.blob_limit,a.email_limit,a.receipt_limit,p.generation,p.email_cursor,p.mailbox_checkpoint,p.inventory_base,p.inventory_cursor,p.inventory_complete,p.email_count,p.receipt_count FROM td_mta.replica_accounts a JOIN td_mta.replica_progress p USING(account) WHERE a.account=$1", &[(&account.as_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?.ok_or(Error::Missing)?;
-            let state = |index, kind| -> Result<DataState, Error> { Ok(DataState{epoch:source.epoch(),account,kind,sequence:Sequence::from_u64(sequence(&row,index)?)}) };
-            let seed_digest = bytes(&row,0)?;
-            let limits = Limits{body_bytes:count(&row,1)?,blobs:count(&row,2)?,emails:count(&row,3)?,receipts:count(&row,4)?};
-            limits.validate().map_err(|_|Error::Integrity)?;
-            let generation = sequence(&row,5)?;
-            if generation == 0 { return Err(Error::Integrity); }
-            let email_cursor = state(6,DataType::Email)?;
-            let mailbox_checkpoint = state(7,DataType::Mailbox)?;
-            let inventory_base = state(8,DataType::Email)?;
-            let inventory_cursor = cursor(&row,9)?;
-            let inventory_complete = row.try_get(10).map_err(|_|Error::Integrity)?;
-            let email_count=count(&row,11)?;
-            let receipt_count=count(&row,12)?;
-            if email_count>limits.emails || receipt_count>limits.receipts || email_cursor.sequence<inventory_base.sequence || inventory_cursor.is_some_and(|c| c.base != inventory_base) {
-                return Err(Error::Integrity);
-            }
-            let pending = client.query_typed_opt("SELECT generation,page,kind,observed,ids,done,next_cursor,next_state,more FROM td_mta.replica_pending WHERE account=$1", &[(&account.as_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?;
-            let pending = pending.as_ref().map(|row| load_pending(row,generation,email_cursor,inventory_base,inventory_cursor,inventory_complete)).transpose()?;
-            if !inventory_complete && pending.is_none() { return Err(Error::Integrity); }
+            let progress=read_snapshot(client,source,account).await?;
             client.batch_execute("ROLLBACK").await.map_err(|_|Error::Database)?;
-            Ok(Progress {source,account,seed_digest,limits,generation,email_cursor,mailbox_checkpoint,inventory_base,inventory_cursor,inventory_complete,email_count,receipt_count,pending})
+            Ok(progress)
         })
     }).map_err(Error::Connection)?;
     if Instant::now() >= deadline {
@@ -95,6 +76,81 @@ pub fn inspect(
     }
     result
 }
+/// Caller owns one consistent snapshot or the account publication lock.
+pub(crate) async fn read_snapshot(
+    client: &Client,
+    source: Source,
+    account: AccountId,
+) -> Result<Progress, Error> {
+    let row = client.query_typed_opt("SELECT a.seed_digest,a.body_limit,a.blob_limit,a.email_limit,a.receipt_limit,p.generation,p.email_cursor,p.mailbox_checkpoint,p.inventory_base,p.inventory_cursor,p.inventory_complete,p.email_count,p.receipt_count FROM td_mta.replica_accounts a JOIN td_mta.replica_progress p USING(account) WHERE a.account=$1", &[(&account.as_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?.ok_or(Error::Missing)?;
+    let state = |index, kind| -> Result<DataState, Error> {
+        Ok(DataState {
+            epoch: source.epoch(),
+            account,
+            kind,
+            sequence: Sequence::from_u64(sequence(&row, index)?),
+        })
+    };
+    let seed_digest = bytes(&row, 0)?;
+    let limits = Limits {
+        body_bytes: count(&row, 1)?,
+        blobs: count(&row, 2)?,
+        emails: count(&row, 3)?,
+        receipts: count(&row, 4)?,
+    };
+    limits.validate().map_err(|_| Error::Integrity)?;
+    let generation = sequence(&row, 5)?;
+    if generation == 0 {
+        return Err(Error::Integrity);
+    }
+    let email_cursor = state(6, DataType::Email)?;
+    let mailbox_checkpoint = state(7, DataType::Mailbox)?;
+    let inventory_base = state(8, DataType::Email)?;
+    let inventory_cursor = cursor(&row, 9)?;
+    let inventory_complete = row.try_get(10).map_err(|_| Error::Integrity)?;
+    let email_count = count(&row, 11)?;
+    let receipt_count = count(&row, 12)?;
+    if email_count > limits.emails
+        || receipt_count > limits.receipts
+        || email_cursor.sequence < inventory_base.sequence
+        || inventory_cursor.is_some_and(|c| c.base != inventory_base)
+    {
+        return Err(Error::Integrity);
+    }
+    let pending = client.query_typed_opt("SELECT generation,page,kind,observed,ids,done,next_cursor,next_state,more FROM td_mta.replica_pending WHERE account=$1", &[(&account.as_bytes().as_slice(),Type::BYTEA)]).await.map_err(|_|Error::Database)?;
+    let pending = pending
+        .as_ref()
+        .map(|row| {
+            load_pending(
+                row,
+                generation,
+                email_cursor,
+                inventory_base,
+                inventory_cursor,
+                inventory_complete,
+            )
+        })
+        .transpose()?;
+    if !inventory_complete && pending.is_none() {
+        return Err(Error::Integrity);
+    }
+    Ok(Progress {
+        source,
+        account,
+        seed_digest,
+        limits,
+        generation,
+        email_cursor,
+        mailbox_checkpoint,
+        inventory_base,
+        inventory_cursor,
+        inventory_complete,
+        email_count,
+        receipt_count,
+        pending,
+    })
+}
+
 fn load_pending(
     row: &Row,
     generation: u64,

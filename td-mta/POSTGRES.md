@@ -2116,7 +2116,8 @@ REVOKE INSERT, UPDATE, DELETE ON
     td_mta.config_version_chunks, td_mta.config_selection,
     td_mta.config_selection_receipts, td_mta.account_bootstraps, td_mta.replica_source,
     td_mta.replica_accounts, td_mta.replica_progress, td_mta.replica_pending,
-    td_mta.replica_mailbox_receipts,
+    td_mta.replica_mailbox_receipts, td_mta.replica_email_receipts,
+    td_mta.replica_blob_identities,
     td_mta.leases, td_mta.imports FROM td_mta_runtime;
 GRANT UPDATE (singleton) ON td_mta.config_selection TO td_mta_runtime;
 GRANT INSERT ON td_mta.leases TO td_mta_runtime;
@@ -7524,7 +7525,8 @@ limits. Progress holds independent source Email replay and Mailbox state,
 inventory phase and counters. Pending work is bounded to one page per account,
 with at most 16384 ID bytes and a 128-byte completion bitmap. Mailbox receipts
 initially cover at most 256 folders. All four tables revoke PUBLIC access and
-ordinary runtime grants allow SELECT only; no replica runtime writer exists yet.
+ordinary runtime grants allow SELECT only. The separate replica publisher
+qualifier below admits its narrowly selected mutable control tables.
 
 The initializer takes the shared migration lock, checks local epoch, schema
 owner and the exact persisted source, and publishes one source account in a
@@ -7543,3 +7545,24 @@ This increment publishes no Email bodies and adds no serving mode or copy CLI.
 Source credentials and transport authentication remain outside passive seed
 preparation. A schema-36 binary cannot serve schema 37; retain a consistent
 backup and follow the fenced upgrade procedure.
+
+
+## Replica Email publication
+
+Schema 38 adds `replica_email_receipts` and `replica_blob_identities`, both
+account-scoped and inaccessible to PUBLIC. Primary runtime grants are SELECT
+only. The separate replica runtime qualifier requires the exact source binding
+and mutable replica control grants; source identity and account limits remain
+owner-controlled. Its retained connection holds the migration lock and checks
+the local epoch and maintenance barrier per job. It offers closed typed
+publication only, never a caller-selected SQL operation.
+
+[REPLICATION.md](REPLICATION.md) owns the observation, receipt, quota and retry
+contract and the finite session/window bounds. One account-locked synchronous
+transaction publishes the full effect, local change history and its pending
+completion bit. No global checkpoint is advanced. Body garbage collection keeps
+an immutable identity receipt and core ID reservation; replica-only restoration
+requires matching length and digest. Normal publication retains fresh-ID refusal.
+Receipt exhaustion pauses publication; no pruning or completeness claim is added.
+A schema-37 binary cannot serve schema 38. Use the fenced upgrade procedure and
+a consistent backup; this increment does not deploy or activate a local replica.

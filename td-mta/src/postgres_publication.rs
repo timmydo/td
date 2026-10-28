@@ -84,8 +84,6 @@ pub(crate) async fn write_blob(
     }
     let account = value.account.as_bytes().as_slice();
     let blob = value.id.as_bytes().as_slice();
-    let length = i64::try_from(value.bytes.len()).map_err(|_| Error::Capacity)?;
-    let chunks = i64::try_from(value.bytes.len().div_ceil(CHUNK)).map_err(|_| Error::Capacity)?;
     if client
         .execute_typed(
             "INSERT INTO td_mta.blob_ids VALUES($1,$2) ON CONFLICT DO NOTHING",
@@ -97,6 +95,23 @@ pub(crate) async fn write_blob(
     {
         return Err(Error::Conflict);
     }
+    write_reserved_blob(client, value, deadline).await
+}
+
+/// The replica caller proves a retained same-ID length/digest receipt under
+/// its account lock. Ordinary fresh publication reserves the ID above.
+pub(crate) async fn write_reserved_blob(
+    client: &Client,
+    value: Blob<'_>,
+    deadline: Instant,
+) -> Result<(), Error> {
+    if value.bytes.len() as u64 > crate::postgres_body::MAX_BODY_BYTES {
+        return Err(Error::Capacity);
+    }
+    let account = value.account.as_bytes().as_slice();
+    let blob = value.id.as_bytes().as_slice();
+    let length = i64::try_from(value.bytes.len()).map_err(|_| Error::Capacity)?;
+    let chunks = i64::try_from(value.bytes.len().div_ceil(CHUNK)).map_err(|_| Error::Capacity)?;
     if client
         .execute_typed(
             "INSERT INTO td_mta.blobs VALUES($1,$2,$3,$4,$5,$6,$7)",

@@ -197,19 +197,7 @@ impl<'a> Reader<'a> {
         out.append("]").map_err(|_| ReadError::Capacity)?;
         request_end(&mut out)?;
         let response = self.api(out.as_str().map_err(|_| ReadError::Invalid)?.as_bytes())?;
-        let mut origin = String::new();
-        origin
-            .try_reserve_exact(self.origin.len())
-            .map_err(|_| ReadError::Capacity)?;
-        origin.push_str(self.origin);
-        let page = MetadataPage {
-            origin,
-            response,
-            binding,
-            requested: ids,
-            bounds: self.limits.email,
-        };
-        page.view()?;
+        let page = MetadataPage::decode(self.origin, binding, ids, self.limits.email, response)?;
         check_time(self.deadline)?;
         Ok(page)
     }
@@ -350,6 +338,34 @@ pub struct MetadataPage {
     bounds: Bounds,
 }
 impl MetadataPage {
+    /// Caller supplies bounded response storage and authenticated source binding.
+    /// This validates data; it does not authenticate the claimed origin.
+    pub fn decode(
+        origin: &str,
+        binding: Binding,
+        requested: Vec<EmailId>,
+        bounds: Bounds,
+        response: Json,
+    ) -> Result<Self, ReadError> {
+        Origin::parse(origin).map_err(|_| ReadError::Invalid)?;
+        if requested.len() > crate::postgres_body::MAX_METADATA_IDS {
+            return Err(ReadError::Capacity);
+        }
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(origin.len())
+            .map_err(|_| ReadError::Capacity)?;
+        owned.push_str(origin);
+        let page = Self {
+            origin: owned,
+            response,
+            binding,
+            requested,
+            bounds,
+        };
+        page.view()?;
+        Ok(page)
+    }
     pub fn source_origin(&self) -> &str {
         &self.origin
     }

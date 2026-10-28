@@ -27,6 +27,9 @@ impl Windows {
     pub(super) fn new(turns: usize) -> Self {
         Self::bounded(turns, INPUT, OUTPUT, FRAMES)
     }
+    pub(super) fn replica(turns: usize) -> Self {
+        Self::bounded(turns, 4 * 1024 * 1024, 72 * 1024 * 1024, 4096)
+    }
     pub(super) fn mutations(turns: usize) -> Self {
         Self::bounded(turns, INPUT, 128 * 1024, FRAMES)
     }
@@ -158,6 +161,40 @@ impl Windows {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replica_windows_bound_qualification_bytes_frames_and_turns() {
+        let window = Windows::replica(2);
+        window.input(100).unwrap();
+        window.output(200).unwrap();
+        window.begin().unwrap();
+        window.input(4 * 1024 * 1024 - 100).unwrap();
+        window.output(72 * 1024 * 1024 - 200).unwrap();
+        for _ in 0..4096 {
+            window.frame().unwrap();
+        }
+        window.finish().unwrap();
+        window.begin().unwrap();
+        window.input(4 * 1024 * 1024).unwrap();
+        window.output(72 * 1024 * 1024).unwrap();
+        window.finish().unwrap();
+        assert!(window.begin().is_err());
+        for (input, output, frames) in [
+            (4 * 1024 * 1024 + 1, 0, 0),
+            (0, 72 * 1024 * 1024 + 1, 0),
+            (0, 0, 4097),
+        ] {
+            let window = Windows::replica(2);
+            window.begin().unwrap();
+            assert!(window
+                .input(input)
+                .and_then(|()| window.output(output))
+                .and_then(|()| (0..frames).try_for_each(|_| window.frame()))
+                .is_err());
+            assert!(window.finish().is_err());
+            assert!(window.begin().is_err());
+        }
+    }
 
     #[test]
     fn fanout_windows_charge_first_qualification_and_actual_account_count() {

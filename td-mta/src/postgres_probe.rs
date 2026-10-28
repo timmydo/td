@@ -1172,6 +1172,8 @@ mod audit_budget;
 pub(crate) use audit_budget::AuditBudget;
 mod retained;
 pub(crate) use retained::{ReadIsolation, ReadSession};
+mod replica;
+pub(crate) use replica::ReplicaSession;
 mod mutation;
 pub(crate) use mutation::MutationSession;
 mod authentication;

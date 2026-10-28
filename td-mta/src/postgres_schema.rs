@@ -51,8 +51,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("postgres_search.sql"),
     include_str!("postgres_replica_source.sql"),
     include_str!("postgres_replica_progress.sql"),
+    include_str!("postgres_replica_effects.sql"),
 ];
-const VERSION: u32 = 37;
+const VERSION: u32 = 38;
 const PRIVATE_ACL: &str = "SELECT NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_namespace n,
     LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl,

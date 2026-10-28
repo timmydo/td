@@ -37,13 +37,21 @@ impl Bounds {
         self.left != 0 && deadline <= self.expires && self.owner == thread::current().id()
     }
     pub(super) fn admit(&mut self, now: Instant, deadline: Instant) -> Result<(), Error> {
+        self.admit_bounded(now, deadline, MAX_DURATION)
+    }
+    pub(super) fn admit_bounded(
+        &mut self,
+        now: Instant,
+        deadline: Instant,
+        maximum: Duration,
+    ) -> Result<(), Error> {
         if self.owner != thread::current().id() {
             return Err(Error::Invalid);
         }
         if now >= deadline || deadline > self.expires {
             return Err(Error::Deadline);
         }
-        if deadline.duration_since(now) > MAX_DURATION {
+        if deadline.duration_since(now) > maximum {
             return Err(Error::Invalid);
         }
         self.left = self.left.checked_sub(1).ok_or(Error::Invalid)?;
