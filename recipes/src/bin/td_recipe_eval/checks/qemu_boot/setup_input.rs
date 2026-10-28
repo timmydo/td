@@ -280,7 +280,12 @@ impl<'a> SetupInputController<'a> {
             match &step.act {
                 Act::Keys(keys) if keys.is_empty() => {}
                 Act::Keys(keys) => {
-                    if step.shown.starts_with("page=review ") && keys.contains(&"ret") {
+                    // Both consent pages reject Return during their 500 ms
+                    // display-settle interval, including key acknowledgement.
+                    if (step.shown.starts_with("page=review ")
+                        || step.shown == "page=recovery step=kept")
+                        && keys.contains(&"ret")
+                    {
                         std::thread::sleep(Duration::from_millis(600));
                     }
                     let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;

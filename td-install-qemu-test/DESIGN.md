@@ -624,7 +624,7 @@ of the disk's GPT ranges to hold the table the host seeded, so the
 service is what clears them. A thread samples every process's command
 line in `/proc` every two milliseconds from before the service starts
 until it exits, and the environment of each whose program is named
-cryptsetup; a line or environment over 4 KiB refuses rather than escape
+td-luks; a line or environment over 4 KiB refuses rather than escape
 the check. In the phase the fixture reads, without a claim, both GPT
 ranges (the protective MBR, primary header and entry array; the backup
 array and header) and requires them zero, then reports
@@ -638,14 +638,13 @@ the finished-complete report. The service
 must exit successfully and leave no workspace or bound loop. No sampled
 line may hold the key's 48 digits or its groups joined by hyphens or by
 spaces; every
-sampled cryptsetup line must be exactly one of td-install's argument
-lists (`luksFormat`, `luksAddKey`, `token import`, `open`,
-`--test-passphrase`, `close`, `status`), word for word, its variable
+sampled td-luks line must be exactly one of td-install's argument
+lists (`format`, `add-key`, `token-import`, `open`, `test`, `close`, `status`), word for word, its variable
 words only the plan's UUID, a `/dev/loopN`, the `td-install-` mapping
 name, a keyslot 0 or 1 and the new key's `/proc/PID/fd/N`; and none may
 have an environment. The record `TD-INSTALL-ENCRYPTED-CMDLINES` carries
-the distinct lines, the cryptsetup lines and the invocations seen, and
-the host requires `luksFormat` and `luksAddKey` among them, the two
+the distinct lines, the td-luks lines and the invocations seen, and
+the host requires `format` and `add-key` among them, the two
 invocations it requires to have been sampled.
 
 The fixture then syncs and drops the clean page cache, reads every byte
@@ -654,10 +653,10 @@ neither form anywhere (`TD-INSTALL-ENCRYPTED-KEY-ABSENT` with the byte
 count, which the host requires to be the disk's capacity). It rereads
 the disk's partitions and takes exactly partitions 1 and 2 from the
 kernel's block inventory under the disk. The verified root's
-cryptsetup, run with an empty environment and the key on standard
-input, must accept the key for keyslot 0 with `--test-passphrase` and
+td-luks, run with an empty environment and the key on standard
+input, must accept the key for keyslot 0 with `test 0 DEVICE` and
 refuse the mistyped key with exit 2; it opens partition 2 itself as
-`td-oracle`, which stock cryptsetup can only when the partition is whole
+`td-oracle`, which stock td-luks can only when the partition is whole
 4 KiB encryption sectors, reads every byte of the mapping for either
 form of the key, and then `td-boot verify` on the mounted volume must
 name the validated deployment as current and `@var` hold the reviewed
@@ -698,35 +697,34 @@ reports `TD-INSTALL-ENCRYPTED-KEY-SENT`. The key never reaches the
 console.
 
 The two later phases mount the source and the verified root's store as
-the installation phases do, so cryptsetup is td's. Each reads the
+the installation phases do, so td-luks is td's. Each reads the
 recovery key from `/oracle/recovery-key` in its initramfs, scrubs the
 buffer it read and then removes the file, before anything else touches
 the disk. The host deletes the medium when the boot ends.
 
 **`encrypted-headers`** runs on a volume whose first-boot transition
 has finished. It requires exactly one td token, device-bound, read with
-`token export`. Then, with keyslot 0's key authorizing each change and
+`metadata`. Then, with keyslot 0's key authorizing each change and
 each new keyslot under a throwaway random passphrase in a mode-0600 RAM
-file, it builds three states:
+file held open and named by its `/proc/PID/fd/N` descriptor, it builds three states:
 
 - an orphan keyslot 1;
 - a keyslot 3 under token 2, a copy of the device-bound token naming
   keyslot 3, i.e. a superseded protector;
 - a keyslot 4 under a first-boot token 0, then killed with
-  `luksKillSlot`, which leaves token 0 naming no keyslot.
+  `kill-slot`, which leaves token 0 naming no keyslot.
 
 It reports `TD-INSTALL-ENCRYPTED-HEADERS-BUILT`, then
 `TD-INSTALL-ENCRYPTED-END`.
 
-**`encrypted-inspect`** takes the volume key with `luksDump
---dump-volume-key` into a fresh mode-0700 directory of the RAM root. It
+**`encrypted-inspect`** takes the volume key with `volume-key` into a fresh mode-0700 directory of the RAM root. It
 reads the key, then unlinks the file and removes the directory. With the
 clean page cache dropped, it searches for the volume key (raw, and
 hexadecimal in both cases) and the recovery key (its digits, and its
 groups joined by hyphens or by spaces) in three places:
 
 - every byte of the disk;
-- every byte of the volume opened read-only as `td-oracle`, then closed,
+- every byte of the volume opened as `td-oracle` and only read by the fixture, then closed,
   with `status` answering inactive;
 - `/oracle/artifacts`, the whole raw consoles the host kept from every
   boot, the installation's included, at most 64 MiB. The host also runs

@@ -5,8 +5,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// The release the cryptsetup-x86-64 recipe's version line pins; the build
-/// flags that follow it there vary by host build and are not compared.
+/// The interoperability oracle release; build flags vary by host.
 const RELEASE: &str = "cryptsetup 2.8.8 ";
 
 pub fn path() -> PathBuf {

@@ -6,8 +6,8 @@
 //! Every TPM operation opens its own client through `Tpm`, every cryptsetup
 //! command runs through `Runner`, and every secret is zeroed when dropped.
 
-use crate::cryptsetup::{Cryptsetup, KeyFile, Progress};
 use crate::lockout;
+use crate::luks::{KeyFile, Luks, Progress};
 use crate::luks2::{Header, MAX_TD_TOKENS};
 use crate::pin::{release_pin_policy, AuthValue, PinPolicy};
 use crate::protected::TpmPin;
@@ -151,12 +151,12 @@ impl Tpm for DeviceTpm {
 
 /// The cryptsetup commands the release runs, after the cap only.
 pub trait Runner {
-    /// One command with `input` on its standard input (`Cryptsetup::run`).
+    /// One command with `input` on its standard input (`Luks::run`).
     fn run(&mut self, args: &[OsString], input: &[u8]) -> io::Result<()>;
-    /// `luksDump --dump-json-metadata` of `device` (`Cryptsetup::metadata`).
+    /// `luksDump --dump-json-metadata` of `device` (`Luks::metadata`).
     fn metadata(&mut self, device: &Path) -> io::Result<Vec<u8>>;
     /// A reencryption, its progress lines passed on as read
-    /// (`Cryptsetup::reencrypt`). `run`'s output bound would stop one, so
+    /// (`Luks::reencrypt`). `run`'s output bound would stop one, so
     /// a runner that does not stream refuses it.
     fn reencrypt(
         &mut self,
@@ -172,12 +172,12 @@ pub trait Runner {
     }
 }
 
-impl Runner for Cryptsetup {
+impl Runner for Luks {
     fn run(&mut self, args: &[OsString], input: &[u8]) -> io::Result<()> {
-        Cryptsetup::run(self, args, input)
+        Luks::run(self, args, input)
     }
     fn metadata(&mut self, device: &Path) -> io::Result<Vec<u8>> {
-        Cryptsetup::metadata(self, device)
+        Luks::metadata(self, device)
     }
     fn reencrypt(
         &mut self,
@@ -185,7 +185,7 @@ impl Runner for Cryptsetup {
         input: &[u8],
         progress: &mut dyn FnMut(Progress),
     ) -> io::Result<()> {
-        Cryptsetup::reencrypt(self, args, input, progress)
+        Luks::reencrypt(self, args, input, progress)
     }
 }
 
@@ -853,7 +853,7 @@ fn run_step<C: Runner>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cryptsetup::MIN_KILL_KEY;
+    use crate::luks::MIN_KILL_KEY;
     use crate::luks2::HeaderCopy;
     use crate::tests::{live_secrets, Scripted};
     use crate::{cap_event, observed_policy, CAP_PCR};
@@ -1036,9 +1036,8 @@ mod tests {
             assert!(words.contains(&DEVICE), "{words:?}");
             let number = |at: usize| -> u8 { words[at].parse().unwrap() };
             match words[0] {
-                "open" => {
-                    assert_eq!(words[1], "--test-passphrase");
-                    let slot = number(5);
+                "test" => {
+                    let slot = number(1);
                     let call = format!("test {slot}");
                     self.calls.push(call.clone());
                     self.refuse("test", &call)?;
@@ -1046,16 +1045,13 @@ mod tests {
                         return Err(io::Error::other(format!("keyslot {slot} does not open")));
                     }
                 }
-                "luksAddKey" => {
-                    let (by, slot) = (number(9), number(11));
+                "add-key" => {
+                    let (by, slot) = (number(1), number(2));
                     let call = format!("add {slot} by {by}");
                     self.calls.push(call.clone());
                     // The new key travels by descriptor alone.
                     let mut key = Vec::new();
-                    File::open(words[14])
-                        .unwrap()
-                        .read_to_end(&mut key)
-                        .unwrap();
+                    File::open(words[4]).unwrap().read_to_end(&mut key).unwrap();
                     assert_eq!(key.len(), crate::SECRET_LEN);
                     assert!(!args.iter().any(|arg| arg.as_encoded_bytes() == &key[..]));
                     self.refuse("add", &call)?;
@@ -1063,7 +1059,7 @@ mod tests {
                     assert!(!self.keyslots.contains_key(&slot), "{call}");
                     self.keyslots.insert(slot, key);
                 }
-                "token" if words[1] == "import" => {
+                "token-import" => {
                     let token = Token::decode(input).unwrap();
                     let call = format!("import {}", token.keyslot());
                     self.calls.push(call.clone());
@@ -1074,15 +1070,15 @@ mod tests {
                         .unwrap();
                     self.tokens.insert(free, Entry::Td(token));
                 }
-                "token" if words[1] == "remove" => {
-                    let token = number(3);
+                "token-remove" => {
+                    let token = number(1);
                     let call = format!("remove {token}");
                     self.calls.push(call.clone());
                     self.refuse("remove", &call)?;
                     assert!(self.tokens.remove(&token).is_some(), "{call}");
                 }
-                "luksKillSlot" => {
-                    let slot = number(4);
+                "kill-slot" => {
+                    let slot = number(1);
                     let call = format!("kill {slot}");
                     self.calls.push(call.clone());
                     // The runner's floor: never an empty or short key.

@@ -17,13 +17,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// The verified root's static cryptsetup: the binary the service runs.
-pub(super) const CRYPTSETUP: &str = "/root-image/bin/cryptsetup";
+/// The verified root's static td-luks: the binary the service runs.
+pub(super) const TD_LUKS: &str = "/root-image/bin/td-luks";
 /// This fixture's own mapping of the installed volume.
 pub(super) const MAPPING: &str = "td-oracle";
-/// cryptsetup's exit when no keyslot accepts the passphrase (`-EPERM`).
+/// td-luks's exit when no keyslot accepts the passphrase (`-EPERM`).
 const BAD_PASSPHRASE: i32 = 2;
-/// cryptsetup 2.8.8's exit for `status` of an inactive mapping.
+/// td-luks's exit for `status` of an inactive mapping.
 pub(super) const INACTIVE: i32 = 4;
 /// Digits per group of the key's display form (td-protector "Recovery key").
 const GROUP_DIGITS: usize = 6;
@@ -64,7 +64,7 @@ pub(super) fn install(device: &str, cut: bool, channel: Option<&Path>) -> Result
         format_args!(
             "{ENCRYPTED_CMDLINES_MARKER} {} {} {invocations}",
             samples.cmdlines.len(),
-            samples.cryptsetup.len()
+            samples.luks.len()
         ),
     )?;
     if bound_loops()? != loops {
@@ -390,25 +390,25 @@ pub(super) fn require_absent(
     }
 }
 
-/// The verified root's cryptsetup with `input` on standard input and an
+/// The verified root's luks with `input` on standard input and an
 /// empty environment, its output on the console; its exit code.
-pub(super) fn cryptsetup(args: &[&str], input: &[u8]) -> Result<Option<i32>, String> {
-    let mut child = Command::new(CRYPTSETUP)
+pub(super) fn luks(args: &[&str], input: &[u8]) -> Result<Option<i32>, String> {
+    let mut child = Command::new(TD_LUKS)
         .args(args)
         .env_clear()
         .current_dir("/")
         .stdin(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("start cryptsetup {}: {error}", args.join(" ")))?;
+        .map_err(|error| format!("start luks {}: {error}", args.join(" ")))?;
     // Dropped at the end of the statement, which closes the child's input.
     let fed = child
         .stdin
         .take()
-        .ok_or("cryptsetup stdin is unavailable")
-        .and_then(|mut stdin| stdin.write_all(input).map_err(|_| "feed cryptsetup"));
+        .ok_or("luks stdin is unavailable")
+        .and_then(|mut stdin| stdin.write_all(input).map_err(|_| "feed luks"));
     let status = child
         .wait()
-        .map_err(|error| format!("wait for cryptsetup: {error}"))?;
+        .map_err(|error| format!("wait for luks: {error}"))?;
     fed?;
     Ok(status.code())
 }
@@ -427,15 +427,8 @@ fn open_installed(
 ) -> Result<(String, u64), String> {
     applet(&["reread-partitions", device])?;
     let (_, volume) = partitions(device)?;
-    let test = |slot: Option<&'static str>, input: &[u8]| {
-        let mut args = vec!["open", "--test-passphrase", "--type", "luks2"];
-        if let Some(slot) = slot {
-            args.extend(["--key-slot", slot]);
-        }
-        args.extend(["--key-file=-", &volume]);
-        cryptsetup(&args, input)
-    };
-    match test(Some("0"), key.as_bytes())? {
+    let test = |slot: &str, input: &[u8]| luks(&["test", slot, &volume], input);
+    match test("0", key.as_bytes())? {
         Some(0) => {}
         other => {
             return Err(format!(
@@ -444,15 +437,12 @@ fn open_installed(
         }
     }
     let wrong = mistyped(key)?;
-    match test(None, wrong.as_bytes())? {
+    match test("0", wrong.as_bytes())? {
         Some(BAD_PASSPHRASE) => {}
         other => return Err(format!("a mistyped key was not refused: {other:?}")),
     }
     drop(wrong);
-    match cryptsetup(
-        &["open", "--type", "luks2", "--key-file=-", &volume, MAPPING],
-        key.as_bytes(),
-    )? {
+    match luks(&["open", &volume, MAPPING], key.as_bytes())? {
         Some(0) => {}
         other => {
             return Err(format!(
@@ -463,8 +453,8 @@ fn open_installed(
     let mapped = format!("/dev/mapper/{MAPPING}");
     let inspected = require_key_absent(&mapped, needles)
         .and_then(|bytes| inspect_volume(&mapped, id).map(|()| bytes));
-    let closed = cryptsetup(&["close", MAPPING], &[])
-        .and_then(|_| cryptsetup(&["status", MAPPING], &[]))
+    let closed = luks(&["close", MAPPING], &[])
+        .and_then(|_| luks(&["status", MAPPING], &[]))
         .and_then(|code| match code {
             Some(INACTIVE) => Ok(()),
             other => Err(format!(
@@ -547,13 +537,13 @@ fn inspect_volume(mapped: &str, id: &str) -> Result<(), String> {
 #[derive(Clone, Default)]
 struct Samples {
     cmdlines: BTreeSet<Vec<u8>>,
-    /// The distinct command lines whose program is named cryptsetup.
-    cryptsetup: BTreeSet<Vec<u8>>,
-    /// cryptsetup processes seen with a nonempty environment.
+    /// The distinct command lines whose program is named luks.
+    luks: BTreeSet<Vec<u8>>,
+    /// luks processes seen with a nonempty environment.
     environments: usize,
 }
 
-/// Samples every process's command line, and each cryptsetup's
+/// Samples every process's command line, and each td-luks's
 /// environment, every two milliseconds on its own thread until finished.
 struct Sampler {
     stop: Arc<AtomicBool>,
@@ -630,11 +620,11 @@ fn sample(stop: &AtomicBool) -> Result<Samples, String> {
                 continue;
             };
             let program = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
-            if Path::new(OsStr::from_bytes(program)).file_name() == Some(OsStr::new("cryptsetup")) {
+            if Path::new(OsStr::from_bytes(program)).file_name() == Some(OsStr::new("td-luks")) {
                 if sampled(&path.join("environ"))?.is_some_and(|environ| !environ.is_empty()) {
                     samples.environments += 1;
                 }
-                samples.cryptsetup.insert(cmdline.clone());
+                samples.luks.insert(cmdline.clone());
             }
             if samples.cmdlines.len() >= MAX_SAMPLES && !samples.cmdlines.contains(&cmdline) {
                 return Err("the sampler saw too many distinct command lines".into());
@@ -646,7 +636,7 @@ fn sample(stop: &AtomicBool) -> Result<Samples, String> {
     Ok(samples)
 }
 
-/// No sampled command line holds the key, cryptsetup was seen running,
+/// No sampled command line holds the key, luks was seen running,
 /// each time as exactly one of td-install's argument lists and always
 /// with an empty environment. Returns the invocations seen, comma-joined.
 fn require_key_unsampled(
@@ -657,11 +647,11 @@ fn require_key_unsampled(
     if samples.cmdlines.iter().any(|line| needles.found_in(line)) {
         return Err("a command line sampled during the installation holds the recovery key".into());
     }
-    if samples.cryptsetup.is_empty() {
-        return Err("no cryptsetup command line was sampled while the service ran".into());
+    if samples.luks.is_empty() {
+        return Err("no luks command line was sampled while the service ran".into());
     }
     let mut seen = BTreeSet::new();
-    for line in &samples.cryptsetup {
+    for line in &samples.luks {
         // The program, then its arguments.
         let words: Vec<&[u8]> = line
             .strip_suffix(&[0])
@@ -671,7 +661,7 @@ fn require_key_unsampled(
             .collect();
         let Some(name) = invocation(&words, uuid) else {
             return Err(format!(
-                "a sampled cryptsetup command line is none of td-install's: {} words",
+                "a sampled luks command line is none of td-install's: {} words",
                 words.len()
             ));
         };
@@ -679,14 +669,14 @@ fn require_key_unsampled(
     }
     if samples.environments != 0 {
         return Err(format!(
-            "{} sampled cryptsetup processes had an environment",
+            "{} sampled luks processes had an environment",
             samples.environments
         ));
     }
     Ok(seen.into_iter().collect::<Vec<_>>().join(","))
 }
 
-/// One word of a documented cryptsetup argument list.
+/// One word of a documented luks argument list.
 #[derive(Clone, Copy)]
 enum Word {
     /// Exactly these bytes.
@@ -705,102 +695,19 @@ enum Word {
 
 use Word::{Descriptor, Is, Loop, Mapping, Slot, Uuid};
 
-/// td-install's cryptsetup argument lists after the program (td-install
+/// td-install's luks argument lists after the program (td-install
 /// `device_bound`: `format_args`, `add_key_args`, `token_import_args`,
 /// `open_args`, `test_args`, `close_args`, `status_args`), by name. A
 /// secret in any encoding matches none of their words.
 const INVOCATIONS: &[(&str, &[Word])] = &[
+    ("format", &[Is("format"), Uuid, Is("td-system"), Loop]),
     (
-        "luksFormat",
-        &[
-            Is("luksFormat"),
-            Is("--batch-mode"),
-            Is("--type"),
-            Is("luks2"),
-            Is("--cipher"),
-            Is("aes-xts-plain64"),
-            Is("--key-size"),
-            Is("512"),
-            Is("--sector-size"),
-            Is("4096"),
-            Is("--hash"),
-            Is("sha256"),
-            Is("--pbkdf"),
-            Is("pbkdf2"),
-            Is("--pbkdf-force-iterations"),
-            Is("1000"),
-            Is("--use-random"),
-            Is("--luks2-metadata-size"),
-            Is("16384"),
-            Is("--luks2-keyslots-size"),
-            Is("16744448"),
-            Is("--offset"),
-            Is("32768"),
-            Is("--uuid"),
-            Uuid,
-            Is("--label"),
-            Is("td-system"),
-            Is("--key-slot"),
-            Is("0"),
-            Is("--key-file=-"),
-            Loop,
-        ],
+        "add-key",
+        &[Is("add-key"), Is("0"), Is("1"), Loop, Descriptor],
     ),
-    (
-        "luksAddKey",
-        &[
-            Is("luksAddKey"),
-            Is("--batch-mode"),
-            Is("--pbkdf"),
-            Is("pbkdf2"),
-            Is("--pbkdf-force-iterations"),
-            Is("1000"),
-            Is("--hash"),
-            Is("sha256"),
-            Is("--key-slot"),
-            Is("0"),
-            Is("--new-key-slot"),
-            Is("1"),
-            Is("--key-file=-"),
-            Loop,
-            Descriptor,
-        ],
-    ),
-    (
-        "token-import",
-        &[
-            Is("token"),
-            Is("import"),
-            Is("--token-id"),
-            Is("0"),
-            Is("--json-file=-"),
-            Loop,
-        ],
-    ),
-    (
-        "open",
-        &[
-            Is("open"),
-            Is("--type"),
-            Is("luks2"),
-            Is("--key-file=-"),
-            Loop,
-            Mapping,
-        ],
-    ),
-    (
-        "test-passphrase",
-        &[
-            Is("open"),
-            Is("--test-passphrase"),
-            Is("--type"),
-            Is("luks2"),
-            Is("--key-slot"),
-            Slot,
-            Is("--key-file=-"),
-            Loop,
-        ],
-    ),
+    ("token-import", &[Is("token-import"), Is("0"), Loop]),
+    ("open", &[Is("open"), Loop, Mapping]),
+    ("test", &[Is("test"), Slot, Loop]),
     ("close", &[Is("close"), Mapping]),
     ("status", &[Is("status"), Mapping]),
 ];
@@ -982,27 +889,20 @@ mod tests {
     }
 
     #[test]
-    fn sampled_lines_holding_the_key_or_no_cryptsetup_refuse() {
+    fn sampled_lines_holding_the_key_or_no_luks_refuse() {
         const UUID: &str = "5a5a5a5a-5a5a-405a-805a-5a5a5a5a5a5a";
         let needles = Needles::new(&RecoveryDigits::new(KEY).unwrap());
         let mut samples = Samples::default();
         samples.cmdlines.insert(b"/bin/td-install\0serve".to_vec());
         assert!(require_key_unsampled(&samples, &needles, UUID).is_err());
-        let program = "/root-image/bin/cryptsetup";
-        let format = format!(
-            "luksFormat --batch-mode --type luks2 --cipher aes-xts-plain64 --key-size 512 \
-             --sector-size 4096 --hash sha256 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
-             --use-random --luks2-metadata-size 16384 --luks2-keyslots-size 16744448 \
-             --offset 32768 --uuid {UUID} --label td-system --key-slot 0 --key-file=- \
-             /dev/loop0"
-        );
+        let program = "/root-image/bin/td-luks";
+        let format = format!("format {UUID} td-system /dev/loop0");
         let lines = [
             format.as_str(),
-            "luksAddKey --batch-mode --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --hash \
-             sha256 --key-slot 0 --new-key-slot 1 --key-file=- /dev/loop0 /proc/812/fd/5",
-            "token import --token-id 0 --json-file=- /dev/loop0",
-            "open --type luks2 --key-file=- /dev/loop0 td-install-0123456789abcdef",
-            "open --test-passphrase --type luks2 --key-slot 1 --key-file=- /dev/loop12",
+            "add-key 0 1 /dev/loop0 /proc/812/fd/5",
+            "token-import 0 /dev/loop0",
+            "open /dev/loop0 td-install-0123456789abcdef",
+            "test 1 /dev/loop12",
             "close td-install-0123456789abcdef",
             "status td-install-0123456789abcdef",
         ];
@@ -1016,11 +916,11 @@ mod tests {
             bytes
         };
         for line in lines {
-            samples.cryptsetup.insert(argv(line));
+            samples.luks.insert(argv(line));
         }
         assert_eq!(
             require_key_unsampled(&samples, &needles, UUID).unwrap(),
-            "close,luksAddKey,luksFormat,open,status,test-passphrase,token-import"
+            "add-key,close,format,open,status,test,token-import"
         );
         samples.environments = 1;
         assert!(require_key_unsampled(&samples, &needles, UUID).is_err());
@@ -1044,7 +944,7 @@ mod tests {
                     let mut changed = words.clone();
                     changed[index] = replacement;
                     let mut odd = samples.clone();
-                    odd.cryptsetup.insert(argv(&changed.join(" ")));
+                    odd.luks.insert(argv(&changed.join(" ")));
                     assert!(
                         require_key_unsampled(&odd, &needles, UUID).is_err(),
                         "{changed:?}"
@@ -1053,14 +953,14 @@ mod tests {
                 let mut dropped = words.clone();
                 dropped.remove(index);
                 let mut odd = samples.clone();
-                odd.cryptsetup.insert(argv(&dropped.join(" ")));
+                odd.luks.insert(argv(&dropped.join(" ")));
                 assert!(require_key_unsampled(&odd, &needles, UUID).is_err());
             }
             let mut odd = samples.clone();
-            odd.cryptsetup.insert(argv(&format!("{line} --debug")));
+            odd.luks.insert(argv(&format!("{line} --debug")));
             assert!(require_key_unsampled(&odd, &needles, UUID).is_err());
         }
-        let mut line = b"/root-image/bin/cryptsetup\0".to_vec();
+        let mut line = b"/root-image/bin/td-luks\0".to_vec();
         line.extend_from_slice(KEY);
         samples.cmdlines.insert(line);
         assert!(require_key_unsampled(&samples, &needles, UUID).is_err());

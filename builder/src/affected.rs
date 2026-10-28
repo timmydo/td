@@ -378,6 +378,12 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-kexec/src", "recipes/src/recipes/td-kexec.rs"),
     ("td-link/src", "recipes/src/recipes/td-link.rs"),
     ("td-login/src", "recipes/src/recipes/td-login.rs"),
+    ("td-luks/src", "recipes/src/recipes/td-luks.rs"),
+    ("td-luks/bin", "recipes/src/recipes/td-luks.rs"),
+    ("td-fido/src", "recipes/src/recipes/td-luks.rs"),
+    ("td-json/src", "recipes/src/recipes/td-luks.rs"),
+    ("td-encoding/src", "recipes/src/recipes/td-luks.rs"),
+    ("td-json/src", "recipes/src/recipes/td-install-qemu-test.rs"),
     ("td-netd/src", "recipes/src/recipes/td-netd.rs"),
     ("td-secret/src", "recipes/src/recipes/td-secret.rs"),
     ("td-fido/src", "recipes/src/recipes/td-secret.rs"),
@@ -926,7 +932,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 
     if pattern_matches("net/*|net/src/*|net/Cargo.toml|net/Cargo.lock", p) {
         // The merged td-net (fetch/feed/subst). It holds the host-PREP warm that feeds the
-        // recipe-graph consumers (`warm sources` + `warm kernel-headers`) → the chain targets
+        // recipe-graph consumers (`warm sources`) → the chain targets
         // (former feed coverage); AND, since the old fetch/* rule mapped to the broad
         // behavioral tier, a net-only change keeps that too — without it such a diff
         // would run nothing while waiving the full check. The union of BOTH former

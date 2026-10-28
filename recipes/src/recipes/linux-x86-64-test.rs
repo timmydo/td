@@ -34,8 +34,8 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      host-side `td-recipe-eval qemu-boot linux-x86-64` tool (host qemu), which
 //      cannot run in this host-free BuildOnly rung.
 //   7. The linked vmlinux contains dm-crypt, generic/accelerated AES-XTS,
-//      HMAC, SHA-256 and the AF_ALG hash/skcipher entry
-//      points. Checking the ELF rejects a kernel built without them even if
+//      HMAC and SHA-256, and no AF_ALG entry points. Checking the ELF
+//      rejects a kernel that violates either condition even if
 //      a recipe or stale .config claims they were selected. This is structural
 //      evidence; encrypted I/O and unlock belong to the later VM oracle.
 pub fn recipe() -> Recipe {
@@ -121,9 +121,10 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "'{nm}' '{vmlinux}' > encryption-symbols || exit 1; \
-                     for symbol in crypt_ctr crypto_aes_mod_init xts_module_init aesni_init hmac_module_init crypto_sha256_mod_init algif_hash_init algif_skcipher_init; do \
+                     for symbol in crypt_ctr crypto_aes_mod_init xts_module_init aesni_init hmac_module_init crypto_sha256_mod_init; do \
                        grep -q \"[[:space:]][tT][[:space:]]$symbol$\" encryption-symbols || {{ echo \"vmlinux is missing the built-in encryption function $symbol\" >&2; exit 1; }}; \
-                     done"
+                     done; \
+                     if grep -qE '[[:space:]][tT][[:space:]](af_alg_|algif_)' encryption-symbols; then echo 'vmlinux contains deprecated AF_ALG entry points' >&2; exit 1; fi"
                 ),
             ],
         )
@@ -135,7 +136,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Linux 7.2.13, source-built in the Debian build root — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, bzImage carries the x86 boot-setup header (0xAA55 + HdrS) and x86-64 PE headers, and initramfs.cpio is a newc cpio carrying the static td-sh, td-init and td-util userland\n".into(),
+        content: "PASS: Linux 7.2.13, source-built in the Debian build root — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and no AF_ALG userspace interfaces, bzImage carries the x86 boot-setup header (0xAA55 + HdrS) and x86-64 PE headers, and initramfs.cpio is a newc cpio carrying the static td-sh, td-init and td-util userland\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -149,7 +150,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.2.13 vmlinux + bzImage + td-sh initramfs, source-built in the Debian build root) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, a bzImage carrying x86 boot-setup and EFI application headers, and a newc initramfs.cpio carrying the static td-sh, td-init and td-util userland"
+echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.2.13 vmlinux + bzImage + td-sh initramfs, source-built in the Debian build root) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and no AF_ALG userspace interfaces, a bzImage carrying x86 boot-setup and EFI application headers, and a newc initramfs.cpio carrying the static td-sh, td-init and td-util userland"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run linux-x86-64-test 1
 "#,

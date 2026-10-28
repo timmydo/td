@@ -241,24 +241,21 @@ impl Volume {
 }
 
 /// cryptsetup's token commands over `Volume`.
-struct Cryptsetup(Rc<RefCell<Volume>>);
+struct Luks(Rc<RefCell<Volume>>);
 
-impl Runner for Cryptsetup {
+impl Runner for Luks {
     fn run(&mut self, args: &[OsString], input: &[u8]) -> io::Result<()> {
         let words: Vec<String> = args
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert_eq!(words.last().map(String::as_str), Some(DEVICE));
-        let id = || -> Option<u8> {
-            let at = words.iter().position(|word| word == "--token-id")?;
-            Some(words[at + 1].parse().unwrap())
-        };
+        let id = || -> Option<u8> { (words.len() == 3).then(|| words[1].parse().unwrap()) };
         let mut volume = self.0.borrow_mut();
         match (words[0].as_str(), words[1].as_str()) {
-            ("token", "import") => {
+            ("token-import" | "token-replace", _) => {
                 let token = Token::decode(input).unwrap();
-                let replace = words.iter().any(|word| word == "--token-replace");
+                let replace = words[0] == "token-replace";
                 let number = match id() {
                     Some(id) => {
                         assert_eq!(volume.tokens.contains_key(&id), replace, "{words:?}");
@@ -270,7 +267,7 @@ impl Runner for Cryptsetup {
                 volume.log.push(format!("import {number} {kind}"));
                 volume.tokens.insert(number, token);
             }
-            ("token", "remove") => {
+            ("token-remove", _) => {
                 if volume.refuse_removal {
                     return Err(io::Error::other("cryptsetup refused the removal"));
                 }
@@ -323,8 +320,8 @@ impl Fake {
         Self::new(Some((&kernel(1), &prepared(TEMPLATE, ARCHIVE))))
     }
 
-    fn cryptsetup(&self) -> Cryptsetup {
-        Cryptsetup(self.volume.clone())
+    fn cryptsetup(&self) -> Luks {
+        Luks(self.volume.clone())
     }
 }
 

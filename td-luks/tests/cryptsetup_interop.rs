@@ -1,8 +1,7 @@
 //! td-luks and the pinned cryptsetup read each other's headers (DESIGN.md
 //! "Tests"): what td-luks writes cryptsetup opens, dumps and leaves
 //! unrepaired, and what cryptsetup writes with td's own arguments td-luks
-//! opens to the same volume key. Ignored by default, as td-protector's
-//! cryptsetup tests are: they need the pinned cryptsetup first on `PATH`
+//! opens to the same volume key. Ignored by default: these tests need the pinned cryptsetup first on `PATH`
 //! and the host kernel's AF_ALG hash and skcipher interfaces, and no
 //! privilege, a regular file serving as the device.
 //!
@@ -26,7 +25,7 @@ use td_luks::header::metadata_json;
 use td_luks::keyslot::{self, DevRandom, SPLIT_LEN};
 use td_luks::write::{self, Error, TokenChange, DATA_OFFSET, KEYSLOTS_OFFSET};
 
-#[path = "../../td-protector/tests/support/pinned_cryptsetup.rs"]
+#[path = "support/pinned_cryptsetup.rs"]
 mod pinned_cryptsetup;
 
 #[path = "../../td-encoding/src/lib.rs"]
@@ -38,7 +37,7 @@ const RECOVERY: &[u8] = b"000000000000000000000000000000000000000000000000";
 const SECOND: &[u8] = b"ABCDEFGHABCDEFGHABCDEFGHABCDEFGH";
 const THIRD: &[u8] = b"zyxwvutsrqponmlkjihgfedcbaZYXWVU";
 const WRONG: &[u8] = b"wrongwrongwrongwrongwrongwrongwr";
-/// td-protector/src/cryptsetup.rs's `FORMAT` and `PBKDF`, word for word.
+/// The pinned stock invocation equivalent to td-luks's compiled profile.
 const FORMAT: &[&str] = &[
     "luksFormat",
     "--batch-mode",

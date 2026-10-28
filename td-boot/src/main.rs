@@ -108,10 +108,10 @@ use std::os::unix::fs::{
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use td_protector::cryptsetup::{Cryptsetup, KeyFile};
+use td_protector::luks::{KeyFile, Luks};
 use td_protector::release::DeviceTpm;
 
-// td-boot reaches no third-party program but D6's source-built cryptsetup,
+// td-boot reaches td-owned programs, including D6's static td-luks,
 // which the deployment initramfs's unlock runs (unlock.rs). `losetup` was the
 // last other one: the ability to BOOT rested on busybox existing at an
 // absolute path and parsing `-r <device> <file>` as expected, with nothing
@@ -3681,7 +3681,7 @@ fn boot_encrypted(
         ));
     }
     let mut tpm = present.then_some(DeviceTpm);
-    let mut cryptsetup = Cryptsetup::new(Path::new("/bin").join(protocol::CRYPTSETUP));
+    let mut cryptsetup = Luks::new(Path::new("/bin").join(protocol::TD_LUKS));
     let mut line = selector_release::Applet(Path::new("/bin").join(protocol::SECRET_LINE_APPLET));
     // A protected header's security keys, one FIDO2 client per Enter.
     let mut keys = selector_release::SecurityKeys::root();
@@ -7371,7 +7371,7 @@ mod tests {
         // Only run_live_boot caps through cap.rs, and it never releases.
         let (production, _) = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap();
         assert_eq!(production.matches("cap::live").count(), 1);
-        for release in ["selector_release::", "boot_encrypted(", "Cryptsetup::new("] {
+        for release in ["selector_release::", "boot_encrypted(", "Luks::new("] {
             assert!(!body.contains(release), "the live selector names {release}");
         }
         // Halts: the live selector's cap, the installed one's release
@@ -7642,7 +7642,7 @@ mod tests {
         assert!(!body.contains("if wait") && !body.contains("tokens"));
         let device = position("let mut tpm = present.then_some(DeviceTpm);");
         let program = position(
-            "let mut cryptsetup = Cryptsetup::new(Path::new(\"/bin\").join(protocol::CRYPTSETUP));",
+            "let mut cryptsetup = Luks::new(Path::new(\"/bin\").join(protocol::TD_LUKS));",
         );
         // The recovery flow's console reader, td-init's applet by its /bin
         // name; the release ending in recovery runs it, and only then.
@@ -7720,7 +7720,7 @@ mod tests {
             "selector_release::",
             "cap::",
             "DeviceTpm",
-            "Cryptsetup",
+            "Luks",
             "td_protector",
             "td_tpm",
             "luks2",

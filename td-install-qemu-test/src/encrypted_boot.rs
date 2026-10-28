@@ -1,12 +1,12 @@
 //! The guest legs of `qemu-boot-encrypted` (td-install/ENCRYPTION.md
 //! increment 6) that need a key the installed system never shows: the
 //! recovery key, which the host carries in this leg's initramfs only, and
-//! the volume key, which this process takes from cryptsetup into RAM to
+//! the volume key, which this process takes from luks into RAM to
 //! search for it and never prints. Every copy here is zeroed when dropped.
 
 use super::encrypted::{
-    contains, cryptsetup, drop_page_cache, partitions, require_absent, Needles, CRYPTSETUP,
-    INACTIVE, MAPPING,
+    contains, drop_page_cache, luks, partitions, require_absent, Needles, INACTIVE, MAPPING,
+    TD_LUKS,
 };
 use super::*;
 use installation_protocol::{scrub, RecoveryDigits, RECOVERY_DIGITS};
@@ -29,7 +29,7 @@ pub(super) fn key_channel() -> Result<PathBuf, String> {
 }
 /// The volume key's length: AES-XTS with a 512-bit key.
 const VOLUME_KEY_BYTES: usize = 64;
-/// A RAM directory of the initramfs root for cryptsetup's key file.
+/// A RAM directory of the initramfs root for td-luks's key file.
 const KEY_DIRECTORY: &str = "/oracle-volume-key";
 /// The most bytes of the host's artifacts this leg is given.
 const MAX_ARTIFACTS: u64 = 64 << 20;
@@ -56,17 +56,17 @@ fn recovery_key() -> Result<RecoveryDigits, String> {
     key
 }
 
-/// The system root and its store, for the verified root's cryptsetup.
+/// The system root and its store, for the verified root's luks.
 fn mount_tools(device: &str) -> Result<(), String> {
     mount_source(device)?;
     mount_system_root()?;
     bind_root_store()
 }
 
-/// cryptsetup with `input` on standard input and an empty environment;
+/// luks with `input` on standard input and an empty environment;
 /// its exit code and standard output, which never reaches the console.
-fn cryptsetup_output(args: &[&str], input: &[u8]) -> Result<(Option<i32>, Vec<u8>), String> {
-    let mut child = Command::new(CRYPTSETUP)
+fn luks_output(args: &[&str], input: &[u8]) -> Result<(Option<i32>, Vec<u8>), String> {
+    let mut child = Command::new(TD_LUKS)
         .args(args)
         .env_clear()
         .current_dir("/")
@@ -74,26 +74,26 @@ fn cryptsetup_output(args: &[&str], input: &[u8]) -> Result<(Option<i32>, Vec<u8
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| format!("start cryptsetup {}: {error}", args.join(" ")))?;
+        .map_err(|error| format!("start luks {}: {error}", args.join(" ")))?;
     let fed = child
         .stdin
         .take()
-        .ok_or("cryptsetup stdin is unavailable")
-        .and_then(|mut stdin| stdin.write_all(input).map_err(|_| "feed cryptsetup"));
+        .ok_or("luks stdin is unavailable")
+        .and_then(|mut stdin| stdin.write_all(input).map_err(|_| "feed luks"));
     let mut output = Vec::new();
     let read = child
         .stdout
         .take()
-        .ok_or("cryptsetup stdout is unavailable")
+        .ok_or("luks stdout is unavailable")
         .and_then(|stdout| {
             stdout
                 .take(128 * 1024)
                 .read_to_end(&mut output)
-                .map_err(|_| "read cryptsetup")
+                .map_err(|_| "read luks")
         });
     let status = child
         .wait()
-        .map_err(|error| format!("wait for cryptsetup: {error}"))?;
+        .map_err(|error| format!("wait for luks: {error}"))?;
     fed?;
     read?;
     Ok((status.code(), output))
@@ -102,7 +102,7 @@ fn cryptsetup_output(args: &[&str], input: &[u8]) -> Result<(Option<i32>, Vec<u8
 fn require_success(what: &str, code: Option<i32>) -> Result<(), String> {
     match code {
         Some(0) => Ok(()),
-        other => Err(format!("cryptsetup {what} failed: {other:?}")),
+        other => Err(format!("luks {what} failed: {other:?}")),
     }
 }
 
@@ -115,7 +115,7 @@ impl Drop for VolumeKey {
     }
 }
 
-/// The volume key from `luksDump --dump-volume-key`, which writes it to a
+/// The volume key from `volume-key`, which writes it to a
 /// file it creates in a fresh mode-0700 directory of the RAM-backed root;
 /// the file is read and unlinked at once, and the directory removed,
 /// whatever happened.
@@ -126,19 +126,8 @@ fn volume_key(volume: &str, key: &RecoveryDigits) -> Result<VolumeKey, String> {
         .map_err(|error| format!("create {KEY_DIRECTORY}: {error}"))?;
     let file = Path::new(KEY_DIRECTORY).join("key");
     let name = file.to_str().ok_or("non-UTF-8 key path")?;
-    let dumped = cryptsetup_output(
-        &[
-            "luksDump",
-            "--dump-volume-key",
-            "--batch-mode",
-            "--volume-key-file",
-            name,
-            "--key-file=-",
-            volume,
-        ],
-        key.as_bytes(),
-    )
-    .and_then(|(code, _)| require_success("luksDump --dump-volume-key", code));
+    let dumped = luks_output(&["volume-key", volume, name], key.as_bytes())
+        .and_then(|(code, _)| require_success("volume-key", code));
     let mut held = VolumeKey(Box::new([0; VOLUME_KEY_BYTES]));
     let read = dumped.and_then(|()| {
         let mut opened =
@@ -235,18 +224,7 @@ pub(super) fn inspect(device: &str) -> Result<(), String> {
     drop_page_cache()?;
     let found = |window: &[u8]| secrets.found(window);
     let disk = require_absent(device, Secrets::KEEP, &found)?;
-    match cryptsetup(
-        &[
-            "open",
-            "--readonly",
-            "--type",
-            "luks2",
-            "--key-file=-",
-            &volume,
-            MAPPING,
-        ],
-        key.as_bytes(),
-    )? {
+    match luks(&["open", &volume, MAPPING], key.as_bytes())? {
         Some(0) => {}
         other => {
             return Err(format!(
@@ -255,8 +233,8 @@ pub(super) fn inspect(device: &str) -> Result<(), String> {
         }
     }
     let mapped = require_absent(&format!("/dev/mapper/{MAPPING}"), Secrets::KEEP, &found);
-    let closed = cryptsetup(&["close", MAPPING], &[])
-        .and_then(|_| cryptsetup(&["status", MAPPING], &[]))
+    let closed = luks(&["close", MAPPING], &[])
+        .and_then(|_| luks(&["status", MAPPING], &[]))
         .and_then(|code| match code {
             Some(INACTIVE) => Ok(()),
             other => Err(format!(
@@ -310,20 +288,17 @@ fn string_field<'a>(json: &'a str, name: &str) -> Result<&'a str, String> {
 /// whitespace; there must be exactly one, device-bound.
 fn device_bound_token(volume: &str) -> Result<(u8, String), String> {
     let mut found = Vec::new();
-    for number in 0..32u8 {
-        let id = number.to_string();
-        let (code, output) =
-            cryptsetup_output(&["token", "export", "--token-id", &id, volume], &[])?;
-        if code != Some(0) {
-            continue;
-        }
-        let json: String = String::from_utf8(output)
-            .map_err(|_| "non-UTF-8 token JSON")?
-            .chars()
-            .filter(|c| !c.is_ascii_whitespace())
-            .collect();
-        if json.contains("\"type\":\"td-protector\"") {
-            found.push((number, json));
+    let (code, output) = luks_output(&["metadata", volume], &[])?;
+    require_success("metadata", code)?;
+    let metadata = td_json::parse_slice(&output).map_err(|e| e.to_string())?;
+    let tokens = metadata
+        .get("tokens")
+        .and_then(td_json::Json::as_obj)
+        .ok_or("metadata has no tokens object")?;
+    for (number, token) in tokens {
+        if token.get("type").and_then(td_json::Json::as_str) == Some("td-protector") {
+            let number = number.parse::<u8>().map_err(|_| "invalid token number")?;
+            found.push((number, token.to_string()));
         }
     }
     match found.as_slice() {
@@ -359,52 +334,24 @@ fn throwaway_key(name: &str) -> Result<PathBuf, String> {
 /// authorizing it, with the format's PBKDF2 parameters.
 fn add_keyslot(volume: &str, slot: &str, key: &RecoveryDigits) -> Result<(), String> {
     let file = throwaway_key(&format!("oracle-keyslot-{slot}"))?;
-    let name = file.to_str().ok_or("non-UTF-8 key path")?;
-    let added = cryptsetup(
-        &[
-            "luksAddKey",
-            "--batch-mode",
-            "--pbkdf",
-            "pbkdf2",
-            "--pbkdf-force-iterations",
-            "1000",
-            "--hash",
-            "sha256",
-            "--key-slot",
-            "0",
-            "--new-key-slot",
-            slot,
-            "--key-file=-",
-            volume,
-            name,
-        ],
-        key.as_bytes(),
-    );
+    let held = File::open(&file).map_err(|error| format!("open key file: {error}"))?;
+    let name = format!("/proc/{}/fd/{}", std::process::id(), held.as_raw_fd());
+    let added = luks(&["add-key", "0", slot, volume, &name], key.as_bytes());
     let removed = fs::remove_file(&file).map_err(|error| format!("remove {name}: {error}"));
-    require_success(&format!("luksAddKey of keyslot {slot}"), added?)?;
+    require_success(&format!("add-key of keyslot {slot}"), added?)?;
     removed
 }
 
 fn import_token(volume: &str, number: &str, json: &str) -> Result<(), String> {
-    let code = cryptsetup(
-        &[
-            "token",
-            "import",
-            "--token-id",
-            number,
-            "--json-file=-",
-            volume,
-        ],
-        json.as_bytes(),
-    )?;
+    let code = luks(&["token-import", number, volume], json.as_bytes())?;
     require_success(&format!("token import at {number}"), code)
 }
 
 /// The header-state leg, on a volume whose first-boot transition finished:
-/// with cryptsetup and the recovery key, an orphan keyslot with no token,
+/// with luks and the recovery key, an orphan keyslot with no token,
 /// a superseded device-bound token (the transition's sealed object again)
 /// on a keyslot of its own, and a first-boot token whose keyslot was then
-/// killed, which cryptsetup leaves naming none. The installed selector's
+/// killed, which luks leaves naming none. The installed selector's
 /// next plan must retire all three.
 pub(super) fn build_headers(device: &str) -> Result<(), String> {
     mount_tools(device)?;
@@ -435,17 +382,8 @@ pub(super) fn build_headers(device: &str) -> Result<(), String> {
         ORPHANED_TOKEN,
         &token(ORPHANED_TOKEN_SLOT, "first-boot"),
     )?;
-    let killed = cryptsetup(
-        &[
-            "luksKillSlot",
-            "--batch-mode",
-            "--key-file=-",
-            &volume,
-            ORPHANED_TOKEN_SLOT,
-        ],
-        key.as_bytes(),
-    )?;
-    require_success(&format!("luksKillSlot {ORPHANED_TOKEN_SLOT}"), killed)?;
+    let killed = luks(&["kill-slot", ORPHANED_TOKEN_SLOT, &volume], key.as_bytes())?;
+    require_success(&format!("kill-slot {ORPHANED_TOKEN_SLOT}"), killed)?;
     drop(key);
     applet(&["sync"])?;
     command("/bin/umount", &["/td/store"])?;

@@ -27,16 +27,12 @@ pub enum Watch {
     Held(&'static str),
 }
 
-const GIT_CRYPTSETUP: &str =
-    "https://gitlab.com/cryptsetup/cryptsetup.git/info/refs?service=git-upload-pack";
 const GIT_LINUX_FIRMWARE: &str =
     "https://gitlab.com/kernel-firmware/linux-firmware.git/info/refs?service=git-upload-pack";
 const GIT_NERD_FONTS: &str =
     "https://github.com/ryanoasis/nerd-fonts.git/info/refs?service=git-upload-pack";
 const GIT_RIPGREP: &str =
     "https://github.com/BurntSushi/ripgrep.git/info/refs?service=git-upload-pack";
-const GIT_UTIL_LINUX: &str =
-    "https://github.com/util-linux/util-linux.git/info/refs?service=git-upload-pack";
 const GIT_ZLIB: &str = "https://github.com/madler/zlib.git/info/refs?service=git-upload-pack";
 const RUST_STABLE: &str = "https://static.rust-lang.org/dist/channel-rust-stable.toml";
 const LINUX_FIRMWARE: Watch = Watch::Index {
@@ -54,13 +50,6 @@ const WATCHES: &[(&str, Watch)] = &[
         Watch::Index {
             index: "https://curl.se/docs/caextract.html",
             pattern: "cacert-{}.pem",
-        },
-    ),
-    (
-        "cryptsetup-x86-64-source",
-        Watch::Index {
-            index: GIT_CRYPTSETUP,
-            pattern: "refs/tags/v{}",
         },
     ),
     (
@@ -95,49 +84,51 @@ const WATCHES: &[(&str, Watch)] = &[
     ("nerd-fonts-powerline-symbols-license-source", NERD_FONTS),
     ("nerd-fonts-weather-icons-license-source", NERD_FONTS),
     (
-        "json-c-x86-64-source",
-        Watch::Held(
-            "0.19 frees containers inside assert(), so td's NDEBUG build leaks every non-empty object or array; check json-c's releases by hand until one carries upstream's f291fa8 (UPDATING.md)",
-        ),
-    ),
-    (
-        "libdevmapper-x86-64-source",
-        Watch::Index {
-            index: "https://sourceware.org/pub/lvm2/",
-            pattern: "LVM2.{}.tgz",
-        },
-    ),
-    (
         "libressl-x86-64-source",
         Watch::Index {
             index: "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/",
             pattern: "libressl-{}.tar.gz",
         },
     ),
-    ("linux-firmware-amdgpu-dcn-3-1-4-dmcub-source", LINUX_FIRMWARE),
+    (
+        "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
+        LINUX_FIRMWARE,
+    ),
     ("linux-firmware-amdgpu-gc-11-0-1-imu-source", LINUX_FIRMWARE),
-    ("linux-firmware-amdgpu-gc-11-0-1-mes1-source", LINUX_FIRMWARE),
-    ("linux-firmware-amdgpu-gc-11-0-1-mes-2-source", LINUX_FIRMWARE),
+    (
+        "linux-firmware-amdgpu-gc-11-0-1-mes1-source",
+        LINUX_FIRMWARE,
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-0-1-mes-2-source",
+        LINUX_FIRMWARE,
+    ),
     ("linux-firmware-amdgpu-gc-11-0-1-me-source", LINUX_FIRMWARE),
     ("linux-firmware-amdgpu-gc-11-0-1-mec-source", LINUX_FIRMWARE),
     ("linux-firmware-amdgpu-gc-11-0-1-pfp-source", LINUX_FIRMWARE),
     ("linux-firmware-amdgpu-gc-11-0-1-rlc-source", LINUX_FIRMWARE),
     ("linux-firmware-amdgpu-psp-13-0-4-ta-source", LINUX_FIRMWARE),
-    ("linux-firmware-amdgpu-psp-13-0-4-toc-source", LINUX_FIRMWARE),
+    (
+        "linux-firmware-amdgpu-psp-13-0-4-toc-source",
+        LINUX_FIRMWARE,
+    ),
     ("linux-firmware-amdgpu-sdma-6-0-1-source", LINUX_FIRMWARE),
     ("linux-firmware-amdgpu-vcn-4-0-2-source", LINUX_FIRMWARE),
     ("linux-firmware-amdgpu-license-source", LINUX_FIRMWARE),
     ("linux-firmware-ath11k-wcn6855-amss-source", LINUX_FIRMWARE),
-    ("linux-firmware-ath11k-wcn6855-board-2-source", LINUX_FIRMWARE),
-    ("linux-firmware-ath11k-wcn6855-m3-source", LINUX_FIRMWARE),
-    ("linux-firmware-ath11k-wcn6855-notice-source", LINUX_FIRMWARE),
-    ("linux-firmware-ath11k-wcn6855-regdb-source", LINUX_FIRMWARE),
-    ("linux-firmware-qualcomm-atheros-license-source", LINUX_FIRMWARE),
     (
-        "linux-source",
-        Watch::Held(
-            "the UAPI headers the build-root C packages compile against; moving them is its own decision (UPDATING.md)",
-        ),
+        "linux-firmware-ath11k-wcn6855-board-2-source",
+        LINUX_FIRMWARE,
+    ),
+    ("linux-firmware-ath11k-wcn6855-m3-source", LINUX_FIRMWARE),
+    (
+        "linux-firmware-ath11k-wcn6855-notice-source",
+        LINUX_FIRMWARE,
+    ),
+    ("linux-firmware-ath11k-wcn6855-regdb-source", LINUX_FIRMWARE),
+    (
+        "linux-firmware-qualcomm-atheros-license-source",
+        LINUX_FIRMWARE,
     ),
     (
         "linux-kernel-source",
@@ -151,13 +142,6 @@ const WATCHES: &[(&str, Watch)] = &[
         Watch::Index {
             index: "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/",
             pattern: "openssh-{}.tar.gz",
-        },
-    ),
-    (
-        "popt-x86-64-source",
-        Watch::Index {
-            index: "http://ftp.rpm.org/popt/releases/popt-1.x/",
-            pattern: "popt-{}.tar.gz",
         },
     ),
     (
@@ -207,13 +191,6 @@ const WATCHES: &[(&str, Watch)] = &[
         Watch::Index {
             index: "https://data.iana.org/time-zones/releases/",
             pattern: "tzdata{}.tar.gz",
-        },
-    ),
-    (
-        "util-linux-libs-x86-64-source",
-        Watch::Index {
-            index: GIT_UTIL_LINUX,
-            pattern: "refs/tags/v{}",
         },
     ),
     (

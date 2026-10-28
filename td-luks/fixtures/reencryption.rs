@@ -492,6 +492,43 @@ fn prefixes() -> Result<()> {
     }
     Ok(())
 }
+/// Exercise the replacement with no guest cryptsetup invocation. The host
+/// passes the realized kernel whose recipe asserts every AF_ALG option off.
+fn cutover() -> Result<()> {
+    td(&["format", UUID, "td-system", "/dev/vda"])?;
+    let mut base = vec![0; 16 << 20];
+    File::open("/dev/vda")?.read_exact_at(&mut base, 0)?;
+    for resilience in ["checksum", "journal"] {
+        for case in ["rewrite", "concurrent", "interrupt"] {
+            seed(&base)?;
+            let expected = match case {
+                "concurrent" => concurrent(resilience)?,
+                "interrupt" => {
+                    interrupt(resilience, "td")?;
+                    vec![0x5a; DATA]
+                }
+                _ => {
+                    td(&["reencrypt", "0", resilience, "/dev/vda", "live"])?;
+                    vec![0x5a; DATA]
+                }
+            };
+            no_temporary_maps()?;
+            td(&["close", "live"])?;
+            td(&["test", "1", "/dev/vda"])?;
+            td(&["open", "/dev/vda", "live"])?;
+            let mut actual = vec![0; DATA];
+            File::open("/dev/mapper/live")?.read_exact(&mut actual)?;
+            if actual != expected {
+                return Err("cutover plaintext differs".into());
+            }
+            td(&["close", "live"])?;
+            eprintln!("passed cutover/{resilience}/{case}");
+        }
+    }
+    println!("TD-LUKS-FIXTURES-PASS");
+    Ok(())
+}
+
 fn guest() -> Result<()> {
     for dir in ["/dev", "/proc", "/sys", "/run", "/tmp"] {
         fs::create_dir_all(dir)?;
@@ -499,13 +536,16 @@ fn guest() -> Result<()> {
     for (kind, target) in [("devtmpfs", "/dev"), ("proc", "/proc"), ("sysfs", "/sys")] {
         run("/td-init", &["mount", "-t", kind, kind, target])?;
     }
-    crypt(&["--version"])?;
     fs::write("/key", KEY)?;
     let cmdline = fs::read_to_string("/proc/cmdline")?;
     let mode = cmdline
         .split_whitespace()
         .find_map(|s| s.strip_prefix("td_luks_oracle="))
         .ok_or("missing mode")?;
+    if mode == "cutover" {
+        return cutover();
+    }
+    crypt(&["--version"])?;
     if mode == "prefixes" {
         prefixes()?;
     } else {
@@ -560,7 +600,7 @@ fn host(args: &[String]) -> Result<()> {
     };
     if !matches!(
         mode.as_str(),
-        "smoke" | "prefixes" | "concurrent" | "interrupt" | "locks"
+        "smoke" | "prefixes" | "concurrent" | "interrupt" | "locks" | "cutover"
     ) {
         return Err("unknown oracle mode".into());
     }

@@ -56,7 +56,6 @@ mod install_apps;
 mod install_fonts;
 mod install_mta;
 mod integration;
-mod kernel_headers;
 mod lock;
 mod main_integration;
 mod nar;
@@ -79,7 +78,6 @@ mod test_root;
 #[path = "../../td-fs/src/temp_dir.rs"]
 mod test_temp;
 mod toolchain_x86_64;
-mod unifdef;
 mod verdict_journal;
 mod worktree_gc;
 mod zstd;
@@ -5796,7 +5794,7 @@ const NON_APPLICATION_PHASE_RUNNERS: &[&str] = &["rust-dist-build"];
 
 /// The single shared sources cache: `$HOME/.td/sources` (HOME unset/empty -> relative), the
 /// flat pin-filename-keyed dir recipes read their warmed tarballs and generated
-/// kernel-headers from. Shared across ALL worktrees with NO env override; keep identical to
+/// source archives from. Shared across ALL worktrees with NO env override; keep identical to
 /// the feed/recipes copies (`var_os`, so a non-UTF-8 HOME resolves the same in all three).
 /// Deliberately NOT under `~/.td/build-daemon` (bound read-write into build sandboxes) — a
 /// pinned tarball is re-verified by sha256 on every read anyway.
@@ -9572,13 +9570,6 @@ fn main() -> ExitCode {
             }
         }
         Some("worktree-gc") => worktree_gc::cli(args.get(2..).unwrap_or(&[])),
-        Some("kernel-headers") => match kernel_headers::run_cli(args.get(2..).unwrap_or(&[])) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("td-builder: kernel-headers: {error}");
-                ExitCode::FAILURE
-            }
-        },
         Some("nar-hash") if args.len() == 3 => match nar_hash(&args[2]) {
             Ok(h) => {
                 println!("{h}");
@@ -12145,7 +12136,7 @@ fn main() -> ExitCode {
                     // The shared warmed-source cache (~/.td/sources, populated HOST-SIDE by
                     // `td-feed warm sources` before this sandbox starts) — READ-ONLY: the
                     // recipe gates STAGE the pinned tarballs + generated
-                    // kernel-headers from it (verified against their sha256) and never write
+                    // source archives from it (verified against their sha256) and never write
                     // it from inside. Same absolute path inside so the resolver finds it.
                     // Deliberately RO, unlike ~/.td/build-daemon above: recipe build steps must
                     // not be able to mutate the shared source cache. Bound only when present.

@@ -5,7 +5,7 @@
 //! cap, once cryptsetup's own metadata agrees with the header the plan was
 //! computed from (`Plan::confirm`).
 
-use crate::cryptsetup;
+use crate::luks;
 use crate::luks2::{self, Header, Metadata, MAX_TD_TOKENS};
 use crate::token::{Role, Token, MAX_SLOT};
 use std::ffi::OsString;
@@ -77,11 +77,11 @@ impl Step {
     /// descriptor and appears only in `AddKeyslot`'s.
     pub fn args(&self, device: &Path, new_key: &Path) -> Vec<OsString> {
         match self {
-            Self::Test { slot } => cryptsetup::test_args(device, *slot),
-            Self::KillSlot { slot, .. } => cryptsetup::kill_slot_args(device, *slot),
-            Self::RemoveToken { token } => cryptsetup::token_remove_args(device, *token),
-            Self::AddKeyslot { slot, by } => cryptsetup::add_key_args(device, *by, *slot, new_key),
-            Self::ImportToken { .. } => cryptsetup::token_import_args(device, None),
+            Self::Test { slot } => luks::test_args(device, *slot),
+            Self::KillSlot { slot, .. } => luks::kill_slot_args(device, *slot),
+            Self::RemoveToken { token } => luks::token_remove_args(device, *token),
+            Self::AddKeyslot { slot, by } => luks::add_key_args(device, *by, *slot, new_key),
+            Self::ImportToken { .. } => luks::token_import_args(device, None),
         }
     }
 
@@ -169,7 +169,7 @@ impl Plan {
     }
 
     /// The steps to execute, once `metadata`, the output of `luksDump
-    /// --dump-json-metadata` (`Cryptsetup::metadata`) taken before the
+    /// --dump-json-metadata` (`Luks::metadata`) taken before the
     /// first step, agrees with the view the plan was computed from: the
     /// same keyslots and the same tokens of every type. td's reader can use
     /// a checksum-valid copy that cryptsetup rejects (DESIGN.md "LUKS2
@@ -1595,29 +1595,29 @@ mod tests {
         let cases = [
             (
                 Step::Test { slot: 2 },
-                cryptsetup::test_args(device, 2),
+                luks::test_args(device, 2),
                 Input::KeyOf(2),
             ),
             (
                 Step::KillSlot { slot: 1, by: 2 },
-                cryptsetup::kill_slot_args(device, 1),
+                luks::kill_slot_args(device, 1),
                 Input::KeyOf(2),
             ),
             (
                 Step::RemoveToken { token: 0 },
-                cryptsetup::token_remove_args(device, 0),
+                luks::token_remove_args(device, 0),
                 Input::Nothing,
             ),
             (
                 Step::AddKeyslot { slot: 2, by: 1 },
-                cryptsetup::add_key_args(device, 1, 2, key),
+                luks::add_key_args(device, 1, 2, key),
                 Input::KeyOf(1),
             ),
             (
                 Step::ImportToken {
                     token: token.clone(),
                 },
-                cryptsetup::token_import_args(device, None),
+                luks::token_import_args(device, None),
                 Input::Token(&token),
             ),
         ];

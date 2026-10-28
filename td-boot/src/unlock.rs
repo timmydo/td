@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use td_protector::cryptsetup::{self, Cryptsetup, KeyFile};
+use td_protector::luks::{self, KeyFile, Luks};
 use td_protector::luks2::{self, Header};
 use td_protector::protected::TpmPin;
 use td_protector::release::{self, Tpm};
@@ -161,7 +161,7 @@ pub(crate) trait Unlocker {
     /// One tpm-pin token's PolicyPCR alone on a fresh TPM client: no Load,
     /// Unseal or PIN (td-protector's `policy_pcr_alone`).
     fn policy_pcr(&mut self, token: &TpmPin) -> Result<(), UnsealError>;
-    /// One cryptsetup command (`Cryptsetup::run`).
+    /// One cryptsetup command (`Luks::run`).
     fn run(&mut self, args: &[OsString], input: &[u8]) -> io::Result<()>;
     /// The active mapping of the partition that discovery admits.
     fn admit(&mut self) -> io::Result<Option<volume::Mapping>>;
@@ -282,11 +282,7 @@ pub(crate) fn unlock<U: Unlocker>(
         let key_file = KeyFile::new(key.expose())?;
         drop(key);
         unlocker.run(
-            &cryptsetup::open_by_volume_key_args(
-                device,
-                protocol::VOLUME_MAPPING_NAME,
-                key_file.path(),
-            ),
+            &luks::open_by_volume_key_args(device, protocol::VOLUME_MAPPING_NAME, key_file.path()),
             &[],
         )?;
     }
@@ -307,12 +303,12 @@ pub(crate) fn unlock<U: Unlocker>(
 }
 
 /// The unlock over the running system: td-tpm's resource manager, the
-/// source-built `/bin/cryptsetup` and sysfs.
+/// source-built `/bin/td-luks` and sysfs.
 pub(crate) struct System<'a> {
     partition: &'a volume::Pinned,
     name: String,
     uuid: &'a volume::Uuid,
-    cryptsetup: Cryptsetup,
+    cryptsetup: Luks,
 }
 
 impl<'a> System<'a> {
@@ -327,7 +323,7 @@ impl<'a> System<'a> {
             partition,
             name,
             uuid,
-            cryptsetup: Cryptsetup::new(PathBuf::from(format!("/bin/{}", protocol::CRYPTSETUP))),
+            cryptsetup: Luks::new(PathBuf::from(format!("/bin/{}", protocol::TD_LUKS))),
         })
     }
 }
@@ -617,7 +613,7 @@ mod tests {
             self.events.push(format!("run {}", words[0]));
             assert!(input.is_empty(), "nothing on standard input");
             // cryptsetup opens the key file by its name and reads it.
-            let at = words.iter().position(|w| w == "--volume-key-file").unwrap();
+            let at = 2;
             let mut read = Vec::new();
             File::open(&words[at + 1])
                 .unwrap()
@@ -662,7 +658,14 @@ mod tests {
         assert_eq!(mapping.name(), protocol::VOLUME_MAPPING_NAME);
         assert_eq!(
             unlocker.events,
-            ["tpm", "header", "unseal 1", "unseal 2", "run open", "admit"]
+            [
+                "tpm",
+                "header",
+                "unseal 1",
+                "unseal 2",
+                "run open-volume-key",
+                "admit"
+            ]
         );
         assert_eq!(
             out.matches("post-cap unseal of td token").count(),
@@ -672,9 +675,15 @@ mod tests {
         assert_eq!(unlocker.key_read.as_deref(), Some(key_bytes().as_slice()));
         let argv = &unlocker.argv[0];
         let prefix = format!("/proc/{}/fd/", std::process::id());
-        assert_eq!(argv[..4], ["open", "--type", "luks2", "--volume-key-file"]);
-        assert!(argv[4].starts_with(&prefix), "{argv:?}");
-        assert_eq!(argv[5..], ["/proc/7/fd/3", protocol::VOLUME_MAPPING_NAME]);
+        assert_eq!(
+            argv[..3],
+            [
+                "open-volume-key",
+                "/proc/7/fd/3",
+                protocol::VOLUME_MAPPING_NAME
+            ]
+        );
+        assert!(argv[3].starts_with(&prefix), "{argv:?}");
     }
 
     /// A protected header: each tpm-pin token by PolicyPCR alone, after the
@@ -730,7 +739,14 @@ mod tests {
             assert!(matches!(result.unwrap(), Unlocked::Mapping(_)));
             assert_eq!(
                 unlocker.events,
-                ["tpm", "header", "policy 0", "policy 1", "run open", "admit"]
+                [
+                    "tpm",
+                    "header",
+                    "policy 0",
+                    "policy 1",
+                    "run open-volume-key",
+                    "admit"
+                ]
             );
             assert_eq!(out.matches("post-cap PolicyPCR of td token").count(), 2);
         }
@@ -766,7 +782,7 @@ mod tests {
         unlocker.tpm = false;
         let (result, out) = unlock_with(&mut unlocker);
         assert!(matches!(result.unwrap(), Unlocked::Mapping(_)));
-        assert_eq!(unlocker.events, ["tpm", "run open", "admit"]);
+        assert_eq!(unlocker.events, ["tpm", "run open-volume-key", "admit"]);
         assert!(out.contains("not attempted"), "{out}");
     }
 
@@ -776,7 +792,10 @@ mod tests {
         unlocker.header = Err("copies disagree".into());
         let (result, out) = unlock_with(&mut unlocker);
         assert!(matches!(result.unwrap(), Unlocked::Mapping(_)));
-        assert_eq!(unlocker.events, ["tpm", "header", "run open", "admit"]);
+        assert_eq!(
+            unlocker.events,
+            ["tpm", "header", "run open-volume-key", "admit"]
+        );
         assert!(out.contains("copies disagree"), "{out}");
     }
 
@@ -841,7 +860,15 @@ mod tests {
         assert!(matches!(result.unwrap(), Unlocked::Mapping(_)));
         assert_eq!(
             unlocker.events,
-            ["tpm", "header", "unseal 2", "unseal 1", "unseal 3", "run open", "admit"]
+            [
+                "tpm",
+                "header",
+                "unseal 2",
+                "unseal 1",
+                "unseal 3",
+                "run open-volume-key",
+                "admit"
+            ]
         );
     }
 
@@ -885,7 +912,7 @@ mod tests {
         unlocker.run_fails = true;
         let (result, _) = unlock_with(&mut unlocker);
         assert!(result.is_err());
-        assert_eq!(unlocker.events, ["tpm", "header", "run open"]);
+        assert_eq!(unlocker.events, ["tpm", "header", "run open-volume-key"]);
 
         let mut unlocker = Scripted::new(&[]);
         unlocker.admit = None;
@@ -902,7 +929,7 @@ mod tests {
     fn the_production_unlocker_names_the_shipped_programs() {
         let source = include_str!("unlock.rs");
         let (production, _) = source.split_once("\n#[cfg(test)]\n").unwrap();
-        assert!(production.contains("format!(\"/bin/{}\", protocol::CRYPTSETUP)"));
+        assert!(production.contains("format!(\"/bin/{}\", protocol::TD_LUKS)"));
         assert!(production.contains("const TPM_DEVICE: &str = \"/dev/tpmrm0\";"));
         assert_eq!(protocol::VOLUME_KEY_MEMBER, "td-volume-key-v1");
         assert_eq!(protocol::VOLUME_KEY_BYTES, 64);

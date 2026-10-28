@@ -13,7 +13,7 @@
 //! runs through `Runner`, and every secret is zeroed when dropped. Library
 //! code: td-boot dispatches a protected header here.
 
-use crate::cryptsetup::{exit_code, test_args, KeyFile, EXIT_BAD_PASSPHRASE};
+use crate::luks::{exit_code, test_args, KeyFile, EXIT_BAD_PASSPHRASE};
 use crate::luks2::{Header, Kind, UpgradeView, MAX_FIDO2_TOKENS};
 use crate::pin::{
     chain_check, observe_pin, protected_auth_policy, release_pin_policy, ChainError, Pin, PinPcrs,
@@ -585,7 +585,7 @@ pub struct Finished {
 /// After the selector opened the mapping and took `volume_key` with the
 /// released key. A pending request's fate is read under its tag
 /// (`request::fate`), and a clear's or re-enrollment's question asked at
-/// `prompt`, after the cap with the tag verified. Cryptsetup's metadata is
+/// `prompt`, after the cap with the tag verified. Luks's metadata is
 /// confirmed once before the first write.
 ///
 /// Without a reseal the plan runs, `request::plan`'s beside a request, a
@@ -2219,7 +2219,7 @@ fn run_step<C: Runner>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::cryptsetup::{Failed, MIN_KILL_KEY};
+    use crate::luks::{Failed, MIN_KILL_KEY};
     use crate::luks2::{self, HeaderCopy};
     use crate::pin::{AuthValue, PROTECTED_ATTRIBUTES};
     use crate::protected::{Fido2, Lockout};
@@ -2601,7 +2601,7 @@ pub(crate) mod tests {
 
     pub(crate) fn exited(code: i32) -> io::Error {
         Failed::new(
-            Path::new("/bin/cryptsetup"),
+            Path::new("/bin/td-luks"),
             "open",
             ExitStatus::from_raw(code << 8),
         )
@@ -2709,10 +2709,7 @@ pub(crate) mod tests {
                 1,
                 "{words:?}"
             );
-            let after = |flag: &str| -> Option<u8> {
-                let at = words.iter().position(|w| w == flag)?;
-                Some(words[at + 1].parse().unwrap())
-            };
+            let number = |at: usize| -> u8 { words[at].parse().unwrap() };
             let index = self.commands;
             self.commands += 1;
             if self.cut == Some(index) {
@@ -2720,17 +2717,17 @@ pub(crate) mod tests {
                 return Err(io::Error::other("cut"));
             }
             match (words[0].as_str(), words[1].as_str()) {
-                ("open", "--test-passphrase") => {
-                    let slot = after("--key-slot").unwrap();
+                ("test", _) => {
+                    let slot = number(1);
                     if !self.opens(slot, input) {
                         note(&self.log, format!("cs test {slot} refused"));
                         return Err(exited(EXIT_BAD_PASSPHRASE));
                     }
                     note(&self.log, format!("cs test {slot} ok"));
                 }
-                ("luksAddKey", _) => {
-                    let by = after("--key-slot").unwrap();
-                    let slot = after("--new-key-slot").unwrap();
+                ("add-key", _) => {
+                    let by = number(1);
+                    let slot = number(2);
                     let key = std::fs::read(words.last().unwrap()).unwrap();
                     assert_eq!(key.len(), SECRET_LEN);
                     assert!(self.opens(by, input), "add {slot} by {by}");
@@ -2738,13 +2735,13 @@ pub(crate) mod tests {
                     self.keyslots.insert(slot, key);
                     note(&self.log, format!("cs add {slot} by {by}"));
                 }
-                ("token", "import") => {
+                ("token-import" | "token-replace", _) => {
                     let token = Token::decode(input).unwrap();
                     if let Some(slot) = token.keyslot() {
                         assert!(self.keyslots.contains_key(&slot));
                     }
-                    let replace = words.iter().any(|w| w == "--token-replace");
-                    let number = match after("--token-id") {
+                    let replace = words[0] == "token-replace";
+                    let number = match (words.len() == 3).then(|| number(1)) {
                         Some(id) => {
                             assert_eq!(self.tokens.contains_key(&id), replace, "{words:?}");
                             id
@@ -2755,13 +2752,13 @@ pub(crate) mod tests {
                     self.tokens.insert(number, token);
                     note(&self.log, format!("cs import {number} {kind}"));
                 }
-                ("token", "remove") => {
-                    let id = after("--token-id").unwrap();
+                ("token-remove", _) => {
+                    let id = number(1);
                     assert!(self.tokens.remove(&id).is_some());
                     note(&self.log, format!("cs remove {id}"));
                 }
-                ("luksKillSlot", _) => {
-                    let slot: u8 = words.last().unwrap().parse().unwrap();
+                ("kill-slot", _) => {
+                    let slot = number(1);
                     assert!(input.len() >= MIN_KILL_KEY);
                     assert!(
                         self.keyslots

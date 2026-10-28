@@ -84,3 +84,17 @@ d766dcdb1c0144109458fc86b59b761a737af7dd5d818333bc83909ee4654f42  td-luks/fixtur
 bdd0bbd6e80f28bdd23dba2b9952f2ac1c26eed7e15c70a12875b305df7ad5a1  td-luks/fixtures/token.bin
 2b80ed1216f6da433ac9c4bed623fd3f00c7ab770ae54962be4b24bfca039b6a  td-luks/fixtures/unbound.bin
 ```
+
+## Retaining the stock oracle after cutover
+
+The runtime distribution no longer builds cryptsetup. The pinned 2.8.8
+KERNEL_CAPI oracle is a host test artifact. Its reviewed source recipe,
+closure pins and AF_ALG-enabled kernel remain in git at
+`28dd1d6afdf6d8222252bcb2d693834125d77fa5`, before the cutover.
+To reproduce it, use an isolated checkout of that commit under the owning
+worktree's `.td-build-cache/agent-scratch/`, follow DEVELOPMENT.md's host
+preparation, and build `cryptsetup-x86-64` and `linux-x86-64` there.
+Keep those outputs for the stock interoperability modes; never introduce
+them as inputs to the current distribution recipes. The `cutover` runtime
+mode instead uses the current target-built td-luks and AF_ALG-disabled
+kernel, with no guest cryptsetup invocation.

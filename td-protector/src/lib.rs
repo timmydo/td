@@ -24,8 +24,8 @@ use std::io::Read;
 use std::path::Path;
 use td_tpm::{Client, PcrPolicy, PcrReadError, PcrSelection, Refusal, SealedObject, Transport};
 
-pub mod cryptsetup;
 pub mod lockout;
+pub mod luks;
 pub mod luks2;
 pub mod manage;
 pub mod pin;

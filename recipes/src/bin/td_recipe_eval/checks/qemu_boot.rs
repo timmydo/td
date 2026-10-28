@@ -372,7 +372,9 @@ pub(crate) const QEMU_USER_NET_DEVICE: &str = "virtio-net-pci,netdev=net0";
 const POLL: Duration = Duration::from_millis(200);
 /// A power-cut boot's poll: the kill should land as close after its
 /// marker as the host allows, since the guest keeps committing meanwhile.
-const CUT_POLL: Duration = Duration::from_millis(5);
+/// Metadata-only td-luks commits can complete between 5 ms polls.
+const CUT_POLL: Duration = Duration::from_micros(100);
+const WATCH_POLL: Duration = Duration::from_millis(5);
 /// One QMP exchange's bound, which only a hung QEMU should reach. QEMU
 /// answers its monitor from the main loop that also scans the display out,
 /// so on a loaded host a full-frame screendump, or an input event queued
@@ -4529,8 +4531,8 @@ struct BootPlan<'a> {
     /// Typed at console prompts as they arrive, over the same serial
     /// socket the shell uses; the marker kill waits for the last.
     answers: Option<&'a serial_shell::ConsoleAnswers<'a>>,
-    /// The marker is a power cut: the console is polled every few
-    /// milliseconds rather than every `POLL`.
+    /// The marker is a power cut: poll at `CUT_POLL` to catch short
+    /// metadata commit windows, rather than at the ordinary interval.
     cut: bool,
     /// A path, which must not exist yet, for QEMU to write the whole raw
     /// console to instead of the boot's scratch, so that it outlives the
@@ -5617,7 +5619,13 @@ fn boot_source(
         let watching = screens
             .as_ref()
             .is_some_and(guest_screens::ScreenSteps::watching);
-        thread::sleep(if plan.cut || watching { CUT_POLL } else { POLL });
+        thread::sleep(if plan.cut {
+            CUT_POLL
+        } else if watching {
+            WATCH_POLL
+        } else {
+            POLL
+        });
     }
 
     // Drain all final bytes qemu flushed before it was reaped. A marker-killed

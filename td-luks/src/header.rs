@@ -378,6 +378,8 @@ pub struct Volume {
     /// The keyslots of type `luks2`, ascending: a reencryption's own keyslot
     /// is another type, and unlocks nothing.
     pub luks2: Vec<u8>,
+    /// Normal keyslots assigned to exactly one digest naming segment 0.
+    pub bound: Vec<u8>,
     /// The `mode` of each keyslot of type `reencrypt`, in keyslot order:
     /// `reencrypt`, `encrypt` or `decrypt` as cryptsetup writes it.
     pub reencrypt_modes: Vec<String>,
@@ -399,7 +401,7 @@ pub fn volume(json: &Json) -> Result<Volume, String> {
             .iter()
             .filter(move |(_, keyslot)| keyslot.get("type").and_then(Json::as_str) == Some(kind))
     };
-    let luks2 = typed("luks2").map(|(number, _)| *number).collect();
+    let luks2: Vec<u8> = typed("luks2").map(|(number, _)| *number).collect();
     let reencrypt_modes = typed("reencrypt")
         .map(|(_, keyslot)| {
             keyslot
@@ -410,6 +412,26 @@ pub fn volume(json: &Json) -> Result<Volume, String> {
         })
         .collect();
     let digests = numbered(json, "digests")?;
+    let bound = luks2
+        .iter()
+        .copied()
+        .filter(|slot| {
+            let text = slot.to_string();
+            let mut assigned = digests.iter().filter(|(_, digest)| {
+                digest
+                    .get("keyslots")
+                    .and_then(Json::as_arr)
+                    .is_some_and(|slots| slots.iter().any(|s| s.as_str() == Some(text.as_str())))
+            });
+            match (assigned.next(), assigned.next()) {
+                (Some((_, digest)), None) => digest
+                    .get("segments")
+                    .and_then(Json::as_arr)
+                    .is_some_and(|segments| segments.iter().any(|s| s.as_str() == Some("0"))),
+                _ => false,
+            }
+        })
+        .collect();
     let mut naming = digests.iter().filter(|(_, digest)| {
         digest
             .get("segments")
@@ -446,6 +468,7 @@ pub fn volume(json: &Json) -> Result<Volume, String> {
         segment,
         reencryption,
         luks2,
+        bound,
         reencrypt_modes,
     })
 }

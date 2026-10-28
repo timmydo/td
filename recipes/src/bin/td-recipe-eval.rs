@@ -710,7 +710,7 @@ mod tests {
         let pins = td_recipe::source_pins::all();
         // source_pins::tests::catalog_carries_all_legacy_source_locks names
         // each of them.
-        assert_eq!(pins.len(), 51);
+        assert_eq!(pins.len(), 45);
         assert!(pins.iter().all(|pin| pin.key != "stage0-source"));
         // The build root lists through `build-root-pins` alone.
         assert!(pins.iter().all(|pin| !pin.key.starts_with("debian-root-")));
@@ -736,17 +736,14 @@ mod tests {
             .all(|pin| pin.key != "btrfs-progs-x86-64-source"));
         assert!(pins
             .iter()
-            .any(|pin| pin.key == "util-linux-libs-x86-64-source"));
+            .all(|pin| pin.key != "util-linux-libs-x86-64-source"));
         for key in [
             "cryptsetup-x86-64-source",
             "json-c-x86-64-source",
             "libdevmapper-x86-64-source",
             "popt-x86-64-source",
         ] {
-            assert!(
-                pins.iter().any(|pin| pin.key == key && !pin.foreign()),
-                "missing {key}"
-            );
+            assert!(pins.iter().all(|pin| pin.key != key), "retired pin {key}");
         }
     }
 

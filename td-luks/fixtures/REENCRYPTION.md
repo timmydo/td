@@ -23,6 +23,7 @@ initramfs and working disk are removed. Each guest has a 600-second deadline.
 
 | Mode | Evidence |
 | --- | --- |
+| `cutover` | Uses td-luks format, test, open and close with no guest cryptsetup invocation; both resilience modes preserve 32 MiB through complete rewriting, concurrent sector writes, and interruption/resume. Run with the realized AF_ALG-disabled kernel and target-built td-luks. |
 | `smoke` | Partial stack setup and final teardown close without leaked helpers, while a foreign helper UUID survives. Both resilience modes reclaim an owned orphan temporary map, reencrypt 32 MiB, remove helper maps and preserve plaintext through both tools' open/close. |
 | `prefixes` | td-luks opens and recovers all 92 supported stock write prefixes, completes each through its real resume command, and stock reopens the same 2 MiB plaintext. The 14 unsafe all-new profiles are excluded as in the offline tests. |
 | `concurrent` | A separate writer writes, syncs and reads back distributed 4096-byte sectors during 32 MiB online reencryption. Both tools verify the final mixed plaintext pattern. |
@@ -44,3 +45,7 @@ resilience choice requires. Journal recovery does not make that assumption.
 The separate library fault-injection tests cover final-header persistence,
 free-journal cleanup and restart ordering; the guest does not inject every
 physical write, torn sector, device write-cache failure or ioctl failure.
+
+The stock KERNEL_CAPI oracle modes retain the pre-cutover kernel because
+that pinned cryptsetup requires AF_ALG. They establish interoperability;
+`cutover` separately proves the replacement works on the new kernel.

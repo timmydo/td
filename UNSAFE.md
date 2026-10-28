@@ -94,7 +94,7 @@ Its PCR 11 measurement, the live selector's PCR 12 cap and the installed
 selector's release run over td-tpm (with td-fido) and td-protector (with
 td-json and td-luks, its LUKS2 header reader), each forbidding unsafe code,
 the TPM being td-tpm's safe file I/O on `/dev/tpmrm0`; a refused cap or
-release halts by parking the thread through std. The release's cryptsetup
+release halts by parking the thread through std. The release's td-luks
 children, and the pipe that hands the volume key to td-kexec, are std's,
 through td-protector's runner and its `KeyFile`; its recovery flow's
 secret-line child and the pipe it reads the entry from are std's too, the
@@ -103,7 +103,7 @@ lines' mirror to the VT is a std non-blocking open and write of `/dev/tty1`,
 and which terminal `/dev/console` is comes from sysfs through td-init's
 std-only `console.rs`. The deployment initramfs's unlock adds none: its
 post-cap unseal is td-protector's over the same client, its key member is
-read with std file I/O, and its one cryptsetup child, with the key on a
+read with std file I/O, and its one td-luks child, with the key on a
 pipe, is td-protector's runner's std process and pipe. `td-install` was the
 second until it had to publish onto a disk it holds (§21). Its partition
 tables and filesystems are still bytes at offsets, a device's size is a
@@ -650,7 +650,7 @@ or call the two wrappers. That amendment is what lets both initramfses and
 `/etc/inittab` mount without busybox, and the `LOOP_SET_FD` request above
 is what lets `td-boot` attach the verified root loop without it — so
 nothing td-boot runs is a third-party program any more but D6's
-source-built cryptsetup, with which the deployment initramfs opens an
+td-luks, with which the deployment initramfs opens an
 encrypted volume (`td-install/DESIGN.md` D6). Neither
 initramfs packs the multicall, and since `getty` became an applet here
 neither does the real root: that used to be a claim about the ARCHIVES
@@ -3438,7 +3438,7 @@ device-bound service's TPM probe and formatting; each forbids unsafe
 code and adds no syscall, the TPM being td-tpm's safe file I/O on
 `/dev/tpmrm0` and the recovery key and protector secret td-protector's
 read of `/dev/random`.
-Device-bound formatting hands key material to cryptsetup through
+Device-bound formatting hands key material to td-luks through
 td-protector's runner, whose std pipes and child processes add no
 syscall surface either. The
 `asm!` block leaves out `options(nomem)` because the kernel reads the

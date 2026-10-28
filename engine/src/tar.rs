@@ -1121,11 +1121,7 @@ mod tests {
 
     #[test]
     fn unpack_archive_keep_top_round_trips_an_uncompressed_tar() {
-        // The X3 toolchain path (toolchain_x86_64.rs) unpacks the host-free,
-        // UNCOMPRESSED kernel-headers seed via unpack_archive(keep_top=true) — magic-byte
-        // sniffing falls through to plain `extract_tar` for a non-gzip/bz2/xz magic. Lock
-        // that a plain tar with a top-level dir round-trips WITHOUT stripping that dir
-        // (keep_top=true == the old untar strip=0), the exact behavior that swap relies on.
+        // Plain tar sniffing must preserve the top directory when requested.
         let tmp = temp_dir("td-tar-keeptop");
         let tar = tmp.join("plain.tar");
         let out = tmp.join("out");

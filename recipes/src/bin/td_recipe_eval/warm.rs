@@ -25,8 +25,8 @@ use td_recipe::catalog;
 use td_recipe::types::{Recipe, SourcePin};
 
 use crate::check_runner::{
-    classify_graph_inputs, is_executable, linux_version_from_file, recipe_closure,
-    source_pin_for_key, RecipeCheckRunner, RecipeNode, SeedInput,
+    classify_graph_inputs, is_executable, recipe_closure, source_pin_for_key, RecipeCheckRunner,
+    RecipeNode, SeedInput,
 };
 
 /// One `td-feed warm crate`/`warm crate-local` job: the argv that populates
@@ -41,8 +41,6 @@ struct VendorJob {
 struct Cold {
     /// Pinned tarballs missing from the shared sources cache.
     sources: Vec<SourcePin>,
-    /// Kernel-header seed arches missing from the same cache.
-    headers: Vec<&'static str>,
     /// Rust rungs whose vendored dep closure is missing.
     vendors: Vec<VendorJob>,
     /// The Debian build root's layer and .debs, when a recipe in the closure
@@ -52,10 +50,7 @@ struct Cold {
 
 impl Cold {
     fn is_empty(&self) -> bool {
-        self.sources.is_empty()
-            && self.headers.is_empty()
-            && self.vendors.is_empty()
-            && self.build_root.is_empty()
+        self.sources.is_empty() && self.vendors.is_empty() && self.build_root.is_empty()
     }
 
     /// One operator-facing line naming what is missing. A cold checkout is
@@ -70,14 +65,6 @@ impl Cold {
                 files.len(),
                 plural(files.len()),
                 elided(&files)
-            ));
-        }
-        if !self.headers.is_empty() {
-            parts.push(format!(
-                "{} kernel-header seed{} ({})",
-                self.headers.len(),
-                plural(self.headers.len()),
-                self.headers.join(" ")
             ));
         }
         if !self.build_root.is_empty() {
@@ -134,7 +121,7 @@ pub(crate) fn preflight(runner: &RecipeCheckRunner, targets: &[&str]) -> Result<
 
     // `warm sources` fetches every cold pin and derives BOTH kernel-header seeds
     // from the pinned linux source, so one call covers both classes.
-    if !cold.sources.is_empty() || !cold.headers.is_empty() {
+    if !cold.sources.is_empty() {
         run_warm(&td_net, root, builder, &[s("warm"), s("sources")]);
     }
     if !cold.build_root.is_empty() {
@@ -165,15 +152,9 @@ pub(crate) fn preflight(runner: &RecipeCheckRunner, targets: &[&str]) -> Result<
 fn survey(root: &Path, sources_dir: &Path, targets: &[&str]) -> Result<Cold, String> {
     let graph = recipe_closure(targets)?;
     let mut sources: Vec<SourcePin> = Vec::new();
-    let mut headers: Vec<&'static str> = Vec::new();
     for input in classify_graph_inputs(&graph)? {
         match input {
             SeedInput::Source { pin, .. } => push_cold_source(&mut sources, sources_dir, pin),
-            SeedInput::LinuxHeaders { arch, .. } => {
-                if !headers.contains(&arch) && !header_seed_is_warm(sources_dir, arch)? {
-                    headers.push(arch);
-                }
-            }
             SeedInput::LocalSource { .. } => {}
         }
     }
@@ -185,7 +166,6 @@ fn survey(root: &Path, sources_dir: &Path, targets: &[&str]) -> Result<Cold, Str
     }
     Ok(Cold {
         sources,
-        headers,
         vendors: cold_vendor_jobs(root, &graph)?,
         build_root,
     })
@@ -199,17 +179,6 @@ fn push_cold_source(cold: &mut Vec<SourcePin>, sources_dir: &Path, pin: SourcePi
         return;
     }
     cold.push(pin);
-}
-
-/// The generated `linux-headers-<version>-<arch>.tar` seed, named exactly as the
-/// intern will look for it — derived from the pinned linux source, so a pin bump
-/// makes the old seed cold rather than passing a stale one off as warm.
-fn header_seed_is_warm(sources_dir: &Path, arch: &str) -> Result<bool, String> {
-    let pin = source_pin_for_key("linux-source")?;
-    let version = linux_version_from_file(&pin.file)?;
-    Ok(sources_dir
-        .join(format!("linux-headers-{version}-{arch}.tar"))
-        .is_file())
 }
 
 /// The warm jobs for rust rungs in the closure whose vendored dep closure is
@@ -535,11 +504,6 @@ mod tests {
             files.iter().any(|f| f.starts_with("rustc-1.99.1-")),
             "the Rust toolchain must be reported cold: {files:?}"
         );
-        assert!(
-            cold.headers.contains(&"x86_64"),
-            "the x86_64 kernel-header seed must be reported cold: {:?}",
-            cold.headers
-        );
         assert!(!cold.is_empty());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&sources);
@@ -593,15 +557,6 @@ mod tests {
         for pin in cold.sources.iter().chain(&cold.build_root) {
             fs::write(sources.join(&pin.file), b"pinned bytes").unwrap();
         }
-        let linux = source_pin_for_key("linux-source").unwrap();
-        let version = linux_version_from_file(&linux.file).unwrap();
-        for arch in &cold.headers {
-            fs::write(
-                sources.join(format!("linux-headers-{version}-{arch}.tar")),
-                b"headers",
-            )
-            .unwrap();
-        }
         for job in &cold.vendors {
             let vendor = root
                 .join(".td-build-cache/crate-vendor")
@@ -651,21 +606,6 @@ mod tests {
 
     // A stale header seed must read as COLD: the name carries the pinned linux
     // version, so a pin bump cannot be satisfied by the previous version's tar.
-    #[test]
-    fn a_header_seed_for_another_linux_version_is_not_warm() {
-        let sources = scratch("hdr");
-        fs::write(sources.join("linux-headers-0.0.0-x86_64.tar"), b"stale").unwrap();
-        assert!(!header_seed_is_warm(&sources, "x86_64").unwrap());
-        let linux = source_pin_for_key("linux-source").unwrap();
-        let version = linux_version_from_file(&linux.file).unwrap();
-        fs::write(
-            sources.join(format!("linux-headers-{version}-x86_64.tar")),
-            b"fresh",
-        )
-        .unwrap();
-        assert!(header_seed_is_warm(&sources, "x86_64").unwrap());
-        let _ = fs::remove_dir_all(&sources);
-    }
 
     // The crates.io name is not the recipe stem and not "everything before the
     // last hyphen" either; both of td's vendoring shapes have to come out right.

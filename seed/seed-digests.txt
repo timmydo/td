@@ -11,13 +11,10 @@
 # is self-defeating: the runner
 # re-derives from the pins every run and reds on disagreement.
 ca-certificates-source gwd0r7fyqs45rzrnwwbzl2p5c76zrfad-ca-certificates-source
-cryptsetup-x86-64-source v3g69yip0g4zybh9yw2hlp3zzcfy98fc-cryptsetup-x86-64-source
 curl-x86-64-source s38hackr0p194d351xs9pc71gjknclls-curl-x86-64-source
 fd-source 3hg9h3s5x6qcs26fp90j0zknw2pd7z13-fd-source
 git-x86-64-source dsg8dzp8rizb8x2jfjzs50wqmlq29x44-git-x86-64-source
 jetbrains-mono-nerd-font-source 632myin1d84lnr23d9ma4f4iwgs13bk2-jetbrains-mono-nerd-font-source
-json-c-x86-64-source csb78c2cixywmxii4vxp4ab11q5273p5-json-c-x86-64-source
-libdevmapper-x86-64-source 14i35fjwswmcjr5jp6p00vhh8b2m99d4-libdevmapper-x86-64-source
 libressl-x86-64-source iad2rcbcs4301jyahxbd8cxv41y1r97h-libressl-x86-64-source
 linux-firmware-amdgpu-dcn-3-1-4-dmcub-source 639m8ngg6xa7zy4g29q6r54zx4n6y3dl-linux-firmware-amdgpu-dcn-3-1-4-dmcub-source
 linux-firmware-amdgpu-gc-11-0-1-imu-source msiwa2192ss51pk94nvanddcgbhky40s-linux-firmware-amdgpu-gc-11-0-1-imu-source
@@ -38,7 +35,6 @@ linux-firmware-ath11k-wcn6855-m3-source ykcwq4kcp109fzh2mndzd43i4c32bycw-linux-f
 linux-firmware-ath11k-wcn6855-notice-source 408zncrpy9bx106rkgjg1np9xxzgrzdb-linux-firmware-ath11k-wcn6855-notice-source
 linux-firmware-ath11k-wcn6855-regdb-source vf2wajzx7j1xg371lwsvdshzyxspwyj2-linux-firmware-ath11k-wcn6855-regdb-source
 linux-firmware-qualcomm-atheros-license-source r04z3gvrpns65smawdy3s7cijnv6y8j0-linux-firmware-qualcomm-atheros-license-source
-linux-headers-x86-64 r4mg86l36d6x7c08wqj8v2fdkx23sxjv-linux-headers-x86-64
 linux-kernel-source 2az87mvc15qnmdy0rj4n740039lkgcgc-linux-kernel-source
 nerd-fonts-codicons-license-source ma6jj9n0qgmk2p4nr8r9x2axnbf2wkip-nerd-fonts-codicons-license-source
 nerd-fonts-font-awesome-license-source 933m2kl6wlld9mma2bwcxvqyjd4wfqbh-nerd-fonts-font-awesome-license-source
@@ -50,7 +46,6 @@ nerd-fonts-powerline-extra-license-source rqafa2h34k4pcd02p46256hcm2bg9l9m-nerd-
 nerd-fonts-powerline-symbols-license-source l6byrv5ddn1xvnysn7lrpjmr53pfzlna-nerd-fonts-powerline-symbols-license-source
 nerd-fonts-weather-icons-license-source jsmpd2zdj5zkna7diqcrzyirzngh7rdm-nerd-fonts-weather-icons-license-source
 openssh-x86-64-source 7q2m5kisis6k0rbkjwnvj5n2fvba581p-openssh-x86-64-source
-popt-x86-64-source i2hswa2a3s6kzvqrzl9hz4gvgavsx4yh-popt-x86-64-source
 ripgrep-seed-source vg4gdaxl18mqlbhybnn2pq7lpwm3wm2q-ripgrep-seed-source
 ripgrep-source 5lqzfa2vx99vmcy2cd3g88wf06pgs3kl-ripgrep-source
 rust-cargo-dist vv9hjbvrx25p93ai791gkcci9xy5vfzj-rust-cargo-dist
@@ -58,6 +53,5 @@ rust-clippy-dist jrj59nm73bkic24bg9hpwga99xcg79yk-rust-clippy-dist
 rust-rustc-dist 3390kbk5914rr9rgmf7f1br1l9v9zsmr-rust-rustc-dist
 rust-std-dist pvkrzbqpml6v8y28q7zxib8siydhxm8l-rust-std-dist
 tzdata-source k7vlacf1y4h7hk6isx94ig6hq0cnl516-tzdata-source
-util-linux-libs-x86-64-source jaa0srjhf8plvajwbna72q6lxzar5r81-util-linux-libs-x86-64-source
 uutils-source lbvl02m37zd8l069hrdcax519pikgjsn-uutils-source
 zlib-x86-64-source pamiaj7i38xzslsd712inwc7ix77cjlp-zlib-x86-64-source

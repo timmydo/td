@@ -191,13 +191,13 @@ pub fn valid_digest(bytes: &[u8]) -> bool {
 // argument as `REQUIRED_TD_INIT_APPLETS` above, one program wide.
 #[allow(dead_code)]
 pub const MKFS_BTRFS: &str = "mkfs.btrfs";
-// The other (D6): the static cryptsetup a live installer formats a
+// The other (D6): the static td-luks a live installer formats a
 // device-bound volume with, from the verified root's /bin, and both
 // initramfs open one with, the selector after its release and the deployment
 // initramfs with the handed-off key, each from its own /bin. Bound the same way,
 // so an image without any of them reds the build.
 #[allow(dead_code)]
-pub const CRYPTSETUP: &str = "cryptsetup";
+pub const TD_LUKS: &str = "td-luks";
 // The device-bound volume-key handoff (td-install/ENCRYPTION.md "Boot and
 // authority boundaries"): the selector's td-kexec appends to its sealed copy
 // of the deployment initramfs one newc archive whose only member is this
@@ -238,8 +238,8 @@ pub const DEFAULT_BOOT_ATTEMPTS: u8 = ATTEMPT_V1_MAX_REMAINING;
 //
 // `REQUIRED_BUSYBOX_APPLETS` used to sit beside this holding `losetup`, and
 // deleting it is the point of the landing that added td-init's `LOOP_SET_FD`
-// request: td-boot now reaches no third-party program but `CRYPTSETUP`, D6's
-// source-built cryptsetup, which the image's shape check binds.
+// request: td-boot reaches only td-owned programs; the image shape check
+// binds `TD_LUKS` as D6 requires.
 pub const MOUNT_APPLET: &str = "mount";
 pub const UMOUNT_APPLET: &str = "umount";
 pub const LOSETUP_APPLET: &str = "losetup";

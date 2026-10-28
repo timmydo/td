@@ -1017,6 +1017,7 @@ mod tests {
                 segment: segment(U1_SEGMENT),
                 reencryption: false,
                 luks2: vec![0],
+                bound: vec![0],
                 reencrypt_modes: vec![],
             }
         );
@@ -1026,6 +1027,7 @@ mod tests {
                 segment: segment(U1_SEGMENT),
                 reencryption: true,
                 luks2: vec![0, 1],
+                bound: vec![0],
                 reencrypt_modes: vec!["reencrypt".into()],
             }
         );
@@ -1035,6 +1037,7 @@ mod tests {
                 segment: segment(U3_SEGMENT),
                 reencryption: false,
                 luks2: vec![1],
+                bound: vec![1],
                 reencrypt_modes: vec![],
             }
         );

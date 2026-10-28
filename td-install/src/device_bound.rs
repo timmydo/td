@@ -3,7 +3,7 @@
 //! the order of cryptsetup's commands, the first-boot protector and the
 //! checks verifying boot adds. td-protector's runner spells each command
 //! and passes key material by descriptor only (td-protector/DESIGN.md
-//! "Cryptsetup runner").
+//! "Luks runner").
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -11,9 +11,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use td_protector::cryptsetup::{
-    add_key_args, close_args, format_args, open_args, test_args, token_import_args, Cryptsetup,
-    KeyFile, Mapping,
+use td_protector::luks::{
+    add_key_args, close_args, format_args, open_args, test_args, token_import_args, KeyFile, Luks,
+    Mapping,
 };
 use td_protector::luks2;
 use td_protector::recovery::RecoveryKey;
@@ -182,7 +182,7 @@ pub(crate) enum Stopped {
 
 /// What the volume format runs besides cryptsetup, so tests can stand in.
 pub(crate) struct Volume<'a> {
-    pub(crate) cryptsetup: &'a Cryptsetup,
+    pub(crate) cryptsetup: &'a Luks,
     pub(crate) protector: &'a dyn Protector,
     /// The plan's volume UUID, canonical.
     pub(crate) uuid: &'a str,
@@ -202,7 +202,7 @@ pub(crate) struct Volume<'a> {
 /// neither active nor inactive is treated as active. A mapping still not
 /// inactive at the end is reported as surviving: its volume key is still
 /// live in the kernel.
-fn close(cryptsetup: &Cryptsetup, name: &str, mapping: &Path) -> io::Result<()> {
+fn close(cryptsetup: &Luks, name: &str, mapping: &Path) -> io::Result<()> {
     let mut failed = String::new();
     for attempt in 0..=CLOSE_ATTEMPTS {
         match cryptsetup.mapping(name) {
@@ -335,7 +335,7 @@ mod tests {
     use crate::scratch;
     use std::cell::RefCell;
     use std::path::PathBuf;
-    use td_protector::cryptsetup::status_args;
+    use td_protector::luks::status_args;
 
     const UUID: &str = "5a5a5a5a-5a5a-405a-805a-5a5a5a5a5a5a";
     const NAME: &str = "td-install-0707070707070707";
@@ -351,55 +351,20 @@ mod tests {
     #[test]
     fn each_command_names_the_installation() {
         let device = Path::new("/dev/loop7");
-        let format = format_volume_args(UUID, device);
         assert_eq!(
-            words(&format)[23..],
-            [
-                "--uuid",
-                UUID,
-                "--label",
-                "td-system",
-                "--key-slot",
-                "0",
-                "--key-file=-",
-                "/dev/loop7",
-            ]
+            words(&format_volume_args(UUID, device)),
+            ["format", UUID, "td-system", "/dev/loop7"]
         );
         assert_eq!(
-            words(&add_protector_args(device, Path::new("/proc/9/fd/4")))[8..],
-            [
-                "--key-slot",
-                "0",
-                "--new-key-slot",
-                "1",
-                "--key-file=-",
-                "/dev/loop7",
-                "/proc/9/fd/4",
-            ]
+            words(&add_protector_args(device, Path::new("/proc/9/fd/4"))),
+            ["add-key", "0", "1", "/dev/loop7", "/proc/9/fd/4"]
         );
         assert_eq!(
             words(&import_protector_args(device)),
-            [
-                "token",
-                "import",
-                "--token-id",
-                "0",
-                "--json-file=-",
-                "/dev/loop7"
-            ]
+            ["token-import", "0", "/dev/loop7"]
         );
-        // Two 16 KiB header copies and the keyslots area fill the 16 MiB
-        // before the data segment, whose offset counts 512-byte sectors.
-        let at = |word: &str| {
-            let index = words(&format).iter().position(|w| *w == word).unwrap();
-            words(&format)[index + 1].parse::<u64>().unwrap()
-        };
-        assert_eq!(
-            2 * at("--luks2-metadata-size") + at("--luks2-keyslots-size"),
-            HEADER_BYTES
-        );
-        assert_eq!(at("--offset") * 512, HEADER_BYTES);
-        assert_eq!(at("--sector-size"), SECTOR_BYTES);
+        assert_eq!(HEADER_BYTES, 16 * 1024 * 1024);
+        assert_eq!(SECTOR_BYTES, 4096);
         assert_eq!(protocol::VOLUME_LABEL, "td-system");
     }
 
@@ -422,7 +387,7 @@ mod tests {
     /// active and 4 while not.
     struct Recorder {
         dir: PathBuf,
-        cryptsetup: Cryptsetup,
+        cryptsetup: Luks,
     }
 
     impl Recorder {
@@ -441,7 +406,7 @@ mod tests {
                      if [ -f \"$d/fail.$n\" ]; then c=1; read c < \"$d/fail.$n\" || :; exit \"${{c:-1}}\"; fi\n\
                      m=0\nif [ -f \"$d/mapped\" ]; then read m < \"$d/mapped\"; fi\n\
                      case \"$1 $2\" in\n\
-                     'open --test-passphrase') ;;\n\
+                     'test '*) ;;\n\
                      'open '*) echo 1 > \"$d/mapped\";;\n\
                      'close '*) echo 0 > \"$d/mapped\";;\n\
                      'status '*) if [ \"$m\" = 1 ]; then exit 0; fi; exit 4;;\n\
@@ -453,7 +418,7 @@ mod tests {
             .unwrap();
             Self {
                 dir,
-                cryptsetup: Cryptsetup::new(program),
+                cryptsetup: Luks::new(program),
             }
         }
 

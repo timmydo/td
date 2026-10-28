@@ -47,8 +47,8 @@ use td_fido::fido_disk::{
 use td_fido::fido_p256::PublicKey;
 use td_fido::fido_pin::{LoginRefusal, Pin};
 use td_fido::fido_transaction::{Devices, Error as FidoError, Status};
-use td_protector::cryptsetup::{self, Bounded, Cryptsetup, KeyFile};
 use td_protector::lockout::volume_uuid;
+use td_protector::luks::{self, Bounded, KeyFile, Luks};
 use td_protector::luks2::{self, Header, Kind, UpgradeView};
 use td_protector::manage;
 use td_protector::protected::{Fido2, FidoRole, Shape, Token};
@@ -2354,15 +2354,13 @@ impl Host for Machine {
             return Ok(Tested::Changed);
         }
         drop(reread);
-        let program = Cryptsetup::new(self.root.join("bin").join(protocol::CRYPTSETUP));
+        let program = Luks::new(self.root.join("bin").join(protocol::TD_LUKS));
         let authority = self.authority.as_ref();
         let mut abandoned = || authority.is_some_and(hung_up);
-        let args = cryptsetup::detached_test_args(&copy.path, device, slot);
+        let args = luks::detached_test_args(&copy.path, device, slot);
         let tested = match program.run_bounded(&args, key, deadline, &mut abandoned) {
             Ok(Bounded::Exited(status)) if status.success() => Ok(Tested::Opened),
-            Ok(Bounded::Exited(status))
-                if status.code() == Some(cryptsetup::EXIT_BAD_PASSPHRASE) =>
-            {
+            Ok(Bounded::Exited(status)) if status.code() == Some(luks::EXIT_BAD_PASSPHRASE) => {
                 Ok(Tested::Refused)
             }
             Ok(Bounded::Exited(_)) => Err("cryptsetup's keyslot test failed".into()),
@@ -2377,7 +2375,7 @@ impl Host for Machine {
         // cryptsetup creates the file `O_CREAT|O_EXCL` at mode 0400 in the
         // copy's own mode-0700 directory.
         let file = copy.dir.join(VOLUME_KEY_FILE);
-        let args = cryptsetup::dump_volume_key_args(&copy.path, &file);
+        let args = luks::dump_volume_key_args(&copy.path, &file);
         let dumped = match program.run_bounded(&args, key, deadline, &mut abandoned) {
             Ok(Bounded::Exited(status)) if status.success() => {
                 read_volume_key(&file, &mut volume).map(|()| Tested::Opened)
@@ -2511,8 +2509,8 @@ impl Machine {
         }
     }
 
-    fn cryptsetup(&self) -> Cryptsetup {
-        Cryptsetup::new(self.root.join("bin").join(protocol::CRYPTSETUP))
+    fn cryptsetup(&self) -> Luks {
+        Luks::new(self.root.join("bin").join(protocol::TD_LUKS))
     }
 
     /// The node `td-boot volume` named, while it still names the held
@@ -2860,6 +2858,7 @@ mod tests {
                     segment: Some(SEGMENT),
                     reencryption: false,
                     luks2: vec![0, 1],
+                    bound: vec![0, 1],
                     reencrypt_modes: Vec::new(),
                 },
                 views: Vec::new(),
@@ -3839,7 +3838,7 @@ mod tests {
         assert_eq!(run.frames.last().unwrap(), &[FAILURE, 0x28]);
         assert_eq!(run.log, ["header", "standing", "view", "header"]);
         assert!(run.commits.is_empty());
-        // Cryptsetup's metadata that disagrees: CHANGED too.
+        // Luks's metadata that disagrees: CHANGED too.
         let mut disagrees = device_bound_host(upgrading(&[0xc1]));
         disagrees.metadata = Some(dump(&upgrading(&[0xc3])));
         let run = upgraded(disagrees, &mut Scripted::selecting(0), &cancel);
@@ -5686,15 +5685,15 @@ mod tests {
         // It records its arguments, its input and the header it was given,
         // then repairs that header as cryptsetup repairs a stale copy.
         crate::scratch::executable(
-            &bin.join(protocol::CRYPTSETUP),
+            &bin.join(protocol::TD_LUKS),
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = luksDump ]; then \
+                "#!/bin/sh\nif [ \"$1\" = volume-key ]; then \
                  printf '%s\\n' \"$@\" > '{dir}/dump-argv'; read key || :; \
-                 case \"$key\" in right) printf '{whole}' > \"$5\";; \
-                 short) printf 'kkk' > \"$5\";; long) printf '{whole}k' > \"$5\";; \
+                 case \"$key\" in right) printf '{whole}' > \"$3\";; \
+                 short) printf 'kkk' > \"$3\";; long) printf '{whole}k' > \"$3\";; \
                  stalled) exec '{sleep}' 60;; *) exit 1;; esac; exit 0; fi\n\
                  printf '%s\\n' \"$@\" > '{dir}/argv'\n\
-                 h=\nfor a; do if [ \"$p\" = --header ]; then h=$a; fi; p=$a; done\n\
+                 h=\"$4\"\n\
                  '{cat}' > '{dir}/stdin'\n'{cat}' \"$h\" > '{dir}/seen'\n\
                  printf 'REPAIRED' > \"$h\"\n\
                  read key < '{dir}/stdin' || :\n\
@@ -5840,16 +5839,10 @@ mod tests {
         assert_eq!(
             argv.lines().collect::<Vec<_>>(),
             [
-                "open",
-                "--test-passphrase",
-                "--type",
-                "luks2",
-                "--header",
-                copy.to_str().unwrap(),
-                "--key-slot",
+                "test",
                 "0",
-                "--key-file=-",
-                test.device.to_str().unwrap()
+                test.device.to_str().unwrap(),
+                copy.to_str().unwrap()
             ]
         );
         assert_eq!(std::fs::read(test.bin.join("stdin")).unwrap(), b"right");
@@ -6138,21 +6131,10 @@ mod tests {
         assert_eq!(volume.unwrap().expose(), [b'k'; VOLUME_KEY_BYTES]);
         let argv = std::fs::read_to_string(test.bin.join("dump-argv")).unwrap();
         let argv: Vec<&str> = argv.lines().collect();
-        let copy = argv.last().unwrap().to_string();
+        let copy = argv[1].to_string();
         assert!(copy.contains(COPY_PREFIX) && copy.ends_with("/header"));
         let file = copy.replace("/header", &format!("/{VOLUME_KEY_FILE}"));
-        assert_eq!(
-            argv,
-            [
-                "luksDump",
-                "--dump-volume-key",
-                "--batch-mode",
-                "--volume-key-file",
-                &file,
-                "--key-file=-",
-                &copy,
-            ]
-        );
+        assert_eq!(argv, ["volume-key", &copy, &file]);
         test.untouched();
         // A file one byte short or long is no key, a dump that fails gives
         // none, and one past the deadline is killed: no key, each time

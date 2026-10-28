@@ -4675,23 +4675,23 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
     s.push_str("dir {in:td-util}/bin 0755 0 0\n");
     s.push_str("file {in:td-util}/bin/td-util {in:td-util}/bin/td-util 0755 0 0\n");
     s.push_str("slink /bin/td-util {in:td-util}/bin/td-util 0777 0 0\n");
-    // The static cryptsetup (D6), in BOTH phases, at td-boot's
-    // `/bin/{CRYPTSETUP}`: an installed selector opens a device-bound volume
+    // The static td-luks (D6), in BOTH phases, at td-boot's
+    // `/bin/{TD_LUKS}`: an installed selector opens a device-bound volume
     // after its release and takes the handoff's volume key with it, and
     // `td-boot on-volume mount-root` opens the volume with that key. Static,
     // so it runs before any root is mounted; its debug companion ships in
     // the real root with the package. The live selector carries it too,
     // since both selectors are the stock one, and never runs it.
-    s.push_str("dir {in:cryptsetup-x86-64} 0755 0 0\n");
-    s.push_str("dir {in:cryptsetup-x86-64}/bin 0755 0 0\n");
+    s.push_str("dir {in:td-luks} 0755 0 0\n");
+    s.push_str("dir {in:td-luks}/bin 0755 0 0\n");
     s.push_str(&format!(
-        "file {{in:cryptsetup-x86-64}}/bin/{c}.static \
-         {{in:cryptsetup-x86-64}}/bin/{c}.static 0755 0 0\n",
-        c = td_boot_protocol::CRYPTSETUP
+        "file {{in:td-luks}}/bin/{c} \
+         {{in:td-luks}}/bin/{c} 0755 0 0\n",
+        c = td_boot_protocol::TD_LUKS
     ));
     s.push_str(&format!(
-        "slink /bin/{c} {{in:cryptsetup-x86-64}}/bin/{c}.static 0777 0 0\n",
-        c = td_boot_protocol::CRYPTSETUP
+        "slink /bin/{c} {{in:td-luks}}/bin/{c} 0777 0 0\n",
+        c = td_boot_protocol::TD_LUKS
     ));
     match phase {
         Phase::Selector => {
@@ -5116,26 +5116,23 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         link: format!("{{root}}/real-root/bin/{}", td_boot_protocol::MKFS_BTRFS),
     });
     // A live installer formats a device-bound volume with the static
-    // cryptsetup, bound at /bin in the hashed root as mkfs.btrfs is (D6). The
+    // td-luks, bound at /bin in the hashed root as mkfs.btrfs is (D6). The
     // image carries the binary and its debug companion; both initramfs
     // carry the binary, the selector's for its release and the deployment
     // initramfs's for its unlock (ENCRYPTION.md increment 6), the companion
     // staying here.
     steps.push(Step::MkDir {
-        path: "{root}/real-root{in:cryptsetup-x86-64}".into(),
+        path: "{root}/real-root{in:td-luks}".into(),
     });
     for child in ["bin", "lib/debug"] {
         steps.push(Step::CopyTree {
-            from: format!("{{in:cryptsetup-x86-64}}/{child}"),
-            dest: format!("{{root}}/real-root{{in:cryptsetup-x86-64}}/{child}"),
+            from: format!("{{in:td-luks}}/{child}"),
+            dest: format!("{{root}}/real-root{{in:td-luks}}/{child}"),
         });
     }
     steps.push(Step::Symlink {
-        target: format!(
-            "{{in:cryptsetup-x86-64}}/bin/{}.static",
-            td_boot_protocol::CRYPTSETUP
-        ),
-        link: format!("{{root}}/real-root/bin/{}", td_boot_protocol::CRYPTSETUP),
+        target: format!("{{in:td-luks}}/bin/{}", td_boot_protocol::TD_LUKS),
+        link: format!("{{root}}/real-root/bin/{}", td_boot_protocol::TD_LUKS),
     });
     // Stage the dynamically linked userland and every transitively referenced store item
     // at its canonical absolute path. uutils, ripgrep, fd and OpenSSH pull their
@@ -5554,13 +5551,15 @@ fn shape_check(sys: &SystemDef) -> String {
      if printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-btrfs$'; then echo 'selector initramfs: the mkfs.btrfs payload must be deployment-only' >&2; exit 1; fi; \
      [ -f \"$root{in:td-btrfs}/lib/debug/bin/td-btrfs.debug\" ] || { echo 'root tree: td-btrfs lacks its debug companion' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/mkfs.btrfs\" 2>/dev/null)\" = \"{in:td-btrfs}/bin/td-btrfs\" ] && [ -f \"$root{in:td-btrfs}/bin/td-btrfs\" ] && [ -x \"$root{in:td-btrfs}/bin/td-btrfs\" ] || { echo 'root tree: /bin/mkfs.btrfs must link the static td-btrfs a live installer formats with' >&2; exit 1; }; \
-     [ \"$(readlink \"$root/bin/cryptsetup\" 2>/dev/null)\" = \"{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] && [ -f \"$root{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] && [ -x \"$root{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] || { echo 'root tree: /bin/cryptsetup must link the static cryptsetup a live installer formats device-bound volumes with' >&2; exit 1; }; \
-     [ -s \"$root{in:cryptsetup-x86-64}/lib/debug/bin/cryptsetup.static.debug\" ] || { echo 'root tree: cryptsetup lacks its debug companion' >&2; exit 1; }; \
-     printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/cryptsetup || { echo 'selector initramfs: bin/cryptsetup missing - an installed selector could not open a device-bound volume after its release' >&2; exit 1; }; \
-     printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'selector initramfs: cryptsetup store member missing - /bin/cryptsetup would dangle' >&2; exit 1; }; \
-     printf '%s\\n' \"$init_list\" | grep -q -x -F bin/cryptsetup || { echo 'deployment initramfs: bin/cryptsetup missing - td-boot could not open a device-bound volume with the handed-off key' >&2; exit 1; }; \
-     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'deployment initramfs: cryptsetup store member missing - /bin/cryptsetup would dangle' >&2; exit 1; }; \
-     for a in \"$selector\" \"$init\"; do \"$tu\" cpio -tv < \"$a\" 2>/dev/null | grep -q -x -F 'bin/cryptsetup -> {in:cryptsetup-x86-64}/bin/cryptsetup.static' || { echo \"initramfs $a: /bin/cryptsetup must link the static cryptsetup td-boot opens volumes with\" >&2; exit 1; }; done; \
+     [ \"$(readlink \"$root/bin/td-luks\" 2>/dev/null)\" = \"{in:td-luks}/bin/td-luks\" ] && [ -f \"$root{in:td-luks}/bin/td-luks\" ] && [ -x \"$root{in:td-luks}/bin/td-luks\" ] || { echo 'root tree: /bin/td-luks must link the static td-luks a live installer formats device-bound volumes with' >&2; exit 1; }; \
+     [ ! -e \"$root/bin/cryptsetup\" ] && [ ! -L \"$root/bin/cryptsetup\" ] || { echo 'root tree: retired cryptsetup present' >&2; exit 1; }; \
+     for l in \"$selector_list\" \"$init_list\"; do if printf '%s\\n' \"$l\" | grep -qE '(^|/)cryptsetup([.]static)?$'; then echo 'initramfs: retired cryptsetup present' >&2; exit 1; fi; done; \
+     [ -s \"$root{in:td-luks}/lib/debug/bin/td-luks.debug\" ] || { echo 'root tree: td-luks lacks its debug companion' >&2; exit 1; }; \
+     printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/td-luks || { echo 'selector initramfs: bin/td-luks missing - an installed selector could not open a device-bound volume after its release' >&2; exit 1; }; \
+     printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-luks$' || { echo 'selector initramfs: td-luks store member missing - /bin/td-luks would dangle' >&2; exit 1; }; \
+     printf '%s\\n' \"$init_list\" | grep -q -x -F bin/td-luks || { echo 'deployment initramfs: bin/td-luks missing - td-boot could not open a device-bound volume with the handed-off key' >&2; exit 1; }; \
+     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-luks$' || { echo 'deployment initramfs: td-luks store member missing - /bin/td-luks would dangle' >&2; exit 1; }; \
+     for a in \"$selector\" \"$init\"; do \"$tu\" cpio -tv < \"$a\" 2>/dev/null | grep -q -x -F 'bin/td-luks -> {in:td-luks}/bin/td-luks' || { echo \"initramfs $a: /bin/td-luks must link the static td-luks td-boot opens volumes with\" >&2; exit 1; }; done; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/losetup || { echo 'deployment initramfs: bin/losetup missing - td-boot root-loop could not bind the verified root and the boot would stop there' >&2; exit 1; }; \
      for a in \"$selector\" \"$init\"; do for p in losetup mknod; do \"$tu\" cpio -tv < \"$a\" 2>/dev/null | grep -q -x -F \"bin/$p -> {in:td-init}/bin/td-init\" || { echo \"initramfs $a: /bin/$p must link td-init - the deployment binds its verified root with it and a staged selector update's commit binds current's root.erofs\" >&2; exit 1; }; done; done; \
      \"$tu\" cpio -tv < \"$selector\" 2>/dev/null | grep -q -x -F 'bin/secret-line -> {in:td-init}/bin/td-init' || { echo 'selector initramfs: /bin/secret-line must link td-init - the recovery flow could not read the recovery key and an encrypted boot that reaches recovery would halt' >&2; exit 1; }; \
@@ -6339,7 +6338,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
         //   unprivileged live client probe.
         // td-btrfs: static mkfs.btrfs for a live boot's volatile volume and a
         //   live installer's destination.
-        // cryptsetup-x86-64: static cryptsetup a live installer formats a
+        // td-luks: static td-luks a live installer formats a
         //   device-bound volume with, and the deployment initramfs opens one.
         // post_rust_inputs adds the tool farm's providers (td-sh, td-txt,
         // td-util, uutils, all also packed), so the farm and this list cannot
@@ -6349,7 +6348,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
             &[
                 "linux-x86-64",
                 "td-btrfs",
-                "cryptsetup-x86-64",
+                "td-luks",
                 "ripgrep",
                 "fd",
                 "git-x86-64",
@@ -8653,54 +8652,54 @@ mod tests {
     }
 
     #[test]
-    fn the_live_installer_formats_device_bound_volumes_with_the_root_images_cryptsetup() {
+    fn the_live_installer_formats_device_bound_volumes_with_the_root_images_td_luks() {
         let recipe = recipe();
         assert!(recipe
             .native_inputs
             .as_ref()
             .unwrap()
             .iter()
-            .any(|input| input == "cryptsetup-x86-64"));
+            .any(|input| input == "td-luks"));
         let steps = recipe.steps.unwrap();
         let position = |wanted: &dyn Fn(&Step) -> bool| steps.iter().position(wanted).unwrap();
         let copied = position(&|step| {
             matches!(step, Step::CopyTree { from, dest }
-            if from == "{in:cryptsetup-x86-64}/bin"
-                && dest == "{root}/real-root{in:cryptsetup-x86-64}/bin")
+            if from == "{in:td-luks}/bin"
+                && dest == "{root}/real-root{in:td-luks}/bin")
         });
         let companion = position(&|step| {
             matches!(step, Step::CopyTree { from, dest }
-            if from == "{in:cryptsetup-x86-64}/lib/debug"
-                && dest == "{root}/real-root{in:cryptsetup-x86-64}/lib/debug")
+            if from == "{in:td-luks}/lib/debug"
+                && dest == "{root}/real-root{in:td-luks}/lib/debug")
         });
         let linked = position(&|step| {
             matches!(step, Step::Symlink { target, link }
-            if target == "{in:cryptsetup-x86-64}/bin/cryptsetup.static"
-                && link == "{root}/real-root/bin/cryptsetup")
+            if target == "{in:td-luks}/bin/td-luks"
+                && link == "{root}/real-root/bin/td-luks")
         });
         let packed = position(
             &|step| matches!(step, Step::PackErofs { root, .. } if root == "{root}/real-root"),
         );
         assert!(copied < linked && companion < packed && linked < packed);
-        assert_eq!(td_boot_protocol::CRYPTSETUP, "cryptsetup");
+        assert_eq!(td_boot_protocol::TD_LUKS, "td-luks");
         // The shape check names the binary, its companion, and both
-        // initramfs's copies and links; nothing refuses cryptsetup in
+        // initramfs's copies and links; nothing refuses td-luks in
         // either any longer.
         let check = shape_check(&SYSTEM);
         for needle in [
-            "\"$root/bin/cryptsetup\"",
-            "{in:cryptsetup-x86-64}/bin/cryptsetup.static",
-            "{in:cryptsetup-x86-64}/lib/debug/bin/cryptsetup.static.debug",
-            "printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/cryptsetup || { echo 'selector initramfs: bin/cryptsetup missing",
-            "printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'selector initramfs: cryptsetup store member missing",
-            "printf '%s\\n' \"$init_list\" | grep -q -x -F bin/cryptsetup || { echo 'deployment initramfs: bin/cryptsetup missing",
-            "printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'deployment initramfs: cryptsetup store member missing",
+            "\"$root/bin/td-luks\"",
+            "{in:td-luks}/bin/td-luks",
+            "{in:td-luks}/lib/debug/bin/td-luks.debug",
+            "printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/td-luks || { echo 'selector initramfs: bin/td-luks missing",
+            "printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-luks$' || { echo 'selector initramfs: td-luks store member missing",
+            "printf '%s\\n' \"$init_list\" | grep -q -x -F bin/td-luks || { echo 'deployment initramfs: bin/td-luks missing",
+            "printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-luks$' || { echo 'deployment initramfs: td-luks store member missing",
             // The link's target in both, as the root tree's readlink check
             // pins its own.
             "for a in \"$selector\" \"$init\"; do \"$tu\" cpio -tv < \"$a\" 2>/dev/null \
-             | grep -q -x -F 'bin/cryptsetup -> {in:cryptsetup-x86-64}/bin/cryptsetup.static' \
-             || { echo \"initramfs $a: /bin/cryptsetup must link the static cryptsetup",
-            "root tree: cryptsetup lacks its debug companion",
+             | grep -q -x -F 'bin/td-luks -> {in:td-luks}/bin/td-luks' \
+             || { echo \"initramfs $a: /bin/td-luks must link the static td-luks",
+            "root tree: td-luks lacks its debug companion",
         ] {
             assert!(check.contains(needle), "{needle}");
         }
@@ -8714,18 +8713,18 @@ mod tests {
         ] {
             let spec = build_initramfs_spec(name, phase);
             for entry in [
-                "dir {in:cryptsetup-x86-64} 0755 0 0",
-                "dir {in:cryptsetup-x86-64}/bin 0755 0 0",
-                "file {in:cryptsetup-x86-64}/bin/cryptsetup.static \
-                 {in:cryptsetup-x86-64}/bin/cryptsetup.static 0755 0 0",
-                "slink /bin/cryptsetup {in:cryptsetup-x86-64}/bin/cryptsetup.static 0777 0 0",
+                "dir {in:td-luks} 0755 0 0",
+                "dir {in:td-luks}/bin 0755 0 0",
+                "file {in:td-luks}/bin/td-luks \
+                 {in:td-luks}/bin/td-luks 0755 0 0",
+                "slink /bin/td-luks {in:td-luks}/bin/td-luks 0777 0 0",
             ] {
                 assert!(spec.lines().any(|line| line == entry), "{name}: {entry}");
             }
-            assert!(!spec.contains("cryptsetup-x86-64}/lib/debug"), "{name}");
+            assert!(!spec.contains("td-luks}/lib/debug"), "{name}");
             assert!(initramfs_bin_names(phase)
                 .iter()
-                .any(|bin| bin == td_boot_protocol::CRYPTSETUP));
+                .any(|bin| bin == td_boot_protocol::TD_LUKS));
         }
     }
 
@@ -14223,7 +14222,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         const PAT: &str = "^td/store/[^/]+/bin/";
         let mut greps = 0usize;
         for (at, _) in check.match_indices(PAT) {
-            // `[.]` is the regex's literal dot, as in `cryptsetup[.]static`.
+            // `[.]` is the regex's literal dot, as in `td-luks`.
             let name: String = check
                 .get(at + PAT.len()..)
                 .unwrap_or_default()
@@ -16766,7 +16765,6 @@ mod server_tests {
             sorted,
             [
                 "ca-certificates",
-                "cryptsetup-x86-64",
                 "fd",
                 "gcc-runtime",
                 "git-x86-64",
@@ -16783,6 +16781,7 @@ mod server_tests {
                 "td-kexec",
                 "td-link-runtime",
                 "td-login",
+                "td-luks",
                 "td-net",
                 "td-netd",
                 "td-profiler",

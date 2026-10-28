@@ -22,7 +22,7 @@ use td_fido::fido_disk::{DiskError, Operation, Person, Phase, Released, Token as
 use td_fido::fido_p256::PublicKey;
 use td_fido::fido_pin::{LoginRefusal, Pin};
 use td_fido::fido_transaction::{Devices, Error as FidoFailure, Status};
-use td_protector::cryptsetup::{
+use td_protector::luks::{
     dump_volume_key_args, exit_code, open_args, open_slot_args, test_args, Resilience,
     EXIT_BAD_PASSPHRASE,
 };
@@ -1243,8 +1243,8 @@ pub(crate) mod tests {
     /// The runner's error for a cryptsetup `open` that exited `code`.
     fn exited(code: i32) -> io::Error {
         use std::os::unix::process::ExitStatusExt;
-        td_protector::cryptsetup::Failed::new(
-            Path::new("/bin/cryptsetup"),
+        td_protector::luks::Failed::new(
+            Path::new("/bin/td-luks"),
             "open",
             std::process::ExitStatus::from_raw(code << 8),
         )
@@ -1278,8 +1278,8 @@ pub(crate) mod tests {
         fn tests(&self) -> Vec<&str> {
             self.commands
                 .iter()
-                .filter(|(args, _)| args.iter().any(|a| a == "--test-passphrase"))
-                .map(|(args, _)| args[5].as_str())
+                .filter(|(args, _)| args[0] == "test")
+                .map(|(args, _)| args[1].as_str())
                 .collect()
         }
     }
@@ -1294,27 +1294,26 @@ pub(crate) mod tests {
                 .map(|arg| arg.to_str().unwrap().to_owned())
                 .collect();
             self.commands.push((words.clone(), input.to_vec()));
-            let slot = words
-                .iter()
-                .position(|w| w == "--key-slot")
-                .map(|at| words[at + 1].clone());
+            let slot = match words[0].as_str() {
+                "test" => Some(words[1].clone()),
+                "open" if words.len() == 4 => Some(words[1].clone()),
+                _ => None,
+            };
             let opens_0 = (slot.as_deref() == Some("0") && input == KEY)
                 || self
                     .extra
                     .as_ref()
                     .is_some_and(|(other, key)| slot.as_ref() == Some(other) && input == key);
             match words.first().map(String::as_str) {
-                Some("open") if words.iter().any(|w| w == "--test-passphrase") => {
-                    match self.test_exit {
-                        Some(code) => Err(exited(code)),
-                        None if opens_0 => Ok(()),
-                        None => Err(exited(EXIT_BAD_PASSPHRASE)),
-                    }
-                }
+                Some("test") => match self.test_exit {
+                    Some(code) => Err(exited(code)),
+                    None if opens_0 => Ok(()),
+                    None => Err(exited(EXIT_BAD_PASSPHRASE)),
+                },
                 Some("open") if self.open_fails => Err(io::Error::other("open failed")),
                 Some("open") if slot.is_some() && !opens_0 => Err(exited(EXIT_BAD_PASSPHRASE)),
-                Some("luksDump") => {
-                    let at = words.iter().position(|w| w == "--volume-key-file").unwrap();
+                Some("volume-key") => {
+                    let at = 1;
                     let file = PathBuf::from(&words[at + 1]);
                     self.directory_mode =
                         Some(fs::metadata(file.parent().unwrap()).unwrap().mode() & 0o7777);
@@ -1386,30 +1385,12 @@ pub(crate) mod tests {
         };
         assert_eq!(keyslot, 2);
         assert_eq!(key.expose(), script.key);
-        assert_eq!(script.verbs(), ["open", "luksDump"]);
-        assert_eq!(
-            script.commands[0].0,
-            [
-                "open",
-                "--type",
-                "luks2",
-                "--key-file=-",
-                PARTITION,
-                MAPPING_NAME
-            ]
-        );
+        assert_eq!(script.verbs(), ["open", "volume-key"]);
+        assert_eq!(script.commands[0].0, ["open", PARTITION, MAPPING_NAME]);
         let file = scratch.keys().join(KEY_FILE);
         assert_eq!(
             script.commands[1].0,
-            [
-                "luksDump",
-                "--dump-volume-key",
-                "--batch-mode",
-                "--volume-key-file",
-                file.to_str().unwrap(),
-                "--key-file=-",
-                PARTITION,
-            ]
+            ["volume-key", PARTITION, file.to_str().unwrap(),]
         );
         for (_, input) in &script.commands {
             assert_eq!(input, &secret);
@@ -1462,7 +1443,7 @@ pub(crate) mod tests {
             let Unlock::Failed(error) = opened_on_keyslot_0(&mut script, &scratch.keys()).0 else {
                 panic!("a bad dump booted");
             };
-            assert_eq!(script.verbs(), ["open", "luksDump"], "{error}");
+            assert_eq!(script.verbs(), ["open", "volume-key"], "{error}");
             assert!(!scratch.keys().exists(), "{error}");
         }
     }
@@ -1727,6 +1708,7 @@ pub(crate) mod tests {
                 segment,
                 reencryption: false,
                 luks2: header.keyslots.clone(),
+                bound: header.keyslots.clone(),
                 reencrypt_modes: Vec::new(),
             },
             header,
@@ -1901,7 +1883,7 @@ pub(crate) mod tests {
                           cryptsetup: &mut Script,
                           console: &mut dyn FnMut(&str)| {
             // Once keyslot 0 opened, and before the mapping is.
-            assert_eq!(cryptsetup.verbs().last(), Some(&"open"));
+            assert_eq!(cryptsetup.verbs().last(), Some(&"test"));
             assert_eq!(cryptsetup.tests().last(), Some(&"0"));
             assert_eq!(cryptsetup.commands.last().unwrap().1, KEY);
             console("resealing");
@@ -1932,9 +1914,9 @@ pub(crate) mod tests {
     fn assert_key_on_keyslot_0_alone(script: &Script, lines: &[String]) {
         for (args, input) in &script.commands {
             if input == KEY {
-                let slot = args.iter().position(|a| a == "--key-slot");
+                let slot = matches!(args[0].as_str(), "test" | "open").then_some(0);
                 assert!(
-                    slot.is_some_and(|at| args[at + 1] == "0") || args[0] == "luksDump",
+                    slot.is_some_and(|at| args[at + 1] == "0") || args[0] == "volume-key",
                     "{args:?}"
                 );
             }
@@ -1982,20 +1964,11 @@ pub(crate) mod tests {
         assert_eq!(run.prompts, vec![KEY_PROMPT; typed.len()]);
         // Only the two wrong keys and the right one reached cryptsetup.
         assert_eq!(script.tests(), ["0", "0", "0"]);
-        assert_eq!(script.verbs(), ["open", "open", "open", "open", "luksDump"]);
         assert_eq!(
-            script.commands[3].0,
-            [
-                "open",
-                "--type",
-                "luks2",
-                "--key-slot",
-                "0",
-                "--key-file=-",
-                PARTITION,
-                MAPPING_NAME
-            ]
+            script.verbs(),
+            ["test", "test", "test", "open", "volume-key"]
         );
+        assert_eq!(script.commands[3].0, ["open", "0", PARTITION, MAPPING_NAME]);
         for (_, input) in &script.commands[2..] {
             assert_eq!(input, KEY);
         }
@@ -2061,10 +2034,7 @@ pub(crate) mod tests {
             };
             assert!(reason.starts_with(expected), "{reason}");
             assert!(reason.ends_with("boot is refused without the recovery key"));
-            assert!(script
-                .commands
-                .iter()
-                .all(|(args, _)| args[1] == "--test-passphrase"));
+            assert!(script.commands.iter().all(|(args, _)| args[0] == "test"));
             assert!(run.resealed.is_empty());
             assert!(!run.prompts.iter().any(|p| p == RESEAL_PROMPT));
             assert!(!scratch.keys().exists());
@@ -2153,7 +2123,7 @@ pub(crate) mod tests {
                 .position(|l| l == "the recovery key opens keyslot 0")
                 .unwrap();
             assert!(opened < resealing);
-            assert_eq!(script.verbs(), ["open", "open", "luksDump"]);
+            assert_eq!(script.verbs(), ["test", "open", "volume-key"]);
             assert_key_on_keyslot_0_alone(&script, &run.lines);
         }
     }
@@ -2191,7 +2161,7 @@ pub(crate) mod tests {
             assert!(run.lines.iter().any(|l| l
                 == "reseal declined: this boot opens with the recovery key once and the \
                     header is unchanged"));
-            assert_eq!(script.verbs(), ["open", "open", "luksDump"]);
+            assert_eq!(script.verbs(), ["test", "open", "volume-key"]);
         }
     }
 
@@ -2234,7 +2204,7 @@ pub(crate) mod tests {
             "{lines:?}"
         );
         assert_eq!(state.borrow().extends, 1);
-        assert_eq!(script.verbs(), ["open", "open", "open", "luksDump"]);
+        assert_eq!(script.verbs(), ["test", "test", "open", "volume-key"]);
         assert_key_on_keyslot_0_alone(&script, &lines);
 
         for pcr12 in [None, Some([1; 32])] {
@@ -2269,7 +2239,7 @@ pub(crate) mod tests {
                 "{lines:?}"
             );
             assert_eq!(console.prompts, [KEY_PROMPT]);
-            assert_eq!(script.verbs(), ["open", "open", "luksDump"]);
+            assert_eq!(script.verbs(), ["test", "open", "volume-key"]);
         }
     }
 
@@ -2597,13 +2567,10 @@ pub(crate) mod tests {
         assert!(lines.contains(&"td: connect exactly one security key, then press Enter".into()));
         assert!(lines.contains(&"td: touch your security key".into()));
         assert!(lines.iter().any(|l| l.starts_with("PCR 12 is not capped")));
-        assert_eq!(script.verbs(), ["open", "open", "luksDump"]);
+        assert_eq!(script.verbs(), ["test", "open", "volume-key"]);
         assert_eq!(script.tests(), ["1"]);
         let open = &script.commands[1].0;
-        assert!(
-            open.windows(2).any(|w| w == ["--key-slot", "1"]),
-            "{open:?}"
-        );
+        assert!(open[0] == "open" && open[1] == "1", "{open:?}");
         let passphrase = fido_passphrase(&header);
         assert_not_in_argv(&script, &passphrase);
         assert!(!lines.iter().any(|l| l.contains(KEY_PIN)), "{lines:?}");
@@ -2997,7 +2964,7 @@ pub(crate) mod tests {
             words(open_args(partition, MAPPING_NAME))
         );
         assert!(!script.commands[1].0.iter().any(|w| w == "--key-slot"));
-        assert_eq!(script.commands[2].0[0], "luksDump");
+        assert_eq!(script.commands[2].0[0], "volume-key");
         assert!(script.commands.iter().all(|(_, input)| input == KEY));
         assert_eq!(key.expose(), script.key);
         assert_eq!(Host::<Script>::read(&mut host), viewed(&header, Some(FROM)));

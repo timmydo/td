@@ -1,5 +1,5 @@
 use super::*;
-use crate::cryptsetup::Progress;
+use crate::luks::Progress;
 use crate::protected_release::tests::{exited, note, Log, Model};
 use crate::protected_release::{self, Entered, Entry};
 use crate::release::Runner;
@@ -28,6 +28,7 @@ struct World {
     /// The mapping the host opened, by the keyslot it named.
     opened: Option<Option<u8>>,
     commands: usize,
+    finish_on_open: bool,
     /// The command of this index, and every later one, fails, as a power
     /// cut stops the boot there.
     cut: Option<usize>,
@@ -47,6 +48,7 @@ fn world(disk: Disk, log: &Log) -> Shared {
         log: log.clone(),
         opened: None,
         commands: 0,
+        finish_on_open: false,
         cut: None,
         inside: None,
         after_seal: None,
@@ -95,14 +97,9 @@ impl World {
     }
 }
 
-fn value(words: &[String], flag: &str) -> Option<u8> {
-    let at = words.iter().position(|word| word == flag)?;
-    words.get(at + 1)?.parse().ok()
-}
+struct Luks(Shared);
 
-struct Cryptsetup(Shared);
-
-impl Runner for Cryptsetup {
+impl Runner for Luks {
     fn run(&mut self, args: &[OsString], input: &[u8]) -> io::Result<()> {
         let words: Vec<String> = args
             .iter()
@@ -119,13 +116,15 @@ impl Runner for Cryptsetup {
         // reencryption cut inside commits what it reached.
         if world.cut.is_some_and(|cut| index >= cut) {
             note(&world.log, format!("cs cut {}", words[0]));
-            if world.cut == Some(index) && words[0] == "reencrypt" {
+            if world.cut == Some(index)
+                && matches!(words[0].as_str(), "reencrypt" | "reencrypt-resume")
+            {
                 if let Some(partial) = world.inside {
-                    let step = if words.iter().any(|word| word == "--resume-only") {
+                    let step = if words[0] == "reencrypt-resume" {
                         Step::ResumeReencrypt
                     } else {
                         Step::Reencrypt {
-                            slot: value(&words, "--key-slot").unwrap(),
+                            slot: words[1].parse().unwrap(),
                             resilience: Resilience::Journal,
                         }
                     };
@@ -136,8 +135,8 @@ impl Runner for Cryptsetup {
         }
         let key = world.key(input);
         let step = match (words[0].as_str(), words.get(1).map(String::as_str)) {
-            ("open", Some("--test-passphrase")) => {
-                let slot = value(&words, "--key-slot").unwrap();
+            ("test", _) => {
+                let slot = words[1].parse().unwrap();
                 let ok = world.disk.opens(slot, key);
                 note(
                     &world.log,
@@ -145,16 +144,22 @@ impl Runner for Cryptsetup {
                 );
                 return if ok { Ok(()) } else { Err(exited(2)) };
             }
-            ("luksKillSlot", _) => {
-                let slot: u8 = words.last().unwrap().parse().unwrap();
+            ("kill-unbound", _) => {
+                if world.opening(key, u8::MAX).is_none() {
+                    return Err(exited(2));
+                }
+                Step::KillUnbound
+            }
+            ("kill-slot", _) => {
+                let slot: u8 = words[1].parse().unwrap();
                 let Some(by) = world.opening(key, slot) else {
                     return Err(exited(2));
                 };
                 Step::KillSlot { slot, by }
             }
-            ("luksAddKey", _) => {
-                let by = value(&words, "--key-slot").unwrap();
-                let slot = value(&words, "--new-key-slot").unwrap();
+            ("add-key", _) => {
+                let by = words[1].parse().unwrap();
+                let slot = words[2].parse().unwrap();
                 if !world.disk.opens(by, key) {
                     return Err(exited(2));
                 }
@@ -165,19 +170,21 @@ impl Runner for Cryptsetup {
                 note(&world.log, format!("cs add {slot}"));
                 return Ok(());
             }
-            ("token", Some("remove")) => Step::RemoveToken {
-                token: value(&words, "--token-id").unwrap(),
+            ("token-remove", _) => Step::RemoveToken {
+                token: words[1].parse().unwrap(),
             },
-            ("token", Some("import")) => Step::ImportToken {
+            ("token-import" | "token-replace", _) => Step::ImportToken {
                 token: Token::decode(input).unwrap(),
-                id: value(&words, "--token-id"),
-                replace: words.iter().any(|word| word == "--token-replace"),
+                id: (words.len() == 3).then(|| words[1].parse().unwrap()),
+                replace: words[0] == "token-replace",
             },
-            ("reencrypt", _) => {
+            ("reencrypt" | "reencrypt-resume", _) => {
                 assert_eq!(key, RECOVERY_KEY);
                 assert!(world.opened.is_some(), "a reencryption with no mapping");
-                assert!(words.iter().any(|word| word == "--progress-json"));
-                if words.iter().any(|word| word == "--resume-only") {
+                if words[0] == "reencrypt-resume" {
+                    if world.disk.reencrypting.is_none() {
+                        return Err(exited(1));
+                    }
                     Step::ResumeReencrypt
                 } else {
                     let resilience = if words.iter().any(|word| word == "checksum") {
@@ -186,7 +193,7 @@ impl Runner for Cryptsetup {
                         Resilience::Journal
                     };
                     Step::Reencrypt {
-                        slot: value(&words, "--key-slot").unwrap(),
+                        slot: words[1].parse().unwrap(),
                         resilience,
                     }
                 }
@@ -234,14 +241,14 @@ impl AsRef<[u8]> for VolumeKey {
 
 struct Selector(Shared);
 
-impl Host<Cryptsetup> for Selector {
+impl Host<Luks> for Selector {
     type VolumeKey = VolumeKey;
 
     fn read(&mut self) -> Result<UpgradeView, String> {
         Ok(self.0.borrow().disk.view())
     }
 
-    fn open(&mut self, _: &mut Cryptsetup, slot: Option<u8>, key: &[u8]) -> io::Result<()> {
+    fn open(&mut self, _: &mut Luks, slot: Option<u8>, key: &[u8]) -> io::Result<()> {
         let mut world = self.0.borrow_mut();
         assert!(world.opened.is_none(), "the mapping opened twice");
         let key = world.key(key);
@@ -262,10 +269,14 @@ impl Host<Cryptsetup> for Selector {
         }
         note(&world.log, format!("host open {slot:?}"));
         world.opened = Some(slot);
+        if world.finish_on_open {
+            world.disk.finalized();
+            world.finish_on_open = false;
+        }
         Ok(())
     }
 
-    fn volume_key(&mut self, _: &mut Cryptsetup, key: &[u8]) -> io::Result<VolumeKey> {
+    fn volume_key(&mut self, _: &mut Luks, key: &[u8]) -> io::Result<VolumeKey> {
         let mut world = self.0.borrow_mut();
         assert!(world.opened.is_some(), "a volume key with no mapping");
         assert!(
@@ -403,7 +414,7 @@ fn boot_once(
         &view,
         &boot,
         tpm,
-        &mut Cryptsetup(shared.clone()),
+        &mut Luks(shared.clone()),
         keys,
         &mut Selector(shared.clone()),
         person,
@@ -595,7 +606,7 @@ fn u0_cancels_at_the_recovery_keys_empty_entry() {
     cancel(
         &view,
         Path::new(DEVICE),
-        &mut Cryptsetup(shared.clone()),
+        &mut Luks(shared.clone()),
         &mut |line| console.push(line.to_owned()),
     );
     let header = shared.borrow().disk.header();
@@ -877,7 +888,7 @@ fn every_cut_converges() {
                     assert!(finish_u5(
                         &view,
                         Path::new(DEVICE),
-                        &mut Cryptsetup(shared.clone()),
+                        &mut Luks(shared.clone()),
                         &mut |_| {}
                     ));
                 }
@@ -908,14 +919,14 @@ fn every_cut_converges() {
 /// resumption, and a resumption cut inside resumes again.
 #[test]
 fn a_cut_inside_the_reencryption_resumes() {
-    for inside in [Partial::Unbound, Partial::Initialized] {
+    for inside in [Partial::Unbound, Partial::Initialized, Partial::Finalized] {
         let log = Log::default();
         let shared = world(Disk::u0(Shape::Fido2), &log);
         // The reencryption is the U1 round's last command, after U0's three
-        // and U1's test.
+        // and U1's cleanup and test.
         {
             let mut world = shared.borrow_mut();
-            world.cut = Some(4);
+            world.cut = Some(5);
             world.inside = Some(inside);
         }
         let booted = boot_once(
@@ -933,6 +944,7 @@ fn a_cut_inside_the_reencryption_resumes() {
         let state = upgrade::check(&shared.borrow().disk.view()).map(|(state, _)| state);
         let expected = match inside {
             Partial::Initialized => State::U2,
+            Partial::Finalized => State::U3,
             _ => State::U1,
         };
         assert_eq!(state, Ok(expected), "{inside:?}");
@@ -978,6 +990,62 @@ fn a_cut_inside_the_reencryption_resumes() {
     }
 }
 
+/// Recovering the final dirty hotzone during open moves U2 to U3 before
+/// the selector can issue resume. That same boot must clean up and finish.
+#[test]
+fn final_hotzone_recovery_during_open_replans_without_resuming() {
+    let log = Log::default();
+    let shared = world(Disk::u0(Shape::Fido2), &log);
+    {
+        let mut world = shared.borrow_mut();
+        world.cut = Some(5);
+        world.inside = Some(Partial::Initialized);
+    }
+    let cut = boot_once(
+        &shared,
+        None,
+        &mut security_keys(&log),
+        &mut Person::new(),
+        true,
+    );
+    assert!(matches!(cut.outcome, Outcome::Halt(_)));
+    assert_eq!(
+        upgrade::check(&shared.borrow().disk.view()).unwrap().0,
+        State::U2
+    );
+    {
+        let mut world = shared.borrow_mut();
+        world.cut = None;
+        world.opened = None;
+        world.finish_on_open = true;
+    }
+    log.borrow_mut().clear();
+    let booted = boot_once(
+        &shared,
+        None,
+        &mut security_keys(&log),
+        &mut Person::new(),
+        true,
+    );
+    assert!(
+        matches!(booted.outcome, Outcome::Upgraded { .. }),
+        "{:?}",
+        booted.console
+    );
+    assert_protected(&shared.borrow().disk, Shape::Fido2, 2, (0, 0));
+    assert_eq!(
+        log.borrow()
+            .iter()
+            .filter(|entry| entry.starts_with("host open"))
+            .count(),
+        1
+    );
+    assert!(!log
+        .borrow()
+        .iter()
+        .any(|entry| entry.contains("reencrypt-resume")));
+}
+
 /// A U5 header, which a cut before the last step leaves, is the protected
 /// release's: `release_upgraded` admits it and only it, and `finish_u5`
 /// removes the `td-upgrade` token, after which the header is protected.
@@ -1015,7 +1083,7 @@ fn u5_releases_as_a_protected_boot_and_removes_td_upgrade() {
         &early,
         Path::new(DEVICE),
         None,
-        &mut Cryptsetup(shared.clone()),
+        &mut Luks(shared.clone()),
         &mut security_keys(&log),
         &mut person,
         &mut |_| None,
@@ -1057,7 +1125,7 @@ fn u5_releases_as_a_protected_boot_and_removes_td_upgrade() {
         &u5,
         Path::new(DEVICE),
         Some(&mut model),
-        &mut Cryptsetup(tpm_shared.clone()),
+        &mut Luks(tpm_shared.clone()),
         &mut security_keys(&tpm_log),
         &mut person,
         &mut |_| None,
@@ -1079,7 +1147,7 @@ fn u5_releases_as_a_protected_boot_and_removes_td_upgrade() {
         let mut release = |person: &mut Person, model: &mut Model| {
             let console = &mut |line: &str| lines.push(line.to_owned());
             let keys = &mut security_keys(&tpm_log);
-            let runner = &mut Cryptsetup(tpm_shared.clone());
+            let runner = &mut Luks(tpm_shared.clone());
             if view.header.kind() == Kind::Upgrading {
                 protected_release::release_upgraded(
                     view,
@@ -1125,7 +1193,7 @@ fn u5_releases_as_a_protected_boot_and_removes_td_upgrade() {
     assert!(finish_u5(
         &u5,
         Path::new(DEVICE),
-        &mut Cryptsetup(tpm_shared.clone()),
+        &mut Luks(tpm_shared.clone()),
         &mut |_| {}
     ));
     let protected = tpm_shared.borrow().disk.view();
@@ -1135,7 +1203,7 @@ fn u5_releases_as_a_protected_boot_and_removes_td_upgrade() {
     assert!(finish_u5(
         &view,
         Path::new(DEVICE),
-        &mut Cryptsetup(shared.clone()),
+        &mut Luks(shared.clone()),
         &mut |line| console.push(line.to_owned())
     ));
     assert_protected(&shared.borrow().disk, Shape::Fido2, 2, (0, 0));
@@ -1144,7 +1212,7 @@ fn u5_releases_as_a_protected_boot_and_removes_td_upgrade() {
     assert!(!finish_u5(
         &shared.borrow().disk.view(),
         Path::new(DEVICE),
-        &mut Cryptsetup(shared.clone()),
+        &mut Luks(shared.clone()),
         &mut |_| {}
     ));
     assert_eq!(shared.borrow().commands, commands);
@@ -1387,7 +1455,7 @@ fn orphans_removes_phase_ones_pending_tokens() {
     orphans(
         &header,
         Path::new(DEVICE),
-        &mut Cryptsetup(shared.clone()),
+        &mut Luks(shared.clone()),
         &mut |line| console.push(line.to_owned()),
     );
     assert_eq!(shared.borrow().commands, 1, "{console:?}");
@@ -1399,7 +1467,7 @@ fn orphans_removes_phase_ones_pending_tokens() {
     orphans(
         &header,
         Path::new(DEVICE),
-        &mut Cryptsetup(shared.clone()),
+        &mut Luks(shared.clone()),
         &mut |line| console.push(line.to_owned()),
     );
     assert_eq!(shared.borrow().commands, 2, "{console:?}");
@@ -1410,7 +1478,7 @@ fn orphans_removes_phase_ones_pending_tokens() {
         orphans(
             &header,
             Path::new(DEVICE),
-            &mut Cryptsetup(shared.clone()),
+            &mut Luks(shared.clone()),
             &mut |_| panic!("wrote"),
         );
     }

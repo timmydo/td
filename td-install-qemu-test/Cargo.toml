@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 description = "Native PID-1 fixture for disposable QEMU installation tests"
 
+[dependencies]
+td-json = { path = "../td-json" }
+
 [workspace]
 
 [lints.rust]

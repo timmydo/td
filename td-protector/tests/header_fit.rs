@@ -1,10 +1,7 @@
-//! The protected tier's largest LUKS2 headers, written by the pinned
-//! cryptsetup on header files this test builds (td-install/ENCRYPTION.md,
-//! "Re-encrypting upgrade" and increment 8a's acceptance evidence): each
-//! must leave at least 1 KiB of the 12 KiB JSON area spare. Ignored by
-//! default: it needs the source-built cryptsetup and the host kernel's
-//! AF_ALG hash and skcipher interfaces, which the gate sandbox need not
-//! provide.
+//! The protected tier's largest headers written by td-luks must leave
+//! at least 1 KiB of the 12 KiB JSON area spare. Set TD_LUKS to the built
+//! program's absolute path. Reencryption transitions here measure metadata
+//! only; the td-luks QEMU oracle tests actual data rewriting and recovery.
 //!
 //! ```text
 //! cargo test --frozen --manifest-path td-protector/Cargo.toml \
@@ -17,13 +14,12 @@
     clippy::panic
 )]
 
-use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use td_fs::TempDir;
-use td_protector::cryptsetup::Resilience;
-use td_protector::cryptsetup::{self, Cryptsetup, KeyFile};
+use td_protector::luks::Resilience;
+use td_protector::luks::{self, KeyFile, Luks};
 use td_protector::luks2::UpgradeView;
 use td_protector::luks2::{self, Kind, BINARY_HEADER_LEN, JSON_AREA_LEN};
 use td_protector::pin::PinPcrs;
@@ -41,7 +37,7 @@ use td_tpm::SealedObject;
 const SPARE: usize = 1024;
 /// The recovery key's passphrase, keyslot 0's key.
 const RECOVERY: &[u8] = b"000000000000000000000000000000000000000000000000";
-/// The JSON text each header measured, cryptsetup 2.8.8 writing it. The
+/// The JSON text each header measured, td-luks writing it. The
 /// fixtures are fixed and every PBKDF parameter forced, so the sizes are
 /// exact.
 const PROTECTED_JSON: usize = 10510;
@@ -52,37 +48,31 @@ fn scratch(name: &str) -> TempDir {
     TempDir::new(&format!("td-protector-header-fit-{name}")).unwrap()
 }
 
-#[path = "support/pinned_cryptsetup.rs"]
-mod pinned_cryptsetup;
+#[path = "support/luks_program.rs"]
+mod luks_program;
 
-fn tool() -> Cryptsetup {
-    Cryptsetup::new(pinned_cryptsetup::path())
+fn tool() -> Luks {
+    Luks::new(luks_program::path())
 }
 
 /// A td-formatted volume on a 20 MiB file: keyslot 0 the recovery key.
-fn format(cs: &Cryptsetup, dir: &Path) -> PathBuf {
+fn format(cs: &Luks, dir: &Path) -> PathBuf {
     let image = dir.join("volume");
     File::create(&image).unwrap().set_len(20 << 20).unwrap();
-    let args = cryptsetup::format_args("0f0e0d0c-0b0a-4908-8706-050403020100", "td-system", &image);
+    let args = luks::format_args("0f0e0d0c-0b0a-4908-8706-050403020100", "td-system", &image);
     cs.run(&args, RECOVERY).unwrap();
     image
 }
 
-fn add_keyslot(cs: &Cryptsetup, image: &Path, slot: u8) {
+fn add_keyslot(cs: &Luks, image: &Path, slot: u8) {
     let key = KeyFile::new(&[slot; 32]).unwrap();
-    cs.run(
-        &cryptsetup::add_key_args(image, 0, slot, key.path()),
-        RECOVERY,
-    )
-    .unwrap();
+    cs.run(&luks::add_key_args(image, 0, slot, key.path()), RECOVERY)
+        .unwrap();
 }
 
-fn import(cs: &Cryptsetup, image: &Path, id: u8, json: &str) {
-    cs.run(
-        &cryptsetup::token_import_args(image, Some(id)),
-        json.as_bytes(),
-    )
-    .unwrap();
+fn import(cs: &Luks, image: &Path, id: u8, json: &str) {
+    cs.run(&luks::token_import_args(image, Some(id)), json.as_bytes())
+        .unwrap();
 }
 
 /// The JSON text of each copy, up to its NUL padding; both must agree.
@@ -186,7 +176,7 @@ fn later_tokens() -> Vec<String> {
 /// token beside them, then 8i's tokens. td's reader reads the header
 /// before the last two, which it does not know yet.
 #[test]
-#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
+#[ignore = "set TD_LUKS to the built td-luks executable"]
 fn the_largest_protected_header_fits() {
     let cs = tool();
     let dir = scratch("protected");
@@ -229,42 +219,16 @@ fn the_largest_protected_header_fits() {
     assert_eq!(used, PROTECTED_JSON);
 }
 
-fn reencrypt_init(cs: &Cryptsetup, image: &Path, resilience: &[&str]) {
-    let mut args: Vec<OsString> = [
-        "reencrypt",
-        "--init-only",
-        "--batch-mode",
-        "--key-slot",
-        "0",
-        "--key-file=-",
-        "--use-random",
-        "--cipher",
-        "aes-xts-plain64",
-        "--key-size",
-        "512",
-        "--sector-size",
-        "4096",
-        "--hash",
-        "sha256",
-        "--pbkdf",
-        "pbkdf2",
-        "--pbkdf-force-iterations",
-        "1000",
-    ]
-    .iter()
-    .chain(resilience)
-    .map(OsString::from)
-    .collect();
-    args.push(image.into());
-    cs.run(&args, RECOVERY).unwrap();
+fn reencrypt_init(_cs: &Luks, image: &Path, resilience: Resilience) {
+    reencrypt_init_only(_cs, image, 0, resilience);
 }
 
 /// U2 as the upgrade reaches it: keyslot 0, the four pending fido2 tokens
-/// and the `td-upgrade` token, then cryptsetup's reencryption keyslot,
-/// segments and second digest by `reencrypt --init-only`. td's reader
-/// reads it as an upgrading header, as cryptsetup's metadata dump does.
+/// and the `td-upgrade` token, then td-luks's reencryption keyslot,
+/// segments and second digest by library initialization. td's reader
+/// reads it as an upgrading header, as td-luks's metadata dump does.
 #[test]
-#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
+#[ignore = "set TD_LUKS to the built td-luks executable"]
 fn a_u2_header_reads_as_upgrading() {
     let cs = tool();
     let dir = scratch("u2-read");
@@ -273,7 +237,7 @@ fn a_u2_header_reads_as_upgrading() {
         import(&cs, &image, id, &fido2(None).encode().unwrap());
     }
     import(&cs, &image, 4, &upgrade().encode().unwrap());
-    reencrypt_init(&cs, &image, &["--resilience", "journal"]);
+    reencrypt_init(&cs, &image, Resilience::Journal);
     let header = luks2::read(&mut File::open(&image).unwrap()).unwrap();
     assert_eq!(header.kind(), Kind::Upgrading);
     assert_eq!(header.keyslots, [0, 1, 2]);
@@ -285,9 +249,9 @@ fn a_u2_header_reads_as_upgrading() {
 
 /// The largest U2: besides keyslot 0, the pending fido2 tokens and the
 /// `td-upgrade` token, every other token naming no keyslot, more than U2
-/// holds, then `reencrypt --init-only`, after which cryptsetup refuses a
+/// holds, then library initialization, after which td-luks refuses a
 /// token import.
-fn upgrading_u2(name: &str, resilience: &[&str], expected: usize) {
+fn upgrading_u2(name: &str, resilience: Resilience, expected: usize) {
     let cs = tool();
     let dir = scratch(name);
     let image = format(&cs, dir.path());
@@ -325,51 +289,70 @@ fn upgrading_u2(name: &str, resilience: &[&str], expected: usize) {
 }
 
 #[test]
-#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
+#[ignore = "set TD_LUKS to the built td-luks executable"]
 fn the_largest_u2_header_fits_in_journal_resilience() {
-    upgrading_u2(
-        "u2-journal",
-        &["--resilience", "journal"],
-        UPGRADE_U2_JOURNAL_JSON,
-    );
+    upgrading_u2("u2-journal", Resilience::Journal, UPGRADE_U2_JOURNAL_JSON);
 }
 
 #[test]
-#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
+#[ignore = "set TD_LUKS to the built td-luks executable"]
 fn the_largest_u2_header_fits_in_checksum_resilience() {
     upgrading_u2(
         "u2-checksum",
-        &["--resilience", "checksum", "--resilience-hash", "sha256"],
+        Resilience::Checksum,
         UPGRADE_U2_CHECKSUM_JSON,
     );
 }
 
-/// The runner's reencryption as the upgrade spells it, initialized only:
-/// online it runs under the selector's mapping, which a file has none of.
-fn reencrypt_init_only(cs: &Cryptsetup, image: &Path, slot: u8, resilience: Resilience) {
-    let mut args = cryptsetup::reencrypt_args(image, "td-selector", slot, resilience);
-    let at = args.iter().position(|arg| arg == "--active-name").unwrap();
-    args.splice(at..at + 2, [OsString::from("--init-only")]);
-    cs.run(&args, RECOVERY).unwrap();
+/// Initialize metadata with the library; this fixture has no live mapping.
+fn reencrypt_init_only(_cs: &Luks, image: &Path, slot: u8, resilience: Resilience) {
+    let mut file = File::options().read(true).write(true).open(image).unwrap();
+    let mode = match resilience {
+        Resilience::Checksum => td_luks::reencrypt::Resilience::Checksum,
+        Resilience::Journal => td_luks::reencrypt::Resilience::Journal,
+    };
+    let (plan, _keys) = td_luks::reencrypt::plan_start(
+        &mut file,
+        &mut td_luks::keyslot::DevRandom,
+        slot,
+        RECOVERY,
+        mode,
+    )
+    .unwrap();
+    td_luks::reencrypt::commit(&mut file, &mut td_luks::keyslot::DevRandom, &plan).unwrap();
 }
 
-/// The runner's resumption, offline in place of under the mapping, with no
-/// lock directory to take.
-fn resume_offline(cs: &Cryptsetup, image: &Path) {
-    let mut args = cryptsetup::reencrypt_resume_args(image, "td-selector");
-    let at = args.iter().position(|arg| arg == "--active-name").unwrap();
-    args.splice(
-        at..at + 2,
-        ["--force-offline-reencrypt", "--disable-locks"].map(OsString::from),
-    );
-    cs.run(&args, RECOVERY).unwrap();
+/// Advance only the metadata. The disposable image contains no payload;
+/// this proves planner/header compatibility, not encrypted data recovery.
+fn finish_metadata(_cs: &Luks, image: &Path) {
+    use td_luks::{reencrypt, write::Plan};
+    let mut file = File::options().read(true).write(true).open(image).unwrap();
+    loop {
+        let (header, layout) = reencrypt::load(&mut file).unwrap();
+        let size = (layout.data_size - layout.progress).min(reencrypt::HOTZONE_SIZE);
+        let dirty = reencrypt::mark_hotzone(&header.json, layout.data_size, size).unwrap();
+        let json = reencrypt::finish_hotzone(&dirty, layout.data_size).unwrap();
+        let done = json.get_path(&["config", "requirements"]).is_none();
+        let plan = Plan {
+            uuid: header.uuid,
+            label: header.label,
+            seqid: header.seqid + 1,
+            json,
+            areas: vec![],
+            used: header.used,
+        };
+        reencrypt::commit(&mut file, &mut td_luks::keyslot::DevRandom, &plan).unwrap();
+        if done {
+            break;
+        }
+    }
 }
 
-/// The upgrade planner's growth bounds hold for what cryptsetup writes: a
+/// The upgrade planner's growth bounds hold for what td-luks writes: a
 /// keyslot added at a two-digit number, and the reencryption's
 /// initialization in both resilience modes.
 #[test]
-#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
+#[ignore = "set TD_LUKS to the built td-luks executable"]
 fn the_upgrade_growth_bounds_hold() {
     let cs = tool();
     let dir = scratch("growth-keyslot");
@@ -405,15 +388,15 @@ fn secret(key: Key) -> Vec<u8> {
 
 /// One plan step through the runner, the reencryption stopped after its
 /// initialization when `interrupt` is set.
-fn run_step(cs: &Cryptsetup, image: &Path, step: &Step, interrupt: bool) {
+fn run_step(cs: &Luks, image: &Path, step: &Step, interrupt: bool) {
     match step {
         Step::Reencrypt { slot, resilience } => {
             reencrypt_init_only(cs, image, *slot, *resilience);
             if !interrupt {
-                resume_offline(cs, image);
+                finish_metadata(cs, image);
             }
         }
-        Step::ResumeReencrypt => resume_offline(cs, image),
+        Step::ResumeReencrypt => finish_metadata(cs, image),
         Step::TakeLockout => {
             let lockout = Lockout {
                 primary: [0x0b; 34],
@@ -450,7 +433,7 @@ fn run_step(cs: &Cryptsetup, image: &Path, step: &Step, interrupt: bool) {
 /// 1 KiB, so a retry is never refused for size; phase 1's own header is
 /// within it, and reads as U0.
 #[test]
-#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
+#[ignore = "set TD_LUKS to the built td-luks executable"]
 fn the_largest_phase_one_header_fits() {
     let cs = tool();
     let dir = scratch("phase-one");
@@ -498,17 +481,17 @@ fn the_largest_phase_one_header_fits() {
     assert!(json_len(&image) <= fits);
 }
 
-/// The upgrade from U0 to a protected header over the headers cryptsetup
+/// The upgrade from U0 to a protected header over the headers td-luks
 /// writes: phase 1's pending tokens and `td-upgrade` token over a
 /// device-bound volume, then each state's plan, confirmed against
-/// cryptsetup's own metadata and run through the runner: the TPM shape in
+/// td-luks's own metadata and run through the runner: the TPM shape in
 /// both resilience modes, uncut and interrupted after the reencryption's
 /// initialization (U2), and the FIDO2 shape interrupted so. The result is
 /// a header of the shape the protected planner admits, its volume key
 /// rotated, every protector opening its keyslot and a wrong key refused.
 #[test]
-#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
-fn the_upgrade_runs_over_cryptsetup_headers() {
+#[ignore = "set TD_LUKS to the built td-luks executable"]
+fn the_upgrade_plans_run_over_td_luks_metadata() {
     let cs = tool();
     for (shape, resilience, interrupt) in [
         (Shape::Tpm, Resilience::Checksum, false),
@@ -542,7 +525,7 @@ fn the_upgrade_runs_over_cryptsetup_headers() {
             y: [n; 32],
         });
         // Phase 1 as the storage worker writes it, confirmed against
-        // cryptsetup's own metadata: tokens 1 and 2, then `td-upgrade`.
+        // td-luks's own metadata: tokens 1 and 2, then `td-upgrade`.
         let view = read_upgrade(&image);
         let from = view.volume.segment.unwrap();
         let metadata = cs.metadata(&image).unwrap();
@@ -623,15 +606,12 @@ fn the_upgrade_runs_over_cryptsetup_headers() {
                 other => panic!("{other:?} remains"),
             };
             let slot = token.keyslot().unwrap();
-            cs.run(&cryptsetup::test_args(&image, slot), &secret(key))
+            cs.run(&luks::test_args(&image, slot), &secret(key))
                 .unwrap();
             let wrong = cs
-                .run(&cryptsetup::test_args(&image, slot), &[0x33; 32])
+                .run(&luks::test_args(&image, slot), &[0x33; 32])
                 .unwrap_err();
-            assert_eq!(
-                cryptsetup::exit_code(&wrong),
-                Some(cryptsetup::EXIT_BAD_PASSPHRASE)
-            );
+            assert_eq!(luks::exit_code(&wrong), Some(luks::EXIT_BAD_PASSPHRASE));
             opened.push(slot);
         }
         opened.sort_unstable();
@@ -639,34 +619,4 @@ fn the_upgrade_runs_over_cryptsetup_headers() {
         let tpm_pin = usize::from(shape == Shape::Tpm);
         assert_eq!(opened.len(), 3 + tpm_pin, "{case}");
     }
-}
-
-/// cryptsetup's last reencryption commits destroy the old key's keyslots
-/// one at a time while its requirement stays (ENCRYPTION.md "Threat and
-/// limits"). The header a cut there leaves, emulated by killing keyslot 0
-/// of an initialized reencryption, is one no resumption opens with the
-/// recovery key, though the rewrapped keyslot still holds it: the
-/// planner's U2 can only offer the resumption again.
-#[test]
-#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
-fn a_cut_inside_cryptsetups_last_commits_cannot_resume() {
-    let cs = tool();
-    let dir = scratch("finishing");
-    let image = format(&cs, dir.path());
-    reencrypt_init_only(&cs, &image, 0, Resilience::Journal);
-    cs.run(&cryptsetup::kill_slot_args(&image, 0), RECOVERY)
-        .unwrap();
-    let view = read_upgrade(&image);
-    assert!(view.volume.reencryption);
-    assert_eq!(view.volume.luks2, [1]);
-    let mut resume = cryptsetup::reencrypt_resume_args(&image, "td-selector");
-    let at = resume
-        .iter()
-        .position(|arg| arg == "--active-name")
-        .unwrap();
-    resume.splice(
-        at..at + 2,
-        ["--force-offline-reencrypt", "--disable-locks"].map(OsString::from),
-    );
-    assert!(cs.run(&resume, RECOVERY).is_err());
 }

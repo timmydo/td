@@ -34,16 +34,6 @@ const PINS: &[PinDef] = &[
         version: "2026-10-20",
     },
     PinDef {
-        key: "cryptsetup-x86-64-source",
-        aliases: &[],
-        // LUKS2 userspace for td-install/ENCRYPTION.md, under the owner's
-        // principle-2 sign-off; hash matches upstream's sha256sums.asc.
-        url: "https://www.kernel.org/pub/linux/utils/cryptsetup/v2.8/cryptsetup-2.8.8.tar.xz",
-        sha256: "3acfa685f2dd7fcc832e0b77bc7093aa7da554a51ce8dafbb4138eaa854eee35",
-        file: "cryptsetup-2.8.8.tar.xz",
-        version: "2.8.8",
-    },
-    PinDef {
         key: "curl-x86-64-source",
         aliases: &[],
         // curl 8.23.0 supplies Git's source-built HTTP/HTTPS transport. The
@@ -160,27 +150,6 @@ const PINS: &[PinDef] = &[
         version: "3.5.1",
     },
     PinDef {
-        key: "json-c-x86-64-source",
-        aliases: &[],
-        // cryptsetup's LUKS2 metadata library; only libjson-c.a is built. The
-        // project's static release object; its contents are identical to the
-        // json-c-0.18-20240915 tag archive whose SHA-512 Fedora records.
-        url: "https://s3.amazonaws.com/json-c_releases/releases/json-c-0.18.tar.gz",
-        sha256: "876ab046479166b869afc6896d288183bbc0e5843f141200c677b3e8dfb11724",
-        file: "json-c-0.18.tar.gz",
-        version: "0.18",
-    },
-    PinDef {
-        key: "libdevmapper-x86-64-source",
-        aliases: &[],
-        // LVM2, of which only libdevmapper.a is built for cryptsetup; the
-        // file matches upstream's sha512.sum.
-        url: "https://sourceware.org/pub/lvm2/LVM2.2.03.43.tgz",
-        sha256: "d87ec0dac9061f1fa58ebced5c6b1360c87d4c5cd7b455dc0ebe1d3f036920d7",
-        file: "LVM2.2.03.43.tgz",
-        version: "2.03.43",
-    },
-    PinDef {
         key: "libressl-x86-64-source",
         aliases: &[],
         // LibreSSL 4.4.0 supplies the OpenSSL-compatible TLS implementation
@@ -191,18 +160,6 @@ const PINS: &[PinDef] = &[
         sha256: "7d02522ad5070b9adb32eb253ecabce181184a3750cf65abac0675ee908687c1",
         file: "libressl-4.4.0.tar.gz",
         version: "4.4.0",
-    },
-    PinDef {
-        key: "linux-source",
-        // The 4.14.67 tree stays pinned ONLY as the source of the UAPI kernel
-        // headers (`linux-headers-x86-64`) the build-root C packages use.
-        // The bootable kernel is a separate, current pin
-        // (`linux-kernel-source`); imported glibc carries Debian headers.
-        aliases: &["linux-headers-x86-64"],
-        url: "https://cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.14.67.tar.xz",
-        sha256: "3f4b056dc27233a78f7a4a35ed6fdcfd0a9680ec40b611a898bb6c8b905070ba",
-        file: "linux-4.14.67.tar.xz",
-        version: "4.14.67",
     },
     PinDef {
         key: "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
@@ -364,14 +321,7 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "linux-kernel-source",
         aliases: &[],
-        // Linux 7.2.13 — the latest STABLE mainline kernel (not a longterm/LTS
-        // line) the `linux-x86-64` recipe builds into a bootable x86_64
-        // `vmlinux` in the Debian build root (re #529). DISTINCT from the
-        // `linux-source` pin above: this is the full kernel tree to compile, kept
-        // current; that one is the frozen 4.14 UAPI-header source for td glibc.
-        // Keeping them separate confines a kernel bump to this one recipe
-        // instead of glibc and everything above it. A reviewed update bumps
-        // version + sha256 + the seed-digests.txt row together.
+        // The bootable kernel; libc's UAPI headers come from its own recipe.
         url: "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.13.tar.xz",
         sha256: "08e7b0c4f2dd1971f972da274b5e589a98989390ac56acd7a1a5af922363ea6c",
         file: "linux-7.2.13.tar.xz",
@@ -387,16 +337,6 @@ const PINS: &[PinDef] = &[
         sha256: "a9dc9565dffe8640f64d863cd29a32bc4a3dbdec0566a7fc44c5d6ee767d5f39",
         file: "openssh-10.6p1.tar.gz",
         version: "10.6p1",
-    },
-    PinDef {
-        key: "popt-x86-64-source",
-        aliases: &[],
-        // cryptsetup's command-line parser; only libpopt.a is built. The file
-        // matches Fedora's recorded SHA-512; the host serves no valid https.
-        url: "http://ftp.rpm.org/popt/releases/popt-1.x/popt-1.19.tar.gz",
-        sha256: "c25a4838fc8e4c1c8aacb8bd620edb3084a3d63bf8987fdad3ca2758c63240f9",
-        file: "popt-1.19.tar.gz",
-        version: "1.19",
     },
     PinDef {
         key: "ripgrep-seed-source",
@@ -458,16 +398,6 @@ const PINS: &[PinDef] = &[
         sha256: "b26882805f26aac59d5b222978e6580484b834ccdc98be89df2f05a6dc53a652",
         file: "tzdata2026e.tar.gz",
         version: "2026e",
-    },
-    PinDef {
-        key: "util-linux-libs-x86-64-source",
-        aliases: &[],
-        // cryptsetup requires libuuid and libblkid. The recipe builds only
-        // those two static libraries; no util-linux programs are shipped.
-        url: "https://www.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.4.tar.xz",
-        sha256: "fbd62a100ab7bb8746ba0661255c3c48185b1e9021507c624da01fbc696330ec",
-        file: "util-linux-2.42.4.tar.xz",
-        version: "2.42.4",
     },
     PinDef {
         key: "uutils-source",
@@ -641,33 +571,7 @@ mod tests {
 
     #[test]
     fn catalog_carries_all_legacy_source_locks() {
-        // The Linux 4.14 UAPI-header source + the
-        // linux-x86-64 kernel source (separate from the 4.14 UAPI-header
-        // pin, re #529) + the upstream Rust 1.99.1 rustc, rust-std, Cargo and
-        // Clippy release components +
-        // coreutils-0.12.0, ripgrep 15.2.0, and fd 10.5.0 (the Rust userland
-        // `.crate` sources) +
-        // util-linux 2.42.4 (cryptsetup's minimal libuuid/libblkid build
-        // closure) + the first reviewed
-        // foreign application seed, upstream ripgrep 15.2.0, LibreSSL 4.4.0,
-        // curl 8.23.0 (the static HTTPS foundation for Git), Git 2.56.0,
-        // curl's dated Mozilla CA extract and OpenSSH Portable 10.6p1. The
-        // td-ui applications are td's own trees (APPLICATIONS.md §W.8) and
-        // pin nothing here.
-        // IANA timezone data 2026e adds one source-data pin, and the Nerd
-        // Fonts v3.5.1 JetBrains Mono release ten pinned upstream data pins:
-        // the archive and nine licence notices. cryptsetup 2.8.8 with json-c
-        // 0.18, popt 1.19 and LVM2 2.03.43 add the LUKS2 userspace closure.
-        // zlib 1.3.x is td zlib. BusyBox's pin left with its last consumer,
-        // the kernel's bc, flex and elfutils left when it moved into the
-        // Debian build root, and btrfs-progs left when td-btrfs replaced it.
-        // CMake and the Rust source and its bootstrap snapshot left with the
-        // source-built toolchain, and the stage0 ladder's 36 pins with the
-        // ladder. GCC, glibc, GMP, MPFR and MPC left when Debian runtime
-        // imports replaced the remaining source bootstrap.
-        // linux-firmware's WCN6855 files and their licence add six pins,
-        // four of them device firmware (AGENTS.md).
-        assert_eq!(all().len(), 51);
+        assert_eq!(all().len(), 45);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice
@@ -820,19 +724,8 @@ mod tests {
         );
     }
 
-    /// A marked pin answers to its ALIASES too, which is what `by_key` does and
-    /// what a key-only set silently disagreed with. Driven over the real
-    /// `linux-source` pin, whose alias is the reachable case.
     #[test]
-    fn a_marked_pins_aliases_are_marked_with_it() {
-        const KEY: &str = "linux-source";
-        let mut names = foreign_names_with(&[KEY]);
-        names.sort();
-        assert_eq!(
-            names,
-            vec!["linux-headers-x86-64".to_string(), KEY.to_string()],
-            "every name `by_key' resolves to a marked pin must be marked"
-        );
+    fn foreign_names_include_only_declared_pins() {
         // A pin with no alias contributes exactly its key, and a neighbour's
         // names are not swept in with it.
         assert_eq!(
@@ -843,12 +736,5 @@ mod tests {
         // A name that resolves to no pin contributes nothing, which is what
         // `every_foreign_name_is_a_pin_key` refuses at the roster instead.
         assert!(foreign_names_with(&["linux-headers"]).is_empty());
-    }
-
-    #[test]
-    fn linux_header_inputs_resolve_to_the_linux_source_pin() {
-        let linux = by_key("linux-headers-x86-64").unwrap();
-        assert_eq!(linux.file, "linux-4.14.67.tar.xz");
-        assert_eq!(linux.key, "linux-headers-x86-64");
     }
 }

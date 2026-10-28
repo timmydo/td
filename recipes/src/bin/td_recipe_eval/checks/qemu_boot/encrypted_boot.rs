@@ -374,11 +374,16 @@ fn recovery_answers(key: &RecoveryKey, reseal: bool) -> Result<Vec<ConsoleAnswer
 }
 
 /// The installed selector's and deployment initramfs's console lines, as
-/// they reached the console, each trimmed: every line beginning `td-boot: `.
+/// they reached the console, each trimmed, excluding the output-device banner.
 fn td_boot_lines(console: &str) -> Vec<&str> {
     console
         .lines()
         .map(str::trim_end)
+        // Kernel output can arrive between the banner and its newline.
+        .map(|line| {
+            line.strip_prefix("td-boot: initramfs output on /dev/console")
+                .unwrap_or(line)
+        })
         .filter(|line| line.starts_with(TD_BOOT))
         .collect()
 }
@@ -2112,9 +2117,11 @@ mod tests {
     fn release_lines_run_to_their_end_without_the_wait() {
         let text = console(&[
             "[    1.0] kernel noise",
+            "td-boot: initramfs output on /dev/console",
+            "td-boot: initramfs output on /dev/consolescsi host6: usb-storage 2-1:1.0",
             "TD-BOOT-VOLUME x /dev/vda2",
             "td-boot: waiting up to 10 s for /dev/tpmrm0",
-            FIRST_BOOT_RELEASED,
+            &format!("td-boot: initramfs output on /dev/console{FIRST_BOOT_RELEASED}"),
             CAP_CLOSED,
             &format!("td-boot: volume {UUID} opened with keyslot 2 as dm-0 (td-selector)"),
             "td-boot: post-cap unseal of td token 1 (device-bound) refused: policy refused: x",
@@ -2233,7 +2240,7 @@ mod tests {
             KEY_PROMPT,
             "td-boot: the entry holds 5 digits, not 48: enter it again",
             KEY_PROMPT,
-            "td-boot: the recovery key does not open keyslot 0 (/bin/cryptsetup open failed (exit status: 2)): enter it again",
+            "td-boot: the recovery key does not open keyslot 0 (/bin/td-luks test failed (exit status: 2)): enter it again",
             KEY_PROMPT,
             KEY_OPENS,
             RESEAL_WARNING,

@@ -56,6 +56,8 @@ pub(crate) enum Partial {
     Unbound,
     /// After its initialization: U2.
     Initialized,
+    /// td-luks final metadata is durable; old slots and journal await cleanup.
+    Finalized,
     /// After the data, between the commits that destroy the old key's
     /// keyslots one at a time and the one that drops the requirement.
     Finishing,
@@ -217,6 +219,12 @@ impl Disk {
                 .filter(|(_, slot)| slot.luks2)
                 .map(|(number, _)| *number)
                 .collect(),
+            bound: self
+                .keyslots
+                .iter()
+                .filter(|(_, slot)| slot.luks2 && slot.vk == self.vk)
+                .map(|(n, _)| *n)
+                .collect(),
             reencrypt_modes: self
                 .keyslots
                 .values()
@@ -362,21 +370,15 @@ impl Disk {
         }
     }
 
-    /// A reencryption's end: every keyslot of another volume key, its own
-    /// keyslot among them, wiped.
+    pub(crate) fn finalized(&mut self) {
+        self.vk = self.reencrypting.take().unwrap();
+        self.keyslots.retain(|_, slot| slot.luks2);
+    }
+
+    /// A completed command includes the post-final cleanup.
     fn finish(&mut self) {
-        let new = self.reencrypting.take().unwrap();
-        let old: Vec<u8> = self
-            .keyslots
-            .iter()
-            .filter(|(_, slot)| slot.vk != new)
-            .map(|(number, _)| *number)
-            .collect();
-        for slot in old {
-            self.keyslots.remove(&slot);
-            self.strip(slot);
-        }
-        self.vk = new;
+        self.finalized();
+        self.apply(&Step::KillUnbound, None, None);
     }
 
     /// Destroys the old key's keyslots, one commit each in cryptsetup.
@@ -399,6 +401,23 @@ impl Disk {
         match step {
             Step::Test { slot, key } => {
                 assert!(self.opens(*slot, secret(*key, tpm)), "{step:?}")
+            }
+            Step::KillUnbound => {
+                assert!(self.reencrypting.is_none());
+                assert!(self
+                    .keyslots
+                    .values()
+                    .any(|s| s.luks2 && s.vk == self.vk && s.key == RECOVERY_KEY));
+                let unbound: Vec<u8> = self
+                    .keyslots
+                    .iter()
+                    .filter(|(_, s)| s.vk != self.vk)
+                    .map(|(n, _)| *n)
+                    .collect();
+                for slot in unbound {
+                    self.keyslots.remove(&slot);
+                    self.strip(slot);
+                }
             }
             Step::KillSlot { slot, by } => {
                 assert!(slot != by && self.opens(*by, RECOVERY_KEY), "{step:?}");
@@ -470,6 +489,7 @@ impl Disk {
                     match partial {
                         None => self.finish(),
                         Some(Partial::Finishing) => self.wipe_old(),
+                        Some(Partial::Finalized) => self.finalized(),
                         Some(_) => {}
                     }
                 }
@@ -488,6 +508,7 @@ impl Disk {
                 match partial {
                     None => self.finish(),
                     Some(Partial::Finishing) => self.wipe_old(),
+                    Some(Partial::Finalized) => self.finalized(),
                     Some(_) => {}
                 }
             }
@@ -514,7 +535,12 @@ struct Cut {
 
 /// The cuts inside a reencryption the upgrade converges from: between
 /// steps, before the initialization's commit, and after it.
-const INSIDE: &[Option<Partial>] = &[None, Some(Partial::Unbound), Some(Partial::Initialized)];
+const INSIDE: &[Option<Partial>] = &[
+    None,
+    Some(Partial::Unbound),
+    Some(Partial::Initialized),
+    Some(Partial::Finalized),
+];
 
 /// One boot of the upgrade: the gather, then each state's plan, confirmed,
 /// until the `td-upgrade` token is gone or `cut` stops it. A usable TPM
@@ -1318,11 +1344,8 @@ fn the_u4_plan_adds_each_protector_under_the_recovery_key() {
         .iter()
         .map(|step| step.args(device, "td-selector", new_key))
         .collect();
-    assert_eq!(
-        args[2],
-        Some(cryptsetup::add_key_args(device, 1, 2, new_key))
-    );
-    assert_eq!(args[4], Some(cryptsetup::token_replace_args(device, 1)));
+    assert_eq!(args[2], Some(luks::add_key_args(device, 1, 2, new_key)));
+    assert_eq!(args[4], Some(luks::token_replace_args(device, 1)));
     assert_eq!(args[11], None);
     assert_eq!(plan.steps()[2].new_key(), Some(Key::Fido2 { token: 1 }));
     assert_eq!(plan.steps()[2].input(), Input::Key(Key::Recovery));
@@ -1370,6 +1393,7 @@ fn the_reencryption_runs_with_the_recovery_key_on_keyslot_0() {
     assert_eq!(
         u1.steps(),
         [
+            Step::KillUnbound,
             Step::Test {
                 slot: 0,
                 key: Key::Recovery
@@ -1382,20 +1406,20 @@ fn the_reencryption_runs_with_the_recovery_key_on_keyslot_0() {
     );
     let device = Path::new("/proc/1/fd/5");
     assert_eq!(
-        u1.steps()[1].args(device, "td-selector", Path::new("/unused")),
-        Some(cryptsetup::reencrypt_args(
+        u1.steps()[2].args(device, "td-selector", Path::new("/unused")),
+        Some(luks::reencrypt_args(
             device,
             "td-selector",
             0,
             Resilience::Checksum
         ))
     );
-    disk.apply(&u1.steps()[1], None, Some(Partial::Initialized));
+    disk.apply(&u1.steps()[2], None, Some(Partial::Initialized));
     let u2 = plan(&disk.view(), &gathered).unwrap();
     assert_eq!(u2.steps(), [Step::ResumeReencrypt]);
     assert_eq!(
         u2.steps()[0].args(device, "td-selector", Path::new("/unused")),
-        Some(cryptsetup::reencrypt_resume_args(device, "td-selector"))
+        Some(luks::reencrypt_resume_args(device, "td-selector"))
     );
     disk.apply(&u2.steps()[0], None, None);
     // The rewrapped recovery keyslot is the one no token names.
@@ -1403,6 +1427,7 @@ fn the_reencryption_runs_with_the_recovery_key_on_keyslot_0() {
     assert_eq!(
         u3.steps(),
         [
+            Step::KillUnbound,
             Step::Test {
                 slot: 1,
                 key: Key::Recovery
@@ -1502,16 +1527,60 @@ fn an_unbound_keyslot_a_cut_initialization_left_is_killed() {
     assert_eq!(
         plan(&disk.view(), &gathered).unwrap().steps(),
         [
+            Step::KillUnbound,
             Step::Test {
                 slot: 0,
                 key: Key::Recovery
             },
-            Step::KillSlot { slot: 1, by: 0 },
             Step::Reencrypt {
                 slot: 0,
                 resilience: Resilience::Journal
             },
         ]
+    );
+}
+
+/// Final metadata can retain several old slots; only the new bound slot
+/// may become the recovery marker, and cleanup must precede its test.
+#[test]
+fn finalized_upgrade_cleans_old_slots_before_selecting_recovery() {
+    let mut disk = in_state(Shape::Tpm, State::U3);
+    let recovery = *disk.view().volume.bound.first().unwrap();
+    for slot in [20, 21] {
+        disk.keyslots.insert(
+            slot,
+            Slot {
+                key: RECOVERY_KEY,
+                vk: disk.vk - 1,
+                luks2: true,
+            },
+        );
+    }
+    let gathered = Gathered {
+        fido2: &[1, 2],
+        dropped: &[],
+        tpm: Tpm::Unusable,
+        resilience: Resilience::Journal,
+    };
+    let steps = plan(&disk.view(), &gathered).unwrap();
+    assert_eq!(steps.steps().first(), Some(&Step::KillUnbound));
+    assert_eq!(
+        steps.steps().get(1),
+        Some(&Step::Test {
+            slot: recovery,
+            key: Key::Recovery
+        })
+    );
+    disk.apply(&Step::KillUnbound, None, None);
+    assert_eq!(
+        disk.keyslots.keys().copied().collect::<Vec<_>>(),
+        [recovery]
+    );
+    // A cleanup interrupted after removing the last old slot must still
+    // sanitize free journal space on retry.
+    assert_eq!(
+        plan(&disk.view(), &gathered).unwrap().steps().first(),
+        Some(&Step::KillUnbound)
     );
 }
 

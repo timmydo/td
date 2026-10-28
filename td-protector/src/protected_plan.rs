@@ -7,8 +7,8 @@
 //! with the header (`Plan::confirm`). Upgrading headers are 8f's planner's
 //! and device-bound ones `transition`'s; this one refuses both.
 
-use crate::cryptsetup;
 use crate::lockout;
+use crate::luks;
 use crate::luks2::{self, Header, Metadata, MAX_TPM_PIN_TOKENS};
 use crate::pin::PRIMARY_NAME_LEN;
 use crate::protected::{Lockout, Shape, Token, TpmPin, UpdateRetry};
@@ -68,16 +68,16 @@ impl Step {
     /// descriptor and appears only in `AddKeyslot`'s.
     pub fn args(&self, device: &Path, new_key: &Path) -> Vec<OsString> {
         match self {
-            Self::Test { slot } => cryptsetup::test_args(device, *slot),
-            Self::KillSlot { slot, .. } => cryptsetup::kill_slot_args(device, *slot),
-            Self::RemoveToken { token } => cryptsetup::token_remove_args(device, *token),
-            Self::AddKeyslot { slot, by } => cryptsetup::add_key_args(device, *by, *slot, new_key),
+            Self::Test { slot } => luks::test_args(device, *slot),
+            Self::KillSlot { slot, .. } => luks::kill_slot_args(device, *slot),
+            Self::RemoveToken { token } => luks::token_remove_args(device, *token),
+            Self::AddKeyslot { slot, by } => luks::add_key_args(device, *by, *slot, new_key),
             Self::ImportToken {
                 id: Some(id),
                 replace: true,
                 ..
-            } => cryptsetup::token_replace_args(device, *id),
-            Self::ImportToken { id, .. } => cryptsetup::token_import_args(device, *id),
+            } => luks::token_replace_args(device, *id),
+            Self::ImportToken { id, .. } => luks::token_import_args(device, *id),
         }
     }
 

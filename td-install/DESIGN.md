@@ -157,23 +157,14 @@ between a machine and its root filesystem. This workstream does not
 reintroduce one. D7's `mkfs.btrfs`, run at INSTALL time and on a LIVE boot,
 whose deployment initramfs formats its volatile volume with it (MEDIA.md
 "Live boot"), is td's own Rust from the `td-btrfs` recipe, not a third-party
-program. The deliberate exception is the source-built static `cryptsetup`
-that [ENCRYPTION.md](ENCRYPTION.md) approves for LUKS2: the
-installer formats with it, and the selector and deployment initramfs open
-the volume with it. Its key material reaches it only through a descriptor,
-never argv or the environment. The installer's device-bound formatting
-execs `/bin/cryptsetup` from the verified root (td-boot's `CRYPTSETUP`
-names it), bound at build time as D7 binds `mkfs.btrfs`: the image build
-refuses a root whose `/bin/cryptsetup` does not link the static binary or
-lacks its debug companion. Increment 6 binds both initramfs, each to the
-exec it runs, as D7's live-boot exec is bound. The installed selector
-execs `/bin/cryptsetup` to open the volume after its release and to read
-the handoff's key (ENCRYPTION.md "Selector release"), and the deployment
-initramfs's unlock execs it to open the volume with that key ("Full-system
-volume consumers"). So the image build refuses either initramfs without
-`/bin/cryptsetup` or its store payload, the static binary, or with a
-`/bin/cryptsetup` that does not link that payload; the debug companion
-ships in the root with the package. The live selector, the same stock
+program. LUKS2 formatting and activation use the static Rust `td-luks`
+program (ENCRYPTION.md and td-luks/DESIGN.md). The verified root and both
+selector and deployment initramfs bind `/bin/td-luks` to its exact store
+payload; the root also carries its debug companion. Image construction
+checks these bindings. Keys travel only through descriptors. The
+selector opens the volume and exports its handoff key through td-luks;
+the deployment initramfs verifies and activates that volume key.
+The live selector, the same stock
 initramfs, carries it and never runs it. The installed selector's
 recovery flow reads the recovery key through td-init's `secret-line`
 (td-boot's `SECRET_LINE_APPLET`), as its protected release reads every
@@ -218,8 +209,8 @@ filesystem. The sibling crates the binary links for device-bound storage,
 td-protector, td-tpm with its td-fido, and td-json, forbid `unsafe` and
 reach the TPM through td-tpm's safe file I/O on `/dev/tpmrm0` (D10
 records that open and td-protector's `/dev/random` read). The pipes that
-carry key material to cryptsetup are std's, created by td-protector's
-runner, and the device-mapper requests cryptsetup's own.
+carry key material to td-luks are std's, created by td-protector's
+runner, and the device-mapper requests td-luks's own.
 The one exception is publication onto a disk this process holds, which
 binds a loop device over the volume with two value-pinned requests
 (`UNSAFE.md` §21, §5 "Publishing through a loop over the claim"). Any
@@ -284,7 +275,7 @@ character device, and names the TPM resource manager in its error. The
 execution draws the recovery key and the protector secret through
 td-protector, which reads the fixed path `/dev/random` and names it in
 its error. Those two device opens are the documented exceptions;
-td-protector's cryptsetup runner also execs the absolute cryptsetup path
+td-protector's td-luks runner also execs the absolute td-luks path
 td-install gives it, naming that program in its errors, which is an exec
 of a path this crate chose rather than an open. td-tpm's salted
 sessions and its lockout authorization read `/dev/random` and td-fido's
@@ -629,14 +620,14 @@ not a complete filesystem validator; the kernel still validates mounts.
 
 The same held descriptor is probed for a td LUKS2 header
 ([ENCRYPTION.md](ENCRYPTION.md) "Device-bound formatting"). Each 4096-byte
-binary header copy at offset zero and at cryptsetup's secondary offsets
+binary header copy at offset zero and at td-luks's secondary offsets
 (16 KiB to 4 MiB, those the device holds) whose position's magic and
 version 2 carry the `td-system` label is a claim, read through
 td-protector's `luks2::binary_claim`, which verifies no checksum.
 Discovery checks identity only. A claim naming the volume sought, or any
 claim when no UUID is given, hands the device to td-protector's
 `luks2::identity` (td-protector/DESIGN.md "LUKS2 tokens"): the copy
-cryptsetup would use, chosen by magic, version, offsets, checksum and
+td-luks would use, chosen by magic, version, offsets, checksum and
 sequence number, with no JSON parsed. Its label must be `td-system`
 (another label is not a td volume) and its UUID canonical lowercase text
 and, when one is sought, that volume's (otherwise the device is passed
@@ -860,11 +851,11 @@ The system's root image carries the stock selector at
 `SELECTOR_TEMPLATE_PATH`), `td-install` at `/bin/td-install` and the
 static `td-btrfs` the deployment initramfs already carries, linked at
 `/bin/mkfs.btrfs` (the name D7's `MKFS_BTRFS` gives), and the static
-`cryptsetup` with its debug companion, linked at `/bin/cryptsetup` (D6),
+`td-luks` with its debug companion, linked at `/bin/td-luks` (D6),
 so a live installer finds them in the root image `live-root` hashed
 against the medium's manifest rather than on the medium's unverified
 ESP. The image build refuses a root whose
-`/bin/mkfs.btrfs` or `/bin/cryptsetup` does not link exactly that
+`/bin/mkfs.btrfs` or `/bin/td-luks` does not link exactly that
 executable static binary.
 That template carries no volume identity, and `prepare-selector` appends
 one, so it is that command's template as shipped.
@@ -1016,13 +1007,11 @@ opens. Then, on that loop:
 
 1. draws the recovery key and the first-boot protector secret from
    `/dev/random` through td-protector;
-2. runs `luksFormat` with ENCRYPTION.md's parameters;
-3. adds keyslot 1 with `luksAddKey --key-slot 0 --new-key-slot 1` and the
-   same PBKDF parameters (`--pbkdf pbkdf2 --pbkdf-force-iterations 1000
-   --hash sha256`), the recovery passphrase authorizing it;
+2. runs `format` with ENCRYPTION.md's parameters;
+3. adds keyslot 1 with `add-key 0 1 DEVICE NEW-FD`, the compiled PBKDF
+   parameters and the recovery passphrase authorizing it;
 4. seals the protector under the first-boot policy on a fresh TPM client
-   and imports token 0, naming keyslot 1, with `token import --token-id 0
-   --json-file=-`, its JSON first held to td-protector's 4096-byte
+   and imports token 0, naming keyslot 1, with `token-import 0 DEVICE`, its JSON first held to td-protector's 4096-byte
    `MAX_TOKEN_JSON`;
 5. opens the mapping `/dev/mapper/td-install-TAG`, the workspace
    directory's own name, with the recovery passphrase;
@@ -1043,20 +1032,20 @@ opens. Then, on that loop:
    kernel until the live session ends.
 
 Verifying boot then also requires, while the loop is bound, that
-`open --test-passphrase --key-slot N` succeeds for keyslot 0 with the
+`test N DEVICE` succeeds for keyslot 0 with the
 recovery passphrase and for keyslot 1 with the protector secret, and that
 the header, read back through the claim by td-protector's reader from a
 valid primary copy no older than the secondary, carries the plan's UUID,
 the label, keyslots 0 and 1 alone and exactly the token imported as token
 0 with no orphan, which `verify_first_boot_object` on a fresh TPM client
 accepts. The reader reports neither whether both copies were valid nor
-the data segment's cipher, sector size or offset; the keyslot tests open
-the segment, and `luksFormat`'s exact arguments are the rest. These
+the data segment's cipher, sector size or offset; the keyslot tests authenticate the keys and td-luks's compiled profile
+validates the cipher, sector size and offset. These
 checks report the verifying boot phase, and their failure is
 verification failed. The protector secret is then zeroed and the loop
 released as before, and the boot artifacts are read back as on the
 unencrypted path, except that both of the table's ranges must still read
-zero. Nothing names a partition of the destination: cryptsetup,
+zero. Nothing names a partition of the destination: td-luks,
 mkfs.btrfs and td-boot see only the loop and the mapping.
 
 The execution then removes its workspace and holds the claim while the
@@ -1079,26 +1068,26 @@ and what one between the backup and primary writes leaves: the backup
 GPT alone, without a protective MBR, which firmware may or may not boot,
 with the key already acknowledged.
 
-Every cryptsetup child runs through td-protector's runner, which
-the selector shares (td-protector/DESIGN.md "Cryptsetup runner"), and
-execs `/bin/cryptsetup` from the verified root with a cleared
+Every td-luks child runs through td-protector's runner, which
+the selector shares (td-protector/DESIGN.md "LUKS runner"), and
+execs `/bin/td-luks` from the verified root with a cleared
 environment, its output captured, copied to standard error and zeroed,
 and its error inherited. Key material reaches it only by descriptor. The first secret travels on
 standard input as `--key-file=-`, written whole and then closed. The
-second, the new key `luksAddKey` takes as its key file, travels through a
+second, the new key `add-key` takes as its key file, travels through a
 pipe created with std: the runner writes the secret, closes the write end,
 keeps the read end, close-on-exec, and names it to the child as
-`/proc/<td-install pid>/fd/N`, so cryptsetup opens the pipe anew and reads
+`/proc/<td-install pid>/fd/N`, so td-luks opens the pipe anew and reads
 exactly the secret and end of file. Standard input carries the
 passphrase, at most 48 bytes, or the token's JSON, and a pipe is filled
 whole before its child starts, so its input is held to one page, the
 least any pipe holds, and more is refused rather than risk a write that
 blocks. That `/proc` name opens only for a process the kernel lets trace
-td-install: td-install stays dumpable and runs cryptsetup under its own
-uid, and a `PR_SET_DUMPABLE(0)` would break `luksAddKey`. No argv element
+td-install: td-install stays dumpable and runs td-luks under its own
+uid, and a `PR_SET_DUMPABLE(0)` would break `add-key`. No argv element
 or environment variable carries key material; a descriptor path names no
 secret. This adds no `unsafe` and no syscall to UNSAFE.md: pipes and
-children are std's and the device-mapper requests are cryptsetup's own.
+children are std's and the device-mapper requests are td-luks's own.
 
 The cost of formatting in place is the refusal order. A failing mkfs,
 which the unencrypted path meets before the first write, is here a write
@@ -1114,7 +1103,7 @@ itself fails keeps that code too, as at verifying boot ("Executing a
 consented installation"): its error names each part that failed, and the
 disk may keep what that part did not zero.
 
-`luksFormat` does not erase the data segment, and nothing here does:
+`format` does not erase the data segment, and nothing here does:
 ENCRYPTION.md "Device-bound formatting" says what of the disk's earlier
 plaintext an attacker with the disk still reads.
 
@@ -1385,7 +1374,7 @@ and from 8f an upgrading one runs td-protector's upgrade boot
 release; the upgrade's no-mains and cancelled boots keep the
 device-bound order without a reseal, the cancelled one's cancellation
 after its open, and a device-bound header's open then removes pending
-orphans. cryptsetup names the partition by its held descriptor,
+orphans. td-luks names the partition by its held descriptor,
 `/proc/<pid>/fd/N`; the mapping is then admitted by this walk, under
 that name only, held with the partition, and the boot's mounts name it
 as `/proc/<pid>/fd/M`. It does not survive `kexec`.
@@ -1393,7 +1382,7 @@ as `/proc/<pid>/fd/M`. It does not survive `kexec`.
 The deployment initramfs opens its own mapping with the handed-off key
 ([ENCRYPTION.md](ENCRYPTION.md) "Boot and authority boundaries" owns the
 key, the refusals and the post-cap check): `on-volume mount-root` runs
-cryptsetup on the partition by its held descriptor, `/proc/<pid>/fd/N`,
+td-luks on the partition by its held descriptor, `/proc/<pid>/fd/N`,
 under the fixed name `td-system` (td-boot's `VOLUME_MAPPING_NAME`), so
 its `dm/uuid` is `CRYPT-LUKS2-<hex>-td-system`; it then admits the
 mapping by this walk, requires that name, and mounts the held mapping
@@ -1414,7 +1403,7 @@ operation unchanged: its mounts, transaction lock, stale-mount probe and
 publication reach the Btrfs inside through that descriptor. Admission
 is the walk above, so a mapping over another device, or whose Btrfs
 carries another UUID or none, refuses. The running system never opens
-or unlocks the volume: it runs no cryptsetup, reaches no TPM and reads
+or unlocks the volume: it runs no td-luks, reaches no TPM and reads
 no key, so a LUKS2 partition with no active mapping, or with an active
 mapping under another name, refuses. The planned exception is
 ENCRYPTION.md increment 8's `td-install storage-operation` ("Storage
@@ -1422,7 +1411,7 @@ operation worker" below): the
 upgrade's first phase reads one TPM capability, it and the requests
 import key-less tokens, protector management adds and kills keyslots
 under a disk proof's secret, a FIDO2 passphrase or the recovery key, a
-request reads the volume key through cryptsetup's volume-key dump under
+request reads the volume key through td-luks's volume-key dump under
 that secret to tag its token, a login-key disk proof tests one of them
 on its keyslot, the selector update writes the ESP, and Secure
 Boot enrollment signs with a TPM-held key and writes EFI variables;
@@ -1654,7 +1643,7 @@ The ESP is the held partition's disk's first GPT partition, `td-esp` of the
 EFI System type, as td's layout writes it. `td-install storage-operation
 --uid 1000` is the root worker td-authd's amendment 10 supervises
 (td-authd/DESIGN.md, "Login keys and session lock"), the one running-system
-process that runs a key-bearing cryptsetup command or writes the ESP
+process that runs a key-bearing td-luks command or writes the ESP
 ("Full-system volume consumers"). It reaches the command line only through
 `main`, accepts no other operand, and keeps the login worker's startup,
 unnamed socketpair, descriptor inventory and bounded framing
@@ -1762,9 +1751,9 @@ consent time holds no I/O.
   standing and the ESP as the selector update does (`28`), and
   td-protector's `upgrade::phase_one` plans the header commits from the
   re-read view (`28` should it refuse what `phase_one_fits` admitted,
-  since the header changed), confirmed against cryptsetup's own metadata
+  since the header changed), confirmed against td-luks's own metadata
   (`Plan::confirm`; `28` when they disagree), so the imports land where
-  td's copy of the header expects and `from` is the identity cryptsetup
+  td's copy of the header expects and `from` is the identity td-luks
   also reads (`0f` should that read fail). Its writes, in order, each a
   key-less header commit through td-protector's runner but the
   selector's: the removal of any pending token a crashed phase 1 left;
@@ -1786,7 +1775,7 @@ consent time holds no I/O.
   admits only U0 (`21` otherwise). After the presentation's `11` it
   sends `12` with 120 seconds left (`08` otherwise); after root's `13`
   it re-reads the header, failing as `28` if it changed, and runs the
-  plan, confirmed against cryptsetup's own metadata (`Plan::confirm`;
+  plan, confirmed against td-luks's own metadata (`Plan::confirm`;
   `28` when they disagree): the `td-upgrade` token's removal, then each
   pending token's, each a key-less header commit. Then it sends `14`.
 - **Protector management** (tags 19 to 24; ENCRYPTION.md "Protector
@@ -1817,16 +1806,14 @@ consent time holds no I/O.
     storage for its keyslot.
   - *A request's volume key.* The worker reads it from that header copy
     through the runner's existing dump shape, the selector's
-    (ENCRYPTION.md "Selector release"): `cryptsetup luksDump
-    --dump-volume-key --batch-mode --volume-key-file FILE --key-file=-
-    COPY`, with the proof's secret on standard input.
+    (ENCRYPTION.md "Selector release"): `td-luks volume-key COPY FILE`,
+    with the proof's secret on standard input.
     - It runs bounded, as the keyslot test does, within the proof's 120
       seconds and before `12`.
-    - FILE is a new name in the worker's own mode-0700 directory under
-      `/run`, beside the copy. cryptsetup 2.8.8 creates it with
-      `O_CREAT|O_EXCL` at mode 0400.
-    - cryptsetup tries every keyslot (`CRYPT_ANY_SLOT`), not the tested
-      one, which the check before the first `10` bounds.
+    - FILE is a new name in the worker's mode-0700 directory under
+      `/run`, beside the copy, created exclusively at mode 0400.
+    - td-luks tries bound candidate keyslots, not just the tested one;
+      the check before the first `10` bounds every admitted slot's cost.
     - The worker reads exactly 64 bytes, the header's volume-key size,
       into clearing storage, then unlinks FILE and the copy whether or
       not the read succeeded. The test having passed, the dump's
@@ -1843,7 +1830,7 @@ consent time holds no I/O.
     After root's `13`, before any write, it re-reads the header (`28`
     if it is not the baseline's) and plans with td-protector's `manage`
     planners from the re-read view. The plan is confirmed against
-    cryptsetup's own metadata (`Plan::confirm`); `28` when they
+    td-luks's own metadata (`Plan::confirm`); `28` when they
     disagree, or when a planner refuses what the baseline admitted,
     since the header changed. Its writes, through td-protector's
     runner, are then:
@@ -1865,13 +1852,13 @@ consent time holds no I/O.
   discloses, and narrows its deadline to the description's ceiling.
   With the recovery key: after the recovery-key step's `11` it takes
   one `16`, parses it with td-protector's recovery-key codec (`25` on a
-  refusal, before any cryptsetup), re-reads the header, failing as `28`
+  refusal, before any td-luks), re-reads the header, failing as `28`
   if it changed since the baseline (or `20` if it is gone or the reader
   now refuses it), and tests the keyslot the marker names, the key on
-  standard input (`26` when it refuses, cryptsetup's wrong-passphrase
+  standard input (`26` when it refuses, td-luks's wrong-passphrase
   exit; any other failure `0f`). The entry frame, the codec's key and
   its passphrase are each zeroed on drop, and the passphrase reaches
-  cryptsetup only through its standard-input pipe: no copy enters a
+  td-luks only through its standard-input pipe: no copy enters a
   string, an error or a log. With a disk key: it identifies the one
   connected key among the header's fido2 tokens whose public key td-fido
   admits, as the selector's release does, skipping any other, presents
@@ -1887,20 +1874,18 @@ consent time holds no I/O.
   input. The key's sessions live one transport lifetime at most, inside
   the operation's ceiling.
 
-  A keyslot test never runs on the disk's own metadata, which cryptsetup
-  would repair there (a stale or damaged second copy, rewritten before
-  the key is tried), writing outside any commit round. The node `td-boot
+  A keyslot test uses a private snapshot of the admitted header area.
+  td-luks tests are read-only, including with stale or damaged secondary
+  metadata; the snapshot also keeps the bounded proof tied to its view. The node `td-boot
   volume` named must still be the held partition (the same `st_rdev`).
   td-protector's `test_area` then reads the used copy through the held
   descriptor, which must equal the presented header (`28` otherwise),
   and the tested keyslot's cost, whose bounds refuse Argon2 and any
-  PBKDF2 count over its ceiling (`0f`, before cryptsetup starts). The
+  PBKDF2 count over its ceiling (`0f`, before td-luks starts). The
   worker copies exactly that area, both copies and the keyslots area,
   into a file of its own, mode 0600, in a directory it makes for it
   under `/run`, mode 0700, and reads the copy again, which must equal
-  what it read (`28` otherwise). `cryptsetup open --test-passphrase
-  --header COPY --key-slot N --key-file=- DEVICE` then reads, and
-  repairs, only the copy, which is removed afterwards, after its
+  what it read (`28` otherwise). `td-luks test N DEVICE COPY` reads only the copy, which is removed afterwards, after its
   volume-key dump for a request. A worker killed
   meanwhile leaves its copy behind, so each worker's start removes the
   copies dead workers left: real directories root owns, named exactly
@@ -1970,20 +1955,18 @@ offer, a token whose point td-fido refuses, skipped, and the disk key's
 refusals and statuses through a scripted `Keys`; td-fido's own tests
 drive `authorize` against its virtual authenticator. A source test holds
 the secret's path free of copies. The production host's keyslot test
-runs a scripted cryptsetup over a scratch partition whose second copy is
+runs a scripted td-luks over a scratch partition whose second copy is
 stale: the repair it makes lands in the copy and the partition is
 unchanged; a header other than the presented one, an Argon2 keyslot and
-a node that is not the held one run nothing; and a stalled cryptsetup
+a node that is not the held one run nothing; and a stalled td-luks
 is killed and reaped at the deadline and when root hangs up. A start's
 sweep removes only dead workers' copies root owns. td-protector's
-`keyslot_test`, run as `header_fit` is, holds the pinned cryptsetup
-2.8.8 itself to the copy: over a td-formatted volume whose second copy
+`keyslot_test`, run as `header_fit` is, holds td-luks itself to the copy: over a td-formatted volume whose second copy
 is stale or damaged, the exact invocation leaves the volume's SHA-256
-unchanged for a right key and a wrong one (exit 2, `26`), while
-cryptsetup repairs the copy.
+unchanged for a right key and a wrong one (exit 2, `26`), and the copy is unchanged too.
 
 Protector management's drive each operation over protected headers the
-test builds, in both shapes, through a scripted `Keys` and cryptsetup:
+test builds, in both shapes, through a scripted `Keys` and td-luks:
 each proof and its kinds, a removal's choose step and its digit, a
 removal's disk key that is the chosen token's (`04` detail `01`), an
 addition's ceremony with every credential excluded, a description the
@@ -1994,7 +1977,7 @@ is not 64 bytes (`0f`), FILE and the copy removed on every path, a
 pending request replaced, and the imported tag recomputed through
 td-protector's `request::tag`, which `tests/token_vectors.py`'s vectors
 pin. td-protector's `keyslot_test` also runs the exact dump against the
-pinned cryptsetup over a header copy of a volume it formats: the file
+built td-luks over a header copy of a volume it formats: the file
 reproduces the key the volume itself dumps, through either keyslot, and
 a name that exists is refused.
 

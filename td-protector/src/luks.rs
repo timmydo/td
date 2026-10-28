@@ -1,9 +1,9 @@
-//! The cryptsetup runner the installer and the selector share (DESIGN.md
-//! "Cryptsetup runner"): each command's exact arguments, and one child per
+//! The td-luks runner the installer and the selector share (DESIGN.md
+//! "LUKS runner"): each command's exact arguments, and one child per
 //! command with key material by descriptor only.
 //!
 //! Every child gets a cleared environment and an absolute program. The
-//! first secret goes on standard input; the second, the new key `luksAddKey`
+//! first secret goes on standard input; the second, the new key `add-key`
 //! reads as its key file, through a std pipe this process keeps open and
 //! names as `/proc/<pid>/fd/N`. No argv element, environment variable or file
 //! carries key material, and nothing here is `unsafe`.
@@ -20,58 +20,16 @@ use std::time::{Duration, Instant};
 /// is held to `token::MAX_TOKEN_JSON`, no more than this.
 pub const MAX_PIPE_INPUT: usize = 4096;
 
-/// The shortest key `luksKillSlot` takes on standard input: td's shortest
-/// secret, a protector's. cryptsetup 2.8.8 destroys the keyslot unasked
-/// when that input is empty (`action_luksKillSlot` ignores `-EPIPE`), so
-/// the runner refuses a shorter one before any child starts.
+/// The shortest key for either destructive keyslot operation: td's
+/// protector secret. Refuse less before starting a child.
 pub const MIN_KILL_KEY: usize = crate::SECRET_LEN;
 
 /// The most standard output the runner reads from one child, the metadata
 /// dump's bound; a child writing more fails.
 pub const MAX_OUTPUT: usize = crate::luks2::MAX_METADATA_JSON;
 
-/// cryptsetup 2.8.8's exit for an inactive `status`: `action_status` returns
-/// `-ENODEV` for `CRYPT_INACTIVE`, which `translate_errno` makes 4. An
-/// active mapping exits 0; anything else (`CRYPT_INVALID` exits 1) says
-/// neither.
+/// td-luks's inactive mapping status. Active is 0; any other exit is an error.
 pub const STATUS_INACTIVE: i32 = 4;
-
-/// `luksFormat`'s fixed arguments, in ENCRYPTION.md's order, up to the UUID.
-const FORMAT: &[&str] = &[
-    "luksFormat",
-    "--batch-mode",
-    "--type",
-    "luks2",
-    "--cipher",
-    "aes-xts-plain64",
-    "--key-size",
-    "512",
-    "--sector-size",
-    "4096",
-    "--hash",
-    "sha256",
-    "--pbkdf",
-    "pbkdf2",
-    "--pbkdf-force-iterations",
-    "1000",
-    "--use-random",
-    "--luks2-metadata-size",
-    "16384",
-    "--luks2-keyslots-size",
-    "16744448",
-    "--offset",
-    "32768",
-];
-
-/// The PBKDF every keyslot takes: `luksFormat`'s, for `luksAddKey`.
-const PBKDF: &[&str] = &[
-    "--pbkdf",
-    "pbkdf2",
-    "--pbkdf-force-iterations",
-    "1000",
-    "--hash",
-    "sha256",
-];
 
 fn os(words: &[&str]) -> Vec<OsString> {
     words.iter().map(OsString::from).collect()
@@ -81,220 +39,100 @@ fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-/// `luksFormat` of `device` as keyslot 0, its passphrase on standard input.
+/// Format the fixed td profile, with keyslot 0's passphrase on stdin.
 pub fn format_args(uuid: &str, label: &str, device: &Path) -> Vec<OsString> {
-    let mut args = os(FORMAT);
-    args.extend(os(&[
-        "--uuid",
-        uuid,
-        "--label",
-        label,
-        "--key-slot",
-        "0",
-        "--key-file=-",
-    ]));
-    args.push(device.into());
-    args
+    vec!["format".into(), uuid.into(), label.into(), device.into()]
 }
 
-/// `luksAddKey` of keyslot `new_slot`, keyslot `by`'s key on standard input
-/// authorizing it, the new key read from `new_key`.
+/// Authorize with BY on stdin; read the new key from its held descriptor.
 pub fn add_key_args(device: &Path, by: u8, new_slot: u8, new_key: &Path) -> Vec<OsString> {
-    let mut args = os(&["luksAddKey", "--batch-mode"]);
-    args.extend(os(PBKDF));
-    args.push("--key-slot".into());
-    args.push(by.to_string().into());
-    args.push("--new-key-slot".into());
-    args.push(new_slot.to_string().into());
-    args.push("--key-file=-".into());
-    args.push(device.into());
-    args.push(new_key.into());
-    args
+    vec![
+        "add-key".into(),
+        by.to_string().into(),
+        new_slot.to_string().into(),
+        device.into(),
+        new_key.into(),
+    ]
 }
 
-/// `token import` of the JSON on standard input, as token `id`, or as the
-/// lowest free token number when `None`.
 pub fn token_import_args(device: &Path, id: Option<u8>) -> Vec<OsString> {
-    let mut args = os(&["token", "import"]);
+    let mut args = os(&["token-import"]);
     if let Some(id) = id {
-        args.push("--token-id".into());
         args.push(id.to_string().into());
     }
-    args.push("--json-file=-".into());
     args.push(device.into());
     args
 }
 
-/// `token import` of the JSON on standard input as token `id`, replacing
-/// the token there in the one header commit cryptsetup makes of an import
-/// (`--token-replace`), so no cut leaves the number empty.
 pub fn token_replace_args(device: &Path, id: u8) -> Vec<OsString> {
-    let mut args = os(&["token", "import", "--token-id"]);
-    args.push(id.to_string().into());
-    args.push("--token-replace".into());
-    args.push("--json-file=-".into());
-    args.push(device.into());
-    args
+    vec!["token-replace".into(), id.to_string().into(), device.into()]
 }
 
-/// `token remove` of token `id`.
 pub fn token_remove_args(device: &Path, id: u8) -> Vec<OsString> {
-    let mut args = os(&["token", "remove", "--token-id"]);
-    args.push(id.to_string().into());
-    args.push(device.into());
-    args
+    vec!["token-remove".into(), id.to_string().into(), device.into()]
 }
 
-/// `luksKillSlot` of `slot`, the key of another keyslot on standard input:
-/// with a key, cryptsetup destroys the keyslot only once that key opens a
-/// keyslot other than `slot`. Without one it would destroy it unasked, so
-/// `Cryptsetup::run` refuses a key shorter than `MIN_KILL_KEY`.
 pub fn kill_slot_args(device: &Path, slot: u8) -> Vec<OsString> {
-    let mut args = os(&["luksKillSlot", "--batch-mode", "--key-file=-"]);
-    args.push(device.into());
-    args.push(slot.to_string().into());
-    args
+    vec!["kill-slot".into(), slot.to_string().into(), device.into()]
 }
 
-/// `luksDump --dump-json-metadata`: the JSON of the header copy
-/// cryptsetup itself uses, on standard output. It holds no key material.
+/// Authenticate a bound key, sanitize freed areas and retire unbound slots.
+pub fn kill_unbound_args(device: &Path) -> Vec<OsString> {
+    vec!["kill-unbound".into(), device.into()]
+}
+
 pub fn dump_metadata_args(device: &Path) -> Vec<OsString> {
-    let mut args = os(&["luksDump", "--dump-json-metadata"]);
-    args.push(device.into());
-    args
+    vec!["metadata".into(), device.into()]
 }
 
-/// `luksDump --dump-volume-key` of `device` into `file`, unlocked by the key
-/// of a keyslot on standard input, for the selector's handoff. cryptsetup
-/// 2.8.8 (`tools_write_mk`) creates `file` with `O_CREAT|O_EXCL` at mode
-/// 0400, so a name that exists, a symlink or a `/proc/self/fd` link
-/// included, is refused, and writes the raw key there; standard output then
-/// carries the header's summary and the file's name, never the key.
-/// `--batch-mode` answers its confirmation.
+/// Create FILE exclusively at mode 0400; key bytes never reach stdout.
 pub fn dump_volume_key_args(device: &Path, file: &Path) -> Vec<OsString> {
-    let mut args = os(&[
-        "luksDump",
-        "--dump-volume-key",
-        "--batch-mode",
-        "--volume-key-file",
-    ]);
-    args.push(file.into());
-    args.push("--key-file=-".into());
-    args.push(device.into());
-    args
+    vec!["volume-key".into(), device.into(), file.into()]
 }
 
-/// Whether `args` is exactly the shape `dump_metadata_args` or
-/// `dump_volume_key_args` builds, with operands that cannot be read as
-/// options: the only luksDump forms the runner starts.
-fn known_dump(args: &[OsString]) -> bool {
-    let operand = |arg: &OsString| !arg.is_empty() && !arg.as_encoded_bytes().starts_with(b"-");
-    match args {
-        [verb, flag, device] => {
-            verb == "luksDump" && flag == "--dump-json-metadata" && operand(device)
-        }
-        [verb, dump, batch, to, file, key, device] => {
-            verb == "luksDump"
-                && dump == "--dump-volume-key"
-                && batch == "--batch-mode"
-                && to == "--volume-key-file"
-                && operand(file)
-                && key == "--key-file=-"
-                && operand(device)
-        }
-        _ => false,
-    }
-}
-
-/// The mapping `name`, opened with the passphrase on standard input.
 pub fn open_args(device: &Path, name: &str) -> Vec<OsString> {
-    let mut args = os(&["open", "--type", "luks2", "--key-file=-"]);
-    args.push(device.into());
-    args.push(name.into());
-    args
+    vec!["open".into(), device.into(), name.into()]
 }
 
-/// The mapping `name`, opened with the passphrase on standard input tried
-/// on keyslot `slot` alone: the selector's recovery flow opens with the
-/// recovery key on keyslot 0 this way.
 pub fn open_slot_args(device: &Path, name: &str, slot: u8) -> Vec<OsString> {
-    let mut args = os(&["open", "--type", "luks2", "--key-slot"]);
-    args.push(slot.to_string().into());
-    args.push("--key-file=-".into());
-    args.push(device.into());
-    args.push(name.into());
-    args
+    vec![
+        "open".into(),
+        slot.to_string().into(),
+        device.into(),
+        name.into(),
+    ]
 }
 
-/// The mapping `name`, opened with the raw volume key cryptsetup reads from
-/// `key`, a `KeyFile`'s descriptor name. cryptsetup 2.8.8's `open` with
-/// `--volume-key-file` reads the header's volume-key size from it
-/// (`tools_read_vk`) and activates only a key that matches the header's
-/// digest of the data segment (`_verify_key`,
-/// `LUKS2_digest_verify_by_segment`); it tries no token or keyslot.
 pub fn open_by_volume_key_args(device: &Path, name: &str, key: &Path) -> Vec<OsString> {
-    let mut args = os(&["open", "--type", "luks2", "--volume-key-file"]);
-    args.push(key.into());
-    args.push(device.into());
-    args.push(name.into());
-    args
+    vec![
+        "open-volume-key".into(),
+        device.into(),
+        name.into(),
+        key.into(),
+    ]
 }
 
 pub fn close_args(name: &str) -> Vec<OsString> {
     os(&["close", name])
 }
 
-/// Whether the mapping `name` is active, asked of device-mapper by name:
-/// no node under `/dev/mapper` is consulted.
 pub fn status_args(name: &str) -> Vec<OsString> {
     os(&["status", name])
 }
 
-/// Whether `slot` opens with the key on standard input; nothing is mapped.
 pub fn test_args(device: &Path, slot: u8) -> Vec<OsString> {
-    let mut args = os(&["open", "--test-passphrase", "--type", "luks2", "--key-slot"]);
-    args.push(slot.to_string().into());
-    args.push("--key-file=-".into());
-    args.push(device.into());
-    args
+    vec!["test".into(), slot.to_string().into(), device.into()]
 }
 
-/// `test_args` against `header`, a detached copy of the device's header
-/// area: cryptsetup reads and repairs metadata only there, and the device
-/// is named for its data alone, which a test never reads or writes.
+/// Test only the copied header and keyslot area; DEVICE is never mutated.
 pub fn detached_test_args(header: &Path, device: &Path, slot: u8) -> Vec<OsString> {
-    let mut args = os(&["open", "--test-passphrase", "--type", "luks2", "--header"]);
-    args.push(header.into());
-    args.push("--key-slot".into());
-    args.push(slot.to_string().into());
-    args.push("--key-file=-".into());
-    args.push(device.into());
-    args
+    vec![
+        "test".into(),
+        slot.to_string().into(),
+        device.into(),
+        header.into(),
+    ]
 }
-
-/// The new volume key's parameters `reencrypt` takes: formatting's cipher,
-/// key size and sector size, and its keyslots' PBKDF2. cryptsetup 2.8.8
-/// sizes a new key by `--new-key-size`; `--key-size` names the current key,
-/// which it reads from the header instead.
-const REENCRYPT: &[&str] = &[
-    "--use-random",
-    "--cipher",
-    "aes-xts-plain64",
-    "--new-key-size",
-    "512",
-    "--sector-size",
-    "4096",
-    "--hash",
-    "sha256",
-    "--pbkdf",
-    "pbkdf2",
-    "--pbkdf-force-iterations",
-    "1000",
-];
-
-/// A reencryption's progress, one JSON line a second on standard output
-/// (`Cryptsetup::reencrypt`); `--batch-mode` alone prints none.
-const PROGRESS: &[&str] = &["--progress-json", "--progress-frequency", "1"];
 
 /// The longest progress line read; a longer one is skipped as unreadable.
 pub const MAX_PROGRESS_LINE: usize = 4096;
@@ -343,40 +181,28 @@ pub enum Resilience {
     Journal,
 }
 
-/// `reencrypt` of `device` online under the active mapping `name` to a new
-/// volume key: keyslot `slot`'s key on standard input unlocks it, and
-/// cryptsetup rewraps that keyslot alone for the new key, wiping every
-/// other keyslot once it finishes.
+/// Rotate the volume key under the already active mapping.
 pub fn reencrypt_args(
     device: &Path,
     name: &str,
     slot: u8,
     resilience: Resilience,
 ) -> Vec<OsString> {
-    let mut args = os(&["reencrypt", "--batch-mode"]);
-    args.extend(os(PROGRESS));
-    args.extend(os(&["--active-name", name]));
-    args.push("--key-slot".into());
-    args.push(slot.to_string().into());
-    args.push("--key-file=-".into());
-    args.extend(os(REENCRYPT));
-    args.extend(os(match resilience {
-        Resilience::Checksum => &["--resilience", "checksum", "--resilience-hash", "sha256"],
-        Resilience::Journal => &["--resilience", "journal"],
-    }));
-    args.push(device.into());
-    args
+    let mode = match resilience {
+        Resilience::Checksum => "checksum",
+        Resilience::Journal => "journal",
+    };
+    vec![
+        "reencrypt".into(),
+        slot.to_string().into(),
+        mode.into(),
+        device.into(),
+        name.into(),
+    ]
 }
 
-/// `reencrypt --resume-only` of an interrupted reencryption of `device`,
-/// online under the active mapping `name`: the key on standard input opens
-/// one of the keyslots cryptsetup then holds for each volume key.
 pub fn reencrypt_resume_args(device: &Path, name: &str) -> Vec<OsString> {
-    let mut args = os(&["reencrypt", "--resume-only", "--batch-mode"]);
-    args.extend(os(PROGRESS));
-    args.extend(os(&["--active-name", name, "--key-file=-"]));
-    args.push(device.into());
-    args
+    vec!["reencrypt-resume".into(), device.into(), name.into()]
 }
 
 /// How long a bounded run sleeps between looks at its child.
@@ -527,12 +353,12 @@ pub fn exit_code(error: &io::Error) -> Option<i32> {
     error.get_ref()?.downcast_ref::<Failed>()?.status.code()
 }
 
-/// A static cryptsetup at an absolute path.
-pub struct Cryptsetup {
+/// A static td-luks at an absolute path.
+pub struct Luks {
     program: PathBuf,
 }
 
-impl Cryptsetup {
+impl Luks {
     /// The program is checked at each run: a path that is not absolute is
     /// refused rather than looked up.
     pub fn new(program: PathBuf) -> Self {
@@ -543,7 +369,7 @@ impl Cryptsetup {
         &self.program
     }
 
-    /// Runs one cryptsetup command with `input` on its standard input. Its
+    /// Runs one td-luks command with `input` on its standard input. Its
     /// output is captured, copied to standard error, which it inherits, and
     /// zeroed: no verb that prints key material may run through it.
     pub fn run(&self, args: &[OsString], input: &[u8]) -> io::Result<()> {
@@ -556,7 +382,7 @@ impl Cryptsetup {
         Ok(())
     }
 
-    /// Runs one cryptsetup command with `input` on its standard input,
+    /// Runs one td-luks command with `input` on its standard input,
     /// keeping none of its output, until it exits, `deadline` passes or
     /// `abandoned` says the caller is gone. Past either of those the child
     /// is killed and reaped, so no child outlives the run holding its
@@ -630,7 +456,7 @@ impl Cryptsetup {
         Ok(())
     }
 
-    /// The JSON metadata of the header copy cryptsetup uses on `device`,
+    /// The JSON metadata of the header copy td-luks uses on `device`,
     /// returned rather than copied to standard error.
     pub fn metadata(&self, device: &Path) -> io::Result<Vec<u8>> {
         let args = dump_metadata_args(device);
@@ -705,23 +531,13 @@ impl Cryptsetup {
                 self.program.display()
             )));
         }
-        // Other luksDump forms can print key material to the standard output
-        // `run` copies to standard error: `--dump-volume-key` (or its alias
-        // `--dump-master-key`) without a file, and `--unbound`. cryptsetup
-        // takes options before its action too, so the verb is looked for
-        // anywhere.
-        if args.iter().any(|arg| arg == "luksDump") && !known_dump(args) {
-            return Err(invalid(
-                "luksDump runs only as --dump-json-metadata or as --dump-volume-key \
-                 into a --volume-key-file"
-                    .to_string(),
-            ));
-        }
-        if args.first().is_some_and(|verb| verb == "luksKillSlot") && input.len() < MIN_KILL_KEY {
+        if args
+            .first()
+            .is_some_and(|verb| verb == "kill-slot" || verb == "kill-unbound")
+            && input.len() < MIN_KILL_KEY
+        {
             return Err(invalid(format!(
-                "luksKillSlot needs a key of at least {MIN_KILL_KEY} bytes on standard input, \
-                 not {}",
-                input.len()
+                "slot removal needs a key of at least {MIN_KILL_KEY} bytes on standard input, not {}", input.len()
             )));
         }
         Ok(())
@@ -734,7 +550,6 @@ mod tests {
     use crate::token::{Role, Token, MAX_PRIVATE_BYTES, MAX_PUBLIC_BYTES, MAX_TOKEN_JSON};
     use std::fs::File;
     use std::io::Read;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use td_tpm::SealedObject;
 
     const UUID: &str = "5a5a5a5a-5a5a-405a-805a-5a5a5a5a5a5a";
@@ -744,266 +559,74 @@ mod tests {
         args.iter().map(|arg| arg.to_str().unwrap()).collect()
     }
 
-    /// The arguments are ENCRYPTION.md's and DESIGN.md's, word for word.
     #[test]
     fn each_command_is_spelled_exactly() {
-        let device = Path::new("/dev/loop7");
-        assert_eq!(
-            words(&format_args(UUID, "td-system", device)),
-            [
-                "luksFormat",
-                "--batch-mode",
-                "--type",
-                "luks2",
-                "--cipher",
-                "aes-xts-plain64",
-                "--key-size",
-                "512",
-                "--sector-size",
-                "4096",
-                "--hash",
-                "sha256",
-                "--pbkdf",
-                "pbkdf2",
-                "--pbkdf-force-iterations",
-                "1000",
-                "--use-random",
-                "--luks2-metadata-size",
-                "16384",
-                "--luks2-keyslots-size",
-                "16744448",
-                "--offset",
-                "32768",
-                "--uuid",
-                UUID,
-                "--label",
-                "td-system",
-                "--key-slot",
-                "0",
-                "--key-file=-",
-                "/dev/loop7",
-            ]
-        );
-        assert_eq!(
-            words(&add_key_args(device, 0, 1, Path::new("/proc/9/fd/4"))),
-            [
-                "luksAddKey",
-                "--batch-mode",
-                "--pbkdf",
-                "pbkdf2",
-                "--pbkdf-force-iterations",
-                "1000",
-                "--hash",
-                "sha256",
-                "--key-slot",
-                "0",
-                "--new-key-slot",
-                "1",
-                "--key-file=-",
-                "/dev/loop7",
-                "/proc/9/fd/4",
-            ]
-        );
-        assert_eq!(
-            words(&add_key_args(device, 1, 12, Path::new("/proc/9/fd/4")))[8..13],
-            ["--key-slot", "1", "--new-key-slot", "12", "--key-file=-"]
-        );
-        assert_eq!(
-            words(&token_import_args(device, Some(0))),
-            [
-                "token",
-                "import",
-                "--token-id",
-                "0",
-                "--json-file=-",
-                "/dev/loop7"
-            ]
-        );
-        assert_eq!(
-            words(&token_import_args(device, None)),
-            ["token", "import", "--json-file=-", "/dev/loop7"]
-        );
-        assert_eq!(
-            words(&token_replace_args(device, 5)),
-            [
-                "token",
-                "import",
-                "--token-id",
-                "5",
-                "--token-replace",
-                "--json-file=-",
-                "/dev/loop7"
-            ]
-        );
-        assert_eq!(
-            words(&token_remove_args(device, 3)),
-            ["token", "remove", "--token-id", "3", "/dev/loop7"]
-        );
-        assert_eq!(
-            words(&kill_slot_args(device, 2)),
-            [
-                "luksKillSlot",
-                "--batch-mode",
-                "--key-file=-",
-                "/dev/loop7",
-                "2"
-            ]
-        );
-        assert_eq!(
-            words(&open_args(device, "td-install-07")),
-            [
-                "open",
-                "--type",
-                "luks2",
-                "--key-file=-",
-                "/dev/loop7",
-                "td-install-07"
-            ]
-        );
-        assert_eq!(
-            words(&open_slot_args(Path::new("/proc/1/fd/5"), "td-selector", 0)),
-            [
-                "open",
-                "--type",
-                "luks2",
-                "--key-slot",
-                "0",
-                "--key-file=-",
-                "/proc/1/fd/5",
-                "td-selector"
-            ]
-        );
-        assert_eq!(
-            words(&open_by_volume_key_args(
-                Path::new("/proc/9/fd/5"),
-                "td-system",
-                Path::new("/proc/9/fd/4")
-            )),
-            [
-                "open",
-                "--type",
-                "luks2",
-                "--volume-key-file",
-                "/proc/9/fd/4",
-                "/proc/9/fd/5",
-                "td-system"
-            ]
-        );
-        assert_eq!(
-            words(&close_args("td-install-07")),
-            ["close", "td-install-07"]
-        );
-        assert_eq!(
-            words(&status_args("td-install-07")),
-            ["status", "td-install-07"]
-        );
-        assert_eq!(
-            words(&dump_metadata_args(device)),
-            ["luksDump", "--dump-json-metadata", "/dev/loop7"]
-        );
-        assert_eq!(
-            words(&dump_volume_key_args(
-                Path::new("/proc/1/fd/5"),
-                Path::new("/run/td-boot-volume-key/volume-key")
-            )),
-            [
-                "luksDump",
-                "--dump-volume-key",
-                "--batch-mode",
-                "--volume-key-file",
-                "/run/td-boot-volume-key/volume-key",
-                "--key-file=-",
-                "/proc/1/fd/5",
-            ]
-        );
-        for slot in [0, 1, 31] {
-            let slot_text = slot.to_string();
-            assert_eq!(
-                words(&test_args(device, slot)),
-                [
-                    "open",
-                    "--test-passphrase",
-                    "--type",
-                    "luks2",
-                    "--key-slot",
-                    slot_text.as_str(),
-                    "--key-file=-",
-                    "/dev/loop7",
-                ]
-            );
+        let d = Path::new("/dev/loop7");
+        let k = Path::new("/proc/9/fd/4");
+        let commands = [
+            (
+                format_args(UUID, "td-system", d),
+                vec!["format", UUID, "td-system", "/dev/loop7"],
+            ),
+            (
+                add_key_args(d, 1, 12, k),
+                vec!["add-key", "1", "12", "/dev/loop7", "/proc/9/fd/4"],
+            ),
+            (
+                token_import_args(d, None),
+                vec!["token-import", "/dev/loop7"],
+            ),
+            (
+                token_import_args(d, Some(3)),
+                vec!["token-import", "3", "/dev/loop7"],
+            ),
+            (
+                token_replace_args(d, 5),
+                vec!["token-replace", "5", "/dev/loop7"],
+            ),
+            (
+                token_remove_args(d, 3),
+                vec!["token-remove", "3", "/dev/loop7"],
+            ),
+            (kill_slot_args(d, 2), vec!["kill-slot", "2", "/dev/loop7"]),
+            (kill_unbound_args(d), vec!["kill-unbound", "/dev/loop7"]),
+            (dump_metadata_args(d), vec!["metadata", "/dev/loop7"]),
+            (
+                dump_volume_key_args(d, Path::new("/run/key")),
+                vec!["volume-key", "/dev/loop7", "/run/key"],
+            ),
+            (open_args(d, NAME), vec!["open", "/dev/loop7", NAME]),
+            (
+                open_slot_args(d, NAME, 31),
+                vec!["open", "31", "/dev/loop7", NAME],
+            ),
+            (
+                open_by_volume_key_args(d, NAME, k),
+                vec!["open-volume-key", "/dev/loop7", NAME, "/proc/9/fd/4"],
+            ),
+            (close_args(NAME), vec!["close", NAME]),
+            (status_args(NAME), vec!["status", NAME]),
+            (test_args(d, 31), vec!["test", "31", "/dev/loop7"]),
+            (
+                detached_test_args(Path::new("/run/header"), d, 31),
+                vec!["test", "31", "/dev/loop7", "/run/header"],
+            ),
+            (
+                reencrypt_args(d, NAME, 0, Resilience::Checksum),
+                vec!["reencrypt", "0", "checksum", "/dev/loop7", NAME],
+            ),
+            (
+                reencrypt_args(d, NAME, 17, Resilience::Journal),
+                vec!["reencrypt", "17", "journal", "/dev/loop7", NAME],
+            ),
+            (
+                reencrypt_resume_args(d, NAME),
+                vec!["reencrypt-resume", "/dev/loop7", NAME],
+            ),
+        ];
+        for (actual, expected) in commands {
+            assert_eq!(words(&actual), expected);
         }
-    }
-
-    /// The upgrade's reencryption, in both resilience modes, and its
-    /// resumption, word for word (ENCRYPTION.md "Re-encrypting upgrade").
-    #[test]
-    fn the_reencryption_is_spelled_exactly() {
-        let device = Path::new("/proc/1/fd/5");
-        let start = |slot| {
-            vec![
-                "reencrypt",
-                "--batch-mode",
-                "--progress-json",
-                "--progress-frequency",
-                "1",
-                "--active-name",
-                "td-selector",
-                "--key-slot",
-                slot,
-                "--key-file=-",
-                "--use-random",
-                "--cipher",
-                "aes-xts-plain64",
-                "--new-key-size",
-                "512",
-                "--sector-size",
-                "4096",
-                "--hash",
-                "sha256",
-                "--pbkdf",
-                "pbkdf2",
-                "--pbkdf-force-iterations",
-                "1000",
-                "--resilience",
-            ]
-        };
-        let mut checksum = start("0");
-        checksum.extend(["checksum", "--resilience-hash", "sha256", "/proc/1/fd/5"]);
-        assert_eq!(
-            words(&reencrypt_args(
-                device,
-                "td-selector",
-                0,
-                Resilience::Checksum
-            )),
-            checksum
-        );
-        let mut journal = start("17");
-        journal.extend(["journal", "/proc/1/fd/5"]);
-        assert_eq!(
-            words(&reencrypt_args(
-                device,
-                "td-selector",
-                17,
-                Resilience::Journal
-            )),
-            journal
-        );
-        assert_eq!(
-            words(&reencrypt_resume_args(device, "td-selector")),
-            [
-                "reencrypt",
-                "--resume-only",
-                "--batch-mode",
-                "--progress-json",
-                "--progress-frequency",
-                "1",
-                "--active-name",
-                "td-selector",
-                "--key-file=-",
-                "/proc/1/fd/5",
-            ]
-        );
     }
 
     /// cryptsetup 2.8.8's progress lines, as the pinned binary printed them
@@ -1062,7 +685,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(written.success());
-        let cryptsetup = Cryptsetup::new(program);
+        let cryptsetup = Luks::new(program);
         let mut seen = Vec::new();
         cryptsetup
             .reencrypt(&os(&["0"]), b"secret\n", &mut |line| seen.push(line))
@@ -1103,7 +726,7 @@ mod tests {
         assert!(written.success());
         let mut count = 0u64;
         let mut last = None;
-        Cryptsetup::new(many)
+        Luks::new(many)
             .reencrypt(&os(&[]), b"", &mut |line| {
                 if let Progress::Bytes { done, .. } = line {
                     count += 1;
@@ -1113,31 +736,6 @@ mod tests {
             .unwrap();
         assert_eq!(count, lines as u64);
         assert_eq!(last, Some(lines as u64 - 1));
-    }
-
-    /// The reencryption's new key takes formatting's parameters, its size
-    /// as `--new-key-size`.
-    #[test]
-    fn the_reencryption_takes_the_formats_parameters() {
-        let value = |list: &[&'static str], flag: &str| {
-            let at = list.iter().position(|word| *word == flag).unwrap();
-            list[at + 1]
-        };
-        for flag in [
-            "--cipher",
-            "--sector-size",
-            "--hash",
-            "--pbkdf",
-            "--pbkdf-force-iterations",
-        ] {
-            assert_eq!(value(REENCRYPT, flag), value(FORMAT, flag), "{flag}");
-        }
-        assert_eq!(
-            value(REENCRYPT, "--new-key-size"),
-            value(FORMAT, "--key-size")
-        );
-        assert!(!REENCRYPT.contains(&"--key-size"));
-        assert!(REENCRYPT.contains(&"--use-random"));
     }
 
     /// The key file holds exactly the secret and then end of file, is open
@@ -1197,29 +795,18 @@ mod tests {
             .unwrap()
     }
 
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-
     /// A cryptsetup stand-in in a fresh directory: each call's argv,
     /// exported environment, standard input and any `/proc` key file it
     /// names, numbered in order. A `code.N` file makes call N exit with the
     /// code it holds.
     struct Recorder {
-        dir: PathBuf,
-        cryptsetup: Cryptsetup,
+        dir: td_fs::TempDir,
+        cryptsetup: Luks,
     }
 
     impl Recorder {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "td-protector-cryptsetup-{}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir(&dir).unwrap();
+            let dir = td_fs::TempDir::new("td-protector-luks").unwrap();
             let cat = tool("cat");
             let program = dir.join("cryptsetup");
             let body = format!(
@@ -1248,7 +835,7 @@ mod tests {
             assert!(written.success());
             Self {
                 dir,
-                cryptsetup: Cryptsetup::new(program),
+                cryptsetup: Luks::new(program),
             }
         }
 
@@ -1266,12 +853,6 @@ mod tests {
                 .lines()
                 .map(str::to_owned)
                 .collect()
-        }
-    }
-
-    impl Drop for Recorder {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -1318,8 +899,7 @@ mod tests {
         }
     }
 
-    /// cryptsetup destroys a keyslot unasked when `luksKillSlot`'s input is
-    /// empty, so an input shorter than td's shortest secret is refused
+    /// An input shorter than td's shortest secret is refused
     /// before any child starts; a protector's or the recovery key's runs.
     #[test]
     fn a_kill_without_a_whole_key_never_starts() {
@@ -1330,7 +910,7 @@ mod tests {
                 .cryptsetup
                 .run(&kill_slot_args(device, 1), key)
                 .unwrap_err();
-            assert!(error.to_string().contains("luksKillSlot needs"), "{error}");
+            assert!(error.to_string().contains("slot removal needs"), "{error}");
         }
         assert!(!recorder.dir.join("count").exists());
         recorder
@@ -1345,82 +925,6 @@ mod tests {
         assert_eq!(MIN_KILL_KEY, 32);
     }
 
-    /// A luksDump that could print key material to the output `run` copies
-    /// to standard error never starts: a volume-key dump without a file,
-    /// cryptsetup 2.8.8's `--dump-master-key` and `--master-key-file`
-    /// aliases, `--unbound`, an operand read as an option, or options before
-    /// the verb. Only the two shapes this module builds run.
-    #[test]
-    fn a_volume_key_dump_runs_only_into_a_file() {
-        let recorder = Recorder::new();
-        let device = Path::new("/dev/loop7");
-        let refused: &[&[&str]] = &[
-            &[
-                "luksDump",
-                "--dump-volume-key",
-                "--batch-mode",
-                "--key-file=-",
-                "/dev/loop7",
-            ],
-            &[
-                "luksDump",
-                "--dump-master-key",
-                "--batch-mode",
-                "--key-file=-",
-                "/dev/loop7",
-            ],
-            &[
-                "luksDump",
-                "--dump-master-key",
-                "--batch-mode",
-                "--master-key-file",
-                "/run/k",
-                "--key-file=-",
-                "/dev/loop7",
-            ],
-            &[
-                "luksDump",
-                "--dump-volume-key",
-                "--batch-mode",
-                "--volume-key-file",
-                "--unbound",
-                "--key-file=-",
-                "/dev/loop7",
-            ],
-            &[
-                "luksDump",
-                "--unbound",
-                "--key-slot",
-                "1",
-                "--batch-mode",
-                "--key-file=-",
-                "/dev/loop7",
-            ],
-            &["luksDump", "--dump-json-metadata", "--unbound"],
-            &["luksDump", "/dev/loop7"],
-            &["luksDump"],
-            &[
-                "--dump-volume-key",
-                "--batch-mode",
-                "--key-file=-",
-                "luksDump",
-                "/dev/loop7",
-            ],
-            &["--unbound", "luksDump", "/dev/loop7"],
-        ];
-        for args in refused {
-            let error = recorder.cryptsetup.run(&os(args), &[7; 32]).unwrap_err();
-            assert!(error.to_string().contains("--volume-key-file"), "{error}");
-        }
-        assert!(!recorder.dir.join("count").exists());
-        let file = recorder.dir.join("volume-key");
-        recorder
-            .cryptsetup
-            .run(&dump_volume_key_args(device, &file), &[7; 32])
-            .unwrap();
-        assert_eq!(recorder.read("stdin", 1), [7; 32]);
-    }
-
     /// The metadata dump's output is returned, not echoed, and a failed
     /// dump is an error.
     #[test]
@@ -1428,19 +932,16 @@ mod tests {
         let recorder = Recorder::new();
         let device = Path::new("/dev/loop7");
         assert_eq!(recorder.cryptsetup.metadata(device).unwrap(), b"out-1\n");
-        assert_eq!(
-            recorder.argv(1),
-            ["luksDump", "--dump-json-metadata", "/dev/loop7"]
-        );
+        assert_eq!(recorder.argv(1), ["metadata", "/dev/loop7"]);
         recorder.exit_with(2, 1);
         let error = recorder.cryptsetup.metadata(device).unwrap_err();
-        assert!(error.to_string().contains("luksDump failed"), "{error}");
+        assert!(error.to_string().contains("metadata failed"), "{error}");
     }
 
     /// A program named by a relative path is refused, not looked up.
     #[test]
     fn a_relative_program_is_refused() {
-        let error = Cryptsetup::new(PathBuf::from("cryptsetup"))
+        let error = Luks::new(PathBuf::from("cryptsetup"))
             .run(&close_args(NAME), b"")
             .unwrap_err();
         assert!(
@@ -1464,7 +965,7 @@ mod tests {
                 .run(&test_args(device, 0), b"secret")
                 .unwrap_err();
             assert_eq!(exit_code(&error), Some(code), "{error}");
-            assert!(error.to_string().contains(" open failed ("), "{error}");
+            assert!(error.to_string().contains(" test failed ("), "{error}");
             assert!(!error.to_string().contains("secret"), "{error}");
         }
         assert_eq!(EXIT_BAD_PASSPHRASE, 2);
@@ -1488,29 +989,6 @@ mod tests {
         assert_eq!(cryptsetup.mapping(NAME).unwrap(), Mapping::Inactive);
         assert_eq!(recorder.argv(5), ["status", NAME]);
         assert!(!recorder.dir.join(NAME).exists());
-    }
-
-    #[test]
-    fn a_detached_test_names_the_copy_as_its_header_and_the_device_last() {
-        assert_eq!(
-            words(&detached_test_args(
-                Path::new("/run/td-keyslot-test.7/header"),
-                Path::new("/dev/nvme0n1p2"),
-                3
-            )),
-            [
-                "open",
-                "--test-passphrase",
-                "--type",
-                "luks2",
-                "--header",
-                "/run/td-keyslot-test.7/header",
-                "--key-slot",
-                "3",
-                "--key-file=-",
-                "/dev/nvme0n1p2"
-            ]
-        );
     }
 
     /// A bounded run passes the key by standard input alone, reports the
@@ -1558,7 +1036,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(written.success());
-        let stalled = Cryptsetup::new(stalled);
+        let stalled = Luks::new(stalled);
         let gone = |name: &str| {
             let path = recorder.dir.join(name);
             let pid = (0..500)
@@ -1594,7 +1072,7 @@ mod tests {
         assert!(matches!(ended, Bounded::Abandoned), "{ended:?}");
         assert!(gone("pid.abandoned"));
         // The refusals `run` has hold before any child starts.
-        assert!(Cryptsetup::new(PathBuf::from("cryptsetup"))
+        assert!(Luks::new(PathBuf::from("cryptsetup"))
             .run_bounded(&args, b"secret", far, &mut || false)
             .is_err());
         assert!(recorder

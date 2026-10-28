@@ -34,7 +34,7 @@ needs them:
 - For the Rust link driver td's Rust recipes link through, read
   `td-link/DESIGN.md`.
 - For disk encryption or session unlock, read `td-install/ENCRYPTION.md`;
-  for LUKS2 headers, keyslots or the cryptsetup replacement, read
+  for LUKS2 headers, keyslots, activation or reencryption, read
   `td-luks/DESIGN.md`.
 - For compositor/UI, service supervision, or installation, read the matching
   `td-compositor/DESIGN.md`, `td-svc/DESIGN.md`, or `td-install/DESIGN.md`;

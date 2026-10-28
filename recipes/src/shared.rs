@@ -1607,7 +1607,7 @@ mod tests {
             "{src}",
             "{root}/out.map",
             "prog.static",
-            &["gcc-runtime", "popt-x86-64"],
+            &["gcc-runtime", "zlib-x86-64"],
             super::LinkedLibc::Archive,
         );
         let shared = super::build_root_link_map_check(
@@ -1625,7 +1625,7 @@ mod tests {
                 .replace("{root}", &root)
                 .replace("{src}", &src)
                 .replace("{in:gcc-runtime}", &format!("{store}/gcc-runtime"))
-                .replace("{in:popt-x86-64}", &format!("{store}/popt-x86-64"))
+                .replace("{in:zlib-x86-64}", &format!("{store}/zlib-x86-64"))
         };
         let (script, shared) = (script(step), script(shared));
         for dir in [&src, &format!("{root}/sysroot/lib")] {
@@ -1633,7 +1633,7 @@ mod tests {
         }
         let clean = format!(
             "OUTPUT(prog.static elf64-x86-64)\nLOAD {store}/gcc-runtime/lib/libgcc.a\n\
-             LOAD {root}/sysroot/lib/libc.a\nLOAD {store}/popt-x86-64/lib/libpopt.a\n\
+             LOAD {root}/sysroot/lib/libc.a\nLOAD {store}/zlib-x86-64/lib/libz.a\n\
              LOAD prog.o\nLOAD linker stubs\n"
         );
         let cases = [

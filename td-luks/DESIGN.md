@@ -7,25 +7,22 @@ dm-crypt. It implements only the one LUKS2 profile td formats
 (td-install/ENCRYPTION.md "Device-bound formatting") and the operations
 td-protector's runner performs on it, and it refuses everything else.
 
-This document is the design. It is planned and not yet implemented:
-"Increments" says which parts exist. Until the cutover lands,
-cryptsetup 2.8.8 remains td's LUKS2 program and ENCRYPTION.md's
-increment 3 sign-off still governs it. Source citations describe the
-planned protocol; compatibility claims must be checked against the
-pinned 2.8.8 binary. The tests below state what is checked so far.
+The boot and installation paths use td-luks. "Increments" records the
+implementation boundaries. Source citations describe the protocol;
+compatibility claims are checked against the pinned cryptsetup 2.8.8
+binary. The tests below state what is checked so far.
 
 ## Why
 
-cryptsetup is built with its kernel crypto backend, so LUKS2's PBKDF2
+The replaced cryptsetup was built with its kernel crypto backend, so LUKS2's PBKDF2
 and keyslot encryption run through AF_ALG sockets. Linux 7.2 deprecates
 AF_ALG (`Documentation/crypto/userspace-if.rst`): every
 `CONFIG_CRYPTO_USER_API_*` option is now marked deprecated, the
 interface "regularly has vulnerabilities", and the kernel recommends
-moving programs to userspace crypto and turning the options off. td
-compiles the hash and skcipher interfaces in for cryptsetup alone, which
-leaves any unjailed process on a td system able to reach them.
+moving programs to userspace crypto and turning the options off. td previously compiled the hash and skcipher interfaces for cryptsetup
+alone, exposing them to every unjailed process.
 
-The cutover therefore removes:
+The cutover removes:
 
 - the AF_ALG interfaces from td's kernel;
 - cryptsetup and the four C libraries it alone needs: LVM2's
@@ -102,7 +99,7 @@ td-luks is a library and a program:
 
 The command line is td-luks's own, one verb per operation td-protector's
 runner performs, with the profile compiled in. Each cryptsetup argument
-list in `td-protector/src/cryptsetup.rs` has exactly one replacement, and
+list in `td-protector/src/luks.rs` has exactly one replacement, and
 td-luks takes no option that would select a different profile.
 
 | cryptsetup 2.8.8 form td uses | td-luks |
@@ -782,5 +779,5 @@ Each increment is one landable commit, or a short series:
   - the kernel recipe drops `CONFIG_CRYPTO_USER_API_*` and asserts it
     absent;
   - ENCRYPTION.md increment 3, td-install/DESIGN.md D6 and D7,
-    td-protector/DESIGN.md "Cryptsetup runner", UNSAFE.md, UPDATING.md
+    td-protector/DESIGN.md "LUKS runner", UNSAFE.md, UPDATING.md
     and AGENTS.md are amended to match.

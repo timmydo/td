@@ -350,8 +350,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> 
          confirmed, then the table written over the seeded one's cleared ranges; the recovery \
          key opens the volume holding the published deployment and settings and a mistyped \
          one does not; no recovery key on the disk, in the opened volume, on the console or in \
-         sampled command lines, every sampled cryptsetup line one of td-install's, luksFormat \
-         and luksAddKey among them; no Btrfs or staged plaintext in a data segment that \
+         sampled command lines, every sampled cryptsetup line one of td-install's, format \
+         and add-key among them; no Btrfs or staged plaintext in a data segment that \
          started zeroed (no erasure claim); a power cut before the acknowledgement leaves the seeded \
          table's ranges zero. The installed system is not booted: selector release is \
          increment 6"
@@ -734,7 +734,7 @@ pub(super) fn validate_installation(
 
 /// The cryptsetup invocations the guest must have sampled: the format and
 /// the protector's keyslot, which every installation runs once.
-const REQUIRED_INVOCATIONS: &[&str] = &["luksAddKey", "luksFormat"];
+const REQUIRED_INVOCATIONS: &[&str] = &["add-key", "format"];
 
 /// The CMDLINES record: distinct lines, cryptsetup's among them, and the
 /// invocations seen, which include `REQUIRED_INVOCATIONS`.
@@ -761,7 +761,7 @@ fn sampled_invocations(sampled: &str) -> Result<(), String> {
             .any(|required| !seen.contains(required))
     {
         return Err(format!(
-            "the guest did not sample luksFormat and luksAddKey: {sampled}"
+            "the guest did not sample format and add-key: {sampled}"
         ));
     }
     Ok(())
@@ -1648,16 +1648,16 @@ mod tests {
 
     #[test]
     fn the_sampled_invocations_include_both_secret_carriers() {
-        sampled_invocations("15 8 close,luksAddKey,luksFormat,open,status").unwrap();
-        sampled_invocations("2 2 luksAddKey,luksFormat").unwrap();
+        sampled_invocations("15 8 close,add-key,format,open,status").unwrap();
+        sampled_invocations("2 2 add-key,format").unwrap();
         for bad in [
-            "15 8 close,luksFormat,open",
-            "15 8 luksAddKey,open",
+            "15 8 close,format,open",
+            "15 8 add-key,open",
             "15 8",
-            "1 2 luksAddKey,luksFormat",
-            "15 0 luksAddKey,luksFormat",
-            "15 8 luksAddKey,luksFormat extra",
-            "x 8 luksAddKey,luksFormat",
+            "1 2 add-key,format",
+            "15 0 add-key,format",
+            "15 8 add-key,format extra",
+            "x 8 add-key,format",
         ] {
             assert!(sampled_invocations(bad).is_err(), "{bad}");
         }

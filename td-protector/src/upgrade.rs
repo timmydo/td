@@ -9,7 +9,7 @@
 //! ones `transition`'s; this one also removes the pending fido2 tokens a
 //! cancelled or interrupted phase 1 leaves on a device-bound header.
 
-use crate::cryptsetup::{self, Resilience};
+use crate::luks::{self, Resilience};
 use crate::luks2::{self, Header, Kind, Metadata, UpgradeView, Volume, JSON_AREA_LEN};
 use crate::pin::PinPcrs;
 use crate::protected::{
@@ -112,6 +112,8 @@ pub enum Step {
     /// `luksKillSlot` of `slot`, the recovery key authorizing it on keyslot
     /// `by`.
     KillSlot { slot: u8, by: u8 },
+    /// Sanitize free areas and retire every unbound slot under a bound recovery key.
+    KillUnbound,
     /// `token remove` of token `token`.
     RemoveToken { token: u8 },
     /// `luksAddKey` of keyslot `slot` for `key`, the recovery key
@@ -148,22 +150,21 @@ impl Step {
     /// which is no cryptsetup command.
     pub fn args(&self, device: &Path, name: &str, new_key: &Path) -> Option<Vec<OsString>> {
         Some(match self {
-            Self::Test { slot, .. } => cryptsetup::test_args(device, *slot),
-            Self::KillSlot { slot, .. } => cryptsetup::kill_slot_args(device, *slot),
-            Self::RemoveToken { token } => cryptsetup::token_remove_args(device, *token),
-            Self::AddKeyslot { slot, by, .. } => {
-                cryptsetup::add_key_args(device, *by, *slot, new_key)
-            }
+            Self::Test { slot, .. } => luks::test_args(device, *slot),
+            Self::KillUnbound => luks::kill_unbound_args(device),
+            Self::KillSlot { slot, .. } => luks::kill_slot_args(device, *slot),
+            Self::RemoveToken { token } => luks::token_remove_args(device, *token),
+            Self::AddKeyslot { slot, by, .. } => luks::add_key_args(device, *by, *slot, new_key),
             Self::ImportToken {
                 id: Some(id),
                 replace: true,
                 ..
-            } => cryptsetup::token_replace_args(device, *id),
-            Self::ImportToken { id, .. } => cryptsetup::token_import_args(device, *id),
+            } => luks::token_replace_args(device, *id),
+            Self::ImportToken { id, .. } => luks::token_import_args(device, *id),
             Self::Reencrypt { slot, resilience } => {
-                cryptsetup::reencrypt_args(device, name, *slot, *resilience)
+                luks::reencrypt_args(device, name, *slot, *resilience)
             }
-            Self::ResumeReencrypt => cryptsetup::reencrypt_resume_args(device, name),
+            Self::ResumeReencrypt => luks::reencrypt_resume_args(device, name),
             Self::TakeLockout => return None,
         })
     }
@@ -171,7 +172,8 @@ impl Step {
     pub fn input(&self) -> Input<'_> {
         match self {
             Self::Test { key, .. } => Input::Key(*key),
-            Self::KillSlot { .. }
+            Self::KillUnbound
+            | Self::KillSlot { .. }
             | Self::AddKeyslot { .. }
             | Self::Reencrypt { .. }
             | Self::ResumeReencrypt => Input::Key(Key::Recovery),
@@ -550,7 +552,7 @@ pub fn check(view: &UpgradeView) -> Result<(State, Shape), Refusal> {
         if !unchanged {
             return Ok((State::U3, shape));
         }
-        if !header.keyslots.contains(&0) {
+        if !volume.bound.contains(&0) {
             return Err(Refusal::NoRecoveryKeyslot);
         }
         if let Some((token, _)) = header.tokens.iter().find(|(_, t)| t.keyslot() == 0) {
@@ -647,6 +649,9 @@ pub fn plan(view: &UpgradeView, gathered: &Gathered) -> Result<Plan, Refusal> {
     let mut growth = 0usize;
     match state {
         State::U0 | State::U1 => {
+            if state == State::U1 {
+                steps.push(Step::KillUnbound);
+            }
             steps.push(Step::Test {
                 slot: 0,
                 key: Key::Recovery,
@@ -655,7 +660,9 @@ pub fn plan(view: &UpgradeView, gathered: &Gathered) -> Result<Plan, Refusal> {
                 header
                     .keyslots
                     .iter()
-                    .filter(|slot| **slot != 0)
+                    .filter(|slot| {
+                        **slot != 0 && (state != State::U1 || view.volume.bound.contains(slot))
+                    })
                     .map(|slot| Step::KillSlot { slot: *slot, by: 0 }),
             );
             steps.extend(
@@ -673,8 +680,9 @@ pub fn plan(view: &UpgradeView, gathered: &Gathered) -> Result<Plan, Refusal> {
         }
         State::U2 => steps.push(Step::ResumeReencrypt),
         State::U3 => {
+            steps.push(Step::KillUnbound);
             let named = header.foreign_keyslots();
-            let mut unnamed = view.volume.luks2.iter().filter(|s| !named.contains(s));
+            let mut unnamed = view.volume.bound.iter().filter(|s| !named.contains(s));
             let (Some(slot), None) = (unnamed.next(), unnamed.next()) else {
                 return Err(Refusal::NoRecoveryKeyslot);
             };

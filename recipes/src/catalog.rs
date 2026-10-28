@@ -265,6 +265,7 @@ mod tests {
             "td-link-runtime",
             "td-link-test",
             "td-login",
+            "td-luks",
             "td-netd",
             "td-photo-test",
             "td-profiler",

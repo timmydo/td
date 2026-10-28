@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use td_fat::{BootDir, Esp, FileEntry};
-use td_protector::cryptsetup::Resilience;
+use td_protector::luks::Resilience;
 use td_protector::luks2::{self, Header};
 use td_protector::protected::TpmPin;
 use td_protector::protected_plan;

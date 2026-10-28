@@ -1,11 +1,6 @@
-//! A keyslot test against a detached copy of the header leaves the disk
-//! byte-for-byte unchanged, run by the pinned cryptsetup itself
-//! (td-install/DESIGN.md, "Storage operation worker"): cryptsetup repairs
-//! a stale or damaged second copy before it tries a key, and that repair
-//! must land in the copy. A request's volume-key dump of that copy gives
-//! the volume's key. Ignored by default, as `header_fit` is: it
-//! needs the source-built cryptsetup and the host kernel's AF_ALG hash
-//! and skcipher interfaces.
+//! Detached-header tests and key export through td-luks leave both the
+//! source volume and the header copy unchanged, including a stale or
+//! damaged secondary copy. Set TD_LUKS to the built program's absolute path.
 //!
 //! ```text
 //! cargo test --frozen --manifest-path td-protector/Cargo.toml \
@@ -22,7 +17,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use td_protector::cryptsetup::{self, Bounded, Cryptsetup, KeyFile, EXIT_BAD_PASSPHRASE};
+use td_protector::luks::{self, Bounded, KeyFile, Luks, EXIT_BAD_PASSPHRASE};
 use td_protector::luks2;
 use td_protector::protected::{Fido2, FidoRole, Token};
 
@@ -34,37 +29,21 @@ const FIDO_KEY: [u8; 32] = [FIDO_SLOT; 32];
 /// Where the second copy begins: td formats 16 KiB copies.
 const SECONDARY: u64 = 0x4000;
 
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
+fn scratch(name: &str) -> td_fs::TempDir {
+    td_fs::TempDir::new(&format!("td-protector-keyslot-test-{name}")).unwrap()
 }
 
-fn scratch(name: &str) -> Scratch {
-    let dir = std::env::temp_dir().join(format!(
-        "td-protector-keyslot-test-{name}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir(&dir).unwrap();
-    Scratch(dir)
+#[path = "support/luks_program.rs"]
+mod luks_program;
+
+fn tool() -> Luks {
+    Luks::new(luks_program::path())
 }
 
-#[path = "support/pinned_cryptsetup.rs"]
-mod pinned_cryptsetup;
-
-fn tool() -> Cryptsetup {
-    Cryptsetup::new(pinned_cryptsetup::path())
-}
-
-fn import(cs: &Cryptsetup, image: &Path, id: u8, token: &Token) {
+fn import(cs: &Luks, image: &Path, id: u8, token: &Token) {
     let json = token.encode().unwrap();
-    cs.run(
-        &cryptsetup::token_import_args(image, Some(id)),
-        json.as_bytes(),
-    )
-    .unwrap();
+    cs.run(&luks::token_import_args(image, Some(id)), json.as_bytes())
+        .unwrap();
 }
 
 fn fido2(slot: u8) -> Token {
@@ -100,14 +79,14 @@ fn digest(path: &Path) -> [u8; 32] {
 /// with its marker and keyslot 26 a fido2 token's, each PBKDF2 as td
 /// adds them, whose second copy is one sequence number behind, or
 /// damaged.
-fn volume(cs: &Cryptsetup, dir: &Path, damaged: bool) -> PathBuf {
+fn volume(cs: &Luks, dir: &Path, damaged: bool) -> PathBuf {
     let image = dir.join("volume");
     File::create(&image).unwrap().set_len(20 << 20).unwrap();
-    let args = cryptsetup::format_args("0f0e0d0c-0b0a-4908-8706-050403020100", "td-system", &image);
+    let args = luks::format_args("0f0e0d0c-0b0a-4908-8706-050403020100", "td-system", &image);
     cs.run(&args, RECOVERY).unwrap();
     let key = KeyFile::new(&FIDO_KEY).unwrap();
     cs.run(
-        &cryptsetup::add_key_args(&image, 0, FIDO_SLOT, key.path()),
+        &luks::add_key_args(&image, 0, FIDO_SLOT, key.path()),
         RECOVERY,
     )
     .unwrap();
@@ -124,12 +103,12 @@ fn volume(cs: &Cryptsetup, dir: &Path, damaged: bool) -> PathBuf {
 }
 
 /// The test exactly as the storage worker runs it: the header area read
-/// through `test_area`, copied, and named as `--header` with the volume
+/// through `test_area`, copied, and named as the detached header with the volume
 /// as the data device.
-fn test(cs: &Cryptsetup, header: &Path, image: &Path, slot: u8, key: &[u8]) -> Bounded {
+fn test(cs: &Luks, header: &Path, image: &Path, slot: u8, key: &[u8]) -> Bounded {
     let deadline = Instant::now() + Duration::from_secs(60);
     cs.run_bounded(
-        &cryptsetup::detached_test_args(header, image, slot),
+        &luks::detached_test_args(header, image, slot),
         key,
         deadline,
         &mut || false,
@@ -140,7 +119,7 @@ fn test(cs: &Cryptsetup, header: &Path, image: &Path, slot: u8, key: &[u8]) -> B
 fn untouched(damaged: bool) {
     let cs = tool();
     let dir = scratch(if damaged { "damaged" } else { "stale" });
-    let image = volume(&cs, &dir.0, damaged);
+    let image = volume(&cs, dir.path(), damaged);
     let area = luks2::test_area(&mut File::open(&image).unwrap()).unwrap();
     assert_eq!(area.header.keyslots, [0, FIDO_SLOT]);
     assert!(area.cost(0).is_ok() && area.cost(FIDO_SLOT).is_ok());
@@ -154,7 +133,7 @@ fn untouched(damaged: bool) {
         (FIDO_SLOT, &[0; 32], None),
     ];
     for (slot, key, code) in cases {
-        let header = dir.0.join("header");
+        let header = dir.path().join("header");
         fs::write(&header, bytes(&image, 0, length)).unwrap();
         let ended = test(&cs, &header, &image, *slot, key);
         let Bounded::Exited(status) = ended else {
@@ -166,24 +145,24 @@ fn untouched(damaged: bool) {
             "keyslot {slot}"
         );
         assert_eq!(digest(&image), before, "keyslot {slot} changed the volume");
-        // The repair happened, in the copy.
-        assert_ne!(
+        // Testing is read-only even when the selected copy is stale or damaged.
+        assert_eq!(
             bytes(&header, SECONDARY, SECONDARY as usize),
             second,
-            "keyslot {slot}: cryptsetup repaired nothing"
+            "keyslot {slot}: td-luks modified the detached copy"
         );
         fs::remove_file(&header).unwrap();
     }
 }
 
 #[test]
-#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
+#[ignore = "set TD_LUKS to the built td-luks executable"]
 fn a_detached_test_leaves_a_volume_with_a_stale_second_copy_unchanged() {
     untouched(false);
 }
 
 #[test]
-#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
+#[ignore = "set TD_LUKS to the built td-luks executable"]
 fn a_detached_test_leaves_a_volume_with_a_damaged_second_copy_unchanged() {
     untouched(true);
 }
@@ -193,11 +172,11 @@ fn a_detached_test_leaves_a_volume_with_a_damaged_second_copy_unchanged() {
 /// new file beside the copy. It reproduces the key the volume itself
 /// dumps, through either keyslot, and refuses a name that exists.
 #[test]
-#[ignore = "needs the pinned cryptsetup on PATH and the kernel's AF_ALG"]
+#[ignore = "set TD_LUKS to the built td-luks executable"]
 fn a_dump_of_a_header_copy_gives_the_volumes_key() {
     let cs = tool();
     let dir = scratch("dump");
-    let image = volume(&cs, &dir.0, false);
+    let image = volume(&cs, dir.path(), false);
     let area = luks2::test_area(&mut File::open(&image).unwrap()).unwrap();
     area.all_costed().unwrap();
     let length = usize::try_from(area.length).unwrap();
@@ -205,7 +184,7 @@ fn a_dump_of_a_header_copy_gives_the_volumes_key() {
     let dump = |device: &Path, file: &Path, key: &[u8]| {
         let deadline = Instant::now() + Duration::from_secs(60);
         cs.run_bounded(
-            &cryptsetup::dump_volume_key_args(device, file),
+            &luks::dump_volume_key_args(device, file),
             key,
             deadline,
             &mut || false,
@@ -213,16 +192,15 @@ fn a_dump_of_a_header_copy_gives_the_volumes_key() {
         .unwrap()
     };
     let succeeded = |ended: Bounded| matches!(ended, Bounded::Exited(status) if status.success());
-    // The volume's own key, its copy as read before: this dump repairs
-    // the stale second copy on the image.
-    let whole = dir.0.join("whole");
+    // Export also preserves the stale second copy on the image.
+    let whole = dir.path().join("whole");
     assert!(succeeded(dump(&image, &whole, RECOVERY)));
     let expected = fs::read(&whole).unwrap();
     assert_eq!(expected.len(), 64);
-    let header = dir.0.join("header");
-    let file = dir.0.join("volume-key");
+    let header = dir.path().join("header");
+    let file = dir.path().join("volume-key");
     for (slot, key) in [(0, RECOVERY), (FIDO_SLOT, &FIDO_KEY[..])] {
-        // The copy as the worker leaves it: tested, and repaired, first.
+        // The copy as the worker leaves it: tested without repair.
         fs::write(&header, &copy).unwrap();
         assert!(succeeded(test(&cs, &header, &image, slot, key)));
         assert!(succeeded(dump(&header, &file, key)));

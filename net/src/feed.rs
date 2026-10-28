@@ -411,14 +411,6 @@ struct RemoveFileOnDrop {
     _reservation: File,
 }
 
-struct RemoveDirOnDrop(PathBuf);
-
-impl Drop for RemoveDirOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 impl Drop for RemoveFileOnDrop {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -436,26 +428,6 @@ fn sweep_download_temps(parent: &Path) {
     });
     for entry in abandoned.take(4096) {
         let _ = std::fs::remove_file(entry.path());
-    }
-}
-
-fn sweep_kernel_header_temps(parent: &Path) {
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return;
-    };
-    let abandoned = entries.flatten().filter(|entry| {
-        let name = entry.file_name();
-        let bytes = name.as_bytes();
-        bytes.starts_with(b".td-feed-kh-work-")
-            || (bytes.starts_with(b".td-feed-kh-output-") && bytes.ends_with(b".tmp"))
-    });
-    for entry in abandoned.take(4096) {
-        let path = entry.path();
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            let _ = std::fs::remove_dir_all(path);
-        } else {
-            let _ = std::fs::remove_file(path);
-        }
     }
 }
 
@@ -1479,7 +1451,7 @@ fn cargo_proxy_selftest() {
 
 // =======================================================================================
 // warm <action> — the STRUCTURED host-PREP orchestration that consolidates the former
-// tools/warm-{cargo-proxy,cargo-proxy-local,bootstrap-sources,kernel-headers{,-x86_64}}.sh
+// tools/warm-{cargo-proxy,cargo-proxy-local,bootstrap-sources}.sh
 // shell scripts into one typed, in-process subcommand (move-off-shell). These run on the
 // HOST during `td-builder check`'s network-permitted prelude (the offline loop has no
 // egress) and are BEST-EFFORT by design: a runner without required host tools/network warns to
@@ -2496,7 +2468,7 @@ fn resolve_feed_dir(td_feed_dir: Option<&str>, home: Option<&str>) -> PathBuf {
 
 /// The single shared sources cache: `$HOME/.td/sources` (HOME unset/empty -> relative). The
 /// flat, pin-filename-keyed dir recipes read their warmed tarballs and generated
-/// kernel-headers from. Shared across ALL worktrees with NO env override, so one
+/// source archives from. Shared across ALL worktrees with NO env override, so one
 /// `td-feed warm sources` warms every tree. Deliberately NOT under `~/.td/build-daemon`
 /// (which is bound read-write into every build sandbox); a pinned tarball is re-verified
 /// against its sha256 on every read regardless. Keep identical to the builder/recipes copies
@@ -2841,7 +2813,6 @@ fn consume_sources(root: &Path) -> Result<(), String> {
     let base = configured_consumer_feed_base()?;
     let pins = recipe_source_pins_result(root)?;
     consume_source_pins(&pins, &sources_dir(), &base)?;
-    warm_kernel_headers_from_pins(root, "x86_64", &pins);
     Ok(())
 }
 
@@ -2863,7 +2834,6 @@ fn warm_sources(root: &Path) -> Result<(), String> {
 
     // Derived input: the sanitized Linux UAPI headers td glibc builds against, produced FROM
     // the pinned linux source (the sandbox can't run the kernel build). Best-effort.
-    warm_kernel_headers_from_pins(root, "x86_64", &pins);
     Ok(())
 }
 
@@ -2927,164 +2897,6 @@ fn warm_pins(label: &str, pins: &[SourcePin], dest: &Path) -> Result<(), String>
     Ok(())
 }
 
-/// `LINUX_VERSION_CODE` for a `maj.min.sub` version (e.g. 4.14.67 -> 265795).
-fn linux_ver_from_file(file: &str) -> Option<String> {
-    let s = file.strip_prefix("linux-")?;
-    let i = s.find(".tar.")?;
-    Some(s[..i].to_string())
-}
-
-/// Prepare the pinned x86 UAPI seed through the native control-plane builder.
-fn warm_kernel_headers(root: &Path, arch: &str) {
-    match recipe_source_pins_result(root) {
-        Ok(pins) => warm_kernel_headers_from_pins(root, arch, &pins),
-        Err(e) => eprintln!(
-            ">> td-feed warm kernel-headers ({arch}): cannot read recipe source pins: {e}"
-        ),
-    }
-}
-
-fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
-    prepare_kernel_headers(root, arch, pins, &sources_dir());
-}
-
-fn prepare_kernel_headers(root: &Path, arch: &str, pins: &[SourcePin], cache: &Path) {
-    static NEXT_KERNEL_HEADERS: AtomicU64 = AtomicU64::new(0);
-    let Some(pin) = pins.iter().find(|pin| pin.key == "linux-source") else {
-        return;
-    };
-    let file = pin.file.as_str();
-    let Some(ver) = linux_ver_from_file(file) else {
-        eprintln!(
-            ">> td-feed warm kernel-headers ({arch}): cannot parse version from {file} — skipping"
-        );
-        return;
-    };
-    let src = cache.join(file);
-    let out = cache.join(format!("linux-headers-{ver}-{arch}.tar"));
-    if let Err(e) = std::fs::create_dir_all(cache) {
-        eprintln!(
-            ">> td-feed warm kernel-headers ({arch}): cannot create {} ({e}) — skipping",
-            cache.display()
-        );
-        return;
-    }
-    if let Err(e) = require_disk_backed(cache) {
-        eprintln!(
-            ">> td-feed warm kernel-headers ({arch}): shared scratch is not disk-backed ({e}) — skipping"
-        );
-        return;
-    }
-    // One shared lock covers output publication and crash recovery for both
-    // architectures. The producer inherits this lease, so recovery waits for
-    // its descendants before removing abandoned staging.
-    let lock_path = cache.join(".td-feed-kernel-headers.lock");
-    let lock = match OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&lock_path)
-    {
-        Ok(lock) => lock,
-        Err(e) => {
-            eprintln!(
-                ">> td-feed warm kernel-headers ({arch}): cannot open {} ({e}) — skipping",
-                lock_path.display()
-            );
-            return;
-        }
-    };
-    if let Err(e) = lock.lock() {
-        eprintln!(
-            ">> td-feed warm kernel-headers ({arch}): cannot lock {} ({e}) — skipping",
-            lock_path.display()
-        );
-        return;
-    }
-    sweep_kernel_header_temps(cache);
-    if out.exists() {
-        return;
-    }
-    if !src.is_file() {
-        eprintln!(">> td-feed warm kernel-headers ({arch}): linux source not warm ({}) — skipping (PREP best-effort)", src.display());
-        return;
-    }
-    let builder = match control_builder(root) {
-        Ok(builder) => builder,
-        Err(error) => {
-            eprintln!(">> td-feed warm kernel-headers ({arch}): {error}");
-            return;
-        }
-    };
-    let nonce = NEXT_KERNEL_HEADERS.fetch_add(1, Ordering::Relaxed);
-    let work = cache.join(format!(
-        ".td-feed-kh-work-{arch}-{}-{nonce}",
-        std::process::id()
-    ));
-    let cleanup = RemoveDirOnDrop(work.clone());
-    let tmp = cache.join(format!(
-        ".td-feed-kh-output-{ver}-{arch}-{}-{nonce}.tmp",
-        std::process::id()
-    ));
-    let tmp_cleanup = RemoveFileOnDrop {
-        path: tmp.clone(),
-        _directory_lock: lock,
-        _reservation: match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-        {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!(
-                    ">> td-feed warm kernel-headers ({arch}): cannot reserve {} ({e}) — skipping",
-                    tmp.display()
-                );
-                return;
-            }
-        },
-    };
-    let produced = (|| -> Result<(), String> {
-        let lease = tmp_cleanup
-            ._directory_lock
-            .try_clone()
-            .map_err(|e| e.to_string())?;
-        let output = tmp_cleanup
-            ._reservation
-            .try_clone()
-            .map_err(|e| e.to_string())?;
-        let status = Command::new(builder)
-            .arg("kernel-headers")
-            .arg(&src)
-            .arg(&pin.sha256)
-            .arg(arch)
-            .arg(&work)
-            .stdin(Stdio::from(lease))
-            .stdout(Stdio::from(output))
-            .status()
-            .map_err(|e| format!("start native header preparation: {e}"))?;
-        if !status.success() {
-            return Err(format!("native header preparation: {status}"));
-        }
-        tmp_cleanup
-            ._reservation
-            .sync_all()
-            .map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, &out).map_err(|e| e.to_string())
-    })();
-    match produced {
-        Ok(()) => eprintln!(
-            ">> td-feed warm kernel-headers ({arch}): produced {} from the pinned {file}",
-            out.display()
-        ),
-        Err(error) => eprintln!(">> td-feed warm kernel-headers ({arch}): {error} — skipping"),
-    }
-    drop(tmp_cleanup);
-    drop(cleanup);
-}
-
 /// Hermetic OFFLINE selftest of the warm orchestration's pure + in-process legs (the parts
 /// that need no compiler or network). The remaining legs stay best-effort host PREP,
 /// proven by the consuming heavy gates (as the shell scripts were). std::net loopback only.
@@ -3118,11 +2930,6 @@ fn warm_selftest() {
     }
     if strip_scheme("https://h/p") != "h/p" || strip_scheme("http://h/p") != "h/p" {
         die("warm-selftest: strip_scheme wrong".into());
-    }
-
-    // 2) Kernel source filename selection.
-    if linux_ver_from_file("linux-4.14.67.tar.xz").as_deref() != Some("4.14.67") {
-        die("warm-selftest: linux_ver_from_file wrong".into());
     }
 
     // 3) cargo_config: routes crates.io at the proxy via sparse source replacement.
@@ -3229,7 +3036,7 @@ fn warm_usage() -> ! {
     eprintln!(
         "usage:\n  td-feed warm index INDEX STORE        (also: td-feed warm INDEX STORE)\n  \
          td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
-         td-feed warm sources\n  td-feed warm build-root\n  td-feed warm kernel-headers ARCH"
+         td-feed warm sources\n  td-feed warm build-root"
     );
     std::process::exit(2);
 }
@@ -3488,7 +3295,6 @@ pub fn run(a: &[String]) {
                         die(format!("warm build-root: {e}"));
                     }
                 }
-                Some("kernel-headers") if a.len() == 4 => warm_kernel_headers(&root, &a[3]),
                 // Legacy: `warm INDEX STORE` (a[2] is an index path, not an action keyword).
                 // Exclude every action keyword so a mis-argc'd action (e.g. `warm crate X`)
                 // reports usage instead of being misread as an index path.
@@ -3496,12 +3302,7 @@ pub fn run(a: &[String]) {
                     if a.len() == 4
                         && !matches!(
                             kw,
-                            "index"
-                                | "crate"
-                                | "crate-local"
-                                | "sources"
-                                | "build-root"
-                                | "kernel-headers"
+                            "index" | "crate" | "crate-local" | "sources" | "build-root"
                         ) =>
                 {
                     warm_index(&a[2], &a[3])
@@ -3551,7 +3352,7 @@ pub fn run(a: &[String]) {
             eprintln!(
                 "usage:\n  td-feed warm INDEX STORE   (low-level; also: warm index INDEX STORE)\n  \
                  td-feed warm crate CRATE VERSION [DEST]\n  td-feed warm crate-local SRCDIR DEST\n  \
-                 td-feed warm sources\n  td-feed warm build-root\n  td-feed warm kernel-headers ARCH\n  \
+                 td-feed warm sources\n  td-feed warm build-root\n  \
                  td-feed debian-root resolve LOCK\n  \
                  td-feed outdated [--transitive] [pins|build-root|cargo]...\n  \
                  td-feed serve STORE ADDR\n  \
@@ -3570,8 +3371,7 @@ pub(crate) mod tests {
         feed_daemon_policy, file_sha256_before, index_path, is_warm_complete, mark_warm_complete,
         mount_is_memory_backed, parse_locked_cargo_sources, parse_serve_addr, read_digest_sidecar,
         real_relative_file, resolve_feed_dir, snapshot_for_serve, snapshot_for_serve_before,
-        sweep_download_temps, sweep_kernel_header_temps, write_before, FeedDaemonPolicy,
-        ResponseGuard, RESPONSE_DEADLINE,
+        sweep_download_temps, write_before, FeedDaemonPolicy, ResponseGuard, RESPONSE_DEADLINE,
     };
     use std::io::Read;
     use std::path::PathBuf;
@@ -3836,25 +3636,6 @@ pub(crate) mod tests {
         std::fs::write(&unrelated, b"keep").unwrap();
         sweep_download_temps(&dir);
         assert!(!stale.exists());
-        assert!(unrelated.exists());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn abandoned_kernel_header_trees_and_outputs_are_swept() {
-        let dir = unique_tmp_dir("kernel-header-sweep");
-        let stale_tree = dir.join(".td-feed-kh-work-x86_64-1-0");
-        let stale_output = dir.join(".td-feed-kh-output-1-x86_64-1-0.tmp");
-        let unrelated = dir.join("linux-source.tar.xz");
-        std::fs::create_dir_all(&stale_tree).unwrap();
-        std::fs::write(stale_tree.join("partial"), b"partial").unwrap();
-        std::fs::write(&stale_output, b"partial").unwrap();
-        std::fs::write(&unrelated, b"keep").unwrap();
-
-        sweep_kernel_header_temps(&dir);
-
-        assert!(!stale_tree.exists());
-        assert!(!stale_output.exists());
         assert!(unrelated.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4715,39 +4496,6 @@ pub(crate) mod tests {
             "the table header must stand alone: {text:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    #[ignore = "requires the pinned Linux source and a built native builder"]
-    fn native_kernel_header_preparation_preserves_both_seed_archives() {
-        let root = PathBuf::from(std::env::var_os("TD_HEADER_FIXTURE_ROOT").unwrap());
-        let source = PathBuf::from(std::env::var_os("TD_HEADER_FIXTURE_SOURCE").unwrap());
-        let scratch = PathBuf::from(std::env::var_os("TD_HEADER_FIXTURE_SCRATCH").unwrap());
-        let cache = scratch.join(format!("native-header-feed-{}", std::process::id()));
-        std::fs::create_dir(&cache).unwrap();
-        let _cleanup = super::RemoveDirOnDrop(cache.clone());
-        let file = "linux-4.14.67.tar.xz";
-        std::fs::copy(source, cache.join(file)).unwrap();
-        let pins = vec![super::SourcePin {
-            key: "linux-source".into(),
-            url: "https://cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.14.67.tar.xz".into(),
-            sha256: "3f4b056dc27233a78f7a4a35ed6fdcfd0a9680ec40b611a898bb6c8b905070ba".into(),
-            file: file.into(),
-        }];
-        super::prepare_kernel_headers(&root, "x86_64", &pins, &cache);
-        let bytes = std::fs::read(cache.join("linux-headers-4.14.67-x86_64.tar")).unwrap();
-        assert_eq!(bytes.len(), 5160960);
-        assert_eq!(
-            super::hex_sha256(&bytes),
-            "e395d859211f8924fdf19a2ef7ee37e2d92bb1fdbc5fa083a2bdf03f6fd04ce0"
-        );
-        assert!(std::fs::read_dir(&cache).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".td-feed-kh-")
-        }));
     }
 
     #[test]

@@ -1956,7 +1956,7 @@ fn ladder_work_dir(root: &Path, home: Option<&Path>) -> PathBuf {
 
 /// The single shared sources cache: `$HOME/.td/sources` (HOME unset/empty -> relative), the
 /// flat pin-filename-keyed dir the ladder reads its warmed tarballs and generated
-/// kernel-headers from. Shared across ALL worktrees with NO env override; keep identical to
+/// source archives from. Shared across ALL worktrees with NO env override; keep identical to
 /// the feed/builder copies (`home` comes from `var_os`, so a non-UTF-8 HOME resolves the
 /// same in all three). Deliberately NOT under `~/.td/build-daemon` (bound RW into sandboxes).
 fn shared_sources_dir(home: Option<&Path>) -> PathBuf {
@@ -3039,7 +3039,7 @@ pub(crate) struct RecipeCheckRunner {
     builder_db: PathBuf,
     lw: PathBuf,
     /// The single shared sources cache (`$HOME/.td/sources`) holding the warmed pinned
-    /// tarballs + generated kernel-headers, shared across worktrees (see `shared_sources_dir`).
+    /// source tarballs, shared across worktrees (see `shared_sources_dir`).
     sources_dir: PathBuf,
     store: PathBuf,
     db: PathBuf,
@@ -3139,10 +3139,6 @@ pub(crate) enum SeedInput {
         key: String,
         pin: SourcePin,
     },
-    LinuxHeaders {
-        key: String,
-        arch: &'static str,
-    },
     /// An IN-TREE source directory (#469 local-source provenance): `path` is the
     /// repo-relative dir the recipe's `local_source` names, `trees` the sibling
     /// dirs its `local_source_trees` stage beside it. Interned by copying the
@@ -3159,9 +3155,7 @@ pub(crate) enum SeedInput {
 impl SeedInput {
     pub(crate) fn key(&self) -> &str {
         match self {
-            SeedInput::Source { key, .. }
-            | SeedInput::LinuxHeaders { key, .. }
-            | SeedInput::LocalSource { key, .. } => key,
+            SeedInput::Source { key, .. } | SeedInput::LocalSource { key, .. } => key,
         }
     }
 }
@@ -3742,27 +3736,6 @@ impl RecipeCheckRunner {
         self.store_add_recursive_into(intern_name, &file, db)
     }
 
-    fn intern_linux_headers(
-        &self,
-        intern_name: &str,
-        arch: &str,
-        db: &Path,
-    ) -> Result<String, String> {
-        let pin = source_pin_for_key("linux-source")?;
-        validate_source_file_basename(&pin)?;
-        let version = linux_version_from_file(&pin.file)?;
-        let file = self
-            .sources_dir
-            .join(format!("linux-headers-{version}-{arch}.tar"));
-        if !file.is_file() {
-            return Err(format!(
-                "ladder: kernel-headers tarball not warm ({})",
-                file.display()
-            ));
-        }
-        self.store_add_recursive_into(intern_name, &file, db)
-    }
-
     /// Stage an IN-TREE source directory for hashing (#469 local-source
     /// provenance): resolve the repo-relative path and copy the committed source
     /// (minus `target`/`.git`) into scratch. The staged tree is what both the
@@ -4184,12 +4157,8 @@ impl RecipeCheckRunner {
         // leaves only the intentionally shared content-addressed tree.
         let _ = fs::remove_file(&candidate_db);
         let derived = derived_result?;
-        // The COMPILED table must vouch for the derivation (re #469): pin
-        // verification proves the fetched artifact, but a GENERATED seed (the
-        // kernel-headers tarball) has no upstream pin — the compiled expected
-        // digest is what binds its bytes; and every seed's expected basename
-        // being compiled in is what lets td-builder reject a forged map even
-        // when invoked directly.
+        // The compiled basename binds the derived tree as well as the
+        // fetched archive, so direct builder invocations reject forged maps.
         crate::seed_digests::require(input.key(), path_basename_str(&derived)?)?;
         // Promote the already-interned candidate only after the gate. Re-adding
         // from the immutable store tree re-hashes it and merges exactly that row
@@ -4233,7 +4202,6 @@ impl RecipeCheckRunner {
     fn derive_seed_input_into(&self, input: &SeedInput, db: &Path) -> Result<String, String> {
         match input {
             SeedInput::Source { key, pin } => self.intern_source(key, pin, db),
-            SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch, db),
             SeedInput::LocalSource { key, path, trees } => {
                 self.intern_local_source(key, path, trees, db)
             }
@@ -6411,28 +6379,19 @@ fn seed_input_for_recipe_source(key: &str, recipe: &Recipe) -> Result<SeedInput,
             trees: recipe.local_source_trees.clone().unwrap_or_default(),
         });
     }
-    match special_seed_input(key)? {
-        Some(input) => Ok(input),
-        None => {
-            let pin = source_pin_for_key(key).map_err(|e| {
-                format!(
-                    "ladder: cannot resolve sourceInput `{key}' for {}-{} to a recipe source \
-                     pin: {e}",
-                    recipe.name, recipe.version
-                )
-            })?;
-            Ok(SeedInput::Source {
-                key: key.to_string(),
-                pin,
-            })
-        }
-    }
+    let pin = source_pin_for_key(key).map_err(|e| {
+        format!(
+            "ladder: cannot resolve sourceInput `{key}' for {}-{} to a recipe source pin: {e}",
+            recipe.name, recipe.version
+        )
+    })?;
+    Ok(SeedInput::Source {
+        key: key.to_string(),
+        pin,
+    })
 }
 
 fn seed_input_for_recipe_input(key: &str) -> Result<Option<SeedInput>, String> {
-    if let Some(input) = special_seed_input(key)? {
-        return Ok(Some(input));
-    }
     Ok(source_pins::by_key(key).map(|pin| SeedInput::Source {
         key: key.to_string(),
         pin,
@@ -6468,16 +6427,6 @@ fn warm_operator_inputs(runner: &RecipeCheckRunner, targets: &[&str]) {
             eprintln!("   [warm] {e} — continuing; the build reports what it cannot resolve");
         }
     }
-}
-
-fn special_seed_input(key: &str) -> Result<Option<SeedInput>, String> {
-    if key == "linux-headers-x86-64" {
-        return Ok(Some(SeedInput::LinuxHeaders {
-            key: key.to_string(),
-            arch: "x86_64",
-        }));
-    }
-    Ok(None)
 }
 
 pub(crate) fn source_pin_for_key(key: &str) -> Result<SourcePin, String> {
@@ -7076,17 +7025,6 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<PathBuf>, String> {
     }
     out.sort();
     Ok(out)
-}
-
-pub(crate) fn linux_version_from_file(file_name: &str) -> Result<String, String> {
-    let rest = file_name
-        .strip_prefix("linux-")
-        .ok_or_else(|| format!("linux source file name is malformed: {file_name}"))?;
-    rest.split(".tar")
-        .next()
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| format!("linux source file name is malformed: {file_name}"))
 }
 
 fn path_basename_str(path: &str) -> Result<&str, String> {
@@ -8200,11 +8138,6 @@ mod tests {
             names > 30,
             "{names} pins — the sweep must have something to do"
         );
-        // The ALIASES too, since `by_key` resolves one to the pin and
-        // `foreign_names` marks it.
-        for alias in ["linux-headers", "linux-headers-x86-64"] {
-            assert!(!stems.contains(alias), "alias `{alias}' is also a stem");
-        }
     }
 
     /// The query REFUSES rather than reporting when a marked path reached the
@@ -8492,7 +8425,7 @@ mod tests {
         assert!(answer.pins.is_empty());
         // Members built in or imported from Debian: the kernel, glibc and
         // libgcc, the upstream toolchain's runtime,
-        // zlib, cryptsetup with its libraries, OpenSSH, Git with curl and
+        // zlib, OpenSSH, Git with curl and
         // LibreSSL, and every Rust recipe: td-link, whose throwaway first
         // stage the root's GCC links, each Cargo recipe, whose build
         // scripts' C the root's GCC compiles, and each direct-rustc
@@ -8500,18 +8433,14 @@ mod tests {
         assert_eq!(
             answer.build_root_members,
             [
-                "cryptsetup-x86-64",
                 "curl-x86-64",
                 "fd",
                 "gcc-runtime",
                 "git-x86-64",
                 "glibc-x86-64",
-                "json-c-x86-64",
-                "libdevmapper-x86-64",
                 "libressl-x86-64",
                 "linux-x86-64",
                 "openssh-x86-64",
-                "popt-x86-64",
                 "ripgrep",
                 "td-agent",
                 "td-audio",
@@ -8530,6 +8459,7 @@ mod tests {
                 "td-link",
                 "td-link-runtime",
                 "td-login",
+                "td-luks",
                 "td-mail",
                 "td-net",
                 "td-netd",
@@ -8552,7 +8482,6 @@ mod tests {
                 "td-update",
                 "td-util",
                 "td-vm-guest",
-                "util-linux-libs-x86-64",
                 "uutils",
                 "zlib-x86-64",
             ]
@@ -10643,7 +10572,7 @@ chmod 755 '{}'
             .is_some());
         assert!(seed_input_for_recipe_input("linux-headers-x86-64")
             .unwrap()
-            .is_some());
+            .is_none());
     }
 
     #[test]

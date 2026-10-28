@@ -9,7 +9,7 @@
 //! A U5 header is the protected release's (`protected_release::
 //! release_upgraded`), its `td-upgrade` token removed by `finish_u5`.
 
-use crate::cryptsetup::{exit_code, KeyFile, Progress, Resilience, EXIT_BAD_PASSPHRASE};
+use crate::luks::{exit_code, KeyFile, Progress, Resilience, EXIT_BAD_PASSPHRASE};
 use crate::luks2::{Header, Kind, UpgradeView};
 use crate::pin::{observe_pin, PinPcrs};
 use crate::protected::{Shape, Token};
@@ -258,7 +258,7 @@ impl Secrets {
 
 /// How a state's plan ended.
 enum Round {
-    /// Every step committed: read the header again.
+    /// Read the header again and plan from its current state.
     Done,
     /// The recovery key did not open its keyslot: ask again, then plan the
     /// state again.
@@ -398,6 +398,9 @@ impl<C: Runner, H: Host<C>> Run<'_, '_, C, H> {
                     if let Some(round) = self.open(None)? {
                         return Ok(round);
                     }
+                    // Recovery can finish the final hotzone during open.
+                    // Reconfirm U2 or plan U3 before issuing another command.
+                    return Ok(Round::Done);
                 }
                 Step::TakeLockout => return Ok(self.take(tpm.as_deref_mut())),
                 _ => {}
@@ -621,10 +624,11 @@ fn unusable(console: &mut dyn FnMut(&str), why: &str) -> Protector {
 fn is_recovery_test(step: &Step) -> bool {
     matches!(
         step,
-        Step::Test {
-            key: Key::Recovery,
-            ..
-        }
+        Step::KillUnbound
+            | Step::Test {
+                key: Key::Recovery,
+                ..
+            }
     )
 }
 
@@ -634,6 +638,7 @@ fn wrong_key(error: &io::Error) -> bool {
 
 fn describe(step: &Step) -> String {
     match step {
+        Step::KillUnbound => "free keyslot areas sanitized and unbound keyslots removed".into(),
         Step::Test { slot, .. } => format!("keyslot {slot} tested"),
         Step::KillSlot { slot, by } => {
             format!("keyslot {slot} destroyed, keyslot {by} authorizing")
