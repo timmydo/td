@@ -148,6 +148,9 @@ const JSON_STRING_RS: &str = include_str!("../../../td-json/src/string.rs");
 const JSON_STRING_ARRAY_RS: &str = include_str!("../../../td-json/src/string_array.rs");
 const LUKS_RS: &str = include_str!("../../../td-luks/src/lib.rs");
 const LUKS_HEADER_RS: &str = include_str!("../../../td-luks/src/header.rs");
+const LUKS_KEYSLOT_RS: &str = include_str!("../../../td-luks/src/keyslot.rs");
+const LUKS_WRITE_RS: &str = include_str!("../../../td-luks/src/write.rs");
+const ENCODING_RS: &str = include_str!("../../../td-encoding/src/lib.rs");
 const PROTECTOR_RS: &str = include_str!("../../../td-protector/src/lib.rs");
 const PROTECTOR_CRYPTSETUP_RS: &str = include_str!("../../../td-protector/src/cryptsetup.rs");
 const PROTECTOR_LOCKOUT_RS: &str = include_str!("../../../td-protector/src/lockout.rs");
@@ -201,6 +204,9 @@ pub fn recipe() -> Recipe {
         },
         Step::MkDir {
             path: "{src}/td-luks/src".into(),
+        },
+        Step::MkDir {
+            path: "{src}/td-encoding/src".into(),
         },
         Step::MkDir {
             path: "{src}/td-fido/src".into(),
@@ -386,6 +392,21 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-luks/src/header.rs".into(),
             content: LUKS_HEADER_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-luks/src/keyslot.rs".into(),
+            content: LUKS_KEYSLOT_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-luks/src/write.rs".into(),
+            content: LUKS_WRITE_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-encoding/src/lib.rs".into(),
+            content: ENCODING_RS.into(),
             exec: false,
         },
         Step::WriteFile {
@@ -641,6 +662,7 @@ mod tests {
                 "td-fido",
                 "td-json",
                 "td-luks",
+                "td-encoding",
                 "td-protector",
                 "td-fat",
             ],

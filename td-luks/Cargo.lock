@@ -7,6 +7,10 @@ name = "td-fido"
 version = "0.1.0"
 
 [[package]]
+name = "td-fs"
+version = "0.1.0"
+
+[[package]]
 name = "td-json"
 version = "0.1.0"
 
@@ -15,5 +19,6 @@ name = "td-luks"
 version = "0.1.0"
 dependencies = [
  "td-fido",
+ "td-fs",
  "td-json",
 ]

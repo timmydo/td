@@ -713,6 +713,237 @@ mod tests {
         assert_eq!(MAX_DIGEST_ITERATIONS, 4_000_000);
     }
 
+    fn seal(area: &mut [u8]) {
+        area[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_FIELD_LEN].fill(0);
+        let digest = td_fido::digest(area);
+        area[CHECKSUM_AT..CHECKSUM_AT + SHA256_LEN].copy_from_slice(&digest);
+    }
+
+    #[test]
+    fn an_invalid_primary_falls_back_to_the_secondary() {
+        // Each damages one check, the checksum left as written.
+        let corrupt: &[(&str, usize, &[u8])] = &[
+            ("magic", 0, b"LUKS\xba\xbf"),
+            ("version", VERSION_AT, &[0, 1]),
+            (
+                "hdr_size below 16 KiB",
+                HDR_SIZE_AT,
+                &0x2000u64.to_be_bytes(),
+            ),
+            (
+                "hdr_size above 4 MiB",
+                HDR_SIZE_AT,
+                &0x80_0000u64.to_be_bytes(),
+            ),
+            ("hdr_offset", HDR_OFFSET_AT, &1u64.to_be_bytes()),
+            ("JSON area", BINARY_HEADER_LEN, b"["),
+            ("stored checksum", CHECKSUM_AT, &[0xff]),
+        ];
+        for (what, at, value) in corrupt {
+            let mut bytes = device(9, JSON, 7, JSON);
+            bytes[*at..*at + value.len()].copy_from_slice(value);
+            let used = read_bytes(bytes).unwrap();
+            assert_eq!(used.identity.copy, HeaderCopy::Secondary, "{what}");
+            assert_eq!(used.identity.seqid, 7);
+        }
+        // The secondary is then found by scanning cryptsetup's offsets: at
+        // 64 KiB here, after a primary of that size whose checksum fails.
+        // It is the copy cryptsetup uses, and td refuses its size.
+        let mut bytes = copy(false, 0, 0x1_0000, 9, JSON.as_bytes());
+        bytes[BINARY_HEADER_LEN] = b' ';
+        bytes.extend(copy(true, 0x1_0000, 0x1_0000, 7, JSON.as_bytes()));
+        assert_eq!(
+            read_bytes(bytes).unwrap().json().unwrap_err(),
+            "LUKS2 secondary header copy has hdr_size 65536, not the 16384 td formats"
+        );
+        // A valid secondary must sit at its own size.
+        let mut bytes = copy(false, 0, 0x4000, 9, JSON.as_bytes());
+        bytes[BINARY_HEADER_LEN] = b' ';
+        bytes.extend(copy(true, 0x4000, 0x8000, 7, JSON.as_bytes()));
+        assert_eq!(read_bytes(bytes).unwrap_err(), "no valid LUKS2 header copy");
+    }
+
+    #[test]
+    fn an_invalid_secondary_leaves_the_primary() {
+        let mut bytes = device(7, JSON, 9, JSON);
+        bytes[0x4000] = b'L';
+        let used = read_bytes(bytes).unwrap();
+        assert_eq!(
+            (used.identity.copy, used.identity.seqid),
+            (HeaderCopy::Primary, 7)
+        );
+        // A medium that ends inside the secondary is the same.
+        let mut bytes = device(7, JSON, 9, JSON);
+        bytes.truncate(0x4000 + 100);
+        assert_eq!(
+            read_bytes(bytes).unwrap().identity.copy,
+            HeaderCopy::Primary
+        );
+    }
+
+    #[test]
+    fn no_valid_copy_and_unknown_algorithms_refuse() {
+        for len in [0x10000, 100] {
+            assert_eq!(
+                read_bytes(vec![0; len]).unwrap_err(),
+                "no valid LUKS2 header copy"
+            );
+        }
+        let mut bytes = device(7, JSON, 7, JSON);
+        bytes[CHECKSUM_ALG_AT..CHECKSUM_ALG_AT + 6].copy_from_slice(b"sha1\0\0");
+        seal(&mut bytes[..0x4000]);
+        assert_eq!(
+            read_bytes(bytes).unwrap_err(),
+            "LUKS2 header copy at 0 uses a checksum algorithm other than sha256"
+        );
+    }
+
+    #[test]
+    fn a_size_td_does_not_format_is_refused() {
+        // 20 KiB passes the copy checks, as it does cryptsetup's, but is no
+        // size td formats; nor is 32 KiB.
+        for size in [0x5000u64, 0x8000] {
+            let mut bytes = copy(false, 0, size, 7, JSON.as_bytes());
+            bytes.extend(copy(true, size, size, 7, JSON.as_bytes()));
+            assert_eq!(
+                read_bytes(bytes).unwrap().json().unwrap_err(),
+                format!("LUKS2 primary header copy has hdr_size {size}, not the 16384 td formats")
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_copy_is_refused_before_its_json_is_parsed() {
+        // A checksum-valid 4 MiB primary whose JSON area is one string
+        // filling it, with nothing after it: cryptsetup would use it, and
+        // td refuses its size without handing the JSON to td-json.
+        let size = 0x40_0000usize;
+        let mut json = vec![b'b'; size - BINARY_HEADER_LEN - 1];
+        json[..6].copy_from_slice(b"{\"a\":\"");
+        let end = json.len();
+        json[end - 2..].copy_from_slice(b"\"}");
+        let used = read_bytes(copy(false, 0, size as u64, 9, &json)).unwrap();
+        assert!(used.json.is_none(), "the large area is not even kept");
+        assert_eq!(
+            used.json().unwrap_err(),
+            "LUKS2 primary header copy has hdr_size 4194304, not the 16384 td formats"
+        );
+    }
+
+    #[test]
+    fn the_json_area_is_one_object_then_nul_bytes() {
+        let full = format!(
+            "{{\"a\":\"{}\"}}",
+            "b".repeat(0x4000 - BINARY_HEADER_LEN - 8)
+        );
+        assert_eq!(
+            read_bytes(device(7, &full, 7, &full))
+                .unwrap()
+                .json()
+                .unwrap_err(),
+            "LUKS2 JSON area has no NUL padding"
+        );
+        let mut bytes = device(7, JSON, 7, JSON);
+        bytes[0x4000 - 1] = b' ';
+        seal(&mut bytes[..0x4000]);
+        bytes[0x8000 - 1] = b' ';
+        seal(&mut bytes[0x4000..0x8000]);
+        assert_eq!(
+            read_bytes(bytes).unwrap().json().unwrap_err(),
+            "LUKS2 JSON area has bytes after its NUL padding"
+        );
+        for area in [" {}", "{} ", "{\"keyslots\":}"] {
+            assert!(read_bytes(device(7, area, 7, area))
+                .unwrap()
+                .json()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn metadata_is_one_bounded_object() {
+        assert!(metadata_json(JSON.as_bytes()).is_ok());
+        assert_eq!(
+            metadata_json(b"[1]").unwrap_err(),
+            "cryptsetup's LUKS2 metadata is not one object"
+        );
+        let over = format!("{{\"a\":\"{}\"}}", "b".repeat(MAX_METADATA_JSON));
+        assert_eq!(
+            metadata_json(over.as_bytes()).unwrap_err(),
+            format!("cryptsetup's LUKS2 metadata is over {MAX_METADATA_JSON} bytes")
+        );
+    }
+
+    #[test]
+    fn costs_hold_each_pbkdf2_to_its_ceiling() {
+        let header = |keyslot: u64, digest: u64, kind: &str| {
+            td_json::parse_slice(format!(
+                r#"{{"keyslots":{{"0":{{"type":"luks2","kdf":{{"type":"{kind}","hash":"sha256","iterations":{keyslot}}}}}}},"digests":{{"0":{{"type":"pbkdf2","hash":"sha256","iterations":{digest},"keyslots":["0"],"segments":["0"]}}}}}}"#
+            ).as_bytes())
+            .unwrap()
+        };
+        let cost = |json: &Json| costs(json).unwrap().remove(0).1;
+        assert_eq!(
+            cost(&header(1000, 1000, "pbkdf2")),
+            Ok(Cost {
+                keyslot: 1000,
+                digest: 1000
+            })
+        );
+        assert_eq!(
+            cost(&header(
+                MAX_KEYSLOT_ITERATIONS,
+                MAX_DIGEST_ITERATIONS,
+                "pbkdf2"
+            )),
+            Ok(Cost {
+                keyslot: MAX_KEYSLOT_ITERATIONS,
+                digest: MAX_DIGEST_ITERATIONS
+            })
+        );
+        for (keyslot, digest, kind, refusal) in [
+            (MAX_KEYSLOT_ITERATIONS + 1, 1000, "pbkdf2", "asks more than"),
+            (1000, MAX_DIGEST_ITERATIONS + 1, "pbkdf2", "asks more than"),
+            (0, 1000, "pbkdf2", "asks more than"),
+            (1000, 1000, "argon2id", "is not PBKDF2-SHA256"),
+        ] {
+            let error = cost(&header(keyslot, digest, kind)).unwrap_err();
+            assert!(error.contains(refusal), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_test_length_bounds_the_keyslots_area_and_requirements_are_read() {
+        let used = read_bytes(device(5, JSON, 5, JSON)).unwrap();
+        let with = |config: &str| {
+            td_json::parse_slice(
+                format!(r#"{{"keyslots":{{}},"digests":{{}},"config":{config}}}"#).as_bytes(),
+            )
+            .unwrap()
+        };
+        let bound = format!(r#"{{"keyslots_size":"{MAX_KEYSLOTS_SIZE}"}}"#);
+        assert_eq!(
+            test_length(&used, &with(&bound)).unwrap(),
+            2 * 0x4000 + MAX_KEYSLOTS_SIZE
+        );
+        for config in [
+            format!(r#"{{"keyslots_size":"{}"}}"#, MAX_KEYSLOTS_SIZE + 1),
+            r#"{"keyslots_size":16744448}"#.into(),
+            "{}".into(),
+        ] {
+            assert!(test_length(&used, &with(&config)).is_err(), "{config}");
+        }
+        let reencrypting = with(r#"{"requirements":{"mandatory":["online-reencrypt-v2"]}}"#);
+        assert!(volume(&reencrypting).unwrap().reencryption);
+        assert!(
+            !volume(&with(r#"{"requirements":{"mandatory":[]}}"#))
+                .unwrap()
+                .reencryption
+        );
+        assert!(volume(&with(r#"{"requirements":{"mandatory":"x"}}"#)).is_err());
+        assert!(volume(&with(r#"{"requirements":{"mandatory":[7]}}"#)).is_err());
+    }
+
     #[test]
     fn the_binary_claim_needs_its_position_magic_and_version_two() {
         let primary = copy(false, 0, 0x4000, 7, JSON.as_bytes());

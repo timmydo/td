@@ -391,8 +391,7 @@ mod tests {
     use crate::token::Role;
     use std::io::{Cursor, SeekFrom};
     use td_luks::header::{
-        CHECKSUM_ALG_AT, CHECKSUM_AT, CHECKSUM_FIELD_LEN, HDR_OFFSET_AT, HDR_SIZE_AT,
-        PRIMARY_MAGIC, SECONDARY_MAGIC, SHA256_LEN, VERSION_AT,
+        CHECKSUM_AT, CHECKSUM_FIELD_LEN, PRIMARY_MAGIC, SECONDARY_MAGIC, SHA256_LEN,
     };
     use td_tpm::SealedObject;
 
@@ -527,118 +526,6 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_primary_falls_back_to_the_secondary() {
-        let json = standard();
-        // Each damages one check, the checksum left as written.
-        let corrupt: &[(&str, usize, &[u8])] = &[
-            ("magic", 0, b"LUKS\xba\xbf"),
-            ("version", VERSION_AT, &[0, 1]),
-            (
-                "hdr_size below 16 KiB",
-                HDR_SIZE_AT,
-                &0x2000u64.to_be_bytes(),
-            ),
-            (
-                "hdr_size above 4 MiB",
-                HDR_SIZE_AT,
-                &0x80_0000u64.to_be_bytes(),
-            ),
-            ("hdr_offset", HDR_OFFSET_AT, &1u64.to_be_bytes()),
-            ("JSON area", BINARY_HEADER_LEN, b"["),
-            ("stored checksum", CHECKSUM_AT, &[0xff]),
-        ];
-        for (what, at, value) in corrupt {
-            let mut bytes = device(9, &json, 7, &json);
-            bytes[*at..*at + value.len()].copy_from_slice(value);
-            let header = read_bytes(bytes).unwrap();
-            assert_eq!(header.copy, HeaderCopy::Secondary, "{what}");
-            assert_eq!(header.seqid, 7);
-        }
-        // The secondary is then found by scanning cryptsetup's offsets: at
-        // 64 KiB here, after a primary of that size whose checksum fails.
-        // It is the copy cryptsetup uses, and td refuses its size.
-        let mut bytes = copy(false, 0, 0x1_0000, 9, json.as_bytes());
-        bytes[BINARY_HEADER_LEN] = b' ';
-        bytes.extend(copy(true, 0x1_0000, 0x1_0000, 7, json.as_bytes()));
-        assert_eq!(
-            read_bytes(bytes).unwrap_err(),
-            "LUKS2 secondary header copy has hdr_size 65536, not the 16384 td formats"
-        );
-        // A valid secondary must sit at its own size.
-        let mut bytes = copy(false, 0, 0x4000, 9, json.as_bytes());
-        bytes[BINARY_HEADER_LEN] = b' ';
-        bytes.extend(copy(true, 0x4000, 0x8000, 7, json.as_bytes()));
-        assert_eq!(read_bytes(bytes).unwrap_err(), "no valid LUKS2 header copy");
-    }
-
-    #[test]
-    fn an_invalid_secondary_leaves_the_primary() {
-        let json = standard();
-        let mut bytes = device(7, &json, 9, &json);
-        bytes[0x4000] = b'L';
-        let header = read_bytes(bytes).unwrap();
-        assert_eq!((header.copy, header.seqid), (HeaderCopy::Primary, 7));
-        // A medium that ends inside the secondary is the same.
-        let mut bytes = device(7, &json, 9, &json);
-        bytes.truncate(0x4000 + 100);
-        assert_eq!(read_bytes(bytes).unwrap().copy, HeaderCopy::Primary);
-    }
-
-    #[test]
-    fn no_valid_copy_and_unknown_algorithms_refuse() {
-        assert_eq!(
-            read_bytes(vec![0; 0x10000]).unwrap_err(),
-            "no valid LUKS2 header copy"
-        );
-        assert_eq!(
-            read_bytes(vec![0; 100]).unwrap_err(),
-            "no valid LUKS2 header copy"
-        );
-        let json = standard();
-        let mut bytes = device(7, &json, 7, &json);
-        bytes[CHECKSUM_ALG_AT..CHECKSUM_ALG_AT + 6].copy_from_slice(b"sha1\0\0");
-        seal(&mut bytes[..0x4000]);
-        assert_eq!(
-            read_bytes(bytes).unwrap_err(),
-            "LUKS2 header copy at 0 uses a checksum algorithm other than sha256"
-        );
-    }
-
-    #[test]
-    fn a_size_td_does_not_format_is_refused() {
-        // 20 KiB passes the copy checks, as it does cryptsetup's, but is no
-        // size td formats; nor is 32 KiB.
-        let json = standard();
-        for size in [0x5000u64, 0x8000] {
-            let mut bytes = copy(false, 0, size, 7, json.as_bytes());
-            bytes.extend(copy(true, size, size, 7, json.as_bytes()));
-            assert_eq!(
-                read_bytes(bytes).unwrap_err(),
-                format!("LUKS2 primary header copy has hdr_size {size}, not the 16384 td formats")
-            );
-        }
-    }
-
-    #[test]
-    fn a_large_copy_is_refused_before_its_json_is_parsed() {
-        // A checksum-valid 4 MiB primary whose JSON area is one string
-        // filling it, with nothing after it: cryptsetup would use it, and
-        // td refuses its size without handing the JSON to td-json.
-        let size = 0x40_0000usize;
-        let mut json = vec![b'b'; size - BINARY_HEADER_LEN - 1];
-        json[..6].copy_from_slice(b"{\"a\":\"");
-        let end = json.len();
-        json[end - 2..].copy_from_slice(b"\"}");
-        let bytes = copy(false, 0, size as u64, 9, &json);
-        let started = std::time::Instant::now();
-        assert_eq!(
-            read_bytes(bytes).unwrap_err(),
-            "LUKS2 primary header copy has hdr_size 4194304, not the 16384 td formats"
-        );
-        eprintln!("4 MiB primary refused in {:?}", started.elapsed());
-    }
-
-    #[test]
     fn malformed_json_areas_are_refused() {
         let duplicate = standard().replacen(r#""digests""#, r#""tokens":{},"digests""#, 1);
         let cases: &[(&[u8], &str)] = &[
@@ -681,23 +568,6 @@ mod tests {
         let bad = header_json(&format!(r#""3":{token}"#));
         let refused = read_bytes(device(7, &bad, 7, &bad)).unwrap_err();
         assert_eq!(refused, "LUKS2 token 3: td token has an unknown key \"x\"");
-        // An area the JSON fills has no NUL; bytes after the NUL refuse.
-        let full = format!(
-            "{{\"a\":\"{}\"}}",
-            "b".repeat(0x4000 - BINARY_HEADER_LEN - 8)
-        );
-        let refused = read_bytes(device(7, &full, 7, &full)).unwrap_err();
-        assert_eq!(refused, "LUKS2 JSON area has no NUL padding");
-        let json = standard();
-        let mut bytes = device(7, &json, 7, &json);
-        bytes[0x4000 - 1] = b' ';
-        seal(&mut bytes[..0x4000]);
-        bytes[0x8000 - 1] = b' ';
-        seal(&mut bytes[0x4000..0x8000]);
-        assert_eq!(
-            read_bytes(bytes).unwrap_err(),
-            "LUKS2 JSON area has bytes after its NUL padding"
-        );
     }
 
     #[test]

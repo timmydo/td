@@ -129,17 +129,34 @@ The runner's contract with its child does not change:
 
 The key on standard input authorizes each verb as cryptsetup's would:
 
-- **`add-key`:** the key must open keyslot BY.
+- **`add-key`:** the key must open keyslot BY, and BY must be bound to
+  the volume's segment. An unbound BY is a failure (status 1), as
+  cryptsetup 2.8.8's `luksAddKey` reports it ("No usable keyslot is
+  available"), not a wrong key.
+- **`test`:** the key must open SLOT. An unbound SLOT is tested against
+  its own digest, as cryptsetup 2.8.8's `open --test-passphrase
+  --key-slot` tests it: status 0 for its key, 2 for another. The
+  interop tests pin both behaviours.
 - **`kill-slot`:** the key must open an active keyslot other than SLOT,
-  or SLOT itself when it is the last keyslot. A shorter key than td's
-  shortest secret is refused before anything is read; cryptsetup instead
-  kills unasked on empty input.
+  whatever its priority, as cryptsetup's `verify_keyslot` tries each by
+  number, or SLOT itself when it is the last keyslot. A shorter key
+  than td's shortest secret is refused before anything is read;
+  cryptsetup instead kills unasked on empty input. When SLOT is
+  unbound and no bound keyslot remains, td-luks still needs SLOT's own
+  key, where cryptsetup kills unverified; this is deliberately
+  stricter, and a keyslot with no digest at all, which no key can be
+  checked against, is then refused. Killing the last bound keyslot by
+  its own key leaves a header no key opens, as with cryptsetup, and so
+  does a crash after that kill's wipe ("Commits").
 - **`kill-unbound`:** the key must open a bound keyslot. It removes each
   unbound keyslot, meaning one with no digest or whose digest names no
-  segment (cryptsetup's `LUKS2_keyslot_unbound`). It refuses a header
+  segment (cryptsetup's `LUKS2_keyslot_unbound`). Their digests stay,
+  with empty `keyslots`, as cryptsetup leaves them. It refuses a header
   that carries the reencryption requirement.
-- **`open` with no slot:** tries each bound keyslot whose priority is not
-  0, in cryptsetup's order.
+- **`open` with no slot:** tries each bound keyslot whose priority is
+  not 0: priority 2 first, then priority 1, each in keyslot-number
+  order. cryptsetup goes in JSON order within a priority, so only which
+  keyslot opens can differ, never whether one does.
 
 Exit statuses:
 
@@ -163,6 +180,15 @@ over the copy with its checksum field zeroed. The JSON area follows
 cryptsetup's schema for keyslots, digests, segments, config and tokens,
 NUL-padded to the area. Numbers that LUKS2 writes as strings (offsets,
 sizes) are written as strings.
+
+A commit rewrites the label and UUID it read and an empty subsystem,
+so td-luks refuses, when it loads a header and so for reads and
+mutations alike, a header whose label or UUID field is not UTF-8 up to
+a NUL followed only by NUL bytes, or whose subsystem is not empty. td
+formats no subsystem, and refusing keeps every commit's binary fields
+byte for byte what was read. The
+profile also refuses a second digest naming segment 0, which only a
+reencryption writes.
 
 The JSON text need not match cryptsetup's byte for byte. It must be a
 header that cryptsetup 2.8.8 and the reader both accept with the same
@@ -198,10 +224,15 @@ Every mutation is one commit:
 1. Read and validate the header under the lock.
 2. Build the new JSON with sequence id + 1.
 3. Write the keyslot-area changes and sync them.
-4. Write the primary copy, then the secondary. For each copy, write the
-   binary header without its checksum, then the JSON, then the binary
-   header with its checksum, then `fsync`, as cryptsetup's
-   `hdr_write_disk` does.
+4. Write the copy the reader did not use, then the one it used. For
+   each copy, write the binary header without its checksum, then the
+   JSON, then the binary header with its checksum, then `fsync`, as
+   cryptsetup's `hdr_write_disk` does. cryptsetup always writes the
+   primary first, which is safe for it because it repairs a bad copy
+   on every load; td-luks repairs nothing on read ("No repair on
+   read"), so when only one copy is valid it must be the last one
+   overwritten. When both are valid at one sequence id, the order is
+   immaterial.
 
 A crash at any point leaves at least one valid copy, carrying either the
 old JSON or the new, and the reader's validity and sequence rule picks
@@ -428,6 +459,15 @@ detached form, and it writes nothing.
   trips through the reader; every mutation's fault-injection points;
   authorization of each verb; refusal of every header outside the
   profile. These run on ordinary files without privilege.
+- **Host interop tests:** `tests/cryptsetup_interop.rs`, ignored by
+  default, runs the pinned cryptsetup found first on `PATH` against
+  regular files in both directions: cryptsetup dumps, opens and leaves
+  unrepaired what td-luks writes, and td-luks opens what cryptsetup
+  writes with td-protector's own format arguments, to the same volume
+  key. They need the host's AF_ALG and leave with cryptsetup. One of
+  them captured the keyslot known answer `src/keyslot.rs` pins in the
+  ordinary unit tests: a cryptsetup keyslot's first area sector, its
+  plaintext, and its digest of the dumped volume key.
 - **Committed fixtures:** headers and keyslot areas that cryptsetup
   2.8.8 produced with known keys. The set covers a fresh format, added
   keyslots and tokens, a killed keyslot, and reencryption interrupted at
@@ -450,18 +490,21 @@ Each increment is one landable commit, or a short series:
 
 - **A.** This design. Status: landed.
 - **B.** Libraries and the verbs that need no device mapper:
-  - the library: the reader moved from td-protector, with td-protector
-    switched onto it (landed: `src/header.rs`), and the writer;
-  - in td-fido: PBKDF2 and XTS (landed);
-  - the AF splitter;
-  - the verbs `format`, `add-key`, `kill-slot`, `kill-unbound`,
-    `token-*`, `metadata`, `volume-key` and `test`;
-  - unit tests and the cryptsetup fixtures. The reader's format-only
-    refusal tests, still in td-protector's `luks2` module, move here
-    with the writer: the copy-field fallback matrix, the
-    `HEADER_SIZES` scan, the checksum-algorithm refusal, NUL padding,
-    the `metadata_json` bound, the PBKDF2 ceilings, the keyslots-area
-    bounds and requirements parsing.
+  - **B1.** In td-fido: PBKDF2 and XTS. Status: landed.
+  - **B2.** The reader moved from td-protector, with td-protector
+    switched onto it (`src/header.rs`). Status: landed.
+  - **B3a.** The writer library: header commits through the `Medium`
+    trait (`src/write.rs`), the AF splitter and keyslot cryptography
+    (`src/keyslot.rs`), and the operations behind `format`, `add-key`,
+    `kill-slot`, `kill-unbound`, `token-*`, `metadata`, `volume-key`
+    and `test`, with the profile check, fault-injection tests, the
+    reader's format-only refusal tests moved from td-protector, and
+    ignored interop tests against the pinned cryptsetup
+    (`tests/cryptsetup_interop.rs`). Status: landed.
+  - **B3b.** Next: the `td-luks` program and its verbs, exit statuses
+    and key input over that library, with cryptsetup's lock protocol
+    ("Locking").
+  - **B4.** The cryptsetup fixtures ("Tests").
 - **C.** The device-mapper surface: `open`, `open-volume-key`, `close`
   and `status` for headers without the reencryption requirement, with
   UNSAFE.md's section and the interop oracle for activation.
