@@ -203,7 +203,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
             let mut opened = None;
             for address in addresses {
                 let mut request = self.loaded.bootstrap.request(address);
-                request.mode = postgres_probe::Mode::Runtime;
+                request.mode = self.binding.runtime_mode();
                 match ReadSession::open_body(&request, &self.loaded.trust, deadline) {
                     Ok(session) => {
                         opened = Some(session);
@@ -374,6 +374,9 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         {
             return Err(Error::Forbidden);
         }
+        if self.binding.read_only() && !self.session.is_read_only() {
+            return Err(Error::Forbidden);
+        }
         let presented = Presented::parse(request.credentials.password()).ok_or(Error::Forbidden)?;
         if presented.id() != request.device {
             return Err(Error::Forbidden);
@@ -421,7 +424,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                 cache.reserve(self.slots, deadline).map_err(read_error)?;
             }
             let mut connection = self.loaded.bootstrap.request(address);
-            connection.mode = postgres_probe::Mode::Runtime;
+            connection.mode = self.binding.runtime_mode();
             let result = postgres_body::with_pinned_blob_cached(
                 &connection,
                 &self.loaded.trust,
@@ -478,6 +481,9 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         cache: Option<&RefCell<Option<CachedRead<'s>>>>,
         headers: Option<&mut crate::postgres_header_cache::Cache>,
     ) -> Result<(), ApiError> {
+        if self.binding.read_only() && !self.session.is_read_only() {
+            return Err(Error::Forbidden.into());
+        }
         let presented = Presented::parse(request.credentials.password()).ok_or(Error::Forbidden)?;
         if presented.id() != request.device {
             return Err(Error::Forbidden.into());

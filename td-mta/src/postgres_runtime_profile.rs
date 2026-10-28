@@ -40,6 +40,7 @@ pub struct Binding {
     account: AccountId,
     profile: String,
     roles: Roles,
+    runtime_mode: postgres_probe::Mode,
     route: crate::postgres_routes::Route,
     submission_route: crate::postgres_routes::Route,
     relay_policy: Option<crate::ports::TlsPolicyId>,
@@ -68,6 +69,12 @@ impl Binding {
         self.relay_policy
     }
 
+    pub fn runtime_mode(&self) -> postgres_probe::Mode {
+        self.runtime_mode
+    }
+    pub fn read_only(&self) -> bool {
+        self.runtime_mode == postgres_probe::Mode::ReplicaRead
+    }
     pub fn epoch(&self) -> StoreEpoch {
         self.epoch
     }
@@ -300,6 +307,14 @@ pub fn load(
         .identities()
         .map_err(|_| Error::Account)?;
     let roles = configuration.roles();
+    if request.mode == postgres_probe::Mode::ReplicaRead && roles.bits() != Roles::JMAP {
+        return Err(Error::Account);
+    }
+    let runtime_mode = if request.mode == postgres_probe::Mode::ReplicaRead {
+        postgres_probe::Mode::ReplicaRead
+    } else {
+        postgres_probe::Mode::Runtime
+    };
     let relay_policy = if roles.relay() {
         Some(TlsPolicies::prepared_relay(&policies).map_err(Error::TlsPolicy)?)
     } else {
@@ -368,6 +383,7 @@ pub fn load(
             account,
             profile: name.clone(),
             roles,
+            runtime_mode,
             route: route.clone(),
             submission_route: candidate
                 .submission_route(account, profile)

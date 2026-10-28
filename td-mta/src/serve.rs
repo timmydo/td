@@ -24,10 +24,19 @@ pub(super) struct Options {
     profile: String,
     runtime: String,
     scratch: String,
+    read_only: bool,
 }
 pub(super) fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Options> {
     let (mut connection, mut profile, mut runtime, mut scratch) = (None, None, None, None);
+    let mut read_only = false;
     while let Some(flag) = args.next() {
+        if flag == "--read-only" {
+            if read_only {
+                return None;
+            }
+            read_only = true;
+            continue;
+        }
         let value = args.next()?.into_string().ok()?;
         match flag.to_str()? {
             "--connection-file" if connection.is_none() => connection = Some(value),
@@ -42,6 +51,7 @@ pub(super) fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> O
         profile: profile?,
         runtime: runtime?,
         scratch: scratch?,
+        read_only,
     })
 }
 
@@ -58,6 +68,11 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
 }
 
 fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure> {
+    let mode = if options.read_only {
+        td_mta::postgres_probe::Mode::ReplicaRead
+    } else {
+        td_mta::postgres_probe::Mode::Runtime
+    };
     let clock = Arc::new(RuntimeClock::new());
     let loaded = td_mta::postgres_input::Loaded::open(&options.connection, &options.profile)
         .map_err(|error| config_failure("postgres", error.code()))?;
@@ -76,7 +91,7 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
     let mut certificate_revisions = Vec::new();
     for address in addresses {
         let mut request = loaded.bootstrap.request(address);
-        request.mode = td_mta::postgres_probe::Mode::Runtime;
+        request.mode = mode;
         let schema = match td_mta::postgres_schema::inspect(&request, &loaded.trust, until) {
             Ok(schema) => schema,
             Err(td_mta::postgres_schema::Error::Connection(
@@ -114,7 +129,7 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
     let mut relay_request = loaded
         .bootstrap
         .request(selected_address.ok_or_else(|| config_failure("postgres", "connection"))?);
-    relay_request.mode = td_mta::postgres_probe::Mode::Runtime;
+    relay_request.mode = mode;
     let mailbox_access = binding.roles().jmap();
     let candidate = resolved.candidate();
     let runtime_path = options.runtime.as_str();
@@ -155,6 +170,9 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                     .map_err(|_| config_failure("certificate", "configuration"))?
                     .ok_or_else(|| config_failure("certificate", "configuration"))?;
                 if certificate.mode == td_mta::config::certificate::Mode::Acme {
+                    if options.read_only {
+                        return Err(config_failure("certificate", "replica-acme"));
+                    }
                     managed_names.push(certificate.name.to_owned());
                 }
             }
@@ -172,6 +190,9 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                     .listener(index)
                     .map_err(|_| config_failure("configuration", "invariant"))?
                     .ok_or_else(|| config_failure("configuration", "invariant"))?;
+                if options.read_only && (row.kind != Kind::Https || !row.bind.ip().is_loopback()) {
+                    return Err(config_failure("listeners", "replica-loopback-https-only"));
+                }
                 match row.kind {
                     Kind::DirectSmtp => direct.push(row),
                     Kind::Https if mailbox_access => https_rows.push(row),
@@ -267,7 +288,11 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                         .binding_for(account.id)
                         .ok_or_else(|| config_failure("configuration", "invariant"))?;
                     for origin in origins.iter().copied() {
-                        let session = td_mta::jmap_session::Session::mail_submission(
+                        let session = (if options.read_only {
+                            td_mta::jmap_session::Session::mail_read_only
+                        } else {
+                            td_mta::jmap_session::Session::mail_submission
+                        })(
                             origin,
                             account,
                             resources,
@@ -387,6 +412,11 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                 candidate.minimum_severity(),
             )
             .map_err(|error| adapter("logging", error))?;
+            let log_writer = if options.read_only {
+                log_writer.for_replica_reader()
+            } else {
+                log_writer
+            };
             let control = Control::with_logging(logging);
             control.log(td_mta::observability::Kind::BootStarted, None, None);
             control.log(td_mta::observability::Kind::ConfigActivated, None, None);
@@ -453,7 +483,7 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                                 .ok()?;
                                 for address in addresses {
                                     let mut request = loaded.bootstrap.request(address);
-                                    request.mode = td_mta::postgres_probe::Mode::Runtime;
+                                    request.mode = mode;
                                     if let Ok(mut revisions) = td_mta::postgres_acme::generations(
                                         &request,
                                         &loaded.trust,

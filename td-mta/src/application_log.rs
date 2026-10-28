@@ -30,6 +30,7 @@ pub struct Producer {
 }
 pub struct Writer {
     receiver: Receiver<Event>,
+    replica_reader: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Status {
@@ -63,7 +64,10 @@ impl Producer {
                 failures: AtomicU64::new(0),
                 degraded: AtomicBool::new(false),
             },
-            Writer { receiver },
+            Writer {
+                receiver,
+                replica_reader: false,
+            },
         ))
     }
     fn event(
@@ -214,6 +218,11 @@ impl PerformanceSchedule {
 }
 
 impl Writer {
+    pub fn for_replica_reader(mut self) -> Self {
+        self.replica_reader = true;
+        self
+    }
+
     fn collect(&self, batch: &mut Vec<Event>, stopping: impl FnOnce() -> bool) -> bool {
         let stopping = stopping();
         while batch.len() < postgres_logs::BATCH - 1 {
@@ -282,13 +291,18 @@ impl Writer {
                 || last_maintenance
                     .is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(60))
             {
-                let result = postgres_logs::append_resolved(
+                let result = postgres_logs::append_resolved_mode(
                     loaded,
                     executable,
                     Instant::now() + Duration::from_secs(2),
                     epoch,
                     profile,
                     &batch,
+                    if self.replica_reader {
+                        crate::postgres_probe::Mode::ReplicaRead
+                    } else {
+                        crate::postgres_probe::Mode::Runtime
+                    },
                 );
                 match result {
                     Ok(done) => {

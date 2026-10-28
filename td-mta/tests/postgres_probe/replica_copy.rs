@@ -166,4 +166,13 @@ pub(super) fn exercise(
     assert!(progress.pending.unwrap().complete());
     assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.emails"), "1");
     assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.blobs"), "1");
+    super::replica_serving::exercise(
+        &fixture,
+        epoch,
+        binding.account,
+        mail.id,
+        mail.blob,
+        mail.size,
+        mail.digest,
+    );
 }

@@ -853,7 +853,7 @@ pub(super) fn exercise(
     assert_eq!(page["retention_days"].as_u64(), Some(30));
 }
 
-fn persistent_reply(stream: &mut impl Read) -> (String, Vec<u8>) {
+pub(super) fn persistent_reply(stream: &mut impl Read) -> (String, Vec<u8>) {
     let mut head = Vec::new();
     while !head.ends_with(b"\r\n\r\n") {
         assert!(head.len() < 16 * 1024);

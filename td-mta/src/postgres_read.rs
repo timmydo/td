@@ -239,7 +239,7 @@ impl<'a> Snapshot<'a> {
         binding: &Binding,
         password: &[u8],
     ) -> Result<Self, Error> {
-        if request.mode != postgres_probe::Mode::Runtime {
+        if request.mode != binding.runtime_mode() {
             return Err(Error::Invalid);
         }
         Self::open(slots, request, trust, deadline, binding, password)
@@ -448,7 +448,7 @@ impl<'a> BetweenMethods<'a> {
                 })?;
         for address in addresses {
             let mut request = loaded.bootstrap.request(address);
-            request.mode = postgres_probe::Mode::Runtime;
+            request.mode = self.binding.runtime_mode();
             let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
             let result = connect_authenticated(
                 &request,

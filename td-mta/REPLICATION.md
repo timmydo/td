@@ -3,9 +3,10 @@
 ## Status and scope
 
 The source inventory/metadata API and bounded local copy commands are
-implemented. Continuous synchronization, the local read-only service and
-recovery qualification remain subsequent work, not available service or
-recovery claims. The client honors read-only discovery; full local service
+implemented, together with a low-level loopback read service for an already
+provisioned replica. Installer integration, continuous synchronization and
+recovery qualification remain subsequent work, not available setup or recovery
+claims. The client honors read-only discovery; full local service
 qualification remains required. PostgreSQL remains the
 only backend. Synchronization is application-level over authenticated HTTPS;
 it does not expose PostgreSQL or require replication credentials on clients.
@@ -73,8 +74,8 @@ SMTP, relay, writable JMAP and ACME operations. Retained sessions hold the share
 migration lock, so initialization cannot change their mode while they run.
 The ACME executable claims its persistent profile before binding its HTTP-01
 listener; that row also prevents later replica initialization on the database.
-Read-only local serving remains subsequent work; the replica publisher has a
-separate qualification path described below.
+The loopback reader and replica publisher use separate qualification paths
+described below.
 Owner administrative access remains trusted and is not a read-only SQL sandbox.
 
 ## Synchronization contract
@@ -83,7 +84,7 @@ Owner administrative access remains trusted and is not a read-only SQL sandbox.
 
 The authenticated PostgreSQL snapshot adapter provides
 `replica_inventory(cursor, maximum)`, exposed by the HTTPS method below. It is
-not yet connected to a local synchronizer. Each call
+used by the bounded copy worker described below. Each call
 uses the snapshot's existing authentication, account, deadline and bounded
 database worker. At most 256 IDs and one lookahead row are read. No body bytes
 or derived interpretation are returned.
@@ -356,7 +357,7 @@ A newer per-object observation never becomes the global change checkpoint.
 
 The account initializer persists only the first page. Bounded receipt retention and restart orchestration
 remain subsequent work. Limits reserve no bodies and cannot authorize an
-unbounded writer. Exhaustion must pause a future publisher without skipping mail.
+unbounded writer. Exhaustion pauses publication without skipping mail.
 This increment does not make a replica usable or certify copy completeness.
 
 ### Reloading persisted work
@@ -379,7 +380,8 @@ connection. It takes a repeatable-read read-only snapshot and rolls it back,
 uses the same source/account binding and finite session/job budgets, and checks
 the epoch and maintenance barrier. Failure retires that connection; a result
 that exceeds its deadline is not returned. It neither mutates progress nor
-requires the owner credential. The copy command remains subsequent work.
+requires the owner credential. The bounded copy command uses this retained
+progress inspection.
 
 ### Transactional Email publication
 
@@ -520,7 +522,7 @@ removal dependencies remain. Repeating the same source graph can remove folders
 whose references have since cleared and then finish the checkpoint; repeating
 an already applied graph emits no local change. Metadata-only observation
 changes do not advance the Email cursor. The copy scheduler, retention, history
-reset, read-only service and completeness qualification remain subsequent work.
+reset and completeness qualification remain subsequent work.
 
 ### Bounded copy steps
 
@@ -690,9 +692,10 @@ entire disallowed batch after bounded request parsing and before opening a
 storage view or invoking mutations. Passive dispatch reports no mailbox write
 rights. HTTPS refuses authenticated uploads before reserving a body slot, and
 the PostgreSQL upload adapter independently refuses them before ingress.
-These guards do not qualify a database or activate a listener. Ordinary runtime
-qualification still refuses a replica-bound store; a separately qualified local
-read profile and installer remain required. Existing primary Sessions retain
+These guards alone do not qualify a database or activate a listener. Ordinary
+runtime qualification still refuses a replica-bound store; the explicit local
+read service below uses separate qualification. Installer provisioning remains
+required. Existing primary Sessions retain
 their writable behavior. Client policy remains advisory; server refusal owns
 the authorization boundary.
 
@@ -705,7 +708,8 @@ refuses an unbound primary, owner or ordinary writable runtime login. The
 ordinary Runtime mode continues to refuse bound replicas. Outbound validation
 workers refuse ReplicaRead before connecting. Retained reads use
 the same migration lock, finite session lifetime, epoch checks and retirement
-rules as primary reads. This mode is not yet selected by `serve` or an installer.
+rules as primary reads. The explicit `serve --read-only` entry selects this mode; installer
+provisioning remains subsequent work.
 
 The reader has SELECT on the existing tables, INSERT-only on leases,
 UPDATE(singleton)-only on config_selection, UPDATE(id)-only on accounts, and
@@ -716,3 +720,27 @@ policy enforce mail immutability. All other writes, grant options, ownership,
 role memberships and elevated role attributes refuse qualification, including
 writes to replica progress and receipts. Schema ownership, replication
 publication, local credential provisioning and mail serving use distinct roles.
+
+## Loopback read service
+
+A provisioned replica can run `td-mta serve --read-only --connection-file
+READER_FILE --profile NAME --runtime PRIVATE_RUNTIME --scratch PRIVATE_SCRATCH`.
+The reader login must have exactly the restricted grants above. The selected
+profile must have only the JMAP role, with loopback HTTPS listeners and local
+file-mode certificates. SMTP, relay, HTTP-01 and ACME profiles refuse before
+listener startup. Omitting `--read-only` retains ordinary primary qualification
+and refuses this database. A writable publisher login cannot stand in for the
+reader login.
+
+Prepared account bindings retain their database mode, so authentication,
+metadata reads, renewed method snapshots and body downloads all qualify as
+replica reads. Local device credentials and selected configuration remain
+owner-provisioned; source passwords and device registries are not copied.
+The Session advertises read-only access, uploads and mutation batches refuse,
+and reading leaves flags unchanged. Database application logging retains its
+normal bounded retention and suppression under the restricted reader role.
+
+This low-level service entry does not provision PostgreSQL, certificates,
+configuration, local credentials or a synchronization schedule. Installer and
+continuous-copy integration remain required for the supported local setup.
+It reports no full-copy or disaster-recovery qualification.

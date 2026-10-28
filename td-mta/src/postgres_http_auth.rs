@@ -24,6 +24,7 @@ pub struct Authentication<'a> {
     executable: &'a Path,
     accounts: &'a [(&'a str, &'a Binding)],
     clock: &'a RuntimeClock,
+    mode: Mode,
     state: Mutex<State>,
 }
 struct State {
@@ -37,6 +38,7 @@ impl<'a> Authentication<'a> {
         accounts: &'a [(&'a str, &'a Binding)],
         clock: &'a RuntimeClock,
     ) -> Result<Self, Error> {
+        let mode = accounts.first().ok_or(Error::Invalid)?.1.runtime_mode();
         if !executable.is_absolute()
             || accounts.is_empty()
             || accounts.len() > crate::config::identities::MAX_ACCOUNTS
@@ -49,6 +51,7 @@ impl<'a> Authentication<'a> {
                         || !username
                             .bytes()
                             .all(|byte| (33..=126).contains(&byte) && byte != b':')
+                        || binding.runtime_mode() != mode
                         || !binding.roles().jmap()
                         || loaded.bootstrap.profile() != binding.profile()
                         || accounts.iter().take(index).any(|(prior, other)| {
@@ -63,6 +66,7 @@ impl<'a> Authentication<'a> {
             executable,
             accounts,
             clock,
+            mode,
             state: Mutex::new(State {
                 owner: None,
                 session: None,
@@ -205,7 +209,7 @@ impl Authentication<'_> {
                 })?;
         for address in addresses {
             let mut request = self.loaded.bootstrap.request(address);
-            request.mode = Mode::Runtime;
+            request.mode = self.mode;
             let result = AuthenticationSession::open(&request, &self.loaded.trust, deadline);
             if Instant::now() >= deadline {
                 return Err(Error::Deadline);

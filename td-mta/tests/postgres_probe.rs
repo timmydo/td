@@ -41,6 +41,8 @@ mod replica_operator;
 mod replica_publish;
 #[path = "postgres_probe/replica_seed.rs"]
 mod replica_seed;
+#[path = "postgres_probe/replica_serving.rs"]
+mod replica_serving;
 #[path = "postgres_probe/replica_source_mode.rs"]
 mod replica_source_mode;
 #[path = "postgres_probe/replication_inventory.rs"]

@@ -65,7 +65,7 @@ pub fn append(
     profile: &str,
     events: &[Event],
 ) -> Result<Written, Error> {
-    if request.mode != Mode::Runtime || !profile_valid(profile) || events.len() > BATCH {
+    if request.mode == Mode::Preparation || !profile_valid(profile) || events.len() > BATCH {
         return Err(Error::Invalid);
     }
     let mut records = Vec::with_capacity(events.len());
@@ -261,11 +261,31 @@ pub fn append_resolved(
     profile: &str,
     events: &[Event],
 ) -> Result<Written, Error> {
+    append_resolved_mode(
+        loaded,
+        executable,
+        deadline,
+        epoch,
+        profile,
+        events,
+        Mode::Runtime,
+    )
+}
+
+pub(crate) fn append_resolved_mode(
+    loaded: &crate::postgres_input::Loaded,
+    executable: &std::path::Path,
+    deadline: Instant,
+    epoch: StoreEpoch,
+    profile: &str,
+    events: &[Event],
+    mode: Mode,
+) -> Result<Written, Error> {
     let addresses = crate::postgres_resolver::resolve(executable, &loaded.bootstrap, deadline)
         .map_err(|_| Error::Resolution)?;
     for address in addresses {
         let mut request = loaded.bootstrap.request(address);
-        request.mode = Mode::Runtime;
+        request.mode = mode;
         match append(&request, &loaded.trust, deadline, epoch, profile, events) {
             Err(Error::Connect(postgres_probe::Error::Transport)) => continue,
             result => return result,
