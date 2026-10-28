@@ -307,3 +307,5 @@ pub mod migration;
 pub mod postgres_replica_accounts;
 pub mod replica_pending;
 pub mod replica_seed;
+
+pub mod postgres_replica_progress;

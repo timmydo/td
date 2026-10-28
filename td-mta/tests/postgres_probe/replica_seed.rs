@@ -141,6 +141,133 @@ pub(super) fn exercise() {
         "DROP TRIGGER reject_replica_page ON td_mta.replica_pending",
     );
     publish().unwrap();
+    let progress = td_mta::postgres_replica_progress::inspect(
+        &owner,
+        &trust,
+        deadline(),
+        local,
+        seed.account(),
+    )
+    .unwrap();
+    assert_eq!(progress.seed_digest, seed.digest());
+    assert_eq!(progress.email_cursor.sequence.number(), 5);
+    assert_eq!(progress.mailbox_checkpoint.sequence.number(), 6);
+    assert!(!progress.inventory_complete);
+    assert_eq!(progress.pending.unwrap().unfinished().count(), 2);
+    sql(
+        &fixture,
+        "UPDATE td_mta.replica_pending SET done=set_byte(done,0,1)",
+    );
+    let progress = td_mta::postgres_replica_progress::inspect(
+        &owner,
+        &trust,
+        deadline(),
+        local,
+        seed.account(),
+    )
+    .unwrap();
+    assert_eq!(
+        progress.pending.unwrap().unfinished().collect::<Vec<_>>(),
+        vec![EmailId::from_bytes([1; 16])]
+    );
+    sql(
+        &fixture,
+        "UPDATE td_mta.replica_pending SET done=set_byte(done,0,4)",
+    );
+    assert!(matches!(
+        td_mta::postgres_replica_progress::inspect(
+            &owner,
+            &trust,
+            deadline(),
+            local,
+            seed.account()
+        ),
+        Err(td_mta::postgres_replica_progress::Error::Integrity)
+    ));
+    sql(
+        &fixture,
+        "UPDATE td_mta.replica_pending SET done=set_byte(done,0,0)",
+    );
+    let inspect = || {
+        td_mta::postgres_replica_progress::inspect(
+            &owner,
+            &trust,
+            deadline(),
+            local,
+            seed.account(),
+        )
+    };
+    sql(
+        &fixture,
+        "UPDATE td_mta.replica_pending SET observed=decode('0000000000000006','hex')",
+    );
+    assert!(matches!(
+        inspect(),
+        Err(td_mta::postgres_replica_progress::Error::Integrity)
+    ));
+    sql(
+        &fixture,
+        "UPDATE td_mta.replica_pending SET observed=decode('0000000000000005','hex')",
+    );
+    sql(
+        &fixture,
+        "UPDATE td_mta.replica_pending SET generation=decode('0000000000000002','hex')",
+    );
+    assert!(matches!(
+        inspect(),
+        Err(td_mta::postgres_replica_progress::Error::Integrity)
+    ));
+    sql(&fixture,"UPDATE td_mta.replica_pending SET generation=decode('0000000000000001','hex'),ids=decode(repeat('00',32),'hex')");
+    assert!(matches!(
+        inspect(),
+        Err(td_mta::postgres_replica_progress::Error::Integrity)
+    ));
+    sql(
+        &fixture,
+        "UPDATE td_mta.replica_pending SET ids=decode(repeat('00',16)||repeat('01',16),'hex')",
+    );
+    inspect().unwrap();
+    let initial_next = sql(&fixture, "SELECT next_cursor FROM td_mta.replica_pending");
+    sql(&fixture, &format!("UPDATE td_mta.replica_progress SET inventory_cursor='{initial_next}'; UPDATE td_mta.replica_pending SET page=decode('0000000000000002','hex'),observed=decode('0000000000000007','hex'),ids=decode(repeat('02',16)||repeat('03',16),'hex'),next_cursor=NULL"));
+    let later = inspect().unwrap();
+    assert_eq!(
+        later.pending.unwrap().unfinished().collect::<Vec<_>>(),
+        vec![EmailId::from_bytes([2; 16]), EmailId::from_bytes([3; 16])]
+    );
+    sql(&fixture, "UPDATE td_mta.replica_progress SET inventory_complete=true; UPDATE td_mta.replica_pending SET kind=2,observed=decode('0000000000000009','hex'),next_state=decode('0000000000000009','hex'),more=true,done=set_byte(done,0,1)");
+    let changes = inspect().unwrap();
+    let pending = changes.pending.unwrap();
+    assert_eq!(
+        pending.unfinished().collect::<Vec<_>>(),
+        vec![EmailId::from_bytes([3; 16])]
+    );
+    assert!(
+        matches!(pending.advance(), td_mta::replica_pending::Advance::Changes { state, more:true } if state.sequence.number()==9)
+    );
+    assert_eq!(changes.email_cursor.sequence.number(), 5);
+    sql(&fixture, &format!("UPDATE td_mta.replica_progress SET inventory_cursor=NULL,inventory_complete=false; UPDATE td_mta.replica_pending SET page=decode('0000000000000001','hex'),kind=1,observed=decode('0000000000000005','hex'),ids=decode(repeat('00',16)||repeat('01',16),'hex'),done=set_byte(done,0,0),next_cursor='{initial_next}',next_state=NULL,more=false"));
+
+    assert!(matches!(
+        td_mta::postgres_replica_progress::inspect(
+            &owner,
+            &trust,
+            deadline(),
+            local,
+            AccountId::from_bytes([8; 16])
+        ),
+        Err(td_mta::postgres_replica_progress::Error::Missing)
+    ));
+    assert!(matches!(
+        td_mta::postgres_replica_progress::inspect(
+            &owner,
+            &trust,
+            deadline(),
+            StoreEpoch::from_bytes([8; 16]),
+            seed.account()
+        ),
+        Err(td_mta::postgres_replica_progress::Error::Epoch)
+    ));
+
     assert_eq!(sql(&fixture,"SELECT encode(id,'hex'),encode(sequence,'hex'),encode(floor,'hex') FROM td_mta.accounts"),format!("{}|0000000000000001|0000000000000000","02".repeat(16)));
     assert_eq!(sql(&fixture,"SELECT encode(id,'hex'),name,COALESCE(encode(parent_id,'hex'),'none'),COALESCE(role,'none'),sort_order,subscribed FROM td_mta.mailboxes ORDER BY id"),format!("{}|Child archive|{}|none|87|0\n{}|Source inbox name|none|inbox|19|1","03".repeat(16),"09".repeat(16),"09".repeat(16)));
     assert_eq!(

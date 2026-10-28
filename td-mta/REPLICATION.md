@@ -358,6 +358,23 @@ remain subsequent work. Limits reserve no bodies and cannot authorize an
 unbounded writer. Exhaustion must pause a future publisher without skipping mail.
 This increment does not make a replica usable or certify copy completeness.
 
+### Reloading persisted work
+
+The owner progress reader takes one repeatable-read snapshot of the source
+binding, account limits and receipt, source cursors, generation, phase and exact
+pending page. It validates source/local epoch separation, scoped inventory
+continuation, quota counters and page identity before reconstructing unfinished
+IDs. Duplicate or unsorted stored IDs, mismatched generations, malformed state
+or bitmap padding refuse. No missing pending page may silently complete an
+unfinished inventory. Completion bits reflect only the stored snapshot.
+
+This library read does not contact the source, mutate progress, acquire a writer
+lease or certify a current copy. Its Email cursor remains a replay anchor during
+initial inventory. The worker must revalidate its generation/page against locked
+current rows when publishing; a historical inspection is not permission to write.
+No per-message synchronizer uses this cold owner connection. The bounded runtime
+publisher and copy command remain subsequent work.
+
 ### Remaining synchronization work
 
 Qualify the existing JMAP Email/Mailbox get and changes surfaces and raw
