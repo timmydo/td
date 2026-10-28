@@ -53,14 +53,7 @@ pub(super) fn run(args: impl Iterator<Item = OsString>, status: bool) -> io::Res
         return Ok(ExitCode::from(2));
     };
     let result = (|| {
-        let file = FileState::open(
-            &options.state,
-            if status {
-                Duration::from_secs(15)
-            } else {
-                Duration::ZERO
-            },
-        )?;
+        let file = FileState::open(&options.state, Duration::from_secs(15))?;
         let mut state = file.load(options.epoch)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

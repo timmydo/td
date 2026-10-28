@@ -7388,8 +7388,10 @@ Completed failure counts remain visible throughout the next cycle and clear
 only after a complete clean cycle. Failures return nonzero and structured
 JSON to the supervisor; progress also has structured JSON. The status command
 `postgres blob-scrub-status --state-dir PATH --epoch HEX` needs no database
-credentials. It waits at most fifteen seconds for an overlapping bounded page
-to release the state lock. It fails on known corruption, the last operational failure,
+credentials. Both commands wait at most fifteen seconds for an overlapping
+invocation to release the state lock. This also lets a scheduled page tolerate
+the short status writer when both timers fire together; an owner that keeps
+the lock beyond that bound still causes a nonzero failure. It fails on known corruption, the last operational failure,
 missing completion, completion older than 172,800 seconds or backward wall
 clock observations. Every invocation, including status and waiting, persists
 the latest observed second before reporting freshness; a lower observation

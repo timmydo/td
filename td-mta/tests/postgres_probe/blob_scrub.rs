@@ -182,7 +182,13 @@ pub(super) fn real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance
                 "1",
             ]);
         }
-        let output = super::command_output(&args, fixture.root.path(), exit);
+        // A held operational lock deliberately consumes its 15-second wait.
+        let output = super::command_output_with_timeout(
+            &args,
+            fixture.root.path(),
+            exit,
+            std::time::Duration::from_secs(45),
+        );
         assert!(!output.contains(std::str::from_utf8(super::PASSWORD).unwrap()));
         td_json::parse(&output).unwrap()
     };
