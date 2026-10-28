@@ -34,6 +34,14 @@ pub(super) fn exercise() {
         replica::initialize(&runtime, &trust, deadline(), epoch, &source),
         Err(Error::Owner)
     );
+    sql(&fixture, "CREATE ROLE mail_reader LOGIN PASSWORD 'disposable-postgres-fixture-password'; GRANT USAGE ON SCHEMA td_mta TO mail_reader; GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO mail_reader; GRANT UPDATE(singleton) ON td_mta.config_selection TO mail_reader; GRANT UPDATE(id) ON td_mta.accounts TO mail_reader; GRANT INSERT ON td_mta.leases TO mail_reader; GRANT INSERT,UPDATE,DELETE ON td_mta.application_logs,td_mta.application_log_state TO mail_reader");
+    let mut reader = fixture.request();
+    reader.user = "mail_reader";
+    reader.mode = Mode::ReplicaRead;
+    assert_eq!(
+        postgres_probe::probe(&reader, &trust, deadline()),
+        Err(postgres_probe::Error::RuntimeReplica)
+    );
     let same_epoch = Source::new(source.origin(), epoch).unwrap();
     assert_eq!(
         replica::initialize(&owner, &trust, deadline(), epoch, &same_epoch),
@@ -111,6 +119,63 @@ pub(super) fn exercise() {
         receipt
     );
     assert_eq!(sql(&fixture, "SELECT has_table_privilege('mail_runtime','td_mta.replica_source','SELECT'),has_any_column_privilege('mail_runtime','td_mta.replica_source','INSERT,UPDATE'),has_table_privilege('mail_runtime','td_mta.replica_source','DELETE')"), "t|f|f");
+    assert!(postgres_probe::probe(&reader, &trust, deadline()).is_ok());
+    assert_eq!(
+        schema::inspect(&reader, &trust, deadline()).unwrap(),
+        receipt
+    );
+    // A reader login cannot substitute for a primary runtime, nor vice versa.
+    reader.mode = Mode::Runtime;
+    assert_eq!(
+        postgres_probe::probe(&reader, &trust, deadline()),
+        Err(postgres_probe::Error::RuntimePrivileges)
+    );
+    reader.mode = Mode::ReplicaRead;
+    runtime.mode = Mode::ReplicaRead;
+    assert_eq!(
+        postgres_probe::probe(&runtime, &trust, deadline()),
+        Err(postgres_probe::Error::RuntimePrivileges)
+    );
+    runtime.mode = Mode::Runtime;
+    for table in ["emails", "blob_chunks", "replica_progress", "submissions"] {
+        sql(
+            &fixture,
+            &format!("GRANT UPDATE ON td_mta.{table} TO mail_reader"),
+        );
+        assert_eq!(
+            postgres_probe::probe(&reader, &trust, deadline()),
+            Err(postgres_probe::Error::RuntimePrivileges)
+        );
+        sql(
+            &fixture,
+            &format!("REVOKE UPDATE ON td_mta.{table} FROM mail_reader"),
+        );
+    }
+    sql(
+        &fixture,
+        "GRANT UPDATE(sequence) ON td_mta.accounts TO mail_reader",
+    );
+    assert_eq!(
+        postgres_probe::probe(&reader, &trust, deadline()),
+        Err(postgres_probe::Error::RuntimePrivileges)
+    );
+    sql(&fixture, "REVOKE UPDATE(sequence) ON td_mta.accounts FROM mail_reader; UPDATE td_mta.runtime_barrier SET blocked=true");
+    assert_eq!(
+        postgres_probe::probe(&reader, &trust, deadline()),
+        Err(postgres_probe::Error::RuntimeMaintenance)
+    );
+    sql(&fixture, "UPDATE td_mta.runtime_barrier SET blocked=false");
+    assert!(postgres_probe::probe(&reader, &trust, deadline()).is_ok());
+    sql(&fixture, "UPDATE td_mta.replica_source SET source_epoch=(SELECT store_epoch FROM td_mta.schema_migrations ORDER BY version LIMIT 1)");
+    assert_eq!(
+        postgres_probe::probe(&reader, &trust, deadline()),
+        Err(postgres_probe::Error::RuntimeReplica)
+    );
+    sql(
+        &fixture,
+        "UPDATE td_mta.replica_source SET source_epoch=decode(repeat('07',16),'hex')",
+    );
+    assert!(postgres_probe::probe(&reader, &trust, deadline()).is_ok());
     executable_refuses_service(&fixture, epoch);
     // Corrupt spelling is not normalized into a successful persisted identity.
     sql(

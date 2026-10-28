@@ -2,10 +2,11 @@
 
 ## Status and scope
 
-The source inventory and metadata API is implemented. The local synchronizer,
-read-only service and recovery procedure remain design direction, not available
-commands or recovery claims. Search and td-mail qualification precede the local
-synchronization and read service described here. PostgreSQL remains the
+The source inventory/metadata API and bounded local copy commands are
+implemented. Continuous synchronization, the local read-only service and
+recovery qualification remain subsequent work, not available service or
+recovery claims. The client honors read-only discovery; full local service
+qualification remains required. PostgreSQL remains the
 only backend. Synchronization is application-level over authenticated HTTPS;
 it does not expose PostgreSQL or require replication credentials on clients.
 
@@ -694,3 +695,24 @@ qualification still refuses a replica-bound store; a separately qualified local
 read profile and installer remain required. Existing primary Sessions retain
 their writable behavior. Client policy remains advisory; server refusal owns
 the authorization boundary.
+
+## Restricted replica database readers
+
+`postgres_probe::Mode::ReplicaRead` qualifies a dedicated local reader login
+against a valid bound replica, distinct source/local epochs and the current
+schema/maintenance barrier. It
+refuses an unbound primary, owner or ordinary writable runtime login. The
+ordinary Runtime mode continues to refuse bound replicas. Outbound validation
+workers refuse ReplicaRead before connecting. Retained reads use
+the same migration lock, finite session lifetime, epoch checks and retirement
+rules as primary reads. This mode is not yet selected by `serve` or an installer.
+
+The reader has SELECT on the existing tables, INSERT-only on leases,
+UPDATE(singleton)-only on config_selection, UPDATE(id)-only on accounts, and
+INSERT/UPDATE/DELETE on application_logs and application_log_state. The two
+column grants permit PostgreSQL row locks in body reauthorization; they do not
+make arbitrary SQL a read-only sandbox. Closed typed runtime SQL and the HTTP
+policy enforce mail immutability. All other writes, grant options, ownership,
+role memberships and elevated role attributes refuse qualification, including
+writes to replica progress and receipts. Schema ownership, replication
+publication, local credential provisioning and mail serving use distinct roles.

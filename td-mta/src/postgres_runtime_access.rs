@@ -123,7 +123,16 @@ const PRIVILEGES: &str = "SELECT c.relname::text,
         ELSE false END,
     pg_catalog.has_table_privilege(c.oid,'INSERT')
         AND NOT pg_catalog.has_any_column_privilege(c.oid,'UPDATE')
+        AND NOT pg_catalog.has_table_privilege(c.oid,'DELETE'),
+    CASE WHEN c.relname='accounts' THEN
+        pg_catalog.has_column_privilege(c.oid,'id','UPDATE')
+        AND NOT pg_catalog.has_any_column_privilege(c.oid,'INSERT')
         AND NOT pg_catalog.has_table_privilege(c.oid,'DELETE')
+        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+            WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+            AND a.attname<>'id'
+            AND pg_catalog.has_column_privilege(c.oid,a.attnum,'UPDATE'))
+        ELSE false END
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
     WHERE n.nspname='td_mta' AND c.relkind IN ('r','p','v','m','f','S')
     ORDER BY c.relname LIMIT $1";
@@ -163,7 +172,7 @@ pub fn inspect(
 }
 
 pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
-    qualify_role(client, false).await?;
+    qualify_role(client, Authority::Primary).await?;
     if crate::postgres_replica_source::read(client)
         .await
         .map_err(|_| Error::Database)?
@@ -178,7 +187,7 @@ pub(crate) async fn qualify_replica(
     client: &Client,
     source: &crate::postgres_replica_source::Source,
 ) -> Result<(), Error> {
-    qualify_role(client, true).await?;
+    qualify_role(client, Authority::Publisher).await?;
     let actual = crate::postgres_replica_source::read(client)
         .await
         .map_err(|_| Error::Database)?
@@ -189,7 +198,29 @@ pub(crate) async fn qualify_replica(
     Ok(())
 }
 
-async fn qualify_role(client: &Client, replica: bool) -> Result<(), Error> {
+pub(crate) async fn qualify_replica_reader(
+    client: &Client,
+    epoch: crate::ids::StoreEpoch,
+) -> Result<(), Error> {
+    qualify_role(client, Authority::Reader).await?;
+    let source = crate::postgres_replica_source::read(client)
+        .await
+        .map_err(|_| Error::Database)?
+        .ok_or(Error::Replica)?;
+    if source.epoch() == epoch {
+        return Err(Error::Replica);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Authority {
+    Primary,
+    Publisher,
+    Reader,
+}
+
+async fn qualify_role(client: &Client, authority: Authority) -> Result<(), Error> {
     let row = client
         .query_typed_one(ROLE, &[])
         .await
@@ -219,7 +250,7 @@ async fn qualify_role(client: &Client, replica: bool) -> Result<(), Error> {
         let allowed = match access {
             Access::Read => !value(4)?,
             Access::Replica => {
-                if replica {
+                if authority == Authority::Publisher {
                     value(3)?
                 } else {
                     !value(4)?
@@ -227,6 +258,11 @@ async fn qualify_role(client: &Client, replica: bool) -> Result<(), Error> {
             }
             Access::Insert => value(7)?,
             Access::Selection => value(6)?,
+            Access::Mail if authority == Authority::Reader => match name {
+                "accounts" => value(8)?,
+                "application_log_state" | "application_logs" => value(3)?,
+                _ => !value(4)?,
+            },
             Access::Mail => value(3)?,
         };
         if !allowed {

@@ -42,6 +42,8 @@ pub struct Request<'a> {
 pub enum Mode {
     Preparation,
     Runtime,
+    /// Restricted local mail reader; never ordinary primary or publisher access.
+    ReplicaRead,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -505,6 +507,9 @@ pub(crate) fn validation_worker(
     deadline: Instant,
     budget: Option<ValidationBudget>,
 ) -> Result<Worker, Error> {
+    if request.mode == Mode::ReplicaRead {
+        return Err(Error::Invalid);
+    }
     let (output, input) = match budget {
         Some(budget) => (budget.output(), Input::validation_checks(budget)),
         None => (64 * 1024, Input::mutations()),
@@ -544,13 +549,14 @@ fn connect_worker_with_schema(
 ) -> Result<(Worker, Option<crate::postgres_schema::Receipt>), Error> {
     let mut worker =
         connect_authenticated_bounded(request, trust, deadline, output_limit, input, maximum)?;
-    let runtime_schema = if request.mode == Mode::Runtime {
+    let mode = request.mode;
+    let runtime_schema = if mode != Mode::Preparation {
         Some(worker.run(|client| {
             Box::pin(async move {
                 let receipt = crate::postgres_schema::lock_and_inspect(client)
                     .await
                     .map_err(|_| Error::RuntimeSchema)?;
-                qualify_runtime(client).await?;
+                qualify_runtime_mode(client, mode, Some(receipt.store_epoch)).await?;
                 Ok(receipt)
             })
         })??)
@@ -561,15 +567,32 @@ fn connect_worker_with_schema(
 }
 
 pub(crate) async fn qualify_runtime(client: &tokio_postgres::Client) -> Result<(), Error> {
+    qualify_runtime_mode(client, Mode::Runtime, None).await
+}
+
+pub(crate) async fn qualify_runtime_mode(
+    client: &tokio_postgres::Client,
+    mode: Mode,
+    epoch: Option<crate::ids::StoreEpoch>,
+) -> Result<(), Error> {
     let mut timing = crate::performance::Timer::start(crate::performance::Phase::DbRuntime);
-    let result = crate::postgres_runtime_access::qualify(client)
-        .await
-        .map_err(|error| match error {
-            crate::postgres_runtime_access::Error::Role => Error::RuntimeRole,
-            crate::postgres_runtime_access::Error::Maintenance => Error::RuntimeMaintenance,
-            crate::postgres_runtime_access::Error::Replica => Error::RuntimeReplica,
-            _ => Error::RuntimePrivileges,
-        });
+    let result = match mode {
+        Mode::Runtime => crate::postgres_runtime_access::qualify(client).await,
+        Mode::ReplicaRead => {
+            crate::postgres_runtime_access::qualify_replica_reader(
+                client,
+                epoch.ok_or(Error::Invalid)?,
+            )
+            .await
+        }
+        Mode::Preparation => return Err(Error::Invalid),
+    }
+    .map_err(|error| match error {
+        crate::postgres_runtime_access::Error::Role => Error::RuntimeRole,
+        crate::postgres_runtime_access::Error::Maintenance => Error::RuntimeMaintenance,
+        crate::postgres_runtime_access::Error::Replica => Error::RuntimeReplica,
+        _ => Error::RuntimePrivileges,
+    });
     if result.is_ok() {
         timing.succeeded();
     }
@@ -670,7 +693,7 @@ fn connect_authenticated_until(
         .ssl_mode(SslMode::Require)
         .ssl_negotiation(SslNegotiation::Postgres)
         .channel_binding(ChannelBinding::Disable);
-    let input = if request.mode == Mode::Runtime {
+    let input = if request.mode != Mode::Preparation {
         input.runtime()
     } else {
         input
@@ -1336,6 +1359,28 @@ mod tests {
         assert!(io.transport.aborted);
         assert!(window.finish().is_err());
         assert!(window.begin().is_err());
+    }
+
+    #[test]
+    fn replica_reader_cannot_open_outbound_validation_worker() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let request = Request {
+            address: listener.local_addr().unwrap(),
+            server_name: "localhost",
+            mode: Mode::ReplicaRead,
+            user: "reader",
+            database: "probe",
+            password: b"fixture",
+        };
+        let trust = TrustStore::public_roots().unwrap();
+        assert!(matches!(
+            validation_worker(&request, &trust, Instant::now() + MAX_DURATION, None),
+            Err(Error::Invalid)
+        ));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
     }
 
     #[test]

@@ -93,7 +93,7 @@ impl ReadSession {
         deadline: Instant,
         body: bool,
     ) -> Result<Self, Error> {
-        if request.mode != Mode::Runtime || super::remaining(deadline)? > MAX_DURATION {
+        if request.mode == Mode::Preparation || super::remaining(deadline)? > MAX_DURATION {
             return Err(Error::Invalid);
         }
         let mut bounds = Bounds::new(Instant::now())?;
@@ -118,12 +118,13 @@ impl ReadSession {
             LIFETIME,
         )?;
         worker.deadline = deadline;
+        let mode = request.mode;
         let schema = worker.run(|client| {
             Box::pin(async move {
                 let receipt = postgres_schema::lock_and_inspect(client)
                     .await
                     .map_err(|_| Error::RuntimeSchema)?;
-                super::qualify_runtime(client).await?;
+                super::qualify_runtime_mode(client, mode, Some(receipt.store_epoch)).await?;
                 Ok(receipt)
             })
         })??;
