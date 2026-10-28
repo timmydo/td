@@ -130,6 +130,33 @@ URL and verify both size and digest before publication. A missing body after
 metadata was fetched requires fresh reconciliation, never silent omission.
 No source transaction remains open across API calls.
 
+### Passive source-response validation
+
+The client decoder validates complete bounded source responses before they can
+be offered to a future local publisher. It does not open HTTPS connections,
+create accounts, write mail, or advance durable checkpoints. Source identity
+values are checked against an explicit account/epoch binding; verified HTTPS
+origin and credential handling remain the transport caller's responsibility.
+
+Inventory responses must preserve scope, starting state and continuation
+bounds, contain strictly increasing unique IDs, and return a next cursor that
+matches the last ID and requested page size. The first page's observed state
+must equal its base. A completed page alone still grants no deletion authority.
+
+Metadata responses must exactly partition the unique requested IDs between
+list and notFound. Unknown or duplicate fields/IDs, unexpected rows, omitted
+coverage, noncanonical digests and inconsistent exact/formatted timestamps
+refuse. Mailbox and keyword sets are bounded and validated; duplicate values refuse
+rather than being silently dropped. The caller chooses body and value bounds,
+within 64 MiB per body and 4096 values of each kind per Email; resource refusal
+must pause copying rather than skip data. Parsed keywords borrow the bounded
+response storage, and sorted set validation avoids quadratic large-set scans.
+
+Single-call response matching checks method and invocation ID before decoding.
+cannotCalculateChanges is a reset outcome; malformed and other remote failures
+are distinct errors, never successful empty lists. Raw bodies still require
+separate complete length/digest verification before publication.
+
 ### Remaining synchronization work
 
 Qualify the existing JMAP Email/Mailbox get and changes surfaces and raw

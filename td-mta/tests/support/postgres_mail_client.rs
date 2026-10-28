@@ -1558,7 +1558,21 @@ fn exercise_replica_source(
         Some("TdReplica/inventory"),
         "{inventory}"
     );
-    let page = &inventory["methodResponses"][0][1];
+    let page = td_mta::replica_source::reply(&inventory, "TdReplica/inventory", "replica").unwrap();
+    let source_binding = td_mta::replica_source::Binding {
+        account: backend.binding.account(),
+        epoch: backend.binding.epoch(),
+    };
+    let copied_inventory =
+        td_mta::replica_source::inventory(page, source_binding, None, 1).unwrap();
+    assert_eq!(copied_inventory.ids.len(), 1);
+    assert_eq!(
+        copied_inventory.ids.first(),
+        td_mta::wire::Id::parse(&email)
+            .unwrap()
+            .local::<td_mta::ids::EmailId>()
+            .as_ref()
+    );
     assert_eq!(page["ids"], json!([email]));
     assert_eq!(page["nextCursor"], Json::Null);
     let base = td_mta::sync::DataState::decode(page["baseState"].as_str().unwrap()).unwrap();
@@ -1575,7 +1589,30 @@ fn exercise_replica_source(
         Some("TdReplica/metadata"),
         "{metadata}"
     );
-    let result = &metadata["methodResponses"][0][1];
+    let result = td_mta::replica_source::reply(&metadata, "TdReplica/metadata", "replica").unwrap();
+    let requested = [
+        td_mta::wire::Id::parse(&email)
+            .unwrap()
+            .local::<td_mta::ids::EmailId>()
+            .unwrap(),
+        td_mta::wire::Id::parse(&absent)
+            .unwrap()
+            .local::<td_mta::ids::EmailId>()
+            .unwrap(),
+    ];
+    let copied_metadata = td_mta::replica_source::metadata(
+        result,
+        source_binding,
+        &requested,
+        td_mta::replica_source::Bounds {
+            body_bytes: 4096,
+            values_per_email: 256,
+        },
+    )
+    .unwrap();
+    assert_eq!(copied_metadata.emails.len(), 1);
+    assert_eq!(copied_metadata.missing, vec![requested[1]]);
+    assert_eq!(copied_metadata.observed, copied_inventory.observed);
     assert_eq!(result["sourceId"], page["sourceId"]);
     assert_eq!(result["state"], page["state"]);
     assert_eq!(result["notFound"], json!([absent]));

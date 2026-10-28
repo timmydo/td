@@ -184,6 +184,7 @@ pub mod preview_json;
 pub mod property_selection;
 pub mod recipient_sweep;
 pub mod reference_sweep;
+pub mod replica_source;
 pub mod root_headers;
 pub mod row_references;
 pub mod smtp_network;
