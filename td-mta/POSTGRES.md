@@ -2115,6 +2115,8 @@ REVOKE INSERT, UPDATE, DELETE ON
     td_mta.config_material_chunks, td_mta.config_versions,
     td_mta.config_version_chunks, td_mta.config_selection,
     td_mta.config_selection_receipts, td_mta.account_bootstraps, td_mta.replica_source,
+    td_mta.replica_accounts, td_mta.replica_progress, td_mta.replica_pending,
+    td_mta.replica_mailbox_receipts,
     td_mta.leases, td_mta.imports FROM td_mta_runtime;
 GRANT UPDATE (singleton) ON td_mta.config_selection TO td_mta_runtime;
 GRANT INSERT ON td_mta.leases TO td_mta_runtime;
@@ -7511,3 +7513,33 @@ future local-copy contract. This foundation does not provide a synchronizer,
 read-only service, promotion or recovery qualification. Core mail tables and
 source/local JMAP state separation remain unchanged. A schema-35 binary cannot
 serve schema 36; use the documented fenced upgrade and consistent backup.
+
+
+## Replica account initialization
+
+Schema 37 adds `replica_accounts`, `replica_progress`, `replica_pending` and
+`replica_mailbox_receipts`. The owner-only account row binds its source and
+immutable seed digest and records explicit body-byte, blob, Email and receipt
+limits. Progress holds independent source Email replay and Mailbox state,
+inventory phase and counters. Pending work is bounded to one page per account,
+with at most 16384 ID bytes and a 128-byte completion bitmap. Mailbox receipts
+initially cover at most 256 folders. All four tables revoke PUBLIC access and
+ordinary runtime grants allow SELECT only; no replica runtime writer exists yet.
+
+The initializer takes the shared migration lock, checks local epoch, schema
+owner and the exact persisted source, and publishes one source account in a
+synchronous transaction. The core account insertion serializes concurrent
+initializations. A matching existing seed receipt returns without changing any
+later state; conflicts refuse. Batch typed SQL preserves mailbox IDs, parent
+relationships, roles, order and subscriptions, emits local Created history,
+records the source Inbox and zero usage, and persists the initial work page in
+the same commit. A failure before COMMIT leaves no partially created account;
+uncertain COMMIT remains explicit and may be settled using the retained seed.
+The owner connection has the existing reconciliation window: 2 MiB output,
+4 MiB input, 2048 frames and a finite ten-second cold operation deadline.
+
+[REPLICATION.md](REPLICATION.md) defines the page and checkpoint semantics.
+This increment publishes no Email bodies and adds no serving mode or copy CLI.
+Source credentials and transport authentication remain outside passive seed
+preparation. A schema-36 binary cannot serve schema 37; retain a consistent
+backup and follow the fenced upgrade procedure.

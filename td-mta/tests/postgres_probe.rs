@@ -31,6 +31,8 @@ fn migration_archive_cli_preserves_and_verifies_snapshots() {
 #[path = "support/postgres_mail_client.rs"]
 mod mail_client;
 
+#[path = "postgres_probe/replica_seed.rs"]
+mod replica_seed;
 #[path = "postgres_probe/replica_source_mode.rs"]
 mod replica_source_mode;
 #[path = "postgres_probe/replication_inventory.rs"]
@@ -345,7 +347,7 @@ fn create_runtime_login(fixture: &Fixture) {
 }
 
 fn grant_runtime_mail(fixture: &Fixture) {
-    sql(fixture, "GRANT INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA td_mta TO mail_runtime; REVOKE INSERT,UPDATE,DELETE ON td_mta.schema_migrations,td_mta.runtime_barrier,td_mta.config_materials,td_mta.config_material_chunks,td_mta.config_versions,td_mta.config_version_chunks,td_mta.config_selection,td_mta.config_selection_receipts,td_mta.account_bootstraps,td_mta.leases,td_mta.imports,td_mta.replica_source FROM mail_runtime; GRANT UPDATE(singleton) ON td_mta.config_selection TO mail_runtime; GRANT INSERT ON td_mta.leases TO mail_runtime");
+    sql(fixture, "GRANT INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA td_mta TO mail_runtime; REVOKE INSERT,UPDATE,DELETE ON td_mta.schema_migrations,td_mta.runtime_barrier,td_mta.config_materials,td_mta.config_material_chunks,td_mta.config_versions,td_mta.config_version_chunks,td_mta.config_selection,td_mta.config_selection_receipts,td_mta.account_bootstraps,td_mta.leases,td_mta.imports,td_mta.replica_source,td_mta.replica_accounts,td_mta.replica_progress,td_mta.replica_pending,td_mta.replica_mailbox_receipts FROM mail_runtime; GRANT UPDATE(singleton) ON td_mta.config_selection TO mail_runtime; GRANT INSERT ON td_mta.leases TO mail_runtime");
 }
 
 fn hold_schema_lock(fixture: &Fixture, shared: bool) -> ProbeChild {
@@ -409,7 +411,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 36);
+    assert_eq!(receipt.version, 37);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -622,7 +624,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":36"));
+    assert!(initialized.contains("\"schema_version\":37"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -867,7 +869,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=36",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=37",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -875,7 +877,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=36 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=37 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1057,7 +1059,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 36);
+    assert_eq!(receipt.version, 37);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1559,7 +1561,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "56");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "60");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1766,7 +1768,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
     for previous_version in [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27, 28, 31, 32, 33, 34, 35,
+        27, 28, 31, 32, 33, 34, 35, 36,
     ] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
@@ -1806,6 +1808,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_summaries.sql"),
             include_str!("../src/postgres_mime_evidence.sql"),
             include_str!("../src/postgres_search.sql"),
+            include_str!("../src/postgres_replica_source.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1860,6 +1863,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             33 => "blob_interpretations",
             34 => "blob_search",
             35 => "replica_source",
+            36 => "replica_accounts",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1917,7 +1921,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 36);
+        assert_eq!(receipt.version, 37);
         assert_eq!(
             sql(
                 &fixture,

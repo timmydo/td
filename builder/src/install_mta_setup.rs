@@ -737,7 +737,9 @@ REVOKE INSERT, UPDATE, DELETE ON
     td_mta.config_materials, td_mta.config_material_chunks,
     td_mta.config_versions, td_mta.config_version_chunks,
     td_mta.config_selection, td_mta.config_selection_receipts,
-    td_mta.account_bootstraps, td_mta.leases, td_mta.imports, td_mta.replica_source
+    td_mta.account_bootstraps, td_mta.leases, td_mta.imports, td_mta.replica_source,
+    td_mta.replica_accounts, td_mta.replica_progress, td_mta.replica_pending,
+    td_mta.replica_mailbox_receipts
     FROM td_mta_runtime;
 GRANT UPDATE (singleton) ON td_mta.config_selection TO td_mta_runtime;
 GRANT INSERT ON td_mta.leases TO td_mta_runtime;

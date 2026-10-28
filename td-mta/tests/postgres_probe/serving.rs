@@ -19,6 +19,7 @@ pub(super) fn exercise(
 ) {
     super::migration_archive::exercise();
     super::replica_source_mode::exercise();
+    super::replica_seed::exercise();
     let relay = super::serving_relay::Relay::new(fixture, relay, dns);
     let smtp_address = smtp.local_addr().unwrap();
     let https_address = https.local_addr().unwrap();

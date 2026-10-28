@@ -272,8 +272,7 @@ impl<'a> Reader<'a> {
             .map_err(|_| ReadError::Capacity)?;
         request_end(&mut out)?;
         let response = self.api(out.as_str().map_err(|_| ReadError::Invalid)?.as_bytes())?;
-        let page = MailboxPage { response, binding };
-        page.view()?;
+        let page = MailboxPage::decode(self.origin, binding, response)?;
         check_time(self.deadline)?;
         Ok(page)
     }
@@ -351,6 +350,9 @@ pub struct MetadataPage {
     bounds: Bounds,
 }
 impl MetadataPage {
+    pub fn source_origin(&self) -> &str {
+        &self.origin
+    }
     pub fn view(&self) -> Result<Metadata<'_>, ReadError> {
         let value = super::reply(&self.response, METADATA, CALL)?;
         Ok(super::metadata(
@@ -364,10 +366,31 @@ impl MetadataPage {
 
 /// A complete mailbox observation; it grants no Email deletion authority.
 pub struct MailboxPage {
+    origin: String,
     response: Json,
     binding: Binding,
 }
 impl MailboxPage {
+    /// Decode caller-owned, already bounded response storage. The origin is a
+    /// caller binding, not evidence that this function authenticated a peer.
+    pub fn decode(origin: &str, binding: Binding, response: Json) -> Result<Self, ReadError> {
+        Origin::parse(origin).map_err(|_| ReadError::Invalid)?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(origin.len())
+            .map_err(|_| ReadError::Capacity)?;
+        owned.push_str(origin);
+        let page = Self {
+            origin: owned,
+            response,
+            binding,
+        };
+        page.view()?;
+        Ok(page)
+    }
+    pub fn source_origin(&self) -> &str {
+        &self.origin
+    }
     pub fn view(&self) -> Result<super::Mailboxes<'_>, ReadError> {
         let value = super::reply(&self.response, "Mailbox/get", CALL)?;
         Ok(super::mailboxes(value, self.binding)?)

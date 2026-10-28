@@ -28,6 +28,7 @@ pub struct Binding {
     pub epoch: StoreEpoch,
 }
 pub struct Inventory {
+    pub(crate) previous: Option<ReplicaInventoryCursor>,
     pub base: DataState,
     pub observed: DataState,
     pub ids: Vec<EmailId>,
@@ -152,6 +153,7 @@ pub fn inventory(
         }
     };
     Ok(Inventory {
+        previous,
         base,
         observed,
         ids,

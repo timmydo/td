@@ -314,6 +314,50 @@ transactions. Mailbox updatedProperties must be null: this reader requests full
 metadata for changed objects, not a partial-property interpretation. A change
 page carries no body, local commit evidence or checkpoint advancement authority.
 
+### Local account initialization
+
+The owner-side library can prepare a replica account from a validated first
+inventory page and complete mailbox graph. This is not yet an operator copy
+command. The caller authenticates the source; passive response constructors
+validate supplied data but do not establish transport provenance. Preparation
+binds canonical source origin, epoch, account, initial Email state, independent
+Mailbox state, complete graph and explicit resource limits into an immutable,
+domain-separated digest. The decoder retains the requested inventory cursor; a continuation refuses
+initialization even when an idle source returns equal base and observed states.
+The mailbox observation must be at least as new as
+the first inventory. The source Inbox role is required; no folder is invented.
+
+Schema 37 stores owner-controlled replica account limits and the initialization
+receipt separately from mutable progress. All four new tables are SELECT-only
+for the ordinary runtime role in this increment. Account creation, preserved
+mailbox IDs and parent relationships, local change history, usage, source
+mailbox receipts and the exact first pending inventory page commit together.
+The local sequence starts at one; source sequences are never local JMAP states.
+No Email, credential or operational configuration is copied at initialization.
+
+A matching initialization retry returns success without overwriting later mail,
+mailboxes or progress. A different seed for an existing account refuses.
+Retain the same seed to resolve an uncertain COMMIT; fetching a new inventory
+is not an equivalent retry. The stored Email cursor initially names the change
+replay anchor, not a fully applied source checkpoint. Inventory remains explicitly
+incomplete even when the initial pending page has no IDs.
+
+A pending page retains its exact bounded IDs and completion bitmap before any
+Email effects. This includes the first page and the all-zero Email ID; restarting
+must not replace it with a new initial inventory and skip earlier work. Inventory
+pages hold at most 256 IDs; change pages at most 1024. Generation and page ordinal
+are positive and must match the publisher's locked current row. Passive page
+helpers reject stale observations, foreign scope, duplicate IDs and nonzero
+padding bits. Each effect's completion bit must commit with its local publication;
+only all completed effects permit advancement to the page's original continuation.
+A newer per-object observation never becomes the global change checkpoint.
+
+The account initializer persists only the first page. Loading it, publishing
+Email effects, advancing pages, bounded receipt retention and restart orchestration
+remain subsequent work. Limits reserve no bodies and cannot authorize an
+unbounded writer. Exhaustion must pause a future publisher without skipping mail.
+This increment does not make a replica usable or certify copy completeness.
+
 ### Remaining synchronization work
 
 Qualify the existing JMAP Email/Mailbox get and changes surfaces and raw
