@@ -1,9 +1,7 @@
 use super::*;
 use crate::{
     config::endpoint::HttpsUri,
-    operator_files::{Inputs, Role},
     outbound_http::{Client, Request},
-    store_fs::PrivateRoot,
 };
 use std::{cell::Cell, io::Write, path::PathBuf};
 use td_crypto::TrustStore;
@@ -29,54 +27,13 @@ impl Source {
         ca: Option<&str>,
     ) -> Result<Self> {
         HttpsUri::parse(endpoint).map_err(|_| "migration-invalid-url")?;
-        if username.is_empty()
-            || username.len() > 998
-            || username.contains(':')
-            || username.chars().any(char::is_control)
-        {
-            return Err("migration-invalid-username");
-        }
-        let parent = Path::new(password_file)
-            .parent()
-            .and_then(Path::to_str)
-            .ok_or("migration-secret-parent")?;
-        let root = PrivateRoot::open(parent).map_err(|_| "migration-secret-parent")?;
-        let mut inputs = Inputs::new();
-        inputs.bind(&root).map_err(|_| "migration-secret-parent")?;
-        let bytes = read_bounded(
-            inputs
-                .open(password_file, Role::Secret)
-                .map_err(|_| "migration-secret-file")?,
-            1024,
-        )?;
-        let password = std::str::from_utf8(&bytes).map_err(|_| "migration-invalid-password")?;
-        let password = password
-            .strip_suffix("\r\n")
-            .or_else(|| password.strip_suffix('\n'))
-            .unwrap_or(password);
-        if password.is_empty() || password.chars().any(char::is_control) {
-            return Err("migration-invalid-password");
-        }
-        let authorization = format!(
-            "Basic {}",
-            crate::acme::wire::base64(format!("{username}:{password}").as_bytes(), false)
-                .map_err(|_| "migration-credential-capacity")?
-        );
-        let trust = match ca {
-            Some(path) => TrustStore::from_pem(&read_bounded(
-                inputs
-                    .open(path, Role::Public)
-                    .map_err(|_| "migration-trust-file")?,
-                128 * 1024,
-            )?),
-            None => TrustStore::public_roots(),
-        }
-        .map_err(|_| "migration-trust")?;
+        let credentials = crate::outbound_credentials::Loaded::open(username, password_file, ca)
+            .map_err(|_| "migration-source-credentials")?;
         let mut source = Self {
             endpoint: endpoint.to_owned(),
             account: account.to_owned(),
-            authorization,
-            trust,
+            authorization: credentials.authorization,
+            trust: credentials.trust,
             executable: std::env::current_exe().map_err(|_| "migration-executable")?,
             api: String::new(),
             download: String::new(),

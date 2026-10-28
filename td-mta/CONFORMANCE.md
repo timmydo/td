@@ -732,3 +732,9 @@ refusal, a too-small body bound, a late transaction failure with no Email or
 completion bit, verified body/identity publication, worker restart, and empty
 catch-up without duplicate rows or local sequence changes. These are functional
 assertions, not throughput or host-load-sensitive timing thresholds.
+
+The native replica operator fixture exercises protected-file credentials,
+initialization and repeated initialization without progress reset, dedicated
+runtime copy versus owner refusal, historical JSON progress, and refusal of a
+world-readable source password. CLI parser cases reject missing binding,
+secret-on-command-line options, duplicate flags and out-of-range copy budgets.

@@ -35,6 +35,8 @@ mod mail_client;
 mod replica_copy;
 #[path = "postgres_probe/replica_graph.rs"]
 mod replica_graph;
+#[path = "postgres_probe/replica_operator.rs"]
+mod replica_operator;
 #[path = "postgres_probe/replica_publish.rs"]
 mod replica_publish;
 #[path = "postgres_probe/replica_seed.rs"]

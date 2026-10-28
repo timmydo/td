@@ -21,6 +21,7 @@ mod maintenance;
 mod material;
 mod metadata_audit;
 mod recovery;
+mod replica;
 mod replica_source;
 mod scrub;
 mod scrub_state;
@@ -110,6 +111,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     }
     if command.as_deref() == Some(OsStr::new("logs")) {
         return logs::run(args);
+    }
+    if let Some(operation) = command.as_deref().and_then(replica::Operation::parse) {
+        return replica::run(operation, args);
     }
     if let Some(operation) = command
         .as_deref()

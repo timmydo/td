@@ -185,7 +185,14 @@ pub(super) fn exercise(
         .unwrap()
         .0
         .as_str();
-    replica_source_reads(fixture, https_address.port(), &encoded, account, epoch);
+    replica_source_reads(
+        fixture,
+        https_address.port(),
+        &encoded,
+        device.password(),
+        account,
+        epoch,
+    );
     if replica_only {
         return;
     }
@@ -871,6 +878,7 @@ fn replica_source_reads(
     fixture: &Fixture,
     port: u16,
     credentials: &str,
+    password: &[u8],
     account: td_mta::ids::AccountId,
     epoch: td_mta::ids::StoreEpoch,
 ) {
@@ -981,6 +989,7 @@ fn replica_source_reads(
     );
     drop(reader);
     super::replica_copy::exercise(client(), &authorization, limits, Binding { account, epoch });
+    super::replica_operator::exercise(&origin, &fixture.ca, password, Binding { account, epoch });
     let mut reader = Reader::connect(
         client(),
         &authorization,

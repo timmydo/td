@@ -300,6 +300,7 @@ pub mod postgres_acme;
 pub mod account_configuration;
 pub mod postgres_account_admin;
 
+pub mod outbound_credentials;
 pub mod outbound_http;
 
 pub mod migration;

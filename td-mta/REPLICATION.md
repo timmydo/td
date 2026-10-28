@@ -591,6 +591,45 @@ advance a checkpoint, silently omit large messages, or grow server retention
 without bound. No source transaction or database lease spans a disconnected
 client. Retry uses bounded backoff and fresh authentication.
 
+## Operator copy commands
+
+Prepare a fresh schema and bind it with `postgres replica-source-init` first.
+`postgres replica-account-init` takes the owner connection, local epoch,
+source origin/epoch, preserved account ID, username, protected password file,
+optional CA file and explicit positive `--body-bytes`, `--blobs`, `--emails`
+and `--receipts` quotas. It authenticates discovery and obtains the initial
+inventory and mailbox graph before atomically creating the account. Existing
+matching source/account/quotas are reported without reseeding, resetting work
+or asserting that a newly fetched seed matches an older request. Inspect an
+indeterminate initialization with `postgres replica-progress`; do not infer
+absence from a lost command response. No credentials or routing are copied.
+
+`postgres replica-copy` takes the same binding and source credential options,
+with a dedicated replica runtime connection instead of the owner connection.
+It runs `--steps 1..1024` (default 1) under `--timeout-seconds 1..3600` (default
+60), stopping at an empty Email changes observation. Each step remains bounded
+to 60 seconds and the existing per-job limits. JSON lines report successful
+steps; the publisher is retired before each potentially blocking output write.
+The timeout bounds copy work, not a blocked host stdout consumer. A later error
+exits nonzero and leaves earlier committed progress intact.
+Read-only inspection and initial owner preflights may try the next resolved
+local address on connection failure. Copy errors and post-publication errors
+never replay against another address. There is no background loop, automatic
+history reset or binding replacement. The runtime login must have the restricted
+replica grants; the ordinary primary login remains ineligible. Installer support
+for provisioning the replica role and read-only service is subsequent work.
+
+`postgres replica-progress --connection-file PATH --epoch HEX --account ID`
+uses the owner connection to report a historical snapshot of stored copy work.
+It contacts no upstream and proves neither freshness nor coverage. All commands
+report `copy_complete:false` and `recovery_verified:false`; an inventory-complete
+flag or empty pending page does not change those claims. Configured quotas,
+source identity and account IDs contain no secret bytes. Passwords are accepted
+only from protected files beneath a private parent, with one final LF or CRLF
+removed. Explicit CA trust uses the same checked input inventory; public roots
+remain the default. Passwords, Authorization headers and message content never
+enter command output. There are no new listeners or service activation.
+
 ## Local access and diagnostics
 
 Upstream credentials use protected files and verified HTTPS. Local access has
