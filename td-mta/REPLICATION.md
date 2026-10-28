@@ -157,6 +157,31 @@ cannotCalculateChanges is a reset outcome; malformed and other remote failures
 are distinct errors, never successful empty lists. Raw bodies still require
 separate complete length/digest verification before publication.
 
+### Source Session negotiation
+
+The passive discovery decoder requires advertised core, mail and replication
+support before selecting source endpoints. It selects an explicitly bound
+account, or the sole advertised account on first discovery; it never chooses
+among multiple accounts implicitly. Missing required capability support is an
+Unsupported outcome. Malformed or missing limits refuse instead of supplying
+optimistic defaults. Advertised inventory/metadata/request bounds are capped
+by local limits; a smaller source bound is retained.
+
+API URLs must be HTTPS and match the configured source origin. The supported
+download template contains exactly one each of accountId, blobId, name and
+type using simple brace substitution. Expansion uses typed IDs, a fixed
+message.eml name and percent-encoded message/rfc822 type, then rechecks the
+complete URL against the same origin. Unknown, duplicate or missing variables,
+malformed URLs, fragments and cross-origin endpoints refuse. No redirect or
+cross-origin credential authority follows from discovery.
+
+Relevant duplicate fields refuse; additional Session fields and capabilities
+are ignored within a 64-field per-object bound. Strings are borrowed from the
+bounded response owner. The caller must still bound JSON intake and allocation
+before constructing that response. These checks establish routing and supported
+limits only, not peer authentication, source epoch continuity or local progress.
+Tests feed actual td-mta read and submission Session documents through discovery.
+
 ### Bounded reusable source transport
 
 The outbound HTTPS helper has an explicit sequential reuse owner for the

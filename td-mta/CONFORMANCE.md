@@ -508,7 +508,10 @@ capability opt-in, bounded arguments, source/account scope, cursor continuation,
 stored digest/length agreement, exact timestamps and the closed metadata field
 set. The same replies pass through the passive source-client decoder, checking
 typed inventory, exact metadata coverage and source state. This is source API
-and decoder coverage, not an end-to-end synchronizer test.
+and decoder coverage, not an end-to-end synchronizer test. Discovery unit tests
+consume actual read and submission Session documents and check explicit account
+selection, advertised limits, same-origin endpoints, template variables and
+refusal of ambiguous fields or missing support.
 Local TLS transport tests serve 32 sequential, individually identified length
 and chunked responses over exactly one accepted socket, checking authorization
 on every request and retirement at the request limit. Refusal fixtures cover

@@ -6,6 +6,8 @@ use crate::{
     wire,
 };
 use td_json::Json;
+mod discovery;
+pub use discovery::{discover, Discovery, SourceLimits};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -14,6 +16,7 @@ pub enum Error {
     SourceChanged,
     Reset,
     RemoteFailure,
+    Unsupported,
 }
 #[derive(Clone, Copy)]
 pub struct Binding {
