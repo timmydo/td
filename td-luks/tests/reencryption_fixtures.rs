@@ -448,3 +448,62 @@ fn reencryption_profile_refuses_unsupported_or_inconsistent_layouts() {
         }
     }
 }
+
+#[test]
+fn forward_transitions_cover_the_volume_without_an_unsafe_final_header() {
+    use td_luks::reencrypt;
+    for (mode, base, _) in CASES {
+        let image = replay::initial(base).unwrap();
+        let original = header::read_copy(&mut Cursor::new(&image))
+            .unwrap()
+            .json()
+            .unwrap()
+            .0;
+        let mut json = original.clone();
+        let size = replay::DATA_LEN as u64;
+        assert!(reencrypt::finish_hotzone(&json, size).is_err());
+        for bad in [0, 1, 4095, reencrypt::HOTZONE_SIZE + 4096, u64::MAX] {
+            assert!(reencrypt::mark_hotzone(&json, size, bad).is_err());
+        }
+        for offset in (0..size).step_by(4096) {
+            let dirty = reencrypt::mark_hotzone(&json, size, 4096).unwrap();
+            let admitted = reencrypt::profile(&dirty, size).unwrap();
+            assert_eq!(admitted.progress, offset);
+            assert_eq!(
+                admitted.hotzone.unwrap(),
+                reencrypt::Hotzone { offset, size: 4096 }
+            );
+            assert!(reencrypt::mark_hotzone(&dirty, size, 4096).is_err());
+            json = reencrypt::finish_hotzone(&dirty, size).unwrap();
+            if offset + 4096 < size {
+                let admitted = reencrypt::profile(&json, size).unwrap();
+                assert_eq!(admitted.progress, offset + 4096);
+                assert_eq!(admitted.hotzone, None);
+            } else {
+                td_luks::write::profile(&json).unwrap();
+                assert!(reencrypt::profile(&json, size).is_err());
+                assert_eq!(
+                    json.get_path(&["digests", "0", "segments"]).unwrap(),
+                    &Json::Arr(vec![])
+                );
+                assert_eq!(
+                    json.get_path(&["keyslots", "0"]),
+                    original.get_path(&["keyslots", "0"])
+                );
+                assert_eq!(
+                    json.get_path(&["keyslots", "1"]),
+                    original.get_path(&["keyslots", "1"])
+                );
+            }
+        }
+        assert_eq!(
+            original,
+            header::read_copy(&mut Cursor::new(&image))
+                .unwrap()
+                .json()
+                .unwrap()
+                .0,
+            "{mode}"
+        );
+    }
+}

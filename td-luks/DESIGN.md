@@ -158,7 +158,11 @@ The key on standard input authorizes each verb as cryptsetup's would:
   unbound keyslot, meaning one whose digest names no segment. Their
   digests stay,
   with empty `keyslots`, as cryptsetup leaves them. It refuses a header
-  that carries the reencryption requirement.
+  that carries the reencryption requirement. Before reencryption is
+  enabled, D must extend this operation to wipe and sync all free
+  keyslot-area spans even when no unbound slot remains, after bound-key
+  authentication ("Start and end"). B3b's current implementation only
+  removes the unbound normal slots.
 - **`open` with no slot:** tries each bound keyslot whose priority is
   not 0: priority 2 first, then priority 1, each in keyslot-number
   order. cryptsetup goes in JSON order within a priority, so only which
@@ -452,8 +456,10 @@ from these parts:
   area's size / 32 × 4096 bytes. Journal resilience stores the hotzone's
   data there. The hotzone's length is not part of the on-disk protocol:
   a resume reads it from the segments. cryptsetup caps it at 1 GiB and
-  holds it in one buffer. td-luks sets its own smaller limit, which
-  increment D fixes from the selector's memory at boot.
+  holds it in one buffer. td-luks caps each newly marked hotzone at
+  1 MiB. Recovery must stream larger stock hotzones within a bounded
+  working buffer; the metadata validator does not impose td's creation
+  limit on stock's recorded hotzone.
 - **Reencryption digest:** a PBKDF2 digest over a binary blob, matched
   byte for byte (cryptsetup's `luks2_reencrypt_digest.c`). The blob
   holds:
@@ -493,9 +499,41 @@ fields separately. It does not change the input or perform I/O.
 `reencrypt::digest` encodes version 2 with the fixed backup profile into
 a bounded, zeroed-on-drop buffer: 274 bytes for checksum and 263 for
 journal. The caller must validate the metadata separately and authenticate
-the resulting digest before trusting recovery parameters. This increment
-provides validation and digest calculation only; ordinary activation and
-mutations continue to refuse the reencryption requirement.
+the resulting digest before trusting recovery parameters. D1 provides
+validation and digest calculation; ordinary activation and mutations
+continue to refuse the reencryption requirement.
+
+### Metadata transitions
+
+D2 adds the header protocol without enabling reencryption commands or
+production data writes. `reencrypt::load` preserves binary identity and
+validates the layout against the held device size. `unlock` opens both
+keys from their enabled keyslots and authenticates the v2 digest before
+returning them. Wrong passphrases and mismatched verification metadata
+remain distinct failures.
+
+`plan_start` authenticates the selected ordinary bound slot, generates
+a fresh volume key, seals its new keyslot under the same passphrase,
+allocates the largest free resilience span and prepares the atomic start
+below. Tokens naming the selected slot follow its replacement; other old
+slots remain assigned until cleanup. A priority-zero authorizing slot is
+refused so automatic resume does not depend on a disabled slot.
+
+`mark_hotzone` and `finish_hotzone` are pure JSON transitions. Marking
+requires a clean prefix and a whole-sector hotzone of at most 1 MiB that
+fits the resilience area. Completion requires one dirty hotzone and goes
+directly to ordinary metadata when it reaches the end. `reencrypt::commit`
+validates the in-progress or final ordinary profile and uses the existing
+writer's sequence and copy ordering. The caller must hold the locks,
+persist resilience before committing dirty metadata, and sync rewritten
+data before committing completion. These library APIs do not establish
+that data ordering themselves.
+
+`fixtures/metadata.rs` constructs 22 states under checksum and journal
+resilience, using dm-crypt for old/new ciphertext, and asks stock 2.8.8 to
+repair/resume each and verify all plaintext. `fixtures/METADATA.md` records
+that oracle and its boundary. Rust tests separately interrupt every
+start and final header write/sync and check the surviving header.
 
 ### Start and end
 
@@ -512,9 +550,22 @@ ENCRYPTION.md's upgrade machine resolves:
   requirement, the reencrypt keyslot and its digest, the backup segments
   while retaining the old key's digest with `segments: []` and its
   keyslots unchanged. The old key's keyslots stay, unbound but each
-  assigned to exactly one digest. Then each is wiped and removed in
-  its own commit; the old digest stays with an empty `keyslots` list
-  after the last removal.
+  assigned to exactly one digest. After authenticating the new bound
+  key, wipe and sync every free span of the keyslots area, then wipe
+  and remove each old keyslot in its own commit. The old digest stays
+  with an empty `keyslots` list after the last removal.
+
+Journal resilience retains old-key ciphertext in its area. Dropping the
+reencryption keyslot from JSON does not erase those bytes, so completion
+of the final metadata commit alone does not establish old-key revocation.
+Free spans are derived from the surviving normal keyslot areas, not from
+the deleted reencryption slot: an interrupted U3 cleanup can repeat the
+wipe even when no unbound slot remains. This cleanup must finish before
+ENCRYPTION.md's old-key-uselessness claim applies. Do not wipe resilience
+before the final metadata commit: a crash could still select the dirty
+header, whose recovery requires those bytes. D must implement the
+post-commit free-area wipe and its restart oracle before enabling data
+reencryption; D2's metadata APIs do not perform it.
 
 The last hotzone stays marked `in-reencryption` through its data sync.
 There is no intervening commit with one all-new active segment while the
@@ -538,7 +589,8 @@ keyslot in U1 and U3, removes them. It also removes the stray keyslot a
 crash in cryptsetup's own start leaves.
 
 Increment D amends ENCRYPTION.md's U1 and U3 definitions, the selector's
-recovery-keyslot rule and the gap paragraph to match. It may do so only
+recovery-keyslot rule, post-commit free-area cleanup and the gap paragraph
+to match. It may do so only
 after the interop oracle shows that cryptsetup 2.8.8 accepts every
 intermediate header.
 
@@ -632,8 +684,13 @@ Each increment is one landable commit, or a short series:
     the digest for all 106 stock prefixes, accept the 92 recoverable
     layouts and refuse the 14 unsafe all-new layouts, with malformed
     layout cases. No reencryption command or data rewriting is enabled.
-  - Remaining D work adds metadata transitions, device stacks, recovery,
-    data rewriting and the bidirectional interruption oracle.
+  - **D2.** Authenticated header loading, atomic start and hotzone/end
+    metadata transitions (`src/reencrypt_metadata.rs` and
+    `src/reencrypt_transition.rs`), with commit fault injection and
+    the pinned stock metadata recovery oracle. Reencryption commands
+    and production data rewriting remain disabled.
+  - Remaining D work adds device stacks, recovery, data rewriting and
+    the bidirectional interruption oracle.
 - **E.** The cutover, in one landing (AGENTS.md principle 4):
   - td-protector's runner and every caller switch to td-luks;
   - the image ships `/bin/td-luks` where it ships cryptsetup;

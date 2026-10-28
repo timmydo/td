@@ -158,3 +158,11 @@ mod tests {
 #[path = "reencrypt_profile.rs"]
 mod profile;
 pub use profile::{profile, Hotzone, Layout};
+
+#[path = "reencrypt_transition.rs"]
+mod transition;
+pub use transition::{finish_hotzone, mark_hotzone, HOTZONE_SIZE};
+
+#[path = "reencrypt_metadata.rs"]
+mod metadata;
+pub use metadata::{commit, load, plan_start, unlock, Keys};

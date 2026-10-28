@@ -192,12 +192,18 @@ fn round_trips(binary: &[u8]) -> Result<(), String> {
 /// Read the header the reader chooses and refuse it unless it is td's
 /// profile.
 pub fn load<M: Medium + ?Sized>(medium: &mut M) -> Result<Header, Error> {
+    let header = load_raw(medium)?;
+    profile(&header.json)?;
+    Ok(header)
+}
+
+/// Read binary identity and JSON without choosing a normal/reencryption profile.
+pub(crate) fn load_raw<M: Medium + ?Sized>(medium: &mut M) -> Result<Header, Error> {
     let used = header::read_copy(&mut Reading {
         medium: &mut *medium,
         at: 0,
     })?;
     let (json, _) = used.json()?;
-    profile(&json)?;
     let mut binary = vec![0u8; BINARY_HEADER_LEN];
     read_exact_at(medium, copy_offset(used.identity.copy), &mut binary)
         .map_err(io("LUKS2 binary header read"))?;
@@ -261,7 +267,7 @@ pub(crate) fn decimal(value: &Json, key: &str, what: &str) -> Result<u64, String
 }
 
 /// A base64 field of exactly `len` bytes.
-fn bytes_of(value: &Json, key: &str, len: usize, what: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn bytes_of(value: &Json, key: &str, len: usize, what: &str) -> Result<Vec<u8>, String> {
     value
         .get(key)
         .and_then(Json::as_str)
@@ -270,7 +276,7 @@ fn bytes_of(value: &Json, key: &str, len: usize, what: &str) -> Result<Vec<u8>, 
         .ok_or_else(|| format!("LUKS2 {what}'s {key} is not {len} bytes of base64"))
 }
 
-fn iterations(value: &Json, ceiling: u64, what: &str) -> Result<u32, String> {
+pub(crate) fn iterations(value: &Json, ceiling: u64, what: &str) -> Result<u32, String> {
     value
         .get("iterations")
         .and_then(Json::as_u64)
@@ -541,7 +547,7 @@ pub fn commit<M: Medium + ?Sized>(
 }
 
 /// `commit` without the profile check.
-fn write_plan<M: Medium + ?Sized>(
+pub(crate) fn write_plan<M: Medium + ?Sized>(
     medium: &mut M,
     random: &mut dyn Random,
     plan: &Plan,
@@ -604,7 +610,7 @@ fn write_plan<M: Medium + ?Sized>(
     Ok(())
 }
 
-fn salt(random: &mut dyn Random) -> Result<[u8; SALT_LEN], Error> {
+pub(crate) fn salt(random: &mut dyn Random) -> Result<[u8; SALT_LEN], Error> {
     let mut salt = [0u8; SALT_LEN];
     random.fill(&mut salt).map_err(io("salt"))?;
     Ok(salt)
@@ -646,7 +652,7 @@ fn keyslot_json(offset: u64, salt: &[u8]) -> Json {
 
 /// A new keyslot for `volume_key` under `passphrase`: its JSON and its
 /// sealed split key.
-fn new_keyslot(
+pub(crate) fn new_keyslot(
     random: &mut dyn Random,
     volume_key: &Key,
     passphrase: &[u8],
@@ -662,13 +668,13 @@ fn new_keyslot(
     Ok((keyslot_json(offset, &salt), split))
 }
 
-fn section_mut<'a>(json: &'a mut Json, section: &str) -> Result<&'a mut Json, Error> {
+pub(crate) fn section_mut<'a>(json: &'a mut Json, section: &str) -> Result<&'a mut Json, Error> {
     json.get_mut(section)
         .ok_or_else(|| Error::Refused(format!("LUKS2 JSON has no {section} object")))
 }
 
 /// The digest naming `slot`, if any.
-fn digest_of(json: &Json, slot: u8) -> Result<Option<(u8, Json)>, Error> {
+pub(crate) fn digest_of(json: &Json, slot: u8) -> Result<Option<(u8, Json)>, Error> {
     for (number, digest) in numbered(json, "digests")? {
         if slots(digest, "keyslots", "digest")?.contains(&slot) {
             return Ok(Some((number, digest.clone())));
@@ -742,7 +748,7 @@ fn verify_digest(digest: &Json, key: &Key) -> Result<(), Error> {
 /// `CRYPT_DEFAULT_SEGMENT`). An unbound one is refused, as cryptsetup's
 /// -ENOENT is a failure (exit 1, "No usable keyslot is available"), not
 /// a wrong key.
-fn unlock_bound<M: Medium + ?Sized>(
+pub(crate) fn unlock_bound<M: Medium + ?Sized>(
     medium: &mut M,
     json: &Json,
     slot: u8,
@@ -790,7 +796,7 @@ fn bound_slots(json: &Json, except: Option<u8>) -> Result<Vec<u8>, Error> {
 }
 
 /// The first of `slots` that `passphrase` opens.
-fn unlock_any<M: Medium + ?Sized>(
+pub(crate) fn unlock_any<M: Medium + ?Sized>(
     medium: &mut M,
     json: &Json,
     passphrase: &[u8],
@@ -809,7 +815,7 @@ fn unlock_any<M: Medium + ?Sized>(
 
 /// The lowest 4096-aligned span of the keyslots area that holds a new
 /// area: cryptsetup's first fit.
-fn free_area(json: &Json) -> Result<u64, Error> {
+pub(crate) fn free_area(json: &Json) -> Result<u64, Error> {
     let mut used = Vec::new();
     for (_, keyslot) in numbered(json, "keyslots")? {
         let area = keyslot.get("area").unwrap_or(&Json::Null);
@@ -829,7 +835,7 @@ fn free_area(json: &Json) -> Result<u64, Error> {
     Ok(candidate)
 }
 
-fn slot_in_use(json: &Json, section: &str, slot: u8) -> Result<bool, Error> {
+pub(crate) fn slot_in_use(json: &Json, section: &str, slot: u8) -> Result<bool, Error> {
     Ok(numbered(json, section)?
         .iter()
         .any(|(number, _)| *number == slot))
@@ -866,7 +872,7 @@ fn wipe(random: &mut dyn Random, json: &Json, slot: u8) -> Result<(u64, Vec<u8>)
     Ok((offset, bytes))
 }
 
-fn next(header: &Header) -> Result<Plan, Error> {
+pub(crate) fn next(header: &Header) -> Result<Plan, Error> {
     Ok(Plan {
         uuid: header.uuid.clone(),
         label: header.label.clone(),

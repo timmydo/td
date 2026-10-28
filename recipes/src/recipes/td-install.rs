@@ -152,6 +152,9 @@ const LUKS_KEYSLOT_RS: &str = include_str!("../../../td-luks/src/keyslot.rs");
 const LUKS_WRITE_RS: &str = include_str!("../../../td-luks/src/write.rs");
 const LUKS_REENCRYPT_RS: &str = include_str!("../../../td-luks/src/reencrypt.rs");
 const LUKS_REENCRYPT_PROFILE_RS: &str = include_str!("../../../td-luks/src/reencrypt_profile.rs");
+const LUKS_REENCRYPT_METADATA_RS: &str = include_str!("../../../td-luks/src/reencrypt_metadata.rs");
+const LUKS_REENCRYPT_TRANSITION_RS: &str =
+    include_str!("../../../td-luks/src/reencrypt_transition.rs");
 const ENCODING_RS: &str = include_str!("../../../td-encoding/src/lib.rs");
 const PROTECTOR_RS: &str = include_str!("../../../td-protector/src/lib.rs");
 const PROTECTOR_CRYPTSETUP_RS: &str = include_str!("../../../td-protector/src/cryptsetup.rs");
@@ -308,6 +311,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-luks/src/reencrypt_profile.rs".into(),
             content: LUKS_REENCRYPT_PROFILE_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-luks/src/reencrypt_metadata.rs".into(),
+            content: LUKS_REENCRYPT_METADATA_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-luks/src/reencrypt_transition.rs".into(),
+            content: LUKS_REENCRYPT_TRANSITION_RS.into(),
             exec: false,
         },
         Step::WriteFile {
