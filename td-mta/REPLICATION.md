@@ -427,7 +427,7 @@ remains success even if subsequent connection retirement fails.
 
 This is a library primitive, not an operator copy command or a read service.
 No resident worker, new default memory allowance, local credentials or source
-configuration is enabled. Mailbox reconciliation, retention
+configuration is enabled. Copy scheduling, retention
 and completeness validation remain required before a usable full-copy claim.
 
 ### Reusing verified local bodies
@@ -486,6 +486,40 @@ own original newState until a subsequent transition. Status must distinguish
 these values and must not promote an object observation into a checkpoint.
 This primitive adds no polling worker, mailbox reconciliation, expired-history
 reset, receipt pruning, read service or copy-completeness claim.
+
+### Full mailbox graph reconciliation
+
+A replica graph operation binds a complete authenticated Mailbox/get observation
+to the fixed source/account and current positive copy generation. It requires
+the initialized source Inbox identity. Publication locks the account and refuses
+older observations, stale generations, or conflicting metadata at the same
+source state. Local mailbox rows, roles and parent relationships remain bounded
+and valid; no folder is invented to satisfy a missing dependency.
+
+Source-present folders are created or updated with their original IDs, metadata
+and complete parent graph. Source-absent folders are marked absent in source
+receipts. A locally referenced absent folder remains readable until its Email
+memberships are reconciled; retired parents needed by such children remain too.
+Retired roles are cleared so a replacement source folder can hold the role
+without ambiguity. Other absent folders are removed under the deferred foreign
+keys. No Email or membership is silently deleted by the graph operation.
+
+The visible union, including retained retired folders, must fit the existing
+256-mailbox bound. A source graph that fits by itself may temporarily exceed
+that limit when combined with local removal dependencies. Capacity refusal
+pauses reconciliation and leaves the previous view intact; this limitation is
+explicit, not truncation or copy completion. Receipt accumulation shares the
+configured receipt quota. Historical tombstones remain bounded by that quota.
+Schema 39 adds latest-observation and present-folder receipt indexes so graph
+checks do not scan all historical mailbox identities.
+
+Changes, local history/sequence, source receipts, receipt usage and the Mailbox
+checkpoint commit together. The checkpoint advances only once no retired
+removal dependencies remain. Repeating the same source graph can remove folders
+whose references have since cleared and then finish the checkpoint; repeating
+an already applied graph emits no local change. Metadata-only observation
+changes do not advance the Email cursor. The copy scheduler, retention, history
+reset, read-only service and completeness qualification remain subsequent work.
 
 ### Remaining synchronization work
 

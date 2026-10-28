@@ -544,6 +544,7 @@ pub(super) fn exercise(
     assert!(!publisher.reusable(deadline()));
     drop(publisher);
     sql(&fixture, "UPDATE td_mta.runtime_barrier SET blocked=false");
+    super::replica_graph::exercise(&fixture, &source, account, local, page, id);
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -554,6 +555,16 @@ fn observation(
     id: EmailId,
     advance: u64,
     keywords: Option<&[&str]>,
+) -> MetadataPage {
+    observation_with_mailboxes(source, page, id, advance, keywords, None)
+}
+pub(super) fn observation_with_mailboxes(
+    source: &Source,
+    page: &MetadataPage,
+    id: EmailId,
+    advance: u64,
+    keywords: Option<&[&str]>,
+    folders: Option<&[td_mta::ids::MailboxId]>,
 ) -> MetadataPage {
     use td_json::{json, Json};
     use td_mta::{bounded::TextBuffer, format::Sequence, sync::DataState, wire};
@@ -575,8 +586,8 @@ fn observation(
         .unwrap()
         .to_owned();
     let mailboxes = Json::Obj(
-        original
-            .mailboxes
+        folders
+            .unwrap_or(&original.mailboxes)
             .iter()
             .map(|id| {
                 let mut b = [0; wire::IdKind::WIRE_BYTES];

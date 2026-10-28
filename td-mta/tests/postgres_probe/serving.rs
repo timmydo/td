@@ -979,6 +979,14 @@ fn replica_source_reads(
             fresh.body(&page, email.id).unwrap()
         },
     );
+    drop(reader);
+    let mut reader = Reader::connect(
+        client(),
+        &authorization,
+        Some(Binding { account, epoch }),
+        limits,
+    )
+    .unwrap();
     let missing = td_mta::ids::EmailId::from_bytes([0x42; 16]);
     let absent = reader.metadata(&[missing]).unwrap();
     assert_eq!(absent.view().unwrap().missing, vec![missing]);

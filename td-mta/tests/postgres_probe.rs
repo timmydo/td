@@ -31,6 +31,8 @@ fn migration_archive_cli_preserves_and_verifies_snapshots() {
 #[path = "support/postgres_mail_client.rs"]
 mod mail_client;
 
+#[path = "postgres_probe/replica_graph.rs"]
+mod replica_graph;
 #[path = "postgres_probe/replica_publish.rs"]
 mod replica_publish;
 #[path = "postgres_probe/replica_seed.rs"]
@@ -413,7 +415,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 38);
+    assert_eq!(receipt.version, 39);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -626,7 +628,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":38"));
+    assert!(initialized.contains("\"schema_version\":39"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -871,7 +873,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=38",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=39",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -879,7 +881,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=38 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=39 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1061,7 +1063,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 38);
+    assert_eq!(receipt.version, 39);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1770,7 +1772,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
     for previous_version in [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27, 28, 31, 32, 33, 34, 35, 36, 37,
+        27, 28, 31, 32, 33, 34, 35, 36, 37, 38,
     ] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
@@ -1812,6 +1814,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_search.sql"),
             include_str!("../src/postgres_replica_source.sql"),
             include_str!("../src/postgres_replica_progress.sql"),
+            include_str!("../src/postgres_replica_effects.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1868,6 +1871,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             35 => "replica_source",
             36 => "replica_accounts",
             37 => "replica_email_receipts",
+            38 => "replica_mailbox_observation",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1925,7 +1929,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 38);
+        assert_eq!(receipt.version, 39);
         assert_eq!(
             sql(
                 &fixture,

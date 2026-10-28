@@ -316,3 +316,6 @@ pub mod postgres_replica_apply;
 
 mod postgres_replica_transition;
 pub mod replica_transition;
+
+pub mod postgres_replica_mailboxes;
+pub mod replica_mailboxes;

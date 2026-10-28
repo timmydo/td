@@ -34,11 +34,13 @@ pub(crate) struct ReplicaSession {
     clean_idle: bool,
 }
 enum Job {
+    Mailboxes(Arc<crate::replica_mailboxes::Graph>),
     Inspect { source: Source, account: AccountId },
     Publish(Arc<Effect>),
     Advance(Arc<Transition>),
 }
 enum Completed {
+    Mailboxes(crate::postgres_replica_mailboxes::Outcome),
     MissingBody,
     Inspected(Box<Progress>),
     Published(Outcome),
@@ -47,6 +49,7 @@ enum Completed {
 impl Job {
     fn source(&self) -> &Source {
         match self {
+            Self::Mailboxes(graph) => &graph.source,
             Self::Inspect { source, .. } => source,
             Self::Publish(value) => &value.source,
             Self::Advance(value) => &value.source,
@@ -54,6 +57,7 @@ impl Job {
     }
     fn account(&self) -> AccountId {
         match self {
+            Self::Mailboxes(graph) => graph.account,
             Self::Inspect { account, .. } => *account,
             Self::Publish(value) => value.account,
             Self::Advance(value) => value.account,
@@ -61,6 +65,7 @@ impl Job {
     }
     fn body_length(&self) -> u64 {
         match self {
+            Self::Mailboxes(_) => 0,
             Self::Inspect { .. } => 0,
             Self::Publish(value) => value
                 .mail
@@ -138,6 +143,16 @@ impl ReplicaSession {
             && self.worker.failed.is_none()
             && self.bounds.reusable(deadline)
     }
+    pub(crate) fn mailboxes(
+        &mut self,
+        graph: Arc<crate::replica_mailboxes::Graph>,
+        deadline: Instant,
+    ) -> Result<crate::postgres_replica_mailboxes::Outcome, apply::Error> {
+        match self.run(Job::Mailboxes(graph), deadline)? {
+            Completed::Mailboxes(value) => Ok(value),
+            _ => Err(apply::Error::Integrity),
+        }
+    }
     pub(crate) fn inspect(&mut self, deadline: Instant) -> Result<Progress, apply::Error> {
         let source = Source::new(self.source.origin(), self.source.epoch())
             .map_err(|_| apply::Error::Source)?;
@@ -207,6 +222,7 @@ impl ReplicaSession {
                 if observed!=epoch.as_bytes().as_slice(){return Err(apply::Error::Connection(Error::RuntimeSchema));}
                 if blocked{return Err(apply::Error::Connection(Error::RuntimeMaintenance));}
                 match job {
+                    Job::Mailboxes(graph)=>crate::postgres_replica_mailboxes::publish(client,&graph,deadline,&marker).await.map(Completed::Mailboxes),
                     Job::Inspect {source,account}=>{
                         let progress=crate::postgres_replica_progress::read_snapshot(client,source,account).await.map_err(|_|apply::Error::Integrity)?;
                         client.batch_execute("ROLLBACK").await.map_err(|_|apply::Error::Database)?;

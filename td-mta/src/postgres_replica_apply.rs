@@ -598,7 +598,7 @@ async fn collect_blob(client: &Client, account_id: AccountId, blob: BlobId) -> R
     Ok(())
 }
 
-/// A finite, thread-owned copy connection with only the closed publish operation.
+/// A finite, thread-owned copy connection with closed replica operations.
 pub struct Publisher {
     session: postgres_probe::ReplicaSession,
 }
@@ -617,6 +617,14 @@ impl Publisher {
             )
             .map_err(Error::Connection)?,
         })
+    }
+    /// Publish a complete graph while retaining referenced retired folders.
+    pub fn mailboxes(
+        &mut self,
+        graph: std::sync::Arc<crate::replica_mailboxes::Graph>,
+        deadline: Instant,
+    ) -> Result<crate::postgres_replica_mailboxes::Outcome, Error> {
+        self.session.mailboxes(graph, deadline)
     }
     /// A consistent historical observation; it grants no future write authority.
     pub fn inspect(

@@ -7605,3 +7605,18 @@ publish mail. Raw storage is not rehashed for this metadata operation, matching
 the existing immutable-body/derived-metadata trust boundary. Publication with
 fresh bytes still requires the full verified body capability. No schema,
 ordinary fresh-ID publication or source checkpoint policy changes.
+
+
+## Replica mailbox graph publication
+
+Schema 39 adds indexes on mailbox receipt account/observation and current
+present account/ID. Tables and role grants remain unchanged. The replica-only
+session accepts a closed complete-graph operation under its existing finite
+budgets and the account lock. It validates source/account/generation, the
+initialized Inbox and observation ordering, and commits graph changes, local
+history, receipts, receipt usage and the completed Mailbox checkpoint together.
+[REPLICATION.md](REPLICATION.md) owns deferred retirement dependencies and the
+explicit 256-folder union capacity boundary. The operation never removes Email
+memberships to force a folder deletion or claims completeness while retirement
+is pending. A schema-38 binary cannot serve schema 39; retain a consistent
+backup and use the fenced upgrade procedure. No replica service is activated.
