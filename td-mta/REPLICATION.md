@@ -372,7 +372,13 @@ This library read does not contact the source, mutate progress, acquire a writer
 lease or certify a current copy. Its Email cursor remains a replay anchor during
 initial inventory. The worker must revalidate its generation/page against locked
 current rows when publishing; a historical inspection is not permission to write.
-No per-message synchronizer uses this cold owner connection. The copy command remains subsequent work.
+No per-message synchronizer uses this cold owner connection. The retained
+replica publisher also offers progress inspection through its qualified runtime
+connection. It takes a repeatable-read read-only snapshot and rolls it back,
+uses the same source/account binding and finite session/job budgets, and checks
+the epoch and maintenance barrier. Failure retires that connection; a result
+that exceeds its deadline is not returned. It neither mutates progress nor
+requires the owner credential. The copy command remains subsequent work.
 
 ### Transactional Email publication
 

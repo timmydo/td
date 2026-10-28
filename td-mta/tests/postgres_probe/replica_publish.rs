@@ -482,6 +482,44 @@ pub(super) fn exercise(
     assert!(!progress.inventory_complete);
     assert_eq!(progress.inventory_cursor, Some(cursor));
     assert!(progress.pending.unwrap().complete());
+    let runtime_progress = publisher.inspect(deadline()).unwrap();
+    assert_eq!(runtime_progress.account, account);
+    assert_eq!(runtime_progress.source, source);
+    assert_eq!(runtime_progress.generation, 2);
+    assert_eq!(runtime_progress.email_cursor, base);
+    assert_eq!(runtime_progress.inventory_cursor, Some(cursor));
+    assert!(runtime_progress.pending.unwrap().complete());
+    sql(
+        &fixture,
+        "UPDATE td_mta.replica_pending SET done=set_byte(done,127,128)",
+    );
+    assert!(matches!(
+        publisher.inspect(deadline()),
+        Err(Error::Integrity)
+    ));
+    assert!(!publisher.reusable(deadline()));
+    drop(publisher);
+    sql(
+        &fixture,
+        "UPDATE td_mta.replica_pending SET done=decode(repeat('00',128),'hex')",
+    );
+    let mut publisher = open();
+    assert!(publisher
+        .inspect(deadline())
+        .unwrap()
+        .pending
+        .unwrap()
+        .complete());
+    sql(&fixture, "UPDATE td_mta.runtime_barrier SET blocked=true");
+    assert!(matches!(
+        publisher.inspect(deadline()),
+        Err(Error::Connection(
+            td_mta::postgres_probe::Error::RuntimeMaintenance
+        ))
+    ));
+    assert!(!publisher.reusable(deadline()));
+    drop(publisher);
+    sql(&fixture, "UPDATE td_mta.runtime_barrier SET blocked=false");
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

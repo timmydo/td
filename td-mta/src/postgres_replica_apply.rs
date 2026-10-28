@@ -616,6 +616,13 @@ impl Publisher {
             .map_err(Error::Connection)?,
         })
     }
+    /// A consistent historical observation; it grants no future write authority.
+    pub fn inspect(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<crate::postgres_replica_progress::Progress, Error> {
+        self.session.inspect(deadline)
+    }
     pub fn advance(
         &mut self,
         transition: std::sync::Arc<crate::replica_transition::Transition>,

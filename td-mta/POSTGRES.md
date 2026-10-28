@@ -7578,3 +7578,16 @@ and JMAP sequences remain unchanged. Matching retries preserve the new page's
 existing completion bitmap. [REPLICATION.md](REPLICATION.md) defines cursor
 provenance, inventory-to-change catch-up and retry recognition. Schema 38 is
 unchanged; no unbounded queue or general SQL execution interface is added.
+
+
+## Replica runtime progress snapshots
+
+The replica-only retained session offers a closed progress inspection operation
+alongside publication and transition. It reads source-bound account progress in
+a repeatable-read, read-only transaction, then rolls back. Epoch, maintenance,
+source/account qualification and the same finite connection/turn windows apply.
+It shares the owner's progress decoder and returns no future writer authority.
+Malformed state or deadline failure retires the session and returns no snapshot;
+confirmed mutation COMMIT handling remains unchanged. The copy worker can load
+progress without holding the schema-owner password or opening a new database
+connection for each read.

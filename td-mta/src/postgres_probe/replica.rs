@@ -7,6 +7,7 @@ use super::{
 use crate::{
     ids::{AccountId, StoreEpoch},
     postgres_replica_apply::{self as apply, Outcome},
+    postgres_replica_progress::Progress,
     postgres_replica_source::Source,
     postgres_schema,
     replica_effect::Effect,
@@ -33,28 +34,33 @@ pub(crate) struct ReplicaSession {
     clean_idle: bool,
 }
 enum Job {
+    Inspect { source: Source, account: AccountId },
     Publish(Arc<Effect>),
     Advance(Arc<Transition>),
 }
 enum Completed {
+    Inspected(Box<Progress>),
     Published(Outcome),
     Advanced(Ticket),
 }
 impl Job {
     fn source(&self) -> &Source {
         match self {
+            Self::Inspect { source, .. } => source,
             Self::Publish(value) => &value.source,
             Self::Advance(value) => &value.source,
         }
     }
     fn account(&self) -> AccountId {
         match self {
+            Self::Inspect { account, .. } => *account,
             Self::Publish(value) => value.account,
             Self::Advance(value) => value.account,
         }
     }
     fn body_length(&self) -> u64 {
         match self {
+            Self::Inspect { .. } => 0,
             Self::Publish(value) => value
                 .mail
                 .as_ref()
@@ -130,6 +136,20 @@ impl ReplicaSession {
             && self.worker.failed.is_none()
             && self.bounds.reusable(deadline)
     }
+    pub(crate) fn inspect(&mut self, deadline: Instant) -> Result<Progress, apply::Error> {
+        let source = Source::new(self.source.origin(), self.source.epoch())
+            .map_err(|_| apply::Error::Source)?;
+        match self.run(
+            Job::Inspect {
+                source,
+                account: self.account,
+            },
+            deadline,
+        )? {
+            Completed::Inspected(progress) => Ok(*progress),
+            _ => Err(apply::Error::Integrity),
+        }
+    }
     pub(crate) fn publish(
         &mut self,
         effect: Arc<Effect>,
@@ -172,13 +192,23 @@ impl ReplicaSession {
                 .map_err(apply::Error::Connection)?;
             let epoch = self.epoch;
             match self.worker.run(move |client|Box::pin(async move {
-                client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=30000").await.map_err(|_|apply::Error::Database)?;
+                let begin = if matches!(&job, Job::Inspect { .. }) {
+                    "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000"
+                } else {
+                    "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=30000"
+                };
+                client.batch_execute(begin).await.map_err(|_|apply::Error::Database)?;
                 let row=client.query_typed_one("SELECT m.store_epoch,b.blocked FROM td_mta.schema_migrations m CROSS JOIN td_mta.runtime_barrier b WHERE m.version=1 AND b.singleton=true",&[]).await.map_err(|_|apply::Error::Database)?;
                 let observed:&[u8]=row.try_get(0).map_err(|_|apply::Error::Integrity)?;
                 let blocked:bool=row.try_get(1).map_err(|_|apply::Error::Integrity)?;
                 if observed!=epoch.as_bytes().as_slice(){return Err(apply::Error::Connection(Error::RuntimeSchema));}
                 if blocked{return Err(apply::Error::Connection(Error::RuntimeMaintenance));}
                 match job {
+                    Job::Inspect {source,account}=>{
+                        let progress=crate::postgres_replica_progress::read_snapshot(client,source,account).await.map_err(|_|apply::Error::Integrity)?;
+                        client.batch_execute("ROLLBACK").await.map_err(|_|apply::Error::Database)?;
+                        Ok(Completed::Inspected(Box::new(progress)))
+                    },
                     Job::Publish(effect)=>apply::apply(client,&effect,deadline,&marker).await.map(Completed::Published),
                     Job::Advance(transition)=>crate::postgres_replica_transition::advance(client,&transition,deadline,&marker).await.map(Completed::Advanced),
                 }
@@ -195,10 +225,14 @@ impl ReplicaSession {
                     .check_deadline()
                     .and_then(|()| self.worker.check())
                     .and_then(|()| self.worker.finish_validation_turn());
-                if finish.is_ok() {
-                    self.clean_idle = true;
-                } else {
-                    self.retired = true;
+                match finish {
+                    Ok(()) => self.clean_idle = true,
+                    Err(error) => {
+                        self.retired = true;
+                        if matches!(&outcome, Completed::Inspected(_)) {
+                            return Err(apply::Error::Connection(error));
+                        }
+                    }
                 }
                 // Preserve confirmed COMMIT even when subsequent retirement fails.
                 Ok(outcome)
