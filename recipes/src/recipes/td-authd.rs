@@ -243,6 +243,7 @@ pub fn recipe() -> Recipe {
         "{src}/engine/src",
         "{src}/td-install/src",
         "{src}/td-secret/src",
+        "{src}/td-civil/src",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),
@@ -294,6 +295,19 @@ pub fn recipe() -> Recipe {
         (
             "{src}/engine/src/sha256.rs",
             include_str!("../../../engine/src/sha256.rs"),
+        ),
+        // The shared tier reader's production-appender regression.
+        (
+            "{src}/engine/src/boot_info.rs",
+            include_str!("../../../engine/src/boot_info.rs"),
+        ),
+        (
+            "{src}/engine/src/cpio.rs",
+            include_str!("../../../engine/src/cpio.rs"),
+        ),
+        (
+            "{src}/td-civil/src/tzif.rs",
+            include_str!("../../../td-civil/src/tzif.rs"),
         ),
         (
             "{src}/engine/src/principals.rs",

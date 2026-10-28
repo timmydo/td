@@ -31,6 +31,9 @@ pub fn recipe() -> Recipe {
             "td-tpm",
             "td-fido",
             "td-test-compositor",
+            // The source-closure proof includes td-secret's test-only mounts.
+            "td-fs",
+            "td-civil",
         ])
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
@@ -62,7 +65,9 @@ mod tests {
                     "engine",
                     "td-tpm",
                     "td-fido",
-                    "td-test-compositor"
+                    "td-test-compositor",
+                    "td-fs",
+                    "td-civil"
                 ]
                 .map(String::from)
                 .to_vec()

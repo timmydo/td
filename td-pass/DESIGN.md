@@ -498,6 +498,10 @@ worker's. A recipe test walks every literal `#[path]`, `include!`,
 `include_str!` and `include_bytes!` the compiled crates name, and those
 the named files name in turn, and pins the staged trees to exactly the
 trees reached; a name built with `concat!` is not walked.
+That source closure includes test-only mounts: td-secret's shared
+temporary-directory guard reaches td-fs, and its deployment-assembly
+regression reaches td-civil through engine's build-info date reader.
+Both trees are staged without adding a production Cargo dependency.
 
 On a host, `./install-apps` builds td-pass with the host's cargo, as it
 builds td-photo and td-editor, and installs it to run by name from

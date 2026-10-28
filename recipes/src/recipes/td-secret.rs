@@ -224,6 +224,8 @@ pub fn recipe() -> Recipe {
         "{src}/td-tpm/tests",
         "{src}/td-fido/src",
         "{src}/td-fido/tests",
+        "{src}/td-fs/src",
+        "{src}/td-civil/src",
         "{root}/test-deps",
     ] {
         steps.push(Step::MkDir {
@@ -363,6 +365,23 @@ pub fn recipe() -> Recipe {
         (
             "{src}/engine/src/principals.rs",
             include_str!("../../../engine/src/principals.rs"),
+        ),
+        // The tier reader's production-appender regression and fixture owner.
+        (
+            "{src}/engine/src/boot_info.rs",
+            include_str!("../../../engine/src/boot_info.rs"),
+        ),
+        (
+            "{src}/engine/src/cpio.rs",
+            include_str!("../../../engine/src/cpio.rs"),
+        ),
+        (
+            "{src}/td-civil/src/tzif.rs",
+            include_str!("../../../td-civil/src/tzif.rs"),
+        ),
+        (
+            "{src}/td-fs/src/temp_dir.rs",
+            include_str!("../../../td-fs/src/temp_dir.rs"),
         ),
     ] {
         steps.push(Step::WriteFile {
@@ -551,6 +570,43 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_login_reader_recipes_stage_their_transitive_test_imports() {
+        let mut missing = Vec::new();
+        for (label, recipe) in [
+            ("td-secret", recipe()),
+            ("td-authd", crate::catalog::lookup("td-authd").unwrap()),
+        ] {
+            let written: std::collections::BTreeMap<_, _> = recipe
+                .steps
+                .iter()
+                .flatten()
+                .filter_map(|step| match step {
+                    Step::WriteFile { path, content, .. } if path.starts_with("{src}/") => {
+                        Some((std::path::Path::new(path), content))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (path, source) in &written {
+                if path.extension().is_none_or(|extension| extension != "rs") {
+                    continue;
+                }
+                for name in crate::source_closure::named(source) {
+                    let target = crate::source_closure::normal(&path.parent().unwrap().join(name));
+                    if !written.contains_key(target.as_path()) {
+                        missing.push(format!(
+                            "{label}: {} names {}",
+                            path.display(),
+                            target.display()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "unstaged literal imports: {missing:#?}");
+    }
 
     #[test]
     fn embedded_rust_has_no_recipe_substitution_tokens() {

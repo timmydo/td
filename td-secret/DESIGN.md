@@ -1915,25 +1915,38 @@ read, each retry of that last probe, and the verdict once the stream
 ends first check the caller's give-up, a parameter (the worker's ten
 seconds per deployment, td-authd's two for request 19), so a read that
 finishes late reads nothing; the give-up cannot interrupt a stalled
-filesystem. The newc reader takes magic `070701` only, a name
-field of 2 to 4096 bytes with its NUL last and no other, at most 65536
-members before `TRAILER!!!` and only NUL bytes after it; other members'
-data is passed through the buffer unkept. The marker is the one member
-named exactly `etc/td-login-tier`, a single-link regular file of at most
-256 bytes whose bytes are exactly the grammar; a second one, another
-type or a malformed one refuses.
+filesystem. The concatenated newc grammar and path rules are
+TOKEN-LOGIN.md's "Deployments" contract: the stream includes assembly's
+build-info appendix, and a trailer never finishes verification early or
+resets the member count, marker or path state. In addition to the fixed
+data buffer, the reader retains a map of member names and file
+types, bounded by that contract's member and name limits. Other members'
+data is passed through the buffer unkept. Only a complete, hash-matching
+stream yields the unique marker's versions.
 
 Host tests, run in both crates, cover the grammar's every rule, archives
 with and without the marker and under other spellings of its name, every
 bound at and past its limit (the archive's by a sparse file), a bad
-magic, bytes after the trailer, truncation at each member boundary and
+magic, non-padding bytes and incomplete or misaligned appended archives,
+truncation at each member boundary and
 inside each header, a budget spent by the last read or the end probe, a
 duplicated or odd marker, a size change in both directions and the
 give-up, the digest chain both ways, links, a FIFO, a directory and the
 wrong owner in each file's place, and retained deployments through
 fixture volumes: both markers, one missing, malformed selectors, a
 deployment directory that is a link, contents that are another
-deployment's and no volume at all.
+deployment's and no volume at all. The assembled-deployment regression
+calls the production `engine/src/boot_info.rs` appender and reads both
+retained selectors against the resulting manifest; changing only the
+appendix invalidates its hash. Cross-archive tests refuse duplicate and
+alias markers, symlink parents, file-type replacement (including hardlink
+sources replaced by symlinks), nonempty trailers
+and aggregate member/archive limit overruns. Disposable filesystem
+fixtures use the shared `td-fs::TempDir` guard.
+Both direct target recipes stage that guard, the appender, its cpio
+writer and its td-civil date reader for their unit-test builds. A recipe
+test follows every staged Rust file's literal imports and requires the
+named files to be staged too, including transitive test-only imports.
 
 ## Login record store
 

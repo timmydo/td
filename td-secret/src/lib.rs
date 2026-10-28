@@ -203,6 +203,10 @@ fn parse_uid(value: &str) -> Result<u32, String> {
 #[cfg(test)]
 mod pty_fixture_sys;
 
+#[cfg(test)]
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod test_temp;
+
 // The cutover record stage 1 leaves (td-authd/DESIGN.md amendment 7),
 // which the paired desktop guests provision before each generation.
 #[cfg(test)]

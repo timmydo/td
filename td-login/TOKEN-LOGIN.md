@@ -941,13 +941,26 @@ through the last) or `openat2`, or move capture's open and reads and
 request 19's marker read off the serve loop together. The manifest's
 SHA-256 must equal the deployment ID naming it and the archive's the
 manifest's `initramfs.cpio` entry, each over the bytes parsed. The newc
-reader is bounded: magic `070701` only; each member's name field of 2 to
-4096 bytes counting its terminating NUL, which must be its last byte and
-its only NUL; at most 65536 members before `TRAILER!!!`, the trailer not
-counted; every other member's data skipped unbuffered; the marker the
-one member named exactly `etc/td-login-tier`, a regular file with one
-link and at most 256 bytes; and nothing after `TRAILER!!!` but NUL
-padding.
+reader accepts up to 64 concatenated uncompressed archives, including
+the deployment assembly's build-info appendix. Every archive starts
+four-byte aligned with magic `070701` and ends in a zero-length
+`TRAILER!!!`; inter-archive, member and final padding is NUL only. All
+header fields must be hex. A name field is 2 to 4096 bytes including its
+terminating NUL, which is its only NUL. At most 65536 non-trailer members
+occur across the whole stream; neither that count nor marker uniqueness
+resets at a trailer. Every member's name is relative with no empty,
+`.` or `..` component. Every parent must already have appeared as a
+directory with no data, and no path may change its file type across the
+stream. In particular, a regular hardlink's remembered source path cannot
+become a symlink whose target a later hardlink's data would follow. The
+reader retains this bounded map of names and file types; other members'
+data is skipped unbuffered.
+These rules exclude alternate path spellings, symlink-parent traversal
+and ancestor replacement. The marker remains the one member named
+exactly `etc/td-login-tier`, a regular file with one link and at most
+256 bytes; any second marker, including a later archive's, refuses.
+The digest covers every archive and all padding, with the existing size,
+EOF and deadline checks applied to the entire stream.
 
 - A **queued update** is read through the directory File td-authd
   holds for request 19, against the ID it was admitted with.
@@ -968,8 +981,10 @@ record version, as a deployment without the tier.
 C4; `td-secret/DESIGN.md`, "Tier marker reader"), with the budget a
 parameter of each reader: td-authd's `MARKER_GIVE_UP` of two seconds
 and the worker's `RETAINED_GIVE_UP` of ten. Its tests build their own
-archives; the recipe's writing is C10b's, which a recipe test and the
-build's archive check hold to the placement above.
+archives, including one passed through `engine::boot_info::append`, the
+production deployment assembly writer; the recipe's writing is C10b's,
+which a recipe test and the build's archive check hold to the placement
+above.
 
 A deployment without the marker ignores the record, so booting it
 restores automatic login. Therefore:

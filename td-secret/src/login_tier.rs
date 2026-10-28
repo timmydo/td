@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use crate::sha256::{self, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
@@ -35,9 +36,10 @@ const MANIFEST_HEADER: &[u8] = b"td-deployment-v1";
 pub const MANIFEST_LIMIT: u64 = 4096;
 pub const ARCHIVE_LIMIT: u64 = 512 << 20;
 /// The newc reader's bounds: a member's name field with its NUL, the
-/// members before the trailer, and the marker's bytes.
+/// total members across archives, and the marker's bytes.
 pub const NAME_LIMIT: usize = 4096;
 pub const MEMBER_LIMIT: usize = 65536;
+pub const ARCHIVE_COUNT_LIMIT: usize = 64;
 pub const MARKER_LIMIT: usize = 256;
 const MAGIC: &[u8] = b"070701";
 const TRAILER: &[u8] = b"TRAILER!!!";
@@ -49,6 +51,7 @@ const NONBLOCK: i32 = 0o4000;
 const OPEN_DIRECTORY: i32 = 0o200000;
 const FORMAT: u32 = 0o170000;
 const REGULAR: u32 = 0o100000;
+const DIRECTORY: u32 = 0o040000;
 
 /// The versions a marker lists, when its bytes are exactly the grammar:
 /// `td-login-tier-v1`, then for each version a space and a decimal from 1
@@ -223,7 +226,7 @@ fn entry<'a>(line: &'a [u8], label: &[u8]) -> Option<&'a [u8]> {
     (is_id(digest) && rest.strip_prefix(b"  ")? == label).then_some(digest)
 }
 
-/// Scans `source`, `size` bytes, as one newc archive, hashing every byte
+/// Scans `source`, `size` bytes, as concatenated newc archives, hashing every byte
 /// read; `measure` is the size once it ends. The marker's versions only if
 /// the archive is whole, unchanged and hashes to `expected`.
 fn verify(
@@ -307,7 +310,7 @@ impl<R: Read> Stream<'_, R> {
                 let chunk = scratch.get_mut(..take).ok_or("archive scratch")?;
                 self.fill(chunk)?;
                 if zero && chunk.iter().any(|byte| *byte != 0) {
-                    return Err("the archive has bytes after its trailer".into());
+                    return Err("the archive has nonzero padding".into());
                 }
                 count -= u64::try_from(take).map_err(|_| "archive scratch")?;
             }
@@ -317,9 +320,31 @@ impl<R: Read> Stream<'_, R> {
         result
     }
 
-    /// The rest of the archive must be NUL padding, and nothing may follow.
+    /// Skip NUL padding to EOF or the next four-aligned archive header.
+    fn next_archive(&mut self, header: &mut [u8; NEWC_HEADER]) -> Result<bool> {
+        while self.read < self.size {
+            let left = self.size.saturating_sub(self.read);
+            if left < 4 {
+                self.pass(left, true)?;
+                break;
+            }
+            let prefix = header.get_mut(..4).ok_or("newc prefix buffer")?;
+            self.fill(prefix)?;
+            if prefix.iter().all(|byte| *byte == 0) {
+                continue;
+            }
+            if prefix != MAGIC.get(..4).ok_or("newc magic prefix")? {
+                return Err("the archive has invalid inter-archive padding or magic".into());
+            }
+            self.fill(header.get_mut(4..).ok_or("newc header buffer")?)?;
+            return Ok(true);
+        }
+        self.finish()?;
+        Ok(false)
+    }
+
+    /// All admitted bytes were consumed; nothing may follow.
     fn finish(&mut self) -> Result<()> {
-        self.pass(self.size.saturating_sub(self.read), true)?;
         loop {
             self.expired()?;
             match self.source.read(&mut [0]) {
@@ -355,17 +380,21 @@ fn padding(length: u64) -> u64 {
     (4 - length % 4) % 4
 }
 
-/// The marker's versions, or none, once the trailer and its padding end
-/// the archive.
+/// The marker's versions only after every archive's trailer and the final padding.
 fn scan<R: Read>(stream: &mut Stream<'_, R>) -> Result<Option<Vec<u8>>> {
     let mut header = [0u8; NEWC_HEADER];
     let mut name = vec![0u8; NAME_LIMIT];
     let mut marker = None;
     let mut members = 0usize;
+    let mut archives = 1usize;
+    let mut paths = BTreeMap::new();
+    stream.fill(&mut header)?;
     loop {
-        stream.fill(&mut header)?;
         if header.get(..MAGIC.len()) != Some(MAGIC) {
             return Err("a member does not start with the newc magic 070701".into());
+        }
+        for index in 0..13 {
+            field(&header, index)?;
         }
         let mode = field(&header, 1)?;
         let links = field(&header, 4)?;
@@ -383,15 +412,50 @@ fn scan<R: Read>(stream: &mut Stream<'_, R>) -> Result<Option<Vec<u8>>> {
             return Err("a member's name holds a NUL".into());
         }
         let named = u64::try_from(NEWC_HEADER + name_size).map_err(|_| "newc name size")?;
-        stream.pass(padding(named), false)?;
+        stream.pass(padding(named), true)?;
         if name == TRAILER {
-            stream.finish()?;
-            return Ok(marker);
+            if length != 0 {
+                return Err("a newc trailer carries data".into());
+            }
+            if !stream.next_archive(&mut header)? {
+                return Ok(marker);
+            }
+            archives += 1;
+            if archives > ARCHIVE_COUNT_LIMIT {
+                return Err("the initramfs has more than 64 archives".into());
+            }
+            continue;
         }
         members += 1;
         if members > MEMBER_LIMIT {
             return Err("the archive has more than 65536 members".into());
         }
+        // Canonical names and explicit directory parents exclude aliases
+        // through dot components or symlinks, in every archive.
+        if name
+            .split(|byte| *byte == b'/')
+            .any(|part| part.is_empty() || part == b"." || part == b"..")
+        {
+            return Err("a member's path is not canonical".into());
+        }
+        for (at, byte) in name.iter().enumerate() {
+            if *byte == b'/' && paths.get(name.get(..at).ok_or("newc parent")?) != Some(&DIRECTORY)
+            {
+                return Err("a member's parent is not an earlier directory".into());
+            }
+        }
+        let kind = mode & FORMAT;
+        if name != MEMBER {
+            if kind == DIRECTORY && length != 0 {
+                return Err("a directory member carries data".into());
+            }
+            // A hardlink table remembers paths, so a regular file later
+            // becoming a symlink can redirect another hardlink's data.
+            if paths.get(name).is_some_and(|earlier| *earlier != kind) {
+                return Err("a member changes an earlier path's file type".into());
+            }
+        }
+        paths.insert(name.to_vec(), kind);
         if name == MEMBER {
             if marker.is_some() {
                 return Err("the archive carries two tier markers".into());
@@ -410,17 +474,24 @@ fn scan<R: Read>(stream: &mut Stream<'_, R>) -> Result<Option<Vec<u8>>> {
         } else {
             stream.pass(length, false)?;
         }
-        stream.pass(padding(length), false)?;
+        stream.pass(padding(length), true)?;
+        stream.fill(&mut header)?;
     }
 }
 
+#[cfg(test)]
+#[path = "../../engine/src/boot_info.rs"]
+#[allow(dead_code, reason = "exercise the deployment assembly writer")]
+mod boot_info;
+#[cfg(test)]
+#[path = "../../engine/src/cpio.rs"]
+mod cpio;
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
     use std::os::fd::OwnedFd;
     use std::os::unix::fs::{symlink, FileTypeExt};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// The budget the tests read within when not testing it: far past a
     /// loaded host's debug scan of the largest fixture, so no passing case
@@ -442,6 +513,15 @@ pub(crate) mod tests {
             mode: 0o100444,
             links: 1,
             data,
+        }
+    }
+
+    fn directory(name: &[u8]) -> Member<'_> {
+        Member {
+            name,
+            mode: 0o040755,
+            links: 2,
+            data: b"",
         }
     }
 
@@ -478,8 +558,17 @@ pub(crate) mod tests {
         pad(bytes);
     }
 
-    /// `members`, then the trailer, padded to 512 bytes as gen_init_cpio does.
+    /// A marker fixture supplies its parent, as the deployment spec does.
     pub(crate) fn archive(members: &[Member<'_>]) -> Vec<u8> {
+        let mut members = members.to_vec();
+        if members.iter().any(|m| m.name == MEMBER) && !members.iter().any(|m| m.name == b"etc") {
+            members.insert(0, directory(b"etc"));
+        }
+        raw_archive(&members)
+    }
+
+    /// `members`, then the trailer, padded to 512 bytes as gen_init_cpio does.
+    fn raw_archive(members: &[Member<'_>]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for member in members {
             pack(&mut bytes, *member);
@@ -503,12 +592,6 @@ pub(crate) mod tests {
 
     /// A deployment initramfs's shape, with the marker when one is given.
     pub(crate) fn initramfs(tier: Option<&[u8]>) -> Vec<u8> {
-        let directory = |name| Member {
-            name,
-            mode: 0o040755,
-            links: 2,
-            data: b"",
-        };
         let mut members = vec![
             directory(b"bin"),
             file(b"init", b"#!/bin/sh\nexec /bin/switch_root\n"),
@@ -544,25 +627,19 @@ pub(crate) mod tests {
     pub(crate) struct Scratch {
         pub(crate) path: PathBuf,
         pub(crate) owner: u32,
+        _owned: crate::test_temp::TempDir,
     }
 
     impl Scratch {
         pub(crate) fn new() -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "td-login-tier-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
+            let owned = crate::test_temp::TempDir::new("td-login-tier").unwrap();
+            let path = owned.path().to_path_buf();
             let owner = fs::metadata(&path).unwrap().uid();
-            Self { path, owner }
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+            Self {
+                path,
+                owner,
+                _owned: owned,
+            }
         }
     }
 
@@ -645,10 +722,185 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn assembled_deployments_read_the_marker_after_build_info_is_appended() {
+        let info = boot_info::Info {
+            commit: "55dac3a3a3e9ba8e122d39a2ad1c207a2d4a8936".into(),
+            commit_date: "2026-10-26".into(),
+            build_date: "2026-10-27".into(),
+            dirty: false,
+        };
+        let base = initramfs(Some(&marker(&[1])));
+        let mut bytes = Vec::new();
+        boot_info::append(&mut &base[..], &mut bytes, &info).unwrap();
+        assert_eq!(scanned(&bytes), Ok(vec![1]));
+        let volume = Volume::new();
+        let staging = volume.path().join("deployments/staging");
+        fs::create_dir(&staging).unwrap();
+        let id = bundle(&staging, &bytes);
+        fs::rename(&staging, volume.path().join("deployments").join(&id)).unwrap();
+        for slot in [CURRENT, PREVIOUS] {
+            volume.select(slot, &format!("../deployments/{id}"));
+            assert_eq!(
+                retained(volume.path(), slot, volume.scratch.owner, BUDGET),
+                Ok(vec![1])
+            );
+        }
+        // The manifest authenticates the appendix too, even if it parses.
+        let size = bytes.len() as u64;
+        let digest = sha256::hex_digest(&bytes);
+        let at = bytes
+            .windows(info.commit.len())
+            .position(|w| w == info.commit.as_bytes())
+            .unwrap();
+        bytes[at] = b'6';
+        assert_eq!(
+            verify(
+                &mut &bytes[..],
+                size,
+                &digest,
+                deadline(BUDGET).unwrap(),
+                || Ok(size)
+            ),
+            refused("the archive does not hash to the manifest's entry")
+        );
+    }
+
+    #[test]
+    fn concatenated_archives_require_complete_aligned_bounded_streams() {
+        let good = initramfs(Some(&marker(&[1])));
+        let tail = raw_archive(&[file(b"after", b"payload")]);
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&tail);
+        bytes.extend(raw_archive(&[]));
+        assert_eq!(scanned(&bytes), Ok(vec![1]));
+        // The marker may occur in a later complete archive too.
+        let mut later = initramfs(None);
+        later.extend(raw_archive(&[file(MEMBER, &marker(&[1]))]));
+        assert_eq!(scanned(&later), Ok(vec![1]));
+        for padding in [1, 2, 3, 5] {
+            let mut bytes = good.clone();
+            bytes.resize(bytes.len() + padding, 0);
+            bytes.extend_from_slice(&tail);
+            assert!(scanned(&bytes).is_err(), "unaligned join {padding}");
+        }
+        // A new archive must reach its own trailer. Data, partial headers,
+        // bad hex even in unused fields, and compression are not padding.
+        let trailer = tail
+            .windows(TRAILER.len())
+            .position(|w| w == TRAILER)
+            .unwrap();
+        for cut in [1, 4, 6, 109, 110, trailer, trailer + TRAILER.len()] {
+            let mut bytes = good.clone();
+            bytes.extend_from_slice(&tail[..cut]);
+            assert!(scanned(&bytes).is_err(), "truncated tail {cut}");
+        }
+        for (at, byte) in [(0, 0x1f), (5, b'2'), (6, b'G'), (110, 0)] {
+            let mut bytes = good.clone();
+            bytes.extend_from_slice(&tail);
+            bytes[good.len() + at] = byte;
+            assert!(scanned(&bytes).is_err(), "malformed tail {at}");
+        }
+        let mut nonempty_trailer = Vec::new();
+        pack(&mut nonempty_trailer, file(TRAILER, b"x"));
+        let mut bytes = good.clone();
+        bytes.extend(nonempty_trailer);
+        assert_eq!(scanned(&bytes), refused("a newc trailer carries data"));
+        let mut bytes = good;
+        for _ in 1..ARCHIVE_COUNT_LIMIT {
+            bytes.extend(raw_archive(&[]));
+        }
+        assert_eq!(scanned(&bytes), Ok(vec![1]));
+        bytes.extend(raw_archive(&[]));
+        assert_eq!(
+            scanned(&bytes),
+            refused("the initramfs has more than 64 archives")
+        );
+    }
+
+    #[test]
+    fn later_archives_cannot_override_or_alias_the_marker() {
+        let good = initramfs(Some(&marker(&[1])));
+        let tier = marker(&[2]);
+        let symlink = |name, target| Member {
+            name,
+            mode: 0o120777,
+            links: 1,
+            data: target,
+        };
+        let mut cases = vec![
+            vec![file(MEMBER, &tier)],
+            vec![symlink(MEMBER, b"elsewhere")],
+            vec![directory(MEMBER)],
+            vec![symlink(b"etc", b"elsewhere")],
+            vec![file(b"etc", b"elsewhere")],
+            vec![
+                symlink(b"alias", b"etc"),
+                file(b"alias/td-login-tier", &tier),
+            ],
+            vec![file(b"missing/child", b"")],
+            vec![file(b"etc/td-login-tier/child", b"")],
+        ];
+        for name in [
+            &b"/etc/td-login-tier"[..],
+            b"./etc/td-login-tier",
+            b"etc//td-login-tier",
+            b"etc/./td-login-tier",
+            b"etc/td-login-tier/",
+            b"etc/../etc/td-login-tier",
+            b"elsewhere/../etc/td-login-tier",
+            b"/etc",
+            b"./etc",
+            b"etc/",
+        ] {
+            cases.push(vec![file(name, &tier)]);
+        }
+        for members in cases {
+            let tail = raw_archive(&members);
+            let mut bytes = good.clone();
+            bytes.extend_from_slice(&tail);
+            assert!(scanned(&bytes).is_err(), "later {:?}", members[0].name);
+            // The same defense applies before the canonical marker.
+            let mut before = tail;
+            before.extend_from_slice(&good);
+            assert!(scanned(&before).is_err(), "earlier {:?}", members[0].name);
+        }
+        assert_eq!(
+            scanned(&raw_archive(&[file(MEMBER, &tier)])),
+            refused("a member's parent is not an earlier directory")
+        );
+        // Repeating a genuine directory does not change path identity.
+        let mut bytes = good;
+        bytes.extend(raw_archive(&[directory(b"etc"), file(b"etc/other", b"x")]));
+        assert_eq!(scanned(&bytes), Ok(vec![1]));
+    }
+
+    #[test]
+    fn a_hardlink_source_cannot_be_replaced_by_a_symlink_to_the_marker() {
+        // pack uses the same inode/device tuple for these two hardlinks.
+        // Linux remembers the first path; replacing it with a symlink
+        // would make the second hardlink's data follow that symlink.
+        let first = Member {
+            links: 2,
+            ..file(b"a", b"original")
+        };
+        let link = Member {
+            mode: 0o120777,
+            ..file(b"a", b"/etc/td-login-tier")
+        };
+        let second = Member {
+            links: 2,
+            ..file(b"b", b"td-login-tier-v1 2\n")
+        };
+        let mut bytes = initramfs(Some(&marker(&[1])));
+        bytes.extend(raw_archive(&[first, link, second]));
+        assert!(scanned(&bytes).is_err());
+    }
+
+    #[test]
     fn a_missing_duplicated_odd_or_malformed_marker_reads_nothing() {
         let none = refused("the archive carries no tier marker");
         assert_eq!(scanned(&initramfs(None)), none);
-        // Another spelling of the name is not the marker.
+        // Another spelling of the name cannot supply a marker.
         let tier = marker(&[1]);
         for name in [
             &b"/etc/td-login-tier"[..],
@@ -656,7 +908,7 @@ pub(crate) mod tests {
             b"etc/td-login-tier/",
             b"td-login-tier",
         ] {
-            assert_eq!(scanned(&archive(&[file(name, &tier)])), none);
+            assert!(scanned(&archive(&[file(name, &tier)])).is_err());
         }
         let twice = archive(&[file(MEMBER, &tier), file(MEMBER, &tier)]);
         assert_eq!(
@@ -696,14 +948,17 @@ pub(crate) mod tests {
         let mut bytes = good.clone();
         bytes[6 + 6 * 8] = b'G';
         assert_eq!(scanned(&bytes), refused("a newc header field is not hex"));
-        // A byte after the trailer that is not padding, or a second archive.
-        let trailing = refused("the archive has bytes after its trailer");
+        // A byte after the trailer that is not padding, or a second marker.
+        let trailing = refused("the archive has invalid inter-archive padding or magic");
         let mut bytes = good.clone();
         *bytes.last_mut().unwrap() = 1;
         assert_eq!(scanned(&bytes), trailing);
         let mut bytes = good.clone();
         bytes.extend(archive(&[file(MEMBER, &marker(&[2]))]));
-        assert_eq!(scanned(&bytes), trailing);
+        assert_eq!(
+            scanned(&bytes),
+            refused("the archive carries two tier markers")
+        );
         // Cut at each member boundary, inside each header, and anywhere
         // else before the trailer's name ends.
         let trailer = good
@@ -758,10 +1013,16 @@ pub(crate) mod tests {
         assert_eq!(scanned(&empty), named);
         // 65536 members before the trailer, the marker among them, then one
         // more.
-        let names: Vec<String> = (0..MEMBER_LIMIT).map(|n| format!("m{n:05}")).collect();
+        let names: Vec<String> = (0..MEMBER_LIMIT - 1).map(|n| format!("m{n:05}")).collect();
         let mut members: Vec<Member<'_>> = names.iter().map(|n| file(n.as_bytes(), b"")).collect();
         members[MEMBER_LIMIT / 2] = file(MEMBER, &tier);
         assert_eq!(scanned(&archive(&members)), Ok(vec![1]));
+        let mut split = archive(&members);
+        split.extend(raw_archive(&[file(b"one-more", b"")]));
+        assert_eq!(
+            scanned(&split),
+            refused("the archive has more than 65536 members")
+        );
         members.push(file(b"one-more", b""));
         assert_eq!(
             scanned(&archive(&members)),
