@@ -399,6 +399,38 @@ the complete-body fallback. Raw downloads and owner integrity audits still
 verify the whole message; successful text views do not certify unread
 attachments. The independent whole-body scrub below checks those bytes.
 
+## Persistent search fields
+
+Schema 35 adds `blob_search`. Use the same fenced owner upgrade procedure,
+including a verified backup and restoring ordinary runtime mail grants on
+this table. Check the selected configuration with the candidate before
+activation: search-field buffers add 20 MiB per body/search job to the resource
+plan (60 MiB for the default three jobs), which can invalidate a tightly
+configured memory budget. The default remains within its 512 MiB budget.
+
+Fill search evidence with the standard owner command, one page at a time:
+
+```text
+sudo -u td-mta /opt/td-mta/bin/td-mta postgres summary-backfill --connection-file /var/lib/td-mta/mail/owner-connection --epoch CURRENT_EPOCH --account ACCOUNT_ID --limit 16 --search
+```
+
+Use each successful `after` cursor until `done`, as for summary backfill, and
+repeat for each account listed by `postgres account-list`. Record
+`searches_written` and `searches_skipped` separately from header-summary counts.
+The search-output page cap may produce fewer than sixteen entries. A skipped
+interpretation retains the original parser fallback; completion of the scan
+does not mean every message acquired search evidence. On failure, preserve the
+last successful cursor and inspect the error; an unknown COMMIT is not a
+safe automatic retry. `--structure` may be combined with `--search` when both
+kinds of evidence need rebuilding.
+
+Compare `search_fields`, `jmap_search` and `body_verify` counter deltas around
+the same scoped search before and after backfill. Cache hits avoid repeated
+MIME decoding but still verify the complete original body. Large searches can
+still exceed request work or connection bounds; this is not a full-text index.
+The first implementation has no automatic search-row preparation or scheduled
+rebuild, so new messages use parser fallback until an explicit backfill.
+
 ## Scheduled whole-body integrity verification
 
 `td-mta-maint-scrub.timer` runs one bounded page each minute. Each page checks
