@@ -779,6 +779,10 @@ stopped. `START.txt` gives supervisor and bounded copy commands, and `mail.toml`
 uses the separate local password and generated CA. Quotas are mail publication
 bounds, not filesystem free-space reservations.
 
+The generated td-mail account name is `replica`, separate from an ordinary
+local setup's `local` account. These names also select td-mail's cache files;
+keep a distinct name when combining this configuration with existing accounts.
+
 This prepares an initial, incomplete account. Starting the generated sync
 service continues copying. It does not enable history reset, certificate
 renewal, promotion or recovery. Operators must renew the 90-day leaf certificates

@@ -1093,7 +1093,12 @@ COMMIT;
     database.0.wait().map_err(|e| e.to_string())?;
     let password_command = format!("cat {}", shell(&p.path("jmap-password")));
     let toml = |s: &str| Json::Str(s.into()).to_canonical();
-    p.write("mail.toml", format!("[account.local]\nwell_known_url = \"https://localhost:{}/.well-known/jmap\"\nusername = {}\npassword_command = {}\ntls_ca_file = {}\n[mail]\nreply_from = {}\n", s.https_port, toml(&s.account), toml(&password_command), toml(text(&p.path("tls/ca.pem"))?), toml(&s.account)))?;
+    let client_account = if s.replica.is_some() {
+        "replica"
+    } else {
+        "local"
+    };
+    p.write("mail.toml", format!("[account.{client_account}]\nwell_known_url = \"https://localhost:{}/.well-known/jmap\"\nusername = {}\npassword_command = {}\ntls_ca_file = {}\n[mail]\nreply_from = {}\n", s.https_port, toml(&s.account), toml(&password_command), toml(text(&p.path("tls/ca.pem"))?), toml(&s.account)))?;
     if let Some(replica) = &s.replica {
         replica_services(&p, &postgres, replica, &epoch, &account)?;
         println!(
