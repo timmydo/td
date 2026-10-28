@@ -7,7 +7,11 @@ use crate::{
 };
 use td_json::Json;
 mod discovery;
+mod reader;
+mod state;
 pub use discovery::{discover, Discovery, SourceLimits};
+pub use reader::{MailboxPage, MetadataPage, ReadError, ReadLimits, Reader, VerifiedBody};
+pub use state::{email_changes, mailbox_changes, mailboxes, Changes, Mailbox, Mailboxes};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

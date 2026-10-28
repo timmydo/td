@@ -673,3 +673,30 @@ through the CLI, including private locked state, interrupted writes and symlink
 refusal. Unit fixtures cover failure retention and clock observations across
 cycles. These are correctness
 checks without wall-clock performance thresholds.
+
+
+### Replica source reader
+
+Source-reader unit fixtures exercise bounded JSON bytes, node counts, nesting,
+malformed/trailing input and already-expired deadlines before constructing an
+owned tree. Body staging tests require exact size and digest across chunk sizes,
+refuse short/oversized/wrong-digest input and cover empty bodies. Request tests
+pin the required capabilities and single invocation. Invalid limits and origins
+refuse before DNS. No elapsed-time performance assertion is added.
+
+The native foreground-service fixture connects the source reader to the real
+HTTPS/PostgreSQL service using a fixture device credential and CA. It discovers
+the account, binds its inventory epoch, fetches metadata and verifies a complete
+SMTP-delivered raw body against its PostgreSQL length/digest. It checks explicit
+notFound, duplicate request refusal, wrong-epoch refusal without rebinding and
+reconnect with the correct binding. Reads leave Email and submission counts
+unchanged. This proves the source transport/decoder path, not local publication,
+checkpoint durability, full-copy completeness or recovery readiness.
+
+Mailbox/change decoder tests cover scoped state kinds, exact old state,
+monotonic new state, empty advancing pages, aggregate ID limits, disjoint sets,
+duplicate/wrong-kind IDs, stored mailbox fields, invalid rows, duplicate roles,
+missing parents and cycles. The native reader also fetches the actual Inbox
+graph and independently exercises both change streams from their beginnings
+and current states. It validates Email membership against the observed graph;
+this remains one observation, not a completed ongoing reconciliation.

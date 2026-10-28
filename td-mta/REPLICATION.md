@@ -213,6 +213,64 @@ callers retain their existing single-use request policy. This helper creates
 no background workers or unbounded connection pool. Retry and credential
 refresh belong to the synchronizer's bounded read-operation policy.
 
+### Authenticated source reader
+
+The source reader connects Session discovery, inventory, metadata and raw body
+fetching, complete Mailbox/get observations and independent Email/Mailbox
+changes over the bounded reusable HTTPS transport. It sends one closed read
+method per request and obeys the smaller negotiated request and ID limits.
+It has no local database access, publication authority or durable checkpoints;
+there is still no synchronization command or local read service.
+
+A new reader selects the sole authenticated account and learns its epoch only
+after a complete valid initial inventory response. A resumed reader takes the
+persisted account/epoch binding. Changed scope refuses without replacing that
+binding. Metadata and body reads require a bound epoch. Metadata pages own their
+immutable response storage, selected origin and binding; keyword views borrow
+that storage. Passing a page across origins/accounts/epochs refuses. The caller
+must also preserve its configured source origin with its persistent binding.
+
+JSON intake has caller-chosen byte and value/key-node limits, capped at 8 MiB
+and 262144 nodes, with depth 32. Discovery uses the smaller of these and 32 KiB /
+8192 nodes. A nonallocating structural pass enforces those limits before the
+owned JSON tree is built. This bounds both raw strings and tiny-value allocation
+amplification; it is not a promise that heap use equals wire bytes. Media type
+must be application/json. Byte/node/depth refusal never becomes an empty page.
+The original absolute job deadline covers network, parsing and verification.
+
+A body read takes an Email from a validated metadata page, reserves its declared
+length within the configured body limit (at most 64 MiB), and incrementally
+hashes the received raw bytes. No bytes are exposed until HTTP completion,
+exact byte count and SHA-256 all succeed. The resulting immutable owner can be
+read but not altered. A short, oversized, truncated or digest-mismatched body
+cannot become a successful body, even if a prefix was received. HTTP error,
+source reset, malformed data, resource refusal and integrity failure are explicit
+outcomes. This reader does not automatically retry, redirect or skip objects.
+
+The future worker must charge one complete provisional body plus raw/parsed
+JSON and retained metadata pages against its memory plan. There is no new
+worker or default memory allowance in this increment. Use one background reader
+initially and measure before increasing concurrency. Current metadata is not a
+snapshot of later body availability: deletion requires fresh reconciliation,
+not an inferred successful copy. Inventory completion still proves enumeration
+only; mailbox dependencies and change catch-up remain separate work.
+
+The mailbox request selects the six stored properties and all IDs. Its decoder
+requires complete coverage, valid core row values, unique IDs/roles, and a
+bounded acyclic parent graph with no missing parent. It retains subscription
+and ordering without importing computed counts or remote rights. The source's
+256-mailbox ceiling is retained. If a source has a smaller get limit than its
+complete graph, copying pauses explicitly; it does not truncate the graph.
+
+Change pages bind oldState exactly to the requested Email or Mailbox state and
+require a matching account/epoch/type and monotonic newState. Created, updated
+and destroyed IDs are bounded in aggregate (at most 1024), unique and disjoint.
+They are sorted locally; wire order confers no authority. A page with changes,
+or hasMoreChanges, must advance. Empty pages may advance past unrelated account
+transactions. Mailbox updatedProperties must be null: this reader requests full
+metadata for changed objects, not a partial-property interpretation. A change
+page carries no body, local commit evidence or checkpoint advancement authority.
+
 ### Remaining synchronization work
 
 Qualify the existing JMAP Email/Mailbox get and changes surfaces and raw

@@ -180,6 +180,7 @@ pub(super) fn exercise(
         .unwrap()
         .0
         .as_str();
+    replica_source_reads(fixture, https_address.port(), &encoded, account, epoch);
     let api_body = format!(
         r#"{{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{{"accountId":"{source_account}"}},"persistent"]]}}"#
     );
@@ -856,4 +857,135 @@ fn persistent_reply(stream: &mut impl Read) -> (String, Vec<u8>) {
     let mut body = vec![0; length];
     stream.read_exact(&mut body).unwrap();
     (head, body)
+}
+
+fn replica_source_reads(
+    fixture: &Fixture,
+    port: u16,
+    credentials: &str,
+    account: td_mta::ids::AccountId,
+    epoch: td_mta::ids::StoreEpoch,
+) {
+    use td_mta::replica_source::{Binding, Bounds, ReadError, ReadLimits, Reader};
+    let trust = td_crypto::TrustStore::from_pem(&fixture.ca).unwrap();
+    let origin = format!("https://localhost:{port}");
+    let authorization = format!("Basic {credentials}");
+    let limits = ReadLimits {
+        json_bytes: 1024 * 1024,
+        json_nodes: 65536,
+        email: Bounds {
+            body_bytes: 1024 * 1024,
+            values_per_email: 256,
+        },
+    };
+    let client = || td_mta::outbound_http::Client {
+        executable: std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
+        origin: &origin,
+        trust: &trust,
+        deadline: std::time::Instant::now() + Duration::from_secs(60),
+    };
+    let mut reader = Reader::connect(client(), &authorization, None, limits).unwrap();
+    assert_eq!(reader.account(), account);
+    assert!(reader.binding().is_none());
+    assert_eq!(reader.metadata(&[]).err(), Some(ReadError::Unbound));
+    let inventory = reader.inventory(None).unwrap();
+    assert!(inventory.next.is_none());
+    assert_eq!(inventory.ids.len(), 1);
+    assert_eq!(reader.binding().unwrap().epoch, epoch);
+    let page = reader.metadata(&inventory.ids).unwrap();
+    let view = page.view().unwrap();
+    assert!(view.missing.is_empty());
+    let email = view.emails.first().unwrap();
+    let folders = reader.mailboxes().unwrap();
+    let folders_view = folders.view().unwrap();
+    assert_eq!(folders_view.list.len(), 1);
+    assert_eq!(folders_view.list.first().unwrap().row.role, Some("inbox"));
+    for mailbox in &email.mailboxes {
+        assert!(folders_view.list.iter().any(|folder| folder.id == *mailbox));
+    }
+    let email_current = reader.email_changes(inventory.base).unwrap();
+    assert!(
+        email_current.created.is_empty()
+            && email_current.updated.is_empty()
+            && email_current.destroyed.is_empty()
+            && !email_current.more
+    );
+    let folder_current = reader.mailbox_changes(folders_view.observed).unwrap();
+    assert!(
+        folder_current.created.is_empty()
+            && folder_current.updated.is_empty()
+            && folder_current.destroyed.is_empty()
+            && !folder_current.more
+    );
+    let mut beginning = inventory.base;
+    beginning.sequence = td_mta::format::Sequence::from_u64(0);
+    let arrivals = reader.email_changes(beginning).unwrap();
+    assert_eq!(arrivals.created, inventory.ids);
+    assert!(!arrivals.more);
+    beginning.kind = td_mta::sync::DataType::Mailbox;
+    let creations = reader.mailbox_changes(beginning).unwrap();
+    assert_eq!(
+        creations.created,
+        folders_view.list.iter().map(|v| v.id).collect::<Vec<_>>()
+    );
+    assert!(!creations.more);
+    assert_eq!(
+        reader.email_changes(beginning).err(),
+        Some(ReadError::Invalid)
+    );
+    let body = reader.body(&page, email.id).unwrap();
+    assert_eq!(body.blob(), email.blob);
+    assert_eq!(body.digest(), email.digest);
+    assert_eq!(body.bytes().len() as u64, email.size);
+    assert!(body
+        .bytes()
+        .ends_with(b"Delivered by the real process.\r\n"));
+    assert_eq!(
+        sql(fixture, "SELECT length FROM td_mta.blobs"),
+        body.bytes().len().to_string()
+    );
+    let digest = body
+        .digest()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        sql(fixture, "SELECT encode(digest,'hex') FROM td_mta.blobs"),
+        digest
+    );
+    let missing = td_mta::ids::EmailId::from_bytes([0x42; 16]);
+    let absent = reader.metadata(&[missing]).unwrap();
+    assert_eq!(absent.view().unwrap().missing, vec![missing]);
+    assert_eq!(
+        reader.body(&absent, missing).err(),
+        Some(ReadError::Invalid)
+    );
+    assert_eq!(
+        reader.metadata(&[email.id, email.id]).err(),
+        Some(ReadError::Invalid)
+    );
+    drop(reader);
+    let wrong = Binding {
+        account,
+        epoch: td_mta::ids::StoreEpoch::from_bytes([0x42; 16]),
+    };
+    let mut reader = Reader::connect(client(), &authorization, Some(wrong), limits).unwrap();
+    assert_eq!(
+        reader.inventory(None).err(),
+        Some(ReadError::Source(
+            td_mta::replica_source::Error::SourceChanged
+        ))
+    );
+    assert_eq!(reader.binding().unwrap().epoch, wrong.epoch);
+    drop(reader);
+    let mut reader = Reader::connect(
+        client(),
+        &authorization,
+        Some(Binding { account, epoch }),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(reader.inventory(None).unwrap().ids, inventory.ids);
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submissions"), "0");
 }
