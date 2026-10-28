@@ -469,7 +469,17 @@ ENCRYPTION.md's upgrade machine resolves:
   its own commit; the old digest stays with an empty `keyslots` list
   after the last removal.
 
-cryptsetup 2.8.8 instead destroys the old keyslots before dropping the
+The last hotzone stays marked `in-reencryption` through its data sync.
+There is no intervening commit with one all-new active segment while the
+reencryption requirement remains: cryptsetup 2.8.8 mistakes that clean
+layout for offset zero, rewrites the new ciphertext as though it used the
+old key, and returns success with corrupted plaintext. B4b's replayed
+stock write prefixes reproduce this under checksum and journal resilience.
+The final commit above goes directly from the last dirty hotzone to the
+final segments without the requirement; a torn commit selects either a
+recoverable last hotzone or the finished volume.
+
+cryptsetup 2.8.8 also destroys the old keyslots before dropping the
 requirement, and a power cut between them leaves a header no resumption
 opens (ENCRYPTION.md "Re-encrypting upgrade"). With td-luks's order,
 the intended invariant is that every commit leaves a header both
@@ -510,8 +520,12 @@ detached form, and it writes nothing.
 - **Committed fixtures:** headers and keyslot areas that cryptsetup
   2.8.8 produced with known keys. The set covers a fresh format, added
   keyslots and tokens, a killed keyslot, and reencryption interrupted at
-  each resume point under both resilience modes. A recorded procedure
-  regenerates them in a qemu guest. They keep the interoperability
+  each captured write boundary under both resilience modes, before old
+  keyslot erasure. Each replay prefix is checked with stock cryptsetup:
+  recoverable states must restore the known plaintext; the all-new layout
+  still carrying the requirement is retained as negative evidence and
+  must never be emitted by td-luks. A recorded procedure regenerates them
+  in a qemu guest. They keep the interoperability
   evidence after cryptsetup leaves the tree.
 - **Interop oracle:** a qemu guest with both programs runs each verb
   with td-luks and checks the result with cryptsetup, and the other way
@@ -550,8 +564,12 @@ Each increment is one landable commit, or a short series:
     token, killed slot and unbound slot, captured in QEMU by
     `fixtures/generate.rs`; `fixtures/README.md` records the procedure.
     `tests/fixtures.rs` consumes the committed answers without AF_ALG.
-  - **B4b.** Next: interrupted reencryption fixtures under both
-    resilience modes, with stock-resumption evidence ("Tests").
+  - **B4b.** Reencryption fixtures under both resilience modes:
+    `fixtures/generate_reencrypt.rs` captures stock block writes and
+    validates every retained prefix in QEMU; `tests/reencryption_fixtures.rs`
+    checks their headers, keyslots, ciphertext and resilience bytes
+    offline. `fixtures/reencrypt/README.md` records the replay boundary
+    and the stock end-state failure retained as negative evidence.
 - **C.** The device-mapper surface: `open`, `open-volume-key`, `close`
   and `status` for headers without the reencryption requirement, with
   UNSAFE.md's section and the interop oracle for activation.

@@ -25,9 +25,9 @@ the dump operations did not alter the captured prefix. Ordinary tests check
 the keyslots, digests, token membership and both independent header copies.
 They need neither AF_ALG nor cryptsetup nor QEMU.
 
-This is increment B4a. Interrupted checksum/journal reencryption fixtures
-and their stock-resumption proof remain B4b; these ordinary snapshots make
-no reencryption or device-mapper interoperability claim.
+This is increment B4a. B4b adds the interrupted checksum/journal
+reencryption fixtures and stock-resumption proof in `reencrypt/README.md`.
+These ordinary snapshots make no reencryption or device-mapper claim.
 
 ## Regeneration
 
