@@ -3801,6 +3801,39 @@ mod tests {
         assert_eq!(window.input.take_for_test(), b"\x1bOA");
     }
 
+    #[test]
+    fn shift_left_reaches_a_prompt_and_repeats_in_application_mode() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        history(&mut window);
+        chord(&mut window, SHIFT, 104); // PageUp opens scrollback.
+        assert!(window.viewport.offset(window.history()) > 0);
+        chord(&mut window, SHIFT, 105); // Left belongs to the child.
+        assert_eq!(window.input.take_for_test(), b"\x1b[1;2D");
+        assert_eq!(window.viewport.offset(window.history()), 0);
+
+        window.output(b"\x1b[?1h\x1b[?1049h").unwrap();
+        // Keep this fixture without a PTY writer so the queue is observable.
+        window.keymap_ready = false;
+        window.event(message(KEYBOARD, 5, &[25, 600])).unwrap();
+        modifiers(&mut window, SHIFT);
+        let now = window.clock;
+        window
+            .event(message(KEYBOARD, 3, &[10, 0, 105, 1]))
+            .unwrap();
+        assert_eq!(window.input.take_for_test(), b"\x1b[1;2D");
+        assert_eq!(window.client.wait_ms(now + 599), 1, "repeat armed");
+        window.end_turn(now + 700, true).unwrap();
+        assert_eq!(window.input.take_for_test(), b"\x1b[1;2D");
+        window
+            .event(message(KEYBOARD, 3, &[11, 0, 105, 0]))
+            .unwrap();
+        window.end_turn(now + 800, true).unwrap();
+        assert!(window.input.take_for_test().is_empty());
+        chord(&mut window, 0, 105);
+        assert_eq!(window.input.take_for_test(), b"\x1bOD");
+    }
+
     /// foot's font chords are td-term's, and with no outline face, as
     /// here, do nothing: the selection stays, and the encoder, which sends
     /// the child nothing for any of them, never sees them.

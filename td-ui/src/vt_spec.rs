@@ -2155,7 +2155,7 @@ fn literal_terminfo_capabilities_appear_in_the_case_they_name() {
     const KEYS: &[&str] = &[
         "kbs", "kcbt", "kcuu1", "kcud1", "kcuf1", "kcub1", "khome", "kend", "kpp", "knp", "kich1",
         "kdch1", "kf1", "kf2", "kf3", "kf4", "kf5", "kf6", "kf7", "kf8", "kf9", "kf10", "kf11",
-        "kf12", "kmous",
+        "kf12", "kmous", "kLFT", "kRIT", "kHOM", "kEND",
     ];
     const REPLIES: &[&str] = &["u6", "u8"];
     /// Finals whose parameter names the operation. `m` is here too, but as a

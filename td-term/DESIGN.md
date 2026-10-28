@@ -517,8 +517,9 @@ bytes. The table is exhaustive:
 - Control gives the C0 byte of the character the keymap chose: `@` and Space
   give NUL, letters give 0x01 through 0x1a, `[ \ ] ^ _` give 0x1b through
   0x1f, and `?` gives DEL; Control on any other character is silent;
-- Alt (`M-`) prefixes the whole resulting sequence with ESC; an Alt chord
-  spells its letter lowercase, so the case sent is the one the keymap
+- Except on cursor keys below, Alt (`M-`) prefixes the whole resulting
+  sequence with ESC; an Alt chord spells its letter lowercase, so the case
+  sent is the one the keymap
   resolved (`Stroke::text`, Caps Lock included), not the chord's;
 - Escape is ESC, Backspace is DEL (`0x7f`), matching the slave's
   Linux-default canonical `VERASE`, and Return is CR; Shift passes through
@@ -527,7 +528,12 @@ bytes. The table is exhaustive:
 - Tab is HT and `S-Tab` is `CSI Z`, Tab being the one fixed key with a defined
   second spelling;
 - the arrows, Home and End are `CSI A/B/C/D/H/F` normally and
-  `SS3 A/B/C/D/H/F` under DECCKM;
+  `SS3 A/B/C/D/H/F` under DECCKM; with any of Shift, Alt and Control they
+  are `CSI 1 ; m A/B/C/D/H/F` in either mode, where `m` is 1 plus 1 for
+  Shift, 2 for Alt and 4 for Control. Alt adds no ESC prefix in this form.
+  Thus Shift+Left sends `CSI 1 ; 2 D`, including in an interactive prompt
+  using application cursor mode. The terminfo entry advertises Shift+Left,
+  Right, Home and End as `kLFT`, `kRIT`, `kHOM` and `kEND`;
 - Insert, Delete, PageUp and PageDown are `CSI 2 ~`, `CSI 3 ~`, `CSI 5 ~` and
   `CSI 6 ~`;
 - F1 through F4 are `SS3 P/Q/R/S`, and F5 through F12 are `CSI 15 ~`, `17`,
@@ -536,24 +542,24 @@ bytes. The table is exhaustive:
   the child as nothing; End while the viewport shows scrollback returns it to
   the live bottom (Control on `+`, `=`, `-` and `0`, also silent here, are
   the font chords above, which td-term answers before the table); and
-- Control on any named key, Shift on a named key other than Escape,
-  Backspace, Return and Tab (and the two paging chords), and every name the
-  table does not list are silent.
+- Control on any other named key, Shift on a named key other than Escape,
+  Backspace, Return, Tab and the cursor keys (and the two paging chords),
+  and every name the table does not list are silent.
 
-Those rules exclude things deliberately. Control reaches printable keys only,
-and only where a C0 spelling is defined; the character it maps is the one
-Shift already selected, so `Ctrl+Shift+6` needs no second rule to reach `RS`.
-Alt prefixes ESC uniformly rather than folding a modifier into a CSI
-parameter, because this profile does not claim the modified-key encodings
-such a parameter implies, and a sequence it does not claim would be
-indistinguishable to the child from one it does. Shift on an arrow or a
-function key is therefore silent, and `S-PageUp` and `S-PageDown` belong to
-the scrollback viewport rather than to the child. Keys the keymap names but
-the table does not -- Print, Pause, Menu, and the media keys -- are silent for
-the same reason. The acceptance is two-sided and needs no byte-exact keymap:
-td's own keymap compiles, and each chord encodes per the table, which the
-encoder's unit tests pin and the corpus's `key` cases exercise through td's
-keymap end to end (§5).
+Outside the cursor keys, Control reaches printable keys only, and only
+where a C0 spelling is defined; the character it maps is the one Shift
+already selected, so `Ctrl+Shift+6` needs no second rule to reach `RS`.
+Cursor modifiers follow [xterm's PC-style cursor-key encoding][cursor-keys];
+other keys keep the ESC-prefixed Alt spelling. Shift on a function key
+remains silent, and `S-PageUp` and `S-PageDown` belong to the scrollback
+viewport rather than to the child. Keys the keymap names but the table
+does not -- Print, Pause, Menu, and the media keys -- remain silent:
+the profile defines no byte sequence for them. The acceptance is two-sided
+and needs no byte-exact keymap: td's own keymap compiles, and each chord
+encodes per the table, which the encoder's unit tests pin and the corpus's
+`key` cases exercise through td's keymap end to end (§5).
+
+[cursor-keys]: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-PC-Style-Function-Keys
 
 The terminal mode that picks between two spellings is read from the model
 for each key, because a child's reply to one key can change how the next is

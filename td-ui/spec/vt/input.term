@@ -68,7 +68,7 @@ expect input b"\r\t\x1b[Z\x7f\x1b\x1b[2~\x1b[3~"
 end
 
 # Shift is not silent everywhere. The fixed keys have one spelling at both
-# levels and pass it through, as real terminals do; the navigation and function
+# levels and pass it through, as real terminals do; the editing and function
 # keys have no shifted spelling here and are silent.
 case input/shift-passes-through-fixed-keys
 source td
@@ -78,8 +78,6 @@ key shift+enter
 key shift+backspace
 key shift+escape
 key shift+kpenter
-key shift+up
-key shift+home
 key shift+f1
 key shift+delete
 expect input b"\r\x7f\x1b\r"
@@ -133,6 +131,41 @@ key up
 expect input b"\x1b[A\x1b[B\x1b[D\x1b[C\x1b[H\x1b[F\x1bOA\x1bOB\x1bOD\x1bOC\x1bOH\x1bOF\x1b[A"
 end
 
+# Cursor modifiers use xterm's CSI parameter in either cursor-key mode.
+case input/modified-cursor-keys
+source td
+tags core input modes
+size 2 8
+key shift+up
+key shift+down
+key shift+right
+key shift+left
+key shift+home
+key shift+end
+key alt+left
+key alt+shift+left
+key ctrl+left
+key ctrl+shift+left
+key ctrl+alt+left
+key ctrl+alt+shift+left
+expect input b"\x1b[1;2A\x1b[1;2B\x1b[1;2C\x1b[1;2D\x1b[1;2H\x1b[1;2F\x1b[1;3D\x1b[1;4D\x1b[1;5D\x1b[1;6D\x1b[1;7D\x1b[1;8D"
+write b"\x1b[?1h"
+expect mode application-cursor on
+key shift+up
+key shift+down
+key shift+right
+key shift+left
+key shift+home
+key shift+end
+key alt+left
+key alt+shift+left
+key ctrl+left
+key ctrl+shift+left
+key ctrl+alt+left
+key ctrl+alt+shift+left
+expect input b"\x1b[1;2A\x1b[1;2B\x1b[1;2C\x1b[1;2D\x1b[1;2H\x1b[1;2F\x1b[1;3D\x1b[1;4D\x1b[1;5D\x1b[1;6D\x1b[1;7D\x1b[1;8D\x1b[1;2A\x1b[1;2B\x1b[1;2C\x1b[1;2D\x1b[1;2H\x1b[1;2F\x1b[1;3D\x1b[1;4D\x1b[1;5D\x1b[1;6D\x1b[1;7D\x1b[1;8D"
+end
+
 # Paging keys never change spelling, and their shifted forms belong to the
 # scrollback viewport rather than to the child.
 case input/paging-keys-are-mode-independent
@@ -174,11 +207,9 @@ case input/unlisted-combinations-are-silent
 source td
 tags core input
 size 2 8
-key ctrl+up
 key ctrl+f1
 key ctrl+insert
 key ctrl+enter
-key shift+up
 key shift+f1
 key shift+insert
 key leftshift

@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use crate::vt::{MouseMode, MouseTracking};
 
 /// Room for the longest sequence this profile emits — an Alt prefix before
-/// `CSI 24 ~`, six bytes — with slack.
+/// `CSI 24 ~`, or a modified cursor key `CSI 1 ; 8 D` — with slack.
 pub const MAX_SEQUENCE: usize = 8;
 
 /// The keyboard-input ceiling. A sequence is admitted whole or not at all.
@@ -56,7 +56,7 @@ impl Sequence {
     }
 
     /// Alt is Meta: the whole resulting sequence is prefixed with ESC rather
-    /// than folded into a CSI parameter, which this profile does not encode.
+    /// than folded into a CSI parameter. Cursor keys encode Alt separately.
     fn with_alt(self) -> Option<Sequence> {
         let mut prefixed = [0u8; MAX_SEQUENCE];
         *prefixed.first_mut()? = ESC;
@@ -285,13 +285,12 @@ fn control(character: u8) -> Option<u8> {
 ///
 /// The keymap has already applied Shift and Caps Lock to a character, and
 /// reports Shift beside a letter only under Control or Alt, where it
-/// lowercases the letter. Ctrl reaches printable characters only; Shift
-/// selects a defined second spelling of a named key; Alt prefixes whatever
-/// the other two produced. Any other combination — Ctrl on an arrow, Shift
-/// on a function key — is unlisted and silent rather than guessed, because a
-/// modified-key encoding this profile does not claim would be
-/// indistinguishable from one it does. A modifier the keymap gives no role
-/// (Super, AltGr) never reaches here: the keymap refuses the press.
+/// lowercases the letter. Cursor keys carry Shift, Alt and Control in a CSI
+/// modifier parameter. Otherwise Ctrl reaches printable characters only;
+/// Shift selects a defined second spelling; Alt prefixes what those produce.
+/// Unlisted combinations, such as Shift on a function key, are silent. A
+/// modifier the keymap gives no role (Super, AltGr) never reaches here: the
+/// keymap refuses the press.
 pub fn sequence(text_chord: &str, modes: Modes) -> Option<Sequence> {
     typed(text_chord, None, modes)
 }
@@ -321,6 +320,15 @@ fn typed(text_chord: &str, resolved: Option<char>, modes: Modes) -> Option<Seque
         Sequence::new(&[byte])?
     } else {
         let kind = named(chord.base)?;
+        if let Kind::Cursor { normal, .. } = kind {
+            let modifier =
+                1 + u8::from(chord.shift) + 2 * u8::from(chord.alt) + 4 * u8::from(chord.control);
+            if modifier > 1 {
+                // Modified cursors use CSI even under DECCKM; Alt is already
+                // in the parameter, so it must not gain another ESC below.
+                return Sequence::new(&[ESC, b'[', b'1', b';', b'0' + modifier, *normal.last()?]);
+            }
+        }
         if chord.control {
             return None;
         }
@@ -744,7 +752,8 @@ pub fn selftest() -> Result<(), String> {
         || found("M-a", escape).as_deref() != Some(&[ESC, b'a'][..])
         || found("Up", escape).as_deref() != Some(b"\x1b[A")
         || found("Up", application).as_deref() != Some(b"\x1bOA")
-        || found("S-Up", escape).is_some()
+        || found("S-Left", escape).as_deref() != Some(b"\x1b[1;2D")
+        || found("C-M-S-Left", application).as_deref() != Some(b"\x1b[1;8D")
         || action("S-PageUp", None, escape, false) != Action::Scroll(Scroll::Back)
         || action("End", None, escape, true) != Action::Scroll(Scroll::Bottom)
     {
@@ -968,9 +977,7 @@ mod tests {
             assert_eq!(normal(chord), Some(vec![byte]), "{chord}");
         }
         assert_eq!(normal("C-M-a"), Some(vec![ESC, 0x01]));
-        for silent in [
-            "C-1", "C-!", "C-Up", "C-Return", "C-Tab", "C-F1", "C-Escape",
-        ] {
+        for silent in ["C-1", "C-!", "C-Return", "C-Tab", "C-F1", "C-Escape"] {
             assert_eq!(normal(silent), None, "{silent}");
         }
     }
@@ -991,7 +998,7 @@ mod tests {
             ("Up", b"\x1b[A"),
             ("Home", b"\x1b[H"),
             ("End", b"\x1b[F"),
-            ("M-Left", b"\x1b\x1b[D"),
+            ("M-Left", b"\x1b[1;3D"),
             ("Insert", b"\x1b[2~"),
             ("Delete", b"\x1b[3~"),
             ("PageUp", b"\x1b[5~"),
@@ -1018,17 +1025,53 @@ mod tests {
             let found = sequence(chord, application).map(|s| s.as_slice().to_vec());
             assert_eq!(found.as_deref(), Some(bytes), "{chord}");
         }
-        // Shift has no second spelling on navigation and function keys.
-        for silent in [
-            "S-Up", "S-Home", "S-Insert", "S-Delete", "S-F1", "S-PageUp", "Menu",
-        ] {
+        // Editing, paging and function keys have no shifted byte sequence.
+        for silent in ["S-Insert", "S-Delete", "S-F1", "S-PageUp", "Menu"] {
             assert_eq!(normal(silent), None, "{silent}");
         }
     }
 
     #[test]
-    fn every_named_key_survives_an_alt_prefix() {
-        for (name, _) in NAMED {
+    fn modified_cursor_keys_preserve_every_modifier_in_both_modes() {
+        for application_cursor in [false, true] {
+            let modes = Modes { application_cursor };
+            for (key, final_byte) in [
+                ("Up", b'A'),
+                ("Down", b'B'),
+                ("Right", b'C'),
+                ("Left", b'D'),
+                ("Home", b'H'),
+                ("End", b'F'),
+            ] {
+                for (prefix, modifier) in [
+                    ("S-", b'2'),
+                    ("M-", b'3'),
+                    ("M-S-", b'4'),
+                    ("C-", b'5'),
+                    ("C-S-", b'6'),
+                    ("C-M-", b'7'),
+                    ("C-M-S-", b'8'),
+                ] {
+                    let chord = format!("{prefix}{key}");
+                    let expected = [ESC, b'[', b'1', b';', modifier, final_byte];
+                    for viewing in [false, true] {
+                        assert_eq!(
+                            action(&chord, None, modes, viewing),
+                            Action::Bytes(Sequence::new(&expected).unwrap()),
+                            "{chord}, application={application_cursor}, viewing={viewing}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_cursor_named_keys_keep_an_alt_prefix() {
+        for (name, kind) in NAMED {
+            if matches!(kind, Kind::Cursor { .. }) {
+                continue;
+            }
             let plain = normal(name).unwrap();
             let meta = normal(&format!("M-{name}")).unwrap();
             assert_eq!(meta[0], ESC, "{name}");
@@ -1053,8 +1096,8 @@ mod tests {
     fn end_is_the_childs_at_the_bottom_and_the_viewports_above_it() {
         assert!(matches!(act("End", false), Action::Bytes(_)));
         assert_eq!(act("End", true), Action::Scroll(Scroll::Bottom));
-        assert_eq!(act("S-End", true), Action::Silent);
-        assert_eq!(act("C-End", true), Action::Silent);
+        assert!(matches!(act("S-End", true), Action::Bytes(_)));
+        assert!(matches!(act("C-End", true), Action::Bytes(_)));
         assert!(matches!(act("M-End", true), Action::Bytes(_)));
     }
 

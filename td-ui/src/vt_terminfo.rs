@@ -201,6 +201,11 @@ str kcuf1  \EOC     input/cursor-keys-follow-application-mode
 str kcub1  \EOD     input/cursor-keys-follow-application-mode
 str khome  \EOH     input/cursor-keys-follow-application-mode
 str kend   \EOF     input/cursor-keys-follow-application-mode
+# Shifted cursor keys have the same spelling with or without `smkx`.
+str kLFT   \E[1;2D  input/modified-cursor-keys
+str kRIT   \E[1;2C  input/modified-cursor-keys
+str kHOM   \E[1;2H  input/modified-cursor-keys
+str kEND   \E[1;2F  input/modified-cursor-keys
 str kpp    \E[5~    input/paging-keys-are-mode-independent
 str knp    \E[6~    input/paging-keys-are-mode-independent
 str kich1  \E[2~    input/named-keys-use-terminal-bytes
@@ -941,6 +946,10 @@ mod tests {
             ("kich1", "Insert"),
             ("kdch1", "Delete"),
             ("kbs", "Backspace"),
+            ("kLFT", "S-Left"),
+            ("kRIT", "S-Right"),
+            ("kHOM", "S-Home"),
+            ("kEND", "S-End"),
         ] {
             assert_eq!(string(&entry, capability), send(key, plain), "{capability}");
             assert_eq!(
