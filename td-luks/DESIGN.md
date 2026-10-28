@@ -158,11 +158,9 @@ The key on standard input authorizes each verb as cryptsetup's would:
   unbound keyslot, meaning one whose digest names no segment. Their
   digests stay,
   with empty `keyslots`, as cryptsetup leaves them. It refuses a header
-  that carries the reencryption requirement. Before reencryption is
-  enabled, D must extend this operation to wipe and sync all free
-  keyslot-area spans even when no unbound slot remains, after bound-key
-  authentication ("Start and end"). B3b's current implementation only
-  removes the unbound normal slots.
+  that carries the reencryption requirement. After bound-key
+  authentication, it first wipes and syncs all free keyslot-area spans,
+  even when no unbound slot remains ("Start and end").
 - **`open` with no slot:** tries each bound keyslot whose priority is
   not 0: priority 2 first, then priority 1, each in keyslot-number
   order. cryptsetup goes in JSON order within a priority, so only which
@@ -551,8 +549,9 @@ ENCRYPTION.md's upgrade machine resolves:
   while retaining the old key's digest with `segments: []` and its
   keyslots unchanged. The old key's keyslots stay, unbound but each
   assigned to exactly one digest. After authenticating the new bound
-  key, wipe and sync every free span of the keyslots area, then wipe
-  and remove each old keyslot in its own commit. The old digest stays
+  key, sync the final metadata, wipe and sync every free span of the
+  keyslots area, then wipe
+  and remove the old keyslots in one commit. The old digest stays
   with an empty `keyslots` list after the last removal.
 
 Journal resilience retains old-key ciphertext in its area. Dropping the
@@ -563,9 +562,21 @@ the deleted reencryption slot: an interrupted U3 cleanup can repeat the
 wipe even when no unbound slot remains. This cleanup must finish before
 ENCRYPTION.md's old-key-uselessness claim applies. Do not wipe resilience
 before the final metadata commit: a crash could still select the dirty
-header, whose recovery requires those bytes. D must implement the
-post-commit free-area wipe and its restart oracle before enabling data
-reencryption; D2's metadata APIs do not perform it.
+header, whose recovery requires those bytes. `kill-unbound` implements
+this post-commit cleanup using a reusable 64 KiB random buffer, deriving
+free spans from the validated fixed-size normal keyslot areas. An initial
+sync makes the authenticated final header durable before any erasure:
+a previous process may have stopped after writing its checksum but before
+syncing it. Failure of that barrier leaves the journal untouched. The header,
+occupied slots and data segment stay untouched until the free-space sync
+succeeds. Its fault-injection tests interrupt free-space writes, the sync
+and old-slot retirement, then repeat cleanup and verify the journal is
+erased and the new bound key still opens. They also cover cleanup with
+no unbound slots and refusal of a wrong key or in-progress header. A
+separate volatile/durable fixture stops finalization before its first sync,
+persists cleanup's first erase out of order and then simulates power loss;
+the surviving dirty header must never have lost its journal.
+D2's metadata APIs alone do not perform cleanup.
 
 The last hotzone stays marked `in-reencryption` through its data sync.
 There is no intervening commit with one all-new active segment while the
@@ -689,6 +700,10 @@ Each increment is one landable commit, or a short series:
     `src/reencrypt_transition.rs`), with commit fault injection and
     the pinned stock metadata recovery oracle. Reencryption commands
     and production data rewriting remain disabled.
+  - **D3a.** Repeatable authenticated free-keyslot-space erasure before
+    `kill-unbound` retires old normal slots, with journal cleanup and
+    interruption tests. This establishes the cleanup operation required
+    by the runtime; production data reencryption remains disabled.
   - Remaining D work adds device stacks, recovery, data rewriting and
     the bidirectional interruption oracle.
 - **E.** The cutover, in one landing (AGENTS.md principle 4):

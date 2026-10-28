@@ -239,3 +239,217 @@ fn start_refusals_write_nothing_and_tokens_follow_the_replacement_slot() {
         Some(&Json::from("preserved"))
     );
 }
+
+#[test]
+fn free_space_cleanup_restarts_without_unbound_slots_and_preserves_live_areas() {
+    let mut medium = Memory::new();
+    let header = write::load(&mut medium).unwrap();
+    let start = write::KEYSLOTS_OFFSET + keyslot::AREA_LEN;
+    medium.bytes[start as usize..write::DATA_OFFSET as usize].fill(0xa5);
+    let original = medium.bytes.clone();
+    assert!(matches!(
+        write::kill_unbound(&mut medium, &mut Random(7), b"wrong"),
+        Err(write::Error::WrongKey)
+    ));
+    assert_eq!(medium.mutations, 0);
+    let total = write::KEYSLOTS_SIZE - keyslot::AREA_LEN;
+    let calls = 1 + total.div_ceil(64 * 1024) as usize;
+    for cut in [0, 1, calls / 2, calls, calls + 1] {
+        let mut image = medium.clone();
+        image.fail_at = cut;
+        let result = write::kill_unbound(&mut image, &mut Random(7), KEY);
+        assert_eq!(result.is_ok(), cut == calls + 1);
+        assert_eq!(&image.bytes[..start as usize], &original[..start as usize]);
+        assert_eq!(
+            &image.bytes[write::DATA_OFFSET as usize..],
+            &original[write::DATA_OFFSET as usize..]
+        );
+        assert_eq!(write::load(&mut image).unwrap(), header);
+        image.fail_at = usize::MAX;
+        assert_eq!(
+            write::kill_unbound(&mut image, &mut Random(19), KEY).unwrap(),
+            0
+        );
+        for block in image.bytes[start as usize..write::DATA_OFFSET as usize].chunks(4096) {
+            assert!(block.iter().any(|b| *b != 0xa5), "retained journal block");
+        }
+        assert_eq!(write::load(&mut image).unwrap(), header);
+        write::activation(
+            &mut image,
+            write::ActivationKey::Passphrase {
+                slot: Some(0),
+                bytes: KEY,
+            },
+        )
+        .unwrap();
+    }
+    let (plan, _) = reencrypt::plan_start(
+        &mut medium,
+        &mut Random(7),
+        0,
+        KEY,
+        reencrypt::Resilience::Journal,
+    )
+    .unwrap();
+    reencrypt::commit(&mut medium, &mut Random(19), &plan).unwrap();
+    medium.mutations = 0;
+    assert!(write::kill_unbound(&mut medium, &mut Random(7), KEY).is_err());
+    assert_eq!(medium.mutations, 0);
+}
+
+#[test]
+fn finalized_journal_is_erased_before_old_slot_retirement_and_retries() {
+    let mut medium = Memory::new();
+    let (mut plan, keys) = reencrypt::plan_start(
+        &mut medium,
+        &mut Random(7),
+        0,
+        KEY,
+        reencrypt::Resilience::Journal,
+    )
+    .unwrap();
+    let size = 2 * 1024 * 1024;
+    let area = reencrypt::profile(&plan.json, size).unwrap().area;
+    let journal = area.offset as usize..(area.offset + area.size) as usize;
+    medium.bytes[journal.clone()].fill(0xa5);
+    plan.json = reencrypt::mark_hotzone(&plan.json, size, 1024 * 1024).unwrap();
+    plan.json = reencrypt::finish_hotzone(&plan.json, size).unwrap();
+    plan.json = reencrypt::mark_hotzone(&plan.json, size, 1024 * 1024).unwrap();
+    plan.json = reencrypt::finish_hotzone(&plan.json, size).unwrap();
+    write::commit(&mut medium, &mut Random(19), &plan).unwrap();
+    assert!(medium.bytes[journal.clone()].iter().all(|b| *b == 0xa5));
+    let original = medium.clone();
+    medium.mutations = 0;
+    assert_eq!(
+        write::kill_unbound(&mut medium, &mut Random(33), KEY).unwrap(),
+        1
+    );
+    let calls = medium.mutations;
+    let free_calls =
+        1 + (write::KEYSLOTS_SIZE - 2 * keyslot::AREA_LEN).div_ceil(64 * 1024) as usize;
+    for cut in [
+        0,
+        1,
+        free_calls / 2,
+        free_calls,
+        free_calls + 1,
+        calls - 1,
+        calls,
+    ] {
+        let mut image = original.clone();
+        image.mutations = 0;
+        image.fail_at = cut;
+        let result = write::kill_unbound(&mut image, &mut Random(33), KEY);
+        assert_eq!(result.is_ok(), cut == calls);
+        if cut <= free_calls {
+            write::test(&mut image, 0, KEY).unwrap();
+        }
+        image.fail_at = usize::MAX;
+        write::kill_unbound(&mut image, &mut Random(55), KEY).unwrap();
+        assert!(write::unbound(&write::load(&mut image).unwrap().json)
+            .unwrap()
+            .is_empty());
+        for block in image.bytes[journal.clone()].chunks(4096) {
+            assert!(block.iter().any(|b| *b != 0xa5), "retained journal block");
+        }
+        let (_, key) = write::activation(
+            &mut image,
+            write::ActivationKey::Passphrase {
+                slot: None,
+                bytes: KEY,
+            },
+        )
+        .unwrap();
+        assert_eq!(key.bytes(), keys.new.bytes());
+        assert_eq!(
+            &image.bytes[write::DATA_OFFSET as usize..],
+            &original.bytes[write::DATA_OFFSET as usize..]
+        );
+        assert!(write::test(&mut image, 0, KEY).is_err());
+    }
+}
+
+#[test]
+fn cleanup_makes_cached_final_header_durable_before_erasing_journal() {
+    struct Cached {
+        live: Memory,
+        durable: Vec<u8>,
+        fail_sync: bool,
+        erased: bool,
+    }
+    impl Medium for Cached {
+        fn read_at(&mut self, at: u64, bytes: &mut [u8]) -> io::Result<usize> {
+            self.live.read_at(at, bytes)
+        }
+        fn size(&mut self) -> io::Result<u64> {
+            self.live.size()
+        }
+        fn sync(&mut self) -> io::Result<()> {
+            if self.fail_sync {
+                return Err(io::Error::other("failed durability barrier"));
+            }
+            self.durable.clone_from(&self.live.bytes);
+            Ok(())
+        }
+        fn write_at(&mut self, at: u64, bytes: &[u8]) -> io::Result<()> {
+            self.live.write_at(at, bytes)?;
+            // The disk may persist this write before earlier unsynced writes.
+            self.durable[at as usize..at as usize + bytes.len()].copy_from_slice(bytes);
+            self.erased = true;
+            Err(io::Error::other("power loss after first erase"))
+        }
+    }
+    let mut medium = Memory::new();
+    let (mut plan, _) = reencrypt::plan_start(
+        &mut medium,
+        &mut Random(7),
+        0,
+        KEY,
+        reencrypt::Resilience::Journal,
+    )
+    .unwrap();
+    let size = 2 * 1024 * 1024;
+    let area = reencrypt::profile(&plan.json, size).unwrap().area;
+    let journal = area.offset as usize..(area.offset + area.size) as usize;
+    medium.bytes[journal.clone()].fill(0xa5);
+    plan.json = reencrypt::mark_hotzone(&plan.json, size, 1024 * 1024).unwrap();
+    plan.json = reencrypt::finish_hotzone(&plan.json, size).unwrap();
+    plan.json = reencrypt::mark_hotzone(&plan.json, size, 1024 * 1024).unwrap();
+    reencrypt::commit(&mut medium, &mut Random(19), &plan).unwrap();
+    let durable = medium.bytes.clone();
+    plan.json = reencrypt::finish_hotzone(&plan.json, size).unwrap();
+    plan.seqid += 1;
+    plan.areas.clear();
+    medium.mutations = 0;
+    medium.fail_at = 3;
+    assert!(reencrypt::commit(&mut medium, &mut Random(19), &plan).is_err());
+    write::load(&mut medium).unwrap(); // Visible, but not yet durable.
+    medium.fail_at = usize::MAX;
+    for fail_sync in [false, true] {
+        let mut cached = Cached {
+            live: medium.clone(),
+            durable: durable.clone(),
+            fail_sync,
+            erased: false,
+        };
+        assert!(write::kill_unbound(&mut cached, &mut Random(33), KEY).is_err());
+        let mut after = Memory {
+            bytes: cached.durable,
+            mutations: 0,
+            fail_at: usize::MAX,
+        };
+        if reencrypt::load(&mut after).is_ok() {
+            assert!(
+                after.bytes[journal.clone()].iter().all(|b| *b == 0xa5),
+                "power loss selected dirty metadata after journal erasure"
+            );
+        }
+        if fail_sync {
+            assert!(!cached.erased);
+            assert_eq!(after.bytes, durable);
+        } else {
+            assert!(cached.erased);
+            write::load(&mut after).unwrap();
+        }
+    }
+}

@@ -1119,12 +1119,55 @@ pub fn plan_kill_unbound<M: Medium + ?Sized>(
     Ok(Some(plan))
 }
 
-/// Remove every unbound keyslot; the number removed.
+/// Authenticate a bound key and wipe every unused keyslot-area span.
+/// This is repeatable after final reencryption metadata lost its journal
+/// area reference. In-progress metadata is refused before any write.
+fn wipe_free<M: Medium + ?Sized>(
+    medium: &mut M,
+    random: &mut dyn Random,
+    key: &[u8],
+) -> Result<(), Error> {
+    let header = load(medium)?;
+    unlock_any(medium, &header.json, key, &bound_slots(&header.json, None)?)?;
+    if medium.size().map_err(io("device size"))? < DATA_OFFSET {
+        return refused("device does not hold the complete keyslots area");
+    }
+    let mut occupied = Vec::new();
+    for (_, slot) in numbered(&header.json, "keyslots")? {
+        let area = slot.get("area").ok_or("keyslot has no area")?;
+        occupied.push(decimal(area, "offset", "keyslot area")?);
+    }
+    occupied.sort_unstable();
+    occupied.push(DATA_OFFSET);
+    // A previous process may have left a valid final header only in cache.
+    medium.sync().map_err(io("cleanup metadata sync"))?;
+    let mut cursor = KEYSLOTS_OFFSET;
+    let mut buffer = vec![0; 64 * 1024];
+    for start in occupied {
+        while cursor < start {
+            let length = usize::try_from((start - cursor).min(buffer.len() as u64))
+                .map_err(|_| "free-area write length")?;
+            let bytes = buffer.get_mut(..length).ok_or("free-area buffer bounds")?;
+            random.fill(bytes).map_err(io("free-area wipe bytes"))?;
+            medium
+                .write_at(cursor, bytes)
+                .map_err(io("free-area wipe"))?;
+            cursor += length as u64;
+        }
+        cursor = start.checked_add(AREA_LEN).ok_or("keyslot area overflow")?;
+    }
+    medium.sync().map_err(io("free-area wipe sync"))?;
+    Ok(())
+}
+
+/// Sanitize free keyslot space and remove every unbound keyslot; the
+/// number removed. Free space is wiped even when that number is zero.
 pub fn kill_unbound<M: Medium + ?Sized>(
     medium: &mut M,
     random: &mut dyn Random,
     key: &[u8],
 ) -> Result<usize, Error> {
+    wipe_free(medium, random, key)?;
     match plan_kill_unbound(medium, random, key)? {
         None => Ok(0),
         Some(plan) => {
