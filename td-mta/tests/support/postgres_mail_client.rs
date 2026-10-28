@@ -258,6 +258,13 @@ pub(super) fn exercise(
         timeouts: &timeouts,
     };
     if !sending {
+        exercise_replica_source(
+            &backend,
+            device.device_id(),
+            device.password(),
+            delivery.email(),
+            fixture,
+        );
         exercise_rule_projection(
             &backend,
             device.device_id(),
@@ -1486,4 +1493,243 @@ fn exercise_send(
         Err(drafts_api::Error::MissingAttachment)
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), before);
+}
+
+fn exercise_replica_source(
+    backend: &td_mta::postgres_http_api::Service<'_, '_, '_>,
+    device: td_mta::ids::DeviceId,
+    password: &[u8],
+    email: td_mta::ids::EmailId,
+    fixture: &Fixture,
+) {
+    use td_mta::https_upload::Backend;
+    use td_mta::jmap_request::{CORE, MAIL, REPLICATION};
+    let credentials = http_fixture::credentials(password);
+    let mut buffer = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let account = td_mta::wire::encode_id(backend.binding.account(), &mut buffer)
+        .unwrap()
+        .to_owned();
+    let email = td_mta::wire::encode_id(email, &mut buffer)
+        .unwrap()
+        .to_owned();
+    let absent = td_mta::wire::encode_id(td_mta::ids::EmailId::from_bytes([0xfe; 16]), &mut buffer)
+        .unwrap()
+        .to_owned();
+    let batch = |using: Json, methods: Json| {
+        let body = json!({"using":using,"methodCalls":methods}).to_string();
+        let mut wire = http_fixture::Wire {
+            input: body.as_bytes().to_vec(),
+            position: 0,
+            output: Vec::new(),
+            fail_write: false,
+        };
+        backend
+            .api(
+                td_mta::https_api::Request {
+                    keep_alive: false,
+                    device,
+                    credentials: &credentials,
+                    framing: td_mta::http_request::Framing::Length(body.len() as u64),
+                    prefix: &[],
+                    expect_continue: false,
+                    deadline: Deadline::after(backend.clock.sample().unwrap().monotonic, 10_000)
+                        .unwrap(),
+                },
+                &mut wire,
+                &Control::default(),
+            )
+            .unwrap();
+        let wire = String::from_utf8(wire.output).unwrap();
+        let (headers, body) = wire.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{wire}");
+        td_json::parse(body).unwrap()
+    };
+    let call = |using: Json, method: &str, arguments: Json| {
+        batch(using, json!([[method, arguments, "replica"]]))
+    };
+    let using = json!([CORE, MAIL, REPLICATION]);
+    let inventory = call(
+        using.clone(),
+        "TdReplica/inventory",
+        json!({"accountId":account,"limit":1}),
+    );
+    assert_eq!(
+        inventory["methodResponses"][0][0].as_str(),
+        Some("TdReplica/inventory"),
+        "{inventory}"
+    );
+    let page = &inventory["methodResponses"][0][1];
+    assert_eq!(page["ids"], json!([email]));
+    assert_eq!(page["nextCursor"], Json::Null);
+    let base = td_mta::sync::DataState::decode(page["baseState"].as_str().unwrap()).unwrap();
+    assert_eq!(base.account, backend.binding.account());
+    assert_eq!(base.epoch, backend.binding.epoch());
+    assert_eq!(page["state"], page["baseState"]);
+    let metadata = call(
+        using.clone(),
+        "TdReplica/metadata",
+        json!({"accountId":account,"ids":[email,absent,email]}),
+    );
+    assert_eq!(
+        metadata["methodResponses"][0][0].as_str(),
+        Some("TdReplica/metadata"),
+        "{metadata}"
+    );
+    let result = &metadata["methodResponses"][0][1];
+    assert_eq!(result["sourceId"], page["sourceId"]);
+    assert_eq!(result["state"], page["state"]);
+    assert_eq!(result["notFound"], json!([absent]));
+    assert_eq!(result["list"].as_array().unwrap().len(), 1);
+    let item = &result["list"][0];
+    assert_eq!(item["id"], json!(email));
+    assert_eq!(item["receivedAtMs"].as_str(), Some("1700000000000"));
+    let body = sql(fixture,"SELECT encode(b.digest,'hex') || ':' || b.length::text FROM td_mta.blobs b JOIN td_mta.emails e ON e.account=b.account AND e.blob_id=b.id LIMIT 1");
+    let (digest, length) = body.split_once(':').unwrap();
+    assert_eq!(item["bodySha256"].as_str(), Some(digest));
+    assert_eq!(item["size"].as_u64(), Some(length.parse().unwrap()));
+    let keys = item.as_object().unwrap();
+    assert_eq!(keys.len(), 9, "{item}");
+    for name in [
+        "id",
+        "blobId",
+        "threadId",
+        "mailboxIds",
+        "keywords",
+        "size",
+        "receivedAt",
+        "receivedAtMs",
+        "bodySha256",
+    ] {
+        assert!(item.get(name).is_some(), "{name}: {item}");
+    }
+    for method in ["TdReplica/inventory", "TdReplica/metadata"] {
+        let arguments = if method.ends_with("inventory") {
+            json!({"accountId":account})
+        } else {
+            json!({"accountId":account,"ids":[email]})
+        };
+        let refusal = call(json!([CORE, MAIL]), method, arguments.clone());
+        assert_eq!(
+            refusal["methodResponses"][0][1]["type"].as_str(),
+            Some("unknownMethod"),
+            "{refusal}"
+        );
+        let refusal = call(json!([CORE, REPLICATION]), method, arguments);
+        assert_eq!(
+            refusal["methodResponses"][0][1]["type"].as_str(),
+            Some("unknownMethod"),
+            "{refusal}"
+        );
+    }
+    for (method, arguments, error) in [
+        (
+            "TdReplica/inventory",
+            json!({"accountId":account,"limit":0}),
+            "invalidArguments",
+        ),
+        (
+            "TdReplica/inventory",
+            json!({"accountId":account,"limit":257}),
+            "requestTooLarge",
+        ),
+        (
+            "TdReplica/inventory",
+            json!({"accountId":account,"cursor":"invalid"}),
+            "invalidArguments",
+        ),
+        (
+            "TdReplica/metadata",
+            json!({"accountId":account,"ids":null}),
+            "invalidArguments",
+        ),
+        (
+            "TdReplica/metadata",
+            json!({"accountId":account,"ids":[email],"properties":["subject"]}),
+            "invalidArguments",
+        ),
+        (
+            "TdReplica/metadata",
+            json!({"accountId":"a99999999999999999999999999999999","ids":[email]}),
+            "accountNotFound",
+        ),
+    ] {
+        let refusal = call(using.clone(), method, arguments);
+        assert_eq!(
+            refusal["methodResponses"][0][1]["type"].as_str(),
+            Some(error),
+            "{refusal}"
+        );
+    }
+    let original = td_mta::postgres_read::ReplicaInventoryCursor {
+        base,
+        upper: td_mta::wire::Id::parse(&email)
+            .unwrap()
+            .local::<td_mta::ids::EmailId>()
+            .unwrap(),
+        after: td_mta::wire::Id::parse(&email)
+            .unwrap()
+            .local::<td_mta::ids::EmailId>()
+            .unwrap(),
+    };
+    let mut cursor_bytes = [0; td_mta::postgres_read::ReplicaInventoryCursor::WIRE_BYTES];
+    let cursor = original.encode(&mut cursor_bytes).unwrap();
+    let end = call(
+        using.clone(),
+        "TdReplica/inventory",
+        json!({"accountId":account,"cursor":cursor}),
+    );
+    assert_eq!(end["methodResponses"][0][1]["ids"], json!([]));
+    assert_eq!(end["methodResponses"][0][1]["baseState"], page["baseState"]);
+    for foreign in [
+        td_mta::sync::DataState {
+            account: td_mta::ids::AccountId::from_bytes([99; 16]),
+            ..base
+        },
+        td_mta::sync::DataState {
+            epoch: td_mta::ids::StoreEpoch::from_bytes([99; 16]),
+            ..base
+        },
+    ] {
+        let cursor = td_mta::postgres_read::ReplicaInventoryCursor {
+            base: foreign,
+            ..original
+        }
+        .encode(&mut cursor_bytes)
+        .unwrap()
+        .to_owned();
+        let refusal = batch(
+            using.clone(),
+            json!([
+                ["TdReplica/inventory",{"accountId":account,"cursor":cursor},"bad"],
+                ["TdReplica/inventory",{"accountId":account},"good"],
+                ["TdReplica/metadata",{"accountId":account,"ids":[email]},"metadata"]
+            ]),
+        );
+        assert_eq!(
+            refusal["methodResponses"].as_array().unwrap().len(),
+            3,
+            "{refusal}"
+        );
+        assert_eq!(
+            refusal["methodResponses"][1][1]["ids"],
+            json!([email]),
+            "{refusal}"
+        );
+        assert_eq!(
+            refusal["methodResponses"][2][1]["list"][0]["id"],
+            json!(email),
+            "{refusal}"
+        );
+        assert_eq!(
+            refusal["methodResponses"][0][1]["type"].as_str(),
+            Some("cannotCalculateChanges"),
+            "{refusal}"
+        );
+    }
+    let empty = call(
+        using,
+        "TdReplica/metadata",
+        json!({"accountId":account,"ids":[]}),
+    );
+    assert_eq!(empty["methodResponses"][0][1]["list"], json!([]));
 }

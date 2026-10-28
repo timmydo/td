@@ -106,7 +106,7 @@ impl Session {
                 ",\"maxCallsInRequest\":{}",
                 ",\"maxObjectsInGet\":{}",
                 ",\"maxObjectsInSet\":{}",
-                ",\"collationAlgorithms\":[]}},\"urn:ietf:params:jmap:mail\":{{}}{submission_global}}}",
+                ",\"collationAlgorithms\":[]}},\"urn:ietf:params:jmap:mail\":{{}},\"{replication}\":{{}}{submission_global}}}",
                 ",\"accounts\":{{\"{}\":{{\"name\":",
             ),
             limits.message_bytes,
@@ -121,6 +121,7 @@ impl Session {
                 .min(crate::store_fs::MAX_MAILBOX_CREATES)
                 .min(crate::store_fs::MAX_EMAIL_DESTROYS),
             id,
+            replication = crate::jmap_request::REPLICATION,
             submission_global = if submission { ",\"urn:ietf:params:jmap:submission\":{}" } else { "" },
         ))
         .map_err(|_| Error::Capacity)?;
@@ -131,12 +132,15 @@ impl Session {
             "\"urn:ietf:params:jmap:core\":{{}},\"urn:ietf:params:jmap:mail\":{{",
             "\"maxMailboxesPerEmail\":null,\"maxMailboxDepth\":null,",
             "\"maxSizeMailboxName\":{},\"maxSizeAttachmentsPerEmail\":{},",
-            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":true}}{submission_account}}}}}}}",
+            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":true}},\"{replication}\":{{\"maxInventoryIds\":{inventory_limit},\"maxMetadataIds\":{metadata_limit}}}{submission_account}}}}}}}",
             ",\"primaryAccounts\":{{\"urn:ietf:params:jmap:mail\":\"{}\""
         ),
             crate::format::row::MAX_MAILBOX_NAME,
             limits.message_bytes,
             id,
+            replication = crate::jmap_request::REPLICATION,
+            inventory_limit = limits.query_page.min(crate::postgres_read::MAX_REPLICA_INVENTORY_PAGE),
+            metadata_limit = limits.objects_per_method.min(crate::postgres_body::MAX_METADATA_IDS),
             submission_account = if submission { ",\"urn:ietf:params:jmap:submission\":{\"maxDelayedSend\":0,\"submissionExtensions\":{}}" } else { "" },
         ))
         .map_err(|_| Error::Capacity)?;
@@ -189,11 +193,11 @@ impl Session {
     }
     /// The request parser accepts exactly the capabilities in this document.
     pub fn capabilities(&self) -> &'static [&'static str] {
-        use crate::jmap_request::{CORE, MAIL, SUBMISSION};
+        use crate::jmap_request::{CORE, MAIL, REPLICATION, SUBMISSION};
         if self.submission {
-            &[CORE, MAIL, SUBMISSION]
+            &[CORE, MAIL, SUBMISSION, REPLICATION]
         } else {
-            &[CORE, MAIL]
+            &[CORE, MAIL, REPLICATION]
         }
     }
     pub fn origin(&self) -> Result<Origin<'_>, Error> {
@@ -289,12 +293,19 @@ mod tests {
         assert_eq!(core["maxObjectsInGet"].as_u64(), Some(256));
         assert_eq!(core["maxObjectsInSet"].as_u64(), Some(256));
         assert!(core["collationAlgorithms"].as_array().unwrap().is_empty());
-        assert_eq!(value["capabilities"].as_object().unwrap().len(), 2);
+        assert_eq!(value["capabilities"].as_object().unwrap().len(), 3);
         assert_eq!(value["accounts"].as_object().unwrap().len(), 1);
         let object = &value["accounts"]["a07070707070707070707070707070707"];
         assert_eq!(object["name"].as_str(), Some("Personal mail"));
         assert_eq!(object["isPersonal"].as_bool(), Some(true));
         assert_eq!(object["isReadOnly"].as_bool(), Some(false));
+        let replication = crate::jmap_request::REPLICATION;
+        assert!(session.capabilities().contains(&replication));
+        assert!(value["capabilities"][replication].as_object().is_some());
+        assert_eq!(
+            object["accountCapabilities"][replication],
+            td_json::json!({"maxInventoryIds":256,"maxMetadataIds":16})
+        );
         let mail = &object["accountCapabilities"][crate::jmap_request::MAIL];
         assert_eq!(
             mail["maxSizeMailboxName"].as_u64(),

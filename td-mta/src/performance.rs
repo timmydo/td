@@ -53,6 +53,8 @@ pub enum Phase {
     RelayWake,
     SearchFields,
     JmapSearch,
+    ReplicaInventory,
+    ReplicaMetadata,
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
@@ -101,6 +103,8 @@ impl Phase {
         Self::RelayWake,
         Self::SearchFields,
         Self::JmapSearch,
+        Self::ReplicaInventory,
+        Self::ReplicaMetadata,
     ];
     pub const fn code(self) -> &'static str {
         match self {
@@ -149,6 +153,8 @@ impl Phase {
             Self::RelayWake => "relay_wake",
             Self::SearchFields => "search_fields",
             Self::JmapSearch => "jmap_search",
+            Self::ReplicaInventory => "replica_inventory",
+            Self::ReplicaMetadata => "replica_metadata",
         }
     }
 }

@@ -502,7 +502,11 @@ It also runs the query adapter fixture in a separate disposable database,
 including replica inventory continuation across deletion and date changes,
 arrivals outside retained bounds, foreign or expired checkpoints, corrupt
 lookahead revisions and empty accounts. This qualifies the source read adapter,
-not a network replication protocol or replica completeness.
+not replica completeness. The read client fixture also exercises the actual
+HTTP API adapter and JMAP parser for TdReplica inventory/metadata: explicit
+capability opt-in, bounded arguments, source/account scope, cursor continuation,
+stored digest/length agreement, exact timestamps and the closed metadata field
+set. This is source API coverage, not an end-to-end synchronizer test.
 The separate send and executable-service cases cover their named flows. Process and file cleanup belong to
 the fixture; no public endpoint is contacted.
 

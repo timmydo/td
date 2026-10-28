@@ -1,4 +1,7 @@
 //! Stable source inventory windows; completion still requires change catch-up.
+#[path = "replica_cursor.rs"]
+mod cursor_wire;
+
 use super::{check_changed, EmailId, Error, Snapshot, Type};
 use crate::sync::{DataState, DataType};
 
@@ -38,7 +41,9 @@ impl Snapshot<'_> {
             sequence: identity.committed_sequence,
         };
         let validation = validate(cursor, maximum, observed, identity.history_floor);
-        self.retain(validation)?;
+        // A client checkpoint refusal is a method error, not a damaged view.
+        self.check()?;
+        validation?;
         let result = self
             .worker
             .run(|client| {

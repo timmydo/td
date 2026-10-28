@@ -45,9 +45,11 @@ mod mailbox_get;
 mod object_changes;
 #[path = "push.rs"]
 mod push;
+#[path = "replica.rs"]
+mod replica;
 #[path = "thread_get.rs"]
 mod thread_get;
-use super::{MAIL, SUBMISSION};
+use super::{MAIL, REPLICATION, SUBMISSION};
 #[path = "identity_get.rs"]
 mod identity_get;
 #[path = "submission_get.rs"]
@@ -435,8 +437,17 @@ fn reborrow_read<'short, 'long: 'short>(
     view
 }
 
-// This preparation seam disappears with the local database adapter at cutover.
+// One authenticated snapshot supplies every passive method in a read batch.
 trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Error> {
+    fn replica_inventory(
+        &mut self,
+        cursor: Option<crate::postgres_read::ReplicaInventoryCursor>,
+        maximum: usize,
+    ) -> Result<crate::postgres_read::ReplicaInventoryPage, Error>;
+    fn replica_metadata(
+        &mut self,
+        id: crate::ids::EmailId,
+    ) -> Result<Option<crate::postgres_body::Metadata>, Error>;
     fn prefetch_metadata(
         &mut self,
         ids: &[crate::ids::EmailId],
@@ -486,6 +497,21 @@ trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Erro
     ) -> Result<(), Error>;
 }
 impl MailRead for crate::postgres_read::Snapshot<'_> {
+    fn replica_inventory(
+        &mut self,
+        cursor: Option<crate::postgres_read::ReplicaInventoryCursor>,
+        maximum: usize,
+    ) -> Result<crate::postgres_read::ReplicaInventoryPage, Error> {
+        self.replica_inventory(cursor, maximum)
+            .map_err(postgres_read_error)
+    }
+    fn replica_metadata(
+        &mut self,
+        id: crate::ids::EmailId,
+    ) -> Result<Option<crate::postgres_body::Metadata>, Error> {
+        self.email(id).map_err(postgres_read_error)
+    }
+
     fn prefetch_metadata(
         &mut self,
         ids: &[crate::ids::EmailId],
@@ -839,11 +865,13 @@ fn run_inner<'state, 'c, 's, 'sr, 'a>(
     let mut core = false;
     let mut mail = false;
     let mut submission = false;
+    let mut replication = false;
     for capability in request.using {
         retention.admit_work_turn().map_err(Error::Storage)?;
         core |= capability.as_string_bytes() == Some(CORE.as_bytes());
         mail |= capability.as_string_bytes() == Some(MAIL.as_bytes());
         submission |= capability.as_string_bytes() == Some(SUBMISSION.as_bytes());
+        replication |= capability.as_string_bytes() == Some(REPLICATION.as_bytes());
     }
     let mut calls = Vec::new();
     calls
@@ -871,7 +899,7 @@ fn run_inner<'state, 'c, 's, 'sr, 'a>(
         implicit: None,
     };
     for (ordinal, token) in calls.into_iter().enumerate() {
-        let result = worker.method(&responses, ordinal, token, core, mail);
+        let result = worker.method(&responses, ordinal, token, core, mail, replication);
         let (name, range) = match result {
             Ok(result) => result,
             Err(error) => {
@@ -1068,6 +1096,7 @@ impl Worker<'_, '_, '_, '_, '_> {
         token: usize,
         core: bool,
         mail: bool,
+        replication: bool,
     ) -> Result<(&'static str, Range<u64>), Error> {
         self.check()?;
         let document = responses
@@ -1099,7 +1128,9 @@ impl Worker<'_, '_, '_, '_, '_> {
         if self.read.is_some()
             && !matches!(
                 call.name,
-                b"Core/echo"
+                b"TdReplica/inventory"
+                    | b"TdReplica/metadata"
+                    | b"Core/echo"
                     | b"Identity/get"
                     | b"EmailSubmission/get"
                     | b"EmailSubmission/query"
@@ -1115,6 +1146,12 @@ impl Worker<'_, '_, '_, '_, '_> {
             return Err(Error::UnknownMethod);
         }
         let name = match call.name {
+            b"TdReplica/inventory" if core && mail && replication && self.read.is_some() => {
+                "TdReplica/inventory"
+            }
+            b"TdReplica/metadata" if core && mail && replication && self.read.is_some() => {
+                "TdReplica/metadata"
+            }
             b"EmailSubmission/set" if self.submission && self.submissions.is_some() => {
                 "EmailSubmission/set"
             }
@@ -1150,7 +1187,11 @@ impl Worker<'_, '_, '_, '_, '_> {
         if name == "Core/echo" {
             return Ok((name, start..end));
         }
-        let result = if name == "EmailSubmission/set" {
+        let result = if name == "TdReplica/inventory" {
+            self.replica_inventory(start..end, responses.request().envelope.query_page)
+        } else if name == "TdReplica/metadata" {
+            self.replica_metadata(start..end, responses.request().envelope.maximum_objects)
+        } else if name == "EmailSubmission/set" {
             self.submission_set(
                 call,
                 responses.request().view().map_err(|_| Error::State)?,

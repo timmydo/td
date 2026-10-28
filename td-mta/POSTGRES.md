@@ -7411,11 +7411,15 @@ account/ID primary key, with a maximum of 256 returned IDs and one lookahead.
 Every page authenticates through its enclosing snapshot and rejects a source
 account, epoch or kind mismatch, a future starting sequence, expired history,
 or inverted bounds. Row revisions and strict ID ordering are validated before
-returning detached data, and failures latch the snapshot as other read errors
-do. The adapter creates no retained transaction or retention lease; its
+returning detached data. Storage, integrity and deadline failures latch the
+snapshot; ordinary cursor/limit validation refusals do not poison later methods
+in the same request. The adapter creates no retained transaction or retention lease; its
 enclosing snapshot keeps its ordinary caller-owned lifetime and deadline. No
-schema change or public protocol is introduced by this adapter. Catch-up and
-deletion authority are separate synchronization work.
+schema change is introduced by this adapter. REPLICATION.md specifies its
+authenticated HTTPS inventory/metadata extension and versioned cursor. Metadata
+returns the stored complete-body digest and exact timestamp without reading raw
+chunks, through the same snapshot and metadata prefetch as Email/get. Catch-up
+and deletion authority remain separate synchronization work.
 
 ## Complete search-field evidence
 
