@@ -217,7 +217,7 @@ fn object<'a>(json: &'a Json, what: &str) -> Result<&'a [(String, Json)], String
 }
 
 /// `value`'s keys are exactly `keys`, in any order.
-fn exactly(value: &Json, keys: &[&str], what: &str) -> Result<(), String> {
+pub(crate) fn exactly(value: &Json, keys: &[&str], what: &str) -> Result<(), String> {
     let pairs = object(value, what)?;
     for (key, _) in pairs {
         if !keys.contains(&key.as_str()) {
@@ -234,7 +234,7 @@ fn exactly(value: &Json, keys: &[&str], what: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn text_is(value: &Json, key: &str, want: &str, what: &str) -> Result<(), String> {
+pub(crate) fn text_is(value: &Json, key: &str, want: &str, what: &str) -> Result<(), String> {
     if value.get(key).and_then(Json::as_str) == Some(want) {
         Ok(())
     } else {
@@ -242,7 +242,7 @@ fn text_is(value: &Json, key: &str, want: &str, what: &str) -> Result<(), String
     }
 }
 
-fn number_is(value: &Json, key: &str, want: u64, what: &str) -> Result<(), String> {
+pub(crate) fn number_is(value: &Json, key: &str, want: u64, what: &str) -> Result<(), String> {
     if value.get(key).and_then(Json::as_u64) == Some(want) {
         Ok(())
     } else {
@@ -251,7 +251,7 @@ fn number_is(value: &Json, key: &str, want: u64, what: &str) -> Result<(), Strin
 }
 
 /// A decimal string offset or size, as LUKS2 writes them.
-fn decimal(value: &Json, key: &str, what: &str) -> Result<u64, String> {
+pub(crate) fn decimal(value: &Json, key: &str, what: &str) -> Result<u64, String> {
     value
         .get(key)
         .and_then(Json::as_str)
@@ -280,7 +280,7 @@ fn iterations(value: &Json, ceiling: u64, what: &str) -> Result<u32, String> {
 }
 
 /// The slot numbers an array of slot-number strings names.
-fn slots(value: &Json, key: &str, what: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn slots(value: &Json, key: &str, what: &str) -> Result<Vec<u8>, String> {
     let array = value
         .get(key)
         .and_then(Json::as_arr)

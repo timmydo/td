@@ -474,6 +474,29 @@ not increment C. That open verifies the reencryption digest, runs crash
 recovery, which writes data, and loads a multi-segment table. Until
 increment D lands, `open` refuses such a header.
 
+### Metadata and digest admission
+
+The library's `reencrypt::profile` validates the forward in-place layout
+against the opened device's data length. It accepts one to three active
+segments followed by the fixed full-volume previous/final backups, with
+distinct old/new digests and one private reencryption digest. Offsets and
+IVs must cover the data contiguously. At most one finite dirty hotzone
+may lie between the new prefix and old suffix; its resilience bytes must
+fit the nonoverlapping area. The clean all-new layout with the requirement
+still present is refused because of the stock resume failure below.
+
+Normal keyslots, digests, tokens and configuration retain the ordinary
+profile's checks. The validator applies those checks to a private clone
+with the reencryption-only fields normalized, after validating those
+fields separately. It does not change the input or perform I/O.
+
+`reencrypt::digest` encodes version 2 with the fixed backup profile into
+a bounded, zeroed-on-drop buffer: 274 bytes for checksum and 263 for
+journal. The caller must validate the metadata separately and authenticate
+the resulting digest before trusting recovery parameters. This increment
+provides validation and digest calculation only; ordinary activation and
+mutations continue to refuse the reencryption requirement.
+
 ### Start and end
 
 td-luks orders its own commits so that a crash leaves a state
@@ -604,6 +627,13 @@ Each increment is one landable commit, or a short series:
 - **D.** Reencryption: `reencrypt`, `reencrypt-resume` and `open` on a
   header mid-reencryption, in both directions, with the ordered start
   and end and the ENCRYPTION.md amendments above.
+  - **D1.** Read-only layout admission and the v2 verification digest
+    (`src/reencrypt.rs`, `src/reencrypt_profile.rs`). Offline tests match
+    the digest for all 106 stock prefixes, accept the 92 recoverable
+    layouts and refuse the 14 unsafe all-new layouts, with malformed
+    layout cases. No reencryption command or data rewriting is enabled.
+  - Remaining D work adds metadata transitions, device stacks, recovery,
+    data rewriting and the bidirectional interruption oracle.
 - **E.** The cutover, in one landing (AGENTS.md principle 4):
   - td-protector's runner and every caller switch to td-luks;
   - the image ships `/bin/td-luks` where it ships cryptsetup;

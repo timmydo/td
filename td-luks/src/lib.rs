@@ -21,4 +21,5 @@ mod encoding;
 
 pub mod header;
 pub mod keyslot;
+pub mod reencrypt;
 pub mod write;
