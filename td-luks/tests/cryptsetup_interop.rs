@@ -129,7 +129,10 @@ impl Fixture {
             .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(input).unwrap();
+        if let Err(error) = child.stdin.take().unwrap().write_all(input) {
+            // Invalid headers can be rejected before the key is read.
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
         let output = child.wait_with_output().unwrap();
         (output.status.code().unwrap_or(-1), output.stdout)
     }
@@ -563,4 +566,164 @@ fn the_program_and_cryptsetup_read_each_other_s_work() {
     );
     holder.unlock().unwrap();
     assert!(child.wait().unwrap().success());
+}
+
+#[test]
+#[ignore = "needs the pinned cryptsetup on PATH and the host kernel's AF_ALG"]
+fn a_keyslot_with_no_digest_fails_alike_in_both() {
+    let fixture = Fixture::new("digestless");
+    let device = fixture.device();
+    fixture.ok(FORMAT, &device, RECOVERY);
+    let mut file = open(&device);
+    let mut random = DevRandom;
+    write::add_key(&mut file, &mut random, 0, 1, RECOVERY, SECOND).unwrap();
+    // Keyslot 1 left out of every digest: the writer must refuse it.
+    let header = write::load(&mut file).unwrap();
+    let mut json = header.json.clone();
+    let Some(Json::Arr(slots)) = json
+        .get_mut("digests")
+        .and_then(|digests| digests.get_mut("0"))
+        .and_then(|digest| digest.get_mut("keyslots"))
+    else {
+        panic!("digest 0 names its keyslots");
+    };
+    slots.retain(|slot| *slot != Json::Str("1".into()));
+    let plan = write::Plan {
+        uuid: header.uuid.clone(),
+        label: header.label.clone(),
+        seqid: header.seqid + 1,
+        json,
+        areas: Vec::new(),
+        used: header.used,
+    };
+    assert!(matches!(
+        write::commit(&mut file, &mut random, &plan),
+        Err(Error::Refused(_))
+    ));
+    drop(file);
+    // Manufacture the invalid header independently of the checked writer.
+    let mut bytes = fs::read(&device).unwrap();
+    let json = plan.json.to_string();
+    for offset in [0, 16384] {
+        let copy = &mut bytes[offset..offset + 16384];
+        copy[4096..].fill(0);
+        copy[4096..4096 + json.len()].copy_from_slice(json.as_bytes());
+        copy[448..512].fill(0);
+        let checksum = td_fido::digest(copy);
+        copy[448..480].copy_from_slice(&checksum);
+    }
+    fs::write(&device, bytes).unwrap();
+    assert!(matches!(
+        write::load(&mut open(&device)),
+        Err(Error::Refused(_))
+    ));
+    let written = header_bytes(&device);
+    // cryptsetup refuses the whole header: "Keyslot 1 is not assigned to
+    // exactly 1 digest".
+    let dump = ["luksDump", "--dump-json-metadata"];
+    assert_eq!(fixture.run(&dump, &device, b"").0, 1);
+    // `test` and `open --test-passphrase --key-slot`, by its key and by
+    // another: a failure, not a wrong key.
+    assert_eq!(fixture.test(&device, 1, SECOND), 1);
+    assert_eq!(fixture.test(&device, 1, WRONG), 1);
+    assert_eq!(program(&["test", "1"], &device, &[], SECOND), 1);
+    assert_eq!(program(&["test", "1"], &device, &[], WRONG), 1);
+    // `add-key` by it and `luksAddKey --key-slot 1 --new-key-slot 2`.
+    let third = fixture.file("third.key", THIRD);
+    let mut add = vec![
+        "luksAddKey",
+        "--batch-mode",
+        "--key-slot",
+        "1",
+        "--new-key-slot",
+        "2",
+        "--key-file=-",
+    ];
+    add.extend(PBKDF);
+    assert_eq!(fixture.run_tail(&add, &device, &[&third], SECOND).0, 1);
+    let (_held_third, third_fd) = key_file(THIRD);
+    assert_eq!(
+        program(&["add-key", "1", "2"], &device, &[&third_fd], SECOND),
+        1
+    );
+    assert_eq!(header_bytes(&device), written);
+}
+
+/// Header states after the final data rewrite, then after each old slot
+/// removal. This proves metadata acceptance, not reencryption or dm-crypt.
+#[test]
+#[ignore = "needs the pinned cryptsetup on PATH and the host kernel's AF_ALG"]
+fn retained_old_digest_keeps_each_end_cleanup_header_compatible() {
+    let fixture = Fixture::new("end-cleanup");
+    let device = fixture.device();
+    let old = fixture.dir.path().join("old.img");
+    fs::rename(&device, &old).unwrap();
+    let new = fixture.device();
+    let mut random = DevRandom;
+    let mut file = open(&old);
+    write::format(&mut file, &mut random, UUID, "td-system", RECOVERY).unwrap();
+    write::add_key(&mut file, &mut random, 0, 2, RECOVERY, THIRD).unwrap();
+    let old_key = write::volume_key(&mut file, Some(0), RECOVERY).unwrap();
+    write::format(&mut open(&new), &mut random, UUID, "td-system", SECOND).unwrap();
+    let new_header = write::load(&mut open(&new)).unwrap();
+    let new_key = write::volume_key(&mut open(&new), Some(0), SECOND).unwrap();
+    assert_ne!(old_key.bytes(), new_key.bytes());
+    let header = write::load(&mut file).unwrap();
+    let mut json = header.json.clone();
+    json.get_mut("digests")
+        .unwrap()
+        .get_mut("0")
+        .unwrap()
+        .insert("segments", Json::Arr(vec![]));
+    let mut digest = new_header.json.get_path(&["digests", "0"]).unwrap().clone();
+    digest.insert("keyslots", Json::Arr(vec![Json::from("1")]));
+    json.get_mut("digests").unwrap().insert("1", digest);
+    let mut slot = new_header
+        .json
+        .get_path(&["keyslots", "0"])
+        .unwrap()
+        .clone();
+    let offset = KEYSLOTS_OFFSET + 2 * keyslot::AREA_LEN;
+    slot.get_mut("area")
+        .unwrap()
+        .insert("offset", offset.to_string());
+    json.get_mut("keyslots").unwrap().insert("1", slot);
+    let bytes = fs::read(&new).unwrap();
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(
+        &bytes[KEYSLOTS_OFFSET as usize..(KEYSLOTS_OFFSET + keyslot::AREA_LEN) as usize],
+        offset,
+    )
+    .unwrap();
+    file.sync_data().unwrap();
+    let plan = write::Plan {
+        uuid: header.uuid,
+        label: header.label,
+        seqid: header.seqid + 1,
+        json,
+        areas: Vec::new(),
+        used: header.used,
+    };
+    write::commit(&mut file, &mut random, &plan).unwrap();
+    for removed in [None, Some(0), Some(2)] {
+        if let Some(slot) = removed {
+            write::kill_slot(&mut file, &mut random, slot, SECOND).unwrap();
+        }
+        let written = header_bytes(&old);
+        assert_eq!(fixture.dump(&old), metadata(&old));
+        assert_eq!(fixture.test(&old, 1, SECOND), 0);
+        assert_eq!(
+            fixture.volume_key(&old, SECOND, &format!("key-{removed:?}")),
+            new_key.bytes()
+        );
+        for (slot, key) in [(0, RECOVERY), (2, THIRD)] {
+            if metadata(&old)
+                .get_path(&["keyslots", &slot.to_string()])
+                .is_some()
+            {
+                assert_eq!(fixture.test(&old, slot, key), 0);
+            }
+        }
+        assert_eq!(header_bytes(&old), written);
+    }
 }

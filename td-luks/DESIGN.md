@@ -10,8 +10,9 @@ td-protector's runner performs on it, and it refuses everything else.
 This document is the design. It is planned and not yet implemented:
 "Increments" says which parts exist. Until the cutover lands,
 cryptsetup 2.8.8 remains td's LUKS2 program and ENCRYPTION.md's
-increment 3 sign-off still governs it. Facts stated here about
-cryptsetup are those of its 2.8.8 source.
+increment 3 sign-off still governs it. Source citations describe the
+planned protocol; compatibility claims must be checked against the
+pinned 2.8.8 binary. The tests below state what is checked so far.
 
 ## Why
 
@@ -53,6 +54,9 @@ td-luks formats exactly the profile ENCRYPTION.md fixes:
   512-bit key, in 512-byte sectors, the IV counting from 0 at the area's
   offset. A keyslot's split key is 256000 bytes (500 sectors) in a
   258048-byte area.
+- **Digest assignment:** every keyslot belongs to exactly one digest.
+  An unbound keyslot retains its digest with an empty `segments` list;
+  a keyslot with no digest makes the whole header invalid.
 - **Digests:** PBKDF2-HMAC-SHA256 with 1000 iterations, a 32-byte salt
   and a 32-byte result, for the volume key, a reencryption's new key and
   the reencryption digest. 1000 is cryptsetup's own count under
@@ -144,13 +148,13 @@ The key on standard input authorizes each verb as cryptsetup's would:
   cryptsetup instead kills unasked on empty input. When SLOT is
   unbound and no bound keyslot remains, td-luks still needs SLOT's own
   key, where cryptsetup kills unverified; this is deliberately
-  stricter, and a keyslot with no digest at all, which no key can be
-  checked against, is then refused. Killing the last bound keyslot by
-  its own key leaves a header no key opens, as with cryptsetup, and so
+  stricter. A keyslot with no digest invalidates the whole header.
+  Killing the last bound keyslot by its own key leaves a header no key
+  opens, as with cryptsetup, and so
   does a crash after that kill's wipe ("Commits").
 - **`kill-unbound`:** the key must open a bound keyslot. It removes each
-  unbound keyslot, meaning one with no digest or whose digest names no
-  segment (cryptsetup's `LUKS2_keyslot_unbound`). Their digests stay,
+  unbound keyslot, meaning one whose digest names no segment. Their
+  digests stay,
   with empty `keyslots`, as cryptsetup leaves them. It refuses a header
   that carries the reencryption requirement.
 - **`open` with no slot:** tries each bound keyslot whose priority is
@@ -166,6 +170,17 @@ Exit statuses:
 | 2 | a key that opens no candidate keyslot (cryptsetup's wrong-passphrase status) |
 | 4 | `status` finds no mapping |
 | 1 | any other failure, with a message on standard error |
+
+A keyslot no digest names is a failure (status 1) for `test` and
+`add-key` whatever the key, never a wrong key. cryptsetup 2.8.8 exits 1
+for `open --test-passphrase --key-slot` and `luksAddKey --key-slot` on
+such a header too, refusing the whole header ("Keyslot N is not assigned
+to exactly 1 digest"); the profile check refuses it on load and commit.
+The interop tests pin both refusals. They also construct the proposed
+end-cleanup metadata with distinct old and new volume keys and verify
+cryptsetup accepts it before cleanup and after each old keyslot removal,
+without repairing either copy. This checks headers and keyslots only;
+actual reencryption and its interrupted states remain increment D's oracle.
 
 Reencryption prints one `--progress-json`-shaped line a second,
 `{"device_bytes":"N","device_size":"M"}` with decimal strings, so the
@@ -448,13 +463,18 @@ ENCRYPTION.md's upgrade machine resolves:
   key.)
 - **End:** one commit finalizes the segments and removes the
   requirement, the reencrypt keyslot and its digest, the backup segments
-  and the old key's digest. The old key's keyslots stay, unbound. Then
-  each is wiped and removed in its own commit.
+  while retaining the old key's digest with `segments: []` and its
+  keyslots unchanged. The old key's keyslots stay, unbound but each
+  assigned to exactly one digest. Then each is wiped and removed in
+  its own commit; the old digest stays with an empty `keyslots` list
+  after the last removal.
 
 cryptsetup 2.8.8 instead destroys the old keyslots before dropping the
 requirement, and a power cut between them leaves a header no resumption
 opens (ENCRYPTION.md "Re-encrypting upgrade"). With td-luks's order,
-every commit leaves a header both programs open or resume. A crash
+the intended invariant is that every commit leaves a header both
+programs open or resume. Increment D must prove this for every
+intermediate header against the pinned binary before shipping. A crash
 during the end leaves unbound keyslots and no requirement.
 `kill-unbound`, run by the selector before it chooses the recovery
 keyslot in U1 and U3, removes them. It also removes the stray keyslot a

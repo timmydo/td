@@ -451,6 +451,11 @@ pub fn profile(json: &Json) -> Result<(), String> {
             }
         }
     }
+    for (number, _) in &keyslots {
+        if !digested.contains(number) {
+            return Err(format!("LUKS2 keyslot {number} has no digest"));
+        }
+    }
     for (number, token) in numbered(json, "tokens")? {
         let what = format!("token {number}");
         token
@@ -676,7 +681,7 @@ fn digest_of(json: &Json, slot: u8) -> Result<Option<(u8, Json)>, Error> {
 fn bound(json: &Json, slot: u8) -> Result<bool, Error> {
     Ok(match digest_of(json, slot)? {
         Some((_, digest)) => !slots(&digest, "segments", "digest")?.is_empty(),
-        None => false,
+        None => return refused(format!("LUKS2 keyslot {slot} has no digest")),
     })
 }
 
@@ -1069,8 +1074,7 @@ pub fn kill_slot<M: Medium + ?Sized>(
     commit(medium, random, &plan)
 }
 
-/// Keyslots with no digest, or whose digest names no segment
-/// (cryptsetup's `LUKS2_keyslot_unbound`).
+/// Keyslots whose digest names no segment. A missing digest is refused.
 pub fn unbound(json: &Json) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     for (number, _) in numbered(json, "keyslots")? {
@@ -1508,11 +1512,14 @@ pub(crate) mod tests {
         let mut medium = formatted(&mut random);
         add_key(&mut medium, &mut random, 0, 1, RECOVERY, SECOND).unwrap();
         assert_eq!(kill_unbound(&mut medium, &mut random, RECOVERY), Ok(0));
-        // Keyslot 1 left with no digest, as a reencryption's end leaves
-        // the old key's keyslots.
+        // Retain the old digest with no segment during end cleanup.
         let header = load(&mut medium).unwrap();
         let mut json = header.json.clone();
         strip(&mut json, 1).unwrap();
+        let mut digest = header.json.get_path(&["digests", "0"]).unwrap().clone();
+        digest.insert("keyslots", parse(r#"["1"]"#));
+        digest.insert("segments", parse("[]"));
+        at(&mut json, &["digests"]).insert("1", digest);
         let plan = rewrite(&header, json);
         commit(&mut medium, &mut random, &plan).unwrap();
         assert_eq!(unbound(&load(&mut medium).unwrap().json).unwrap(), [1]);
@@ -1730,6 +1737,9 @@ pub(crate) mod tests {
             ),
             ("keyslot areas overlap", |json| {
                 at(json, &["keyslots", "1", "area"]).insert("offset", "36864");
+            }),
+            ("keyslot 1 has no digest", |json| {
+                at(json, &["digests", "0"]).insert("keyslots", parse(r#"["0"]"#));
             }),
             ("digest 0 names a segment other than 0", |json| {
                 at(json, &["digests", "0"]).insert("segments", parse(r#"["1"]"#));
