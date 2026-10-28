@@ -515,6 +515,31 @@ fn read_only_discovery_keeps_reads_and_refuses_remote_mutations() {
 }
 
 #[test]
+fn read_only_policy_survives_offline_restart_without_projection() {
+    let mut h = CliHarness::start();
+    h.server().read_only();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    let before = h.send(json!({"command":"get_email", "id":"email-002"}));
+    assert!(before["ok"].is_true());
+    h.restart_with_offline(true);
+    let connected = h.send(json!({"command":"connect", "account":"test"}));
+    assert!(
+        connected["ok"].is_true() && connected["offline"].is_true(),
+        "{connected}"
+    );
+    let refused = h.send(json!({"command":"mark_read", "id":"email-002"}));
+    assert!(!refused["ok"].is_true(), "{refused}");
+    assert!(refused.to_string().contains("read-only"), "{refused}");
+    let after = h.send(json!({"command":"get_email", "id":"email-002"}));
+    assert!(after["ok"].is_true(), "{after}");
+    assert_eq!(after["email"]["keywords"], before["email"]["keywords"]);
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.server().update_calls().is_empty());
+}
+
+#[test]
 fn test_mark_read_unread() {
     let mut h = CliHarness::start();
 

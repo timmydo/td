@@ -363,6 +363,7 @@ enum TreeDrag {
 }
 
 struct Session {
+    read_only: Vec<bool>,
     setup: Setup,
     stack: ViewStack,
     pane: Pane,
@@ -442,6 +443,7 @@ impl Session {
         );
         let sidebar = Sidebar::new(&setup.account_names, current);
         let mut session = Session {
+            read_only: vec![false; live.len()],
             sync_interval: setup.sync_interval_secs.map(Duration::from_secs),
             setup,
             stack,
@@ -1226,6 +1228,7 @@ impl Session {
             self.current = index;
         }
         let old = std::mem::replace(&mut self.stack, ViewStack::new(view, index));
+        self.stack.apply_account_access(&self.read_only);
         for slot in old.into_slots() {
             self.pane.close(slot.text);
         }
@@ -1518,6 +1521,18 @@ impl Session {
             return;
         };
         let title = view.scene().title;
+        let title = if self
+            .stack
+            .top()
+            .and_then(|slot| slot.account)
+            .and_then(|account| self.read_only.get(account))
+            .copied()
+            .unwrap_or(false)
+        {
+            format!("[Read-only] {title}")
+        } else {
+            title
+        };
         let shown = title
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
@@ -2033,6 +2048,7 @@ impl Session {
     /// where Control is held over a link, and the title is the view's.
     /// Before every paint and every read of the frame.
     fn prepare_frame(&mut self) {
+        self.stack.apply_account_access(&self.read_only);
         self.lay_out();
         // The frame may show another view or layout than the input did.
         self.underline_link();
@@ -2262,6 +2278,12 @@ impl Handler for Session {
                     if self.side() != Side::None {
                         self.redraw();
                     }
+                }
+                if let BackendResponse::AccountReadOnly(value) = &response {
+                    if let Some(current) = self.read_only.get_mut(index) {
+                        *current = *value;
+                    }
+                    self.redraw();
                 }
                 self.marked_read(index, &response);
                 if self.stack.handle_response(index, &response) {
@@ -3230,6 +3252,25 @@ mod frame_tests {
     /// and both answers fill it, newest first; a message opens over it
     /// bound to its own account, whose backend a reply or draft there
     /// then uses, and another account's answers do not reach it.
+    #[test]
+    fn read_only_policy_reaches_replaced_root_before_paint() {
+        let (mut session, _state, _test_cmds, _work_cmds, [_, work_answer]) =
+            two_accounts_answering();
+        work_answer
+            .send(BackendResponse::AccountReadOnly(true))
+            .unwrap();
+        assert_eq!(session.poll(0), Flow::Continue);
+        session.open_unified();
+        // No paint or frame preparation between root creation and observation.
+        assert!(session
+            .stack
+            .current()
+            .unwrap()
+            .scene()
+            .status
+            .contains("Read-only accounts: work"));
+    }
+
     #[test]
     fn all_inboxes_merge_every_account_and_a_message_opens_on_its_own() {
         let (mut session, _state, test_cmds, work_cmds, [test_answer, work_answer]) =

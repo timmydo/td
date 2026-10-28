@@ -159,6 +159,7 @@ pub enum BackendCommand {
 
 /// Responses sent from the backend thread to the UI thread.
 pub enum BackendResponse {
+    AccountReadOnly(bool),
     Mailboxes(Result<Vec<Mailbox>, String>),
     MailboxCreated {
         name: String,
@@ -945,6 +946,9 @@ fn queue_offline(
     op: &QueuedMutation,
     reason: Option<&str>,
 ) -> Result<(), String> {
+    if cache.is_some_and(Cache::is_read_only) {
+        return Err("This account is read-only; offline changes are not queued".into());
+    }
     queue_mutation(cache, op)
         .map(|_| apply_local_mutation(cache, op))
         .map_err(|e| offline_error(&e, reason))
@@ -1733,6 +1737,27 @@ impl BackgroundBodies {
     }
 }
 
+fn account_access(
+    client: Option<&JmapClient>,
+    cache: Option<&Cache>,
+    response: &mpsc::Sender<BackendResponse>,
+    previous: bool,
+) -> bool {
+    let read_only = client.map_or_else(
+        || cache.is_some_and(Cache::is_read_only),
+        JmapClient::is_read_only,
+    );
+    if let (Some(_), Some(cache)) = (client, cache) {
+        if let Err(error) = cache.put_read_only(read_only) {
+            log_warn!("[Backend] {}", error);
+        }
+    }
+    if read_only || read_only != previous {
+        let _ = response.send(BackendResponse::AccountReadOnly(read_only));
+    }
+    read_only
+}
+
 #[allow(clippy::too_many_arguments)]
 fn backend_loop(
     client: Option<JmapClient>,
@@ -1753,6 +1778,7 @@ fn backend_loop(
     let mut client = client;
     let mut connecting = connecting;
     let mut cache = cache;
+    let mut read_only = account_access(client.as_ref(), cache.as_ref(), &resp_tx, false);
     // What arrived while the connection was pending, answered in order
     // once it is decided: nothing is answered from the cache that the
     // connection then supersedes, and no fetch fails as offline while
@@ -1838,6 +1864,8 @@ fn backend_loop(
                         );
                     }
                     cache = Some(opened);
+                    read_only =
+                        account_access(client.as_ref(), cache.as_ref(), &resp_tx, read_only);
                 }
             }
         }
@@ -1850,6 +1878,7 @@ fn backend_loop(
             BackendCommand::Connect(connected) => {
                 background_bodies.0.clear();
                 log_info!("[Backend] cmd#{} Connect", command_seq);
+                read_only = account_access(Some(&connected), cache.as_ref(), &resp_tx, read_only);
                 if let Some(cache) = cache.as_ref() {
                     replay_queued_mutations(
                         &connected,

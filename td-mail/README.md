@@ -576,9 +576,13 @@ queued operations remain retained without replay. Reading, search, raw messages
 and attachment downloads remain available. These client guards complement the
 server's authorization checks; they do not grant authority.
 
-This is the connected-client boundary. Read-only UI affordances, automatic
-mark-read suppression and persistence of read-only policy while disconnected
-remain required before using td-mail as the supported offline replica client.
+The window title identifies a selected read-only account; the unified inbox
+names its read-only accounts. Opening or navigating to unread messages leaves
+them unread. Explicit write commands still report the read-only refusal.
+The cache retains the last discovered account policy across offline restarts
+and refuses offline queueing for a known read-only account. Discovery updates
+that policy when reconnecting. A cache write failure is logged; a missing or
+recreated cache has no retained policy. The server remains authoritative.
 Use a separate configured account name/cache for a local replica.
 
 ## Development

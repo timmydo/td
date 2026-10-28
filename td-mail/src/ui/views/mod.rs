@@ -293,6 +293,17 @@ impl ViewStack {
         needs_render
     }
 
+    pub fn apply_account_access(&mut self, access: &[bool]) {
+        for slot in &mut self.slots {
+            for (account, value) in access.iter().enumerate() {
+                if slot.account.is_none_or(|bound| bound == account) {
+                    slot.view
+                        .on_account_response(account, &BackendResponse::AccountReadOnly(*value));
+                }
+            }
+        }
+    }
+
     pub fn current_mut(&mut self) -> Option<&mut Box<dyn View>> {
         self.slots.last_mut().map(|slot| &mut slot.view)
     }

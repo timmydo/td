@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use td_json::ToJson;
 use td_kv::{Error as KvError, Key, Store};
 
-/// The six tables. `op_queue` is keyed by a big-endian `u64`, so iteration
+/// The mail tables and retained account access observation. `op_queue` is keyed by a big-endian `u64`, so iteration
 /// order is numeric order and replay is FIFO; the rest are keyed by text.
 const EMAILS: &str = "emails";
 const RULES_PROCESSED: &str = "rules_processed";
@@ -11,6 +11,7 @@ const MAILBOX_INDEX: &str = "mailbox_index";
 const MAILBOXES: &str = "mailboxes";
 const OP_QUEUE: &str = "op_queue";
 const OP_PROGRESS: &str = "op_progress";
+const ACCESS: &str = "account_access";
 
 /// The single row `mailboxes` holds.
 const MAILBOXES_ROW: &str = "mailboxes";
@@ -98,6 +99,25 @@ impl Cache {
             }
         };
         Ok(Cache { store })
+    }
+
+    /// Preserve known read-only policy across offline startup. An invalid
+    /// stored value refuses writes; legacy caches have no observation yet.
+    pub fn is_read_only(&self) -> bool {
+        let txn = self.store.read();
+        txn.table(ACCESS)
+            .and_then(|table| table.get(&Key::from_str("read_only")))
+            .is_some_and(|value| value != b"0")
+    }
+    pub fn put_read_only(&self, read_only: bool) -> Result<(), String> {
+        let mut txn = self.store.write();
+        txn.insert(
+            ACCESS,
+            &Key::from_str("read_only"),
+            if read_only { b"1" } else { b"0" },
+        );
+        txn.commit()
+            .map_err(|error| format!("cannot retain account access: {error}"))
     }
 
     pub fn get_email(&self, id: &str) -> Option<Email> {

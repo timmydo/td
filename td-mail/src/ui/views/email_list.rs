@@ -71,6 +71,7 @@ pub struct CachedEmailListState {
 }
 
 pub struct EmailListView {
+    read_only: bool,
     cmd_tx: mpsc::Sender<BackendCommand>,
     reply_from_address: String,
     mailbox_id: String,
@@ -121,6 +122,7 @@ impl EmailListView {
         browser: Option<String>,
     ) -> Self {
         EmailListView {
+            read_only: false,
             cmd_tx,
             reply_from_address,
             mailbox_id,
@@ -529,7 +531,7 @@ impl EmailListView {
         let _ = self.cmd_tx.send(BackendCommand::GetEmail {
             id: email_id.clone(),
         });
-        if !was_seen {
+        if !was_seen && !self.read_only {
             let op_id = self.next_op_id();
             self.pending_write_ops.insert(
                 op_id,
@@ -1127,6 +1129,11 @@ impl View for EmailListView {
     }
 
     fn on_response(&mut self, response: &BackendResponse) -> bool {
+        if let BackendResponse::AccountReadOnly(value) = response {
+            let changed = self.read_only != *value;
+            self.read_only = *value;
+            return changed;
+        }
         match response {
             BackendResponse::EmailListPreview {
                 mailbox_id,
@@ -1491,6 +1498,23 @@ mod tests {
 
     /// Opening a message of a thread reads that message alone, so a
     /// delete there moves it and not the rest of its thread.
+    #[test]
+    fn read_only_open_preserves_unread_and_only_requests_body() {
+        let (mut view, receiver) = make_view();
+        while receiver.try_recv().is_ok() {}
+        view.on_response(&BackendResponse::AccountReadOnly(true));
+        assert!(matches!(
+            view.handle_key(Key::Enter, 24),
+            ViewAction::Push(_)
+        ));
+        assert!(
+            matches!(receiver.try_recv(), Ok(BackendCommand::GetEmail { id }) if id == "email-1")
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(view.emails.iter().all(EmailListView::is_unread));
+        assert_eq!(view.thread_counts.get("thread-A"), Some(&(2, 2)));
+    }
+
     #[test]
     fn enter_on_a_threads_message_opens_that_message_alone() {
         let (mut view, cmd_rx) = make_view();

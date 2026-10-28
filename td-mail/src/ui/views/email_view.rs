@@ -130,6 +130,7 @@ pub struct EmailNavEntry {
 }
 
 pub struct EmailView {
+    read_only: bool,
     cmd_tx: mpsc::Sender<BackendCommand>,
     reply_from_address: String,
     can_expire_now: bool,
@@ -182,6 +183,7 @@ impl EmailView {
         browser: Option<String>,
     ) -> Self {
         EmailView {
+            read_only: false,
             cmd_tx,
             reply_from_address,
             can_expire_now,
@@ -264,13 +266,15 @@ impl EmailView {
         let _ = self.cmd_tx.send(BackendCommand::GetEmail {
             id: self.email_id.clone(),
         });
-        let op_id = self.next_op_id();
-        let _ = self.cmd_tx.send(BackendCommand::MarkEmailRead {
-            op_id,
-            id: self.email_id.clone(),
-        });
-        if let Some(entry) = self.nav_entries.get_mut(next_idx) {
-            entry.unread = false;
+        if !self.read_only {
+            let op_id = self.next_op_id();
+            let _ = self.cmd_tx.send(BackendCommand::MarkEmailRead {
+                op_id,
+                id: self.email_id.clone(),
+            });
+            if let Some(entry) = self.nav_entries.get_mut(next_idx) {
+                entry.unread = false;
+            }
         }
         true
     }
@@ -1089,6 +1093,11 @@ impl View for EmailView {
     }
 
     fn on_response(&mut self, response: &BackendResponse) -> bool {
+        if let BackendResponse::AccountReadOnly(value) = response {
+            let changed = self.read_only != *value;
+            self.read_only = *value;
+            return changed;
+        }
         match response {
             BackendResponse::EmailBody { id, result } if *id == self.email_id => {
                 self.loading = false;
@@ -1296,6 +1305,27 @@ mod tests {
     }
 
     /// The key of the text the scene shows, and the text itself.
+    #[test]
+    fn read_only_unread_navigation_preserves_flags() {
+        let (mut view, receiver) = loaded_view("preview");
+        view.nav_entries = vec![
+            EmailNavEntry {
+                id: "e1".into(),
+                unread: true,
+            },
+            EmailNavEntry {
+                id: "e2".into(),
+                unread: true,
+            },
+        ];
+        view.on_response(&BackendResponse::AccountReadOnly(true));
+        while receiver.try_recv().is_ok() {}
+        assert!(view.navigate_unread(true));
+        assert!(matches!(receiver.try_recv(), Ok(BackendCommand::GetEmail { id }) if id == "e2"));
+        assert!(receiver.try_recv().is_err());
+        assert!(view.nav_entries.iter().all(|entry| entry.unread));
+    }
+
     fn shown_text(view: &EmailView, columns: usize) -> (String, String) {
         match view.scene().body {
             Body::Text { key, text } => (key, text(columns)),

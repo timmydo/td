@@ -68,6 +68,7 @@ pub struct Inbox {
 
 /// An account's part of the list.
 struct Part {
+    read_only: bool,
     inbox: Inbox,
     /// The inbox's mailbox id, once the account's folders name one.
     id: Option<String>,
@@ -141,6 +142,7 @@ impl UnifiedInboxView {
             parts: inboxes
                 .into_iter()
                 .map(|inbox| Part {
+                    read_only: false,
                     id: inbox_id(&inbox.mailboxes),
                     inbox,
                     emails: Vec::new(),
@@ -382,7 +384,12 @@ impl UnifiedInboxView {
         let _ = inbox
             .cmd_tx
             .send(BackendCommand::GetEmail { id: id.clone() });
-        if unread {
+        if unread
+            && self
+                .parts
+                .get(part_index)
+                .is_some_and(|part| !part.read_only)
+        {
             self.mark(part_index, &id, true);
         }
         self.opened = Some(part_index);
@@ -591,6 +598,17 @@ impl View for UnifiedInboxView {
                 self.rows.len()
             )
         };
+        if self.parts.iter().any(|part| part.read_only) {
+            status = format!(
+                "Read-only accounts: {} | {status}",
+                self.parts
+                    .iter()
+                    .filter(|part| part.read_only)
+                    .map(|part| part.inbox.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         if !notes.is_empty() {
             status = format!("{} | {status}", notes.join("; "));
         }
@@ -665,6 +683,14 @@ impl View for UnifiedInboxView {
         let Some(index) = self.parts.iter().position(|p| p.inbox.account == account) else {
             return false;
         };
+        if let BackendResponse::AccountReadOnly(value) = response {
+            let Some(part) = self.parts.get_mut(index) else {
+                return false;
+            };
+            let changed = part.read_only != *value;
+            part.read_only = *value;
+            return changed;
+        }
         match response {
             // A listing names the inbox; a changed one (the account set
             // up anew) starts the part over.
@@ -983,6 +1009,36 @@ mod tests {
     /// message to its own account's archive; a refusal answered by that
     /// account puts it back, and the same operation number from another
     /// account is not its answer.
+    #[test]
+    fn read_only_unified_open_preserves_only_that_accounts_unread() {
+        let (home, home_rx) = inbox(0, "home", vec![folder("h-in", "Inbox", Some("inbox"))]);
+        let (work, work_rx) = inbox(1, "work", vec![folder("w-in", "Inbox", Some("inbox"))]);
+        let mut view = UnifiedInboxView::new(
+            vec![home, work],
+            50,
+            None,
+            "home".into(),
+            "me@home.test".into(),
+        );
+        view.on_account_response(0, &emails("h-in", vec![email("h1", "2026-01-01")]));
+        view.on_account_response(1, &emails("w-in", vec![email("w1", "2026-01-02")]));
+        view.on_account_response(1, &BackendResponse::AccountReadOnly(true));
+        while home_rx.try_recv().is_ok() {}
+        while work_rx.try_recv().is_ok() {}
+        view.handle_key(Key::Home, 10);
+        view.handle_key(Key::Enter, 10);
+        assert!(matches!(work_rx.try_recv(), Ok(BackendCommand::GetEmail { id }) if id == "w1"));
+        assert!(work_rx.try_recv().is_err());
+        assert!(view.row(0).marked);
+        view.handle_key(Key::End, 10);
+        view.handle_key(Key::Enter, 10);
+        assert!(matches!(home_rx.try_recv(), Ok(BackendCommand::GetEmail { id }) if id == "h1"));
+        assert!(matches!(
+            home_rx.try_recv(),
+            Ok(BackendCommand::MarkEmailRead { .. })
+        ));
+    }
+
     #[test]
     fn a_rows_actions_go_to_its_own_account() {
         let (home, home_rx) = inbox(0, "home", vec![folder("h-in", "Inbox", Some("inbox"))]);

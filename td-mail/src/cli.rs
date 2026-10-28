@@ -74,11 +74,18 @@ impl CliState {
     }
 
     fn recv_resp(&self) -> Result<BackendResponse, String> {
-        self.resp_rx
+        let receiver = self
+            .resp_rx
             .as_ref()
-            .ok_or_else(|| "not connected".to_string())?
-            .recv()
-            .map_err(|_| "backend channel closed".to_string())
+            .ok_or_else(|| "not connected".to_string())?;
+        loop {
+            let response = receiver
+                .recv()
+                .map_err(|_| "backend channel closed".to_string())?;
+            if !matches!(response, BackendResponse::AccountReadOnly(_)) {
+                return Ok(response);
+            }
+        }
     }
 
     fn next_plan_id(&mut self) -> String {

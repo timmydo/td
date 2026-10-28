@@ -48,6 +48,7 @@ enum PendingWriteOp {
 }
 
 pub struct ThreadView {
+    read_only: bool,
     cmd_tx: mpsc::Sender<BackendCommand>,
     reply_from_address: String,
     thread_id: String,
@@ -88,6 +89,7 @@ impl ThreadView {
             thread_id: thread_id.clone(),
         });
         ThreadView {
+            read_only: false,
             cmd_tx,
             reply_from_address,
             thread_id,
@@ -274,7 +276,7 @@ impl ThreadView {
         let _ = self.cmd_tx.send(BackendCommand::GetEmail {
             id: email_id.clone(),
         });
-        if !was_seen {
+        if !was_seen && !self.read_only {
             let op_id = self.next_op_id();
             self.pending_write_ops.insert(
                 op_id,
@@ -568,6 +570,11 @@ impl View for ThreadView {
     }
 
     fn on_response(&mut self, response: &BackendResponse) -> bool {
+        if let BackendResponse::AccountReadOnly(value) = response {
+            let changed = self.read_only != *value;
+            self.read_only = *value;
+            return changed;
+        }
         match response {
             BackendResponse::ThreadEmails { thread_id, emails } if *thread_id == self.thread_id => {
                 self.loading = false;
@@ -730,6 +737,20 @@ mod tests {
             None,
         );
         (view, cmd_rx)
+    }
+
+    #[test]
+    fn read_only_thread_open_does_not_mark_read() {
+        let (mut view, receiver) = make_view(None);
+        view.on_response(&messages("mbox-inbox"));
+        view.on_response(&BackendResponse::AccountReadOnly(true));
+        while receiver.try_recv().is_ok() {}
+        assert!(matches!(
+            view.handle_key(Key::Enter, 24),
+            ViewAction::Push(_)
+        ));
+        assert!(matches!(receiver.try_recv(), Ok(BackendCommand::GetEmail { id }) if id == "e1"));
+        assert!(receiver.try_recv().is_err());
     }
 
     fn rows(view: &ThreadView) -> Vec<Row> {
