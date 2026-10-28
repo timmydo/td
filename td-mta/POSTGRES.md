@@ -7591,3 +7591,17 @@ Malformed state or deadline failure retires the session and returns no snapshot;
 confirmed mutation COMMIT handling remains unchanged. The copy worker can load
 progress without holding the schema-owner password or opening a new database
 connection for each read.
+
+
+## Replica reuse of verified immutable Blobs
+
+A metadata-only replica effect can reuse an account-scoped live Blob only when
+its retained identity receipt and current manifest match source ID, length and
+digest. Existing Email identity checks remain mandatory. A missing live Blob
+for a new Email returns MissingBody without publication or progress; its
+acknowledged rollback allows reuse of the bounded session. Any rollback or
+deadline failure retires it. A retained identity without live bytes cannot
+publish mail. Raw storage is not rehashed for this metadata operation, matching
+the existing immutable-body/derived-metadata trust boundary. Publication with
+fresh bytes still requires the full verified body capability. No schema,
+ordinary fresh-ID publication or source checkpoint policy changes.

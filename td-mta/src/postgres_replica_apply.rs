@@ -21,6 +21,7 @@ pub enum Error {
     Stale,
     Missing,
     MissingMailbox,
+    MissingBody,
     Integrity,
     Capacity,
     Quota,
@@ -502,8 +503,8 @@ async fn blob(
     } = budget;
     let account = effect.account.as_bytes().as_slice();
     let id = mail.blob.as_bytes().as_slice();
-    let length = mail.body.bytes().len() as i64;
-    let digest = mail.body.digest();
+    let length = i64::try_from(mail.length).map_err(|_| Error::Integrity)?;
+    let digest = mail.digest;
     let identity = client
         .query_typed_opt(
             "SELECT length,digest FROM td_mta.replica_blob_identities WHERE account=$1 AND id=$2",
@@ -538,6 +539,7 @@ async fn blob(
     if require_existing {
         return Err(Error::Integrity);
     }
+    let body = mail.body.as_ref().ok_or(Error::MissingBody)?;
     let caps = SharedQuotas {
         body_bytes: limits.body_bytes,
         blob_count: limits.blobs,
@@ -560,7 +562,7 @@ async fn blob(
     let value = Blob {
         account: effect.account,
         id: mail.blob,
-        bytes: mail.body.bytes(),
+        bytes: body.bytes(),
         digest: &digest,
         interpretation: mail.interpretation.as_ref(),
         created_at,

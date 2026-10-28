@@ -74,6 +74,30 @@ pub(super) fn exercise(
     let effect = Arc::new(
         Effect::prepare(&source, account, ticket, page, id, Some(body), deadline()).unwrap(),
     );
+    let reuse =
+        Arc::new(Effect::prepare_existing(&source, account, ticket, page, id, deadline()).unwrap());
+    let mut publisher = open();
+    assert_eq!(
+        publisher.publish(reuse.clone(), deadline()),
+        Err(Error::MissingBody)
+    );
+    assert!(publisher.reusable(deadline()));
+    assert_eq!(publisher.inspect(deadline()).unwrap().email_count, 0);
+    drop(publisher);
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM td_mta.replica_email_receipts"
+        ),
+        "0"
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT get_byte(done,0) FROM td_mta.replica_pending"
+        ),
+        "0"
+    );
     let change_metadata = observation(&source, page, id, 4, Some(&[]));
     let change_state = change_metadata.view().unwrap().observed;
     let next_page = Arc::new(
@@ -176,7 +200,7 @@ pub(super) fn exercise(
     let copied = publisher.publish(effect.clone(), deadline()).unwrap();
     assert!(copied.changed && copied.present);
     assert_eq!(copied.local_sequence, 2);
-    let repeated = publisher.publish(effect.clone(), deadline()).unwrap();
+    let repeated = publisher.publish(reuse.clone(), deadline()).unwrap();
     assert!(!repeated.changed && repeated.present);
     assert_eq!(repeated.local_sequence, 2);
     assert_eq!(
@@ -214,16 +238,7 @@ pub(super) fn exercise(
     let mut publisher = open();
     let update = observation(&source, page, id, 1, Some(&["$seen"]));
     let updated = Arc::new(
-        Effect::prepare(
-            &source,
-            account,
-            ticket,
-            &update,
-            id,
-            Some(body_again()),
-            deadline(),
-        )
-        .unwrap(),
+        Effect::prepare_existing(&source, account, ticket, &update, id, deadline()).unwrap(),
     );
     assert_eq!(
         publisher
@@ -263,6 +278,15 @@ pub(super) fn exercise(
         "1"
     );
     let restored = observation(&source, page, id, 3, Some(&[]));
+    let reuse_absent = Arc::new(
+        Effect::prepare_existing(&source, account, ticket, &restored, id, deadline()).unwrap(),
+    );
+    assert_eq!(
+        publisher.publish(reuse_absent, deadline()),
+        Err(Error::MissingBody)
+    );
+    assert!(publisher.reusable(deadline()));
+
     let recreated = Arc::new(
         Effect::prepare(
             &source,

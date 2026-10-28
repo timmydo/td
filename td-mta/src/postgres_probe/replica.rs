@@ -39,6 +39,7 @@ enum Job {
     Advance(Arc<Transition>),
 }
 enum Completed {
+    MissingBody,
     Inspected(Box<Progress>),
     Published(Outcome),
     Advanced(Ticket),
@@ -64,7 +65,8 @@ impl Job {
             Self::Publish(value) => value
                 .mail
                 .as_ref()
-                .map_or(0, |mail| mail.body.bytes().len() as u64),
+                .and_then(|mail| mail.body.as_ref())
+                .map_or(0, |body| body.bytes().len() as u64),
             Self::Advance(_) => 0,
         }
     }
@@ -157,6 +159,7 @@ impl ReplicaSession {
     ) -> Result<Outcome, apply::Error> {
         match self.run(Job::Publish(effect), deadline)? {
             Completed::Published(value) => Ok(value),
+            Completed::MissingBody => Err(apply::Error::MissingBody),
             _ => Err(apply::Error::Integrity),
         }
     }
@@ -209,7 +212,14 @@ impl ReplicaSession {
                         client.batch_execute("ROLLBACK").await.map_err(|_|apply::Error::Database)?;
                         Ok(Completed::Inspected(Box::new(progress)))
                     },
-                    Job::Publish(effect)=>apply::apply(client,&effect,deadline,&marker).await.map(Completed::Published),
+                    Job::Publish(effect)=>match apply::apply(client,&effect,deadline,&marker).await {
+                        Ok(value)=>Ok(Completed::Published(value)),
+                        Err(apply::Error::MissingBody)=>{
+                            client.batch_execute("ROLLBACK").await.map_err(|_|apply::Error::Database)?;
+                            Ok(Completed::MissingBody)
+                        },
+                        Err(error)=>Err(error),
+                    },
                     Job::Advance(transition)=>crate::postgres_replica_transition::advance(client,&transition,deadline,&marker).await.map(Completed::Advanced),
                 }
             })){
@@ -229,7 +239,7 @@ impl ReplicaSession {
                     Ok(()) => self.clean_idle = true,
                     Err(error) => {
                         self.retired = true;
-                        if matches!(&outcome, Completed::Inspected(_)) {
+                        if matches!(&outcome, Completed::Inspected(_) | Completed::MissingBody) {
                             return Err(apply::Error::Connection(error));
                         }
                     }

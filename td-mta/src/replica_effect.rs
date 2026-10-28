@@ -36,8 +36,15 @@ pub(crate) struct Mail {
     pub(crate) received_at: i64,
     pub(crate) mailboxes: Vec<MailboxId>,
     pub(crate) keywords: Vec<String>,
-    pub(crate) body: VerifiedBody,
+    pub(crate) body: Option<VerifiedBody>,
+    pub(crate) length: u64,
+    pub(crate) digest: [u8; 32],
     pub(crate) interpretation: Option<postgres_mime_evidence::Prepared>,
+}
+enum Intake {
+    Verified(VerifiedBody),
+    Absent,
+    Existing,
 }
 impl Effect {
     /// The metadata page binds the source observation; verified bytes still
@@ -49,6 +56,45 @@ impl Effect {
         page: &MetadataPage,
         id: EmailId,
         body: Option<VerifiedBody>,
+        deadline: Instant,
+    ) -> Result<Self, Error> {
+        Self::prepare_inner(
+            source,
+            account,
+            ticket,
+            page,
+            id,
+            body.map_or(Intake::Absent, Intake::Verified),
+            deadline,
+        )
+    }
+    /// Reuse requires a matching, previously verified local Blob at publication.
+    /// Missing local bytes request a verified download; no placeholder is written.
+    pub fn prepare_existing(
+        source: &Source,
+        account: AccountId,
+        ticket: Ticket,
+        page: &MetadataPage,
+        id: EmailId,
+        deadline: Instant,
+    ) -> Result<Self, Error> {
+        Self::prepare_inner(
+            source,
+            account,
+            ticket,
+            page,
+            id,
+            Intake::Existing,
+            deadline,
+        )
+    }
+    fn prepare_inner(
+        source: &Source,
+        account: AccountId,
+        ticket: Ticket,
+        page: &MetadataPage,
+        id: EmailId,
+        intake: Intake,
         deadline: Instant,
     ) -> Result<Self, Error> {
         if Instant::now() >= deadline {
@@ -75,13 +121,19 @@ impl Effect {
         field(&mut hash, account.as_bytes())?;
         field(&mut hash, id.as_bytes())?;
         let mail = if let Some(email) = metadata.emails.into_iter().find(|email| email.id == id) {
-            let body = body.ok_or(Error::Invalid)?;
-            if body.blob() != email.blob
-                || body.bytes().len() as u64 != email.size
-                || body.digest() != email.digest
-            {
-                return Err(Error::Integrity);
-            }
+            let body = match intake {
+                Intake::Verified(body) => {
+                    if body.blob() != email.blob
+                        || body.bytes().len() as u64 != email.size
+                        || body.digest() != email.digest
+                    {
+                        return Err(Error::Integrity);
+                    }
+                    Some(body)
+                }
+                Intake::Existing => None,
+                Intake::Absent => return Err(Error::Invalid),
+            };
             field(&mut hash, &[1])?;
             field(&mut hash, email.blob.as_bytes())?;
             field(&mut hash, email.thread.as_bytes())?;
@@ -106,8 +158,9 @@ impl Effect {
                 owned.push_str(value);
                 keywords.push(owned);
             }
-            let interpretation =
-                postgres_mime_evidence::prepare(body.bytes(), &email.digest, deadline);
+            let interpretation = body.as_ref().and_then(|body| {
+                postgres_mime_evidence::prepare(body.bytes(), &email.digest, deadline)
+            });
             Some(Mail {
                 blob: email.blob,
                 thread: email.thread,
@@ -115,10 +168,12 @@ impl Effect {
                 mailboxes: email.mailboxes,
                 keywords,
                 body,
+                length: email.size,
+                digest: email.digest,
                 interpretation,
             })
         } else {
-            if body.is_some() || !metadata.missing.contains(&id) {
+            if matches!(intake, Intake::Verified(_)) || !metadata.missing.contains(&id) {
                 return Err(Error::Invalid);
             }
             field(&mut hash, &[0])?;

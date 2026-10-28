@@ -383,8 +383,9 @@ requires the owner credential. The copy command remains subsequent work.
 ### Transactional Email publication
 
 The library publisher applies one immutable source observation to the exact
-locked pending generation/page. Present mail requires a complete verified raw
-body matching the metadata Blob ID, size and digest. Explicit metadata notFound
+locked pending generation/page. Present mail requires either a complete verified raw
+body matching the metadata Blob ID, size and digest or a matching previously
+verified local body as described below. Explicit metadata notFound
 is deletion evidence; a missing download or absent inventory row is not.
 Preparation derives local MIME evidence from the verified bytes and binds all
 preserved metadata into a domain-separated receipt digest. Passive metadata
@@ -421,13 +422,38 @@ within one 60-second connection lifetime. Each job has at most 4 MiB database
 input, 72 MiB output and 4096 protocol frames; initial qualification consumes
 the first window. Deadlines use the existing bounded import allowance, at most
 30 seconds, without extending the connection lifetime. Failed jobs retire the
-session. An unknown COMMIT remains explicitly indeterminate; a confirmed COMMIT
+session, except a missing reusable body whose explicit rollback is acknowledged. An unknown COMMIT remains explicitly indeterminate; a confirmed COMMIT
 remains success even if subsequent connection retirement fails.
 
 This is a library primitive, not an operator copy command or a read service.
 No resident worker, new default memory allowance, local credentials or source
 configuration is enabled. Mailbox reconciliation, retention
 and completeness validation remain required before a usable full-copy claim.
+
+### Reusing verified local bodies
+
+A metadata-only observation may request reuse of the local immutable Blob.
+Publication checks the account-scoped Blob identity receipt and live manifest
+against the authenticated source Blob ID, exact length and digest. Matching
+bytes can support flag/membership updates or another Email referring to the
+same Blob without another download or MIME interpretation. The canonical
+Email receipt digest is identical whether bytes were downloaded or reused.
+
+If an existing Email's Blob or identity is inconsistent, publication refuses
+with Integrity. If a new Email needs bytes absent from the live Blob store,
+MissingBody means download and verify the complete source body, then retry the
+same observation/ticket. A surviving identity receipt alone cannot publish an
+absent body. MissingBody writes no placeholder, completion bit or receipt; its
+transaction is explicitly rolled back. Acknowledged rollback keeps the finite
+session reusable. Failed rollback, deadline or transport retires it, and every
+attempt still consumes a turn. Other publication errors retain retirement.
+
+This reuses the existing verified-write and trusted stored-metadata boundary;
+it does not rehash local raw chunks or certify their present integrity. Ordinary
+body verification and scrubbing remain responsible for detecting later storage
+corruption. The future worker can use verified downloads for initial inventory
+and reuse during change catch-up, fetching only a cache miss. No automatic
+network retry or silent body eviction is added.
 
 ### Durable page transitions
 
