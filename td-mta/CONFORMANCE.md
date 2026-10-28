@@ -725,3 +725,10 @@ profile is created. Owner CLI inspection reports the source without claiming
 copy completeness. CLI parsing requires the explicit source and local scopes. Schema
 upgrade coverage includes versions 34 and 35 and preserves the existing epoch.
 This evidence does not claim a complete local copy or a usable local reader.
+
+The native replica publication fixture also runs the bounded copy worker over
+real HTTPS into a fresh PostgreSQL replica. It checks origin and deadline
+refusal, a too-small body bound, a late transaction failure with no Email or
+completion bit, verified body/identity publication, worker restart, and empty
+catch-up without duplicate rows or local sequence changes. These are functional
+assertions, not throughput or host-load-sensitive timing thresholds.

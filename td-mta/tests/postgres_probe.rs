@@ -31,6 +31,8 @@ fn migration_archive_cli_preserves_and_verifies_snapshots() {
 #[path = "support/postgres_mail_client.rs"]
 mod mail_client;
 
+#[path = "postgres_probe/replica_copy.rs"]
+mod replica_copy;
 #[path = "postgres_probe/replica_graph.rs"]
 mod replica_graph;
 #[path = "postgres_probe/replica_publish.rs"]

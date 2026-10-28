@@ -451,7 +451,7 @@ attempt still consumes a turn. Other publication errors retain retirement.
 This reuses the existing verified-write and trusted stored-metadata boundary;
 it does not rehash local raw chunks or certify their present integrity. Ordinary
 body verification and scrubbing remain responsible for detecting later storage
-corruption. The future worker can use verified downloads for initial inventory
+corruption. The copy worker uses verified downloads for initial inventory
 and reuse during change catch-up, fetching only a cache miss. No automatic
 network retry or silent body eviction is added.
 
@@ -520,6 +520,45 @@ whose references have since cleared and then finish the checkpoint; repeating
 an already applied graph emits no local change. Metadata-only observation
 changes do not advance the Email cursor. The copy scheduler, retention, history
 reset, read-only service and completeness qualification remain subsequent work.
+
+### Bounded copy steps
+
+The copy worker binds one source, account, distinct local epoch and immutable
+local connection/trust references at construction. Changing the local endpoint
+or credentials requires a new worker; a cached publisher cannot outlive that
+configuration binding. Each step
+reloads durable progress through the restricted runtime publisher, authenticates
+fresh source discovery, and reconciles the complete mailbox graph before Email
+work. It either applies at most 16 unfinished IDs (also bounded by negotiated
+metadata limits), or advances a completed page. It never advances unfinished
+work. Initial inventory downloads and verifies each complete body; change
+catch-up reuses a matching local Blob and downloads only MissingBody results.
+The source HTTP connection is reused within the step. No source or local SQL
+transaction spans a network body download.
+
+The caller supplies a step deadline at most 60 seconds away. Each local job
+also obeys the existing 10–30 second import deadline and finite runtime session
+turn/lifetime limits; an exhausted publisher is retired and requalified before
+the next job. The worker retains at most one provisional body alongside bounded
+metadata, discovery and mailbox pages. A future resident worker must account
+for these allocations in its memory plan; this library adds no default allowance.
+
+Each successful Email is independently durable. An error later in a batch
+returns failure without undoing committed Emails; the next step reloads their
+completion bits. Any error, including indeterminate COMMIT, retires the local
+session. There is no blind retry of publication, source reset, or automatic
+change of binding. Expired history and resource exhaustion pause with the last
+usable view preserved. A caller must retire the publisher before an external
+wait or pause; worker drop also releases it. An empty changes observation
+retires it automatically so idle scheduling holds no database lease.
+
+Step counters describe only a successful step, not historical totals. Empty
+changes means only that one source Email changes page was empty; it is not a
+full-copy certificate, simultaneous Email/Mailbox snapshot, or BCDR readiness.
+Mailbox removal dependencies and independently observed source states remain
+explicit. Scheduling/backoff, protected configuration, durable contact/error
+status, reconciliation after history expiry, read-only serving and completeness
+qualification are not enabled by this primitive.
 
 ### Remaining synchronization work
 

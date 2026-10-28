@@ -980,6 +980,7 @@ fn replica_source_reads(
         },
     );
     drop(reader);
+    super::replica_copy::exercise(client(), &authorization, limits, Binding { account, epoch });
     let mut reader = Reader::connect(
         client(),
         &authorization,
