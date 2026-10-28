@@ -153,6 +153,11 @@ pub fn discover<'a>(
     let caps = required(selected, "accountCapabilities")?;
     capability(caps, MAIL)?;
     let replica = capability(caps, REPLICATION)?;
+    match member(replica, "inventoryBaseFence")? {
+        Some(Json::Bool(true)) => (),
+        None | Some(Json::Bool(false)) => return Err(Error::Unsupported),
+        Some(_) => return Err(Error::Invalid),
+    }
     let limits = SourceLimits {
         request_bytes,
         inventory_ids: limit(
@@ -212,7 +217,7 @@ mod tests {
             (MAIL.to_owned(), json!({})),
             (
                 REPLICATION.to_owned(),
-                json!({"maxInventoryIds":256,"maxMetadataIds":16}),
+                json!({"inventoryBaseFence":true,"maxInventoryIds":256,"maxMetadataIds":16}),
             ),
         ]);
         json!({"capabilities":caps,"accounts":Json::Obj(vec![(encoded(account()),json!({"name":"source","accountCapabilities":account_caps}))]),
@@ -270,6 +275,33 @@ mod tests {
         assert_eq!(
             discover(&multi, ORIGIN, Some(account())).unwrap().account(),
             account()
+        );
+    }
+    #[test]
+    fn old_or_ambiguous_inventory_semantics_refuse_before_following_endpoints() {
+        let mut missing = value();
+        let _ = limits(&mut missing).remove("inventoryBaseFence");
+        assert_eq!(
+            discover(&missing, ORIGIN, None).err(),
+            Some(Error::Unsupported)
+        );
+        for (flag, error) in [
+            (json!(false), Error::Unsupported),
+            (Json::Null, Error::Invalid),
+            (json!("true"), Error::Invalid),
+            (json!(1), Error::Invalid),
+        ] {
+            let mut unsupported = value();
+            let _ = limits(&mut unsupported).insert("inventoryBaseFence", flag);
+            assert_eq!(discover(&unsupported, ORIGIN, None).err(), Some(error));
+        }
+        let mut duplicate = value();
+        if let Json::Obj(fields) = limits(&mut duplicate) {
+            fields.push(("inventoryBaseFence".to_owned(), json!(true)));
+        }
+        assert_eq!(
+            discover(&duplicate, ORIGIN, None).err(),
+            Some(Error::Invalid)
         );
     }
     #[test]

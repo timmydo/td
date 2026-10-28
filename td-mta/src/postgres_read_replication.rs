@@ -25,7 +25,7 @@ pub struct ReplicaInventoryPage {
 
 impl Snapshot<'_> {
     /// Enumerate immutable IDs across separately authenticated snapshots.
-    /// Arrivals above the initial upper ID are left to change catch-up.
+    /// Rows changed after the initial state are left to change catch-up.
     /// Changes since `base` must still be applied before claiming completeness.
     pub fn replica_inventory(
         &mut self,
@@ -80,10 +80,15 @@ impl Snapshot<'_> {
                     let upper_bytes = upper.as_bytes().as_slice();
                     let after_bytes = after.as_ref().map(|id| id.as_bytes().as_slice());
                     let limit = (maximum + 1) as i64;
+                    let base_sequence = base.sequence.number().to_be_bytes();
+                    let current_sequence = observed.sequence.number().to_be_bytes();
+                    // Post-base creations may vanish from coalesced changes if
+                    // destroyed before catch-up. Never inventory them. Keep
+                    // future/corrupt revisions visible to check_changed below.
                     let rows = client
                         .query_typed(
-                            "SELECT id,changed FROM td_mta.emails WHERE account=$1 AND id<=$2 AND ($3::bytea IS NULL OR id>$3) ORDER BY id LIMIT $4",
-                            &[(&account, Type::BYTEA), (&upper_bytes, Type::BYTEA), (&after_bytes, Type::BYTEA), (&limit, Type::INT8)],
+                            "SELECT id,changed FROM td_mta.emails WHERE account=$1 AND id<=$2 AND ($3::bytea IS NULL OR id>$3) AND (changed<=$5 OR changed>$6) ORDER BY id LIMIT $4",
+                            &[(&account, Type::BYTEA), (&upper_bytes, Type::BYTEA), (&after_bytes, Type::BYTEA), (&limit, Type::INT8), (&base_sequence.as_slice(), Type::BYTEA), (&current_sequence.as_slice(), Type::BYTEA)],
                         )
                         .await
                         .map_err(|_| Error::Database)?;

@@ -132,7 +132,7 @@ impl Session {
             "\"urn:ietf:params:jmap:core\":{{}},\"urn:ietf:params:jmap:mail\":{{",
             "\"maxMailboxesPerEmail\":null,\"maxMailboxDepth\":null,",
             "\"maxSizeMailboxName\":{},\"maxSizeAttachmentsPerEmail\":{},",
-            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":true}},\"{replication}\":{{\"maxInventoryIds\":{inventory_limit},\"maxMetadataIds\":{metadata_limit}}}{submission_account}}}}}}}",
+            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":true}},\"{replication}\":{{\"inventoryBaseFence\":true,\"maxInventoryIds\":{inventory_limit},\"maxMetadataIds\":{metadata_limit}}}{submission_account}}}}}}}",
             ",\"primaryAccounts\":{{\"urn:ietf:params:jmap:mail\":\"{}\""
         ),
             crate::format::row::MAX_MAILBOX_NAME,
@@ -304,7 +304,7 @@ mod tests {
         assert!(value["capabilities"][replication].as_object().is_some());
         assert_eq!(
             object["accountCapabilities"][replication],
-            td_json::json!({"maxInventoryIds":256,"maxMetadataIds":16})
+            td_json::json!({"inventoryBaseFence":true,"maxInventoryIds":256,"maxMetadataIds":16})
         );
         let mail = &object["accountCapabilities"][crate::jmap_request::MAIL];
         assert_eq!(

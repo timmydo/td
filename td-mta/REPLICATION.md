@@ -60,10 +60,16 @@ ID and advance strictly by Email ID, never by received date or OFFSET. Each
 later page may use a fresh authenticated snapshot and requires the starting state
 to belong to the same account and epoch and remain within retained history.
 Changed dates, mailbox moves and deletion of an already visited ID cannot
-shift remaining IDs out of a page. Arrivals above the fixed upper ID cannot
-extend the scan indefinitely; arrivals behind the cursor are deliberately left
-to change catch-up. All rows, including lookahead, must have revisions no newer
-than their observed snapshot.
+shift remaining IDs out of a page. Inventory returns only rows whose last change
+is no newer than its starting state; newer updates and creations are handled by
+change catch-up. Every inventoried ID therefore existed by the starting state.
+This matters because JMAP coalesces a later creation followed by deletion to no
+change: copying that creation from a later inventory page could otherwise leave
+a stale local Email. Arrivals above the fixed upper ID cannot extend the scan
+indefinitely; arrivals behind the cursor likewise belong to change catch-up.
+All selected rows, including lookahead, must have revisions no newer than their
+observed snapshot. Future/corrupt revisions remain selected for integrity refusal,
+not silently excluded by the starting-state filter.
 
 Cursors are passive continuation values, never authorization credentials. Finishing this enumeration proves neither a
 historical snapshot nor a current full copy. Metadata/body fetching, changes
@@ -85,6 +91,11 @@ carry their existing rights. Ordinary public HTTPS verification is required.
 
 Account capability values `maxInventoryIds` and `maxMetadataIds` are respectively
 the smaller of configured query-page/256 and configured objects-per-method/16.
+The account capability also advertises `inventoryBaseFence: true`. Discovery
+requires this exact boolean before using the source. An older source without
+it, or one advertising false, is Unsupported; malformed/duplicate values
+refuse. This distinguishes the starting-state inventory guarantee from older
+servers using the same capability URI. The cursor encoding remains unchanged.
 
 `TdReplica/inventory` accepts `accountId`, optional `cursor` (null or omitted
 starts an inventory), and optional `limit` (defaults to the advertised bound).

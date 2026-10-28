@@ -7408,6 +7408,14 @@ application-level replica. REPLICATION.md owns its coverage boundary. A first
 page captures the committed sequence and greatest ID together; continuation
 queries use `id > after AND id <= upper ORDER BY id`, under the existing
 account/ID primary key, with a maximum of 256 returned IDs and one lookahead.
+Rows changed after the starting sequence are left exclusively to change
+catch-up. This excludes post-base creations that could otherwise be copied and
+then disappear from a coalesced Created/Destroyed change page. Post-base updates
+to older objects are also omitted from inventory and recovered through changes.
+The SQL filter still selects revisions newer than the observed snapshot so the
+ordinary integrity check refuses them; corruption is not silently filtered out.
+This predicate bounds returned rows, not the number of index entries PostgreSQL
+may examine; the existing statement and operation deadlines still apply.
 Every page authenticates through its enclosing snapshot and rejects a source
 account, epoch or kind mismatch, a future starting sequence, expired history,
 or inverted bounds. Row revisions and strict ID ordering are validated before
@@ -7419,7 +7427,9 @@ schema change is introduced by this adapter. REPLICATION.md specifies its
 authenticated HTTPS inventory/metadata extension and versioned cursor. Metadata
 returns the stored complete-body digest and exact timestamp without reading raw
 chunks, through the same snapshot and metadata prefetch as Email/get. Catch-up
-and deletion authority remain separate synchronization work.
+and deletion authority remain separate synchronization work. Source Session
+advertises `inventoryBaseFence: true`; discovery requires it so an older source
+cannot silently weaken the starting-state guarantee.
 
 ## Complete search-field evidence
 

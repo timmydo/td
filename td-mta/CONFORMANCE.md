@@ -500,8 +500,12 @@ This PostgreSQL fixture is part of the native gate. It does not qualify
 cloud-provider failover or managed-database deployment.
 It also runs the query adapter fixture in a separate disposable database,
 including replica inventory continuation across deletion and date changes,
-arrivals outside retained bounds, foreign or expired checkpoints, corrupt
-lookahead revisions and empty accounts. This qualifies the source read adapter,
+post-base updates recovered through changes, arrivals outside retained bounds,
+foreign or expired checkpoints, corrupt lookahead revisions and empty accounts.
+A creation inside the retained ID window is excluded from inventory; its later
+deletion coalesces with creation when changes start at the inventory base, but
+remains visible when changes start at the creation page's state. This qualifies
+the boundary needed to avoid stale copies of transient post-base objects. This qualifies the source read adapter,
 not replica completeness. The read client fixture also exercises the actual
 HTTP API adapter and JMAP parser for TdReplica inventory/metadata: explicit
 capability opt-in, bounded arguments, source/account scope, cursor continuation,
@@ -700,3 +704,8 @@ missing parents and cycles. The native reader also fetches the actual Inbox
 graph and independently exercises both change streams from their beginnings
 and current states. It validates Email membership against the observed graph;
 this remains one observation, not a completed ongoing reconciliation.
+
+Discovery rejects missing, false, malformed and duplicate inventoryBaseFence
+capabilities; the source Session fixture advertises the required true value.
+Older source semantics therefore refuse before copying rather than silently
+weakening the inventory/change boundary.
