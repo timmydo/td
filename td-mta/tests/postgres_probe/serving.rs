@@ -18,6 +18,7 @@ pub(super) fn exercise(
     https_ipv4: TcpListener,
 ) {
     super::migration_archive::exercise();
+    super::replica_source_mode::exercise();
     let relay = super::serving_relay::Relay::new(fixture, relay, dns);
     let smtp_address = smtp.local_addr().unwrap();
     let https_address = https.local_addr().unwrap();

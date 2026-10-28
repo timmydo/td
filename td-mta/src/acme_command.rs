@@ -91,6 +91,17 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
         .settings
         .identity()
         .map_err(|_| config_failure("acme", "settings"))?;
+    let mut first_claim = Some(
+        claim_turn(
+            &loaded,
+            &executable,
+            &options.profile,
+            settings_hash,
+            owner,
+            &initial,
+        )
+        .map_err(|_| config_failure("acme", "runtime-claim"))?,
+    );
     super::signal_sys::block().map_err(|_| config_failure("acme", "signals"))?;
     let listener =
         TcpListener::bind(options.bind).map_err(|_| config_failure("acme", "http01-bind"))?;
@@ -121,41 +132,17 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
             }
             next = Instant::now() + Duration::from_secs(30);
             let result = (|| -> Result<(), acme::Error> {
-                let until = Instant::now() + Duration::from_secs(10);
-                let addresses = td_mta::postgres_resolver::resolve(
-                    &executable,
-                    &loaded.bootstrap,
-                    Instant::now() + Duration::from_secs(5),
-                )
-                .map_err(|_| acme::Error::Transport)?;
-                let mut selected = None;
-                for address in addresses {
-                    let mut request = loaded.bootstrap.request(address);
-                    request.mode = Mode::Runtime;
-                    match td_mta::postgres_runtime_access::inspect(&request, &loaded.trust, until) {
-                        Ok(receipt) => {
-                            selected = Some((request, receipt));
-                            break;
-                        }
-                        Err(td_mta::postgres_runtime_access::Error::Connection(
-                            td_mta::postgres_probe::Error::Transport,
-                        )) => continue,
-                        Err(_) => return Err(acme::Error::Database),
-                    }
-                }
-                let (request, receipt) = selected.ok_or(acme::Error::Transport)?;
-                let lease = postgres_acme::claim(
-                    &request,
-                    &loaded.trust,
-                    Instant::now() + Duration::from_secs(10),
-                    receipt.store_epoch,
-                    postgres_acme::Claim {
-                        profile: &options.profile,
-                        settings: settings_hash,
+                let (request, receipt, lease) = match first_claim.take() {
+                    Some(value) => value,
+                    None => claim_turn(
+                        &loaded,
+                        &executable,
+                        &options.profile,
+                        settings_hash,
                         owner,
-                    },
-                    &initial,
-                )?;
+                        &initial,
+                    )?,
+                };
                 let mut state = lease.state;
                 {
                     let mut current = current.write().map_err(|_| acme::Error::Conflict)?;
@@ -346,6 +333,61 @@ pub(super) fn status(args: impl Iterator<Item = OsString>) -> Result<bool, Confi
         return Ok(!options.require_ready || health == "ready");
     }
     Err(config_failure("acme", "connection"))
+}
+
+// Claiming before bind establishes an ACME row under the shared schema lock.
+// Empty-database replica initialization subsequently refuses that row.
+fn claim_turn<'a>(
+    loaded: &'a td_mta::postgres_input::Loaded,
+    executable: &std::path::Path,
+    profile: &str,
+    settings: [u8; 32],
+    owner: [u8; 16],
+    initial: &State,
+) -> Result<
+    (
+        td_mta::postgres_probe::Request<'a>,
+        td_mta::postgres_schema::Receipt,
+        postgres_acme::Lease,
+    ),
+    acme::Error,
+> {
+    let until = Instant::now() + Duration::from_secs(10);
+    let addresses = td_mta::postgres_resolver::resolve(
+        executable,
+        &loaded.bootstrap,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .map_err(|_| acme::Error::Transport)?;
+    let mut selected = None;
+    for address in addresses {
+        let mut request = loaded.bootstrap.request(address);
+        request.mode = Mode::Runtime;
+        match td_mta::postgres_runtime_access::inspect(&request, &loaded.trust, until) {
+            Ok(receipt) => {
+                selected = Some((request, receipt));
+                break;
+            }
+            Err(td_mta::postgres_runtime_access::Error::Connection(
+                td_mta::postgres_probe::Error::Transport,
+            )) => continue,
+            Err(_) => return Err(acme::Error::Database),
+        }
+    }
+    let (request, receipt) = selected.ok_or(acme::Error::Transport)?;
+    let lease = postgres_acme::claim(
+        &request,
+        &loaded.trust,
+        Instant::now() + Duration::from_secs(10),
+        receipt.store_epoch,
+        postgres_acme::Claim {
+            profile,
+            settings,
+            owner,
+        },
+        initial,
+    )?;
+    Ok((request, receipt, lease))
 }
 
 #[cfg(test)]

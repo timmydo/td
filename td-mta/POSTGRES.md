@@ -2114,7 +2114,7 @@ REVOKE INSERT, UPDATE, DELETE ON
     td_mta.config_materials,
     td_mta.config_material_chunks, td_mta.config_versions,
     td_mta.config_version_chunks, td_mta.config_selection,
-    td_mta.config_selection_receipts, td_mta.account_bootstraps,
+    td_mta.config_selection_receipts, td_mta.account_bootstraps, td_mta.replica_source,
     td_mta.leases, td_mta.imports FROM td_mta_runtime;
 GRANT UPDATE (singleton) ON td_mta.config_selection TO td_mta_runtime;
 GRANT INSERT ON td_mta.leases TO td_mta_runtime;
@@ -7490,3 +7490,24 @@ messages retain the existing search behavior. This cache avoids repeated MIME
 interpretation; it is not an inverted index and does not eliminate full-body
 reads or bounded candidate scans. Schema-34 binaries cannot serve schema 35;
 upgrade with fencing and a consistent pre-upgrade backup.
+
+
+## Replica source mode
+
+Schema 36 adds `replica_source`, an owner-writable singleton with canonical HTTPS
+origin (at most 4096 bytes), a 16-byte source epoch and protocol version 1.
+Runtime grants permit SELECT only. The ordinary runtime qualifier requires the
+row to be absent; a bound or invalid source refuses before mail SQL. This is a
+cold connection check, not another per-message query. Existing retained sessions
+keep their shared migration lock. Owner initialization takes its exclusive
+transaction counterpart, validates the local epoch and owner, and refuses
+accounts, selected configuration or ACME profiles before insertion. A matching
+binding can be inspected or repeated; a conflicting binding refuses. COMMIT
+uncertainty is retained explicitly. No source credentials or source operational
+configuration are stored in the identity row.
+
+[REPLICATION.md](REPLICATION.md) owns source identity, operator commands and the
+future local-copy contract. This foundation does not provide a synchronizer,
+read-only service, promotion or recovery qualification. Core mail tables and
+source/local JMAP state separation remain unchanged. A schema-35 binary cannot
+serve schema 36; use the documented fenced upgrade and consistent backup.

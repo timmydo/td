@@ -43,6 +43,38 @@ data. The same implementation serves local and cloud reads; a replica may
 rebuild compatible evidence from verified raw bytes. Remote derived data is
 not silently granted local integrity authority.
 
+## Persistent source binding
+
+The owner may initialize a replica identity on a freshly prepared local database:
+
+```text
+td-mta postgres replica-source-init --connection-file OWNER_FILE --epoch LOCAL_EPOCH --source-origin https://mail.example.test --source-epoch SOURCE_EPOCH
+td-mta postgres replica-source-inspect --connection-file OWNER_FILE --epoch LOCAL_EPOCH
+```
+
+These commands prepare and inspect identity only. They do not contact the source,
+copy mail, provision local HTTPS or credentials, activate a read service, certify
+completeness, or approve recovery. Obtain the source epoch through authenticated
+source discovery/inventory; an origin alone is not proof of the source identity.
+The local epoch must differ from the source epoch.
+
+Schema 36 adds one owner-writable singleton source row, containing the canonical
+HTTPS origin, source epoch and protocol version. Empty means ordinary primary
+mode. Initialization requires the schema owner and the exclusive migration lock,
+and refuses existing accounts, a selected configuration or an ACME profile.
+Matching repetition is idempotent; a different binding refuses. There is no
+unbind or promotion command. After an indeterminate COMMIT, inspect this exact
+local epoch and source binding before retrying; never assume rollback or choose
+a new identity to resolve uncertainty.
+
+Ordinary runtime database qualification refuses a bound replica, including
+SMTP, relay, writable JMAP and ACME operations. Retained sessions hold the shared
+migration lock, so initialization cannot change their mode while they run.
+The ACME executable claims its persistent profile before binding its HTTP-01
+listener; that row also prevents later replica initialization on the database.
+Read-only local runtime qualification and publication remain subsequent work.
+Owner administrative access remains trusted and is not a read-only SQL sandbox.
+
 ## Synchronization contract
 
 ### Source inventory adapter

@@ -56,6 +56,7 @@ pub enum Error {
     RuntimeRole,
     RuntimePrivileges,
     RuntimeMaintenance,
+    RuntimeReplica,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -566,6 +567,7 @@ pub(crate) async fn qualify_runtime(client: &tokio_postgres::Client) -> Result<(
         .map_err(|error| match error {
             crate::postgres_runtime_access::Error::Role => Error::RuntimeRole,
             crate::postgres_runtime_access::Error::Maintenance => Error::RuntimeMaintenance,
+            crate::postgres_runtime_access::Error::Replica => Error::RuntimeReplica,
             _ => Error::RuntimePrivileges,
         });
     if result.is_ok() {

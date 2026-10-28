@@ -21,6 +21,7 @@ mod maintenance;
 mod material;
 mod metadata_audit;
 mod recovery;
+mod replica_source;
 mod scrub;
 mod scrub_state;
 mod selection;
@@ -109,6 +110,12 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     }
     if command.as_deref() == Some(OsStr::new("logs")) {
         return logs::run(args);
+    }
+    if let Some(operation) = command
+        .as_deref()
+        .and_then(replica_source::Operation::parse)
+    {
+        return replica_source::run(operation, args);
     }
     if let Some(operation) = command.as_deref().and_then(maintenance::Operation::parse) {
         return maintenance::run(operation, args);
@@ -210,6 +217,7 @@ fn check(loaded: &Loaded, operation: Operation) -> Result<Outcome, (&'static str
                         Error::Maintenance => {
                             AttemptError::Failed("runtime", "maintenance-barrier")
                         }
+                        Error::Replica => AttemptError::Failed("runtime", "replica-read-only"),
                         Error::Privileges => {
                             AttemptError::Failed("runtime", "incorrect-data-privileges")
                         }
@@ -310,6 +318,7 @@ fn classify(error: postgres_schema::Error) -> (&'static str, &'static str) {
                 postgres_probe::Error::RuntimeRole => "runtime-owner-or-privileged-role",
                 postgres_probe::Error::RuntimePrivileges => "runtime-data-privileges",
                 postgres_probe::Error::RuntimeMaintenance => "maintenance-barrier",
+                postgres_probe::Error::RuntimeReplica => "replica-read-only",
                 postgres_probe::Error::Transport => "transport",
             },
         ),

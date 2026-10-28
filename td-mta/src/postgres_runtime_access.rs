@@ -27,6 +27,7 @@ const ROLE: &str = "SELECT current_user=session_user AND r.rolcanlogin
 const TABLES: &[(&str, Access)] = &[
     ("schema_migrations", Access::Read),
     ("runtime_barrier", Access::Read),
+    ("replica_source", Access::Read),
     ("config_materials", Access::Read),
     ("config_material_chunks", Access::Read),
     ("config_versions", Access::Read),
@@ -127,6 +128,7 @@ pub enum Error {
     Role,
     Privileges,
     Maintenance,
+    Replica,
     Database,
 }
 
@@ -203,6 +205,13 @@ pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
         || row.try_get::<_, bool>(1).map_err(|_| Error::Database)?
     {
         return Err(Error::Maintenance);
+    }
+    if crate::postgres_replica_source::read(client)
+        .await
+        .map_err(|_| Error::Database)?
+        .is_some()
+    {
+        return Err(Error::Replica);
     }
     Ok(())
 }

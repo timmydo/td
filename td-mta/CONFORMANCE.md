@@ -709,3 +709,19 @@ Discovery rejects missing, false, malformed and duplicate inventoryBaseFence
 capabilities; the source Session fixture advertises the required true value.
 Older source semantics therefore refuse before copying rather than silently
 weakening the inventory/change boundary.
+
+
+### Replica source mode
+
+The foreground-service native fixture separately prepares a disposable replica
+database and checks canonical binding, matching retries, conflicting identities,
+wrong local/source epochs, occupied-account refusal and exclusion by a held
+shared migration lock. Runtime credentials cannot change the binding and ordinary
+runtime qualification refuses a bound replica. Owner inspection remains
+available, while malformed persisted spelling refuses rather than silently
+normalizing. The executable refuses ordinary serve and ACME startup; an occupied
+HTTP-01 port proves that replica refusal precedes listener binding, and no ACME
+profile is created. Owner CLI inspection reports the source without claiming
+copy completeness. CLI parsing requires the explicit source and local scopes. Schema
+upgrade coverage includes versions 34 and 35 and preserves the existing epoch.
+This evidence does not claim a complete local copy or a usable local reader.
