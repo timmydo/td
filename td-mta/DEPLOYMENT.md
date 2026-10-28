@@ -914,11 +914,14 @@ the new local JMAP password. The installer discovers source IDs through HTTPS;
 no custom SQL or PostgreSQL access to the source is needed.
 
 The default PostgreSQL and HTTPS ports are 35433 and 54444. Its systemd and
-Shepherd service names are `td-mta-replica-postgres` and `td-mta-replica`, so they
+Shepherd service names are `td-mta-replica-postgres`, `td-mta-replica` and
+`td-mta-replica-sync`, so they
 can coexist with an ordinary local setup. Follow the generated `START.txt` to
-start one supervisor, run bounded copy batches and use `mail.toml` with td-mail.
+start one supervisor and use `mail.toml` with td-mail. The sync worker continues
+bounded rounds with idle polling and failure backoff; the reader stays usable
+when the source is offline. Generated instructions include historical sync
+status and a manual copy command to use with the worker stopped.
 Services are not enabled automatically. Initial preparation is not a complete
-copy. No SMTP or relay service is generated. Certificate renewal and continuous
-synchronization are not yet automated for this setup; the leaf expires in 90
-days. [REPLICATION.md](REPLICATION.md#fresh-local-provisioning) records the
+copy. No SMTP or relay service is generated. Certificate renewal is not yet automated for this setup; the leaf expires
+in 90 days. [REPLICATION.md](REPLICATION.md#fresh-local-provisioning) records the
 copy, credential and recovery boundaries.

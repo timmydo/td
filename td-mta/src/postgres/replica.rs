@@ -21,8 +21,12 @@ use td_mta::{
     replica_source::{Binding, Bounds, ReadLimits, Reader},
 };
 
+mod follow;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Operation {
+    Follow,
+    FollowStatus,
     Discover,
     Seed,
     Copy,
@@ -31,6 +35,8 @@ pub(super) enum Operation {
 impl Operation {
     pub(super) fn parse(value: &OsStr) -> Option<Self> {
         match value.to_str()? {
+            "replica-follow" => Some(Self::Follow),
+            "replica-follow-status" => Some(Self::FollowStatus),
             "replica-discover" => Some(Self::Discover),
             "replica-account-init" => Some(Self::Seed),
             "replica-copy" => Some(Self::Copy),
@@ -40,6 +46,8 @@ impl Operation {
     }
     fn name(self) -> &'static str {
         match self {
+            Self::Follow => "postgres-replica-follow",
+            Self::FollowStatus => "postgres-replica-follow-status",
             Self::Discover => "postgres-replica-discover",
             Self::Seed => "postgres-replica-account-init",
             Self::Copy => "postgres-replica-copy",
@@ -152,6 +160,12 @@ fn read_limits() -> ReadLimits {
 }
 pub(super) fn run(op: Operation, args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let name = op.name();
+    if op == Operation::Follow {
+        return follow::run(args);
+    }
+    if op == Operation::FollowStatus {
+        return follow::status(args);
+    }
     if op == Operation::Discover {
         return discover(args);
     }

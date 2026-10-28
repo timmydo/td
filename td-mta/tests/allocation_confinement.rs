@@ -119,6 +119,15 @@ fn scan(root: &Path, path: &Path) {
                 assert_eq!(source.matches("super::signal_sys::requested()").count(), 1);
                 assert_eq!(words(&source, "signal_sys"), 2);
             }
+            "td-mta/src/postgres/replica/follow.rs" => {
+                assert_eq!(source.matches("crate::signal_sys::block()").count(), 1);
+                assert_eq!(source.matches("crate::signal_sys::requested()").count(), 1);
+                assert_eq!(words(&source, "signal_sys"), 2);
+                assert!(
+                    source.find("signal_sys::block()").unwrap()
+                        < source.find("while !stopped()?").unwrap()
+                );
+            }
             "td-mta/src/control.rs" => {
                 assert_eq!(source.matches("super::signal_sys::requested()").count(), 1);
                 assert_eq!(words(&source, "signal_sys"), 1);
@@ -152,6 +161,21 @@ fn scan(root: &Path, path: &Path) {
             assert_eq!(source.matches("#![deny(unsafe_code)]").count(), 1);
         } else if relative == "td-mta/tests/postgres_probe/serving.rs" {
             assert_eq!(words(&source, "termination_sender"), 1);
+        } else if relative == "td-mta/tests/postgres_probe/replica_operator.rs" {
+            assert_eq!(words(&source, "termination_sender"), 4);
+            assert_eq!(source.matches("termination_sender::send(").count(), 2);
+            assert_eq!(
+                source
+                    .matches("termination_sender::Signal::Terminate")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                source
+                    .matches("termination_sender::Signal::Interrupt")
+                    .count(),
+                1
+            );
         } else {
             assert_eq!(words(&source, "termination_sender"), 0, "{relative}");
         }

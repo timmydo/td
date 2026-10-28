@@ -161,6 +161,12 @@ fn read_key(j: &Json, name: &str) -> Result<Option<Key>> {
 }
 impl FileState {
     pub fn open(path: &str, wait: Duration) -> Result<Self> {
+        Self::open_inner(path, wait, false)
+    }
+    pub(super) fn open_follow(path: &str) -> Result<Self> {
+        Self::open_inner(path, Duration::ZERO, true)
+    }
+    fn open_inner(path: &str, wait: Duration, follow: bool) -> Result<Self> {
         let until = Instant::now() + wait;
         let lock = loop {
             match PrivateRoot::open(path)
@@ -187,6 +193,11 @@ impl FileState {
             if name == "LOCK" {
                 continue;
             }
+            if follow && name == "observer" {
+                PrivateRoot::open(entry.path().to_str().ok_or("scrub-state-path")?)
+                    .map_err(|_| "scrub-state-root")?;
+                continue;
+            }
             if name != "state.json" && name != "partial" {
                 return Err("scrub-state-entry");
             }
@@ -210,23 +221,22 @@ impl FileState {
             .map_err(|_| "scrub-state-file")
     }
     pub fn load(&self, epoch: StoreEpoch) -> Result<State> {
-        match fs::symlink_metadata(self.path.join("state.json")) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::new(epoch)),
-            Err(_) => return Err("scrub-state-read"),
-            Ok(_) => (),
+        match self.load_text()? {
+            Some(text) => State::parse(&text, epoch),
+            None => Ok(State::new(epoch)),
         }
-        let mut text = String::new();
-        self.file("state.json")?
-            .take(MAX_BYTES + 1)
-            .read_to_string(&mut text)
-            .map_err(|_| "scrub-state-read")?;
-        if text.len() as u64 > MAX_BYTES {
-            return Err("scrub-state-size");
-        }
-        State::parse(&text, epoch)
+    }
+    pub(super) fn load_text(&self) -> Result<Option<String>> {
+        read_snapshot_from(self.lock.root(), &self.path)
+    }
+    pub(super) fn read_snapshot(path: &str) -> Result<Option<String>> {
+        let root = PrivateRoot::open(path).map_err(|_| "scrub-state-root")?;
+        read_snapshot_from(&root, &PathBuf::from(path))
     }
     pub fn save(&self, state: &State) -> Result<()> {
-        let text = state.json().to_string();
+        self.save_text(&state.json().to_string())
+    }
+    pub(super) fn save_text(&self, text: &str) -> Result<()> {
         if text.len() as u64 > MAX_BYTES {
             return Err("scrub-state-size");
         }
@@ -255,6 +265,27 @@ impl FileState {
             .and_then(|f| f.sync_all())
             .map_err(|_| "scrub-state-sync")
     }
+}
+fn read_snapshot_from(root: &PrivateRoot, path: &std::path::Path) -> Result<Option<String>> {
+    let file = path.join("state.json");
+    match fs::symlink_metadata(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("scrub-state-read"),
+        Ok(_) => (),
+    }
+    let mut inputs = Inputs::new();
+    inputs.bind(root).map_err(|_| "scrub-state-owner")?;
+    let mut text = String::new();
+    inputs
+        .open(file.to_str().ok_or("scrub-state-path")?, Role::Secret)
+        .map_err(|_| "scrub-state-file")?
+        .take(MAX_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| "scrub-state-read")?;
+    if text.len() as u64 > MAX_BYTES {
+        return Err("scrub-state-size");
+    }
+    Ok(Some(text))
 }
 #[cfg(test)]
 mod tests {

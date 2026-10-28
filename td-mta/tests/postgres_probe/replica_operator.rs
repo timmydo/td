@@ -204,6 +204,105 @@ pub(super) fn exercise(origin: &str, source_ca: &[u8], password: &[u8], binding:
         ),
         "1"
     );
+    let state = fixture.root.join("follow-state");
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let start_follow = || {
+        super::ProbeChild(
+            std::process::Command::new(env!("CARGO_BIN_EXE_td-mta"))
+                .env_clear()
+                .args([
+                    "postgres",
+                    "replica-follow",
+                    "--connection-file",
+                    runtime.to_str().unwrap(),
+                    "--epoch",
+                    &epoch.to_string(),
+                    "--account",
+                    &binding.account.to_string(),
+                    "--state-dir",
+                    state.to_str().unwrap(),
+                    "--idle-seconds",
+                    "1",
+                ])
+                .args(&remote)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let observe = |phase: &str| {
+        let stop = std::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            if let Ok(text) = fs::read_to_string(state.join("state.json")) {
+                let value = td_json::parse(&text).unwrap();
+                if value.get("phase").and_then(td_json::Json::as_str) == Some(phase) {
+                    return value;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < stop,
+                "follow observation: {phase}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let status = |expected| {
+        command_output_with_timeout(
+            &[
+                "postgres",
+                "replica-follow-status",
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--epoch",
+                &epoch.to_string(),
+                "--account",
+                &binding.account.to_string(),
+            ],
+            fixture.root.path(),
+            expected,
+            Duration::from_secs(15),
+        )
+    };
+    let mut follow = start_follow();
+    observe("idle");
+    assert!(status(0).contains("\"recent_success\":true"));
+    let mut duplicate = start_follow();
+    let duplicate_end = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = duplicate.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < duplicate_end,
+            "duplicate follow must refuse its held lock"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let original = fs::read(&secret).unwrap();
+    fs::write(&secret, b"wrong-private-proof-password").unwrap();
+    let failed = observe("backoff");
+    assert!(failed
+        .get("error")
+        .and_then(td_json::Json::as_str)
+        .is_some());
+    assert!(status(1).contains("\"recent_success\":false"));
+    fs::write(&secret, original).unwrap();
+    observe("idle");
+    super::termination_sender::send(&follow.0, super::termination_sender::Signal::Terminate)
+        .unwrap();
+    super::wait_command(&mut follow);
+    observe("stopped");
+    assert!(status(1).contains("\"phase\":\"stopped\""));
+    let mut follow = start_follow();
+    observe("idle");
+    super::termination_sender::send(&follow.0, super::termination_sender::Signal::Interrupt)
+        .unwrap();
+    super::wait_command(&mut follow);
+    observe("stopped");
     remote.extend(["--steps", "4"]);
     let output = invoke("replica-copy", &runtime, &remote, 0);
     assert!(output.contains("\"applied\":0"));

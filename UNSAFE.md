@@ -3515,6 +3515,13 @@ may delay shutdown by its 100-second cap plus bounded database operations.
 The mail coordinator also polls before starting another certificate-reload
 cycle. No additional syscall, mask, pointer shape or unsafe block is added.
 
+The supervised replica-copy command uses those same operations before its first
+bounded copy round, polling between rounds and every 100 ms during idle/backoff
+waits. A round may delay orderly stop by its 60-second work deadline; blocked
+host filesystem or output I/O retains its existing limits. It retires database
+sessions before status publication or waits. Its caller is included in the
+source confinement roster; no syscall, mask or pointer shape changes.
+
 The binary's `listener_sys.rs` binds IPv6 sockets with an explicit
 IPv6-only policy before exposing a listener. IPv4 still uses safe std's
 binding path. Its private five-argument instruction admits exactly:

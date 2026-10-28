@@ -5,7 +5,8 @@
 The source inventory/metadata API and bounded local copy commands are
 implemented, together with a low-level loopback read service for an already
 provisioned replica. Fresh local provisioning is available through `install-td-mta --setup-replica`.
-Continuous synchronization and recovery qualification remain subsequent work. The client honors read-only discovery; full local service
+Supervised synchronization is implemented; completeness and recovery qualification
+remain subsequent work. The client honors read-only discovery; full local service
 qualification remains required. PostgreSQL remains the
 only backend. Synchronization is application-level over authenticated HTTPS;
 it does not expose PostgreSQL or require replication credentials on clients.
@@ -625,8 +626,8 @@ The timeout bounds copy work, not a blocked host stdout consumer. A later error
 exits nonzero and leaves earlier committed progress intact.
 Read-only inspection and initial owner preflights may try the next resolved
 local address on connection failure. Copy errors and post-publication errors
-never replay against another address. There is no background loop, automatic
-history reset or binding replacement. The runtime login must have the restricted
+never replay against another address. The bounded command has no background loop, automatic
+history reset or binding replacement; supervised copying is described below. The runtime login must have the restricted
 replica grants; the ordinary primary login remains ineligible. The fresh local installer provisions separate publisher and reader roles.
 
 `postgres replica-progress --connection-file PATH --epoch HEX --account ID`
@@ -748,8 +749,7 @@ normal bounded retention and suppression under the restricted reader role.
 
 This low-level service entry does not provision PostgreSQL, certificates,
 configuration, local credentials or a synchronization schedule. The fresh
-installer below provisions the first three; continuous-copy integration remains
-required.
+installer below provisions these resources and a separate copy service.
 It reports no full-copy or disaster-recovery qualification.
 
 ## Fresh local provisioning
@@ -772,16 +772,79 @@ unused localhost route with a random password, never the source credential.
 Only a loopback JMAP profile is selected; no SMTP, relay or ACME service exists.
 
 Default ports are PostgreSQL 35433 and HTTPS 54444. Generated service names
-`td-mta-replica-postgres` and `td-mta-replica` differ from the ordinary local
+`td-mta-replica-postgres`, `td-mta-replica` and `td-mta-replica-sync` differ from the ordinary local
 setup's names, allowing one of each per user manager. Both systemd and Shepherd
 files are emitted, with reader ordering behind PostgreSQL. Services are left
 stopped. `START.txt` gives supervisor and bounded copy commands, and `mail.toml`
 uses the separate local password and generated CA. Quotas are mail publication
 bounds, not filesystem free-space reservations.
 
-This prepares an initial, incomplete account. It does not enable automatic
-copying, history reset, certificate renewal, promotion or recovery. Operators
-must run further bounded copy batches and renew the 90-day leaf certificates
+This prepares an initial, incomplete account. Starting the generated sync
+service continues copying. It does not enable history reset, certificate
+renewal, promotion or recovery. Operators must renew the 90-day leaf certificates
 before expiry. Interrupted setup retains its directory and private receipts;
 there is no automatic resume or overwrite. Full-copy qualification and offline
 attachment acceptance remain separate from successful provisioning.
+
+## Supervised synchronization
+
+`postgres replica-follow` takes the copy command's connection, local epoch,
+account and source credential options, plus `--state-dir PRIVATE_DIRECTORY`
+and optional `--idle-seconds 1..3600` (default 30). The existing private directory
+has one cooperative writer lock. Duplicate workers using that directory refuse;
+the database's source/generation/page checks remain publication authority.
+The command accepts no `--steps` or `--timeout-seconds` override. Each round is
+one existing copy step with its 60-second deadline and at most 16 Email effects.
+Progress continues immediately; an empty Email changes observation waits for
+the idle interval. Failures wait 5, 10, 20, 40, 80, 160, then at most 300 seconds.
+A successful round resets that backoff. Every round reloads protected local and
+source credentials. Authentication, quota, source-reset and integrity failures
+never authorize a new binding, skipped work or history reset.
+
+Database sessions retire before operational status writes, stdout or waiting.
+SIGINT/SIGTERM use the existing fixed synchronous signal boundary; they are
+checked between rounds and every 100 ms during waits. A running round may take
+its remaining 60-second work deadline to finish. Blocked host filesystem or
+stdout operations retain their ordinary host-I/O limits. SIGKILL may interrupt
+a round; restart reloads durable database progress and never infers rollback
+from an unconfirmed COMMIT.
+
+The state directory contains LOCK, an at-most-8192-byte `state.json`, an
+optional bounded `partial`, and an optional private `observer` directory.
+The latter uses the same bounded files and its own short-lived lock for status
+checks; it never changes worker progress. The existing scrub operational-file owner is
+shared for private access, lock lifetime, bounded reads and synced replacement.
+The copy payload is separately versioned and bound to local epoch, account,
+canonical source origin and source epoch. It reports last successful round,
+last empty Email changes observation, local sequence, copied effects/bytes,
+pending mailbox removals, phase and a fixed error code. Counters describe
+successful rounds observed by this process lineage, not a complete inventory;
+a crash after publication but before status can undercount. Status cannot
+advance or repair the database checkpoint. Clock rollback refuses publication
+of a newly fresh operational observation. Regular stdout progress is limited
+to one record per minute, plus final shutdown or fatal-error reporting; content,
+passwords and Authorization values are never logged.
+
+`postgres replica-follow-status --state-dir PATH --epoch HEX --account ID
+[--maximum-age-seconds 1..86400]` reads a bounded historical snapshot without
+locking out the active writer or opening PostgreSQL. Its default age is 120
+seconds; configure a larger threshold when selecting a longer idle interval.
+Status checks persist their highest observed wall time in the separate private
+observer directory, including stale observations. Clock rollback cannot make a
+previously stale observation fresh again. Concurrent status checks may refuse
+on that short-lived lock; they never contend with the worker's lifetime lock.
+The command needs write access to this operational directory.
+Exit zero means the last successful round is within that age, its recorded phase
+is copying or idle and the observed clock has not moved backward. It is not a
+process-liveness check. Missing, malformed, foreign, stale, backoff or stopped
+status exits nonzero. Every report retains `copy_complete:false` and
+`recovery_verified:false`; even a recent empty changes page is not a full-copy
+or recovery certificate. td-mail synchronization-status presentation remains
+separate work.
+
+Fresh setup emits `td-mta-replica-sync` for both systemd and Shepherd. It uses
+the publisher connection and its own private status directory; the independent
+JMAP service uses the reader connection. Both depend on PostgreSQL. A failed
+copy round or unavailable source does not stop local reads. Start only one
+supervisor and stop its sync worker before running a manual copy batch. Setup
+still leaves every service stopped until explicitly started.

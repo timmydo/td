@@ -58,8 +58,8 @@ Creates a NEW private read-only replica with independent local credentials.
 Requires installed td-mta, PostgreSQL 17 tools and openssl on PATH.
 Defaults: PostgreSQL 35433, HTTPS 54444; loopback only.
 Source username defaults to --account, which is also the local login/address.
-Discovers and seeds the source account; full copying must be run separately.
-Writes PostgreSQL and read-only service definitions, but enables no services.
+Discovers and seeds the source account; the sync service continues copying.
+Writes PostgreSQL, read-only and sync service definitions, but enables none.
 No SMTP, relay or ACME service is generated. Retain receipts on failure.
 ";
 
@@ -692,12 +692,36 @@ fn replica_services(
         account.into(),
         "--source-epoch".into(),
         fs::read_to_string(p.path("source-epoch")).map_err(|e| e.to_string())?,
+    ];
+    copy.extend(source_args(p, replica)?);
+    let state = p.path("copy-state");
+    directory(&state, 0o700)?;
+    let mut follow = copy.clone();
+    *follow.get_mut(2).ok_or("missing copy operation")? = "replica-follow".into();
+    follow.extend(["--state-dir".into(), text(&state)?.into()]);
+    let (unit, scm) = super::supervisor_files(
+        &follow.iter().map(String::as_str).collect::<Vec<_>>(),
+        "td-mta-replica-sync",
+        &p.path("copy-service.log"),
+        120,
+        "td-mta postgres replica-follow-status",
+    )?;
+    p.write("services/td-mta-replica-sync.service", unit.replacen("[Unit]\n", "[Unit]\nRequires=td-mta-replica-postgres.service\nAfter=td-mta-replica-postgres.service\nPartOf=td-mta-replica-postgres.service\n", 1))?;
+    p.write(
+        "services/td-mta-replica-sync.scm",
+        scm.replacen(
+            "#:respawn? #t",
+            "#:requirement '(td-mta-replica-postgres)\n  #:respawn? #t",
+            1,
+        ),
+    )?;
+    copy.extend([
         "--steps".into(),
         "1024".into(),
         "--timeout-seconds".into(),
         "3600".into(),
-    ];
-    copy.extend(source_args(p, replica)?);
+    ]);
+
     let copy_command = copy
         .iter()
         .map(|arg| shell(Path::new(arg)))
@@ -708,22 +732,31 @@ fn replica_services(
         Json::Arr(copy.into_iter().map(Json::Str).collect()).to_canonical(),
     )?;
     let mut start = String::from("Replica preparation complete. Services are stopped; no full copy is claimed.\nUse ONE supervisor. Replica service names differ from ordinary local mail.\n\nSystemd:\n");
-    for name in ["td-mta-replica-postgres", "td-mta-replica"] {
+    for name in [
+        "td-mta-replica-postgres",
+        "td-mta-replica",
+        "td-mta-replica-sync",
+    ] {
         start.push_str(&format!(
             "  systemctl --user link {}\n",
             shell(&p.path(&format!("services/{name}.service")))
         ));
     }
-    start.push_str("  systemctl --user daemon-reload\n  systemctl --user enable --now td-mta-replica-postgres td-mta-replica\n\nShepherd (Guix Home persistence follows DEPLOYMENT.md):\n");
-    for name in ["td-mta-replica-postgres", "td-mta-replica"] {
+    start.push_str("  systemctl --user daemon-reload\n  systemctl --user enable --now td-mta-replica-postgres td-mta-replica td-mta-replica-sync\n\nShepherd (Guix Home persistence follows DEPLOYMENT.md):\n");
+    for name in [
+        "td-mta-replica-postgres",
+        "td-mta-replica",
+        "td-mta-replica-sync",
+    ] {
         start.push_str(&format!(
             "  herd load root {}\n",
             shell(&p.path(&format!("services/{name}.scm")))
         ));
     }
-    start.push_str("  herd start td-mta-replica\n\nCopy a bounded batch after PostgreSQL is running; repeat to continue:\n  ");
+    start.push_str("  herd start td-mta-replica\n  herd start td-mta-replica-sync\n\nFor a manual bounded batch, stop the sync service first:\n  ");
     start.push_str(&copy_command);
-    start.push_str(&format!("\n\nLocal client:\n  td-net launch --allow-loopback td-mail --config={}\n\nThe local credential is independent of the upstream password.\nNo automatic synchronization, certificate renewal or recovery promotion is enabled.\nLeaf certificates expire in 90 days; see DEPLOYMENT.md before expiry.\nThe unused relay configuration is required by the shared config grammar; no relay service runs.\nProtect this directory: it holds full mail, passwords and private keys.\n", shell(&p.path("mail.toml"))));
+    start.push_str(&format!("\n\nHistorical synchronization status (not copy completeness or process liveness):\n  {} postgres replica-follow-status --state-dir {} --epoch {} --account {}\n", shell(&bin), shell(&state), shell(Path::new(epoch)), shell(Path::new(account))));
+    start.push_str(&format!("\n\nLocal client:\n  td-net launch --allow-loopback td-mail --config={}\n\nThe local credential is independent of the upstream password.\nThe sync service continues copying when started; certificate renewal and recovery promotion are not automated.\nLeaf certificates expire in 90 days; see DEPLOYMENT.md before expiry.\nThe unused relay configuration is required by the shared config grammar; no relay service runs.\nProtect this directory: it holds full mail, passwords and private keys.\n", shell(&p.path("mail.toml"))));
     p.write("START.txt", start)
 }
 
@@ -1213,7 +1246,13 @@ mod tests {
         assert!(unit.contains("Requires=td-mta-replica-postgres.service"));
         assert!(scm.contains("#:requirement '(td-mta-replica-postgres)"));
         let files = fs::read_dir(p.path("services")).unwrap().count();
-        assert_eq!(files, 4);
+        assert_eq!(files, 6);
+        let sync = fs::read_to_string(p.path("services/td-mta-replica-sync.service")).unwrap();
+        assert!(sync.contains("replica-follow"));
+        assert!(sync.contains("runtime-connection"));
+        assert!(!sync.contains("reader-connection"));
+        assert!(!sync.contains("owner-connection"));
+        assert!(sync.contains("--state-dir"));
         let copy = fs::read_to_string(p.path("copy-arguments.json")).unwrap();
         let copy = json::parse(&copy).unwrap();
         let args = copy.as_arr().unwrap();
