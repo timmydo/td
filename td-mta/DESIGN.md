@@ -39,6 +39,7 @@ The current contract is organized by responsibility:
 | Supported flows, test evidence and performance measurement | [CONFORMANCE.md](CONFORMANCE.md) |
 | Installation, schedules and recovery | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | Current Azure host updates and operations | [PRODUCTION.md](PRODUCTION.md) |
+| Planned account replication and recovery boundaries | [REPLICATION.md](REPLICATION.md) |
 | Logs and diagnostic counters | [OBSERVABILITY.md](OBSERVABILITY.md) |
 
 [IMPLEMENTATION.md](IMPLEMENTATION.md) retains component task sequencing and
