@@ -8,6 +8,12 @@ description = "td's LUKS2 volume tool: the bounded reader of the one LUKS2 profi
 [package.metadata.td-gate]
 clippy-all-targets = true
 
+# The program lives outside src/, which td-boot and td-install stage file
+# by file for the library they compile.
+[[bin]]
+name = "td-luks"
+path = "bin/main.rs"
+
 [workspace]
 
 [dependencies]

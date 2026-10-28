@@ -455,3 +455,112 @@ fn orphaned_tokens_unbound_keyslots_and_no_keyslots_read_back() {
     assert_ne!(any, 0);
     assert_eq!(header_bytes(&device), written);
 }
+
+/// The td-luks program's verbs, as td-protector's runner will run them.
+fn program(args: &[&str], device: &Path, extra: &[&str], input: &[u8]) -> i32 {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_td-luks"))
+        .args(args)
+        .arg(device)
+        .args(extra)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(input);
+    child.wait().unwrap().code().unwrap_or(-1)
+}
+
+/// A key file only a descriptor holds, as td-protector's `KeyFile`.
+fn key_file(secret: &[u8]) -> (std::io::PipeReader, String) {
+    use std::os::fd::AsRawFd;
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    writer.write_all(secret).unwrap();
+    drop(writer);
+    let path = format!("/proc/{}/fd/{}", std::process::id(), reader.as_raw_fd());
+    (reader, path)
+}
+
+#[test]
+#[ignore = "needs the pinned cryptsetup on PATH and the host kernel's AF_ALG"]
+fn the_program_and_cryptsetup_read_each_other_s_work() {
+    let fixture = Fixture::new("program");
+    // td-luks formats and adds; cryptsetup opens and dumps alike.
+    let ours = fixture.device();
+    assert_eq!(
+        program(&["format", UUID, "td-system"], &ours, &[], RECOVERY),
+        0
+    );
+    let (_held_second, second) = key_file(SECOND);
+    assert_eq!(
+        program(&["add-key", "0", "1"], &ours, &[&second], RECOVERY),
+        0
+    );
+    let token = br#"{"type":"td-protector","keyslots":["1"],"role":"first-boot"}"#;
+    assert_eq!(program(&["token-import", "0"], &ours, &[], token), 0);
+    assert_eq!(fixture.dump(&ours), metadata(&ours));
+    assert_eq!(fixture.test(&ours, 1, SECOND), 0);
+    assert_eq!(fixture.test(&ours, 1, WRONG), 2);
+    let key_path = fixture.dir.path().join("ours.key");
+    assert_eq!(
+        program(
+            &["volume-key"],
+            &ours,
+            &[key_path.to_str().unwrap()],
+            SECOND
+        ),
+        0
+    );
+    assert_eq!(
+        fs::read(&key_path).unwrap(),
+        fixture.volume_key(&ours, RECOVERY, "theirs-of-ours.key")
+    );
+
+    // cryptsetup formats with td's arguments; the program opens, adds,
+    // kills and tests the detached header, and cryptsetup agrees.
+    let theirs = fixture.dir.path().join("theirs.img");
+    fs::rename(fixture.device(), &theirs).unwrap();
+    fixture.ok(FORMAT, &theirs, RECOVERY);
+    assert_eq!(program(&["test", "0"], &theirs, &[], RECOVERY), 0);
+    assert_eq!(program(&["test", "0"], &theirs, &[], WRONG), 2);
+    let (_held_third, third) = key_file(THIRD);
+    assert_eq!(
+        program(&["add-key", "0", "2"], &theirs, &[&third], RECOVERY),
+        0
+    );
+    assert_eq!(fixture.test(&theirs, 2, THIRD), 0);
+    assert_eq!(program(&["kill-slot", "2"], &theirs, &[], RECOVERY), 0);
+    assert_eq!(fixture.test(&theirs, 2, THIRD), 1, "keyslot 2 is gone");
+    assert_eq!(fixture.dump(&theirs), metadata(&theirs));
+    let header = fixture.dir.path().join("theirs.header");
+    fs::write(&header, header_bytes(&theirs)).unwrap();
+    assert_eq!(
+        program(
+            &["test", "0"],
+            &theirs,
+            &[header.to_str().unwrap()],
+            RECOVERY
+        ),
+        0
+    );
+
+    // cryptsetup locks a regular file as itself, as the program does:
+    // while that flock is held exclusively, cryptsetup waits on it.
+    let holder = open(&theirs);
+    holder.lock().unwrap();
+    let mut child = Command::new(&fixture.cryptsetup)
+        .args(["luksDump", "--dump-json-metadata"])
+        .arg(&theirs)
+        .env_clear()
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "cryptsetup waits on the flock"
+    );
+    holder.unlock().unwrap();
+    assert!(child.wait().unwrap().success());
+}

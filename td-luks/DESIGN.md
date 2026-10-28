@@ -201,21 +201,40 @@ td-luks follows cryptsetup's whole lock-file protocol
 (`utils_device_locking.c`), so td-luks and stock cryptsetup exclude each
 other. The locks are:
 
-- `/run/cryptsetup/L_<major>:<minor>` for the device: exclusive for a
-  mutation, shared for a read;
+- `/run/cryptsetup/L_<major>:<minor>` for a block device: exclusive for
+  a mutation, shared for a read;
+- a regular file, as tests use, locked as itself with the same modes,
+  with no resource file and no check, as cryptsetup locks one;
 - the reencryption lock `LN_LUKS2-reencryption-<uuid>`, while a
   reencryption runs and when `open` activates a header mid-reencryption.
 
 Each lock is taken as cryptsetup takes it:
 
-1. Create `/run/cryptsetup` if it is missing.
-2. Open the lock file with `O_CREAT | O_NOFOLLOW`, then `flock` it.
+1. Create `/run/cryptsetup` if it is missing, requesting mode 0700,
+   subject to umask, refusing it
+   when it is a symlink or no directory.
+2. Open the lock file with `O_CREAT | O_NOFOLLOW`, requesting mode 0644
+   subject to umask, then
+   `flock` it, blocking.
 3. Check that the path still names the locked inode; if it does not,
    cryptsetup unlinked the file meanwhile, so start again.
 4. On release, take `LOCK_EX | LOCK_NB` and unlink the file if it is
    still the same inode.
 
+A device is opened once, before locking, and the same descriptor serves
+all header I/O. A replaced regular-file path cannot redirect an operation
+to an inode its lock does not cover. The program reads stdin through a
+duplicated descriptor directly into a preallocated zeroing buffer, with
+no buffered-stdio or growing-buffer copies of secrets.
+
 A header file in "Detached test" is only read and takes no lock.
+
+cryptsetup opens the lock file relative to the directory's descriptor;
+std has no `openat`, so td-luks opens it by path once the directory is
+known to be no symlink. Only root can create or swap that directory, and
+root needs no race to defeat a lock. The lock code belongs to the
+program (`bin/lock.rs`, outside the `src/` the boot recipes stage file
+by file), not the library they compile.
 
 ### Commits
 
@@ -501,10 +520,13 @@ Each increment is one landable commit, or a short series:
     reader's format-only refusal tests moved from td-protector, and
     ignored interop tests against the pinned cryptsetup
     (`tests/cryptsetup_interop.rs`). Status: landed.
-  - **B3b.** Next: the `td-luks` program and its verbs, exit statuses
-    and key input over that library, with cryptsetup's lock protocol
-    ("Locking").
-  - **B4.** The cryptsetup fixtures ("Tests").
+  - **B3b.** The `td-luks` program (`bin/main.rs`): the verbs that
+    need no device mapper, their exit statuses and key input over that
+    library, `format`'s `O_EXCL` open of a block device, and
+    cryptsetup's lock protocol (`bin/lock.rs`, "Locking"), with CLI
+    tests (`tests/cli.rs`) and the program in the interop tests. No
+    recipe ships it until E. Status: landed.
+  - **B4.** Next: the cryptsetup fixtures ("Tests").
 - **C.** The device-mapper surface: `open`, `open-volume-key`, `close`
   and `status` for headers without the reencryption requirement, with
   UNSAFE.md's section and the interop oracle for activation.
