@@ -27,6 +27,7 @@ Service configuration requires connection/state and a mail or certificate profil
 Generates both systemd user units and Shepherd definitions; does not enable them.
 Database preparation and credentials remain explicit (td-mta/POSTGRES.md).
 --services-only uses the already installed executable without rebuilding.
+Use --setup-replica --help to provision a new read-only local account copy.
 Use --setup-local --help to provision a new private local PostgreSQL account.
 Use --postgres-tls-renew --help for local PostgreSQL leaf renewal.
 Use --operations-services --help to generate backup and health schedules.
@@ -447,6 +448,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|v| v == "--backup") {
         return install_mta_backup::run(args.get(1..).unwrap_or_default());
+    }
+    if args.first().is_some_and(|v| v == "--setup-replica") {
+        return install_mta_setup::run_replica(args.get(1..).unwrap_or_default());
     }
     if args.first().is_some_and(|v| v == "--setup-local") {
         return install_mta_setup::run(args.get(1..).unwrap_or_default());

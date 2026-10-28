@@ -4,9 +4,8 @@
 
 The source inventory/metadata API and bounded local copy commands are
 implemented, together with a low-level loopback read service for an already
-provisioned replica. Installer integration, continuous synchronization and
-recovery qualification remain subsequent work, not available setup or recovery
-claims. The client honors read-only discovery; full local service
+provisioned replica. Fresh local provisioning is available through `install-td-mta --setup-replica`.
+Continuous synchronization and recovery qualification remain subsequent work. The client honors read-only discovery; full local service
 qualification remains required. PostgreSQL remains the
 only backend. Synchronization is application-level over authenticated HTTPS;
 it does not expose PostgreSQL or require replication credentials on clients.
@@ -628,8 +627,7 @@ Read-only inspection and initial owner preflights may try the next resolved
 local address on connection failure. Copy errors and post-publication errors
 never replay against another address. There is no background loop, automatic
 history reset or binding replacement. The runtime login must have the restricted
-replica grants; the ordinary primary login remains ineligible. Installer support
-for provisioning the replica role and read-only service is subsequent work.
+replica grants; the ordinary primary login remains ineligible. The fresh local installer provisions separate publisher and reader roles.
 
 `postgres replica-progress --connection-file PATH --epoch HEX --account ID`
 uses the owner connection to report a historical snapshot of stored copy work.
@@ -703,8 +701,8 @@ rights. HTTPS refuses authenticated uploads before reserving a body slot, and
 the PostgreSQL upload adapter independently refuses them before ingress.
 These guards alone do not qualify a database or activate a listener. Ordinary
 runtime qualification still refuses a replica-bound store; the explicit local
-read service below uses separate qualification. Installer provisioning remains
-required. Existing primary Sessions retain
+read service below uses separate qualification. Fresh installer provisioning
+is described below. Existing primary Sessions retain
 their writable behavior. Client policy remains advisory; server refusal owns
 the authorization boundary.
 
@@ -717,8 +715,7 @@ refuses an unbound primary, owner or ordinary writable runtime login. The
 ordinary Runtime mode continues to refuse bound replicas. Outbound validation
 workers refuse ReplicaRead before connecting. Retained reads use
 the same migration lock, finite session lifetime, epoch checks and retirement
-rules as primary reads. The explicit `serve --read-only` entry selects this mode; installer
-provisioning remains subsequent work.
+rules as primary reads. The explicit `serve --read-only` entry selects this mode.
 
 The reader has SELECT on the existing tables, INSERT-only on leases,
 UPDATE(singleton)-only on config_selection, UPDATE(id)-only on accounts, and
@@ -750,6 +747,41 @@ and reading leaves flags unchanged. Database application logging retains its
 normal bounded retention and suppression under the restricted reader role.
 
 This low-level service entry does not provision PostgreSQL, certificates,
-configuration, local credentials or a synchronization schedule. Installer and
-continuous-copy integration remain required for the supported local setup.
+configuration, local credentials or a synchronization schedule. The fresh
+installer below provisions the first three; continuous-copy integration remains
+required.
 It reports no full-copy or disaster-recovery qualification.
+
+## Fresh local provisioning
+
+`./install-td-mta --setup-replica --help` describes preparation of a fresh,
+private local PostgreSQL installation. It uses the installed td-mta executable,
+PostgreSQL 17 and openssl, like `--setup-local`, and never adopts existing data.
+An explicit source origin, protected source password, local account address,
+resolver and positive body/blob/Email/receipt quotas are required. Source login
+defaults to the account address; `--source-username` overrides it. Optional
+`--ca-file` supplies source trust. The source binding comes from authenticated
+`replica-discover`, not SQL or a manually invented account ID.
+
+Preparation initializes a distinct local epoch, preserves the discovered
+account ID and seeds the first inventory page. It creates separate owner,
+publisher and reader PostgreSQL logins and an independent local device
+password. Source credentials and optional CA are copied into protected files.
+The shared config grammar still requires a relay record: the replica gets an
+unused localhost route with a random password, never the source credential.
+Only a loopback JMAP profile is selected; no SMTP, relay or ACME service exists.
+
+Default ports are PostgreSQL 35433 and HTTPS 54444. Generated service names
+`td-mta-replica-postgres` and `td-mta-replica` differ from the ordinary local
+setup's names, allowing one of each per user manager. Both systemd and Shepherd
+files are emitted, with reader ordering behind PostgreSQL. Services are left
+stopped. `START.txt` gives supervisor and bounded copy commands, and `mail.toml`
+uses the separate local password and generated CA. Quotas are mail publication
+bounds, not filesystem free-space reservations.
+
+This prepares an initial, incomplete account. It does not enable automatic
+copying, history reset, certificate renewal, promotion or recovery. Operators
+must run further bounded copy batches and renew the 90-day leaf certificates
+before expiry. Interrupted setup retains its directory and private receipts;
+there is no automatic resume or overwrite. Full-copy qualification and offline
+attachment acceptance remain separate from successful provisioning.

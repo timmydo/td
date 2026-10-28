@@ -39,7 +39,29 @@ struct Settings {
     https_port: u16,
     smtp_port: u16,
     relay_port: u16,
+    replica: Option<Replica>,
 }
+struct Replica {
+    origin: String,
+    username: String,
+    password: PathBuf,
+    ca: Option<PathBuf>,
+    quotas: [u64; 4],
+}
+const REPLICA_HELP: &str = "Usage: ./install-td-mta --setup-replica --root PATH --account EMAIL
+  --source-origin HTTPS_ORIGIN --password-file PATH --resolver IP:PORT
+  --body-bytes N --blobs N --emails N --receipts N
+  [--source-username USER] [--ca-file PATH] [--prefix PATH]
+  [--postgres-port PORT] [--https-port PORT]
+
+Creates a NEW private read-only replica with independent local credentials.
+Requires installed td-mta, PostgreSQL 17 tools and openssl on PATH.
+Defaults: PostgreSQL 35433, HTTPS 54444; loopback only.
+Source username defaults to --account, which is also the local login/address.
+Discovers and seeds the source account; full copying must be run separately.
+Writes PostgreSQL and read-only service definitions, but enables no services.
+No SMTP, relay or ACME service is generated. Retain receipts on failure.
+";
 
 fn atom(value: &str) -> bool {
     !value.is_empty()
@@ -50,25 +72,45 @@ fn atom(value: &str) -> bool {
 }
 
 fn settings(args: &[String], home: &str) -> Result<Settings> {
+    settings_mode(args, home, false)
+}
+fn settings_mode(args: &[String], home: &str, replica: bool) -> Result<Settings> {
     let mut values = BTreeMap::new();
     let mut it = args.iter();
     while let Some(flag) = it.next() {
-        if ![
+        let common = [
             "--root",
             "--prefix",
             "--account",
-            "--relay-host",
-            "--relay-user",
-            "--relay-password-file",
-            "--relay-ca-file",
             "--resolver",
             "--postgres-port",
             "--https-port",
-            "--smtp-port",
-            "--relay-port",
         ]
-        .contains(&flag.as_str())
-        {
+        .contains(&flag.as_str());
+        let mode_option = if replica {
+            [
+                "--source-origin",
+                "--source-username",
+                "--password-file",
+                "--ca-file",
+                "--body-bytes",
+                "--blobs",
+                "--emails",
+                "--receipts",
+            ]
+            .contains(&flag.as_str())
+        } else {
+            [
+                "--relay-host",
+                "--relay-user",
+                "--relay-password-file",
+                "--relay-ca-file",
+                "--smtp-port",
+                "--relay-port",
+            ]
+            .contains(&flag.as_str())
+        };
+        if !common && !mode_option {
             return Err(format!("unknown setup option: {flag}"));
         }
         let value = it
@@ -97,8 +139,16 @@ fn settings(args: &[String], home: &str) -> Result<Settings> {
         Ok(n)
     };
     let account = required("--account")?;
-    let host = required("--relay-host")?;
-    let user = required("--relay-user")?;
+    let host = if replica {
+        "localhost"
+    } else {
+        required("--relay-host")?
+    };
+    let user = if replica {
+        "disabled"
+    } else {
+        required("--relay-user")?
+    };
     if !atom(account)
         || account.split('@').count() != 2
         || account.starts_with('@')
@@ -115,7 +165,11 @@ fn settings(args: &[String], home: &str) -> Result<Settings> {
         account: account.into(),
         relay_host: host.into(),
         relay_user: user.into(),
-        relay_password: absolute(required("--relay-password-file")?)?,
+        relay_password: if replica {
+            absolute(required("--root")?)?.join("relay-password")
+        } else {
+            absolute(required("--relay-password-file")?)?
+        },
         relay_ca: values
             .get("--relay-ca-file")
             .map(|v| absolute(v))
@@ -123,12 +177,46 @@ fn settings(args: &[String], home: &str) -> Result<Settings> {
         resolver: required("--resolver")?
             .parse()
             .map_err(|_| "resolver must be IP:PORT")?,
-        pg_port: port("--postgres-port", 35432)?,
-        https_port: port("--https-port", 54443)?,
+        pg_port: port("--postgres-port", if replica { 35433 } else { 35432 })?,
+        https_port: port("--https-port", if replica { 54444 } else { 54443 })?,
         smtp_port: port("--smtp-port", 55225)?,
         relay_port: port("--relay-port", 465)?,
+        replica: if replica {
+            let mut quotas = [0; 4];
+            for (slot, name) in
+                quotas
+                    .iter_mut()
+                    .zip(["--body-bytes", "--blobs", "--emails", "--receipts"])
+            {
+                let value = required(name)?;
+                *slot = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid {name}"))?;
+                if !value.bytes().all(|b| b.is_ascii_digit())
+                    || *slot == 0
+                    || *slot > i64::MAX as u64
+                {
+                    return Err(format!("{name} must be positive and at most {}", i64::MAX));
+                }
+            }
+            Some(Replica {
+                origin: required("--source-origin")?.into(),
+                username: values
+                    .get("--source-username")
+                    .copied()
+                    .unwrap_or(account)
+                    .into(),
+                password: absolute(required("--password-file")?)?,
+                ca: values.get("--ca-file").map(|v| absolute(v)).transpose()?,
+                quotas,
+            })
+        } else {
+            None
+        },
     };
-    if s.pg_port == s.https_port || s.pg_port == s.smtp_port || s.https_port == s.smtp_port {
+    if s.pg_port == s.https_port
+        || (s.replica.is_none() && (s.pg_port == s.smtp_port || s.https_port == s.smtp_port))
+    {
         return Err("local ports must be distinct".into());
     }
     Ok(Settings {
@@ -348,7 +436,14 @@ fn preflight(s: &Settings) -> Result<()> {
     if text(&s.root.join("frontend/runtime/smtp-control.sock"))?.len() > 107 {
         return Err("setup root is too long for the MTA control socket (maximum 72 bytes)".into());
     }
-    for n in [s.pg_port, s.https_port, s.smtp_port] {
+    for n in [
+        Some(s.pg_port),
+        Some(s.https_port),
+        s.replica.is_none().then_some(s.smtp_port),
+    ]
+    .into_iter()
+    .flatten()
+    {
         TcpListener::bind(("127.0.0.1", n)).map_err(|e| format!("local port {n}: {e}"))?;
     }
     for program in ["initdb", "postgres", "pg_ctl", "psql"] {
@@ -475,7 +570,7 @@ fn postgres_program() -> Result<PathBuf> {
     Err("postgres must be in an absolute PATH directory".into())
 }
 
-fn services(p: &Setup<'_>, postgres: &Path) -> Result<()> {
+fn database_services(p: &Setup<'_>, postgres: &Path, name: &str) -> Result<()> {
     let data = p.path("postgres");
     let config = format!("config_file={}", text(&p.path("postgresql.conf"))?);
     let args = [text(postgres)?, "-D", text(&data)?, "-c", &config];
@@ -484,9 +579,13 @@ fn services(p: &Setup<'_>, postgres: &Path) -> Result<()> {
         .map(|s| systemd(s))
         .collect::<Vec<_>>()
         .join(" ");
-    p.write("services/td-mta-postgres.service", format!("[Unit]\nDescription=td-mta private PostgreSQL\n\n[Service]\nType=exec\nExecStart=:{exec}\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGINT\nTimeoutStopSec=120\nUMask=0077\n\n[Install]\nWantedBy=default.target\n"))?;
+    p.write(&format!("services/{name}.service"), format!("[Unit]\nDescription=td-mta private PostgreSQL\n\n[Service]\nType=exec\nExecStart=:{exec}\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGINT\nTimeoutStopSec=120\nUMask=0077\n\n[Install]\nWantedBy=default.target\n"))?;
     let exec = args.iter().map(|s| scheme(s)).collect::<Vec<_>>().join(" ");
-    p.write("services/td-mta-postgres.scm", format!("(use-modules (shepherd service))\n(register-services\n (service '(td-mta-postgres)\n  #:documentation \"Private local mail PostgreSQL\"\n  #:respawn? #t\n  #:respawn-delay 5\n  #:start (make-forkexec-constructor '({exec})\n    #:log-file {} #:file-creation-mask #o077)\n  #:stop (make-kill-destructor SIGINT #:grace-period 120)))\n", scheme(text(&p.path("postgres.log"))?)))?;
+    p.write(&format!("services/{name}.scm"), format!("(use-modules (shepherd service))\n(register-services\n (service '({name})\n  #:documentation \"Private local mail PostgreSQL\"\n  #:respawn? #t\n  #:respawn-delay 5\n  #:start (make-forkexec-constructor '({exec})\n    #:log-file {} #:file-creation-mask #o077)\n  #:stop (make-kill-destructor SIGINT #:grace-period 120)))\n", scheme(text(&p.path("postgres.log"))?)))?;
+    Ok(())
+}
+fn services(p: &Setup<'_>, postgres: &Path) -> Result<()> {
+    database_services(p, postgres, "td-mta-postgres")?;
     for profile in ["frontend", "receive", "relay"] {
         for name in ["runtime", "scratch"] {
             directory(&p.path(profile).join(name), 0o700)?;
@@ -509,10 +608,133 @@ fn services(p: &Setup<'_>, postgres: &Path) -> Result<()> {
     Ok(())
 }
 
+const REPLICA_GRANTS: &str = r"\connect td_mta
+BEGIN;
+SET ROLE td_mta_owner;
+GRANT INSERT,UPDATE,DELETE ON td_mta.replica_progress,td_mta.replica_pending,
+ td_mta.replica_mailbox_receipts,td_mta.replica_email_receipts,
+ td_mta.replica_blob_identities TO td_mta_runtime;
+GRANT USAGE ON SCHEMA td_mta TO td_mta_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO td_mta_reader;
+GRANT UPDATE(singleton) ON td_mta.config_selection TO td_mta_reader;
+GRANT UPDATE(id) ON td_mta.accounts TO td_mta_reader;
+GRANT INSERT ON td_mta.leases TO td_mta_reader;
+GRANT INSERT,UPDATE,DELETE ON td_mta.application_logs,td_mta.application_log_state TO td_mta_reader;
+COMMIT;
+";
+fn source_args(p: &Setup<'_>, replica: &Replica) -> Result<Vec<String>> {
+    let mut args = vec![
+        "--source-origin".into(),
+        replica.origin.clone(),
+        "--username".into(),
+        replica.username.clone(),
+        "--password-file".into(),
+        text(&p.path("source-password"))?.into(),
+    ];
+    if replica.ca.is_some() {
+        args.extend(["--ca-file".into(), text(&p.path("source-ca.pem"))?.into()]);
+    }
+    Ok(args)
+}
+fn replica_services(
+    p: &Setup<'_>,
+    postgres: &Path,
+    replica: &Replica,
+    epoch: &str,
+    account: &str,
+) -> Result<()> {
+    database_services(p, postgres, "td-mta-replica-postgres")?;
+    for name in ["runtime", "scratch"] {
+        directory(&p.path("frontend").join(name), 0o700)?;
+    }
+    let bin = p.s.prefix.join("bin/td-mta");
+    let connection = p.path("reader-connection");
+    let runtime = p.path("frontend/runtime");
+    let scratch = p.path("frontend/scratch");
+    let argv = [
+        text(&bin)?,
+        "serve",
+        "--read-only",
+        "--connection-file",
+        text(&connection)?,
+        "--profile",
+        "frontend",
+        "--runtime",
+        text(&runtime)?,
+        "--scratch",
+        text(&scratch)?,
+    ];
+    let (unit, scm) = super::supervisor_files(
+        &argv,
+        "td-mta-replica",
+        &p.path("frontend/service.log"),
+        120,
+        "td-mta status",
+    )?;
+    p.write("services/td-mta-replica.service", unit.replacen("[Unit]\n", "[Unit]\nRequires=td-mta-replica-postgres.service\nAfter=td-mta-replica-postgres.service\nPartOf=td-mta-replica-postgres.service\n", 1))?;
+    p.write(
+        "services/td-mta-replica.scm",
+        scm.replacen(
+            "#:respawn? #t",
+            "#:requirement '(td-mta-replica-postgres)\n  #:respawn? #t",
+            1,
+        ),
+    )?;
+    let mut copy = vec![
+        text(&bin)?.to_owned(),
+        "postgres".into(),
+        "replica-copy".into(),
+        "--connection-file".into(),
+        text(&p.path("runtime-connection"))?.into(),
+        "--epoch".into(),
+        epoch.into(),
+        "--account".into(),
+        account.into(),
+        "--source-epoch".into(),
+        fs::read_to_string(p.path("source-epoch")).map_err(|e| e.to_string())?,
+        "--steps".into(),
+        "1024".into(),
+        "--timeout-seconds".into(),
+        "3600".into(),
+    ];
+    copy.extend(source_args(p, replica)?);
+    let copy_command = copy
+        .iter()
+        .map(|arg| shell(Path::new(arg)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    p.write(
+        "copy-arguments.json",
+        Json::Arr(copy.into_iter().map(Json::Str).collect()).to_canonical(),
+    )?;
+    let mut start = String::from("Replica preparation complete. Services are stopped; no full copy is claimed.\nUse ONE supervisor. Replica service names differ from ordinary local mail.\n\nSystemd:\n");
+    for name in ["td-mta-replica-postgres", "td-mta-replica"] {
+        start.push_str(&format!(
+            "  systemctl --user link {}\n",
+            shell(&p.path(&format!("services/{name}.service")))
+        ));
+    }
+    start.push_str("  systemctl --user daemon-reload\n  systemctl --user enable --now td-mta-replica-postgres td-mta-replica\n\nShepherd (Guix Home persistence follows DEPLOYMENT.md):\n");
+    for name in ["td-mta-replica-postgres", "td-mta-replica"] {
+        start.push_str(&format!(
+            "  herd load root {}\n",
+            shell(&p.path(&format!("services/{name}.scm")))
+        ));
+    }
+    start.push_str("  herd start td-mta-replica\n\nCopy a bounded batch after PostgreSQL is running; repeat to continue:\n  ");
+    start.push_str(&copy_command);
+    start.push_str(&format!("\n\nLocal client:\n  td-net launch --allow-loopback td-mail --config={}\n\nThe local credential is independent of the upstream password.\nNo automatic synchronization, certificate renewal or recovery promotion is enabled.\nLeaf certificates expire in 90 days; see DEPLOYMENT.md before expiry.\nThe unused relay configuration is required by the shared config grammar; no relay service runs.\nProtect this directory: it holds full mail, passwords and private keys.\n", shell(&p.path("mail.toml"))));
+    p.write("START.txt", start)
+}
+
 fn prepare(s: &Settings) -> Result<()> {
     preflight(s)?;
     let postgres = postgres_program()?;
-    let mut password = protected_input(&s.relay_password, 4096)?;
+    let mut password = if s.replica.is_some() {
+        random_hex(32)?.into_bytes()
+    } else {
+        protected_input(&s.relay_password, 4096)?
+    };
     if password.last() == Some(&b'\n') {
         password.pop();
         if password.last() == Some(&b'\r') {
@@ -539,6 +761,20 @@ fn prepare(s: &Settings) -> Result<()> {
     if let Some(ca) = relay_ca {
         p.write("relay-ca.pem", ca)?;
     }
+    let discovered = if let Some(replica) = &s.replica {
+        p.write("source-password", protected_input(&replica.password, 1026)?)?;
+        if let Some(ca) = &replica.ca {
+            p.write("source-ca.pem", protected_input(ca, 128 * 1024)?)?;
+        }
+        let mut args = vec!["replica-discover".to_owned()];
+        args.extend(source_args(&p, replica)?);
+        Some(p.mta(
+            "source-discovery",
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?)
+    } else {
+        None
+    };
     certificates(&mut p)?;
     let mut init = command(Path::new("initdb"));
     init.args([
@@ -568,7 +804,7 @@ fn prepare(s: &Settings) -> Result<()> {
             quote(p.path("socket"))?
         ),
     )?;
-    fs::write(p.path("postgres/pg_hba.conf"), "local all setup_admin trust\nhostssl all td_mta_owner 127.0.0.1/32 scram-sha-256\nhostssl all td_mta_runtime 127.0.0.1/32 scram-sha-256\nhost all all 0.0.0.0/0 reject\n").map_err(|e| e.to_string())?;
+    fs::write(p.path("postgres/pg_hba.conf"), "local all setup_admin trust\nhostssl all td_mta_owner 127.0.0.1/32 scram-sha-256\nhostssl all td_mta_runtime 127.0.0.1/32 scram-sha-256\nhostssl all td_mta_reader 127.0.0.1/32 scram-sha-256\nhost all all 0.0.0.0/0 reject\n").map_err(|e| e.to_string())?;
     p.write("postgres.log", b"")?;
     let log = fs::OpenOptions::new()
         .append(true)
@@ -605,14 +841,63 @@ fn prepare(s: &Settings) -> Result<()> {
     for (name, password) in [("owner", owner), ("runtime", runtime)] {
         p.write(&format!("{name}-connection"), format!("postgresql://td_mta_{name}:{password}@localhost:{}/td_mta?sslmode=verify-full&sslrootcert={}", s.pg_port, uri_path(&p.path("tls/ca.pem"))?))?;
     }
+    if s.replica.is_some() {
+        let password = random_hex(32)?;
+        p.write("reader-password", &password)?;
+        p.sql("reader-role", &format!("CREATE ROLE td_mta_reader LOGIN PASSWORD '{password}'; GRANT CONNECT ON DATABASE td_mta TO td_mta_reader;"))?;
+        p.write("reader-connection", format!("postgresql://td_mta_reader:{password}@localhost:{}/td_mta?sslmode=verify-full&sslrootcert={}", s.pg_port, uri_path(&p.path("tls/ca.pem"))?))?;
+    }
     let receipt = p.owner("schema", &["schema-init"])?;
     let epoch = field(&receipt, "store_epoch")?;
-    let account = random_hex(16)?;
+    p.write("store-epoch", &epoch)?;
+    let account = if let (Some(replica), Some(discovered)) = (&s.replica, discovered) {
+        let account = field(&discovered, "account")?;
+        let source_epoch = field(&discovered, "source_epoch")?;
+        let origin = field(&discovered, "source_origin")?;
+        p.write("source-origin", &origin)?;
+        p.write("source-epoch", &source_epoch)?;
+        p.owner(
+            "source-bind",
+            &[
+                "replica-source-init",
+                "--epoch",
+                &epoch,
+                "--source-origin",
+                &origin,
+                "--source-epoch",
+                &source_epoch,
+            ],
+        )?;
+        let mut args = vec![
+            "replica-account-init".into(),
+            "--epoch".into(),
+            epoch.clone(),
+            "--account".into(),
+            account.clone(),
+            "--source-epoch".into(),
+            source_epoch,
+        ];
+        args.extend(source_args(&p, replica)?);
+        for (flag, value) in ["--body-bytes", "--blobs", "--emails", "--receipts"]
+            .into_iter()
+            .zip(replica.quotas)
+        {
+            args.extend([flag.into(), value.to_string()]);
+        }
+        p.owner(
+            "replica-account",
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
+        account
+    } else {
+        let account = random_hex(16)?;
+        p.owner(
+            "account",
+            &["account-init", "--epoch", &epoch, "--account", &account],
+        )?;
+        account
+    };
     p.write("account-id", &account)?;
-    p.owner(
-        "account",
-        &["account-init", "--epoch", &epoch, "--account", &account],
-    )?;
     let device = p.owner(
         "device",
         &[
@@ -674,36 +959,46 @@ fn prepare(s: &Settings) -> Result<()> {
     if let Some(ca) = materials.get("ca") {
         base.push_str(&format!("ca_file = \"/postgres-material/{ca}\"\n"));
     }
-    p.write("relay.toml", &base)?;
+    if s.replica.is_none() {
+        p.write("relay.toml", &base)?;
+    }
     base.push_str(&format!("[certificate \"local\"]\nmode = \"files\"\nchain_file = \"/postgres-material/{}\"\nkey_file = \"/postgres-material/{}\"\n", material("chain")?, material("key")?));
     p.write("frontend.toml", format!("{base}[listener \"https\"]\nkind = \"https\"\nbind = \"127.0.0.1:{}\"\ncertificate = \"local\"\n", s.https_port))?;
-    p.write("receive.toml", format!("{base}[listener \"smtp\"]\nkind = \"direct_smtp\"\nbind = \"127.0.0.1:{}\"\nserver_name = \"localhost\"\ncertificate = \"local\"\nsession_limit = 2\nper_peer_limit = 2\n", s.smtp_port))?;
+    if s.replica.is_none() {
+        p.write("receive.toml", format!("{base}[listener \"smtp\"]\nkind = \"direct_smtp\"\nbind = \"127.0.0.1:{}\"\nserver_name = \"localhost\"\ncertificate = \"local\"\nsession_limit = 2\nper_peer_limit = 2\n", s.smtp_port))?;
+    }
     let version = field(&p.mta("config-version", &["config-version"])?, "version")?;
     p.write("config-version", &version)?;
-    p.owner(
+    let shared_path = p.path("shared.toml");
+    let frontend_path = p.path("frontend.toml");
+    let receive_path = p.path("receive.toml");
+    let relay_path = p.path("relay.toml");
+    let mut import = vec![
         "config-import",
-        &[
-            "config-import",
-            "--epoch",
-            &epoch,
-            "--version",
-            &version,
-            "--shared-file",
-            text(&p.path("shared.toml"))?,
-            "--instance",
-            "frontend",
-            "jmap",
-            text(&p.path("frontend.toml"))?,
+        "--epoch",
+        &epoch,
+        "--version",
+        &version,
+        "--shared-file",
+        text(&shared_path)?,
+        "--instance",
+        "frontend",
+        "jmap",
+        text(&frontend_path)?,
+    ];
+    if s.replica.is_none() {
+        import.extend([
             "--instance",
             "receive",
             "receive",
-            text(&p.path("receive.toml"))?,
+            text(&receive_path)?,
             "--instance",
             "relay",
             "relay",
-            text(&p.path("relay.toml"))?,
-        ],
-    )?;
+            text(&relay_path)?,
+        ]);
+    }
+    p.owner("config-import", &import)?;
     p.owner(
         "config-check",
         &["config-check", "--epoch", &epoch, "--version", &version],
@@ -747,14 +1042,18 @@ GRANT INSERT ON td_mta.leases TO td_mta_runtime;
 COMMIT;
 "#;
     p.sql("runtime-grants", grants)?;
-    p.mta(
-        "runtime-check",
-        &[
+    if s.replica.is_some() {
+        p.sql("replica-grants", REPLICA_GRANTS)?;
+    } else {
+        p.mta(
             "runtime-check",
-            "--connection-file",
-            text(&p.path("runtime-connection"))?,
-        ],
-    )?;
+            &[
+                "runtime-check",
+                "--connection-file",
+                text(&p.path("runtime-connection"))?,
+            ],
+        )?;
+    }
     let mut stop = command(Path::new("pg_ctl"));
     stop.args(["-D", text(&p.path("postgres"))?, "-m", "fast", "-w", "stop"]);
     p.execute("stop", &mut stop, None)?;
@@ -762,6 +1061,15 @@ COMMIT;
     let password_command = format!("cat {}", shell(&p.path("jmap-password")));
     let toml = |s: &str| Json::Str(s.into()).to_canonical();
     p.write("mail.toml", format!("[account.local]\nwell_known_url = \"https://localhost:{}/.well-known/jmap\"\nusername = {}\npassword_command = {}\ntls_ca_file = {}\n[mail]\nreply_from = {}\n", s.https_port, toml(&s.account), toml(&password_command), toml(text(&p.path("tls/ca.pem"))?), toml(&s.account)))?;
+    if let Some(replica) = &s.replica {
+        replica_services(&p, &postgres, replica, &epoch, &account)?;
+        println!(
+            "Replica setup complete: {} (services stopped; initial copy pending)",
+            s.root.display()
+        );
+        println!("Next steps: {}", p.path("START.txt").display());
+        return Ok(());
+    }
     services(&p, &postgres)?;
     let mut start = String::from("Provisioning complete; PostgreSQL and MTA are stopped.\nUse ONE supervisor; these names represent one local setup per user manager.\n\nSystemd user manager: link all units before enabling any:\n");
     for profile in ["postgres", "frontend", "receive", "relay"] {
@@ -825,6 +1133,97 @@ mod tests {
         settings(&args(root), "/home/test").unwrap()
     }
 
+    fn replica_args(root: &Path) -> Vec<String> {
+        [
+            "--root",
+            root.to_str().unwrap(),
+            "--account",
+            "user@example.test",
+            "--source-origin",
+            "https://mail.example.test",
+            "--password-file",
+            "/private/password",
+            "--resolver",
+            "127.0.0.1:53",
+            "--body-bytes",
+            "1048576",
+            "--blobs",
+            "100",
+            "--emails",
+            "100",
+            "--receipts",
+            "1000",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+    #[test]
+    fn replica_setup_has_distinct_ports_and_refuses_sending_options() {
+        let args = replica_args(Path::new("/private/replica"));
+        let s = settings_mode(&args, "/home/test", true).unwrap();
+        assert_eq!(s.pg_port, 35433);
+        assert_eq!(s.https_port, 54444);
+        assert_eq!(s.replica.as_ref().unwrap().username, "user@example.test");
+        for extra in [
+            vec!["--smtp-port", "55226"],
+            vec!["--relay-host", "smtp.example.test"],
+            vec!["--account", "duplicate@example.test"],
+            vec!["--postgres-port", "54444"],
+        ] {
+            let mut invalid = args.clone();
+            invalid.extend(extra.into_iter().map(String::from));
+            assert!(settings_mode(&invalid, "/home/test", true).is_err());
+        }
+        for value in ["0", "-1", "9223372036854775808"] {
+            let mut invalid = args.clone();
+            let index = invalid
+                .iter()
+                .position(|arg| arg == "--body-bytes")
+                .unwrap()
+                + 1;
+            invalid[index] = value.into();
+            assert!(settings_mode(&invalid, "/home/test", true).is_err());
+        }
+        assert!(settings_mode(&args, "/home/test", false).is_err());
+    }
+    #[test]
+    fn replica_services_separate_reader_from_copy_and_generate_no_smtp_units() {
+        let temp = crate::test_temp::TempDir::new("replica-setup-services").unwrap();
+        let s = settings_mode(&replica_args(temp.path()), "/home/test", true).unwrap();
+        let p = Setup { s: &s, serial: 0 };
+        directory(&p.path("services"), 0o700).unwrap();
+        p.write("source-epoch", "11111111111111111111111111111111")
+            .unwrap();
+        replica_services(
+            &p,
+            Path::new("/host/bin/postgres"),
+            s.replica.as_ref().unwrap(),
+            "22222222222222222222222222222222",
+            "33333333333333333333333333333333",
+        )
+        .unwrap();
+        let unit = fs::read_to_string(p.path("services/td-mta-replica.service")).unwrap();
+        let scm = fs::read_to_string(p.path("services/td-mta-replica.scm")).unwrap();
+        for service in [&unit, &scm] {
+            assert!(service.contains("--read-only"));
+            assert!(service.contains("reader-connection"));
+            assert!(!service.contains("runtime-connection"));
+            assert!(!service.contains("owner-connection"));
+        }
+        assert!(unit.contains("Requires=td-mta-replica-postgres.service"));
+        assert!(scm.contains("#:requirement '(td-mta-replica-postgres)"));
+        let files = fs::read_dir(p.path("services")).unwrap().count();
+        assert_eq!(files, 4);
+        let copy = fs::read_to_string(p.path("copy-arguments.json")).unwrap();
+        let copy = json::parse(&copy).unwrap();
+        let args = copy.as_arr().unwrap();
+        assert!(args.iter().any(|arg| arg
+            .as_str()
+            .is_some_and(|v| v.ends_with("runtime-connection"))));
+        assert!(!args.iter().any(|arg| arg
+            .as_str()
+            .is_some_and(|v| v.contains("reader-connection") || v.contains("owner-connection"))));
+    }
     #[test]
     fn defaults_accept_tls_relay_but_refuse_local_privileged_ports() {
         let s = options(Path::new("/private/mail"));
@@ -944,6 +1343,24 @@ pub(super) fn run(args: &[String]) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("local td-mta setup: {e}\nRetain any created directory and private receipts; setup never resumes partial data.");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+pub(super) fn run_replica(args: &[String]) -> ExitCode {
+    if args == ["--help"] || args == ["-h"] {
+        print!("{REPLICA_HELP}");
+        return ExitCode::SUCCESS;
+    }
+    let result = std::env::var("HOME")
+        .map_err(|_| "HOME is required".into())
+        .and_then(|home| settings_mode(args, &home, true))
+        .and_then(|s| prepare(&s));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("replica td-mta setup: {error}\nRetain any created directory and private receipts; setup never resumes partial data.");
             ExitCode::FAILURE
         }
     }

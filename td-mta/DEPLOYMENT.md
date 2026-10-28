@@ -903,3 +903,22 @@ it does not expose message content. Preserve the report and investigate with
 checks; mailbox notifications and off-host alert delivery remain explicit.
 Do not delete progress to hide a failure. After restoring a database to a new
 epoch, retain old evidence and provision a fresh scrub directory.
+
+## Read-only local replica setup
+
+After installing the current td-mta binary, use `./install-td-mta
+--setup-replica --help` for fresh local provisioning. Supply the source HTTPS
+origin, a protected password file, your local mailbox address, resolver and
+explicit body/blob/Email/receipt quotas. Source credentials stay separate from
+the new local JMAP password. The installer discovers source IDs through HTTPS;
+no custom SQL or PostgreSQL access to the source is needed.
+
+The default PostgreSQL and HTTPS ports are 35433 and 54444. Its systemd and
+Shepherd service names are `td-mta-replica-postgres` and `td-mta-replica`, so they
+can coexist with an ordinary local setup. Follow the generated `START.txt` to
+start one supervisor, run bounded copy batches and use `mail.toml` with td-mail.
+Services are not enabled automatically. Initial preparation is not a complete
+copy. No SMTP or relay service is generated. Certificate renewal and continuous
+synchronization are not yet automated for this setup; the leaf expires in 90
+days. [REPLICATION.md](REPLICATION.md#fresh-local-provisioning) records the
+copy, credential and recovery boundaries.
