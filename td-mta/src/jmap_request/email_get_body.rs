@@ -16,6 +16,7 @@ use crate::{
     ports::{BlobReader, Clock, Tick},
     store_fs::PinnedBlob,
 };
+pub use search::collect_verified_search;
 pub(in crate::jmap_request::dispatch) use search::search_verified;
 
 pub(super) fn buffer<T: Default + Clone>(count: usize) -> Result<Vec<T>, Error> {

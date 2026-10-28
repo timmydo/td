@@ -659,6 +659,119 @@ impl Snapshot<'_> {
         })();
         self.retain(result)
     }
+    pub(crate) fn search_fields(
+        &mut self,
+        metadata: Metadata,
+        limits: &crate::limits::Limits,
+        work: &mut crate::admission::work::Meter,
+        clock: &dyn ports::Clock,
+    ) -> Result<Option<crate::jmap_request::dispatch::SearchFields>, Error> {
+        use crate::postgres_search;
+        self.check()?;
+        if !postgres_search::compatible(limits) {
+            return Ok(None);
+        }
+        let account = self.identity.account;
+        let blob = metadata.blob;
+        let result = self.worker.run(|client| Box::pin(async move {
+            client.query_typed_opt("SELECT body_length,body_digest,octet_length(fields),fields_digest FROM td_mta.blob_search WHERE account=$1 AND blob_id=$2 AND version=$3", &[(&account.as_bytes().as_slice(),Type::BYTEA),(&blob.as_bytes().as_slice(),Type::BYTEA),(&postgres_search::VERSION,Type::INT4)]).await.map_err(|_| Error::Database)
+        })).map_err(Error::Connection).and_then(|row| row);
+        let Some(row) = self.retain(result)? else {
+            return Ok(None);
+        };
+        let length: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
+        let body_digest: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
+        let size: i32 = row.try_get(2).map_err(|_| Error::Integrity)?;
+        let expected: &[u8] = row.try_get(3).map_err(|_| Error::Integrity)?;
+        let Ok(size) = usize::try_from(size) else {
+            return Ok(None);
+        };
+        if u64::try_from(length).ok() != Some(metadata.body.length)
+            || body_digest != metadata.body.digest
+            || size > postgres_search::MAX_BYTES
+            || expected.len() != 32
+        {
+            return Ok(None);
+        }
+        let count = size.div_ceil(65536) as i32;
+        // Charge all retained bytes before transfer/hash/decode, even when
+        // matching later succeeds in the first field or batch.
+        work.charge(
+            clock.monotonic().map_err(Error::Output)?,
+            crate::admission::work::Charge {
+                io_bytes: 4 * size as u64,
+                records: 1 + size.div_ceil(4096) as u64,
+                ..Default::default()
+            },
+        )
+        .map_err(|stop| match stop {
+            crate::admission::work::Stop::Deadline => {
+                Error::Connection(postgres_probe::Error::Deadline)
+            }
+            _ => Error::Capacity,
+        })?;
+        let result = self.worker.run(|client| Box::pin(async move {
+            client.query_typed("SELECT n,substring(s.fields FROM n*65536+1 FOR 65536) FROM td_mta.blob_search s CROSS JOIN generate_series(0,$3-1) n WHERE s.account=$1 AND s.blob_id=$2 ORDER BY n LIMIT 132", &[(&account.as_bytes().as_slice(),Type::BYTEA),(&blob.as_bytes().as_slice(),Type::BYTEA),(&count,Type::INT4)]).await.map_err(|_| Error::Database)
+        })).map_err(Error::Connection).and_then(|rows| rows);
+        let rows = self.retain(result)?;
+        if rows.len() != count as usize {
+            return Ok(None);
+        }
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(size)
+            .map_err(|_| Error::Capacity)?;
+        for (index, row) in rows.iter().enumerate() {
+            self.check()?;
+            let ordinal: i32 = row.try_get(0).map_err(|_| Error::Integrity)?;
+            let bytes: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
+            if ordinal as usize != index || bytes.len() != (size - encoded.len()).min(65536) {
+                return Ok(None);
+            }
+            encoded.extend_from_slice(bytes);
+        }
+        drop(rows);
+        if encoded.len() != size
+            || postgres_search::digest(
+                &metadata.body.digest,
+                metadata.body.length,
+                &encoded,
+                self.deadline,
+            )
+            .as_ref()
+            .map(|hash| hash.as_slice())
+                != Some(expected)
+        {
+            self.check()?;
+            return Ok(None);
+        }
+        use crate::jmap_request::dispatch::Error as JmapError;
+        let fields = crate::jmap_request::dispatch::SearchFields::decode_charged(&encoded, || {
+            work.charge(
+                clock.monotonic().map_err(JmapError::Storage)?,
+                crate::admission::work::Charge {
+                    records: 1,
+                    ..Default::default()
+                },
+            )
+            .map_err(|stop| match stop {
+                crate::admission::work::Stop::Deadline => JmapError::ExecutionDeadline,
+                _ => JmapError::StorageCapacity,
+            })
+        });
+        let fields = match fields {
+            Ok(fields) => Some(fields),
+            Err(JmapError::ExecutionDeadline) => {
+                return Err(Error::Connection(postgres_probe::Error::Deadline))
+            }
+            Err(JmapError::StorageCapacity) => return Err(Error::Capacity),
+            Err(JmapError::Storage(error)) => return Err(Error::Output(error)),
+            Err(_) => None,
+        };
+        self.check()?;
+        Ok(fields)
+    }
+
     pub(crate) fn mime_evidence(
         &mut self,
         metadata: Metadata,

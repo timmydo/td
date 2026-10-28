@@ -404,7 +404,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 34);
+    assert_eq!(receipt.version, 35);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -617,7 +617,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":34"));
+    assert!(initialized.contains("\"schema_version\":35"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -862,7 +862,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=34",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=35",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -870,7 +870,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=34 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=35 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1052,7 +1052,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 34);
+    assert_eq!(receipt.version, 35);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1908,7 +1908,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 34);
+        assert_eq!(receipt.version, 35);
         assert_eq!(
             sql(
                 &fixture,
@@ -6954,11 +6954,14 @@ fn exercise_http_read(
             after: None,
             maximum: 16,
             structure: true,
+            search: true,
         },
     )
     .unwrap();
     assert_eq!(page.structures_written, 2);
     assert_eq!(page.structures_skipped, 0);
+    assert_eq!(page.searches_written, 2);
+    assert_eq!(page.searches_skipped, 0);
     assert!(page.done);
     assert_eq!(sql(fixture, "SELECT string_agg(encode(manifest_digest,'hex'),',' ORDER BY blob_id) FROM td_mta.blob_interpretations"), original_evidence, "resident publication and streaming backfill must derive identical evidence");
     *api_worker.borrow_mut() = None;

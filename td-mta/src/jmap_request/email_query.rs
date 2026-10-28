@@ -204,8 +204,13 @@ impl Worker<'_, '_, '_, '_, '_> {
         limits: &crate::limits::Limits,
     ) -> Result<crate::postgres_read::EmailPage, Error> {
         use crate::postgres_read::EmailPage;
+        let mut timer = crate::performance::Timer::start(crate::performance::Phase::JmapSearch);
         if search.matched() {
-            return view.query(query);
+            let result = view.query(query);
+            if result.is_ok() {
+                timer.succeeded();
+            }
+            return result;
         }
         let (clock, mut work) = self
             .retention
@@ -283,6 +288,7 @@ impl Worker<'_, '_, '_, '_, '_> {
         }
         view.check()?;
         super::email_search::charge(&mut work, clock.as_ref(), 0)?;
+        timer.succeeded();
         Ok(result)
     }
 

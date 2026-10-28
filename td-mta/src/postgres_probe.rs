@@ -461,6 +461,26 @@ pub(crate) fn with_audit_worker<T>(
     Ok(operation(&mut worker))
 }
 
+pub(crate) fn with_search_backfill_worker<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl FnOnce(&mut Worker) -> T,
+) -> Result<T, Error> {
+    if request.mode != Mode::Preparation {
+        return Err(Error::Invalid);
+    }
+    let mut worker = connect_worker_bounded(
+        request,
+        trust,
+        deadline,
+        16 * 1024 * 1024,
+        Input::body(),
+        MAX_BODY_DURATION,
+    )?;
+    Ok(operation(&mut worker))
+}
+
 pub(crate) fn body_worker(
     request: &Request<'_>,
     trust: &TrustStore,

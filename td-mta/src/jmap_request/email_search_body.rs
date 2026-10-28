@@ -1,6 +1,6 @@
 //! Search the existing decoded header and MIME sources without retaining bodies.
 use super::*;
-use crate::jmap_request::dispatch::email_search::{charge, Search};
+use crate::jmap_request::dispatch::email_search::{charge, Search, SearchFields, Sink};
 
 struct Headers<'a> {
     bytes: Vec<u8>,
@@ -45,6 +45,32 @@ pub(in crate::jmap_request::dispatch) fn search_verified(
     charge(work, clock, 0)?;
     result
 }
+
+/// Derive fields only after complete traversal under the supplied original
+/// snapshot, work and interpretation limits. Errors expose no partial fields.
+pub fn collect_verified_search(
+    pin: &mut PinnedBlob<'_, '_>,
+    limits: &Limits,
+    clock: &dyn Clock,
+    work: &mut Meter,
+) -> Result<SearchFields, Error> {
+    let mut fields = SearchFields::new();
+    let result = walk(
+        pin,
+        limits,
+        &mut fields,
+        clock,
+        work,
+        &mut HeaderBudget::new(),
+    );
+    pin.check_deadline().map_err(storage)?;
+    if let Some(stop) = work.stopped() {
+        return Err(mime(stop));
+    }
+    charge(work, clock, 0)?;
+    result?;
+    Ok(fields)
+}
 fn search_inner(
     pin: &mut PinnedBlob<'_, '_>,
     limits: &Limits,
@@ -53,6 +79,17 @@ fn search_inner(
     work: &mut Meter,
     budget: &mut HeaderBudget,
 ) -> Result<bool, Error> {
+    walk(pin, limits, search, clock, work, budget)?;
+    Ok(search.matched())
+}
+fn walk(
+    pin: &mut PinnedBlob<'_, '_>,
+    limits: &Limits,
+    search: &mut dyn Sink,
+    clock: &dyn Clock,
+    work: &mut Meter,
+    budget: &mut HeaderBudget,
+) -> Result<(), Error> {
     search.reset();
     pin.check_deadline().map_err(storage)?;
     if pin.len() > crate::postgres_body::MAX_BODY_BYTES {
@@ -88,14 +125,14 @@ fn search_inner(
         local.header_bytes = traversal.headers.max(1);
         search_context(pin, &local, clock, work, &mut traversal, context)?;
     }
-    Ok(traversal.search.matched())
+    Ok(())
 }
 struct Context {
     extent: std::ops::Range<u64>,
     stage: usize,
 }
 struct Traversal<'a> {
-    search: &'a mut Search,
+    search: &'a mut dyn Sink,
     budget: &'a mut HeaderBudget,
     pending: Vec<Context>,
     parts: usize,
@@ -278,11 +315,12 @@ fn search_context(
             &mut checkpoints,
         )
         .map_err(mime)?;
-        let clock = crate::mime_text::CheckedClock::new(clock, now(clock)?);
+        let mut clock = crate::mime_text::CheckedClock::new(clock, now(clock)?);
         let mut html = spec.html.then(td_html::extract::Extractor::new);
         let (mut scalar, mut ended) = (None, false);
         'text: loop {
             reader.source_mut().check_deadline().map_err(storage)?;
+            clock.begin_batch().map_err(storage)?;
             for _ in 0..crate::mime_response::framing::SCALAR_BATCH_TURNS {
                 if scalar.is_none() && !ended {
                     match reader.poll(&clock, part.structure.work).map_err(mime)? {
@@ -321,7 +359,9 @@ fn search_context(
                     }
                 }
             }
+            clock.end_batch();
         }
+        clock.end_batch();
         reader.source_mut().check_deadline().map_err(storage)?;
         reader.release().map_err(mime)?;
     }
@@ -372,6 +412,145 @@ mod tests {
         });
         outcome
     }
+    #[test]
+    fn collected_fields_match_verified_traversal_without_reinterpreting_mime() {
+        crate::store_fs::with_pinned_fixture(MESSAGE, &Fixed, |mut pin| {
+            let fields = collect_verified_search(
+                &mut pin,
+                &Limits::default(),
+                &Fixed,
+                &mut work(100_000_000),
+            )
+            .unwrap();
+            assert!(fields.bytes() < MESSAGE.len());
+            for query in [
+                "gardéner sender@example.test harvest report.bin",
+                "\"Harvest & rain\"",
+                "hidden",
+                "notsearchable",
+                "\"orchard harvest\"",
+                "",
+                "absent",
+            ] {
+                assert_eq!(
+                    fields.matches(query, &mut work(100_000_000), &Fixed),
+                    search_verified(
+                        &mut pin,
+                        &Limits::default(),
+                        &mut Search::parse(query).unwrap(),
+                        &Fixed,
+                        &mut work(100_000_000)
+                    ),
+                    "{query}"
+                );
+            }
+        });
+        let source = attached("Subject: Orchard\r\n\r\nInner text");
+        crate::store_fs::with_pinned_fixture(source.as_bytes(), &Fixed, |mut pin| {
+            let fields = collect_verified_search(
+                &mut pin,
+                &Limits::default(),
+                &Fixed,
+                &mut work(100_000_000),
+            )
+            .unwrap();
+            assert!(fields
+                .matches("orchard inner", &mut work(100_000_000), &Fixed)
+                .unwrap());
+            assert!(!fields
+                .matches("\"orchard inner\"", &mut work(100_000_000), &Fixed)
+                .unwrap());
+        });
+    }
+
+    #[test]
+    fn collection_never_exposes_partial_fields_after_late_mime_or_work_refusal() {
+        let source = b"Subject: Found\r\nContent-Type: message/global\r\n\r\nbody";
+        crate::store_fs::with_pinned_fixture(source, &Fixed, |mut pin| {
+            assert!(matches!(
+                collect_verified_search(
+                    &mut pin,
+                    &Limits::default(),
+                    &Fixed,
+                    &mut work(100_000_000)
+                ),
+                Err(Error::MessageInterpretation)
+            ));
+        });
+        crate::store_fs::with_pinned_fixture(MESSAGE, &Fixed, |mut pin| {
+            assert!(matches!(
+                collect_verified_search(&mut pin, &Limits::default(), &Fixed, &mut work(1)),
+                Err(Error::StorageCapacity)
+            ));
+        });
+    }
+    #[test]
+    fn collected_fields_refuse_expiry_at_final_clock_check() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Expiring {
+            calls: AtomicU64,
+            expire: u64,
+        }
+        impl Clock for Expiring {
+            fn sample(&self) -> Result<crate::ports::Time, crate::ports::Error> {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(crate::ports::Time {
+                    utc_ms: 0,
+                    monotonic: Tick(if call >= self.expire { 100 } else { 1 }),
+                })
+            }
+        }
+        let source = format!("Content-Type: text/plain\r\n\r\n{}", "word ".repeat(1024));
+        let baseline = Expiring {
+            calls: AtomicU64::new(0),
+            expire: u64::MAX,
+        };
+        crate::store_fs::with_pinned_fixture(source.as_bytes(), &Fixed, |mut pin| {
+            assert!(collect_verified_search(
+                &mut pin,
+                &Limits::default(),
+                &baseline,
+                &mut work(100_000_000)
+            )
+            .is_ok());
+        });
+        let expiring = Expiring {
+            calls: AtomicU64::new(0),
+            expire: baseline.calls.load(Ordering::Relaxed),
+        };
+        crate::store_fs::with_pinned_fixture(source.as_bytes(), &Fixed, |mut pin| {
+            assert!(matches!(
+                collect_verified_search(
+                    &mut pin,
+                    &Limits::default(),
+                    &expiring,
+                    &mut work(100_000_000)
+                ),
+                Err(Error::ExecutionDeadline)
+            ));
+        });
+    }
+
+    #[test]
+    fn complete_large_text_retains_tail_under_preparation_work_bounds() {
+        let source = format!(
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n{}tailneedle\r\n",
+            format!("{}\r\n", "x".repeat(998)).repeat(1050)
+        );
+        crate::store_fs::with_pinned_fixture(source.as_bytes(), &Fixed, |mut pin| {
+            let fields = collect_verified_search(
+                &mut pin,
+                &Limits::default(),
+                &Fixed,
+                &mut work(64 * 1024 * 1024),
+            )
+            .unwrap();
+            assert!(fields
+                .matches("tailneedle", &mut work(2_000_000), &Fixed)
+                .unwrap());
+        });
+    }
+
     #[test]
     fn text_search_batches_snapshot_checks_and_preserves_tail_matches() {
         let timer = crate::blob_part_json::tests::Timer::new();

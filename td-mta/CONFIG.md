@@ -259,10 +259,17 @@ remain enforced. A plan exceeding the configured budget is refused.
 
 For example, `memory_budget_bytes=536870912` explicitly selects the default
 512-MiB planning budget. This is not an OS-enforced RSS limit. The current
-default plan is 364561664 bytes (about 347.67 MiB), including the
+default plan is 427476224 bytes (about 407.67 MiB), including the
 4-MiB index cache. Bounded folder/keyword prefix prefetch adds 128 KiB per read
 view (768 KiB at the default six views); tightly sized budgets must allow
 this additional scratch reservation. It does not raise protocol limits.
+
+Schema-35 search-field reuse adds 20 MiB of planning scratch per body job
+(60 MiB at the default three jobs). This covers bounded PostgreSQL result,
+encoded field and decoded field overlap; it is allocated only when needed.
+Explicit budgets close to the previous plan must be raised before upgrading.
+The default remains 512 MiB. Owner search backfill runs separately and needs
+headroom for one complete bounded interpretation and its encoded copy.
 Persistent HTTP responses add a bounded 16-KiB pipelined-tail copy per body
 job (48 KiB for the default three jobs); tight budgets must include it.
 The HTTPS handshake worker count follows `tls_handshakes`; the stack plan

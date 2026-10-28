@@ -1978,10 +1978,10 @@ separate.
 
 JMAP preview, body-value serialization and text search may group at most 64
 existing scalar decoder turns between native snapshot checks. Every child turn
-still uses its original work meter; no deadline or budget is renewed. Preview
+still uses its original work meter; no deadline or budget is renewed. Preview, text search
 and body-value JSON batches reuse their entry job-clock tick within those
 bounded turns and freshly check the original clock and meter before returning,
-including on error and completion. Single-turn APIs and text search retain
+including on error and completion. Single-turn APIs retain
 their per-turn clock sampling. Native source I/O keeps its own fresh checks.
 A fresh native check also brackets each batch, including failure and
 completion, and all copied bytes remain provisional. Metadata
@@ -2276,7 +2276,7 @@ The active PostgreSQL search walks date/mailbox-filtered candidates in windows
 of 32 within one authenticated snapshot. One method work budget and deadline
 cover all candidate verification, header decoding, MIME traversal and matching;
 neither a page nor a message renews them. Only the result page and bounded
-decoded headers are retained, with streamed text bodies and fixed HTML
+decoded headers are retained by the uncached path, with streamed text bodies and fixed HTML
 extraction state. Matching uses at most 64 substring automata over a 4096-byte
 operand, with field-local phrase progress and simple Unicode lowercase.
 Identity-encoded message/rfc822 attachments use an iterative worklist of
@@ -2284,7 +2284,15 @@ separate message contexts, retaining one context's parsing buffers at a time.
 The six-boundary nesting limit, aggregate part/header ceilings, original
 work meter and header budget apply across the traversal. POLICY.md owns
 supported sources and explicit refusal of other embedded-message encodings.
-This is a functional bounded scan, not a full-text index or throughput claim.
+Schema 35 optionally retains complete normalized search fields per blob. A
+compatible, digest-bound row replaces repeated interpretation, but every
+candidate still verifies its full original body. Collection uses the same
+parser and completes every supported source before publishing evidence;
+partial traversal cannot become an empty result. Matching preserves field
+boundaries and charges bounded batches against the original method meter.
+POSTGRES.md owns the cache, owner rebuilding and fallback rules. New arrivals
+currently use uncached interpretation until an owner rebuild prepares them.
+This remains a bounded scan, not a full-text index or throughput claim.
 
 ## 11. Submission and retry semantics
 

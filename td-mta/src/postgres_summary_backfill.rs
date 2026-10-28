@@ -33,6 +33,8 @@ pub struct Report {
     pub skipped: usize,
     pub structures_written: usize,
     pub structures_skipped: usize,
+    pub searches_written: usize,
+    pub searches_skipped: usize,
     pub verified_bytes: u64,
     pub after: Option<BlobId>,
     pub done: bool,
@@ -60,6 +62,7 @@ pub fn run(
             after,
             maximum,
             structure: false,
+            search: false,
         },
     )
 }
@@ -69,6 +72,7 @@ pub struct Options {
     pub after: Option<BlobId>,
     pub maximum: usize,
     pub structure: bool,
+    pub search: bool,
 }
 
 pub fn run_with_options(
@@ -84,6 +88,7 @@ pub fn run_with_options(
         after,
         maximum,
         structure,
+        search,
     } = options;
     if request.mode != postgres_probe::Mode::Preparation {
         return Err(Error::Owner);
@@ -93,7 +98,7 @@ pub fn run_with_options(
     }
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+    let operation = |worker: &mut postgres_probe::Worker| {
         let rows = worker.run(move |client| Box::pin(async move {
             crate::postgres_maintenance::owner(client).await.map_err(|_| Error::Owner)?;
             let receipt = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
@@ -109,11 +114,14 @@ pub fn run_with_options(
             skipped: 0,
             structures_written: 0,
             structures_skipped: 0,
+            searches_written: 0,
+            searches_skipped: 0,
             verified_bytes: 0,
             after,
             done: rows.len() <= maximum,
         };
         let mut output_bytes = 0usize;
+        let mut search_bytes = 0usize;
         for row in rows.iter().take(maximum) {
             let id: &[u8] = row.try_get(8).map_err(|_| Error::Invalid)?;
             let blob = BlobId::from_bytes(id.try_into().map_err(|_| Error::Invalid)?);
@@ -131,8 +139,8 @@ pub fn run_with_options(
                 report.done = false;
                 break;
             }
-            let (fields, interpretation) =
-                postgres_body::with_verified_pin(worker, metadata, deadline, |body| {
+            let (fields, interpretation, search_fields) =
+                postgres_body::with_interpreted_pin(worker, metadata, deadline, |body| {
                     let length = usize::try_from(
                         body.len()
                             .min((postgres_summaries::HEADER_LIMIT + 2) as u64),
@@ -171,7 +179,10 @@ pub fn run_with_options(
                     } else {
                         None
                     };
-                    Ok((fields, interpretation))
+                    let search_fields = search
+                        .then(|| crate::postgres_search::prepare(body, deadline))
+                        .flatten();
+                    Ok((fields, interpretation, search_fields))
                 })
                 .map_err(Error::Body)?;
             report.verified_bytes += metadata.body.length;
@@ -185,6 +196,12 @@ pub fn run_with_options(
                 report.done = false;
                 break;
             }
+            let search_size = search_fields.as_ref().map_or(0, |value| value.fields.len());
+            if search_bytes + search_size > crate::postgres_search::MAX_BYTES {
+                report.done = false;
+                break;
+            }
+            search_bytes += search_size;
             output_bytes += size;
             if let Some(fields) = fields {
                 worker.run(move |client| Box::pin(async move {
@@ -202,6 +219,19 @@ pub fn run_with_options(
             } else if structure {
                 report.structures_skipped += 1;
             }
+            if let Some(value) = search_fields {
+                worker.run(move |client| Box::pin(async move {
+                    client.execute_typed("INSERT INTO td_mta.blob_search(account,blob_id,version,body_length,body_digest,fields,fields_digest) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account,blob_id) DO UPDATE SET version=EXCLUDED.version,body_length=EXCLUDED.body_length,body_digest=EXCLUDED.body_digest,fields=EXCLUDED.fields,fields_digest=EXCLUDED.fields_digest", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&crate::postgres_search::VERSION, Type::INT4), (&(metadata.body.length as i64), Type::INT8), (&metadata.body.digest.as_slice(), Type::BYTEA), (&value.fields, Type::BYTEA), (&value.digest.as_slice(), Type::BYTEA)]).await
+                })).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
+                report.searches_written += 1;
+            } else if search {
+                // A rebuild that cannot interpret the complete current body
+                // must not leave earlier evidence available as empty success.
+                worker.run(move |client| Box::pin(async move {
+                    client.execute_typed("DELETE FROM td_mta.blob_search WHERE account=$1 AND blob_id=$2", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA)]).await
+                })).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
+                report.searches_skipped += 1;
+            }
             report.scanned += 1;
             report.after = Some(blob);
         }
@@ -214,7 +244,12 @@ pub fn run_with_options(
             .map_err(|_| Error::Indeterminate)?
             .map_err(|_| Error::Indeterminate)?;
         Ok(report)
-    });
+    };
+    let result = if search {
+        postgres_probe::with_search_backfill_worker(request, trust, deadline, operation)
+    } else {
+        postgres_probe::with_body_worker(request, trust, deadline, operation)
+    };
     match result {
         Ok(result) => result,
         Err(_) if attempted.load(Ordering::Relaxed) => Err(Error::Indeterminate),

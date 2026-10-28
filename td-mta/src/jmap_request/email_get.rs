@@ -134,6 +134,7 @@ impl Default for Selection {
         Self::new()
     }
 }
+pub use body::collect_verified_search;
 pub(super) use body::search_verified;
 pub(crate) use body::write_with_evidence;
 pub use body::{write_verified, Output};

@@ -24,10 +24,10 @@ pub(super) fn real_postgres_acme_fences_ownership_and_pins_complete_pairs() {
         .store_epoch;
     sql(
         &fixture,
-        "DROP TABLE td_mta.blob_interpretations,td_mta.blob_summaries,td_mta.acme_profiles; DELETE FROM td_mta.schema_migrations WHERE version>=30",
+        "DROP TABLE td_mta.blob_search,td_mta.blob_interpretations,td_mta.blob_summaries,td_mta.acme_profiles; DELETE FROM td_mta.schema_migrations WHERE version>=30",
     );
     let upgraded = postgres_schema::upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(upgraded.version, 34);
+    assert_eq!(upgraded.version, 35);
     assert_eq!(upgraded.store_epoch, epoch);
     create_runtime_login(&fixture);
     grant_runtime_mail(&fixture);

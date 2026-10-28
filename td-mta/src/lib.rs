@@ -172,6 +172,7 @@ pub mod postgres_routes;
 pub mod postgres_runtime_access;
 pub mod postgres_runtime_profile;
 pub mod postgres_schema;
+mod postgres_search;
 pub mod postgres_selection;
 mod postgres_sequence;
 mod postgres_snapshot;

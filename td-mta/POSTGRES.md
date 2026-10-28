@@ -7399,3 +7399,64 @@ separate status check every fifteen minutes on systemd or Shepherd. Each
 invocation is bounded, the directory lock excludes overlap, and a failed page
 is retried on the next tick. Schedules require explicit generation and
 activation; normal serving does not enable background scrubbing implicitly.
+
+
+## Complete search-field evidence
+
+Schema 35 adds `blob_search`, keyed by `(account,blob_id)` with cascading blob
+deletion. Version 1 stores the complete field-local Unicode lowercase and
+whitespace normalization produced by the existing search traversal. Its fixed
+interpretation limits are 256 KiB of headers, 1024 MIME parts and depth 32;
+other configured limits use the original uncached path. Collection must finish
+all searchable sources, including late embedded-message validation, before
+any row can be written. Binary attachment contents remain excluded.
+
+At most 8 MiB of UTF-8 text and 65,536 fields are retained, encoded as repeated
+big-endian u32 byte lengths and UTF-8 values, at most 8,650,752 bytes. The row
+binds parser version, original body length and SHA-256. A separate SHA-256
+covers the domain `td-mta-search-fields-v1` followed by NUL, original digest,
+big-endian u64 body length, big-endian u64 encoded length and encoded fields.
+This is corruption detection, not a MAC or protection against the database
+owner. Like summaries, the row is derived interpretation evidence. It grants
+no body pin: search still verifies the entire original body for every
+candidate before using retained fields. Missing, incompatible, malformed or
+checksum-invalid evidence falls back to the original parser; it never means
+no match. Database errors still fail the request.
+
+Reads use the authenticated snapshot, bounded metadata and at most 132 chunks
+of 64 KiB. Before loading fields the original method meter is charged four
+times the encoded length in I/O units for transfer, copying, hashing and
+decoding, and one plus the 4096-byte batch count in records, even if matching
+later stops early. Decoding additionally charges one record and checks the
+method deadline before each field descriptor and allocation. A work refusal
+remains an explicit error, not permission to retry the uncached path. Normalized matching processes at most 4096 UTF-8 bytes per batch,
+charging one work record and `bytes * (1 + 2 * pattern_count)` I/O units before
+matching, with deadline checks on both sides. One method meter covers all
+candidates. Early matching is safe only because collection already validated
+the entire interpretation. Phrase boundaries, ordering, pagination, totals
+and explicit resource refusals remain unchanged. The resource plan reserves
+an additional 20 MiB for each body/search job, including encoded/decoded
+buffers and field descriptors; CONFIG.md records the default-plan increase.
+
+Owner `postgres summary-backfill --search` prepares these rows alongside
+header summaries, optionally with `--structure`. The existing interpreted pin
+batches at most 64 cached source checks between driver polls, while retaining
+per-check deadlines and full checks at cache misses and completion. Text
+decoding samples the monotonic work clock at the existing fixed scalar-batch
+boundary, with original source checks before batches and on completion; UTC
+sampling is not needed for work admission. Existing cursor, verified-body
+page cap, transaction and known-COMMIT publication rules apply. Search output
+has a separate 8,650,752-byte aggregate page cap. Each interpretation has
+512 MiB of I/O work, 64 Mi records and 128 MiB of output work under the original
+finite operation deadline; these are work allowances, not resident buffers.
+The dedicated owner connection allows 16 MiB of output framing, while runtime
+connection bounds remain unchanged. A refused interpretation removes obsolete
+search evidence and increments `searches_skipped`; successful writes increment
+`searches_written`. A timeout or transaction failure yields no usable cursor.
+
+This increment requires explicit owner backfill. Publication does not yet
+prepare search rows, and there is no scheduled rebuild. New or oversized
+messages retain the existing search behavior. This cache avoids repeated MIME
+interpretation; it is not an inverted index and does not eliminate full-body
+reads or bounded candidate scans. Schema-34 binaries cannot serve schema 35;
+upgrade with fencing and a consistent pre-upgrade backup.

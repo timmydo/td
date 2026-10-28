@@ -29,11 +29,13 @@ mod submission_query;
 mod email_query;
 #[path = "email_search.rs"]
 mod email_search;
+pub use email_search::SearchFields;
 
 #[path = "email_get.rs"]
 mod email_get;
 pub use email_get::{
-    write_verified as write_verified_email, Output as EmailOutput, Selection as EmailProjection,
+    collect_verified_search, write_verified as write_verified_email, Output as EmailOutput,
+    Selection as EmailProjection,
 };
 #[path = "get_ids.rs"]
 mod get_ids;
@@ -505,9 +507,27 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
         clock: &dyn ports::Clock,
         work: &mut crate::admission::work::Meter,
     ) -> Result<bool, Error> {
+        let metadata = self
+            .email(id)
+            .map_err(postgres_read_error)?
+            .ok_or(Error::State)?;
+        let fields_timer =
+            crate::performance::Timer::start(crate::performance::Phase::SearchFields);
+        let fields = self
+            .search_fields(metadata, limits, work, clock)
+            .map_err(postgres_read_error)?;
+        fields_timer.finish(if fields.is_some() {
+            crate::performance::Outcome::Success
+        } else {
+            crate::performance::Outcome::Unavailable
+        });
         let mut result = Err(Error::State);
         self.with_interpreted_body(id, |_, pin| {
-            result = email_get::search_verified(pin, limits, search, clock, work);
+            result = if let Some(fields) = &fields {
+                fields.matches_search(search, work, clock)
+            } else {
+                email_get::search_verified(pin, limits, search, clock, work)
+            };
             Ok(())
         })
         .map_err(postgres_read_error)?;

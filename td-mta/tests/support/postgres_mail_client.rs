@@ -408,8 +408,8 @@ pub(super) fn exercise(
             let listing = client.ask(json!({"command":"list_mailboxes"}));
             assert!(listing["ok"].is_true(), "{listing}");
             assert!(!listing["mailboxes"].as_array().unwrap().iter().any(|folder| folder["id"].as_str()==Some(archive_wire)));
-            exercise_queries(&mut client, request, trust, &cloud_binding, inbox_wire,
-                listing["mailboxes"].as_array().unwrap().iter().find(|folder| folder["name"].as_str()==Some("Child")).unwrap()["id"].as_str().unwrap(), email["id"].as_str().unwrap());
+            exercise_queries(&mut client, fixture, request, trust, &cloud_binding, (inbox_wire,
+                listing["mailboxes"].as_array().unwrap().iter().find(|folder| folder["name"].as_str()==Some("Child")).unwrap()["id"].as_str().unwrap(), email["id"].as_str().unwrap()));
             exercise_header_rules(fixture, &config, &runtime, inbox_wire, email["id"].as_str().unwrap());
             let usage_before = sql(fixture, "SELECT body_bytes||':'||blob_count FROM td_mta.account_usage");
             let reply_message = message
@@ -981,13 +981,13 @@ fn exercise_header_rules(
 
 fn exercise_queries(
     client: &mut Client,
+    fixture: &Fixture,
     request: &Request<'_>,
     trust: &TrustStore,
     binding: &Binding,
-    inbox: &str,
-    other: &str,
-    original: &str,
+    ids: (&str, &str, &str),
 ) {
+    let (inbox, other, original) = ids;
     use td_mta::{
         format::row::{ReceiptRecipients, ReceiptTls, SmtpReceipt},
         postgres_receiving,
@@ -1188,6 +1188,109 @@ fn exercise_queries(
         "search":"nested content"})),
         0,
         &[],
+    );
+
+    let large = format!("Subject: Large search corpus\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nearlyneedle\r\n{}tailneedle\r\n", format!("{}\r\n", "x".repeat(998)).repeat(1050));
+    let delivery = postgres_receiving::prepare(
+        binding,
+        &postgres_receiving::Message {
+            bytes: large.as_bytes(),
+            hostname: "localhost",
+            extended: true,
+            header_bytes: 65536,
+            received_at: 1_704_067_200_000,
+            receipt: SmtpReceipt {
+                peer: "192.0.2.1".parse().unwrap(),
+                tls: ReceiptTls::Tls13,
+                gateway: None,
+                ehlo: "sender.example.test",
+                reverse_path: "sender@example.test",
+                recipients,
+            },
+        },
+        deadline(),
+    )
+    .unwrap();
+    postgres_receiving::publish(request, trust, deadline(), &delivery).unwrap();
+    let mut wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let wire = td_mta::wire::encode_id(delivery.email(), &mut wire).unwrap();
+    let query = |text: &str| {
+        json!({"command":"query_emails", "mailbox_id":inbox,
+        "search":text, "headers_only":true})
+    };
+    let uncached = client.ask(query("tailneedle"));
+    assert!(
+        !uncached["ok"].is_true(),
+        "old bounded scan must refuse: {uncached}"
+    );
+    assert!(
+        uncached["error"]
+            .as_str()
+            .unwrap()
+            .contains("storageWorkLimit"),
+        "{uncached}"
+    );
+    let mut after = None;
+    loop {
+        let report = td_mta::postgres_summary_backfill::run_with_options(
+            &fixture.request(),
+            trust,
+            deadline(),
+            binding.epoch(),
+            binding.account(),
+            td_mta::postgres_summary_backfill::Options {
+                after,
+                maximum: 1,
+                structure: false,
+                search: true,
+            },
+        )
+        .unwrap();
+        if report.done {
+            break;
+        }
+        assert_ne!(report.after, after, "a successful page must advance");
+        after = report.after;
+    }
+    for text in ["earlyneedle", "tailneedle", "earlyneedle tailneedle"] {
+        check(client.ask(query(text)), 0, &[wire]);
+    }
+    check(client.ask(query("absent-search-term")), 0, &[]);
+    check(client.ask(query("\"corpus earlyneedle\"")), 0, &[]);
+    let blob = sql(
+        fixture,
+        &format!(
+            "SELECT encode(blob_id,'hex') FROM td_mta.emails WHERE id=decode('{}','hex')",
+            delivery.email()
+        ),
+    );
+    let damage = format!("UPDATE td_mta.blob_search SET fields_digest=set_byte(fields_digest,0,get_byte(fields_digest,0)#1) WHERE blob_id=decode('{blob}','hex')");
+    sql(fixture, &damage);
+    let refused = client.ask(query("tailneedle"));
+    assert!(
+        !refused["ok"].is_true(),
+        "damaged evidence cannot supply a match: {refused}"
+    );
+    sql(fixture, &damage);
+    let damage = format!("UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,get_byte(bytes,0)#1) WHERE blob_id=decode('{blob}','hex') AND ordinal=0");
+    sql(fixture, &damage);
+    let refused = client.ask(query("tailneedle"));
+    assert!(
+        !refused["ok"].is_true(),
+        "cached fields still require whole-body integrity: {refused}"
+    );
+    sql(fixture, &damage);
+    check(client.ask(query("tailneedle")), 0, &[wire]);
+    let deleted = client.ask(json!({"command":"destroy", "id":wire}));
+    assert!(deleted["results"][0]["ok"].is_true(), "{deleted}");
+    assert_eq!(
+        sql(
+            fixture,
+            &format!(
+                "SELECT count(*) FROM td_mta.blob_search WHERE blob_id=decode('{blob}','hex')"
+            )
+        ),
+        "0"
     );
 }
 

@@ -19,12 +19,21 @@ struct Options {
     after: Option<BlobId>,
     maximum: usize,
     structure: bool,
+    search: bool,
 }
 fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<Options> {
     let (mut connection, mut epoch, mut account, mut after, mut maximum) =
         (None, None, None, None, None);
     let mut structure = false;
+    let mut search = false;
     while let Some(flag) = args.next() {
+        if flag == "--search" {
+            if search {
+                return None;
+            }
+            search = true;
+            continue;
+        }
         if flag == "--structure" {
             if structure {
                 return None;
@@ -56,6 +65,7 @@ fn arguments(mut args: impl Iterator<Item = OsString>) -> Option<Options> {
         after,
         maximum: maximum.unwrap_or(16),
         structure,
+        search,
     })
 }
 pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
@@ -81,6 +91,7 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
                 after: options.after,
                 maximum: options.maximum,
                 structure: options.structure,
+                search: options.search,
             },
         )
         .map_err(|error| {
@@ -104,7 +115,7 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
                 .after
                 .map(|id| format!("\"{id}\""))
                 .unwrap_or_else(|| "null".to_owned());
-            writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{COMMAND}\",\"status\":\"ok\",\"scanned\":{},\"written\":{},\"skipped\":{},\"structures_written\":{},\"structures_skipped\":{},\"verified_bytes\":{},\"after\":{after},\"done\":{}}}", report.scanned, report.written, report.skipped, report.structures_written, report.structures_skipped, report.verified_bytes, report.done)?;
+            writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{COMMAND}\",\"status\":\"ok\",\"scanned\":{},\"written\":{},\"skipped\":{},\"structures_written\":{},\"structures_skipped\":{},\"searches_written\":{},\"searches_skipped\":{},\"verified_bytes\":{},\"after\":{after},\"done\":{}}}", report.scanned, report.written, report.skipped, report.structures_written, report.structures_skipped, report.searches_written, report.searches_skipped, report.verified_bytes, report.done)?;
             Ok(ExitCode::SUCCESS)
         }
         Err((stage, code)) => {
