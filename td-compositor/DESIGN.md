@@ -33,7 +33,7 @@ assignment.
 The render node is not the display, and seatd leaves it alone.
 It also assigns only playback PCM nodes to the dedicated audio account and
 creates `/run/td-audio`; `APPLICATIONS.md` §K.5 owns that boundary.
-There is no multi-user arbitration, hotplug, suspend/resume, VT switching or
+There is no multi-user arbitration, hotplug, VT switching or
 live seat reassignment. Deployment reboot discards earlier open descriptors.
 
 Assignment uses safe std path ownership and permission operations, with a
@@ -85,7 +85,7 @@ with no card. The kernel builds in the firmware framebuffer
 (td-install/ENCRYPTION.md "Keyboard console"): a UEFI GOP display td has
 no driver for becomes simpledrm's `card0`, which the KMS backend drives as any card,
 one connector at the firmware's mode, its flips completed by the atomic
-helpers' substitute vblank events since it has none. virtio-gpu and i915
+helpers' substitute vblank events since it has none. virtio-gpu, i915 and amdgpu
 disable the firmware framebuffer before it registers, so where they drive
 the display it stays their `card0`, and the QEMU profile is unchanged. A
 native driver whose probe is deferred until after simpledrm bound
@@ -5946,8 +5946,9 @@ client directory. A bare readiness filename without a directory is refused.
 
 ## Physical secure attention
 
-The menu also offers `F: RESTART` and `P: POWER OFF`. Each opens a named
-confirmation with an unsaved-work notice; only fresh Enter timestamped after
+The menu also offers `F: RESTART`, `P: POWER OFF` and `Z: SLEEP`. Restart
+and power off open named confirmations with an unsaved-work notice; only
+fresh Enter timestamped after
 that prompt reached the display selects the lifetime's operation. A per-prompt
 completion receipt retains that cutoff across later paints, so buffered
 pre-presentation input cannot confirm. Escape drains and cancels as
@@ -5960,6 +5961,32 @@ systems and live media. They do not authorize another privileged operation.
 The power row follows the storage row. The menu keeps existing row positions
 on 1280x800; on 800x600 its top moves to 153 to fit all thirteen rows, and
 on 320x200 the rows use a 16-pixel pitch.
+
+Sleep uses its own confirmation without the unsaved-work warning. A fresh
+Enter after that frame selects the single operation. The authority worker
+claims its commit before preparing sleep; Escape winning first sends nothing.
+The initiating seat must still own that attempt and have a known login state.
+For enrolled/unavailable sessions it calls the existing live lock entry,
+drains attention and held input, and waits up to the presentation deadline
+for a new lock frame with attention closed. A draining attention frame is not
+a lock receipt. No seat or runtime lock is held while waiting for input or
+KMS completion. During both waits the worker exchanges the existing `03`
+heartbeat every 250 ms, within the authority channel deadline. A local
+preparation timeout sends no suspend request and preserves the locked session. Preparation failure sends no suspend request and leaves the
+session locked. The serialized authority worker cannot process a newly queued
+unlock while preparing or polling suspend.
+
+The worker sends td-authd's `25` with whether it obtained that receipt and
+polls `26`, bounded to 65 seconds of monotonic awake time. No failure retries
+the entry request. Explicit busy/failure replies are recoverable operation outcomes; transport
+and malformed-protocol failures retain the authority worker's fatal policy.
+Enrolled sessions remain locked through kernel resume or failure; unenrolled sessions show the completion/failure on attention if that
+lifetime is still open. The existing resume detector remains a backstop for
+externally initiated sleeps. The kernel's native display driver owns hardware
+save/restore; KMS descriptors and client processes remain open. No sleep is
+initiated automatically on lid close in this increment: it retains its lock
+behavior. Hardware acceptance requires testing the panel, input, Wi-Fi and
+hardware sleep residency on the T14s itself; host tests cannot establish it.
 
 The trusted input boundary includes every evdev device admitted at startup,
 including USB HID keyboards and pointers. USB provenance is not device

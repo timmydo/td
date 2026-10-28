@@ -1465,6 +1465,40 @@ sending; cancellation that wins first sends nothing. There is no automatic
 retry: a lost reply may follow acceptance. The ordinary supervisor performs
 ordered service teardown, sync and unmount before the power applet.
 
+### Suspend to idle
+
+Physical secure attention also offers Sleep. Request `25 00` reports that
+no login lock was required; `25 01` carries the paired compositor's receipt
+that the enrolled/unavailable session's lock frame reached the display.
+Only these exact frames start a suspend. Root requires the same prepared,
+idle slot as console power and refuses during revocation restart. For `00`,
+it reads the login predicate afresh and refuses any enforced state; the
+live medium is unenrolled as for `1a`. The compositor is the trusted source
+of presentation receipts; no public socket admits this request.
+
+Root starts the fixed `/bin/td-authd suspend-system` helper through the
+existing bounded inspection launcher, with empty environment, `/` cwd,
+null stdin/stderr and private stdout. The helper requires the existing root,
+single-thread, no-controlling-terminal and standard-descriptor admission.
+It holds an exclusive root-only `/run/td-suspend.lock`, requires `mem` and
+`s2idle` in the kernel's power interfaces, selects `s2idle`, reads the bounded
+`wakeup_count`, writes that same canonical number back and writes `mem` to
+`/sys/power/state`. Each sysfs write is one write, with short writes refused;
+a wakeup-count failure refuses entry without retry. No caller supplies a
+path, mode or command. Hibernation remains disabled.
+
+Reply `a5 00` means pending, `a5 01` busy/unprepared and `a5 02` refused or
+failed. Exact request `26` polls, returning `a5 00` until the helper is reaped,
+then `a5 03` only for successful exit with exactly `suspend returned\n`, or
+`a5 02` otherwise. Polling with no pending helper fails. Completion releases
+the slot; until then no other slot-taking request is admitted, and revocation
+waits. The helper has 60 seconds of monotonic time (Linux excludes time
+asleep); timeout kills it and the slot stays held until it is reaped. Peer
+teardown kills and reaps it before generation cleanup, as for inspection.
+The client polls through ordinary bounded channel exchanges and never
+resubmits an uncertain request. Successful return says the kernel's entry
+write returned, not that hardware reached its deepest sleep state.
+
 ## Private token child supervision
 
 `unlock.rs` owns one root-private `td-secret unlock-operation --uid

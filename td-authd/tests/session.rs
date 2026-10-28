@@ -2497,3 +2497,46 @@ fn power_is_a_fixed_prepared_idle_session_request_with_exact_replies() {
         assert!(Request::decode(bytes).is_err());
     }
 }
+
+#[test]
+fn suspend_requires_idle_preparation_and_a_lock_for_enforced_login() {
+    assert_eq!(
+        Request::decode(&[0x25, 1]).unwrap(),
+        Request::Suspend { locked: true }
+    );
+    for bad in [&[0x25][..], &[0x25, 2], &[0x25, 1, 0], &[0x26, 0]] {
+        assert!(Request::decode(bad).is_err());
+    }
+    let mut session = quiet();
+    assert_eq!(
+        session.suspend(true, || panic!("not prepared")).unwrap(),
+        [0xa5, 1]
+    );
+    session.prepared = true;
+    let root = crate::test_temp::TempDir::new("suspend-login").unwrap();
+    session.login_state =
+        crate::login_status::tests::status_under(root.path(), crate::login_status::tests::never());
+    assert_eq!(
+        session
+            .suspend(false, || panic!("no lock receipt"))
+            .unwrap(),
+        [0xa5, 2]
+    );
+    let start = || crate::inspection::tests::printed(crate::suspend::COMPLETE, 0, false, 128, WAIT);
+    assert_eq!(session.suspend(true, start).unwrap(), [0xa5, 0]);
+    assert!(session
+        .answer(Request::Power(crate::consent::Power::Off))
+        .is_err());
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let reply = session.suspend_status().unwrap();
+        if reply != [0xa5, 0] {
+            assert_eq!(reply, [0xa5, 3]);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(session.suspending.is_none());
+    assert_eq!(session.suspend_status().unwrap(), [0xa5, 2]);
+}

@@ -341,6 +341,7 @@ struct KeyBindings {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum LoginScreen {
+    Sleep,
     Power(crate::authority::consent::Power),
     #[default]
     Closed,
@@ -755,6 +756,17 @@ impl KeyBindings {
         {
             return;
         }
+        if self.login_screen == LoginScreen::Sleep {
+            if code == KEY_ENTER
+                && self
+                    .login_shown
+                    .as_ref()
+                    .is_some_and(|shown| shown.answers(timestamp))
+            {
+                decision.secret = Some(Selection::Suspend);
+            }
+            return;
+        }
         if let LoginScreen::Power(choice) = self.login_screen {
             if code == KEY_ENTER
                 && self
@@ -915,6 +927,11 @@ impl KeyBindings {
             return;
         }
         decision.secret = match code {
+            KEY_Z => {
+                self.login_screen = LoginScreen::Sleep;
+                decision.notice = Some(Notice::SleepConfirm);
+                None
+            }
             KEY_F | KEY_P => {
                 let choice = if code == KEY_F {
                     crate::authority::consent::Power::Restart
@@ -1926,6 +1943,66 @@ pub(crate) struct Seat {
 }
 
 impl Seat {
+    /// Finish the physical request's lock before root may suspend. Waiting
+    /// never holds the seat or runtime locks needed by key release and KMS.
+    pub(crate) fn prepare_suspend(
+        &self,
+        attempt: &crate::secret_client::Attempt,
+        mut heartbeat: impl FnMut() -> Result<(), String>,
+    ) -> Result<Option<bool>, String> {
+        let bindings = self.bindings.upgrade().ok_or("suspend seat disappeared")?;
+        let target = self.target.upgrade().ok_or("suspend target disappeared")?;
+        let runtime = {
+            let mut bindings = bindings
+                .lock()
+                .map_err(|_| "input bindings lock poisoned")?;
+            let mut target = target.lock().map_err(|_| "input target lock poisoned")?;
+            if !bindings.attention_enabled
+                || bindings.attention != AttentionState::Open
+                || !target
+                    .secret_attempt
+                    .as_ref()
+                    .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), attempt))
+            {
+                return Ok(None);
+            }
+            let answer = bindings
+                .login
+                .current()
+                .ok_or("login state unknown before suspend")?;
+            if !answer.locks() {
+                return Ok(Some(false));
+            }
+            bindings.keyless_close = Some(KeylessClose::Suspend);
+            lock_session(&mut *target, &mut bindings)?;
+            Arc::clone(&target.runtime)
+        };
+        let deadline = Instant::now()
+            .checked_add(crate::runtime::ATTENTION_PRESENTATION_DEADLINE)
+            .ok_or("suspend presentation deadline overflow")?;
+        let mut presentation = None;
+        let mut last_heartbeat = Instant::now();
+        loop {
+            if presentation.is_none() {
+                presentation = runtime
+                    .lock()
+                    .map_err(|_| "runtime lock poisoned")?
+                    .suspend_presentation()?;
+            }
+            if presentation.as_ref().is_some_and(|shown| shown.on_glass()) {
+                return Ok(Some(true));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            if last_heartbeat.elapsed() >= Duration::from_millis(250) {
+                heartbeat()?;
+                last_heartbeat = Instant::now();
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Leaves the lock surface and ends `attempt`'s lifetime, which must
     /// still be the open one with its unlock committed and not cancelled:
     /// under the bindings lock no Escape interleaves, and one that came
@@ -10688,6 +10765,190 @@ mod tests {
     }
 
     #[test]
+    fn a_physical_sleep_request_locks_before_the_first_root_request() {
+        let seat = LockedSeat::open(&[]);
+        seat.chord(10);
+        seat.press(&[KEY_Z], 20);
+        seat.press(&[KEY_ENTER], 30);
+        let attempt = seat.queued.attempt().unwrap();
+        assert_eq!(
+            attempt.selection(),
+            &crate::secret_client::Selection::Suspend
+        );
+        struct Wire<'a> {
+            seat: &'a LockedSeat,
+            calls: Vec<Vec<u8>>,
+        }
+        impl crate::authority::Exchange for Wire<'_> {
+            fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+                assert!(self.seat.locked());
+                assert!(!self.seat.attention_open());
+                assert_eq!(self.seat.glass(), self.seat.lock_surface());
+                self.calls.push(bytes.to_vec());
+                Ok(())
+            }
+            fn receive(&mut self) -> Result<Vec<u8>, String> {
+                Ok(if self.calls.len() == 1 {
+                    vec![0xa5, 0]
+                } else {
+                    vec![0xa5, 3]
+                })
+            }
+        }
+        let mut wire = Wire {
+            seat: &seat,
+            calls: vec![],
+        };
+        crate::secret_client::Client::default()
+            .start(&mut wire, attempt)
+            .unwrap();
+        assert_eq!(wire.calls, vec![vec![0x25, 1], vec![0x26]]);
+        assert!(seat.locked());
+        assert!(!seat.client_shown());
+    }
+
+    #[test]
+    fn sleep_preparation_heartbeats_while_enter_is_held() {
+        let seat = LockedSeat::open(&[]);
+        seat.chord(10);
+        seat.press(&[KEY_Z], 20);
+        let mut pointer = PointerMotion::default();
+        for event in later(vec![at_millis(key(KEY_ENTER, KEY_PRESS), 31), syn(31)]) {
+            apply(
+                seat.target.as_ref(),
+                event,
+                0,
+                seat.bindings.as_ref(),
+                &mut pointer,
+                None,
+            )
+            .unwrap();
+        }
+        let attempt = seat.queued.attempt().unwrap();
+        assert_eq!(
+            attempt.selection(),
+            &crate::secret_client::Selection::Suspend
+        );
+        struct Wire<'a> {
+            seat: &'a LockedSeat,
+            calls: Vec<Vec<u8>>,
+            last: Instant,
+        }
+        impl crate::authority::Exchange for Wire<'_> {
+            fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+                assert!(
+                    self.last.elapsed() < Duration::from_secs(5),
+                    "authority heartbeat starved"
+                );
+                self.last = Instant::now();
+                assert!(self.seat.locked());
+                if bytes == [3] {
+                    self.calls.push(bytes.to_vec());
+                    return Ok(());
+                }
+                assert!(!self.seat.attention_open());
+                assert_eq!(self.seat.glass(), self.seat.lock_surface());
+                self.calls.push(bytes.to_vec());
+                Ok(())
+            }
+            fn receive(&mut self) -> Result<Vec<u8>, String> {
+                Ok(if self.calls.last().unwrap() == &[3] {
+                    vec![0x83]
+                } else if self.calls.last().unwrap() == &[0x25, 1] {
+                    vec![0xa5, 0]
+                } else {
+                    vec![0xa5, 3]
+                })
+            }
+        }
+        let mut wire = Wire {
+            seat: &seat,
+            calls: vec![],
+            last: Instant::now(),
+        };
+        std::thread::scope(|scope| {
+            let target = Arc::clone(&seat.target);
+            let bindings = Arc::clone(&seat.bindings);
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_secs(6));
+                for event in later(vec![at_millis(key(KEY_ENTER, KEY_RELEASE), 51), syn(51)]) {
+                    apply(
+                        target.as_ref(),
+                        event,
+                        0,
+                        bindings.as_ref(),
+                        &mut pointer,
+                        None,
+                    )
+                    .unwrap();
+                }
+            });
+            crate::secret_client::Client::default()
+                .start(&mut wire, attempt)
+                .unwrap();
+        });
+        assert!(
+            wire.calls
+                .iter()
+                .filter(|call| call.as_slice() == [3])
+                .count()
+                >= 5
+        );
+        assert_eq!(
+            wire.calls
+                .into_iter()
+                .filter(|call| call.as_slice() != [3])
+                .collect::<Vec<_>>(),
+            vec![vec![0x25, 1], vec![0x26]]
+        );
+        assert!(seat.locked());
+        assert!(!seat.client_shown());
+    }
+
+    #[test]
+    fn a_refused_physical_sleep_preserves_the_locked_session() {
+        let seat = LockedSeat::open(&[]);
+        seat.chord(10);
+        seat.press(&[KEY_Z], 20);
+        seat.press(&[KEY_ENTER], 30);
+        let attempt = seat.queued.attempt().unwrap();
+        assert_eq!(
+            attempt.selection(),
+            &crate::secret_client::Selection::Suspend
+        );
+        struct Wire<'a> {
+            seat: &'a LockedSeat,
+            calls: Vec<Vec<u8>>,
+        }
+        impl crate::authority::Exchange for Wire<'_> {
+            fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+                assert!(self.seat.locked());
+                assert!(!self.seat.attention_open());
+                assert_eq!(self.seat.glass(), self.seat.lock_surface());
+                self.calls.push(bytes.to_vec());
+                Ok(())
+            }
+            fn receive(&mut self) -> Result<Vec<u8>, String> {
+                Ok(if self.calls.len() == 1 {
+                    vec![0xa5, 0]
+                } else {
+                    vec![0xa5, 2]
+                })
+            }
+        }
+        let mut wire = Wire {
+            seat: &seat,
+            calls: vec![],
+        };
+        crate::secret_client::Client::default()
+            .start(&mut wire, attempt)
+            .unwrap();
+        assert_eq!(wire.calls, vec![vec![0x25, 1], vec![0x26]]);
+        assert!(seat.locked());
+        assert!(!seat.client_shown());
+    }
+
+    #[test]
     fn power_choices_require_a_presented_prompt_and_fresh_enter() {
         use crate::attention::Notice;
         use crate::authority::consent::Power;
@@ -10721,6 +10982,40 @@ mod tests {
             read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER, code], 50));
             assert_eq!(target.lock().unwrap().secret_roles.len(), 1);
         }
+    }
+
+    #[test]
+    fn sleep_requires_a_presented_prompt_and_fresh_enter() {
+        use crate::attention::Notice;
+        use crate::secret_client::Selection;
+        let code = KEY_Z;
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(&target, &bindings, 0, &presses(&[code], 20));
+        assert_eq!(
+            target.lock().unwrap().notices.last(),
+            Some(&Notice::SleepConfirm)
+        );
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+        let shown = bindings.lock().unwrap().login_shown.take();
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 30));
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+        shown.as_ref().unwrap().completed_for_test(32_000_000);
+        bindings.lock().unwrap().login_shown = shown;
+        // Already queued before painting, though processed after completion.
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 31));
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+        bindings.lock().unwrap().attention_excluded.insert(1);
+        read_reports(&target, &bindings, 1, &presses(&[KEY_ENTER], 35));
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 40));
+        assert_eq!(
+            target.lock().unwrap().secret_roles,
+            vec![Selection::Suspend]
+        );
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER, code], 50));
+        assert_eq!(target.lock().unwrap().secret_roles.len(), 1);
     }
 
     const ENROLLED: [[u8; 4]; 3] = [[0xa1; 4], [0xa2; 4], [0xa3; 4]];

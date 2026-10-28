@@ -3095,7 +3095,7 @@ pub struct MappedRegion {
             // adapter's entry.
             let live = match *name {
                 "runtime.rs" => 1,
-                "input.rs" => 3,
+                "input.rs" => 4,
                 _ => 0,
             };
             // `unlock_session` aside.

@@ -49,11 +49,17 @@ with their GPIO controller and DesignWare I2C, the HID-over-I2C touchpad
 through hid-multitouch, the Realtek codec, x2APIC, which firmware that hands
 over in x2APIC mode needs, and the AMD IOMMU, for interrupt remapping and
 DMA isolation.
-Its Radeon has no driver, since amdgpu needs device firmware no reviewed
-pin carries yet, so its
-display is the UEFI GOP framebuffer through simpledrm, at the resolution
-firmware set, with no brightness control or external display; its internal
-microphones are on the ACP, whose audio drivers are not built. It has
+Its Phoenix Radeon is driven by AMDGPU and DC with twelve reviewed
+linux-firmware files embedded in the kernel, including DMCUB for display
+power management. AMD PMC, the CMOS RTC and PCIe ASPM following firmware
+policy supply the s2idle platform support. Physical secure attention offers
+`Z: SLEEP`, then Enter, with a presented lock before sleep for enrolled
+sessions. The compositor retains its single-output KMS profile; this is not
+external-display or hotplug support. Its internal microphones are on the ACP,
+whose audio drivers are not built. Suspend/resume is a hardware-validation
+target, not yet an acceptance claim: test repeated short and long sleeps on
+AC and battery, panel recovery, keyboard/TrackPoint/touchpad, Wi-Fi, token
+unlock and the kernel's hardware sleep statistics on the machine. It has
 no wired port. Its Qualcomm WCN6855 Wi-Fi is its network: ath11k is
 built in with linux-firmware's pinned files embedded in the kernel
 (AGENTS.md, "Device firmware"), and `td-netd wifi join` names the network

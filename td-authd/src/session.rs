@@ -48,6 +48,10 @@ pub(crate) enum Request {
     /// `1f`: whether a hostname change waits, and the intake's backoff.
     HostnameState,
     Power(crate::consent::Power),
+    Suspend {
+        locked: bool,
+    },
+    SuspendStatus,
     /// `20`: a storage operation (amendment 10).
     Storage(crate::storage::Selection),
 }
@@ -68,6 +72,7 @@ impl Request {
                 | Self::Hostname
                 | Self::Storage(_)
                 | Self::Power(_)
+                | Self::Suspend { .. }
         )
     }
 
@@ -82,6 +87,10 @@ impl Request {
             [0x1d] => Ok(Self::Rollback),
             [0x1e] => Ok(Self::Hostname),
             [0x1f] => Ok(Self::HostnameState),
+            [0x25, locked @ 0..=1] => Ok(Self::Suspend {
+                locked: *locked == 1,
+            }),
+            [0x26] => Ok(Self::SuspendStatus),
             [0x21, choice] => Ok(Self::Power(crate::consent::Power::decode(*choice)?)),
             [0x12, 1] => Ok(Self::Begin(Role::Primary)),
             [0x12, 2] => Ok(Self::Begin(Role::Recovery)),
@@ -316,6 +325,7 @@ pub(crate) struct Session {
     operation: Option<Active>,
     event: Option<Event>,
     inspection: Option<Inspection>,
+    suspending: Option<Inspection>,
     inspection_event: Option<InspectionEvent>,
     login_state: crate::login_status::Status,
     /// None on a live boot, which runs no check.
@@ -350,6 +360,7 @@ impl Session {
             operation: None,
             event: None,
             inspection: None,
+            suspending: None,
             inspection_event: None,
             login_state: crate::login_status::Status::new(owner, username)?,
             revocation: Some(crate::revocation::Revocation::new()),
@@ -401,6 +412,9 @@ impl Session {
         {
             return Err("a request for the slot while a failed revocation restarts".into());
         }
+        if self.suspending.is_some() && request.takes_slot() {
+            return Err("a request for the slot while suspend is pending".into());
+        }
         match request {
             Request::Prepare => {
                 if self.activated {
@@ -424,6 +438,12 @@ impl Session {
             ),
             Request::Hostname => self.begin_hostname(crate::elevation::Table::load),
             Request::Power(choice) => self.power(choice, power_request),
+            Request::Suspend { locked } => self.suspend(locked, || {
+                let mut command = Command::new("/bin/td-authd");
+                command.arg("suspend-system");
+                Inspection::printing(command, 128, Duration::from_secs(60))
+            }),
+            Request::SuspendStatus => self.suspend_status(),
             // Beside any operation: the menu's row reads it.
             Request::HostnameState => {
                 self.tick()?;
@@ -565,6 +585,52 @@ impl Session {
                 }
             }
         }
+    }
+
+    fn suspend(
+        &mut self,
+        locked: bool,
+        start: impl FnOnce() -> Result<Inspection, String>,
+    ) -> Result<Vec<u8>, String> {
+        if !self.prepared
+            || self.cleanup.is_some()
+            || self.operation.is_some()
+            || self.inspection.is_some()
+            || self.suspending.is_some()
+        {
+            return Ok(vec![0xa5, 1]);
+        }
+        if !locked
+            && self.setup.is_none()
+            && self.login_state.reduced() != crate::cutover::Reduced::Unenrolled
+        {
+            return Ok(vec![0xa5, 2]);
+        }
+        match start() {
+            Ok(helper) => {
+                self.suspending = Some(helper);
+                Ok(vec![0xa5, 0])
+            }
+            Err(_) => Ok(vec![0xa5, 2]),
+        }
+    }
+
+    fn suspend_status(&mut self) -> Result<Vec<u8>, String> {
+        let Some(helper) = &mut self.suspending else {
+            return Ok(vec![0xa5, 2]);
+        };
+        let Some(result) = helper.finished()? else {
+            return Ok(vec![0xa5, 0]);
+        };
+        self.suspending = None;
+        Ok(vec![
+            0xa5,
+            if result.as_deref() == Some(crate::suspend::COMPLETE) {
+                3
+            } else {
+                2
+            },
+        ])
     }
 
     fn power(
@@ -907,7 +973,11 @@ impl Session {
             self.inspection_event = Some(inspection.poll()?);
         }
         self.login_state.tick();
-        let slot_free = self.operation.is_none() && self.inspection.is_none();
+        if let Some(helper) = &mut self.suspending {
+            let _ = helper.finished()?;
+        }
+        let slot_free =
+            self.operation.is_none() && self.inspection.is_none() && self.suspending.is_none();
         if let Some(revocation) = &mut self.revocation {
             let status = &self.login_state;
             revocation.tick(slot_free, || status.reduced())?;
@@ -1026,6 +1096,9 @@ impl Session {
         if !self.activated {
             self.abandon_revocation(true);
             return Ok(());
+        }
+        if let Some(helper) = self.suspending.take() {
+            helper.reap_for_teardown();
         }
         if let Some(operation) = self.operation.take() {
             // The prior operation may retain a fatal cleanup result. Only

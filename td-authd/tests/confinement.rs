@@ -55,6 +55,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "set_hostname.rs",
             "software.rs",
             "storage.rs",
+            "suspend.rs",
             "sys.rs",
             "unlock.rs"
         ]
@@ -90,6 +91,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("proof.rs", 0),
         ("revocation.rs", 0),
         ("storage.rs", 0),
+        ("suspend.rs", 0),
     ] {
         let source = std::fs::read_to_string(root.join("src").join(name)).unwrap();
         assert_eq!(source.matches("unsafe").count(), count, "{name}");
@@ -1324,9 +1326,9 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0xca9ca5668a3cec8c;
 const SOFTWARE_FINGERPRINT: u64 = 0xedb33f4ba9468adf;
-const LAUNCH_FINGERPRINT: u64 = 0xb4e2df40a26dc1d9;
-const MAIN_FINGERPRINT: u64 = 0x97ab356136dd2efb;
-const SESSION_FINGERPRINT: u64 = 0xe87ed71383a70385;
+const LAUNCH_FINGERPRINT: u64 = 0x737ec9658d562a08;
+const MAIN_FINGERPRINT: u64 = 0xb366dd7eb267d32a;
+const SESSION_FINGERPRINT: u64 = 0x90f965682f5b2efd;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;

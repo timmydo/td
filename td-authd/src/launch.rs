@@ -858,7 +858,9 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
-        [0x10..=0x21, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
+        [0x10..=0x21 | 0x25 | 0x26, ..] => {
+            Ok(Request::Secret(crate::session::Request::decode(bytes)?))
+        }
         [0x24, operands @ ..] => Ok(Request::Software(crate::software::Request::decode(
             operands,
         )?)),

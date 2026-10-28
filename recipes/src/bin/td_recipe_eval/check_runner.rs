@@ -8565,6 +8565,18 @@ mod tests {
         assert_eq!(
             answer.device_firmware,
             [
+                "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
+                "linux-firmware-amdgpu-gc-11-0-1-imu-source",
+                "linux-firmware-amdgpu-gc-11-0-1-me-source",
+                "linux-firmware-amdgpu-gc-11-0-1-mec-source",
+                "linux-firmware-amdgpu-gc-11-0-1-mes-2-source",
+                "linux-firmware-amdgpu-gc-11-0-1-mes1-source",
+                "linux-firmware-amdgpu-gc-11-0-1-pfp-source",
+                "linux-firmware-amdgpu-gc-11-0-1-rlc-source",
+                "linux-firmware-amdgpu-psp-13-0-4-ta-source",
+                "linux-firmware-amdgpu-psp-13-0-4-toc-source",
+                "linux-firmware-amdgpu-sdma-6-0-1-source",
+                "linux-firmware-amdgpu-vcn-4-0-2-source",
                 "linux-firmware-ath11k-wcn6855-amss-source",
                 "linux-firmware-ath11k-wcn6855-board-2-source",
                 "linux-firmware-ath11k-wcn6855-m3-source",
@@ -8573,6 +8585,18 @@ mod tests {
         );
         assert!(answer.trust_root_lines().ends_with(
             "upstream-runtime\tdebian\tgcc-runtime\nupstream-runtime\tdebian\tglibc-x86-64\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-dcn-3-1-4-dmcub-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-gc-11-0-1-imu-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-gc-11-0-1-me-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-gc-11-0-1-mec-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-gc-11-0-1-mes-2-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-gc-11-0-1-mes1-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-gc-11-0-1-pfp-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-gc-11-0-1-rlc-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-psp-13-0-4-ta-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-psp-13-0-4-toc-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-sdma-6-0-1-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-vcn-4-0-2-source\n\
              device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-amss-source\n\
              device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-board-2-source\n\
              device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-m3-source\n\

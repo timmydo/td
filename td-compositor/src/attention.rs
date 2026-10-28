@@ -11,6 +11,8 @@ pub(crate) enum Notice {
     PowerConfirm(crate::authority::consent::Power),
     PowerAccepted(crate::authority::consent::Power),
     PowerFailed,
+    SleepConfirm,
+    Resumed,
     Unlocked,
     Stored,
     NoWrite,
@@ -668,6 +670,8 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::PowerConfirm(crate::authority::consent::Power::Off) => "POWER OFF THE COMPUTER?",
         Notice::PowerAccepted(crate::authority::consent::Power::Restart) => "RESTART REQUESTED",
         Notice::PowerAccepted(crate::authority::consent::Power::Off) => "POWER OFF REQUESTED",
+        Notice::SleepConfirm => "SUSPEND THE COMPUTER?",
+        Notice::Resumed => "SUSPEND RETURNED",
         Notice::PowerFailed => "POWER REQUEST FAILED - REOPEN TO TRY AGAIN",
         Notice::NoInstall => "NO INSTALLATION IS READY TO REVIEW",
         Notice::UpdateRefused => "UPDATE CANNOT READ LOGIN KEYS",
@@ -721,6 +725,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         }
     };
     let rest: &[&str] = match notice {
+        Notice::SleepConfirm => &["ENTER TO CONFIRM", "ENROLLED SESSIONS LOCK BEFORE SLEEP"],
         Notice::PowerConfirm(_) => &["ENTER TO CONFIRM", "UNSAVED WORK MAY BE LOST"],
         Notice::Menu(_) => &[
             "E: ENROLL TWO TOKENS (HAVE BOTH READY)",
@@ -794,7 +799,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
     if let Notice::Menu(intake) = notice {
         rows.push(hostname_row(intake));
         rows.push("S: DISK ENCRYPTION".into());
-        rows.push("F: RESTART  P: POWER OFF".into());
+        rows.push("F: RESTART  P: POWER OFF  Z: SLEEP".into());
     }
     rows
 }
@@ -1149,7 +1154,7 @@ mod tests {
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
             "H: NO HOSTNAME CHANGE WAITING",
             "S: DISK ENCRYPTION",
-            "F: RESTART  P: POWER OFF",
+            "F: RESTART  P: POWER OFF  Z: SLEEP",
             "ESC TO RETURN",
         ];
         for (width, height, top, scale, pitch) in [
@@ -1674,6 +1679,8 @@ mod tests {
             Notice::PowerAccepted(crate::authority::consent::Power::Restart),
             Notice::PowerAccepted(crate::authority::consent::Power::Off),
             Notice::PowerFailed,
+            Notice::SleepConfirm,
+            Notice::Resumed,
             Notice::LoginKeys,
             Notice::StateUnknown,
             Notice::Removing {

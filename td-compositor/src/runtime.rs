@@ -3274,6 +3274,21 @@ impl Runtime {
         Ok(self.presented.notice(epoch?))
     }
 
+    /// A lock frame, after attention has closed, for the suspend initiator.
+    /// A draining attention frame is not a lock-surface receipt.
+    pub(crate) fn suspend_presentation(&mut self) -> Result<Option<NoticePresentation>, String> {
+        if !self.attention_enabled || !self.scene.locked() {
+            return Err("suspend requires a locked session".into());
+        }
+        if self.scene.attention_visible() {
+            return Ok(None);
+        }
+        let epoch = self.paints.checked_add(1).ok_or("paint epochs exhausted")?;
+        self.owed_damage = Damage::Whole;
+        self.repaint()?;
+        Ok(Some(self.presented.notice(epoch)))
+    }
+
     /// Leaves the lock surface, once root reported a login unlock's success
     /// for the attention lifetime the person opened on it; closing that
     /// lifetime then restores the ordinary screen, focus and input.
@@ -16925,6 +16940,24 @@ mod tests {
         let evidence = ready.try_recv().unwrap();
         assert_eq!(evidence.content_pixels, [5_000; 2]);
         assert_eq!(evidence.app_id, "org.mozilla.firefox");
+    }
+
+    #[test]
+    fn suspend_receipt_requires_a_lock_frame_after_attention_closes() {
+        let root = crate::temp_dir::TempDir::new("suspend-frame").unwrap();
+        let path = root.path().join("frame");
+        let mut runtime = Runtime::new(Framebuffer::test_file(&path, 800, 600, 3200).unwrap());
+        let origin = crate::input::test_origin();
+        assert!(runtime.suspend_presentation().is_err());
+        runtime.enable_attention(true);
+        assert!(runtime.suspend_presentation().is_err());
+        runtime.attention(&origin, true).unwrap();
+        runtime.drain_attention(&origin).unwrap();
+        runtime.lock_session(&origin).unwrap();
+        assert!(runtime.suspend_presentation().unwrap().is_none());
+        runtime.attention(&origin, false).unwrap();
+        assert!(runtime.suspend_presentation().unwrap().unwrap().on_glass());
+        assert!(runtime.session_locked());
     }
 
     #[test]

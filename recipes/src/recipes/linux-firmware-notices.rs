@@ -10,6 +10,7 @@ pub const DIR: &str = "share/licenses/linux-firmware";
 
 /// Each notice's pin and its path under `DIR`, as linux-firmware lays it out.
 pub const NOTICES: &[(&str, &str)] = &[
+    ("linux-firmware-amdgpu-license-source", "LICENSE.amdgpu"),
     (
         "linux-firmware-ath11k-wcn6855-notice-source",
         "ath11k/WCN6855/hw2.0/Notice.txt",

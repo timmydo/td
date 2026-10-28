@@ -10,9 +10,57 @@ const FIRMWARE_DIR: &str = "td-firmware";
 /// The build root's cp, which may write into the build tree.
 const CP: &str = "/usr/bin/cp";
 
-/// linux-firmware's WCN6855 files ath11k requests at probe (AGENTS.md
+/// Phoenix GPU and WCN6855 files requested at probe (AGENTS.md
 /// "Device firmware"), each by its pin and the name the driver asks for.
 pub const FIRMWARE: &[(&str, &str)] = &[
+    (
+        "linux-firmware-amdgpu-gc-11-0-1-imu-source",
+        "amdgpu/gc_11_0_1_imu.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-0-1-mes1-source",
+        "amdgpu/gc_11_0_1_mes1.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-0-1-mes-2-source",
+        "amdgpu/gc_11_0_1_mes_2.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
+        "amdgpu/dcn_3_1_4_dmcub.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-0-1-me-source",
+        "amdgpu/gc_11_0_1_me.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-0-1-mec-source",
+        "amdgpu/gc_11_0_1_mec.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-0-1-pfp-source",
+        "amdgpu/gc_11_0_1_pfp.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-gc-11-0-1-rlc-source",
+        "amdgpu/gc_11_0_1_rlc.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-psp-13-0-4-ta-source",
+        "amdgpu/psp_13_0_4_ta.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-psp-13-0-4-toc-source",
+        "amdgpu/psp_13_0_4_toc.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-sdma-6-0-1-source",
+        "amdgpu/sdma_6_0_1.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-vcn-4-0-2-source",
+        "amdgpu/vcn_4_0_2.bin",
+    ),
     (
         "linux-firmware-ath11k-wcn6855-amss-source",
         "ath11k/WCN6855/hw2.0/amss.bin",
@@ -153,6 +201,9 @@ pub fn recipe() -> Recipe {
     // places it in the build tree.
     steps.push(Step::MkDir {
         path: format!("{{src}}/{FIRMWARE_DIR}/ath11k/WCN6855/hw2.0"),
+    });
+    steps.push(Step::MkDir {
+        path: format!("{{src}}/{FIRMWARE_DIR}/amdgpu"),
     });
     for (pin, name) in FIRMWARE {
         let from = format!("{{in:{pin}}}");
@@ -393,7 +444,7 @@ pub fn recipe() -> Recipe {
     //    td-audio opens PCMs by name, and defaults in other vendors' HDMI codecs.
     //    SUSPEND brings PM, PM_SLEEP and ACPI_SLEEP into every kernel, QEMU's
     //    too: runtime PM is compiled into each driver and /sys/power/state offers
-    //    freeze and mem, which nothing in td writes. QEMU binds none of the
+    //    freeze and mem; td-authd's physical sleep operation writes mem. QEMU binds none of the
     //    laptop's devices, so /dev/fb0 there stays virtio-gpu's.
     //
     //    ThinkPad T14s Gen 4 AMD (Ryzen 7040) drivers arrive the same way
@@ -432,11 +483,11 @@ pub fn recipe() -> Recipe {
     //    SERIAL_MCTRL_GPIO; the Realtek menu defaults in every Realtek codec
     //    family, whose library selects the side-codec component; AMD_IOMMU
     //    selects the IOMMU API, IOVA, SVA, page fault and PCI ATS/PRI/PASID
-    //    support. Its Radeon is not driven: amdgpu needs device firmware
-    //    no reviewed pin carries yet, so its display is simpledrm's GOP
-    //    framebuffer, as on any UEFI machine. AMD_PMC, which s2idle needs to
-    //    reach its deepest state, is left out with RTC_CLASS behind it,
-    //    since nothing in td enters s2idle. Its internal microphones sit on
+    //    support. AMDGPU and DC drive Phoenix with its pinned firmware
+    //    embedded before probe, including DMCUB for display power management.
+    //    AMD_PMC and the CMOS RTC support s2idle entry and wake accounting.
+    //    PCIe ASPM follows the firmware policy, without forcing unsupported states.
+    //    Its internal microphones sit on
     //    the ACP 6.3 PDM controller, whose SND_SOC_AMD_PS driver and SND_SOC
     //    are not built.
     //
@@ -747,6 +798,14 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_MMC_RICOH_MMC[ =]/d; \
                   /^#? *CONFIG_SND_HDA_CODEC_CONEXANT[ =]/d; \
                   /^#? *CONFIG_SND_HDA_CODEC_HDMI[ =]/d; \
+                  /^#? *CONFIG_DRM_AMDGPU[ =]/d; \
+                  /^#? *CONFIG_DRM_AMD_DC[ =]/d; \
+                  /^#? *CONFIG_RTC_CLASS[ =]/d; \
+                  /^#? *CONFIG_RTC_DRV_CMOS[ =]/d; \
+                  /^#? *CONFIG_PCIEPORTBUS[ =]/d; \
+                  /^#? *CONFIG_PCIEASPM[ =]/d; \
+                  /^#? *CONFIG_PCIEASPM_DEFAULT[ =]/d; \
+                  /^#? *CONFIG_AMD_PMC[ =]/d; \
                   /^#? *CONFIG_X86_AMD_PSTATE[ =]/d; \
                   /^#? *CONFIG_X86_AMD_PLATFORM_DEVICE[ =]/d; \
                   /^#? *CONFIG_PINCTRL_AMD[ =]/d; \
@@ -981,6 +1040,14 @@ pub fn recipe() -> Recipe {
                    'CONFIG_MMC_RICOH_MMC=y' \
                    'CONFIG_SND_HDA_CODEC_CONEXANT=y' \
                    'CONFIG_SND_HDA_CODEC_HDMI=y' \
+                   'CONFIG_DRM_AMDGPU=y' \
+                   'CONFIG_DRM_AMD_DC=y' \
+                   'CONFIG_RTC_CLASS=y' \
+                   'CONFIG_RTC_DRV_CMOS=y' \
+                   'CONFIG_PCIEPORTBUS=y' \
+                   'CONFIG_PCIEASPM=y' \
+                   'CONFIG_PCIEASPM_DEFAULT=y' \
+                   'CONFIG_AMD_PMC=y' \
                    'CONFIG_X86_AMD_PSTATE=y' \
                    'CONFIG_X86_AMD_PLATFORM_DEVICE=y' \
                    'CONFIG_PINCTRL_AMD=y' \
@@ -1001,7 +1068,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_WLAN_VENDOR_ATH=y' \
                    'CONFIG_ATH11K=y' \
                    'CONFIG_ATH11K_PCI=y' \
-                   'CONFIG_EXTRA_FIRMWARE=\"ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' \
+                   'CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' \
                    'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' >> .config"
                     .replace(
                         "@EFI_CMDLINE@",
@@ -1208,6 +1275,14 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_SND_HDA_CODEC_CONEXANT=y' .config || { echo 'SND_HDA_CODEC_CONEXANT off — the T430s Conexant codec falls back to the generic parser' >&2; exit 1; }; \
                  grep -q '^CONFIG_SND_HDA_CODEC_HDMI=y' .config || { echo 'SND_HDA_CODEC_HDMI off — HDMI and DisplayPort audio codecs stay hidden' >&2; exit 1; }; \
                  grep -q '^CONFIG_SND_HDA_CODEC_HDMI_INTEL=y' .config || { echo 'SND_HDA_CODEC_HDMI_INTEL off — Intel HDMI and DisplayPort audio has no codec driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DRM_AMDGPU=y' .config || { echo 'DRM_AMDGPU off - T14s suspend requires it' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DRM_AMD_DC=y' .config || { echo 'DRM_AMD_DC off - T14s suspend requires it' >&2; exit 1; }; \
+                 grep -q '^CONFIG_RTC_CLASS=y' .config || { echo 'RTC_CLASS off - T14s suspend requires it' >&2; exit 1; }; \
+                 grep -q '^CONFIG_RTC_DRV_CMOS=y' .config || { echo 'RTC_DRV_CMOS off - T14s suspend requires it' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PCIEPORTBUS=y' .config || { echo 'PCIEPORTBUS off - PCIe devices cannot follow firmware power policy' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PCIEASPM=y' .config || { echo 'PCIEASPM off - PCIe devices cannot follow firmware power policy' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PCIEASPM_DEFAULT=y' .config || { echo 'PCIEASPM_DEFAULT off - PCIe devices cannot follow firmware power policy' >&2; exit 1; }; \
+                 grep -q '^CONFIG_AMD_PMC=y' .config || { echo 'AMD_PMC off - T14s suspend requires it' >&2; exit 1; }; \
                  grep -q '^CONFIG_X86_AMD_PSTATE=y' .config || { echo 'X86_AMD_PSTATE off — AMD CPUs get no P-state scaling driver' >&2; exit 1; }; \
                  grep -q '^CONFIG_ACPI_PROCESSOR=y' .config || { echo 'ACPI_PROCESSOR off — AMD CPUs get no ACPI idle states and amd-pstate has no CPPC' >&2; exit 1; }; \
                  grep -q '^CONFIG_X86_AMD_PLATFORM_DEVICE=y' .config || { echo 'X86_AMD_PLATFORM_DEVICE off — the AMD I2C and GPIO controllers are never created from ACPI' >&2; exit 1; }; \
@@ -1237,7 +1312,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_QRTR=y' .config || { echo 'QRTR off — ath11k talks QMI to the WCN6855 over QRTR' >&2; exit 1; }; \
                  grep -q '^CONFIG_QRTR_MHI=y' .config || { echo 'QRTR_MHI off — QRTR has no transport to the WCN6855' >&2; exit 1; }; \
                  grep -q '^CONFIG_QCOM_QMI_HELPERS=y' .config || { echo 'QCOM_QMI_HELPERS off — ath11k has no QMI client' >&2; exit 1; }; \
-                 grep -qx 'CONFIG_EXTRA_FIRMWARE=\"ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' .config || { echo 'EXTRA_FIRMWARE is not the WCN6855 set — ath11k probes before any root and finds no firmware' >&2; exit 1; }; \
+                 grep -qx 'CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' .config || { echo 'EXTRA_FIRMWARE is not the Phoenix and WCN6855 set — ath11k probes before any root and finds no firmware' >&2; exit 1; }; \
                  grep -qx 'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' .config || { echo 'EXTRA_FIRMWARE_DIR is not the build-tree firmware directory' >&2; exit 1; }; \
                  if grep -q '^CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y' .config; then echo 'CFG80211_REQUIRE_SIGNED_REGDB on — it selects the trusted keyring and its openssl-linked certs/ tool' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_SYSTEM_TRUSTED_KEYRING=y' .config; then echo 'SYSTEM_TRUSTED_KEYRING on — a select overrode its pin, and certs/ would need openssl' >&2; exit 1; fi; \
@@ -1575,6 +1650,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for symbol in [
+            "DRM_AMDGPU",
+            "DRM_AMD_DC",
+            "RTC_CLASS",
+            "RTC_DRV_CMOS",
+            "PCIEPORTBUS",
+            "PCIEASPM",
+            "PCIEASPM_DEFAULT",
+            "AMD_PMC",
             "X86_AMD_PSTATE",
             "X86_AMD_PLATFORM_DEVICE",
             "PINCTRL_AMD",

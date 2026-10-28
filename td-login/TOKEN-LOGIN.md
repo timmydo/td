@@ -619,12 +619,13 @@ screen's `L`, on a lid close and on resume from any suspend, however it
 began, that lasted longer than the compositor's two-second threshold plus
 the kernel's one-second RTC granularity for measuring sleep on x86
 without a TSC that runs in S3. A shorter suspend can go unnoticed. The
-compositor's detection of each trigger is in its design; it only
-detects a suspend and never starts or delays one. td has
-no suspend initiator and this tier adds none. Any initiator that lands
-later must, for an enrolled account, obtain the lock surface's
-presentation receipt before writing `/sys/power/state` and refuse to
-suspend when locking fails. Hibernation stays disabled.
+compositor's detection of each trigger is in its design. Physical secure
+attention's Sleep action is td's suspend initiator: for an enrolled account
+it obtains the lock surface's presentation receipt before root writes
+`/sys/power/state` and refuses sleep when locking or presentation fails.
+The lock persists across even a short sleep; resume detection remains a
+backstop for sleeps initiated outside that path. Lid close locks but does
+not initiate sleep. Hibernation stays disabled.
 
 Locking closes overlays, withdraws focus and grabs, and paints the lock
 surface over the whole output. Until that paint has a presentation

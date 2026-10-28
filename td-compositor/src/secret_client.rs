@@ -364,6 +364,7 @@ pub(crate) enum Selection {
     Login(LoginSelection),
     Elevation(Elevation),
     Power(crate::authority::consent::Power),
+    Suspend,
 }
 impl From<Role> for Selection {
     fn from(role: Role) -> Self {
@@ -373,9 +374,12 @@ impl From<Role> for Selection {
 impl Selection {
     fn operation(&self) -> Option<Operation> {
         Some(match self {
-            Self::Write | Self::Install | Self::Login(_) | Self::Elevation(_) | Self::Power(_) => {
-                return None
-            }
+            Self::Write
+            | Self::Install
+            | Self::Login(_)
+            | Self::Elevation(_)
+            | Self::Power(_)
+            | Self::Suspend => return None,
             Self::Unlock(role) => Operation::Unlock { role: *role },
             Self::Enroll(recovery) => Operation::Enroll {
                 platform: Platform::TpmPcr7,
@@ -386,6 +390,7 @@ impl Selection {
     }
     fn request(&self) -> Result<Vec<u8>, String> {
         Ok(match self {
+            Self::Suspend => return Err("suspend requires a lock presentation receipt".into()),
             Self::Power(choice) => vec![0x21, choice.byte()],
             Self::Write => vec![0x18],
             Self::Install => vec![0x19],
@@ -1842,6 +1847,33 @@ impl Client {
         if let Some(shown) = self.restarting(&attempt) {
             return shown;
         }
+        if attempt.selection == Selection::Suspend {
+            if !attempt.commit() {
+                return Ok(());
+            }
+            let locked = attempt
+                .seat
+                .as_ref()
+                .ok_or("suspend needs the physical seat")?
+                .prepare_suspend(&attempt, || {
+                    if wire.exchange(&[3])? != [0x83] {
+                        return Err("invalid suspend preparation heartbeat".into());
+                    }
+                    Ok(())
+                })?;
+            let Some(locked) = locked else {
+                return attempt.notice(Notice::PowerFailed);
+            };
+            let resumed = suspend_exchange(wire, locked)?;
+            if locked {
+                return Ok(());
+            }
+            return attempt.notice(if resumed {
+                Notice::Resumed
+            } else {
+                Notice::PowerFailed
+            });
+        }
         if matches!(attempt.selection, Selection::Power(_)) && !attempt.commit() {
             return Ok(());
         }
@@ -2089,6 +2121,30 @@ impl Client {
             Some(0 | 1) => crate::attention::Notice::Unenrolled,
             _ => crate::attention::Notice::Unavailable,
         })
+    }
+}
+
+/// Poll a single submitted operation; never resubmit after an uncertain reply.
+fn suspend_exchange(wire: &mut impl Exchange, locked: bool) -> Result<bool, String> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(65))
+        .ok_or("suspend deadline overflow")?;
+    let started = wire.exchange(&[0x25, u8::from(locked)])?;
+    match started.as_slice() {
+        [0xa5, 0] => {}
+        [0xa5, 1 | 2] => return Ok(false),
+        _ => return Err("invalid suspend start response".into()),
+    }
+    let mut response = started;
+    loop {
+        match response.as_slice() {
+            [0xa5, 3] => return Ok(true),
+            [0xa5, 0] if Instant::now() < deadline => {}
+            [0xa5, 1 | 2] => return Ok(false),
+            _ => return Err("invalid or timed out suspend response".into()),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        response = wire.exchange(&[0x26])?;
     }
 }
 
@@ -3174,6 +3230,65 @@ mod tests {
             },
         };
         Request::new([42; 32], 1000, operation).unwrap()
+    }
+
+    #[test]
+    fn suspend_polls_once_submitted_and_never_retries_a_refusal() {
+        for locked in [false, true] {
+            let mut wire = Wire {
+                replies: VecDeque::from([vec![0xa5, 0], vec![0xa5, 0], vec![0xa5, 3]]),
+                calls: vec![],
+                typist: None,
+            };
+            assert!(suspend_exchange(&mut wire, locked).unwrap());
+            assert_eq!(
+                wire.calls,
+                vec![vec![0x25, u8::from(locked)], vec![0x26], vec![0x26]]
+            );
+            for reply in [
+                vec![0xa5, 1],
+                vec![0xa5, 2],
+                vec![0xa5, 3],
+                vec![0xa5],
+                vec![0xa1, 0],
+            ] {
+                let mut wire = Wire {
+                    replies: VecDeque::from([reply.clone()]),
+                    calls: vec![],
+                    typist: None,
+                };
+                if matches!(reply.as_slice(), [0xa5, 1 | 2]) {
+                    assert!(!suspend_exchange(&mut wire, locked).unwrap());
+                } else {
+                    assert!(suspend_exchange(&mut wire, locked).is_err());
+                }
+                assert_eq!(wire.calls, vec![vec![0x25, u8::from(locked)]]);
+            }
+        }
+    }
+
+    #[test]
+    fn suspend_without_a_live_physical_seat_never_sends() {
+        for cancel in [false, true] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Suspend;
+            if cancel {
+                screen.attempt.cancel();
+            }
+            let mut wire = Wire {
+                replies: VecDeque::new(),
+                calls: vec![],
+                typist: None,
+            };
+            assert_eq!(
+                Client::default()
+                    .start(&mut wire, Arc::clone(&screen.attempt))
+                    .is_ok(),
+                cancel
+            );
+            assert!(wire.calls.is_empty());
+            assert!(Selection::Suspend.request().is_err());
+        }
     }
 
     #[test]

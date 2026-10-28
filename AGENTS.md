@@ -183,8 +183,8 @@ code belongs to no class here and needs an amendment to this file.
 ## Device firmware
 
 Some hardware runs code td cannot build: the ThinkPad T14s Gen 4 AMD's
-Qualcomm WCN6855 Wi-Fi loads its firmware from the host when its driver
-probes. td takes such firmware as upstream bytes from linux-firmware's
+Qualcomm WCN6855 Wi-Fi and Phoenix Radeon GPU load their firmware from
+the host when their drivers probe. td takes such firmware as upstream bytes from linux-firmware's
 tagged tree, each file a pin with a reviewed URL and SHA-256, listed in
 `DEVICE_FIRMWARE` (`recipes/src/source_pins.rs`). Only the peripheral
 it is written for runs it. The kernel recipe copies the pinned files

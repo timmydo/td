@@ -205,6 +205,110 @@ const PINS: &[PinDef] = &[
         version: "4.14.67",
     },
     PinDef {
+        key: "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/dcn_3_1_4_dmcub.bin",
+        sha256: "454d3eb73045d0a46f9014c42c76df9e65ae9e5da45b8c331584443fe49a8516",
+        file: "linux-firmware-20261019-amdgpu-dcn_3_1_4_dmcub.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-gc-11-0-1-imu-source",
+        aliases: &[],
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/gc_11_0_1_imu.bin",
+        sha256: "ac71f4eec713fc35b4a1fe27531e3eb04edd81eeac2cef64df01ac50d8510805",
+        file: "linux-firmware-20261019-amdgpu-gc_11_0_1_imu.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-gc-11-0-1-mes1-source",
+        aliases: &[],
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/gc_11_0_1_mes1.bin",
+        sha256: "3a8b60ea88b7adbbc71da0ddee0370d5d65c1d66186fd4f4ba9d16a854b24db8",
+        file: "linux-firmware-20261019-amdgpu-gc_11_0_1_mes1.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-gc-11-0-1-mes-2-source",
+        aliases: &[],
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/gc_11_0_1_mes_2.bin",
+        sha256: "962f56c7e661479e3cabf89c1fcd6344f10cfa8b8d1f672fc445bb21414c1392",
+        file: "linux-firmware-20261019-amdgpu-gc_11_0_1_mes_2.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-gc-11-0-1-me-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/gc_11_0_1_me.bin",
+        sha256: "62c5e749ad848941e5d8b85f66eeb2b969ee82919724dfd94dbf6e354be8befc",
+        file: "linux-firmware-20261019-amdgpu-gc_11_0_1_me.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-gc-11-0-1-mec-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/gc_11_0_1_mec.bin",
+        sha256: "b0a4006b3934adc1d7996e6d901206dea37203b4839debe4a5ed4e393a615cbb",
+        file: "linux-firmware-20261019-amdgpu-gc_11_0_1_mec.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-gc-11-0-1-pfp-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/gc_11_0_1_pfp.bin",
+        sha256: "449c72cae1c57838185197ad4003aeee7ccbdba892a28bb2624d9e85f57a2df1",
+        file: "linux-firmware-20261019-amdgpu-gc_11_0_1_pfp.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-gc-11-0-1-rlc-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/gc_11_0_1_rlc.bin",
+        sha256: "5f07dc1f0a75ecd9cb56d805ea869184a50ed9e43d811ebf833b8906534650ef",
+        file: "linux-firmware-20261019-amdgpu-gc_11_0_1_rlc.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-psp-13-0-4-ta-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/psp_13_0_4_ta.bin",
+        sha256: "f4a2687e1cd940b016e308bc87b9b840f845526d9ef21147416d89c1c72a7944",
+        file: "linux-firmware-20261019-amdgpu-psp_13_0_4_ta.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-psp-13-0-4-toc-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/psp_13_0_4_toc.bin",
+        sha256: "11e3529d748e2b6b204681183360a6ead80665b8deda996dfcf35973f789fc3d",
+        file: "linux-firmware-20261019-amdgpu-psp_13_0_4_toc.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-sdma-6-0-1-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/sdma_6_0_1.bin",
+        sha256: "708c2c2c45262c98ebe8e34e32c3f1ce8eb5b007bab560c9ea9b576a8e4d6768",
+        file: "linux-firmware-20261019-amdgpu-sdma_6_0_1.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-vcn-4-0-2-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/vcn_4_0_2.bin",
+        sha256: "5633a5212d41e1f3932c1e7e630b1f2c8c4d27bc53ce8149c3be75d1d832053c",
+        file: "linux-firmware-20261019-amdgpu-vcn_4_0_2.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-license-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/LICENSES/LICENSE.amdgpu",
+        sha256: "572872598565dc3513470de971a32bf9db301f47afeef3636345eadae33b2eee",
+        file: "linux-firmware-20261019-amdgpu-LICENSE.amdgpu",
+    },
+    PinDef {
         key: "linux-firmware-ath11k-wcn6855-amss-source",
         aliases: &[],
         // Device firmware (AGENTS.md "Device firmware"): linux-firmware's
@@ -407,6 +511,18 @@ const FOREIGN: &[&str] = &["ripgrep-seed-source"];
 /// names each. Adding an entry is a reviewed pin; firmware the host CPU runs
 /// belongs to no class.
 pub const DEVICE_FIRMWARE: &[&str] = &[
+    "linux-firmware-amdgpu-gc-11-0-1-mes-2-source",
+    "linux-firmware-amdgpu-gc-11-0-1-mes1-source",
+    "linux-firmware-amdgpu-gc-11-0-1-imu-source",
+    "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
+    "linux-firmware-amdgpu-gc-11-0-1-me-source",
+    "linux-firmware-amdgpu-gc-11-0-1-mec-source",
+    "linux-firmware-amdgpu-gc-11-0-1-pfp-source",
+    "linux-firmware-amdgpu-gc-11-0-1-rlc-source",
+    "linux-firmware-amdgpu-psp-13-0-4-ta-source",
+    "linux-firmware-amdgpu-psp-13-0-4-toc-source",
+    "linux-firmware-amdgpu-sdma-6-0-1-source",
+    "linux-firmware-amdgpu-vcn-4-0-2-source",
     "linux-firmware-ath11k-wcn6855-amss-source",
     "linux-firmware-ath11k-wcn6855-board-2-source",
     "linux-firmware-ath11k-wcn6855-m3-source",
@@ -551,7 +667,7 @@ mod tests {
         // imports replaced the remaining source bootstrap.
         // linux-firmware's WCN6855 files and their licence add six pins,
         // four of them device firmware (AGENTS.md).
-        assert_eq!(all().len(), 38);
+        assert_eq!(all().len(), 51);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

@@ -76,6 +76,7 @@ mod set_hostname;
 mod sha256;
 mod software;
 mod storage;
+mod suspend;
 mod sys;
 mod unlock;
 
@@ -95,6 +96,9 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
      td-authd request-update SOURCE DEPLOYMENT-ID | td-authd request-hostname NAME";
 
 fn run(arguments: &[String]) -> Result<(), String> {
+    if arguments == ["suspend-system"] {
+        return suspend::run();
+    }
     if let [verb, name] = arguments {
         if verb == "request-hostname" {
             return set_hostname::request(name);
