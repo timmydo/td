@@ -1087,6 +1087,11 @@ impl Https<'_> {
                                         != Some(backend.account())
                                     {
                                         404
+                                    } else if backend
+                                        .session()
+                                        .is_some_and(|session| session.is_read_only())
+                                    {
+                                        403
                                     } else if !body_active
                                         .admit(&mut client.body_slot, BodyKind::Upload)
                                     {

@@ -957,6 +957,15 @@ fn framed_reply(client: &mut impl Transport, bytes: &mut Vec<u8>) -> (u16, Strin
 
 #[test]
 fn account_and_allowed_origin_select_private_session_and_backend() {
+    account_origin_upload_policy(false);
+}
+
+#[test]
+fn read_only_account_refuses_upload_without_calling_backend() {
+    account_origin_upload_policy(true);
+}
+
+fn account_origin_upload_policy(first_read_only: bool) {
     struct Accounts;
     impl http_auth::Authenticator for Accounts {
         fn authenticate(
@@ -1083,7 +1092,11 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
     let handshakes = HandshakePool::new(2).unwrap();
     let make = |id, username, origin: &str| Backend {
         account: id,
-        session: crate::jmap_session::Session::mail_submission(
+        session: (if first_read_only && id == AccountId::from_bytes([0xaa; 16]) {
+            crate::jmap_session::Session::mail_read_only
+        } else {
+            crate::jmap_session::Session::mail_submission
+        })(
             Origin::parse(origin).unwrap(),
             crate::config::identities::AccountView {
                 id,
@@ -1196,7 +1209,7 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
                 assert!(body.contains(own), "{body}");
                 assert!(!body.contains(other), "{body}");
                 drop(peer);
-                for (target, expected) in [(other, 404), (own, 200)] {
+                for (target, expected) in [(other, 404), (own, if first_read_only && username == "first" { 403 } else { 200 })] {
                     std::thread::sleep(Duration::from_millis(250));
                     let mut peer = client(address, client_lease, clock.clone());
                     send(&mut peer, format!("POST /jmap/upload/{target} HTTP/1.1\r\nHost: {host}:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n", address.port()).as_bytes());
@@ -1212,9 +1225,9 @@ fn account_and_allowed_origin_select_private_session_and_backend() {
                 send(&mut peer, format!("GET /.well-known/jmap HTTP/1.1\r\nHost: {host}:{}\r\nOrigin: {origin}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
                 assert_eq!(full_reply(&mut peer).0, expected);
             }
-            assert_eq!(first_alias.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(first_alias.calls.load(Ordering::Relaxed), u64::from(!first_read_only));
             assert_eq!(second_alias.calls.load(Ordering::Relaxed), 1);
-            assert_eq!(first.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(first.calls.load(Ordering::Relaxed), u64::from(!first_read_only));
             assert_eq!(second.calls.load(Ordering::Relaxed), 1);
             drop(stop);
             worker.join().unwrap().unwrap();

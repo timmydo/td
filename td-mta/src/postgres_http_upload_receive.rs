@@ -22,7 +22,8 @@ pub(crate) fn receive(
     transport: &mut dyn Transport,
     control: &Control,
 ) -> Result<Response, Error> {
-    if request.account != service.binding.account()
+    if service.session.is_read_only()
+        || request.account != service.binding.account()
         || !service.binding.roles().jmap()
         || service.loaded.bootstrap.profile() != service.binding.profile()
         || !service.executable.is_absolute()

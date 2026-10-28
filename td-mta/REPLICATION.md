@@ -678,3 +678,19 @@ measurements only after a real drill, not from schema compatibility alone.
 5. Measure initial-copy and catch-up throughput, storage overhead and freshness.
    Timing measurements are diagnostic, not host-load-sensitive gate assertions.
 6. Design and rehearse explicit recovery separately before claiming BCDR support.
+
+## Read-only HTTP policy preparation
+
+`Session::mail_read_only` prepares an `isReadOnly: true` account with no
+submission capability or top-level mailbox creation permission. Its closed
+method allowlist admits Core echo and the implemented mail and replica reads;
+new or unknown methods are refused. The PostgreSQL API service rejects an
+entire disallowed batch after bounded request parsing and before opening a
+storage view or invoking mutations. Passive dispatch reports no mailbox write
+rights. HTTPS refuses authenticated uploads before reserving a body slot, and
+the PostgreSQL upload adapter independently refuses them before ingress.
+These guards do not qualify a database or activate a listener. Ordinary runtime
+qualification still refuses a replica-bound store; a separately qualified local
+read profile and installer remain required. Existing primary Sessions retain
+their writable behavior. Client policy remains advisory; server refusal owns
+the authorization boundary.

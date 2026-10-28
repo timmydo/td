@@ -498,6 +498,14 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         // for reads is established below, after bounded input preparation.
         let (plan, execution) =
             exchange.receive(request, sender, start, &mut retention, |_| Ok(()))?;
+        if plan
+            .request()
+            .map_err(|_| ApiError::Io(Error::Invalid))?
+            .calls()
+            .any(|call| !self.session.permits_method(call.name))
+        {
+            return Err(Error::Forbidden.into());
+        }
         retention.admit_work_turn()?;
         let execution = execution.min(crate::ports::Deadline::after(sender.last, 10_000)?);
         let (mutation, send_batch) = {
@@ -529,7 +537,12 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                     headers,
                     |snapshot| {
                         dispatch::run_with_postgres_read(
-                            plan, retention, execution, snapshot, self.clock, true,
+                            plan,
+                            retention,
+                            execution,
+                            snapshot,
+                            self.clock,
+                            !self.session.is_read_only(),
                         )
                         .map_err(dispatch_error)
                     },
@@ -658,7 +671,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
                 execution,
                 &mut snapshot,
                 self.clock,
-                true,
+                !self.session.is_read_only(),
             );
             drop(snapshot);
             result

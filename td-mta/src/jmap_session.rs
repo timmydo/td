@@ -33,6 +33,7 @@ pub struct Concurrency {
 pub struct Session {
     origin: String,
     submission: bool,
+    read_only: bool,
     concurrency: Concurrency,
     bytes: Vec<u8>,
     state: [u8; 64],
@@ -49,7 +50,7 @@ impl Session {
         resources: &ResourcePlan,
         concurrency: Concurrency,
     ) -> Result<Self, Error> {
-        Self::prepare(origin, account, resources, concurrency, false)
+        Self::prepare(origin, account, resources, concurrency, false, false)
     }
     /// Prepared PostgreSQL sending profile; caller must implement the td-mail
     /// send and reconciliation flows before exposing this Session.
@@ -59,7 +60,39 @@ impl Session {
         resources: &ResourcePlan,
         concurrency: Concurrency,
     ) -> Result<Self, Error> {
-        Self::prepare(origin, account, resources, concurrency, true)
+        Self::prepare(origin, account, resources, concurrency, true, false)
+    }
+    /// Read-only mail metadata. Callers must enforce this policy on every
+    /// request and separately qualify the database for replica reads.
+    pub fn mail_read_only(
+        origin: Origin<'_>,
+        account: AccountView<'_>,
+        resources: &ResourcePlan,
+        concurrency: Concurrency,
+    ) -> Result<Self, Error> {
+        Self::prepare(origin, account, resources, concurrency, false, true)
+    }
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+    /// Closed allowlist: future methods cannot silently grant replica writes.
+    pub fn permits_method(&self, method: &[u8]) -> bool {
+        !self.read_only
+            || matches!(
+                method,
+                b"Core/echo"
+                    | b"Mailbox/get"
+                    | b"Mailbox/query"
+                    | b"Mailbox/queryChanges"
+                    | b"Mailbox/changes"
+                    | b"Email/get"
+                    | b"Email/query"
+                    | b"Email/changes"
+                    | b"Thread/get"
+                    | b"Thread/changes"
+                    | b"TdReplica/inventory"
+                    | b"TdReplica/metadata"
+            )
     }
     fn prepare(
         origin: Origin<'_>,
@@ -67,6 +100,7 @@ impl Session {
         resources: &ResourcePlan,
         concurrency: Concurrency,
         submission: bool,
+        read_only: bool,
     ) -> Result<Self, Error> {
         let limits = resources.limits();
         if account.username.len() > 254
@@ -128,17 +162,19 @@ impl Session {
         quoted(&mut out, account.name)?;
         out.format(format_args!(
             concat!(
-            ",\"isPersonal\":true,\"isReadOnly\":false,\"accountCapabilities\":{{",
+            ",\"isPersonal\":true,\"isReadOnly\":{read_only},\"accountCapabilities\":{{",
             "\"urn:ietf:params:jmap:core\":{{}},\"urn:ietf:params:jmap:mail\":{{",
             "\"maxMailboxesPerEmail\":null,\"maxMailboxDepth\":null,",
             "\"maxSizeMailboxName\":{},\"maxSizeAttachmentsPerEmail\":{},",
-            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":true}},\"{replication}\":{{\"inventoryBaseFence\":true,\"maxInventoryIds\":{inventory_limit},\"maxMetadataIds\":{metadata_limit}}}{submission_account}}}}}}}",
+            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":{may_create}}},\"{replication}\":{{\"inventoryBaseFence\":true,\"maxInventoryIds\":{inventory_limit},\"maxMetadataIds\":{metadata_limit}}}{submission_account}}}}}}}",
             ",\"primaryAccounts\":{{\"urn:ietf:params:jmap:mail\":\"{}\""
         ),
             crate::format::row::MAX_MAILBOX_NAME,
             limits.message_bytes,
             id,
             replication = crate::jmap_request::REPLICATION,
+            read_only = read_only,
+            may_create = !read_only,
             inventory_limit = limits.query_page.min(crate::postgres_read::MAX_REPLICA_INVENTORY_PAGE),
             metadata_limit = limits.objects_per_method.min(crate::postgres_body::MAX_METADATA_IDS),
             submission_account = if submission { ",\"urn:ietf:params:jmap:submission\":{\"maxDelayedSend\":0,\"submissionExtensions\":{}}" } else { "" },
@@ -186,6 +222,7 @@ impl Session {
         Ok(Self {
             origin: retained_origin,
             submission,
+            read_only,
             bytes,
             state,
             concurrency,
@@ -274,6 +311,52 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn read_only_session_advertises_and_enforces_closed_read_surface() {
+        let session = Session::mail_read_only(
+            Origin::parse("https://mail.example.test").unwrap(),
+            account(),
+            &Limits::default().plan().unwrap(),
+            Concurrency {
+                uploads: 1,
+                requests: 2,
+            },
+        )
+        .unwrap();
+        assert!(session.is_read_only());
+        assert!(!session
+            .capabilities()
+            .contains(&crate::jmap_request::SUBMISSION));
+        let value = td_json::parse(std::str::from_utf8(session.bytes()).unwrap()).unwrap();
+        let accounts = value["accounts"].as_object().unwrap();
+        let (_, account) = accounts.first().unwrap();
+        assert_eq!(account["isReadOnly"].as_bool(), Some(true));
+        assert_eq!(
+            account["accountCapabilities"][crate::jmap_request::MAIL]["mayCreateTopLevelMailbox"]
+                .as_bool(),
+            Some(false)
+        );
+        for method in [
+            b"Email/get".as_slice(),
+            b"Mailbox/get",
+            b"Email/query",
+            b"Email/changes",
+            b"TdReplica/metadata",
+        ] {
+            assert!(session.permits_method(method));
+        }
+        for method in [
+            b"Email/set".as_slice(),
+            b"Mailbox/set",
+            b"EmailSubmission/set",
+            b"Blob/copy",
+            b"PushSubscription/set",
+            b"Future/mutate",
+        ] {
+            assert!(!session.permits_method(method));
+        }
+    }
+
     #[test]
     fn complete_core_document_uses_only_configured_origin_and_limits() {
         let session = build(
