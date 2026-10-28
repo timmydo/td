@@ -23,6 +23,7 @@ use td_mta::{
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Operation {
+    Discover,
     Seed,
     Copy,
     Inspect,
@@ -30,6 +31,7 @@ pub(super) enum Operation {
 impl Operation {
     pub(super) fn parse(value: &OsStr) -> Option<Self> {
         match value.to_str()? {
+            "replica-discover" => Some(Self::Discover),
             "replica-account-init" => Some(Self::Seed),
             "replica-copy" => Some(Self::Copy),
             "replica-progress" => Some(Self::Inspect),
@@ -38,6 +40,7 @@ impl Operation {
     }
     fn name(self) -> &'static str {
         match self {
+            Self::Discover => "postgres-replica-discover",
             Self::Seed => "postgres-replica-account-init",
             Self::Copy => "postgres-replica-copy",
             Self::Inspect => "postgres-replica-progress",
@@ -149,6 +152,9 @@ fn read_limits() -> ReadLimits {
 }
 pub(super) fn run(op: Operation, args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let name = op.name();
+    if op == Operation::Discover {
+        return discover(args);
+    }
     let Some(options) = arguments(op, args) else {
         report_error(name, "arguments", "invalid-arguments")?;
         return Ok(ExitCode::from(2));
@@ -332,6 +338,84 @@ pub(super) fn run(op: Operation, args: impl Iterator<Item = OsString>) -> io::Re
         }
     }
 }
+struct DiscoveryOptions {
+    origin: String,
+    username: String,
+    password: String,
+    ca: Option<String>,
+}
+fn discovery_arguments(mut args: impl Iterator<Item = OsString>) -> Option<DiscoveryOptions> {
+    let mut values = std::collections::BTreeMap::new();
+    while let Some(flag) = args.next() {
+        let flag = flag.into_string().ok()?;
+        if !matches!(
+            flag.as_str(),
+            "--source-origin" | "--username" | "--password-file" | "--ca-file"
+        ) || values
+            .insert(flag, args.next()?.into_string().ok()?)
+            .is_some()
+        {
+            return None;
+        }
+    }
+    let origin = values.remove("--source-origin")?;
+    td_mta::config::endpoint::Origin::parse(&origin).ok()?;
+    Some(DiscoveryOptions {
+        origin,
+        username: values.remove("--username")?,
+        password: values.remove("--password-file")?,
+        ca: values.remove("--ca-file"),
+    })
+}
+fn discover(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
+    let name = Operation::Discover.name();
+    let Some(options) = discovery_arguments(args) else {
+        report_error(name, "arguments", "invalid-arguments")?;
+        return Ok(ExitCode::from(2));
+    };
+    let credentials = match outbound_credentials::Loaded::open(
+        &options.username,
+        &options.password,
+        options.ca.as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(code) => {
+            report_error(name, "source-credentials", code)?;
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    let executable = std::env::current_exe()?;
+    let result = (|| {
+        let mut reader = Reader::connect(
+            Client {
+                executable: &executable,
+                origin: &options.origin,
+                trust: &credentials.trust,
+                deadline: Instant::now() + Duration::from_secs(60),
+            },
+            &credentials.authorization,
+            None,
+            read_limits(),
+        )
+        .map_err(|_| "source-discovery-failed")?;
+        reader
+            .inventory(None)
+            .map_err(|_| "source-inventory-failed")?;
+        let binding = reader.binding().ok_or("source-binding-missing")?;
+        let source = Source::new(&options.origin, binding.epoch).map_err(|_| "source-invalid")?;
+        Ok::<_, &str>((source, binding.account))
+    })();
+    match result {
+        Ok((source, account)) => {
+            writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"source_origin\":\"{}\",\"source_epoch\":\"{}\",\"account\":\"{account}\",\"copy_complete\":false,\"recovery_verified\":false}}", source.origin(), source.epoch())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(code) => {
+            report_error(name, "source", code)?;
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
 fn no_retry(error: AttemptError) -> AttemptError {
     match error {
         AttemptError::Transport => fail("connection-failed"),
@@ -415,6 +499,49 @@ fn print_progress(name: &str, epoch: StoreEpoch, p: &Progress) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discovery_requires_only_remote_scope_and_rejects_ambiguous_options() {
+        let base = [
+            "--source-origin",
+            "https://mail.example.test",
+            "--username",
+            "user",
+            "--password-file",
+            "private/password",
+        ];
+        let parse =
+            |extra: &[&str]| discovery_arguments(base.iter().chain(extra).map(OsString::from));
+        assert!(parse(&[]).is_some());
+        assert!(parse(&["--ca-file", "private/ca"]).is_some());
+        for extra in [
+            vec!["--connection-file", "local"],
+            vec!["--account", "id"],
+            vec!["--password", "secret"],
+            vec!["--username", "other"],
+            vec!["--ca-file"],
+        ] {
+            assert!(parse(&extra).is_none());
+        }
+        assert!(discovery_arguments(
+            [
+                "--source-origin",
+                "http://mail.example.test",
+                "--username",
+                "user",
+                "--password-file",
+                "private/password"
+            ]
+            .map(OsString::from)
+            .into_iter()
+        )
+        .is_none());
+        assert!(discovery_arguments(
+            ["--source-origin", "https://mail.example.test"]
+                .map(OsString::from)
+                .into_iter()
+        )
+        .is_none());
+    }
     #[test]
     fn address_retry_is_limited_to_read_only_preflights() {
         let transport = td_mta::postgres_probe::Error::Transport;

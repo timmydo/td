@@ -42,6 +42,40 @@ pub(super) fn exercise(origin: &str, source_ca: &[u8], password: &[u8], binding:
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         path
     };
+    let discovered = command_output_with_timeout(
+        &[
+            "postgres",
+            "replica-discover",
+            "--source-origin",
+            origin,
+            "--username",
+            "user",
+            "--password-file",
+            secret.to_str().unwrap(),
+            "--ca-file",
+            remote_ca.to_str().unwrap(),
+        ],
+        fixture.root.path(),
+        0,
+        Duration::from_secs(75),
+    );
+    let discovered: td_json::Json = td_json::parse(&discovered).unwrap();
+    assert_eq!(
+        discovered.get("account").and_then(td_json::Json::as_str),
+        Some(binding.account.to_string().as_str())
+    );
+    assert_eq!(
+        discovered
+            .get("source_epoch")
+            .and_then(td_json::Json::as_str),
+        Some(binding.epoch.to_string().as_str())
+    );
+    assert_eq!(
+        discovered
+            .get("source_origin")
+            .and_then(td_json::Json::as_str),
+        Some(origin)
+    );
     let owner = connection("td_probe");
     let runtime = connection("mail_runtime");
     let invoke = |operation: &str, connection: &std::path::Path, extras: &[&str], status| {

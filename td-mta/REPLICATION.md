@@ -607,6 +607,15 @@ or asserting that a newly fetched seed matches an older request. Inspect an
 indeterminate initialization with `postgres replica-progress`; do not infer
 absence from a lost command response. No credentials or routing are copied.
 
+`postgres replica-discover --source-origin HTTPS_ORIGIN --username USER
+--password-file PATH [--ca-file PATH]` authenticates source discovery and one
+bounded inventory page to report the sole account ID and source epoch. It
+requires no local PostgreSQL connection and writes no replica state. The
+validated binding is a setup input, not copy completeness or freshness proof.
+The entire remote operation has a 60-second deadline; credentials follow the
+same protected-file rules as copying. Unsupported or ambiguous discovery,
+invalid inventory and failed authentication refuse without reporting a binding.
+
 `postgres replica-copy` takes the same binding and source credential options,
 with a dedicated replica runtime connection instead of the owner connection.
 It runs `--steps 1..1024` (default 1) under `--timeout-seconds 1..3600` (default
