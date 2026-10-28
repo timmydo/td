@@ -860,11 +860,11 @@ impl JmapClient {
         received_before: Option<&str>,
     ) -> Result<EmailQueryResult, JmapError> {
         log_info!(
-            "[JMAP] Email/query for mailbox: {} (limit: {}, position: {}, search: {:?}, after: {:?}, before: {:?})",
+            "[JMAP] Email/query for mailbox: {} (limit: {}, position: {}, search: {}, after: {:?}, before: {:?})",
             mailbox_id,
             limit,
             position,
-            search_text,
+            search_text.is_some(),
             received_after,
             received_before
         );
@@ -925,9 +925,10 @@ impl JmapClient {
                     position: query_response.position,
                 });
             }
+            return Err(Self::method_error("Email/query", method_response));
         }
 
-        Err(JmapError::Api("Unexpected response".to_string()))
+        Err(JmapError::Api("Missing response for Email/query".into()))
     }
 
     pub fn query_emails_uncollapsed(
@@ -971,9 +972,10 @@ impl JmapClient {
                     position: query_response.position,
                 });
             }
+            return Err(Self::method_error("Email/query", method_response));
         }
 
-        Err(JmapError::Api("Unexpected response".to_string()))
+        Err(JmapError::Api("Missing response for Email/query".into()))
     }
 
     pub fn get_emails(&self, ids: &[String]) -> Result<Vec<Email>, JmapError> {

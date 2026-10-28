@@ -79,6 +79,8 @@ struct MockState {
     read_batch_limit: Option<usize>,
     refuse_stored: bool,
     read_calls: Vec<Value>,
+    query_refusal: Option<(String, String)>,
+    query_calls: Vec<Value>,
     flag_refusal: Option<String>,
     move_refusal: Option<String>,
     destroy_refusal: Option<String>,
@@ -245,6 +247,8 @@ impl MockState {
             read_batch_limit: None,
             refuse_stored: false,
             read_calls: Vec::new(),
+            query_refusal: None,
+            query_calls: Vec::new(),
             flag_refusal: None,
             move_refusal: None,
             destroy_refusal: None,
@@ -817,6 +821,14 @@ impl MockJmapServer {
         self.state.lock().unwrap().read_calls.clone()
     }
 
+    pub fn refuse_query(&self, kind: &str, description: &str) {
+        self.state.lock().unwrap().query_refusal = Some((kind.into(), description.into()));
+    }
+
+    pub fn query_calls(&self) -> Vec<Value> {
+        self.state.lock().unwrap().query_calls.clone()
+    }
+
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
@@ -1212,6 +1224,17 @@ impl MockJmapServer {
                     }
                 }
                 "Email/query" => {
+                    let refusal = {
+                        let mut guard = state.lock().unwrap();
+                        guard.query_calls.push(args.clone());
+                        guard.query_refusal.clone()
+                    };
+                    if let Some((kind, description)) = refusal {
+                        responses.push(
+                            json!(["error", {"type":kind, "description":description}, call_id]),
+                        );
+                        continue;
+                    }
                     let filter = args.get("filter").cloned().unwrap_or_else(|| json!({}));
                     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
                     let position =

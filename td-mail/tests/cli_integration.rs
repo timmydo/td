@@ -352,6 +352,71 @@ deleted_folder = "nor-this""#,
 }
 
 #[test]
+fn search_keeps_mailbox_dates_paging_and_reports_empty_results() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    let response = h.send(json!({
+        "command":"query_emails", "mailbox_id":"mbox-inbox",
+        "search":"Meeting", "received_after":"2025-12-01T00:00:00Z",
+        "received_before":"2025-12-21T00:00:00Z", "limit":1,
+        "headers_only":true
+    }));
+    assert!(response["ok"].is_true(), "{response}");
+    assert_eq!(response["emails"].as_array().unwrap().len(), 1);
+    assert_eq!(response["emails"][0]["id"].as_str(), Some("email-002"));
+    let calls = h.server().query_calls();
+    let call = calls.last().unwrap();
+    assert_eq!(
+        call["filter"],
+        json!({"operator":"AND", "conditions":[
+            {"inMailbox":"mbox-inbox"}, {"text":"Meeting"},
+            {"after":"2025-12-01T00:00:00Z"}, {"before":"2025-12-21T00:00:00Z"}
+        ]})
+    );
+    assert_eq!(call["position"].as_u64(), Some(0));
+    assert_eq!(call["limit"].as_u64(), Some(1));
+    for (query, position) in [("Meeting", 1), ("absent-search-marker", 0)] {
+        let response = h.send(json!({
+            "command":"query_emails", "mailbox_id":"mbox-inbox",
+            "search":query, "position":position, "headers_only":true
+        }));
+        assert!(response["ok"].is_true(), "{response}");
+        assert!(
+            response["emails"].as_array().unwrap().is_empty(),
+            "{response}"
+        );
+        let calls = h.server().query_calls();
+        assert_eq!(calls.last().unwrap()["position"].as_u64(), Some(position));
+    }
+}
+
+#[test]
+fn search_refusal_preserves_server_reason_without_empty_success_or_retry() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    for (kind, description) in [
+        ("serverFail", "storageWorkLimit"),
+        ("serverFail", "messageInterpretation"),
+        ("unsupportedFilter", "unsupported search operand"),
+    ] {
+        h.server().refuse_query(kind, description);
+        let before = h.server().query_calls().len();
+        let response = h.send(json!({
+            "command":"query_emails", "mailbox_id":"mbox-inbox",
+            "search":"private-search-marker", "headers_only":true
+        }));
+        assert!(!response["ok"].is_true(), "{response}");
+        let error = response["error"].as_str().unwrap();
+        assert!(
+            error.contains(&format!("Email/query failed: {kind} {description}")),
+            "{error}"
+        );
+        assert_eq!(h.server().query_calls().len(), before + 1);
+        assert!(h.server().read_calls().is_empty());
+    }
+}
+
+#[test]
 fn test_query_emails_date_filters() {
     let mut h = CliHarness::start();
     assert!(h.send(json!({"command": "connect", "account": "test"}))["ok"].is_true());

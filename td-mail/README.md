@@ -18,6 +18,17 @@
 - Supports optional mail rules and retention policies.
 - Provides `--cli` NDJSON mode for integrations and automation.
 
+## Searching a folder
+
+In a message list, press `s`, enter a search, then press Enter. Escape
+cancels entry; Escape after searching clears the active search. The title
+shows the active query. Searches go to the account's JMAP server with the
+current mailbox and date filters, and pagination retains those filters.
+Matching behavior depends on the server; td-mta supports case-insensitive
+substring terms and quoted phrases across its documented searchable fields.
+An empty result is distinct from a refused search: server errors such as
+`storageWorkLimit` or `messageInterpretation` are shown with their reason.
+
 ## Reading attachments
 
 Press A or click Attachments in a message to open its attachment list.

@@ -2008,13 +2008,13 @@ fn backend_loop(
                 received_before,
             } => {
                 log_info!(
-                    "[Backend] cmd#{} QueryEmails origin='{}' mailbox_id='{}' page_size={} position={} search={:?} after={:?} before={:?}",
+                    "[Backend] cmd#{} QueryEmails origin='{}' mailbox_id='{}' page_size={} position={} search={} after={:?} before={:?}",
                     command_seq,
                     origin,
                     mailbox_id,
                     page_size,
                     position,
-                    search_query,
+                    search_query.is_some(),
                     received_after,
                     received_before
                 );
