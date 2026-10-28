@@ -42,7 +42,7 @@ pub(crate) fn options(args: &[String]) -> Result<Option<PathBuf>, String> {
 }
 
 /// What every device-bound leg builds once: the host's qemu and firmware,
-/// the signed system deployment the fixture installs, the fixture's live
+/// the system deployment the fixture installs, the fixture's live
 /// medium parts and the encrypted target's capacity, in a scratch
 /// directory removed when the bench is dropped.
 pub(super) struct Bench {
@@ -62,7 +62,6 @@ pub(super) struct Bench {
     /// The store's verified selector and deployment, for a live medium.
     pub(super) selector: VerifiedSelector,
     pub(super) store_deployment: PathBuf,
-    pub(super) trust: RunTrust,
     pub(super) scratch: Scratch,
 }
 
@@ -75,13 +74,12 @@ impl Bench {
         );
         let (code, vars_template) = efi::firmware(&qemu)?;
         let (_, selector, source) = build_system(runner)?;
-        let trust = RunTrust::generate()?;
         let LiveInstaller {
             kernel,
             base,
             common,
             extra,
-        } = LiveInstaller::load(runner, &trust)?;
+        } = LiveInstaller::load(runner)?;
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let scratch = Scratch {
             dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
@@ -97,7 +95,6 @@ impl Bench {
                 .checked_add(copied)
                 .ok_or("system payload length overflow")?;
         }
-        trust.sign_deployment(&deployment)?;
         verify_deployment(&deployment)?;
         let id = crate::sha256::sha256_file(&deployment.join("manifest"))
             .map_err(|error| format!("hash system manifest: {error}"))?;
@@ -126,7 +123,6 @@ impl Bench {
             id,
             selector,
             store_deployment: source,
-            trust,
             scratch,
         })
     }

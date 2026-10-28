@@ -53,13 +53,12 @@ fn a_misplaced_serve_exits_without_a_byte() -> Res<()> {
     let operands = vec![
         file.clone(),
         directory.clone(),
-        file.clone(),
         directory.clone(),
         file.clone(),
     ];
 
     let mut misplaced = operands.clone();
-    misplaced[4] = directory.clone();
+    misplaced[3] = directory.clone();
     let (output, _) = serve(&misplaced, Stdio::null(), Stdio::null(), None)?;
     assert!(!output.status.success(), "{output:?}");
     assert!(

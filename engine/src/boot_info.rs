@@ -1,4 +1,4 @@
-//! Authenticated deployment labels, appended before the deployment is signed.
+//! Deployment labels, appended before the deployment's manifest is written.
 //! The target recipe output stays unchanged; assembly adds only a data archive.
 use super::cpio;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -186,7 +186,7 @@ pub fn read(image: &mut (impl Read + Seek)) -> io::Result<Option<Info>> {
     }
 }
 
-/// Copy a recipe initramfs and append the data before hashing/signing it.
+/// Copy a recipe initramfs and append the data before hashing it.
 pub fn append(input: &mut impl Read, output: &mut impl Write, info: &Info) -> io::Result<u64> {
     let archive = info.archive().map_err(io::Error::other)?;
     let length = io::copy(input, output)?;

@@ -31,8 +31,7 @@ use crate::consent::{
 };
 use crate::frames::{self, remaining, Wire};
 use crate::{
-    esp_region, inventory, logical_sector_size, paths, protocol, read_trusted_key, sha256, td_fs,
-    MAX_BOOT_FILE,
+    esp_region, inventory, logical_sector_size, paths, protocol, sha256, td_fs, MAX_BOOT_FILE,
 };
 use std::fs::File;
 use std::io::{self, Read as _, Seek, SeekFrom};
@@ -404,13 +403,11 @@ pub(crate) trait Host {
     /// The running deployment's manifest ID when it is the volume's
     /// `current`, acknowledged, with no pending attempt.
     fn standing(&mut self) -> Option<[u8; 32]>;
-    /// `current`'s `bzImage`, after its manifest is verified under the
-    /// trusted key and the kernel hashed against it.
+    /// `current`'s `bzImage`, after its manifest is checked against its ID
+    /// and the kernel hashed against the manifest.
     fn kernel(&mut self, id: &[u8; 32]) -> Result<Vec<u8>, String>;
     /// The running root's selector template.
     fn template(&mut self) -> Result<Vec<u8>, String>;
-    /// The trusted key as the volume holds it.
-    fn trusted_key(&mut self) -> Result<Vec<u8>, String>;
     /// The held disk's ESP, admitted by td-fat.
     fn esp(&mut self) -> Result<td_fat::Esp<Self::Disk>, String>;
     /// `cryptsetup open --test-passphrase` of keyslot `slot`, `key` on
@@ -546,8 +543,8 @@ pub(crate) trait Keys {
     ) -> Result<Created, DiskError>;
 }
 
-/// The selector `prepare` builds from the template, key and identity.
-pub(crate) type Prepare<'a> = &'a dyn Fn(&[u8], &[u8], &str, bool) -> Result<Vec<u8>, String>;
+/// The selector `prepare` builds from the template and identity.
+pub(crate) type Prepare<'a> = &'a dyn Fn(&[u8], &str, bool) -> Result<Vec<u8>, String>;
 
 /// The operation, then its failure frame, best effort. A definite `28`
 /// is the one failure the worker exits successfully after.
@@ -674,7 +671,7 @@ fn perform<H: Host, K: Keys>(
 }
 
 /// A selector pair's reads before the presentation: `current`'s
-/// authenticated kernel, the selector prepared from the running root's
+/// verified kernel, the selector prepared from the running root's
 /// template, and the ESP's `EFI/BOOT` sector as td-fat admitted it, which
 /// fits the pair in its form.
 struct Pair {
@@ -694,9 +691,8 @@ impl Pair {
     ) -> Result<Self, Failure> {
         let kernel = host.kernel(id).map_err(|_| Failure::Deployment)?;
         let template = host.template().map_err(|_| Failure::Deployment)?;
-        let key = host.trusted_key().map_err(|_| Failure::Internal)?;
         let selector =
-            prepare(&template, &key, host.uuid(), measured).map_err(|_| Failure::Deployment)?;
+            prepare(&template, host.uuid(), measured).map_err(|_| Failure::Deployment)?;
         drop(template);
         let esp = host.esp().map_err(|_| Failure::Esp)?;
         esp.fits(kernel.len() as u64, selector.len() as u64, staged)
@@ -2082,9 +2078,9 @@ impl Keys for RootKeys {
 
 /// `prepare-selector`'s rules in memory: the template, its padding and the
 /// appended identity, with the measurement policy on a protected volume.
-fn prepare(template: &[u8], key: &[u8], uuid: &str, measured: bool) -> Result<Vec<u8>, String> {
+fn prepare(template: &[u8], uuid: &str, measured: bool) -> Result<Vec<u8>, String> {
     let uuid = crate::VolumeUuid::parse(uuid).map_err(|e| e.to_string())?;
-    crate::selector_bytes(template, key, &uuid, measured).map_err(|e| e.to_string())
+    crate::selector_bytes(template, &uuid, measured).map_err(|e| e.to_string())
 }
 
 /// Where the running system holds the volume, and what it booted, under
@@ -2202,20 +2198,15 @@ fn id_bytes(text: &[u8]) -> Option<[u8; 32]> {
     Some(id)
 }
 
-/// The kernel of the deployment td-boot authenticate's line names: that
-/// line is the ID's, the manifest hashes to the ID, and `bzImage` is the
-/// file the manifest names, hashed here.
-fn authenticated_kernel(
-    directory: &Path,
-    id: &[u8; 32],
-    authenticated: &[u8],
-) -> Result<Vec<u8>, String> {
-    if authenticated != format!("{}\n", hex(id)).as_bytes() {
-        return Err("current's deployment does not authenticate".into());
-    }
-    let manifest = paths::read_bounded(
+/// The kernel of deployment `id`: the manifest hashes to the ID, and
+/// `bzImage` is the file the manifest names, hashed here. A bounded read
+/// and no whole-deployment hash, so a worker root kills leaves nothing
+/// running.
+fn verified_kernel(directory: &Path, id: &[u8; 32]) -> Result<Vec<u8>, String> {
+    let manifest = td_fs::read_bounded_real_file(
         &directory.join(protocol::MANIFEST_NAME),
-        protocol::MAX_MANIFEST_BYTES as usize,
+        "deployment manifest",
+        protocol::MAX_MANIFEST_BYTES,
     )
     .map_err(|e| e.to_string())?;
     if digest(&manifest) != *id {
@@ -2296,26 +2287,9 @@ impl Host for Machine {
         (!bookkeeping).then_some(id)
     }
 
-    /// `td-boot authenticate` checks the deployment's manifest and
-    /// signature under the volume's trusted key: a bounded read and no
-    /// payload hash, so a worker root kills leaves no long child behind.
     fn kernel(&mut self, id: &[u8; 32]) -> Result<Vec<u8>, String> {
-        let volume = self.volume();
-        let directory = volume.join(protocol::DEPLOYMENTS_DIR).join(hex(id));
-        let output = Command::new(TD_BOOT)
-            .arg("authenticate")
-            .arg(&directory)
-            .arg(volume.join(protocol::VOLUME_TRUSTED_KEY))
-            .env_clear()
-            .current_dir("/")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|e| format!("run td-boot authenticate: {e}"))?;
-        if !output.status.success() {
-            return Err("current's deployment does not authenticate".into());
-        }
-        authenticated_kernel(&directory, id, &output.stdout)
+        let directory = self.volume().join(protocol::DEPLOYMENTS_DIR).join(hex(id));
+        verified_kernel(&directory, id)
     }
 
     fn template(&mut self) -> Result<Vec<u8>, String> {
@@ -2325,11 +2299,6 @@ impl Host for Machine {
             MAX_BOOT_FILE,
         )
         .map_err(|e| e.to_string())
-    }
-
-    fn trusted_key(&mut self) -> Result<Vec<u8>, String> {
-        read_trusted_key(&self.volume().join(protocol::VOLUME_TRUSTED_KEY))
-            .map_err(|e| e.to_string())
     }
 
     /// The held partition's disk, read-write, and its `td-esp` partition,
@@ -2704,7 +2673,6 @@ mod tests {
     const UUID: &str = "5a5a5a5a-5a5a-405a-805a-5a5a5a5a5a5a";
     const ID: [u8; 32] = [0xab; 32];
     const NONCE: [u8; 32] = [42; 32];
-    const KEY: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
     /// The ESP's first sector on the test disk.
     const BASE: u64 = 1 << 20;
     const SECTORS: u64 = 67_000;
@@ -2937,10 +2905,6 @@ mod tests {
         fn template(&mut self) -> Result<Vec<u8>, String> {
             self.log.push("template");
             self.template.clone()
-        }
-        fn trusted_key(&mut self) -> Result<Vec<u8>, String> {
-            self.log.push("key");
-            Ok(KEY.to_vec())
         }
         fn esp(&mut self) -> Result<td_fat::Esp<Disk>, String> {
             self.log.push("esp");
@@ -3246,12 +3210,11 @@ mod tests {
         }
     }
 
-    /// The template, a marker, the key and the identity: what the test's
-    /// `prepare` returns, so the staged initrd can be checked.
-    fn prepare(template: &[u8], key: &[u8], uuid: &str, measured: bool) -> Result<Vec<u8>, String> {
+    /// The template, a marker and the identity: what the test's `prepare`
+    /// returns, so the staged initrd can be checked.
+    fn prepare(template: &[u8], uuid: &str, measured: bool) -> Result<Vec<u8>, String> {
         let mut out = template.to_vec();
         out.extend_from_slice(b"|");
-        out.extend_from_slice(key);
         out.extend_from_slice(uuid.as_bytes());
         out.push(u8::from(measured));
         Ok(out)
@@ -3408,7 +3371,7 @@ mod tests {
     }
 
     fn selector(measured: bool) -> Vec<u8> {
-        prepare(&[0x54; 2000], KEY, UUID, measured).unwrap()
+        prepare(&[0x54; 2000], UUID, measured).unwrap()
     }
 
     /// A converged device-bound header: the device-bound token naming
@@ -3602,7 +3565,7 @@ mod tests {
             let tpm = usize::from(shape == UpgradeShape::Tpm);
             let mut reads = vec!["header", "standing", "view"];
             reads.extend(["tpm"].iter().take(tpm));
-            reads.extend(["kernel", "template", "key", "esp"]);
+            reads.extend(["kernel", "template", "esp"]);
             assert_eq!(run.log[..reads.len()], reads[..], "{case}");
             let after: Vec<&str> = run.log[reads.len()..]
                 .iter()
@@ -3907,10 +3870,7 @@ mod tests {
         // Every read before the presentation; the re-reads after the commit.
         assert_eq!(
             run.log,
-            [
-                "header", "standing", "kernel", "template", "key", "esp", "header", "standing",
-                "esp"
-            ]
+            ["header", "standing", "kernel", "template", "esp", "header", "standing", "esp"]
         );
         let (kernel, initrd, staged) = files(&run.disk);
         assert_eq!((kernel, initrd), (vec![1; 5000], vec![2; 4000]));
@@ -4233,31 +4193,21 @@ mod tests {
         assert_eq!(host.machine.standing(), None);
     }
 
-    /// The template is the running root's; the trusted key the volume's.
+    /// The template is the running root's.
     #[test]
-    fn the_machine_reads_the_template_and_key_under_its_root() {
+    fn the_machine_reads_the_template_under_its_root() {
         let mut host = rooted("");
         assert!(host.machine.template().is_err());
-        assert!(host.machine.trusted_key().is_err());
         let template = host.root.join(protocol::SELECTOR_TEMPLATE_PATH);
         std::fs::create_dir_all(template.parent().unwrap()).unwrap();
         std::fs::write(&template, b"template").unwrap();
-        std::fs::write(
-            host.root
-                .join(VOLUME_MOUNT)
-                .join(protocol::VOLUME_TRUSTED_KEY),
-            KEY,
-        )
-        .unwrap();
         assert_eq!(host.machine.template().unwrap(), b"template");
-        assert_eq!(host.machine.trusted_key().unwrap(), KEY);
     }
 
-    /// After `td-boot authenticate`, the kernel is read only when its line
-    /// is the ID's, the manifest hashes to the ID and the kernel to the
-    /// manifest's one `bzImage` line.
+    /// The kernel is read only when the manifest hashes to the ID and the
+    /// kernel to the manifest's one `bzImage` line.
     #[test]
-    fn the_authenticated_kernel_is_current_manifests() {
+    fn the_verified_kernel_is_current_manifests() {
         let host = rooted("");
         let kernel = b"kernel bytes".to_vec();
         let directory = host
@@ -4273,36 +4223,24 @@ mod tests {
         std::fs::write(directory.join(protocol::MANIFEST_NAME), &manifest).unwrap();
         std::fs::write(directory.join("bzImage"), &kernel).unwrap();
         let id = digest(manifest.as_bytes());
-        let line = format!("{}\n", hex(&id));
-        assert_eq!(
-            authenticated_kernel(&directory, &id, line.as_bytes()).unwrap(),
-            kernel
-        );
-        // Another line, or none.
-        for other in [String::new(), hex(&id), format!("{}\n", hex(&ID))] {
-            assert!(authenticated_kernel(&directory, &id, other.as_bytes()).is_err());
-        }
+        assert_eq!(verified_kernel(&directory, &id).unwrap(), kernel);
         // A manifest that is not the ID.
-        assert!(
-            authenticated_kernel(&directory, &ID, format!("{}\n", hex(&ID)).as_bytes()).is_err()
-        );
+        assert!(verified_kernel(&directory, &ID).is_err());
         // A kernel the manifest does not name.
         std::fs::write(directory.join("bzImage"), b"other kernel").unwrap();
-        assert!(authenticated_kernel(&directory, &id, line.as_bytes())
-            .is_err_and(|e| e.contains("does not match")));
+        assert!(verified_kernel(&directory, &id).is_err_and(|e| e.contains("does not match")));
     }
 
-    /// The worker's td-boot children read a bounded amount: discovery and
-    /// the manifest's authentication, never a whole deployment's hash, which
-    /// a worker root killed would leave running.
+    /// The worker's one td-boot child reads a bounded amount: discovery,
+    /// never a whole deployment's hash, which a worker root killed would
+    /// leave running.
     #[test]
     fn the_worker_runs_only_bounded_td_boot_verbs() {
         let source = include_str!("storage_operation.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
-        assert_eq!(production.matches("Command::new(TD_BOOT)").count(), 2);
-        assert_eq!(production.matches("Command::new(").count(), 2);
+        assert_eq!(production.matches("Command::new(TD_BOOT)").count(), 1);
+        assert_eq!(production.matches("Command::new(").count(), 1);
         assert!(production.contains(".args([\"volume\", uuid])"));
-        assert!(production.contains(".arg(\"authenticate\")"));
         for verb in ["validate-source", "verify", "boot", "install"] {
             assert!(!production.contains(&format!("\"{verb}\"")), "{verb}");
         }

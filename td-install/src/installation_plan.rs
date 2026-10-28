@@ -1,4 +1,4 @@
-//! Immutable review data, not a device claim, authenticated source or consent.
+//! Immutable review data, not a device claim, validated source or consent.
 
 /// Input admission ceiling, checked before parsing or allocating fields.
 /// The largest current valid encoding is 1194 bytes.
@@ -493,7 +493,7 @@ impl Plan {
         &self.deployment
     }
     /// Compare with the canonical manifest ID printed by td-boot. This is
-    /// data equality, not proof that the source was authenticated or retained.
+    /// data equality, not proof that the source was validated or retained.
     pub fn matches_deployment_id(&self, id: &str) -> bool {
         if id.len() != 64 {
             return false;

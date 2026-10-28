@@ -13,7 +13,7 @@
 //! manifests before building the boot volume.
 //!
 //! Sibling of checks/qemu_boot.rs. Same host-free build (`build_plan` builds the kernel
-//! and system images inside their own nested build jail) and the same trust model (host
+//! and system images inside their own nested build jail) and the same build model (host
 //! qemu is a control-plane TEST tool that only RUNS the td-built artifact and never
 //! enters a target closure). The difference is the console: qemu_boot is a headless
 //! PASS/FAIL oracle that scans ttyS0 for a marker and kills qemu; this hands the guest a
@@ -34,7 +34,7 @@ use crate::check_runner::RecipeCheckRunner;
 use crate::checks::accel::{AccelPlan, ACCEL_ENV};
 use crate::checks::qemu_boot::{
     build_btrfs_tools, create_persistent_volume, drive_arg, find_qemu, provision_selector,
-    verify_deployment, verify_selector, RunTrust, VolumePurpose,
+    verify_deployment, verify_selector, RunVolume, VolumePurpose,
 };
 use crate::checks::vm_profile;
 
@@ -166,19 +166,19 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     // is removed when it drops — on every return path.
     let images = TempImages::new(runner.ladder_work_dir())?;
     let boot_bzimage = images.stage(&bzimage, "bzImage")?;
-    // This run's trust root. `provision_selector` is what copies the verified
-    // store output into the private image dir AND appends the key, so the
-    // bootable path cannot exist without it — the same helper the headless
-    // modes use, rather than a second copy-then-append here.
-    let trust = RunTrust::generate()?;
-    let boot_init = provision_selector(&selector, &images.dir, &trust)?;
+    // This run's volume identity. `provision_selector` is what copies the
+    // verified store output into the private image dir AND appends the volume
+    // UUID, so the bootable path cannot exist without it — the same helper the
+    // headless modes use, rather than a second copy-then-append here.
+    let identity = RunVolume::generate()?;
+    let boot_init = provision_selector(&selector, &images.dir, &identity)?;
     let boot_disk = images.dir.join("system.btrfs");
     create_persistent_volume(
         &deployment,
         &mkfs,
         &btrfs,
         &boot_disk,
-        &trust,
+        &identity,
         VolumePurpose::Fixture,
     )?;
 

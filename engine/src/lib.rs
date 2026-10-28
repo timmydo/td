@@ -35,14 +35,6 @@
 //! holds §W.9's declarations and the pure half of its admission: the cache's
 //! state formats and rules 3 and 4.
 //!
-//! `sha512` and `ed25519` arrive with AUTHENTICATED deployments, and are
-//! target-side in that same way — which is why the crate's first line no
-//! longer says the two engine bins are who this is shared with. Neither bin
-//! uses either module: a deployment's signature is checked where the
-//! deployment is installed and booted, by a program that cannot depend on a
-//! crate at all. They are a pair, since the verifier reaches its hash as
-//! `crate::sha512`, so a consumer `#[path]`-includes BOTH at its crate root.
-//!
 //! `local_source` is back to being shared by BOTH engine bins (re #469
 //! local-source-roster split): the exclusion rule and staging shape a
 //! `local_source`/`local_source_trees` recipe is copied by must be exactly
@@ -53,8 +45,8 @@
 //! `unsafe`-forbidding and dependency-free, and the NAR hash stays
 //! td-builder's confined syscall surface (`nar.rs`).
 // `cpio` writes selector appendices without parameterizing recipes: host
-// harnesses provision trusted keys and optional volume identities, while
-// target td-install binds the chosen identity in the live environment.
+// harnesses provision optional volume identities, while target td-install
+// binds the chosen identity in the live environment.
 // See td-install/DESIGN.md §§5–7 for the shared-source contract.
 pub mod application;
 pub mod application_spec;
@@ -70,22 +62,12 @@ pub mod tar;
 // its pins, td-builder assembles and admits the root against it.
 pub mod debian_root;
 pub mod dynamic_application;
-pub mod ed25519;
 pub mod elf;
 #[cfg(test)]
 mod elf_synth;
 // `embed_scan` reads Rust source for embeds and test modules: td-recipe-eval's
 // build script and td-builder's fingerprints read through one scanner.
 pub mod embed_scan;
-pub mod launcher;
-pub mod ostree;
-pub mod ostree_deploy;
-pub mod permissions;
-pub mod principals;
-// SIGNING is a separate module because, of the two ed25519 files, td-boot
-// `#[path]`-includes only the VERIFIER: keeping the signer out of that file is
-// what keeps it off the boot path. Its one caller is the recipe-check oracle.
-pub mod ed25519_sign;
 pub mod exit;
 pub mod fat;
 pub mod flathub_app;
@@ -94,9 +76,13 @@ pub mod gzip;
 pub mod host_path;
 pub mod iso9660;
 pub mod json;
+pub mod launcher;
 pub mod local_source;
+pub mod ostree;
+pub mod ostree_deploy;
+pub mod permissions;
+pub mod principals;
 pub mod sha256;
-pub mod sha512;
 pub mod target_profile;
 pub mod xz;
 

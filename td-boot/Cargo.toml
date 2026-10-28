@@ -28,7 +28,7 @@ td-tpm = { path = "../td-tpm" }
 
 # td-boot is a TARGET-built guest program outside the control-plane workspace.
 # It has zero external dependencies. The target recipe compiles this source and
-# the shared engine SHA-256, SHA-512 and ed25519 sources directly with rustc,
+# the shared engine SHA-256 source directly with rustc,
 # linking the sibling td-tpm client and td-protector, whose bounded LUKS2
 # reader volume discovery uses and whose release cap the live selector runs,
 # td-fido, whose disk flows and root HID worker its FIDO2 client runs,

@@ -760,7 +760,8 @@ block also names `/var/lib/td/authorized-keys` and then
 `/run/td-metadata-authorized-keys`, between the self-test file and
 `.ssh/authorized_keys`, and keeps both in the enforced form too. The
 volume's builder writes the first, or on a live medium td-boot's live
-seed stages it from the medium's signed provision. With
+seed stages it from the medium's provision, unsigned and vouched for
+only by the medium the person chose to boot. With
 `--provisioned-keys`, which stage 1 passes on a server only, the
 render refuses to publish any policy unless the file is absent or is
 one root-owned, singly linked, mode-0644 regular file of at most 64

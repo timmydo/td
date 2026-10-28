@@ -1,18 +1,5 @@
-// The ed25519 + hex primitives td's two SIGNING domains share. `ring` signs on
-// this side; what verifies differs by domain — `ring` again for narinfos
-// (td-subst fetch), and the engine's dependency-free verifier for deployment
-// manifests, since td-boot may carry no external crate.
-//
-// One copy rather than two for the reason `engine/src/crc32.rs` is one copy:
-// the private-per-caller version is a divergence waiting to happen, and these
-// are the functions where a divergence is a signature that verifies under one
-// half of td and not the other.
-//
-// The DOMAINS stay separate even though the primitives do not. td-subst's key
-// says "this store path came from this builder" and the deployment key says
-// "this is a system you may boot"; sharing one key would make a substituter
-// compromise a boot compromise. Nothing here generates or names a key — that
-// is each applet's own verb.
+// td-subst's ed25519 + hex primitives: `ring` signs and verifies narinfos.
+// Nothing here generates or names a key — that is the applet's own verb.
 
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};

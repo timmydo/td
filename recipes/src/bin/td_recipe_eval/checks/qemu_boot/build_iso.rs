@@ -1,14 +1,13 @@
-//! Write a bootable td installation medium: the signed system deployment on a
-//! hybrid ISO whose firmware entry boots the live selector.
+//! Write a bootable td installation medium: the system deployment on a hybrid
+//! ISO whose firmware entry boots the live selector.
 //!
 //! The ISO is the live profile of td-install/MEDIA.md "Live boot": its ESP holds
-//! the kernel and a selector initramfs carrying this run's public key and the
-//! live marker, and its root holds the deployment td-boot authenticates and
-//! boots from the medium. Like `bundle`, it signs with a key made for this run
-//! and discarded; the ISO carries only the public half.
+//! the kernel and a selector initramfs carrying the live marker, and its root
+//! holds the deployment td-boot verifies against its manifest and boots from
+//! the medium.
 //!
 //! Assembly copies the verified store deployment and appends public build
-//! identity data to its initramfs before hashing and signing the manifest.
+//! identity data to its initramfs before hashing the manifest.
 
 use std::fs;
 use std::io::Read;
@@ -17,13 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 
 use super::{
-    build_system, create_scratch_dir, media, provision_live_selector, RunTrust, Scratch,
-    VerifiedSelector,
+    build_system, create_scratch_dir, media, provision_live_selector, Scratch, VerifiedSelector,
 };
 use crate::check_runner::RecipeCheckRunner;
-use td_recipe::td_boot_protocol::{
-    MANIFEST_NAME, MANIFEST_SIG_NAME, MEDIA_DEPLOYMENT_FILES, MEDIA_VOLUME_ID,
-};
+use td_recipe::td_boot_protocol::{MANIFEST_NAME, MEDIA_DEPLOYMENT_FILES, MEDIA_VOLUME_ID};
 
 /// Where the ISO goes when the operator does not say. Repo-relative and
 /// gitignored, like a bundle.
@@ -256,12 +252,11 @@ pub(crate) fn run(
     td_engine::boot_info_source::assemble(&deployment, &assembled, &info)?;
     println!("   [build-iso] {}", info.label()?);
     let deployment = assembled;
-    let trust = RunTrust::generate()?;
     let LiveMedium {
         id,
         selector: live,
         payloads,
-    } = live_medium(&selector, &deployment, &scratch.dir, &trust)?;
+    } = live_medium(&selector, &deployment, &scratch.dir)?;
 
     let staged = staged_path(&options.out)?;
     refuse_stale(&staged)?;
@@ -284,48 +279,27 @@ pub(crate) fn run(
     Ok(())
 }
 
-/// What a live medium carries besides its kernel: the signed deployment's ID,
-/// the live selector, and the payloads under their medium names.
+/// What a live medium carries besides its kernel: the deployment's ID, the
+/// live selector, and the payloads under their medium names.
 pub(crate) struct LiveMedium {
     pub(crate) id: String,
     pub(crate) selector: PathBuf,
     pub(crate) payloads: Vec<(&'static str, PathBuf)>,
 }
 
-/// Sign the verified store deployment with `trust` and provision the live
-/// selector for it, in `dir`. Only the manifest is copied, so its signature
-/// can be written beside it; the other payloads stay in the store.
+/// Provision the live selector for the verified deployment, in `dir`, and
+/// name the deployment's files under their medium names.
 pub(crate) fn live_medium(
     selector: &VerifiedSelector,
     deployment: &Path,
     dir: &Path,
-    trust: &RunTrust,
 ) -> Result<LiveMedium, String> {
-    let signed = dir.join("signed");
-    fs::create_dir(&signed).map_err(|error| format!("create {}: {error}", signed.display()))?;
-    fs::copy(deployment.join(MANIFEST_NAME), signed.join(MANIFEST_NAME))
-        .map_err(|error| format!("stage the deployment manifest: {error}"))?;
-    trust.sign_deployment(&signed)?;
-    let id = crate::sha256::sha256_file(&signed.join(MANIFEST_NAME))
+    let id = crate::sha256::sha256_file(&deployment.join(MANIFEST_NAME))
         .map_err(|error| format!("hash the deployment manifest: {error}"))?;
-    // `build_system` verified the payloads against the store manifest; the
-    // signed copy must be those bytes, or the signature vouches for another.
-    let store_id = crate::sha256::sha256_file(&deployment.join(MANIFEST_NAME))
-        .map_err(|error| format!("hash the store manifest: {error}"))?;
-    if store_id != id {
-        return Err("the deployment manifest changed while it was signed".into());
-    }
-    let selector = provision_live_selector(selector, dir, trust)?;
+    let selector = provision_live_selector(selector, dir)?;
     let payloads = MEDIA_DEPLOYMENT_FILES
         .iter()
-        .map(|(iso, name)| {
-            let from = if *name == MANIFEST_NAME || *name == MANIFEST_SIG_NAME {
-                &signed
-            } else {
-                deployment
-            };
-            (*iso, from.join(name))
-        })
+        .map(|(iso, name)| (*iso, deployment.join(name)))
         .collect();
     Ok(LiveMedium {
         id,

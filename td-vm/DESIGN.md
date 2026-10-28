@@ -190,7 +190,7 @@ operations. Force-stop is a distinct destructive action through QMP.
 ## Templates and isolated persistent state
 
 A reusable template starts from the existing clean `system-x86-64` deployment
-and `./build-qcow` bundle. Reuse its kernel, selector, signed deployment, and
+and `./build-qcow` bundle. Reuse its kernel, selector, deployment, and
 Btrfs/EROFS layout. Add missing development capabilities through that same
 image producer, rather than introducing a second distro image pipeline. No
 maintainer-operated image server or binary cache is introduced.

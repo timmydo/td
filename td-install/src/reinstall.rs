@@ -28,8 +28,12 @@ fn command(root: &Path, program: &str, args: &[&std::ffi::OsStr]) -> io::Result<
 }
 
 fn directory(path: &Path) -> io::Result<()> {
+    owned_directory(path, 0)
+}
+
+fn owned_directory(path: &Path, owner: u32) -> io::Result<()> {
     let metadata = paths::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+    if !metadata.is_dir() || metadata.uid() != owner || metadata.mode() & 0o022 != 0 {
         return Err(invalid(format!(
             "{} must be a real root-owned directory",
             path.display()
@@ -200,12 +204,6 @@ pub(crate) fn inspect(
     })
 }
 
-fn write_new(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    let mut file = paths::create_new_with_mode(path, mode)?;
-    file.write_all(bytes)?;
-    file.sync_all()
-}
-
 fn approved_manifest(path: &Path, expected: &[u8; 32]) -> io::Result<()> {
     let mut file = paths::open_read(path)?;
     let length = file.metadata()?.len();
@@ -231,13 +229,32 @@ fn copy(source: &Path, destination: &Path, limit: u64) -> io::Result<()> {
     output.sync_all()
 }
 
-const STAGED_FILES: &[&str] = &[
-    "manifest",
-    "manifest.sig",
-    "bzImage",
-    "initramfs.cpio",
-    "root.erofs",
-];
+const STAGED_FILES: &[&str] = &["manifest", "bzImage", "initramfs.cpio", "root.erofs"];
+
+/// Where, under the volume root, the approved deployment is copied before
+/// td-boot publishes it: root-private state on the volume being replaced,
+/// so the bytes published are the bytes the review approved whatever the
+/// medium does meanwhile.
+const STAGE_PARENT: &str = "@var/lib/td-install";
+
+/// The stage's parent on the writable volume, made if absent. Every
+/// directory above it is checked first, under this mount, so a link in the
+/// volume being replaced cannot send root's writes off it. `owner` is root
+/// but in tests.
+fn stage_parent(volume: &Path, owner: u32) -> io::Result<std::path::PathBuf> {
+    for ancestor in ["", "@var", "@var/lib"] {
+        owned_directory(&volume.join(ancestor), owner)?;
+    }
+    let state = volume.join(STAGE_PARENT);
+    match paths::symlink_metadata(&state) {
+        Ok(_) => owned_directory(&state, owner)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            paths::create_dir_with_mode(&state, 0o700)?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(state)
+}
 
 // The caller validates root ownership first. Inspect every entry before
 // removing anything, and never follow links or recurse into directories.
@@ -285,8 +302,8 @@ pub(crate) fn execute(
             "the existing installation changed after review".into(),
         ));
     }
-    // Reject an undersized or damaged ESP before creating signing state or
-    // publishing a replacement. Its geometry is read from the existing GPT.
+    // Reject an undersized or damaged ESP before staging or publishing a
+    // replacement. Its geometry is read from the existing GPT.
     let sector = crate::logical_sector_size(&claim)?;
     let capacity = claim.seek(SeekFrom::End(0))?;
     let (offset, length) = crate::esp_region(&mut claim, sector, capacity / sector)?;
@@ -295,7 +312,6 @@ pub(crate) fn execute(
     let (kernel, _) = crate::deployment_bytes(&execution.source)?;
     let selector = crate::selector_parts(
         &execution.root.join(protocol::SELECTOR_TEMPLATE_PATH),
-        &execution.trusted_key,
         &crate::VolumeUuid::parse(&crate::canonical_uuid(plan.volume_uuid()))?,
     )?
     .total()
@@ -303,12 +319,7 @@ pub(crate) fn execute(
     esp.fits(kernel, selector, false)
         .map_err(|e| invalid(e.to_string()))?;
     drop(esp);
-    crate::authenticate_source(
-        &execution.td_boot,
-        &execution.source,
-        &execution.trusted_key,
-    )
-    .and_then(|id| {
+    crate::validate_source(&execution.td_boot, &execution.source).and_then(|id| {
         if plan.matches_deployment_id(&id) {
             Ok(())
         } else {
@@ -331,27 +342,12 @@ pub(crate) fn execute(
         true,
         |volume, device, uuid| {
             progress(Phase::PublishingDeployment);
-            let state = volume.join("@var/lib/td-deploy");
-            // identity preserves an existing valid key and refuses malformed state.
-            let public = command(
-                &execution.root,
-                "td-deploy",
-                &["identity".as_ref(), state.as_os_str()],
-            )?;
-            let public_text = std::str::from_utf8(&public)
-                .map_err(|_| invalid("invalid signing public key".into()))?;
-            let public_hex = public_text
-                .strip_suffix('\n')
-                .ok_or_else(|| invalid("invalid signing public key".into()))?;
-            crate::digest_bytes(public_hex)?;
-            let key = workspace.dir.join("trusted.pub");
-            write_new(&key, &public, 0o600)?;
             crate::prepare_selector(
                 &execution.root.join(protocol::SELECTOR_TEMPLATE_PATH),
-                &key,
                 &crate::VolumeUuid::parse(&crate::canonical_uuid(&uuid))?,
                 &workspace.selector,
             )?;
+            let state = stage_parent(volume, 0)?;
             let stage = state.join("reinstall");
             match paths::symlink_metadata(&stage) {
                 Ok(_) => {
@@ -375,29 +371,8 @@ pub(crate) fn execute(
                         limit,
                     )?;
                 }
-                let manifest = stage.join("manifest");
-                approved_manifest(&manifest, plan.deployment())?;
-                let private = state.join("deployment.pk8");
-                let signature = stage.join("manifest.sig");
-                command(
-                    &execution.root,
-                    "td-deploy",
-                    &[
-                        "sign".as_ref(),
-                        manifest.as_os_str(),
-                        private.as_os_str(),
-                        signature.as_os_str(),
-                    ],
-                )?;
-                command(
-                    &execution.root,
-                    "td-boot",
-                    &[
-                        "validate-source".as_ref(),
-                        stage.as_os_str(),
-                        key.as_os_str(),
-                    ],
-                )?;
+                // td-boot checks every payload against this manifest.
+                approved_manifest(&stage.join("manifest"), plan.deployment())?;
                 let publish = workspace.dir.join("publish");
                 paths::create_dir_with_mode(&publish, 0o700)?;
                 let installed = command(
@@ -408,17 +383,12 @@ pub(crate) fn execute(
                         device.as_os_str(),
                         publish.as_os_str(),
                         stage.as_os_str(),
-                        key.as_os_str(),
                     ],
                 );
                 // Never recursively remove a mountpoint, including on failure.
                 let removed = paths::remove_dir_if_present(&publish);
                 installed?;
                 removed?;
-                let pending = volume.join("td/trusted.pub.reinstall");
-                paths::remove_file_if_present(&pending)?;
-                write_new(&pending, &public, 0o644)?;
-                paths::rename(&pending, &volume.join(protocol::VOLUME_TRUSTED_KEY))?;
                 paths::open_read(&volume.join("td"))?.sync_all()?;
                 Ok(())
             })();
@@ -447,9 +417,7 @@ pub(crate) fn execute(
             reader: &mut selector,
         },
     )
-    .map_err(|e| invalid(e.to_string()))?;
-    paths::remove_file_if_present(&workspace.dir.join("trusted.pub"))?;
-    Ok(())
+    .map_err(|e| invalid(e.to_string()))
 }
 
 #[cfg(test)]
@@ -459,7 +427,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     #[test]
-    fn changed_media_manifest_cannot_be_resigned_as_the_approved_deployment() {
+    fn changed_media_manifest_cannot_be_published_as_the_approved_deployment() {
         let temp = ::td_fs::TempDir::new("reinstall-manifest").unwrap();
         let source = temp.path().join("source");
         let staged = temp.path().join("manifest");
@@ -500,26 +468,53 @@ mod tests {
     }
 
     #[test]
-    fn workspace_removes_public_key_but_never_walks_a_publish_mountpoint() {
+    fn workspace_never_walks_a_publish_mountpoint() {
         let temp = ::td_fs::TempDir::new("reinstall-workspace").unwrap();
         for held in [false, true] {
             let workspace =
                 Workspace::create(temp.path(), &[if held { 2 } else { 1 }; 32]).unwrap();
             let publish = workspace.dir.join("publish");
             fs::create_dir(&publish).unwrap();
-            let public = workspace.dir.join("trusted.pub");
-            fs::write(&public, b"public key").unwrap();
             if held {
                 fs::write(publish.join("personal"), b"keep").unwrap();
             }
             assert_eq!(workspace.remove().is_err(), held);
-            assert!(!public.exists());
             if held {
                 assert_eq!(fs::read(publish.join("personal")).unwrap(), b"keep");
             } else {
                 assert!(!publish.exists());
             }
         }
+    }
+
+    #[test]
+    fn the_stage_parent_is_made_only_beneath_checked_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = ::td_fs::TempDir::new("reinstall-stage-parent").unwrap();
+        let owner = fs::metadata(temp.path()).unwrap().uid();
+        let volume = temp.path().join("volume");
+        let elsewhere = temp.path().join("elsewhere");
+        for directory in [&volume, &volume.join("@var"), &elsewhere] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // A link where `@var/lib` belongs: refused, and nothing made there.
+        symlink(&elsewhere, volume.join("@var/lib")).unwrap();
+        assert!(stage_parent(&volume, owner).is_err());
+        assert!(!elsewhere.join("td-install").exists());
+        fs::remove_file(volume.join("@var/lib")).unwrap();
+        fs::create_dir(volume.join("@var/lib")).unwrap();
+        fs::set_permissions(volume.join("@var/lib"), fs::Permissions::from_mode(0o755)).unwrap();
+        // A parent others may write is refused too.
+        fs::set_permissions(volume.join("@var"), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(stage_parent(&volume, owner).is_err());
+        fs::set_permissions(volume.join("@var"), fs::Permissions::from_mode(0o755)).unwrap();
+        // Another owner's tree is refused; ours is made at 0700.
+        assert!(stage_parent(&volume, owner + 1).is_err());
+        let state = stage_parent(&volume, owner).unwrap();
+        assert_eq!(state, volume.join(STAGE_PARENT));
+        assert_eq!(fs::metadata(&state).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(stage_parent(&volume, owner).unwrap(), state);
     }
 
     #[test]

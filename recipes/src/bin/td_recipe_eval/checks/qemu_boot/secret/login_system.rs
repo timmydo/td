@@ -547,12 +547,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let (kernel, _, _) = verify_deployment(&deployment)?;
     let selector = verify_selector(&system.join("boot"))?;
     let builder = PathBuf::from(runner.builder_command().get_program());
-    let trust = RunTrust::generate_root_owned(builder)?;
+    let identity = RunVolume::generate_root_owned(builder)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let scratch = Scratch {
         dir: create_qmp_scratch_dir(&env::temp_dir(), &SEQ)?,
     };
-    let initramfs = provision_selector(&selector, &scratch.dir, &trust)?;
+    let initramfs = provision_selector(&selector, &scratch.dir, &identity)?;
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
     let volume = scratch.dir.join("login-system.btrfs");
     create_persistent_volume(
@@ -560,7 +560,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         &mkfs,
         &btrfs,
         &volume,
-        &trust,
+        &identity,
         VolumePurpose::Fixture,
     )?;
     let id = crate::sha256::sha256_file(&deployment.join("manifest"))

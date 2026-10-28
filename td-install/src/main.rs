@@ -36,7 +36,7 @@ mod fat;
 #[allow(dead_code)]
 mod gpt;
 // The selector appendix, shared with td-boot's staged-update commit, which
-// rebuilds it to authenticate a staged `INITRD.NEW`.
+// rebuilds it to check a staged `INITRD.NEW`.
 #[path = "../../td-boot/src/selector_appendix.rs"]
 mod selector_appendix;
 // A live installation checks the kernel it copies to the ESP against the
@@ -128,10 +128,10 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <trusted-key> <volume-uuid> <output>\n       td-install storage-operation --uid <uid> (stdin: td-authd's private socket)\n       td-install fido-worker <index> <inode> <rdev>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install storage-operation --uid <uid> (stdin: td-authd's private socket)\n       td-install fido-worker <index> <inode> <rdev>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
-                     [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]\n       \
-                     td-install format ... --trusted-key <trusted-key> --publish <td-boot> <deployment> <mountpoint>";
+                     [<td-boot> <deployment> | --seed]\n       \
+                     td-install format ... --seed --publish <td-boot> <deployment> <mountpoint>";
 
 fn candidate_output_allowed(terminal: bool) -> io::Result<()> {
     if terminal {
@@ -153,13 +153,11 @@ enum Mode {
     ObserveSourcePlan {
         td_boot: PathBuf,
         source: PathBuf,
-        trusted_key: PathBuf,
     },
     /// The installation service core, for one installer on the stdin socket.
     Serve(LiveHost),
     PrepareSelector {
         template: PathBuf,
-        trusted_key: PathBuf,
         uuid: VolumeUuid,
         output: PathBuf,
     },
@@ -202,13 +200,14 @@ enum Mode {
         destination: PathBuf,
         mkfs: PathBuf,
         scratch: PathBuf,
-        /// Publish requires all three operands and authenticated publication.
-        /// Trust initializes only the key/layout and claims no deployment.
+        /// Publish requires both operands and a verified publication.
+        /// Layout initializes only the td directories and claims no
+        /// deployment.
         seed: Option<VolumeSeed>,
     },
 }
 
-/// The caller binds this read-only validator to an authenticated deployment.
+/// The caller binds this read-only validator to a verified deployment.
 #[derive(Debug, Eq, PartialEq)]
 struct PrimarySelection {
     name: String,
@@ -427,20 +426,15 @@ impl SelectorParts {
     }
 }
 
-/// Prepare the selector copy: the template, which carries neither, then the
-/// trust root and the volume identity it boots.
-fn prepare_selector(
-    template: &Path,
-    trusted_key: &Path,
-    uuid: &VolumeUuid,
-    output: &Path,
-) -> io::Result<()> {
+/// Prepare the selector copy: the template, which carries none, then the
+/// volume identity it boots.
+fn prepare_selector(template: &Path, uuid: &VolumeUuid, output: &Path) -> io::Result<()> {
     let SelectorParts {
         file,
         len,
         padding,
         appendix,
-    } = selector_parts(template, trusted_key, uuid)?;
+    } = selector_parts(template, uuid)?;
     // Existing files, links and device nodes refuse before any output write.
     let mut destination = paths::create_new_with_mode(output, 0o600)?;
     let mut source = BootInput {
@@ -491,14 +485,8 @@ fn prepare_selector(
         .map_err(|error| output_error("sync", error))
 }
 
-fn selector_parts(
-    template: &Path,
-    trusted_key: &Path,
-    uuid: &VolumeUuid,
-) -> io::Result<SelectorParts> {
-    let key = read_trusted_key(trusted_key)?;
-    let appendix = selector_appendix::appendix(&key, &uuid.0, false)
-        .map_err(|error| invalid(format!("{}: {error}", trusted_key.display())))?;
+fn selector_parts(template: &Path, uuid: &VolumeUuid) -> io::Result<SelectorParts> {
+    let appendix = selector_appendix::appendix(&uuid.0, false).map_err(invalid)?;
     let (file, metadata) = td_fs::open_real_file(template, "selector template")?;
     let len = metadata.len();
     let padding = selector_join_padding(len, appendix.len())
@@ -514,13 +502,8 @@ fn selector_parts(
 /// A prepared selector in memory, by `prepare-selector`'s rules: the
 /// template, its padding and the appended archive (the storage worker's
 /// selector update, DESIGN.md "Storage operation worker").
-fn selector_bytes(
-    template: &[u8],
-    key: &[u8],
-    uuid: &VolumeUuid,
-    measured: bool,
-) -> io::Result<Vec<u8>> {
-    let appendix = selector_appendix::appendix(key, &uuid.0, measured).map_err(invalid)?;
+fn selector_bytes(template: &[u8], uuid: &VolumeUuid, measured: bool) -> io::Result<Vec<u8>> {
+    let appendix = selector_appendix::appendix(&uuid.0, measured).map_err(invalid)?;
     let padding = selector_join_padding(template.len() as u64, appendix.len())?;
     let zeros = [0u8; 3];
     let padding = zeros
@@ -542,12 +525,6 @@ struct Publish {
     /// told to, as it does for `mkfs.btrfs`.
     td_boot: PathBuf,
     deployment: PathBuf,
-    /// Named EXPLICITLY rather than left to td-boot's probe, and DESIGN §10
-    /// item 7c says why: absence is what the probe reads as "no trust root",
-    /// and absence is indistinguishable from a key provisioned under the wrong
-    /// name or behind a dangling symlink. Naming it means a wrong path is an
-    /// error instead of an unverified publish.
-    trusted_key: PathBuf,
 }
 
 /// Publication onto the volume just formatted, through a loop over the
@@ -561,34 +538,28 @@ struct LoopPublish {
     mountpoint: PathBuf,
 }
 
-/// Formatting with a trust root alone prepares for a later mounted publish;
-/// `Loop` is that publish, made before the destination is released.
+/// Seeding td's directory layout alone (`--seed`) prepares for a later
+/// mounted publish; `Loop` is that publish, made before the destination is
+/// released.
 #[derive(Debug, Eq, PartialEq)]
 enum VolumeSeed {
     Publish(Publish),
-    Trust(PathBuf),
-    Loop(PathBuf, LoopPublish),
+    Layout,
+    Loop(LoopPublish),
 }
 
 impl VolumeSeed {
-    fn trusted_key(&self) -> &Path {
-        match self {
-            Self::Publish(publish) => &publish.trusted_key,
-            Self::Trust(key) | Self::Loop(key, _) => key,
-        }
-    }
-
     fn publish(&self) -> Option<&Publish> {
         match self {
             Self::Publish(publish) => Some(publish),
-            Self::Trust(_) | Self::Loop(..) => None,
+            Self::Layout | Self::Loop(_) => None,
         }
     }
 
     fn through_loop(&self) -> Option<&LoopPublish> {
         match self {
-            Self::Loop(_, publish) => Some(publish),
-            Self::Publish(_) | Self::Trust(_) => None,
+            Self::Loop(publish) => Some(publish),
+            Self::Publish(_) | Self::Layout => None,
         }
     }
 }
@@ -738,13 +709,9 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                         .into(),
                 ));
             };
-            if head.len() != 5
-                || !head
-                    .get(3)
-                    .is_some_and(|arg| arg.as_os_str() == "--trusted-key")
-            {
+            if head.len() != 4 || !head.get(3).is_some_and(|arg| arg.as_os_str() == "--seed") {
                 return Err(invalid(
-                    "--publish follows the volume operands and --trusted-key KEY".into(),
+                    "--publish follows the volume operands and --seed".into(),
                 ));
             }
             if [td_boot, deployment, mountpoint]
@@ -763,22 +730,20 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             )
         }
     };
-    if rest.iter().any(|arg| arg.as_os_str() == "--trusted-key")
+    if rest.iter().any(|arg| arg.as_os_str() == "--seed")
         && !(verb == "volume"
-            && rest.len() == 5
-            && rest
-                .get(3)
-                .is_some_and(|arg| arg.as_os_str() == "--trusted-key")
+            && rest.len() == 4
+            && rest.get(3).is_some_and(|arg| arg.as_os_str() == "--seed")
             && rest
                 .iter()
-                .filter(|arg| arg.as_os_str() == "--trusted-key")
+                .filter(|arg| arg.as_os_str() == "--seed")
                 .count()
                 == 1)
     {
         return Err(invalid(if verb == "volume" {
-            "--trusted-key requires exactly one key after the volume operands".into()
+            "--seed must appear once, after the volume operands".into()
         } else {
-            "--trusted-key is only supported by volume".into()
+            "--seed is only supported by volume".into()
         }));
     }
     match (verb.to_str(), rest) {
@@ -786,18 +751,14 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         (Some("destinations"), []) => Ok(Mode::Destinations),
         (Some("candidate-record"), []) => Ok(Mode::CandidateRecord),
         (Some("observe-plan"), []) => Ok(Mode::ObservePlan),
-        (Some("observe-source-plan"), [td_boot, source, trusted_key]) => {
-            Ok(Mode::ObserveSourcePlan {
-                td_boot: PathBuf::from(td_boot),
-                source: PathBuf::from(source),
-                trusted_key: PathBuf::from(trusted_key),
-            })
-        }
-        (Some("serve"), [td_boot, source, trusted_key, root, firstboot]) => {
+        (Some("observe-source-plan"), [td_boot, source]) => Ok(Mode::ObserveSourcePlan {
+            td_boot: PathBuf::from(td_boot),
+            source: PathBuf::from(source),
+        }),
+        (Some("serve"), [td_boot, source, root, firstboot]) => {
             let host = LiveHost {
                 td_boot: td_boot.clone(),
                 source: source.clone(),
-                trusted_key: trusted_key.clone(),
                 root: root.clone(),
                 firstboot: firstboot.clone(),
                 timezones: PathBuf::from(TIMEZONE_ROOT),
@@ -806,32 +767,23 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 // Serve's probes set it once admitted; storage follows it.
                 basis: installation_plan::Basis::default(),
             };
-            if [
-                &host.td_boot,
-                &host.source,
-                &host.trusted_key,
-                &host.root,
-                &host.firstboot,
-            ]
-            .iter()
-            .any(|path| !path.is_absolute())
+            if [&host.td_boot, &host.source, &host.root, &host.firstboot]
+                .iter()
+                .any(|path| !path.is_absolute())
             {
                 return Err(invalid("serve operands must be absolute paths".into()));
             }
             Ok(Mode::Serve(host))
         }
         (Some("new-volume-uuid"), []) => Ok(Mode::NewVolumeUuid),
-        (Some("prepare-selector"), [template, trusted_key, uuid, output]) => {
-            Ok(Mode::PrepareSelector {
-                template: template.clone(),
-                trusted_key: trusted_key.clone(),
-                uuid: VolumeUuid::parse(
-                    uuid.to_str()
-                        .ok_or_else(|| invalid("volume UUID must be UTF-8".into()))?,
-                )?,
-                output: output.clone(),
-            })
-        }
+        (Some("prepare-selector"), [template, uuid, output]) => Ok(Mode::PrepareSelector {
+            template: template.clone(),
+            uuid: VolumeUuid::parse(
+                uuid.to_str()
+                    .ok_or_else(|| invalid("volume UUID must be UTF-8".into()))?,
+            )?,
+            output: output.clone(),
+        }),
         (Some("timezones"), []) => Ok(Mode::Timezones),
         (Some("storage-operation"), [flag, uid]) if flag.as_os_str() == "--uid" => {
             let uid = uid
@@ -868,9 +820,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 initramfs: initramfs.clone(),
             }),
         }),
-        (Some("volume"), [destination, mkfs, scratch, flag, trusted_key])
-            if flag.as_os_str() == "--trusted-key" =>
-        {
+        (Some("volume"), [destination, mkfs, scratch, flag]) if flag.as_os_str() == "--seed" => {
             Ok(Mode::Volume {
                 boot,
                 uuid,
@@ -881,28 +831,25 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 mkfs: mkfs.clone(),
                 scratch: scratch.clone(),
                 seed: Some(match through_loop {
-                    Some(publish) => VolumeSeed::Loop(trusted_key.clone(), publish),
-                    None => VolumeSeed::Trust(trusted_key.clone()),
+                    Some(publish) => VolumeSeed::Loop(publish),
+                    None => VolumeSeed::Layout,
                 }),
             })
         }
-        (Some("volume"), [destination, mkfs, scratch, td_boot, deployment, trusted_key]) => {
-            Ok(Mode::Volume {
-                boot,
-                uuid,
-                timezone,
-                hostname,
-                username,
-                destination: destination.clone(),
-                mkfs: mkfs.clone(),
-                scratch: scratch.clone(),
-                seed: Some(VolumeSeed::Publish(Publish {
-                    td_boot: td_boot.clone(),
-                    deployment: deployment.clone(),
-                    trusted_key: trusted_key.clone(),
-                })),
-            })
-        }
+        (Some("volume"), [destination, mkfs, scratch, td_boot, deployment]) => Ok(Mode::Volume {
+            boot,
+            uuid,
+            timezone,
+            hostname,
+            username,
+            destination: destination.clone(),
+            mkfs: mkfs.clone(),
+            scratch: scratch.clone(),
+            seed: Some(VolumeSeed::Publish(Publish {
+                td_boot: td_boot.clone(),
+                deployment: deployment.clone(),
+            })),
+        }),
         (Some("volume"), [destination, mkfs, scratch]) => Ok(Mode::Volume {
             boot,
             uuid,
@@ -943,19 +890,16 @@ fn observe_plan(input: &mut impl Read, output: &mut impl Write) -> io::Result<()
     output.flush()
 }
 
-/// Keep the reviewed disk claimed while td-boot authenticates every payload.
+/// Keep the reviewed disk claimed while td-boot verifies every payload.
 /// The claim ends before return; the report grants no later write authority.
 fn observe_source_plan(
     input: &mut impl Read,
     output: &mut impl Write,
     td_boot: &Path,
     source: &Path,
-    trusted_key: &Path,
 ) -> io::Result<()> {
-    if !td_boot.is_absolute() || !source.is_absolute() || !trusted_key.is_absolute() {
-        return Err(invalid(
-            "td-boot, source and trusted key must be absolute paths".into(),
-        ));
+    if !td_boot.is_absolute() || !source.is_absolute() {
+        return Err(invalid("td-boot and source must be absolute paths".into()));
     }
     let plan = read_plan(input)?;
     observe_source_plan_with_claim(
@@ -963,7 +907,6 @@ fn observe_source_plan(
         output,
         td_boot,
         source,
-        trusted_key,
         inventory::claim_plan,
         inventory::recheck_claim_plan,
     )
@@ -974,12 +917,11 @@ fn observe_source_plan_with_claim<C>(
     output: &mut impl Write,
     td_boot: &Path,
     source: &Path,
-    trusted_key: &Path,
     claim: impl FnOnce(&installation_plan::Plan) -> io::Result<C>,
     recheck: impl FnOnce(&installation_plan::Plan, &mut C) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut claim = claim(plan)?;
-    let id = validate_source_plan(plan, td_boot, source, trusted_key)?;
+    let id = validate_source_plan(plan, td_boot, source)?;
     recheck(plan, &mut claim)?;
     write_source_plan_report(output, plan, &id)?;
     output.flush()
@@ -997,23 +939,22 @@ fn validate_source_plan(
     plan: &installation_plan::Plan,
     td_boot: &Path,
     source: &Path,
-    trusted_key: &Path,
 ) -> io::Result<String> {
-    let id = authenticate_source(td_boot, source, trusted_key)?;
+    let id = validate_source(td_boot, source)?;
     if !plan.matches_deployment_id(&id) {
         return Err(invalid(
-            "reviewed deployment differs from authenticated source".into(),
+            "reviewed deployment differs from the validated source".into(),
         ));
     }
     Ok(id)
 }
 
-/// The canonical manifest ID td-boot prints after authenticating `source`.
-fn authenticate_source(td_boot: &Path, source: &Path, trusted_key: &Path) -> io::Result<String> {
+/// The canonical manifest ID td-boot prints after verifying every payload
+/// of `source` against its manifest.
+fn validate_source(td_boot: &Path, source: &Path) -> io::Result<String> {
     let result = std::process::Command::new(td_boot)
         .arg("validate-source")
         .arg(source)
-        .arg(trusted_key)
         .output()?;
     if !result.status.success() {
         return Err(invalid(format!(
@@ -1047,14 +988,13 @@ const KEYBOARD: &str = "us";
 struct LiveHost {
     td_boot: PathBuf,
     source: PathBuf,
-    trusted_key: PathBuf,
     root: PathBuf,
     firstboot: PathBuf,
     timezones: PathBuf,
     /// The catalog, read once: it is immutable deployment data, so a
     /// repeated request costs root nothing and a broken one logs once.
     catalog: Option<Result<installation_plan::Zones, installation_protocol::Refusal>>,
-    /// Which deployment the running root was authenticated as.
+    /// Which deployment the running root was verified as.
     booted: PathBuf,
     /// What serve's probes found at its start; every plan records it and
     /// names the storage it implies.
@@ -1166,10 +1106,10 @@ impl installation_service::Host for LiveHost {
             .map_err(|error| refuse(claim_refusal(error.kind()), error))
     }
 
-    fn authenticate_source(&mut self) -> Result<[u8; 32], installation_protocol::Refusal> {
+    fn validate_source(&mut self) -> Result<[u8; 32], installation_protocol::Refusal> {
         // The settings are checked against the running root and its catalog;
         // they are checked against this source only if that root is its.
-        authenticate_source(&self.td_boot, &self.source, &self.trusted_key)
+        validate_source(&self.td_boot, &self.source)
             .and_then(|id| {
                 booted_as(&self.booted, &id)?;
                 digest_bytes(&id)
@@ -1208,14 +1148,10 @@ impl installation_service::Host for LiveHost {
             ))));
         }
         let uuid = VolumeUuid::parse(&canonical_uuid(plan.volume_uuid())).map_err(unavailable)?;
-        let selector = selector_parts(
-            &self.root.join(protocol::SELECTOR_TEMPLATE_PATH),
-            &self.trusted_key,
-            &uuid,
-        )
-        .map_err(unavailable)?
-        .total()
-        .ok_or_else(|| unavailable(invalid("the selector's length overflowed".into())))?;
+        let selector = selector_parts(&self.root.join(protocol::SELECTOR_TEMPLATE_PATH), &uuid)
+            .map_err(unavailable)?
+            .total()
+            .ok_or_else(|| unavailable(invalid("the selector's length overflowed".into())))?;
         let sector = u64::from(plan.destination().sector());
         let capacity = plan.destination().capacity();
         volume_fit(sector, capacity, payloads, plan.storage())
@@ -1795,11 +1731,10 @@ fn settle_power(
 struct LiveExecution {
     td_boot: PathBuf,
     source: PathBuf,
-    trusted_key: PathBuf,
     root: PathBuf,
     firstboot: PathBuf,
     timezones: PathBuf,
-    /// The deployment id this boot's root was authenticated as.
+    /// The deployment id this boot's root was verified as.
     booted: PathBuf,
     /// Where the private workspace is made.
     run: PathBuf,
@@ -1808,7 +1743,7 @@ struct LiveExecution {
 /// The live root's record of its deployment, written by its init.
 const BOOTED_DEPLOYMENT: &str = "/run/td-deployment";
 
-/// The running root was authenticated as `deployment`, by the record a live
+/// The running root was verified as `deployment`, by the record a live
 /// boot's init writes.
 fn booted_as(record: &Path, deployment: &str) -> io::Result<()> {
     let booted = td_fs::read_bounded_real_file(record, "booted deployment record", 65)?;
@@ -1858,7 +1793,6 @@ impl LiveExecution {
         Self {
             td_boot: host.td_boot.clone(),
             source: host.source.clone(),
-            trusted_key: host.trusted_key.clone(),
             root: host.root.clone(),
             firstboot: host.firstboot.clone(),
             timezones: host.timezones.clone(),
@@ -1903,7 +1837,6 @@ impl LiveExecution {
         let uuid = VolumeUuid::parse(&canonical_uuid(plan.volume_uuid())).map_err(&verification)?;
         prepare_selector(
             &self.root.join(protocol::SELECTOR_TEMPLATE_PATH),
-            &self.trusted_key,
             &uuid,
             &workspace.selector,
         )
@@ -1918,14 +1851,11 @@ impl LiveExecution {
             root: self.root.clone(),
             firstboot: self.firstboot.clone(),
         };
-        let seed = VolumeSeed::Loop(
-            self.trusted_key.clone(),
-            LoopPublish {
-                td_boot: self.td_boot.clone(),
-                deployment: self.source.clone(),
-                mountpoint: workspace.mountpoint.clone(),
-            },
-        );
+        let seed = VolumeSeed::Loop(LoopPublish {
+            td_boot: self.td_boot.clone(),
+            deployment: self.source.clone(),
+            mountpoint: workspace.mountpoint.clone(),
+        });
         // A convenience, so a file td-netd cannot have written stays behind
         // rather than failing the installation.
         let wifi = read_wifi_networks(&self.root, 0).unwrap_or_else(|error| {
@@ -2032,7 +1962,7 @@ impl LiveExecution {
         }))
     }
 
-    /// The `bzImage` digest the authenticated manifest names, once the
+    /// The `bzImage` digest the verified manifest names, once the
     /// manifest is the one the plan names.
     fn kernel_digest(&self, deployment: &[u8; 32]) -> io::Result<[u8; 32]> {
         let path = self.source.join(protocol::MANIFEST_NAME);
@@ -2045,7 +1975,7 @@ impl LiveExecution {
         hasher.update(&manifest);
         if hasher.finalize() != *deployment {
             return Err(invalid(format!(
-                "{} is not the authenticated deployment's manifest",
+                "{} is not the verified deployment's manifest",
                 path.display()
             )));
         }
@@ -2344,7 +2274,6 @@ impl Workspace {
         [
             paths::remove_file_if_present(&self.kernel),
             paths::remove_file_if_present(&self.selector),
-            paths::remove_file_if_present(&self.dir.join("trusted.pub")),
             paths::remove_dir_if_present(&self.dir.join("publish")),
             paths::remove_dir_all_if_present(&self.scratch),
             paths::remove_dir_if_present(&self.mountpoint),
@@ -2499,12 +2428,10 @@ fn run_serve(mut host: LiveHost) -> io::Result<()> {
     enum Kind {
         Executable,
         Directory,
-        File,
     }
     for (operand, kind) in [
         (&host.td_boot, Kind::Executable),
         (&host.source, Kind::Directory),
-        (&host.trusted_key, Kind::File),
         (&host.root, Kind::Directory),
         (&host.firstboot, Kind::Executable),
     ] {
@@ -2514,7 +2441,6 @@ fn run_serve(mut host: LiveHost) -> io::Result<()> {
                 "an executable file",
             ),
             Kind::Directory => (|metadata| metadata.is_dir(), "a directory"),
-            Kind::File => (|metadata| metadata.is_file(), "a file"),
         };
         match paths::metadata_if_present(operand) {
             None => {
@@ -2906,8 +2832,7 @@ fn random_guid() -> io::Result<gpt::Guid> {
 /// `io::Error` carries an errno and nothing else, so a destination that is not
 /// there refuses with a bare `No such file or directory` on a command line
 /// that names up to five paths — and an operator has no way to tell which one
-/// it meant. Same argument `td-boot`'s `read_trusted_key` makes, on the other
-/// half of the deployment path.
+/// it meant.
 ///
 /// The property is STRUCTURAL rather than checked. Each wrapper takes its path
 /// as a parameter and holds no other, so `.at()` cannot be handed a file the
@@ -3101,21 +3026,6 @@ mod paths {
         }
     }
 
-    /// A rename names BOTH paths: either can be the one at fault, and the
-    /// errno alone does not say which.
-    pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot rename {} to {}: {error}",
-                    from.display(),
-                    to.display()
-                ),
-            )
-        })
-    }
-
     /// A whole small file, named as a READ failure so it cannot be mistaken
     /// for the parse that follows it — `device_numbers` turns on the
     /// difference between a sysfs path that is not there and a sector size
@@ -3284,7 +3194,7 @@ fn prepare_layout(
         let (kernel, initramfs) = inputs
             .as_mut()
             .ok_or_else(|| invalid("boot digests without boot files".into()))?;
-        kernel.check_digest(kernel_sha256, "the kernel the authenticated manifest names")?;
+        kernel.check_digest(kernel_sha256, "the kernel the verified manifest names")?;
         initramfs.check_digest(initramfs_sha256, "the selector this execution prepared")?;
     }
     let kernel_path = format!("\\EFI\\BOOT\\{}", protocol::EFI_BOOT_FILE);
@@ -3749,22 +3659,7 @@ fn zero_edges(file: &mut File, offset: u64, len: u64) -> io::Result<()> {
     zero_at(file, tail, edge)
 }
 
-/// Read the trusted key under td-boot's rule, which is now literally
-/// td-boot's: td-fs is one implementation both crates include.
-///
-/// Applied here rather than left to td-boot because this program SNAPSHOTS
-/// the key and hands td-boot the copy — a copy is a small regular file
-/// whatever the original was, so without this the snapshot would launder a
-/// key past every refusal the real reader makes.
-fn read_trusted_key(path: &Path) -> io::Result<Vec<u8>> {
-    td_fs::read_bounded_real_file(
-        path,
-        "trusted deployment key",
-        protocol::MAX_PUBLIC_KEY_BYTES,
-    )
-}
-
-/// Initialize trust directories and optionally publish through `td-boot`.
+/// Initialize td's directories and optionally publish through `td-boot`.
 ///
 /// D1: this crate does not learn to write a deployment directory, update a
 /// selector, or account for attempts — it hands the whole transaction to the
@@ -3780,7 +3675,7 @@ fn read_trusted_key(path: &Path) -> io::Result<Vec<u8>> {
 /// of byte offsets, and an id is neither a byte offset nor something a caller
 /// reading by position expects to see there. It is also READ, which is the
 /// whole of what stops a successful exit standing in for a publish — see below.
-fn seed_into(staging: &Path, seed: &VolumeSeed, key: &[u8]) -> io::Result<()> {
+fn seed_into(staging: &Path, seed: &VolumeSeed) -> io::Result<()> {
     // The four `install_deployment` requires, in its order and its spelling —
     // `td` is a literal there too, and the two nested constants make it
     // redundant only for as long as they stay under it. Mirroring the check
@@ -3820,63 +3715,17 @@ fn seed_into(staging: &Path, seed: &VolumeSeed, key: &[u8]) -> io::Result<()> {
         paths::create_dir_all(&path)?;
         paths::set_mode(&path, 0o755)?;
     }
-    // The key is SNAPSHOT and td-boot is handed the snapshot, so the file that
-    // authenticates the bundle is the file the volume keeps — two reads of one
-    // path are two chances for it to say different things, and nothing would
-    // report the disagreement. Beside the staging tree rather than in it, so
-    // td-boot never reads a trust root out of the volume root it is writing.
-    // `staging` is canonical, so its parent is the scratch directory.
-    //
-    // In a directory of its own at 0700, because the scratch directory is not
-    // private and `td-trusted.pub` is a guessable name: everything below
-    // narrows the window in which the snapshot can be swapped, and a directory
-    // nothing else may write into is what removes it rather than narrowing it.
-    // Restricting needs no chmod after the fact — a umask can only take mode
-    // bits away, and 0700 is already the fewest this needs — which is the
-    // reverse of the widening two blocks down.
-    let private = staging
-        .parent()
-        .ok_or_else(|| {
-            invalid(format!(
-                "the staging tree {} has no parent",
-                staging.display()
-            ))
-        })?
-        .join("td-install-key");
-    paths::remove_dir_all_if_present(&private)?;
-    paths::create_dir_with_mode(&private, 0o700)?;
-    let snapshot = private.join("td-trusted.pub");
-    let identity;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Created 0600 and WIDENED, not created 0644: a creation mode is
-        // masked by the umask, so 0644 asked for directly is 0600 under `umask
-        // 077` with nothing to correct it — and the other order would leave a
-        // window where a machine's trust root is world-writable.
-        //
-        // Widened through the open DESCRIPTOR, not the path: a path-based
-        // chmod follows a symlink, so one swapped in after the write would
-        // take the 0644 instead — the same race `create_new` closes at the
-        // other end, and closing only one end closes neither.
-        let mut file = paths::create_new_with_mode(&snapshot, 0o600)?;
-        file.write_all(key)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-        use std::os::linux::fs::MetadataExt;
-        let written = file.metadata()?;
-        identity = (written.st_dev(), written.st_ino());
-    }
     if let VolumeSeed::Publish(publish) = seed {
         let output = std::process::Command::new(&publish.td_boot)
             .arg(protocol::PUBLISH_VERB)
             .arg(staging)
             .arg(&publish.deployment)
-            .arg(&snapshot)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .output()
             // A failure to SPAWN reports the errno and no path, so a mistyped or
             // unbuilt `td-boot` says only `No such file or directory` — on a
-            // command line that names four other paths any of which a reader would
+            // command line that names three other paths any of which a reader would
             // suspect first.
             .map_err(|error| {
                 invalid(format!("cannot run {}: {error}", publish.td_boot.display()))
@@ -3927,34 +3776,6 @@ fn seed_into(staging: &Path, seed: &VolumeSeed, key: &[u8]) -> io::Result<()> {
             )));
         }
     }
-    // The volume keeps the key, so the machine this installs can authenticate
-    // its own updates: it has none otherwise, since `TRUSTED_KEY_PATH` is the
-    // SELECTOR initramfs's copy and `switch_root` replaces that rootfs
-    // (DESIGN §10 item 10a).
-    //
-    // A publishing seed promotes only after authentication succeeds. A trust-only
-    // seed provisions bytes for the later mounted publisher; it asserts no
-    // authenticated deployment. Rename preserves the snapshot's identity.
-    //
-    // A rename moves whatever the path names AT RENAME TIME, though, not the
-    // file td-boot just read, so the inode is checked against the one written
-    // above — the `st_dev`/`st_ino` comparison the scratch image already makes
-    // one screen down. The 0700 directory is what makes this a check nothing
-    // is expected to trip; it is here because the alternative to tripping it
-    // is a volume carrying a key that authenticated nothing, which is the one
-    // outcome this whole path exists to prevent.
-    {
-        use std::os::linux::fs::MetadataExt;
-        let now = paths::symlink_metadata(&snapshot)?;
-        if !now.is_file() || (now.st_dev(), now.st_ino()) != identity {
-            return Err(invalid(format!(
-                "the trusted key {} was replaced while the volume was seeded",
-                snapshot.display()
-            )));
-        }
-    }
-    let destination = staging.join(protocol::VOLUME_TRUSTED_KEY);
-    paths::rename(&snapshot, &destination)?;
     Ok(())
 }
 
@@ -4225,10 +4046,7 @@ fn format_held(
         .map_err(HeldFailure::Layout)?;
     step(FormatStep::Writing);
     layout.write_held(destination, true)?;
-    let Some((key, publish)) = seed.and_then(|seed| {
-        seed.through_loop()
-            .map(|publish| (seed.trusted_key(), publish))
-    }) else {
+    let Some(publish) = seed.and_then(VolumeSeed::through_loop) else {
         return image
             .write_to(destination, out)
             .map(|()| Formatted {
@@ -4247,7 +4065,7 @@ fn format_held(
         .write_to(destination, &mut report)
         .map_err(HeldFailure::Written)?;
     step(FormatStep::Publishing);
-    let stdout = publish_through_loop(destination, publish, key).map_err(HeldFailure::Written)?;
+    let stdout = publish_through_loop(destination, publish).map_err(HeldFailure::Written)?;
     out.write_all(&report).map_err(HeldFailure::Written)?;
     Ok(Formatted {
         volume,
@@ -4475,7 +4293,6 @@ fn format_held_device_bound(
         mkfs,
         scratch,
         seed,
-        key,
     } = prepared;
     let not_loop = || {
         HeldFailure::Layout(invalid(
@@ -4492,14 +4309,14 @@ fn format_held_device_bound(
         })?
         .0
         .clone();
-    let staging = stage_tree(settings, Some(seed), key, scratch).map_err(HeldFailure::Staging)?;
+    let staging = stage_tree(settings, Some(seed), scratch).map_err(HeldFailure::Staging)?;
     layout
         .check_unchanged(&mut destination.file)
         .map_err(HeldFailure::Layout)?;
     step(FormatStep::Writing);
     let mkfs =
         |mapping: &Path, len: u64| run_mkfs(mkfs, len, &uuid, &staging, mapping, "the mapping");
-    let td_boot = |mapping: &Path| td_boot_install(publish, mapping, seed.trusted_key());
+    let td_boot = |mapping: &Path| td_boot_install(publish, mapping);
     let volume_extent = volume;
     let written = layout.write_held(destination, false).and_then(|_| {
         let volume = device_bound::Volume {
@@ -4592,14 +4409,13 @@ fn publish_device_bound(
 
 /// `td-boot install` on `device`; its standard output, the deployment id,
 /// copied to standard error and returned.
-fn td_boot_install(publish: &LoopPublish, device: &Path, key: &Path) -> io::Result<Vec<u8>> {
+fn td_boot_install(publish: &LoopPublish, device: &Path) -> io::Result<Vec<u8>> {
     // td-boot's stdout is the deployment id; this program's is a report.
     let output = std::process::Command::new(&publish.td_boot)
         .arg("install")
         .arg(device)
         .arg(&publish.mountpoint)
         .arg(&publish.deployment)
-        .arg(key)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -4625,7 +4441,6 @@ fn td_boot_install(publish: &LoopPublish, device: &Path, key: &Path) -> io::Resu
 fn publish_through_loop(
     destination: &mut FormatDestination,
     publish: &LoopPublish,
-    key: &Path,
 ) -> io::Result<Vec<u8>> {
     let sector_size = logical_sector_size(&destination.file)?;
     let (offset, len) = destination_volume(&mut destination.file)?;
@@ -4639,7 +4454,7 @@ fn publish_through_loop(
                 ),
             )
         })?;
-    let stdout = td_boot_install(publish, device.path(), key)?;
+    let stdout = td_boot_install(publish, device.path())?;
     // td-boot has unmounted, so this is the last opener and the loop clears;
     // release confirms it did, so no loop outlives a reported success.
     device.release()?;
@@ -4661,7 +4476,6 @@ struct PreparedVolume<'a> {
     mkfs: &'a Path,
     scratch: &'a Path,
     seed: Option<&'a VolumeSeed>,
-    key: Option<Vec<u8>>,
 }
 
 /// Validate caller-bound inputs before acquiring or changing the destination.
@@ -4732,15 +4546,6 @@ fn prepare_volume<'a>(
             )));
         }
     }
-    // The KEY is read here for the same reason and in the same place. It is an
-    // argv-shaped mistake like the two above — a path that is not there, or is
-    // not a key — and reading it inside `seed_into` put the refusal after
-    // the staging tree had been emptied, so a mistyped fifth argument
-    // destroyed a directory before saying it did not like the fifth argument.
-    // That is verbatim the failure the paragraph above records for the fourth.
-    let key = seed
-        .map(|seed| read_trusted_key(seed.trusted_key()))
-        .transpose()?;
     if let Some(selection) = settings.username {
         selection.check()?;
     }
@@ -4750,7 +4555,6 @@ fn prepare_volume<'a>(
         mkfs,
         scratch,
         seed,
-        key,
     })
 }
 
@@ -4811,7 +4615,6 @@ fn prepare_volume_image(
         mkfs,
         scratch,
         seed,
-        key,
     } = prepared;
     let file = &destination.file;
     // The image is the volume's own size, because `--byte-count` is what the
@@ -4819,7 +4622,7 @@ fn prepare_volume_image(
     // volume that reports less space than the partition it is copied into, and
     // a larger one a volume whose tail is off the end of the partition.
     let image_path = scratch.join("td-volume.img");
-    let staging = stage_tree(settings, seed, key, scratch)?;
+    let staging = stage_tree(settings, seed, scratch)?;
     // `File::create` TRUNCATES, so a scratch directory that puts the image on
     // top of the DESTINATION destroys the disk whose table was just read — and
     // reports success, since everything after this writes a filesystem into
@@ -4942,7 +4745,6 @@ fn run_mkfs(
 fn stage_tree(
     settings: VolumeSettings<'_>,
     seed: Option<&VolumeSeed>,
-    key: Option<Vec<u8>>,
     scratch: &Path,
 ) -> io::Result<PathBuf> {
     let staging = scratch.join("td-volume-root");
@@ -4954,6 +4756,9 @@ fn stage_tree(
     // on a machine's /var, with nothing about the install saying so.
     paths::remove_dir_all_if_present(&staging)?;
     paths::create_dir_all(&subvol)?;
+    // SET, not left to the umask, since this becomes the volume root, and
+    // td-boot's update refuses a channel below a root others may write.
+    paths::set_mode(&staging, 0o755)?;
     paths::set_mode(&subvol, 0o755)?;
     if let Some(timezone) = settings.timezone {
         seed_timezone(&subvol, timezone)?;
@@ -4980,8 +4785,7 @@ fn stage_tree(
     // different names for one directory.
     let staging = paths::canonicalize(&staging)?;
     if let Some(seed) = seed {
-        let key = key.ok_or_else(|| invalid("the trusted key was not read".to_string()))?;
-        seed_into(&staging, seed, &key)?;
+        seed_into(&staging, seed)?;
     }
     Ok(staging)
 }
@@ -5200,10 +5004,9 @@ fn main() -> ExitCode {
         }
         Mode::PrepareSelector {
             template,
-            trusted_key,
             uuid,
             output,
-        } => prepare_selector(&template, &trusted_key, &uuid, &output),
+        } => prepare_selector(&template, &uuid, &output),
         Mode::Destinations => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
@@ -5221,20 +5024,10 @@ fn main() -> ExitCode {
             let mut output = io::BufWriter::new(stdout.lock());
             observe_plan(&mut io::stdin().lock(), &mut output)
         }
-        Mode::ObserveSourcePlan {
-            td_boot,
-            source,
-            trusted_key,
-        } => {
+        Mode::ObserveSourcePlan { td_boot, source } => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
-            observe_source_plan(
-                &mut io::stdin().lock(),
-                &mut output,
-                &td_boot,
-                &source,
-                &trusted_key,
-            )
+            observe_source_plan(&mut io::stdin().lock(), &mut output, &td_boot, &source)
         }
         Mode::Serve(host) => run_serve(host),
         Mode::Inventory => {
@@ -5335,12 +5128,11 @@ mod tests {
     }
 
     #[test]
-    fn serve_binds_five_absolute_operands() {
+    fn serve_binds_four_absolute_operands() {
         let full = [
             "serve",
             "/bin/td-boot",
             "/source",
-            "/trusted.pub",
             "/root",
             "/bin/td-firstboot",
         ];
@@ -5349,7 +5141,6 @@ mod tests {
             Mode::Serve(LiveHost {
                 td_boot: PathBuf::from("/bin/td-boot"),
                 source: PathBuf::from("/source"),
-                trusted_key: PathBuf::from("/trusted.pub"),
                 root: PathBuf::from("/root"),
                 firstboot: PathBuf::from("/bin/td-firstboot"),
                 timezones: PathBuf::from(TIMEZONE_ROOT),
@@ -5376,14 +5167,8 @@ mod tests {
     /// `--storage` anywhere is an operand like any other, and refused.
     #[test]
     fn serve_takes_no_storage_operand() {
-        let operands = [
-            "/bin/td-boot",
-            "/source",
-            "/trusted.pub",
-            "/root",
-            "/bin/td-firstboot",
-        ];
-        // An operand beside the five is a usage error; one in place of
+        let operands = ["/bin/td-boot", "/source", "/root", "/bin/td-firstboot"];
+        // An operand beside the four is a usage error; one in place of
         // td-boot is not an absolute path. Neither is a storage choice.
         for (line, reason) in [
             (
@@ -5819,7 +5604,6 @@ mod tests {
         let mut host = LiveHost {
             td_boot: PathBuf::from("/nonexistent/td-boot"),
             source: PathBuf::from("/nonexistent/source"),
-            trusted_key: PathBuf::from("/nonexistent/trusted.pub"),
             root: directory.clone(),
             firstboot,
             timezones: zones,
@@ -5855,8 +5639,8 @@ mod tests {
                 installation_plan::Settings::new(username, hostname, keyboard, timezone).unwrap();
             assert_eq!(host.check_settings(&settings), expected, "{choice:?}");
         }
-        // No source is present, so authentication refuses rather than guessing.
-        assert_eq!(host.authenticate_source(), Err(Refusal::SourceUnavailable));
+        // No source is present, so validation refuses rather than guessing.
+        assert_eq!(host.validate_source(), Err(Refusal::SourceUnavailable));
         // Settings are offered exactly the catalog the check admits from.
         let offered = host.timezones().unwrap();
         assert_eq!(offered.as_slice(), ["Etc/UTC", "Europe/London"]);
@@ -5890,7 +5674,6 @@ mod tests {
                     OsString::from("observe-source-plan"),
                     OsString::from("/bin/td-boot"),
                     OsString::from("/source"),
-                    OsString::from("/trusted.pub"),
                 ]
                 .into_iter()
             )
@@ -5898,7 +5681,6 @@ mod tests {
             Mode::ObserveSourcePlan {
                 td_boot: PathBuf::from("/bin/td-boot"),
                 source: PathBuf::from("/source"),
-                trusted_key: PathBuf::from("/trusted.pub"),
             }
         );
         for args in [
@@ -5911,12 +5693,6 @@ mod tests {
                 OsString::from("observe-source-plan"),
                 OsString::from("/bin/td-boot"),
                 OsString::from("/source"),
-            ],
-            vec![
-                OsString::from("observe-source-plan"),
-                OsString::from("/bin/td-boot"),
-                OsString::from("/source"),
-                OsString::from("/trusted.pub"),
                 OsString::from("extra"),
             ],
         ] {
@@ -5928,7 +5704,6 @@ mod tests {
             &mut output,
             Path::new("/bin/td-boot"),
             Path::new("/source"),
-            Path::new("/trusted.pub")
         )
         .is_err());
         assert!(output.is_empty());
@@ -5937,7 +5712,6 @@ mod tests {
             &mut output,
             Path::new("/bin/td-boot"),
             Path::new("source"),
-            Path::new("/trusted.pub"),
         )
         .unwrap_err();
         assert!(error.to_string().contains("absolute paths"));
@@ -5951,7 +5725,6 @@ mod tests {
         let _cleanup = ScratchDirectory(directory.clone());
         let validator = directory.join("td-boot");
         let source = directory.join("source");
-        let key = directory.join("trusted.pub");
         let destination =
             installation_plan::Destination::new(installation_plan::DestinationObservation {
                 name: "vda",
@@ -5991,8 +5764,8 @@ mod tests {
                 Some("invalid source"),
             ),
         ] {
-            scratch::executable(&validator, &format!("#!/bin/sh\n[ \"$1\" = validate-source ] || exit 2\n[ \"$2\" = \"{}\" ] || exit 3\n[ \"$3\" = \"{}\" ] || exit 4\n{body}", source.display(), key.display())).unwrap();
-            let result = validate_source_plan(&plan, &validator, &source, &key);
+            scratch::executable(&validator, &format!("#!/bin/sh\n[ \"$1\" = validate-source ] || exit 2\n[ \"$2\" = \"{}\" ] || exit 3\n[ \"$#\" = 2 ] || exit 4\n{body}", source.display())).unwrap();
+            let result = validate_source_plan(&plan, &validator, &source);
             if let Some(reason) = reason {
                 assert!(result.unwrap_err().to_string().contains(reason));
             } else {
@@ -6012,7 +5785,6 @@ mod tests {
         let validator = directory.join("td-boot");
         let observed_sequence = directory.join("diskseq");
         let source = directory.join("source");
-        let key = directory.join("trusted.pub");
         let destination =
             installation_plan::Destination::new(installation_plan::DestinationObservation {
                 name: "vda",
@@ -6056,7 +5828,6 @@ mod tests {
             &mut report,
             &validator,
             &source,
-            &key,
             |_| Ok(()),
             |_, _| {
                 let sequence = std::fs::read_to_string(&observed_sequence)?;
@@ -6110,29 +5881,27 @@ mod tests {
                 .into_iter()
         };
         assert!(matches!(
-            parse_args(args(&["prepare-selector", "template", "key", good, "out"])).unwrap(),
+            parse_args(args(&["prepare-selector", "template", good, "out"])).unwrap(),
             Mode::PrepareSelector { .. }
         ));
         for parts in [
             vec!["prepare-selector"],
-            vec!["prepare-selector", "template", good, "out"],
-            vec!["prepare-selector", "template", "key", good],
-            vec!["prepare-selector", "template", "key", good, "out", "extra"],
+            vec!["prepare-selector", "template", "key", good, "out"],
+            vec!["prepare-selector", "template", good],
+            vec!["prepare-selector", "template", good, "out", "extra"],
             vec![
                 "prepare-selector",
                 "template",
-                "key",
                 "00000000-0000-0000-0000-000000000000",
                 "out",
             ],
             vec![
                 "prepare-selector",
                 "template",
-                "key",
                 "12345678-1234-4234-8234-123456789ABC",
                 "out",
             ],
-            vec!["prepare-selector", "template", "key", "../../state", "out"],
+            vec!["prepare-selector", "template", "../../state", "out"],
         ] {
             assert!(parse_args(args(&parts)).is_err());
         }
@@ -6144,14 +5913,12 @@ mod tests {
         let dir = ScratchDirectory(scratch::path("selector-copy"));
         std::fs::create_dir_all(&dir.0).unwrap();
         let template = dir.0.join("template");
-        let key = key_file(&dir.0);
-        let key_bytes = std::fs::read(&key).unwrap();
         let uuid = VolumeUuid::parse("12345678-1234-4234-8234-123456789abc").unwrap();
         for length in 1..=8usize {
             let base = vec![b'k'; length];
             std::fs::write(&template, &base).unwrap();
             let output = dir.0.join(format!("out-{length}"));
-            prepare_selector(&template, &key, &uuid, &output).unwrap();
+            prepare_selector(&template, &uuid, &output).unwrap();
             assert_eq!(std::fs::read(&template).unwrap(), base);
             let bytes = std::fs::read(&output).unwrap();
             assert_eq!(&bytes[..length], base);
@@ -6162,7 +5929,7 @@ mod tests {
             let mut at = (length + 3) & !3;
             assert_eq!(
                 bytes.len() - at,
-                532 + 132 + key_bytes.len().next_multiple_of(4),
+                532,
                 "keep the exact-limit accounting tied to the real appendix"
             );
             assert!(bytes[length..at].iter().all(|b| *b == 0));
@@ -6196,10 +5963,6 @@ mod tests {
                         &bytes[data..data + size],
                         format!("{}\n", uuid.0).as_bytes()
                     );
-                } else if name == "etc/td/deployment.pub" {
-                    assert_eq!(mode, 0o100644);
-                    assert_eq!(field(4), 1);
-                    assert_eq!(&bytes[data..data + size], key_bytes);
                 } else {
                     assert_eq!(mode, 0o040755);
                     assert_eq!(field(4), 2);
@@ -6207,15 +5970,7 @@ mod tests {
                 }
                 at = (data + size + 3) & !3;
             }
-            assert_eq!(
-                names,
-                [
-                    "etc",
-                    "etc/td",
-                    "etc/td/deployment.pub",
-                    "etc/td/volume-uuid"
-                ]
-            );
+            assert_eq!(names, ["etc", "etc/td", "etc/td/volume-uuid"]);
         }
     }
 
@@ -6227,22 +5982,19 @@ mod tests {
         std::fs::create_dir_all(&dir.0).unwrap();
         let template = dir.0.join("template");
         std::fs::write(&template, b"kkkkk").unwrap();
-        let key = key_file(&dir.0);
-        let key_bytes = std::fs::read(&key).unwrap();
         let uuid = VolumeUuid::parse("12345678-1234-4234-8234-123456789abc").unwrap();
         let output = dir.0.join("out");
-        prepare_selector(&template, &key, &uuid, &output).unwrap();
-        let plain = selector_bytes(b"kkkkk", &key_bytes, &uuid, false).unwrap();
+        prepare_selector(&template, &uuid, &output).unwrap();
+        let plain = selector_bytes(b"kkkkk", &uuid, false).unwrap();
         assert_eq!(plain, std::fs::read(&output).unwrap());
-        let measured = selector_bytes(b"kkkkk", &key_bytes, &uuid, true).unwrap();
+        let measured = selector_bytes(b"kkkkk", &uuid, true).unwrap();
         let has = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
         let member = format!("{}\0", protocol::MEASUREMENT_POLICY_PATH);
         assert!(!has(&plain, member.as_bytes()));
         assert!(has(&measured, member.as_bytes()));
         assert!(has(&measured, protocol::MEASUREMENT_POLICY));
         assert_eq!(&measured[..8], b"kkkkk\0\0\0");
-        assert!(selector_bytes(b"kkkkk", b"not a key", &uuid, true).is_err());
-        assert!(selector_bytes(b"", &key_bytes, &uuid, true).is_err());
+        assert!(selector_bytes(b"", &uuid, true).is_err());
     }
 
     #[test]
@@ -6250,14 +6002,10 @@ mod tests {
         let dir = ScratchDirectory(scratch::path("selector-limit"));
         std::fs::create_dir_all(&dir.0).unwrap();
         let template = dir.0.join("template");
-        let key = key_file(&dir.0);
-        let key_len = std::fs::read(&key).unwrap().len();
         let uuid = VolumeUuid::parse("12345678-1234-4234-8234-123456789abc").unwrap();
-        // Five newc records: two directories, key file, UUID file, and
-        // trailer. Independently account for each aligned header/name and
-        // file body.
-        let appendix_bytes =
-            116 + 120 + (132 + key_len.next_multiple_of(4) as u64) + 132 + 40 + 124;
+        // Four newc records: two directories, the UUID file, and trailer.
+        // Independently account for each aligned header/name and file body.
+        let appendix_bytes: u64 = 116 + 120 + 132 + 40 + 124;
         let maximum_template = MAX_BOOT_FILE - appendix_bytes;
         // Test the real admission helper without allocating a dense 256 MiB
         // output on the fixture tmpfs; small copies exercise the same writer.
@@ -6272,7 +6020,7 @@ mod tests {
             .unwrap()
             .set_len(maximum_template + 1)
             .unwrap();
-        assert!(prepare_selector(&template, &key, &uuid, &too_large).is_err());
+        assert!(prepare_selector(&template, &uuid, &too_large).is_err());
         assert!(!too_large.exists());
     }
 
@@ -6283,11 +6031,10 @@ mod tests {
         std::fs::create_dir_all(&dir.0).unwrap();
         let template = dir.0.join("template");
         let output = dir.0.join("output");
-        let key = key_file(&dir.0);
         let uuid = VolumeUuid::parse("12345678-1234-4234-8234-123456789abc").unwrap();
         for size in [0, MAX_BOOT_FILE, MAX_BOOT_FILE + 1] {
             File::create(&template).unwrap().set_len(size).unwrap();
-            assert!(prepare_selector(&template, &key, &uuid, &output).is_err());
+            assert!(prepare_selector(&template, &uuid, &output).is_err());
             assert!(!output.exists());
             assert_eq!(std::fs::metadata(&template).unwrap().len(), size);
         }
@@ -6295,47 +6042,18 @@ mod tests {
         let link = dir.0.join("link");
         symlink(&template, &link).unwrap();
         for input in [&link, &dir.0, &dir.0.join("missing")] {
-            assert!(prepare_selector(input, &key, &uuid, &output).is_err());
+            assert!(prepare_selector(input, &uuid, &output).is_err());
             assert!(!output.exists());
         }
-        // A key the trusted-key reader or td-boot's decoder would refuse is
-        // refused before any output, and before the template is read: a
-        // missing template would refuse too, for the wrong reason.
-        let key_link = dir.0.join("key-link");
-        symlink(&key, &key_link).unwrap();
-        let mut bad_keys = vec![key_link, dir.0.clone(), dir.0.join("missing")];
-        for (name, text) in [
-            ("short", "ab".repeat(31)),
-            ("long", "ab".repeat(33)),
-            ("not-hex", format!("{}zz", "ab".repeat(31))),
-            ("empty", String::new()),
-        ] {
-            let path = dir.0.join(name);
-            std::fs::write(&path, text).unwrap();
-            bad_keys.push(path);
-        }
-        let absent = dir.0.join("absent-template");
-        for bad_key in &bad_keys {
-            let refused = prepare_selector(&absent, bad_key, &uuid, &output)
-                .unwrap_err()
-                .to_string();
-            assert!(refused.contains("trusted deployment key"), "{refused}");
-            assert!(!output.exists());
-        }
-        // td-boot trims surrounding whitespace and reads either case.
-        let spaced = dir.0.join("spaced");
-        std::fs::write(&spaced, format!("  {}\r\n", "AB".repeat(32))).unwrap();
-        prepare_selector(&template, &spaced, &uuid, &output).unwrap();
-        std::fs::remove_file(&output).unwrap();
         for existing in [&template, &link, &dir.0] {
-            assert!(prepare_selector(&template, &key, &uuid, existing).is_err());
+            assert!(prepare_selector(&template, &uuid, existing).is_err());
             assert_eq!(
                 std::fs::read(&template).unwrap(),
                 b"verified template bytes"
             );
         }
         std::fs::write(&output, b"preserve existing output").unwrap();
-        assert!(prepare_selector(&template, &key, &uuid, &output).is_err());
+        assert!(prepare_selector(&template, &uuid, &output).is_err());
         assert_eq!(std::fs::read(&output).unwrap(), b"preserve existing output");
     }
 
@@ -6767,7 +6485,7 @@ mod tests {
             wifi: Some(&carried),
             ..VolumeSettings::default()
         };
-        let staging = stage_tree(settings, None, None, &scratch).unwrap();
+        let staging = stage_tree(settings, None, &scratch).unwrap();
         let state = staging.join(protocol::VOLUME_SUBVOL);
         let staged = state.join(WIFI_STATE_DIR_RELATIVE).join(WIFI_FILE);
         assert_eq!(std::fs::read(&staged).unwrap(), networks.as_bytes());
@@ -6775,6 +6493,9 @@ mod tests {
         assert_eq!(mode(&staged), 0o600);
         assert_eq!(mode(&state.join(WIFI_STATE_DIR_RELATIVE)), 0o700);
         assert_eq!(mode(&state.join("lib")), 0o755);
+        // The volume root, whatever the umask: td-boot's update channel
+        // check walks down from it.
+        assert_eq!(mode(&staging), 0o755);
 
         // Stricter modes and the full bound are td-netd's too.
         write(networks.as_bytes(), 0o400, 0o755);
@@ -7872,7 +7593,7 @@ mod tests {
             ],
             vec!["volume", "disk", "/mkfs", "scratch", "--uuid", uuid],
             vec![
-                "volume", "--uuid", uuid, "--uuid", uuid, "disk", "/mkfs", "scratch", "key",
+                "volume", "--uuid", uuid, "--uuid", uuid, "disk", "/mkfs", "scratch", "--seed",
             ],
             vec!["layout", "--uuid", uuid, "disk"],
         ] {
@@ -7884,14 +7605,14 @@ mod tests {
         non_utf8.extend(args(&["disk", "/mkfs", "scratch"]));
         assert!(parse_args(non_utf8.into_iter()).is_err());
         assert!(parse_args(args(&[
-            "volume", "--uuid", uuid, "disk", "/mkfs", "scratch", "/td-boot", "source", "key"
+            "volume", "--uuid", uuid, "disk", "/mkfs", "scratch", "/td-boot", "source"
         ]))
         .is_ok());
     }
 
-    /// The publish arguments are three or none, never a defaulted subset.
+    /// The publish arguments are two or none, never a defaulted subset.
     #[test]
-    fn a_publish_is_all_three_arguments_or_none() {
+    fn a_publish_is_both_arguments_or_none() {
         assert_eq!(
             parse_args(args(&[
                 "volume",
@@ -7900,7 +7621,6 @@ mod tests {
                 "/tmp",
                 "/bin/td-boot",
                 "/media/deployment",
-                "/media/key.pub",
             ]))
             .unwrap(),
             Mode::Volume {
@@ -7915,33 +7635,22 @@ mod tests {
                 seed: Some(VolumeSeed::Publish(Publish {
                     td_boot: PathBuf::from("/bin/td-boot"),
                     deployment: PathBuf::from("/media/deployment"),
-                    trusted_key: PathBuf::from("/media/key.pub"),
                 })),
             }
         );
-        // Four and five arguments are a caller who asked for something this
-        // cannot do. Defaulting the missing one is how a fail-open gets in —
-        // the key most of all, whose absence is what td-boot reads as "publish
-        // without checking".
-        for short in [
-            vec![
+        // Four arguments are a caller who asked for something this cannot
+        // do; defaulting the missing deployment is not an option.
+        assert!(
+            parse_args(args(&[
                 "volume",
                 "/dev/sda",
                 "/bin/mkfs.btrfs",
                 "/tmp",
                 "/bin/td-boot",
-            ],
-            vec![
-                "volume",
-                "/dev/sda",
-                "/bin/mkfs.btrfs",
-                "/tmp",
-                "/bin/td-boot",
-                "/media/deployment",
-            ],
-        ] {
-            assert!(parse_args(args(&short)).is_err(), "{short:?} is incomplete");
-        }
+            ]))
+            .is_err(),
+            "a publish without a deployment is incomplete"
+        );
         assert!(
             parse_args(args(&[
                 "volume",
@@ -7950,26 +7659,17 @@ mod tests {
                 "/tmp",
                 "/bin/td-boot",
                 "/media/deployment",
-                "/media/key.pub",
                 "extra",
             ]))
             .is_err(),
-            "a seventh argument is not silently ignored"
+            "a sixth argument is not silently ignored"
         );
     }
 
     #[test]
-    fn trust_only_arguments_are_explicit_and_cannot_mix_with_publish() {
+    fn seed_only_arguments_are_explicit_and_cannot_mix_with_publish() {
         assert_eq!(
-            parse_args(args(&[
-                "volume",
-                "disk",
-                "/mkfs",
-                "scratch",
-                "--trusted-key",
-                "key"
-            ]))
-            .unwrap(),
+            parse_args(args(&["volume", "disk", "/mkfs", "scratch", "--seed"])).unwrap(),
             Mode::Volume {
                 boot: None,
                 uuid: None,
@@ -7979,50 +7679,21 @@ mod tests {
                 destination: PathBuf::from("disk"),
                 mkfs: PathBuf::from("/mkfs"),
                 scratch: PathBuf::from("scratch"),
-                seed: Some(VolumeSeed::Trust(PathBuf::from("key"))),
+                seed: Some(VolumeSeed::Layout),
             }
         );
         for bad in [
-            vec!["volume", "disk", "/mkfs", "scratch", "--trusted-key"],
+            vec!["volume", "disk", "/mkfs", "scratch", "--seed", "extra"],
+            vec!["volume", "disk", "/mkfs", "scratch", "--seed", "--seed"],
+            vec!["volume", "--seed", "disk", "/mkfs", "scratch"],
+            vec!["volume", "--seed", "/mkfs", "scratch", "--seed"],
+            vec!["volume", "disk", "/mkfs", "--seed", "--seed"],
+            vec!["layout", "disk", "--seed"],
             vec![
-                "volume",
-                "disk",
-                "/mkfs",
-                "scratch",
-                "--trusted-key",
-                "key",
-                "extra",
+                "volume", "disk", "/mkfs", "scratch", "/td-boot", "/deploy", "--seed",
             ],
             vec![
-                "volume",
-                "disk",
-                "/mkfs",
-                "scratch",
-                "--trusted-key",
-                "--trusted-key",
-            ],
-            vec!["volume", "--trusted-key", "key", "disk", "/mkfs", "scratch"],
-            vec!["layout", "disk", "--trusted-key", "key"],
-            vec![
-                "volume",
-                "disk",
-                "/mkfs",
-                "scratch",
-                "/td-boot",
-                "/deploy",
-                "--trusted-key",
-                "key",
-            ],
-            vec![
-                "volume",
-                "disk",
-                "/mkfs",
-                "scratch",
-                "/td-boot",
-                "/deploy",
-                "key1",
-                "--trusted-key",
-                "key2",
+                "volume", "disk", "/mkfs", "scratch", "/td-boot", "--seed", "/deploy",
             ],
         ] {
             assert!(parse_args(args(&bad)).is_err(), "accepted {bad:?}");
@@ -8030,18 +7701,11 @@ mod tests {
     }
 
     #[test]
-    fn trust_only_arguments_retain_the_preselected_uuid() {
+    fn seed_only_arguments_retain_the_preselected_uuid() {
         let uuid = "12345678-1234-4234-8234-123456789abc";
         assert_eq!(
             parse_args(args(&[
-                "volume",
-                "--uuid",
-                uuid,
-                "disk",
-                "/mkfs",
-                "scratch",
-                "--trusted-key",
-                "key"
+                "volume", "--uuid", uuid, "disk", "/mkfs", "scratch", "--seed"
             ]))
             .unwrap(),
             Mode::Volume {
@@ -8053,18 +7717,17 @@ mod tests {
                 destination: PathBuf::from("disk"),
                 mkfs: PathBuf::from("/mkfs"),
                 scratch: PathBuf::from("scratch"),
-                seed: Some(VolumeSeed::Trust(PathBuf::from("key"))),
+                seed: Some(VolumeSeed::Layout),
             }
         );
     }
 
     #[test]
-    fn trust_only_formatting_prepares_an_empty_publication_root() {
+    fn seed_only_formatting_prepares_an_empty_publication_root() {
         use std::os::unix::fs::PermissionsExt;
         let scratch = Scratch::disk(DISK);
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs(RECORDING_MKFS);
-        let key = key_file(&dir);
         let mut out = Vec::new();
         run_volume(
             VolumeSettings::default(),
@@ -8072,7 +7735,7 @@ mod tests {
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
-            Some(&VolumeSeed::Trust(key.clone())),
+            Some(&VolumeSeed::Layout),
             &mut out,
         )
         .unwrap();
@@ -8095,18 +7758,8 @@ mod tests {
         entries.sort();
         assert_eq!(
             entries,
-            ["boot", "deployments", "incoming", "trusted.pub"].map(OsString::from)
+            ["boot", "deployments", "incoming"].map(OsString::from)
         );
-        let carried = root.join("td/trusted.pub");
-        assert_eq!(
-            std::fs::read(&carried).unwrap(),
-            std::fs::read(&key).unwrap()
-        );
-        assert_eq!(
-            std::fs::metadata(&carried).unwrap().permissions().mode() & 0o777,
-            0o644
-        );
-        assert!(!dir.join("td-install-key/td-trusted.pub").exists());
         assert_eq!(
             String::from_utf8(out).unwrap().split_whitespace().count(),
             3
@@ -8114,60 +7767,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn invalid_trust_only_key_preserves_destination_and_scratch() {
-        let scratch = Scratch::disk(4096);
-        let before = std::fs::read(&scratch.path).unwrap();
-        let dir = fake_mkfs(RECORDING_MKFS);
-        let staging = dir.join("td-volume-root");
-        std::fs::create_dir(&staging).unwrap();
-        std::fs::write(staging.join("keep"), b"untouched").unwrap();
-        let missing = dir.join("missing");
-        let link = dir.join("symlink");
-        std::os::unix::fs::symlink(key_file(&dir), &link).unwrap();
-        let oversized = dir.join("oversized");
-        std::fs::write(
-            &oversized,
-            vec![b'x'; protocol::MAX_PUBLIC_KEY_BYTES as usize + 1],
-        )
-        .unwrap();
-        for key in [missing, link, oversized] {
-            let mut out = Vec::new();
-            let error = run_volume(
-                VolumeSettings::default(),
-                None,
-                &scratch.path,
-                &dir.join("mkfs.btrfs"),
-                &dir,
-                Some(&VolumeSeed::Trust(key)),
-                &mut out,
-            )
-            .unwrap_err();
-            assert!(
-                error.to_string().contains("trusted deployment key"),
-                "{error}"
-            );
-            assert!(out.is_empty());
-            assert_eq!(std::fs::read(&scratch.path).unwrap(), before);
-            assert_eq!(std::fs::read(staging.join("keep")).unwrap(), b"untouched");
-            assert!(!dir.join("argv").exists());
-        }
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
     /// 64 lowercase hex, because that is what a deployment id is: `td-install`
     /// checks the shape before joining it onto a path, so a stand-in printing
     /// anything else is exercising the refusal.
     const STAND_IN_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    /// A trusted key on disk. Real bytes and a real file, because the key is
-    /// carried onto the volume and so has to be readable — a stand-in td-boot
-    /// ignores it, but `seed_into` does not.
-    fn key_file(dir: &Path) -> PathBuf {
-        let path = dir.join("key.pub");
-        std::fs::write(&path, format!("{}\n", "ab".repeat(32))).unwrap();
-        path
-    }
 
     /// A `td-boot` stand-in that publishes: runs `body`, then does the two
     /// things `seed_into` reads back — creates `td/deployments/<id>` and
@@ -8211,11 +7814,9 @@ mod tests {
             "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/publish-argv\"\n\
              echo publish >> \"$(dirname \"$0\")/order\"\n",
         );
-        let key = key_file(&dir);
         let publish = Publish {
             td_boot: td_boot.clone(),
             deployment: PathBuf::from("/media/deployment"),
-            trusted_key: key.clone(),
         };
         let mut out = Vec::new();
         run_volume(
@@ -8235,37 +7836,10 @@ mod tests {
         // temporary directory is itself a symlink would otherwise fail this on
         // the spelling rather than on anything it is about.
         let staging = std::fs::canonicalize(dir.join("td-volume-root")).unwrap();
-        // The key argument is the SNAPSHOT, not the path this program was
-        // given: handing td-boot the caller's path would be a second read of
-        // it, which is the race the snapshot exists to close. Asserted as the
-        // exact path rather than merely "not the original", so a snapshot
-        // written somewhere unexpected is a failure too.
-        let snapshot = std::fs::canonicalize(&dir)
-            .unwrap()
-            .join("td-install-key")
-            .join("td-trusted.pub");
-        assert_ne!(snapshot, key, "the snapshot and the given key are one file");
         assert_eq!(
             words,
-            vec![
-                "publish",
-                staging.to_str().unwrap(),
-                "/media/deployment",
-                snapshot.to_str().unwrap(),
-            ],
+            vec!["publish", staging.to_str().unwrap(), "/media/deployment"],
             "td-boot was not asked to publish into the staging tree: {argv:?}"
-        );
-        // ...and it is BESIDE the volume root, never inside it: td-boot must
-        // not read its trust root out of the tree it is writing.
-        assert!(
-            !snapshot.starts_with(&staging),
-            "the trust root snapshot is inside the volume root"
-        );
-        // The snapshot is gone once promoted — it was RENAMED, so the volume's
-        // key is the very file td-boot authenticated under.
-        assert!(
-            !snapshot.exists(),
-            "the snapshot was copied rather than renamed"
         );
         assert!(
             staging
@@ -8292,21 +7866,18 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The volume keeps the trust root, so the installed machine can
-    /// authenticate its own updates — and keeps it only once the publish that
-    /// used those bytes has succeeded.
+    /// The volume carries an empty update channel and no trust root: nothing
+    /// signs a deployment (DESIGN.md §6).
     #[test]
-    fn the_volume_carries_the_key_that_authenticated_it() {
+    fn the_volume_carries_an_empty_channel_and_no_key() {
         let scratch = Scratch::disk(DISK);
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs(RECORDING_MKFS);
         let td_boot = dir.join("td-boot");
         publishing_td_boot(&td_boot, "");
-        let key = key_file(&dir);
         let publish = Publish {
             td_boot,
             deployment: PathBuf::from("/media/deployment"),
-            trusted_key: key.clone(),
         };
         run_volume(
             VolumeSettings::default(),
@@ -8320,20 +7891,8 @@ mod tests {
         .unwrap();
 
         let staging = dir.join("td-volume-root");
-        let carried = staging.join(protocol::VOLUME_TRUSTED_KEY);
-        assert_eq!(
-            std::fs::read(&carried).unwrap(),
-            std::fs::read(&key).unwrap(),
-            "the volume's key is not the one the install was given"
-        );
-        // Where that path is, and that it is relative, are properties of the
-        // constant and are pinned in their own test rather than asserted here
-        // against themselves.
+        assert!(!staging.join("td/trusted.pub").exists());
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&carried).unwrap().permissions().mode() & 0o777,
-            0o644
-        );
 
         // The update CHANNEL, empty and 0755. `td-boot update` treats a missing
         // channel as a configuration fault rather than as nothing to do, so a
@@ -8359,90 +7918,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The snapshot must not LAUNDER a key past td-boot's own reader.
-    ///
-    /// td-boot refuses a symlink, a non-regular file, and anything over
-    /// `MAX_PUBLIC_KEY_BYTES`. Handing it a copy would turn every one of those
-    /// refusals into a successful install, because the copy is a small regular
-    /// file whatever the original was — so the same rule is applied here, and
-    /// each refusal is checked by its REASON rather than by failing at all: a
-    /// non-zero result is satisfied by any error, including one from a later
-    /// step that would mean the rule never ran.
-    #[test]
-    fn a_key_td_boot_would_refuse_is_refused_here_too() {
-        let dir = fake_mkfs(RECORDING_MKFS);
-        let real = key_file(&dir);
-
-        let link = dir.join("link.pub");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let refused = read_trusted_key(&link).unwrap_err().to_string();
-        assert!(refused.contains("must be a real regular file"), "{refused}");
-
-        let big = dir.join("big.pub");
-        std::fs::write(
-            &big,
-            vec![b'a'; protocol::MAX_PUBLIC_KEY_BYTES as usize + 1],
-        )
-        .unwrap();
-        let refused = read_trusted_key(&big).unwrap_err().to_string();
-        // The whole phrase: the message carries the path, which holds a pid,
-        // and a pid containing the bound would satisfy a bare digit check.
-        assert!(
-            refused.contains(&format!(
-                "trusted deployment key exceeds {} bytes",
-                protocol::MAX_PUBLIC_KEY_BYTES
-            )),
-            "{refused}"
-        );
-
-        let refused = read_trusted_key(&dir).unwrap_err().to_string();
-        assert!(refused.contains("must be a real regular file"), "{refused}");
-
-        // A FIFO is the case the type check must catch BEFORE the open rather
-        // than after it: `File::open` on one blocks until a writer appears, so
-        // a version that opened first hung here with no diagnostic instead of
-        // failing. Nothing writes to this one, so a regression does not fail
-        // this test — it hangs it, which is the honest signal.
-        let fifo = dir.join("fifo.pub");
-        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
-        if made.map(|status| status.success()).unwrap_or(false) {
-            let refused = read_trusted_key(&fifo).unwrap_err().to_string();
-            assert!(refused.contains("must be a real regular file"), "{refused}");
-        }
-
-        // The bound is applied to what is READ and not only to what `stat`
-        // claimed, since the two can disagree — a file that grew between them
-        // would otherwise be cut to a valid length and laundered past td-boot's
-        // refusal. `/proc/self/status` is that disagreement without a race to
-        // arrange: a regular file whose reported length is 0 and whose
-        // contents are not.
-        let proc_status = Path::new("/proc/self/status");
-        assert_eq!(std::fs::metadata(proc_status).unwrap().len(), 0);
-        let refused = read_trusted_key(proc_status).unwrap_err().to_string();
-        assert!(refused.contains("changed while reading"), "{refused}");
-
-        // ...and the bound is not so tight that a key AT it is refused, nor so
-        // loose that a real key trips it.
-        let edge = dir.join("edge.pub");
-        std::fs::write(&edge, vec![b'a'; protocol::MAX_PUBLIC_KEY_BYTES as usize]).unwrap();
-        assert_eq!(
-            read_trusted_key(&edge).unwrap().len(),
-            protocol::MAX_PUBLIC_KEY_BYTES as usize
-        );
-        assert_eq!(
-            read_trusted_key(&real).unwrap(),
-            std::fs::read(&real).unwrap()
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// A path this program cannot open NAMES ITSELF.
     ///
     /// `io::Error` carries an errno and nothing else, so the destination — the
     /// one argument an operator is most likely to mistype, and the one that is
     /// a device node on a real install — refused with a bare `No such file or
-    /// directory` on a command line naming up to five paths. The key already
-    /// named itself, through `td_fs`; this is the rest of them.
+    /// directory` on a command line naming up to five paths.
     ///
     /// Both verbs, because they open the destination independently and only
     /// `layout` was ever driven with a bad one.
@@ -8482,14 +7963,6 @@ mod tests {
         assert!(
             refused.contains(&dir.display().to_string()),
             "layout must name a destination that is not a file, got {refused:?}"
-        );
-
-        // The key's own refusal is `td_fs`'s and predates this; asserted
-        // here so the property is stated over every path the verbs take.
-        let refused = read_trusted_key(&absent).unwrap_err().to_string();
-        assert!(
-            refused.contains(&absent.display().to_string()),
-            "the trusted key must name itself, got {refused:?}"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -9106,7 +8579,7 @@ mod tests {
         }
         // A naming test that found nothing to check would pass whatever the
         // wrappers did.
-        assert_eq!(checked, 26, "{checked} wrappers were checked");
+        assert_eq!(checked, 25, "{checked} wrappers were checked");
     }
 
     /// The text of the item opened at `marker`, up to the next line that is a
@@ -9915,128 +9388,11 @@ mod tests {
         last
     }
 
-    /// A KEY THAT IS NOT THERE COSTS NOTHING.
-    ///
-    /// The refusal has to come before the staging tree is emptied, or a
-    /// mistyped fifth argument destroys a directory before saying it did not
-    /// like the fifth argument. That is the same failure `run_volume`'s own
-    /// comment records for the fourth, which is why the read sits beside those
-    /// checks rather than in `seed_into` where it started: there it ran
-    /// after `remove_dir_all`, and this test reds.
-    #[test]
-    fn a_key_that_is_not_there_does_not_cost_the_staging_tree() {
-        let scratch = Scratch::disk(DISK);
-        run_layout(&scratch.path, &mut Vec::new()).unwrap();
-        let dir = fake_mkfs(RECORDING_MKFS);
-        let td_boot = dir.join("td-boot");
-        publishing_td_boot(&td_boot, "");
-        // Something in the staging tree that a premature refusal would take.
-        let keep = dir.join("td-volume-root").join("keepme");
-        std::fs::create_dir_all(&keep).unwrap();
-        std::fs::write(keep.join("data"), b"not yours to remove").unwrap();
-        let publish = Publish {
-            td_boot,
-            deployment: PathBuf::from("/media/deployment"),
-            trusted_key: dir.join("no-such-key.pub"),
-        };
-        let error = run_volume(
-            VolumeSettings::default(),
-            None,
-            &scratch.path,
-            &dir.join("mkfs.btrfs"),
-            &dir,
-            Some(&VolumeSeed::Publish(publish)),
-            &mut Vec::new(),
-        )
-        .unwrap_err();
-        assert!(
-            format!("{error}").contains("trusted deployment key"),
-            "the refusal must name the key: {error}"
-        );
-        assert_eq!(
-            std::fs::read(keep.join("data")).unwrap(),
-            b"not yours to remove",
-            "a missing key emptied the caller's staging tree"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The trust root's path is RELATIVE and outside the deployments
-    /// directory.
-    ///
-    /// Both are properties of the constant rather than of any run, and both
-    /// are pinned here because `staging.join(…)` is where they bite: an
-    /// absolute constant would discard the staging tree silently and put a
-    /// machine's trust root at `/td/trusted.pub` on the INSTALLER, and one
-    /// under `td/deployments` would be replaced by the first update. The
-    /// literal is pinned too, as `TRUSTED_KEY_PATH` is, since a rename is a
-    /// key the reader never finds.
-    #[test]
-    fn the_trust_roots_path_is_relative_and_outside_the_deployments() {
-        assert_eq!(protocol::VOLUME_TRUSTED_KEY, "td/trusted.pub");
-        let path = Path::new(protocol::VOLUME_TRUSTED_KEY);
-        assert!(
-            path.is_relative(),
-            "an absolute key path discards the volume"
-        );
-        assert!(!path.starts_with(protocol::DEPLOYMENTS_DIR));
-        assert_eq!(
-            Path::new("/vol").join(protocol::VOLUME_TRUSTED_KEY),
-            Path::new("/vol/td/trusted.pub")
-        );
-    }
-
-    /// Nothing pre-placed where the snapshot goes is ever WRITTEN THROUGH.
-    ///
-    /// The scratch directory is not private and both names here are guessable,
-    /// so each is tried as a symlink pointing at a file that must survive:
-    /// following either would truncate it under an installer that is usually
-    /// root. Whether the install then succeeds or refuses is not the property
-    /// — the victim is — so both outcomes are accepted and only the bytes are
-    /// asserted.
-    #[test]
-    fn nothing_pre_placed_at_the_snapshot_is_written_through() {
-        for name in ["td-install-key", "td-install-key/td-trusted.pub"] {
-            let scratch = Scratch::disk(DISK);
-            run_layout(&scratch.path, &mut Vec::new()).unwrap();
-            let dir = fake_mkfs(RECORDING_MKFS);
-            let td_boot = dir.join("td-boot");
-            publishing_td_boot(&td_boot, "");
-            let victim = dir.join("victim");
-            std::fs::write(&victim, b"do not truncate me").unwrap();
-            let planted = dir.join(name);
-            if let Some(parent) = planted.parent() {
-                std::fs::create_dir_all(parent).unwrap();
-            }
-            std::os::unix::fs::symlink(&victim, &planted).unwrap();
-            let publish = Publish {
-                td_boot,
-                deployment: PathBuf::from("/media/deployment"),
-                trusted_key: key_file(&dir),
-            };
-            let _ = run_volume(
-                VolumeSettings::default(),
-                None,
-                &scratch.path,
-                &dir.join("mkfs.btrfs"),
-                &dir,
-                Some(&VolumeSeed::Publish(publish)),
-                &mut Vec::new(),
-            );
-            assert_eq!(
-                std::fs::read(&victim).unwrap(),
-                b"do not truncate me",
-                "a symlink at {name} was followed and its target truncated"
-            );
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-    }
-
-    /// Bare formatting remains unprovisioned unless a seed is explicit.
+    /// Bare formatting remains unseeded unless a seed is explicit.
     /// This guards a future unconditional seed; it cannot red a mutation
     /// inside seed_into because bare formatting does not call that function.
     #[test]
-    fn a_volume_without_an_explicit_seed_carries_no_key() {
+    fn a_volume_without_an_explicit_seed_carries_no_td_layout() {
         let scratch = Scratch::disk(DISK);
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs(RECORDING_MKFS);
@@ -10051,10 +9407,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !dir.join("td-volume-root")
-                .join(protocol::VOLUME_TRUSTED_KEY)
-                .exists(),
-            "a volume with no deployment carries a trust root"
+            !dir.join("td-volume-root").join("td").exists(),
+            "a volume with no seed carries td's layout"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -10089,7 +9443,6 @@ mod tests {
             let publish = Publish {
                 td_boot,
                 deployment: PathBuf::from("/media/deployment"),
-                trusted_key: key_file(&dir),
             };
             let error = run_volume(
                 VolumeSettings::default(),
@@ -10143,7 +9496,6 @@ mod tests {
         let publish = Publish {
             td_boot,
             deployment: PathBuf::from("/media/deployment"),
-            trusted_key: key_file(&dir),
         };
         let error = run_volume(
             VolumeSettings::default(),
@@ -10187,7 +9539,6 @@ mod tests {
         let publish = Publish {
             td_boot,
             deployment: PathBuf::from("/media/deployment"),
-            trusted_key: key_file(&dir),
         };
         let error = run_volume(
             VolumeSettings::default(),
@@ -10218,7 +9569,6 @@ mod tests {
         let publish = Publish {
             td_boot,
             deployment: PathBuf::from("/media/deployment"),
-            trusted_key: key_file(&dir),
         };
         let error = run_volume(
             VolumeSettings::default(),
@@ -10239,16 +9589,6 @@ mod tests {
             !dir.join("argv").exists(),
             "the filesystem was made despite the publish failing"
         );
-        // Nor is the trust root there. The key is READ before the publish and
-        // written after it, so a staging tree that failed carries no key — one
-        // written first would outlive the publish it belonged to and be the
-        // root a later, unrelated publish into the same scratch inherited.
-        assert!(
-            !dir.join("td-volume-root")
-                .join(protocol::VOLUME_TRUSTED_KEY)
-                .exists(),
-            "a failed publish left its trust root behind"
-        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -10262,7 +9602,6 @@ mod tests {
         let publish = Publish {
             td_boot: PathBuf::from("td-boot"),
             deployment: PathBuf::from("/media/deployment"),
-            trusted_key: key_file(&dir),
         };
         let error = run_volume(
             VolumeSettings::default(),
@@ -10514,11 +9853,7 @@ mod tests {
 
     #[test]
     fn format_cli_reuses_volume_options_after_the_boot_pair() {
-        for tail in [
-            vec![],
-            vec!["--trusted-key", "/key"],
-            vec!["/td-boot", "/bundle", "/key"],
-        ] {
+        for tail in [vec![], vec!["--seed"], vec!["/td-boot", "/bundle"]] {
             let mut values = vec![
                 "format",
                 "/kernel",
@@ -11918,17 +11253,10 @@ mod tests {
     }
 
     #[test]
-    fn loop_publication_follows_the_trusted_key_in_format_only() {
+    fn loop_publication_follows_the_seed_in_format_only() {
         let publish = |tail: &[&str]| {
             let mut all = vec![
-                "format",
-                "kernel",
-                "initrd",
-                "disk",
-                "/mkfs",
-                "scratch",
-                "--trusted-key",
-                "key",
+                "format", "kernel", "initrd", "disk", "/mkfs", "scratch", "--seed",
             ];
             all.extend_from_slice(tail);
             parse_args(args(&all))
@@ -11947,14 +11275,11 @@ mod tests {
                 destination: PathBuf::from("disk"),
                 mkfs: PathBuf::from("/mkfs"),
                 scratch: PathBuf::from("scratch"),
-                seed: Some(VolumeSeed::Loop(
-                    PathBuf::from("key"),
-                    LoopPublish {
-                        td_boot: PathBuf::from("/td-boot"),
-                        deployment: PathBuf::from("/source"),
-                        mountpoint: PathBuf::from("/volume"),
-                    }
-                )),
+                seed: Some(VolumeSeed::Loop(LoopPublish {
+                    td_boot: PathBuf::from("/td-boot"),
+                    deployment: PathBuf::from("/source"),
+                    mountpoint: PathBuf::from("/volume"),
+                })),
             }
         );
         for tail in [
@@ -11973,8 +11298,7 @@ mod tests {
                 "disk",
                 "/mkfs",
                 "scratch",
-                "--trusted-key",
-                "key",
+                "--seed",
                 "--publish",
                 "/td-boot",
                 "/source",
@@ -12003,8 +11327,7 @@ mod tests {
                 "/td-boot",
                 "/source",
                 "/volume",
-                "--trusted-key",
-                "key",
+                "--seed",
             ],
         ] {
             assert!(parse_args(args(&bad)).is_err(), "accepted {bad:?}");
@@ -12033,14 +11356,11 @@ mod tests {
         .unwrap();
         let mountpoint = dir.0.join("volume");
         std::fs::create_dir(&mountpoint).unwrap();
-        let seed = VolumeSeed::Loop(
-            key_file(&dir.0),
-            LoopPublish {
-                td_boot,
-                deployment: dir.0.clone(),
-                mountpoint,
-            },
-        );
+        let seed = VolumeSeed::Loop(LoopPublish {
+            td_boot,
+            deployment: dir.0.clone(),
+            mountpoint,
+        });
         let mkfs = dir.0.join("mkfs.btrfs");
         let prepared =
             prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, Some(&seed)).unwrap();
@@ -12072,14 +11392,11 @@ mod tests {
             (&dir.0, &file, "is not an empty directory"),
             (&dir.0, &dir.0.join("absent"), "is not an empty directory"),
         ] {
-            let seed = VolumeSeed::Loop(
-                key_file(&dir.0),
-                LoopPublish {
-                    td_boot: PathBuf::from("/td-boot"),
-                    deployment: deployment.clone(),
-                    mountpoint: mountpoint.clone(),
-                },
-            );
+            let seed = VolumeSeed::Loop(LoopPublish {
+                td_boot: PathBuf::from("/td-boot"),
+                deployment: deployment.clone(),
+                mountpoint: mountpoint.clone(),
+            });
             let error = prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, Some(&seed))
                 .err()
                 .unwrap();
@@ -12153,7 +11470,6 @@ mod tests {
             let execution = LiveExecution {
                 td_boot,
                 source,
-                trusted_key: key_file(&dir.0),
                 root,
                 firstboot,
                 timezones: zones,
@@ -12447,7 +11763,6 @@ mod tests {
         let mut host = LiveHost {
             td_boot: execution.td_boot.clone(),
             source: source.clone(),
-            trusted_key: execution.trusted_key.clone(),
             root: execution.root.clone(),
             firstboot: execution.firstboot.clone(),
             timezones: execution.timezones.clone(),
@@ -12497,11 +11812,7 @@ mod tests {
         assert_eq!(fit(&mut host), Err(Refusal::SourceUnavailable));
         std::fs::remove_dir(source.join("initramfs.cpio")).unwrap();
         sized(&source.join("initramfs.cpio"), 9_629_184);
-        // So is a key or selector template the root does not hold.
-        let key = std::fs::read(&execution.trusted_key).unwrap();
-        std::fs::remove_file(&execution.trusted_key).unwrap();
-        assert_eq!(fit(&mut host), Err(Refusal::SourceUnavailable));
-        std::fs::write(&execution.trusted_key, &key).unwrap();
+        // So is a selector template the root does not hold.
         std::fs::remove_file(&template).unwrap();
         assert_eq!(fit(&mut host), Err(Refusal::SourceUnavailable));
     }
@@ -12610,12 +11921,9 @@ mod tests {
         let execution = &fixture.execution;
         let template = execution.root.join(protocol::SELECTOR_TEMPLATE_PATH);
         let uuid = VolumeUuid::parse(&canonical_uuid(fixture.plan.volume_uuid())).unwrap();
-        let total = selector_parts(&template, &execution.trusted_key, &uuid)
-            .unwrap()
-            .total()
-            .unwrap();
+        let total = selector_parts(&template, &uuid).unwrap().total().unwrap();
         let output = execution.run.join("selector.cpio");
-        prepare_selector(&template, &execution.trusted_key, &uuid, &output).unwrap();
+        prepare_selector(&template, &uuid, &output).unwrap();
         assert_eq!(std::fs::metadata(&output).unwrap().len(), total);
     }
 
@@ -12637,7 +11945,7 @@ mod tests {
         }
     }
 
-    /// A source td-boot authenticates is admitted only as the deployment
+    /// A source td-boot validates is admitted only as the deployment
     /// the running root is.
     #[test]
     fn a_source_is_admitted_only_as_the_booted_deployment() {
@@ -12650,7 +11958,6 @@ mod tests {
         let mut host = LiveHost {
             td_boot: validator,
             source: execution.source.clone(),
-            trusted_key: execution.trusted_key.clone(),
             root: execution.root.clone(),
             firstboot: execution.firstboot.clone(),
             timezones: execution.timezones.clone(),
@@ -12658,11 +11965,11 @@ mod tests {
             booted: execution.booted.clone(),
             basis: installation_plan::Basis::default(),
         };
-        assert_eq!(host.authenticate_source(), Ok(*fixture.plan.deployment()));
+        assert_eq!(host.validate_source(), Ok(*fixture.plan.deployment()));
         std::fs::write(&execution.booted, format!("{}\n", "cd".repeat(32))).unwrap();
-        assert_eq!(host.authenticate_source(), Err(Refusal::SourceUnavailable));
+        assert_eq!(host.validate_source(), Err(Refusal::SourceUnavailable));
         std::fs::remove_file(&execution.booted).unwrap();
-        assert_eq!(host.authenticate_source(), Err(Refusal::SourceUnavailable));
+        assert_eq!(host.validate_source(), Err(Refusal::SourceUnavailable));
     }
 
     /// A source the kernel's block inventory cannot place, as a scratch
@@ -12678,7 +11985,6 @@ mod tests {
         let mut host = LiveHost {
             td_boot: execution.td_boot.clone(),
             source: execution.source.clone(),
-            trusted_key: execution.trusted_key.clone(),
             root: execution.root.clone(),
             firstboot: execution.firstboot.clone(),
             timezones: execution.timezones.clone(),

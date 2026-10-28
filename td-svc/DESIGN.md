@@ -1732,7 +1732,7 @@ no password and no console login, and administration stays what
 APPLICATIONS.md §L.1 describes.
 
 td-recipe-eval's persistent-volume layout writes the pair, and
-td-boot's live seed stages it from a server medium's signed provision
+td-boot's live seed stages it from a server medium's provision
 (td-install/MEDIA.md "Live boot"); no installer or bundle stages it.
 td-recipe-eval refuses any name the guest would refuse, which would
 leave the volume unreachable. That means one outside the guest's
@@ -1745,35 +1745,31 @@ account with that key, and holds the host key the client accepted to
 the one the console reported. The same key must be refused as root,
 and a key the server was never given must be refused.
 
-`server-image` (`./build-server-image`) writes that volume into a disk
-image firmware boots, for one account: `--user` (default `$USER`) and
-the keys of every `--authorized-keys` file. With no file named, it
-takes every `~/.ssh/*.pub` holding only keys the account admits and
-names each file it skipped and why; a named file with no key or any
-other line is refused. Key comments are kept. The image is
-td-install/DESIGN.md §4's layout at a 512-byte sector, sized by
-`--size` (8 GiB by default). The ESP holds the deployment's EFI-stub
-kernel as the removable-media loader and a selector carrying the run's
-key and the volume's UUID. The volume carries the deployment signed by
-that key as `current`, its trust root, and the provisioned pair, all
-owned by guest root. It carries no test scaffolding. The key is made
-for the run and discarded. The image is immutable: no shipped path
-delivers it a candidate, and a newer image replaces the machine.
-`--vhd` appends a fixed-disk VHD footer, the disk format Azure takes
-and AWS imports, at most 2040 GiB. Its size field is the disk and its
-CHS geometry the largest, which every reader takes to mean the size
-field. "Cloud images" below says what each cloud needs. An existing
-output file is refused, and a finished image is published under its
-name only once complete. `--iso` writes the same server as a live
-medium instead: build-iso's medium of the server deployment, signed by
-the run key and carrying the account as a provision signed by that key
-too, which the live seed stages. It boots from optical or USB media
-with its volume in RAM, so a live server's host key and every write
-are lost at power-off. The volume is half of RAM: td-boot refuses a
-machine with less than 1 GiB, and the oracle boots it with 4 GiB.
-`qemu-boot-server` ends by composing an image and a live medium, each
-for another account and a fresh key, cold-booting each under UEFI
-firmware with no command line from the host, and holding both to the
+`server-image` (`./build-server-image`) writes that volume into a disk image
+firmware boots, for one account: `--user` (default `$USER`) and the keys of
+every `--authorized-keys` file. With no file named, it takes every
+`~/.ssh/*.pub` holding only keys the account admits and names each file it
+skipped and why; a named file with no key or any other line is refused. Key
+comments are kept. The image is td-install/DESIGN.md §4's layout at a
+512-byte sector, sized by `--size` (8 GiB by default). The ESP holds the
+deployment's EFI-stub kernel as the removable-media loader and a selector
+carrying the volume's UUID. The volume carries the deployment as `current`
+and the provisioned pair, all owned by guest root. It carries no test
+scaffolding. The image is immutable: no shipped path delivers it a
+candidate, and a newer image replaces the machine. `--vhd` appends a
+fixed-disk VHD footer, the disk format Azure takes and AWS imports, at most
+2040 GiB. Its size field is the disk and its CHS geometry the largest, which
+every reader takes to mean the size field. "Cloud images" below says what
+each cloud needs. An existing output file is refused, and a finished image
+is published under its name only once complete. `--iso` writes the same
+server as a live medium instead: build-iso's medium of the server
+deployment, carrying the account as a provision, which the live seed stages.
+It boots from optical or USB media with its volume in RAM, so a live
+server's host key and every write are lost at power-off. The volume is half
+of RAM: td-boot refuses a machine with less than 1 GiB, and the oracle boots
+it with 4 GiB. `qemu-boot-server` ends by composing an image and a live
+medium, each for another account and a fresh key, cold-booting each under
+UEFI firmware with no command line from the host, and holding both to the
 steady state and the same logins.
 
 ### Cloud images
@@ -1880,8 +1876,9 @@ hostname=NAME keys=N`. Whoever can attach a disk can admit a key: on
 a cloud that is the instance's owner, and on hardware it is physical
 access, which can already boot a medium of its own, since the image's
 Secure Boot is off, and read a server's unencrypted volume
-(td-login/THREAT-MODEL.md §1). A live medium's keys are signed, but a
-seed attached to a live boot adds unsigned ones for the same reason.
+(td-login/THREAT-MODEL.md §1). A live medium's provisioned keys are as
+trusted as whoever can write the medium, and a seed attached to a live
+boot adds keys for the same reason.
 
 `qemu-boot-server`'s disk-image boot attaches a seed on q35's AHCI
 optical drive. Its `meta-data` names the host `td-seeded`, and its

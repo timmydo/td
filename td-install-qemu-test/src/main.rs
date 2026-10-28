@@ -582,7 +582,7 @@ fn canaries(device: &str) -> Result<Vec<u8>, String> {
 
 fn source_deployment() -> Result<([u8; 32], String), String> {
     let result = Command::new("/bin/td-boot")
-        .args(["validate-source", "/source", "/trusted.pub"])
+        .args(["validate-source", "/source"])
         .output()
         .map_err(|error| format!("validate source: {error}"))?;
     if !result.status.success() {
@@ -670,15 +670,7 @@ fn check_source_plan_observation(
 ) -> Result<(), String> {
     let before = canaries(device)?;
     let plan = observed_plan(device, deployment)?;
-    let source = plan_observation(
-        &[
-            "observe-source-plan",
-            "/bin/td-boot",
-            "/source",
-            "/trusted.pub",
-        ],
-        &plan,
-    )?;
+    let source = plan_observation(&["observe-source-plan", "/bin/td-boot", "/source"], &plan)?;
     let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
     let expected_source = format!("{{\"version\":1,\"scope\":\"held-source-plan-observation-only\",\"destination\":\"{name}\",\"deployment\":\"{id}\"}}\n");
     if !source.status.success() || source.stdout != expected_source.as_bytes() {
@@ -704,7 +696,6 @@ fn check_source_plan_observation(
             "observe-source-plan",
             "/init",
             "/scratch/source-claim-probe",
-            "/trusted.pub",
         ],
         &plan,
     )?;
@@ -728,18 +719,13 @@ fn check_source_plan_observation(
         .ok_or("fixture plan lacks deployment digest")?;
     *digest_first ^= 1;
     let refused = plan_observation(
-        &[
-            "observe-source-plan",
-            "/bin/td-boot",
-            "/source",
-            "/trusted.pub",
-        ],
+        &["observe-source-plan", "/bin/td-boot", "/source"],
         &stale_source,
     )?;
     let diagnostic = String::from_utf8_lossy(&refused.stderr);
     if refused.status.success()
         || !refused.stdout.is_empty()
-        || !diagnostic.contains("reviewed deployment differs from authenticated source")
+        || !diagnostic.contains("reviewed deployment differs from the validated source")
     {
         return Err(format!("changed source plan was accepted or refused for another reason: status {}; stderr {diagnostic}",
             refused.status));
@@ -753,8 +739,8 @@ fn check_source_plan_observation(
     )
 }
 
-fn claim_probe_validator(source: &Path, key: &Path) -> Result<(), String> {
-    if source != Path::new("/scratch/source-claim-probe") || key != Path::new("/trusted.pub") {
+fn claim_probe_validator(source: &Path) -> Result<(), String> {
+    if source != Path::new("/scratch/source-claim-probe") {
         return Err("source claim probe received unexpected operands".into());
     }
     let device = fs::read_to_string(source.join("device"))
@@ -818,8 +804,7 @@ fn preview(name: &str, geometry: u64) -> Result<(), String> {
 }
 
 fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), String> {
-    // The ISO carries the signed payloads and the live initramfs's public key.
-    // Every path is fixture-owned; no deployment-signing key enters the guest.
+    // The ISO carries the deployment's payloads; every path is fixture-owned.
     // Only install-system carries the disposable SSH administrator test key.
     let media = mount_source(device)?;
     inventory(INVENTORY_BEFORE_MARKER)?;
@@ -855,7 +840,7 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
         check_plan_observation(device)?;
     }
     // Validate the source before the first destructive command. Publication
-    // still rechecks every copied payload and its signature.
+    // still rechecks every copied payload against the manifest.
     let (deployment, id) = source_deployment()?;
     if writable && sectors >= PLAN_PROBE_MINIMUM_SECTORS {
         check_source_plan_observation(device, deployment, &id)?;
@@ -904,7 +889,7 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
     report(std::io::stdout(), format_args!("{INSTALL_MARKER}"))
 }
 
-/// The signed EROFS, read-only on a loop, as the service's verified root,
+/// The deployment's EROFS, read-only on a loop, as the service's verified root,
 /// once the primary account name is admitted against it.
 fn mount_system_root() -> Result<(), String> {
     if !Path::new("/dev/loop0").exists() {
@@ -953,7 +938,6 @@ fn format_install(device: &str, interrupt: bool) -> Result<String, String> {
         &[
             "prepare-selector",
             "/selector.cpio",
-            "/trusted.pub",
             &uuid,
             "/prepared-selector.cpio",
         ],
@@ -971,8 +955,7 @@ fn format_install(device: &str, interrupt: bool) -> Result<String, String> {
         device,
         "/bin/mkfs.btrfs",
         "/scratch",
-        "--trusted-key",
-        "/trusted.pub",
+        "--seed",
     ];
     // Publication runs inside format, through a loop over its own claim on
     // the target. The interrupted leg keeps the mounted route, whose
@@ -1045,8 +1028,8 @@ fn served_install(
     Ok(uuid)
 }
 
-/// A live boot's init records the deployment the root was authenticated
-/// as; the fixture's validation of the source stands in.
+/// A live boot's init records the deployment the root was verified as;
+/// the fixture's validation of the source stands in.
 fn record_deployment(id: &str) -> Result<(), String> {
     fs::OpenOptions::new()
         .write(true)
@@ -1081,7 +1064,6 @@ impl Service {
                 "serve",
                 "/bin/td-boot",
                 "/media",
-                "/trusted.pub",
                 "/root-image",
                 "/bin/td-firstboot",
             ])
@@ -1559,7 +1541,7 @@ fn interrupt_publication(partition: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .len();
     let mut child = Command::new("/bin/td-boot")
-        .args(["install", partition, "/volume", "/source", "/trusted.pub"])
+        .args(["install", partition, "/volume", "/source"])
         .spawn()
         .map_err(|error| format!("start interrupted publisher: {error}"))?;
     let observed = observe_partial(&mut child, expected);
@@ -1631,12 +1613,7 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
         }
         report(std::io::stdout(), format_args!("{PLAN_BUSY_MARKER}"))?;
         let refused = plan_observation(
-            &[
-                "observe-source-plan",
-                "/bin/td-boot",
-                "/source",
-                "/trusted.pub",
-            ],
+            &["observe-source-plan", "/bin/td-boot", "/source"],
             &observed_plan(device, [0; 32])?,
         )?;
         let diagnostic = String::from_utf8_lossy(&refused.stderr);
@@ -1944,10 +1921,7 @@ fn protect_writable_media(target: &str) -> Result<(), String> {
     }
     inventory(INVENTORY_BEFORE_MARKER)?;
     candidates(CANDIDATES_BEFORE_MARKER)?;
-    command(
-        "/bin/td-boot",
-        &["validate-source", "/source", "/trusted.pub"],
-    )?;
+    command("/bin/td-boot", &["validate-source", "/source"])?;
     reject_busy_formatters(device, "mounted installer medium")?;
     report(std::io::stdout(), format_args!("{MEDIA_BUSY_MARKER}"))?;
     // Every file bind also retains the ISO filesystem's block-device claim.
@@ -2053,9 +2027,7 @@ fn main() -> ExitCode {
     if std::process::id() != 1 {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let result = match args.as_slice() {
-            [verb, source, key] if verb == "validate-source" => {
-                claim_probe_validator(Path::new(source), Path::new(key))
-            }
+            [verb, source] if verb == "validate-source" => claim_probe_validator(Path::new(source)),
             _ => Err("invalid source claim probe arguments".into()),
         };
         return match result {

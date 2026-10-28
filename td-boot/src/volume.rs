@@ -1201,7 +1201,7 @@ mod tests {
             vec!["on-volume", "boot", "/volume", "quiet"],
             vec!["on-volume", "mount-root", "/volume"],
             vec!["on-volume", "mount-var", "/sysroot/var"],
-            vec!["on-volume", "install", "/update", "/source", "/key"],
+            vec!["on-volume", "install", "/update", "/source"],
             vec![
                 "on-volume",
                 "rollback",
@@ -2271,8 +2271,8 @@ mod tests {
     }
 
     const RUNNING: &[&[&str]] = &[
-        &["install", "/update", "/source", "/key"],
-        &["update", "/update", "/volume", "/volume/channel", "/key"],
+        &["install", "/update", "/source"],
+        &["update", "/update", "/volume", "/volume/channel"],
         &[
             "rollback",
             "/update",

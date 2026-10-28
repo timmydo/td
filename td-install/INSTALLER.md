@@ -121,24 +121,24 @@ existing ESP's capacity before changing persistent state.
 
 Reinstall never runs a formatter, writes GPT, deletes `@var`, recreates a
 home or applies new account settings. It preserves all of `@var` except its
-root-private deployment-signing state and temporary replacement payloads.
-`td-deploy identity` retains a valid signing key or provisions the missing
-one; malformed retained keys refuse. A fixed root-private `reinstall` staging
-directory is reclaimed on retry before copying; unknown entries, links and
-subdirectories refuse cleanup before any staged file is removed. Source payloads are copied beneath that
-state, signed and fully verified before the boot publisher is invoked.
+temporary replacement payloads. A fixed root-private staging directory,
+`@var/lib/td-install/reinstall` (0700), is reclaimed on retry before
+copying, and a stage an older reinstall left elsewhere is left alone;
+unknown entries, links and subdirectories refuse cleanup before any staged file is removed. Source
+payloads are copied beneath it and fully verified before the boot publisher
+is invoked.
 The publisher replaces both system selections, including damaged payloads
 with the same deployment ID, using its existing verified bundle writer.
-Old system rollback is not retained by a reset. The volume public key is
-synced, the filesystem unmounted, and the existing ESP receives the kernel
-and selector with the matching public key and unchanged UUID through td-fat.
+Old system rollback is not retained by a reset. The filesystem is
+unmounted, and the existing ESP receives the kernel and a selector with the
+unchanged UUID through td-fat.
 No partition, encryption header, user file or saved login credential is reset.
 
 Interruption can leave the system unbootable until reinstall is retried from
-the USB. The retained signing key survives retry, personal files remain in
-place, and the same mode can replace incomplete boot state. This is not an
-atomic boot-chain rotation or a backup. Scratch cleanup never recursively
-walks a mountpoint. Failed unmounts are reported and leave their mounts held.
+the USB. Personal files remain in place, and the same mode can replace
+incomplete boot state. This is not an atomic boot-chain rotation or a
+backup. Scratch cleanup never recursively walks a mountpoint. Failed
+unmounts are reported and leave their mounts held.
 
 Protocol request `0x0b` carries a destination observation only. Root supplies
 the saved settings and UUID. Preserve plans have the unencrypted storage and
@@ -147,17 +147,17 @@ The private consent review appends a boolean preserve byte after storage,
 and its greeting is `TDINA03\n`. The ordinary service greeting is
 `TDINS09\n`. The mode is part of the reviewed plan and exact Execute bytes.
 
-Before re-signing, the private staged manifest must hash to the deployment
-ID bound by the reviewed plan. Full staged payload verification follows under
-the installation key, so changing removable media cannot substitute another
-manifest or payload bundle between initial authentication and copying.
+The private staged manifest must hash to the deployment ID bound by the
+reviewed plan, and full staged payload verification follows, so changing
+removable media cannot substitute another manifest or payload bundle
+between initial validation and copying.
 
 The live QEMU oracle installs, writes a personal file through the installed
 account, boots the same disk from USB into reinstall, and boots it again.
 Its post-reinstall checks require the same filesystem UUID, host identity,
 home inode, personal-file contents and saved account settings. Host tests
-also cover a damaged same-ID payload, repeated reset, and invalid-signature
-refusal before replacement.
+also cover a damaged same-ID payload, repeated reset, and a changed
+manifest's refusal before replacement.
 
 ## User flow and authority
 
@@ -802,18 +802,18 @@ propose request, which carry the destination alone, have neither. UUID bytes are
 textual/network order, with version 4 and the RFC variant bits checked;
 any 32-byte deployment digest is representable, including all zeroes. A
 digest is a full-width hash value, not a reserved nonce sentinel; only
-source authentication can establish that it names the intended manifest.
+source validation can establish that it names the intended manifest.
 The codec does not prove a nonce is fresh or a UUID globally unique. The
 authority generates them.
 
 Before a service presents this value to an operator for consent, it must
-authenticate and retain its source, validate all choices against that
+validate and retain its source, validate all choices against that
 source, establish destination eligibility and layout and payload fit, and
 retain the exact proposed value. Scratch shortage is refused before the
 first write instead (DESIGN.md "Payload fit"). The service core below does
 each of these: it retains the source and excludes the disk it is stored on,
-authenticates it under its claim, requires it to be the deployment the
-running root was authenticated as, so that the choices it checks against
+validates it under its claim, requires it to be the deployment the
+running root was verified as, so that the choices it checks against
 that root and its time zone catalog are checked against the source, refuses
 a disk that cannot hold its payloads and retains the value. td-authd starts
 it on a live boot and answers its consent channel. Execution requires the wizard's final
@@ -859,7 +859,7 @@ Requests carry no path, executable, mount option, source or consent:
   labels included, the service's own fresh observation of an eligible
   candidate, and otherwise refuses with destination changed. The reviewed
   plan carries the service's observation, never UI-supplied values. The
-  service chooses the nonce and volume UUID, authenticates the source,
+  service chooses the nonce and volume UUID, validates the source,
   claims the disk and checks that the disk holds the deployment.
 - `0x03` execute: the complete `TDPLAN04` record the installer reviewed. It
   asks the service to seek consent for the review it retains, and is
@@ -1174,14 +1174,14 @@ but drops none:
 
 ## Installation service core
 
-`td-install serve <td-boot> <deployment-directory> <trusted-key>
-<verified-root> <td-firstboot>` is the service core for one
-installer. Its five operands are absolute control-plane inputs bound by its
+`td-install serve <td-boot> <deployment-directory> <verified-root>
+<td-firstboot>` is the service core for one
+installer. Its four operands are absolute control-plane inputs bound by its
 caller, never by the installer, and must be present and of their kind
 (an execution also reads the live session's saved Wi-Fi networks under
 the verified root, DESIGN.md "Carried Wi-Fi networks"):
 `td-boot` and `td-firstboot` executable files, the deployment directory and
-verified root directories, the key a file. It requires effective uid 0 (a
+verified root directories. It requires effective uid 0 (a
 sanity gate against a misplaced start, not proof of privilege), the
 installer's channel on standard input and td-authd's consent channel on
 standard output: each a connected Unix stream socket, found as such in
@@ -1223,7 +1223,7 @@ disk standing on no other device, or one it cannot resolve, refuses
 discovery), which must contain the proposed destination exactly, and whose
 observation the review then carries; the read-write exclusive claim of
 DESIGN.md (a disk held elsewhere is refused as busy; any other failure to
-claim a disk discovery just listed, as changed); source authentication
+claim a disk discovery just listed, as changed); source validation
 through `td-boot validate-source` while that claim is held, whose manifest
 digest must be the one `/run/td-deployment` records for the running root;
 the nonce and version-4 volume UUID from `/dev/urandom`; payload fit
@@ -1256,7 +1256,7 @@ catalog's, kept with the catalog, is written once. While a review is held,
 its own claim keeps the held disk out of destinations replies; that omission
 is not a disk change. Each request is served in turn, and the next is not
 read until the reply to the last is written, so an installer that does not
-read cannot queue requests; it can still repeat source authentication at
+read cannot queue requests; it can still repeat source validation at
 will, which the caller that starts the service bounds.
 
 The service has an execution (DESIGN.md "Executing a consented
@@ -1343,11 +1343,11 @@ unavailable and kept.
 
 `td-install new-volume-uuid` takes no operands and prints one canonical
 lowercase version-4 UUID and a newline. It uses the formatter's existing
-kernel random-device reader; each request draws a new value independently
-of the ISO's signing key. It opens no destination, writes no disk bytes,
-and does not reserve a UUID or grant destructive authority. Random values
-are not hardware authentication, secrets or a proof of global uniqueness.
-The live environment must provide its trusted kernel random device.
+kernel random-device reader; each request draws a new value. It opens no
+destination, writes no disk bytes, and does not reserve a UUID or grant
+destructive authority. Random values are not hardware authentication,
+secrets or a proof of global uniqueness. The live environment must provide
+its trusted kernel random device.
 
 The caller requires successful exit and complete output, retains that
 value once per proposed installation, and supplies it unchanged to
@@ -1357,47 +1357,36 @@ service responsibilities; retrying this command chooses a different value.
 
 ## Preparing the installed selector
 
-`td-install prepare-selector TEMPLATE TRUSTED-KEY VOLUME-UUID OUTPUT` makes
-a private selector copy that trusts the given key and is bound to the
-chosen volume. The UUID must be canonical,
-nonzero lowercase text, using the same admission as `format --uuid`.
-The installation service chooses it once for its plan and passes the same
-value to this operation and formatting. This command neither generates an
-identity nor authorizes a disk operation.
+`td-install prepare-selector TEMPLATE VOLUME-UUID OUTPUT` makes
+a private selector copy bound to the chosen volume. The UUID must be
+canonical, nonzero lowercase text, using the same admission as
+`format --uuid`. The installation service chooses it once for its plan
+and passes the same value to this operation and formatting. This command
+neither generates an identity nor authorizes a disk operation.
 
-The caller supplies an already verified selector template, the trusted
-public key the installation's deployment was authenticated under, and
-trusted, stable source/output ancestors. The template is the stock
-selector, which carries neither a key nor an identity (td-boot's
-`SELECTOR_TEMPLATE_PATH`); this operation preserves all its bytes and
-appends the key as given, read by the same real-file reader and bound as
-`format --trusted-key` and refused unless it is the 64 hexadecimal digits
-td-boot decodes, since a key the selector cannot read makes an unbootable
-disk. It chooses and authenticates no key: the caller
-passes the one it authenticated the source under. A template that did
-carry a key would have it replaced, since the kernel takes the later file.
-It must never be used to modify the manifest-covered deployment
-initramfs. No archive parser or selector signature verifier is added:
+The caller supplies an already verified selector template and trusted,
+stable source/output ancestors. The template is the stock selector, which
+carries no identity (td-boot's `SELECTOR_TEMPLATE_PATH`); this operation
+preserves all its bytes. It must never be used to modify the
+manifest-covered deployment initramfs. No archive parser is added:
 ordinary nonempty files pass byte admission, so the caller must establish
 that TEMPLATE is the correct boot artifact.
 
-The key is admitted first. The template is then admitted through the same
-descriptor-pinned regular-file reader as EFI inputs. Symlinks and
-non-regular inputs refuse. The complete prepared file, including padding
-and appendix, must fit the formatter's 256 MiB EFI input bound. All
-admission and appendix construction precedes exclusive output creation;
-existing files, links and device nodes refuse without being changed. The
-held template is streamed through the existing bounded EFI copier, which
-rejects length changes. Same-sized concurrent mutation remains outside the
-trusted, stable-source contract.
+The template is admitted through the same descriptor-pinned regular-file
+reader as EFI inputs. Symlinks and non-regular inputs refuse. The complete
+prepared file, including padding and appendix, must fit the formatter's
+256 MiB EFI input bound. All admission and appendix construction precedes
+exclusive output creation; existing files, links and device nodes refuse
+without being changed. The held template is streamed through the existing
+bounded EFI copier, which rejects length changes. Same-sized concurrent
+mutation remains outside the trusted, stable-source contract.
 
 The copy gets zero padding to a four-byte boundary and a deterministic
-newc archive containing root-owned mode-0755 parent directories, a
-mode-0644 `etc/td/deployment.pub` with the key's bytes and a mode-0644
-`etc/td/volume-uuid` with the UUID and one newline. The shared
+newc archive containing root-owned mode-0755 parent directories and a
+mode-0644 `etc/td/volume-uuid` with the UUID and one newline. The shared
 engine writer supplies the header and trailer rules. The pinned kernel
 reads concatenated archives and replaces an earlier regular file of the
-same name, so the appended key and UUID are the ones the selector reads.
+same name, so the appended UUID is the one the selector reads.
 
 Success has no stdout and requires the complete output, exact mode 0600
 and file sync. Output is temporary preparation data, not a published
@@ -1408,16 +1397,15 @@ this prepared file into the ESP and owns destination sync. Preparation
 writes no block device and performs no source deployment publication.
 
 The small and full-system installation fixtures carry a trusted selector
-template without a host-provisioned trust root or volume UUID, as the
-stock selector is. In the live guest, after source validation, they
-prepare the selector with the run's key and the fixture's chosen UUID and
-pass that copy to `format`, so the installed boots depend on the appended
-key. Each live installation calls `new-volume-uuid`; the ISO carries no
-destination UUID. The host validates one canonical identity report against
-the primary Btrfs fsid in its private disk image and rejects reuse across
-successful installs and interrupted reinstalls. Detached boots must bind
-that exact UUID across every existing bus/media case. Immutable plans and
-installer confirmation remain separate work.
+template without a volume UUID, as the stock selector is. In the live guest,
+after source validation, they prepare the selector with the fixture's chosen
+UUID and pass that copy to `format`, so the installed boots depend on the
+appended identity. Each live installation calls `new-volume-uuid`; the ISO
+carries no destination UUID. The host validates one canonical identity
+report against the primary Btrfs fsid in its private disk image and rejects
+reuse across successful installs and interrupted reinstalls. Detached boots
+must bind that exact UUID across every existing bus/media case. Immutable
+plans and installer confirmation remain separate work.
 
 ## Media, boot and persistence
 
@@ -1430,11 +1418,9 @@ Any marked foreign application payload remains subject to AGENTS.md and
 APPLICATIONS.md, including the dedicated read-only payload-input channel.
 No new external dependency is approved by this document.
 
-The media's reproducible content is built without signing secrets. As in
-DESIGN.md D4, deployment signing occurs outside derivations. The assembly
-interface must explicitly bind the signed deployment and trusted public
-key; development fixture keys must not become an implicit distribution key.
-Neither installer nor installed boot silently accepts unsigned deployments.
+The media's content is built reproducibly and carries no key or signature
+(DESIGN.md §6). The installer and installed boot verify every payload
+against its manifest; neither authenticates who produced a deployment.
 UEFI bootability does not claim Secure Boot authentication.
 
 Optical and USB boots enter the same live profile, with the installation
@@ -1445,7 +1431,7 @@ changes or installation media is absent. Selector and deployment initramfs
 must agree on volume identity across kexec. The fixed ESP stub retains the
 deployment-selection boundary in DESIGN.md D5.
 
-Publish the bundled deployment through td-boot, preserving signature
+Publish the bundled deployment through td-boot, preserving payload
 verification and transactional current/previous bookkeeping. Reuse the
 td-install GPT/FAT32 implementation and its file-image test path. Check
 scratch-space requirements before erasure; the current formatter stages
@@ -1552,7 +1538,7 @@ verification and boot-time publication remain the caller's responsibility.
 
 `td-install volume` accepts `--username NAME VERIFIED-ROOT TD-FIRSTBOOT`
 after the regional settings and before its destination operands. The caller
-binds the absolute source-built validator and authenticated, stable deployment
+binds the absolute source-built validator and verified, stable deployment
 root, just as it binds the formatter and publisher tools. These paths are
 control-plane inputs, not wizard fields. Before opening the destination or
 clearing scratch, the formatter validates the bounded name syntax locally and
@@ -1563,7 +1549,7 @@ containing the name and one newline under mode-0755 parents. A caller doing
 layout first must perform the same preflight before layout; volume cannot
 retroactively protect an earlier write. This primitive supplies no consent.
 
-`td-firstboot prepare-primary-profile ROOT` runs over an authenticated
+`td-firstboot prepare-primary-profile ROOT` runs over a verified
 deployment with persistent `/var`, fresh volatile `/run`, and procfs mounted.
 The calling initramfs retains devtmpfs while this operation runs: spawning
 its mount applet with null stdin/stdout requires the real `/dev/null`.
@@ -1589,14 +1575,14 @@ boot environment and the private prepared tree. No user process, SSH
 daemon or competing root writer may run until this sequence succeeds. A partial failure stops
 boot; the next boot starts with fresh volatile state. This is publication
 before consumers start, not a multi-file atomic update for running readers.
-The raw signed EROFS payload is never edited. With no saved name, its original
+The raw EROFS payload is never edited. With no saved name, its original
 account tables must also pass the read-only checks.
 
 Only after coherent publication does the operation derive `/var/home/NAME`
 from the UID/GID-1000 account and prepare the primary home. ROOT, its `var`,
 and `var/home` must be real root-owned mode-0755 directories. The caller
 supplies trusted ancestors and serializes the operation; the provisioner does
-not verify the deployment signature or establish the persistent mount itself.
+not verify the deployment or establish the persistent mount itself.
 
 An existing primary home must be a real UID/GID-1000 directory. Its
 inode, contents and ownership are retained; after ownership validation,
@@ -1716,7 +1702,7 @@ JSON. This command neither selects nor persists a timezone. The
 compositor reads the selection written by the volume formatter below.
 
 `td-install volume [--uuid UUID] [--timezone IANA-ID] [--hostname NAME]
-DESTINATION MKFS SCRATCH --trusted-key KEY` accepts an optional catalog selection. It
+DESTINATION MKFS SCRATCH --seed` accepts an optional catalog selection. It
 validates the entire offline catalog and selected identifier before
 opening the destination or creating scratch state. Unknown names and
 backward aliases refuse. The formatter seeds one mode-0644,
@@ -1874,8 +1860,8 @@ not discover `/etc/zoneinfo` automatically.
 
 Use per-run disposable disks and firmware variables. No test discovers or
 opens an operator's real disk for writing. Exercise both supported media
-attachments (`qemu-boot-live` alone boots only USB), wrong deployment
-signatures, insufficient capacity and scratch, interrupted installation,
+attachments (`qemu-boot-live` alone boots only USB), corrupt deployment
+payloads, insufficient capacity and scratch, interrupted installation,
 changed disk ordering and a second installed boot. Require actual
 rendered/input and installed-session evidence, not only serial markers
 printed before the relevant operation completes.
@@ -2015,7 +2001,7 @@ execution, not a service channel or UI selection.
 Read-only and undersized targets must be absent even though the fixture
 still invokes the formatter to test its refusal. Source-corruption cases
 also collect this read-only report before source validation; candidates do
-not imply an authenticated source. The installation medium is always
+not imply a validated source. The installation medium is always
 absent. These are private optical/USB, virtio/AHCI/NVMe observations; no
 physical-device compatibility claim is added.
 
@@ -2053,13 +2039,13 @@ unchanged first, middle and final device canaries after each check.
 Read-only and undersized fixture targets do not run the positive
 observation.
 
-`td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key>` takes
+`td-install observe-source-plan <td-boot> <deployment-directory>` takes
 the same bounded plan from standard input. It runs the shipped
-absolute `td-boot validate-source` to authenticate the manifest and verify
-all three payload hashes with the supplied trust key, then compares the canonical
+absolute `td-boot validate-source` to read the manifest and verify
+all three payload hashes, then compares the canonical
 manifest SHA-256 ID byte-for-byte with the plan's deployment digest. It
 holds the reviewed disk's exclusive claim during that source validation.
-Only after source authentication, digest comparison and the post-validation
+Only after source validation, digest comparison and the post-validation
 disk recheck succeed does it print a version-1 JSON report scoped
 `held-source-plan-observation-only`, naming the disk and deployment. A
 malformed plan or relative path refuses before the claim or child; a busy
@@ -2270,7 +2256,7 @@ Press any ordinary key to stop the countdown, use Up/Down or 1/2 to choose,
 and press Enter to boot. Entries show commit date, short hash and build
 date in UTC. Older versions without this metadata say unknown and show a
 short deployment ID. Selecting a version makes it the default current
-system; the other authenticated version remains available as previous.
+system; the other verified version remains available as previous.
 Without input, the existing automatic rollback after failed boots remains.
 
 Adding this menu to an older installation requires refreshing its firmware

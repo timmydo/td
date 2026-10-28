@@ -8,8 +8,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const STATE: &str = "/var/lib/td-deploy";
-const TRUST: &str = "/run/td-volume/td/trusted.pub";
+// Root-private staging this operation owns; nothing else is kept there.
+const STATE: &str = "/var/lib/td-update";
 const O_PATH: i32 = 0x200000; // Linux x86-64, safe std open flag.
 const PAYLOADS: [(&str, u64); 3] = [
     ("bzImage", 256 << 20),
@@ -57,44 +57,45 @@ fn regular(path: &Path, owner: u32, limit: u64) -> Result<File> {
 }
 
 fn private_state(path: &Path) -> Result<File> {
-    // This fixed installation path is never created or repaired by an update.
-    // In particular, losing the signing identity must not generate a new one.
-    for ancestor in path.ancestors() {
+    let parent = path
+        .parent()
+        .ok_or_else(|| String::from("update staging has no parent"))?;
+    for ancestor in parent.ancestors() {
         let metadata = io(
             fs::symlink_metadata(ancestor),
-            &format!("inspect installation state path {}", ancestor.display()),
+            &format!("inspect update staging path {}", ancestor.display()),
         )?;
         if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-            return Err("installation state needs real root-owned trusted ancestors".into());
+            return Err("update staging needs real root-owned trusted ancestors".into());
         }
     }
+    let created = match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(format!("create update staging: {error}")),
+    };
     let directory = io(
         OpenOptions::new()
             .read(true)
             .custom_flags(O_NOFOLLOW)
             .open(path),
-        "open installation state",
+        "open update staging",
     )?;
-    let key = regular(&descriptor(&directory).join("deployment.pk8"), 0, 16384)
-        .map_err(|e| format!("installation signing key: {e}"))?;
-    validate_private_metadata(&directory, &key, 0)?;
+    // A creation mode is masked by the umask; the descriptor's is exact.
+    if created {
+        io(
+            directory.set_permissions(fs::Permissions::from_mode(0o700)),
+            "protect update staging",
+        )?;
+    }
+    validate_private_state(&directory, 0)?;
     Ok(directory)
 }
 
-fn validate_private_metadata(directory: &File, key: &File, owner: u32) -> Result<()> {
-    let state = io(directory.metadata(), "inspect installation state")?;
+fn validate_private_state(directory: &File, owner: u32) -> Result<()> {
+    let state = io(directory.metadata(), "inspect update staging")?;
     if !state.is_dir() || state.uid() != owner || state.mode() & 0o7777 != 0o700 {
-        return Err("installation signing state must be an owned 0700 directory".into());
-    }
-    let metadata = io(key.metadata(), "inspect installation key")?;
-    if !metadata.is_file()
-        || metadata.uid() != owner
-        || metadata.len() == 0
-        || metadata.len() > 16384
-        || metadata.nlink() != 1
-        || metadata.mode() & 0o7777 != 0o600
-    {
-        return Err("installation key must be an owned bounded single-link 0600 file".into());
+        return Err("update staging must be an owned 0700 directory".into());
     }
     Ok(())
 }
@@ -190,8 +191,7 @@ fn copy_input(mut input: File, destination: &Path, limit: u64) -> Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
-    Sign,
-    Authenticate,
+    Validate,
     Install,
 }
 
@@ -200,7 +200,7 @@ fn apply(
     expected: &str,
     state: &Path,
     requester: u32,
-    execute: &mut impl FnMut(Step, &Path, &Path) -> Result<()>,
+    execute: &mut impl FnMut(Step, &Path) -> Result<Vec<u8>>,
 ) -> Result<()> {
     if !crate::protocol::valid_digest(expected.as_bytes()) {
         return Err("invalid approved deployment ID".into());
@@ -242,49 +242,43 @@ fn apply(
         staging.directory.sync_all(),
         "persist private update directory",
     )?;
-    execute(Step::Sign, &staging.path.0, state)?;
-    execute(Step::Authenticate, &staging.path.0, state)?;
-    // td-boot rechecks the signature and all payload digests inside its existing
-    // serialized transaction before publishing current/previous selectors.
-    execute(Step::Install, &staging.path.0, state)
+    // The staged copy must be the approved deployment as td-boot reads it.
+    let validated = execute(Step::Validate, &staging.path.0)?;
+    if validated.strip_suffix(b"\n") != Some(expected.as_bytes()) {
+        return Err("staged deployment is not the approved deployment".into());
+    }
+    // td-boot rechecks all payload digests inside its existing serialized
+    // transaction before publishing current/previous selectors, and reports
+    // what it published, which must be the approved deployment too.
+    let installed = execute(Step::Install, &staging.path.0)?;
+    if installed.strip_suffix(b"\n") != Some(expected.as_bytes()) {
+        return Err("published deployment is not the approved deployment".into());
+    }
+    Ok(())
 }
 
-fn execute(step: Step, source: &Path, state: &Path) -> Result<()> {
-    let mut command = match step {
-        Step::Sign => {
-            let mut command = Command::new("/bin/td-deploy");
-            command
-                .arg("sign")
-                .arg(source.join("manifest"))
-                .arg(state.join("deployment.pk8"))
-                .arg(source.join("manifest.sig"));
-            command
-        }
-        Step::Authenticate => {
-            let mut command = Command::new("/bin/td-boot");
-            command.arg("authenticate").arg(source).arg(TRUST);
-            command
-        }
-        Step::Install => {
-            let mut command = Command::new("/bin/td-boot");
-            command
-                .args(["on-volume", "install", "/run/td-update"])
-                .arg(source)
-                .arg(TRUST);
-            command
-        }
+fn execute(step: Step, source: &Path) -> Result<Vec<u8>> {
+    let mut command = Command::new("/bin/td-boot");
+    match step {
+        Step::Validate => command.arg("validate-source").arg(source),
+        Step::Install => command
+            .args(["on-volume", "install", "/run/td-update"])
+            .arg(source),
     };
-    command
-        .env_clear()
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-    let status = io(command.status(), "run installation operation")?;
-    if status.success() {
-        Ok(())
+    let output = io(
+        command
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .output(),
+        "run installation operation",
+    )?;
+    if output.status.success() {
+        Ok(output.stdout)
     } else {
-        Err(format!("installation {step:?} failed ({status})"))
+        Err(format!("installation {step:?} failed ({})", output.status))
     }
 }
 
@@ -326,7 +320,7 @@ mod tests {
                 owner,
             }
         }
-        fn apply(&self, executor: &mut impl FnMut(Step, &Path, &Path) -> Result<()>) -> Result<()> {
+        fn apply(&self, executor: &mut impl FnMut(Step, &Path) -> Result<Vec<u8>>) -> Result<()> {
             apply(
                 &self.source,
                 &self.expected,
@@ -346,44 +340,24 @@ mod tests {
     }
 
     #[test]
-    fn retained_signing_state_refuses_exposure_aliases_and_damaged_keys() {
+    fn staging_state_refuses_exposure() {
         let fixture = Fixture::new();
         let state_path = fixture.root.join("state");
         fs::set_permissions(&state_path, fs::Permissions::from_mode(0o700)).unwrap();
         let state = File::open(&state_path).unwrap();
-        let key_path = state_path.join("deployment.pk8");
-        fs::write(&key_path, b"retained key").unwrap();
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
-        let key = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&key_path)
-            .unwrap();
-        validate_private_metadata(&state, &key, fixture.owner).unwrap();
-        for mode in [0o644, 0o4600] {
-            key.set_permissions(fs::Permissions::from_mode(mode))
-                .unwrap();
-            assert!(validate_private_metadata(&state, &key, fixture.owner).is_err());
-        }
-        key.set_permissions(fs::Permissions::from_mode(0o600))
-            .unwrap();
-        for mode in [0o755, 0o2700] {
+        validate_private_state(&state, fixture.owner).unwrap();
+        for mode in [0o755, 0o2700, 0o500] {
             state
                 .set_permissions(fs::Permissions::from_mode(mode))
                 .unwrap();
-            assert!(validate_private_metadata(&state, &key, fixture.owner).is_err());
+            assert!(validate_private_state(&state, fixture.owner).is_err());
         }
         state
             .set_permissions(fs::Permissions::from_mode(0o700))
             .unwrap();
-        let alias = state_path.join("alias");
-        fs::hard_link(&key_path, &alias).unwrap();
-        assert!(validate_private_metadata(&state, &key, fixture.owner).is_err());
-        fs::remove_file(alias).unwrap();
-        for size in [0, 16385] {
-            key.set_len(size).unwrap();
-            assert!(validate_private_metadata(&state, &key, fixture.owner).is_err());
-        }
+        assert!(validate_private_state(&state, fixture.owner + 1).is_err());
+        let file = File::create(fixture.root.join("file")).unwrap();
+        assert!(validate_private_state(&file, fixture.owner).is_err());
     }
 
     #[test]
@@ -393,8 +367,9 @@ mod tests {
         fs::create_dir(fixture.root.join("source")).unwrap();
         fs::write(fixture.root.join("source/manifest"), b"replacement").unwrap();
         let mut calls = Vec::new();
+        let id = format!("{}\n", fixture.expected).into_bytes();
         fixture
-            .apply(&mut |step, staged, _| {
+            .apply(&mut |step, staged| {
                 calls.push(step);
                 assert_eq!(fs::metadata(staged).unwrap().mode() & 0o7777, 0o700);
                 for (name, _) in PAYLOADS {
@@ -402,10 +377,11 @@ mod tests {
                     assert_eq!(fs::read(&path).unwrap(), name.as_bytes());
                     assert_eq!(fs::metadata(path).unwrap().mode() & 0o7777, 0o600);
                 }
-                Ok(())
+                assert!(!staged.join("manifest.sig").exists());
+                Ok(id.clone())
             })
             .unwrap();
-        assert_eq!(calls, [Step::Sign, Step::Authenticate, Step::Install]);
+        assert_eq!(calls, [Step::Validate, Step::Install]);
         fixture.empty();
         fs::write(
             fixture.root.join("moved/manifest"),
@@ -413,23 +389,74 @@ mod tests {
         )
         .unwrap();
         assert!(fixture
-            .apply(&mut |_, _, _| panic!("changed manifest reached signer"))
+            .apply(&mut |_, _| panic!("changed manifest reached td-boot"))
             .is_err());
         fixture.empty();
     }
 
     #[test]
-    fn failed_signing_or_authentication_never_reaches_publication() {
-        for fail in [Step::Sign, Step::Authenticate, Step::Install] {
+    fn a_validation_naming_another_deployment_never_reaches_publication() {
+        for answer in [
+            format!("{}\n", "0".repeat(64)),
+            String::new(),
+            "not an id\n".to_string(),
+        ] {
             let fixture = Fixture::new();
+            // Without its newline the approved id is not td-boot's report.
+            let bare = fixture.expected.clone();
+            for reported in [answer.clone(), bare] {
+                let mut calls = Vec::new();
+                assert!(fixture
+                    .apply(&mut |step, _| {
+                        calls.push(step);
+                        Ok(reported.clone().into_bytes())
+                    })
+                    .is_err());
+                assert_eq!(calls, [Step::Validate]);
+                fixture.empty();
+            }
+        }
+    }
+
+    #[test]
+    fn an_install_reporting_another_deployment_fails() {
+        for answer in [
+            format!("{}\n", "0".repeat(64)),
+            String::new(),
+            "not an id\n".to_string(),
+        ] {
+            let fixture = Fixture::new();
+            let id = format!("{}\n", fixture.expected);
+            let mut calls = Vec::new();
+            let error = fixture
+                .apply(&mut |step, _| {
+                    calls.push(step);
+                    Ok(match step {
+                        Step::Validate => id.clone(),
+                        Step::Install => answer.clone(),
+                    }
+                    .into_bytes())
+                })
+                .unwrap_err();
+            assert!(error.contains("published deployment"), "{error}");
+            assert_eq!(calls, [Step::Validate, Step::Install]);
+            fixture.empty();
+        }
+    }
+
+    #[test]
+    fn failed_validation_never_reaches_publication() {
+        for fail in [Step::Validate, Step::Install] {
+            let fixture = Fixture::new();
+            let id = format!("{}\n", fixture.expected).into_bytes();
             let mut calls = Vec::new();
             assert!(fixture
-                .apply(&mut |step, _, _| {
+                .apply(&mut |step, _| {
                     calls.push(step);
                     if step == fail {
                         Err("injected failure".into())
                     } else {
-                        Ok(())
+                        Ok(id.clone())
                     }
                 })
                 .is_err());
@@ -449,13 +476,13 @@ mod tests {
         fs::remove_file(&path).unwrap();
         symlink("/dev/zero", &path).unwrap();
         assert!(fixture
-            .apply(&mut |_, _, _| panic!("symlink reached signer"))
+            .apply(&mut |_, _| panic!("symlink reached td-boot"))
             .is_err());
         fixture.empty();
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
         assert!(fixture
-            .apply(&mut |_, _, _| panic!("directory reached signer"))
+            .apply(&mut |_, _| panic!("directory reached td-boot"))
             .is_err());
         fs::remove_dir(&path).unwrap();
         File::create(&path)
@@ -463,7 +490,7 @@ mod tests {
             .set_len((256 << 20) + 1)
             .unwrap();
         assert!(fixture
-            .apply(&mut |_, _, _| panic!("oversized input reached signer"))
+            .apply(&mut |_, _| panic!("oversized input reached td-boot"))
             .is_err());
         fixture.empty();
     }

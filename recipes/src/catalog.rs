@@ -635,7 +635,6 @@ mod tests {
                 "net",
                 "td-agent",
                 "td-authd",
-                "td-boot",
                 "td-busd",
                 "td-civil",
                 "td-compositor",

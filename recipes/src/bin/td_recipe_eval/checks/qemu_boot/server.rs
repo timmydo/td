@@ -42,7 +42,7 @@ use super::{
     create_persistent_volume_layout, efi, find_qemu, provision_selector, require_action_marker,
     require_distinct_identity, require_same_identity, require_selected_deployment, tail,
     validate_primary_selection, BootDisk, BootPlan, BootResult, BootSource, Devices,
-    FirmwareAttachment, RunTrust, VolumeLayout, VolumePurpose, AUTOTEST_CMDLINE_TOKEN,
+    FirmwareAttachment, RunVolume, VolumeLayout, VolumePurpose, AUTOTEST_CMDLINE_TOKEN,
     BOOT_FAIL_TARGET_CMDLINE_TOKEN, DEPLOY_INSTALL_CMDLINE_TOKEN, GIT_RUNTIME_MARKER,
     GREETER_MARKER, RIPGREP_FD_RUNTIME_MARKER, ROOT_SSH_REFUSED_MARKER, SSHD_MARKER,
     SU_ABSENT_MARKER, SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER,
@@ -215,8 +215,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let seccomp_probe = build_td_jail_seccomp_probe(runner)?;
     // The provisioned files must be guest root's, as an image's are.
     let builder = PathBuf::from(runner.builder_command().get_program());
-    let trust = RunTrust::generate_root_owned(builder)?;
-    let initramfs = provision_selector(&selector, runner.scratch_dir(), &trust)?;
+    let identity = RunVolume::generate_root_owned(builder)?;
+    let initramfs = provision_selector(&selector, runner.scratch_dir(), &identity)?;
     let volume = runner.scratch_dir().join("server-volume.btrfs");
     let client = runner.scratch_dir().join("server-ssh-client");
     match fs::remove_dir_all(&client) {
@@ -234,7 +234,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             &volume,
             VolumeLayout::Transactional,
             true,
-            &trust,
+            &identity,
             Some(&seccomp_probe),
             VolumePurpose::Fixture,
             None,
@@ -462,8 +462,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
 /// Compose a published form for a provisioned account of its own and
 /// cold-boot it under firmware, with no command line from the host. A disk's
 /// ESP kernel and selector find the volume by the identity the image bound;
-/// a live medium's selector authenticates the medium and its seed stages the
-/// signed provision into the RAM volume. Either way the account logs in over
+/// a live medium's selector verifies the medium and its seed stages the
+/// provision into the RAM volume. Either way the account logs in over
 /// SSH.
 fn image_boot(
     runner: &RecipeCheckRunner,
@@ -500,19 +500,19 @@ fn image_boot(
     fs::create_dir(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
     let client = dir.join("ssh-client");
     let login = HostLogin::prepare(&client, STEM, account)?;
-    let trust = server_image::root_owned_trust(runner)?;
+    let identity = server_image::root_owned_identity(runner)?;
     let disk = dir.join(name);
     let id = match form {
         Published::Disk => server_image::compose(
             inputs,
-            &trust,
+            &identity,
             login.account(),
             server_image::DEFAULT_DISK_GIB * 1024 * 1024 * 1024,
             Format::Raw,
             &dir,
             &disk,
         )?,
-        Published::Iso => server_image::compose_iso(inputs, &trust, login.account(), &dir, &disk)?,
+        Published::Iso => server_image::compose_iso(inputs, login.account(), &dir, &disk)?,
     };
     // As `cloud-localds` writes one: the hostname in meta-data, keys in
     // user-data under a user whose name the baked account overrides, and

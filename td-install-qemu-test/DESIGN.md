@@ -5,7 +5,7 @@ and the live installation phases of `qemu-install-system`,
 `qemu-install-encrypted` and `qemu-boot-encrypted`.
 It is built from source through the ordinary Rust recipe graph and is never packed
 in the system or graphical installer profile. It adds no user-facing device
-admission, account configuration or signing identity. In
+admission or account configuration. In
 `qemu-install-system` it is td-authd's end of the installation service's
 consent channel and consents to the review it is sent: a stand-in for a
 person's physical consent inside this disposable guest only.
@@ -34,12 +34,12 @@ td-authd's recipe writes the consent codec, and the fixture compiles them
 through `#[path]`, so it speaks the service's protocols with the service's
 own code.
 
-The live initramfs holds source-built tools and the public trust root. The
-tiny signed deployment and fixed selector are streamed into separate ISO
+The live initramfs holds source-built tools. The tiny deployment and fixed
+selector are streamed into separate ISO
 files. Boot files and tools read into the fixture initramfs are bounded at
 256 MiB. The shared composer accepts larger ISO payloads under MEDIA.md,
 while the full-system diagnostic supplies the built system deployment. The
-private key remains on the host outside derivations. The small oracle's
+small oracle's
 installations call the actual td-install format coordinator, which
 publishes through td-boot's verified install onto a loop over its own claim
 (td-install/DESIGN.md "Publishing through a loop over the claim"); the
@@ -70,25 +70,21 @@ ReadOnlyFilesystem before the media-access marker prints the selected
 device. The host requires that device to match its attachment. The
 write-open check proves payloads are unwritable, not each individual
 bind-mount flag; all mount commands must independently succeed. The fixed
-selector is bound outside /source, which holds only the signed deployment
+selector is bound outside /source, which holds only the deployment
 bundle. Discovery checks only currently visible candidates; it does not
 establish exclusive admission against later hotplug. Missing payloads refuse
 before layout; no initramfs copy is available as a fallback. The formatter
-stages only a trust layout and sparse Btrfs metadata image in RAM; the
+stages only a seed layout and sparse Btrfs metadata image in RAM; the
 deployment is published directly onto the mounted disk.
 
-The host provisions the run's throwaway public key into the live
-configuration as `/trusted.pub`, but the selector template contains
-neither a key nor a volume UUID, like the stock template a live system
-carries. After source validation, the live fixture invokes production
-`td-install new-volume-uuid`, requires successful bounded output with the
-canonical version-4 shape, and invokes `prepare-selector` to copy the
-read-only template to `/prepared-selector.cpio` with `/trusted.pub` and
-that identity.
+The selector template contains no volume UUID, like the stock template a
+live system carries. After source validation, the live fixture invokes
+production `td-install new-volume-uuid`, requires successful bounded output
+with the canonical version-4 shape, and invokes `prepare-selector` to copy
+the read-only template to `/prepared-selector.cpio` with that identity.
 It passes the same value to `format --uuid`. The copy remains volatile.
 Detached boots therefore depend on live preparation; copying the ISO
-template directly would leave the selector with no trust root and volume
-discovery unbound.
+template directly would leave the selector's volume discovery unbound.
 
 The host requires one exact partition-refresh identity report for its
 expected device and independently reads the UUID field and magic from the
@@ -97,7 +93,7 @@ This is an identity spot-check, not full superblock validation; detached
 td-boot boots retain their complete profile and checksum admission.
 Each installation and destructive reinstall must have a UUID distinct from
 every prior run in that matrix, including the interrupted installation.
-Repeated installs use the same ISO bytes and public key. Cold and reordered
+Repeated installs use the same ISO bytes. Cold and reordered
 boots retain their own observed UUID; the full-system direct application
 boot receives a host selector bound to that installed volume's UUID.
 The fixture registry proves those observations, not global uniqueness or
@@ -113,14 +109,12 @@ names and unsupported buses are excluded. This remains a private test
 topology, not discovery or admission for an operator's physical disk.
 
 Before invoking layout, the live fixture calls `td-boot validate-source` on
-the read-only source and the provisioned public key. Missing or invalid
-signatures, malformed authenticated manifests, missing or symlinked payloads,
+the read-only source. Malformed manifests, missing or symlinked payloads,
 and payload hash mismatches refuse before the first disk-writing command.
-The preflight uses the publisher's bundle verifier, retaining manifest-only
-`authenticate` for callers that ask only about the signing identity. Source
-bytes stay stable on the read-only ISO across preflight and publication;
-the result is not a retained snapshot. Volume publication still repeats
-authentication and verifies copied payload hashes. Space, firmware-selector
+The preflight uses the publisher's bundle verifier. Source bytes stay
+stable on the read-only ISO across preflight and publication; the result
+is not a retained snapshot. Volume publication still verifies copied
+payload hashes. Space, firmware-selector
 and target admission are the production installer service's requirements.
 
 After the combined formatting command, the guest asks td-init to reread the
@@ -163,20 +157,19 @@ diagnostics and numeric OS error suffix. A diagnostic-format or path-binding
 change must update the fixture rather than accepting any nonzero exit as
 evidence of a busy device.
 
-The live guest supplies `--trusted-key` to `td-install format` instead of
-the three staged-publishing operands, and on its ordinary legs `--publish
-/bin/td-boot /source /volume`. The formatter initializes the publication
-directories and key without staging a deployment or selector, then publishes
-through a loop over its claim with the same read-only live public key before
-it exits. The guest requires the set of bound loop devices to be the same
-before and after, so the loop cleared. The fixture requires empty staged
-boot, deployment and incoming directories, plus only the expected timezone
-and hostname settings beneath @var, then deletes its entire private scratch
-directory after partition refresh. The interrupted leg formats without
-`--publish` and, after partition refresh, calls `td-boot install` with the
-resolved partition, /source and the key, which it then interrupts.
-Successful publication and sync precede the direct-publication and
-installation markers; the host requires both. The full cold-boot oracle
+The live guest supplies `--seed` to `td-install format` instead of the
+staged-publishing operands, and on its ordinary legs `--publish /bin/td-boot
+/source /volume`. The formatter initializes the publication directories
+without staging a deployment or selector, then publishes through a loop over
+its claim before it exits. The guest requires the set of bound loop devices
+to be the same before and after, so the loop cleared. The fixture requires
+empty staged boot, deployment and incoming directories, plus only the
+expected timezone and hostname settings beneath @var, then deletes its
+entire private scratch directory after partition refresh. The interrupted
+leg formats without `--publish` and, after partition refresh, calls `td-boot
+install` with the resolved partition and /source, which it then
+interrupts. Successful publication and sync precede the direct-publication
+and installation markers; the host requires both. The full cold-boot oracle
 still proves the expected deployment is installed. The separate full-system
 diagnostic checks its installed desktop under a RAM ceiling. Neither
 diagnostic admits operator target capacity.
@@ -191,8 +184,8 @@ boot, including the additional application-evidence boot. That production
 marker follows setting and reading back the kernel hostname; merely
 saving the file cannot satisfy it.
 
-The full-system profile also chooses `alice`. After authenticating all ISO
-payloads, it read-only loop-mounts the signed EROFS and runs the source-built
+The full-system profile also chooses `alice`. After validating all ISO
+payloads, it read-only loop-mounts the EROFS and runs the source-built
 `td-firstboot check-primary-name` before layout. The service repeats
 admission against `/root-image` with the same td-firstboot; the verified
 source remains stable on read-only media. The fixture checks the exact
@@ -212,12 +205,12 @@ This is a fixed diagnostic choice, not an operator account-configuration UI.
 
 The full-system installation is td-install's installation service as
 td-authd starts it on a live boot, run as root with an empty environment and
-`/` as its directory: `td-install serve /bin/td-boot /media /trusted.pub
-/root-image /bin/td-firstboot`, the installer's channel on its standard
+`/` as its directory: `td-install serve /bin/td-boot /media /root-image
+/bin/td-firstboot`, the installer's channel on its standard
 input and the consent channel on its standard output, each one end of a
 socketpair whose other end the fixture holds. The source is the ISO mount
 itself, in the medium's spelling, as `/run/td-media` is. The root is the
-signed EROFS mounted above, with its `/td/store` bound at `/td/store` so
+EROFS mounted above, with its `/td/store` bound at `/td/store` so
 that its absolute links, `/bin/mkfs.btrfs` among them, resolve as on a live
 root. The fixture writes `/run/td-deployment`, mode 0600, with the ID it
 validated, standing in for the record a live boot's init leaves; the service
@@ -270,42 +263,39 @@ virtio or /dev/sda2 to /dev/sdb2 for AHCI. Firmware still
 boots the destination by explicit boot index. Both phases must report the
 expected device and preserve the same UUID across those cold boots.
 
-The fixed selector authenticates and kexecs the installed tiny deployment. Its init verifies and loop-mounts the installed EROFS payload,
-reads its sentinel, and writes a synced count in Btrfs @var. A second cold
-boot must observe and advance that count. The reported deployment ID must
-match the host's signed manifest. Successful installed boots also acknowledge
-that deployment through td-boot. An otherwise identical source offered under
-a second public key must produce an authentication refusal and no installation
-success marker on both optical and USB boots. The host exclusively creates
-each wrong-key target, seeds nonzero canaries at its beginning, middle and
-end, and records its byte length and a SHA-256 over the entire disk. After
-QEMU exits, both must remain identical. This also detects changes between
-the canaries and inside sparse gaps; merely observing a refusal is not enough.
-Each negative boot must independently prove read-only access to the expected
-media device. Both valid installation boots share one ISO; both wrong-key
-boots share another, with unchanged signed payloads and only a different
-live trust root. A third ISO replaces only `root.erofs`, retaining its
-authentic manifest/signature and the correct trust root. Both optical and
-USB boots must report the root payload hash mismatch and preserve every
-target byte under the same whole-disk comparison. Unit tests in td-boot
-exercise corruption, missing files and symlinks for all three payloads.
-A fourth ISO selects an interruption phase with otherwise identical valid
-payloads and the same selector. After layout and partition refresh, the
-fixture starts the production publisher as its owned child. It observes one
-real private .install-* directory and a nonempty kernel shorter than the
-source kernel, then kills and reaps that child. Every observer error also
-kills/reaps the child. The fixture checks the length again after death and
-requires both current and previous to be absent, then syncs the volume.
-Only then does it report the written/expected byte counts. Missing, empty,
-complete or indirect payloads cannot stand in for partial publication.
-The report triggers the host VM power cut. Afterward, the host verifies
-that QEMU was killed and checks the counts against its source kernel. This is a deliberate publisher kill followed by a VM power cut,
-not arbitrary timing of unassisted power loss or a media-flush fault model.
+The fixed selector verifies and kexecs the installed tiny deployment. Its
+init verifies and loop-mounts the installed EROFS payload, reads its
+sentinel, and writes a synced count in Btrfs @var. A second cold boot must
+observe and advance that count. The reported deployment ID must match the
+host's manifest. Successful installed boots also acknowledge that deployment
+through td-boot. Both valid installation boots share one ISO. A second ISO
+replaces only `root.erofs`, retaining its manifest. Both optical and USB
+boots must report the root payload hash mismatch and no installation success
+marker. The host exclusively creates each such target, seeds nonzero
+canaries at its beginning, middle and end, and records its byte length and a
+SHA-256 over the entire disk. After QEMU exits, both must remain identical.
+This also detects changes between the canaries and inside sparse gaps;
+merely observing a refusal is not enough. Each negative boot must
+independently prove read-only access to the expected media device. Unit
+tests in td-boot exercise corruption, missing files and symlinks for all
+three payloads. A third ISO selects an interruption phase with otherwise
+identical valid payloads and the same selector. After layout and partition
+refresh, the fixture starts the production publisher as its owned child. It
+observes one real private .install-* directory and a nonempty kernel shorter
+than the source kernel, then kills and reaps that child. Every observer
+error also kills/reaps the child. The fixture checks the length again after
+death and requires both current and previous to be absent, then syncs the
+volume. Only then does it report the written/expected byte counts. Missing,
+empty, complete or indirect payloads cannot stand in for partial
+publication. The report triggers the host VM power cut. Afterward, the host
+verifies that QEMU was killed and checks the counts against its source
+kernel. This is a deliberate publisher kill followed by a VM power cut, not
+arbitrary timing of unassisted power loss or a media-flush fault model.
 
 A detached firmware boot must bind the expected volume, refuse specifically
 because both selectors are absent, and select no deployment. A subsequent
 explicit installation from the normal ISO must succeed; its detached boot
-must authenticate the expected deployment and start with fresh persisted
+must verify the expected deployment and start with fresh persisted
 state. No automatic resume or preservation of the erased disk is claimed.
 Both optical and USB attachments run all four interruption/recovery boots.
 Four further boots use the valid normal ISO with undersized and read-only
@@ -344,8 +334,8 @@ machine identity per installation and distinct identity across all four.
 The fixture's serial convention does not implement production installation
 admission. Volume discovery uses the production read-only primitive under
 the oracle's fixed topology; it does not establish exclusive admission.
-The small fixture does not launch the compositor, configure an account or
-retain an installation signing key. The separate full-system diagnostic
+The small fixture does not launch the compositor or configure an
+account. The separate full-system diagnostic
 uses the ordinary system init after installation to test the desktop.
 The production installer's end-to-end evidence, a complete desktop
 installation with its settings, is `qemu-boot-live` in
@@ -531,7 +521,7 @@ prove physical-device, swap, hotplug or arbitrary raw-I/O exclusion.
 ## Scratch exhaustion before destination writes
 
 The small installation matrix adds optical and USB boots with a valid
-signed source and an ordinary writable virtio destination. The dedicated
+source and an ordinary writable virtio destination. The dedicated
 `install-scratch` phase mounts only `/scratch` as a mode-0700, nodev/nosuid
 64 KiB tmpfs using the existing td-init mount applet. The fixture requires
 exactly one `/scratch` tmpfs entry with `size=64k` in its bounded mountinfo
@@ -577,7 +567,7 @@ The guest mounts ISO9660 and its payload file binds read-only as usual.
 It requires a writable 512-byte /dev/sda source and reports inventory and
 candidates. The host compares both reports with its image geometry and
 requires only the unused destination in the candidate list, excluding the
-mounted writable source. The guest verifies the signed source, then tries
+mounted writable source. The guest verifies the source, then tries
 all three actual raw formatters against that source. Every command must
 refuse its open with exit status 1, EBUSY, no stdout and unchanged first
 64 KiB before the media-busy record is emitted.
@@ -603,7 +593,7 @@ matrix remains unchanged.
 `qemu-install-encrypted` (td-install/DESIGN.md, ENCRYPTION.md "Acceptance
 evidence") boots four phases of this fixture from the full-system ISO
 through optical firmware media onto a fresh virtio target. Each mounts
-the source, validates it, loop-mounts the signed EROFS as the verified
+the source, validates it, loop-mounts the EROFS as the verified
 root with its store bound at `/td/store`, and records the deployment, as
 the full-system installation does, and starts `td-install serve` with
 the same operands and channels and no storage operand, for there is

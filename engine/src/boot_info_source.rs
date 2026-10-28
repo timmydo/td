@@ -123,7 +123,7 @@ fn manifest_for(directory: &Path, info: Option<&boot_info::Info>) -> Result<Stri
 }
 
 /// Reuse identical assemblies without replacing anything a pending approval
-/// can hold. Different signed identities remain distinct retained outputs.
+/// can hold. Different deployment identities remain distinct retained outputs.
 pub fn cached(source: &Path, parent: &Path, info: &boot_info::Info) -> Result<PathBuf, String> {
     if fs::read(source.join("manifest")).map_err(|e| e.to_string())?
         != manifest_for(source, None)?.as_bytes()
@@ -155,7 +155,7 @@ pub fn cached(source: &Path, parent: &Path, info: &boot_info::Info) -> Result<Pa
     Ok(destination)
 }
 
-/// Assemble a new unsigned deployment in a caller-owned, absent directory.
+/// Assemble a new deployment in a caller-owned, absent directory.
 /// Check the original manifest before replacing its initramfs digest.
 pub fn assemble(source: &Path, destination: &Path, info: &boot_info::Info) -> Result<(), String> {
     let entries = ["bzImage", "initramfs.cpio", "root.erofs"];

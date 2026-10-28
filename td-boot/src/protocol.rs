@@ -5,65 +5,18 @@ pub const BOOKKEEPING_UNAVAILABLE_MARKER: &str = "TD-BOOT-BOOKKEEPING-UNAVAILABL
 pub const BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN: &str = "td.boot-bookkeeping-unavailable=1";
 pub const SELECTED_CURRENT_MARKER: &str = "TD-BOOT-SELECTED-CURRENT";
 pub const SELECTED_PREVIOUS_MARKER: &str = "TD-BOOT-SELECTED-PREVIOUS";
-// The manifest contract, shared because BOTH halves of a deployment must agree
-// about it: td-boot reads and verifies, and the host-side `td-deploy` signs. A
-// bound stated twice is a bound that can disagree with itself — a signer that
-// accepted 8192 would emit signatures no machine could ever check, and the
-// failure would surface at boot rather than at signing.
+// The manifest contract, shared because every writer and reader of a
+// deployment must agree about it: the recipes write it, td-boot reads and
+// verifies its payloads, and td-install checks the one a review approved. The
+// deployment id is sha256(manifest); nothing signs it (td-install/DESIGN.md
+// §6, "No deployment signatures").
 pub const MANIFEST_HEADER: &[u8] = b"td-deployment-v1";
 pub const MANIFEST_NAME: &str = "manifest";
 pub const MAX_MANIFEST_BYTES: u64 = 4096;
-// Detached, beside the manifest: the deployment id stays sha256(manifest), so
-// re-signing under a new key does not rename the deployment.
-pub const MANIFEST_SIG_NAME: &str = "manifest.sig";
-// An ed25519 signature is 64 bytes, which `td-deploy` writes as 128 hex
-// characters and a newline. The bound is slack enough for a trailing CRLF and
-// nothing like a payload: this file is read off a volume anyone who can write
-// the disk can write, so it is bounded before it is read, as the manifest is.
-pub const MAX_SIGNATURE_BYTES: u64 = 160;
-// The trusted deployment key: 32 bytes as 64 hex characters and a newline, the
-// shape `td-deploy keygen` writes and `tests/td-subst.pub` already established
-// for a committed public half. Bounded before it is read for the signature's
-// reason — whatever supplies it, td-boot reads it as a file and a file can be
-// any size.
-pub const MAX_PUBLIC_KEY_BYTES: u64 = 96;
-// Where that key sits in the SELECTOR initramfs, relative to its root — the
-// rootfs td-boot is running from when it selects and verifies, which is the
-// artifact firmware loads and NOT the deployment's own initramfs. A key inside
-// the deployment would be inside the thing being authenticated, and a verifier
-// that reads its trust root out of its input authenticates nothing.
-//
-// Rootfs-relative rather than absolute because the harness writes it as a cpio
-// entry name, and `engine/src/cpio.rs` refuses an absolute one; td-boot joins
-// it to `/`. Shared here so the writer and the reader cannot disagree about the
-// spelling — a mismatch is a key the kernel places somewhere td-boot never
-// looks, which reports nothing on either side.
-pub const TRUSTED_KEY_PATH: &str = "etc/td/deployment.pub";
 pub const BOOT_DIR: &str = "td/boot";
 pub const ATTEMPTS_DIR: &str = "td/boot/attempts";
 pub const DEPLOYMENTS_DIR: &str = "td/deployments";
 pub const SELECTOR_PREFIX: &str = "../deployments/";
-// The trust root a RUNNING machine authenticates an update under, on the
-// persistent volume rather than in any rootfs. `TRUSTED_KEY_PATH` above is the
-// SELECTOR initramfs's copy and is gone after `switch_root`, so a booted system
-// has no key at all until this one exists (DESIGN §10 item 10).
-//
-// Outside `DEPLOYMENTS_DIR` deliberately: a trust root inside the thing it
-// authenticates vouches for nothing, and one owned by a deployment would be
-// replaced by every update. Named `trusted.pub` rather than repeating the
-// selector's `deployment.pub` so a path says WHICH of the two it is — and
-// because it would otherwise differ from the `deployments` directory beside it
-// by one character.
-#[allow(dead_code)]
-pub const VOLUME_TRUSTED_KEY: &str = "td/trusted.pub";
-// The refusal a bundle gets when its signature, its bytes and the trust root do
-// not agree. Shared because the boot oracle's negative pass GREPS for it: that
-// pass installs under a valid-but-wrong key and requires a failure, and any
-// other failure — a key that is not there, a busy volume lock, a missing
-// candidate — would satisfy a test meant to prove the key was consulted. Stated
-// once so a reworded diagnostic cannot quietly turn that check into a tautology.
-#[allow(dead_code)]
-pub const MANIFEST_UNAUTHENTICATED: &str = "manifest does not authenticate";
 // An update CHANNEL is a directory holding at most one bundle, under this fixed
 // name. Which bundle to install is the producer's decision and not a search:
 // a manifest carries a header and payload digests and nothing that orders two
@@ -74,8 +27,8 @@ pub const MANIFEST_UNAUTHENTICATED: &str = "manifest does not authenticate";
 #[allow(dead_code)]
 pub const CHANNEL_CANDIDATE: &str = "candidate";
 // Where the volume keeps its own channel, for a producer writing into the disk
-// rather than onto removable media. Beside `td/deployments` and outside it, for
-// `VOLUME_TRUSTED_KEY`'s reason: an incoming bundle is a claim, not state.
+// rather than onto removable media. Beside `td/deployments` and outside it: an
+// incoming bundle is a claim, not state.
 #[allow(dead_code)]
 pub const VOLUME_CHANNEL_DIR: &str = "td/incoming";
 // The two selector slots, by the names they have on disk. Here rather than as
@@ -120,16 +73,12 @@ pub const LIVE_CMDLINE_TOKEN: &str = "td.live=1";
 pub const LIVE_CMDLINE_PREFIX: &str = "td.live=";
 // The stock selector initramfs, carried in the system's root image so a live
 // installer takes its template from root.erofs, which live-root has hashed,
-// rather than from the unauthenticated ESP image on the medium. Root-relative
-// for the reason TRUSTED_KEY_PATH is. It holds no trust root or volume
-// identity; an installation appends both.
+// rather than from the unverified ESP image on the medium. Root-relative
+// because the harness writes such names as cpio entries, which
+// `engine/src/cpio.rs` refuses to make absolute. It holds no volume
+// identity; an installation appends one.
 #[allow(dead_code)]
 pub const SELECTOR_TEMPLATE_PATH: &str = "lib/td-boot/selector-initramfs.cpio";
-// The live selector's trust root, handed over as its 64 hex digits so the live
-// system holds the key its deployment was authenticated under. Reserved in
-// every base line, as the live token is.
-#[allow(dead_code)]
-pub const LIVE_TRUST_PREFIX: &str = "td.trust=";
 // brd's size parameter, in KiB, for the volatile volume on /dev/ram0.
 #[allow(dead_code)]
 pub const RAM_DISK_SIZE_PREFIX: &str = "brd.rd_size=";
@@ -138,25 +87,21 @@ pub const RAM_DISK_SIZE_PREFIX: &str = "brd.rd_size=";
 // `the_writer_labels_and_names_what_live_boot_looks_for` holds the two together.
 #[allow(dead_code)]
 pub const MEDIA_VOLUME_ID: &str = "TD_INSTALL";
-// The signed deployment's ISO root names, each paired with the deployment name
-// it carries. Linux mounts ISO-9660 with `map=normal`, which lowercases names,
+// The deployment's ISO root names, each paired with the deployment name it
+// carries. Linux mounts ISO-9660 with `map=normal`, which lowercases names,
 // so a mounted medium shows the lowercase form of the first column.
 #[allow(dead_code)]
-pub const MEDIA_DEPLOYMENT_FILES: [(&str, &str); 5] = [
+pub const MEDIA_DEPLOYMENT_FILES: &[(&str, &str)] = &[
     ("BZIMAGE", "bzImage"),
     ("INITRAMFS.CPIO", "initramfs.cpio"),
     ("ROOT.EROFS", "root.erofs"),
     ("MANIFEST", "manifest"),
-    ("MANIFEST.SIG", "manifest.sig"),
 ];
 // A server medium's provisioned primary account (td-svc/DESIGN.md §10,
-// "Profiles"), beside the deployment it boots and signed under the same key.
-// The file's first line names its format, as a manifest's does, so neither
-// signature can stand for the other. Lowercased when mounted.
+// "Profiles"), beside the deployment it boots. The file's first line names
+// its format. Lowercased when mounted.
 #[allow(dead_code)]
 pub const MEDIA_PROVISION_NAME: &str = "PROVISION";
-#[allow(dead_code)]
-pub const MEDIA_PROVISION_SIG_NAME: &str = "PROVISION.SIG";
 #[allow(dead_code)]
 pub const PROVISION_FORMAT: &str = "td-provision-v1\n";
 #[allow(dead_code)]

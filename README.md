@@ -118,7 +118,7 @@ host draw with it rather than Unifont (`td-builder install-fonts`).
 
 `./build-qcow` is the wrapper for `td-recipe-eval bundle`. It builds the same
 system `./start` boots and writes `dist/td-vm-x86-64/`: the kernel, the
-selector initramfs, a qcow2 Btrfs volume holding the signed deployment, a
+selector initramfs, a qcow2 Btrfs volume holding the deployment, a
 `SHA256SUMS`, a README, and a POSIX-sh `start` launcher rendered from the very
 QEMU profile `./start` uses. Someone with QEMU and no checkout unpacks it and
 runs `./start`, and the guest writes go to a throwaway overlay so the image
@@ -152,11 +152,8 @@ system. A first build builds the whole recipe graph and can take
 hours; subsequent updates reuse the retained build cache.
 
 This launcher keeps guest writes in the installation disk across boots.
-Each installation generates its own signing key, retained in root-only
-state outside the recipe graph. Keep the installation directory private:
-copying its disk also copies that identity. Create another installation for
-a separate identity. The default evaluation bundle discards its signing
-key and cannot install locally built updates.
+Keep the installation directory private: copying its disk copies the
+machine, its host identity and its users' files.
 
 Once first boot has initialized the checkout, run inside td:
 
@@ -167,18 +164,18 @@ git pull --ff-only
 ```
 
 The updater builds the recipe graph with the installed toolchain and the
-pinned Debian build root. The first build fetches declared sources and builds
-the graph locally; later builds reuse local outputs. When installation is
-requested, press Ctrl+Alt+Escape, then I. Review the deployment ID and type
-the two digits the prompt shows to approve, or press Escape to cancel; Enter
-does not approve. A request left unapproved makes the next wait, longer each
-time. The authorized operation signs with this installation's key and installs
-the successor. Restart explicitly to boot it; the previous deployment remains
-available for recovery. Use `./update build` to stop after building without
-requesting installation.
+pinned Debian build root. The first build fetches declared sources and
+builds the graph locally; later builds reuse local outputs. When
+installation is requested, press Ctrl+Alt+Escape, then I. Review the
+deployment ID and type the two digits the prompt shows to approve, or press
+Escape to cancel; Enter does not approve. A request left unapproved makes
+the next wait, longer each time. The authorized operation verifies and
+installs the successor. Restart explicitly to boot it; the previous
+deployment remains available for recovery. Use `./update build` to stop
+after building without requesting installation.
 
 The checkout, build cache and other user state persist across updates and
-rollback. The source bundle is companion data outside the signed deployment;
+rollback. The source bundle is companion data outside the deployment;
 it does not authorize installation. See [td-update/DESIGN.md](td-update/DESIGN.md)
 for the source, build and installation contract and native VM regression.
 
@@ -236,8 +233,7 @@ td-recipe-eval qemu-boot-live        # live wizard installs a disk, which then b
 `td-builder main-integration run` runs it on main after landings, after
 every recipe check, and a branch's `ready` never does (`DEVELOPMENT.md`).
 
-To build a bootable live ISO of the system, signed with a key made for that
-ISO alone:
+To build a bootable live ISO of the system:
 
 ```sh
 ./build-iso                          # writes dist/td-install-x86-64.iso

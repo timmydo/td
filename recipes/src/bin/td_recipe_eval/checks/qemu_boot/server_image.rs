@@ -20,7 +20,7 @@ use std::sync::atomic::AtomicU64;
 use super::build_iso::{live_medium, publish, refuse_stale, staged_path, Admitted, LiveMedium};
 use super::{
     build_btrfs_tools, build_system_stem, create_persistent_volume_layout, create_scratch_dir,
-    media, provision_selector, RunTrust, Scratch, VerifiedSelector, VolumeLayout, VolumePurpose,
+    media, provision_selector, RunVolume, Scratch, VerifiedSelector, VolumeLayout, VolumePurpose,
 };
 use crate::check_runner::RecipeCheckRunner;
 use crate::checks::provisioned_account::{check_keys, ProvisionedAccount, KEY_TYPE};
@@ -312,7 +312,7 @@ pub(crate) fn run(
     let scratch = Scratch {
         dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
     };
-    let trust = root_owned_trust(runner)?;
+    let identity = root_owned_identity(runner)?;
     let staged = staged_path(&options.out)?;
     refuse_stale(&staged)?;
     let disk_bytes = options
@@ -320,10 +320,10 @@ pub(crate) fn run(
         .checked_mul(GIB)
         .ok_or("the disk size overflows")?;
     let id = match options.format {
-        Format::Iso => compose_iso(&inputs, &trust, account, &scratch.dir, &staged)?,
+        Format::Iso => compose_iso(&inputs, account, &scratch.dir, &staged)?,
         format => compose(
             &inputs,
-            &trust,
+            &identity,
             account,
             disk_bytes,
             format,
@@ -377,9 +377,9 @@ impl ImageInputs {
     }
 }
 
-/// A run key whose volume files are guest root's, as an image's must be.
-pub(crate) fn root_owned_trust(runner: &RecipeCheckRunner) -> Result<RunTrust, String> {
-    RunTrust::generate_root_owned(PathBuf::from(runner.builder_command().get_program()))
+/// A volume identity whose files are guest root's, as an image's must be.
+pub(crate) fn root_owned_identity(runner: &RecipeCheckRunner) -> Result<RunVolume, String> {
+    RunVolume::generate_root_owned(PathBuf::from(runner.builder_command().get_program()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,11 +392,10 @@ pub(crate) enum Format {
 
 /// Write the live medium to `out`, which must not exist, returning the
 /// deployment id: build-iso's medium of the server deployment, carrying the
-/// account as a provision signed under the run key, which td-boot's live
-/// seed stages into the RAM volume's `@var`.
+/// account as a provision, which td-boot's live seed stages into the RAM
+/// volume's `@var`.
 pub(crate) fn compose_iso(
     inputs: &ImageInputs,
-    trust: &RunTrust,
     account: &ProvisionedAccount,
     scratch: &Path,
     out: &Path,
@@ -405,14 +404,11 @@ pub(crate) fn compose_iso(
         id,
         selector,
         mut payloads,
-    } = live_medium(&inputs.selector, &inputs.deployment, scratch, trust)?;
+    } = live_medium(&inputs.selector, &inputs.deployment, scratch)?;
     let provision = scratch.join("provision");
     fs::write(&provision, account.provision())
         .map_err(|error| format!("write {}: {error}", provision.display()))?;
-    let signature = scratch.join("provision.sig");
-    trust.sign_file(&provision, &signature)?;
     payloads.push((protocol::MEDIA_PROVISION_NAME, provision));
-    payloads.push((protocol::MEDIA_PROVISION_SIG_NAME, signature));
     // The writer refuses an existing name; settled here, a failure after
     // this can only be one the writer reached by creating `out` itself.
     match fs::symlink_metadata(out) {
@@ -434,7 +430,7 @@ pub(crate) fn compose_iso(
 /// deployment id. `scratch` holds the volume until it is copied in.
 pub(crate) fn compose(
     inputs: &ImageInputs,
-    trust: &RunTrust,
+    identity: &RunVolume,
     account: &ProvisionedAccount,
     disk_bytes: u64,
     format: Format,
@@ -455,7 +451,7 @@ pub(crate) fn compose(
         &volume,
         VolumeLayout::Basic,
         false,
-        trust,
+        identity,
         None,
         VolumePurpose::Image {
             bytes: volume_bytes,
@@ -463,7 +459,7 @@ pub(crate) fn compose(
         None,
         Some(account),
     )?;
-    let selector = provision_selector(&inputs.selector, scratch, trust)?;
+    let selector = provision_selector(&inputs.selector, scratch, identity)?;
     let id = crate::sha256::sha256_file(&inputs.deployment.join(protocol::MANIFEST_NAME))
         .map_err(|error| format!("hash the deployment manifest: {error}"))?;
 

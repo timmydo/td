@@ -35,16 +35,16 @@ an already-unlocked desktop are outside this scope. A locked running or
 suspended machine still holds storage keys in RAM and relies on session
 isolation; it does not regain the powered-off confidentiality boundary.
 
-Use LUKS2 over kernel dm-crypt, initially AES-XTS, around the whole td
-Btrfs volume: deployments and `@var`, including homes, logs and credentials.
-The EFI partition and partition/enrollment metadata remain readable. Keep
-deployment signatures: encryption does not authenticate mutable sectors or
-prevent replay. Authenticated sectors and general anti-rollback storage are
-separate work. Encryption applies only to fresh installs; no plaintext
-volume is converted in place, and there is no erasure claim about
-historical plaintext copies. Recipe-built file images, including the stock
-VM, stay unencrypted: a build cannot hold a volume key without placing it
-in a store output.
+Use LUKS2 over kernel dm-crypt, initially AES-XTS, around the whole td Btrfs
+volume: deployments and `@var`, including homes, logs and credentials. The
+EFI partition and partition/enrollment metadata remain readable. Deployment
+payloads stay hash-verified, and nothing signs them (DESIGN.md §6):
+encryption does not authenticate mutable sectors or prevent replay.
+Authenticated sectors and general anti-rollback storage are separate work.
+Encryption applies only to fresh installs; no plaintext volume is converted
+in place, and there is no erasure claim about historical plaintext copies.
+Recipe-built file images, including the stock VM, stay unencrypted: a build
+cannot hold a volume key without placing it in a store output.
 
 ## Device-bound default
 
@@ -392,7 +392,7 @@ firmware does not boot. It still holds the ESP, with the kernel and the
 prepared selector, and the volume: its header with keyslot 0, opened by
 the unconfirmed recovery key, and keyslot 1 with token 0, whose protector
 only this TPM releases; inside, the published deployment and the staged
-settings, account and trusted key, none of them secret, and any carried
+settings and account, neither of them secret, and any carried
 Wi-Fi networks (DESIGN.md "Carried Wi-Fi networks"), whose PMKs are
 secret. A withdrawal also zeroes the volume's first 16 MiB, so neither
 keyslot opens; a crash leaves no withdrawal behind it, and a new
@@ -919,7 +919,7 @@ tier authenticates no pre-selector code, as the device-bound tier does
 not: a boot chain changed by someone holding the machine is refused by
 release, not by firmware, and a counterfeit selector can still record
 the PIN ("Protected release", "Threat and limits"). The trusted selector
-authenticates the selected deployment after opening the volume; it
+verifies the selected deployment after opening the volume; it
 cannot require a measurement of unreadable deployment bytes to unlock
 that volume. It then measures the verified deployment and its boot
 arguments into PCR 11 before the handoff, its prepared selector carrying
@@ -949,20 +949,20 @@ does not survive `kexec`: the deployment initramfs must create it again.
 Before enabling encrypted boot, specify and prove either re-release under
 the second kernel's policy or a bounded volatile key handoff to the verified
 deployment. That protocol must preserve a single user interaction, verify
-the original signed deployment bytes, and retire intermediate secrets. A
+the original deployment bytes, and retire intermediate secrets. A
 plaintext key on the command line or in a stored initramfs is forbidden.
 This handoff is an explicit implementation gate, not existing machinery.
 
 The device-bound tier uses a bounded volatile handoff, which the protected
 tier adopts, adding the admission record beside the key ("Verified
-account handoff"). After authenticating the selected deployment and
+account handoff"). After verifying the selected deployment and
 making its configured PCR 11 measurement, the selector copies the
 verified deployment initramfs into an unlinked memfd, verifies that copy
 against the manifest, appends one 4-byte-aligned cpio archive holding
 only the volume key (and, on a protected volume, the admission record),
 seals the
 memfd and passes it to `kexec_file_load`. The appended archive is outside
-the signed manifest and the measured event. Its single member's name and
+the manifest and the measured event. Its single member's name and
 the 64-byte key length are td-boot protocol constants and a permanent v1
 contract: an installed selector may never be updated (increment 8's
 selector update is a consented operation, not an automatic one), so it
@@ -1453,7 +1453,7 @@ the plan only after the cap, the TPM wait) and replaces steps 2 and 3:
    needs the TPM. The selector then opens the mapping and takes the
    volume key with the released secret, as the device-bound order
    does, and under Secure Boot verifies `TDCONFIG` against the volume
-   before its trusted key selects or verifies anything ("Firmware
+   before it selects or verifies anything ("Firmware
    authentication"). The plan then runs as step 5: a request whose tag
    fails, one declined and a re-enrollment on the recorded primary are
    removed first ("Protector management"), a PIN change a confirmed
@@ -1657,8 +1657,8 @@ so one must stay reachable.
 `EFI/BOOT/BOOTX64.EFI` and `EFI/BOOT/INITRD` with the running
 deployment's kernel and a selector prepared from the running root's
 stock template (`/lib/td-boot/selector-initramfs.cpio`) by
-`prepare-selector`'s rules, with the installation's trusted key as the
-volume holds it and the volume UUID of `td.volume=`; on a protected
+`prepare-selector`'s rules, with the volume UUID of `td.volume=`; on a
+protected
 volume, and for the upgrade, the prepared selector also carries
 `etc/td/boot-measurement` (DESIGN.md "Selector deployment measurement
 prerequisite"). Under Secure Boot the pair is the signed image and
@@ -1704,7 +1704,7 @@ The update takes one of two forms:
      selector after a PIN release. It reads each staged file once with
      `td-fat`, computing in that one pass the digests every later step
      uses: `BOOTX64.NEW`'s SHA-256 and Authenticode SHA-256 and
-     `INITRD.NEW`'s SHA-256. It authenticates nothing yet: before the
+     `INITRD.NEW`'s SHA-256. It checks nothing yet: before the
      cap it can read no deployment. It predicts the new chain's PCR 4
      and PCR 9 from the event log ("Prediction" below) and seals the
      secret this boot released, with the PIN typed this boot under a
@@ -1713,7 +1713,7 @@ The update takes one of two forms:
      inert until the commit imports it, and it cannot be verified, since
      its chain is not running.
   3. **Commit**, in the same boot after the cap and before any import.
-     With the volume open, the selector authenticates the staged pair
+     With the volume open, the selector checks the staged pair
      against the volume's `current` deployment, whose manifest it
      verifies as it does to boot it: `BOOTX64.NEW`'s SHA-256 must equal
      that manifest's `bzImage`; and, after it hashes `root.erofs` once
@@ -1721,22 +1721,25 @@ The update takes one of two forms:
      (UNSAFE.md §3) and mounts it read-only, `INITRD.NEW` must be that
      root's `/lib/td-boot/selector-initramfs.cpio` followed by exactly
      the archive `prepare-selector` appends with this selector's own
-     trusted key, volume UUID and measurement policy (the same
+     volume UUID and measurement policy (the same
      `engine/src/cpio.rs` writer): the SHA-256 of those bytes must equal
      the digest the pre-seal took, so what was predicted is what was
-     authenticated. Only then does it import the predicted object as a
+     checked. Only then does it import the predicted object as a
      second tpm-pin token naming the same keyslot, and commit: one
      sector write points `BOOTX64.EFI` and `INITRD` at the first
      clusters and sizes the pre-seal read and hashed, never at entries
      it reads again, and deletes the staged entries; then the old chains
      are freed.
 
-  Any authenticity failure (another kernel, another template, another
+  Any check failure (another kernel, another template, another
   appended archive, a deployment that is not `current`) discards the
   object and deletes the staged update in one sector write, with a
-  console line naming the check; an older signed selector therefore
-  never installs. A failed prediction with every authenticity check
-  passed keeps the staged update and retries the pre-seal at the next
+  console line naming the check; an older selector therefore never
+  installs. Nor does a staged update across the removal of deployment
+  signing (DESIGN.md §6): a selector that carried a deployment key
+  rebuilds its appendix with it, a keyless one without, so a pair staged
+  for the other does not match and is deleted. A failed prediction with
+  every such check passed keeps the staged update and retries the pre-seal at the next
   PIN boot, recording the retry in an `update-retry` token that binds
   the staged pair's digests under a tag HKDF-SHA256 derives from the
   volume key (info `td/disk-protector/update-retry/v1`, a zero byte and
@@ -1843,19 +1846,18 @@ someone writing the disk, stages a pair. They read:
 - The commit runs once, after `finish`, inside the boot's deployment
   selection: with the volume mounted (read-only, or writable where an
   earlier unmount failed) and only read, and the deployment to
-  boot already authenticated, just before that deployment's handoff,
+  boot already verified, just before that deployment's handoff,
   on whichever path the selection took. It reads `current` from that
   mount. The loop it binds `current`'s `root.erofs` on stays bound until
   the handoff, since td-init has no detach. It commits only when the
   TPM PIN released this boot: a pair read before a PIN whose keyslot
   did not open waits.
-- "Any authenticity failure" is a `current` the selector cannot
-  authenticate as it does to boot it (no `current` link, a manifest
-  whose signature fails, a `root.erofs` that does not hash to it, a
-  root without the template) and either digest that differs. A
-  `current` that cannot be reached for another reason (the selector's
-  trust root, the loop or its mount) keeps the staged update, writing
-  nothing.
+- "Any check failure" is a `current` the selector cannot verify as it
+  does to boot it (no `current` link, a malformed manifest, a
+  `root.erofs` that does not hash to it, a root without the template)
+  and either digest that differs. A `current` that cannot be reached for
+  another reason (the loop or its mount) keeps the staged update,
+  writing nothing.
 - Only a prediction that failed this boot, the running pair unreadable
   included, takes the retry path, so `update`'s warning is true when
   it shows. A prediction that held but left no object at the commit (a
@@ -1896,9 +1898,9 @@ someone writing the disk, stages a pair. They read:
 
 **Threat and limits.** Staging needs root on the running system and
 physical consent. Anyone who can write the ESP can also stage files, but
-the predicted object leaves RAM only after the pair is authenticated
+the predicted object leaves RAM only after the pair is checked
 against the volume's `current` deployment, so a forged staging gains no
-seal and no installation, and an older signed selector is refused.
+seal and no installation, and an older selector is refused.
 Between the import and the next boot the old chain's object stays
 valid, which lets that genuine chain boot once more.
 
@@ -2626,7 +2628,7 @@ TPM-primary shape.
   embedded sections is excluded by D6, and relinking per installation
   would need a toolchain on the running system.
 - **Configuration.** The per-installation values `prepare-selector`
-  appends today (trusted key, volume UUID, measurement policy) become
+  appends today (volume UUID, measurement policy) become
   the data file `EFI/BOOT/TDCONFIG`, written by the same
   `engine/src/cpio.rs` writer as a cpio archive. The selector reads it
   once, extends its SHA-256 into PCR 9 with TPM2_PCR_Extend before
@@ -2634,12 +2636,12 @@ TPM-primary shape.
   "Prediction"); tpm-pin seals bind it through PCR 9. A replaced
   `TDCONFIG` changes PCR 9, so the PIN releases nothing, but a token or
   the recovery key still releases after the warning, and the attacker's
-  trusted key would then select an attacker-signed deployment. So the
-  volume authenticates it: a `config` token holds one or two
+  `TDCONFIG` would then name another volume or drop the measurement
+  policy. So the volume authenticates it: a `config` token holds one or two
   HMAC-SHA256 tags over `TDCONFIG`'s bytes under a key HKDF-SHA256
   derives from the volume key with the info `td/disk-protector/config/v1`,
   a zero byte and the volume UUID. After every release and the volume
-  key's retrieval, before the trusted key selects or verifies anything,
+  key's retrieval, before the selector selects or verifies anything,
   the selector requires `TDCONFIG`'s tag to be in the token, compared in
   constant time; otherwise it zeroes the key and halts, saying the
   ESP's configuration is not this volume's. A staged update's
@@ -2648,7 +2650,7 @@ TPM-primary shape.
   to the token before the sector write and the next boot's plan drops
   the old one, so a crash between them leaves both pairs valid. While
   both tags are valid, a one-boot rollback to the old `TDCONFIG` is
-  possible, only when the trusted key or measurement policy changed,
+  possible, only when the measurement policy changed,
   and only through a token or recovery-key boot, since PCR 9 refuses
   the PIN.
 - **Enrollment** is `storage-operation`'s `secure-boot-enroll`, with
@@ -2712,7 +2714,7 @@ TPM-primary shape.
 - **Kernel.** `EFIVAR_FS` is built in and mounted by nothing but
   enrollment; lockdown stays off (no lockdown LSM: the LSM framework is
   built for securityfs alone, "Prediction") and `KEXEC_SIG` stays
-  off, since td-boot authenticates deployments itself.
+  off, since td-boot verifies deployments itself.
 
 **Threat and limits.** With Secure Boot and a firmware setup password,
 firmware runs only the td-signed image, which holds every line of the
@@ -2894,7 +2896,7 @@ commit.
      `storage-operation`'s `selector-update` in both
      forms, with td-authd's supervision and the compositor's storage
      screen, which production refuses; the selector's pre-seal, its
-     authentication against `current`'s `bzImage` and `root.erofs`, its
+     verification against `current`'s `bzImage` and `root.erofs`, its
      retry token, deletion and immediate reboot after `update`, and the
      commit; and last, once the storage-operation wire exists,
      TOKEN-LOGIN.md's disk proof for login-key operations, whose keyslot

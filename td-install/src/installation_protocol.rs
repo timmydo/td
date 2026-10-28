@@ -1,5 +1,5 @@
 //! The unprivileged installer's typed channel to the root installation
-//! service. Decoding grants no authority: the service authenticates the
+//! service. Decoding grants no authority: the service validates the
 //! source, establishes eligibility and holds its disk claim itself, and
 //! consent reaches it only from the compositor, never through this channel.
 
@@ -394,7 +394,7 @@ pub enum Request {
     /// Eligible whole disks, as the service observes them.
     Destinations,
     /// Review one destination with these settings. The service chooses the
-    /// nonce, volume UUID and authenticated source, and claims the disk.
+    /// nonce, volume UUID and validated source, and claims the disk.
     /// `unencrypted` is the person's choice of unencrypted storage;
     /// otherwise the storage is what the service's probes allow.
     Propose {

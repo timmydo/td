@@ -1208,7 +1208,7 @@ service. The only change to an existing service is ordering seat assignment
 after the fixture keyboard is enumerated. The shipping system closure has
 no test executable, fixture service or synthetic PCR writer.
 
-Two fresh QEMU processes boot the same signed deployment through the normal
+Two fresh QEMU processes boot the same deployment through the normal
 selector, verified kexec, read-only EROFS root and persistent Btrfs @var.
 The fixture runs beneath stock td-svc after successful firstboot, without
 rewriting account tables, application configuration, store setup, broker,
@@ -1251,7 +1251,7 @@ ID. R performs exactly one fresh recovery assertion before mail retrieval.
 Both boots require exact CTAP sequences and nonzero, globally fresh
 challenges; each cold boot starts with no release. The runner requires one
 successful ignored test, the exact supervised result line, the selected
-signed deployment ID, clean QEMU exit, stock persistent shutdown and an
+deployment ID, clean QEMU exit, stock persistent shutdown and an
 offline Btrfs check. The private disposable volume and TPM state live under
 `TMPDIR` (the ordinary temporary directory by default), separate from the
 persistent build cache. The owner removes that scratch on completion or
@@ -2972,14 +2972,14 @@ serial greeter, sshd, boot health, seat, compositor, td-authd, terminal
 and the rest of the unit table; the test adds a UHID keyboard before the
 seat starts, which the fixture unit's readiness gates, and UHID keys.
 
-The volume is made as the boot oracles make theirs, with a throwaway
-signing identity, but mkfs runs beneath `td-builder userns-private`, as
-an installation's does, so its files are guest root's. That is what the
-worker's production read of the retained deployments needs: `Volume`
-with owner 0 over `/run/td-volume/td` gives this build's version only
-because the current deployment's files are root's, and the guest shows
-that the same read with another owner gives none. The machine is a
-direct-boot q35 with `ICH9-LPC.disable_s3=0`, so its ACPI offers S3.
+The volume is made as the boot oracles make theirs, but mkfs runs beneath
+`td-builder userns-private`, as an installation's does, so its files are
+guest root's. That is what the worker's production read of the retained
+deployments needs: `Volume` with owner 0 over `/run/td-volume/td` gives this
+build's version only because the current deployment's files are root's, and
+the guest shows that the same read with another owner gives none. The
+machine is a direct-boot q35 with `ICH9-LPC.disable_s3=0`, so its ACPI
+offers S3.
 
 The host checks the display as for login-desktop (`guest_screens.rs`),
 with its `blank`, `blank-unlocked`, `pin`, `touch`, `unlocked` and

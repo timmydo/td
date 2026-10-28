@@ -36,7 +36,7 @@ Adversaries considered:
   user's credentials.
 - **A2 — a hostile or corrupted account database**: `/etc/passwd`,
   `/etc/group`, `/etc/shadow` with duplicate, malformed, or crafted
-  entries. The signed EROFS deployment supplies the base tables. Before
+  entries. The read-only EROFS deployment supplies the base tables. Before
   starting consumers, firstboot may publish a read-only account projection
   for the validated root-owned saved username; `td-install/INSTALLER.md`
   specifies its complete admission and publication. A build-time tailoring
@@ -65,7 +65,7 @@ password, interactive, host-based, and forwarding paths. This document does
 not extend td-login's syscall or post-condition claims to OpenSSH; the image
 recipe instead pins its source, configuration, locked account, empty volatile
 chroot, split helpers, seccomp sandbox, and a real unprivileged loopback login.
-Before entering the authenticated deployment, firstboot validates its complete
+Before entering the verified deployment, firstboot validates its complete
 root-owned account tables and publishes the server policy itself as root:root
 mode-0600 `/run/td-sshd.conf`, renaming into place a temporary it created
 exclusively without following a link, then writes the volatile cutover
@@ -120,7 +120,8 @@ written each boot from the attached seed. Whoever can attach a disk can
 therefore admit one: the instance's owner on a cloud, and physical access on
 hardware, which can already boot a medium of its own (the image's Secure Boot
 is off) and read a server's unencrypted volume. That holds for a live medium
-too, whose signed provision a seed's keys join unsigned. Removing the key from
+too, whose provision is unsigned like the seed's keys: the medium the person
+chose to boot is all that vouches for either. Removing the key from
 the seed, or the seed, revokes it at the next boot. With no seed, a server whose
 firmware's DMI names EC2 takes them from the instance metadata service instead
 ("Cloud metadata"): the account that launched the instance admits one with its
@@ -567,8 +568,8 @@ paired compositor selects one queued build with physical I and presents
 its full manifest ID; the root-drawn approval key, typed after complete
 presentation, authorizes only that installation, and Enter does not.
 td-authd passes its pinned source directory to the fixed
-installed helper, which signs with the already-provisioned installation key
-and uses the existing boot transaction. td-login does not elevate the
+installed helper, which verifies it and uses the existing boot
+transaction. td-login does not elevate the
 caller. This does not change human login, hardware authentication, credential
 release or sensitive protector policy. See td-authd/DESIGN.md and
 td-install/DESIGN.md for admission and lifetime limits.

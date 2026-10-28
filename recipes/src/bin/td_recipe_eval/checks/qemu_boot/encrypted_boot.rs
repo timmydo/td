@@ -1160,8 +1160,7 @@ fn wizard(runner: &RecipeCheckRunner, bench: &Bench, tpm: &Path) -> Result<Strin
     };
     let dir = bench.scratch.dir.join("wizard");
     fs::create_dir(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
-    let medium =
-        build_iso::live_medium(&bench.selector, &bench.store_deployment, &dir, &bench.trust)?;
+    let medium = build_iso::live_medium(&bench.selector, &bench.store_deployment, &dir)?;
     if medium.id != bench.id {
         return Err(format!(
             "the live medium's deployment {} is not the bench's {}",
@@ -1583,7 +1582,6 @@ fn live(
         &machine.bench.selector,
         &machine.bench.store_deployment,
         &dir,
-        &machine.bench.trust,
     )?;
     let iso = dir.join("live.iso");
     media::write_image_with_payloads(

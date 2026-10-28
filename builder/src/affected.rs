@@ -334,18 +334,6 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
         "engine/src/fat.rs",
         "target-static td-install, and td-boot's tests, which build ESP images with it; neither control-plane bin uses it",
     ),
-    (
-        "engine/src/ed25519.rs",
-        "target-static td-boot and td-net's cfg(test) ring differential; neither control-plane bin uses it",
-    ),
-    (
-        "engine/src/sha512.rs",
-        "target-static td-boot (paired with ed25519.rs, which reaches its hash as crate::sha512) and td-net's cfg(test) ring differential; neither control-plane bin uses it",
-    ),
-    (
-        "engine/src/ed25519_sign.rs",
-        "td-net's cfg(test) ring differential ONLY — never td-boot, which is the point of it being a separate file from ed25519.rs; neither control-plane bin uses it",
-    ),
 ];
 
 /// ASCII double quote, as a BYTE and not as a char literal. Two shipped sites
@@ -520,14 +508,13 @@ fn collect_rs_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// `text` with `//` line comments removed, so a source scan sees CODE.
 ///
-/// The confinement scans below look for tokens that must not appear, and the
-/// files they scan are the files most likely to DISCUSS those tokens: td-boot's
-/// header explains at length why it does not include the signer, and naming it
-/// there is worth more than the scan's convenience. Without this, that comment
-/// alone red the gate — which is how this came to exist.
+/// The scans below look for `#[path]` includes and staged paths, and the
+/// files they scan are the files most likely to DISCUSS those paths: a
+/// recipe's prose names the files its staging is for, and naming them there
+/// is worth more than the scan's convenience.
 ///
 /// A `//` inside a STRING LITERAL is not a comment, and cutting there would
-/// discard the rest of a real line — `let u = "http://x"; mod ed25519_sign;`
+/// discard the rest of a real line — `let u = "http://x"; mod staged;`
 /// would strip the declaration and hide it from the scan. So a cut only happens
 /// where the quotes before it are balanced. That is a heuristic and not a lexer
 /// (it knows nothing of escapes or raw strings), which is sound in the
@@ -568,26 +555,6 @@ pub(crate) fn strip_line_comments(text: &str) -> String {
         out.push('\n');
     }
     out
-}
-
-/// Does `text` declare a function named exactly `name`?
-///
-/// A plain `contains("fn sign")` is what a first draft used, and it matched the
-/// test helper `fn signature_of` — so the boundary is checked rather than
-/// assumed. Both `fn name(` and `fn name<` count; anything continuing the
-/// identifier does not.
-fn declares_fn(text: &str, name: &str) -> bool {
-    let needle = format!("fn {name}");
-    let mut from = 0usize;
-    while let Some(at) = text.get(from..).and_then(|rest| rest.find(&needle)) {
-        let end = from.saturating_add(at).saturating_add(needle.len());
-        let next = text.get(end..).and_then(|rest| rest.chars().next());
-        if !next.is_some_and(|c| c.is_alphanumeric() || c == '_') {
-            return true;
-        }
-        from = end;
-    }
-    false
 }
 
 /// The consumer list for a target-included engine source, or `None` for an
@@ -1108,31 +1075,20 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // td-boot's protocol.rs is the deployment contract, `#[path]`-included by
-    // two OTHER trees: the td-recipe lib root, which is where every recipe and
-    // the qemu oracle reach it, and — since the manifest header and size bound
-    // moved into it — the host-side td-net, whose `td-deploy` signs what td-boot
-    // verifies. The td-boot rule below covers the first through recipe-checks
-    // but compiles no net, and no gate builds td-net from source: the WARM does,
-    // which is a chain target. So this file takes the td-boot rule plus those,
-    // or a change here that breaks only the signer runs nothing.
-    //
-    // td-fs joined it in that class: its real-bounded-file rule began as
-    // td-boot's `realfile.rs`, and td-net includes it for the same reason —
-    // the signer must refuse exactly what the verifier refuses — so it needs
-    // the same chain targets. td-fs is also the crate the cargo-built
-    // programs depend on, whose checks are a subset of these. The rule is
-    // about protocol.rs and not about td-boot, which is why
-    // `td-boot/src/main.rs` is pinned to the narrower one beside the
-    // assertions below.
-    if p == "td-boot/src/protocol.rs" || (p.starts_with("td-fs/") && !p.contains("..")) {
+    // td-fs's real-bounded-file rule began as td-boot's `realfile.rs`, and
+    // the host-side td-net `#[path]`-includes it and its replace. The td-boot
+    // rule below compiles no net, and no gate builds td-net from source: the
+    // WARM does, which is a chain target. So td-fs takes the chain targets
+    // too, or a change here that breaks only td-net runs nothing. td-fs is
+    // also the crate the cargo-built programs depend on, whose checks are a
+    // subset of these.
+    if p.starts_with("td-fs/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
-        // td-net's own suite: its feed, substituter and signer write through
-        // td-fs's replace, and the chain targets only compile it.
+        // td-net's own suite: its feed and substituter write through td-fs's
+        // replace, and the chain targets only compile it.
         sel.add_preflight("net-test");
-        // Both are `#[path]`-included by td-net, and `td-boot/` and `td-fs/`
-        // are staged into td-net's seed, but that identity is re-derived LIVE
-        // from the checkout (re #469 local-source-roster split) — no
+        // td-fs is staged into td-net's seed, but that identity is re-derived
+        // LIVE from the checkout (re #469 local-source-roster split) — no
         // local-source preflight to select.
         sel.add_target("check");
         sel.add_target("recipe-checks");
@@ -1148,9 +1104,6 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         p,
     ) {
         sel.add_preflight("cargo-test");
-        // Retained `td-boot/` inputs enter td-net's seed, re-derived LIVE from
-        // the checkout (re #469 local-source-roster split) — no local-source
-        // preflight to select here either.
         sel.add_target("check");
         sel.add_target("recipe-checks");
         return;
@@ -2454,9 +2407,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/cpio.rs", "target-static td-install");
     assert_contains!("engine/src/cpio.rs", "target-static td-boot");
     assert_contains!("engine/src/sha256.rs", "td-install (its live installation");
-    assert_contains!("engine/src/ed25519.rs", "target-static td-boot");
-    assert_contains!("engine/src/sha512.rs", "target-static td-boot");
-    assert_contains!("engine/src/ed25519_sign.rs", "never td-boot");
     assert_contains!("engine/src/flathub_app.rs", "td-software's status reader");
     // The other half. Without it a table that matched EVERY engine source would
     // satisfy every line above, and the note would claim a target consumer for
@@ -2476,9 +2426,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "engine/src/gpt.rs",
         "engine/src/cpio.rs",
         "engine/src/fat.rs",
-        "engine/src/ed25519.rs",
-        "engine/src/sha512.rs",
-        "engine/src/ed25519_sign.rs",
     ];
     let actual_target_included: Vec<&str> = TARGET_INCLUDED_ENGINE_SOURCES
         .iter()
@@ -2498,41 +2445,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         if !root.join(src).is_file() {
             fail(format!(
                 "{src} is in TARGET_INCLUDED_ENGINE_SOURCES but does not exist"
-            ));
-        }
-    }
-    // The ed25519 SPLIT, asserted against the tree because the compiler cannot
-    // see it and the note above is only a note. `ed25519.rs` is the file the
-    // verifying boot shim `#[path]`-includes, so a signer reaching it puts
-    // one in the boot binary; the whole reason `ed25519_sign.rs` is a separate
-    // file is that neither half of that is otherwise enforced. Two ways in, so
-    // both are shut: td-boot naming a path to the signer, and the signer's own
-    // entry points migrating into the file td-boot does include.
-    //
-    // The needles are what a signer NEEDS rather than what one is called: a
-    // secret seed to expand (`SEED_LEN`) and something to expand it with
-    // (`fn sign`, `fn public_key`). A file with none of the three cannot derive
-    // a key from a secret whatever its functions are named. The two function
-    // needles check an identifier BOUNDARY — the first draft's plain substring
-    // matched the test helper `fn signature_of` and red against a clean tree.
-    // RECURSIVE, because a non-recursive read would never look inside
-    // `td-boot/src/<dir>/mod.rs` — a module tree this crate does not have today
-    // and which nothing stops it growing.
-    let mut boot_files = Vec::new();
-    collect_rs_recursive(&root.join("td-boot/src"), &mut boot_files);
-    if boot_files.is_empty() {
-        fail("td-boot/src has no .rs files to scan for the ed25519 split".to_string());
-    }
-    for path in &boot_files {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            fail(format!("cannot read {}", path.display()));
-            continue;
-        };
-        if strip_line_comments(&text).contains("ed25519_sign") {
-            fail(format!(
-                "{} names ed25519_sign in CODE: the signer must not reach the boot binary \
-                 (engine/src/ed25519_sign.rs, td-install/DESIGN.md §6)",
-                path.display()
             ));
         }
     }
@@ -2636,30 +2548,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
                 }
             }
         }
-    }
-    match std::fs::read_to_string(root.join("engine/src/ed25519.rs")) {
-        Ok(verifier) => {
-            let verifier = strip_line_comments(&verifier);
-            for name in ["sign", "public_key"] {
-                if declares_fn(&verifier, name) {
-                    fail(format!(
-                        "engine/src/ed25519.rs declares `fn {name}`: it is verify-only, and \
-                         the boot shim includes it — a signer belongs in ed25519_sign.rs"
-                    ));
-                }
-            }
-            // Substring is right for this one: nothing in a verify-only file has
-            // a reason to spell SEED_LEN at all, so there is no boundary case to
-            // get wrong and the loose direction is a loud failure, not a pass.
-            if verifier.contains("SEED_LEN") {
-                fail(
-                    "engine/src/ed25519.rs names SEED_LEN: a seed is the secret half, and \
-                     this is the file the boot shim includes"
-                        .to_string(),
-                );
-            }
-        }
-        Err(e) => fail(format!("cannot read engine/src/ed25519.rs: {e}")),
     }
     assert_target!("engine/Cargo.toml", "check-engine");
     assert_target!("engine/Cargo.toml", "recipe-rs");
@@ -3087,23 +2975,21 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_no_preflight!("td-fs/src/real_file.rs", "local-source-roster");
     assert_target!("td-boot/Cargo.toml", "check");
     assert_target!("td-boot/Cargo.toml", "recipe-checks");
-    // protocol.rs is the deployment contract three OTHER trees compile: two
-    // recipes and — since the manifest header and bound moved into it — td-net.
-    // No gate builds td-net from source, the recipe-graph WARM does, so a break
-    // that only reaches the signer must still select the recipe checks.
+    // protocol.rs is the deployment contract the recipes and td-install
+    // compile: the td-boot rule's recipe checks cover it, and td-net no longer
+    // includes it.
     assert_target!("td-boot/src/protocol.rs", "check");
     assert_target!("td-boot/src/protocol.rs", "recipe-checks");
     assert_preflight!("td-boot/src/protocol.rs", "cargo-test");
-    // td-fs is in that same class and pinned the same way: td-net
-    // `#[path]`-includes it so the signer refuses what the verifier refuses,
-    // and without the chain targets an edit here that breaks only the signer
-    // would compile td-boot and td-install and build no net at all.
+    assert_no_preflight!("td-boot/src/protocol.rs", "net-test");
+    // td-net `#[path]`-includes td-fs, and without the chain targets an edit
+    // here that breaks only td-net would compile td-boot and td-install and
+    // build no net at all.
     assert_target!("td-fs/src/real_file.rs", "check");
     assert_target!("td-fs/src/real_file.rs", "recipe-checks");
     assert_preflight!("td-fs/src/real_file.rs", "cargo-test");
     assert_preflight!("td-fs/src/real_file.rs", "net-test");
     assert_preflight!("td-fs/src/replace.rs", "net-test");
-    assert_preflight!("td-boot/src/protocol.rs", "net-test");
     // The crate root is in td-net's staged tree too, so it routes the same.
     assert_target!("td-fs/src/lib.rs", "check");
     // td-review is a static target recipe packed into the image: its source
@@ -6261,24 +6147,18 @@ mod tests {
         }
     }
 
-    /// The ed25519 confinement scan reads CODE, so the comment strip it reads
-    /// through has to keep code and drop prose — and its dangerous failure is
-    /// the silent one, a strip that removes too much and blinds the scan
-    /// without failing anything.
+    /// The staging scans read CODE, so the comment strip they read through
+    /// has to keep code and drop prose — and its dangerous failure is the
+    /// silent one, a strip that removes too much and blinds the scan without
+    /// failing anything.
     #[test]
     fn the_comment_strip_keeps_code_and_drops_prose() {
-        // The shape that made this necessary: td-boot's header names the
-        // signer in order to say it is absent.
-        assert!(
-            !strip_line_comments("// ed25519_sign.rs is deliberately absent")
-                .contains("ed25519_sign")
-        );
-        assert!(!strip_line_comments("    //! reaches ed25519_sign").contains("ed25519_sign"));
+        // Prose naming a file is not an include of it.
+        assert!(!strip_line_comments("// staged.rs is deliberately absent").contains("staged"));
+        assert!(!strip_line_comments("    //! reaches staged").contains("staged"));
         // Code survives, including code with a comment after it — the case a
         // naive "drop any line containing //" would lose.
-        assert!(
-            strip_line_comments("mod ed25519_sign; // the signer").contains("mod ed25519_sign;")
-        );
+        assert!(strip_line_comments("mod staged; // the module").contains("mod staged;"));
         assert!(strip_line_comments("let x = 1;\nlet y = 2;").contains("let y = 2;"));
         // And the strip must not join lines: two declarations on separate lines
         // stay on separate lines, or a needle could straddle the seam.
@@ -6287,18 +6167,17 @@ mod tests {
         // discard the rest of a real line and HIDE what follows from the scan,
         // which is the one direction this must not fail in.
         assert!(
-            strip_line_comments(r#"let u = "http://x"; mod ed25519_sign;"#)
-                .contains("mod ed25519_sign;"),
+            strip_line_comments(r#"let u = "http://x"; mod staged;"#).contains("mod staged;"),
             "a URL must not swallow the declaration after it"
         );
         // Balanced quotes then a real comment still cuts.
-        assert!(!strip_line_comments(r#"let u = "x"; // ed25519_sign"#).contains("ed25519_sign"));
+        assert!(!strip_line_comments(r#"let u = "x"; // staged"#).contains("staged"));
         // The evasion a reviewer proposed against the first draft: a DOUBLED
-        // SLASH inside a path string. `src//ed25519_sign.rs` is the same file to
+        // SLASH inside a path string. `src//staged.rs` is the same file to
         // Linux, so a stripper that cut there would let the include through.
         assert!(
-            strip_line_comments(r#"#[path = "../../engine/src//ed25519_sign.rs"] mod signing;"#)
-                .contains("ed25519_sign"),
+            strip_line_comments(r#"#[path = "../../engine/src//staged.rs"] mod staged;"#)
+                .contains("src//staged.rs"),
             "a doubled slash inside a path string must not hide the include"
         );
     }

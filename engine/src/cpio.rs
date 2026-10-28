@@ -53,14 +53,14 @@
 //! backwards. td's appendix goes onto a private copy of the SELECTOR
 //! initramfs — the artifact firmware loads, whose rootfs runs the td-boot that
 //! verifies. Its modified hash is recorded nowhere: the selector's own manifest
-//! describes the recipe output and is checked BEFORE the append. It is
-//! never appended as trust material to a deployment's `initramfs.cpio`: a
-//! trusted key there would be inside the artifact being authenticated.
+//! describes the recipe output and is checked BEFORE the append. The volume
+//! identity it carries belongs to the machine, not to a deployment, so it is
+//! never appended to a deployment's `initramfs.cpio`.
 //!
 //! Public build labels use a separate appendix (`boot_info`), added to a
-//! private deployment copy before regenerating and signing its manifest.
-//! That data is authenticated by the selector's key, never used as a key.
-//! The recipe output stays unchanged; deployment assembly owns its date.
+//! private deployment copy before regenerating its manifest, whose digest
+//! then names that copy. The recipe output stays unchanged; deployment
+//! assembly owns its date.
 //!
 //! ## Why the appendix works at all, and what it rests on
 //!
@@ -356,14 +356,14 @@ mod tests {
     /// only that way. Two of the six were sharp — `070702` turns the last field
     /// into a checksum the kernel verifies against the 0 written there
     /// (`init/initramfs.c:290-291`, `:430`), and a type nibble of `0o120000`
-    /// makes `do_header` take the `S_ISLNK` branch (`:306`) so the key's BYTES
-    /// become a symlink target.
+    /// makes `do_header` take the `S_ISLNK` branch (`:306`) so the file's
+    /// BYTES become a symlink target.
     #[test]
     fn header_fields_sit_at_their_spec_offsets() {
         let archive = build(&[Entry {
-            name: "etc/td/deployment.pub",
+            name: "etc/td/volume-uuid",
             mode: 0o644,
-            kind: Kind::File(b"key\n"),
+            kind: Kind::File(b"id!\n"),
         }])
         .unwrap();
 
@@ -387,9 +387,9 @@ mod tests {
         assert_eq!(field(&archive, 0, 8), 1, "devminor");
         assert_eq!(field(&archive, 0, 9), 0, "rdevmajor");
         assert_eq!(field(&archive, 0, 10), 0, "rdevminor");
-        assert_eq!(field(&archive, 0, 11), 22, "namesize counts the NUL");
+        assert_eq!(field(&archive, 0, 11), 19, "namesize counts the NUL");
         assert_eq!(field(&archive, 0, 12), 0, "chksum");
-        assert_eq!(name_at(&archive, 0, 22), "etc/td/deployment.pub");
+        assert_eq!(name_at(&archive, 0, 19), "etc/td/volume-uuid");
     }
 
     /// `nlink = 1` is what keeps the kernel's hardlink path out of this
@@ -577,7 +577,7 @@ mod tests {
                     kind: Kind::Directory,
                 },
                 Entry {
-                    name: "etc/deployment.pub",
+                    name: "etc/volume-uuid",
                     mode: 0o644,
                     kind: Kind::File(b"abc\n"),
                 },

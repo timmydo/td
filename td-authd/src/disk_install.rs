@@ -4,10 +4,9 @@
 
 use crate::installation_consent::{self as wire, Answer, Outcome, Report};
 use crate::secret_sys as sys;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, Command, Stdio};
 
@@ -16,8 +15,6 @@ const SOCKET: &str = "/run/td-authd/1000/setup";
 /// the socket and the only peer admitted.
 const INSTALLER_UID: u32 = 990;
 const CMDLINE: &str = "/proc/cmdline";
-/// The key the live selector handed to the live system (td-install/MEDIA.md).
-const TRUSTED_KEY: &str = "/run/td-volume/td/trusted.pub";
 /// A frame and its header.
 const FRAME_BYTES: usize = 4 + wire::MAX_MESSAGE_BYTES;
 /// Nonblocking reads, and writes, per heartbeat: a service cannot hold the
@@ -41,7 +38,7 @@ pub(crate) fn live_marker(cmdline: &str) -> Result<bool, String> {
     }
 }
 
-/// Whether this is a live boot whose handed-off trust root is in place.
+/// Whether this is a live boot.
 pub(crate) fn live_boot() -> Result<bool, String> {
     let mut cmdline = String::new();
     File::open(CMDLINE)
@@ -50,14 +47,7 @@ pub(crate) fn live_boot() -> Result<bool, String> {
     if cmdline.len() > 4096 {
         return Err(format!("{CMDLINE} exceeds 4096 bytes"));
     }
-    if !live_marker(&cmdline)? {
-        return Ok(false);
-    }
-    let key = fs::symlink_metadata(TRUSTED_KEY).map_err(|e| format!("{TRUSTED_KEY}: {e}"))?;
-    if !key.is_file() || key.uid() != 0 || key.mode() & 0o022 != 0 {
-        return Err("live trust root is not a protected root file".into());
-    }
-    Ok(true)
+    live_marker(&cmdline)
 }
 
 /// How an execution ended, as the service reported it.
@@ -98,7 +88,6 @@ impl Service {
                 "serve",
                 "/bin/td-boot",
                 "/run/td-media",
-                TRUSTED_KEY,
                 "/",
                 "/bin/td-firstboot",
             ])

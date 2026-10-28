@@ -218,8 +218,7 @@ pub(super) fn initramfs(
     phase: &str,
     extra: &[PackedFile],
 ) -> Result<Vec<u8>, String> {
-    let mut parents: std::collections::BTreeSet<String> =
-        key_path_parents().into_iter().map(str::to_owned).collect();
+    let mut parents = std::collections::BTreeSet::new();
     for (name, _, _) in common.iter().chain(extra) {
         let mut parent = Path::new(name).parent();
         while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
@@ -264,7 +263,7 @@ pub(super) struct LiveInstaller {
 }
 
 impl LiveInstaller {
-    pub(super) fn load(runner: &RecipeCheckRunner, trust: &RunTrust) -> Result<Self, String> {
+    pub(super) fn load(runner: &RecipeCheckRunner) -> Result<Self, String> {
         let outputs = runner.build_and_stage("td-install-qemu-test", OUTPUTS)?;
         let [probe, linux, installer, firstboot, init, boot, kexec, btrfs, tzdata] =
             outputs.as_slice()
@@ -301,7 +300,6 @@ impl LiveInstaller {
                 0o755,
                 read(&btrfs.join("bin/mkfs.btrfs"))?,
             ),
-            ("trusted.pub".into(), 0o644, trust.trusted_key_line()),
         ];
         let zoneinfo = tzdata.join("share/zoneinfo");
         let catalog = td_recipe::td_install_timezones::Catalog::load(&zoneinfo)
@@ -329,13 +327,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
     let timeout = installation_timeout(env::var("TD_QEMU_BOOT_TIMEOUT_SECS").ok().as_deref(), 180);
     let (code, vars_template) = efi::firmware(&qemu)?;
-    let trust = RunTrust::generate()?;
     let LiveInstaller {
         kernel,
         base,
         common,
-        mut extra,
-    } = LiveInstaller::load(runner, &trust)?;
+        extra,
+    } = LiveInstaller::load(runner)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let scratch = Scratch {
         dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
@@ -365,11 +362,10 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         manifest.push_str(&format!("{digest}  {name}\n"));
     }
     write(&deployment.join("manifest"), manifest.as_bytes())?;
-    trust.sign_deployment(&deployment)?;
     verify_deployment(&deployment)?;
     let id = crate::sha256::sha256_file(&deployment.join("manifest"))
         .map_err(|e| format!("hash manifest: {e}"))?;
-    // No key, as the stock template carries none: the guest's
+    // No volume identity, as the stock template carries none: the guest's
     // `prepare-selector` appends it, and the installed boots read it.
     let selector = initramfs(&base, &common, "selector\n", &[])?;
     write(&scratch.dir.join("selector.cpio"), &selector)?;
@@ -827,7 +823,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         }
         Ok(())
     };
-    // Retain the authentic manifest/signature and replace only one payload.
+    // Retain the authentic manifest and replace only one payload.
     let corrupt_root = scratch.dir.join("corrupt-root.erofs");
     write(&corrupt_root, b"tampered installation payload\n")?;
     let mut corrupt_payloads = payloads.clone();
@@ -839,29 +835,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let corrupt_iso = scratch.dir.join("corrupt-root.iso");
     media::write_image_with_payloads(&corrupt_iso, &kernel, &live, &corrupt_payloads)?;
     refuse("corrupt-root", &corrupt_iso, "root.erofs hash mismatch:")?;
-    // A second public key must refuse the otherwise identical signed source.
-    let wrong_key = RunTrust::generate()?.trusted_key_line();
-    let mut replaced = 0;
-    for (name, _, bytes) in &mut extra {
-        if name == "trusted.pub" {
-            *bytes = wrong_key.clone();
-            replaced += 1;
-        }
-    }
-    if replaced != 1 {
-        return Err("wrong-key fixture has no unique trust input".into());
-    }
-    let bad_live = scratch.dir.join("wrong-key.cpio");
-    write(&bad_live, &initramfs(&base, &common, "install\n", &extra)?)?;
-    let bad_iso = scratch.dir.join("wrong-key.iso");
-    media::write_image_with_payloads(&bad_iso, &kernel, &bad_live, &payloads)?;
-    refuse(
-        "wrong-key",
-        &bad_iso,
-        td_boot_protocol::MANIFEST_UNAUTHENTICATED,
-    )?;
     println!(
-        "PASS: native optical/USB virtio/NVMe 512-byte/4Kn and AHCI 512-byte installation and interrupted-publication refusal/reinstallation; guest-generated UUID binding across verified kexec and reordered disks; duplicate identity refusal; mounted writable USB media, undersized/read-only targets, exhausted scratch and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
+        "PASS: native optical/USB virtio/NVMe 512-byte/4Kn and AHCI 512-byte installation and interrupted-publication refusal/reinstallation; guest-generated UUID binding across verified kexec and reordered disks; duplicate identity refusal; mounted writable USB media, undersized/read-only targets, exhausted scratch and corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
     );
     Ok(())
 }
@@ -1822,13 +1797,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     let timeout = installation_timeout(env::var("TD_QEMU_BOOT_TIMEOUT_SECS").ok().as_deref(), 900);
     let (code, vars_template) = efi::firmware(&qemu)?;
     let (_, selector, source) = build_system(runner)?;
-    let trust = RunTrust::generate()?;
     let LiveInstaller {
         kernel,
         base,
         common,
         mut extra,
-    } = LiveInstaller::load(runner, &trust)?;
+    } = LiveInstaller::load(runner)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let scratch = Scratch {
         dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
@@ -1843,7 +1817,6 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             .checked_add(copied)
             .ok_or("system payload length overflow")?;
     }
-    trust.sign_deployment(&deployment)?;
     verify_deployment(&deployment)?;
     let id = crate::sha256::sha256_file(&deployment.join("manifest"))
         .map_err(|error| format!("hash system manifest: {error}"))?;
@@ -1958,12 +1931,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             if installations.is_empty() {
                 // Firmware cannot inject autotest tokens. Keep both stock firmware
                 // boots above and add one direct selector boot of that SAME disk.
-                let provisioned = provision_selector_as(
-                    &selector,
-                    &scratch.dir,
-                    &trust,
-                    SelectorRole::Installed(&uuid),
-                )?;
+                let provisioned =
+                    provision_selector_as(&selector, &scratch.dir, SelectorRole::Installed(&uuid))?;
                 let app_timeout = boot_timeout();
                 let tokens = format!(
                     "{AUTOTEST_CMDLINE_TOKEN} {}",

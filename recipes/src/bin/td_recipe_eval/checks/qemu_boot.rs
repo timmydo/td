@@ -841,10 +841,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     let (bzimage, selector, deployment) = build_system(runner)?;
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
     let seccomp_probe = build_td_jail_seccomp_probe(runner)?;
-    // One trust root for the run: its public half rides the selector this boots,
-    // its private half signs every deployment reaching the volume below.
-    let trust = RunTrust::generate()?;
-    let init_cpio = provision_selector(&selector, runner.scratch_dir(), &trust)?;
+    // One volume identity for the run: its UUID rides the selector this boots.
+    // Root-owned, because the oracle's `td-boot update` passes refuse a channel
+    // its guest root does not own.
+    let identity =
+        RunVolume::generate_root_owned(PathBuf::from(runner.builder_command().get_program()))?;
+    let init_cpio = provision_selector(&selector, runner.scratch_dir(), &identity)?;
     let volume = runner.scratch_dir().join("system-volume.btrfs");
     let fixture = create_persistent_volume_layout(
         &deployment,
@@ -853,7 +855,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &volume,
         VolumeLayout::Transactional,
         true,
-        &trust,
+        &identity,
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
         None,
@@ -996,10 +998,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         runner.scratch_dir(),
         true,
     )?;
-    let moved = format!(
-        "TD-BOOT-VOLUME {} /dev/vdb",
-        installation_uuid(&trust.public)
-    );
+    let moved = format!("TD-BOOT-VOLUME {} /dev/vdb", identity.uuid());
     if !healthy_candidate
         .console
         .lines()
@@ -1133,7 +1132,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &volume,
         VolumeLayout::Transactional,
         true,
-        &trust,
+        &identity,
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
         None,
@@ -1321,7 +1320,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &volume,
         VolumeLayout::CorruptCurrent,
         true,
-        &trust,
+        &identity,
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
         None,
@@ -3302,13 +3301,13 @@ pub(crate) fn verify_selector(boot: &Path) -> Result<VerifiedSelector, String> {
 /// A selector initramfs straight from the store, verified against its own
 /// manifest — and NOT yet bootable.
 ///
-/// The path is private on purpose. Every provisioning helper appends the run's
-/// trusted key: `provision_selector` also binds a volume, and
+/// The path is private on purpose. Every provisioning helper appends an
+/// identity: `provision_selector` binds a volume, and
 /// `provision_live_selector` marks a live selector instead. The one exception
 /// is `stage_stock_selector_template`, the live installer's media input,
-/// whose key that installer appends; no other helper exposes the
+/// whose identity that installer appends; no other helper exposes the
 /// unprovisioned original.
-/// That mistake has no symptom: the machine comes up with no trust root and
+/// That mistake has no symptom: the machine comes up bound to no volume and
 /// nothing on either side reports it. A review found four mutations of exactly
 /// that shape surviving the whole suite, which is why this is a type rather
 /// than another assertion.
@@ -3343,8 +3342,8 @@ fn build_persistent_system(
     let (bzimage, selector, deployment) = build_system(runner)?;
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
     let seccomp_probe = build_td_jail_seccomp_probe(runner)?;
-    let trust = RunTrust::generate()?;
-    let initramfs = provision_selector(&selector, runner.scratch_dir(), &trust)?;
+    let identity = RunVolume::generate()?;
+    let initramfs = provision_selector(&selector, runner.scratch_dir(), &identity)?;
     let volume = runner.scratch_dir().join("system-volume.btrfs");
     create_persistent_volume_layout(
         &deployment,
@@ -3353,7 +3352,7 @@ fn build_persistent_system(
         &volume,
         VolumeLayout::Basic,
         true,
-        &trust,
+        &identity,
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
         None,
@@ -3409,8 +3408,8 @@ pub(crate) fn build_btrfs_tools(runner: &RecipeCheckRunner) -> Result<(PathBuf, 
 /// oracle input on the build host and may carry whatever scaffolding makes an
 /// assertion mean something. A `Published` one is handed to strangers, so it
 /// carries no scaffolding and leaks nothing about the machine that built it.
-/// An `Installation` retains its own private key and gives a local build graph
-/// two TiB of sparse virtual capacity; it is never a redistributable template.
+/// An `Installation` persists guest writes and gives a local build graph two
+/// TiB of sparse virtual capacity; it is never a redistributable template.
 /// An `Image` is a `Published` volume sized to fill a disk image's volume
 /// partition (`server_image`), whose geometry the caller fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3437,7 +3436,7 @@ pub(crate) fn create_persistent_volume(
     mkfs: &Path,
     btrfs: &Path,
     output: &Path,
-    trust: &RunTrust,
+    identity: &RunVolume,
     purpose: VolumePurpose,
 ) -> Result<(), String> {
     create_persistent_volume_layout(
@@ -3447,7 +3446,7 @@ pub(crate) fn create_persistent_volume(
         output,
         VolumeLayout::Basic,
         false,
-        trust,
+        identity,
         None,
         purpose,
         None,
@@ -3462,7 +3461,7 @@ pub(crate) fn create_release_volume(
     mkfs: &Path,
     btrfs: &Path,
     output: &Path,
-    trust: &RunTrust,
+    identity: &RunVolume,
     source: &Path,
 ) -> Result<(), String> {
     create_persistent_volume_layout(
@@ -3472,9 +3471,9 @@ pub(crate) fn create_release_volume(
         output,
         VolumeLayout::Basic,
         false,
-        trust,
+        identity,
         None,
-        if matches!(&trust.signing, SigningIdentity::Installation { .. }) {
+        if identity.installation {
             VolumePurpose::Installation
         } else {
             VolumePurpose::Published
@@ -3535,16 +3534,14 @@ fn create_persistent_volume_layout(
     output: &Path,
     layout: VolumeLayout,
     system_runtime_fixtures: bool,
-    trust: &RunTrust,
+    identity: &RunVolume,
     seccomp_probe: Option<&Path>,
     purpose: VolumePurpose,
     source: Option<&Path>,
     account: Option<&crate::checks::provisioned_account::ProvisionedAccount>,
 ) -> Result<VolumeFixture, String> {
-    if matches!(&trust.signing, SigningIdentity::Installation { .. })
-        != (purpose == VolumePurpose::Installation)
-    {
-        return Err("installation volume and signing identity must agree".into());
+    if identity.installation != (purpose == VolumePurpose::Installation) {
+        return Err("installation volume and identity must agree".into());
     }
     let manifest = deployment.join("manifest");
     let deployment_id = crate::sha256::sha256_file(&manifest)
@@ -3588,11 +3585,10 @@ fn create_persistent_volume_layout(
     }
     let _seed_cleanup = Scratch { dir: seed.clone() };
 
-    populate_persistent_seed(deployment, &seed, &deployment_id, trust, purpose)?;
+    populate_persistent_seed(deployment, &seed, &deployment_id, purpose)?;
     if let Some(account) = account {
         account.stage(&seed)?;
     }
-    trust.stage_installation_identity(&seed)?;
     if let Some(source) = source {
         super::release_source::copy_to_volume(source, &seed)?;
     }
@@ -3605,16 +3601,21 @@ fn create_persistent_volume_layout(
     let alternate_id = match layout {
         VolumeLayout::Basic => deployment_id.clone(),
         VolumeLayout::Transactional => {
-            let candidate = seed
-                .join(td_boot_protocol::VOLUME_CHANNEL_DIR)
-                .join(td_boot_protocol::CHANNEL_CANDIDATE);
-            create_bootable_candidate(deployment, &candidate, trust)?
+            let channel = seed.join(td_boot_protocol::VOLUME_CHANNEL_DIR);
+            let candidate = channel.join(td_boot_protocol::CHANNEL_CANDIDATE);
+            let id = create_bootable_candidate(deployment, &candidate)?;
+            // `td-boot update` refuses a channel, a directory above it, a
+            // candidate or a candidate file that others can write, and
+            // `--rootdir` copies modes in verbatim, so none is left to the
+            // runner's umask.
+            pin_update_offer(&seed, &channel, &candidate)?;
+            id
         }
         VolumeLayout::CorruptCurrent => {
             let candidate = seed
                 .join(td_boot_protocol::VOLUME_CHANNEL_DIR)
                 .join("corrupt-candidate");
-            let id = create_bootable_candidate(deployment, &candidate, trust)?;
+            let id = create_bootable_candidate(deployment, &candidate)?;
             let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
             fs::rename(&candidate, &installed).map_err(|e| {
                 format!(
@@ -3637,7 +3638,7 @@ fn create_persistent_volume_layout(
             let candidate = seed
                 .join(td_boot_protocol::VOLUME_CHANNEL_DIR)
                 .join("rollback-current");
-            let id = create_bootable_candidate(deployment, &candidate, trust)?;
+            let id = create_bootable_candidate(deployment, &candidate)?;
             let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
             fs::rename(&candidate, &installed).map_err(|e| {
                 format!(
@@ -3665,16 +3666,15 @@ fn create_persistent_volume_layout(
         File::create(output)
             .map_err(|e| format!("create persistent volume {}: {e}", output.display()))?;
     }
-    // One provisioning identity binds selector and volume for every profile.
-    // Independent installations/runs have independent public keys.
-    let fixture_uuid = installation_uuid(&trust.public);
-    let status = trust
+    // One identity binds selector and volume for every profile; independent
+    // installations and runs draw independent UUIDs.
+    let status = identity
         .mkfs_command(mkfs)
         .args(["--rootdir"])
         .arg(&seed)
         .args(["--subvol", "rw:@var", "--byte-count"])
         .arg(volume_bytes.to_string())
-        .args(["--uuid", &fixture_uuid, "--label", "td-system"])
+        .args(["--uuid", identity.uuid(), "--label", "td-system"])
         .arg(output)
         .status()
         .map_err(|e| format!("spawn {}: {e}", mkfs.display()))?;
@@ -3808,58 +3808,36 @@ fn copy_candidate_payload(source: &Path, destination: &Path) -> Result<(), Strin
     Ok(())
 }
 
-/// A deployment signing context. Fixtures discard their seed; an installation
-/// retains its source-built ring signer's key in private writable state.
-///
-/// The public half goes into the SELECTOR initramfs — the artifact firmware
-/// loads, and the rootfs `td-boot boot` is running from when it selects and
-/// verifies. The private half signs every deployment that reaches the volume.
-///
-/// WHICH initramfs is the whole of it. The deployment's own initramfs is a
-/// payload the manifest hashes and it sits on the Btrfs volume, so a key there
-/// would be inside the artifact being authenticated: a hostile update source
-/// supplies bundle, key and signature together and self-authenticates, which
-/// is the Btrfs-volume weakening §6 forbids by name. Putting it in the selector
-/// also keeps D3 intact — rotating the key changes the selector rather than any
-/// deployment's initramfs digest, so a re-signed deployment keeps its id.
-enum SigningIdentity {
-    Throwaway([u8; 32]),
-    Installation {
-        signer: PathBuf,
-        key: PathBuf,
-        builder: PathBuf,
-    },
-}
-
-pub(crate) struct RunTrust {
-    signing: SigningIdentity,
-    public: [u8; 32],
-    /// The builder that maps a throwaway volume seed's owner to guest root,
-    /// as an installation's is mapped; none records the host owner.
+/// One run's volume identity: the random UUID that binds a provisioned
+/// selector to the volume it boots, drawn per run as `td-install
+/// new-volume-uuid` draws one per installation, and how `mkfs.btrfs` records
+/// the seed's owner.
+pub(crate) struct RunVolume {
+    uuid: String,
+    /// The builder that maps the seed's owner to guest root while mkfs reads
+    /// it; none records the host owner.
     root_owner: Option<PathBuf>,
+    /// A private installation, whose volume persists guest writes.
+    installation: bool,
 }
 
-impl RunTrust {
-    /// D4: a signing key never enters a recipe or a store path, so it is made
-    /// here, host-side, from `/dev/urandom` and dropped when the run ends.
+impl RunVolume {
     pub(crate) fn generate() -> Result<Self, String> {
-        let mut seed = [0u8; 32];
+        let mut bytes = [0u8; 16];
         File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut seed))
-            .map_err(|e| format!("read /dev/urandom for a throwaway signing seed: {e}"))?;
-        let public = td_engine::ed25519_sign::public_key(&seed)
-            .ok_or_else(|| "derive a public key from the throwaway seed".to_string())?;
+            .and_then(|mut f| f.read_exact(&mut bytes))
+            .map_err(|e| format!("read /dev/urandom for a volume UUID: {e}"))?;
         Ok(Self {
-            signing: SigningIdentity::Throwaway(seed),
-            public,
+            uuid: volume_uuid(bytes),
             root_owner: None,
+            installation: false,
         })
     }
 
-    /// `generate`, its volumes' files guest root's: mkfs runs beneath
+    /// `generate`, its volume's files guest root's: mkfs runs beneath
     /// `builder userns-private`, as an installation's does, so a guest
-    /// reader that requires root's files, as the login worker's retained
-    /// deployment read does, accepts them.
+    /// reader that requires root's files — the login worker's retained
+    /// deployment read, `td-boot update`'s channel — accepts them.
     pub(crate) fn generate_root_owned(builder: PathBuf) -> Result<Self, String> {
         Ok(Self {
             root_owner: Some(builder),
@@ -3867,76 +3845,22 @@ impl RunTrust {
         })
     }
 
-    /// Provision one private installation outside the artifact graph.
-    pub(crate) fn installation(
-        signer: PathBuf,
-        state: &Path,
-        builder: PathBuf,
-    ) -> Result<Self, String> {
-        let output = Command::new(&signer)
-            .env_clear()
-            .args(["deploy", "identity"])
-            .arg(state)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| format!("provision installation signing identity: {e}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "installation signer failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        let public = canonical_hex::<32>(&output.stdout)?;
+    /// One private installation outside the artifact graph, root-owned.
+    pub(crate) fn installation(builder: PathBuf) -> Result<Self, String> {
         Ok(Self {
-            signing: SigningIdentity::Installation {
-                signer,
-                key: state.join("deployment.pk8"),
-                builder,
-            },
-            public,
-            root_owner: None,
+            installation: true,
+            ..Self::generate_root_owned(builder)?
         })
     }
 
-    fn stage_installation_identity(&self, seed: &Path) -> Result<(), String> {
-        let SigningIdentity::Installation { key, .. } = &self.signing else {
-            return Ok(());
-        };
-        let lib = seed.join("@var/lib");
-        let state = lib.join("td-deploy");
-        fs::create_dir_all(&state).map_err(|e| format!("create installation state seed: {e}"))?;
-        fs::set_permissions(&lib, fs::Permissions::from_mode(0o755))
-            .and_then(|()| fs::set_permissions(&state, fs::Permissions::from_mode(0o700)))
-            .map_err(|e| format!("protect installation state seed: {e}"))?;
-        let mut input =
-            File::open(key).map_err(|e| format!("open retained installation key: {e}"))?;
-        let mut bytes = Vec::new();
-        (&mut input)
-            .take(16385)
-            .read_to_end(&mut bytes)
-            .map_err(|e| format!("read retained installation key: {e}"))?;
-        if bytes.is_empty() || bytes.len() > 16384 {
-            return Err("retained installation key has an invalid size".into());
-        }
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(state.join("deployment.pk8"))
-            .map_err(|e| format!("create installation key seed: {e}"))?;
-        output
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .and_then(|()| output.write_all(&bytes))
-            .and_then(|()| output.sync_all())
-            .map_err(|e| format!("persist installation key seed: {e}"))
+    pub(crate) fn uuid(&self) -> &str {
+        &self.uuid
     }
 
     fn mkfs_command(&self, mkfs: &Path) -> Command {
-        match (&self.signing, &self.root_owner) {
-            (SigningIdentity::Throwaway(_), None) => Command::new(mkfs),
-            (SigningIdentity::Throwaway(_), Some(builder))
-            | (SigningIdentity::Installation { builder, .. }, _) => {
+        match &self.root_owner {
+            None => Command::new(mkfs),
+            Some(builder) => {
                 // mkfs records numeric owners. Map the private seed's owner to
                 // guest root without host privilege or a first-boot chown.
                 let mut command = Command::new(builder);
@@ -3945,77 +3869,12 @@ impl RunTrust {
             }
         }
     }
-
-    /// The public half in the wire format td-boot reads: lowercase hex, one
-    /// trailing newline.
-    pub(crate) fn trusted_key_line(&self) -> Vec<u8> {
-        hex_line(&self.public)
-    }
-
-    /// Write `manifest.sig` beside a staged deployment's manifest.
-    ///
-    /// EVERY deployment that reaches the volume gets one, not just the ones a
-    /// test swaps in. The seed deployment is what current and previous point at
-    /// and what every mode but the transactional ones boots, so signing only
-    /// candidates would leave the ordinary boot path unsigned — and the moment
-    /// verification is fail-closed, refused.
-    fn sign_deployment(&self, directory: &Path) -> Result<(), String> {
-        self.sign_file(
-            &directory.join(td_boot_protocol::MANIFEST_NAME),
-            &directory.join(td_boot_protocol::MANIFEST_SIG_NAME),
-        )
-    }
-
-    /// Write `input`'s detached signature to `path` as a hex line. A run key
-    /// signs any bytes; its callers sign only files whose first line names
-    /// their format, as a manifest and a provision do, and td-boot's format
-    /// checks keep one signature from standing for another kind of file. An
-    /// installation key signs manifests only, as its signer does.
-    pub(crate) fn sign_file(&self, input: &Path, path: &Path) -> Result<(), String> {
-        let bytes =
-            fs::read(input).map_err(|e| format!("read {} to sign: {e}", input.display()))?;
-        match &self.signing {
-            SigningIdentity::Throwaway(seed) => {
-                let signature = td_engine::ed25519_sign::sign(seed, &bytes)
-                    .ok_or_else(|| format!("sign {}", input.display()))?;
-                fs::write(path, hex_line(&signature))
-                    .map_err(|e| format!("write signature {}: {e}", path.display()))?;
-            }
-            SigningIdentity::Installation { signer, key, .. } => {
-                if !bytes.starts_with(td_boot_protocol::MANIFEST_HEADER) {
-                    return Err(format!(
-                        "{}: an installation key signs deployment manifests only",
-                        input.display()
-                    ));
-                }
-                let status = Command::new(signer)
-                    .env_clear()
-                    .args(["deploy", "sign"])
-                    .arg(input)
-                    .arg(key)
-                    .arg(path)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .status()
-                    .map_err(|e| format!("sign with the installation key: {e}"))?;
-                if !status.success() {
-                    return Err(format!("installation signing failed ({status})"));
-                }
-                let signature = canonical_hex::<64>(
-                    &fs::read(path).map_err(|e| format!("read installation signature: {e}"))?,
-                )?;
-                if !td_engine::ed25519::verify(&self.public, &bytes, &signature) {
-                    return Err("installation signature does not match its selector key".into());
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
-fn installation_uuid(public: &[u8; 32]) -> String {
+/// A version-4 UUID's text from 16 random bytes.
+fn volume_uuid(bytes: [u8; 16]) -> String {
     let mut uuid = String::with_capacity(36);
-    for (index, byte) in public.iter().take(16).enumerate() {
+    for (index, byte) in bytes.iter().enumerate() {
         if matches!(index, 4 | 6 | 8 | 10) {
             uuid.push('-');
         }
@@ -4030,29 +3889,8 @@ fn installation_uuid(public: &[u8; 32]) -> String {
     uuid
 }
 
-fn canonical_hex<const N: usize>(bytes: &[u8]) -> Result<[u8; N], String> {
-    if bytes.len() != N.saturating_mul(2).saturating_add(1) || bytes.last() != Some(&b'\n') {
-        return Err("signer did not return canonical hex".into());
-    }
-    let digits = bytes
-        .get(..N.saturating_mul(2))
-        .ok_or("missing signer hex")?;
-    if !digits
-        .iter()
-        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
-    {
-        return Err("signer did not return lowercase hex".into());
-    }
-    let nibble = |c: u8| if c <= b'9' { c - b'0' } else { c - b'a' + 10 };
-    let mut result = [0; N];
-    for (output, [hi, lo]) in result.iter_mut().zip(digits.as_chunks::<2>().0) {
-        *output = (nibble(*hi) << 4) | nibble(*lo);
-    }
-    Ok(result)
-}
-
 /// Copy the verified selector initramfs into scratch and append this run's
-/// trusted key to the copy, returning the path to boot.
+/// volume identity to the copy, returning the path to boot.
 ///
 /// A copy because the verified original is a content-addressed store output,
 /// and because `verify_selector` has already checked it against its own
@@ -4061,21 +3899,20 @@ fn canonical_hex<const N: usize>(bytes: &[u8]) -> Result<[u8; N], String> {
 pub(crate) fn provision_selector(
     selector: &VerifiedSelector,
     destination_dir: &Path,
-    trust: &RunTrust,
+    identity: &RunVolume,
 ) -> Result<PathBuf, String> {
     provision_selector_as(
         selector,
         destination_dir,
-        trust,
-        SelectorRole::Installed(&installation_uuid(&trust.public)),
+        SelectorRole::Installed(identity.uuid()),
     )
 }
 
 /// Stage the stock selector, as root.erofs carries it at
-/// `SELECTOR_TEMPLATE_PATH`, at `media_input`: no trust root and no volume
-/// identity. The live installer's `td-install prepare-selector` appends both,
-/// so an installed boot proves the key that command appended rather than one
-/// this host baked in. The one sanctioned bare copy, and written only where
+/// `SELECTOR_TEMPLATE_PATH`, at `media_input`: no volume identity. The live
+/// installer's `td-install prepare-selector` appends one, so an installed boot
+/// proves the identity that command appended rather than one this host baked
+/// in. The one sanctioned bare copy, and written only where
 /// the media writer reads its inputs: no path to it is returned, so it cannot
 /// be handed to a boot.
 pub(crate) fn stage_stock_selector_template(
@@ -4086,16 +3923,15 @@ pub(crate) fn stage_stock_selector_template(
 }
 
 /// Install media boot the deployment they carry (td-install/MEDIA.md "Live
-/// boot"): the key and the live marker, and no volume identity.
+/// boot"): the live marker, and no volume identity.
 pub(crate) fn provision_live_selector(
     selector: &VerifiedSelector,
     destination_dir: &Path,
-    trust: &RunTrust,
 ) -> Result<PathBuf, String> {
-    provision_selector_as(selector, destination_dir, trust, SelectorRole::Live)
+    provision_selector_as(selector, destination_dir, SelectorRole::Live)
 }
 
-/// What a provisioned selector boots, beyond the key every one carries.
+/// What a provisioned selector boots.
 #[derive(Clone, Copy)]
 enum SelectorRole<'a> {
     /// The installed volume with this UUID.
@@ -4107,7 +3943,6 @@ enum SelectorRole<'a> {
 fn provision_selector_as(
     selector: &VerifiedSelector,
     destination_dir: &Path,
-    trust: &RunTrust,
     role: SelectorRole,
 ) -> Result<PathBuf, String> {
     let filename = match role {
@@ -4132,30 +3967,26 @@ fn provision_selector_as(
             provisioned.display()
         )
     })?;
-    append_selector_identity(&provisioned, &trust.trusted_key_line(), role)?;
+    append_selector_identity(&provisioned, role)?;
     Ok(provisioned)
 }
 
-/// Append the key and optional volume UUID as a concatenated cpio archive.
+/// Append the volume UUID or the live marker as a concatenated cpio archive.
 ///
 /// The alignment is the whole of this function's correctness and is NOT
 /// backstopped by the kernel. A misaligned appendix makes `do_reset` error
 /// `broken padding`, and because td's initramfs is an initrd whose base
 /// archive carries `/init`, that error only logs (`KERN_INFO`, with a copy of
 /// the initrd left in rootfs as `/initrd.image`, since `CONFIG_BLK_DEV_RAM` is
-/// on) and the boot CONTINUES with the key absent
+/// on) and the boot CONTINUES with the identity absent
 /// (`init/initramfs.c:734-741`, `init/main.c:1675-1682`). Nothing
 /// downstream reports it, so the padding here is the only thing between a run
-/// and a machine that boots without its trust root.
+/// and a selector that boots without its volume identity or live marker.
 ///
 /// The directory entries are emitted rather than assumed: neither phase of
 /// `build_initramfs_spec` creates `/etc`, and a missing parent is silent too —
 /// `filp_open` failing is `return 0` (`init/initramfs.c:393-395`).
-fn append_selector_identity(
-    initramfs: &Path,
-    key: &[u8],
-    role: SelectorRole,
-) -> Result<(), String> {
+fn append_selector_identity(initramfs: &Path, role: SelectorRole) -> Result<(), String> {
     use td_engine::cpio::{Entry, Kind};
 
     // The caller's copy came from a store output, and `fs::copy` preserves the
@@ -4181,8 +4012,19 @@ fn append_selector_identity(
     let length = usize::try_from(length)
         .map_err(|_| format!("initramfs {} is too large", initramfs.display()))?;
 
+    let uuid_line;
+    let (path, bytes): (&str, &[u8]) = match role {
+        SelectorRole::Installed(uuid) => {
+            uuid_line = format!("{uuid}\n");
+            (td_boot_protocol::VOLUME_UUID_PATH, uuid_line.as_bytes())
+        }
+        SelectorRole::Live => (
+            td_boot_protocol::LIVE_MEDIA_MARKER_PATH,
+            td_boot_protocol::LIVE_MEDIA_MARKER,
+        ),
+    };
     let mut entries = Vec::new();
-    for parent in key_path_parents() {
+    for parent in path_parents(path) {
         entries.push(Entry {
             name: parent,
             mode: 0o755,
@@ -4190,29 +4032,10 @@ fn append_selector_identity(
         });
     }
     entries.push(Entry {
-        name: td_boot_protocol::TRUSTED_KEY_PATH,
+        name: path,
         mode: 0o644,
-        kind: Kind::File(key),
+        kind: Kind::File(bytes),
     });
-
-    let uuid_line = match role {
-        SelectorRole::Installed(uuid) => Some(format!("{uuid}\n")),
-        SelectorRole::Live => None,
-    };
-    if let Some(uuid) = &uuid_line {
-        entries.push(Entry {
-            name: td_boot_protocol::VOLUME_UUID_PATH,
-            mode: 0o644,
-            kind: Kind::File(uuid.as_bytes()),
-        });
-    }
-    if matches!(role, SelectorRole::Live) {
-        entries.push(Entry {
-            name: td_boot_protocol::LIVE_MEDIA_MARKER_PATH,
-            mode: 0o644,
-            kind: Kind::File(td_boot_protocol::LIVE_MEDIA_MARKER),
-        });
-    }
 
     let mut appendix = vec![0u8; td_engine::cpio::alignment_padding(length)];
     appendix.extend_from_slice(&td_engine::cpio::build(&entries)?);
@@ -4221,16 +4044,15 @@ fn append_selector_identity(
         .append(true)
         .open(initramfs)
         .and_then(|mut f| f.write_all(&appendix))
-        .map_err(|e| format!("append key archive to {}: {e}", initramfs.display()))
+        .map_err(|e| format!("append identity archive to {}: {e}", initramfs.display()))
 }
 
-/// Every proper directory prefix of `TRUSTED_KEY_PATH`, shallowest first.
+/// Every proper directory prefix of `path`, shallowest first.
 ///
-/// Derived from the path rather than written beside it, so moving the key
+/// Derived from the path rather than written beside it, so moving a member
 /// cannot leave the parent list behind — which the kernel would report by
 /// creating nothing at all.
-fn key_path_parents() -> Vec<&'static str> {
-    let path = td_boot_protocol::TRUSTED_KEY_PATH;
+fn path_parents(path: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut at = 0usize;
     while let Some(slash) = path.get(at..).and_then(|rest| rest.find('/')) {
@@ -4243,11 +4065,7 @@ fn key_path_parents() -> Vec<&'static str> {
     out
 }
 
-fn create_bootable_candidate(
-    deployment: &Path,
-    destination: &Path,
-    trust: &RunTrust,
-) -> Result<String, String> {
+fn create_bootable_candidate(deployment: &Path, destination: &Path) -> Result<String, String> {
     fs::create_dir_all(destination)
         .map_err(|e| format!("create candidate directory {}: {e}", destination.display()))?;
     for name in ["bzImage", "initramfs.cpio", "root.erofs"] {
@@ -4274,23 +4092,9 @@ fn create_bootable_candidate(
     );
     fs::write(destination.join("manifest"), manifest)
         .map_err(|e| format!("write candidate manifest {}: {e}", destination.display()))?;
-    trust.sign_deployment(destination)?;
     verify_deployment(destination)?;
     crate::sha256::sha256_file(&destination.join("manifest"))
         .map_err(|e| format!("hash candidate manifest {}: {e}", destination.display()))
-}
-
-/// Lowercase hex plus a trailing newline — the wire format DESIGN.md §6 fixes
-/// for both the key and the signature, and the one td-boot's `decode_hex` trims
-/// back off. Lowercase is the documented half a permissive reader would hide.
-fn hex_line(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len().saturating_mul(2).saturating_add(1));
-    for byte in bytes {
-        out.push(hex_nibble(byte >> 4));
-        out.push(hex_nibble(byte & 0xf));
-    }
-    out.push(b'\n');
-    out
 }
 
 fn hex_nibble(value: u8) -> u8 {
@@ -4318,7 +4122,6 @@ fn populate_persistent_seed(
     deployment: &Path,
     seed: &Path,
     deployment_id: &str,
-    trust: &RunTrust,
     purpose: VolumePurpose,
 ) -> Result<(), String> {
     let installed = seed
@@ -4334,11 +4137,9 @@ fn populate_persistent_seed(
         let target = installed.join(name);
         link_or_copy(&source, &target)?;
     }
-    // The staged copy is signed, not the recipe output: the source is a
-    // read-only store path, and `link_or_copy` hard-links when it can, so a
-    // signature written through it would land in the store.
-    trust.sign_deployment(&installed)?;
-    stage_volume_trust_roots(seed, trust, purpose)?;
+    if purpose == VolumePurpose::Fixture {
+        stage_idle_channel(seed)?;
+    }
     for slot in ["current", "previous"] {
         let link = seed.join(td_boot_protocol::BOOT_DIR).join(slot);
         symlink(
@@ -4350,70 +4151,43 @@ fn populate_persistent_seed(
     Ok(())
 }
 
-/// The two keys a booted machine's update path is given, written where
-/// `td-install` would put the first (DESIGN §10 item 10a).
+/// The idle channel is a DIRECTORY and stays empty; `update` must read it as
+/// nothing to do rather than as a fault. Its mode, and those of the volume
+/// root and `td/` above it, are pinned because `mkfs.btrfs --rootdir` copies
+/// them in verbatim and `td-boot update` refuses a channel, or a directory
+/// above it, that anyone but its owner can write.
 ///
-/// The wrong one is what makes the oracle's update passes mean anything: the
-/// candidate is signed by the run key whether or not td-boot is told to check
-/// it, so an ignored `trusted-key` argument would leave every existing
-/// assertion green. It is a REAL key rather than a corrupt file, so the refusal
-/// it earns is a signature that does not verify and not a key that will not
-/// parse — those are different failures and only the first is the one under
-/// test.
-///
-/// Mode 0644 explicitly: `mkfs.btrfs --rootdir` copies a mode in verbatim, so
-/// an ambient umask would otherwise decide what the fixture's trust root looks
-/// like — the pin `td-install` makes for the same reason.
-fn stage_volume_trust_roots(
-    seed: &Path,
-    trust: &RunTrust,
-    purpose: VolumePurpose,
-) -> Result<(), String> {
-    let decoy = RunTrust::generate()?;
-    if decoy.trusted_key_line() == trust.trusted_key_line() {
-        return Err("the decoy trust root matched the run key".to_string());
+/// Fixture-only. `td/incoming-idle` is not a path any real deployment has:
+/// only the boot oracle names it, to prove `td-boot update` reads an empty
+/// channel as nothing to do. A published volume carrying it would be shipping
+/// the test's furniture to strangers.
+fn stage_idle_channel(seed: &Path) -> Result<(), String> {
+    let idle = seed.join(td_recipe::shared::DEPLOY_IDLE_CHANNEL);
+    fs::create_dir_all(&idle)
+        .map_err(|e| format!("create fixture idle channel {}: {e}", idle.display()))?;
+    for path in [seed.to_path_buf(), seed.join("td"), idle] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod fixture idle channel {}: {e}", path.display()))?;
     }
-    // The idle channel is a DIRECTORY and stays empty; `update` must read it as
-    // nothing to do rather than as a fault. Its mode is pinned for the trust
-    // roots' reason below — `--rootdir` copies one in verbatim — and to 0755
-    // because that is what `td-install` gives the real channel.
-    //
-    // Fixture-only, like the decoy. `td/incoming-idle` is not a path any real
-    // deployment has: only the boot oracle names it, to prove `td-boot update`
-    // reads an empty channel as nothing to do. A published volume carrying it
-    // would be shipping the test's furniture to strangers.
-    if purpose == VolumePurpose::Fixture {
-        let idle = seed.join(td_recipe::shared::DEPLOY_IDLE_CHANNEL);
-        fs::create_dir_all(&idle)
-            .map_err(|e| format!("create fixture idle channel {}: {e}", idle.display()))?;
-        fs::set_permissions(&idle, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod fixture idle channel {}: {e}", idle.display()))?;
-    }
-    // The decoy is oracle scaffolding: it exists so an ignored `--trusted-key`
-    // cannot leave the update assertions green. A published volume gets only
-    // the real root — shipping a deliberately-wrong trust root to strangers
-    // invites exactly the misreading the README works to avoid, and proves
-    // nothing to anyone who is not running the oracle.
-    let mut roots = vec![(
-        td_boot_protocol::VOLUME_TRUSTED_KEY,
-        trust.trusted_key_line(),
-    )];
-    if purpose == VolumePurpose::Fixture {
-        roots.push((
-            td_recipe::shared::DEPLOY_WRONG_KEY,
-            decoy.trusted_key_line(),
-        ));
-    }
-    for (relative, line) in roots {
-        let path = seed.join(relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("create fixture trust root dir {}: {e}", parent.display()))?;
-        }
-        fs::write(&path, &line)
-            .map_err(|e| format!("write fixture trust root {}: {e}", path.display()))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
-            .map_err(|e| format!("chmod fixture trust root {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// The seed's volume root, `td/`, the channel and the candidate at 0755,
+/// and the candidate's four files at 0644: what `td-boot update` admits.
+fn pin_update_offer(seed: &Path, channel: &Path, candidate: &Path) -> Result<(), String> {
+    let td = seed.join("td");
+    for (path, mode) in [
+        (seed.to_path_buf(), 0o755),
+        (td, 0o755),
+        (channel.to_path_buf(), 0o755),
+        (candidate.to_path_buf(), 0o755),
+        (candidate.join("manifest"), 0o644),
+        (candidate.join("bzImage"), 0o644),
+        (candidate.join("initramfs.cpio"), 0o644),
+        (candidate.join("root.erofs"), 0o644),
+    ] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("chmod fixture update offer {}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -9159,73 +8933,31 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     #[test]
-    fn installation_uuid_uses_all_fields_and_retains_the_identity() {
-        let a = installation_uuid(&[0; 32]);
-        let b = installation_uuid(&[255; 32]);
+    fn volume_uuids_are_version_4_and_drawn_per_run() {
+        let a = volume_uuid([0; 16]);
+        let b = volume_uuid([255; 16]);
         assert_eq!(a, "00000000-0000-4000-8000-000000000000");
         assert_eq!(b, "ffffffff-ffff-4fff-bfff-ffffffffffff");
-        assert!(a
-            .split('-')
-            .zip(b.split('-'))
-            .all(|(left, right)| left != right));
-        assert_eq!(a, installation_uuid(&[0; 32]));
-    }
-
-    #[test]
-    fn installation_signer_output_requires_exact_canonical_bytes() {
-        assert_eq!(canonical_hex::<2>(b"01af\n").unwrap(), [1, 175]);
-        for wrong in [b"01AF\n".as_slice(), b"01af", b"01af\n\n", b"01ag\n", b"\n"] {
-            assert!(canonical_hex::<2>(wrong).is_err());
+        let first = RunVolume::generate().unwrap();
+        let second = RunVolume::generate().unwrap();
+        assert_ne!(first.uuid(), second.uuid(), "each run draws its own UUID");
+        for uuid in [first.uuid(), second.uuid()] {
+            assert_eq!(uuid.len(), 36);
+            assert_eq!(uuid.as_bytes()[14], b'4', "{uuid} is not version 4");
+            assert!(matches!(uuid.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
         }
     }
 
     #[test]
-    fn only_an_installation_stages_a_private_key_in_writable_state() {
-        let dir = create_scratch_dir(&env::temp_dir(), &AtomicU64::new(2100)).unwrap();
-        let _guard = Scratch { dir: dir.clone() };
-        let demo = dir.join("demo");
-        fs::create_dir(&demo).unwrap();
-        RunTrust::generate()
-            .unwrap()
-            .stage_installation_identity(&demo)
-            .unwrap();
-        assert_eq!(fs::read_dir(&demo).unwrap().count(), 0);
-        let key = dir.join("source.pk8");
-        fs::write(&key, b"private fixture bytes").unwrap();
-        let trust = RunTrust {
-            signing: SigningIdentity::Installation {
-                signer: dir.join("signer"),
-                key,
-                builder: dir.join("builder"),
-            },
-            public: [3; 32],
-            root_owner: None,
-        };
-        let seed = dir.join("installed");
-        trust.stage_installation_identity(&seed).unwrap();
-        let state = seed.join("@var/lib/td-deploy");
-        assert_eq!(
-            fs::metadata(&state).unwrap().permissions().mode() & 0o7777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(state.join("deployment.pk8"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777,
-            0o600
-        );
-        assert_eq!(
-            fs::read(state.join("deployment.pk8")).unwrap(),
-            b"private fixture bytes"
-        );
-        assert!(!seed.join("td/store").exists());
-        assert!(trust.stage_installation_identity(&seed).is_err());
-        assert_eq!(
-            fs::read(state.join("deployment.pk8")).unwrap(),
-            b"private fixture bytes"
-        );
+    fn only_an_installation_is_an_installation_volume() {
+        assert!(!RunVolume::generate().unwrap().installation);
+        let builder = PathBuf::from("/builder");
+        let root_owned = RunVolume::generate_root_owned(builder.clone()).unwrap();
+        assert!(!root_owned.installation);
+        assert_eq!(root_owned.root_owner.as_deref(), Some(builder.as_path()));
+        let installation = RunVolume::installation(builder.clone()).unwrap();
+        assert!(installation.installation);
+        assert_eq!(installation.root_owner.as_deref(), Some(builder.as_path()));
     }
 
     #[test]
@@ -10685,8 +10417,7 @@ mod tests {
         let initial_id = crate::sha256::sha256_file(&deployment.join("manifest")).unwrap();
 
         let candidate = dir.join("incoming/candidate");
-        let trust = RunTrust::generate().unwrap();
-        let candidate_id = create_bootable_candidate(&deployment, &candidate, &trust).unwrap();
+        let candidate_id = create_bootable_candidate(&deployment, &candidate).unwrap();
         assert_ne!(candidate_id, initial_id);
         assert_eq!(
             crate::sha256::sha256_file(&candidate.join("manifest")).unwrap(),
@@ -10697,61 +10428,41 @@ mod tests {
             .unwrap()
             .ends_with(&[0u8; 4]));
 
-        // The candidate's IDENTITY must not depend on the key, or `run_system`
-        // — which recreates this fixture and requires the id to be unchanged —
-        // fails every run. A second trust root signs differently and names the
-        // same deployment.
-        let other_trust = RunTrust::generate().unwrap();
-        let resigned = dir.join("incoming/resigned");
-        let resigned_id = create_bootable_candidate(&deployment, &resigned, &other_trust).unwrap();
+        // Recreating the fixture names the same deployment: `run_system`
+        // requires the id unchanged across its volumes.
+        let again = dir.join("incoming/again");
         assert_eq!(
-            resigned_id, candidate_id,
-            "D3: re-signing under another key must not change the deployment id"
+            create_bootable_candidate(&deployment, &again).unwrap(),
+            candidate_id
         );
-        assert_ne!(
-            fs::read(resigned.join("manifest.sig")).unwrap(),
-            fs::read(candidate.join("manifest.sig")).unwrap(),
-            "a different key must produce a different signature"
-        );
+        assert!(!candidate.join("manifest.sig").exists());
     }
 
-    /// The signature the harness writes must verify under the key it would put
-    /// in the selector — through `engine/src/ed25519.rs`, the same file td-boot
-    /// `#[path]`-includes and a DIFFERENT module from the `ed25519_sign` that
-    /// signed. So this checks the mechanism rather than the signer agreeing
-    /// with itself.
-    /// The decoy trust root is oracle scaffolding and must never reach an
-    /// artifact handed to strangers: a published volume carrying a
-    /// deliberately-wrong trust root invites exactly the misreading the
-    /// bundle README works to prevent, and proves nothing outside the oracle.
+    /// The idle channel is oracle scaffolding and must never reach an artifact
+    /// handed to strangers.
     #[test]
-    fn a_published_volume_carries_only_the_real_trust_root() {
+    fn only_a_fixture_volume_carries_the_idle_channel() {
         let seq = AtomicU64::new(9310);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
-        let trust = RunTrust::generate().unwrap();
-        let seed = dir.join("seed");
-        fs::create_dir_all(&seed).unwrap();
-        stage_volume_trust_roots(&seed, &trust, VolumePurpose::Published).unwrap();
-        assert!(seed.join(td_boot_protocol::VOLUME_TRUSTED_KEY).is_file());
+        let deployment = dir.join("deployment");
+        fs::create_dir(&deployment).unwrap();
+        for name in ["bzImage", "initramfs.cpio", "root.erofs", "manifest"] {
+            fs::write(deployment.join(name), name.as_bytes()).unwrap();
+        }
+        let id = "b".repeat(64);
+        let published = dir.join("published");
+        populate_persistent_seed(&deployment, &published, &id, VolumePurpose::Published).unwrap();
         assert!(
-            !seed.join(td_recipe::shared::DEPLOY_WRONG_KEY).exists(),
-            "a published volume shipped the oracle's decoy trust root"
-        );
-
-        let fixture_seed = dir.join("fixture-seed");
-        fs::create_dir_all(&fixture_seed).unwrap();
-        stage_volume_trust_roots(&fixture_seed, &trust, VolumePurpose::Fixture).unwrap();
-        assert!(
-            fixture_seed
-                .join(td_recipe::shared::DEPLOY_WRONG_KEY)
-                .is_file(),
-            "the oracle still needs its decoy"
+            !published
+                .join(td_recipe::shared::DEPLOY_IDLE_CHANNEL)
+                .exists(),
+            "a published volume shipped the oracle's idle channel"
         );
     }
 
     #[test]
-    fn every_staged_deployment_is_signed_by_the_runs_key() {
+    fn the_staged_deployment_is_the_source_and_carries_no_key() {
         let seq = AtomicU64::new(2060);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
@@ -10772,81 +10483,21 @@ mod tests {
         fs::write(deployment.join("manifest"), &manifest).unwrap();
         let id = crate::sha256::sha256_file(&deployment.join("manifest")).unwrap();
 
-        let trust = RunTrust::generate().unwrap();
         let seed = dir.join("seed");
-        populate_persistent_seed(&deployment, &seed, &id, &trust, VolumePurpose::Fixture).unwrap();
+        populate_persistent_seed(&deployment, &seed, &id, VolumePurpose::Fixture).unwrap();
 
-        // The SEED deployment, not just a candidate: this is what current and
-        // previous point at and what every mode but the transactional ones
-        // boots. Signing only candidates would leave the ordinary boot path
-        // unsigned, and fail-closed verification would then refuse it.
+        // The SEED deployment is the source's bytes, and nothing beside them:
+        // no signature in the deployment and no key on the volume.
         let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
-        let signature =
-            decode_hex_fixture::<64>(&fs::read(installed.join("manifest.sig")).unwrap());
-        let staged = fs::read(installed.join("manifest")).unwrap();
-        assert!(
-            td_engine::ed25519::verify(&trust.public, &staged, &signature),
-            "the run's key must verify the seed deployment's signature"
-        );
-
-        // Negative controls: a verifier returning true unconditionally passes
-        // the line above.
-        let mut tampered = staged.clone();
-        tampered[0] ^= 1;
-        assert!(!td_engine::ed25519::verify(
-            &trust.public,
-            &tampered,
-            &signature
-        ));
-        let stranger = RunTrust::generate().unwrap();
-        assert!(
-            !td_engine::ed25519::verify(&stranger.public, &staged, &signature),
-            "another run's key must not authenticate this run's deployment"
-        );
-
-        // The signature must NOT be written back through the hard link into the
-        // source deployment, which in a real run is a read-only store path.
-        assert!(
-            !deployment.join("manifest.sig").exists(),
-            "the source deployment must be left untouched"
-        );
-
-        // Both trust roots, checked HERE because no gate boots the VM that uses
-        // them: without this, deleting `stage_volume_trust_roots` outright would
-        // leave the whole gate green.
-        let real = fs::read(seed.join(td_boot_protocol::VOLUME_TRUSTED_KEY)).unwrap();
-        let decoy = fs::read(seed.join(td_recipe::shared::DEPLOY_WRONG_KEY)).unwrap();
         assert_eq!(
-            real,
-            trust.trusted_key_line(),
-            "the volume's trust root must be the key that signed the deployment"
+            fs::read(installed.join("manifest")).unwrap(),
+            fs::read(deployment.join("manifest")).unwrap()
         );
-        assert_ne!(
-            real, decoy,
-            "a decoy equal to the real key would make the refused pass succeed"
-        );
-        // A WHOLE VALID key, so what it earns is a signature that does not
-        // verify rather than a key that will not parse.
-        let decoy_key = decode_hex_fixture::<32>(&decoy);
-        assert!(
-            !td_engine::ed25519::verify(&decoy_key, &staged, &signature),
-            "the decoy must fail to authenticate what the real key authenticates"
-        );
-        for relative in [
-            td_boot_protocol::VOLUME_TRUSTED_KEY,
-            td_recipe::shared::DEPLOY_WRONG_KEY,
-        ] {
-            // `--rootdir` copies a mode in verbatim, so an ambient umask would
-            // otherwise decide what the fixture's trust root looks like.
-            let mode = fs::metadata(seed.join(relative))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o644, "{relative} must be staged 0644");
-        }
+        assert!(!installed.join("manifest.sig").exists());
+        assert!(!seed.join("td/trusted.pub").exists());
 
-        // The IDLE channel, for the same reason the two keys above are here:
-        // the only thing that reads it boots a VM, and no gate does. Removing
+        // The IDLE channel, checked HERE because the only thing that reads it
+        // boots a VM, and no gate does. Removing
         // the two lines that stage it left every check green while the oracle's
         // idle pass got a MISSING channel — which `update` calls a fault, so the
         // pass that proves an up-to-date machine is quiet would have failed as
@@ -10872,15 +10523,14 @@ mod tests {
 
     /// The appendix's members, and that its parents are DIRECTORIES.
     ///
-    /// The key path is spelled as a LITERAL here rather than as
-    /// `TRUSTED_KEY_PATH`. Comparing the constant to itself passes however
-    /// wrong the constant is — a review showed `var/lib/td/deployment.pub`
-    /// surviving, which at boot is `filp_open` failing on a missing `var` and
+    /// The marker path is spelled as a LITERAL here rather than as the
+    /// constant. Comparing the constant to itself passes however wrong the
+    /// constant is, and a wrong path at boot is `filp_open` failing and
     /// returning 0 with no diagnostic. The type bits are asserted for the same
-    /// class of reason: parents emitted as empty FILES also survived, and give
-    /// ENOTDIR and the same silent absence.
+    /// class of reason: parents emitted as empty FILES give ENOTDIR and the
+    /// same silent absence.
     #[test]
-    fn the_appendix_places_the_key_under_real_parent_directories() {
+    fn the_appendix_places_its_member_under_real_parent_directories() {
         let seq = AtomicU64::new(2070);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
@@ -10894,27 +10544,15 @@ mod tests {
         // passes whatever the code does about permissions, and did.
         fs::set_permissions(&initramfs, fs::Permissions::from_mode(0o444)).unwrap();
 
-        let trust = RunTrust::generate().unwrap();
-        append_selector_identity(&initramfs, &trust.trusted_key_line(), SelectorRole::Live)
-            .unwrap();
+        append_selector_identity(&initramfs, SelectorRole::Live).unwrap();
         let bytes = fs::read(&initramfs).unwrap();
 
         let members = appendix_members(&bytes, BASE_LEN);
         let names: Vec<&str> = members.iter().map(|(n, _, _)| n.as_str()).collect();
         assert_eq!(
             names,
-            vec![
-                "etc",
-                "etc/td",
-                "etc/td/deployment.pub",
-                "etc/td/live-media"
-            ],
+            vec!["etc", "etc/td", "etc/td/live-media"],
             "the literal path td-boot will open, and every parent of it"
-        );
-        assert_eq!(
-            td_boot_protocol::TRUSTED_KEY_PATH,
-            "etc/td/deployment.pub",
-            "the shared constant must be the path asserted above"
         );
 
         const S_IFMT: u32 = 0o170000;
@@ -10933,15 +10571,6 @@ mod tests {
                  gives ENOTDIR and the kernel skips the file in silence"
             );
         }
-
-        // And the key bytes are this run's public half in the documented wire
-        // format, not something that merely parses.
-        let (_, _, key) = members
-            .iter()
-            .find(|(n, _, _)| n == "etc/td/deployment.pub")
-            .expect("the key member");
-        assert_eq!(key, &trust.trusted_key_line());
-        assert_eq!(decode_hex_fixture::<32>(key), trust.public);
     }
 
     /// A live selector carries the exact marker td-boot requires and no volume
@@ -10953,31 +10582,20 @@ mod tests {
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
         const BASE: &[u8] = b"070701selector";
-        let trust = RunTrust::generate().unwrap();
-        let uuid = installation_uuid(&trust.public);
+        let identity = RunVolume::generate().unwrap();
         for (role, wanted) in [
             (
                 SelectorRole::Live,
-                vec![
-                    "etc",
-                    "etc/td",
-                    "etc/td/deployment.pub",
-                    "etc/td/live-media",
-                ],
+                vec!["etc", "etc/td", "etc/td/live-media"],
             ),
             (
-                SelectorRole::Installed(&uuid),
-                vec![
-                    "etc",
-                    "etc/td",
-                    "etc/td/deployment.pub",
-                    "etc/td/volume-uuid",
-                ],
+                SelectorRole::Installed(identity.uuid()),
+                vec!["etc", "etc/td", "etc/td/volume-uuid"],
             ),
         ] {
             let initramfs = dir.join("selector.cpio");
             fs::write(&initramfs, BASE).unwrap();
-            append_selector_identity(&initramfs, &trust.trusted_key_line(), role).unwrap();
+            append_selector_identity(&initramfs, role).unwrap();
             let members = appendix_members(&fs::read(&initramfs).unwrap(), BASE.len());
             let names: Vec<&str> = members.iter().map(|(n, _, _)| n.as_str()).collect();
             assert_eq!(names, wanted);
@@ -10993,31 +10611,19 @@ mod tests {
         );
     }
 
-    /// The wire format DESIGN.md §6 fixes: lowercase hex and one trailing
-    /// newline. Both readers accept uppercase, so neither would notice.
-    #[test]
-    fn hex_line_is_lowercase_hex_with_one_trailing_newline() {
-        assert_eq!(hex_line(&[0x00, 0xff, 0xa5]), b"00ffa5\n".to_vec());
-        assert_eq!(hex_line(&[0xde, 0xad, 0xbe, 0xef]), b"deadbeef\n".to_vec());
-        let signature = hex_line(&[0u8; 64]);
-        assert_eq!(signature.len(), 129, "64 bytes as hex plus the newline");
-        assert!(signature
-            .iter()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'\n'));
-    }
-
     /// The WIRING, which none of the other tests reach: that what
     /// `provision_selector` hands back is a different file from the store
-    /// output, carries the run's key, and leaves the original alone.
+    /// output, carries the run's volume identity, and leaves the original
+    /// alone.
     ///
     /// A review mutated four ways of losing this — returning the source instead
     /// of the copy, dropping the append in either caller, and booting the
     /// unprovisioned selector — and all four survived the whole suite. Three
     /// are now type errors (`VerifiedSelector`'s path is private, and both
-    /// exits use the key-appending helper); this covers the fourth, which is
-    /// a body a compiler cannot object to.
+    /// exits use the appending helper); this covers the fourth, which is a
+    /// body a compiler cannot object to.
     #[test]
-    fn provisioning_returns_a_keyed_copy_and_leaves_the_store_output_alone() {
+    fn provisioning_returns_a_bound_copy_and_leaves_the_store_output_alone() {
         let seq = AtomicU64::new(2080);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
@@ -11032,8 +10638,8 @@ mod tests {
 
         let out = dir.join("images");
         fs::create_dir(&out).unwrap();
-        let trust = RunTrust::generate().unwrap();
-        let booted = provision_selector(&VerifiedSelector(store.clone()), &out, &trust).unwrap();
+        let identity = RunVolume::generate().unwrap();
+        let booted = provision_selector(&VerifiedSelector(store.clone()), &out, &identity).unwrap();
 
         assert_ne!(
             booted, store,
@@ -11063,7 +10669,7 @@ mod tests {
             "the provisioned copy takes owner-write and nothing else"
         );
 
-        // And what boots really does carry this run's key.
+        // And what boots really does carry this run's volume identity.
         let bytes = fs::read(&booted).unwrap();
         assert!(
             bytes.starts_with(BASE),
@@ -11071,42 +10677,27 @@ mod tests {
         );
         let members = appendix_members(&bytes, BASE_LEN);
         let names: Vec<&str> = members.iter().map(|(n, _, _)| n.as_str()).collect();
-        assert_eq!(
-            names,
-            vec![
-                "etc",
-                "etc/td",
-                "etc/td/deployment.pub",
-                "etc/td/volume-uuid"
-            ]
-        );
+        assert_eq!(names, vec!["etc", "etc/td", "etc/td/volume-uuid"]);
         let (_, _, uuid) = members
             .iter()
             .find(|(n, _, _)| n == "etc/td/volume-uuid")
             .unwrap();
-        assert_eq!(
-            uuid,
-            format!("{}\n", installation_uuid(&trust.public)).as_bytes()
-        );
-        let (_, _, key) = members
-            .iter()
-            .find(|(n, _, _)| n == "etc/td/deployment.pub")
-            .expect("the key member");
-        assert_eq!(decode_hex_fixture::<32>(key), trust.public);
+        assert_eq!(uuid, format!("{}\n", identity.uuid()).as_bytes());
 
         let bound_bytes = bytes;
         let template = out.join("selector.cpio");
         stage_stock_selector_template(&VerifiedSelector(store.clone()), &template).unwrap();
         assert_eq!(fs::read(&booted).unwrap(), bound_bytes);
         // The template is the stock bytes, with nothing appended: the live
-        // installer appends the key and the volume identity.
+        // installer appends the volume identity.
         assert_eq!(fs::read(&template).unwrap(), BASE);
         assert_eq!(fs::read(&store).unwrap(), BASE);
     }
 
     #[test]
-    fn key_path_parents_are_every_proper_prefix_shallowest_first() {
-        assert_eq!(key_path_parents(), vec!["etc", "etc/td"]);
+    fn path_parents_are_every_proper_prefix_shallowest_first() {
+        assert_eq!(path_parents("etc/td/volume-uuid"), vec!["etc", "etc/td"]);
+        assert!(path_parents("top").is_empty());
     }
 
     /// `(name, mode, data)` for each member of the appendix, walked from the
@@ -11148,16 +10739,6 @@ mod tests {
         }
     }
 
-    fn decode_hex_fixture<const N: usize>(text: &[u8]) -> [u8; N] {
-        let trimmed = text.trim_ascii();
-        assert_eq!(trimmed.len(), N * 2, "expected {N} bytes of hex");
-        let mut out = [0u8; N];
-        for (slot, pair) in out.iter_mut().zip(trimmed.chunks_exact(2)) {
-            *slot = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
-        }
-        out
-    }
-
     #[test]
     fn selector_manifest_verifies_payload_and_rejects_tampering() {
         let seq = AtomicU64::new(2100);
@@ -11190,14 +10771,7 @@ mod tests {
         }
         let id = "a".repeat(64);
         let seed = dir.join("seed");
-        populate_persistent_seed(
-            &deployment,
-            &seed,
-            &id,
-            &RunTrust::generate().unwrap(),
-            VolumePurpose::Fixture,
-        )
-        .unwrap();
+        populate_persistent_seed(&deployment, &seed, &id, VolumePurpose::Fixture).unwrap();
 
         let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
         assert_eq!(fs::read(installed.join("manifest")).unwrap(), b"manifest");
@@ -11324,12 +10898,11 @@ mod tests {
         let public = wire_string(private, &mut p).to_vec();
         let secret = wire_string(private, &mut p);
         assert_eq!(wire_string(private, &mut p), comment.as_bytes());
-        let seed: [u8; 32] = secret[..32].try_into().unwrap();
+        // OpenSSH stores the 32-byte seed followed by the public half; the
+        // seed-to-public derivation is OpenSSH's own, checked when the key
+        // was made.
+        assert_eq!(secret.len(), 64);
         assert_eq!(&secret[32..], &public[..]);
-        assert_eq!(
-            td_engine::ed25519_sign::public_key(&seed).unwrap()[..],
-            public[..]
-        );
         let mut at = 0;
         assert_eq!(wire_string(&authorized_blob, &mut at), b"ssh-ed25519");
         assert_eq!(wire_string(&authorized_blob, &mut at), &public[..]);

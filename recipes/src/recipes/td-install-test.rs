@@ -3,11 +3,9 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 use crate::td_boot_protocol;
 
-// The SAME fixture deployment td-boot's own tests verify, so the signature
-// staged here is over the manifest these payloads hash to rather than over a
-// second copy of them that could drift. td-boot cannot sign and no recipe
-// builds `td-deploy`, so a publish this check can authenticate has to come
-// from a committed vector; this is the only payload-matched one there is.
+// The SAME fixture deployment td-boot's own tests verify, so the manifest
+// staged here is computed from these payloads rather than from a second copy
+// of them that could drift.
 #[path = "../../../td-boot/src/fixture.rs"]
 #[allow(dead_code)]
 mod td_boot_fixture;
@@ -47,15 +45,15 @@ const SUPERBLOCK_MIRROR_AT: u64 = 64 * 1024 * 1024;
 const MAGIC_IN_SUPERBLOCK: u64 = 64;
 const LABEL_IN_SUPERBLOCK: u64 = 299;
 
-/// The PUBLISH pass: a real signed deployment, put in the volume by the real
+/// The PUBLISH pass: a real deployment, put in the volume by the real
 /// `td-boot`, read back out of the unmounted image.
 ///
 /// This is what the two commits before it could not check. They pin td-install's
 /// side of the contract against a shell script standing in for `td-boot`, so a
 /// renamed verb or a reordered argument would leave both suites green and break
 /// every install; here the two programs are the ones that ship, and the bundle
-/// is authenticated rather than taken on trust — the key is passed, so a
-/// signature that did not verify is a failed build.
+/// is verified rather than taken on trust — a payload that did not match its
+/// manifest is a failed build.
 ///
 /// Offline throughout. `td-btrfs list` walks an unmounted filesystem's
 /// directory entries, which is the only kind this check has: nothing mounts,
@@ -72,45 +70,41 @@ fn publish_steps(
 ) -> Vec<Step> {
     let td_boot = "{in:td-boot}/bin/td-boot";
     let deployment = "{root}/deployment";
-    let key = "{root}/trusted.pub";
+    let tampered = "{root}/tampered";
     // Built HERE from the shared definition rather than copied: the manifest is
     // the payload digests, so computing it is what makes a drifted payload a
-    // signature that stops verifying instead of a fixture nobody rechecked.
+    // publish that stops verifying instead of a fixture nobody rechecked.
     let manifest = td_boot_fixture::manifest("", td_engine::sha256::hex_digest);
     // `sha256(manifest)` — the deployment's identity, and the directory name
     // the publish creates. Computed rather than written down for the same
     // reason, and it is what the check below looks for in the image.
     let id = td_engine::sha256::hex_digest(manifest.as_bytes());
-    let signature = td_boot_fixture::signature("").unwrap_or("");
 
-    let mut steps = vec![Step::MkDir {
-        path: deployment.into(),
-    }];
-    for (label, bytes) in td_boot_fixture::payloads("") {
+    // The same manifest over a kernel that no longer matches it, for the
+    // refusal pass below.
+    let mut steps = Vec::new();
+    for (directory, tamper) in [(deployment, false), (tampered, true)] {
+        steps.push(Step::MkDir {
+            path: directory.into(),
+        });
+        for (label, bytes) in td_boot_fixture::payloads("") {
+            let content = if tamper && label == "bzImage" {
+                format!("{bytes}tampered\n")
+            } else {
+                bytes
+            };
+            steps.push(Step::WriteFile {
+                path: format!("{directory}/{label}"),
+                content,
+                exec: false,
+            });
+        }
         steps.push(Step::WriteFile {
-            path: format!("{deployment}/{label}"),
-            content: bytes,
+            path: format!("{directory}/{}", td_boot_protocol::MANIFEST_NAME),
+            content: manifest.clone(),
             exec: false,
         });
     }
-    steps.push(Step::WriteFile {
-        path: format!("{deployment}/{}", td_boot_protocol::MANIFEST_NAME),
-        content: manifest,
-        exec: false,
-    });
-    // Hex plus a newline, which is what `td-deploy` writes and what the shipped
-    // parser reads — so the fixture goes back in through that parser rather
-    // than around it.
-    steps.push(Step::WriteFile {
-        path: format!("{deployment}/{}", td_boot_protocol::MANIFEST_SIG_NAME),
-        content: format!("{signature}\n"),
-        exec: false,
-    });
-    steps.push(Step::WriteFile {
-        path: key.into(),
-        content: format!("{}\n", td_boot_fixture::PUBLIC_KEY),
-        exec: false,
-    });
     // Named before the step that execs it, as `mkfs.btrfs` is: a td-boot that
     // stopped being built reds here rather than inside a shell diagnostic.
     steps.push(Step::Require {
@@ -146,7 +140,7 @@ fn publish_steps(
     // Compared with `cmp -s`, byte for byte, rather than through `cat`:
     // `$(cat f)` strips trailing newlines from BOTH sides, so two files
     // differing only there compare equal — and every file compared here is
-    // one whose exact bytes are the assertion, the trust root most of all.
+    // one whose exact bytes are the assertion.
     //
     // The update channel is asserted for all three of its properties: it
     // exists, it is a DIRECTORY, and it is EMPTY. The last is the contract — a
@@ -167,16 +161,12 @@ fn publish_steps(
          {{ echo 'the {current} selector did not survive as a symlink' >&2; exit 1; }}; \
          [ \"$target\" = '{prefix}{id}' ] || \
          {{ echo \"the {current} selector points at $target, not {prefix}{id}\" >&2; exit 1; }}; \
-         for f in {manifest} {sig} bzImage; do \
+         for f in {manifest} bzImage; do \
            [ -f \"{{root}}/restored/{deployments}/{id}/$f\" ] || \
            {{ echo \"the published $f is not in the volume at all\" >&2; exit 1; }}; \
            cmp -s \"{{root}}/restored/{deployments}/{id}/$f\" \"{{root}}/deployment/$f\" || \
-           {{ echo \"the published $f is not the one that was signed\" >&2; exit 1; }}; \
+           {{ echo \"the published $f is not the one that was staged\" >&2; exit 1; }}; \
          done; \
-         [ -f '{{root}}/restored/{trusted}' ] && [ ! -L '{{root}}/restored/{trusted}' ] || \
-         {{ echo 'the volume trust root is missing or not a regular file' >&2; exit 1; }}; \
-         cmp -s '{{root}}/restored/{trusted}' '{key}' || \
-         {{ echo 'the volume does not carry the key that authenticated it' >&2; exit 1; }}; \
          [ -d '{{root}}/restored/{channel}' ] || \
          {{ echo 'the volume has no update channel, or it is not a directory' >&2; exit 1; }}; \
          offered=$(ls -A '{{root}}/restored/{channel}') || \
@@ -190,12 +180,10 @@ fn publish_steps(
          {{ echo 'the published deployment {id} is not in the volume' >&2; exit 1; }}",
         boot = td_boot_protocol::BOOT_DIR,
         deployments = td_boot_protocol::DEPLOYMENTS_DIR,
-        trusted = td_boot_protocol::VOLUME_TRUSTED_KEY,
         channel = td_boot_protocol::VOLUME_CHANNEL_DIR,
         current = td_boot_protocol::CURRENT_SLOT,
         prefix = td_boot_protocol::SELECTOR_PREFIX,
-        manifest = td_boot_protocol::MANIFEST_NAME,
-        sig = td_boot_protocol::MANIFEST_SIG_NAME
+        manifest = td_boot_protocol::MANIFEST_NAME
     );
 
     steps.push(
@@ -206,7 +194,7 @@ fn publish_steps(
                 "-c",
                 &format!(
                     "'{bin}' volume '{disk}' '{mkfs}' '{{root}}/scratch' '{td_boot}' \
-                     '{deployment}' '{key}' > '{{root}}/publish-out' \
+                     '{deployment}' > '{{root}}/publish-out' \
                      || {{ echo 'td-install volume with a publish failed' >&2; exit 1; }}; \
                      read -r off len written < '{{root}}/publish-out' || exit 1; \
                      [ \"$off\" -eq {VOLUME_AT} ] || {{ echo \"the volume landed at $off, not {VOLUME_AT}\" >&2; exit 1; }}; \
@@ -223,27 +211,12 @@ fn publish_steps(
         .env("PATH", PATH),
     );
 
-    // ...and the key is LOAD-BEARING rather than passed along: the same publish
-    // under an unrelated key must fail. Without this the check would pass just
-    // as well if td-install dropped the argument, which is the fail-open its
-    // arity rule exists to prevent.
-    //
-    // The REASON is asserted, not just the exit status. A non-zero exit alone
-    // is satisfied by any failure at all — a full disk, a missing directory, a
-    // td-install that segfaults before it reaches the key — so a test that
-    // asked only for failure would keep passing while the thing it is about
-    // stopped happening. `scratch2` is a live example rather than a
-    // hypothetical: it does not exist when this runs, and it passes only
-    // because `volume` creates its scratch tree BEFORE the publish, so the
-    // failure that arrives really is the signature's. Measured on the built
-    // binaries, which reported `manifest does not authenticate` and not ENOENT.
-    // The pattern is the shared constant, not a third spelling of it: a reworded
-    // diagnostic must move every site that greps for one.
-    steps.push(Step::WriteFile {
-        path: "{root}/other.pub".into(),
-        content: format!("{}\n", td_boot_fixture::OTHER_PUBLIC_KEY),
-        exec: false,
-    });
+    // ...and the manifest is LOAD-BEARING: the same publish over a kernel
+    // that no longer matches it must fail, and on the digest rather than on
+    // anything else. A non-zero exit alone is satisfied by any failure at
+    // all — a full disk, a missing directory — so the reason is asserted.
+    // `scratch2` does not exist when this runs; it passes only because
+    // `volume` creates its scratch tree before the publish.
     steps.push(
         Step::run(
             "{root}",
@@ -252,21 +225,16 @@ fn publish_steps(
                 "-c",
                 &format!(
                     "if '{bin}' volume '{disk}' '{mkfs}' '{{root}}/scratch2' '{td_boot}' \
-                        '{deployment}' '{{root}}/other.pub' > '{{root}}/wrong-out' 2>'{{root}}/wrong-err'; \
-                     then echo 'a deployment signed by another key was published anyway' >&2; exit 1; fi; \
-                     err=$(cat '{{root}}/wrong-err') || exit 1; \
-                     case \"$err\" in *'{unauthenticated}'*) ;; \
-                     *) echo \"the publish failed, but not on the signature: $err\" >&2; exit 1 ;; esac; \
+                        '{tampered}' > '{{root}}/tampered-out' 2>'{{root}}/tampered-err'; \
+                     then echo 'a deployment whose kernel differs from its manifest was published anyway' >&2; exit 1; fi; \
+                     err=$(cat '{{root}}/tampered-err') || exit 1; \
+                     case \"$err\" in *'bzImage hash mismatch'*) ;; \
+                     *) echo \"the publish failed, but not on the kernel digest: $err\" >&2; exit 1 ;; esac; \
                      [ ! -e '{{root}}/scratch2/td-volume-root/{boot}/{current}' ] && \
                      [ ! -L '{{root}}/scratch2/td-volume-root/{boot}/{current}' ] || \
-                     {{ echo 'a refused publish still left a selector' >&2; exit 1; }}; \
-                     [ ! -e '{{root}}/scratch2/td-volume-root/{trusted}' ] && \
-                     [ ! -L '{{root}}/scratch2/td-volume-root/{trusted}' ] || \
-                     {{ echo 'a refused publish still left a trust root' >&2; exit 1; }}",
+                     {{ echo 'a refused publish still left a selector' >&2; exit 1; }}",
                     boot = td_boot_protocol::BOOT_DIR,
-                    trusted = td_boot_protocol::VOLUME_TRUSTED_KEY,
                     current = td_boot_protocol::CURRENT_SLOT,
-                    unauthenticated = td_boot_protocol::MANIFEST_UNAUTHENTICATED
                 ),
             ],
         )
@@ -444,7 +412,7 @@ pub fn recipe() -> Recipe {
         },
         Step::WriteFile {
             path: "{out}/result".into(),
-            content: "PASS: target-built static td-install writes a GPT with its backup, a labelled FAT32 ESP, and a freshly drawn disk GUID on install and reinstall, then a checked Btrfs volume copied into its own partition, with a signed deployment published into it by the target-built td-boot, the authenticating key carried onto the volume beside it, and both refused under an unrelated key\n".into(),
+            content: "PASS: target-built static td-install writes a GPT with its backup, a labelled FAT32 ESP, and a freshly drawn disk GUID on install and reinstall, then a checked Btrfs volume copied into its own partition, with a deployment published into it by the target-built td-boot, and a deployment whose kernel differs from its manifest refused\n".into(),
             exec: false,
         },
         Step::Require {
@@ -459,7 +427,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-install-test: target static installer lays out a GPT and a labelled FAT32 ESP on a regular file, then publishes a signed deployment into the volume through the target-built td-boot"
+echo ">> recipe-check td-install-test: target static installer lays out a GPT and a labelled FAT32 ESP on a regular file, then publishes a deployment into the volume through the target-built td-boot"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-install-test 1
 "#,
@@ -471,30 +439,6 @@ exec "$TD_RECIPE_EVAL" check-run td-install-test 1
 mod tests {
     use super::{td_boot_fixture, td_boot_protocol, Step};
 
-    /// The fixture this recipe stages really carries a signature.
-    ///
-    /// `signature("")` is an `Option` because `fixture.rs` is ordinary compiled
-    /// code here and may not panic, and the call site falls back to `""`. That
-    /// fallback is fail-CLOSED — an empty `manifest.sig` fails to decode and
-    /// the publish is refused — but the refusal arrives at the far end of a
-    /// build, in the one tier that does not run on every host. So the fact it
-    /// depends on is asserted where `cargo test` can see it.
-    #[test]
-    fn the_staged_fixture_has_a_signature_to_stage() {
-        let signature = td_boot_fixture::signature("").expect("the default tag is signed");
-        assert_eq!(
-            signature.len(),
-            128,
-            "an ed25519 signature is 64 bytes, written as 128 hex characters"
-        );
-        assert!(
-            signature
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-            "the committed signature is not lowercase hexadecimal"
-        );
-    }
-
     /// The restored volume is checked for an EMPTY update channel.
     ///
     /// Everything `td-boot update` does on an installed machine rests on that
@@ -504,7 +448,7 @@ mod tests {
     /// restore` have both had it — which is the survival of an empty directory
     /// through them, the fact the whole channel design rests on. It runs in the
     /// tier that does not run on every host, so its PRESENCE is asserted where
-    /// `cargo test` can see it, as the signature above is.
+    /// `cargo test` can see it.
     #[test]
     fn the_restored_volume_is_checked_for_an_empty_update_channel() {
         // The EMPTINESS half specifically, since `[ -d … ]` alone would leave

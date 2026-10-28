@@ -7,11 +7,11 @@
 //! somebody with qemu and no td checkout can try the system in the time it
 //! takes to download it.
 //!
-//! `--installation` creates a private VM with a retained signing identity and
-//! persistent writes; it is separate from the redistributable demo default.
+//! `--installation` creates a private VM with persistent writes; it is
+//! separate from the redistributable demo default.
 //!
 //! Sibling of `checks/run.rs`: identical build, identical verification,
-//! identical trust root, and — through `checks/vm_profile.rs` — literally the
+//! and — through `checks/vm_profile.rs` — literally the
 //! same qemu argv. The difference is only where the boot happens. `run` boots
 //! private copies it deletes on exit; this writes the images somewhere durable
 //! and renders the launcher instead of spawning qemu at all.
@@ -33,7 +33,7 @@ use std::process::Command;
 use crate::check_runner::RecipeCheckRunner;
 use crate::checks::qemu_boot::{
     build_btrfs_tools, create_release_volume, find_qemu_tool, provision_selector,
-    verify_deployment, verify_selector, RunTrust, PUBLISHED_VOLUME_BYTES, SYSTEM_GUEST_MEMORY_MIB,
+    verify_deployment, verify_selector, RunVolume, PUBLISHED_VOLUME_BYTES, SYSTEM_GUEST_MEMORY_MIB,
 };
 use crate::checks::release_source::ReleaseSource;
 use crate::checks::vm_profile::{
@@ -73,7 +73,7 @@ pub(crate) struct BundleOptions {
     pub(crate) zlib: bool,
     /// Overwrite a bundle already in `out`.
     pub(crate) force: bool,
-    /// A private VM disk with a unique retained installation signing identity.
+    /// A private VM disk that persists guest writes.
     pub(crate) installation: bool,
     pub(crate) source_upstream: super::release_source::upstream::Upstream,
 }
@@ -112,12 +112,7 @@ pub(crate) fn run(
          An unchanged tree is reused whole and returns at once; a cold tree builds every\n            \
          recipe and can take a long time. Per-recipe progress streams below.\n"
     );
-    let outputs = if options.installation {
-        vec![SYSTEM, "td-net"]
-    } else {
-        vec![SYSTEM]
-    };
-    let trees = runner.build_and_stage(SYSTEM, &outputs)?;
+    let trees = runner.build_and_stage(SYSTEM, &[SYSTEM])?;
     let system_tree = trees
         .first()
         .cloned()
@@ -160,23 +155,18 @@ pub(crate) fn run(
     let staged_kernel = scratch.dir.join(KERNEL_NAME);
     copy_into(&bzimage, &staged_kernel)?;
 
-    // Installation keys enter private writable state after signing; demo
-    // seeds are discarded. Both selectors carry only their public key.
-    let trust = if options.installation {
-        let signer = trees
-            .get(1)
-            .ok_or("missing source-built installation signer")?
-            .join("bin/td-net");
-        let builder = PathBuf::from(runner.builder_command().get_program());
-        RunTrust::installation(signer, &scratch.dir.join("installation-identity"), builder)?
+    // Each bundle draws its own volume UUID, which its selector names. An
+    // installation's files are guest root's, as an installed disk's are.
+    let identity = if options.installation {
+        RunVolume::installation(PathBuf::from(runner.builder_command().get_program()))?
     } else {
-        RunTrust::generate()?
+        RunVolume::generate()?
     };
     // `provision_selector` names its output for the boot fixture that first
     // needed it. The bundle publishes it under the name its launcher passes to
     // `-initrd`, so rename rather than teach every reader two names for one
     // file. Same directory, so this cannot cross a filesystem.
-    let provisioned = provision_selector(&selector, &scratch.dir, &trust)?;
+    let provisioned = provision_selector(&selector, &scratch.dir, &identity)?;
     let staged_initrd = scratch.dir.join(INITRD_NAME);
     fs::rename(&provisioned, &staged_initrd).map_err(|e| {
         format!(
@@ -193,7 +183,7 @@ pub(crate) fn run(
         &mkfs,
         &btrfs,
         &raw_volume,
-        &trust,
+        &identity,
         &source_directory,
     )?;
 
@@ -1022,7 +1012,7 @@ fn human_bytes(bytes: u64) -> String {
 /// The README that ships beside the images.
 fn installation_readme(deployment_id: &str, format: DiskFormat) -> String {
     let disk = format.file_name();
-    format!("# td VM installation\n\nRun `./start` to boot. Guest writes persist in `{disk}`. The Btrfs volume\nprovides 2 TiB of sparse virtual capacity for local builds; physical disk\nusage grows as the guest writes.\n\nThis disk owns a unique deployment signing key in `/var/lib/td-deploy`.\nIts public key is installed in the accompanying boot selector and volume.\nKeep this directory private: copying the disk also copies the identity.\nCreate another installation to obtain a new identity.\n\nDeployment: `{deployment_id}`\n\nThe source checkout is initialized at `~/src/td`. Inspect `git remote -v`\nand configure origin if absent. Run `git pull --ff-only` for new source,\nthen `./update` to build a successor. When prompted, press\nCtrl+Alt+Escape, then I. Review the deployment ID and type the two digits\nthe prompt shows to approve; Enter does not approve, and Escape cancels.\nRestart to boot the installed system; the previous system is retained.\nUse `./update build` to build without installing.\n\n`SHA256SUMS` records the initial files; the disk changes after first boot.\nQEMU {} or newer is required. Use `TD_QEMU_ACCEL=tcg` for software emulation\nand `TD_VM_MEMORY` to set guest RAM in MiB.\n", format.minimum_qemu())
+    format!("# td VM installation\n\nRun `./start` to boot. Guest writes persist in `{disk}`. The Btrfs volume\nprovides 2 TiB of sparse virtual capacity for local builds; physical disk\nusage grows as the guest writes.\n\nKeep this directory private: it is your machine's disk.\n\nDeployment: `{deployment_id}`\n\nThe source checkout is initialized at `~/src/td`. Inspect `git remote -v`\nand configure origin if absent. Run `git pull --ff-only` for new source,\nthen `./update` to build a successor. When prompted, press\nCtrl+Alt+Escape, then I. Review the deployment ID and type the two digits\nthe prompt shows to approve; Enter does not approve, and Escape cancels.\nRestart to boot the installed system; the previous system is retained.\nUse `./update build` to build without installing.\n\n`SHA256SUMS` records the initial files; the disk changes after first boot.\nQEMU {} or newer is required. Use `TD_QEMU_ACCEL=tcg` for software emulation\nand `TD_VM_MEMORY` to set guest RAM in MiB.\n", format.minimum_qemu())
 }
 
 fn readme(deployment_id: &str, format: DiskFormat) -> String {
@@ -1105,8 +1095,8 @@ fn readme(deployment_id: &str, format: DiskFormat) -> String {
          | --- | --- |\n\
          | `{LAUNCHER_NAME}` | POSIX-sh launcher: finds QEMU, picks an accelerator, boots the system |\n\
          | `{KERNEL_NAME}` | the Linux kernel, built from source by td |\n\
-         | `{INITRD_NAME}` | td's boot selector, carrying this bundle's public key |\n\
-         | `{disk}` | a Btrfs volume: the signed deployment (td's userland, plus Firefox and its runtime) and an empty `@var` |\n\
+         | `{INITRD_NAME}` | td's boot selector, naming this bundle's volume |\n\
+         | `{disk}` | a Btrfs volume: the deployment (td's userland, plus Firefox and its runtime) and an empty `@var` |\n\
          | `{README_NAME}` | this file |\n\
          | `{CHECKSUMS_NAME}` | SHA-256 of every file above |\n\
          \n\
@@ -1137,17 +1127,17 @@ fn readme(deployment_id: &str, format: DiskFormat) -> String {
          \n\
          Inspect `git remote -v`; configure origin if absent, then use\n\
          `git pull --ff-only` to get future changes.\n\
-         `td-update init` retries initialization. Building does not yet sign\n\
-         or activate a deployment.\n\
+         `td-update init` retries initialization. Building does not activate\n\
+         a deployment.\n\
          Use a persistent VM disk to retain your checkout across restarts.\n\
          Source is companion data covered by this download's disk checksum;\n\
-         it is outside the signed deployment and is never executed at boot.\n\
+         it is outside the deployment and is never executed at boot.\n\
          \n\
          ## What actually happens when you boot it\n\
          \n\
          QEMU direct-boots the kernel with the selector initramfs. The selector\n\
-         verifies the deployment on the virtual disk against its manifest and this\n\
-         bundle's key, kexecs it, and the deployment's own initramfs loop-mounts a\n\
+         verifies the deployment on the virtual disk against its manifest,\n\
+         kexecs it, and the deployment's own initramfs loop-mounts a\n\
          read-only EROFS root, mounts the persistent `@var` subvolume plus a\n\
          volatile `/run` and `/tmp`, and `switch_root`s into the real system.\n\
          \n\
@@ -1170,20 +1160,18 @@ fn readme(deployment_id: &str, format: DiskFormat) -> String {
          \x20 foreign payload that no part of td is built from, running behind td's\n\
          \x20 namespace, seccomp, D-Bus, portal and Wayland boundaries. Everything\n\
          \x20 else in the image is built from source.\n\
-         - **Two bundles built from the same tree are not byte-identical.** Each is\n\
-         \x20 signed with a freshly generated throwaway key, so the volume differs\n\
-         \x20 every time. `{CHECKSUMS_NAME}` verifies THIS download; the deployment\n\
-         \x20 id above is the reproducible identity of what is inside it.\n\
+         - **Two bundles built from the same tree are not byte-identical.** Each\n\
+         \x20 volume gets a freshly drawn UUID, which its selector names, so the\n\
+         \x20 volume differs every time. `{CHECKSUMS_NAME}` verifies THIS download;\n\
+         \x20 the deployment id above is the reproducible identity of what is inside\n\
+         \x20 it.\n\
          \n\
-         ## About the signature\n\
+         ## Nothing here is signed\n\
          \n\
-         The deployment inside the volume is signed with an Ed25519 key generated\n\
-         when this bundle was made. The public half is the only trust root inside\n\
-         `{INITRD_NAME}`; the private half was never written to disk and no\n\
-         longer exists. So the pairing proves the volume holds the deployment this\n\
-         bundle shipped, and nothing else — it is not a project release identity.\n\
-         Check the download against `{CHECKSUMS_NAME}` and the checksums published\n\
-         beside it.\n\
+         td does not sign deployments: the selector checks that every payload\n\
+         matches the manifest, and the deployment id is that manifest's hash.\n\
+         That detects corruption, not who made the bundle. Check the download\n\
+         against `{CHECKSUMS_NAME}` and the checksums published beside it.\n\
          \n\
          ## This is a convenience artifact, not a distribution channel\n\
          \n\

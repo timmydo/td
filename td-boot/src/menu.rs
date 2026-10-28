@@ -1,4 +1,4 @@
-//! Physical selection of authenticated retained deployments.
+//! Physical selection of verified retained deployments.
 use super::*;
 use std::io::Read;
 
@@ -9,14 +9,14 @@ struct Entry {
     attempts: Option<u8>,
 }
 
-fn entries(root: &Path, key: &TrustRoot) -> io::Result<Vec<Entry>> {
+fn entries(root: &Path) -> io::Result<Vec<Entry>> {
     let mut entries: Vec<Entry> = Vec::new();
     for slot in ["current", "previous"] {
-        // Labels need only the signed manifest and its hashed initramfs.
+        // Labels need only the manifest and its hashed initramfs.
         // Verify the full kernel/root payloads only on the selected boot path.
         let candidate = (|| {
             let id = read_selector(root, slot)?;
-            let (directory, manifest) = authenticated_manifest(root, &id, key)?;
+            let (directory, manifest) = verified_manifest(root, &id)?;
             let initramfs = verify_payload(&directory, "initramfs.cpio", &manifest.initramfs)?;
             Ok::<_, io::Error>((id, initramfs))
         })();
@@ -91,8 +91,8 @@ fn default_index(entries: &[Entry]) -> usize {
 
 /// The transaction lock remains held across the prompt and selection.
 /// A timeout preserves the ordinary automatic rollback policy.
-pub(super) fn choose(root: &Path, key: &TrustRoot) -> io::Result<Option<String>> {
-    let entries = entries(root, key)?;
+pub(super) fn choose(root: &Path) -> io::Result<Option<String>> {
+    let entries = entries(root)?;
     if entries.is_empty() {
         return Ok(None);
     }
@@ -138,8 +138,8 @@ pub(super) fn choose(root: &Path, key: &TrustRoot) -> io::Result<Option<String>>
 
 /// A physical choice makes that system current so older deployments' success
 /// acknowledgement still works. Publication preserves a known-good fallback.
-pub(super) fn select(root: &Path, key: &TrustRoot, id: &str) -> io::Result<BootDecision> {
-    let current = authenticated_slot(root, "current", key);
+pub(super) fn select(root: &Path, id: &str) -> io::Result<BootDecision> {
+    let current = verify_slot(root, "current");
     if read_selector(root, "current").is_ok_and(|named| named == id) {
         let current = current?;
         if current.id != id {
@@ -150,7 +150,7 @@ pub(super) fn select(root: &Path, key: &TrustRoot, id: &str) -> io::Result<BootD
         }
     } else {
         let current = current.ok();
-        let previous = authenticated_slot(root, "previous", key)?;
+        let previous = verify_slot(root, "previous")?;
         if previous.id != id {
             return Err(invalid("the chosen deployment is no longer retained"));
         }

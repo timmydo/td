@@ -3,7 +3,7 @@
 The offline installer uses one image for optical and USB boot, as required
 by [INSTALLER.md](INSTALLER.md). `engine/src/iso9660.rs` defines the initial
 metadata writer. It is a pure formatter: it neither opens a destination nor
-supplies the FAT contents, deployment, signatures or a live boot profile.
+supplies the FAT contents, deployment or a live boot profile.
 Its unit tests establish layout properties; `qemu-boot-media` below proves
 firmware loading, and `qemu-boot-live` ([INSTALLER.md](INSTALLER.md)) the
 live and installed sessions booted as USB storage.
@@ -72,25 +72,24 @@ most 64 payloads is a nonempty regular file of at most 64 GiB. Level-3
 sections permit files larger than four GiB. Files stream
 through held descriptors; composition does not buffer the deployment in RAM.
 
-For example, after building and provisioning a live initramfs and signing a
-deployment outside derivations, its assembly inputs can be named explicitly:
+For example, after building and provisioning a live initramfs and a
+deployment, its assembly inputs can be named explicitly:
 
 ```text
 td-recipe-eval compose-iso installer.iso bzImage live.cpio \
   BZIMAGE=deployment/bzImage INITRAMFS.CPIO=deployment/initramfs.cpio \
   ROOT.EROFS=deployment/root.erofs MANIFEST=deployment/manifest \
-  MANIFEST.SIG=deployment/manifest.sig SELECTOR.CPIO=selector.cpio
+  SELECTOR.CPIO=selector.cpio
 ```
 
 This is a byte-composition primitive, not a build/profile selector or an
-installer release command. It does not sign, parse deployment manifests,
-authenticate payloads, provision keys, validate PE executability or create a
-live environment. The profile producer must supply the validated source-built
-boot artifacts, signed deployment, and matching public trust roots required
-by INSTALLER.md. Arbitrary command-line files carry no provenance claim.
-No host executable is added to the image by this tool. The same writer is
-used by the optical/USB boot and native installation oracles; those callers
-own their diagnostic profiles and signing. `./build-iso` composes the
+installer release command. It does not parse deployment manifests, verify
+payloads, validate PE executability or create a live environment. The
+profile producer must supply the validated source-built boot artifacts and
+deployment required by INSTALLER.md. Arbitrary command-line files carry no
+provenance claim. No host executable is added to the image by this tool. The
+same writer is used by the optical/USB boot and native installation oracles;
+those callers own their diagnostic profiles. `./build-iso` composes the
 desktop installation profile ([INSTALLER.md](INSTALLER.md)).
 
 The output parent must exist and support hard links and directory sync.
@@ -127,16 +126,13 @@ including simultaneous attachment of two media with these template GUIDs.
 `./build-iso [--out FILE] [--force]`, the wrapper for `td-recipe-eval
 build-iso`, is the live profile's producer. It builds `system-x86-64`,
 verifies the deployment and selector against their build manifests, and
-generates a signing key for this run only, as `bundle` does; the medium
-carries its public half and nothing retains the seed. It signs a copy of the
-deployment manifest and writes, through the same writer as `compose-iso`:
+writes, through the same writer as `compose-iso`:
 
 - `EFI/BOOT/BOOTX64.EFI`: the deployment's kernel;
 - `EFI/BOOT/INITRD`: the live selector, which is the stock selector with the
-  public key at `etc/td/deployment.pub` and the marker `etc/td/live-media`
-  appended, and no `etc/td/volume-uuid`;
+  marker `etc/td/live-media` appended, and no `etc/td/volume-uuid`;
 - the ISO root: `BZIMAGE`, `INITRAMFS.CPIO` and `ROOT.EROFS` streamed from
-  the verified store deployment, the manifest, and its new signature.
+  the verified store deployment, and its manifest.
 
 The default output is `dist/td-install-x86-64.iso` in the checkout; `--out`
 names another file, relative to the caller, outside the shared work tree
@@ -156,10 +152,10 @@ the file between the check and the rename. A refused publication keeps the
 staged image and the error names it. The directory is synced after
 publication.
 
-Firmware boots the selector, which takes the "Live boot" path below. Each ISO
-has its own key, so a deployment signed for one medium does not authenticate
-under another, and an installed system's key is unrelated to the medium's.
-The medium holds no private key, no volume identity and no operator data.
+Firmware boots the selector, which takes the "Live boot" path below. The
+medium holds no volume identity and no operator data. Nothing on it is
+signed: a medium anyone can write boots whatever they wrote
+(DESIGN.md §6).
 
 ## Live boot diagnostics
 
@@ -208,7 +204,7 @@ each result. Repeated notes are suppressed and at most 64 distinct notes
 are printed per discovery, including probes; a blocked read still has the
 kernel's command timeout, not a new userspace deadline. Stage messages
 identify RAM-disk sizing, manifest/kernel/initramfs verification and root
-image hashing. These diagnostics do not change media selection or signature
+image hashing. These diagnostics do not change media selection or payload
 checks. They are volatile; photograph the final screen or capture serial
 output before restarting.
 
@@ -270,7 +266,7 @@ firmware discovery and configuration requirements are the same as
 
 Both attachments must reach the diagnostic initramfs's actual userspace
 marker. This proves firmware loading of the shared ESP, kernel and initrd;
-it does not prove the kernel can mount the ISO, authenticate a deployment,
+it does not prove the kernel can mount the ISO, verify a deployment,
 run the compositor or boot an installed disk; `qemu-boot-live` proves
 those for the live profile booted as USB storage and the disk it installs
 ([INSTALLER.md](INSTALLER.md)). `qemu-boot-media` accepts no output or
@@ -291,22 +287,22 @@ default size, which holds no memory. Destination discovery
 never offers it, because its allow-list admits only virtio, SCSI-named and
 NVMe disks.
 The native `qemu-install` diagnostic extends the firmware evidence by
-mounting the ISO read-only in Linux and installing its signed payload files.
+mounting the ISO read-only in Linux and installing its payload files.
 It exercises both attachments with the same image and then boots the
 destination with media detached. Its exact bounds and fixture-only device
 conventions are specified in [the fixture design](../td-install-qemu-test/DESIGN.md).
 
 ## Live boot
 
-A live boot runs the signed system deployment from the medium, with the root
+A live boot runs the system deployment from the medium, with the root
 image read-only and all writable state in RAM. It reuses the installed boot
-chain: a selector authenticates and kexecs, and the deployment initramfs
+chain: a selector verifies and kexecs, and the deployment initramfs
 mounts a td volume named by `td.volume=` and loop-mounts `root.erofs`. The
 differences are where the selector finds the deployment, where the root image
 stays, and what backs the volume.
 
-Install media carry the signed deployment in the ISO root as `BZIMAGE`,
-`INITRAMFS.CPIO`, `ROOT.EROFS`, `MANIFEST` and `MANIFEST.SIG`
+Install media carry the deployment in the ISO root as `BZIMAGE`,
+`INITRAMFS.CPIO`, `ROOT.EROFS` and `MANIFEST`
 (`td-boot/src/protocol.rs` `MEDIA_DEPLOYMENT_FILES`). Linux mounts the medium
 `ro,nodev,nosuid,noexec` with ISO-9660 `map=normal`, which shows those names in
 lowercase. td-boot reads the lowercase names, so `bzImage` is `bzimage` on the
@@ -334,18 +330,16 @@ seconds for slow USB enumeration. More than one medium is refused rather
 than chosen between: attach only the one to boot. Probes run one device at a
 time with the same bound as volume discovery: a read that stalls is ended by
 the kernel's command timeout, not by td-boot. The descriptor is an identity,
-not a credential; authenticity comes from the signature below.
+not a credential.
 
-The live selector is the stock selector initramfs with two appended entries:
-the trust root at `etc/td/deployment.pub`, as for an installed selector, and
+The live selector is the stock selector initramfs with one appended entry,
 the marker `etc/td/live-media` holding `td-live-media-v1`. It has no
 `etc/td/volume-uuid` and no `etc/td/boot-measurement` policy. `td-boot
-live-boot MOUNTPOINT CMDLINE` refuses without the exact marker or its trust
-root, and refuses a selector carrying either of those files, since it would
-apply neither; these read only the selector's own rootfs. The stock
-selector carries the static cryptsetup an installed selector opens its
-volume with (DESIGN.md D6); the live branch never releases, opens a
-volume or runs it. Then it:
+live-boot MOUNTPOINT CMDLINE` refuses without the exact marker, and refuses
+a selector carrying either of those files, since it would apply neither;
+these read only the selector's own rootfs. The stock selector carries the
+static cryptsetup an installed selector opens its volume with (DESIGN.md
+D6); the live branch never releases, opens a volume or runs it. Then it:
 
 0. caps PCR 12 through td-protector before anything else, when
    `/dev/tpmrm0` exists, so that no live session can release a td disk's
@@ -372,11 +366,11 @@ volume or runs it. Then it:
    512 MiB;
 2. draws a fresh version-4 volume UUID from `/dev/urandom`;
 3. finds and mounts the medium;
-4. authenticates the manifest under the trust root before parsing it, and
-   verifies `bzImage` and `initramfs.cpio` against it;
+4. parses the manifest and verifies `bzImage` and `initramfs.cpio` against
+   it, saying `td-boot: verifying live kernel/initramfs against the
+   manifest` on the console;
 5. kexecs them with the base command line plus `td.volume=UUID`,
-   `td.deployment=ID`, `td.live=1`, `td.trust=KEY` (the trust root as 64
-   hex digits) and `brd.rd_size=KIB`.
+   `td.deployment=ID`, `td.live=1` and `brd.rd_size=KIB`.
 
 It does not hash `root.erofs`: with no previous deployment to fall back to,
 `live-root`'s hash after kexec is the one that decides. Every payload hash
@@ -391,9 +385,9 @@ nothing today; a protector that ever did would need the live selector to cap
 PCR 11 first.
 
 The base command line may not carry the literal tokens `td.volume=`,
-`td.deployment=`, `td.live=`, `td.trust=` or `brd.rd_size=`. The last three
-are refused in an installed selector's base line too, so firmware cannot
-steer an installed boot into the live branch or hand it a key. Only those
+`td.deployment=`, `td.live=` or `brd.rd_size=`. The last two are refused
+in an installed selector's base line too, so firmware cannot steer an
+installed boot into the live branch. Only those
 spellings are refused: the kernel also accepts `brd.rd-size=` and
 `ramdisk_size=`, but td-boot's token comes last and wins. A live base line
 may not contain a bare `--`, after which the kernel hands every word to init
@@ -405,8 +399,8 @@ In the deployment initramfs, `td-boot live-root MOUNTPOINT ID LOOP` requires
 `td.live=1` and `td.deployment=ID` in `/proc/cmdline`, finds and mounts the
 medium again, and
 requires its manifest to hash to the handed-off id, which the selector
-authenticated. A different medium carrying the same signed deployment is
-therefore acceptable and any other is refused. It hashes `root.erofs` against
+verified. A different medium carrying the same deployment is therefore
+acceptable and any other is refused. It hashes `root.erofs` against
 that manifest and attaches the verified descriptor to a read-only loop, as
 `root-loop` does for an installed volume, and leaves the medium mounted
 because the loop holds its file. On failure it unmounts.
@@ -414,41 +408,34 @@ because the loop holds its file. On failure it unmounts.
 The deployment initramfs takes the live branch only on `td.live=1`, which
 only `live-boot` hands over, and requires `td.volume=` with it. It runs
 `live-root`, then `td-boot live-seed MOUNTPOINT ID SEED`, which requires the
-same handoff and exactly one well-formed `td.trust=`, rechecks that the
-mounted medium's manifest hashes to the id, authenticates it again under the
-handed-off key, and stages only what the booted system reads from its volume
-in a directory that must not already exist: `td/boot/current` naming the
-deployment, its `manifest` and `manifest.sig`, `td/trusted.pub` holding the
-handed-off key as an installed volume holds its key, an empty `td/incoming`
-and `@var`, with directories 0755 and files 0644. A medium without a
-signature, or a handoff naming a key the deployment was not signed under, is
-refused before anything is staged.
+same handoff, rechecks that the mounted medium's manifest hashes to the id,
+and stages only what the booted system reads from its volume in a directory
+that must not already exist: `td/boot/current` naming the deployment, its
+`manifest`, an empty `td/incoming` and `@var`, with directories 0755 and
+files 0644. A medium whose manifest does not hash to the id is refused
+before anything is staged.
 
-A server medium (td-svc/DESIGN.md §10, "Profiles") also carries
-`PROVISION` and its detached signature `PROVISION.SIG`, both or neither:
-the account the server admits. The file is the line `td-provision-v1`,
-then `user NAME`, then one or more `ssh-ed25519` key lines of printable
-ASCII, every line newline-terminated, at most 64 KiB. Its signature must
-verify under the handed-off key, and the name must be 1-32 lowercase
+A server medium (td-svc/DESIGN.md §10, "Profiles") may also carry
+`PROVISION`, the account the server admits. The file is the line
+`td-provision-v1`, then `user NAME`, then one or more `ssh-ed25519` key
+lines of printable ASCII, every line newline-terminated, at most 64 KiB.
+The name must be 1-32 lowercase
 letters, digits, `_` or `-`, starting with a letter, which is td-authd's
 grammar; td-firstboot also refuses a reserved or taken name at boot.
 Each key line is `ssh-ed25519`, a base64 blob and an optional comment.
 `live-seed` then stages the name in `@var/lib/td/username` and the key
 lines in `@var/lib/td/authorized-keys`, as an image's volume carries
 them, mode 0644 in directories of mode 0755 and, being formatted by PID
-1's initramfs, owned by root. The format line differs from a manifest's,
-so a provision signature cannot stand for a deployment's or the other
-way round. A provision that fails any check, or one of the pair alone,
-stages nothing and stops the live boot, as any `live-seed` refusal does.
+1's initramfs, owned by root. A provision that fails any check stages
+nothing and stops the live boot, as any `live-seed` refusal does. Like
+the deployment beside it, it is unsigned: whoever can write the medium
+chooses the account it admits.
 `mkfs.btrfs` formats `/dev/ram0` from that tree with the handed-off
 UUID, the `td-system` label and a writable `@var` subvolume, as
 td-install formats an installed volume. From `on-volume mount-root` on,
 the boot is the installed one: the volume is found by UUID, the root
 loop is already bound, `@var` is mounted, and the medium is moved to
-`/run/td-media` so it stays mounted under the loop. The live volume's
-`td/trusted.pub` is the key the running deployment was authenticated
-under, both before kexec and in `live-seed`, so a live installer can
-authenticate its source under the key that booted it. A live session has
+`/run/td-media` so it stays mounted under the loop. A live session has
 no bundled `td/source`, and everything it writes is lost at power-off.
 Its graphical session differs from an installed one in its windows: it
 opens the installer wizard and no other (INSTALLER.md "Live startup"),

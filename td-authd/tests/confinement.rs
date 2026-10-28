@@ -849,7 +849,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(disk.matches("Command::new(").count(), 1);
     assert!(disk.contains("Command::new(\"/bin/td-install\")"));
     assert!(disk.contains(
-        "\"serve\",\n                \"/bin/td-boot\",\n                \"/run/td-media\",\n                TRUSTED_KEY,\n                \"/\",\n                \"/bin/td-firstboot\","
+        "\"serve\",\n                \"/bin/td-boot\",\n                \"/run/td-media\",\n                \"/\",\n                \"/bin/td-firstboot\","
     ));
     assert!(disk.contains("sys::peer_uid(peer).is_ok_and(|uid| uid == self.installer)"));
     assert!(disk.contains("if self.admits(&installer) {"));
@@ -1341,5 +1341,5 @@ const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const REVOCATION_FINGERPRINT: u64 = 0xae6413da1bcf5b12;
 const SHARED_CUTOVER_FINGERPRINT: u64 = 0x358939aac41ef40a;
-const DISK_INSTALL_FINGERPRINT: u64 = 0x7089e614566ed61a;
+const DISK_INSTALL_FINGERPRINT: u64 = 0x45e5e48767f17d03;
 const CONSENT_CODEC_FINGERPRINT: u64 = 0x282490be2a44c4e5;

@@ -1974,9 +1974,7 @@ On a live boot td-authd installs disks and never updates itself. Prepare
 reads `/proc/cmdline` (a longer one than 4096 bytes fails Prepare): exactly
 one `td.live=` token, `td.live=1`, marks a live boot; none marks an
 installed system; any other spelling or a repeated token is ambiguous and
-fails Prepare, as does a live boot whose handed-off trust root
-`/run/td-volume/td/trusted.pub` is not a root-owned regular file without
-group or other write. A live boot binds `disk_install.rs`'s setup intake at
+fails Prepare. A live boot binds `disk_install.rs`'s setup intake at
 `/run/td-authd/1000/setup` in place of the update intake; an installed
 system binds only the update intake. Both use one binder: protected
 root-owned parents, a stale socket of root or of the socket's owner
@@ -1991,7 +1989,7 @@ of UID 990, the wizard's (the fixed peer-UID query), gets a service; any
 other connection is closed unanswered. A peer of the session owner cannot
 connect at all, the socket being mode 0600 and the wizard's. The service is
 `/bin/td-install serve /bin/td-boot
-/run/td-media /run/td-volume/td/trusted.pub / /bin/td-firstboot`, with an
+/run/td-media / /bin/td-firstboot`, with an
 empty environment, cwd `/`, the accepted socket as stdin, one end of a new
 socketpair as stdout and authority stderr: td-install/INSTALLER.md
 "Installation service core" says what it admits, including the supervisor's

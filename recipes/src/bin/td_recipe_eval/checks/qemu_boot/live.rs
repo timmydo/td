@@ -6,14 +6,12 @@
 //! increment 6, and increment 7's firmware boot of the medium).
 //!
 //! The medium is `build-iso`'s, composed by the same function from the same
-//! verified store deployment and signed with a key made for this run, and
-//! firmware boots it as USB mass storage: the run's private copy of the
-//! firmware's variables holds one boot entry, the medium's removable
+//! verified store deployment, and firmware boots it as USB mass storage:
+//! the run's private copy of the firmware's variables holds one boot entry, the medium's removable
 //! loader with the autotest and wizard-evidence tokens as its load options,
 //! which the kernel appends to its built-in command line and the live
-//! selector hands on. The selector finds, mounts and authenticates the
-//! medium, and an empty sparse disk after it is the only eligible
-//! destination.
+//! selector hands on. The selector finds, mounts and verifies the medium,
+//! and an empty sparse disk after it is the only eligible destination.
 //!
 //! Once the live session says the wizard is ready, every key is pressed
 //! through QEMU's emulated keyboard only after td-setup says it showed the
@@ -215,12 +213,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let scratch = Scratch {
         dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
     };
-    let trust = RunTrust::generate()?;
     let LiveMedium {
         id,
         selector: live,
         payloads,
-    } = live_medium(&selector, &deployment, &scratch.dir, &trust)?;
+    } = live_medium(&selector, &deployment, &scratch.dir)?;
     let iso = scratch.dir.join("live.iso");
     media::write_image_with_payloads(&iso, &kernel, &live, &payloads)?;
     let mut payload_bytes = 0u64;

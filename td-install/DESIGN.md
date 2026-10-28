@@ -3,22 +3,21 @@
 [INSTALLER.md](INSTALLER.md) specifies the offline graphical installer and
 its hybrid installation media. Its v1 deliberately defers the
 encrypted profile in [ENCRYPTION.md](ENCRYPTION.md). The contracts below
-continue to own disk layout, deployment publication and signature checks.
+continue to own disk layout, deployment publication and payload checks.
 
 This file is the normative specification for td's **deployment path**: how a
-disk is laid out, how a deployment bundle is published onto it, how that
-bundle's authenticity is established, and how a machine moves from one
-deployment to the next. Where the code and this document disagree, one of
-them is a bug.
+disk is laid out, how a deployment bundle is published onto it and verified,
+and how a machine moves from one deployment to the next. Where the code and
+this document disagree, one of them is a bug.
 
 It is deliberately wider than one crate. The path runs through `td-install`
-(the installer), the signing half in `td-net`, the on-disk protocol and
-transactional publish in `td-boot`, and the update channel that will become
-`td-update`. Those were three workstreams and are now one, with one owner and
-one branch, because every coordination point between them was a place where
-two agents could each write half of a mechanism. Several invariants below are
-not checkable by any compiler or lint; they are recorded here because the
-failure modes they prevent are silent.
+(the installer), the on-disk protocol and transactional publish in
+`td-boot`, and the update path in `td-update`. Those were three workstreams
+and are now one, with one owner and one branch, because every coordination
+point between them was a place where two agents could each write half of a
+mechanism. Several invariants below are not checkable by any compiler or
+lint; they are recorded here because the failure modes they prevent are
+silent.
 
 ## 1. Why this file exists
 
@@ -87,9 +86,6 @@ installer image in INSTALLER.md and the rest in the sections below:
   could run it, so a machine is still only ever reached by QEMU `-kernel` —
   a development harness, not a way to boot hardware.
 - No bootloader, and nothing that writes an ESP.
-- No **authenticity**. Manifest hashes prove integrity and transaction
-  completeness. They prove nothing about who produced the bundle: anyone who
-  can write the volume can write a manifest that matches their own payloads.
 - No update channel.
 
 `engine/src/gpt.rs` + `engine/src/fat.rs` (with `engine/src/crc32.rs`)
@@ -97,10 +93,9 @@ landed toward it and were consumed by nothing until §10 item 7a, which is
 the installer that writes what they produce — and by a TARGET binary since
 7b's recipe, which is what makes them shipped code rather than host code
 that happens to compile.
-`engine/src/ed25519.rs` + `engine/src/sha512.rs` (verify-only, `aa347e60`)
-were in that list until §10 item 5: td-boot compiles them in, and since item
-6's flip the boot path CALLS them — no slot is selected whose manifest does
-not verify under the trust root in the selector's own rootfs.
+
+Manifest hashes prove integrity and transaction completeness, not who
+produced a bundle; §6 is why td adds nothing to them.
 
 ## 3. Hard invariants
 
@@ -114,7 +109,7 @@ with the second one exercised only by installs, which are the rarest
 operation on the path and the one nobody watches.
 
 That writer has TWO ways in and one body, which is the distinction the rule
-is about: `td-boot install <device> <mountpoint> <source> [key]` mounts and
+is about: `td-boot install <device> <mountpoint> <source>` mounts and
 then publishes, and the verb 7c adds publishes into a volume root that is
 already writable. The second exists because staging needs no mount at all and a
 regular-file destination has no partition device to mount anyway (D9); the
@@ -129,56 +124,22 @@ include, rather than restating the layout. A layout stated twice is a layout
 that can disagree with itself, and the disagreement surfaces at the first
 boot after an install rather than at build time.
 
-**D2. Sign before install, and verify fail-closed.** The signing half lands
-*first*, before `td-install` exists. This ordering is not stylistic. The
-system oracle already stages bundles, so signing and verification are
-testable today with no new boot path at all; whereas an installer written
-first would be a bundle publisher that must then be retrofitted, and — worse
-— an installer that stages an *unsigned* bundle produces a machine that fails
-closed on its first boot. The first thing the installer ever does would be
-the thing that bricks it.
+**D2. Verify fail-closed.** Every reader of a deployment — the selector
+choosing a slot, the publisher, the installer's source checks and the
+update helper — hashes each payload it uses against the manifest and
+refuses on any mismatch, missing payload or malformed manifest. There is
+no permissive mode and no flag to add one.
 
-Fail-closed means: a missing signature, a malformed signature, a signature by
-a key other than the trusted one, or a manifest that does not verify, each
-refuse the deployment. There is no permissive mode and no flag to add one.
-"Trusted" rather than "pinned": §6 settled on a key read at runtime from the
-selector initramfs, so there is no build-time pin to be other than.
+**D3. The id is the manifest's hash.** The deployment id is
+`sha256(manifest)`, recomputed at every verify, so it is a claim about
+content rather than a name someone chose. Nothing beside the manifest is
+an input to it, and a deployment directory holds the manifest and its
+three payloads and nothing else td reads.
 
-**D3. The signature is DETACHED and the id is unchanged by it.** The
-deployment id stays `sha256(manifest)`. The signature lives beside the
-manifest as `manifest.sig`, and is not an input to the id. This is what lets
-a bundle be re-signed under a new key — key rotation, or a bundle promoted
-from a test key to a release key — **without changing its identity**, so a
-machine that already has that deployment installed still recognises it as the
-same one. Folding the signature into the id would make every re-signing a
-different deployment, and rollback would stop finding what it rolled back to.
-
-Item 6's flip gave that a consequence worth writing down. A re-sign now decides
-whether the deployment still BOOTS, and `install` cannot check the replacement:
-it runs on the real root, which per §6 has no trust root. Publishing already
-refuses to remove a signature (`SignatureWithdrawn`); it cannot refuse to
-replace one with a signature under the wrong key, because telling those apart
-is the thing it has no key for. Mostly this is absorbed by the mechanism that
-exists for it — `current` fails to authenticate and the boot rolls back to
-`previous`. What it is not absorbed by is the case where both slots select the
-SAME deployment, which is exactly the state a freshly installed machine is in:
-there the re-sign costs the machine its boot, and nothing before the next
-power-on says so. So `td-boot install` warns on stderr when a re-sign replaces
-the signature of a slot that selects it — a warning rather than a refusal
-because refusing is D3's feature, and rather than silence because the next
-report is a machine that does not come back. The real answer was a trust root
-on the installing rootfs, and item 7c is where it arrived: where one is
-present the replacement is authenticated before anything is written, a wrong
-key is a refusal rather than a warning, and this path is what remains for a
-rootfs that has none.
-
-**D4. Signing happens outside the derivation.** A signing key inside a build
-would break both reproducibility (the output depends on a secret) and offline
-purity (the key is an undeclared input). Signing is a control-plane `td-net`
-operation over an already-built bundle, exactly as `td-subst sign` is over
-narinfos. It runs outside derivations, on either the build host or an
-installed system using its source-built signer. A private key never enters the target graph, never enters a recipe,
-and never appears in a store path.
+**D4. No secret enters the deployment path.** A deployment is built
+reproducibly from the recipe graph and published as built; no key is
+generated, retained or consulted to build, install, update or boot it
+(§6).
 
 **D5. The ESP is not the system.** The EFI System Partition holds a *fixed*
 boot stub and nothing per-deployment. It is FAT32 — the one filesystem in td
@@ -402,54 +363,17 @@ those keys readably. The `volume` and `format` commands carry none.
 Reinstall keeps the installed `@var`, and so its own saved networks, and
 carries none from the live session.
 
-### Installation signing identity
+### VM installations
 
-Each installation generates its own deployment signing key during
-provisioning. A redistributable image contains no installation private key.
-The installer must provision the matching public key into the selector and
-the volume before first activation, then retain the private key in protected
-installation state outside deployments, recipes and `/td/store`. Updates and
-rollback retain that identity. Copying an installed disk copies its identity;
-creating another installation requires new state.
-
-The source-built `td-deploy identity STATE` primitive creates or reopens that
-identity. `STATE` is an absolute, caller-owned 0700 directory beneath trusted
-directory ancestors. Ancestors may be root-owned or caller-owned; shared
-writable ancestors require the sticky bit. Symlinks are refused, including a
-state path ending in a slash or dot. The parent must be readable for the
-durability barrier. New directories and files receive exact private modes
-through pinned descriptors regardless of the caller's umask; existing modes
-are never repaired. Special permission bits are refused on retained state.
-The command requires procfs, pins the state directory by descriptor, and
-serializes cooperating callers with its private `identity.lock`. Both the
-lock and `deployment.pk8` must be owned regular files with one link and mode
-0600. The caller's UID is the cooperation boundary, not an adversarial peer.
-
-The private PKCS#8 key is the only persisted key authority. The command
-derives and prints its canonical public key after syncing the key, its
-directory, and the directory's parent. Publication is a synced temporary file
-renamed under the lease. A crash before publication permits retry; a crash
-after publication preserves the same identity. An existing malformed,
-oversized, symlinked, hardlinked or exposed key is refused rather than
-replaced. There is no automatic key rotation or recovery from key loss:
-recovery requires explicit reprovisioning of both the identity and selector.
-
-This primitive uses td-net's existing reviewed ring signer and never executes
-inside a target derivation. `/bin/td-deploy` exposes the installed source-built
-multicall. The primitive supplies no elevation, installation consent, hardware
-sealing or application credential storage. The installer's operation
-(INSTALLER.md) owns those boundaries and does not rely on `su`.
 `td-recipe-eval bundle --installation --out DIR` creates a private VM
-installation. It builds the source-built signer along with the system,
-generates a fresh key outside the artifact graph, signs the initial
-deployment, provisions the matching selector and volume public keys, and
-retains the PKCS#8 key at `/var/lib/td-deploy/deployment.pk8` in writable
-`@var`. The directory and key are root-owned 0700 and 0600 in the guest.
-The existing builder `userns-private` operation maps the seed's owner to
-numeric root while `mkfs.btrfs` reads it; no host privilege or first-boot
-ownership repair is required. Each installation receives a UUID derived
-from 128 bits of its own public key, with UUID version/variant bits set,
-and 2 TiB of sparse virtual capacity for local builds.
+installation. It builds the system, provisions the selector with the
+volume identity and publishes the initial deployment onto a fresh
+volume. The existing builder `userns-private` operation maps the seed's
+owner to numeric root while `mkfs.btrfs` reads it; no host privilege or
+first-boot ownership repair is required. Each installation receives a
+random version-4 UUID from the kernel random device, as `td-install
+new-volume-uuid` draws one, and 2 TiB of sparse virtual capacity for
+local builds.
 
 The installation output directory is pinned by descriptor, caller-owned 0700
 and empty apart from its private publication lease; the disk is 0600.
@@ -459,35 +383,32 @@ refuses existing destination files or a moved directory, and syncs its
 completed files and directory entries. This mode requires explicit
 `--out`, refuses `--force`, uses a distinct marker that demo replacement does
 not recognize, and generates a launcher that persists guest writes by
-default. Copying this output copies the installation identity. It is not a
-redistributable release template. The default `bundle` remains a demo with
-disposable trust and no retained signing key.
+default. It is not a redistributable release template. The default
+`bundle` remains a disposable demo.
 
-VM provisioning establishes trust before first activation; it never trusts
-a replacement public key supplied by an update volume. It does not install
-an EFI boot stub, provide disk encryption, or authorize successor activation.
-The named, consent-bound update operation below authorizes successor activation.
-
+VM provisioning does not install an EFI boot stub, provide disk
+encryption, or authorize successor activation. The named, consent-bound
+update operation below authorizes successor activation.
 
 ### Offline reinstall
 
 `INSTALLER.md` "Reinstall while keeping personal files" defines the live
-preserve mode. It is separate from formatting and preserves the existing GPT,
-filesystem UUID and writable state. Its first increment refuses encryption.
-It can provision missing installation signing state and replace both boot
-selections and the matching ESP trust. It requires explicit physical consent
-to reinstall and does not grant an installed updater permission to rotate keys.
-An interrupted reset may require another USB boot; keeping personal files is
+preserve mode. It is separate from formatting and preserves the existing
+GPT, filesystem UUID and writable state. Its first increment refuses
+encryption. It replaces both boot selections and the ESP's kernel and
+selector, and requires explicit physical consent to reinstall. An
+interrupted reset may require another USB boot; keeping personal files is
 not a claim of atomic activation across Btrfs and FAT.
 
-`td-boot reinstall DEVICE MOUNTPOINT SOURCE TRUSTED-KEY` is its root mechanism.
-It requires an explicit key, verifies the complete source before a writable
-mount and takes the normal transaction locks. It uses the one bundle writer,
+`td-boot reinstall DEVICE MOUNTPOINT SOURCE` is its root mechanism.
+It verifies the complete source before a writable mount and takes the
+normal transaction locks. It uses the one bundle writer,
 replacing a same-ID destination through the existing installation temporary
 namespace, then selects the verified replacement in both slots and clears its
 attempt budget. Ordinary install retains its existing predecessor checks.
-Only the live installer binds this mechanism to physical consent and repairs
-the selector trust; the command alone is not a complete reinstall interface.
+Only the live installer binds this mechanism to physical consent and
+refreshes the selector; the command alone is not a complete reinstall
+interface.
 
 ### Privileged local installation mechanism
 
@@ -502,30 +423,32 @@ table must grant. Physical I selects it, and its root-drawn approval
 key, typed after complete presentation, confirms it; Enter does not, as
 specified in td-authd/DESIGN.md.
 
-The helper requires the existing root-owned 0700 installation signing
-state and single-link 0600 key. It never creates or replaces an identity.
-It reads a bounded manifest through the supplied directory, compares its
-SHA-256 with the approved ID, and pins all three regular payload files,
-which must also belong to the requester. Symlinks and special files refuse.
-The staging bounds are 256 MiB for the kernel, 512 MiB for the initramfs,
-and 128 GiB for the root image. A size change during copying refuses;
-content changes remain subject to the boot verifier's payload hashes.
+The helper reads a bounded manifest through the supplied directory,
+compares its SHA-256 with the approved ID, and pins all three regular
+payload files, which must also belong to the requester. Symlinks and
+special files refuse. The staging bounds are 256 MiB for the kernel,
+512 MiB for the initramfs, and 128 GiB for the root image. A size change
+during copying refuses; content changes remain subject to the payload
+hashes.
 
-A fresh root-private directory beneath the signing state receives copies
-of those four files, with each file synced at mode 0600. The installed
-source-built signer signs that manifest, and `td-boot authenticate` checks
-the signature and manifest under the running volume's provisioned key.
-Only then does `td-boot install` verify all payloads and enter its existing
-transaction, publishing current/previous on the running volume UUID through the private
-`/run/td-update` mountpoint. No requester-selected command, key, device,
-mountpoint, or signature crosses this interface. This device selection is
-the current stock VM profile, not a hardware installer discovery policy.
+A fresh root-private directory beneath td-update's own state,
+`/var/lib/td-update`, receives copies of those four files, each synced
+at mode 0600. Every ancestor of that state must be a real root-owned
+directory with no group or other write; the state itself is created
+0700 if absent and its mode then set exactly, and a symlink or any other
+owner or mode refuses. `td-boot validate-source STAGE` then checks every
+staged payload against the staged manifest, and its stdout must be
+exactly the approved ID and a newline. Only then does `td-boot install`
+verify all payloads again and enter its existing transaction, publishing current/previous on the
+running volume UUID through the private `/run/td-update` mountpoint. No
+requester-selected command, device, mountpoint or file name crosses this
+interface. This device selection is the current stock VM profile, not a
+hardware installer discovery policy.
 
 Ordinary completion or refusal removes the helper's private staging.
 Process death can retain a root-private `.update-*` orphan but cannot
 publish an unverified deployment; the boot transaction owns crash recovery
-once installation begins. There is no signing-key rotation or implicit
-reboot in this mechanism.
+once installation begins. There is no implicit reboot in this mechanism.
 
 
 ## 4. Disk layout
@@ -546,14 +469,13 @@ do not lock out a concurrent editor or establish a snapshot of build reads.
 The source files have mode 0644 and their volume directories have mode 0755,
 independent of the publisher's umask. They count against the volume payload
 budget. The published disk checksum covers these bytes; the deployment
-signature does not. Boot never executes them. The unprivileged `release-source`
+manifest does not. Boot never executes them. The unprivileged `release-source`
 oneshot clones the bundle into the human's persistent `~/src/td` if absent,
 where ordinary Git owns subsequent edits and pulls. It preserves an existing
 checkout and never makes console startup depend on cloning. The initializer
 and native build command are specified in `td-update/DESIGN.md`.
 Update activation preserves this initial source companion and the user's
-checkout. Future source provenance and signing integration must not treat
-this mutable volume metadata as a boot trust root.
+checkout. Nothing may treat this mutable volume metadata as boot input.
 
 Positions are in SECTORS of the destination's own logical size, not in
 512-byte units. The entry array is 16 KiB and the first partition starts at
@@ -612,8 +534,8 @@ owned by guest root, and the image is never an installation target.
 
 After unlocking and mounting the volume read-only, the installed selector
 shows the retained `current` and distinct `previous` deployments. Each
-entry requires a manifest authenticated under the selector's trust root
-and an initramfs matching that signed manifest. Full kernel and root
+entry requires a well-formed manifest and an initramfs matching it. Full
+kernel and root
 verification remains mandatory on the selected boot path; showing a label
 is not a claim that those larger payloads have already been read.
 The writer locks remain held across the menu and activation.
@@ -628,11 +550,11 @@ consumes its first attempt before boot.
 
 An explicit previous choice becomes current, so older systems' success
 acknowledgements still refer to the running deployment. A successful choice
-is published as current before the displaced authenticated current is
+is published as current before the displaced verified current is
 retained as previous. A pending choice instead preserves the successful
 current as previous before activation. These publication orders preserve the known-good
 fallback when one exists. Manual transaction errors refuse rather than silently
-boot a different entry. Authentication is repeated after the writable
+boot a different entry. Verification is repeated after the writable
 transaction before handing descriptor-bound payloads to kexec.
 
 `td-init boot-menu` owns the fixed keyboard and serial consoles through
@@ -650,18 +572,18 @@ canonical archive, from the already hash-verified initramfs descriptor.
 No inode timestamp or current checkout supplies an old system's label.
 
 ISO and installed-update assembly add that data to a private copy of the
-recipe initramfs, regenerate the four-line manifest, and only then request
-signing. The recipe outputs and source-bootstrap graph stay unchanged.
-Build date means deployment assembly date; identical source assembled on
-different dates can have distinct deployment IDs. Git identity is captured
-before the build and checked again afterward; a changed HEAD or clean/dirty
-state refuses assembly. A dirty label does not identify uncommitted bytes
-by Git hash; payload hashes and the deployment signature still bind them.
+recipe initramfs and regenerate the four-line manifest. The recipe outputs
+and source-bootstrap graph stay unchanged. Build date means deployment
+assembly date; identical source assembled on different dates can have
+distinct deployment IDs. Git identity is captured before the build and
+checked again afterward; a changed HEAD or clean/dirty state refuses
+assembly. A dirty label does not identify uncommitted bytes by Git hash;
+payload hashes still bind them.
 
 The menu lives in the firmware-loaded selector. Ordinary deployment updates
 retain the installed selector. Existing machines receive this menu through
 the preserving reinstall path, which refreshes the selector, or the
-separate authenticated selector-update protocol for protected machines.
+separate selector-update protocol for protected machines.
 
 
 ### Read-only volume discovery primitive
@@ -679,7 +601,7 @@ pins the partition as `on-volume` does and adds a third field, the
 `/dev/dm-N` node of its active `td-system` mapping, admitted as the
 running system's operations admit it; with no such mapping it refuses
 as they do ("Full-system volume consumers"). UUIDs and labels identify
-bytes; they do not authenticate a deployment or authorize a write.
+bytes; they do not vouch for a deployment or authorize a write.
 
 The resolver refuses more than 4096 `/sys/class/block` entries and probes only
 direct virtio, SCSI/SATA and NVMe disk/partition names (`vd*`, `sd*`, and
@@ -765,15 +687,14 @@ Media/backing-device exclusion, stable identity, the service's held
 operation descriptors through execution and trusted destructive consent
 remain required; `td-install serve` holds the claim through review only.
 
-The internal `FormatDestination` owns one File and a diagnostic label.
-Both formatting bodies borrow that File; neither reopens its label. A
+The internal `FormatDestination` owns one File and a diagnostic label. Both
+formatting bodies borrow that File; neither reopens its label. A
 same-process coordinator can retain the object through layout and volume
-formatting. `prepare_volume` validates caller-bound programs, trust and
-account selection before the destination is acquired or changed; its
-consumed result feeds volume formatting. It retains the admitted key bytes,
-but other source paths and contents must remain stable under the caller's
-control. This preparation does not establish payload fit, scratch capacity,
-disk eligibility, a reviewed installation plan or consent.
+formatting. `prepare_volume` validates caller-bound programs and account
+selection before the destination is acquired or changed; its consumed result
+feeds volume formatting. Source paths and contents must remain stable under
+the caller's control. This preparation does not establish payload fit,
+scratch capacity, disk eligibility, a reviewed installation plan or consent.
 
 The pathname CLI commands each construct and release their own object;
 format retains one through both raw writes. A service holding a separate
@@ -863,7 +784,7 @@ service activation, immutable installation plan or capacity admission. The
 combined formatter below uses it before layout; a service must additionally
 admit disk eligibility. The image alone binds a length, not an offset, disk
 identity or destructive consent; its destination check reads the current
-table and does not authenticate it against a reviewed plan. Source bytes and
+table and does not check it against a reviewed plan. Source bytes and
 destination topology must remain stable while copying, and a later refusal
 cannot undo layout already performed.
 
@@ -873,7 +794,7 @@ cannot undo layout already performed.
 the same ordered options and operands as `volume`, after the two required
 boot files. Option-like boot names refuse with an ordering diagnostic; a
 relative filename starting with a dash must use a ./ prefix. It prepares
-settings, trust and account validation, opens the destination once, and
+settings and account validation, opens the destination once, and
 builds the GPT/FAT metadata and holds both EFI inputs before staging the
 Btrfs image. The image length comes from the new layout, so no existing GPT
 is required. All scratch writes, optional staged deployment publication,
@@ -907,17 +828,14 @@ concurrent source mutation remains outside the contract. Boot-file
 admission checks type, bounds and FAT fit, not signatures or PE validity.
 No disk eligibility, media exclusion, reviewed identity, trusted consent,
 mount claim handoff or complete-installation success is supplied. The
-trust-only form still publishes the deployment later on the mounted disk;
+seed-only form still publishes the deployment later on the mounted disk;
 its later capacity or publication failures cannot preserve old contents.
 
 ### Selector identity preparation
 
-`td-install prepare-selector TEMPLATE TRUSTED-KEY VOLUME-UUID OUTPUT`
-creates the private selector copy described in INSTALLER.md. It appends the
-trusted public key, admitted by the same reader as `format --trusted-key`
-and refused unless it is the 64 hexadecimal digits td-boot decodes (a
-stricter rule than `format` applies, since a key the selector cannot
-read makes an unbootable disk), and the validated volume identity, using `engine/src/cpio.rs`, and leaves
+`td-install prepare-selector TEMPLATE VOLUME-UUID OUTPUT`
+creates the private selector copy described in INSTALLER.md. It appends
+the validated volume identity, using `engine/src/cpio.rs`, and leaves
 the verified base template's bytes unchanged. The appended archive is
 built by `td-boot/src/selector_appendix.rs`, which the storage worker's
 selector update and the installed selector's staged-update commit
@@ -928,10 +846,9 @@ creation cannot overwrite an existing destination. This preparation
 belongs before raw formatting and supplies no destructive authority.
 The live QEMU installer uses `new-volume-uuid` to draw one version-4 identity
 through the formatter's existing random-device reader before preparing the
-copy. Its live configuration carries the run's key as `/trusted.pub` and no
-destination UUID; its ISO selector template carries neither, as the stock
-selector does not, so the installed boots read the key `prepare-selector`
-appended from `/trusted.pub`. The host checks the reported identity
+copy. Its live configuration carries no destination UUID, and its ISO
+selector template carries none, as the stock selector does not. The host
+checks the reported identity
 against the private image's primary Btrfs fsid and refuses reuse across
 installations, then requires the same binding on detached boots. The direct
 application-evidence boot uses the first installed volume's observed UUID;
@@ -945,14 +862,12 @@ static `td-btrfs` the deployment initramfs already carries, linked at
 `/bin/mkfs.btrfs` (the name D7's `MKFS_BTRFS` gives), and the static
 `cryptsetup` with its debug companion, linked at `/bin/cryptsetup` (D6),
 so a live installer finds them in the root image `live-root` hashed
-against the authenticated manifest rather than on the medium's
-unauthenticated ESP. The image build refuses a root whose
+against the medium's manifest rather than on the medium's unverified
+ESP. The image build refuses a root whose
 `/bin/mkfs.btrfs` or `/bin/cryptsetup` does not link exactly that
 executable static binary.
-That template carries neither a trust root nor a volume identity, and
-`prepare-selector` appends both, so it is that command's template as
-shipped. A selector built from it without a key refuses to boot. No live
-installation uses them yet.
+That template carries no volume identity, and `prepare-selector` appends
+one, so it is that command's template as shipped.
 
 ### Refreshing partitions after formatting
 
@@ -983,30 +898,26 @@ a final successful reread before reporting installation success. Both optical
 and USB installation legs require this evidence before direct publication
 onto the mounted destination, as described below.
 
-### Trust-only initialization and mounted publication
+### Seed-only initialization and mounted publication
 
 `td-install volume [--uuid UUID] [--timezone IANA-ID] DESTINATION MKFS
-SCRATCH --trusted-key KEY`
+SCRATCH --seed`
 formats the same Btrfs image and destination region as bare `volume`, but
-initializes the publication directories and `td/trusted.pub` without
-copying a deployment into scratch. The existing three-operand publishing
-form remains available for unmounted image production; the two forms cannot
+initializes the publication directories without copying a deployment into
+scratch. The existing publishing form (`... SCRATCH TD-BOOT DEPLOYMENT`)
+remains available for unmounted image production; the two forms cannot
 be combined. Bare formatting remains unprovisioned.
 
-The key is read through the shared bounded real-file reader before opening
-the destination or clearing staging. Directory modes are 0755 and the key
-is 0644, using the same private snapshot and identity-checked promotion as
-the publishing form. This mode carries bytes; it does not parse Ed25519,
-authenticate a deployment, create `current` or `previous`, or claim a
-bootable installation. The coordinator must authenticate its stable source
-before erasure, keep the selector and volume keys consistent, then complete
-verified publication through `td-boot install DEVICE MOUNTPOINT SOURCE KEY`.
+Directory modes are 0755. This mode does not verify a deployment, create
+`current` or `previous`, or claim a bootable installation. The
+coordinator must verify its stable source before erasure, then complete
+verified publication through `td-boot install DEVICE MOUNTPOINT SOURCE`.
 That command remains the single transaction writer and rechecks copied
 payloads. The formatter itself gains no dependency or syscall for this;
 the loop publication below is a separate route with its own surface.
 
 The diagnostic ISO's interrupted-publication leg uses this sequence after
-preflight and layout. After trust-only formatting it requires empty staged
+preflight and layout. After seed-only formatting it requires empty staged
 boot, deployment and incoming directories and only the selected timezone
 under `@var`, refreshes and checks the partition devices, deletes its entire
 owned scratch directory, then invokes `td-boot install` on the resolved
@@ -1023,17 +934,17 @@ or capacity bounds; the full-system diagnostic in §8 supplies a separate
 ### Publishing through a loop over the claim
 
 `td-install format EFI-KERNEL SELECTOR-INITRAMFS [OPTIONS] DESTINATION MKFS
-SCRATCH --trusted-key KEY --publish TD-BOOT DEPLOYMENT MOUNTPOINT` formats
-exactly as the trust-only form does, then publishes the deployment before it
+SCRATCH --seed --publish TD-BOOT DEPLOYMENT MOUNTPOINT` formats
+exactly as the seed-only form does, then publishes the deployment before it
 releases the destination. Only `format` accepts `--publish`, only directly
-after `--trusted-key KEY`, and its three operands must be absolute: td-boot
+after `--seed`, and its three operands must be absolute: td-boot
 requires two of them, and a bare program name would resolve through `PATH`.
 
 After the volume copy and its sync barriers, the formatter rereads the
 volume extent from the table it just wrote through the held destination and
 binds a loop device over exactly that byte range, with the destination's
 logical sector size as the loop's block size. It then runs `TD-BOOT install
-/dev/loopN MOUNTPOINT DEPLOYMENT KEY`. The loop's backing file is the
+/dev/loopN MOUNTPOINT DEPLOYMENT`. The loop's backing file is the
 destination's own open file, so the exclusive claim, which refuses a mount
 of any partition of the disk, lasts while the loop is bound, and nothing
 names the disk by path. The kernel's partition table is neither read nor
@@ -1048,9 +959,7 @@ published disk and no loop left behind.
 Before the destination is opened, the formatter requires the deployment to
 be a directory and the mountpoint an empty one. td-boot takes those two in
 the other order, so a swap is the likely mistake, and without the check it
-would surface only after the disk was written. td-install bakes the key
-bytes it read into the volume and td-boot reads the same key path again;
-the caller keeps that file stable, as with every other source.
+would surface only after the disk was written.
 
 The loop is bound in one `LOOP_CONFIGURE` call and checked through sysfs
 before use, including that it is backed by the destination's own file;
@@ -1068,7 +977,7 @@ is left bound afterwards. Its interrupted-publication leg keeps the mounted
 route, whose publisher it can stop on its own.
 
 A failure after the first write leaves the disk as the raw formatter does: a
-trust-only volume with no selector, or a partial publication whose recovery
+seed-only volume with no selector, or a partial publication whose recovery
 td-boot's transaction owns. The live execution adds one state: a fully
 written installation whose verification failed, with its table withdrawn
 ("Executing a consented installation"). Nothing retries. If td-boot leaves
@@ -1087,24 +996,23 @@ A plan naming device-bound storage, which a service's own probes choose
 installation" says, except as follows. [ENCRYPTION.md](ENCRYPTION.md)
 "Device-bound formatting" owns the volume format and its parameters.
 
-No plaintext volume image exists. The settings, account and trusted key
-are staged as a directory tree in the workspace before the first write,
-as on the unencrypted path. The only secret among them is the carried
-Wi-Fi networks' PMKs ("Carried Wi-Fi networks"), in the root-only
-workspace and then inside the encrypted volume. The scratch image and
-its admission ("Prepared volume image admission") remain only for the
-unencrypted path. The layout's writes stop short of the table: the old
-table is invalidated and the ESP written, each synced, as on the
-unencrypted path, but neither copy of the new table is written until the
-recovery key is acknowledged (below). A refusal by the layout's recheck
-before its first write leaves the disk untouched. The formatter then binds
-the loop over the layout's volume extent, which no table on the disk yet
-places, as "Publishing through a loop over the claim" does. The loop
-covers the whole partition, which the layout ends on whole 4 KiB
-encryption sectors ("Disk layout"); an extent that is not whole sectors
-is refused before the first write rather than shortened, because a
-format shorter than the partition would be a volume no mapping of the
-partition opens. Then, on that loop:
+No plaintext volume image exists. The settings and account are staged as a
+directory tree in the workspace before the first write, as on the
+unencrypted path. The only secret among them is the carried Wi-Fi networks'
+PMKs ("Carried Wi-Fi networks"), in the root-only workspace and then inside
+the encrypted volume. The scratch image and its admission ("Prepared volume
+image admission") remain only for the unencrypted path. The layout's writes
+stop short of the table: the old table is invalidated and the ESP written,
+each synced, as on the unencrypted path, but neither copy of the new table
+is written until the recovery key is acknowledged (below). A refusal by the
+layout's recheck before its first write leaves the disk untouched. The
+formatter then binds the loop over the layout's volume extent, which no
+table on the disk yet places, as "Publishing through a loop over the claim"
+does. The loop covers the whole partition, which the layout ends on whole 4
+KiB encryption sectors ("Disk layout"); an extent that is not whole sectors
+is refused before the first write rather than shortened, because a format
+shorter than the partition would be a volume no mapping of the partition
+opens. Then, on that loop:
 
 1. draws the recovery key and the first-boot protector secret from
    `/dev/random` through td-protector;
@@ -1213,11 +1121,11 @@ plaintext an attacker with the disk still reads.
 ### Payload fit
 
 A review is presented only for a disk that holds what installing its
-source writes. After authenticating the source under the claim, and with
+source writes. After validating the source under the claim, and with
 the plan's volume identity in hand, the service sizes the source's
 `bzImage`, `initramfs.cpio` and `root.erofs` under td-boot's source
 naming, each a real regular file, and the selector that preparing the
-stock template with the bound key and that identity yields.
+stock template with that identity yields.
 
 The system volume must hold one copy of the three payloads and 1 GiB, the
 share td-boot's `MIN_VOLUME_BYTES` reserves for Btrfs metadata and `@var`;
@@ -1265,14 +1173,14 @@ is involved. This does not change installed-system update authorization.
 
 `td-install serve`'s execution installs onto the disk the service holds,
 on the service's own thread, once consent arrives and the held disk has
-rechecked. Its inputs are serve's five operands and the plan, never the
-installer's: the deployment directory, trusted key, `td-boot` and
+rechecked. Its inputs are serve's four operands and the plan, never the
+installer's: the deployment directory, `td-boot` and
 `td-firstboot` as bound, and from the verified root its stock selector
 template (`SELECTOR_TEMPLATE_PATH`) and `bin/mkfs.btrfs` (D7), and the
 running system's time zone catalog, re-read from the read-only root the
 settings were checked against. The root is `/` because td-authd binds the
 verified root there; the execution does not assert it. A live boot's
-init records the deployment its root was authenticated as in
+init records the deployment its root was verified as in
 `/run/td-deployment`, and the execution reads it too. It also reads the
 live session's saved Wi-Fi networks under that root, which are the
 session's mutable state rather than the deployment's, under their own
@@ -1282,15 +1190,15 @@ Before the destination is touched it checks the source. The booted record
 must name the plan's deployment, since the account and catalog checks, the
 selector template and `mkfs.btrfs` are all that root's. The source's
 manifest must hash to the plan's deployment digest, which source
-authentication produced; td-boot's manifest has a fixed line order, so its
+validation produced; td-boot's manifest has a fixed line order, so its
 `bzImage` entry is then the digest the ESP kernel's bytes must have.
 td-boot's source naming applies to the kernel: the deployment's `bzImage`
 or the medium's `bzimage`, a real regular file, never both as two files.
 The kernel is copied into the workspace, which only root can write, and
 the formatter hashes that copy through the descriptor it pinned and
 rewinds it, so the bytes checked are the bytes copied; a mismatch refuses
-before the first write. The selector is the template with the bound key
-and the plan's volume identity appended (`prepare-selector`). The
+before the first write. The selector is the template with the plan's
+volume identity appended (`prepare-selector`). The
 review's volume fit, with the layout's own refusal of a disk too small for
 it, is asked again of the source's payloads before anything is staged.
 
@@ -1326,7 +1234,7 @@ it writes, and the outcome is verification failed.
 
 Every failure is written to standard error and maps to one protocol failure,
 by the stage that met it. A source or layout check, preparing the selector
-from the template and trusted key, td-boot's output, the published id and
+from the template, td-boot's output, the published id and
 the read-back of the boot artifacts are verification failed; the time zone,
 hostname, account or seed operands are settings failed; a disk too small for
 the layout or a deployment the volume cannot hold, or a workspace that
@@ -1352,7 +1260,7 @@ is reported and leaves the outcome as it was.
 
 Production constructs this execution and `run_serve` opens the consent
 channel, so it runs once td-authd answers a review with consent. The kernel
-check binds the ESP to the authenticated manifest; the remaining payloads
+check binds the ESP to the approved manifest; the remaining payloads
 are td-boot's to verify as it publishes them. The execution's own path past
 the loop attach, which unprivileged tests cannot reach, is
 `qemu-install-system`'s: the guest drives the service as root and boots the
@@ -1362,7 +1270,7 @@ disk it installed.
 
 `td-boot on-volume OPERATION ARGS...` supplies the device operand to
 `boot`, `install`, `update`, `rollback`, `success`, `mount-root` or `mount-var`.
-The operation keeps the existing authentication, transaction locking and
+The operation keeps the existing verification, transaction locking and
 publication semantics. Other verbs and nested `on-volume` are refused.
 
 `rollback` names the pair it acts on: `td-boot rollback DEVICE
@@ -1402,10 +1310,9 @@ Other operations require exactly one canonical `td.volume=` token from
 installation retain the identity chosen by the selector.
 
 VM provisioning puts the same UUID in the selector and Btrfs formatter.
-Host-only provisioning profiles derive it from their provisioning public
-key using the installation UUID rule above. Independent provisioning keys
-yield distinct volumes; those profiles' alternate disk fixtures retain
-that run's UUID and must not be attached together. Live installation
+Host-only provisioning profiles draw a random one per run, as VM
+installations do; those profiles' alternate disk fixtures retain that
+run's UUID and must not be attached together. Live installation
 fixtures instead generate a fresh UUID inside the guest for every install
 and destructive reinstall. An installed volume retains its UUID across
 updates. Selector configuration is boot-source data, outside deployments
@@ -1547,7 +1454,7 @@ activates a physical-device installer, machine settings or destructive
 user consent.
 
 `td-install volume [--uuid UUID] [--timezone IANA-ID] DESTINATION MKFS SCRATCH
-[TD-BOOT DEPLOYMENT TRUSTED-KEY]` accepts a preselected filesystem identity.
+[TD-BOOT DEPLOYMENT | --seed]` accepts a preselected filesystem identity.
 The optional pair appears immediately after `volume`; UUID is exactly
 36 ASCII bytes of nonzero, canonical lowercase UUID text. Invalid input
 refuses during argument parsing, before destination or scratch access.
@@ -1564,8 +1471,7 @@ consent. The caller owns unique provisioning, stable device topology and
 exclusive admission. Reusing a UUID on two attached volumes deliberately
 causes boot discovery to refuse. The live diagnostic generates a fresh UUID
 per installation with `new-volume-uuid`, including separate optical/USB
-destinations and destructive reinstalls. No installation private key ships
-on media.
+destinations and destructive reinstalls.
 
 td boots by the **removable-media path**: `\EFI\BOOT\BOOTX64.EFI` on the ESP,
 which every UEFI implementation boots when no NVRAM boot entry names anything
@@ -1681,16 +1587,16 @@ Absent configuration preserves the unenrolled development profile; malformed
 or unreadable configuration refuses boot. Neither the deployment volume nor
 a kernel command-line token enables or disables this policy. The stock
 selector has no such file. The full-system secret QEMU oracle provisions it
-in its private selector alongside the deployment trust key.
+in its private selector.
 
 The version-1 event is the concatenation of `td/selector-deployment/v1`,
-one zero byte, the 64 lowercase ASCII bytes of the authenticated manifest ID,
+one zero byte, the 64 lowercase ASCII bytes of the verified manifest ID,
 a big-endian u32 byte count, and the exact final kexec command line without
 its terminating NUL. The ID binds kernel, initramfs and root payload hashes;
 the command line includes the chosen deployment and any bookkeeping warning.
 Whitespace and argument order are significant. All boot decisions, including
-read-only recovery, pass through this same handoff with already authenticated
-and verified kernel/initramfs descriptors. No payload pathname is reopened
+read-only recovery, pass through this same handoff with already verified
+kernel/initramfs descriptors. No payload pathname is reopened
 for measurement or kexec.
 
 The selector reads PCR 11 through root's `/dev/tpmrm0` and requires zero,
@@ -1712,7 +1618,7 @@ This follows TPM2 PCR_Read/PCR_Extend's wire operations in the
 [TCG TPM command specification](https://trustedcomputinggroup.org/wp-content/uploads/Trusted-Platform-Module-2.0-Library-Part-3_Commands-V185-RC4_12Dec2025.pdf).
 It is a td selector event, not a firmware TCG event log or an attestation.
 The QEMU host still supplies the first kernel and selector. Authentication
-and measurement of that entry, its trust key and policy remain prerequisites
+and measurement of that entry and its policy remain prerequisites
 for using PCR 11 in a shipped release policy. Root and the running kernel
 remain trusted. This adds no key release, enrollment or authorization for a
 changed deployment. Update authorization for approved current/previous
@@ -1720,47 +1626,42 @@ states remains governed by [ENCRYPTION.md](ENCRYPTION.md).
 
 ### Storage operation worker
 
-Fixed by [ENCRYPTION.md](ENCRYPTION.md) increment 8e's documentation
-commit before its code, the upgrade and its cancellation by 8f's, and
-protector management by 8g's.
-`storage_operation.rs` implements the selector update, the disk
-proof's keyslot test, the upgrade's phase 1 and its cancellation, and
-protector management's addition, removal, recovery-key removal and
-requests; the upgrade boot is the selector's. td-authd refuses every
-storage operation in a production build until that document's item 9,
-and starts a disk proof's worker only in builds that decode the proof,
-test builds until then. The worker
-compiles td-secret's endpoint (`frames.rs`, whose shared secret frame
-`16` it reads into clearing storage) and memory rules (`memory.rs`) and
-td-authd's consent descriptions by `#[path]`, admits and writes the
-ESP through `td-fat`, and asks a disk security key through td-fido's
-`fido_disk::authorize` over root-admitted devices, each HID session's
-worker this program's own `fido-worker` verb, started from
+Fixed by [ENCRYPTION.md](ENCRYPTION.md) increment 8e's documentation commit
+before its code, the upgrade and its cancellation by 8f's, and protector
+management by 8g's. `storage_operation.rs` implements the selector update,
+the disk proof's keyslot test, the upgrade's phase 1 and its cancellation,
+and protector management's addition, removal, recovery-key removal and
+requests; the upgrade boot is the selector's. td-authd refuses every storage
+operation in a production build until that document's item 9, and starts a
+disk proof's worker only in builds that decode the proof, test builds until
+then. The worker compiles td-secret's endpoint (`frames.rs`, whose shared
+secret frame `16` it reads into clearing storage) and memory rules
+(`memory.rs`) and td-authd's consent descriptions by `#[path]`, admits and
+writes the ESP through `td-fat`, and asks a disk security key through
+td-fido's `fido_disk::authorize` over root-admitted devices, each HID
+session's worker this program's own `fido-worker` verb, started from
 `/proc/self/exe` as td-boot's selector starts its own; td-install never
-builds or dispatches the desktop verb. Discovery
-takes the one `td.volume=` UUID of `/proc/cmdline`, asks `td-boot
-volume` for its partition and holds that partition open; the volume's
-files are read through the running system's `/run/td-volume`, and
-`current`'s manifest and signature are verified by `td-boot
-authenticate` under the volume's trusted key, the signature check
-td-boot makes before it boots it. That child reads a manifest and a
-signature and hashes no payload: root's kill on a cancellation or
-timeout reaches the worker alone (neither td-authd nor td-install has a
-process-group kill), so an unbounded child, such as `validate-source`
-hashing `root.erofs`, would outlive it; and the update reads no payload
-but the kernel, which the worker hashes itself. The ESP is the held partition's disk's first GPT
-partition, `td-esp` of the EFI System type, as td's layout writes it. `td-install storage-operation --uid 1000` is the root worker
-td-authd's amendment 10 supervises (td-authd/DESIGN.md, "Login keys
-and session lock"), the one running-system process that runs a
-key-bearing cryptsetup command or writes the ESP ("Full-system volume
-consumers"). It reaches the command line only through `main`, accepts
-no other operand, and keeps the login worker's startup, unnamed
-socketpair, descriptor inventory and bounded framing
-(td-secret/DESIGN.md, "Login-key worker"): it requires no active swap
-and a zero core-dump soft limit before its baseline, since it may hold
-a recovery key, a PIN, a derived passphrase or a volume key, and reads
-every frame
-into clearing storage.
+builds or dispatches the desktop verb. Discovery takes the one `td.volume=`
+UUID of `/proc/cmdline`, asks `td-boot volume` for its partition and holds
+that partition open; the volume's files are read through the running
+system's `/run/td-volume`, and `current`'s manifest is read there by the
+worker itself and must hash to the ID it serves. It starts no td-boot child
+for this: root's kill on a cancellation or timeout reaches the worker alone
+(neither td-authd nor td-install has a process-group kill), so an unbounded
+child, such as `validate-source` hashing `root.erofs`, would outlive it; and
+the update reads no payload but the kernel, which the worker hashes itself.
+The ESP is the held partition's disk's first GPT partition, `td-esp` of the
+EFI System type, as td's layout writes it. `td-install storage-operation
+--uid 1000` is the root worker td-authd's amendment 10 supervises
+(td-authd/DESIGN.md, "Login keys and session lock"), the one running-system
+process that runs a key-bearing cryptsetup command or writes the ESP
+("Full-system volume consumers"). It reaches the command line only through
+`main`, accepts no other operand, and keeps the login worker's startup,
+unnamed socketpair, descriptor inventory and bounded framing
+(td-secret/DESIGN.md, "Login-key worker"): it requires no active swap and a
+zero core-dump soft limit before its baseline, since it may hold a recovery
+key, a PIN, a derived passphrase or a volume key, and reads every frame into
+clearing storage.
 
 Its frames are the login worker's: it sends `18` its baseline, `10` and
 `12` invitations, `14` success and `15` a failure; root sends the
@@ -1796,33 +1697,28 @@ or fails as INTERNAL before any I/O, and repeats it exactly as its
 first `10`, a selector update's after the reads below, so the key's
 consent time holds no I/O.
 
-- **Selector update** (tag 16). The form must be the one the volume
-  byte gives and the ID the baseline's. Before its first `10` it
-  reads `current`'s manifest and signature from the held volume and
-  verifies them under the trusted key through `td-boot authenticate`,
-  requires its line to be the ID and the manifest it then reads to hash
-  to it, and hashes the deployment's `bzImage` against that manifest
-  (`23` otherwise). The manifest names no selector template; the template is
-  authenticated through `root.erofs`, as the selector's commit
-  authenticates it: the baseline requires the running deployment to be
-  that `current`, whose root is the `root.erofs` the deployment
-  initramfs hashed against this manifest and bound read-only, so the
-  worker reads the template from that running root's
-  `/lib/td-boot/selector-initramfs.cpio`. It prepares the selector in
-  memory by `prepare-selector`'s rules with the trusted key as the
-  volume holds it, the volume UUID of `td.volume=` and, for a protected
-  volume, `etc/td/boot-measurement`, and admits the ESP with `td-fat`
-  (`24` otherwise), reclaiming nothing yet. After the presentation's
-  `11` it sends `12` only with 120 seconds of its deadline left (`08`
-  otherwise); after root's `13`, before any write, it re-reads the
-  header, the running deployment's standing and the ESP's `EFI/BOOT`
-  sector, failing as `28` if the header changed since the baseline,
-  the deployment is no longer an acknowledged `current` with no pending
-  attempt, the sector changed since its admission, or td-fat's `fits`,
-  which writes nothing, now refuses the pair (the ESP's free clusters
-  changed). Then it stages
-  the pair or writes it directly (ENCRYPTION.md, "Selector update") and
-  sends `14`. It never opens the volume or reads its key.
+- **Selector update** (tag 16). The form must be the one the volume byte
+  gives and the ID the baseline's. Before its first `10` it reads
+  `current`'s manifest from the held volume, requires it to hash to that ID,
+  and hashes the deployment's `bzImage` against that manifest (`23`
+  otherwise). The manifest names no selector template; the template is
+  verified through `root.erofs`, as the selector's commit verifies it: the
+  baseline requires the running deployment to be that `current`, whose root
+  is the `root.erofs` the deployment initramfs hashed against this manifest
+  and bound read-only, so the worker reads the template from that running
+  root's `/lib/td-boot/selector-initramfs.cpio`. It prepares the selector in
+  memory by `prepare-selector`'s rules with the volume UUID of `td.volume=`
+  and, for a protected volume, `etc/td/boot-measurement`, and admits the ESP
+  with `td-fat` (`24` otherwise), reclaiming nothing yet. After the
+  presentation's `11` it sends `12` only with 120 seconds of its deadline
+  left (`08` otherwise); after root's `13`, before any write, it re-reads
+  the header, the running deployment's standing and the ESP's `EFI/BOOT`
+  sector, failing as `28` if the header changed since the baseline, the
+  deployment is no longer an acknowledged `current` with no pending attempt,
+  the sector changed since its admission, or td-fat's `fits`, which writes
+  nothing, now refuses the pair (the ESP's free clusters changed). Then it
+  stages the pair or writes it directly (ENCRYPTION.md, "Selector update")
+  and sends `14`. It never opens the volume or reads its key.
 - **Upgrade** (tag 17; ENCRYPTION.md "Re-encrypting upgrade", phase 1).
   The volume byte must be `01` and the ID the baseline's. Before its
   first `10` the worker reads the header again through td-protector's
@@ -2051,8 +1947,8 @@ which the worker sends only from its checks before its first write, is
 definite, and root forwards it as `91 0d`. Host tests drive each
 form over a header and an ESP the test builds, every kind at its point,
 the commit margin and the change check, including space taken after the
-presentation, and the production host's standing, template, key and
-authenticated kernel over a scratch root. The upgrade's drive phase 1 in
+presentation, and the production host's standing, template and
+verified kernel over a scratch root. The upgrade's drive phase 1 in
 both shapes, with and without new keys and over a crashed phase 1's
 orphans, through a scripted `Keys` whose creation presents each step:
 the review and each ceremony's steps in order, td-fido's hashes bound
@@ -2102,272 +1998,82 @@ pinned cryptsetup over a header copy of a volume it formats: the file
 reproduces the key the volume itself dumps, through either keyslot, and
 a name that exists is refused.
 
-## 6. Signing and keys
+## 6. No deployment signatures
 
-**A dedicated deployment-signing key**, separate from the `td-subst` cache
-key. They are different trust domains: `td-subst`'s key says "this store path
-came from this builder", and the deployment key says "this is a system you
-may boot". Sharing one key would mean a compromise of the substituter's
-signing key is also a compromise of every machine's boot chain, and the two
-have different lifetimes and different exposure.
+td does not sign deployments, and nothing on the boot, install or update
+path authenticates one. A deployment is its manifest and three payloads;
+every reader checks the payloads against the manifest (D2) and the id is
+the manifest's hash (D3). What decides which deployment a machine runs is
+who can write its volume, and for a person's update, rollback or install,
+their consent at secure attention or in the live installer.
 
-Signing uses `td-net` outside derivations, where `ring` already signs:
-**`td-deploy`**, supplied by the host control plane or the installed
-source-built multicall. It is its own applet rather than a verb on
-`td-subst`, because the two are the
-different trust domains named above and one tool serving both invites one key
-serving both. `td-deploy sign MANIFEST PRIV OUT` signs the manifest's exact
-bytes — no canonicalisation, since the verifier hashes that same file to
-derive the id — and writes the detached signature (D3, D4).
+A per-machine signing key was tried and removed because it guarded
+nothing. A machine must hold its own private key to sign its own
+updates, which td builds locally from git (AGENTS.md principles 5 and 6),
+so the key lives where the deployments do:
 
-What it will sign is bounded by td-boot's OWN contract rather than by a
-restatement of it: `MANIFEST_HEADER`, `MANIFEST_NAME`, `MAX_MANIFEST_BYTES`
-and `MANIFEST_SIG_NAME` live in `td-boot/src/protocol.rs`, which `td-net`
-`#[path]`-includes exactly as the recipes do. So the signer refuses a
-manifest larger than the verifier will read, and one that does not carry the
-verifier's header — a signature that could never be checked fails on the
-builder rather than on a machine. The header check is also the only thing
-separating the two signing domains at the *message* level, since neither tool
-tags what it signs; without it a deployment key would sign any blob handed to
-it. It reads the manifest the way td-boot does, too — `symlink_metadata`
-first, then an open whose device and inode must still match — because a
-signer that accepts what the target refuses produces a bundle that fails at
-boot instead of at signing.
+| Who | Unencrypted volume | Device-bound encrypted volume |
+|---|---|---|
+| Offline, writes the volume | reads the key and signs | cannot write the volume |
+| Offline, replaces the ESP selector and its key | not stopped | the TPM seal over PCR 4 and PCR 9 refuses release |
+| Root on the running system | holds the key | holds the key |
 
-`td-deploy keygen PRIV PUB` produces a pkcs8 private half and a raw 32-byte
-public half. The private half is created **`0600` and exclusively**: a
-signing key any local reader can copy forges whatever it authorises, and a
-second `keygen` over an existing path must be an error rather than silently
-destroying a key machines are still pinned to. **No private key is ever
-committed**, which is the repository's existing practice: `tests/td-subst.pub`
-is committed and its private half never was.
+The signature therefore stopped nothing that disk encryption, the TPM
+seal and the manifest hashes do not, and a key carried in the selector
+it vouched for, or on install media beside the deployment it signed,
+vouched only for itself. So:
 
-Verification is `engine/src/ed25519.rs`, which is verify-only and strict: it
-refuses `S >= L`, non-canonical encodings, keys outside the prime-order
-subgroup, and small-order `R`. It reaches SHA-512 as `crate::sha512`, so a
-consumer must declare **both** modules at its crate root; they are a pair.
+- Offline protection is device-bound encryption and its TPM seal over
+  the selector (ENCRYPTION.md). An unencrypted installation has no tamper
+  protection: anyone who can write its disk chooses what it boots.
+- Root on a running system can write the volume and so choose what boots
+  next; consent governs what a person's session asks root to do, not
+  what a compromised root can do.
+- Verified boot, if it becomes a goal, needs both halves a local key
+  cannot give: firmware that refuses an unsigned selector (Secure Boot
+  with td's own keys enrolled, the kernel and selector built into one
+  signed EFI image, and the firmware locked), and a deployment-signing
+  key the disk does not hold, such as a FIDO2 key exercised at the
+  consent prompt. That is a separate design.
+- Installations made before this change keep a selector that requires a
+  signature and so refuses an unsigned update, falling back to
+  `previous`. They are reinstalled from current media; no update path
+  replaces their selector, and a staged selector update cannot either:
+  a key-carrying selector's commit rebuilds its appendix with that key,
+  so a staged keyless `INITRD.NEW` does not match and is deleted
+  (ENCRYPTION.md "Selector update").
 
-### Where the trusted public key lives — SETTLED
+Volumes may still hold `td/trusted.pub` and a `manifest.sig` beside a
+published manifest from that time. td never reads, requires or removes
+them. A source directory holding a `manifest.sig` is accepted; the file
+is ignored and never published.
 
-**In the SELECTOR initramfs** (`boot/selector-initramfs.cpio`), in a cpio
-archive appended after the stock one — by the harness for its provisioned
-selectors, by `td-install prepare-selector` for an installation — at
-`TRUSTED_KEY_PATH` — `etc/td/deployment.pub`,
-declared in `td-boot/src/protocol.rs` so the writer and the reader cannot
-disagree about the spelling.
+### Validating a source
 
-*Which* initramfs is the whole of the answer and the sentence below that says
-only "the initramfs the firmware loads" was not specific enough to prevent a
-wrong implementation of itself. td builds two: the selector, which firmware
-loads and in whose rootfs `td-boot boot` runs when it selects, verifies and
-kexecs; and the deployment's own, which is a payload the manifest hashes and
-which lives on the Btrfs volume. Only the first is right. A key in the second
-is inside the artifact being authenticated — a hostile update source supplies
-bundle, key and signature together and self-authenticates, which is exactly
-the Btrfs-volume weakening the first bullet below forbids by name. It also
-breaks D3: the key would be hashed into the deployment's initramfs, so
-rotating it would rename the deployment.
-
-The reasoning that got here is kept below rather than replaced by the answer,
-because a first answer turned out to be unbuildable and that is the
-load-bearing part of the record.
-
-The intent was that td-boot's key be pinned at build time. It cannot be a key
-the test harness generates: every recipe embeds its sources with
-`include_str!`, which Rust resolves when *td-recipe-eval itself* compiles, and
-recipes are content-addressed targets with no per-run parameter. So a
-build-time pin can only carry a key that exists before the build — and since
-no private key may be committed, nothing at test time holds the matching half
-to sign a bundle with. **Build-pinning and "no committed private key" cannot
-both hold.** The manifest changes with every system build, so its signature
-must be produced per build; a committed *fixture* signature cannot stand in.
-
-What follows is that the trusted key is read at runtime. The important part
-is WHERE, and the distinction is not "compiled in vs. read from a file":
-
-- A key on the **Btrfs volume**, beside the deployments it authorises, is a
-  real weakening. Anyone who can write a forged deployment can write the
-  matching public key next to it, and the signature degrades to an integrity
-  check the manifest hashes already provide. Do not put it there.
-
-  That prohibition is about THIS key — the one the boot path reads to decide
-  what to kexec — rather than about the location, and item 10 puts one on the
-  volume at `td/trusted.pub` without contradicting it. What that second key
-  checks is an INCOMING BUNDLE, which is a claim someone is making rather
-  than state already on the disk (item 6 draws the same line). So it does not
-  authorise anything beside it, and the objection above does not reach it:
-  the bundle came from somewhere else, and replacing the key does not make a
-  forged bundle appear.
-
-  It can also admit a deployment to the VOLUME and never to a BOOT. Every
-  branch of `select_boot_deployment` authenticates `current` under the
-  initramfs's key before anything else, including before a boot attempt is
-  consumed, so a deployment published under the wrong update key — or under
-  none — is refused at the next boot and rolled back from. That is what
-  bounds the whole update-time check: it turns a bad bundle into a refusal
-  NOW instead of a failed boot later, and it is not what stands between an
-  attacker and running code.
-
-  Where the bundle IS on the volume the check degrades to exactly what this
-  bullet describes, and that case is not hypothetical: the qemu oracle stages
-  its candidate at `td/incoming/candidate`, the same filesystem and the same
-  write domain as `td/trusted.pub`. Against someone who can write the volume
-  nothing there is gained — the last paragraph of this section already says
-  td has no defence against that one either way. What the update-time check
-  is worth is what it is worth for a bundle that arrived from somewhere else,
-  which is the channel item 10 is for and which does not exist yet.
-
-- A key travelling in the **same artifact as td-boot** — the initramfs the
-  firmware loads — moves the trust boundary hardly at all. Substituting it
-  requires writing that artifact, which is what patching a compiled-in
-  constant would require too.
-
-Three differences survive even then, and each is a thing to get right rather
-than a reason to prefer the constant: something must WRITE the key, and any
-path that writes a trust root can be induced to write the wrong one; a
-missing key becomes a runtime branch, where the tempting branch is the
-fail-open D2 forbids, so absence must be a refusal; and the trust root
-becomes per-machine state that the reproducible artifact does not record.
-
-A live boot from install media hands the live selector's key to the
-deployment it authenticated, as the reserved `td.trust=` command-line token,
-and `live-seed` stages it as the RAM volume's `td/trusted.pub` after checking
-the deployment's signature under it again (MEDIA.md "Live boot"). That is the
-update-time key above, on a volume only live root can write, so the
-installer can authenticate its source under the key that booted it.
-
-An installation can carry two copies of this key: the selector initramfs's
-`etc/td/deployment.pub` and the volume's `td/trusted.pub`. The layout and
-volume primitives do not check their agreement. Layout treats the selector
-as opaque bytes, while volume authenticates under its explicitly supplied
-key. The installation service is the coordinator that keeps them in
-agreement: it prepares the selector with the trusted key it serves under
-and seeds the volume with that same key ("Executing a consented
-installation"). A mismatch, which only the primitives used directly can
-produce, can accept an update that the selector refuses to boot. The
-diagnostic EFI oracle carries no signed deployment or volume key and does
-not claim to test this integration boundary.
-
-Against the threat this signature exists for — a hostile or compromised
-update source — the two are equivalent: that attacker supplies bytes and
-touches neither the ESP nor the key. Against a local-disk attacker td has no
-defence either way today (§9: no Secure Boot, no TPM, no encryption), so
-"pinned at build time" buys less here than the phrase suggests.
-
-The mechanism that makes a per-run key workable is verified: Linux accepts
-**concatenated cpio archives** for initramfs, so a harness can append a
-one-file archive carrying that run's public key without any recipe being
-parameterized. Checked against the pinned tree, `linux-7.2.13`,
-`init/initramfs.c` — `unpack_to_rootfs`'s driver loop restarts the state
-machine at `Start` on each `070701` magic and skips NUL padding between
-archives, and the compressed path does the same in `flush_buffer`. Two
-consequences: the appended archive must begin **4-byte aligned** (the branch
-is guarded by `!(this_header & 3)`), and a later archive's file replaces an
-earlier one's (`clean_path` plus `O_TRUNC`), which is what lets a key be
-appended rather than reserved.
-
-What a *misaligned* appendix costs was stated wrongly here at first, and the
-correction matters because the whole appeal of the mechanism was that the
-kernel would catch the mistake loudly. It does not, twice over. `do_reset`
-eats the NUL run and errors `broken padding` (`:324-331`) — not `invalid
-magic`, which is unreachable here, because that error sets `message` and the
-driver loop is `while (!message && len)`. And td's selector initramfs — the
-one this appendix rides — is an
-**initrd** (`CONFIG_INITRAMFS_SOURCE=""`, qemu `-initrd`), so it takes
-`:726-733` rather than the `panic_show_mem` the built-in archive gets at
-`:714-716`. The recipe builds in `CONFIG_BLK_DEV_RAM` for the live volume
-(MEDIA.md), so that arm is `populate_initrd_image`: a `KERN_INFO` "rootfs
-image is not initramfs ... looks like an initrd" line and a copy of the whole
-initrd written into rootfs as `/initrd.image`. The base archive's `/init`
-still exists, so `prepare_namespace` and its legacy initrd loader never run
-(`init/main.c:1675-1682`) and **the boot continues**, base archive
-extracted and the key absent. Without `CONFIG_BLK_DEV_RAM` the same arm is a
-`KERN_EMERG` "Initramfs unpacking failed" line, with the same outcome. That
-is precisely the "a missing key becomes a runtime branch" hazard named three
-paragraphs above — whose tempting branch is the fail-open D2 forbids —
-arriving through the very mechanism meant to avoid it. So the harness's own
-padding is the entire defence, and item 6's fail-closed flip is what turned a
-keyless boot from a silent one into a refusal: `run_boot` reads the trust
-root before it touches the volume, so the missing key is what gets named.
-
-One tension in the list above is worth naming rather than leaving to be
-noticed: D5 calls the ESP the least trustworthy surface on the disk —
-firmware writes it, other OS installers write it, nothing checksums it — and
-the second bullet nonetheless prefers it to the Btrfs volume. Both hold. D5
-is about the ESP relative to a volume td controls and verifies, and the
-bullet is about the ESP relative to a *compiled-in constant in a binary that
-already lives on the ESP*. An attacker who can rewrite the key file there can
-rewrite td-boot itself, so pinning buys nothing against them. What D5 does
-rule out is treating the ESP as a place where a key could be *safely* left
-for something else to trust; the key is only as good as the binary beside it,
-and that is the whole of the claim.
-
-**What is built.** The system oracle generates a throwaway ed25519 keypair per
-run from `/dev/urandom` (`RunTrust`). The public half is appended to a *copy*
-of the verified selector initramfs — the copy is what boots, so the recipe
-output and its own manifest stay intact — and the private half signs the
-manifest of **every** deployment the run stages onto the volume: the seed that
-`current` and `previous` point at, and every candidate. Signing only candidates
-would leave the ordinary boot path unsigned, and fail-closed verification would
-then refuse the deployment nearly every mode boots. Nothing is committed and
-nothing is stored; the private half is dropped when the run ends.
-
-This is what dissolves the contradiction recorded above as unbuildable.
-"Build-pinned" and "no committed private key" cannot both hold — and neither
-does. The key is per-run.
-
-D3 survives because the key is not in any deployment: the deployment id stays
-`sha256(manifest)`, re-signing under another key changes only `manifest.sig`,
-and `run_system` — which recreates its fixture and requires the ids to be
-unchanged — keeps working. A key hashed into a deployment's initramfs would
-break all three at once.
-
-Two things the appendix must carry that are easy to omit, both because the
-kernel declines in silence rather than complaining. It emits its own `etc` and
-`etc/td` directory entries — derived from `TRUSTED_KEY_PATH` rather than
-written beside it — since a missing parent is `filp_open` returning 0
-(`init/initramfs.c:393-395`), and a parent that exists but is not a directory
-is ENOTDIR through the same path. And it is padded to a 4-byte boundary at the
-join, which per the correction above nothing downstream would report.
-
-### The signature file
-
-`manifest.sig`, beside `manifest` in the deployment directory
-(`MANIFEST_SIG_NAME` in `td-boot/src/protocol.rs`). Its contents are the
-detached ed25519 signature as **lowercase hex with a trailing newline** — 129
-bytes. The verifier must tolerate the newline; `from_hex` trims. This is
-recorded because it is the wire format between the two halves, and a format
-that lives only in the signer's code is one the verifier can disagree with.
-
-### What the publish path carries
-
-`td-boot validate-source DEPLOYMENT TRUSTED-KEY` is a read-only preflight
-for an absolute deployment directory and an explicitly supplied public key.
-It uses the publisher's existing bundle verifier: require and authenticate
-the bounded manifest/signature, parse the same authenticated manifest bytes,
-then open and stream-hash `bzImage`, `initramfs.cpio` and `root.erofs`.
-A source may spell the kernel `bzimage`, as a mounted install medium does
-(MEDIA.md); a directory holding both spellings as different files refuses.
-Symlink and special-file payloads refuse. Stdout is exactly the manifest's
-deployment ID and a newline after every payload succeeds; validation failure
-emits no ID. The operation creates no staging tree, lock, selector or mount
-and has no destination argument. `authenticate` retains its manifest-only
-meaning.
+`td-boot validate-source DEPLOYMENT` is a read-only preflight for an
+absolute deployment directory. It uses the publisher's bundle verifier:
+read the bounded manifest, parse it, then open and stream-hash `bzImage`,
+`initramfs.cpio` and `root.erofs`. A source may spell the kernel
+`bzimage`, as a mounted install medium does (MEDIA.md); a directory
+holding both spellings as different files refuses. Symlink and
+special-file payloads refuse. Stdout is exactly the manifest's deployment
+ID and a newline after every payload succeeds; validation failure emits
+no ID. The operation creates no staging tree, lock, selector or mount and
+has no destination argument.
 
 Validation keeps the opened payload files for the duration of the command,
 then closes them. Its result is not a snapshot or authorization for a later
 write: the caller must keep source bytes and their namespace stable. The
 native ISO fixture normally supplies read-only media under a fixed test
 topology; its writable-source claim test retains read-only payload mounts
-and never publishes. Volume publication still reauthenticates and checks
-every copied payload.
-Preflight does not validate the separate firmware selector, its key/UUID
-agreement, scratch capacity, destination eligibility or destructive consent.
+and never publishes. Volume publication still checks every copied payload.
+Preflight does not validate the separate firmware selector, its UUID,
+scratch capacity, destination eligibility or destructive consent.
 Those remain installation-coordinator responsibilities.
 `td-install observe-source-plan` holds the reviewed destination's exclusive
 claim while this preflight compares the canonical manifest ID with the
 bounded plan. Its report names the disk identity checked at claim time and
-again after hashing, and the deployment authenticated while that claim
+again after hashing, and the deployment validated while that claim
 remains open. After source
 validation, it rechecks the held descriptor's capacity and compares a
 fresh, bracketed sysfs inventory with the plan before reporting success.
@@ -2382,141 +2088,11 @@ its source descriptors and the destination claim closes before return, so
 the report cannot authorize a later formatting step. The service must keep
 its own source and destination lifetimes through consent and writes.
 
-`td-boot install` carries the detached signature. Two things used to stop it
-reaching a machine at all, and both are closed:
-
-- `publish_bundle` copied exactly `bzImage`, `initramfs.cpio`, `root.erofs`
-  and `manifest`, so a `manifest.sig` beside the manifest was silently
-  dropped. It is staged with the rest now, and the staged directory is read
-  back for it — the id is the manifest's hash and is structurally blind to a
-  detached file.
-- Publishing early-returned when the destination's deployment id matched.
-  Since re-signing deliberately does not change the id (D3), a rotated key
-  could never update an installed signature. The id still says the PAYLOADS
-  agree — it is the hash of the manifest naming their digests — so the
-  signature is what is left to compare, and an already-published deployment
-  is now one of four things:
-
-  | destination | source | outcome |
-  |---|---|---|
-  | same id, same signature | signed | no-op, as before |
-  | same id, no signature | signed | signature added |
-  | same id, different signature | signed | signature replaced in place |
-  | same id, signed | unsigned | **refused** |
-  | different id | — | refused, as before |
-
-  Five rows for five inputs, spelled out rather than folded: adding a
-  signature to an already-installed unsigned deployment is what a first
-  signed release does to a running machine, and it has its own test.
-
-  Replacing in place is sound only because the ids match, which means the
-  manifest bytes match, which means the payloads just verified are the same
-  contents; nothing changes but which key vouches for the deployment. It goes
-  through a temporary and a rename, because a truncated signature verifies as
-  nothing and would strand a machine on a deployment it cannot authenticate.
-
-  The withdrawal case is refused rather than performed because removing a
-  signature is a downgrade, and quietly doing nothing would ignore what the
-  caller asked for. Neither is a decision an installer should make silently.
-
-  Its cost is worth stating rather than discovering: the refusal comes from
-  `publish_bundle`, which `install_deployment` calls BEFORE any selector
-  work, so it fails the whole activation and not just the signature carry.
-  An operator holding an unsigned but byte-identical copy of an installed
-  signed deployment cannot use it to re-point `current`; the recovery is to
-  obtain the signature or remove the deployment directory. Note the
-  asymmetry with the row above it, which silently ADDS a signature and
-  proceeds. Both are deliberate — one direction gains authenticity and the
-  other loses it — but only one of them takes an unrelated operation down
-  with it.
-
-The signature is **optional** at this stage: nothing verifies it yet, so
-requiring one would make every existing bundle uninstallable for no gain.
-What is NOT optional is a signature that exists and is malformed — a
-symlink, a directory, or larger than `MAX_SIGNATURE_BYTES` is a refusal, not
-a bundle read as unsigned. Downgrading a bad signature to "no signature" is
-precisely the fail-open D2 forbids, and the verifying half must not inherit
-it from the reader.
-
-### Signing cannot be done by the verifier — what tests may assume
-
-`engine/src/ed25519.rs` exposes `verify` and no signer — only that
-function plus `PUBLIC_KEY_LEN` and `SIGNATURE_LEN`. There is no signing in
-THAT FILE and there must not be: **td-boot `#[path]`-includes it** (§10
-item 5), so anything added there lands in the boot binary, whose job is to
-refuse what does not verify. A signer on the boot path would be a crypto
-surface serving no boot-time purpose. This paragraph stood in the future
-tense for exactly one commit — the rule was written down before the
-include landed, on the grounds that afterwards the cost of having got it
-wrong is a boot binary carrying a signer.
-
-`engine/src/ed25519_sign.rs` is therefore a SEPARATE module, and the
-separation is the whole design: td-boot does not include it, so it cannot
-reach the boot path. It has exactly one caller — the recipe-check oracle,
-which must sign a manifest whose digests change with every build and so
-cannot use a committed fixture signature. It is hand-rolled rather than
-`ring` because the check crate may carry no external dependency and the
-host signer is unreachable from a gate: no recipe builds td-net, and
-nothing puts it on a check's PATH.
-
-Neither half of the split is enforced by the compiler, so both are
-asserted against the tree by `builder/src/affected.rs`'s table test — the
-same place `TARGET_INCLUDED_ENGINE_SOURCES` membership is written out by
-hand. No file under `td-boot/src` may name `ed25519_sign`, and
-`ed25519.rs` may contain none of `fn sign`, `fn public_key` or `SEED_LEN`
-— what a signer needs rather than what one might be called. Without that,
-a later "just reuse the verifier's file, it already has `Point`" refactor
-lands a signer in the boot binary with every gate green.
-
-That is a new crypto surface and is recorded as one. It signs THROWAWAY
-per-run test keys only; `td-deploy` remains the signer for anything that
-authorises a real deployment. Its nonce is RFC 8032's deterministic one,
-so there is no RNG to misuse, and it makes no side-channel claim — note
-that it drives `ed25519.rs`'s deliberately variable-time `scalar_mul` with
-a SECRET scalar, the one caller for which that function's "every input is
-public" does not hold. Acceptable here because the keys are throwaway and
-the sandbox is the attacker's absence, and recorded at both ends.
-
-Correctness is pinned three ways, because a signer cannot check its own
-work — and **where each runs differs**, which matters more than the count:
-
-| pin | runs in the gate? |
-|---|---|
-| RFC 8032 §7.1's five vectors (the standard's own) | yes — `cargo test --workspace` |
-| round-trip through `ed25519::verify` | yes — same |
-| differential against `ring` (`net/src/ed25519_cross.rs`) | **no** |
-
-The differential is the one that matters most — a signer agreeing with
-td's own verifier and with nothing else would pass every test in the
-engine and still emit signatures no other implementation accepts — and it
-is precisely the one no gate runs, because nothing builds td-net from
-source (§7). It is a developer and prep-time check, run with
-`CC=<cc> cargo test --manifest-path net/Cargo.toml`. The RFC vectors are
-the standard's own and carry the gated half on their own, which is why
-this is a stated gap rather than a blocker; the same gap already applies
-to the verifier and is recorded in §7.
-
-The consequence lands on tests. td-boot's own tests **cannot produce a
-signature**, so the positive path is exercised with committed fixtures — a
-public key, a canonical manifest, and its detached signature, generated once
-by `td-deploy`. No private key is committed, exactly as `tests/td-subst.pub`
-already establishes.
-
-What makes the triple self-consistent is the SIGNATURE over the manifest
-bytes, and nothing else. An earlier draft of this paragraph said the fixture
-manifest names the digests of payload bytes the test writes; it does not,
-and it does not need to — authenticity is decided over the manifest's bytes
-and the digests it names are never resolved on this path. `td-boot/tests/README`
-is the normative note on the fixtures and says so.
-
-Every NEGATIVE assertion — wrong key, tampered manifest, absent signature,
-truncated signature, signature over a different manifest — needs no signer
-at all, and those are the fail-closed ones that matter. The oracle is the
-other half: it signs per run with a throwaway key rather than a fixture,
-using `ed25519_sign.rs` above. (An earlier draft of this section said the
-oracle "has `td-deploy` available". It does not, and that is the whole
-reason the module above exists — no recipe builds td-net and nothing puts
-it on a check's PATH.)
+`td-boot install` publishes exactly `bzImage`, `initramfs.cpio`,
+`root.erofs` and `manifest`. When a directory with the bundle's id is
+already published, it is read as a published deployment: if its manifest
+hashes to that id and its payloads match, publication is a no-op;
+otherwise it refuses ("existing deployment … does not verify as …").
 
 ## 7. Engine sources compiled into target binaries
 
@@ -2533,16 +2109,9 @@ which ones is written down in `TARGET_INCLUDED_ENGINE_SOURCES`:
 | `gpt.rs` | td-install |
 | `cpio.rs` | td-install selector identity preparation, td-boot's selector appendix |
 | `fat.rs` | td-install |
-| `ed25519.rs` | td-boot, td-net's `cfg(test)` ring differential |
-| `sha512.rs` | td-boot (pair with ed25519), td-net's ring differential |
-| `ed25519_sign.rs` | td-net's `cfg(test)` ring differential ONLY — never td-boot |
 
 Each entry stores the full consumer list the router prints in its note; the
-column above shows only the target half that distinguishes these nine.
-
-The last row is the one that is a declaration in both directions: being in
-this table records that a `#[path]` include exists, and its note records
-where the include may NOT go. §6 has the assertion that holds it shut.
+column above shows only the target half that distinguishes them.
 
 **The table is a declaration, not what selects a gate.** `recipe-checks` is
 itself a build gate and the engine rule adds every build gate, so *all* of
@@ -2564,11 +2133,9 @@ than one per increment: the alternative is editing `affected.rs` in three
 later landings, which is the coordination point the single-owner change
 exists to dissolve.
 
-What being in the table does NOT mean is that some gate builds the consumer.
-Nothing builds td-net from source (`aa347e60`), so a change to `ed25519.rs`
-runs its ring differential — the primary correctness pin for that verifier —
-**nowhere**. Naming td-net in the note does not close that; it makes it
-visible at the routing decision, and closing it belongs to td-net.
+What being in the table does NOT mean is that some gate builds the
+consumer; the note makes a consumer visible at the routing decision, and
+building it belongs to that consumer.
 
 A target consumer whose source is *missing* from the table is the failure
 that matters: a target binary whose engine sources nothing checks.
@@ -2576,16 +2143,9 @@ that matters: a target binary whose engine sources nothing checks.
 ### The other shared source: `td-boot/src/protocol.rs`
 
 Not an engine source, and so not in the table, but the same shape: it is
-`#[path]`-included by `recipes/src/recipes/system-x86-64.rs`,
-`recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs` and — since the manifest
-header and size bound moved into it — `net/src/main.rs`. It gets its own
-routing arm ahead of the `td-boot/*` glob, because the glob selects nothing
-that compiles td-net: no gate builds td-net from source, the recipe-graph
-warm does, and that is a chain target. The arm is `cargo-test` + `check` +
-`recipe-checks` + the chain, and what pins it is the contrast — the
-assertions require `td-boot/src/main.rs` to select none of the three
-bootstrap targets, so the rule has to be about this FILE rather than about
-the crate.
+`#[path]`-included by `td-install`, `recipes/src/recipes/system-x86-64.rs`
+and `recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs`, and routes with
+td-boot's other sources to every gate that compiles one of them.
 
 ### Shared hostname grammar
 
@@ -2630,49 +2190,42 @@ interface makes the negative control an empty ESP, rather than an ESP
 containing only INITRD. No disk destination is accepted from the
 operator. Only the installed disk is attached. This proves the
 installer's EFI file path with a tiny diagnostic initramfs; it does not
-format Btrfs, run installation inside a guest, or boot a signed system
-deployment. The signed selector and full deployment oracle described
-below remain required.
+format Btrfs, run installation inside a guest, or boot a system
+deployment. The full deployment oracle described below remains required.
 
 `td-recipe-eval qemu-install` adds a native guest installation fixture,
 [td-install-qemu-test](../td-install-qemu-test/DESIGN.md). Its source-built
-PID 1 runs td-install format, which publishes the signed deployment through
+PID 1 runs td-install format, which publishes the deployment through
 a loop over its own claim, on an exclusively created QEMU virtio or AHCI
 target. The same private ISO is exercised as optical and
 USB media. After installation, the host detaches media and cold-boots only
-the destination, requiring authenticated selector kexec, a read from the
+the destination, requiring verified selector kexec, a read from the
 installed EROFS payload, persistent Btrfs state across two boots, and
 successful deployment acknowledgement. Before layout, the live fixture
-validates the authenticated source and all three payloads under its
-provisioned public key. A second
-public key must refuse the otherwise identical signed source on both optical
-and USB boots without an installation-success marker. The host seeds each
-refusal target with nonzero canaries and compares its complete byte length
-and SHA-256 before and after QEMU exits. A refusal after changing the GPT,
-ESP, volume or sparse gaps fails the oracle. A second negative ISO retains
-the valid manifest, signature and trust root but substitutes corrupt
-`root.erofs` bytes. Both optical and USB boots must report the payload hash
-mismatch and preserve the complete destination. Unit tests exercise all
+validates the source's manifest and all three payloads. A negative ISO
+retains the valid manifest but substitutes corrupt `root.erofs` bytes.
+Both optical and USB boots must report the payload hash mismatch without
+an installation-success marker. The host seeds each refusal target with
+nonzero canaries and compares its complete byte length and SHA-256
+before and after QEMU exits. A refusal after changing the GPT, ESP,
+volume or sparse gaps fails the oracle. Unit tests exercise all
 three payloads, including missing files and symlinks. This is source
 preflight, not complete device, space or firmware-selector admission.
-The private signing key never enters the guest or a derivation.
 
 The fixture accepts no operator destination and is absent from system and
 installer profiles. Its serial-based installation target identification is
 diagnostic scaffolding, not production consent. Installed boots exercise
 the read-only resolver above, including changed disk ordering and duplicate
 identity refusal before selection. Linux mounts its ISO payload files
-read-only before installation; the live initramfs holds tools and the public
-trust root. Machine settings and the production installer are
-INSTALLER.md's. This fixture does not enforce selector/volume key
-agreement for arbitrary caller-provided inputs.
+read-only before installation; the live initramfs holds tools. Machine
+settings and the production installer are INSTALLER.md's.
 
 The small fixture also interrupts the real publisher while its staged kernel
 is nonempty and incomplete. It kills/reaps its own child, proves there are
 no current/previous selectors, syncs the partial data, then reports byte
 counts so the host can cut VM power. A detached firmware boot must refuse
 both absent selectors without selecting a deployment. Explicit whole-disk
-reinstallation from the normal ISO must restore an authenticated boot and
+reinstallation from the normal ISO must restore a verified boot and
 fresh state. Both media attachments exercise this sequence. The observer
 has no production pause hook; this is a controlled publisher interruption
 followed by a VM power cut, not a model of every storage power-loss window.
@@ -2715,7 +2268,7 @@ boots twice with the ISO detached; the second boot places a blank disk
 on the same bus before the installed disk. Target and decoy retain their
 bus throughout; the host requires vda2/vdb2 for virtio and sda2/sdb2 for
 AHCI. Each boot must bind the planned UUID before selecting the exact
-signed deployment, reach the greeter, prove immutable root/configuration
+deployment, reach the greeter, prove immutable root/configuration
 and writable owned state, complete compositor modesetting and page
 flips, and acknowledge deployment health. First-boot identity must
 become stable on the second boot, with the same SSH host-key
@@ -2737,8 +2290,8 @@ headroom rounded up to the partition alignment, whichever is larger. This
 is diagnostic sizing, not admission of an operator-owned disk. The default
 per-boot deadline is 900 seconds. The host prints each installation and
 cold boot duration from its QEMU runner. A positive `TD_QEMU_BOOT_TIMEOUT_SECS`
-overrides it. The diagnostic accepts no destination operand, provisions a
-throwaway signing key on the host, and does not enter the shipped closure.
+overrides it. The diagnostic accepts no destination operand and does not
+enter the shipped closure.
 It retains the stock system's account defaults: username/PIN selection,
 production consent and hardware support remain separate milestones.
 
@@ -2816,14 +2369,8 @@ legs without a display device or without a keyboard expect one too;
 machine, and its changed-initramfs leg answers recovery on the VT
 through QMP key events with nothing typed on the serial line.
 
-The oracle signs with a **per-run throwaway key**: generate a keypair, sign
-the staged bundle, build `td-boot` pinned to that run's public key, boot, and
-require the machine to reach its target. This exercises the entire
-keygen → sign → pin → verify chain every run, and it cannot rot into a
-fixture that passes without testing anything. Its **negative control** is a
-second fresh key: a bundle signed by a key the build did not pin must fail
-closed. A signing test without that control passes just as well against a
-verifier that returns `true`.
+The negative controls are payloads that do not match their manifests,
+as above: a verifier that returns success passes none of them.
 
 Both halves of the disk are already validated against independent
 implementations: `sfdisk --verify` and `fsck.vfat` read what `gpt.rs` and
@@ -2836,13 +2383,13 @@ makes them a *boot* rather than a parse.
 Recorded so it is not re-litigated, and so nothing here is mistaken for a
 stronger claim than it is:
 
-- **No Secure Boot.** Verification is td's own signature check inside
-  `td-boot`, after firmware has already run the stub. Chaining to the
-  platform's own trust root (shim, MOK, a signed PE) is a separate trust
-  policy increment with its own key management, and D2's fail-closed check is
-  not a substitute for it. ENCRYPTION.md increment 8 plans it as an
-  optional increment: a signed image holding the selector's initramfs,
-  and a TPM-held db key ("Firmware authentication").
+- **No Secure Boot and no deployment authenticity.** Nothing
+  authenticates the selector or a deployment (§6); D2's payload check is
+  integrity, not authenticity. Chaining to the platform's own trust root
+  (shim, MOK, a signed PE) is a separate trust policy increment with its
+  own key management. ENCRYPTION.md increment 8 plans it as an optional
+  increment: a signed image holding the selector's initramfs, and a
+  TPM-held db key ("Firmware authentication").
 - **No measured boot / TPM.** Nothing is sealed to PCRs.
 - **No ESP redundancy.** One ESP. A machine whose ESP is destroyed is
   recovered by reinstalling it, not by a second copy.
@@ -2862,137 +2409,25 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
 1. **This file.** Docs-only.
 2. **The `affected.rs` routing table** (§7). Mechanism only; no behaviour
    change, and the entries land with it.
-3. **Signing, host-side** (§6, D2, D3, D4): `td-deploy sign` emits a detached
-   `manifest.sig`. Nothing consumes it yet — the same shape `aa347e60` used
-   to land the verifier, and it is what lets the target half land against a
-   signer that already exists.
-4. **Publishing carries the signature** (D1, D3): `td-boot install` stages a
-   `manifest.sig` beside the manifest and treats a changed signature on an
-   already-published deployment as an update rather than a no-op. Still
-   nothing that verifies — this is the half that makes a signature able to
-   REACH a machine, and it needs no answer to the §6 key question above.
-5. **The verifier reaches the target** (§6): td-boot `#[path]`-includes
-   `ed25519.rs` and `sha512.rs`, its recipe stages them, and it gains a hex
-   decoder, a trusted-key reader, and `authenticate_manifest` — reached by
-   one new verb, `td-boot authenticate <deployment-directory>
-   [trusted-key]`, which answers authenticity and nothing else. (The key
-   became optional with item 6's provisioning half, defaulting to
-   `TRUSTED_KEY_PATH`; it was mandatory when this landed.) The BOOT
-   path is untouched, which is the shape items 3 and 4 landed in; what this
-   settles is that the target-static build carries those sources, separately
-   from the boot-path change that depends on it.
-
-   The verb is what makes that true rather than a convenience. rustc drops
-   dead code, so declaring the modules and calling nothing compiles the
-   verifier and then discards it: measured on the recipe's own layout, the
-   binary was 24576 bytes SMALLER with the functions unreferenced. A
-   `#[path]` include with no caller proves the sources TYPE-CHECK and
-   nothing more.
-
-   The positive case is a committed fixture triple (`td-boot/tests/`), since
-   td-boot has the verifier and deliberately not the signer; every negative
-   needs no signer at all.
-6. **Verification, target-side, fail-closed** (§6, D2): `td-boot` refuses a
-   deployment whose manifest does not verify. This is the increment that
-   needed §6's key question answered — where the trusted key lives — because
-   it is the first one whose ANSWER has to reach a running machine. It was
-   scoped with item 3 as a single landing and has been split five times: as
-   that question turned out to be unsettled, as carrying the file turned out
-   to be its own increment, as getting the verifier into the target binary
-   turned out to be separable from deciding what it trusts, and then twice
-   more inside the answer itself.
-
-   All three halves are done. First a newc cpio WRITER in the engine
-   (`engine/src/cpio.rs`), since the mechanism is an appended archive and the
-   tree had no writer at all. Then PROVISIONING: the oracle's `RunTrust` puts
-   a per-run public key in the selector initramfs it boots and signs every
-   deployment it stages with the private half. Both are host-side and change
-   no boot path, which is what made them separable from the flip.
-
-   Then the POLICY, deliberately last, because until td-boot refuses there is
-   nothing to distinguish a run whose key arrived from one whose key did not
-   — which per §6's alignment correction is also what a misaligned appendix
-   silently produces. `run_boot` reads the trust root from the rootfs it is
-   running in BEFORE it touches the volume, so a selector provisioned without
-   one names the missing key rather than failing about whatever the first
-   slot happens to be wrong about; and every slot the BOOT DECISION considers
-   — `select_boot_deployment`, its verified-previous fallback, and both
-   read-only paths — is authenticated before its payload digests are read.
-
-   Authentication is a property of SELECTION and could not be anything else,
-   which is what the answer to §6's key question forces: only the selector's
-   rootfs has the key, so the td-boot that runs `root-loop` after kexec and
-   the one that runs `success` after switch_root cannot check a signature.
-   Nothing is lost, because the deployment id IS the manifest hash — a
-   downstream reader holding `<id>/manifest` is holding the bytes the
-   selector authenticated or it errors.
-
-   What does NOT authenticate, and must not: `install`'s question about the
-   EXISTING slots — whether the fallback is intact — asked from the real root
-   where no trust root exists, and `verify`, the operator's diagnostic, which
-   runs in the same place. The two questions are separate functions —
-   `verify_slot` for state, `authenticated_slot` for the boot decision —
-   because a key threaded through the shared one would turn every install into
-   a hard failure.
-
-   What install DOES authenticate, since 7c, is the bundle it is about to
-   publish, and only where a trust root is present: `open_bundle` takes the
-   key, and the two questions stay separate because they are about different
-   things — the slots already on the volume are state, and the incoming bundle
-   is a claim someone is making. Where there is no trust root nothing changes.
-
-   The manifest is read ONCE and the signature checked over the bytes the
-   payload digests are then parsed out of. Reading it again to parse would
-   leave a window in which a writer could serve a signed manifest to the
-   check and a different one to the parse, and an attacker who can write the
-   volume is the entire reason any of this is signed.
-
-   `run_boot` re-verifies the chosen deployment under the mount whose handles
-   go to kexec, and does that through the authenticated reader too. The id
-   came from an authenticated selection, so the hashes alone already bound
-   it; going through the authenticated reader makes "everything handed to
-   kexec was authenticated" a property of the call rather than of a trace
-   back to the id's origin, which is the half a later edit breaks silently.
-   It is asserted over the SOURCE, because `run_boot` needs a block device, a
-   mount and a working kexec, and no unit test has any of the three. That
-   assertion pins the WHOLE trust-root call and not just the function's name,
-   which is the sharpest thing review found here: `read_boot_trust_root(
-   mountpoint)` reads the key off the Btrfs volume — the surface the first
-   bullet of §6 rules out by name, since anyone who can write a forged
-   deployment can write the matching public key beside it — and it passed
-   every test in the crate. It is the most damaging single edit possible in
-   that file, it is one word, and nothing saw it.
-
-   Its negative controls are the point of the increment rather than its trim:
-   a deployment signed under another key, an unsigned one, a manifest that
-   does not hash to its directory name, and a rootfs with no trust root at
-   all. Each was verified to red by removing the guard it names. The
-   wrong-key control is a whole SECOND key rather than the trusted one with a
-   bit flipped: a public key is a compressed curve point, so a flipped bit is
-   not reliably a point at all, and a control built on one proves that a
-   malformed key is refused rather than that somebody else's signature is.
-
-   What is NOT proven is a real boot. The oracle for that is
-   `qemu-boot-system`, which wants a warm store — a cold one means building
-   the whole graph. What stands in for it is that nothing can boot an
-   unprovisioned selector: `VerifiedSelector` keeps its path private and
-   both provisioning exits append the trusted key through the same helper.
-   `provision_selector` also binds the volume. The one bare copy,
-   `stage_stock_selector_template`, writes only the live installer's media
-   input and returns no path; the guest's `td-install prepare-selector`
-   appends the key and the identity before the ESP is written.
+3. **Host-side signing** — withdrawn (§6).
+4. **Publishing a signature** — withdrawn (§6).
+5. **The verifier in td-boot** — withdrawn (§6).
+6. **Fail-closed signature verification** — withdrawn (§6). What remains
+   of it is the engine's newc cpio writer (`engine/src/cpio.rs`), which
+   the selector appendix uses, and `run_boot` re-verifying the chosen
+   deployment under the mount whose handles go to kexec.
 7. **`td-install`**, a standalone crate outside the workspace (D9): GPT +
-   FAT32 ESP + Btrfs volume onto a device or a regular file,
-   sharing the GPT, FAT, CPIO, checksum, boot protocol, real-file and
-   hostname implementations through `#[path]` includes, and delegating
-   publication to td-boot (D1). Carries the
-   `mkfs.btrfs` build-time binding (D7). Registering a new crate no longer
-   has touch points: `builder/src/affected.rs` discovers every
-   `td-*/Cargo.toml` at the repo root and derives the lock roster, the routes
-   and the cargo commands, and the cargo-test gate
-   (`builder/src/gate_defs/325-cargo-test.rs`) asks it for the same list.
-   Commit the crate's `Cargo.lock` and declare any non-default gating in its
-   own `[package.metadata.td-gate]`; the workspace `exclude` list is gone.
+   FAT32 ESP + Btrfs volume onto a device or a regular file, sharing the
+   GPT, FAT, CPIO, checksum, boot protocol, real-file and hostname
+   implementations through `#[path]` includes, and delegating publication to
+   td-boot (D1). Carries the `mkfs.btrfs` build-time binding (D7).
+   Registering a new crate no longer has touch points:
+   `builder/src/affected.rs` discovers every `td-*/Cargo.toml` at the repo
+   root and derives the lock roster, the routes and the cargo commands, and
+   the cargo-test gate (`builder/src/gate_defs/325-cargo-test.rs`) asks it
+   for the same list. Commit the crate's `Cargo.lock` and declare any
+   non-default gating in its own `[package.metadata.td-gate]`; the workspace
+   `exclude` list is gone.
 
    Split in three, because the volume and the publish each bring a
    dependency the layout does not. **7a, the LAYOUT**, is landed: the crate,
@@ -3026,8 +2461,7 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    partition and leaves it holding the read-write `@var` subvolume, with the
    `mkfs.btrfs` binding D7 requires beside the exec that needs it. **7c**
    delegates the publish to `td-boot`, into the staging tree rather than
-   through a mount, and settles the install-time trust root; its own
-   paragraphs are below the 7b ones.
+   through a mount; its own paragraphs are below the 7b ones.
 
    7b is itself two commits, and the RECIPE is the first of them. D7's binding
    is a build-time complaint about a missing program, so something has to
@@ -3200,25 +2634,16 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    more than a claim: they substitute a shell script for `td-boot` on both
    sides, so a renamed verb or a reordered argument would leave every cargo
    test green and break every install. Here both programs are the ones that
-   ship, out of `/td/store`, and the bundle is AUTHENTICATED rather than taken
-   on trust — the key is passed, so a signature that does not verify is a
-   failed build.
+   ship, out of `/td/store`, and the bundle's payloads are verified, so one
+   that does not match its manifest is a failed build. Its negative pass
+   publishes a tampered kernel and requires td-boot's `bzImage hash
+   mismatch` with no selector left on the volume.
 
-   The FIXTURE is the part that took the thinking, because a publish this
-   check can authenticate needs a signature, and nothing in the build can
-   make one: td-boot deliberately cannot sign (`affected.rs` refuses any file
-   under `td-boot/src` naming `ed25519_sign`), and no recipe builds
-   `td-deploy`, so it cannot be an input either. The committed triple under
-   `td-boot/tests` cannot serve — its own README says the digests it names
-   are never resolved, which is exactly what a publish needs — so the one
-   usable set is the PAYLOAD-MATCHED one td-boot's own tests carry, and it
-   moved to `td-boot/src/fixture.rs` to be shared by `#[path]`, the way
-   `protocol.rs` already is. One definition rather than two because the
-   signatures are over the manifest those payloads hash to; the recipe
-   COMPUTES that manifest from the shared payloads rather than copying it, so
-   a drifted payload is a signature that stops verifying instead of a fixture
-   nobody rechecked. No private key is added: the rule stays one key, every
-   fixture manifest signed under it, the private half discarded.
+   The FIXTURE is the payload-matched set td-boot's own tests carry, shared
+   from `td-boot/src/fixture.rs` by `#[path]`, the way `protocol.rs` already
+   is. The recipe COMPUTES the manifest from those payloads rather than
+   copying one, so a drifted payload changes the deployment id instead of
+   leaving a fixture nobody rechecked.
 
    Two things about the check are worth writing down because they were
    measured rather than assumed. `--rootdir` preserves a SYMLINK as one, which
@@ -3233,66 +2658,20 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    it, the deployment id being conclusive on its own since a 64-character hex
    name appears nowhere else in a filesystem tree.
 
-   **The install-time trust root is settled here, because it is item 7's to
-   settle** — `warn_unverifiable_resign` says so in as many words. Today
-   `install` runs with no trust root at all (§6: the real root has none), so
-   it publishes what it is given and warns that nothing present can check it;
-   the first thing that actually verifies the bundle is the next boot, and a
-   bundle signed with the wrong key is discovered by a machine that does not
-   come back. That is the wrong end of the operation to learn it at.
-
-   An INSTALLER is not the real root, though, and that is the distinction the
-   warning was waiting for. It runs from installation media that td built,
-   which can carry a trust root exactly as the selector initramfs does, so
-   the publishing verb takes an optional trusted key — the spelling
-   `td-boot authenticate <deployment-directory> [trusted-key]` already uses —
-   and REFUSES a bundle that does not verify under it. Fail-closed where a
-   key is supplied, and today's warn-and-publish only where one is not, which
-   keeps a rootfs with no trust root behaving as D3 requires while making the
-   installer the first thing on the path to check rather than the last.
-
-   Two consequences worth stating rather than discovering. The deployment
-   source has to exist when `volume` runs, since the publish now happens
-   before the filesystem does — so it is an argument to that verb rather than
-   a later step, and an install with no bundle to publish is the same command
-   without it. Three arguments or none, never a subset: the publish needs a
-   writer, a bundle and the key that makes it CHECK that bundle, so a caller
-   naming two of them asked for something this cannot do, and defaulting the
-   third is how the fail-open the paragraph below is about gets in through
-   the command line instead. And a bundle published this way is subject to
-   the copy's ordering above: it is inside the image, so it lands before the
-   superblock does, and an interrupted install leaves no filesystem rather
-   than a filesystem with a half-written deployment in it.
-
-   Two more that are about the trust root, written down because both are the
-   kind of thing a later reader would otherwise re-derive from a diff.
-
-   **`td-install` passes the key EXPLICITLY, and that is load-bearing rather
-   than tidy.** The unasked-for default answers "no trust root" from the
-   ABSENCE of a file, and absence is indistinguishable from a key provisioned
-   under the wrong name, behind a dangling symlink, or in an image that was
-   built without one — all of which publish unverified. That fail-open is
-   structural: a probe cannot tell a deliberate absence from a mistake. The
-   explicit branch has no such hole (a path that is not there is an error),
-   so the installer names its key rather than hoping one is where it looks.
-
-   **`install`'s own policy is coupled to what a rootfs ships, and nothing
-   enforces that coupling.** `install` probes the same default path, so the
-   day any real rootfs gains `TRUSTED_KEY_PATH` every `td-boot install` on
-   that machine becomes fail-closed and unsigned bundles — a supported case
-   today — start being refused, with no code change. Nothing ships that key
-   to the real root now (the harness writes it into the selector initramfs,
-   and `/etc` there is immutable store content), so behaviour is unchanged;
-   but `td-boot authenticate` defaults to the same path for a running
-   machine's benefit, and a later decision to make THAT work by shipping the
-   key would flip install silently. Whoever makes it should change this
-   paragraph in the same landing.
-8. **The EFI-stub kernel** (§5): the EFI/EFI_STUB configuration and
-   realized PE format checks are present. The pinned tree requires ACPI,
-   already enabled for TPM discovery. Signed selector initramfs
-   packaging remains required for full system firmware boot.
+   The deployment source has to exist when `volume` runs, since the publish
+   happens before the filesystem does — so it is an argument to that verb
+   rather than a later step, and an install with no bundle to publish is
+   the same command without it. Two arguments or none, never one: the
+   publish needs a writer and a bundle. And a bundle published this way is
+   subject to the copy's ordering above: it is inside the image, so it
+   lands before the superblock does, and an interrupted install leaves no
+   filesystem rather than a filesystem with a half-written deployment in it.
+8. **The EFI-stub kernel** (§5): the EFI/EFI_STUB configuration and realized
+   PE format checks are present. The pinned tree requires ACPI, already
+   enabled for TPM discovery. Signed selector packaging belongs to Secure
+   Boot (§9).
 9. **The OVMF oracle** (§8), beside the `-kernel` one, not replacing it.
-10. **`td-update` and its local channel**: fetch a signed bundle, verify it,
+10. **`td-update` and its local channel**: take a bundle, verify it,
    delegate the publish (D1 again), and roll back on a failed boot. This is
    where the update channel that was its own workstream rejoins this one.
 
@@ -3300,8 +2679,8 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    for that to be written down** — otherwise its obvious-looking scope is a
    rebuild of `td-boot`. Everything after "verify it" exists and is driven
    from the shipped image today. `install_deployment` IS the update
-   transaction: it opens the bundle, authenticates it where a key is
-   supplied, publishes it, and activates it against a known-good fallback.
+   transaction: it opens the bundle, verifies it, publishes it, and
+   activates it against a known-good fallback.
    It is already idempotent — republishing the id that is `current` retains
    it and repairs `previous` rather than activating anything — and it already
    refuses the cases that would leave a machine with nowhere to go: activation
@@ -3315,8 +2694,8 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    for this item and predates it.
 
    So the update path is a CHANNEL front end, not a second publisher. What it
-   adds over `td-boot install` is where a bundle comes from, which one to take,
-   and the trust root to check it under.
+   adds over `td-boot install` is where a bundle comes from and which one to
+   take.
 
    **It is a VERB, `td-boot update`, and not the separate `td-update` program
    this item first specified.** The reversal is recorded rather than quietly
@@ -3339,163 +2718,28 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    selector ever needs to shrink, splitting the update verbs out is the move,
    and this paragraph is what to re-read.
 
-   **THE TRUST ROOT IS THE REAL QUESTION, and it is the reason this item is
-   not just a directory scan.** A running machine has none. The key lives at
-   `TRUSTED_KEY_PATH` in the SELECTOR initramfs — the rootfs td-boot is
-   running from when it selects and verifies — and `switch_root` replaces
-   that rootfs with the deployment's `root.erofs`, which ships no such file
-   (§6). `td-boot authenticate`'s default path is spelled for the selector's
-   benefit and resolves to nothing once a machine is up. An update that ran
-   there today would publish whatever it was handed and warn that nothing
-   could check it, which is exactly the wrong end of the operation to learn
-   at — item 7c's argument, one machine further along.
+   **The real-file rule.** Every reader of a manifest, payload or channel
+   entry takes it through one rule: a regular file, not a symlink, of at
+   most its bound, typed by `lstat` BEFORE the open (opening a FIFO
+   read-only blocks until a writer appears, so a check after it never
+   runs), its `st_dev`/`st_ino` pair compared across the open, and the
+   bound applied to what is READ, one byte past the limit refusing, not
+   only to what `stat` claimed. `/proc/self/status` is that disagreement
+   without a race to arrange — a regular file whose reported length is
+   zero and whose contents are not — and is what the test uses.
 
-   **The answer taken is that the VOLUME carries it**, at a path outside
-   `/td/deployments` so it is not inside anything it authenticates, and
-   `td-install` writes it there at install time from the key it is already
-   given (7c-ii). That gives a running machine a trust root with exactly the
-   provenance of the media that installed it, survives every update and
-   rollback because no deployment owns it, and is one place to rotate.
-   `td-boot update` is then handed it EXPLICITLY, the rule 7c already set for
-   `td-install`: no probe, so no absence that reads as "publish without
-   checking".
-
-   Two alternatives were weighed and are recorded because the choice is not
-   obvious. Shipping the key INSIDE the deployment root would make each
-   deployment vouch for its successor, which is a normal enough design, but
-   it couples key rotation to rebuilding a deployment and it flips every
-   `td-boot install` on that machine to fail-closed as a side effect — the
-   silent change 7c's last paragraph warns about, which should be a decision
-   rather than a consequence. Requiring the operator to pass a key on every
-   invocation is honest and unusable unattended, which is the case an update
-   channel exists for. Neither is refuted by anything here; if the volume
-   turns out to be the wrong home, this paragraph is what to change.
-
-   What the volume's key does NOT buy is protection against someone who can
-   already write the disk — they can replace the key as easily as the bundle.
-   That is not a regression: the selector initramfs it replaces is on the same
-   disk, in the ESP, and is no harder to rewrite. Making either meaningfully
-   harder is Secure Boot and a measured boot chain, which is out of scope here
-   and would be its own specification.
-
-   **10a — the volume carries the trust root — is BUILT.** The path is
-   `protocol::VOLUME_TRUSTED_KEY` (`td/trusted.pub`), stated once beside the
-   layout for D1's reason, and named `trusted.pub` rather than repeating the
-   selector's `deployment.pub` so a path says WHICH of the two copies it is.
-   It sits beside `td/deployments` rather than in it, for the reason above.
-   Mode 0644, pinned for the staged directories' reason — `--rootdir` copies a
-   mode in verbatim, so an ambient umask would otherwise decide what a
-   machine's trust root looks like.
-
-   **The key is SNAPSHOT ONCE and PROMOTED, not read twice.** `seed_into`
-   copies the operator's key to `<scratch>/td-install-key/td-trusted.pub`,
-   hands td-boot THAT
-   path, and renames it into the volume on success. The trust-only form
-   provisions that snapshot without a deployment or authentication claim.
-   The obvious shape — read the bytes, pass the original path to td-boot, write the bytes out
-   afterwards — reads one path twice, and two reads are two chances for it to
-   say different things: td-boot authenticates under what its read found, the
-   volume keeps what this program's read found, and an attacker able to swap
-   the file between them installs a legitimately-signed deployment while
-   provisioning THEIR key for every update after it. Nothing reports the
-   difference, which is the "nothing observable distinguishes the wrong
-   outcome" test that also drove `losetup`'s read-only readback. With one file
-   renamed, the volume's key is not merely equal to the one that authenticated
-   the bundle; it IS that file.
-
-   A SNAPSHOT IS A FILE AN ATTACKER CAN ALSO REACH, though, and most of what
-   surrounds it is about that. It sits BESIDE the staging tree, never inside
-   it, so td-boot is never asked to read its trust root out of the volume root
-   it is writing — the shape `TRUSTED_KEY_PATH`'s comment warns about. It sits
-   in a directory of its OWN, removed and recreated at 0700, because the
-   scratch directory is not private and `td-trusted.pub` is a guessable name:
-   every other measure here narrows the window in which the file can be
-   swapped, and a directory nothing else may write into is what removes the
-   window rather than narrowing it. Restricting needs no chmod afterwards — a
-   umask only takes mode bits away — which is the reverse of the widening
-   below and worth stating because the two look alike and are not.
-
-   Within it the file is created by `create_new` at 0600 and WIDENED to 0644,
-   and every part of that is load-bearing. `create_new` refuses to open what
-   is already there, so a pre-placed symlink is not followed and its target
-   not truncated. 0600-then-widen rather than a create at 0644, because a
-   creation mode is masked by the umask: 0644 asked for directly is 0600 under
-   `umask 077` with nothing to correct it, and the opposite order leaves a
-   window in which a machine's trust root is world-writable. And the widening
-   goes through the open DESCRIPTOR rather than the path, because a path-based
-   chmod follows a symlink — one swapped in after the write would take the
-   0644 instead, and closing that race at creation while leaving it open at
-   the chmod closes neither.
-
-   The PROMOTE checks identity before it renames, since a rename moves
-   whatever the path names at rename time and not the file td-boot read. The
-   `st_dev`/`st_ino` pair written is compared against the pair the path
-   carries now — the same comparison the scratch image already makes against
-   the destination — and a mismatch is a refusal. With the 0700 directory this
-   is a check nothing is expected to trip; it is there because the alternative
-   to tripping it is a volume carrying a key that authenticated nothing.
-
-   The READ applies td-boot's own rule — a regular file, not a symlink, of at
-   most `MAX_PUBLIC_KEY_BYTES`. Not defensive duplication: handing td-boot a
-   copy would otherwise LAUNDER a key past a refusal the real reader makes,
-   since the copy is a small regular file whatever the original was, and
-   silently turning three refusals into successful installs is the kind of
-   side effect this section elsewhere insists should be a decision.
-
-   Its ORDER matters twice over. The type is settled by `lstat` BEFORE the
-   open, not by `is_file` after it, because opening a FIFO read-only blocks
-   until a writer appears — a check that runs afterwards never runs at all,
-   and the installer hangs with no diagnostic. The `st_dev`/`st_ino` pair is
-   then compared across the open, as td-boot's own reader compares it, so the
-   type holds of the bytes rather than of a name an attacker replaced in
-   between. And the bound is applied to what is READ and not only to what
-   `stat` claimed: the read takes one byte past the limit and refuses if it
-   gets it, since cutting an oversized file to a valid length is precisely the
-   laundering the rest of this paragraph exists to prevent. `/proc/self/status`
-   is that disagreement without a race to arrange — a regular file whose
-   reported length is zero and whose contents are not — and is what the test
-   uses.
-
-   The ORDER is the rest of it, and it has two ends. The read happens in
-   `run_volume`, in the same block that refuses a relative `mkfs.btrfs` or
-   `td-boot` — before the destination is opened and before the staging tree is
-   emptied. A key path is an argv-shaped mistake like those two, and reading
-   it inside `publish_into` put the refusal AFTER `remove_dir_all`, so a
-   mistyped fifth argument destroyed a directory before saying it did not like
-   the fifth argument. That is verbatim the failure this crate already
-   recorded and fixed for the fourth, reintroduced one argument along; the
-   test named for it is `a_key_that_is_not_there_does_not_cost_the_staging_
-   tree`. At the other end the key reaches the VOLUME only once the publish
-   has succeeded, so a failed publish leaves none — otherwise it would outlive
-   the publish it belonged to and become the root a later, unrelated publish
-   into the same scratch tree inherited. The bytes are carried rather than
-   parsed: this crate has no ed25519 and should not grow one for a file it
-   only carries. In the publishing form the publish is the parse; trust-only
-   initialization defers parsing and authentication to the coordinator's
-   source preflight and mounted publisher described in §5.
-
-   **10b made that rule ONE implementation, across THREE crates.** It had been
-   written three times — `td-boot`'s `open_real_file`/`read_bounded_real_file`,
-   `td-install`'s own `read_trusted_key`, and `td-net`'s
-   `read_as_td_boot_would`, whose doc comment said outright that it was
-   "mirrored". That is exactly the shape `protocol.rs` exists to prevent, "a
-   thing spelled in both crates is a thing they can come to disagree about",
-   and it is not a hypothetical: the td-install copy diverged three ways on the
-   day it was written (type checked after the open, no identity pin across the
-   open, an oversized read truncated rather than refused), all found by review
-   rather than by anything that runs. So the pair moved to
-   `td-boot/src/realfile.rs`, which all three `#[path]`-include as they already
-   do `protocol.rs`; it has since become `td-fs/src/real_file.rs`, one file
-   of the crate td's other programs take their file helpers from.
-
-   The signer matters most of the three and was the one nobody would have
-   thought to check. Its own comment gives the reason to share rather than
-   mirror: a signer that accepts what the target REFUSES produces a bundle that
-   fails at boot instead of at signing. Mirroring makes that agreement a thing
-   somebody maintains; sharing makes it a thing that cannot drift. The one
-   check that stayed behind is the signer's own — an empty manifest, which
-   td-boot has no opinion about and which is worth refusing where the signature
-   is made.
+   **10b made that rule ONE implementation.** It had been written three
+   times, in td-boot, td-install and td-net, one of them saying outright
+   that it was "mirrored". That is exactly the shape `protocol.rs` exists to
+   prevent, "a thing spelled in both crates is a thing they can come to
+   disagree about", and it is not a hypothetical: the td-install copy
+   diverged three ways on the day it was written (type checked after the
+   open, no identity pin across the open, an oversized read truncated rather
+   than refused), all found by review rather than by anything that runs. So
+   the pair moved to `td-boot/src/realfile.rs`, which all three
+   `#[path]`-include as they already do `protocol.rs`; it has since become
+   `td-fs/src/real_file.rs`, one file of the crate td's other programs take
+   their file helpers from.
 
    It carries the redundant `#[path]` `fixture.rs` carries, for the same
    reason: `affected.rs`'s staging guard reads `#[path]` attributes and is
@@ -3503,17 +2747,14 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    recipes staging the file a checked property rather than something to
    remember. Removing either stage reds `self_test_passes_against_repo` naming
    the file and the recipe, instead of failing the target build an hour later
-   inside `recipe-checks`. `td-net` needs no stage: no recipe builds it.
+   inside `recipe-checks`.
 
-   That last fact is also why the real-file rule needed a ROUTING rule of its
-   own, beside the one `protocol.rs` already had. No gate builds td-net from
-   source — the recipe-graph warm does, which is a chain target — so a file
-   td-net `#[path]`-includes must select those targets or an edit that breaks
-   only the signer compiles td-boot and td-install and builds no net at all.
-   There are two in that class now, `protocol.rs` and the `td-fs/` tree the
-   rule moved into, and `builder/src/affected.rs` pins both, with
-   `td-boot/src/main.rs` pinned to select NONE of them: the rule has to be
-   about these files rather than about the crate.
+   td-net also `#[path]`-includes the `td-fs/` tree, and no gate builds
+   td-net from source — the recipe-graph warm does, which is a chain target
+   — so that tree has a ROUTING rule of its own in
+   `builder/src/affected.rs` that selects those targets and td-net's own
+   suite; td-boot's sources, `protocol.rs` included, fall to the td-boot
+   rule.
 
    **10c closed the residual race, once, for all three.** The type is settled
    by `lstat` and the open follows it, so the entry can be replaced in between
@@ -3562,89 +2803,14 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    is the only thing that refuses. What those tests still do not pin is
    EXACTNESS: each flag is checked as sufficient, so a superset would pass.
 
-   Applying the rule in `td-install` at all is not belt-and-braces, and the
-   doc comment says so: this program SNAPSHOTS the key and hands td-boot the
-   copy, and a copy is a small regular file whatever the original was — so
-   without it the snapshot would launder a key past every refusal the real
-   reader makes.
-
-   The recipe check asserts it off the RESTORED IMAGE rather than off the
-   staging tree, for the reason the selector symlink is checked that way, and
-   the wrong-key pass asserts the volume carries neither a selector nor a
-   trust root. What that check does NOT cover is the MODE: `td-btrfs restore`
-   does not restore modes, so the 0644 is asserted on the staging tree —
-   which is what `--rootdir` reads — and under a hostile umask by the
-   subprocess test, rather than off the image.
-
-   **10d — `td-boot install` can be TOLD which key**, which is what makes the
-   trust root 10a writes reachable by anything. The verb took three arguments
-   and resolved its key by PROBING the running rootfs, which is the right
-   answer in the selector initramfs and finds nothing on a booted deployment
-   (§6) — so an update on a live machine published whatever it was handed and
-   only warned. The fourth argument is optional and is `publish`'s, with
-   `publish`'s semantics: absent still probes, and a NAMED key is fail-closed,
-   so a missing or truncated one refuses rather than quietly publishing
-   unverified.
-
-   A key ON the volume being installed into is not circular, and what makes
-   that true is an ORDERING rather than an argument. `run_install` resolves
-   the trust root BEFORE it mounts the device writable — the property that
-   already made "an install refused for want of a key leaves the disk exactly
-   as it found it" hold — and a running td machine already has the volume
-   mounted READ-ONLY at `/run/td-volume`, moved there out of the selector
-   initramfs by `/init`. So the key is read through a mount nothing can write,
-   off the state the volume was in before the transaction opened.
-
-   That reading is the reason §6's own pin needed rewording rather than
-   relaxing, and the distinction is the whole of it. What §6 rules out is
-   td-boot PROBING the volume: a probe makes ABSENCE mean "publish without
-   checking", so deleting the key is a silent downgrade to an unauthenticated
-   install. Being TOLD a path is the opposite — the caller has decided, and
-   the same deletion is a refusal. The test that pinned this now says so, and
-   pins the second half as well: both shipped calls must PASS THE KEY THEY
-   WERE GIVEN, since dropping it on the floor compiles and reads as the probe.
-
-   What the volume's key still does not defend against is someone who can
-   already write the volume, which item 10 recorded above and is not what it
-   is for. The threat an update channel has is the other one: the BUNDLE
-   arrives from removable media, a share, or a build host, and the trust root
-   does not.
-
-   **10e — the boot oracle's install runs under a key, and under a wrong one
-   first.** The `td.deploy=install` pass had never exercised authentication:
-   the script used the three-argument form, `switch_root` had taken the
-   selector's key away, and so the probe found nothing and the in-guest update
-   published unverified. The harness now stages the run's public half on the
-   fixture volume at `VOLUME_TRUSTED_KEY`, where `td-install` puts it, and the
-   script passes it.
-
-   THE NEGATIVE IS THE POINT. The candidate is signed whether or not td-boot
-   is told to check it, so passing the key and asserting the same marker would
-   prove nothing — an ignored argument leaves every existing assertion green.
-   So the script updates THREE times: first under `DEPLOY_WRONG_KEY`, a second
-   generated key staged beside the real one, which must FAIL; then over an
-   EMPTY channel, which must succeed and name nothing; then over the real one,
-   which must install. Only the last echoes the marker.
-
-   A refusal is not enough on its own, because almost anything makes an
-   install fail — a key that is not there, a busy volume lock, a candidate
-   that moved — and each would satisfy a bare "it failed" as well as a
-   signature check does. So the refused pass greps the captured stderr for
-   `MANIFEST_UNAUTHENTICATED`, and that string is a `protocol.rs` constant
-   both sides derive from: td-boot formats its diagnostic out of it and the
-   script looks for it, so a reworded message cannot turn the check into a
-   tautology. The decoy is a WHOLE VALID key rather than a corrupt file, so
-   what it earns is a signature that does not verify rather than a key that
-   will not parse — different failures, and only the first is under test.
-
-   What the gate can and cannot see here is worth stating plainly, because no
-   gate boots a VM. It CAN see, and mutation-reds, that the script carries all
-   three passes, that the wrong key is tried first, that the refusal's reason
-   is checked, and that each pass is held to BOTH halves of its contract; and
-   separately that td-boot really does refuse a bundle under a whole valid
-   wrong key with that constant in the message. What only `td-recipe-eval
-   qemu-boot-system` can see is the guest executing it. The two halves meet at
-   the shared constant, which is what makes the guarded half worth having.
+   **10e — the boot oracle's update runs three times.** The
+   `td.deploy=install` pass first updates over an EMPTY channel, which must
+   succeed and name nothing, then over the real one, which must install
+   and echo the marker; the rollback pass (§11) then reinstalls from that
+   same channel. Both channels, `td/incoming` and `td/incoming-idle`, are
+   seeded 0755, and the fixture volume is built root-owned through
+   `builder userns-private`, since 10f refuses a channel that is not
+   uid 0 with no group or other write.
 
    **10g — the oracle drives the VERB.** Those passes went through `install`
    with a bundle path until `td-boot update` existed; they take a CHANNEL now,
@@ -3689,140 +2855,55 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    that added the idle pass to catch it. The real pass now requires a non-empty
    id as the idle pass requires an empty one.
 
-   The gate pins the real pass's channel and key as a PAIR, which is not
-   redundancy: `VOLUME_CHANNEL_DIR` is a strict PREFIX of `DEPLOY_IDLE_CHANNEL`
+   The gate pins the real pass's channel as a whole argument, not by
+   substring: `VOLUME_CHANNEL_DIR` is a strict PREFIX of `DEPLOY_IDLE_CHANNEL`
    (`td/incoming` of `td/incoming-idle`), so a substring test for the channel
-   alone is satisfied by the idle pass and says nothing about the real one.
+   is satisfied by the idle pass and says nothing about the real one.
 
-   **10f — two things owed, both now closed for `update`.** Both were found in
-   review of 10d and neither was a defect until something passed the argument.
-   10e is what passed it, and 10e carried neither; each is closed below, in the
-   verb that turned out to own it:
-
-   - `/run/td-volume` is not checked to BE a mount point — and the first
-     version of this note, taken from review, overstated what that costs.
-     It said an unmounted volume "is not a refusal, it is a different file".
-     It is a refusal: `/init` creates the mountpoint before moving the volume
-     onto it, so a move that never happened leaves an EMPTY directory on the
-     `/run` tmpfs, the key is absent, and an explicit key that is absent is
-     already fail-closed. The ordinary failure is loud.
-
-     What is actually left is a PLANTED file — something writing
-     `/run/td-volume/td/` while the volume is not mounted — which on a booted
-     machine means root, and a root that can write `/run` has better things to
-     do. So this is defence in depth and is recorded at that weight.
-
-     Where it belongs is not `install`, which is the other half of the
-     correction. That verb takes an arbitrary path, so requiring it to sit on
-     a mount would refuse a perfectly good `td-boot install … /root/key.pub`.
-     The caller that knows the key is supposed to be on the volume is the
-     UPDATE verb — which is td-boot's own now rather than the separate program
-     this paragraph was written against, so the check has an owner again and
-     is owed by `update` rather than by a program that will not exist.
-
-     On 10e's path it is separately covered, by something that is nobody's
-     check of this: the boot-success script runs only after rootcheck, which
-     greps `/proc/mounts` for `/run/td-volume` as btrfs `ro`. One caller's
-     precondition, so it reaches no other caller and disappears if the script
-     is reordered.
-
-     **CLOSED.** `update` takes the volume's read-only view as an argument and
-     requires it to BE a mount point, through the `is_mount_point` this file
-     already had — `mountpoint(1)`'s test, a device number that differs from
-     its parent's, and no `/proc` at all. The trust root must then be UNDER
-     that volume, or naming any mount point would satisfy the gate while the
-     key came from somewhere else; `/proc` is a mount point on every host, so
-     that is not a hypothetical. The check is eager, before the candidate is
-     looked for, for the reason the key is read eagerly.
-
-     Both paths are RESOLVED before either is judged, and the resolved key is
-     what is then read. `Path::starts_with` is lexical — it compares components
-     and normalizes nothing — so `<volume>/../forged.pub` is inside the volume
-     to it and `/run/forged.pub` to the kernel, which is the whole gate
-     defeated by one `..`; an intermediate symlink escapes the same way, since
-     td-fs's `O_NOFOLLOW` binds only the final component. A symlink AT the
-     key is refused outright rather than resolved, because resolving it would
-     otherwise make `update` the one verb here that accepts one — td-fs
-     refuses a symlink by lstat and `O_NOFOLLOW`, and neither ever sees a path
-     already resolved.
-
-     Resolving also NARROWS, but does not close, the window between the check
-     and the read: `open_real_file` walks the path again, so a rename of an
-     intermediate DIRECTORY still redirects it. What resolving removes is the
-     symlink-swap form. What bounds the rest is authentication rather than the
-     lookup, which is what `run_update`'s own note already says.
-
-     The volume is NAMED rather than derived, and that is the whole shape of
-     the answer. Nothing distinguishes a mounted volume from an ordinary
-     directory of the same name except being told which to expect — the
-     argument this bullet already makes about rootcheck's ERE, which spells the
-     path out. Deriving it from the key's own path cannot work: the conventional
-     layout would exclude the oracle's `DEPLOY_WRONG_KEY`, and a positional rule
-     like "the key's grandparent" is satisfied by `/` for a key at `/root/k.pub`
-     and so fails open exactly where it is loosest.
-
-     What it does not catch, and the list is longer than it first looked. A
-     bind mount of a directory on the same filesystem shares its parent's
-     device number — `is_mount_point`'s own documented gap, and not this
-     danger, which is a volume with a filesystem of its own. A btrfs SUBVOLUME
-     boundary goes the other way and reads as a mount point, since each
-     subvolume carries its own anonymous device number; that is a false
-     positive rather than a false negative, and it is unreachable in the layout
-     that matters because `/run` is a tmpfs and has no subvolumes. A file
-     planted on a volume that really is mounted needs a write to the disk and
-     is the out-of-scope case above.
-
-     And the property established is "the key is on WHATEVER mount point the
-     caller named", not "on the volume" — a caller who chooses argv can name
-     `/run` itself, which is a genuine mount point, and satisfy both checks with
-     a key on the writable tmpfs. That is inherent to naming rather than
-     deriving, and what stands behind it is that argv is not attacker input
-     here: the three passes are composed in `system-x86-64.rs` and pinned by
-     the gate three times over.
-
-     **A READ-ONLY-MOUNT CHECK WAS BUILT FIRST AND REJECTED**, and it is
-     recorded because both reasons are easy to walk back into. The idea was to
-     require the trust root's MOUNT to be read-only, which needs no extra
-     argument and looked strictly stronger.
-
-     It is not stronger. Read-only-per-mount and mount-point are INCOMPARABLE:
-     a read-only bind of a writable filesystem refuses writes through that path
-     while the same files stay writable through the original mount, so "a trust
-     root anything can rewrite in place is not a trust root" is not what the
-     check would have established.
-
-     And it cannot be implemented from `/proc/self/mountinfo` by pathname at
-     all. mountinfo is ordered by mount ID, `mount --move` PRESERVES the id, and
-     `/init` mounts the volume BEFORE the `/run` tmpfs it later moves it onto —
-     so the volume is listed BEFORE `/run`, and the last entry covering the key
-     is `/run`, which is `rw`. A "last covering entry" rule therefore refuses
-     td's own volume and would have failed every update on every booted machine.
-     No gate would have caught it — not because nothing boots a VM, since
-     `qemu-boot-system` does, but because that check ran only in a full image
-     build and no gate ran one; it now runs in the `td-builder check
-     integration` tier, on main after each landing. The obvious
-     alternative,
-     "deepest covering entry", is wrong in the other direction: a read-only
-     mount at `/vol/sub` hidden by a later writable one at `/vol` is still in
-     the table, and a path under it resolves through the writable mount. Both
-     were reproduced against real kernel output in a user namespace. The
-     discriminator is the parent-ID column, which neither rule reads, and the
-     only thing that settles it is the ID of the mount a path actually resolved
-     through — `statx(STATX_MNT_ID)`, a syscall, so an `UNSAFE.md` amendment.
-   - an explicit key path is not required ABSOLUTE, where `source`, `device`,
-     `mountpoint` and `root` all are. It resolves against whatever cwd the
-     caller had. CLOSED for `update`, where nothing sets a timer's working
-     directory and the key is mandatory; still open for `install`, `publish`
-     and `authenticate`, whose key belongs to a person who typed it.
+   **10f — the channel is the volume's and root's.** With no key, what
+   keeps an unattended updater from installing whatever anyone offers is
+   where the channel may be. `update` takes the volume's read-only view as
+   an argument and requires it to BE a mount point, through
+   `is_mount_point` — `mountpoint(1)`'s test, a device number that differs
+   from its parent's, and no `/proc` at all: `/init` creates that
+   directory before moving the volume onto it, so a move that never
+   happened leaves an ordinary directory on the `/run` tmpfs. The channel
+   must be absolute and a real directory; it is resolved, and the resolved
+   path must lie on that volume ("update channel … is not on the volume
+   …"). Every directory from the volume root down to the channel must be
+   a root-owned real directory that no group or other may write, except
+   that any directory above the channel may be group- or other-writable if
+   sticky; the channel itself may not ("update channel …: … must be
+   root-owned and writable by no one else"). The installer pins the
+   volume root it stages to 0755, so no umask leaves it writable to
+   others. Every tick checks this before looking
+   for a candidate, idle ticks included, so a channel that has become
+   unsafe is reported on a tick with nothing to install. A candidate that
+   is there must be a root-owned real directory no one else may write
+   ("update candidate … must be root-owned and writable by no one
+   else"), holding a manifest, kernel, initramfs and root that are each a
+   root-owned regular file no one else may write ("update candidate file
+   … must be a root-owned regular file writable by no one else");
+   otherwise its owner could rewrite it between the decision and the
+   publish. The candidate is looked up once, so one removed before
+   that lookup is nothing offered, not an error; one removed after it
+   fails the tick at its files.
+   Resolving first matters because `Path::starts_with` is lexical:
+   `<volume>/../x` is inside the volume to it and outside to the kernel.
+   The volume is NAMED rather than derived: nothing distinguishes a
+   mounted volume from an ordinary directory of the same name except being
+   told which to expect. A bind mount of a directory on the same
+   filesystem shares its parent's device number, `is_mount_point`'s
+   documented gap; a btrfs subvolume boundary reads as a mount point,
+   unreachable here because `/run` is a tmpfs.
 
    **The LOCAL channel** is a directory holding AT MOST ONE bundle, under the
    fixed name `protocol::CHANNEL_CANDIDATE`. Local is the whole of it for now:
-   no network, no fetch, no protocol. td's network tools are the only crates
-   allowed dependencies and none of them is built for the target, so a fetching
-   update is a separate decision with its own trust argument, not an increment
-   of this one. The bundle arrives by whatever put it there — removable media,
-   a share the operator mounted, a build host writing into the volume, for
-   which `VOLUME_CHANNEL_DIR` is the volume's own.
+   no network, no fetch, no protocol. A fetching update is a separate
+   decision with its own trust argument, not an increment of this one. The
+   channel lies on the volume and only root writes it (10f), so a bundle
+   arrives there by root copying it in; `VOLUME_CHANNEL_DIR` is the
+   volume's own.
 
    **One fixed name rather than a search, because td cannot order two
    bundles.** A manifest is a header and a list of payload digests; it carries
@@ -3831,7 +2912,7 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    picked the "newest" would be guessing from mtimes an attacker supplies or
    from names nobody validates. So WHICH bundle is the producer's decision,
    expressed by what it leaves at that name. Giving td a real notion of newer
-   means a version field inside the signed manifest, which is a change to the
+   means a version field inside the manifest, which is a change to the
    deployment contract and its own landing.
 
    **How a producer publishes into the channel**, stated because an earlier
@@ -3848,8 +2929,8 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    stage-then-rename does still buy is the atomicity that matters: no reader
    ever sees a HALF-WRITTEN bundle, only a whole one or none. A tick that
    catches the removal mid-read fails loudly rather than installing something
-   partial, because the payload names come from a manifest that must verify
-   first.
+   partial, because every payload must match the manifest it is read
+   with.
 
    Closing the window properly needs an atomic exchange — `renameat2`'s
    `RENAME_EXCHANGE`, a syscall, so an `UNSAFE.md` amendment — or a `candidate`
@@ -3863,14 +2944,9 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    updater nobody is watching must not decide for itself that something
    missing is fine.
 
-   Its trust root is REQUIRED, where `install`'s is optional. For `install` an
-   absent key is a real configuration — a rootfs with no trust root publishes
-   as it always has — and for an unattended updater there is no such
-   configuration. It is also required ABSOLUTE, as the channel is: nothing sets
-   a timer's working directory, so a relative path is a different file
-   depending on who started it. That is 10f's second bullet, and it is closed
-   HERE rather than in `install` because `install`'s key belongs to a person
-   who typed it.
+   Its channel is required ABSOLUTE: nothing sets a timer's working
+   directory, so a relative path is a different directory depending on who
+   started it. And it is held to 10f's rule on every tick.
 
    A missing CHANNEL is an error and a missing CANDIDATE is not. That is the
    one distinction the verb exists to draw: pointing a timer at a typo would
@@ -3891,40 +2967,31 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
 
    Consuming the candidate is the obvious refinement and is deliberately not
    taken here, because it decides something this item has not: whether the
-   channel is the updater's to mutate. On removable media or a read-only share
-   it is not, and a verb that only works when it can write the channel is a
-   worse verb than one that re-reads a 4 KiB manifest.
-
-   The trust root is read BEFORE the candidate is looked for. That costs a read
-   on every idle tick and is the point: a key that has gone missing or
-   unreadable is reported on a tick with nothing to install rather than on the
-   first tick that has one, which is the tick least able to afford it.
+   channel is the updater's to mutate, and the updater holds the volume
+   read-only.
 
    The candidate must be a real DIRECTORY, `require_real_directory`'s rule
    everywhere else in td-boot. A symlink would make the channel's contents
-   depend on something outside it whose path nothing authenticates — the bundle
-   is authenticated, but where it was read from would not be.
+   depend on something outside it whose path nothing checks.
 
    That rule holds against a producer that got it wrong and NOT against one
    RACING the call, which is a residual worth stating rather than leaving to be
    discovered. The candidate is typed before the volume is locked and mounted
-   and is opened by pathname afterwards, so a writer who has the channel can
-   swap a directory in between; `O_NOFOLLOW` binds only the final component of
-   each file it then opens, not the directory above them. What bounds the
-   damage is AUTHENTICATION rather than the lookup: whatever is read still has
-   to verify under the trust root, so the most a racing writer achieves is
-   installing a DIFFERENT SIGNED bundle — which is also what it achieves by
-   simply writing that bundle to the candidate, which it is entitled to do.
+   and is opened by pathname afterwards, so a writer who has the channel —
+   root, by 10f — can swap a directory in between; `O_NOFOLLOW` binds only
+   the final component of each file it then opens, not the directory
+   above them. What bounds the
+   damage is that whatever is read must still match its manifest, so the
+   most a racing writer achieves is installing a DIFFERENT whole bundle —
+   which is also what it achieves by simply writing that bundle to the
+   candidate, which it is entitled to do.
    Closing it needs the directory-handle route (`O_PATH` plus `openat`), which
    `std` does not expose and which item 10c already declined on the boot path.
 
-   A REPEAT tick is cheap, which is the property that makes this fit for a
-   timer at all and is not obvious from the call. `open_bundle` reads the
-   bounded manifest and the signature and nothing else — payload digests are
-   verified on the BOOT path, not here — and `publish_bundle` short-circuits an
-   id already published, so a tick that finds the candidate it installed last
-   time costs a 4 KiB read, one signature check and a directory sync rather
-   than a copy of the image.
+   A REPEAT tick copies nothing: `publish_bundle` short-circuits an id
+   already published, so a tick that finds the candidate it installed last
+   time costs reading and hashing it and a directory sync rather than a copy
+   of the image.
 
 Items 8 and 9 depend on nothing above them and may land whenever they fit.
 
@@ -3941,13 +3008,12 @@ During development, `td-builder affected-checks --run`; before pushing,
 the per-commit review record.
 
 Beyond the existing deployment/persistence/rollback oracles, this path adds:
-an install onto a regular file that then boots under OVMF; a bundle signed by
-an unpinned key that must be refused; and an update that installs a second
-deployment and rolls back to the first.
+an install onto a regular file that then boots under OVMF, and an update
+that installs a second deployment and rolls back to the first.
 
-The second and third are BUILT, both inside `qemu-boot-system`'s install boot,
-which is the only place a running td machine exists to drive them from. The
-refused pass is 10e's. The rollback pass runs after the install one and ends
+The second is BUILT, inside `qemu-boot-system`'s install boot, which is
+the only place a running td machine exists to drive it from. The
+rollback pass runs after the install one and ends
 where it began — it rolls back to the deployment that is RUNNING, requires the
 id it lands on to be exactly that one, then reinstalls from the same channel
 and requires that to name what the first install named. Restoring is not

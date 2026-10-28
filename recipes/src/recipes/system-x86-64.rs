@@ -65,7 +65,7 @@ const BOOT_SUCCESS_RETRY_SECS: u8 = 3;
 const BUS_MARKER_GRACE_SWEEPS: u8 = 2;
 const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
 /// What ONE iteration of the boot-success loop may cost on a slow TCG guest: nine
-/// `exec-primary` probe blocks, four `td-boot update` passes and a `rollback`. Exactly ONE of
+/// `exec-primary` probe blocks, three `td-boot update` passes and a `rollback`. Exactly ONE of
 /// those copies an image; what the rest add is deployment-sized READS, and the
 /// distinction is worth the words because the QEMU volume budget turns on it
 /// — see BOOTSUCCESS below. Named rather than spelled twice because the td-svc
@@ -1529,10 +1529,10 @@ mod svc_timeouts {
     /// validated in the VM.
     pub const APPLICATION_FETCH: u32 = 900;
     /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
-    /// but each runs a large probe farm (nine `exec-primary` blocks) and can run four
+    /// but each runs a large probe farm (nine `exec-primary` blocks) and can run three
     /// transactional `td-boot update` passes plus a `rollback`, so an iteration is worth
-    /// seconds on a slow disk, not one. Two of the four are cheap by construction — a
-    /// refusal and an idle tick each read a bounded manifest and stop.
+    /// seconds on a slow disk, not one. The idle tick is cheap by construction: it finds
+    /// no candidate and stops.
     ///
     /// Exactly ONE copies an image, and that is the first install. The REINSTALL the
     /// rollback pass restores with copies nothing: the deployment is already published,
@@ -3499,11 +3499,6 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     let td_login_exec_as_probe = td_login_exec_as_probe(sys);
     let td_txt_probes = build_td_txt_probes();
     let sandbox_kernel_probes = build_sandbox_kernel_probes();
-    // Named rather than spelled, so a renamed key or a reworded refusal cannot
-    // leave the oracle's negative pass quietly satisfied by any failure at all.
-    let trusted_key = td_boot_protocol::VOLUME_TRUSTED_KEY;
-    let wrong_key = crate::shared::DEPLOY_WRONG_KEY;
-    let unauthenticated = td_boot_protocol::MANIFEST_UNAUTHENTICATED;
     let channel = td_boot_protocol::VOLUME_CHANNEL_DIR;
     let idle_channel = crate::shared::DEPLOY_IDLE_CHANNEL;
     let update = td_boot_protocol::UPDATE_VERB;
@@ -3754,22 +3749,13 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          if [ \"$healthy\" = 1 ] \
          {busd_ready}&& /bin/td-boot on-volume success /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
-         if /bin/td-boot on-volume {update} /run/td-update /run/td-volume \
-         /run/td-volume/{channel} /run/td-volume/{wrong_key} \
-         >/run/td-refused-id 2>/run/td-refused-err; then \
-         echo 'td-boot update accepted a bundle under the wrong key'; healthy=0; \
-         elif ! /bin/grep -q -F '{unauthenticated}' /run/td-refused-err; then \
-         echo 'td-boot update refused under the wrong key for another reason'; \
-         healthy=0; \
-         elif ! /bin/td-boot on-volume {update} /run/td-update /run/td-volume \
-         /run/td-volume/{idle_channel} /run/td-volume/{trusted_key} \
-         >/run/td-idle-id; then \
+         if ! /bin/td-boot on-volume {update} /run/td-update /run/td-volume \
+         /run/td-volume/{idle_channel} >/run/td-idle-id; then \
          echo 'td-boot update failed on a channel with nothing in it'; healthy=0; \
          elif [ -s /run/td-idle-id ]; then \
          echo 'td-boot update named a deployment for an empty channel'; healthy=0; \
          elif ! /bin/td-boot on-volume {update} /run/td-update /run/td-volume \
-         /run/td-volume/{channel} /run/td-volume/{trusted_key} \
-         >/run/td-installed-id; then \
+         /run/td-volume/{channel} >/run/td-installed-id; then \
          echo 'td-boot update failed on the channel holding a bundle'; healthy=0; \
          elif ! [ -s /run/td-installed-id ]; then \
          echo 'td-boot update installed nothing from the channel holding a bundle'; \
@@ -3786,8 +3772,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          >/run/td-rolled-current; then \
          echo 'td-boot rollback printed an id without making it current'; healthy=0; \
          elif ! /bin/td-boot on-volume {update} /run/td-update /run/td-volume \
-         /run/td-volume/{channel} /run/td-volume/{trusted_key} \
-         >/run/td-reinstalled-id; then \
+         /run/td-volume/{channel} >/run/td-reinstalled-id; then \
          echo 'td-boot update could not reinstall the deployment after a rollback'; \
          healthy=0; \
          elif ! /bin/grep -q -x -F -f /run/td-installed-id /run/td-reinstalled-id; then \
@@ -5356,19 +5341,14 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-net}/bin/td-net".into(),
         link: "{root}/real-root/bin/td-feed".into(),
     });
-    // The application cache, the installation identity primitive, the
-    // Firefox fixture origin and the portal: a server ships no application,
-    // retains no signing identity, and has no session.
+    // The application cache, the Firefox fixture origin and the portal: a
+    // server ships no application and has no session.
     if sys.desktop() {
         // /bin/td-app — the Flathub cache's applet (APPLICATIONS.md §W.9), which
         // td-jail runs by this full path as the application's account.
         steps.push(Step::Symlink {
             target: "{in:td-net}/bin/td-net".into(),
             link: "{root}/real-root/bin/td-app".into(),
-        });
-        steps.push(Step::Symlink {
-            target: "{in:td-net}/bin/td-net".into(),
-            link: "{root}/real-root/bin/td-deploy".into(),
         });
         // /bin/td-test-https — the QEMU-only Firefox HTTPS origin's mint, server
         // and readiness probe (APPLICATIONS.md §B.8 item 6).
@@ -8568,7 +8548,7 @@ mod tests {
                 // The loop is clamped to this many iterations; budget a slow one each.
                 (BOOT_SUCCESS_RETRY_MAX_SECS as u32)
                     .saturating_mul(BOOT_SUCCESS_ITERATION_BUDGET_SECS),
-                "clamped iterations of nine exec-primary probe blocks, four td-boot updates and \
+                "clamped iterations of nine exec-primary probe blocks, three td-boot updates and \
                  a rollback",
             ),
             (
@@ -13904,8 +13884,8 @@ mod tests {
             "the root-owned health target must wire the transactional update through \
              td-boot's own update verb"
         );
-        // EVERY pass names the volume, including the wrong-key one, which is the
-        // only one no whole-fragment pin covers. `update` requires it to be a
+        // EVERY pass names the volume, counted here as well as pinned by each
+        // whole fragment below. `update` requires it to be a
         // real mount point, so a pass that dropped it would not merely lose the
         // check — it would take the CHANNEL as the volume and fail for a reason
         // that has nothing to do with what the pass is about.
@@ -13913,10 +13893,10 @@ mod tests {
             bootsuccess
                 .matches("/run/td-update /run/td-volume /run/td-volume/")
                 .count(),
-            4,
-            "all four update passes — wrong key, idle, real, and the reinstall \
-             after the rollback — must name the volume between the mountpoint \
-             and the channel"
+            3,
+            "all three update passes — idle, real, and the reinstall after the \
+             rollback — must name the volume between the mountpoint and the \
+             channel"
         );
         // The verb takes a CHANNEL, not a bundle. Passing the candidate would
         // make it look for `<candidate>/candidate` and read every tick as
@@ -13928,8 +13908,8 @@ mod tests {
         // td-util, td-txt and td-login probe farms and the configured hostname,
         // so unscoped it false-REDS on any innocent later use of the word —
         // rewording a diagnostic here would do it — and the message it fails
-        // with points at these four passes. The scan grew with the rollback
-        // pass and so did that hazard: its four diagnostics sit inside the
+        // with points at these passes. The scan grew with the rollback
+        // pass and so did that hazard: its diagnostics sit inside the
         // region now, and one reworded to say "a different candidate" would
         // red this for no reason. None of them does today.
         let chain = bootsuccess
@@ -13955,19 +13935,18 @@ mod tests {
         // false forever, and the pass would fall through to the install having
         // asserted nothing at all.
         let idle_branch = format!(
-            "elif ! /bin/td-boot on-volume {update} /run/td-update {volume} {volume}/{idle} \
-{volume}/{key} >{out}; then echo 'td-boot update failed on a channel with nothing \
+            "if ! /bin/td-boot on-volume {update} /run/td-update {volume} {volume}/{idle} \
+>{out}; then echo 'td-boot update failed on a channel with nothing \
 in it'; healthy=0; elif [ -s {out} ]; then",
             update = td_boot_protocol::UPDATE_VERB,
             volume = "/run/td-volume",
             idle = crate::shared::DEPLOY_IDLE_CHANNEL,
-            key = td_boot_protocol::VOLUME_TRUSTED_KEY,
             out = "/run/td-idle-id",
         );
         assert!(
             bootsuccess.contains(&idle_branch),
-            "the oracle must drive an empty channel under the REAL key, require exit \
-             0, and read the same file it redirected; wanted\n{idle_branch}\nin\n{bootsuccess}"
+            "the oracle must drive an empty channel, require exit 0, and read the \
+             same file it redirected; wanted\n{idle_branch}\nin\n{bootsuccess}"
         );
         // The REAL pass, held to BOTH halves as the idle one is. Review found it
         // held to only the first: it asserted exit 0 and never looked at what it
@@ -13984,19 +13963,18 @@ in it'; healthy=0; elif [ -s {out} ]; then",
         // IDLE pass and says nothing about this one.
         let real_branch = format!(
             "elif ! /bin/td-boot on-volume {update} /run/td-update {volume} {volume}/{channel} \
-{volume}/{key} >{out}; then echo 'td-boot update failed on the channel holding a \
+>{out}; then echo 'td-boot update failed on the channel holding a \
 bundle'; healthy=0; elif ! [ -s {out} ]; then echo 'td-boot update installed nothing \
 from the channel holding a bundle'; healthy=0; else echo {marker};",
             update = td_boot_protocol::UPDATE_VERB,
             volume = "/run/td-volume",
             channel = td_boot_protocol::VOLUME_CHANNEL_DIR,
-            key = td_boot_protocol::VOLUME_TRUSTED_KEY,
             out = "/run/td-installed-id",
             marker = SYSTEM_DEPLOY_INSTALL_MARKER,
         );
         assert!(
             bootsuccess.contains(&real_branch),
-            "the real update pass must name the channel AND the real key, and must \
+            "the real update pass must name the channel, and must \
              require that it INSTALLED something rather than only that it exited 0; \
              wanted\n{real_branch}\nin\n{bootsuccess}"
         );
@@ -14024,7 +14002,7 @@ elif ! /bin/grep -q -x -F \"$deployment\" {rolled}; then echo 'td-boot rollback 
 return to the deployment that booted'; healthy=0; elif ! /bin/td-boot on-volume success \
 /run/td-update \"$deployment\" >{current}; then echo 'td-boot rollback printed an id \
 without making it current'; healthy=0; elif ! /bin/td-boot on-volume {update} \
-/run/td-update {volume} {volume}/{channel} {volume}/{key} >{again}; then echo 'td-boot \
+/run/td-update {volume} {volume}/{channel} >{again}; then echo 'td-boot \
 update could not reinstall the deployment after a rollback'; healthy=0; elif ! /bin/grep \
 -q -x -F -f {installed} {again}; then echo 'the reinstall after a rollback named a \
 different deployment'; healthy=0; else echo {marker}; fi; fi;",
@@ -14032,7 +14010,6 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             update = td_boot_protocol::UPDATE_VERB,
             volume = "/run/td-volume",
             channel = td_boot_protocol::VOLUME_CHANNEL_DIR,
-            key = td_boot_protocol::VOLUME_TRUSTED_KEY,
             rolled = "/run/td-rolled-id",
             current = "/run/td-rolled-current",
             installed = "/run/td-installed-id",
@@ -14044,49 +14021,6 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             "the rollback pass must roll back, require the id it lands on to be the \
              deployment that BOOTED, reinstall, and require that reinstall to name \
              what the first install did; wanted\n{rollback_branch}\nin\n{bootsuccess}"
-        );
-        // The NEGATIVE half, guarded here because no gate boots a VM: the oracle
-        // that would notice its absence runs only under `qemu-boot-system`. The
-        // candidate is signed whether or not td-boot is told to check it, so
-        // without a refused pass the trusted-key argument could be ignored
-        // outright and every marker would still appear.
-        assert!(
-            bootsuccess.contains(&format!(
-                "/run/td-volume/{}",
-                crate::shared::DEPLOY_WRONG_KEY
-            )) && bootsuccess.contains(&format!(
-                "/run/td-volume/{}",
-                td_boot_protocol::VOLUME_TRUSTED_KEY
-            )),
-            "the update pass must run under BOTH the wrong key and the real one"
-        );
-        assert!(
-            bootsuccess.contains(td_boot_protocol::MANIFEST_UNAUTHENTICATED),
-            "the refused pass must check WHY it was refused: a missing key or a \
-             busy lock would satisfy a bare failure check"
-        );
-        // Bound rather than compared as `Option`s: `None < Some(_)` is true,
-        // so a MISSING wrong key would satisfy the ordering it is meant to fail.
-        let wrong_at = bootsuccess.find(crate::shared::DEPLOY_WRONG_KEY).unwrap();
-        let real_at = bootsuccess
-            .find(td_boot_protocol::VOLUME_TRUSTED_KEY)
-            .unwrap();
-        assert!(
-            wrong_at < real_at,
-            "the wrong key must be tried FIRST, so a refusal that did not refuse \
-             cannot be masked by the install that follows it"
-        );
-        // The refusal pattern is interpolated into SINGLE-QUOTED shell. A reword
-        // carrying an apostrophe emits a broken script that no gate executes, and
-        // an empty one turns `grep -F ''` into a match on anything — either way
-        // the refused pass stops testing what it says it does while staying green.
-        let pattern = td_boot_protocol::MANIFEST_UNAUTHENTICATED;
-        assert!(
-            pattern.len() >= 8
-                && !pattern
-                    .chars()
-                    .any(|c| c == '\'' || c == '\\' || c.is_control()),
-            "the refusal pattern must be a non-trivial, single-quotable string: {pattern:?}"
         );
         assert!(
             bootfail.contains(BOOT_FAIL_TARGET_CMDLINE_TOKEN)
@@ -16363,7 +16297,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     #[test]
     fn td_net_is_packed_and_not_merely_symlinked() {
         let steps = real_root_steps(&SYSTEM).unwrap();
-        for applet in ["td-feed", "td-deploy", "td-app"] {
+        for applet in ["td-feed", "td-app"] {
             assert!(
                 steps.iter().any(|step| matches!(step,
                     Step::Symlink { target, link }

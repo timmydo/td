@@ -85,16 +85,16 @@ pub(crate) fn run_system(
     let deployment = system.join("deployment");
     let (kernel, _, _) = verify_deployment(&deployment)?;
     let selector = verify_selector(&system.join("boot"))?;
-    let trust = RunTrust::generate()?;
+    let identity = RunVolume::generate()?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     // Keep large disposable disks with the private TPM scratch. TMPDIR can
     // place this runtime-only fixture on a roomier filesystem than the cache.
     let scratch = Scratch {
         dir: create_qmp_scratch_dir(&env::temp_dir(), &SEQ)?,
     };
-    let initramfs = provision_selector(&selector, &scratch.dir, &trust)?;
-    // This provisioned selector is private host fixture input, like its trust
-    // key. The shipping selector remains without a measurement policy.
+    let initramfs = provision_selector(&selector, &scratch.dir, &identity)?;
+    // This provisioned selector is private host fixture input. The shipping
+    // selector remains without a measurement policy.
     let policy = cpio::build(&[Entry {
         name: "etc/td/boot-measurement",
         mode: 0o644,
@@ -119,7 +119,7 @@ pub(crate) fn run_system(
         &mkfs,
         &btrfs,
         &volume,
-        &trust,
+        &identity,
         VolumePurpose::Fixture,
     )?;
     let id = crate::sha256::sha256_file(&deployment.join("manifest"))

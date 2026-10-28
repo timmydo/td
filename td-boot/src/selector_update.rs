@@ -4,7 +4,7 @@
 //! the ESP, holding it for the commit, and predicts its chain's PCRs 4 and
 //! 9 from the event log; td-protector seals the released secret to that
 //! prediction. After the cap, with the volume mounted, `commit`
-//! authenticates the staged pair against the volume's `current`
+//! checks the staged pair against the volume's verified `current`
 //! deployment and then imports the predicted object and commits, deletes
 //! the staged update, or keeps it under an `update-retry` token. The
 //! machine is behind `Machine`, so the decisions are tested over an ESP,
@@ -46,7 +46,6 @@ const TEMPLATE_ROOT: &str = "/sysroot";
 const SECURITYFS: &str = "/sys/kernel/security";
 /// The largest staged initramfs or template read, as the largest kernel.
 const MAX_FILE_BYTES: usize = authenticode::MAX_IMAGE_BYTES;
-const MAX_KEY_BYTES: u64 = 4096;
 const MAX_SYSFS_BYTES: u64 = 4096;
 
 /// The staged pair's digests, from the pre-seal's one read of each file.
@@ -78,14 +77,14 @@ impl<D: td_fat::Device> Staged<D> {
     }
 }
 
-/// `current`'s kernel digest, as its authenticated manifest names it, and
+/// `current`'s kernel digest, as its verified manifest names it, and
 /// the selector template its hashed `root.erofs` holds.
 pub(crate) struct Current {
     pub(crate) kernel: [u8; 32],
     pub(crate) template: Vec<u8>,
 }
 
-/// Why the commit cannot authenticate the staged pair.
+/// Why the commit cannot match the staged pair to `current`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Unverified {
     /// It is not `current`'s: the staged update is deleted.
@@ -105,11 +104,11 @@ pub(crate) trait Machine {
     fn predict(&mut self, running: &Chain, staged: &Chain) -> Result<Pcrs, String>;
     /// The held partition's LUKS2 header, read afresh.
     fn header(&mut self) -> Result<Header, String>;
-    /// `current` on the volume mounted at `root`, authenticated under this
-    /// selector's trust root.
+    /// `current` on the volume mounted at `root`, its manifest hashing to
+    /// its id and its root to the manifest.
     fn current(&mut self, root: &Path) -> Result<Current, Unverified>;
     /// The archive `prepare-selector` appends with this selector's own
-    /// trusted key, volume UUID and measurement policy.
+    /// volume UUID and measurement policy.
     fn appendix(&mut self) -> Result<Vec<u8>, String>;
 }
 
@@ -253,7 +252,7 @@ pub(crate) enum Outcome {
 /// The staged pair is `current`'s: `BOOTX64.NEW` is its kernel, and
 /// `INITRD.NEW` its root's template followed by exactly this selector's
 /// appended archive.
-fn authenticate<M: Machine>(
+fn matches_current<M: Machine>(
     machine: &mut M,
     root: &Path,
     digests: &Digests,
@@ -373,7 +372,7 @@ pub(crate) fn commit<M: Machine, C: Runner>(
         }
         Outcome::Deleted
     };
-    match authenticate(machine, root, &digests) {
+    match matches_current(machine, root, &digests) {
         Ok(()) => {}
         Err(Unverified::Refused(why)) => {
             console(&format!("the staged selector update is refused: {why}"));
@@ -691,11 +690,9 @@ impl Machine for Selector<'_> {
 
     fn current(&mut self, root: &Path) -> Result<Current, Unverified> {
         let refused = |why: String| Unverified::Refused(why);
-        let key = crate::read_boot_trust_root(Path::new(crate::BOOT_ROOTFS))
-            .map_err(|error| Unverified::Unavailable(error.to_string()))?;
         let id = crate::read_selector(root, "current")
             .map_err(|error| refused(format!("the volume's current deployment: {error}")))?;
-        let (directory, manifest) = crate::authenticated_manifest(root, &id, &key)
+        let (directory, manifest) = crate::verified_manifest(root, &id)
             .map_err(|error| refused(format!("the current deployment: {error}")))?;
         let kernel = parse_digest(&manifest.kernel)
             .ok_or_else(|| refused("the current manifest's kernel digest".into()))?;
@@ -706,15 +703,9 @@ impl Machine for Selector<'_> {
     }
 
     fn appendix(&mut self) -> Result<Vec<u8>, String> {
-        let rootfs = Path::new(crate::BOOT_ROOTFS);
-        let key = td_fs::read_bounded_real_file(
-            &rootfs.join(protocol::TRUSTED_KEY_PATH),
-            "trusted deployment key",
-            MAX_KEY_BYTES,
-        )
-        .map_err(|error| error.to_string())?;
-        let measured = crate::measurement::enabled(rootfs).map_err(|error| error.to_string())?;
-        selector_appendix::appendix(&key, &self.uuid, measured)
+        let measured =
+            crate::measurement::enabled(Path::new("/")).map_err(|error| error.to_string())?;
+        selector_appendix::appendix(&self.uuid, measured)
     }
 }
 

@@ -966,7 +966,7 @@ location, which is `td-authd`'s (§L.1) and is the honest gap.
 
 **What store placement buys back**, beside deleting the delivery
 problem: a package is root-owned inside a read-only image admitted by a
-signed manifest, so it is not writable by the uid that runs it; the tier
+deployment manifest, so it is not writable by the uid that runs it; the tier
 has the store's hashing and its collector rather than needing its own;
 and a runtime is shared by every account instead of copied per home.
 
@@ -2076,9 +2076,9 @@ per-user package tier.
 **Collection** is the store's, not this design's: a package is reachable
 while a deployment names it, and deployments are retained two deep.
 
-`verify` and `fsck` verbs do not exist. The deployment's signature is
-checked once at publish and the payload is a read-only image; a userspace
-hash sweep would re-check it with a weaker mechanism. That is a statement
+`verify` and `fsck` verbs do not exist. The deployment's payload digests
+are checked at publish and at boot, and the payload is a read-only
+image; a userspace hash sweep would re-check it with a weaker mechanism. That is a statement
 about *publish-time* integrity, and it is worth being exact: plain EROFS
 is not dm-verity, so nothing authenticates each read at run time, and a
 process that can rewrite the backing file defeats it. Applications are in
@@ -2098,7 +2098,7 @@ for one has to argue past this rather than rediscover it:
 | **runtime summary browsing, refs and updates** | Summary browsing stays refused. A mutable ref is never derivation input: no build reads a Flathub ref. §W.9's applications follow one declared ref per application and runtime, as a hint whose answer must pass its admission rules. |
 | **OpenPGP verification** | Not in any application, launcher or service. td-app (§W.9), an applet run as an application's account, verifies each Flathub commit with the bounded single-packet verifier of §B.3.1 against the key compiled into td-net; nothing reads a keyring, armor, summary signature or trust database. |
 | **HTTP/TLS on the target** | Two things on the target fetch, both applets of the target-built `td-net`: `td-fetchd` (§W.8), which a jailed application reaches over a socket under `sockets=fetch`, and td-app (§W.9), which fetches an account's Flathub applications outside any jail. The applications themselves carry no TLS, resolve no names and hold no network; the control plane's `td-net` does this under the existing dependency exception, and the target's copy is the same tier rebuilt on the target toolchain. |
-| **a target-side `fsck`/`verify` verb** | Refused. A package is in a read-only image admitted by a signed manifest, so a userspace hash sweep would re-check it with a weaker mechanism (§B.5). This refusal has flipped three times as the layout moved, which is the entry's real content: **a refusal argued from a layout is only as settled as the layout.** |
+| **a target-side `fsck`/`verify` verb** | Refused. A package is in a read-only image admitted by a deployment manifest, so a userspace hash sweep would re-check it with a weaker mechanism (§B.5). This refusal has flipped three times as the layout moved, which is the entry's real content: **a refusal argued from a layout is only as settled as the layout.** |
 | **OCI / container registries** | A second foreign format with the same objection as the first. The selected Firefox experiment uses Flathub's signed OSTree commits directly; an OCI translation would add a second parser without removing the first. |
 
 ### B.7 Reuse from the control plane
@@ -2117,7 +2117,7 @@ served the repository client:
 | `net/src/http.rs`, `td-feed` | **reuse in the control plane, and on the target through `td-fetchd` and `td-app`** — exact immutable OSTree objects use td-net's bounded HTTP/TLS fetcher and a commit-specific authenticated local cache; the target's network clients are the same tier's fetch service (§W.8) and td-app's bounded Flathub reader (§W.9), and there is no target repository client |
 | `builder/src/xz.rs`, `bzip2.rs`, `erofs.rs`, `tar.rs`, `oci.rs` | do not port — these serve source extraction or the image writer on the control plane |
 | `builder/src/nar.rs` | **needed, but only in the control plane** — `read_nar` is how host mode materializes a package (§X.1). Nothing on the target extracts an archive. §X.6 records the arbitrary-file-write this design found in it, fixed on main before this landed |
-| `engine` SHA-256 | **not needed** — nothing on the target hashes a package; the deployment's signed manifest is the integrity check |
+| `engine` SHA-256 | **not needed** — nothing on the target hashes a package; the deployment's manifest is the integrity check |
 
 ### B.8 The sandboxed-application marker
 
@@ -8994,7 +8994,7 @@ them into its own image; no user's home or setting adds one.
 
 **Live installation.** Trusted boot media uses the isolated installer's
 final review to confirm erase or preserve mode. It does not open secure
-attention. Root still authenticates the source, admits only the wizard's
+attention. Root still validates the source, admits only the wizard's
 UID 990 and retains the exact plan and exclusive disk claim; the wizard
 and ordinary input are trusted here. This exception grants no installed
 application an elevation path (`td-install/INSTALLER.md`).
@@ -9975,16 +9975,13 @@ deployment.
 
 **What exists, and it is the hard half.** A deployment is a bundle —
 `{bzImage, initramfs.cpio, root.erofs, manifest}` — whose id is
-`sha256(manifest)`, with the manifest carrying a SHA-256 per payload and
-signed host-side by `td-deploy` into a *detached* `manifest.sig`
-(detached so a bundle can be re-signed under a rotated key without
-becoming a different deployment, which would break rollback). On the
-machine, `td-boot publish` verifies and materializes it into
+`sha256(manifest)`, with the manifest carrying a SHA-256 per payload;
+nothing signs it (td-install/DESIGN.md §6). On the machine,
+`td-boot publish` verifies and materializes it into
 `td/deployments/<id>/`; `td/boot/current` and `td/boot/previous` are
 symlinks naming two of them. At boot, `td-boot` prefers `current`, falls
-back to `previous`, and requires a valid ed25519 signature under a trust
-root read from the rootfs it is running in — hashes prove integrity,
-never authorship. A boot-attempt counter is decremented before trying,
+back to `previous`, and requires every payload to match its manifest —
+integrity, not authorship. A boot-attempt counter is decremented before trying,
 `td-boot success` confirms a deployment that came up, and exhaustion
 falls back. `/var` is a Btrfs subvolume minted once per machine by
 `td-firstboot`, so it survives every deployment.
@@ -10003,7 +10000,7 @@ the work that is deferred:**
 | unit | a deployment bundle | *the same bundle* | one package |
 | carries | kernel, initramfs, `root.erofs` | everything, including every other application | one application, or one runtime |
 | applied by | `td-boot publish` + reboot | `td-boot publish` + **reboot** | a pointer flip, no reboot |
-| verified by | signed manifest, ed25519 | the same signed manifest | a content hash against the recipe graph |
+| verified by | manifest payload hashes | the same manifest | a content hash against the recipe graph |
 | rollback | `previous` selector, attempt counter | `previous` — so an application rollback is a **system** rollback, and can undo an unrelated security fix | repoint; state in `$HOME` untouched |
 | covered by the attempt counter | yes | **not application execution** — `bootsuccess` requires the terminal but not Firefox. Firefox has a separate readiness-gated evidence unit for QEMU, so broken application code or mutable per-app state cannot drive the counter down. Firefox's name resolves through the immutable application registry; the compositor receives the exact selected name as a service argument. The builder-authenticated launcher table is emitted but remains future table-driven discovery work | n/a |
 | frequency | td's cadence | td's cadence | upstream's, which for a browser is far higher |

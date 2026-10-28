@@ -36,8 +36,8 @@ pub(crate) trait Host {
     fn existing(&mut self, _claim: &mut Self::Claim) -> Result<([u8; 16], Settings), Refusal> {
         Err(Refusal::SourceUnavailable)
     }
-    /// The authenticated deployment manifest digest.
-    fn authenticate_source(&mut self) -> Result<[u8; 32], Refusal>;
+    /// The verified deployment manifest digest.
+    fn validate_source(&mut self) -> Result<[u8; 32], Refusal>;
     /// Whether the plan's disk holds what installing its source writes.
     fn check_fit(&mut self, plan: &Plan) -> Result<(), Refusal>;
     fn recheck(&mut self, destination: &Destination, claim: &mut Self::Claim) -> bool;
@@ -350,7 +350,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             Ok(claim) => claim,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        let deployment = match self.host.authenticate_source() {
+        let deployment = match self.host.validate_source() {
             Ok(deployment) => deployment,
             Err(refusal) => return Ok(Err(refusal)),
         };
@@ -382,7 +382,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
         if let Err(refusal) = self.host.check_fit(&plan) {
             return Ok(Err(refusal));
         }
-        // Source authentication can take a while; the disk must not have
+        // Source validation can take a while; the disk must not have
         // changed under the claim meanwhile.
         if !self.host.recheck(plan.destination(), &mut claim) {
             return Ok(Err(Refusal::DestinationChanged));
@@ -1062,9 +1062,9 @@ mod tests {
             uuid[8] = 0x82;
             Ok((uuid, settings()))
         }
-        fn authenticate_source(&mut self) -> Result<[u8; 32], Refusal> {
+        fn validate_source(&mut self) -> Result<[u8; 32], Refusal> {
             self.call("source");
-            // The source is authenticated while the disk is held.
+            // The source is validated while the disk is held.
             assert_eq!(self.log.lock().unwrap().live, 1);
             self.source
         }

@@ -23,7 +23,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Union of the three former crates' deps. ureq + sha2 are shared by all three;
-# ring signs for td-subst and td-deploy (ed25519) and mints td-test-https's
+# ring signs for td-subst (ed25519) and mints td-test-https's
 # P-256 test identities. ureq 3 no longer re-exports rustls: td-test-https
 # serves with it directly and fetchd checks custom roots with it, under the
 # features ureq's `rustls` feature already turns on (ring, never aws-lc-rs).

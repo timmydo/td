@@ -88,7 +88,6 @@ pub const MEDIA_FILES: &[(&str, &str)] = &[
     ("INITRAMFS.CPIO", "source/initramfs.cpio"),
     ("ROOT.EROFS", "source/root.erofs"),
     ("MANIFEST", "source/manifest"),
-    ("MANIFEST.SIG", "source/manifest.sig"),
     ("SELECTOR.CPIO", "selector.cpio"),
 ];
 

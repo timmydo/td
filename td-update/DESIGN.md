@@ -4,8 +4,10 @@
 image supplies it at `/bin/td-update`; the checkout's `./update` points there.
 It does not change credentials. `./update` builds the checkout and requests
 one installation through the paired authority; explicit `build` stops after
-building. The root-only `apply-operation` helper signs with the retained
-installation key and calls `td-boot on-volume install`, which resolves the
+building. The root-only `apply-operation` helper stages the approved
+source under root-private `/var/lib/td-update`, requires `td-boot
+validate-source` to report exactly the approved ID, and calls `td-boot
+on-volume install`, which resolves the
 running kernel's UUID handoff inside the single writer, as specified in
 `td-install/DESIGN.md`. Restart remains explicit.
 
@@ -40,8 +42,8 @@ can inspect `git remote -v` and use `git pull --ff-only` before `./update`;
 divergent local work remains for the human to reconcile. Existing checkouts
 retain their own settings even if the companion changes. An installation
 without these settings needs a reachable origin configured before pulling.
-Source remains the unsigned companion described by `td-install/DESIGN.md`, never
-a boot trust root or evidence authorizing an installation.
+Source remains the companion described by `td-install/DESIGN.md`, never
+boot input or evidence authorizing an installation.
 
 A newly created `~/src` has mode 0700, private to the human.
 An existing parent keeps its permissions. Any existing destination, including
@@ -50,8 +52,7 @@ untracked files are never reset on boot. The private `~/.td-update/source.lock`
 serializes cooperating initializers. Git inherits the same lease on stdin
 and stderr so surviving Git workers prevent a restarted initializer from
 reclaiming staging. Git diagnostics live in that private lock file; each
-command clears them and resets the file offset under the lease. They contain
-no signing key.
+command clears them and resets the file offset under the lease.
 
 `~/src/.td-update-source.tmp` is reserved for unpublished initialization.
 Interrupted staging can be removed only under the lease. If a destination
@@ -164,7 +165,7 @@ requesting installation. These messages report phase entry, not completion
 or an estimate; the child process output and exit status remain authoritative.
 
 Before requesting installation, the updater assembles a private deployment
-under `.td-build-cache/update-deployments/`. Its signed build labels and
+under `.td-build-cache/update-deployments/`. Its build labels and
 initramfs appendix follow `td-install/DESIGN.md`, "Installed startup menu".
 It checks the recipe deployment against its manifest, copies its payloads,
 adds the metadata appendix, and writes the replacement manifest. The
@@ -184,8 +185,7 @@ then presses Ctrl+Alt+Escape and I and, after reviewing the full ID, types
 the two-digit approval key the prompt shows; Enter does not install.
 Escape or a wrong digit cancels before commitment. The installation state
 machine and its uncertain-result policy are normative in
-`td-authd/DESIGN.md`; no automatic retry or reboot follows. Demo images
-without a retained matching key cannot install.
+`td-authd/DESIGN.md`; no automatic retry or reboot follows.
 
 ## Evidence
 
@@ -213,8 +213,7 @@ update path on a disposable qcow2 overlay of a stopped private installation.
 The supplied kernel and selector must match that installation. This is a
 host-side QEMU oracle over operator-selected inputs, outside recipe gates;
 it does not establish those inputs' source provenance. Keep the backing
-files stable for the run and while retaining its overlay. A demo without a
-retained signing key cannot satisfy this test.
+files stable for the run and while retaining its overlay.
 
 The oracle uses four CPUs and 12 GiB of guest memory. TCG is the default;
 `--accel kvm` selects hardware virtualization explicitly. KVM must be
@@ -272,10 +271,7 @@ Success must publish that successor as current and the initial
 deployment as previous. A host test pins this order, since the oracle
 needs an operator's installation. After an
 explicit VM restart, boot health, kernel deployment ID, installed HELP
-marker, user file, source edit and unchanged public signing identity must
-all agree. The private key must remain unreadable to the human account.
-This proves continued signing with the installation identity, not a
-byte-for-byte comparison of the inaccessible private key. `result.txt`
+marker, user file and source edit must all agree. `result.txt`
 exists only after the complete sequence succeeds. Normal restarts sync the guest, request QMP quit and require a successful
 QEMU exit so its block driver can flush and close the overlay. This is a
 host-directed restart, not a guest filesystem unmount. Failure teardown
@@ -297,7 +293,7 @@ Missing, duplicate, wrong-deployment or premature exhaustion evidence fails.
 The next ordinary boot must report exhausted attempts and select the initial
 deployment as previous, reach health and persist it as current. Another boot
 must select it as current without consuming or exhausting an attempt. Both
-recovery boots verify the user file, edited source and signing identity.
+recovery boots verify the user file and edited source.
 The result records `automatic_rollback_verified=true` only after both pass.
 Keep all three overlays with their backing files when retaining this evidence.
 

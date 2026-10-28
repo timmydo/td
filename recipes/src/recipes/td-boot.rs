@@ -2,10 +2,8 @@ use crate::shared::{split_target_debug, target_rustc_at_roots};
 use crate::types::{Recipe, Step};
 
 // Target-built static deployment verifier and kexec boot shim. The shipped
-// source reuses the engine's dependency-free SHA-256 implementation, and its
-// ed25519 VERIFIER — which reaches its hash as `crate::sha512`, so the two
-// arrive as a pair or the build does not link. `ed25519_sign.rs` is NOT here
-// and must not be: this binary verifies and never signs. Its PCR 11 measurement
+// source reuses the engine's dependency-free SHA-256 implementation, which
+// checks every payload against its manifest. Its PCR 11 measurement
 // runs over the sibling TPM 2.0 client td-tpm (td-tpm/DESIGN.md), whose
 // sessions use td-fido's P-256 and AES (td-fido/DESIGN.md), and its
 // volume discovery, the live selector's PCR 12 release cap and the installed
@@ -39,8 +37,6 @@ const TD_FS_RS: &str = include_str!("../../../td-fs/src/real_file.rs");
 // td-init's console identity, which secret-line and td-boot's VT mirror share.
 const CONSOLE_RS: &str = include_str!("../../../td-init/src/console.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
-const SHA512_RS: &str = include_str!("../../../engine/src/sha512.rs");
-const ED25519_RS: &str = include_str!("../../../engine/src/ed25519.rs");
 const CPIO_RS: &str = include_str!("../../../engine/src/cpio.rs");
 const CRC32_RS: &str = include_str!("../../../engine/src/crc32.rs");
 const GPT_RS: &str = include_str!("../../../engine/src/gpt.rs");
@@ -322,16 +318,6 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/engine/src/sha256.rs".into(),
             content: SHA256_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/engine/src/sha512.rs".into(),
-            content: SHA512_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/engine/src/ed25519.rs".into(),
-            content: ED25519_RS.into(),
             exec: false,
         },
         Step::WriteFile {

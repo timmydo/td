@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 use super::*;
 use crate::test_temp::TempDir;
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -128,7 +130,7 @@ fn only_one_td_live_1_token_marks_a_live_boot() {
         ("console=ttyS0 quiet", Some(false)),
         ("", Some(false)),
         ("td.live=1", Some(true)),
-        ("root=x td.live=1 td.trust=ab", Some(true)),
+        ("root=x td.live=1 quiet", Some(true)),
         ("td.live=0", None),
         ("td.live=", None),
         ("td.live=11", None),

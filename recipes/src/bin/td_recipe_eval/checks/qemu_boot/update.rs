@@ -1277,7 +1277,7 @@ fn deploy_rollback(guest: &mut Guest, work: &Path, current: &str, previous: &str
 }
 
 /// `qemu-deploy-rollback`: the system image on a fixture volume whose
-/// `current` is a second signed deployment and `previous` the recipe's
+/// `current` is a second deployment and `previous` the recipe's
 /// own, the rollback phase and the first hostname phase, then a reboot
 /// that selects `previous` and the second hostname phase, then a reboot
 /// that reports the new name.
@@ -1295,12 +1295,12 @@ pub(crate) fn run_deploy_rollback(runner: &crate::check_runner::RecipeCheckRunne
     };
     let (kernel, selector_template, deployment) = super::build_system(runner)?;
     let (mkfs, btrfs) = super::build_btrfs_tools(runner)?;
-    let trust = super::RunTrust::generate()?;
+    let identity = super::RunVolume::generate()?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let scratch = super::Scratch {
         dir: super::create_qmp_scratch_dir(&std::env::temp_dir(), &SEQ)?,
     };
-    let initramfs = super::provision_selector(&selector_template, &scratch.dir, &trust)?;
+    let initramfs = super::provision_selector(&selector_template, &scratch.dir, &identity)?;
     let volume = scratch.dir.join("rollback.btrfs");
     let fixture = super::create_persistent_volume_layout(
         &deployment,
@@ -1309,7 +1309,7 @@ pub(crate) fn run_deploy_rollback(runner: &crate::check_runner::RecipeCheckRunne
         &volume,
         super::VolumeLayout::Rollback,
         false,
-        &trust,
+        &identity,
         None,
         super::VolumePurpose::Fixture,
         None,
@@ -1595,21 +1595,14 @@ fn overlay(backing: &Path, format: &str, disk: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_persistence(
-    guest: &mut Guest,
-    expected: &str,
-    public: &str,
-    source: &str,
-    token: &str,
-) -> Result<()> {
+fn verify_persistence(guest: &mut Guest, expected: &str, source: &str, token: &str) -> Result<()> {
     let cmdline = guest.scalar("cat /proc/cmdline", |line| kernel_id(line).is_some())?;
     if kernel_id(&cmdline) != Some(expected) {
         return Err("reboot selected a different deployment".into());
     }
-    guest.command(&format!("test \"$(cat /var/home/tester/{token})\" = {token} && test ! -r /var/lib/td-deploy/deployment.pk8"))?;
-    if guest.scalar("cat /run/td-volume/td/trusted.pub", canonical_id)? != public {
-        return Err("installation changed its public signing identity".into());
-    }
+    guest.command(&format!(
+        "test \"$(cat /var/home/tester/{token})\" = {token}"
+    ))?;
     guest.command("cd /var/home/tester/src/td")?;
     if guest.scalar("git hash-object td-update/src/main.rs", git_id)? != source {
         return Err("reboot changed the user's source edit".into());
@@ -1622,7 +1615,6 @@ fn rollback(
     deadline: Instant,
     initial: &str,
     successor: &str,
-    public: &str,
     source: &str,
     token: &str,
 ) -> Result<()> {
@@ -1652,14 +1644,14 @@ fn rollback(
             evidence.observe(line, successor, initial, first)
         })?;
         evidence.finish(first)?;
-        verify_persistence(&mut guest, initial, public, source, token)?;
+        verify_persistence(&mut guest, initial, source, token)?;
         if selector(&mut guest, "current")? != initial {
             return Err("automatic rollback did not persist current".into());
         }
         guest.command("sync")?;
         guest.stop()?;
     }
-    println!("[qemu-update] automatic rollback and its next boot preserved user state and signing identity");
+    println!("[qemu-update] automatic rollback and its next boot preserved user state");
     Ok(())
 }
 
@@ -1715,10 +1707,9 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
         "[qemu-update] guest source checkout ready after {}s",
         source_wait.elapsed().as_secs()
     );
-    guest.command("cd /var/home/tester/src/td && test -L update && test ! -r /var/lib/td-deploy/deployment.pk8")?;
+    guest.command("cd /var/home/tester/src/td && test -L update")?;
     let initial = selector(&mut guest, "current")?;
     let previous = selector(&mut guest, "previous")?;
-    let public = guest.scalar("cat /run/td-volume/td/trusted.pub", canonical_id)?;
     // Only the disposable overlay's checkout is edited; the input disk is a
     // read-only backing file. A unique HELP marker distinguishes a real build.
     guest.command(&format!("test \"$(grep -c '^const HELP: ' td-update/src/main.rs)\" = 1 && sed '/^const HELP: /s/usage: td-update/usage: {token}/' td-update/src/main.rs > td-update/src/main.rs.oracle && mv td-update/src/main.rs.oracle td-update/src/main.rs"))?;
@@ -1780,16 +1771,14 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
         overlay(&pending, "qcow2", &options.work.join("rollback.qcow2"))?;
     }
     let mut guest = Guest::start(&options, 2, deadline)?;
-    verify_persistence(&mut guest, &successor, &public, &source, &token)?;
+    verify_persistence(&mut guest, &successor, &source, &token)?;
     guest.command(&format!("/bin/td-update --help | grep -q {token}"))?;
     guest.command("sync")?;
     guest.stop()?;
     if options.rollback {
-        rollback(
-            &options, deadline, &initial, &successor, &public, &source, &token,
-        )?;
+        rollback(&options, deadline, &initial, &successor, &source, &token)?;
     }
-    let report = format!("initial={initial}\nsuccessor={successor}\npublic={public}\nsource={source}\ncancel_preserved_selectors=true\nbackoff_refused_within_window=true\nphysical_prompt_verified=true\nenter_refused=true\napproval_key_installed=true\ninstalled_and_booted=true\nuser_data_preserved=true\nautomatic_rollback_verified={}\naccelerator={}\n", options.rollback, options.accel);
+    let report = format!("initial={initial}\nsuccessor={successor}\nsource={source}\ncancel_preserved_selectors=true\nbackoff_refused_within_window=true\nphysical_prompt_verified=true\nenter_refused=true\napproval_key_installed=true\ninstalled_and_booted=true\nuser_data_preserved=true\nautomatic_rollback_verified={}\naccelerator={}\n", options.rollback, options.accel);
     private_file(&options.work.join("result.txt"))?
         .write_all(report.as_bytes())
         .map_err(|e| format!("write oracle result: {e}"))?;

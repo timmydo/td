@@ -87,7 +87,7 @@ one.
 
 Standalone crates that carry NO `unsafe` are not on the roster and do not
 need to be, but one is worth naming because it looks like it would need one
-and does not: `td-boot` verifies a signature and kexecs through a helper.
+and does not: `td-boot` verifies a deployment and kexecs through a helper.
 Its PCR 11 measurement, the live selector's PCR 12 cap and the installed
 selector's release run over td-tpm (with td-fido) and td-protector (with
 td-json and td-luks, its LUKS2 header reader), each forbidding unsafe code,

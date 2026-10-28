@@ -396,7 +396,7 @@ fn destination_value(device: &Device) -> io::Result<installation_plan::Destinati
 }
 
 /// Hold a read-write O_EXCL claim through the caller's observation. This
-/// function writes no bytes and does not authenticate the deployment or source.
+/// function writes no bytes and does not validate the deployment or source.
 pub fn claim_plan(plan: &installation_plan::Plan) -> io::Result<File> {
     claim_destination(plan.destination())
 }
@@ -1237,7 +1237,7 @@ mod tests {
         for values in [
             vec!["inventory", "/dev/vda"],
             vec!["inventory", "--uuid", "anything"],
-            vec!["inventory", "--trusted-key", "/key"],
+            vec!["inventory", "--seed"],
         ] {
             assert!(crate::parse_args(args(&values)).is_err());
         }

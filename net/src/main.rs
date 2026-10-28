@@ -32,7 +32,6 @@
 // `td-net subst`. Invoking a bare
 // `td-net` with no applet selector is a usage error (exit 2) by design.
 mod app;
-mod deploy;
 mod egress;
 mod feed;
 mod fetch;
@@ -56,54 +55,15 @@ mod test_https;
 #[path = "../../td-fs/src/temp_dir.rs"]
 mod test_temp;
 
-// The deployment protocol td-boot READS, included from the crate that defines
-// it rather than restated here: `td-deploy` signs a manifest td-boot must
-// accept, so the header it requires and the size bound it enforces are one
-// copy. Unlike the engine sources below this is in the SHIPPED build — the
-// signer consults it on every `sign`. Only the manifest constants are used;
-// the rest of the file is the layout the one-bundle-writer landing shares.
-#[allow(dead_code)]
-#[path = "../../td-boot/src/protocol.rs"]
-mod protocol;
-// The rule for reading a file that must be a real, bounded regular file —
-// td-fs's, and shared with td-boot rather than mirrored. The signer has to
-// refuse exactly what the verifier refuses, or it signs a bundle that fails
-// at boot instead of at signing; `deploy.rs` used to hold a copy written to
-// match, which is the arrangement that guarantees they eventually will not.
+// The rule for reading a file that must be a real, bounded regular file:
+// td-fs's, shared rather than mirrored.
 #[allow(dead_code)]
 #[path = "../../td-fs/src/real_file.rs"]
 mod td_fs;
-// td-fs's durable atomic replace, which the feed, the substituter and the
-// signer write their files through.
+// td-fs's durable atomic replace, which the feed and the substituter write
+// their files through.
 #[path = "../../td-fs/src/replace.rs"]
 mod td_fs_replace;
-
-// The TARGET-side verifier, compiled into the test build only. td signs here
-// with `ring` and verifies on the target with the engine's dependency-free
-// implementation, so the two must agree byte for byte or a deployment that was
-// signed correctly fails to boot. Declared at the crate root because
-// `ed25519.rs` reaches its hash as `crate::sha512`, which is how it resolves
-// inside the engine lib and inside td-boot alike.
-//
-// Including the SOURCE brings the engine's own `#[cfg(test)] mod tests` with
-// it, so `cargo test` here runs ed25519's and sha512's unit tests a second
-// time, reported under td-net. That is duplication of RUNS, not of code — a
-// red named `ed25519::tests::*` in this crate belongs to engine/src.
-#[cfg(test)]
-#[path = "../../engine/src/ed25519.rs"]
-mod ed25519;
-#[cfg(test)]
-#[path = "../../engine/src/sha512.rs"]
-mod sha512;
-// The engine's SIGNER, test-only here for one purpose: `ed25519_cross.rs`
-// checks it against `ring` in both directions. It is not part of td-net's
-// shipped build — `ring` is the signer this crate uses — and td-boot includes
-// neither this file nor anything that reaches it.
-#[cfg(test)]
-mod ed25519_cross;
-#[cfg(test)]
-#[path = "../../engine/src/ed25519_sign.rs"]
-mod ed25519_sign;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -121,7 +81,6 @@ fn main() {
         "td-fetch" => fetch::run(&args),
         "td-feed" => feed::run(&args),
         "td-subst" => subst::run(&args),
-        "td-deploy" => deploy::run(&args),
         "td-fetchd" => fetchd::run(&args),
         "td-egressd" => egress::run(&args),
         "td-launch" => launch::run(&args),
@@ -141,15 +100,14 @@ fn main() {
                 Some("fetch") => "td-fetch",
                 Some("feed") => "td-feed",
                 Some("subst") => "td-subst",
-                Some("deploy") => "td-deploy",
                 Some("fetchd") => "td-fetchd",
                 Some("egressd") => "td-egressd",
                 Some("launch") => "td-launch",
                 Some("test-https") => "td-test-https",
                 _ => {
                     eprintln!(
-                        "usage: td-net <app|rust|fetch|feed|subst|deploy|fetchd|egressd|launch|test-https> ...\n  \
-                         (or invoke via the td-fetch / td-feed / td-subst / td-deploy / \
+                        "usage: td-net <app|rust|fetch|feed|subst|fetchd|egressd|launch|test-https> ...\n  \
+                         (or invoke via the td-fetch / td-feed / td-subst / \
                          td-fetchd / td-test-https applet links)"
                     );
                     std::process::exit(2);
@@ -163,7 +121,6 @@ fn main() {
                 "td-rust" => rust_toolchain::run(&argv),
                 "td-fetch" => fetch::run(&argv),
                 "td-feed" => feed::run(&argv),
-                "td-deploy" => deploy::run(&argv),
                 "td-fetchd" => fetchd::run(&argv),
                 "td-egressd" => egress::run(&argv),
                 "td-launch" => launch::run(&argv),
