@@ -333,6 +333,45 @@ impl<T: Transport, B: TlsWireStorage> TlsIo<T, B> {
 }
 
 impl<B: TlsWireStorage> TlsIo<crate::transport::TcpTransport, B> {
+    /// Wait for more wire bytes only after an operational read reported Pending.
+    /// Buffered TLS work must run before waiting on the socket.
+    pub(crate) fn wait_input(&mut self, until: std::time::Instant) -> Result<bool, Error> {
+        let result = (|| {
+            self.check_deadline(!self.ready)?;
+            let status = self.session.status();
+            if status.plaintext_pending != 0
+                || status.ciphertext_pending != 0
+                || self.output_end != 0
+                || status.read_closed
+                || self.input_used >= self.input_target
+            {
+                return Ok(false);
+            }
+            self.transport.wait_readable_slice(until)?;
+            self.check_deadline(!self.ready)?;
+            Ok(true)
+        })();
+        result.map_err(|error| self.fail(error))
+    }
+
+    /// Only socket WouldBlock establishes an idle HTTP boundary. Never consume
+    /// a protocol-only TLS record that could hide already queued response bytes.
+    pub(crate) fn idle_boundary(&mut self) -> Result<bool, Error> {
+        self.run(|connection| {
+            let status = connection.session.status();
+            if !connection.ready
+                || status.phase != TlsPhase::Open
+                || status.plaintext_pending != 0
+                || status.ciphertext_pending != 0
+                || connection.input_used != 0
+                || connection.output_end != 0
+            {
+                return Ok(false);
+            }
+            connection.transport.idle_boundary()
+        })
+    }
+
     /// Wait only when the next handshake turn needs new wire input.
     pub(crate) fn wait_handshake_input(
         &mut self,

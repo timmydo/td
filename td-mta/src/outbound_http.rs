@@ -85,124 +85,172 @@ impl Client<'_> {
         expected_status: Option<u16>,
         mut sink: impl FnMut(&[u8]) -> Result<(), Error>,
     ) -> Result<Response, Error> {
-        if !matches!(request.method, "GET" | "HEAD" | "POST")
-            || request.body.len() > 1024 * 1024
-            || (request.method != "POST" && !request.body.is_empty())
-            || request.body_limit > MAX_BODY
-            || !header(request.content_type, 128)
-            || !header(request.accept, 256)
-            || request
-                .authorization
-                .is_some_and(|value| !header(value, 4096))
-        {
-            return Err(Error::Invalid);
-        }
-        let origin = HttpsUri::parse(self.origin).map_err(|_| Error::Invalid)?;
-        let uri = HttpsUri::parse(request.url).map_err(|_| Error::Invalid)?;
-        if !origin.same_origin(uri) {
-            return Err(Error::Invalid);
-        }
+        let uri = validate(self.origin, &request)?;
         let deadline = self.deadline.min(Instant::now() + Duration::from_secs(60));
-        let addresses = crate::postgres_resolver::resolve_host(
-            self.executable,
-            uri.host(),
-            deadline.min(Instant::now() + Duration::from_secs(5)),
-        )
-        .map_err(|_| Error::Transport)?;
-        let mut socket = None;
-        for address in addresses {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(Error::Deadline)?;
-            if let Ok(connected) = TcpStream::connect_timeout(
-                &SocketAddr::new(address, uri.port()),
-                remaining.min(Duration::from_secs(2)),
-            ) {
-                socket = Some(connected);
-                break;
-            }
-        }
-        let socket = socket.ok_or(Error::Transport)?;
-        let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
-        let now = clock.sample().map_err(|_| Error::Deadline)?.monotonic;
-        let duration = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(Error::Deadline)?;
-        let cap = Deadline::after(now, duration.as_millis() as u64).map_err(|_| Error::Deadline)?;
-        let config = Arc::new(
-            ClientConfig::new(
-                self.trust,
-                Arc::new(ClockHandle::new(TlsClockSource::new(clock.clone()))),
-                TlsProtocol::Http1,
-            )
-            .map_err(|_| Error::Crypto)?,
-        );
-        let session = TlsSession::client(config, uri.host()).map_err(|_| Error::Crypto)?;
-        let mut transport = TlsIo::new(
-            TcpTransport::from_stream(socket).map_err(|_| Error::Transport)?,
-            session,
-            clock,
-            cap,
-            cap,
-            Box::new([0; TLS_WIRE_BYTES]),
-            Box::new([0; TLS_WIRE_BYTES]),
-        )
-        .map_err(|_| Error::Transport)?;
-        while transport
-            .handshake()
-            .map_err(|_| Error::Transport)?
-            .is_none()
-        {
-            pause(deadline)?;
-        }
-        let mut target_bytes = [0; 4097];
-        let mut target = TextBuffer::new(&mut target_bytes);
-        uri.write_request_target(&mut target)
-            .map_err(|_| Error::Invalid)?;
-        let target = target.as_str().map_err(|_| Error::Invalid)?;
-        let host = if uri.port() == 443 {
-            uri.host().to_owned()
-        } else {
-            format!("{}:{}", uri.host(), uri.port())
-        };
-        let method = request.method;
-        let mut head = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: td-mta\r\nAccept: {}\r\nAccept-Encoding: identity\r\nConnection: close\r\n", request.accept);
-        if let Some(auth) = request.authorization {
-            head.push_str(&format!("Authorization: {auth}\r\n"));
-        }
-        if method == "POST" {
-            head.push_str(&format!(
-                "Content-Type: {}\r\nContent-Length: {}\r\n",
-                request.content_type,
-                request.body.len()
-            ));
-        }
-        head.push_str("\r\n");
-        for mut part in [head.as_bytes(), request.body] {
-            while !part.is_empty() {
-                pause_check(deadline)?;
-                match transport.write(part).map_err(|_| Error::Transport)? {
-                    IoProgress::Bytes(n) if n > 0 => part = part.get(n..).ok_or(Error::Protocol)?,
-                    IoProgress::Pending => pause(deadline)?,
-                    _ => return Err(Error::Transport),
-                }
-            }
-        }
-        while transport.flush().map_err(|_| Error::Transport)? != FlushProgress::Complete {
-            pause(deadline)?;
-        }
-        let reader = Wire {
-            transport: &mut transport,
+        let mut transport = connect(self, uri, deadline)?;
+        exchange_on(
+            &mut transport,
+            uri,
+            request,
             deadline,
-        };
-        receive_checked(
-            reader,
-            method == "HEAD",
-            request.body_limit,
+            false,
             expected_status,
             &mut sink,
         )
+        .map(|(response, _)| response)
     }
+}
+type Connection = TlsIo<TcpTransport, Box<[u8; TLS_WIRE_BYTES]>>;
+
+#[path = "outbound_http_reuse.rs"]
+mod reuse;
+pub use reuse::ReusableClient;
+
+fn validate<'a>(origin: &str, request: &Request<'a>) -> Result<HttpsUri<'a>, Error> {
+    if !matches!(request.method, "GET" | "HEAD" | "POST")
+        || request.body.len() > 1024 * 1024
+        || (request.method != "POST" && !request.body.is_empty())
+        || request.body_limit > MAX_BODY
+        || !header(request.content_type, 128)
+        || !header(request.accept, 256)
+        || request
+            .authorization
+            .is_some_and(|value| !header(value, 4096))
+    {
+        return Err(Error::Invalid);
+    }
+    let origin = HttpsUri::parse(origin).map_err(|_| Error::Invalid)?;
+    let uri = HttpsUri::parse(request.url).map_err(|_| Error::Invalid)?;
+    if !origin.same_origin(uri) {
+        return Err(Error::Invalid);
+    }
+    Ok(uri)
+}
+fn connect(client: &Client<'_>, uri: HttpsUri<'_>, deadline: Instant) -> Result<Connection, Error> {
+    let addresses = crate::postgres_resolver::resolve_host(
+        client.executable,
+        uri.host(),
+        deadline.min(Instant::now() + Duration::from_secs(5)),
+    )
+    .map_err(|_| Error::Transport)?;
+    let mut socket = None;
+    for address in addresses {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(Error::Deadline)?;
+        if let Ok(connected) = TcpStream::connect_timeout(
+            &SocketAddr::new(address, uri.port()),
+            remaining.min(Duration::from_secs(2)),
+        ) {
+            socket = Some(connected);
+            break;
+        }
+    }
+    connected(
+        socket.ok_or(Error::Transport)?,
+        client.trust,
+        uri.host(),
+        deadline,
+    )
+}
+fn connected(
+    socket: TcpStream,
+    trust: &TrustStore,
+    host: &str,
+    deadline: Instant,
+) -> Result<Connection, Error> {
+    let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
+    let now = clock.sample().map_err(|_| Error::Deadline)?.monotonic;
+    let duration = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(Error::Deadline)?;
+    let cap = Deadline::after(now, duration.as_millis() as u64).map_err(|_| Error::Deadline)?;
+    let config = Arc::new(
+        ClientConfig::new(
+            trust,
+            Arc::new(ClockHandle::new(TlsClockSource::new(clock.clone()))),
+            TlsProtocol::Http1,
+        )
+        .map_err(|_| Error::Crypto)?,
+    );
+    let session = TlsSession::client(config, host).map_err(|_| Error::Crypto)?;
+    let mut transport = TlsIo::new(
+        TcpTransport::from_stream(socket).map_err(transport_error)?,
+        session,
+        clock,
+        cap,
+        cap,
+        Box::new([0; TLS_WIRE_BYTES]),
+        Box::new([0; TLS_WIRE_BYTES]),
+    )
+    .map_err(|refusal| transport_error(refusal.error()))?;
+    while transport.handshake().map_err(transport_error)?.is_none() {
+        if !transport
+            .wait_handshake_input(deadline)
+            .map_err(transport_error)?
+        {
+            pause(deadline)?;
+        }
+    }
+    Ok(transport)
+}
+fn exchange_on(
+    transport: &mut Connection,
+    uri: HttpsUri<'_>,
+    request: Request<'_>,
+    deadline: Instant,
+    keep_alive: bool,
+    expected_status: Option<u16>,
+    sink: &mut impl FnMut(&[u8]) -> Result<(), Error>,
+) -> Result<(Response, bool), Error> {
+    let mut target_bytes = [0; 4097];
+    let mut target = TextBuffer::new(&mut target_bytes);
+    uri.write_request_target(&mut target)
+        .map_err(|_| Error::Invalid)?;
+    let target = target.as_str().map_err(|_| Error::Invalid)?;
+    let host = if uri.port() == 443 {
+        uri.host().to_owned()
+    } else {
+        format!("{}:{}", uri.host(), uri.port())
+    };
+    let method = request.method;
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let mut head = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: td-mta\r\nAccept: {}\r\nAccept-Encoding: identity\r\nConnection: {connection}\r\n", request.accept);
+    if let Some(auth) = request.authorization {
+        head.push_str(&format!("Authorization: {auth}\r\n"));
+    }
+    if method == "POST" {
+        head.push_str(&format!(
+            "Content-Type: {}\r\nContent-Length: {}\r\n",
+            request.content_type,
+            request.body.len()
+        ));
+    }
+    head.push_str("\r\n");
+    for mut part in [head.as_bytes(), request.body] {
+        while !part.is_empty() {
+            pause_check(deadline)?;
+            match transport.write(part).map_err(transport_error)? {
+                IoProgress::Bytes(n) if n > 0 => part = part.get(n..).ok_or(Error::Protocol)?,
+                IoProgress::Pending => pause(deadline)?,
+                _ => return Err(Error::Transport),
+            }
+        }
+    }
+    while transport.flush().map_err(transport_error)? != FlushProgress::Complete {
+        pause(deadline)?;
+    }
+    let reader = Wire {
+        transport,
+        deadline,
+    };
+    receive_framed(
+        reader,
+        method == "HEAD",
+        request.body_limit,
+        expected_status,
+        sink,
+    )
 }
 fn pause_check(deadline: Instant) -> Result<(), Error> {
     if Instant::now() >= deadline {
@@ -212,7 +260,7 @@ fn pause_check(deadline: Instant) -> Result<(), Error> {
     }
 }
 struct Wire<'a> {
-    transport: &'a mut dyn Transport,
+    transport: &'a mut Connection,
     deadline: Instant,
 }
 impl Read for Wire<'_> {
@@ -221,17 +269,35 @@ impl Read for Wire<'_> {
             if Instant::now() >= self.deadline {
                 return Err(io::ErrorKind::TimedOut.into());
             }
-            match self
-                .transport
-                .read(output)
-                .map_err(|_| io::ErrorKind::ConnectionAborted)?
-            {
+            match self.transport.read(output).map_err(transport_io_error)? {
                 IoProgress::Bytes(n) if n > 0 && n <= output.len() => return Ok(n),
                 IoProgress::Closed => return Ok(0),
-                IoProgress::Pending => std::thread::sleep(Duration::from_millis(1)),
+                IoProgress::Pending => {
+                    if !self
+                        .transport
+                        .wait_input(self.deadline)
+                        .map_err(transport_io_error)?
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
                 _ => return Err(io::ErrorKind::InvalidData.into()),
             }
         }
+    }
+}
+fn transport_error(error: crate::ports::Error) -> Error {
+    if error == crate::ports::Error::Deadline {
+        Error::Deadline
+    } else {
+        Error::Transport
+    }
+}
+fn transport_io_error(error: crate::ports::Error) -> io::Error {
+    if error == crate::ports::Error::Deadline {
+        io::ErrorKind::TimedOut.into()
+    } else {
+        io::ErrorKind::ConnectionAborted.into()
     }
 }
 fn io_error(error: io::Error) -> Error {
@@ -310,6 +376,7 @@ fn receive(
 ) -> Result<Response, Error> {
     receive_checked(input, head, maximum, None, sink)
 }
+#[cfg(test)]
 fn receive_checked(
     input: impl Read,
     head: bool,
@@ -317,12 +384,22 @@ fn receive_checked(
     expected_status: Option<u16>,
     sink: &mut impl FnMut(&[u8]) -> Result<(), Error>,
 ) -> Result<Response, Error> {
+    receive_framed(input, head, maximum, expected_status, sink).map(|(response, _)| response)
+}
+fn receive_framed(
+    input: impl Read,
+    head: bool,
+    maximum: usize,
+    expected_status: Option<u16>,
+    sink: &mut impl FnMut(&[u8]) -> Result<(), Error>,
+) -> Result<(Response, bool), Error> {
     let mut reader = BufReader::with_capacity(8192, input);
     let status_line = line(&mut reader, MAX_HEAD)?;
     let mut used = status_line.len() + 2;
     let status_line = std::str::from_utf8(&status_line).map_err(|_| Error::Protocol)?;
     let mut parts = status_line.splitn(3, ' ');
-    if !matches!(parts.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
+    let version = parts.next();
+    if !matches!(version, Some("HTTP/1.0" | "HTTP/1.1")) {
         return Err(Error::Protocol);
     }
     let code = parts.next().ok_or(Error::Protocol)?;
@@ -342,6 +419,7 @@ fn receive_checked(
         bytes: 0,
     };
     let (mut length, mut chunked) = (None, false);
+    let mut reusable = version == Some("HTTP/1.1");
     for index in 0..=100 {
         let bytes = line(
             &mut reader,
@@ -379,6 +457,15 @@ fn receive_checked(
             "content-encoding" if !value.eq_ignore_ascii_case("identity") => {
                 return Err(Error::Protocol)
             }
+            "connection" => {
+                // Unknown connection options may alter framing semantics.
+                for option in value.split(',').map(str::trim) {
+                    if !option.eq_ignore_ascii_case("keep-alive") {
+                        reusable = false;
+                    }
+                }
+            }
+            "upgrade" => reusable = false,
             "replay-nonce" => unique(&mut response.nonce, value)?,
             "location" => unique(&mut response.location, value)?,
             "retry-after" => unique(&mut response.retry_after, value)?,
@@ -393,7 +480,9 @@ fn receive_checked(
         return Err(Error::Status(status));
     }
     if head || status == 204 || status == 304 {
-        return Ok(response);
+        // Keep no-body responses single-use; this also avoids reusing a
+        // connection whose sender incorrectly supplied body framing.
+        return Ok((response, false));
     }
     if chunked {
         for _ in 0..65536 {
@@ -416,7 +505,7 @@ fn receive_checked(
                 return Err(Error::Protocol);
             }
             if n == 0 {
-                return Ok(response);
+                return Ok((response, reusable && reader.buffer().is_empty()));
             }
         }
         return Err(Error::Capacity);
@@ -428,6 +517,7 @@ fn receive_checked(
         copy_exact(&mut reader, n, sink)?;
         response.bytes = n;
     } else {
+        reusable = false;
         let mut buffer = [0; 8192];
         loop {
             let n = reader.read(&mut buffer).map_err(io_error)?;
@@ -442,7 +532,7 @@ fn receive_checked(
             sink(buffer.get(..n).ok_or(Error::Protocol)?)?;
         }
     }
-    Ok(response)
+    Ok((response, reusable && reader.buffer().is_empty()))
 }
 
 #[cfg(test)]
@@ -609,5 +699,70 @@ mod tests {
         assert_eq!(response.bytes, MAX_BODY);
         assert_eq!(total, MAX_BODY);
         assert!(largest <= 8192);
+    }
+
+    #[test]
+    fn reuse_requires_explicit_framing_and_no_buffered_tail() {
+        for (wire, head, allowed) in [
+            ("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx", false, true),
+            (
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+                false,
+                true,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: keep-alive\r\n\r\nx",
+                false,
+                true,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: keep-alive, close\r\n\r\nx",
+                false,
+                false,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: unknown\r\n\r\nx",
+                false,
+                false,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nUpgrade: h2c\r\n\r\nx",
+                false,
+                false,
+            ),
+            (
+                "HTTP/1.0 200 OK\r\nContent-Length: 1\r\nConnection: keep-alive\r\n\r\nx",
+                false,
+                false,
+            ),
+            ("HTTP/1.1 200 OK\r\n\r\nx", false, false),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nxEXTRA",
+                false,
+                false,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\n",
+                true,
+                false,
+            ),
+            ("HTTP/1.1 204 Empty\r\n\r\n", false, false),
+            ("HTTP/1.1 304 Cached\r\n\r\n", false, false),
+        ] {
+            let (_, reusable) =
+                receive_framed(wire.as_bytes(), head, 5, None, &mut |_| Ok(())).unwrap();
+            assert_eq!(reusable, allowed, "{wire:?}");
+        }
+    }
+    #[test]
+    fn transport_deadlines_keep_their_category() {
+        for (input, expected) in [
+            (crate::ports::Error::Deadline, Error::Deadline),
+            (crate::ports::Error::Tls, Error::Transport),
+            (crate::ports::Error::Invalid, Error::Transport),
+        ] {
+            assert_eq!(transport_error(input), expected);
+            assert_eq!(io_error(transport_io_error(input)), expected);
+        }
     }
 }

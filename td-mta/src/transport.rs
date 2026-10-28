@@ -57,8 +57,21 @@ impl TcpTransport {
         self.peer
     }
 
-    // Only the PostgreSQL owner uses these waits, between complete driver
-    // polls. Restore nonblocking mode before returning to the TLS adapter.
+    /// Non-consuming, nonblocking probe; any queued byte or closure forbids reuse.
+    pub(crate) fn idle_boundary(&mut self) -> Result<bool, Error> {
+        if self.read_closed || self.write_closed {
+            return Ok(false);
+        }
+        match self.socket()?.peek(&mut [0]) {
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == ErrorKind::Interrupted => Ok(false),
+            Err(error) => Err(self.fail(error.into())),
+        }
+    }
+
+    // Admitted PostgreSQL and HTTPS owners use these waits between progress
+    // turns. Restore nonblocking mode before returning to the TLS adapter.
     pub(crate) fn wait_readable(&mut self, until: Instant) -> Result<(), Error> {
         let result = self.blocking(until, true, |socket| socket.peek(&mut [0]));
         result.map(|_| ())

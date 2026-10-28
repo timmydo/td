@@ -228,3 +228,34 @@ fn readable_slice_timeout_keeps_connection_usable_and_restores_nonblocking() {
     assert_eq!(byte, *b"x");
     assert_eq!(adapter.read(&mut byte), Ok(IoProgress::Pending));
 }
+
+#[test]
+fn tcp_idle_probe_never_consumes_queued_bytes_or_accepts_eof() {
+    let (mut adapter, mut peer) = pair();
+    assert!(adapter.idle_boundary().unwrap());
+    // The probe does not interpret a first control record or overlook bytes
+    // queued after it: every wire byte must remain for the ordinary reader.
+    let bytes = b"\x16\x03\x03\x00\x04ctrlHTTP/1.1 200 OK\r\n\r\n";
+    peer.write_all(bytes).unwrap();
+    adapter
+        .wait_readable(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert!(!adapter.idle_boundary().unwrap());
+    assert!(!adapter.idle_boundary().unwrap());
+    let mut received = vec![0; bytes.len()];
+    let mut used = 0;
+    while used < received.len() {
+        let IoProgress::Bytes(count) = progress(|| adapter.read(&mut received[used..]).unwrap())
+        else {
+            panic!("missing queued bytes")
+        };
+        used += count;
+    }
+    assert_eq!(received, bytes);
+    assert!(adapter.idle_boundary().unwrap());
+    peer.shutdown(Shutdown::Write).unwrap();
+    adapter
+        .wait_readable(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert!(!adapter.idle_boundary().unwrap());
+}

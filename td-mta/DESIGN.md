@@ -2106,6 +2106,13 @@ backend response must explicitly authorize reuse after its complete framing
 and flush. Backend failures, framing failures, HTTP authentication/routing/admission
 refusals, uploads, EventSource and the request-count limit close the
 connection.
+The outbound source-replication client separately supports bounded sequential
+HTTP/1.1 reuse under REPLICATION.md's fixed-origin, lifetime, idle, framing and
+no-replay contract. It owns at most one connection and uses bounded blocking
+input waits only when no buffered TLS work can progress. Existing ACME and
+migration callers keep single-use sockets. This adds no listener, pool or
+relaxation of per-request authentication on the server.
+
 Authenticated upload POSTs use the shared bounded body worker specified in
 ADMISSION.md, with quota admission before 100 Continue and commit-time device
 authorization. Other refusals need not consume the body. When retiring a

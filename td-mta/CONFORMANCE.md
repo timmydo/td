@@ -509,6 +509,13 @@ stored digest/length agreement, exact timestamps and the closed metadata field
 set. The same replies pass through the passive source-client decoder, checking
 typed inventory, exact metadata coverage and source state. This is source API
 and decoder coverage, not an end-to-end synchronizer test.
+Local TLS transport tests serve 32 sequential, individually identified length
+and chunked responses over exactly one accepted socket, checking authorization
+on every request and retirement at the request limit. Refusal fixtures cover
+close, extra buffered bytes, failed sinks, busy status and ambiguous framing;
+there is no automatic replay. Separate fixed-Instant policy checks cover idle
+and lifetime boundaries, without elapsed-time performance assertions. Parser
+cases also exclude EOF-framed, HTTP/1.0 and no-body responses from reuse.
 The separate send and executable-service cases cover their named flows. Process and file cleanup belong to
 the fixture; no public endpoint is contacted.
 

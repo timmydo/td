@@ -157,6 +157,37 @@ cannotCalculateChanges is a reset outcome; malformed and other remote failures
 are distinct errors, never successful empty lists. Raw bodies still require
 separate complete length/digest verification before publication.
 
+### Bounded reusable source transport
+
+The outbound HTTPS helper has an explicit sequential reuse owner for the
+synchronizer. This prepares transport only; no synchronization command or
+local publisher is enabled. One owner borrows immutable source-origin and CA
+trust configuration and has one absolute overall deadline. Each connection
+has at most 32 requests and a fixed lifetime of at most 60 seconds, also capped
+by the owner's deadline. It is retired before reuse after four seconds idle.
+No operation extends the original TLS lifetime. Each request sends its own
+authorization and must match the configured HTTPS origin; no redirect,
+pipelining, cross-origin credential forwarding or automatic request replay
+is provided.
+
+Only a completely framed HTTP/1.1 200 response can retain a connection.
+Content-Length or the admitted chunked subset is required; EOF framing,
+HTTP/1.0, HEAD/no-body replies, Connection close or unknown options, Upgrade,
+and buffered trailing bytes prevent reuse. A non-consuming socket probe before the
+next request requires WouldBlock: any queued wire byte or closure prevents
+reuse, as do buffered TLS input, plaintext or output. The probe never processes
+a control record that could hide later queued bytes. Data arriving later can still
+race that check; a resulting request failure is returned without replay.
+Unexpected status, framing, deadline, transport or sink failure discards the
+connection. The sink's bytes remain provisional until successful completion;
+body length/digest verification is still required before local publication.
+
+TLS input waits use bounded blocking socket readiness once buffered work is
+exhausted. Pending output retains bounded progress turns. ACME and migration
+callers retain their existing single-use request policy. This helper creates
+no background workers or unbounded connection pool. Retry and credential
+refresh belong to the synchronizer's bounded read-operation policy.
+
 ### Remaining synchronization work
 
 Qualify the existing JMAP Email/Mailbox get and changes surfaces and raw
