@@ -2504,7 +2504,7 @@ their write connections are not retained by the read cache.
 
 Original credentials stay borrowed through body preparation and fresh primary
 snapshot authentication. The observed device ID must match their syntax, but
-only the fresh snapshot grants read authority. Each fixed HTTPS body worker
+only the fresh snapshot grants read authority. For API reads, each fixed HTTPS body worker
 retains at most one read connection for its last account and configured origin, holding one existing
 read permit. Connection admission performs DNS, schema and runtime-role
 qualification and retains the shared migration lock. Each job begins a fresh
@@ -2588,16 +2588,20 @@ device must match before connection admission. It reserves two read slots
 before fresh DNS: one for the verified body snapshot, one for fresh primary
 reauthorization before the callback. Both runtime connections qualify the
 database role. The snapshot, MIME processing and transmission share the
-original deadline capped at ten seconds; no reconnect renews that budget.
+original deadline capped at thirty seconds; no reconnect renews that budget.
+The fixed worker may reuse the two clean sessions under the retained-download
+contract below; every request still establishes fresh snapshot authority.
 
 Whole-body digest verification and account-reference/upload-lease policy
 remain `postgres_body::with_pinned_blob` responsibilities. Forged locators
 are checked against the verified MIME tree and decoded length is counted
 before headers. A single foreground work meter covers interpretation and
-replay; no full-message resident buffer is introduced. Both connection
-reservations survive callback output and are released after their sockets
-drop, including failed writes. A pool with fewer than two free slots refuses
-immediately. Uploads and production activation remain unimplemented.
+replay; no full-message resident buffer is introduced. Permits are released
+only after their sockets drop, including failed writes. A worker without a
+retained pair needs two free slots and refuses immediately if either is
+unavailable. Active body custody survives callback output; the idle checker
+may retire during that output. Standalone callers release both connections
+when the operation ends.
 
 ## 75. Prepared PostgreSQL Thread/get dispatch
 
@@ -7169,34 +7173,43 @@ clean idle retirement use the existing bounded termination allowance; an
 unfinished or failed job never gains time through cleanup.
 
 
-## Retained HTTPS download authorization
+## Retained HTTPS download sessions
 
-Each fixed HTTPS body worker keeps either its API read cache or one download
-authorization cache, never both. Account or origin changes, uploads and worker
+Each fixed HTTPS body worker keeps either its API read cache or a pair of
+download sessions, never both. Account or origin changes, uploads and worker
 exit discard that state. Standalone download callers keep the one-shot path.
-A download still opens a fresh repeatable-read body snapshot, authenticates and
-verifies its complete digest, then uses a separate READ COMMITTED transaction
-for current configuration, account, credential and upload-expiry checks. Only
-this second connection is retained. Its acknowledged ROLLBACK precedes output;
-no snapshot, row lock or authorization result survives a request.
+The pair contains a body reader and a separate current-authorization reader.
+Each is Runtime-qualified once under a shared migration lock. Every job checks
+epoch and maintenance, then the existing account, configuration, credential
+and database-clock conditions. Only clean idle connections survive a request;
+no snapshot, row lock or authorization result does.
 
-The authorization session is Runtime-qualified once under the shared migration
-lock. Each turn checks epoch and maintenance before the existing selection-lock,
-account-lock, credential and database-clock checks. The ordinary retained-read
-profile bounds it to 64 turns and an immutable 60-second lifetime, with 1 MiB
-input, 64 KiB output and 1088 frames per turn. Existing cumulative wire ceilings
-remain independent limits. Initial qualification consumes the first window.
-Idle disconnect replacement occurs only before body verification; an admitted
-failed authorization is not replayed. Every failed download retires its cache.
+Each download starts a fresh repeatable-read body snapshot, authenticates and
+verifies the complete digest, then uses a separate READ COMMITTED transaction
+for current configuration, account, credential and upload-expiry checks. The
+authorization transaction acknowledges ROLLBACK before output. The body
+snapshot remains through verification and replay, then acknowledges ROLLBACK
+before its connection is reusable. Neither a failed job nor a failed retirement
+replays an admitted request. Failure after response output closes the exchange.
 
-Reserve two read permits before DNS: one for the body and one for the retained
-check, or two transient permits for a standalone call. A retained connection
-must cover the original body deadline before verification starts; otherwise it
-is retired first. Verification and replay retain their 30-second bound, while
-the fresh authorization turn is capped at ten seconds and the original body
-deadline. Cache borrows end before output. Sender maintenance can retire the
-idle checker during slow response writes, and fixed-worker maintenance retires
-it while no request is active. A worker retains at most one idle permit.
+The authorization session retains the ordinary 64-turn, immutable 60-second
+profile, with 1 MiB input, 64 KiB output and 1088 frames per turn. The body
+session uses the existing eight-turn body profile and its independent cumulative
+wire ceilings; initial qualification consumes the first protocol window.
+Body turns may use the existing 30-second verification/replay deadline; ordinary
+read turns still have their ten-second maximum. A non-body session cannot admit
+a body-duration turn. Both sessions must cover the original request deadline
+before verification begins. Idle disconnect replacement is permitted only before
+admission; no failed SQL or response is retried transparently. Every failed
+download retires both sessions.
+
+Reserve both read permits before DNS, or two transient permits for a standalone
+call. The fixed-worker count and global read capacity do not grow; a download
+worker may now retain two idle permits. Cache borrows prevent retirement of the
+active body reader during output. Sender maintenance can retire the idle
+checker during slow response writes; fixed-worker maintenance retires either
+idle session between requests. The retained connections never authorize one
+another's next transaction.
 
 ## Bulk body verification
 

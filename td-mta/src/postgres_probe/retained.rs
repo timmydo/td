@@ -71,6 +71,7 @@ pub(crate) struct ReadSession {
     retired: bool,
     clean_idle: bool,
     epoch: StoreEpoch,
+    body: bool,
 }
 impl ReadSession {
     pub(crate) fn open(
@@ -134,6 +135,7 @@ impl ReadSession {
             retired: false,
             clean_idle: false,
             epoch: schema.store_epoch,
+            body,
         })
     }
     pub(crate) fn reusable(&self, deadline: Instant) -> bool {
@@ -215,7 +217,28 @@ impl ReadSession {
         deadline: Instant,
         operation: impl FnOnce(&mut Worker) -> Result<Result<T, E>, Error>,
     ) -> Result<Result<T, E>, Error> {
-        let result = self.turn(epoch, isolation, deadline, operation);
+        let result = self.turn(epoch, isolation, deadline, MAX_DURATION, operation);
+        if !matches!(&result, Ok(Ok(_))) {
+            self.retired = true;
+        }
+        result
+    }
+    pub(crate) fn read_body_worker<T, E>(
+        &mut self,
+        epoch: StoreEpoch,
+        deadline: Instant,
+        operation: impl FnOnce(&mut Worker) -> Result<Result<T, E>, Error>,
+    ) -> Result<Result<T, E>, Error> {
+        if !self.body {
+            return Err(Error::Invalid);
+        }
+        let result = self.turn(
+            epoch,
+            ReadIsolation::RepeatableReadOnly,
+            deadline,
+            super::MAX_BODY_DURATION,
+            operation,
+        );
         if !matches!(&result, Ok(Ok(_))) {
             self.retired = true;
         }
@@ -226,13 +249,15 @@ impl ReadSession {
         epoch: StoreEpoch,
         isolation: ReadIsolation,
         deadline: Instant,
+        maximum: Duration,
         operation: impl FnOnce(&mut Worker) -> Result<Result<T, E>, Error>,
     ) -> Result<Result<T, E>, Error> {
         if self.retired || epoch != self.epoch {
             return Err(Error::RuntimeSchema);
         }
         self.clean_idle = false;
-        self.bounds.admit(Instant::now(), deadline)?;
+        self.bounds
+            .admit_bounded(Instant::now(), deadline, maximum)?;
         self.worker.deadline = deadline;
         self.worker.check()?;
         self.worker.begin_validation_turn()?;

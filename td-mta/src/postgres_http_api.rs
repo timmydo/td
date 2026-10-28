@@ -40,7 +40,7 @@ struct ApiWorker<'w, 's, 'sr, 'a> {
 }
 enum WorkerCache<'s> {
     Api(RefCell<Option<CachedRead<'s>>>),
-    Download(crate::postgres_body::AuthorizationCache<'s>),
+    Download(crate::postgres_body::DownloadCache<'s>),
 }
 fn retire_cached(cache: &RefCell<Option<CachedRead<'_>>>) {
     let Ok(mut cache) = cache.try_borrow_mut() else {
@@ -89,7 +89,7 @@ impl https_api::Worker for ApiWorker<'_, '_, '_, '_> {
         control: &Control,
     ) -> Option<Result<https_api::Completion, Failure>> {
         if !matches!(self.cached, WorkerCache::Download(_)) {
-            self.cached = WorkerCache::Download(crate::postgres_body::AuthorizationCache::new());
+            self.cached = WorkerCache::Download(crate::postgres_body::DownloadCache::new());
         }
         let WorkerCache::Download(cache) = &self.cached else {
             return Some(Err(Failure::Before(Error::Invalid)));
@@ -322,7 +322,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         request: &crate::https_download::Request<'_>,
         transport: &mut dyn Transport,
         control: &Control,
-        cache: Option<&crate::postgres_body::AuthorizationCache<'s>>,
+        cache: Option<&crate::postgres_body::DownloadCache<'s>>,
     ) -> Result<https_api::Completion, Failure> {
         let mut sender = Sender::new(
             transport,
@@ -358,7 +358,7 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         &self,
         request: &crate::https_download::Request<'_>,
         sender: &mut Sender<'_>,
-        cache: Option<&crate::postgres_body::AuthorizationCache<'s>>,
+        cache: Option<&crate::postgres_body::DownloadCache<'s>>,
     ) -> Result<(), Error> {
         use crate::{
             admission::work::{Charge, Meter},
@@ -388,12 +388,14 @@ impl<'s, 'sr, 'a> Service<'s, 'sr, 'a> {
         let deadline = self.clock.deadline_instant(until)?;
         // Verification retains one snapshot while fresh authorization opens
         // another connection. Reserve both before launching the DNS helper.
-        let _body_slot = self.slots.acquire().map_err(read_error)?;
-        let _auth_slot = if let Some(cache) = cache {
+        let _transient_slots = if let Some(cache) = cache {
             cache.reserve(self.slots, deadline).map_err(read_error)?;
             None
         } else {
-            Some(self.slots.acquire().map_err(read_error)?)
+            Some((
+                self.slots.acquire().map_err(read_error)?,
+                self.slots.acquire().map_err(read_error)?,
+            ))
         };
         let dns_deadline = deadline.min(
             std::time::Instant::now()

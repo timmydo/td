@@ -7308,6 +7308,7 @@ fn exercise_http_read(
             .unwrap();
         (result, String::from_utf8(wire.output).unwrap())
     };
+    milliseconds.set(30_000);
     let (result, raw_wire) = download(raw, password, false);
     result.unwrap();
     let (headers, message) = raw_wire.split_once("\r\n\r\n").unwrap();
@@ -7317,25 +7318,31 @@ fn exercise_http_read(
         message.contains("Subject:\r\n =?UTF-8?B?U25hcHNob3Q=?=\r\n"),
         "{message}"
     );
-    let download_pid = retained_pid();
+    let download_pids = || {
+        let values = sql(fixture, "SELECT pid FROM pg_stat_activity WHERE usename='mail_runtime' AND state='idle' ORDER BY pid");
+        let pids: Vec<u32> = values.lines().map(|line| line.parse().unwrap()).collect();
+        assert_eq!(pids.len(), 2, "one body and one authorization connection");
+        pids
+    };
+    let first_download_pids = download_pids();
     assert_eq!(sql(fixture, "SELECT count(*) FROM pg_stat_activity WHERE usename='mail_runtime' AND state LIKE 'idle in transaction%'"), "0");
     let (result, part_wire) = download(part, password, false);
     result.unwrap();
     assert_eq!(
-        retained_pid(),
-        download_pid,
-        "raw and MIME downloads reuse the authorization session"
+        download_pids(),
+        first_download_pids,
+        "raw and MIME downloads reuse both sessions"
     );
-    assert_eq!(
-        sql(
-            fixture,
-            &format!("SELECT pg_terminate_backend({download_pid})")
-        ),
-        "t"
-    );
-    download(raw, password, false).0.unwrap();
-    assert_ne!(retained_pid(), download_pid);
+    for pid in first_download_pids {
+        assert_eq!(
+            sql(fixture, &format!("SELECT pg_terminate_backend({pid})")),
+            "t"
+        );
+        download(raw, password, false).0.unwrap();
+        assert!(!download_pids().contains(&pid));
+    }
     assert_eq!(part_wire.split_once("\r\n\r\n").unwrap().1, "snapshot text");
+    milliseconds.set(10_000);
     // The cached checker must observe changes committed after body snapshot
     // establishment, before a single successful response byte is emitted.
     for policy in [false, true] {
@@ -7410,6 +7417,7 @@ fn exercise_http_read(
     download(raw, password, false).0.unwrap();
     // One held read leaves only one slot: refuse before opening either of the
     // download's two connections, then release its partial reservation.
+    *api_worker.borrow_mut() = None;
     let held = td_mta::postgres_read::Snapshot::open_resolved(
         &slots,
         &loaded,
