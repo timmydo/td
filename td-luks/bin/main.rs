@@ -4,9 +4,10 @@
 //! The first secret is standard input, at most one pipe page; `add-key`'s
 //! new key is a `/proc/<pid>/fd/<n>` descriptor the runner holds. Nothing
 //! is read from the environment. The exit status is 0 on success, 2 for a
-//! key that opens no candidate keyslot, 1 for anything else, the reason on
+//! key that opens no candidate keyslot, 4 for an absent mapping, and 1
+//! for anything else, the reason on
 //! standard error and never key material.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![cfg_attr(
     test,
     allow(
@@ -20,6 +21,8 @@
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("td-luks program requires Linux x86-64 open flags");
 
+mod dm;
+mod dm_sys;
 mod lock;
 
 use std::ffi::{OsStr, OsString};
@@ -46,7 +49,11 @@ const USAGE: &str = "usage: td-luks format UUID LABEL DEVICE
        td-luks kill-unbound DEVICE
        td-luks metadata DEVICE
        td-luks volume-key DEVICE FILE
-       td-luks test SLOT DEVICE [HEADER]";
+       td-luks test SLOT DEVICE [HEADER]
+       td-luks open [SLOT] DEVICE NAME
+       td-luks open-volume-key DEVICE NAME KEY-FILE
+       td-luks close NAME
+       td-luks status NAME";
 
 /// Why the program stopped, and its exit status.
 struct Failure {
@@ -88,6 +95,22 @@ impl Drop for Secret {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Verb {
+    Open {
+        slot: Option<u8>,
+        device: PathBuf,
+        name: String,
+    },
+    OpenVolumeKey {
+        device: PathBuf,
+        name: String,
+        file: PathBuf,
+    },
+    Close {
+        name: String,
+    },
+    Status {
+        name: String,
+    },
     Format {
         uuid: String,
         label: String,
@@ -177,7 +200,35 @@ fn parse(args: &[OsString]) -> Result<Verb, Failure> {
     };
     let path = |arg: &OsString| PathBuf::from(arg);
     let verb = verb.to_str().ok_or_else(usage)?;
+    let name = |arg: &OsString| -> Result<String, Failure> {
+        let name = text(arg, "mapping name")?;
+        if !dm_sys::valid_name(&name) {
+            return Err(Failure::new("invalid mapping name"));
+        }
+        Ok(name)
+    };
     Ok(match (verb, rest) {
+        ("open", [device, mapping]) => Verb::Open {
+            slot: None,
+            device: path(device),
+            name: name(mapping)?,
+        },
+        ("open", [number, device, mapping]) => Verb::Open {
+            slot: Some(slot(number)?),
+            device: path(device),
+            name: name(mapping)?,
+        },
+        ("open-volume-key", [device, mapping, file]) => Verb::OpenVolumeKey {
+            device: path(device),
+            name: name(mapping)?,
+            file: path(file),
+        },
+        ("close", [mapping]) => Verb::Close {
+            name: name(mapping)?,
+        },
+        ("status", [mapping]) => Verb::Status {
+            name: name(mapping)?,
+        },
         ("format", [uuid, label, device]) => Verb::Format {
             uuid: text(uuid, "UUID")?,
             label: text(label, "label")?,
@@ -279,6 +330,44 @@ fn open(device: &Path) -> Result<File, Failure> {
 fn run(verb: Verb) -> Result<(), Failure> {
     let mut random = DevRandom;
     match verb {
+        Verb::Open { slot, device, name } => {
+            let key = stdin()?;
+            activate(
+                &device,
+                &name,
+                write::ActivationKey::Passphrase {
+                    slot,
+                    bytes: &key.0,
+                },
+            )?;
+        }
+        Verb::OpenVolumeKey { device, name, file } => {
+            let key = bounded(open(&file)?, "volume key")?;
+            activate(&device, &name, write::ActivationKey::Volume(&key.0))?;
+        }
+        Verb::Close { name } => dm::close(&name).map_err(dm_failure)?,
+        Verb::Status { name } => {
+            let status = dm::status(&name)
+                .map_err(dm_failure)?
+                .ok_or_else(|| Failure {
+                    code: 4,
+                    message: "mapping is absent".into(),
+                })?;
+            writeln!(
+                io::stdout(),
+                "{} {} {}",
+                status.name,
+                status.uuid,
+                if status.suspended {
+                    "suspended"
+                } else if status.active {
+                    "active"
+                } else {
+                    "inactive"
+                }
+            )
+            .map_err(dm_failure)?;
+        }
         Verb::Format {
             uuid,
             label,
@@ -365,6 +454,20 @@ fn run(verb: Verb) -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+fn dm_failure(error: io::Error) -> Failure {
+    Failure::new(format!("device mapper: {error}"))
+}
+
+fn activate(
+    device: &Path,
+    name: &str,
+    credential: write::ActivationKey<'_>,
+) -> Result<(), Failure> {
+    let (mut file, _lock) = locked(device, Mode::Read, false)?;
+    let (header, key) = write::activation(&mut file, credential)?;
+    dm::activate(&mut file, name, &header.uuid, key.bytes()).map_err(dm_failure)
 }
 
 /// The volume key into a new file of mode 0400, which must not exist;
@@ -454,8 +557,6 @@ mod tests {
         );
         for refused in [
             &[][..],
-            &["open", "/dev/sda2", "name"][..],
-            &["status", "name"][..],
             &["reencrypt", "0", "checksum", "/dev/sda2", "name"][..],
             &["format", "u", "l"][..],
             &["metadata", "/dev/sda2", "extra"][..],

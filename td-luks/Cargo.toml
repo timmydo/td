@@ -24,7 +24,7 @@ td-json = { path = "../td-json" }
 td-fs = { path = "../td-fs" }
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 unwrap_used = "deny"

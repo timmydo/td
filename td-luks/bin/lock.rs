@@ -96,7 +96,28 @@ fn device_in(dir: &Path, device: &Path, mode: Mode) -> io::Result<Lock> {
 /// Lock the resource file for the block device numbered `rdev` under
 /// `dir`, retrying while a releasing holder unlinks it underneath.
 pub fn resource_in(dir: &Path, rdev: u64, mode: Mode) -> io::Result<Lock> {
-    let path = lock_dir(dir)?.join(resource_name(rdev));
+    resource_at(lock_dir(dir)?.join(resource_name(rdev)), mode)
+}
+
+/// Serialize td-luks's mapping-name lifecycle independently of volume identity.
+pub fn mapping(name: &str) -> io::Result<Lock> {
+    mapping_in(Path::new(LOCK_DIR), name)
+}
+
+fn mapping_in(dir: &Path, name: &str) -> io::Result<Lock> {
+    if !crate::dm_sys::valid_name(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid mapping name",
+        ));
+    }
+    resource_at(
+        lock_dir(dir)?.join(format!("LN_td-luks-mapping-{name}")),
+        Mode::Write,
+    )
+}
+
+fn resource_at(path: PathBuf, mode: Mode) -> io::Result<Lock> {
     loop {
         let file = OpenOptions::new()
             .read(true)
@@ -212,6 +233,32 @@ mod tests {
 
     fn other_handle(path: &Path) -> File {
         File::open(path).unwrap()
+    }
+
+    #[test]
+    fn mapping_lifecycles_exclude_by_name_and_release_the_resource() {
+        let temp = TempDir::new("td-luks-mapping-lock").unwrap();
+        let dir = temp.path().join("cryptsetup");
+        let path = dir.join("LN_td-luks-mapping-volume");
+        let first = mapping_in(&dir, "volume").unwrap();
+        assert!(other_handle(&path).try_lock().is_err());
+        let other = mapping_in(&dir, "other").unwrap();
+        let (sent, got) = mpsc::channel();
+        let waiter_dir = dir.clone();
+        let waiter = thread::spawn(move || {
+            let lock = mapping_in(&waiter_dir, "volume").unwrap();
+            sent.send(()).unwrap();
+            lock
+        });
+        assert!(got.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(first);
+        got.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = waiter.join().unwrap();
+        assert!(other_handle(&path).try_lock().is_err());
+        drop(second);
+        drop(other);
+        assert!(!path.exists());
+        assert!(mapping_in(&dir, "../escape").is_err());
     }
 
     #[test]

@@ -49,6 +49,12 @@ impl Key {
         Self(Box::new([0; KEY_LEN]))
     }
 
+    pub fn from_bytes(bytes: &[u8; KEY_LEN]) -> Self {
+        let mut key = Self::zeroed();
+        key.0.copy_from_slice(bytes);
+        key
+    }
+
     pub fn random(random: &mut dyn Random) -> io::Result<Self> {
         let mut key = Self::zeroed();
         random.fill(key.0.as_mut_slice())?;

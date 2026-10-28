@@ -13,8 +13,8 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 `sandbox.rs`. Those three files carry `#![allow(unsafe_code)]` so builder
 can stay `libc`-free. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-THREE
-numbered target-side exceptions, TWENTY-ONE of them live, each a standalone
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-FOUR
+numbered target-side exceptions, TWENTY-TWO of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
 `#[allow]` around its recorded raw Linux boundary (the crate itself
 `#![deny(unsafe_code)]`s); the seventeenth and eighteenth are retired and
@@ -51,7 +51,7 @@ value-pinned requests, and `poll(2)` — recorded twice because the
 one-package locks the gate required of a root crate when the two were
 imported left no shared crate to put it in; both now draw in a td-ui
 window and forbid `unsafe` crate-wide, so §17 and §18 are retired and the
-roster counts twenty-one live surfaces in twenty-three numbered entries. The
+roster counts twenty-two live surfaces in twenty-four numbered entries. The
 twentieth, `td-taskmgr`, has one function-scoped instruction for
 process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
@@ -64,7 +64,9 @@ Safe std owns local scratch-path and lock operations; §22 also records the
 admitted private PostgreSQL dependency boundary. The crypto admission
 is specified in [td-crypto/DESIGN.md](td-crypto/DESIGN.md). Test allocators
 remain separate. The twenty-third, `td-open`, compiles §12's module to send one
-file's descriptor to the portal and adopts none.
+file's descriptor to the portal and adopts none. The twenty-fourth,
+`td-luks`, keeps its library safe and confines device-mapper activation
+to one function-scoped ioctl instruction in its binary.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -3571,6 +3573,57 @@ receive path is reachable only from its own tests. A confinement test in
 and the absence of every other module call, of `unsafe` blocks or functions,
 of a scoped allow and of `from_raw_fd`. Receiving a descriptor, a second send
 site or any other use of the module is an amendment here.
+
+## 24. `td-luks` — device-mapper activation
+
+The library keeps `forbid(unsafe_code)`. Only the x86-64 Linux program
+uses `deny` with one function-scoped allowance in `bin/dm_sys.rs`:
+`syscall3` emits one syscall instruction. Its sole caller borrows the
+opened `/dev/mapper/control` File and a live, eight-byte-aligned owned
+64 KiB packet. Open uses O_NOFOLLOW and checks a character device with
+major/minor 10:236. There is no descriptor adoption, mapping, FFI,
+pre-exec hook or owned pointer dereference.
+
+The only syscall is ioctl(16). Its private request enum selects exactly
+DM_VERSION(0xc138fd00), DM_DEV_CREATE(0xc138fd03),
+DM_DEV_REMOVE(0xc138fd04), DM_DEV_SUSPEND(0xc138fd06),
+DM_DEV_STATUS(0xc138fd07), DM_TABLE_LOAD(0xc138fd09),
+DM_TABLE_CLEAR(0xc138fd0a), DM_TABLE_DEPS(0xc138fd0b), or
+DM_TABLE_STATUS(0xc138fd0c). No caller supplies a raw request, descriptor
+or address. The assembly accounts for rcx/r11 and memory effects. Calls
+are not blindly retried on EINTR: a secure request can have cleared its
+input, and a mutating request can have changed kernel state.
+
+Packets carry ABI major 4 and need minor 20 or newer, when secure-data
+was added. All requests set DM_SECURE_DATA_FLAG (0x8000), including
+key-bearing table queries. User buffers are zeroed on drop; key hex is
+written directly into that buffer, never a String. A fixed 312-byte
+header includes seven padding bytes; successful fixed-header replies
+may report only 305 bytes. Every output is bounded by the allocation,
+variable payload offsets and lengths are checked, and BUFFER_FULL is a
+refusal. Dependency lists admit at most 256 devices. Table queries must
+return one crypt target at logical sector zero. No kernel-held pointer
+outlives the call.
+
+Activation loads aes-xts-plain64, a 64-byte key, IV offset zero, data
+sector 32768 and sector_size:4096, then resumes and checks its UUID,
+name, table and backing device. Load/resume failure clears the inactive
+table and removes the created device. Suspend requests fix NOFLUSH and
+SKIP_LOCKFS. Safe std publishes `/dev/mapper/NAME` as a symlink to the
+verified devtmpfs node; names cannot contain path separators, and an
+unrelated regular file or live mapping is never replaced. Safe std's
+existing lock-file protocol serializes td-luks open/close by mapping
+name; kernel CREATE must succeed before a stale entry is unlinked,
+including when competing with stock cryptsetup. Close removes
+ordinary LUKS2 mappings; reencryption subdevice traversal belongs to D.
+
+`tests/confinement.rs` pins the complete syscall module, allowance and
+program module inventory; packet tests exercise exact encoding and
+malformed replies. `fixtures/activation.rs` compiles the same module
+into a disposable QEMU oracle to inspect both programs' tables, exercise
+suspend/resume and failed-load cleanup, and verify cross-program
+activation, plaintext and removal. That helper runs control ioctls only
+as guest PID 1; host preparation adds no target input or syscall surface.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 

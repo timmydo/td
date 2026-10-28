@@ -95,7 +95,8 @@ td-luks is a library and a program:
   the format is read one way, and td-luks does not depend on
   td-protector or td-tpm.
 - **The program** adds the command line and the device-mapper module,
-  which is the only `unsafe` code ("Device mapper").
+  which is the only `unsafe` code ("Device mapper"). Its library keeps
+  `forbid`; the binary and manifest use `deny` with one scoped allowance.
 
 ## Commands
 
@@ -128,8 +129,9 @@ The runner's contract with its child does not change:
 - a second key arrives as a descriptor the runner names
   `/proc/<pid>/fd/N`;
 - `volume-key` creates its file with `O_EXCL` and mode 0400;
-- no argv element, environment variable or file td-luks reads carries
-  key material, and td-luks ignores its environment.
+- no argv element or environment variable carries key material; keys
+  arrive on stdin or through the named descriptor/volume-key file.
+  td-luks ignores its environment.
 
 The key on standard input authorizes each verb as cryptsetup's would:
 
@@ -348,13 +350,16 @@ boot path, so it is accepted and not bounded by the ceiling.
 
 Activation, deactivation, status and reencryption's devices go through
 `/dev/mapper/control` ioctls. This is td-luks's one `unsafe` surface, and
-UNSAFE.md gains its section in increment C:
+UNSAFE.md §24 records its boundary:
 
 - **Requests:** `DM_VERSION`, `DM_DEV_CREATE`, `DM_TABLE_LOAD`,
   `DM_TABLE_CLEAR`, `DM_DEV_SUSPEND` (suspend and resume),
   `DM_DEV_REMOVE`, `DM_DEV_STATUS`, `DM_TABLE_STATUS` and
   `DM_TABLE_DEPS`, each value-pinned, each through a `struct dm_ioctl`
-  buffer td-luks owns, with bounded output.
+  buffer td-luks owns, with bounded output. The allocation is 64 KiB
+  and eight-byte aligned; fixed-header replies may report 305 bytes
+  despite the 312-byte padded input structure. ABI 4.20 or newer is
+  required for secure-data. Interrupted ioctls are not blindly retried.
 - **Secure data:** every request whose input or output carries a key
   sets `DM_SECURE_DATA_FLAG`, so the kernel wipes its copy of the
   buffer. That includes `DM_TABLE_STATUS` with the table flag, whose
@@ -370,6 +375,12 @@ forbidding `unsafe`: they run td-luks as a child, as they run cryptsetup
 today.
 
 ### Activation
+
+Activation requires a block device with a positive, whole-4096-byte
+data segment. The header lock stays held through key verification and
+activation; the table names the opened descriptor's major/minor, never
+a separately resolved pathname. An explicit slot must be bound to
+segment 0; a supplied 64-byte volume key must match that segment's digest.
 
 td-luks activates a mapping exactly as cryptsetup 2.8.8 does:
 
@@ -396,8 +407,21 @@ td-btrfs's target open and td-boot's update locks use `fs::metadata`,
 and td-boot's admission uses sysfs and `/dev/dm-N`.
 
 `open` replaces an existing entry only after checking that no live
-mapping has that name, since a stale symlink left by a crash could name
-a reused `dm-N`. `close` removes the entry with the device.
+mapping has that name and successfully claiming the kernel name with
+CREATE, since a stale symlink left by a crash could name a reused
+`dm-N`. Losing CREATE never unlinks an entry. td-luks also serializes
+open/publication and close/removal under an exclusive per-name lock,
+`/run/cryptsetup/LN_td-luks-mapping-<name>`, using the same inode/retry
+and release protocol as its device locks. Activation takes its header
+lock first, then this name lock. Different volume descriptors do not
+bypass name exclusion. Stock cryptsetup does not take this extra lock;
+CREATE remains the cross-tool name-claim boundary. `close` removes the entry with the device. Names contain only ASCII
+letters, digits, `_`, `-`, `.`, or `+`, and exclude `.`, `..` and
+`control`; both kernel name and UUID field limits apply. An existing
+regular file is refused. The devtmpfs node must have the created
+mapping's device number before its symlink is published. Publication
+failure removes the created mapping. Ordinary `close` requires a LUKS2
+UUID and refuses a mapper entry naming another device.
 
 ### Reencryption devices
 
@@ -572,7 +596,11 @@ Each increment is one landable commit, or a short series:
     and the stock end-state failure retained as negative evidence.
 - **C.** The device-mapper surface: `open`, `open-volume-key`, `close`
   and `status` for headers without the reencryption requirement, with
-  UNSAFE.md's section and the interop oracle for activation.
+  UNSAFE.md's section and the interop oracle for activation. The binary
+  uses `bin/dm.rs` and `bin/dm_sys.rs`; `tests/activation.rs` and
+  `tests/confinement.rs` hold authorization and the syscall boundary.
+  `fixtures/activation.rs` runs the pinned stock comparison in QEMU;
+  `fixtures/ACTIVATION.md` records its scope and procedure.
 - **D.** Reencryption: `reencrypt`, `reencrypt-resume` and `open` on a
   header mid-reencryption, in both directions, with the ordered start
   and end and the ENCRYPTION.md amendments above.

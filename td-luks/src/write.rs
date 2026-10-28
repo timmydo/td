@@ -721,12 +721,17 @@ fn unlock<M: Medium + ?Sized>(
     let volume_key = keyslot::open(&area_key, &mut split).and_then(|()| keyslot::merge(&split));
     keyslot::clear(&mut split);
     let volume_key = volume_key?;
-    let digest_salt = bytes_of(&digest, "salt", SALT_LEN, "digest")?;
-    let stored = bytes_of(&digest, "digest", keyslot::DIGEST_LEN, "digest")?;
-    let count = iterations(&digest, MAX_DIGEST_ITERATIONS, "digest")?;
-    let computed = keyslot::digest(&volume_key, &digest_salt, count)?;
+    verify_digest(&digest, &volume_key)?;
+    Ok(volume_key)
+}
+
+fn verify_digest(digest: &Json, key: &Key) -> Result<(), Error> {
+    let salt = bytes_of(digest, "salt", SALT_LEN, "digest")?;
+    let stored = bytes_of(digest, "digest", keyslot::DIGEST_LEN, "digest")?;
+    let count = iterations(digest, MAX_DIGEST_ITERATIONS, "digest")?;
+    let computed = keyslot::digest(key, &salt, count)?;
     if td_fido::same(&computed, &stored) {
-        Ok(volume_key)
+        Ok(())
     } else {
         Err(Error::WrongKey)
     }
@@ -1231,6 +1236,43 @@ pub fn volume_key<M: Medium + ?Sized>(
             unlock_any(medium, &header.json, key, &candidates(&header.json)?).map(|(_, key)| key)
         }
     }
+}
+
+/// Activation credentials. A supplied volume key still needs the segment's digest.
+pub enum ActivationKey<'a> {
+    Passphrase { slot: Option<u8>, bytes: &'a [u8] },
+    Volume(&'a [u8]),
+}
+
+/// Read and authenticate one ordinary volume header for activation. Explicit
+/// slots must be bound; the test-passphrase operation deliberately differs.
+pub fn activation<M: Medium + ?Sized>(
+    medium: &mut M,
+    credential: ActivationKey<'_>,
+) -> Result<(Header, Key), Error> {
+    let header = load(medium)?;
+    let key = match credential {
+        ActivationKey::Passphrase { slot, bytes } => match slot {
+            Some(slot) => unlock_bound(medium, &header.json, slot, bytes)?,
+            None => unlock_any(medium, &header.json, bytes, &candidates(&header.json)?)?.1,
+        },
+        ActivationKey::Volume(bytes) => {
+            let bytes: &[u8; keyslot::KEY_LEN] = bytes
+                .try_into()
+                .map_err(|_| Error::Refused("a volume key is exactly 64 bytes".into()))?;
+            let key = Key::from_bytes(bytes);
+            let digest = numbered(&header.json, "digests")?
+                .into_iter()
+                .find(|(_, digest)| {
+                    slots(digest, "segments", "digest").is_ok_and(|s| s.contains(&0))
+                })
+                .map(|(_, digest)| digest)
+                .ok_or_else(|| Error::Refused("volume has no segment digest".into()))?;
+            verify_digest(digest, &key)?;
+            key
+        }
+    };
+    Ok((header, key))
 }
 
 /// Whether `key` opens `slot`. The medium is only read, so a detached
