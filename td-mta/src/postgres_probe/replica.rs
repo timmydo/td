@@ -10,6 +10,8 @@ use crate::{
     postgres_replica_source::Source,
     postgres_schema,
     replica_effect::Effect,
+    replica_pending::Ticket,
+    replica_transition::Transition,
 };
 use std::{
     sync::{
@@ -29,6 +31,37 @@ pub(crate) struct ReplicaSession {
     account: AccountId,
     retired: bool,
     clean_idle: bool,
+}
+enum Job {
+    Publish(Arc<Effect>),
+    Advance(Arc<Transition>),
+}
+enum Completed {
+    Published(Outcome),
+    Advanced(Ticket),
+}
+impl Job {
+    fn source(&self) -> &Source {
+        match self {
+            Self::Publish(value) => &value.source,
+            Self::Advance(value) => &value.source,
+        }
+    }
+    fn account(&self) -> AccountId {
+        match self {
+            Self::Publish(value) => value.account,
+            Self::Advance(value) => value.account,
+        }
+    }
+    fn body_length(&self) -> u64 {
+        match self {
+            Self::Publish(value) => value
+                .mail
+                .as_ref()
+                .map_or(0, |mail| mail.body.bytes().len() as u64),
+            Self::Advance(_) => 0,
+        }
+    }
 }
 impl ReplicaSession {
     pub(crate) fn open(
@@ -102,19 +135,32 @@ impl ReplicaSession {
         effect: Arc<Effect>,
         deadline: Instant,
     ) -> Result<Outcome, apply::Error> {
+        match self.run(Job::Publish(effect), deadline)? {
+            Completed::Published(value) => Ok(value),
+            _ => Err(apply::Error::Integrity),
+        }
+    }
+    pub(crate) fn advance(
+        &mut self,
+        transition: Arc<Transition>,
+        deadline: Instant,
+    ) -> Result<Ticket, apply::Error> {
+        match self.run(Job::Advance(transition), deadline)? {
+            Completed::Advanced(value) => Ok(value),
+            _ => Err(apply::Error::Integrity),
+        }
+    }
+    fn run(&mut self, job: Job, deadline: Instant) -> Result<Completed, apply::Error> {
         let attempted = Arc::new(AtomicBool::new(false));
         let marker = attempted.clone();
         let result = (|| {
             if !self.reusable(deadline)
-                || effect.account != self.account
-                || effect.source != self.source
+                || job.account() != self.account
+                || job.source() != &self.source
             {
                 return Err(apply::Error::Source);
             }
-            let length = effect
-                .mail
-                .as_ref()
-                .map_or(0, |mail| mail.body.bytes().len() as u64);
+            let length = job.body_length();
             self.bounds
                 .admit_bounded(Instant::now(), deadline, super::import_duration(length))
                 .map_err(apply::Error::Connection)?;
@@ -132,7 +178,10 @@ impl ReplicaSession {
                 let blocked:bool=row.try_get(1).map_err(|_|apply::Error::Integrity)?;
                 if observed!=epoch.as_bytes().as_slice(){return Err(apply::Error::Connection(Error::RuntimeSchema));}
                 if blocked{return Err(apply::Error::Connection(Error::RuntimeMaintenance));}
-                apply::apply(client,&effect,deadline,&marker).await
+                match job {
+                    Job::Publish(effect)=>apply::apply(client,&effect,deadline,&marker).await.map(Completed::Published),
+                    Job::Advance(transition)=>crate::postgres_replica_transition::advance(client,&transition,deadline,&marker).await.map(Completed::Advanced),
+                }
             })){
                 Ok(result)=>result,
                 Err(_) if attempted.load(Ordering::Relaxed)=>Err(apply::Error::Indeterminate),

@@ -313,3 +313,6 @@ pub mod postgres_replica_progress;
 pub mod replica_effect;
 
 pub mod postgres_replica_apply;
+
+mod postgres_replica_transition;
+pub mod replica_transition;

@@ -616,6 +616,13 @@ impl Publisher {
             .map_err(Error::Connection)?,
         })
     }
+    pub fn advance(
+        &mut self,
+        transition: std::sync::Arc<crate::replica_transition::Transition>,
+        deadline: Instant,
+    ) -> Result<crate::replica_pending::Ticket, Error> {
+        self.session.advance(transition, deadline)
+    }
     pub fn reusable(&self, deadline: Instant) -> bool {
         self.session.reusable(deadline)
     }

@@ -7566,3 +7566,15 @@ requires matching length and digest. Normal publication retains fresh-ID refusal
 Receipt exhaustion pauses publication; no pruning or completeness claim is added.
 A schema-37 binary cannot serve schema 38. Use the fenced upgrade procedure and
 a consistent backup; this increment does not deploy or activate a local replica.
+
+
+## Replica pending-page transitions
+
+The retained replica session also admits the closed page-transition operation.
+It locks the core account, reloads validated progress, and requires the exact
+completed previous ticket before replacing pending work. The source replay
+cursor/phase update and complete next pending row commit together; local mail
+and JMAP sequences remain unchanged. Matching retries preserve the new page's
+existing completion bitmap. [REPLICATION.md](REPLICATION.md) defines cursor
+provenance, inventory-to-change catch-up and retry recognition. Schema 38 is
+unchanged; no unbounded queue or general SQL execution interface is added.

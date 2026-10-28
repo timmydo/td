@@ -10,6 +10,7 @@ use td_mta::{
     replica_pending::Ticket,
     replica_seed::{Limits, Seed},
     replica_source::{Binding, Bounds, Inventory, MailboxPage, MetadataPage, VerifiedBody},
+    replica_transition::Transition,
 };
 
 pub(super) fn exercise(
@@ -31,6 +32,7 @@ pub(super) fn exercise(
     let email = metadata.emails.first().unwrap();
     let id = email.id;
     let account = metadata.observed.account;
+    let base = inventory.base;
     let seed = Arc::new(
         Seed::prepare(
             Source::new(source.origin(), source.epoch()).unwrap(),
@@ -72,6 +74,30 @@ pub(super) fn exercise(
     let effect = Arc::new(
         Effect::prepare(&source, account, ticket, page, id, Some(body), deadline()).unwrap(),
     );
+    let change_metadata = observation(&source, page, id, 4, Some(&[]));
+    let change_state = change_metadata.view().unwrap().observed;
+    let next_page = Arc::new(
+        Transition::changes(
+            &source,
+            account,
+            ticket,
+            &td_mta::replica_source::Changes {
+                old: base,
+                new: change_state,
+                more: false,
+                created: vec![],
+                updated: vec![id],
+                destroyed: vec![],
+            },
+        )
+        .unwrap(),
+    );
+    let mut publisher = open();
+    assert_eq!(
+        publisher.advance(next_page.clone(), deadline()),
+        Err(Error::Stale)
+    );
+    drop(publisher);
     let mut publisher = open();
     sql(
         &fixture,
@@ -289,6 +315,173 @@ pub(super) fn exercise(
     assert_eq!(publisher.publish(recreated, deadline()), Err(Error::Source));
 
     assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.keywords"), "0");
+    drop(publisher);
+    let mut publisher = open();
+    let second = publisher.advance(next_page.clone(), deadline()).unwrap();
+    assert_eq!(
+        second,
+        Ticket {
+            generation: 1,
+            page: 2
+        }
+    );
+    let progress =
+        td_mta::postgres_replica_progress::inspect(&owner, &trust, deadline(), local, account)
+            .unwrap();
+    assert!(progress.inventory_complete);
+    assert_eq!(progress.email_cursor, base);
+    assert_eq!(
+        progress.pending.unwrap().unfinished().collect::<Vec<_>>(),
+        vec![id]
+    );
+    let effect = Arc::new(
+        Effect::prepare(
+            &source,
+            account,
+            second,
+            &change_metadata,
+            id,
+            Some(body_again()),
+            deadline(),
+        )
+        .unwrap(),
+    );
+    assert!(!publisher.publish(effect, deadline()).unwrap().changed);
+    assert_eq!(
+        publisher.advance(next_page.clone(), deadline()).unwrap(),
+        second
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT get_byte(done,0) FROM td_mta.replica_pending"
+        ),
+        "1"
+    );
+    let next_state = td_mta::sync::DataState {
+        sequence: td_mta::format::Sequence::from_u64(change_state.sequence.number() + 1),
+        ..change_state
+    };
+    let empty = Arc::new(
+        Transition::changes(
+            &source,
+            account,
+            second,
+            &td_mta::replica_source::Changes {
+                old: change_state,
+                new: next_state,
+                more: false,
+                created: vec![],
+                updated: vec![],
+                destroyed: vec![],
+            },
+        )
+        .unwrap(),
+    );
+    sql(&fixture,"CREATE TRIGGER reject_replica_completion BEFORE UPDATE ON td_mta.replica_pending FOR EACH ROW EXECUTE FUNCTION public.reject_replica_completion()");
+    assert_eq!(
+        publisher.advance(empty.clone(), deadline()),
+        Err(Error::Database)
+    );
+    drop(publisher);
+    let progress =
+        td_mta::postgres_replica_progress::inspect(&owner, &trust, deadline(), local, account)
+            .unwrap();
+    assert_eq!(progress.email_cursor, base);
+    let pending = progress.pending.unwrap();
+    assert_eq!(pending.ticket(), second);
+    assert!(pending.complete());
+    sql(
+        &fixture,
+        "DROP TRIGGER reject_replica_completion ON td_mta.replica_pending",
+    );
+    let mut publisher = open();
+    assert_eq!(
+        publisher.advance(empty.clone(), deadline()).unwrap(),
+        Ticket {
+            generation: 1,
+            page: 3
+        }
+    );
+    assert_eq!(
+        publisher.advance(empty, deadline()).unwrap(),
+        Ticket {
+            generation: 1,
+            page: 3
+        }
+    );
+    let progress =
+        td_mta::postgres_replica_progress::inspect(&owner, &trust, deadline(), local, account)
+            .unwrap();
+    assert_eq!(progress.email_cursor, change_state);
+    assert!(progress.pending.unwrap().complete());
+    assert_eq!(publisher.advance(next_page, deadline()), Err(Error::Stale));
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+        ),
+        "0000000000000005"
+    );
+    drop(publisher);
+    // Install a valid interrupted inventory fixture; this is not a reset API.
+    let cursor = td_mta::postgres_read::ReplicaInventoryCursor {
+        base,
+        after: id,
+        upper: EmailId::from_bytes([255; 16]),
+    };
+    let mut cursor_bytes = [0; td_mta::postgres_read::ReplicaInventoryCursor::WIRE_BYTES];
+    let cursor_text = cursor.encode(&mut cursor_bytes).unwrap();
+    sql(&fixture,&format!("UPDATE td_mta.replica_progress SET generation=decode('0000000000000002','hex'),email_cursor=decode('{0}','hex'),inventory_base=decode('{0}','hex'),inventory_cursor=NULL,inventory_complete=false; UPDATE td_mta.replica_pending SET generation=decode('0000000000000002','hex'),page=decode('0000000000000001','hex'),kind=1,observed=decode('{0}','hex'),ids=decode('{1}','hex'),done=decode('01'||repeat('00',127),'hex'),next_cursor='{2}',next_state=NULL,more=false",hex(&base.sequence.number().to_be_bytes()),id,cursor_text));
+    let mut state_bytes = [0; td_mta::sync::DataState::WIRE_BYTES];
+    let base_text = base.encode(&mut state_bytes).unwrap().to_owned();
+    let observed_text = next_state.encode(&mut state_bytes).unwrap();
+    let mut account_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let account_text = td_mta::wire::encode_id(account, &mut account_bytes).unwrap();
+    let response = td_json::json!({"accountId":account_text,"sourceId":source.epoch().to_string(),"baseState":base_text,"state":observed_text,"ids":[],"nextCursor":null});
+    let continuation = td_mta::replica_source::inventory(
+        &response,
+        Binding {
+            account,
+            epoch: source.epoch(),
+        },
+        Some(cursor),
+        256,
+    )
+    .unwrap();
+    let transition = Arc::new(
+        Transition::inventory(
+            &source,
+            account,
+            Ticket {
+                generation: 2,
+                page: 1,
+            },
+            &continuation,
+        )
+        .unwrap(),
+    );
+    let mut publisher = open();
+    assert_eq!(
+        publisher.advance(transition.clone(), deadline()).unwrap(),
+        Ticket {
+            generation: 2,
+            page: 2
+        }
+    );
+    assert_eq!(
+        publisher.advance(transition, deadline()).unwrap(),
+        Ticket {
+            generation: 2,
+            page: 2
+        }
+    );
+    let progress =
+        td_mta::postgres_replica_progress::inspect(&owner, &trust, deadline(), local, account)
+            .unwrap();
+    assert!(!progress.inventory_complete);
+    assert_eq!(progress.inventory_cursor, Some(cursor));
+    assert!(progress.pending.unwrap().complete());
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

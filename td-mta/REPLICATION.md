@@ -353,7 +353,7 @@ padding bits. Each effect's completion bit must commit with its local publicatio
 only all completed effects permit advancement to the page's original continuation.
 A newer per-object observation never becomes the global change checkpoint.
 
-The account initializer persists only the first page. Advancing pages, bounded receipt retention and restart orchestration
+The account initializer persists only the first page. Bounded receipt retention and restart orchestration
 remain subsequent work. Limits reserve no bodies and cannot authorize an
 unbounded writer. Exhaustion must pause a future publisher without skipping mail.
 This increment does not make a replica usable or certify copy completeness.
@@ -410,7 +410,7 @@ binding and account limits remain owner-only. Ordinary primary grants retain
 SELECT-only access to those control tables, and ordinary writable runtime
 qualification still refuses a bound replica. The publisher authenticates and
 fully checks one PostgreSQL connection once, retains the shared migration lock,
-and checks epoch/maintenance on each job. It admits at most 16 publication jobs
+and checks epoch/maintenance on each job. It admits at most 16 publication or page-transition jobs
 within one 60-second connection lifetime. Each job has at most 4 MiB database
 input, 72 MiB output and 4096 protocol frames; initial qualification consumes
 the first window. Deadlines use the existing bounded import allowance, at most
@@ -420,8 +420,40 @@ remains success even if subsequent connection retirement fails.
 
 This is a library primitive, not an operator copy command or a read service.
 No resident worker, new default memory allowance, local credentials or source
-configuration is enabled. Page advancement, mailbox reconciliation, retention
+configuration is enabled. Mailbox reconciliation, retention
 and completeness validation remain required before a usable full-copy claim.
+
+### Durable page transitions
+
+The publisher may stage one validated next inventory or Email changes page.
+It reuses the same bounded, source-bound runtime session and account lock.
+The current pending generation and page must match, and every current ID must
+already have its completion bit. Advancing the old cursor and storing all next
+IDs with a fresh zero bitmap occur in one transaction. A failed transaction
+leaves both cursor and old work intact. No local Email/JMAP state changes.
+
+Inventory continuation must equal the old page's original cursor, preserving
+its base, upper bound and strictly advancing ID range. Its observation cannot
+move backward. After the last inventory page, catch-up starts at the retained
+initial replay anchor; finishing inventory alone does not certify a full copy.
+Each changes page starts at the completed old page's original newState, never a
+newer per-object metadata observation. This permits bounded partial catch-up
+pages even when later metadata was fetched during inventory.
+
+A transition names the previous ticket and deterministically uses the next
+page ordinal in the same generation. A matching retry recognizes the exact
+staged page and anchor without resetting completion bits accumulated since its
+commit. A mismatched page, wrong generation, overflow or stale transition
+refuses. Only the immediately next pending page can settle that retry; if work
+has advanced further, reload progress rather than replaying an obsolete request.
+An indeterminate COMMIT has the same inspect/retry boundary as Email publication.
+
+One pending page remains stored even when empty or complete. The durable Email
+cursor represents fully completed previous work, and the next page retains its
+own original newState until a subsequent transition. Status must distinguish
+these values and must not promote an object observation into a checkpoint.
+This primitive adds no polling worker, mailbox reconciliation, expired-history
+reset, receipt pruning, read service or copy-completeness claim.
 
 ### Remaining synchronization work
 
