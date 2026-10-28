@@ -546,7 +546,12 @@ Each increment is one landable commit, or a short series:
     cryptsetup's lock protocol (`bin/lock.rs`, "Locking"), with CLI
     tests (`tests/cli.rs`) and the program in the interop tests. No
     recipe ships it until E. Status: landed.
-  - **B4.** Next: the cryptsetup fixtures ("Tests").
+  - **B4a.** Ordinary cryptsetup fixtures: fresh format, added slot and
+    token, killed slot and unbound slot, captured in QEMU by
+    `fixtures/generate.rs`; `fixtures/README.md` records the procedure.
+    `tests/fixtures.rs` consumes the committed answers without AF_ALG.
+  - **B4b.** Next: interrupted reencryption fixtures under both
+    resilience modes, with stock-resumption evidence ("Tests").
 - **C.** The device-mapper surface: `open`, `open-volume-key`, `close`
   and `status` for headers without the reencryption requirement, with
   UNSAFE.md's section and the interop oracle for activation.
