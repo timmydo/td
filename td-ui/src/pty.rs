@@ -653,6 +653,94 @@ pub fn selftest() -> Result<(), String> {
     Ok(())
 }
 
+/// A foreground terminal relay. Enter only after spawning the child and
+/// before starting threads; those threads must end with this process.
+/// Input reads time out after 100 ms. Catchable termination requests are
+/// polled so the caller can tear down its child and restore the terminal.
+/// SIGKILL cannot be recovered from. Suspension is treated as termination.
+/// The guard owns the entering thread's signal mask.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<td_ui::pty::RelayTerminal>();
+/// ```
+pub struct RelayTerminal {
+    terminal: File,
+    original: [u8; 36],
+    signals: Option<u64>,
+    thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl RelayTerminal {
+    pub fn enter(terminal: File) -> std::io::Result<Self> {
+        let original = sys::terminal_attributes(&terminal)?;
+        let signals = sys::block_relay_signals()?;
+        let guard = Self {
+            terminal,
+            original,
+            signals: Some(signals),
+            thread: std::marker::PhantomData,
+        };
+        sys::set_terminal_attributes(&guard.terminal, &relay_attributes(original))?;
+        Ok(guard)
+    }
+
+    pub fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.terminal.read(bytes)
+    }
+
+    pub fn window(&self) -> Result<WindowSize, String> {
+        window_size(&self.terminal)
+    }
+
+    pub fn signal(&self) -> std::io::Result<Option<u8>> {
+        sys::relay_signal()
+    }
+
+    pub fn restore(&mut self) -> std::io::Result<()> {
+        let attributes = sys::set_terminal_attributes(&self.terminal, &self.original);
+        let mask = if let Some(previous) = self.signals {
+            sys::restore_relay_signals(previous).map(|()| self.signals = None)
+        } else {
+            Ok(())
+        };
+        attributes.and(mask)
+    }
+}
+
+impl Drop for RelayTerminal {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn relay_attributes(mut bytes: [u8; 36]) -> [u8; 36] {
+    // Linux kernel termios: four u32 flags, line byte, nineteen controls.
+    for (offset, clear, set) in [
+        (
+            0,
+            0o000001 | 0o000002 | 0o000010 | 0o000040 | 0o000100 | 0o000200 | 0o000400 | 0o002000,
+            0,
+        ),
+        (4, 1, 0),
+        (8, 0o000060 | 0o000400, 0o000060),
+        (12, 0o000001 | 0o000002 | 0o000010 | 0o000100 | 0o100000, 0),
+    ] {
+        if let Some(field) = bytes.get_mut(offset..offset + 4) {
+            if let Ok(word) = <[u8; 4]>::try_from(&*field) {
+                field.copy_from_slice(&((u32::from_ne_bytes(word) & !clear) | set).to_ne_bytes());
+            }
+        }
+    }
+    if let Some(vtime) = bytes.get_mut(22) {
+        *vtime = 1;
+    }
+    if let Some(vmin) = bytes.get_mut(23) {
+        *vmin = 0;
+    }
+    bytes
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1396,5 +1484,23 @@ mod tests {
     #[test]
     fn the_selftest_covers_the_grid_and_the_field_order() {
         selftest().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+    #[test]
+    fn relay_restores_the_exact_terminal_attributes() -> std::io::Result<()> {
+        let pty = Pty::open().map_err(std::io::Error::other)?;
+        let peer = pty.peer().map_err(std::io::Error::other)?;
+        let original = sys::terminal_attributes(&peer)?;
+        {
+            let guard = RelayTerminal::enter(peer.try_clone()?)?;
+            assert_eq!(sys::terminal_attributes(&peer)?, relay_attributes(original));
+            assert_eq!(guard.signal()?, None);
+        }
+        assert_eq!(sys::terminal_attributes(&peer)?, original);
+        Ok(())
     }
 }

@@ -4912,6 +4912,14 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             target: "{in:td-term}/bin/td-term".into(),
             link: "{root}/real-root/bin/td-term".into(),
         });
+        steps.push(Step::CopyTree {
+            from: "{in:td-sandbox}".into(),
+            dest: "{root}/real-root{in:td-sandbox}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-sandbox}/bin/td-sandbox".into(),
+            link: "{root}/real-root/bin/td-sandbox".into(),
+        });
     }
     steps.push(Step::CopyTree {
         from: "{in:td-term-terminfo}".into(),
@@ -6057,6 +6065,7 @@ const DESKTOP_INPUTS: &[&str] = &[
     "td-taskmgr",
     "td-review",
     "td-agent",
+    "td-sandbox",
     "td-term",
     "td-photo",
     "td-editor",
@@ -6370,6 +6379,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "td-taskmgr",
                 "td-review",
                 "td-agent",
+                "td-sandbox",
                 "td-term",
                 "td-term-terminfo",
                 "td-photo",
@@ -8333,6 +8343,7 @@ mod tests {
             ("td-taskmgr", "td-taskmgr"),
             ("td-review", "td-review"),
             ("td-agent", "td-agent"),
+            ("td-sandbox", "td-sandbox"),
             ("td-photo", "td-photo"),
             ("td-editor", "td-editor"),
             ("td-pass", "td-pass"),
@@ -16444,7 +16455,14 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     fn the_static_desktop_programs_are_packed_and_not_merely_symlinked() {
         let steps = real_root_steps(&SYSTEM).unwrap();
         let native_inputs = recipe().native_inputs.expect("system native inputs");
-        for name in ["td-photo", "td-editor", "td-pass", "td-dua", "td-software"] {
+        for name in [
+            "td-photo",
+            "td-editor",
+            "td-pass",
+            "td-dua",
+            "td-software",
+            "td-sandbox",
+        ] {
             assert!(
                 steps.iter().any(|step| matches!(
                     step,
@@ -16818,6 +16836,7 @@ mod server_tests {
             "td-taskmgr",
             "td-review",
             "td-agent",
+            "td-sandbox",
             "td-photo",
             "td-pass",
             "td-dua",

@@ -4245,3 +4245,22 @@ regressions. Those increments extend the original sequence below.
     press closing the open list (`Overlay::press` and the widget
     window), and the `BUTTON` and `ITEM` labels. Each program's rows,
     check tests and pointer entry follow in its own landing.
+
+## Foreground terminal relay
+
+`pty::RelayTerminal`, used by td-sandbox, owns a borrowed-terminal duplicate,
+the exact original Linux termios bytes and the calling thread's signal mask.
+It enters raw byte mode with VMIN=0/VTIME=1, reads at most one timeout per
+poll, and restores both on return/drop. The caller spawns children before
+entering the guard, so they do not inherit its blocked termination signals;
+subsequent reader threads live only as long as that frontend process.
+HUP/INT/QUIT/TERM/TSTP are blocked and synchronously consumed, never handled
+by a Rust signal handler. Suspension requests terminate the relay; SIGKILL
+cannot restore attributes. The safe API exposes enter/read/window/signal and
+restore, not arbitrary ioctl requests or signal sets. UNSAFE.md section 19
+records the added requests and syscalls; the complete raw-source fingerprint,
+call inventory, and a PTY restoration test pin the implementation.
+
+The relay terminal guard cannot cross threads: its signal mask belongs to
+the entering thread. Restoration attempts both termios and the signal mask,
+even if the terminal has disappeared.

@@ -9053,6 +9053,7 @@ mod tests {
                 "td-pinentry",
                 "td-portal",
                 "td-review",
+                "td-sandbox",
                 "td-seatd",
                 "td-secret",
                 "td-setup",
@@ -9067,7 +9068,7 @@ mod tests {
         );
         // td-agent's, td-photo's, td-mail's, td-pass's and td-pinentry's
         // native cases make their commands three, as td-setup's are; td-dua,
-        // td-news, td-review, td-software and td-term, toolkit consumers
+        // td-news, td-review, td-sandbox, td-software and td-term, toolkit consumers
         // with no native case, add two each.
         // td-crypto's test-only P-256 oracle is td-fido's, which reads no
         // compositor source, so td-crypto is not a reader here. The native mail read
@@ -9079,7 +9080,7 @@ mod tests {
         // td-boot, which includes td-init's console identity by `#[path]`,
         // and td-kexec and td-update, which read td-boot, add two each.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 76, "{comp:?}");
+        assert_eq!(comp.len(), 78, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -9109,6 +9110,7 @@ mod tests {
                 "td-pinentry",
                 "td-portal",
                 "td-review",
+                "td-sandbox",
                 "td-seatd",
                 "td-secret",
                 "td-setup",
@@ -9149,6 +9151,7 @@ mod tests {
                 "td-pinentry",
                 "td-portal",
                 "td-review",
+                "td-sandbox",
                 "td-seatd",
                 "td-secret",
                 "td-setup",

@@ -131,6 +131,7 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-portal",
     "td-profiler",
     "td-review",
+    "td-sandbox",
     "td-seatd",
     "td-secret",
     "td-secret-vm-test",

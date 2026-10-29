@@ -168,6 +168,7 @@ impl Program {
 #[derive(Debug)]
 pub(crate) struct WorkspacePlan {
     pub(crate) development: bool,
+    pub(crate) shared_network: bool,
     pub(crate) scratch: Vec<FilesystemGrant>,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
@@ -242,6 +243,7 @@ pub(crate) fn is_workspace_argument(argument: &OsStr) -> bool {
 #[derive(Debug, Default, Eq, PartialEq)]
 struct Spec {
     development: bool,
+    shared_network: bool,
     scratch: Vec<PathBuf>,
     programs: Vec<PathBuf>,
     aliases: Vec<crate::host_path::Alias>,
@@ -262,12 +264,15 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
     if lines.next() != Some(FORMAT_LINE) {
         return Err(invalid("workspace spec does not begin with format=1"));
     }
-    let development = if lines.peek() == Some(&"profile=development") {
+    let profile = lines.peek().copied();
+    let development = matches!(
+        profile,
+        Some("profile=development" | "profile=development-offline")
+    );
+    let shared_network = profile == Some("profile=development");
+    if development {
         lines.next();
-        true
-    } else {
-        false
-    };
+    }
     const ORDER: &[&str] = &[
         "entry",
         "program",
@@ -283,6 +288,7 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
     ];
     let mut spec = Spec {
         development,
+        shared_network,
         ..Spec::default()
     };
     let mut last = 0usize;
@@ -695,6 +701,7 @@ fn admit(
     }
     Ok(WorkspacePlan {
         development: spec.development,
+        shared_network: spec.shared_network,
         scratch,
         uid,
         gid,
@@ -1059,6 +1066,20 @@ mod tests {
 ";
 
     #[test]
+    fn development_offline_keeps_executable_policy_without_host_network() {
+        let offline =
+            parse_spec("format=1\nprofile=development-offline\nentry=/e\nhome=/h\n").unwrap();
+        assert!(offline.development);
+        assert!(!offline.shared_network);
+        let online = parse_spec("format=1\nprofile=development\nentry=/e\nhome=/h\n").unwrap();
+        assert!(online.development && online.shared_network);
+        assert!(parse_spec(
+            "format=1\nprofile=development-offline\nprofile=development\nentry=/e\nhome=/h\n"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn on_td_a_directory_below_the_home_is_not_the_volumes_maintenance_mount() {
         let identity =
             |path: &str| authority::mount_identity_for_path(TD_MOUNTINFO, Path::new(path)).unwrap();
@@ -1321,6 +1342,7 @@ mod tests {
         let real_home = &[PathBuf::from("/nonexistent-td-jail-home")];
         let spec = |programs: &[&Path], home: &Path, worktrees: &[&Path], read: &[&Path]| Spec {
             development: false,
+            shared_network: false,
             scratch: Vec::new(),
             programs: programs.iter().map(|path| path.to_path_buf()).collect(),
             aliases: Vec::new(),

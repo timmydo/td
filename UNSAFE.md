@@ -2173,6 +2173,11 @@ prctl operation, a second seccomp operation, a seccomp flag outside the exact
 `{0, SECCOMP_FILTER_FLAG_LOG}` set, a fourth ambient sub-operation, a third
 unshare flag set, or a fourth compiled seccomp policy is an amendment here.
 
+Section 9's development workspace device plan includes /dev/tty through the
+existing typed character-device bind, not a new syscall. Its offline variant
+uses the existing isolated unshare set and the development seccomp filter.
+
+
 ## 10. `td-busd` — the session bus broker
 
 `td-busd` carries THREE syscalls through one `syscall5` body in
@@ -3112,13 +3117,14 @@ td-sh's own entry.
 
 ## 19. `td-ui` — the shared Wayland client transport
 
-td-ui's `sys.rs` carries exactly SIX x86-64 Linux syscalls through one
+td-ui's `sys.rs` carries exactly EIGHT x86-64 Linux syscalls through one
 function-scoped instruction: `recvmsg` (47), `sendmsg` (46), `fcntl` (72)
 pinned to `F_DUPFD_CLOEXEC` (1030) for the transport and to `F_GETFL` (3)
 and `F_SETFL` (4) for the clipboard destination owner, `poll` (7) for
 the connection's wait once a consumer holds its waker, `ioctl` (16)
-pinned to five PTY requests for the terminal's device, and `setsid`
-(112) for a PTY child that leads a session. A second function-scoped
+pinned to five PTY requests and two termios requests, `setsid`
+(112) for a PTY child that leads a session, and `rt_sigprocmask` (14)
+and `rt_sigtimedwait` (128) for the foreground relay described below. A second function-scoped
 allowance adopts newly installed nonnegative descriptors into `OwnedFd`,
 and a third installs that child's pre-exec hook. Safe `std` owns
 connection setup, byte-only sends, timeouts, pool file creation and
@@ -3296,10 +3302,10 @@ calls are pinned each at its exact site and in its exact form, that
 the crate root denies `unsafe`, that the keymap reader and the send
 are the only pops beyond the FIFO's own accessor, the reader with its
 format, size and regular-file checks, and that `ioctl` is named at
-exactly its five wrappers, each request constant at its definition and
+exactly its seven wrappers, each request constant at its definition and
 its one use, the peer flags likewise, `setsid` and the pre-exec hook each
-at one site, and `pty.rs` the only caller of the four device wrappers and
-of the hook's installer, each at one site and the installer only under
+at one site, and `pty.rs` the only caller of the device and foreground
+relay wrappers and the hook's installer. The installer is called only under
 `leads_session`, opening the master with `O_NOCTTY` and reading every
 published size back. Kernel tests exercise transfer,
 close-on-exec duplication, refusal cleanup and truncated rights, poll
@@ -3312,15 +3318,35 @@ refusals, the deadline and the byte budget; a byte-level synthetic
 control test checks cleanup beyond unrecognized records and invalid
 entries.
 
-No mmap, ioctl beyond the five PTY requests, termios request, session
+No mmap, ioctl beyond the five PTY and two termios requests, session
 call beyond the child's pre-exec hook, GPU access, poll beyond the
 connection's two-entry wait, close syscall, credential call, raw
 environment-fd adoption or received-fd consumer beyond the keymap reader
-and the send hand-off is authorized here. A seventh syscall, fourth fcntl
-command, sixth ioctl request, another caller, or additional allowance
+and the send hand-off is authorized here. A ninth syscall, fourth fcntl
+command, eighth ioctl request, another caller, or additional allowance
 amends this section
 and `td-ui/DESIGN.md` in the same landing; a consumer that takes a right
 from the FIFO records that consumer in its own section.
+
+### Foreground terminal relay
+
+The td-ui private sys module adds TCGETS=0x5401 and TCSETS=0x5402 over a
+borrowed File and exactly 36 bytes of Linux x86-64 kernel termios. The PTY
+module is the only caller. It preserves the original bytes, changes the
+compiled raw-mode flag masks plus VTIME/VMIN, and restores the original
+bytes. No arbitrary request, descriptor adoption or FFI is added.
+
+Two additional x86-64 syscalls use the existing instruction:
+rt_sigprocmask=14 fixes sigsetsize=8 and either SIG_BLOCK=0 with the compiled
+HUP/INT/QUIT/TERM/TSTP mask and an old-mask pointer, or SIG_SETMASK=2 with that
+saved mask and no output; rt_sigtimedwait=128 fixes the same compiled mask,
+null siginfo, zero two-i64 timeout and sigsetsize=8. EAGAIN/EINTR report no
+pending request. The API exposes no caller-selected signal set or handler.
+The thread-bound guard attempts terminal restoration before mask restoration,
+even when the first operation fails; neither Send nor Sync is implemented.
+No new unsafe allowance, instruction or adoption site is introduced. The
+raw-source fingerprint and inventory pin both wrappers and their sole PTY
+consumer. The frontend is safe Rust and consumes these through td-ui only.
 
 ## 20. `td-taskmgr` — descriptor-bound process signals
 

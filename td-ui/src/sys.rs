@@ -4,7 +4,8 @@
 //! `recvmsg`, `sendmsg`, `fcntl` pinned to `F_DUPFD_CLOEXEC` for the
 //! transport and to `F_GETFL` and `F_SETFL` for the destination owner,
 //! `poll` over exactly the connection's stream and its waker, `ioctl`
-//! pinned to the five PTY requests, and `setsid` for a PTY child; one
+//! pinned to five PTY and two termios requests, `setsid` for a PTY child,
+//! and signal-mask/wait operations for the foreground relay; one
 //! function-scoped adoption site owns freshly installed descriptors, and
 //! one function-scoped pre-exec hook makes a PTY child lead a session on
 //! its terminal. Safe `std` owns connection setup,
@@ -383,6 +384,75 @@ pub(crate) fn send_file(stream: &UnixStream, bytes: &[u8], file: &File) -> io::R
         (&mut message as *mut MsgHdr) as usize,
         MSG_NOSIGNAL,
     ))
+}
+
+// Terminal relay operations; the borrowed terminal is never adopted.
+const TCGETS: usize = 0x5401;
+const TCSETS: usize = 0x5402;
+const SYS_RT_SIGPROCMASK: usize = 14;
+const SYS_RT_SIGTIMEDWAIT: usize = 128;
+const RELAY_SIGNALS: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 14) | (1 << 19);
+
+pub(crate) fn terminal_attributes(terminal: &File) -> io::Result<[u8; 36]> {
+    let mut bytes = [0u8; 36];
+    result(syscall3(
+        SYS_IOCTL,
+        terminal.as_raw_fd() as usize,
+        TCGETS,
+        bytes.as_mut_ptr() as usize,
+    ))?;
+    Ok(bytes)
+}
+
+pub(crate) fn set_terminal_attributes(terminal: &File, bytes: &[u8; 36]) -> io::Result<()> {
+    result(syscall3(
+        SYS_IOCTL,
+        terminal.as_raw_fd() as usize,
+        TCSETS,
+        bytes.as_ptr() as usize,
+    ))
+    .map(|_| ())
+}
+
+pub(crate) fn block_relay_signals() -> io::Result<u64> {
+    let mut previous = 0u64;
+    result(syscall5(
+        SYS_RT_SIGPROCMASK,
+        0,
+        (&RELAY_SIGNALS as *const u64) as usize,
+        (&mut previous as *mut u64) as usize,
+        8,
+        0,
+    ))?;
+    Ok(previous)
+}
+
+pub(crate) fn restore_relay_signals(previous: u64) -> io::Result<()> {
+    result(syscall5(
+        SYS_RT_SIGPROCMASK,
+        2,
+        (&previous as *const u64) as usize,
+        0,
+        8,
+        0,
+    ))
+    .map(|_| ())
+}
+
+pub(crate) fn relay_signal() -> io::Result<Option<u8>> {
+    let timeout = [0i64; 2];
+    match result(syscall5(
+        SYS_RT_SIGTIMEDWAIT,
+        (&RELAY_SIGNALS as *const u64) as usize,
+        0,
+        timeout.as_ptr() as usize,
+        8,
+        0,
+    )) {
+        Ok(signal) => Ok(u8::try_from(signal).ok()),
+        Err(e) if matches!(e.raw_os_error(), Some(11 | 4)) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

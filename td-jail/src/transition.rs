@@ -6492,15 +6492,15 @@ pub fn launch_workspace(plan: WorkspacePlan) -> io::Result<()> {
     let token = random_token()?;
     let executable = std::env::current_exe()?;
     writeln!(io::stderr(), "{WORKSPACE_DEGRADATION}")?;
-    sys::unshare_namespaces(!plan.development).map_err(|error| {
+    sys::unshare_namespaces(!plan.shared_network).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("the workspace kind requires namespace confinement: {error}"),
         )
     })?;
     install_launch_identity_maps(inside_identity, outside_identity, true)?;
-    NamespaceSnapshot::read()?.require_application_change(&before, !plan.development)?;
-    if !plan.development {
+    NamespaceSnapshot::read()?.require_application_change(&before, !plan.shared_network)?;
+    if !plan.shared_network {
         sys::bring_up_loopback()
             .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
     }
@@ -6921,7 +6921,7 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
             format!("{NEW_ROOT}{}/{}", workspace::ALIAS_DIR, alias.name),
         )?;
     }
-    let dev = prepare_base_mounts(identity, false, true, !plan.scratch.is_empty())?;
+    let dev = prepare_base_mounts(identity, plan.development, true, !plan.scratch.is_empty())?;
     for grant in &plan.scratch {
         mount_grant(grant, grant.target != Path::new("/dev/shm"))?;
     }
@@ -7155,7 +7155,7 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
             "detached host root remains reachable in the fresh root",
         ));
     }
-    let mountinfo = require_base_plan(token, false, true, plan.persistent)?;
+    let mountinfo = require_base_plan(token, plan.development, true, plan.persistent)?;
     // The root holds the fixed trees, the host's system trees and the
     // first component of each admitted directory, and nothing else.
     let mut fixed: BTreeSet<String> = ["dev", "etc", "opt", "proc", "run", "tmp", "var"]
@@ -7747,6 +7747,7 @@ mod tests {
         };
         let plan = WorkspacePlan {
             development: false,
+            shared_network: false,
             scratch: Vec::new(),
             uid: 1000,
             gid: 1000,

@@ -367,7 +367,7 @@ mod confinement {
             .0;
         assert!(
             at(launch, "require_workspace_channel()?;")
-                < at(launch, "sys::unshare_namespaces(!plan.development)")
+                < at(launch, "sys::unshare_namespaces(!plan.shared_network)")
                 && at(launch, "sys::bring_up_loopback()")
                     < at(launch, "close_inherited_descriptors(&[])?;")
                 && at(launch, "close_inherited_descriptors(&[])?;")
@@ -1224,7 +1224,7 @@ mod confinement {
         assert_eq!(TRANSITION.matches("sys::unshare_namespaces(").count(), 3);
         assert_eq!(
             TRANSITION
-                .matches("sys::unshare_namespaces(!plan.development).map_err(|error|")
+                .matches("sys::unshare_namespaces(!plan.shared_network).map_err(|error|")
                 .count(),
             1
         );

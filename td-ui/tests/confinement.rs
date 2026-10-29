@@ -172,7 +172,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "lib.rs" => 1,
                 "wayland.rs" => 7,
                 "clipboard.rs" => 6,
-                "pty.rs" => 6,
+                "pty.rs" => 15,
                 _ => 0,
             },
             "raw-module access in {name}"
@@ -578,7 +578,7 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0x392769aeae75189f,
+        hash, 0xf8b81ee83fa4a5e0,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
@@ -588,6 +588,11 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         "const SYS_POLL: usize = 7;",
         "const SYS_IOCTL: usize = 16;",
         "const SYS_SETSID: usize = 112;",
+        "const SYS_RT_SIGPROCMASK: usize = 14;",
+        "const SYS_RT_SIGTIMEDWAIT: usize = 128;",
+        "const TCGETS: usize = 0x5401;",
+        "const TCSETS: usize = 0x5402;",
+        "const RELAY_SIGNALS: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 14) | (1 << 19);",
         "const POLLIN: i16 = 1;",
         "const TIOCSPTLCK: usize = 0x4004_5431;",
         "const TIOCGPTPEER: usize = 0x5441;",
@@ -641,17 +646,21 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     // ioctl(2) is exactly the five PTY requests, each at its one wrapper:
     // the request is never a parameter. setsid(2) is the pre-exec hook's
     // alone, and the hook is installed at one site.
-    assert_eq!(raw.matches("SYS_IOCTL").count(), 6);
+    assert_eq!(raw.matches("SYS_IOCTL").count(), 8);
     for request in [
         "TIOCSPTLCK",
         "TIOCGPTPEER",
         "TIOCSWINSZ",
         "TIOCGWINSZ",
         "TIOCSCTTY",
+        "TCGETS",
+        "TCSETS",
     ] {
         assert_eq!(raw.matches(request).count(), 2, "{request}");
     }
     assert_eq!(raw.matches("SYS_SETSID").count(), 2);
+    assert_eq!(raw.matches("SYS_RT_SIGPROCMASK").count(), 3);
+    assert_eq!(raw.matches("SYS_RT_SIGTIMEDWAIT").count(), 2);
     assert_eq!(raw.matches("pre_exec").count(), 1);
     assert_eq!(raw.matches("lead_session_on_stdin").count(), 2);
     assert_eq!(raw.matches("#[allow(unsafe_code)]").count(), 3);
@@ -744,7 +753,7 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     // a child made to lead a session on the slave exactly when it asks.
     let pty = include_str!("../src/pty.rs");
     let pty = pty.split("\n#[cfg(test)]\n#[allow(").next().unwrap();
-    assert_eq!(pty.matches("sys::").count(), 5);
+    assert_eq!(pty.matches("sys::").count(), 11);
     assert_eq!(pty.matches("use crate::sys;").count(), 1);
     for call in [
         "sys::unlock_pty(&master)",

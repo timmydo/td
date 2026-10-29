@@ -8470,6 +8470,7 @@ mod tests {
                 "td-portal",
                 "td-profiler",
                 "td-review",
+                "td-sandbox",
                 "td-seatd",
                 "td-secret",
                 "td-setup",

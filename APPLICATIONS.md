@@ -11956,3 +11956,24 @@ becomes a build host too, or something must serve it artifacts, and §Z is
 what has to be reopened rather than worked around.
 
 ---
+
+## Private-home development frontend
+
+`td-sandbox` is the named, persistent private-home frontend specified in
+`td-sandbox/DESIGN.md`. It invokes the existing workspace kind, with no
+application identity or package-registry authority. The optional exact
+`profile=development-offline` selects the development syscall and executable
+home policy with an isolated network namespace and loopback up. Existing
+`profile=development` still shares networking; omitted profile still selects
+the confined review policy. Profile spelling is exact and ordered as before.
+
+Development workspace instances now include the generic /dev/tty character
+node (5,0), bound with the existing device flags and verified in both mount
+stages. No controlling terminal is inherited: the socket channel contract
+and stage-2 no-terminal check remain. An entry may create its own PTY and
+session; /dev/tty then resolves only that session's controlling terminal.
+The new frontend's terminal bridge does exactly that, with no host terminal
+file descriptor passed through the jail. Its metadata is outside every
+mounted directory, and its same-UID and host-network limitations are the
+workspace kind's. Runtime installations in its executable private home are
+not target build inputs. No foreign runtime acquisition is added here.
