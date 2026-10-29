@@ -75,9 +75,14 @@ fn launched_program() {
         } else {
             ""
         };
+        let stream = if std::env::var_os("TD_LAUNCH_TEST_STREAM").is_some() {
+            "stream\n"
+        } else {
+            ""
+        };
         write!(
             fetch,
-            "td-fetch 1\nmethod GET\nurl {url}\nlimit 1024\nredirects 0\n{public}body 0\n\n"
+            "td-fetch 1\nmethod GET\nurl {url}\nlimit 1024\nredirects 0\n{public}{stream}body 0\n\n"
         )
         .unwrap();
         let mut response = String::new();
@@ -456,4 +461,109 @@ fn rust_help_needs_no_home_configuration_or_download() {
     assert!(String::from_utf8(output.stderr)
         .unwrap()
         .contains("take no arguments"));
+}
+
+/// Match install-apps' links: only td-mail's private requests can reach a
+/// local account. A public request must not reuse that permission or agent.
+#[test]
+fn installed_mail_reaches_local_accounts_but_public_content_stays_blocked() {
+    let base = scratch("mail-local");
+    let lib = base.join("lib");
+    let bin = base.join("bin");
+    let runtime = base.join("run");
+    for dir in [&lib, &bin, &runtime] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    std::fs::copy(TD_NET, lib.join("td-net")).unwrap();
+    for name in ["td-mail", "td-news", "td-agent"] {
+        std::fs::copy(std::env::current_exe().unwrap(), lib.join(name)).unwrap();
+        std::os::unix::fs::symlink(lib.join("td-net"), bin.join(name)).unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::scope(|scope| {
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let peer = scope.spawn(move || {
+            let mut accepted = 0;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        accepted += 1;
+                        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                        stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+                        let mut request = Vec::new();
+                        let mut byte = [0];
+                        while !request.ends_with(b"\r\n\r\n") {
+                            stream.read_exact(&mut byte).unwrap();
+                            request.push(byte[0]);
+                            assert!(request.len() < 8192);
+                        }
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        match stopped.recv_timeout(Duration::from_millis(10)) {
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+                            _ => return accepted,
+                        }
+                    }
+                    Err(e) => panic!("fixture accept: {e}"),
+                }
+            }
+        });
+        // Drop during assertion unwinding also releases the scoped server.
+        struct Stop(std::sync::mpsc::Sender<()>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let stop = Stop(stop);
+        for (index, (name, public, stream)) in [
+            ("td-mail", false, false),
+            ("td-mail", true, false),
+            ("td-mail", false, true),
+            ("td-mail", true, true),
+            ("td-news", false, false),
+            ("td-agent", false, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mark = base.join(format!("mark-{index}"));
+            let result = base.join(format!("result-{index}"));
+            let mut command = Command::new(bin.join(name));
+            as_child(&mut command, &runtime, &mark);
+            command
+                .env("TD_LAUNCH_TEST_FETCH_URL", &url)
+                .env("TD_LAUNCH_TEST_FETCH_RESULT", &result)
+                .env_remove("TD_LAUNCH_TEST_PUBLIC")
+                .env_remove("TD_LAUNCH_TEST_STREAM");
+            if public {
+                command.env("TD_LAUNCH_TEST_PUBLIC", "1");
+            }
+            if stream {
+                command.env("TD_LAUNCH_TEST_STREAM", "1");
+            }
+            assert!(status_of_a_fresh_copy(&mut command).success());
+            let response = std::fs::read_to_string(result).unwrap();
+            if name == "td-mail" && !public {
+                assert!(
+                    response.contains("status 200\n") && response.contains("ok"),
+                    "{response}"
+                );
+                if stream {
+                    assert!(response.ends_with("end\n"), "{response}");
+                }
+            } else {
+                assert!(
+                    response.contains("error refused:") && response.contains("loopback"),
+                    "{response}"
+                );
+            }
+            nothing_served(&runtime, &mark);
+        }
+        drop(stop);
+        assert_eq!(peer.join().unwrap(), 2);
+    });
 }

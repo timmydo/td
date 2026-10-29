@@ -401,9 +401,9 @@ for the configured origin and no certificate-verification bypass.
 The file must be readable by td-mail itself; inside a jail, use a path
 visible in that application's configuration directory. The fetch service
 receives bounded certificate bytes, not a host pathname. This option does
-not change its destination policy: the stock service still refuses
-loopback. Local host testing uses a separately started fetch service with
-its existing `--allow-loopback` option.
+not change its destination policy: the td image service still refuses
+loopback. The host launcher installed by `./install-apps` permits local
+mail-server requests while keeping public-content fetches off loopback.
 
 Each account sets exactly one of `secret = "portal"` or `password_command`.
 Legacy fallback is supported via `[jmap]` with `well_known_url`, `username`, and one of those;
@@ -664,8 +664,14 @@ the server's maxObjectsInSet. td-mta accepts pure destruction requests and
 atomically removes relationships and unowned bodies; shared or leased bodies
 remain until their last owner releases them.
 
-For a local td-mta account, launch with an explicitly loopback-enabled fetch
-service (using the ordinary binaries installed by `./install-apps`):
+For a local td-mta account, run `./install-apps` and then ordinary `td-mail`.
+The installed launcher permits loopback for mail-server requests, including
+local discovery and attachment downloads. Public-content requests retain
+loopback refusal. Your account's `tls_ca_file` still scopes certificate trust;
+no shell function or special launch command is needed. This host-only policy
+does not change the td image's confined fetch service.
+
+For an explicit diagnostic launch with the broader loopback exception:
 
 ```text
 ~/.local/lib/td/td-net launch --allow-loopback ~/.local/lib/td/td-mail --config=/absolute/path/to/mail.toml
@@ -674,8 +680,8 @@ service (using the ordinary binaries installed by `./install-apps`):
 Add `--cli` for the JSON-line interface. The launcher preserves the Wayland
 connection and stops its fetch service when td-mail exits. The option permits
 loopback for this application's requests; certificate verification
-and the account's `tls_ca_file` origin scope still apply. The ordinary
-`~/.local/bin/td-mail` launch keeps the default loopback refusal.
+and the account's `tls_ca_file` origin scope still apply. Prefer the ordinary
+`~/.local/bin/td-mail` launcher, which keeps public-content loopback refusal.
 
 ### Uncached mailbox loading
 

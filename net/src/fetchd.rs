@@ -205,7 +205,7 @@ pub fn run(args: &[String]) {
         },
         _ => {
             eprintln!(
-                "usage: td-fetchd run --socket PATH [--allow-loopback] [--exit-with-parent PID]\n       td-fetchd probe PATH"
+                "usage: td-fetchd run --socket PATH [--allow-loopback | --allow-private-loopback] [--exit-with-parent PID]\n       td-fetchd probe PATH"
             );
             2
         }
@@ -226,6 +226,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut parent = None;
     let mut policy = Policy {
         allow_loopback: false,
+        allow_private_loopback: false,
     };
     let mut limits = LIMITS;
     let mut shortened = None;
@@ -242,6 +243,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             // For the recipe check and the unit tests, which serve on loopback:
             // never set by a unit.
             "--allow-loopback" => policy.allow_loopback = true,
+            "--allow-private-loopback" => policy.allow_private_loopback = true,
             // For td-launch, the service's only starter off td: it ends when
             // the launched program, which holds this pid, does.
             "--exit-with-parent" => parent = Some(pid_arg(arg, it.next())?),
@@ -280,7 +282,7 @@ struct OriginArgs {
 }
 
 /// `origin --exit-with-parent PID --idle-ms N --memory-bytes N
-/// [--allow-loopback]`, as the service starts it; every part but the flag
+/// [--allow-loopback | --allow-private-loopback]`, as the service starts it; every part but the flag
 /// is required.
 fn parse_origin_args(args: &[String]) -> Result<OriginArgs, String> {
     let mut parent = None;
@@ -288,11 +290,13 @@ fn parse_origin_args(args: &[String]) -> Result<OriginArgs, String> {
     let mut memory = None;
     let mut policy = Policy {
         allow_loopback: false,
+        allow_private_loopback: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--allow-loopback" => policy.allow_loopback = true,
+            "--allow-private-loopback" => policy.allow_private_loopback = true,
             "--exit-with-parent" => parent = Some(pid_arg(arg, it.next())?),
             "--idle-ms" => idle = Some(millis_arg(arg, it.next())?),
             "--memory-bytes" => memory = Some(number_arg(arg, it.next())?),
@@ -329,6 +333,12 @@ fn pid_arg(flag: &str, value: Option<&String>) -> Result<u32, String> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Policy {
     pub(crate) allow_loopback: bool,
+    pub(crate) allow_private_loopback: bool,
+}
+impl Policy {
+    fn loopback_for(self, public: bool) -> bool {
+        self.allow_loopback || (self.allow_private_loopback && !public)
+    }
 }
 
 /// The service's clocks and its stream's memory bound, one value so the
@@ -897,17 +907,19 @@ impl PolicyResolver {
         if addresses.is_empty() {
             return Err(io::Error::other(format!("{netloc}: no address")));
         }
+        let policy = Policy {
+            allow_loopback: self.policy.loopback_for(self.public.is_some()),
+            allow_private_loopback: false,
+        };
         for address in &addresses {
             let ip = address.ip();
-            let reason = refused_address(ip, self.policy)
-                .map(str::to_string)
-                .or_else(|| {
-                    let local = self.public.as_ref()?;
-                    let policy = crate::egress::Policy {
-                        allow_loopback: self.policy.allow_loopback,
-                    };
-                    crate::egress::refused(ip, local, policy).map(|why| format!("{ip} is {why}"))
-                });
+            let reason = refused_address(ip, policy).map(str::to_string).or_else(|| {
+                let local = self.public.as_ref()?;
+                let policy = crate::egress::Policy {
+                    allow_loopback: policy.allow_loopback,
+                };
+                crate::egress::refused(ip, local, policy).map(|why| format!("{ip} is {why}"))
+            });
             if let Some(reason) = reason {
                 if let Ok(mut refusal) = self.refusal.lock() {
                     *refusal = Some(reason.clone());
@@ -1392,6 +1404,9 @@ fn spawn_origin(policy: Policy, limits: Limits) -> io::Result<Child> {
         .arg(limits.memory.to_string());
     if policy.allow_loopback {
         command.arg("--allow-loopback");
+    }
+    if policy.allow_private_loopback {
+        command.arg("--allow-private-loopback");
     }
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
 }
@@ -2287,9 +2302,11 @@ mod tests {
 
     const STRICT: Policy = Policy {
         allow_loopback: false,
+        allow_private_loopback: false,
     };
     const LENIENT: Policy = Policy {
         allow_loopback: true,
+        allow_private_loopback: false,
     };
     /// Enough for a local exchange, short enough for the slow-client test.
     const TEST_BUDGET: Duration = Duration::from_secs(2);
@@ -2396,6 +2413,47 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.contains("request body over"), "{err}");
+    }
+
+    #[test]
+    fn local_mail_policy_keeps_public_and_special_addresses_blocked() {
+        let mail = Policy {
+            allow_loopback: false,
+            allow_private_loopback: true,
+        };
+        for public in [false, true] {
+            let resolver = PolicyResolver {
+                policy: mail,
+                public: public.then(crate::egress::Local::default),
+                refusal: Mutex::new(None),
+            };
+            for address in ["127.0.0.1:443", "[::1]:443", "[::ffff:127.0.0.1]:443"] {
+                assert_eq!(
+                    resolver.resolve_netloc(address).is_ok(),
+                    !public,
+                    "{address}"
+                );
+            }
+            for address in ["0.0.0.0:443", "169.254.169.254:80", "[fe80::1]:443"] {
+                assert!(resolver.resolve_netloc(address).is_err(), "{address}");
+            }
+        }
+        let run = parse_run_args(&[
+            "--socket".into(),
+            "/s".into(),
+            "--allow-private-loopback".into(),
+        ])
+        .unwrap();
+        assert!(run.policy.loopback_for(false));
+        assert!(!run.policy.loopback_for(true));
+        assert!(parse_run_args(&[
+            "--socket".into(),
+            "/s".into(),
+            "--allow-private-loopback".into(),
+            "--client-ms".into(),
+            "1".into()
+        ])
+        .is_err());
     }
 
     #[test]

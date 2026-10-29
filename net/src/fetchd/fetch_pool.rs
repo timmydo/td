@@ -42,7 +42,7 @@ impl Key {
                 Method::Get => request.redirects.unwrap_or(super::MAX_REDIRECTS),
                 Method::Post => 0,
             },
-            loopback: policy.allow_loopback,
+            loopback: policy.loopback_for(request.public),
             budget,
         })
     }
@@ -157,6 +157,7 @@ mod tests {
     use std::cell::Cell;
     const POLICY: Policy = Policy {
         allow_loopback: true,
+        allow_private_loopback: false,
     };
     fn request() -> Request {
         Request {

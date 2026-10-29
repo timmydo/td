@@ -105,6 +105,7 @@ pub(crate) const SELF: &str = "/proc/self/exe";
 struct LaunchOptions {
     loud: bool,
     allow_loopback: bool,
+    allow_private_loopback: bool,
 }
 
 /// `td-launch PROGRAM [ARG...]`, `args[0]` being the applet's name.
@@ -125,6 +126,7 @@ pub fn run(args: &[String]) {
                 LaunchOptions {
                     loud: true,
                     allow_loopback: true,
+                    allow_private_loopback: false,
                 },
             )),
             None => {
@@ -142,6 +144,7 @@ pub fn run(args: &[String]) {
                 LaunchOptions {
                     loud: true,
                     allow_loopback: false,
+                    allow_private_loopback: false,
                 },
             ))
         }
@@ -171,7 +174,10 @@ pub fn run_named(name: &str, args: &[String]) {
                 args,
                 &named,
                 relays(name),
-                LaunchOptions::default(),
+                LaunchOptions {
+                    allow_private_loopback: name == "td-mail",
+                    ..LaunchOptions::default()
+                },
             )
         });
     std::process::exit(say(launched));
@@ -396,7 +402,11 @@ const EGRESSD: Service = Service {
 /// Starts this binary's `service` at `socket`, to end when this process's
 /// pid is no longer its parent, and waits for its probe; the child is
 /// killed when it does not answer.
-fn start_service(service: &Service, socket: &Path, allow_loopback: bool) -> Result<Child, String> {
+fn start_service(
+    service: &Service,
+    socket: &Path,
+    options: LaunchOptions,
+) -> Result<Child, String> {
     let applet = service.applet;
     let mut command = Command::new(SELF);
     command
@@ -407,8 +417,11 @@ fn start_service(service: &Service, socket: &Path, allow_loopback: bool) -> Resu
         .arg(socket)
         .stdin(Stdio::null())
         .process_group(0);
-    if allow_loopback && applet == FETCHD.applet {
+    if options.allow_loopback && applet == FETCHD.applet {
         command.arg("--allow-loopback");
+    }
+    if options.allow_private_loopback && applet == FETCHD.applet {
+        command.arg("--allow-private-loopback");
     }
     let mut child = command
         .spawn()
@@ -458,7 +471,7 @@ fn launch(
         wanted.push((EGRESSD, private.join("td-egress").join("socket")));
     }
     for (service, at) in &wanted {
-        match start_service(service, at, options.allow_loopback) {
+        match start_service(service, at, options) {
             Ok(child) => services.push(child),
             Err(e) => {
                 for mut child in services {

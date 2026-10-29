@@ -11854,18 +11854,30 @@ applications run here as they run on td, the jail is what is absent, and
 a feature owes this launcher nothing. The installed program finds no
 service of its own any other way.
 
-For a deliberately local account, `td-net launch --allow-loopback
-/absolute/path/to/td-mail --config=/absolute/path/to/mail.toml` starts the
-same managed fetch service with its existing loopback exception. This is an
-explicit host launch option, never an inherited environment switch or the
-installed application-name default. It permits loopback destinations for all
-requests made by that launched application, including redirects and requests
-marked public; it is not an account-specific address grant. Public requests
-still refuse other private/local-network destinations. TLS verification, including td-mail's
-per-account CA scoping, is unchanged. The same parent lifetime cleanup and
-Wayland path preservation apply. Normal installed launches still refuse
-loopback; td image confinement and its fetch-service configuration are
-unchanged.
+The installed `td-mail` name starts its managed fetch service with
+`--allow-private-loopback`. Mail-server requests may reach loopback, so an
+account configured for a local replica works through ordinary `td-mail`
+after `./install-apps`. Requests marked `public`, such as public content
+fetches, retain loopback and local-network refusals on every resolution,
+including redirect hops. Buffered connection reuse includes the effective
+loopback policy in its key; public requests never borrow those connections.
+Streaming origin subprocesses retain the same private/public distinction.
+This is application-wide permission for private requests, including their
+redirects, not an account-specific address grant. No password, configuration
+file, shell function or environment switch is needed to select the launcher
+policy. Installed `td-news` and `td-agent` launches retain strict loopback
+refusal, including the agent's egress relay.
+
+For an explicit diagnostic launch, `td-net launch --allow-loopback
+/absolute/path/to/td-mail --config=/absolute/path/to/mail.toml` retains its
+broader exception: it permits loopback destinations for all requests made by
+that application, including redirects and requests marked public. Public
+requests still refuse other private/local-network destinations. A generic
+`td-net launch PROGRAM` without that flag retains strict loopback refusal.
+TLS verification, including td-mail's per-account CA scoping, parent lifetime
+cleanup and Wayland path preservation are unchanged. These are unjailed host
+launch policies; td image confinement and its fetch-service configuration
+are unchanged.
 
 ### X.8 The `workspace` kind on a host
 
