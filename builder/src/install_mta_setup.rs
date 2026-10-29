@@ -52,11 +52,12 @@ const REPLICA_HELP: &str = "Usage: ./install-td-mta --setup-replica --root PATH 
   --source-origin HTTPS_ORIGIN --password-file PATH --resolver IP:PORT
   --body-bytes N --blobs N --emails N --receipts N
   [--source-username USER] [--ca-file PATH] [--prefix PATH]
-  [--postgres-port PORT] [--https-port PORT]
+  [--postgres-port PORT]
 
 Creates a NEW private read-only replica with independent local credentials.
-Requires installed td-mta, PostgreSQL 17 tools and openssl on PATH.
-Defaults: PostgreSQL 35433, HTTPS 54444; loopback only.
+Requires installed td-mta and PostgreSQL 17 tools on PATH.
+PostgreSQL and JMAP use private Unix sockets; no local certificates.
+--postgres-port (default 35433) selects the PostgreSQL socket filename.
 Source username defaults to --account, which is also the local login/address.
 Discovers and seeds the source account; the sync service continues copying.
 Writes PostgreSQL, read-only and sync service definitions, but enables none.
@@ -84,7 +85,6 @@ fn settings_mode(args: &[String], home: &str, replica: bool) -> Result<Settings>
             "--account",
             "--resolver",
             "--postgres-port",
-            "--https-port",
         ]
         .contains(&flag.as_str());
         let mode_option = if replica {
@@ -101,6 +101,7 @@ fn settings_mode(args: &[String], home: &str, replica: bool) -> Result<Settings>
             .contains(&flag.as_str())
         } else {
             [
+                "--https-port",
                 "--relay-host",
                 "--relay-user",
                 "--relay-password-file",
@@ -214,8 +215,8 @@ fn settings_mode(args: &[String], home: &str, replica: bool) -> Result<Settings>
             None
         },
     };
-    if s.pg_port == s.https_port
-        || (s.replica.is_none() && (s.pg_port == s.smtp_port || s.https_port == s.smtp_port))
+    if s.replica.is_none()
+        && (s.pg_port == s.https_port || s.pg_port == s.smtp_port || s.https_port == s.smtp_port)
     {
         return Err("local ports must be distinct".into());
     }
@@ -437,8 +438,8 @@ fn preflight(s: &Settings) -> Result<()> {
         return Err("setup root is too long for the MTA control socket (maximum 72 bytes)".into());
     }
     for n in [
-        Some(s.pg_port),
-        Some(s.https_port),
+        s.replica.is_none().then_some(s.pg_port),
+        s.replica.is_none().then_some(s.https_port),
         s.replica.is_none().then_some(s.smtp_port),
     ]
     .into_iter()
@@ -457,12 +458,13 @@ fn preflight(s: &Settings) -> Result<()> {
             return Err(format!("{program} must be PostgreSQL 17"));
         }
     }
-    if !command(Path::new("openssl"))
-        .arg("version")
-        .output()
-        .map_err(|e| format!("openssl: {e}"))?
-        .status
-        .success()
+    if s.replica.is_none()
+        && !command(Path::new("openssl"))
+            .arg("version")
+            .output()
+            .map_err(|e| format!("openssl: {e}"))?
+            .status
+            .success()
     {
         return Err("openssl version failed".into());
     }
@@ -642,7 +644,6 @@ fn source_args(p: &Setup<'_>, replica: &Replica) -> Result<Vec<String>> {
 fn replica_services(
     p: &Setup<'_>,
     postgres: &Path,
-    openssl: &Path,
     replica: &Replica,
     epoch: &str,
     account: &str,
@@ -735,30 +736,6 @@ fn replica_services(
         "copy-arguments.json",
         Json::Arr(copy.into_iter().map(Json::Str).collect()).to_canonical(),
     )?;
-    super::install_mta_operations::configure(
-        &[
-            "--prefix".into(),
-            text(&p.s.prefix)?.into(),
-            "--state-dir".into(),
-            text(&p.s.root)?.into(),
-            "--postgres-tls-dir".into(),
-            text(&p.path("tls"))?.into(),
-            "--postgres-data-dir".into(),
-            text(&p.path("postgres"))?.into(),
-            "--postgres-port".into(),
-            p.s.pg_port.to_string(),
-            "--postgres-bin".into(),
-            text(postgres.parent().ok_or("PostgreSQL directory missing")?)?.into(),
-            "--openssl-bin".into(),
-            text(&openssl)?.into(),
-            "--replica-root".into(),
-            text(&p.s.root)?.into(),
-            "--replica-https-port".into(),
-            p.s.https_port.to_string(),
-        ],
-        text(&p.s.root)?,
-    )?;
-    let renewal_services = p.s.prefix.join("share/td-mta/services");
     let mut start = String::from("Replica preparation complete. Services are stopped; no full copy is claimed.\nUse ONE supervisor. Replica service names differ from ordinary local mail.\n\nSystemd:\n");
     for name in [
         "td-mta-replica-postgres",
@@ -784,9 +761,56 @@ fn replica_services(
     start.push_str("  herd start td-mta-replica\n  herd start td-mta-replica-sync\n\nFor a manual bounded batch, stop the sync service first:\n  ");
     start.push_str(&copy_command);
     start.push_str(&format!("\n\nHistorical synchronization status (not copy completeness or process liveness):\n  {} postgres replica-follow-status --state-dir {} --epoch {} --account {}\n", shell(&bin), shell(&state), shell(Path::new(epoch)), shell(Path::new(account))));
-    start.push_str(&format!("\n\nLocal client:\n  td-net launch --allow-loopback td-mail --config={}\n\nThe local credential is independent of the upstream password.\nThe sync service continues copying when started. Enable the generated daily local TLS renewal job below; recovery promotion remains manual.\nThe unused relay configuration is required by the shared config grammar; no relay service runs.\nProtect this directory: it holds full mail, passwords and private keys.\n", shell(&p.path("mail.toml"))));
-    start.push_str(&format!("\nDaily PostgreSQL and JMAP certificate renewal (enable with the same supervisor):\n  systemctl --user link {} {}\n  systemctl --user daemon-reload\n  systemctl --user enable --now td-mta-maint-replica-tls-renew.timer\n\nShepherd (also retain this definition in Guix Home):\n  herd load root {}\n  herd start td-mta-maint-replica-tls-renew\n", shell(&renewal_services.join("td-mta-maint-replica-tls-renew.service")),shell(&renewal_services.join("td-mta-maint-replica-tls-renew.timer")),shell(&renewal_services.join("td-mta-maint-replica-tls-renew.scm"))));
+    start.push_str(&format!("\n\nLocal client:\n  td-mail --config={}\n\nThe local credential is independent of the upstream password.\nThe sync service continues copying when started. Local sockets need no certificate renewal; recovery promotion remains manual.\nThe unused relay configuration is required by the shared config grammar; no relay service runs.\nProtect this directory: it holds full mail and passwords.\n", shell(&p.path("mail.toml"))));
+
     p.write("START.txt", start)
+}
+
+fn database_connection(s: &Settings, role: &str, password: &str) -> Result<String> {
+    if s.replica.is_some() {
+        Ok(format!(
+            "postgresql://td_mta_{role}:{password}@:{}/td_mta?host={}",
+            s.pg_port,
+            uri_path(&s.root.join("socket"))?
+        ))
+    } else {
+        Ok(format!("postgresql://td_mta_{role}:{password}@localhost:{}/td_mta?sslmode=verify-full&sslrootcert={}", s.pg_port, uri_path(&s.root.join("tls/ca.pem"))?))
+    }
+}
+
+fn database_configuration(s: &Settings) -> Result<(String, String, String)> {
+    let quote = |path: PathBuf| -> Result<String> {
+        Ok(text(&path)?.replace('\'', "''").replace('\\', "\\\\"))
+    };
+    let socket = quote(s.root.join("socket"))?;
+    let common = format!("port = {}\npassword_encryption = 'scram-sha-256'\nfsync = on\nsynchronous_commit = on\nfull_page_writes = on\nlog_statement = 'none'\nlog_min_error_statement = 'panic'\n", s.pg_port);
+    let base = if s.replica.is_some() {
+        format!("{common}listen_addresses = ''\nssl = off\nunix_socket_permissions = 0600\n")
+    } else {
+        format!("{common}listen_addresses = '127.0.0.1'\nssl = on\nssl_cert_file = '{}'\nssl_key_file = '{}'\n", quote(s.root.join("tls/server.pem"))?, quote(s.root.join("tls/server.key"))?)
+    };
+    let runtime_socket = if s.replica.is_some() {
+        socket.as_str()
+    } else {
+        ""
+    };
+    let runtime = format!("{base}unix_socket_directories = '{runtime_socket}'\n");
+    let bootstrap = format!(
+        "{base}unix_socket_directories = '{socket}'\nhba_file = '{}'\n",
+        quote(s.root.join("bootstrap-hba.conf"))?
+    );
+    let mut hba = String::new();
+    for role in ["owner", "runtime", "reader"] {
+        if s.replica.is_some() {
+            hba.push_str(&format!("local td_mta td_mta_{role} scram-sha-256\n"));
+        } else {
+            hba.push_str(&format!(
+                "hostssl all td_mta_{role} 127.0.0.1/32 scram-sha-256\n"
+            ));
+        }
+    }
+    hba.push_str("local all all reject\nhost all all 0.0.0.0/0 reject\nhost all all ::/0 reject\n");
+    Ok((runtime, bootstrap, hba))
 }
 
 fn prepare(s: &Settings) -> Result<()> {
@@ -816,7 +840,7 @@ fn prepare(s: &Settings) -> Result<()> {
         .create(&s.root)
         .map_err(|e| e.to_string())?;
     let mut p = Setup { s, serial: 0 };
-    for name in ["receipts", "tls", "socket", "services"] {
+    for name in ["receipts", "socket", "services"] {
         directory(&p.path(name), 0o700)?;
     }
     p.write("relay-password", password)?;
@@ -837,7 +861,12 @@ fn prepare(s: &Settings) -> Result<()> {
     } else {
         None
     };
-    certificates(&mut p)?;
+    if s.replica.is_none() {
+        directory(&p.path("tls"), 0o700)?;
+        certificates(&mut p)?;
+    } else {
+        directory(&p.path("jmap"), 0o700)?;
+    }
     let mut init = command(Path::new("initdb"));
     init.args([
         "-D",
@@ -851,22 +880,14 @@ fn prepare(s: &Settings) -> Result<()> {
         "UTF8",
     ]);
     p.execute("initdb", &mut init, None)?;
-    let quote = |path: PathBuf| -> Result<String> {
-        Ok(text(&path)?.replace('\'', "''").replace('\\', "\\\\"))
-    };
-    let base = format!("listen_addresses = '127.0.0.1'\nport = {}\nssl = on\nssl_cert_file = '{}'\nssl_key_file = '{}'\npassword_encryption = 'scram-sha-256'\nfsync = on\nsynchronous_commit = on\nfull_page_writes = on\nlog_statement = 'none'\nlog_min_error_statement = 'panic'\n", s.pg_port, quote(p.path("tls/server.pem"))?, quote(p.path("tls/server.key"))?);
+    let (runtime_config, bootstrap_config, hba) = database_configuration(s)?;
+    p.write("postgresql.conf", runtime_config)?;
+    p.write("bootstrap.conf", bootstrap_config)?;
+    fs::write(p.path("postgres/pg_hba.conf"), &hba).map_err(|e| e.to_string())?;
     p.write(
-        "postgresql.conf",
-        format!("{base}unix_socket_directories = ''\n"),
+        "bootstrap-hba.conf",
+        format!("local all setup_admin trust\n{hba}"),
     )?;
-    p.write(
-        "bootstrap.conf",
-        format!(
-            "{base}unix_socket_directories = '{}'\n",
-            quote(p.path("socket"))?
-        ),
-    )?;
-    fs::write(p.path("postgres/pg_hba.conf"), "local all setup_admin trust\nhostssl all td_mta_owner 127.0.0.1/32 scram-sha-256\nhostssl all td_mta_runtime 127.0.0.1/32 scram-sha-256\nhostssl all td_mta_reader 127.0.0.1/32 scram-sha-256\nhost all all 0.0.0.0/0 reject\n").map_err(|e| e.to_string())?;
     p.write("postgres.log", b"")?;
     let log = fs::OpenOptions::new()
         .append(true)
@@ -901,13 +922,19 @@ fn prepare(s: &Settings) -> Result<()> {
     p.write("runtime-password", &runtime)?;
     p.sql("roles", &format!("CREATE ROLE td_mta_owner LOGIN PASSWORD '{owner}';\nCREATE ROLE td_mta_runtime LOGIN PASSWORD '{runtime}';\nCREATE DATABASE td_mta OWNER td_mta_owner;\nREVOKE ALL ON DATABASE td_mta FROM PUBLIC;\nGRANT CONNECT ON DATABASE td_mta TO td_mta_runtime;\n"))?;
     for (name, password) in [("owner", owner), ("runtime", runtime)] {
-        p.write(&format!("{name}-connection"), format!("postgresql://td_mta_{name}:{password}@localhost:{}/td_mta?sslmode=verify-full&sslrootcert={}", s.pg_port, uri_path(&p.path("tls/ca.pem"))?))?;
+        p.write(
+            &format!("{name}-connection"),
+            database_connection(s, name, &password)?,
+        )?;
     }
     if s.replica.is_some() {
         let password = random_hex(32)?;
         p.write("reader-password", &password)?;
         p.sql("reader-role", &format!("CREATE ROLE td_mta_reader LOGIN PASSWORD '{password}'; GRANT CONNECT ON DATABASE td_mta TO td_mta_reader;"))?;
-        p.write("reader-connection", format!("postgresql://td_mta_reader:{password}@localhost:{}/td_mta?sslmode=verify-full&sslrootcert={}", s.pg_port, uri_path(&p.path("tls/ca.pem"))?))?;
+        p.write(
+            "reader-connection",
+            database_connection(s, "reader", &password)?,
+        )?;
     }
     let receipt = p.owner("schema", &["schema-init"])?;
     let epoch = field(&receipt, "store_epoch")?;
@@ -980,7 +1007,9 @@ fn prepare(s: &Settings) -> Result<()> {
         ("password", "relay-password", "relay-password"),
         ("ca", "trust-bundle", "relay-ca.pem"),
     ] {
-        if name == "ca" && s.relay_ca.is_none() {
+        if (name == "ca" && s.relay_ca.is_none())
+            || (s.replica.is_some() && matches!(name, "chain" | "key"))
+        {
             continue;
         }
         let id = field(
@@ -1017,17 +1046,30 @@ fn prepare(s: &Settings) -> Result<()> {
         .ok_or("invalid account")?;
     let identity = random_hex(16)?;
     p.write("shared.toml", format!("version = 1\n[account \"{account}\"]\nusername = \"{}\"\n[domain \"{domain}\"]\nmx_host = \"localhost\"\n[alias \"{}\"]\naccount = \"{account}\"\n[identity \"{identity}\"]\naccount = \"{account}\"\nemail = \"{}\"\n", s.account, s.account, s.account))?;
-    let mut base = format!("[server]\nhostname = \"localhost\"\njmap_origin = \"https://localhost:{}\"\n[resolver \"primary\"]\naddress = \"{}\"\n[relay]\nroute = \"local-relay\"\nhost = \"{}\"\nport = {}\nusername = \"{}\"\npassword_file = \"/postgres-material/{}\"\n", s.https_port, s.resolver, s.relay_host, s.relay_port, s.relay_user, material("password")?);
+    let origin = if s.replica.is_some() {
+        "http://localhost".to_owned()
+    } else {
+        format!("https://localhost:{}", s.https_port)
+    };
+    let mut base = format!("[server]\nhostname = \"localhost\"\njmap_origin = \"{origin}\"\n[resolver \"primary\"]\naddress = \"{}\"\n[relay]\nroute = \"local-relay\"\nhost = \"{}\"\nport = {}\nusername = \"{}\"\npassword_file = \"/postgres-material/{}\"\n", s.resolver, s.relay_host, s.relay_port, s.relay_user, material("password")?);
     if let Some(ca) = materials.get("ca") {
         base.push_str(&format!("ca_file = \"/postgres-material/{ca}\"\n"));
     }
     if s.replica.is_none() {
         p.write("relay.toml", &base)?;
     }
-    base.push_str(&format!("[certificate \"local\"]\nmode = \"files\"\nchain_file = \"/postgres-material/{}\"\nkey_file = \"/postgres-material/{}\"\n", material("chain")?, material("key")?));
-    p.write("frontend.toml", format!("{base}[listener \"https\"]\nkind = \"https\"\nbind = \"127.0.0.1:{}\"\ncertificate = \"local\"\n", s.https_port))?;
-    if s.replica.is_none() {
-        p.write("receive.toml", format!("{base}[listener \"smtp\"]\nkind = \"direct_smtp\"\nbind = \"127.0.0.1:{}\"\nserver_name = \"localhost\"\ncertificate = \"local\"\nsession_limit = 2\nper_peer_limit = 2\n", s.smtp_port))?;
+    if s.replica.is_some() {
+        let socket = Json::Str(text(&p.path("jmap/socket"))?.into()).to_canonical();
+        p.write(
+            "frontend.toml",
+            format!("{base}[listener \"local\"]\nkind = \"local_jmap\"\nbind = {socket}\n"),
+        )?;
+    } else {
+        base.push_str(&format!("[certificate \"local\"]\nmode = \"files\"\nchain_file = \"/postgres-material/{}\"\nkey_file = \"/postgres-material/{}\"\n", material("chain")?, material("key")?));
+        p.write("frontend.toml", format!("{base}[listener \"https\"]\nkind = \"https\"\nbind = \"127.0.0.1:{}\"\ncertificate = \"local\"\n", s.https_port))?;
+        if s.replica.is_none() {
+            p.write("receive.toml", format!("{base}[listener \"smtp\"]\nkind = \"direct_smtp\"\nbind = \"127.0.0.1:{}\"\nserver_name = \"localhost\"\ncertificate = \"local\"\nsession_limit = 2\nper_peer_limit = 2\n", s.smtp_port))?;
+        }
     }
     let version = field(&p.mta("config-version", &["config-version"])?, "version")?;
     p.write("config-version", &version)?;
@@ -1127,16 +1169,21 @@ COMMIT;
     } else {
         "local"
     };
-    p.write("mail.toml", format!("[account.{client_account}]\nwell_known_url = \"https://localhost:{}/.well-known/jmap\"\nusername = {}\npassword_command = {}\ntls_ca_file = {}\n[mail]\nreply_from = {}\n", s.https_port, toml(&s.account), toml(&password_command), toml(text(&p.path("tls/ca.pem"))?), toml(&s.account)))?;
+    let endpoint = if s.replica.is_some() {
+        format!(
+            "well_known_url = \"http://localhost/.well-known/jmap\"\nunix_socket = {}\n",
+            toml(text(&p.path("jmap/socket"))?)
+        )
+    } else {
+        format!(
+            "well_known_url = \"https://localhost:{}/.well-known/jmap\"\ntls_ca_file = {}\n",
+            s.https_port,
+            toml(text(&p.path("tls/ca.pem"))?)
+        )
+    };
+    p.write("mail.toml", format!("[account.{client_account}]\n{endpoint}username = {}\npassword_command = {}\n[mail]\nreply_from = {}\n", toml(&s.account), toml(&password_command), toml(&s.account)))?;
     if let Some(replica) = &s.replica {
-        replica_services(
-            &p,
-            &postgres,
-            &host_program("openssl")?,
-            replica,
-            &epoch,
-            &account,
-        )?;
+        replica_services(&p, &postgres, replica, &epoch, &account)?;
         println!(
             "Replica setup complete: {} (services stopped; initial copy pending)",
             s.root.display()
@@ -1170,7 +1217,7 @@ COMMIT;
             shell(&p.path(&format!("{profile}/runtime")))
         ));
     }
-    start.push_str(&format!("\nClient:\n  td-net launch --allow-loopback td-mail --config={}\nRelay uses implicit TLS. Setup did not send any mail.\nLeaf certificates expire in 90 days; renew before expiry (DEPLOYMENT.md).\nProtect this directory and backups: it contains passwords and private keys.\n", shell(&p.path("mail.toml"))));
+    start.push_str(&format!("\nClient:\n  td-mail --config={}\nRelay uses implicit TLS. Setup did not send any mail.\nLeaf certificates expire in 90 days; renew before expiry (DEPLOYMENT.md).\nProtect this directory and backups: it contains passwords and private keys.\n", shell(&p.path("mail.toml"))));
     p.write("START.txt", start)?;
     println!(
         "Local setup complete: {} (services stopped)",
@@ -1232,7 +1279,31 @@ mod tests {
         .to_vec()
     }
     #[test]
-    fn replica_setup_has_distinct_ports_and_refuses_sending_options() {
+    fn replica_database_has_no_network_or_runtime_trust_authentication() {
+        let s = settings_mode(
+            &replica_args(Path::new("/private/replica")),
+            "/home/test",
+            true,
+        )
+        .unwrap();
+        let (runtime, bootstrap, hba) = database_configuration(&s).unwrap();
+        assert!(runtime.contains("listen_addresses = ''\n"));
+        assert!(runtime.contains("ssl = off\n"));
+        assert!(runtime.contains("unix_socket_permissions = 0600\n"));
+        assert!(runtime.contains("unix_socket_directories = '/private/replica/socket'\n"));
+        assert!(!runtime.contains("ssl_cert_file"));
+        assert!(!hba.contains("trust"));
+        assert!(!hba.contains("setup_admin"));
+        assert!(hba.contains("local td_mta td_mta_reader scram-sha-256\n"));
+        assert!(hba.ends_with("host all all ::/0 reject\n"));
+        assert!(bootstrap.contains("hba_file = '/private/replica/bootstrap-hba.conf'\n"));
+        let uri = database_connection(&s, "reader", "private").unwrap();
+        assert!(uri.contains("@:35433/td_mta?host="));
+        assert!(!uri.contains("sslrootcert"));
+    }
+
+    #[test]
+    fn replica_setup_uses_sockets_and_refuses_sending_options() {
         let args = replica_args(Path::new("/private/replica"));
         let s = settings_mode(&args, "/home/test", true).unwrap();
         assert_eq!(s.pg_port, 35433);
@@ -1242,7 +1313,7 @@ mod tests {
             vec!["--smtp-port", "55226"],
             vec!["--relay-host", "smtp.example.test"],
             vec!["--account", "duplicate@example.test"],
-            vec!["--postgres-port", "54444"],
+            vec!["--https-port", "54444"],
         ] {
             let mut invalid = args.clone();
             invalid.extend(extra.into_iter().map(String::from));
@@ -1272,7 +1343,6 @@ mod tests {
         replica_services(
             &p,
             Path::new("/host/bin/postgres"),
-            Path::new("/host/bin/openssl"),
             s.replica.as_ref().unwrap(),
             "22222222222222222222222222222222",
             "33333333333333333333333333333333",
@@ -1290,17 +1360,13 @@ mod tests {
         assert!(scm.contains("#:requirement '(td-mta-replica-postgres)"));
         let files = fs::read_dir(p.path("services")).unwrap().count();
         assert_eq!(files, 6);
-        let renewal = fs::read_to_string(
-            s.prefix
-                .join("share/td-mta/services/td-mta-maint-replica-tls-renew.service"),
-        )
-        .unwrap();
-        assert!(renewal.contains("--replica-root"));
-        assert!(renewal.contains("--https-port"));
-        assert!(!renewal.contains("--force"));
-        assert!(fs::read_to_string(p.path("START.txt"))
-            .unwrap()
-            .contains("td-mta-maint-replica-tls-renew.timer"));
+        assert!(!s
+            .prefix
+            .join("share/td-mta/services/td-mta-maint-replica-tls-renew.service")
+            .exists());
+        let start = fs::read_to_string(p.path("START.txt")).unwrap();
+        assert!(start.contains("Local sockets need no certificate renewal"));
+        assert!(!start.contains("td-mta-maint-replica-tls-renew"));
         let sync = fs::read_to_string(p.path("services/td-mta-replica-sync.service")).unwrap();
         assert!(sync.contains("replica-follow"));
         assert!(sync.contains("runtime-connection"));

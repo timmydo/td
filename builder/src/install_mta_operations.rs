@@ -16,8 +16,7 @@ const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PA
    --postgres-bin PATH [--tool-library-dir PATH]
    [--backup-max-archive-bytes N] [--backup-max-total-bytes N] [--backup-retain N]]
   [--postgres-tls-dir PATH --postgres-data-dir PATH --postgres-port N
-   --postgres-bin PATH --openssl-bin PATH [--tool-library-dir PATH]
-   [--replica-root PATH --replica-https-port N]]
+   --postgres-bin PATH --openssl-bin PATH [--tool-library-dir PATH]]
 
 Generates independent systemd timers and Shepherd timed services, without starting
 anything. Body scrubbing runs one bounded page per minute, starts a new cycle
@@ -102,9 +101,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
             | "--tool-library-dir"
             | "--postgres-tls-dir"
             | "--postgres-data-dir"
-            | "--postgres-port"
-            | "--replica-root"
-            | "--replica-https-port" => {
+            | "--postgres-port" => {
                 if values.insert(flag.as_str(), value.as_str()).is_some() {
                     return Err(format!("duplicate {flag}"));
                 }
@@ -200,7 +197,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
     } else {
         None
     };
-    let mut renewal = if [
+    let renewal = if [
         "--postgres-tls-dir",
         "--postgres-data-dir",
         "--postgres-port",
@@ -247,29 +244,6 @@ fn options(args: &[String], home: &str) -> Result<Options> {
     } else {
         None
     };
-    if values.contains_key("--replica-root") || values.contains_key("--replica-https-port") {
-        let root = required("--replica-root")?;
-        let port = values
-            .get("--replica-https-port")
-            .ok_or("missing --replica-https-port")?
-            .parse::<u16>()
-            .map_err(|_| "invalid replica HTTPS port")?;
-        if port == 0 {
-            return Err("replica HTTPS port must be nonzero".into());
-        }
-        let renewal = renewal
-            .as_mut()
-            .ok_or("replica renewal requires PostgreSQL TLS settings")?;
-        let prefix = path("--prefix")?.unwrap_or(absolute(home)?.join(".local"));
-        renewal.argv.extend([
-            "--replica-root".into(),
-            text(&root)?.into(),
-            "--mail-bin".into(),
-            text(&prefix.join("bin/td-mta"))?.into(),
-            "--https-port".into(),
-            port.to_string(),
-        ]);
-    }
     if backup.is_none()
         && renewal.is_none()
         && ["--postgres-bin", "--tool-library-dir"]
@@ -432,11 +406,7 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
         let mut argv = vec![text(&helper)?.into()];
         argv.extend(renewal.argv.iter().cloned());
         add(
-            if renewal.argv.iter().any(|v| v == "--replica-root") {
-                "replica-tls-renew".into()
-            } else {
-                "postgres-tls-renew".into()
-            },
+            "postgres-tls-renew".into(),
             argv,
             renewal.environment.clone(),
             Schedule::Daily,

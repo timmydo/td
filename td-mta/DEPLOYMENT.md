@@ -726,64 +726,30 @@ profile, another account's trust, or the CA. Installations using the same old
 leaf for mail listeners must separately update those stored materials using
 the procedure below. Failure notifications and CA rotation remain explicit.
 
-## Automatic replica PostgreSQL and JMAP renewal
+## Local replica transport
 
-New `--setup-replica` installations also generate the daily
-`td-mta-maint-replica-tls-renew` job and print activation commands in
-`START.txt`. Enable it with the same systemd or Shepherd supervisor as the
-replica. Guix Home users must include its generated service definition in
-their retained Home configuration. Generation alone does not enable a job.
+Fresh `--setup-replica` installations use private Unix sockets for both
+PostgreSQL and JMAP. They generate no CA, certificate, private TLS key, or
+renewal job. The local JMAP socket is `ROOT/jmap/socket`; PostgreSQL uses
+`ROOT/socket/.s.PGSQL.PORT` (default PORT 35433). Both directories are private,
+and sockets are mode 0600. PostgreSQL still authenticates owner, publisher and
+reader roles with SCRAM; td-mail still authenticates with its separate local
+device password. The source synchronization connection remains verified HTTPS.
 
-For an existing setup replica, add `--replica-root ROOT` and
-`--replica-https-port PORT` to the operations-services command above, using
-its own prefix, TLS/data directories and PostgreSQL port. This retains the
-host operator helper and generates the same job. The installed td-mta must
-support `postgres config-snapshot`. To exercise renewal immediately, run the
-retained operator directly:
+The previous replica-specific TLS renewal options and job generation have
+been retired. Existing TLS installations need a deliberate transport migration
+before their old job is disabled: retain their credentials, epochs, copy state
+and mail data; stop the sync and reader; select a `local_jmap` profile; configure
+private PostgreSQL sockets and SCRAM-only local role rules; update protected
+connection files and the td-mail account; restart and verify discovery,
+mailboxes, body reads and sync progress. Remove the old renewal service from
+its persistent supervisor configuration. Retain recovery files until validation
+is complete. Do not run fresh setup over an existing root: it intentionally
+refuses existing data. A pending old renewal journal is retained and refused
+by the PostgreSQL-only renewal helper rather than overwritten.
 
-```text
-PREFIX/bin/td-mta-operator install-td-mta --postgres-tls-renew \
-  --tls-dir ROOT/tls --data-dir ROOT/postgres \
-  --postgres-bin /absolute/postgresql/bin --openssl-bin /absolute/openssl \
-  --port 35433 --replica-root ROOT --mail-bin PREFIX/bin/td-mta \
-  --https-port 54444 --force
-```
-
-Replace ROOT and PREFIX with absolute paths. Omit `--force` from schedules.
-The existing CA and server key stay unchanged: td-mail needs no new trust
-file. After renewing and verifying PostgreSQL, the helper passively exports
-the selected configuration from the database. It supports the setup replica's
-single `frontend` JMAP profile and exact retained local key/chain references.
-Other configurations refuse rather than being reconstructed from stale setup
-files. All unrelated source bytes are preserved. It imports a fresh immutable
-chain and configuration version, then selects using the observed generation.
-Concurrent configuration changes cause a conflict, never an overwrite.
-
-The private `tls/mail-renew.json` journal and `tls/mail-renew-request` retain
-candidate identity and the exact selection request before publication. Retry
-without `--force` after interruption or uncertainty. A still-valid pending
-leaf is reused even inside the 30-day renewal window; a pending leaf that
-has already expired refuses before replacing it and requires explicit
-recovery. Keep the journal for that recovery. A retry recognizes an
-already-selected candidate; it never invents a different candidate to hide an
-uncertain commit. Do not delete pending records to bypass a conflict. Inspect
-manual configuration changes first. The service checks its selected configuration every 30 seconds, including
-idle file-certificate replicas, then drains and reloads when it changes. Success requires a new verified
-JMAP handshake presenting the selected certificate and a final selection
-observation. Only then are the setup's chain/version hints advanced and the
-pending journal retired. Source TOML files remain historical setup inputs.
-
-The helper bounds sources, journal and each tool output to 64 KiB, executes
-at most 64 commands with 30-second deadlines, and retains at most 128 known
-scratch entries. The pending journal is a single fixed slot. Immutable
-configuration/material records remain database audit history; selection has
-its existing 1024-receipt ceiling (more than a century of ordinary 60-day
-renewal cycles). Repeated forced renewals consume those records sooner.
-Renewal failures return nonzero to the supervisor. `tls/renew-last-error`
-contains bounded tool diagnostics; validation and selection failures also
-appear in the job's supervisor log. Check the job's last result, both served
-certificates, and CA expiry. Scheduling does not itself deliver email alerts;
-CA rotation and notification routing remain explicit operator choices.
+Public HTTPS/ACME and a primary's network PostgreSQL TLS renewal are independent
+of this local transport and remain enabled where configured.
 
 ## Renew a local private certificate
 
@@ -972,8 +938,9 @@ explicit body/blob/Email/receipt quotas. Source credentials stay separate from
 the new local JMAP password. The installer discovers source IDs through HTTPS;
 no custom SQL or PostgreSQL access to the source is needed.
 
-The default PostgreSQL and HTTPS ports are 35433 and 54444. Its systemd and
-Shepherd service names are `td-mta-replica-postgres`, `td-mta-replica` and
+PostgreSQL and JMAP use private Unix sockets and require no local certificate
+renewal. `--postgres-port` (default 35433) selects only the PostgreSQL socket
+filename; no local TCP listener is created. Its systemd and Shepherd service names are `td-mta-replica-postgres`, `td-mta-replica` and
 `td-mta-replica-sync`, so they
 can coexist with an ordinary local setup. Follow the generated `START.txt` to
 start one supervisor and use `mail.toml` with td-mail. The sync worker continues
@@ -981,6 +948,5 @@ bounded rounds with idle polling and failure backoff; the reader stays usable
 when the source is offline. Generated instructions include historical sync
 status and a manual copy command to use with the worker stopped.
 Services are not enabled automatically. Initial preparation is not a complete
-copy. No SMTP or relay service is generated. Certificate renewal is not yet automated for this setup; the leaf expires
-in 90 days. [REPLICATION.md](REPLICATION.md#fresh-local-provisioning) records the
+copy. No SMTP, relay or local TLS renewal service is generated. [REPLICATION.md](REPLICATION.md#fresh-local-provisioning) records the
 copy, credential and recovery boundaries.

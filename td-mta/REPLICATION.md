@@ -644,9 +644,10 @@ enter command output. There are no new listeners or service activation.
 ## Local access and diagnostics
 
 Upstream credentials use protected files and verified HTTPS. Local access has
-separate credentials; binding loopback is not authentication against other
-local users. Qualify a supported local transport/trust setup before shipping;
-do not weaken td-mail's public HTTPS verification. Offline reading of previously
+separate credentials and private Unix sockets in the fresh local setup. Socket
+permissions protect access by other local users; account authentication remains
+required. Explicit loopback HTTPS remains supported for separately configured
+profiles and needs certificate management. Public HTTPS verification is unchanged. Offline reading of previously
 copied mail remains possible when upstream credentials expire or are revoked;
 revocation prevents future synchronization but cannot retract downloaded data.
 
@@ -761,7 +762,7 @@ It reports no full-copy or disaster-recovery qualification.
 
 `./install-td-mta --setup-replica --help` describes preparation of a fresh,
 private local PostgreSQL installation. It uses the installed td-mta executable,
-PostgreSQL 17 and openssl, like `--setup-local`, and never adopts existing data.
+and PostgreSQL 17, requires no OpenSSL, and never adopts existing data.
 An explicit source origin, protected source password, local account address,
 resolver and positive body/blob/Email/receipt quotas are required. Source login
 defaults to the account address; `--source-username` overrides it. Optional
@@ -774,14 +775,22 @@ publisher and reader PostgreSQL logins and an independent local device
 password. Source credentials and optional CA are copied into protected files.
 The shared config grammar still requires a relay record: the replica gets an
 unused localhost route with a random password, never the source credential.
-Only a loopback JMAP profile is selected; no SMTP, relay or ACME service exists.
+Only a private `local_jmap` profile is selected; no SMTP, relay or ACME service exists.
 
-Default ports are PostgreSQL 35433 and HTTPS 54444. Generated service names
+PostgreSQL uses `ROOT/socket/.s.PGSQL.PORT` (default PORT 35433), with no TCP
+listener or TLS. Final local HBA rules require SCRAM for the three mail roles
+and reject everything else. A separate bootstrap HBA grants only the temporary
+setup administrator local trust during provisioning. JMAP uses `ROOT/jmap/socket`
+with the fixed logical origin `http://localhost`. Both sockets are owned mode
+0600 in mode-0700 directories. No local CA, leaf, key or renewal job is created.
+Generated service names
 `td-mta-replica-postgres`, `td-mta-replica` and `td-mta-replica-sync` differ from the ordinary local
 setup's names, allowing one of each per user manager. Both systemd and Shepherd
 files are emitted, with reader ordering behind PostgreSQL. Services are left
 stopped. `START.txt` gives supervisor and bounded copy commands, and `mail.toml`
-uses the separate local password and generated CA. Quotas are mail publication
+uses the separate local password and explicit `unix_socket`. The installed
+`td-mail` launcher grants that path after `./install-apps`; no shell wrapper is
+needed. The optional source CA still applies only to remote synchronization. Quotas are mail publication
 bounds, not filesystem free-space reservations.
 
 The generated td-mail account name is `replica`, separate from an ordinary
@@ -789,9 +798,8 @@ local setup's `local` account. These names also select td-mail's cache files;
 keep a distinct name when combining this configuration with existing accounts.
 
 This prepares an initial, incomplete account. Starting the generated sync
-service continues copying. It does not enable history reset, certificate
-renewal, promotion or recovery. Operators must renew the 90-day leaf certificates
-before expiry. Interrupted setup retains its directory and private receipts;
+service continues copying. It does not enable history reset, promotion or
+recovery. Local sockets have no certificates to renew. Interrupted setup retains its directory and private receipts;
 there is no automatic resume or overwrite. Full-copy qualification and offline
 attachment acceptance remain separate from successful provisioning.
 

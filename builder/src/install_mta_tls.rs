@@ -8,19 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 use std::time::Duration;
 
-#[path = "install_mta_tls_mail.rs"]
-mod install_mta_tls_mail;
-
 const HELP: &str = "Usage: ./install-td-mta --postgres-tls-renew --tls-dir PATH --data-dir PATH
   --postgres-bin PATH --openssl-bin PATH --port N [--force]
-  [--replica-root PATH --mail-bin PATH --https-port N]
 
 Renews the local-only localhost/127.0.0.1 PostgreSQL certificate below 30 days.
 Uses the existing CA and server key; issues a 90-day leaf, retains the previous
 certificate, reloads PostgreSQL and verifies its presented certificate. Does not
-rotate CA trust or send mail. The optional replica group updates its stored JMAP
-certificate using retained configuration selection; supervision reloads mail. Run as the
-cluster owner. --force exercises renewal even when the current leaf is not due.
+rotate CA trust or send mail. Run as the cluster owner. --force exercises renewal even when the current leaf is not due.
 ";
 const LIMIT: u64 = 65536;
 const MARGIN: u64 = 30 * 86400;
@@ -31,7 +25,6 @@ struct Options {
     openssl: PathBuf,
     port: u16,
     force: bool,
-    mail: Option<install_mta_tls_mail::Options>,
 }
 fn options(args: &[String]) -> Result<Options> {
     let mut values = BTreeMap::new();
@@ -51,9 +44,6 @@ fn options(args: &[String]) -> Result<Options> {
             "--postgres-bin",
             "--openssl-bin",
             "--port",
-            "--replica-root",
-            "--mail-bin",
-            "--https-port",
         ]
         .contains(&flag.as_str())
         {
@@ -83,24 +73,6 @@ fn options(args: &[String]) -> Result<Options> {
         openssl: absolute(required("--openssl-bin")?)?,
         port,
         force,
-        mail: if values.contains_key("--replica-root")
-            || values.contains_key("--mail-bin")
-            || values.contains_key("--https-port")
-        {
-            let https_port = required("--https-port")?
-                .parse::<u16>()
-                .map_err(|_| "invalid HTTPS port")?;
-            if https_port == 0 || https_port == port {
-                return Err("HTTPS port must be nonzero and distinct".into());
-            }
-            Some(install_mta_tls_mail::Options {
-                root: absolute(required("--replica-root")?)?,
-                binary: absolute(required("--mail-bin")?)?,
-                port: https_port,
-            })
-        } else {
-            None
-        },
     })
 }
 fn private_dir(path: &Path) -> Result<()> {
@@ -360,17 +332,13 @@ fn renew(opts: &Options) -> Result<()> {
     private_dir(&opts.tls)?;
     private_dir(&opts.data)?;
     let _lock = lock(&opts.tls)?;
-    if opts.force
-        && opts
-            .tls
-            .join("mail-renew.json")
-            .try_exists()
-            .map_err(|e| e.to_string())?
+    if opts
+        .tls
+        .join("mail-renew.json")
+        .try_exists()
+        .map_err(|e| e.to_string())?
     {
-        return Err("finish pending mail renewal without --force first".into());
-    }
-    if let Some(mail) = &opts.mail {
-        private_dir(&mail.root)?;
+        return Err("retired replica TLS renewal is pending; retain the journal and migrate the replica to private sockets before retiring its TLS state".into());
     }
     // Validate the diagnostic target before the bounded tool runner can truncate it.
     match fs::symlink_metadata(opts.tls.join("renew-last-error")) {
@@ -464,26 +432,7 @@ fn renew(opts: &Options) -> Result<()> {
     if !valid.success() && valid.code() != Some(1) {
         return Err("cannot inspect certificate expiry".into());
     }
-    let pending = opts
-        .tls
-        .join("mail-renew.json")
-        .try_exists()
-        .map_err(|e| e.to_string())?;
-    if pending && opts.mail.is_none() {
-        return Err(
-            "pending replica renewal requires the replica options; certificate retained".into(),
-        );
-    }
-    if pending {
-        let (still_valid, _) = work.execute(openssl(
-            opts,
-            &["x509", "-in", "server.pem", "-checkend", "0", "-noout"],
-        ))?;
-        if !still_valid.success() {
-            return Err("pending replica certificate has expired; retain journal and recover explicitly before issuing another leaf".into());
-        }
-    }
-    let changed = issue_leaf(opts.force, valid.success(), pending);
+    let changed = opts.force || !valid.success();
     let certificate = if changed {
         let request = work.checked(openssl(
             opts,
@@ -576,9 +525,6 @@ fn renew(opts: &Options) -> Result<()> {
             return Err("PostgreSQL did not present the selected certificate after reload; certificate retained, inspect and retry".into());
         }
     }
-    if let Some(mail) = &opts.mail {
-        install_mta_tls_mail::renew(opts, mail, &mut work, &certificate)?;
-    }
     match fs::remove_file(&work.diagnostic) {
         Ok(()) => (),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
@@ -586,10 +532,6 @@ fn renew(opts: &Options) -> Result<()> {
     }
     println!("{{\"status\":\"ready\",\"renewed\":{changed},\"reloaded\":{reloaded},\"peer_certificate_verified\":true}}");
     Ok(())
-}
-
-fn issue_leaf(force: bool, outside_margin: bool, pending: bool) -> bool {
-    !pending && (force || !outside_margin)
 }
 
 pub(super) fn run(args: &[String]) -> ExitCode {
@@ -610,16 +552,6 @@ pub(super) fn run(args: &[String]) -> ExitCode {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    #[test]
-    fn pending_renewal_keeps_its_leaf_inside_the_renewal_window() {
-        for force in [false, true] {
-            for outside_margin in [false, true] {
-                assert!(!issue_leaf(force, outside_margin, true));
-            }
-        }
-        assert!(issue_leaf(false, false, false));
-        assert!(!issue_leaf(false, true, false));
-    }
     #[test]
     fn names_refuse_other_hostnames_and_extra_addresses() {
         assert!(local_names(
