@@ -55,6 +55,8 @@ pub enum Phase {
     JmapSearch,
     ReplicaInventory,
     ReplicaMetadata,
+    ResponseLedgerLock,
+    ResponseLedgerQuota,
 }
 impl Phase {
     pub const ALL: &'static [Self] = &[
@@ -105,6 +107,8 @@ impl Phase {
         Self::JmapSearch,
         Self::ReplicaInventory,
         Self::ReplicaMetadata,
+        Self::ResponseLedgerLock,
+        Self::ResponseLedgerQuota,
     ];
     pub const fn code(self) -> &'static str {
         match self {
@@ -155,6 +159,8 @@ impl Phase {
             Self::JmapSearch => "jmap_search",
             Self::ReplicaInventory => "replica_inventory",
             Self::ReplicaMetadata => "replica_metadata",
+            Self::ResponseLedgerLock => "response_ledger_lock",
+            Self::ResponseLedgerQuota => "response_ledger_quota",
         }
     }
 }

@@ -23,7 +23,9 @@ mod compose_text;
 
 // Compile filesystem and checker sources with their cfg(test) fixtures.
 // Filesystem fixtures need no production exception for the mapped test identity.
-use td_mta::{bounded, config, format, ids, limits, ownership, ports, store_paths, wire};
+use td_mta::{
+    bounded, config, format, ids, limits, ownership, performance, ports, store_paths, wire,
+};
 pub use td_mta::{mailbox_sweep, reference_sweep};
 #[path = "../src/admission.rs"]
 #[allow(unused)] // Keep quota/work helpers in this measured source compilation.

@@ -163,20 +163,28 @@ impl<'c, 'sr, 'a> RetentionOwner<'c, 'sr, 'a> {
         kind: Kind,
         maximum: u64,
     ) -> Result<ResponseRetention<'c, 's, 'sr, 'a>, ResponseError> {
-        let mut state = self.state().try_lock().map_err(|error| match error {
-            std::sync::TryLockError::WouldBlock => ports::Error::Busy,
-            std::sync::TryLockError::Poisoned(_) => ports::Error::WriterStopped,
-        })?;
+        let lock_timing =
+            crate::performance::Timer::start(crate::performance::Phase::ResponseLedgerLock);
+        // Storage workers serialize only in-memory accounting. Filesystem
+        // work stays outside the guard, and admission checks time afterward.
+        let mut state = self
+            .state()
+            .lock()
+            .map_err(|_| ports::Error::WriterStopped)?;
+        lock_timing.finish(crate::performance::Outcome::Success);
         if state.stopped {
             return Err(ports::Error::WriterStopped.into());
         }
-        // Preserve one cell for simultaneous durable publication/maintenance.
-        if state.ledger.available_cells() < 2 {
-            return Err(logical::Error::Full.into());
-        }
         let mut last = self.clock().sample()?.monotonic;
         let now = self.time(deadline, &mut last)?.monotonic;
-        let lease = state.ledger.reserve(
+        let quota_timing =
+            crate::performance::Timer::start(crate::performance::Phase::ResponseLedgerQuota);
+        // Preserve one cell for simultaneous durable publication/maintenance.
+        if state.ledger.available_cells() < 2 {
+            quota_timing.finish(crate::performance::Outcome::Busy);
+            return Err(logical::Error::Full.into());
+        }
+        let reserved = state.ledger.reserve(
             &[[
                 Charge {
                     kind,
@@ -188,7 +196,15 @@ impl<'c, 'sr, 'a> RetentionOwner<'c, 'sr, 'a> {
             ]],
             deadline,
             now,
-        )?;
+        );
+        quota_timing.finish(match &reserved {
+            Ok(_) => crate::performance::Outcome::Success,
+            Err(logical::Error::Quota(_) | logical::Error::Full) => {
+                crate::performance::Outcome::Busy
+            }
+            Err(_) => crate::performance::Outcome::Failed,
+        });
+        let lease = reserved?;
         let effect = match state
             .ledger
             .part(lease, 0)
@@ -653,6 +669,39 @@ mod tests {
             assert!(owner.retain_response(deadline()).is_err());
             drop(next);
             assert_eq!(owner.used().unwrap(), 72000);
+        });
+    }
+    #[test]
+    fn response_admission_rechecks_deadline_before_reserving() {
+        response_only(|owner, _, clock| {
+            clock.0.store(100, Ordering::SeqCst);
+            assert!(matches!(
+                owner.retain_response(deadline()),
+                Err(ResponseError::Store(ports::Error::Deadline))
+            ));
+            assert_eq!(owner.spool.status().occupied_slots, 0);
+            assert_eq!(owner.used().unwrap(), 0);
+            clock.0.store(1, Ordering::SeqCst);
+            owner
+                .retain_response(deadline())
+                .unwrap()
+                .discard()
+                .unwrap();
+        });
+    }
+    #[test]
+    fn poisoned_response_accounting_refuses_before_file_creation() {
+        response_only(|owner, _, _| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = owner.state.lock().unwrap();
+                panic!("poison fixture");
+            }));
+            assert!(result.is_err());
+            assert!(matches!(
+                owner.retain_response(deadline()),
+                Err(ResponseError::Store(ports::Error::WriterStopped))
+            ));
+            assert_eq!(owner.spool.status().occupied_slots, 0);
         });
     }
     #[test]

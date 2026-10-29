@@ -62,6 +62,15 @@ and auxiliary request indexes. It conveys no durable-mail quota or device
 authority. There are no native database-view or external-sort hooks on this
 owner. [ADMISSION.md](ADMISSION.md) owns generic work and retention rules.
 
+Storage workers serialize the short in-memory response-ledger section on its
+mutex instead of treating momentary contention as exhausted capacity. No
+filesystem, database or peer operation holds that guard; cleanup unlinks before
+acquiring it. Admission freshly checks the original deadline after acquisition
+and before reserving space. Poisoned accounting refuses; actual quota and cell
+exhaustion still refuse without starting a method. This is ordinary worker
+mutex waiting, not an interruptible wait or a host-scheduler deadline guarantee.
+
+
 ## Qualification and operations
 
 The native gate runs real PostgreSQL fixtures with the checkout's td-mail
