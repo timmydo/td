@@ -171,6 +171,7 @@ mod portal_tests {
         );
         let mut placeholder = crate::config::AccountConfig {
             tls_ca_file: None,
+            unix_socket: None,
             name: "main".to_string(),
             well_known_url: "https://mail.example.com/.well-known/jmap".to_string(),
             username: "you@example.com".to_string(),
@@ -221,6 +222,7 @@ pub fn connect_account(account: &AccountConfig) -> Result<JmapClient, String> {
         &account.username,
         &password,
         account.tls_ca_file.as_deref(),
+        account.unix_socket.as_deref(),
     )
     .map_err(|e| match e {
         // The diagnostic already names what is missing and what
@@ -358,6 +360,7 @@ Rules:
 - `well_known_url`, `username`, and exactly one of `password_command` or `secret` are required per account.
 - `secret = "portal"` asks td's credential portal for the secret stored as mail/NAME for [account.NAME] (mail/default for a legacy [jmap] section); it needs no shell and no file, and it works inside a td jail only, where the helper is packaged. Submit the secret from the human session with `td-secret set mail/NAME < file`, then press Ctrl+Alt+Esc and W, verify the target and touch the enrolled token. NAME is 1 to 64 bytes of [A-Za-z0-9_-].
 - `password_command` is a shell command that prints the password to stdout.
+- Optional `unix_socket` names a private local socket and requires `http://localhost/.well-known/jmap` with no `tls_ca_file`. Install with `./install-apps`; the named launcher grants these exact paths. Restart after changing a socket path.
 - Optional `tls_ca_file` names an absolute path to a PEM CA bundle (at most 64 KiB), read on connect. It replaces public roots only for the HTTPS origin of `well_known_url`; other origins use public roots. Certificate and hostname verification remain enabled.
 - Quoted strings support \", \\, \n, \t escapes.
 - `scrolloff` and `[theme]` were the terminal's; they are accepted and ignored. The window keeps the selection in view and draws with the toolkit's colours.
@@ -529,6 +532,7 @@ fn print_help_config() {
     );
     println!("  username = \"user@example.com\"                    # Email address (required)");
     println!("  secret = \"portal\"                                # The credential portal, mail/NAME (this or password_command)");
+    println!("  # unix_socket = \"/absolute/path/jmap/socket\"      # Local replica; use http://localhost/.well-known/jmap and no TLS CA");
     println!("  tls_ca_file = \"/absolute/path/ca.pem\"              # Optional private CA for this HTTPS origin");
     println!("  password_command = \"pass show email/example\"     # Shell command printing the password (or secret)");
     println!("  reply_from, archive_folder, deleted_folder,      # Optional: [mail]'s keys for this account alone");
@@ -548,6 +552,46 @@ fn print_help_config() {
     println!(
         "Legacy: [jmap] section with well_known_url, username, password_command is also supported."
     );
+}
+
+/// Launcher-only export: parse configuration without running credentials,
+/// touching logs or caches, or requiring the replica to be running.
+fn fetch_unix_endpoints(args: &[String]) -> Result<(), String> {
+    use std::io::Write;
+    if args
+        .iter()
+        .any(|a| a != "--fetch-unix-endpoints" && !a.starts_with("--config="))
+    {
+        return Err("endpoint export accepts only --config=PATH".into());
+    }
+    let path = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--config=").map(PathBuf::from))
+        .unwrap_or_else(default_config_path);
+    let config = match Config::load(&path) {
+        Ok(config) => Some(config),
+        Err(config::ConfigError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err("cannot read mail configuration for private endpoint grants".into()),
+    };
+    let mut endpoints = Vec::new();
+    if let Some(config) = config {
+        for account in config.accounts {
+            if let Some(path) = account.unix_socket {
+                if !endpoints.contains(&path) {
+                    if endpoints.len() == 64 {
+                        return Err("at most 64 private Unix endpoints may be granted".into());
+                    }
+                    endpoints.push(path);
+                }
+            }
+        }
+    }
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "td-mail-unix-v1").map_err(|e| e.to_string())?;
+    for path in endpoints {
+        writeln!(out, "{path}").map_err(|e| e.to_string())?;
+    }
+    out.flush().map_err(|e| e.to_string())
 }
 
 fn main() {
@@ -570,6 +614,15 @@ fn main() {
         eprintln!("  --help-config    Print default config path and all options");
         eprintln!("  --help           Show this help");
         std::process::exit(0);
+    }
+
+    if args.iter().any(|a| a == "--fetch-unix-endpoints") {
+        let result = fetch_unix_endpoints(&args);
+        if let Err(error) = result {
+            eprintln!("td-mail: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     if args.iter().any(|a| a == "--clear-cache") {

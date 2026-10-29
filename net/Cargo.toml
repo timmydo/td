@@ -36,6 +36,7 @@ sha2 = "0.11"
 webpki-roots = "=1.0.11"
 ring = "0.17"
 td-engine = { path = "../engine" }
+td-fs = { path = "../td-fs" }
 
 # Rust coding rules (AGENTS.md → "Rust code"). This is a NETWORK tool — the only
 # tier allowed dependencies (the vendored-through-the-cargo-proxy FSDG set above);
@@ -57,3 +58,9 @@ indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
 [profile.release]
 strip = true
+
+# Test-only launcher sibling, built by cargo test rather than invoking a
+# compiler from inside a memory-capped fixture.
+[[example]]
+name = "mail-launcher-fixture"
+path = "tests/fixtures/mail_launcher.rs"

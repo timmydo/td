@@ -10550,7 +10550,21 @@ webpki-roots, and no decoder. So:
    origins use public roots. The file must be visible to the application
    in its jail. This changes TLS trust, never the destination policy.
 
-   Counted, non-public HTTPS requests can reuse a connection when GET
+   An explicitly configured host service may grant at most 64 canonical
+   absolute Unix socket paths with repeated `--allow-unix PATH`. A counted
+   request selects one exact path with `unix-socket PATH`, `redirects 0`,
+   no `tls-ca`, and the fixed logical origin `http://localhost` without a
+   port. Public, streamed and automatic-redirect combinations are refused.
+   The service uses its own HTTP parser to check the origin, performs no
+   DNS lookup and has no TCP fallback. Before each request and connection
+   it checks the same-UID mode-0600 socket in a mode-0700 directory, with
+   physical root/current-UID ancestors (writable ancestors must be sticky).
+   Root and same-UID namespace writers are trusted. Connecting has a
+   deadline through td-fs's bounded connector; pooled blocking Unix I/O
+   retains per-exchange read/write deadlines. The exact socket path is
+   part of the pool key. Image fetch services grant no paths by default.
+
+   Counted, non-public HTTPS or granted Unix requests can reuse a connection when GET
    explicitly requests zero redirects, or POST carries a nonempty body.
    Every exchange supplies fresh headers and credentials. Each agent is
    exclusively checked out until its bounded response is fully consumed;
@@ -10559,7 +10573,7 @@ webpki-roots, and no decoder. So:
    workers. Checkout and return retire agents after four idle seconds,
    sixty seconds of lifetime or sixteen completed exchanges; there is no
    background idle reaper. ureq still keys sockets by origin and applies
-   address policy when connecting. HTTP, automatic redirects, empty POST,
+   address policy when connecting. Network HTTP, automatic redirects, empty POST,
    public-policy and streamed requests do not reuse pooled connections.
    ureq does not resend a request on a pooled connection, and an empty
    mutation stays off one regardless; a nonempty POST is not replayed
@@ -11867,6 +11881,22 @@ redirects, not an account-specific address grant. No password, configuration
 file, shell function or environment switch is needed to select the launcher
 policy. Installed `td-news` and `td-agent` launches retain strict loopback
 refusal, including the agent's egress relay.
+
+For certificate-free local mail, the installed `td-mail` launcher asks its
+trusted sibling binary for `--fetch-unix-endpoints`, passing only the same
+first `--config=PATH` override the application uses. The exporter parses at
+most 1 MiB of configuration, never runs password commands or writes logs
+or caches, and emits a versioned list of at most 64 explicit `unix_socket`
+paths. The launch caps output at 8192 bytes, enforces a ten-second child
+and read deadline, and kills/reaps a failed exporter before serving anything.
+Help, prompts, log/rules display and offline launches skip discovery. A
+missing configuration yields no grants; invalid configuration fails closed.
+No socket needs to exist until an actual fetch, so offline caching remains
+usable while the replica is stopped. Changing a configured socket requires
+restarting td-mail. The path is carried in every request, so a changed
+configuration cannot silently bind credentials to a different granted path.
+Each local account still authenticates normally. The generic launcher and
+other named applications do not discover or grant these paths.
 
 For an explicit diagnostic launch, `td-net launch --allow-loopback
 /absolute/path/to/td-mail --config=/absolute/path/to/mail.toml` retains its

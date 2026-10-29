@@ -384,6 +384,33 @@ does not load, and the rules file is not used. So is an unknown key in
 a rule, its actions or its triage, so a misspelled `account` cannot
 leave a rule running for every account.
 
+A local replica can use a private Unix socket without certificates:
+
+```toml
+[account.replica]
+well_known_url = "http://localhost/.well-known/jmap"
+unix_socket = "/home/me/.local/state/td-mta-replica/jmap/socket"
+username = "mail@example.com"
+password_command = "cat /home/me/.config/td-mail/replica.password"
+```
+
+Use the socket path emitted by the replica installer. It must be an absolute,
+canonical path of at most 107 bytes, with no control characters. The socket
+must belong to your user with mode 0600 in a mode-0700 directory. Parent
+components must be physical directories owned by root or your user; a
+writable ancestor must be sticky. Keep other users from writing these paths.
+`unix_socket` requires the exact discovery URL above and cannot be combined
+with `tls_ca_file`. Account authentication remains required.
+
+After `./install-apps`, ordinary `td-mail` grants its fetch service only the
+configured socket paths. No shell wrapper or renewal job is needed. All
+session, API and download requests stay on that socket; a remote advertised
+URL or redirect is refused, with no TCP fallback. Public content requests
+cannot use it. The replica may be stopped when launching; the grant is
+checked on connection, so cached offline mail remains available. Restart
+td-mail after changing `unix_socket`; edit these accounts in the config file
+rather than the HTTPS setup form. Configuration files are limited to 1 MiB.
+
 For a private HTTPS server, an account may set
 `tls_ca_file = "/absolute/path/to/ca.pem"`. The file contains public CA
 certificates in PEM format (1–65536 bytes), never a private key. td-mail

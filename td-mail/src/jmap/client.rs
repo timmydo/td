@@ -238,6 +238,7 @@ struct Fetched {
 
 #[derive(Default)]
 struct AccountTrust {
+    unix_socket: Option<String>,
     origin: Option<String>,
     pem: Option<Vec<u8>>,
 }
@@ -272,7 +273,31 @@ impl AccountTrust {
         Ok(Self {
             origin: JmapClient::origin(url),
             pem: Some(pem),
+            unix_socket: None,
         })
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        limit: Option<u64>,
+    ) -> Result<td_fetch_client::Response, td_fetch_client::Error> {
+        match self.unix_socket.as_deref() {
+            Some(path) => {
+                td_fetch_client::request_with_unix_socket(method, url, headers, body, limit, path)
+            }
+            None => td_fetch_client::request_with_ca(
+                method,
+                url,
+                headers,
+                body,
+                limit,
+                self.roots_for(url),
+            ),
+        }
     }
 
     fn roots_for(&self, url: &str) -> Option<&[u8]> {
@@ -298,16 +323,7 @@ fn get_with_auth(
     }
     let headers: Vec<(&str, &str)> = auth.map(|a| ("authorization", a)).into_iter().collect();
     let response = read_backoff(
-        || {
-            td_fetch_client::request_with_ca(
-                "GET",
-                url,
-                &headers,
-                &[],
-                RESPONSE_LIMIT,
-                trust.roots_for(url),
-            )
-        },
+        || trust.request("GET", url, &headers, &[], RESPONSE_LIMIT),
         std::thread::sleep,
     )
     .map_err(|e| JmapError::Http(e.to_string()))?;
@@ -588,11 +604,20 @@ impl JmapClient {
         username: &str,
         password: &str,
         tls_ca_file: Option<&str>,
+        unix_socket: Option<&str>,
     ) -> Result<(JmapSession, Self), JmapError> {
         log_info!("[JMAP] Discovering JMAP session from: {}", well_known_url);
         let auth = Self::auth_header(username, password);
 
-        let trust = AccountTrust::load(well_known_url, tls_ca_file)?;
+        let mut trust = AccountTrust::load(well_known_url, tls_ca_file)?;
+        if let Some(path) = unix_socket {
+            if tls_ca_file.is_some() || well_known_url != "http://localhost/.well-known/jmap" {
+                return Err(JmapError::Http(
+                    "unix_socket requires the local JMAP origin and no TLS CA".into(),
+                ));
+            }
+            trust.unix_socket = Some(path.to_string());
+        }
         let (_final_url, response_text) =
             Self::fetch_with_auth_following_redirects(well_known_url, &auth, 5, &trust)?;
 
@@ -684,7 +709,7 @@ impl JmapClient {
         let send = || {
             attempts.set(attempts.get().saturating_add(1));
             let attempt_started = std::time::Instant::now();
-            let result = td_fetch_client::request_with_ca(
+            let result = self.trust.request(
                 "POST",
                 &self.api_url,
                 &[
@@ -693,7 +718,6 @@ impl JmapClient {
                 ],
                 request_json.as_bytes(),
                 RESPONSE_LIMIT,
-                self.trust.roots_for(&self.api_url),
             );
             log_info!(
                 "[JMAP] HTTP methods={} attempt={} elapsed_ms={} status={} request_bytes={} response_bytes={}",
@@ -1661,18 +1685,19 @@ impl JmapClient {
             url
         );
         let auth = Self::auth_header(&self.username, &self.password);
-        let response = td_fetch_client::request_with_ca(
-            "POST",
-            &url,
-            &[
-                ("authorization", auth.as_str()),
-                ("content-type", content_type),
-            ],
-            bytes,
-            RESPONSE_LIMIT,
-            self.trust.roots_for(&url),
-        )
-        .map_err(|e| JmapError::Http(e.to_string()))?;
+        let response = self
+            .trust
+            .request(
+                "POST",
+                &url,
+                &[
+                    ("authorization", auth.as_str()),
+                    ("content-type", content_type),
+                ],
+                bytes,
+                RESPONSE_LIMIT,
+            )
+            .map_err(|e| JmapError::Http(e.to_string()))?;
         if response.status >= 400 {
             return Err(JmapError::Http(format!(
                 "{}: status code {}",
@@ -2321,6 +2346,25 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unix_account_never_sends_session_urls_to_a_network_origin() {
+        let trust = AccountTrust {
+            unix_socket: Some("/private/socket".into()),
+            ..AccountTrust::default()
+        };
+        for url in [
+            "https://elsewhere/api",
+            "http://localhost:80/api",
+            "http://localhost.evil/download",
+            "https://localhost/upload",
+        ] {
+            assert!(matches!(
+                trust.request("POST", url, &[("authorization", "secret")], b"{}", None),
+                Err(td_fetch_client::Error::Malformed(_))
+            ));
+        }
+    }
 
     #[test]
     fn account_ca_is_loaded_bounded_and_scoped_to_one_origin() {

@@ -1760,7 +1760,7 @@ fn is_format_check(command: &str) -> bool {
 
 /// td-net's tests. td-net is outside the roster, so the format check rides its
 /// preflight too, ahead of them.
-const NET_TESTS: &str = "CC=gcc cargo test --frozen --manifest-path net/Cargo.toml";
+const NET_TESTS: &str = "CC=gcc cargo test --frozen --manifest-path net/Cargo.toml --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"' --config 'env.TD_TEST_TRUSTED_ROOT.force=true'";
 
 fn net_test_cmd() -> Result<String, String> {
     Ok(format!("{} && {NET_TESTS}", format_check_cmd()?))

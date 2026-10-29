@@ -2447,3 +2447,34 @@ fn request_logs_report_timings_without_message_payloads() {
     assert!(!log.contains("Request body:"));
     assert!(!log.contains("Response body ("));
 }
+
+#[test]
+fn endpoint_export_needs_neither_password_execution_nor_a_running_replica() {
+    let root = td_fs::TempDir::new("mail-endpoint-export").unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        r#"[account.replica]
+well_known_url = "http://localhost/.well-known/jmap"
+username = "mail@example.com"
+password_command = "this-command-must-not-run"
+unix_socket = "/absent-replica/socket"
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mail"))
+        .arg("--fetch-unix-endpoints")
+        .arg(format!("--config={}", config.display()))
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"td-mail-unix-v1\n/absent-replica/socket\n");
+    assert!(!root.path().join("state").exists());
+    assert!(!root.path().join("cache").exists());
+}

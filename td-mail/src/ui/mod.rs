@@ -2516,6 +2516,7 @@ mod frame_tests {
     fn account() -> AccountConfig {
         AccountConfig {
             tls_ca_file: None,
+            unix_socket: None,
             name: "test".to_string(),
             well_known_url: String::new(),
             username: "me@example.com".to_string(),

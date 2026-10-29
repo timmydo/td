@@ -106,6 +106,7 @@ struct LaunchOptions {
     loud: bool,
     allow_loopback: bool,
     allow_private_loopback: bool,
+    discover_mail_unix: bool,
 }
 
 /// `td-launch PROGRAM [ARG...]`, `args[0]` being the applet's name.
@@ -127,6 +128,7 @@ pub fn run(args: &[String]) {
                     loud: true,
                     allow_loopback: true,
                     allow_private_loopback: false,
+                    discover_mail_unix: false,
                 },
             )),
             None => {
@@ -145,6 +147,7 @@ pub fn run(args: &[String]) {
                     loud: true,
                     allow_loopback: false,
                     allow_private_loopback: false,
+                    discover_mail_unix: false,
                 },
             ))
         }
@@ -176,6 +179,7 @@ pub fn run_named(name: &str, args: &[String]) {
                 relays(name),
                 LaunchOptions {
                     allow_private_loopback: name == "td-mail",
+                    discover_mail_unix: name == "td-mail",
                     ..LaunchOptions::default()
                 },
             )
@@ -406,6 +410,7 @@ fn start_service(
     service: &Service,
     socket: &Path,
     options: LaunchOptions,
+    unix_sockets: &[td_fs::SocketPath],
 ) -> Result<Child, String> {
     let applet = service.applet;
     let mut command = Command::new(SELF);
@@ -417,6 +422,11 @@ fn start_service(
         .arg(socket)
         .stdin(Stdio::null())
         .process_group(0);
+    if applet == FETCHD.applet {
+        for path in unix_sockets {
+            command.arg("--allow-unix").arg(path.as_path());
+        }
+    }
     if options.allow_loopback && applet == FETCHD.applet {
         command.arg("--allow-loopback");
     }
@@ -463,6 +473,11 @@ fn launch(
     egress: bool,
     options: LaunchOptions,
 ) -> Result<(), String> {
+    let unix_sockets = if options.discover_mail_unix && mail_needs_endpoints(args) {
+        mail_endpoints(program, args)?
+    } else {
+        Vec::new()
+    };
     let private = private_runtime(runtime, Path::new("/proc"))?;
     let socket = socket_under(&private);
     let mut services = Vec::new();
@@ -471,7 +486,7 @@ fn launch(
         wanted.push((EGRESSD, private.join("td-egress").join("socket")));
     }
     for (service, at) in &wanted {
-        match start_service(service, at, options) {
+        match start_service(service, at, options, &unix_sockets) {
             Ok(child) => services.push(child),
             Err(e) => {
                 for mut child in services {
@@ -509,6 +524,111 @@ fn launch(
     Err(format!("cannot run {}: {e}", program.display()))
 }
 
+fn mail_needs_endpoints(args: &[String]) -> bool {
+    !args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--help"
+                | "-h"
+                | "--help-cli"
+                | "--help-config"
+                | "--log"
+                | "--print-rules"
+                | "--prompt"
+                | "--fetch-unix-endpoints"
+                | "--offline"
+        ) || arg.starts_with("--prompt=")
+    })
+}
+
+fn parse_mail_endpoints(bytes: &[u8]) -> Result<Vec<td_fs::SocketPath>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "invalid mail endpoint export")?;
+    let mut lines = text.split_terminator('\n');
+    if lines.next() != Some("td-mail-unix-v1") || !text.ends_with('\n') {
+        return Err("invalid mail endpoint export".into());
+    }
+    let mut endpoints = Vec::new();
+    for path in lines {
+        if endpoints.len() == 64 || path.bytes().any(|b| b.is_ascii_control()) {
+            return Err("invalid mail endpoint export".into());
+        }
+        let endpoint =
+            td_fs::SocketPath::new(Path::new(path)).map_err(|_| "invalid mail endpoint export")?;
+        if endpoints.contains(&endpoint) {
+            return Err("duplicate mail endpoint export".into());
+        }
+        endpoints.push(endpoint);
+    }
+    Ok(endpoints)
+}
+
+/// Ask the trusted installed sibling to parse its own config. A socket pair
+/// bounds reads without a blocking pipe-reader thread or unbounded output.
+fn mail_endpoints(program: &Path, args: &[String]) -> Result<Vec<td_fs::SocketPath>, String> {
+    use std::{
+        io::Read,
+        os::{fd::OwnedFd, unix::net::UnixStream},
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    let (mut reader, writer) = UnixStream::pair().map_err(|e| e.to_string())?;
+    let output: OwnedFd = writer.into();
+    let mut command = Command::new(program);
+    command
+        .arg("--fetch-unix-endpoints")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output));
+    if let Some(config) = args.iter().find(|arg| arg.starts_with("--config=")) {
+        command.arg(config);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("mail endpoint export: {e}"))?;
+    drop(command);
+    let result = (|| {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let left = until
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or("mail endpoint export timed out")?;
+            reader
+                .set_read_timeout(Some(left))
+                .map_err(|e| e.to_string())?;
+            let n = match reader.read(&mut buffer) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("mail endpoint export: {e}")),
+            };
+            if n == 0 {
+                break;
+            }
+            if bytes.len().saturating_add(n) > 8192 {
+                return Err("mail endpoint export exceeds limit".into());
+            }
+            bytes.extend_from_slice(buffer.get(..n).ok_or("invalid endpoint read")?);
+        }
+        loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                if !status.success() {
+                    return Err("mail endpoint export failed".into());
+                }
+                break;
+            }
+            if Instant::now() >= until {
+                return Err("mail endpoint export timed out".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        parse_mail_endpoints(&bytes)
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    result
+}
+
 /// Whether `base`, a link's name, is one of the applications this binary
 /// launches.
 pub(crate) fn launches(base: &OsStr) -> Option<&'static str> {
@@ -521,6 +641,41 @@ pub(crate) fn launches(base: &OsStr) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_mail_exports_are_bounded_and_terminal_modes_need_none() {
+        assert_eq!(
+            parse_mail_endpoints(b"td-mail-unix-v1\n/private/socket\n")
+                .unwrap()
+                .len(),
+            1
+        );
+        for value in [
+            "",
+            "td-mail-unix-v1",
+            "td-mail-unix-v1\nrelative\n",
+            "td-mail-unix-v1\n/a/../b\n",
+            "td-mail-unix-v1\n/a\n/a\n",
+            "td-mail-unix-v1\n/a\r\n",
+        ] {
+            assert!(parse_mail_endpoints(value.as_bytes()).is_err());
+        }
+        for flag in [
+            "--help",
+            "--help-config",
+            "--help-cli",
+            "--prompt=config",
+            "--print-rules",
+            "--log",
+            "--offline",
+        ] {
+            assert!(!mail_needs_endpoints(&[flag.into()]));
+        }
+        assert!(mail_needs_endpoints(&[
+            "--cli".into(),
+            "--config=/absent/config".into()
+        ]));
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("td-launch-{tag}-{}", std::process::id()));

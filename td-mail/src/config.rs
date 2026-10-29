@@ -10,6 +10,7 @@ pub struct AccountConfig {
     pub username: String,
     pub password: PasswordSource,
     pub tls_ca_file: Option<String>,
+    pub unix_socket: Option<String>,
     pub mail: AccountMail,
 }
 
@@ -485,6 +486,7 @@ struct RawAccountFields {
     /// The retired key is recognised so its refusal can say what replaced it.
     password_file: bool,
     tls_ca_file: Option<String>,
+    unix_socket: Option<String>,
     /// `[mail]`'s keys, set for this account alone.
     reply_from: Option<String>,
     archive_folder: Option<String>,
@@ -499,6 +501,7 @@ const ACCOUNT_KEYS: &[&str] = &[
     "password_command",
     "secret",
     "tls_ca_file",
+    "unix_socket",
     "reply_from",
     "archive_folder",
     "deleted_folder",
@@ -524,6 +527,7 @@ impl RawAccountFields {
             secret: table.optional_str("secret")?.map(str::to_string),
             password_file: table.get("password_file").is_some(),
             tls_ca_file: table.optional_str("tls_ca_file")?.map(str::to_string),
+            unix_socket: table.optional_str("unix_socket")?.map(str::to_string),
             reply_from: table.optional_str("reply_from")?.map(str::to_string),
             archive_folder: table.optional_str("archive_folder")?.map(str::to_string),
             deleted_folder: table.optional_str("deleted_folder")?.map(str::to_string),
@@ -603,7 +607,23 @@ fn default_spam_min_training() -> u32 {
 
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let contents = fs::read_to_string(path).map_err(ConfigError::Io)?;
+        use std::io::Read;
+        const MAX_CONFIG: u64 = 1024 * 1024;
+        let path = path.as_ref();
+        if !fs::metadata(path).map_err(ConfigError::Io)?.is_file() {
+            return Err(ConfigError::Parse("config must be a regular file".into()));
+        }
+        let file = fs::File::open(path).map_err(ConfigError::Io)?;
+        if !file.metadata().map_err(ConfigError::Io)?.is_file() {
+            return Err(ConfigError::Parse("config must be a regular file".into()));
+        }
+        let mut contents = String::new();
+        file.take(MAX_CONFIG + 1)
+            .read_to_string(&mut contents)
+            .map_err(ConfigError::Io)?;
+        if contents.len() as u64 > MAX_CONFIG {
+            return Err(ConfigError::Parse("config exceeds 1 MiB".into()));
+        }
         Self::parse(&contents)
     }
 
@@ -657,6 +677,7 @@ impl Config {
                 name,
                 mail: AccountMail::resolve(&raw.mail, &account),
                 tls_ca_file: account.tls_ca_file,
+                unix_socket: account.unix_socket,
                 well_known_url: require_field(
                     account.well_known_url,
                     &format!("missing well_known_url in [account.{}]", account_name),
@@ -685,6 +706,7 @@ impl Config {
                 name: "default".to_string(),
                 mail: AccountMail::resolve(&raw.mail, &jmap),
                 tls_ca_file: jmap.tls_ca_file,
+                unix_socket: jmap.unix_socket,
                 well_known_url: require_field(
                     jmap.well_known_url,
                     "missing well_known_url (in [jmap] or [account.NAME])",
@@ -701,6 +723,20 @@ impl Config {
                     "[jmap]",
                 )?,
             });
+        }
+
+        for account in &accounts {
+            if let Some(path) = &account.unix_socket {
+                if account.well_known_url != "http://localhost/.well-known/jmap"
+                    || account.tls_ca_file.is_some()
+                    || path.bytes().any(|b| b.is_ascii_control())
+                    || td_fs::SocketPath::new(Path::new(path)).is_err()
+                {
+                    return Err(ConfigError::Parse(format!(
+                        "[account.{}] unix_socket requires an absolute canonical socket path, http://localhost/.well-known/jmap, and no tls_ca_file", account.name
+                    )));
+                }
+            }
         }
 
         // A policy for an account the file does not configure would
@@ -985,6 +1021,14 @@ fn replace_account_server(
 pub fn editable(path: &Path, name: &str) -> Result<(), String> {
     let contents =
         fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    let config = Config::parse(&contents).map_err(|e| e.to_string())?;
+    if config
+        .accounts
+        .iter()
+        .any(|a| a.name == name && a.unix_socket.is_some())
+    {
+        return Err("edit unix_socket in the configuration file, then restart td-mail".into());
+    }
     replace_account_server(&contents, name, "", "").map(|_| ())
 }
 
@@ -1000,6 +1044,9 @@ pub fn set_up_account(
     server: &str,
     username: &str,
 ) -> Result<AccountConfig, String> {
+    if current.unix_socket.is_some() {
+        return Err("edit unix_socket in the configuration file, then restart td-mail".into());
+    }
     let url = discovery_url(server)?;
     let username = setup_username(username)?;
     // A link is followed, so its target is what is replaced.
@@ -1136,6 +1183,23 @@ password_command = "false"
             &text.replace("tls_ca_file = \"/home/me/local-ca.pem\"", "tls_ca_file = 4")
         )
         .is_err());
+    }
+
+    #[test]
+    fn unix_account_validates_configuration_without_touching_the_socket() {
+        let text = "[account.replica]\nwell_known_url = \"http://localhost/.well-known/jmap\"\nusername = \"mail@example.com\"\npassword_command = \"false\"\nunix_socket = \"/not-running/socket\"\n";
+        let config = Config::parse(text).unwrap();
+        assert_eq!(
+            config.accounts[0].unix_socket.as_deref(),
+            Some("/not-running/socket")
+        );
+        for invalid in [
+            text.replace("http://localhost/", "https://localhost/"),
+            text.replace("/not-running/socket", "/a/../socket"),
+            format!("{text}tls_ca_file = \"/some/ca\"\n"),
+        ] {
+            assert!(Config::parse(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -1662,6 +1726,7 @@ secret = \"portal\"
         let account = |url: &str| AccountConfig {
             name: "a".to_string(),
             tls_ca_file: None,
+            unix_socket: None,
             well_known_url: url.to_string(),
             username: "u@example.com".to_string(),
             password: PasswordSource::Portal("a".to_string()),

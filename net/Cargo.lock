@@ -223,6 +223,10 @@ name = "td-engine"
 version = "0.1.0"
 
 [[package]]
+name = "td-fs"
+version = "0.1.0"
+
+[[package]]
 name = "td-net"
 version = "0.1.0"
 dependencies = [
@@ -230,6 +234,7 @@ dependencies = [
  "rustls",
  "sha2",
  "td-engine",
+ "td-fs",
  "ureq",
  "webpki-roots",
 ]

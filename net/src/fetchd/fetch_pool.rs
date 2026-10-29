@@ -8,10 +8,11 @@ const LIFETIME: Duration = Duration::from_secs(60);
 const REQUESTS: usize = 16;
 
 pub(super) fn can_reuse(request: &Request) -> bool {
-    request
-        .url
-        .split_once("://")
-        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+    (request.unix_socket.is_some()
+        || request
+            .url
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https")))
         && !request.public
         && !request.stream
         && match request.method {
@@ -22,6 +23,7 @@ pub(super) fn can_reuse(request: &Request) -> bool {
 
 #[derive(PartialEq, Eq)]
 struct Key {
+    unix_socket: Option<td_fs::SocketPath>,
     roots: Option<Vec<u8>>,
     redirects: u32,
     loopback: bool,
@@ -37,6 +39,7 @@ impl Key {
             return None;
         }
         Some(Self {
+            unix_socket: request.unix_socket,
             roots: request.tls_ca.clone(),
             redirects: match request.method {
                 Method::Get => request.redirects.unwrap_or(super::MAX_REDIRECTS),
@@ -161,6 +164,7 @@ mod tests {
     };
     fn request() -> Request {
         Request {
+            unix_socket: None,
             tls_ca: None,
             method: Method::Get,
             url: "https://localhost/".into(),
@@ -181,6 +185,7 @@ mod tests {
                     policy: POLICY,
                     public: None,
                     refusal: Mutex::new(None),
+                    local: false,
                 }),
             })
         })

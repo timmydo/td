@@ -80,9 +80,12 @@ fn launched_program() {
         } else {
             ""
         };
+        let unix = std::env::var("TD_LAUNCH_TEST_UNIX_REQUEST")
+            .map(|path| format!("unix-socket {path}\n"))
+            .unwrap_or_default();
         write!(
             fetch,
-            "td-fetch 1\nmethod GET\nurl {url}\nlimit 1024\nredirects 0\n{public}{stream}body 0\n\n"
+            "td-fetch 1\nmethod GET\nurl {url}\nlimit 1024\nredirects 0\n{public}{stream}{unix}body 0\n\n"
         )
         .unwrap();
         let mut response = String::new();
@@ -476,7 +479,15 @@ fn installed_mail_reaches_local_accounts_but_public_content_stays_blocked() {
     }
     std::fs::copy(TD_NET, lib.join("td-net")).unwrap();
     for name in ["td-mail", "td-news", "td-agent"] {
-        std::fs::copy(std::env::current_exe().unwrap(), lib.join(name)).unwrap();
+        if name == "td-mail" {
+            let fixture = Path::new(TD_NET)
+                .parent()
+                .unwrap()
+                .join("examples/mail-launcher-fixture");
+            std::fs::copy(fixture, lib.join(name)).unwrap();
+        } else {
+            std::fs::copy(std::env::current_exe().unwrap(), lib.join(name)).unwrap();
+        }
         std::os::unix::fs::symlink(lib.join("td-net"), bin.join(name)).unwrap();
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -534,6 +545,7 @@ fn installed_mail_reaches_local_accounts_but_public_content_stays_blocked() {
             let result = base.join(format!("result-{index}"));
             let mut command = Command::new(bin.join(name));
             as_child(&mut command, &runtime, &mark);
+            command.env("TD_LAUNCH_TEST_PROGRAM", std::env::current_exe().unwrap());
             command
                 .env("TD_LAUNCH_TEST_FETCH_URL", &url)
                 .env("TD_LAUNCH_TEST_FETCH_RESULT", &result)
@@ -566,4 +578,79 @@ fn installed_mail_reaches_local_accounts_but_public_content_stays_blocked() {
         drop(stop);
         assert_eq!(peer.join().unwrap(), 2);
     });
+}
+
+#[test]
+fn installed_mail_grants_only_its_exported_unix_path() {
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    let base = scratch("unix-mail");
+    let lib = base.join("lib");
+    let bin = base.join("bin");
+    let runtime = base.join("run");
+    let endpoint = base.join("socket");
+    for dir in [&lib, &bin, &runtime] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    std::fs::copy(TD_NET, lib.join("td-net")).unwrap();
+    let fixture = Path::new(TD_NET)
+        .parent()
+        .unwrap()
+        .join("examples/mail-launcher-fixture");
+    std::fs::copy(fixture, lib.join("td-mail")).unwrap();
+    std::os::unix::fs::symlink(lib.join("td-net"), bin.join("td-mail")).unwrap();
+    let listener = UnixListener::bind(&endpoint).unwrap();
+    std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let peer = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(30);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("Unix fixture: {e}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0];
+        while !head.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+            assert!(head.len() < 8192);
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .unwrap();
+    });
+    for (index, grant, public) in [(0, false, false), (1, true, true), (2, true, false)] {
+        let mark = base.join(format!("mark-{index}"));
+        let result = base.join(format!("result-{index}"));
+        let mut command = Command::new(bin.join("td-mail"));
+        as_child(&mut command, &runtime, &mark);
+        command
+            .env("TD_LAUNCH_TEST_PROGRAM", std::env::current_exe().unwrap())
+            .env("TD_LAUNCH_TEST_FETCH_URL", "http://localhost/")
+            .env("TD_LAUNCH_TEST_FETCH_RESULT", &result)
+            .env("TD_LAUNCH_TEST_UNIX_REQUEST", &endpoint)
+            .env_remove("TD_LAUNCH_TEST_UNIX_GRANT");
+        if grant {
+            command.env("TD_LAUNCH_TEST_UNIX_GRANT", &endpoint);
+        }
+        if public {
+            command.env("TD_LAUNCH_TEST_PUBLIC", "1");
+        }
+        assert!(status_of_a_fresh_copy(&mut command).success());
+        let response = std::fs::read_to_string(result).unwrap();
+        if grant && !public {
+            assert!(response.contains("status 200\n"), "{response}");
+        } else {
+            assert!(response.contains("error refused:"), "{response}");
+        }
+        nothing_served(&runtime, &mark);
+    }
+    peer.join().unwrap();
 }

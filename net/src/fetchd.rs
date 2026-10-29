@@ -56,6 +56,8 @@
 // socket 0600, so only that uid connects. This crate forbids `unsafe`, so
 // peer credentials are not read; the mode is the whole of it.
 mod fetch_pool;
+#[path = "fetchd/unix.rs"]
+mod unix;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -166,7 +168,13 @@ const PROBE_EXPECTED: &str = "error refused: unspecified address";
 pub fn run(args: &[String]) {
     let code = match args.get(1).map(String::as_str) {
         Some("run") => match parse_run_args(args.get(2..).unwrap_or(&[])) {
-            Ok(run) => match serve(Path::new(&run.socket), run.policy, run.parent, run.limits) {
+            Ok(run) => match serve(
+                Path::new(&run.socket),
+                run.policy,
+                run.parent,
+                run.limits,
+                run.unix_sockets,
+            ) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("td-fetchd: {e}");
@@ -205,7 +213,7 @@ pub fn run(args: &[String]) {
         },
         _ => {
             eprintln!(
-                "usage: td-fetchd run --socket PATH [--allow-loopback | --allow-private-loopback] [--exit-with-parent PID]\n       td-fetchd probe PATH"
+                "usage: td-fetchd run --socket PATH [--allow-loopback | --allow-private-loopback] [--allow-unix PATH]... [--exit-with-parent PID]\n       td-fetchd probe PATH"
             );
             2
         }
@@ -219,10 +227,12 @@ struct RunArgs {
     policy: Policy,
     parent: Option<u32>,
     limits: Limits,
+    unix_sockets: Vec<td_fs::SocketPath>,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut socket = None;
+    let mut unix_sockets = Vec::new();
     let mut parent = None;
     let mut policy = Policy {
         allow_loopback: false,
@@ -244,6 +254,18 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             // never set by a unit.
             "--allow-loopback" => policy.allow_loopback = true,
             "--allow-private-loopback" => policy.allow_private_loopback = true,
+            "--allow-unix" => {
+                let value = it
+                    .next()
+                    .ok_or("--allow-unix needs an absolute socket path")?;
+                let path = unix::endpoint(value).map_err(|error| error.to_string())?;
+                if unix_sockets.len() >= unix::MAX_ENDPOINTS {
+                    return Err("too many Unix endpoints".into());
+                }
+                if !unix_sockets.contains(&path) {
+                    unix_sockets.push(path);
+                }
+            }
             // For td-launch, the service's only starter off td: it ends when
             // the launched program, which holds this pid, does.
             "--exit-with-parent" => parent = Some(pid_arg(arg, it.next())?),
@@ -270,6 +292,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         policy,
         parent,
         limits,
+        unix_sockets,
     })
 }
 
@@ -382,6 +405,7 @@ impl Method {
 
 #[derive(Debug)]
 struct Request {
+    unix_socket: Option<td_fs::SocketPath>,
     tls_ca: Option<Vec<u8>>,
     method: Method,
     url: String,
@@ -435,13 +459,20 @@ impl Fault {
 /// parent.
 const PARENT_PACE: Duration = Duration::from_millis(250);
 
-fn serve(socket: &Path, policy: Policy, parent: Option<u32>, limits: Limits) -> Result<(), String> {
+fn serve(
+    socket: &Path,
+    policy: Policy,
+    parent: Option<u32>,
+    limits: Limits,
+    unix_sockets: Vec<td_fs::SocketPath>,
+) -> Result<(), String> {
     let listener = bind(socket)?;
     if let Some(parent) = parent {
         watch_parent(socket, parent)?;
     }
     let active = Arc::new((Mutex::new(0usize), Condvar::new()));
     let origins = Origins::new(STREAM_ORIGINS);
+    let unix_sockets = Arc::new(unix_sockets);
     loop {
         let (stream, _) = match listener.accept() {
             Ok(accepted) => accepted,
@@ -452,8 +483,9 @@ fn serve(socket: &Path, policy: Policy, parent: Option<u32>, limits: Limits) -> 
         };
         let slot = Slot::take(&active)?;
         let origins = Arc::clone(&origins);
+        let unix_sockets = Arc::clone(&unix_sockets);
         let spawned = std::thread::Builder::new().spawn(move || {
-            handle(stream, policy, limits, &origins, Some(slot));
+            handle(stream, policy, limits, &origins, Some(slot), &unix_sockets);
         });
         // The stream and the slot went with the closure; when the spawn
         // fails, std drops the closure, the slot with it, and the service
@@ -662,6 +694,7 @@ fn handle(
     limits: Limits,
     origins: &Arc<Origins>,
     slot: Option<Slot>,
+    unix_sockets: &[td_fs::SocketPath],
 ) {
     let Ok(writer) = stream.try_clone() else {
         return;
@@ -683,8 +716,9 @@ fn handle(
             }
             return;
         }
-        read => read
-            .and_then(|request| perform_with_pool(request, policy, limits.origin, &origins.pool)),
+        read => read.and_then(|request| {
+            perform_with_pool(request, policy, limits.origin, &origins.pool, unix_sockets)
+        }),
     };
     let mut writer = Bounded::new(writer, limits.client);
     let written = match outcome {
@@ -735,6 +769,7 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
     let mut stream = false;
     let mut public = false;
     let mut tls_ca_len = None;
+    let mut unix_socket = None;
     let mut body_len = 0u64;
     let mut seen = std::collections::BTreeSet::new();
     loop {
@@ -774,6 +809,11 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
                     .filter(|n| *n > 0)
                     .ok_or_else(|| Fault::Malformed(format!("limit {value:?}")))?
                     .min(MAX_RESPONSE_BODY);
+            }
+            "unix-socket" => {
+                unix_socket = Some(
+                    unix::endpoint(value).map_err(|error| Fault::Malformed(error.to_string()))?,
+                );
             }
             "tls-ca" => {
                 tls_ca_len = Some(
@@ -833,6 +873,12 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
             "tls-ca requires redirects 0 and a counted non-public request".into(),
         ));
     }
+    if unix_socket.is_some() && (stream || public || redirects != Some(0) || tls_ca_len.is_some()) {
+        return Err(Fault::Refused(
+            "Unix endpoints require a counted private request with redirects 0 and no TLS roots"
+                .into(),
+        ));
+    }
     let tls_ca = if let Some(len) = tls_ca_len {
         let mut pem = vec![0; len];
         reader
@@ -847,6 +893,7 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Fault> {
         .read_exact(&mut body)
         .map_err(|e| Fault::Malformed(format!("body short: {e}")))?;
     Ok(Request {
+        unix_socket,
         tls_ca,
         method,
         url,
@@ -899,6 +946,7 @@ struct PolicyResolver {
     /// read once for it, and the relay's predicate over every address.
     public: Option<crate::egress::Local>,
     refusal: Mutex<Option<String>>,
+    local: bool,
 }
 
 impl PolicyResolver {
@@ -948,6 +996,10 @@ impl ureq::unversioned::resolver::Resolver for SharedResolver {
         _config: &ureq::config::Config,
         _timeout: ureq::unversioned::transport::NextTimeout,
     ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        if self.0.local {
+            unix::check_uri(uri)?;
+            return Ok(self.empty());
+        }
         let host = uri
             .host()
             .ok_or_else(|| ureq::Error::BadUri(format!("{uri} names no host")))?;
@@ -984,18 +1036,20 @@ enum Timing {
 /// A buffered exchange: the origin's whole body, under the request's limit.
 #[cfg(test)]
 fn perform(request: Request, policy: Policy, origin: Duration) -> Result<Reply, Fault> {
-    perform_with_pool(request, policy, origin, &fetch_pool::Pool::default())
+    perform_with_pool(request, policy, origin, &fetch_pool::Pool::default(), &[])
 }
 fn perform_with_pool(
     request: Request,
     policy: Policy,
     origin: Duration,
     pool: &fetch_pool::Pool,
+    unix_sockets: &[td_fs::SocketPath],
 ) -> Result<Reply, Fault> {
+    admit_unix(&request, unix_sockets)?;
     let limit = request.limit;
     check_scheme(&request.url)?;
     let lease = pool.acquire(&request, policy, origin, Instant::now(), || {
-        build_agent(&request, policy, Timing::Whole(origin))
+        build_agent(&request, policy, Timing::Whole(origin), unix_sockets)
     })?;
     let ((status, headers), response) = send_origin(request, lease.agent())?;
     let mut body = Vec::new();
@@ -1060,14 +1114,38 @@ type Response = ureq::http::Response<ureq::Body>;
 /// Send the request and read the origin's head, under the address policy
 /// and the head bounds; the body is left for the caller to read.
 fn open(request: Request, policy: Policy, timing: Timing) -> Result<(OriginHead, Response), Fault> {
-    let agent = build_agent(&request, policy, timing)?;
+    let agent = build_agent(&request, policy, timing, &[])?;
     send_origin(request, &agent)
+}
+fn admit_unix(request: &Request, grants: &[td_fs::SocketPath]) -> Result<(), Fault> {
+    if let Some(path) = request.unix_socket {
+        if !grants.contains(&path)
+            || request.public
+            || request.stream
+            || request.tls_ca.is_some()
+            || request.redirects != Some(0)
+        {
+            return Err(Fault::Refused(
+                "Unix endpoint is not granted for this request".into(),
+            ));
+        }
+        let uri = request
+            .url
+            .parse::<ureq::http::Uri>()
+            .map_err(|_| Fault::Malformed("invalid local URI".into()))?;
+        unix::check_uri(&uri).map_err(|error| Fault::Refused(error.to_string()))?;
+        td_fs::check_private_socket(path.as_path())
+            .map_err(|error| Fault::Refused(format!("private Unix endpoint: {error}")))?;
+    }
+    Ok(())
 }
 fn build_agent(
     request: &Request,
     policy: Policy,
     timing: Timing,
+    unix_sockets: &[td_fs::SocketPath],
 ) -> Result<fetch_pool::Agent, Fault> {
+    admit_unix(request, unix_sockets)?;
     check_scheme(&request.url)?;
     let public = if request.public {
         Some(crate::egress::Local::read().map_err(|e| {
@@ -1082,6 +1160,7 @@ fn build_agent(
         policy,
         public,
         refusal: Mutex::new(None),
+        local: request.unix_socket.is_some(),
     });
     let followed = match request.method {
         Method::Get => request.redirects.unwrap_or(MAX_REDIRECTS),
@@ -1132,11 +1211,19 @@ fn build_agent(
             .max_idle_connections(0),
     }
     .build();
-    let agent = ureq::Agent::with_parts(
-        config,
-        ureq::unversioned::transport::DefaultConnector::new(),
-        SharedResolver(Arc::clone(&resolver)),
-    );
+    let agent = if let Some(path) = request.unix_socket {
+        ureq::Agent::with_parts(
+            config,
+            unix::UnixConnector(path),
+            SharedResolver(Arc::clone(&resolver)),
+        )
+    } else {
+        ureq::Agent::with_parts(
+            config,
+            ureq::unversioned::transport::DefaultConnector::new(),
+            SharedResolver(Arc::clone(&resolver)),
+        )
+    };
     Ok(fetch_pool::Agent { agent, resolver })
 }
 fn send_origin(
@@ -1146,6 +1233,7 @@ fn send_origin(
     let agent = &owner.agent;
     let resolver = &owner.resolver;
     let Request {
+        unix_socket: _,
         tls_ca: _,
         method,
         url,
@@ -1416,6 +1504,7 @@ fn hand_over(mut input: impl Write, request: Request) {
     // Whole, so that a field added to a request is handed over or said
     // not to be.
     let Request {
+        unix_socket: _,
         tls_ca: _,
         method,
         url,
@@ -2033,7 +2122,7 @@ mod tests {
             ))
             .unwrap();
             for timing in [Timing::Whole(budget), Timing::Idle(idle)] {
-                let built = build_agent(&request, LENIENT, timing).unwrap();
+                let built = build_agent(&request, LENIENT, timing, &[]).unwrap();
                 let config = built.agent.config();
                 assert_eq!(config.max_redirects(), followed);
                 assert_eq!(config.max_redirects_will_error(), followed > 0);
@@ -2184,7 +2273,7 @@ mod tests {
             )
             .unwrap();
             request.tls_ca = ca.map(Vec::from);
-            let result = perform_with_pool(request, LENIENT, Duration::from_secs(60), pool);
+            let result = perform_with_pool(request, LENIENT, Duration::from_secs(60), pool, &[]);
             if !result.is_ok_and(|reply| reply.status == 200 && reply.body == b"ok") {
                 success = false;
                 break;
@@ -2296,6 +2385,7 @@ mod tests {
             LENIENT,
             Some(std::os::unix::process::parent_id()),
             LIMITS,
+            Vec::new(),
         )
         .unwrap();
     }
@@ -2319,6 +2409,93 @@ mod tests {
 
     fn parse(bytes: &[u8]) -> Result<Request, String> {
         read_request(&mut BufReader::new(bytes)).map_err(|f| f.line())
+    }
+
+    #[test]
+    fn unix_grants_are_exact_and_connections_stay_with_their_endpoint() {
+        let root = td_fs::TempDir::new("fetch-unix").unwrap();
+        let pool = fetch_pool::Pool::default();
+        let mut servers = Vec::new();
+        let mut grants = Vec::new();
+        for (name, response, count) in [("one", b"one", 2), ("two", b"two", 1)] {
+            let path = root.path().join(name);
+            let listener = UnixListener::bind(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            grants.push(td_fs::SocketPath::new(&path).unwrap());
+            servers.push(std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(30);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < until =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("accept private request: {e}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                for _ in 0..count {
+                    let mut head = String::new();
+                    loop {
+                        let mut line = String::new();
+                        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        head.push_str(&line);
+                    }
+                    assert!(head.to_ascii_lowercase().contains("host: localhost\r\n"));
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n")
+                        .unwrap();
+                    socket.write_all(response).unwrap();
+                }
+            }));
+        }
+        let request = |index: usize| {
+            account_request(
+                &format!(
+                    "method GET\nurl http://localhost/\nunix-socket {}\nredirects 0\nbody 0\n",
+                    grants[index].as_path().display()
+                ),
+                b"",
+            )
+            .unwrap()
+        };
+        assert!(
+            perform_with_pool(request(0), STRICT, Duration::from_secs(30), &pool, &[]).is_err()
+        );
+        for (index, expected) in [(0, b"one"), (1, b"two"), (0, b"one")] {
+            let reply = perform_with_pool(
+                request(index),
+                STRICT,
+                Duration::from_secs(30),
+                &pool,
+                &grants,
+            )
+            .unwrap();
+            assert_eq!(reply.body, expected);
+        }
+        for server in servers {
+            server.join().unwrap();
+        }
+        for extra in ["public\n", "stream\n", "redirects 1\n"] {
+            assert!(account_request(&format!(
+                "method GET\nurl http://localhost/\nunix-socket /private/socket\nredirects 0\n{extra}body 0\n"
+            ), b"").is_err());
+        }
+        let mut escaped = request(0);
+        escaped.url = "http://localhost.evil/".into();
+        assert!(admit_unix(&escaped, &grants).is_err());
+        let mut network = request(0);
+        network.unix_socket = None;
+        assert!(perform(network, STRICT, Duration::from_secs(30)).is_err());
     }
 
     #[test]
@@ -2426,6 +2603,7 @@ mod tests {
                 policy: mail,
                 public: public.then(crate::egress::Local::default),
                 refusal: Mutex::new(None),
+                local: false,
             };
             for address in ["127.0.0.1:443", "[::1]:443", "[::ffff:127.0.0.1]:443"] {
                 assert_eq!(
@@ -2549,6 +2727,7 @@ mod tests {
             policy: STRICT,
             public: None,
             refusal: Mutex::new(None),
+            local: false,
         };
         let resolved = resolver.resolve_netloc("93.184.216.34:443").unwrap();
         assert_eq!(
@@ -2579,6 +2758,7 @@ mod tests {
             policy: STRICT,
             public: Some(crate::egress::Local::default()),
             refusal: Mutex::new(None),
+            local: false,
         };
         assert!(public.resolve_netloc("93.184.216.34:443").is_ok());
         for (netloc, reason) in [
@@ -2774,7 +2954,7 @@ mod tests {
         let origins = Origins::new(STREAM_ORIGINS);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                handle(stream, policy, limits, &origins, None);
+                handle(stream, policy, limits, &origins, None, &[]);
             }
         });
         Some(())

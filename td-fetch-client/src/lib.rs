@@ -242,6 +242,7 @@ pub fn get_public(
         &[],
         limit,
         Shape {
+            unix_socket: None,
             tls_ca: None,
             redirects: Some(0),
             stream: false,
@@ -306,10 +307,39 @@ pub fn request_with_ca(
         body,
         limit,
         Shape {
+            unix_socket: None,
             redirects: Some(0),
             stream: false,
             public: false,
             tls_ca,
+        },
+    )?;
+    settle(read_reply(&mut reader, limit), written)
+}
+
+/// A counted request to the explicitly granted private Unix endpoint.
+/// Only the logical origin http://localhost is accepted; no network fallback.
+pub fn request_with_unix_socket(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limit: Option<u64>,
+    path: &str,
+) -> Result<Response, Error> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    let (mut reader, written) = send(
+        method,
+        url,
+        headers,
+        body,
+        limit,
+        Shape {
+            unix_socket: Some(path),
+            tls_ca: None,
+            redirects: Some(0),
+            stream: false,
+            public: false,
         },
     )?;
     settle(read_reply(&mut reader, limit), written)
@@ -331,6 +361,7 @@ fn request(
         body,
         limit,
         Shape {
+            unix_socket: None,
             tls_ca: None,
             redirects,
             stream: false,
@@ -356,6 +387,7 @@ fn stream(
         body,
         limit,
         Shape {
+            unix_socket: None,
             tls_ca: None,
             redirects,
             stream: true,
@@ -386,6 +418,7 @@ fn stream(
 /// A request's optional framing and per-request PEM trust bundle.
 struct Shape<'a> {
     tls_ca: Option<&'a [u8]>,
+    unix_socket: Option<&'a str>,
     redirects: Option<u32>,
     stream: bool,
     public: bool,
@@ -409,7 +442,21 @@ fn send(
         stream,
         public,
         tls_ca,
+        unix_socket,
     } = shape;
+    if let Some(path) = unix_socket {
+        if !path.starts_with('/')
+            || path.len() > 107
+            || path.bytes().any(|b| b.is_ascii_control())
+            || !url.starts_with("http://localhost/")
+            || tls_ca.is_some()
+            || stream
+            || public
+            || redirects != Some(0)
+        {
+            return Err(Error::Malformed("invalid private Unix request".into()));
+        }
+    }
     if tls_ca.is_some_and(|ca| ca.is_empty() || ca.len() > MAX_TLS_CA) {
         return Err(Error::Malformed(
             "TLS CA bundle must contain 1..65536 bytes".into(),
@@ -425,6 +472,9 @@ fn send(
         .and_then(|()| socket.set_write_timeout(Some(REPLY_TIMEOUT)))
         .map_err(|e| Error::Io(e.to_string()))?;
     let mut head = format!("{PROTOCOL}\nmethod {method}\nurl {url}\n");
+    if let Some(path) = unix_socket {
+        head.push_str(&format!("unix-socket {path}\n"));
+    }
     for (name, value) in headers {
         head.push_str("header ");
         head.push_str(name);
@@ -667,6 +717,28 @@ mod tests {
 
     /// A body the service announces past what was asked for is refused
     /// before it is read.
+    #[test]
+    fn unix_requests_refuse_remote_origins_before_connecting() {
+        for url in [
+            "https://localhost/",
+            "http://localhost:80/",
+            "http://localhost.evil/",
+            "http://user@localhost/",
+            "http://127.0.0.1/",
+        ] {
+            assert!(matches!(
+                request_with_unix_socket("GET", url, &[], &[], None, "/private/socket"),
+                Err(Error::Malformed(_))
+            ));
+        }
+        for path in ["relative", "/socket\npublic"] {
+            assert!(matches!(
+                request_with_unix_socket("GET", "http://localhost/", &[], &[], None, path),
+                Err(Error::Malformed(_))
+            ));
+        }
+    }
+
     #[test]
     fn custom_ca_request_refuses_invalid_inputs_before_connecting() {
         for method in ["PUT", "GET\npublic"] {
