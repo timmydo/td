@@ -265,14 +265,35 @@ record="/var/lib/td-mta/operator/manual-$revision"
     wait_ready sudo -u td-mta /opt/td-mta/bin/td-mta status --json --require-ready \
       --runtime "/var/lib/td-mta/mail/$profile/runtime"
   done
+  # A previous ACME owner's lease can outlive its process by 180 seconds.
+  # The HTTP-01 listener is opened only after the new owner acquires it.
+  acme_end=$((SECONDS + 240))
+  while :; do
+    acme_pid=$(systemctl show td-mta-acme-production -p MainPID --value)
+    if [[ "$acme_pid" =~ ^[1-9][0-9]*$ ]] &&
+       sudo ss -H -ltnp 'sport = :80' | grep -Fq "pid=$acme_pid,"; then
+      break
+    fi
+    if (( SECONDS >= acme_end )); then exit 1; fi
+    sleep 2
+  done
   wait_ready sudo -u td-mta /opt/td-mta/bin/td-mta acme-status \
     --connection-file /var/lib/td-mta/mail/runtime-connection \
     --certificate-profile production --require-ready --minimum-validity-seconds 2592000
+  test "$(systemctl show td-mta-acme-production -p MainPID --value)" = "$acme_pid"
   sudo systemctl start td-mta-health.service
 )
 ```
 
-Each readiness check has a two-minute retry window; the command's own bounded
+ACME process startup has a four-minute retry window because the previous
+owner's 180-second database lease survives shutdown. During that interval,
+systemd can retry with `runtime-claim` errors; do not clear the lease by hand.
+`acme-status` reports persisted certificate health, so it cannot alone prove
+that the new renewal worker is running. Require its HTTP-01 listener first,
+then the same PID after the certificate check. The process hash checks below
+remain required.
+
+Each persisted or runtime readiness check has a two-minute retry window; the command's own bounded
 execution time may extend the final attempt. A service being `active` alone is
 not success. If startup or readiness fails, inspect the journal and use the
 rollback procedure below. Confirm that the health timer resumed even after a
