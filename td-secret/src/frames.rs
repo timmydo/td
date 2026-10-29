@@ -219,8 +219,8 @@ impl Wire {
 
     /// One round: `tag`, the caller's 32 random `round` bytes and the
     /// encoded `description`, which root must answer with `answer` and the
-    /// same bytes. The answer's header waits until `wait` when given, as a
-    /// typed approval key's does.
+    /// same bytes. The answer's header waits until `wait` when given, as an
+    /// Enter approval's does.
     pub(crate) fn exchange(
         &mut self,
         tag: u8,

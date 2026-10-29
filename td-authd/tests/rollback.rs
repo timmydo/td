@@ -22,7 +22,7 @@ fn granted() -> Result<Table, String> {
 
 fn started(volume: &Volume) -> Rollback {
     let selectors = admit(1000, granted(), volume.path()).unwrap();
-    Rollback::drawn(1000, selectors, [7; 32], [0x00, 0xfd]).unwrap()
+    Rollback::drawn(1000, selectors, [7; 32]).unwrap()
 }
 
 #[test]
@@ -86,35 +86,16 @@ fn the_table_is_consulted_before_the_selectors_and_both_before_a_description() {
 }
 
 #[test]
-fn each_digit_is_two_plus_its_own_byte_modulo_eight() {
-    let mut seen = [0usize; 8];
-    for byte in 0..=u8::MAX {
-        let key = approval_key([byte, byte.wrapping_add(3)]).unwrap();
-        let [first, second] = key.digits();
-        assert_eq!(first, b'2' + byte % 8);
-        assert_eq!(second, b'2' + byte.wrapping_add(3) % 8);
-        seen[usize::from(first - b'2')] += 1;
-    }
-    // Every digit from 2 to 9 equally likely: no byte is rejected.
-    assert_eq!(seen, [32; 8]);
-}
-
-#[test]
 fn the_description_is_the_pair_under_its_nonce_and_key() {
     let pair = volume(&id('c'), &id('d'));
     let rollback = started(&pair);
     let request = rollback.request();
     assert_eq!(request.nonce(), &[7; 32]);
     assert_eq!(request.owner(), 1000);
-    let Operation::DeployRollback {
-        key,
-        current,
-        previous,
-    } = request.operation()
-    else {
+    let Operation::DeployRollback { current, previous } = request.operation() else {
         panic!("not a rollback");
     };
-    assert_eq!(key.digits(), *b"27");
+    assert!(request.awaits_approval());
     assert_eq!((current, previous), (&id('c'), &id('d')));
     assert_eq!(Request::decode(&request.encode()).unwrap(), request.clone());
     // Production draws a fresh nonce and key each time.
@@ -140,7 +121,7 @@ fn a_rollback_needs_exact_presentation_then_a_single_commit() {
     assert!(rollback
         .commit_with(&wrong, |_, _| panic!("wrong request"))
         .is_err());
-    // Escape, or a wrong digit's cancellation, before commit ends it.
+    // Escape, or a first key other than Enter, before commit ends it.
     rollback.cancel().unwrap();
     assert!(rollback
         .commit_with(&request, |_, _| panic!("cancelled"))

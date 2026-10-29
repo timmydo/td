@@ -8439,18 +8439,11 @@ impl Qmp {
                         | "v"
                         | "w"
                         | "x"
-                        // `qemu-deploy-rollback`'s `B`, `H` and approval-key
-                        // digits.
+                        // `qemu-deploy-rollback`'s `B` and `H`, and the
+                        // letter that ends a request unapproved.
                         | "b"
                         | "h"
-                        | "2"
-                        | "3"
-                        | "4"
-                        | "5"
-                        | "6"
-                        | "7"
-                        | "8"
-                        | "9"
+                        | "q"
                 )
             })
         {
@@ -13344,7 +13337,6 @@ mod tests {
             order: &[],
             keep: None,
             wake: None,
-            reads: &[],
         };
         let check = |_: &[u8]| Ok(true);
         let shell: [serial_shell::ShellStep; 0] = [];

@@ -395,7 +395,6 @@ fn the_description_names_both_names_and_writes_nothing() {
     assert_eq!(fixture.backoff().read().unwrap(), admitted);
     assert_eq!(admitted.count(), 1);
     let Operation::SetHostname {
-        key,
         requester,
         old,
         new,
@@ -405,10 +404,6 @@ fn the_description_names_both_names_and_writes_nothing() {
     };
     assert_eq!((old.as_str(), new.as_str()), ("td", "my-laptop"));
     assert_eq!(*requester, fixture.uid());
-    assert!(key
-        .digits()
-        .iter()
-        .all(|digit| (b'2'..=b'9').contains(digit)));
     assert_eq!(change.request().owner(), fixture.uid());
 }
 
@@ -424,20 +419,8 @@ fn drawn(fixture: &Fixture) -> Change {
         Hostname::parse("td").unwrap(),
         &places,
         [9; 32],
-        [0, 7],
     )
     .unwrap()
-}
-
-#[test]
-fn each_digit_is_two_plus_its_own_byte_modulo_eight() {
-    for byte in 0..=u8::MAX {
-        let key = approval_key([byte, byte.wrapping_add(5)]).unwrap();
-        assert_eq!(
-            key.digits(),
-            [b'2' + byte % 8, b'2' + byte.wrapping_add(5) % 8]
-        );
-    }
 }
 
 /// Presentation, then one commit, which saves the new name canonically
@@ -451,10 +434,7 @@ fn the_commit_saves_the_new_name_once_and_clears_the_backoff() {
         .unwrap();
     let mut change = drawn(&fixture);
     let request = change.request().clone();
-    let Operation::SetHostname { key, .. } = request.operation() else {
-        panic!("not a hostname change");
-    };
-    assert_eq!(key.digits(), *b"29");
+    assert!(request.awaits_approval());
     assert!(change.commit(&request).is_err());
     assert_eq!(fixture.saved(), b"td\n");
     let wrong = Request::new([8; 32], fixture.uid(), request.operation().clone()).unwrap();
@@ -473,9 +453,9 @@ fn the_commit_saves_the_new_name_once_and_clears_the_backoff() {
     assert_eq!(fixture.backoff().read().unwrap(), Entry::default());
 }
 
-/// Escape, expiry, or the person's wrong digit, which the compositor sends
-/// as a cancellation, write nothing: the saved name stays and the count
-/// written at admission remains.
+/// Escape, expiry, or a key other than Enter pressed first, which the
+/// compositor sends as a cancellation, write nothing: the saved name
+/// stays and the count written at admission remains.
 #[test]
 fn an_unapproved_change_writes_nothing() {
     let fixture = Fixture::new("td");

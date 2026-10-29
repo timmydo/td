@@ -36,7 +36,7 @@ so an enrolled machine would otherwise have no administrative path. The
 activation increment therefore landed only after the `APPLICATIONS.md`
 §L.1 consent-only elevation workstream, whose "Elevation increments" L1
 to L7, all landed, made `deploy-rollback`, `set-hostname` and
-`deploy-publish` approval-key operations and then deleted `su` and
+`deploy-publish` consent operations and then deleted `su` and
 locked root ("Retiring the escape hatch"). Enrollment does not exist on
 any build without that elevation. Root login is never re-enabled as an
 administrative path.
@@ -1028,9 +1028,8 @@ scope. The person chooses:
   hardware.
 - `1`, one key.
 
-Either choice first shows an enrollment disclosure, confirmed by the
-root-drawn approval key under `td-compositor/DESIGN.md`, "Elevation
-consent", never by Enter. It states that from then on the
+Either choice first shows an enrollment disclosure, confirmed by Enter
+under `td-compositor/DESIGN.md`, "Elevation consent". It states that from then on the
 machine boots and locks to a screen only an enrolled key and its PIN
 open; that open console and SSH sessions end now, and SSH for any
 account but the primary is refused from then on (root SSH already is,
@@ -1116,7 +1115,7 @@ production with item 9's activation:
   naming the disk credential's fingerprint and its PIN retries, in the
   disk-proof consent tags 13 to 15, which carry which proof was chosen
   in every step. The proof's first step carries the operation's
-  disclosure and its approval key, where it has one.
+  disclosure and awaits approval, where it has one.
 - **PIN field.** The recovery-key step opens the PIN field in its
   recovery-key profile, which admits the 48 digits alone; a disk
   authorize step opens it in this document's PIN profile, then asks
@@ -1354,8 +1353,8 @@ host (`td-firstboot/src/login_directory.rs`).
 Since increment 5, `qemu-login-system` (`td-secret/DESIGN.md`, "Login
 system guest") also drives key management through the attention screen,
 the host checking each step's prompt row by row against consent's own
-lines and reading each disclosure's approval key off the screen, which
-the guest then types. Its `seed` boot is refused a first enrollment
+lines, including each disclosure's approval rows, before the guest
+presses Enter. Its `seed` boot is refused a first enrollment
 while `previous` names a deployment without the tier marker, then
 enrolls two keys with a serial login held by a process that ignores
 TERM and a primary SSH session open; the cutover ends every process of
@@ -1818,7 +1817,7 @@ and the oracle that shows it.
 5. **Activation:** enrollment UI and automatic-login cutover, the
    in-boot SSH render (`td-firstboot render-ssh-policy`), the `stop=leaf`
    key and `sshd`'s use of it (`td-svc/DESIGN.md`), the `K` screens, the
-   disclosures with their approval key, addition and removal, the
+   disclosures with their approval, addition and removal, the
    deployment-marker check on enrollment, and revocation with its reboot
    guard, which returns the greeter's line to root:root with the pinned
    mode before it restarts the greeter ("Cutover"). It lands only after
@@ -1909,41 +1908,36 @@ and the oracle that shows it.
      The cutover ends the logged-in serial session and an open SSH
      session, and leaves the enforced form, the record naming it and a
      greeter that refuses.
-   - A4, landed: the disclosures' approval key, which production
-     reaches since A5 admits a write:
-     - Only a disclosure step carries the key. That is the first step
-       of a first enrollment (its first `connect`), and the first step
-       of a removal that leaves at most one key (`identify`).
-       Root draws it beside the operation's nonce and puts it on its own
-       first step; the worker repeats that description exactly.
+   - A4, landed: the disclosures' approval, which production reaches
+     since A5 admits a write:
+     - Only a disclosure step awaits approval
+       (`consent::Request::awaits_approval`). That is the first step of
+       a first enrollment (its first `connect`), and the first step of a
+       removal that leaves at most one key (`identify`). Root puts the
+       disclosure on its own first step; the worker repeats that
+       description exactly.
      - Both are presented before any token I/O, and each disclosure
-       belongs to the whole operation. So one key confirms the
-       operation, and no later step carries one.
-     - The key's two bytes are drawn as an elevation's are and are the
-       description's last, after the step's (`td-authd/DESIGN.md`,
-       "Elevation operations"). The decoder requires them on such a step
-       and refuses them on any other.
+       belongs to the whole operation. So one approval confirms the
+       operation, and no later step awaits one.
      - The step's rows end with the disclosure ("Enrollment, addition
-       and removal") and then the key rows.
-     - The compositor sends that step's presentation receipt only once
-       the key is typed under its "Elevation consent" rules. The receipt
-       carries the exact description, so it carries the key. Enter and
-       a wrong digit act as they do on an elevation's prompt.
+       and removal") and then the approval rows.
+     - The compositor sends that step's presentation receipt, the exact
+       description, only once Enter approves it under its "Elevation
+       consent" rules; a press that ends the request acts as it does on
+       an elevation's prompt.
      - Root waits for that receipt, and the worker for root's
        acknowledgement, until the operation's deadline rather than the
        usual three and five seconds. A disclosing operation's ceiling
        adds a reading allowance, the same for root, the worker and the
        compositor (`td-authd/DESIGN.md`, amendment 6).
-     - The widest login value is unchanged: the authorize step of an
-       eight-key removal, which carries no key (`td-authd/DESIGN.md`,
-       "Immutable consent description prerequisite").
      - A disclosure prompt an output cannot hold whole is refused with
        a notice before any token I/O; which outputs hold each is
        `td-compositor/DESIGN.md`'s ("Elevation consent").
-     - The evidence is literal vectors, host tests (among them a key
-       typed after ten seconds still proceeds, and a receipt at root's
-       deadline, defence in depth behind the compositor's own deadline,
-       ends as TIMEOUT) and device-dispatcher tests, as for L3's key.
+     - The evidence is literal vectors, host tests (among them an
+       approval after ten seconds still proceeds, and a receipt at
+       root's deadline, defence in depth behind the compositor's own
+       deadline, ends as TIMEOUT) and device-dispatcher tests, as for
+       L3's prompt.
    - A5, landed: activation:
      - `login::WRITES` is gone with its refusal: production admits
        enrollment, addition and removal, and `9b 00` is no longer sent;
@@ -1952,8 +1946,9 @@ and the oracle that shows it.
        describes the tier as usable before the hardware evidence below.
      - Its oracle is this item's full-system QEMU list, plus the
        guest-side failure injection, as further `qemu-login-system`
-       phases that drive the attention screen, the host reading each
-       disclosure's approval key off the screen ("Evidence").
+       phases that drive the attention screen, the host checking each
+       disclosure's prompt on the screen before the guest approves it
+       ("Evidence").
 
    A5 landed only after A3 and A4, so no build admits a write whose
    cutover or disclosure is missing. Increment 5 is complete.

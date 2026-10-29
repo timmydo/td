@@ -50,10 +50,10 @@ impl Wire {
     }
 
     /// A login disclosure step's presentation round: root acknowledges it
-    /// only once the person has read the disclosure and typed its approval
-    /// key, with no token I/O open, so the answer's header waits for the
+    /// only once the person has read the disclosure and approved it with
+    /// Enter, with no token I/O open, so the answer's header waits for the
     /// operation deadline, or an open session's, as a PIN's does.
-    pub(super) fn acknowledge_typed(
+    pub(super) fn acknowledge_approved(
         &mut self,
         tag: u8,
         answer: u8,
@@ -330,9 +330,9 @@ mod tests {
         assert_eq!(
             challenge(&original),
             [
-                0x48, 0xf5, 0xbf, 0x17, 0xed, 0x21, 0xd9, 0xf6, 0x1d, 0xf2, 0x3c, 0xd2, 0x7b, 0x01,
-                0x42, 0x3a, 0xbc, 0x79, 0xa0, 0x31, 0x0e, 0x81, 0x2a, 0xb4, 0xc0, 0x17, 0xb2, 0x0a,
-                0x89, 0xd5, 0x2e, 0xd0
+                0xc0, 0x07, 0x3e, 0xfa, 0x76, 0x67, 0xb4, 0x3a, 0x83, 0x40, 0xa7, 0x2c, 0x2a, 0x74,
+                0x62, 0xdf, 0x87, 0x19, 0x59, 0x90, 0xe2, 0x40, 0x23, 0xdc, 0xc1, 0x12, 0x9b, 0xc2,
+                0xf5, 0x14, 0xab, 0x11
             ]
         );
         assert_eq!(description(&original.encode(), 1000).unwrap(), original);
@@ -476,7 +476,7 @@ mod tests {
                         let _ = root.send(&prompt);
                     });
                     let result = if typed {
-                        wire.acknowledge_typed(0x10, 0x11, &request())
+                        wire.acknowledge_approved(0x10, 0x11, &request())
                     } else {
                         wire.acknowledge(0x10, 0x11, &request())
                     };
@@ -489,7 +489,7 @@ mod tests {
         // The operation deadline still bounds it.
         let (child, _parent) = UnixStream::pair().unwrap();
         let mut wire = Wire::new(child, Instant::now() + Duration::from_millis(30)).unwrap();
-        assert!(wire.acknowledge_typed(0x10, 0x11, &request()).is_err());
+        assert!(wire.acknowledge_approved(0x10, 0x11, &request()).is_err());
         assert!(wire.expired());
     }
 

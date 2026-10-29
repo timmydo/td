@@ -2,11 +2,10 @@
 
 use crate::attention::{Field, Notice};
 use crate::authority::consent::{
-    upgrade_ceiling, Admitted, ApprovalKey, DiskRequest, Enrollment, Fingerprint, LoginStep,
-    Managed, Operation, Platform, Proof, Recovery, Request, Role, SelectorForm, Slot, UpgradeShape,
-    UpgradeStep, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_READING, LOGIN_TWO_CEREMONIES,
-    LOGIN_TWO_KEY_ENROLLMENT, PROTECTOR_CEILING, REQUEST_CEILING, SELECTOR_UPDATE_CEILING,
-    UPGRADE_CANCEL_CEILING,
+    upgrade_ceiling, Admitted, DiskRequest, Enrollment, Fingerprint, LoginStep, Managed, Operation,
+    Platform, Proof, Recovery, Request, Role, SelectorForm, Slot, UpgradeShape, UpgradeStep,
+    LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_READING, LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT,
+    PROTECTOR_CEILING, REQUEST_CEILING, SELECTOR_UPDATE_CEILING, UPGRADE_CANCEL_CEILING,
 };
 use crate::authority::Exchange;
 use crate::input::EvdevOrigin;
@@ -410,9 +409,9 @@ impl Selection {
         }
     }
     /// Whether a physical confirmation on the presented prompt must come
-    /// before commit: the approval key for an update or an elevation, a
+    /// before commit: an approving Enter for an update or an elevation, a
     /// fresh Enter for a live boot's whole-disk installation. A login
-    /// disclosure step's key comes before its receipt instead.
+    /// disclosure step's approval comes before its receipt instead.
     fn confirms(&self) -> bool {
         matches!(self, Self::Install | Self::Elevation(_))
     }
@@ -420,8 +419,7 @@ impl Selection {
 
 /// An elevation (td-compositor/DESIGN.md, "Elevation consent"): what the
 /// attention menu's `B` asks root for, and the queued request its `H`
-/// selects. Each description carries the approval key that alone confirms
-/// it.
+/// selects. Only an approving Enter on its presented prompt confirms it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Elevation {
     Rollback,
@@ -429,11 +427,11 @@ pub(crate) enum Elevation {
 }
 
 impl Elevation {
-    /// The elevation `request` describes, and its approval key.
-    fn of(request: &Request) -> Option<(Self, ApprovalKey)> {
+    /// The elevation `request` describes.
+    fn of(request: &Request) -> Option<Self> {
         match request.operation() {
-            Operation::DeployRollback { key, .. } => Some((Self::Rollback, *key)),
-            Operation::SetHostname { key, .. } => Some((Self::Hostname, *key)),
+            Operation::DeployRollback { .. } => Some(Self::Rollback),
+            Operation::SetHostname { .. } => Some(Self::Hostname),
             _ => None,
         }
     }
@@ -448,33 +446,33 @@ impl Elevation {
     }
 }
 
-/// The approval key `request` carries: an update's (`deploy-publish`), an
-/// elevation's or a login disclosure step's. Every other description, a
-/// whole-disk installation's among them, has none.
-fn approval_key(request: &Request) -> Option<ApprovalKey> {
-    match request.operation() {
-        Operation::Install { key, .. } => Some(*key),
-        Operation::LoginEnroll { approval, .. } | Operation::LoginRemove { approval, .. } => {
-            *approval
-        }
-        Operation::SelectorUpdate { key, .. } | Operation::UpgradeCancel { key } => Some(*key),
-        Operation::Upgrade { approval, .. } | Operation::RecoveryRemove { approval, .. } => {
-            *approval
-        }
-        _ => Elevation::of(request).map(|(_, key)| key),
-    }
+/// The press a prompt awaiting approval counts first (DESIGN.md,
+/// "Elevation consent"): Enter with no Control, Alt or Super held, or any
+/// other key, which ends the request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApprovalPress {
+    Enter,
+    Other,
 }
+
+/// How long, in CLOCK_MONOTONIC nanoseconds, a prompt awaiting approval is
+/// on glass before Enter approves it. An earlier Enter, one already on its
+/// way when the prompt appeared, ends the request instead.
+pub(crate) const APPROVAL_SETTLE: u128 = 500_000_000;
 
 /// A presented prompt that waits for its physical confirmation.
 struct Presented {
     request: Request,
     /// A press must be stamped strictly later than this: the
     /// CLOCK_MONOTONIC sample taken after the prompt's full-frame
-    /// submission, and once an approval key's first digit is typed, that
-    /// digit's time.
+    /// submission.
     after: u128,
-    /// How many of the approval key's digits were typed in order.
-    typed: usize,
+    /// Whether its first counted press came: that press alone approved or
+    /// ended it.
+    decided: bool,
+    /// The approving Enter's stamp, while a press stamped before it, read
+    /// later from another keyboard, may still withdraw it.
+    approved_at: Option<u128>,
 }
 
 /// A login-key operation (td-login/TOKEN-LOGIN.md): root's request `1b`.
@@ -489,8 +487,8 @@ pub(crate) enum LoginSelection {
     /// ceiling: root's description must agree.
     Remove(Vec<Slot>, u8),
     /// Storage operation `01` (td-authd/DESIGN.md amendment 10), root's
-    /// `20 01`, polled as a login operation is: one step, confirmed by its
-    /// approval key, then its commit.
+    /// `20 01`, polled as a login operation is: one step, approved by Enter,
+    /// then its commit.
     SelectorUpdate,
     /// Storage operation `02`, root's `20 02 S N`: phase 1 of the
     /// re-encrypting upgrade to `shape` with `count` new keys, its review
@@ -646,7 +644,6 @@ impl LoginSelection {
                     shape: described,
                     count: counted,
                     step: UpgradeStep::Review,
-                    approval: Some(_),
                     ..
                 },
             ) => {
@@ -655,9 +652,7 @@ impl LoginSelection {
                     && described == shape
                     && counted == count
             }
-            (Self::UpgradeCancel, Operation::UpgradeCancel { .. }) => {
-                return request.owner() == 1000
-            }
+            (Self::UpgradeCancel, Operation::UpgradeCancel) => return request.owner() == 1000,
             (Self::Protector(managed), operation) => {
                 return request.owner() == 1000 && protector_first(*managed, operation)
             }
@@ -731,11 +726,11 @@ impl LoginSelection {
                 },
             },
             Self::SelectorUpdate => match request.and_then(Request::selector_update) {
-                Some((_, SelectorForm::Staged, _)) => &[
+                Some((SelectorForm::Staged, _)) => &[
                     "BOOT SELECTOR UPDATED",
                     "THE NEXT BOOT ASKS FOR THE DISK PIN",
                 ],
-                Some((_, SelectorForm::DeviceBound, _)) => &[
+                Some((SelectorForm::DeviceBound, _)) => &[
                     "BOOT SELECTOR UPDATED",
                     "THE NEXT BOOT NEEDS THE RECOVERY KEY",
                 ],
@@ -777,7 +772,7 @@ fn protector_first(managed: Managed, operation: &Operation) -> bool {
             Operation::RecoveryRemove {
                 account,
                 step: LoginStep::DiskIdentify,
-                approval: Some(_),
+                ..
             },
         ) => *account == 1000,
         (
@@ -1347,25 +1342,24 @@ impl Attempt {
                 .presentation
                 .lock()
                 .map_err(|_| "presentation receipt lock poisoned")?;
-            // A login step replaces the one before it, whose key is spent:
-            // its confirmation goes with it, under the lock a digit sets it.
+            // A login step replaces the one before it, whose approval is
+            // spent: it goes with it, under the lock an Enter sets it.
             if matches!(self.selection, Selection::Login(_)) {
                 self.confirmed.store(false, Ordering::SeqCst);
             }
             *presentation =
-                (self.selection.confirms() || approval_key(&request).is_some()).then(|| {
-                    Presented {
-                        request: request.clone(),
-                        after: completed,
-                        typed: 0,
-                    }
+                (self.selection.confirms() || request.awaits_approval()).then(|| Presented {
+                    request: request.clone(),
+                    after: completed,
+                    decided: false,
+                    approved_at: None,
                 });
         }
         Ok(request)
     }
 
-    /// Whether `request`, the presented login disclosure step, has its
-    /// approval key typed: only then does its receipt go to root.
+    /// Whether `request`, the presented login disclosure step, was approved
+    /// by Enter: only then does its receipt go to root.
     fn approved(&self, request: &Request) -> bool {
         self.confirmed.load(Ordering::SeqCst)
             && self.presentation.lock().is_ok_and(|presented| {
@@ -1386,7 +1380,7 @@ impl Attempt {
 
     /// A fresh Enter, which only the physical evdev adapter can offer,
     /// confirms a live boot's whole-disk installation and nothing else: an
-    /// update takes its approval key.
+    /// update is approved through `approve`.
     pub fn confirm_install(&self, _origin: &EvdevOrigin, timestamp: u128) -> Result<(), String> {
         if self.selection != Selection::Install || !self.active() {
             return Ok(());
@@ -1406,65 +1400,83 @@ impl Attempt {
         Ok(())
     }
 
-    /// One approval-key digit, `2` to `9` in ASCII, pressed at `timestamp`,
-    /// which only the physical evdev adapter can offer, for an update, an
-    /// elevation or a login disclosure step: answers whether it ended the
-    /// request. A press the prompt
-    /// cannot answer (stamped before the prompt was on glass or before the
-    /// first digit, a withdrawn or replaced prompt, a key already typed)
-    /// neither advances nor ends it.
-    /// A digit that matches its position advances, and the second confirms;
-    /// one that does not cancels the attempt, as Escape does, and the
-    /// adapter then drains the screen.
+    /// The first press, pressed at `timestamp`, that a presented prompt
+    /// awaiting approval counts, which only the physical evdev adapter can
+    /// offer (an update, an elevation, a protector step or a login
+    /// disclosure step): answers whether it ended the request. A press the
+    /// prompt cannot answer (stamped before the prompt was on glass, a
+    /// withdrawn or replaced prompt, one already decided) neither approves
+    /// nor ends it. Enter at least `APPROVAL_SETTLE` after the prompt was on
+    /// glass approves; any other key, or an Enter sooner, cancels the
+    /// attempt as Escape does, and the adapter then drains the screen.
+    /// Keyboards are read apart, so the first press delivered need not be
+    /// the first pressed: until the commit, another key stamped before the
+    /// approving Enter withdraws it and ends the request the same way.
     pub fn approve(
         &self,
         _origin: &EvdevOrigin,
-        digit: u8,
+        press: ApprovalPress,
         timestamp: u128,
     ) -> Result<bool, String> {
         if !matches!(
             self.selection,
             Selection::Install | Selection::Elevation(_) | Selection::Login(_)
-        ) || !(b'2'..=b'9').contains(&digit)
-            || !self.active()
+        ) || !self.active()
         {
             return Ok(false);
         }
-        let wrong = {
+        let ended = {
             let runtime = self.runtime.lock().map_err(|_| "runtime lock poisoned")?;
             let mut presentation = self
                 .presentation
                 .lock()
                 .map_err(|_| "presentation receipt lock poisoned")?;
-            let Some(presented) = presentation
-                .as_mut()
-                .filter(|presented| self.answers(&runtime, presented, timestamp))
-            else {
+            let Some(presented) = presentation.as_mut().filter(|presented| {
+                presented.request.awaits_approval() && self.answers(&runtime, presented, timestamp)
+            }) else {
                 return Ok(false);
             };
-            let Some(key) = approval_key(&presented.request) else {
-                return Ok(false);
-            };
-            let digits = key.digits();
-            let Some(expected) = digits.get(presented.typed) else {
-                return Ok(false);
-            };
-            let wrong = digit != *expected;
-            if !wrong {
-                presented.typed += 1;
-                presented.after = timestamp;
-                if presented.typed == digits.len() {
-                    self.confirmed.store(true, Ordering::SeqCst);
+            if presented.decided {
+                let earlier = press == ApprovalPress::Other
+                    && presented.approved_at.is_some_and(|at| timestamp < at);
+                if !earlier {
+                    return Ok(false);
                 }
+                // The commit takes ACTIVE to COMMITTED and this takes it to
+                // CANCELLED: exactly one of the two has the request, and a
+                // login receipt needs the attempt still active.
+                if self
+                    .state
+                    .compare_exchange(ACTIVE, CANCELLED, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    return Ok(false);
+                }
+                presented.approved_at = None;
+                self.confirmed.store(false, Ordering::SeqCst);
+                drop(presentation);
+                drop(runtime);
+                self.close_field();
+                return Ok(true);
             }
-            wrong
+            presented.decided = true;
+            let settled = presented
+                .after
+                .checked_add(APPROVAL_SETTLE)
+                .is_some_and(|settled| timestamp >= settled);
+            let approved = press == ApprovalPress::Enter && settled;
+            if approved {
+                presented.approved_at = Some(timestamp);
+                self.confirmed.store(true, Ordering::SeqCst);
+            }
+            !approved
         };
         // Outside the runtime's guard, since cancellation takes the PIN
         // field's, which every holder takes before the runtime's.
-        if wrong {
+        if ended {
             self.cancel();
         }
-        Ok(wrong)
+        Ok(ended)
     }
 
     pub fn notice(&self, notice: crate::attention::Notice) -> Result<(), String> {
@@ -1521,8 +1533,8 @@ struct LoginPending {
     /// Root's current description; none before the worker's baseline.
     request: Option<Request>,
     receipt: Option<Request>,
-    /// The current step, presented and waiting for its approval key before
-    /// its receipt: a disclosure step.
+    /// The current step, presented and waiting for its approving Enter
+    /// before its receipt: a disclosure step.
     shown: Option<Request>,
     /// The current step is the operation's final one: only its commit
     /// follows.
@@ -1763,12 +1775,11 @@ impl Client {
                         _ => return login.abandon(wire),
                     }
                 }
-                // A disclosure step's receipt waits for its approval key
+                // A disclosure step's receipt waits for its approving Enter
                 // (DESIGN.md, "Elevation consent"); any other step's
                 // follows its presentation. Root polls again meanwhile.
                 if login.shown.as_ref() == Some(&description)
-                    && (approval_key(&description).is_none()
-                        || login.attempt.approved(&description))
+                    && (!description.awaits_approval() || login.attempt.approved(&description))
                     && login.attempt.active()
                 {
                     let mut bytes = vec![0x13];
@@ -1938,9 +1949,7 @@ impl Client {
                         ..
                     }
                 ),
-                Selection::Elevation(elevation) => {
-                    Elevation::of(&request).is_some_and(|(described, _)| described == elevation)
-                }
+                Selection::Elevation(elevation) => Elevation::of(&request) == Some(elevation),
                 // An update on an installed system; a whole disk on a live
                 // boot.
                 Selection::Install => matches!(
@@ -2703,7 +2712,7 @@ mod tests {
                 }
                 // A login disclosure on glass: they type its key.
                 if matches!(attempt.selection, Selection::Login(_)) {
-                    type_key(attempt);
+                    approve_presented(attempt);
                 }
             }
             Ok(reply)
@@ -2723,23 +2732,25 @@ mod tests {
             .shown
             .map_or(0, |shown| shown + 1)
     }
-    /// The presented prompt's approval key, each digit a fresh press after
-    /// the one before, as the evdev adapter offers them; nothing once typed
-    /// or for a prompt without one.
-    fn type_key(attempt: &Attempt) {
+    /// An approving Enter on the presented prompt once it has settled, as
+    /// the evdev adapter offers it; nothing once decided or for a prompt
+    /// that does not await approval.
+    fn approve_presented(attempt: &Attempt) {
         let shown = attempt
             .presentation
             .lock()
             .unwrap()
             .as_ref()
-            .filter(|presented| presented.typed == 0)
-            .and_then(|presented| Some((approval_key(&presented.request)?, presented.after)));
-        if let Some((key, after)) = shown {
-            for (at, digit) in (after + 1..).zip(key.digits()) {
-                attempt
-                    .approve(&crate::input::test_origin(), digit, at)
-                    .unwrap();
-            }
+            .filter(|presented| !presented.decided && presented.request.awaits_approval())
+            .map(|presented| presented.after);
+        if let Some(after) = shown {
+            assert!(!attempt
+                .approve(
+                    &crate::input::test_origin(),
+                    ApprovalPress::Enter,
+                    after + APPROVAL_SETTLE
+                )
+                .unwrap());
         }
     }
     /// `pin`'s keys, then Enter, as the evdev adapter offers them.
@@ -2895,14 +2906,12 @@ mod tests {
         }
     }
 
-    /// Root's description of a queued update for the owner, carrying
-    /// `key`.
-    fn update(key: &[u8; 2]) -> Request {
+    /// Root's description of a queued update for the owner.
+    fn update() -> Request {
         Request::new(
             [42; 32],
             1000,
             Operation::Install {
-                key: crate::authority::consent::ApprovalKey::new(*key).unwrap(),
                 deployment: "ab".repeat(32),
                 requester: 1000,
             },
@@ -2910,21 +2919,20 @@ mod tests {
         .unwrap()
     }
 
-    /// An update (`deploy-publish`) commits once, only after its two
-    /// digits are typed in order on the presented prompt, and the commit
-    /// is root's exact description, so it carries the key typed. Enter,
-    /// fresh or not, confirms nothing.
+    /// An update (`deploy-publish`) commits once, only after an approving
+    /// Enter on the presented prompt, and the commit is root's exact
+    /// description. The whole-disk installation's Enter, fresh or not,
+    /// confirms nothing.
     #[test]
-    fn an_update_commits_only_after_its_key_is_typed_never_on_enter() {
+    fn an_update_commits_only_after_an_approving_enter() {
         let mut screen = Screen::new();
         Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
-        let described = update(b"58");
+        let described = update();
         let invitation = status(5, &described);
         let (mut client, mut wire, shown) = presented_elevation(
             &screen,
             &described,
             vec![
-                invitation.clone(),
                 invitation.clone(),
                 invitation,
                 vec![0x94],
@@ -2932,9 +2940,9 @@ mod tests {
             ],
         );
         assert_eq!(wire.calls[0], [0x19]);
-        // Invited to commit, the client waits: Enter after presentation,
-        // or at any later time, confirms nothing.
-        for at in [shown + 1, shown + 2, u128::MAX] {
+        // Invited to commit, the client waits: the disk installation's
+        // Enter after presentation, or at any later time, confirms nothing.
+        for at in [shown + APPROVAL_SETTLE, u128::MAX] {
             screen
                 .attempt
                 .confirm_install(&crate::input::test_origin(), at)
@@ -2943,10 +2951,11 @@ mod tests {
         assert!(!confirmed(&screen) && screen.attempt.active());
         client.tick(&mut wire).unwrap();
         assert_eq!(sent(&wire, 0x14), 0);
-        assert!(!press(&screen, b'5', shown + 3));
-        client.tick(&mut wire).unwrap();
-        assert_eq!(sent(&wire, 0x14), 0);
-        assert!(!press(&screen, b'8', shown + 4));
+        assert!(!press(
+            &screen,
+            ApprovalPress::Enter,
+            shown + APPROVAL_SETTLE
+        ));
         assert!(confirmed(&screen));
         client.tick(&mut wire).unwrap();
         let commits: Vec<_> = wire
@@ -2955,7 +2964,6 @@ mod tests {
             .filter(|call| call.first() == Some(&0x14))
             .collect();
         assert_eq!(commits, [&description(&[0x14], &described)]);
-        assert_eq!(commits[0][46..48], *b"58");
         client.tick(&mut wire).unwrap();
         assert!(client.pending.is_none());
         assert_eq!(
@@ -2965,30 +2973,41 @@ mod tests {
         assert_eq!(sent(&wire, 0x14), 1);
     }
 
-    /// An update's wrong digit, at either position, ends it unapproved as
-    /// an elevation's does; a digit stamped before the prompt was on glass
-    /// neither advances nor ends it.
+    /// An update's first counted press other than a settled Enter, another
+    /// key or an Enter inside the settle, ends it unapproved as an
+    /// elevation's does; a press stamped before the prompt was on glass
+    /// counts for nothing.
     #[test]
-    fn an_updates_wrong_digit_ends_it_and_an_early_one_counts_for_nothing() {
-        for typed_first in [false, true] {
+    fn an_updates_first_press_decides_and_an_early_one_counts_for_nothing() {
+        for (first, at) in [
+            (ApprovalPress::Other, 1),
+            (ApprovalPress::Other, APPROVAL_SETTLE),
+            (ApprovalPress::Enter, 1),
+            (ApprovalPress::Enter, APPROVAL_SETTLE - 1),
+        ] {
             let mut screen = Screen::new();
             Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
-            let described = update(b"58");
+            let described = update();
             let (mut client, mut wire, shown) = presented_elevation(
                 &screen,
                 &described,
                 vec![vec![0x95, 0], status(7, &described)],
             );
-            for (digit, at) in [(b'5', shown), (b'9', shown - 1), (b'0', shown + 1)] {
-                assert!(!press(&screen, digit, at));
+            for (early, at) in [
+                (ApprovalPress::Enter, shown),
+                (ApprovalPress::Other, shown - 1),
+            ] {
+                assert!(!press(&screen, early, at));
             }
             assert!(screen.attempt.active());
-            if typed_first {
-                assert!(!press(&screen, b'5', shown + 1));
-            }
-            assert!(press(&screen, b'9', shown + 2));
+            assert!(press(&screen, first, shown + at));
             assert!(!screen.attempt.active() && !confirmed(&screen));
-            assert!(!press(&screen, b'8', shown + 3));
+            assert!(!press(
+                &screen,
+                ApprovalPress::Enter,
+                shown + APPROVAL_SETTLE + 1
+            ));
+            assert!(!confirmed(&screen));
             client.tick(&mut wire).unwrap();
             assert!(client.pending.is_none());
             assert_eq!(sent(&wire, 0x15), 1);
@@ -2996,10 +3015,55 @@ mod tests {
         }
     }
 
-    /// A live boot's whole-disk installation keeps its fresh Enter after
-    /// complete presentation, and no digit confirms or ends it.
+    /// Keyboards are read apart: a key another keyboard stamped before the
+    /// approving Enter, delivered after it but before the commit, withdraws
+    /// the approval and ends the request; one stamped after it, or an Enter,
+    /// changes nothing.
     #[test]
-    fn a_disk_installation_waits_for_fresh_enter_and_takes_no_digit() {
+    fn an_earlier_key_read_after_an_approving_enter_withdraws_it() {
+        let approving = |screen: &Screen| -> (Client, Wire, u128) {
+            let described = update();
+            let (client, wire, shown) = presented_elevation(
+                screen,
+                &described,
+                vec![vec![0x95, 0], status(7, &described)],
+            );
+            let enter = shown + APPROVAL_SETTLE + 10;
+            assert!(!press(screen, ApprovalPress::Enter, enter));
+            assert!(confirmed(screen) && screen.attempt.active());
+            (client, wire, enter)
+        };
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+        let (mut client, mut wire, enter) = approving(&screen);
+        assert!(press(&screen, ApprovalPress::Other, enter - 1));
+        assert!(!screen.attempt.active() && !confirmed(&screen));
+        assert!(!press(&screen, ApprovalPress::Other, enter - 2));
+        client.tick(&mut wire).unwrap();
+        assert!(client.pending.is_none());
+        assert_eq!(sent(&wire, 0x15), 1);
+        assert_eq!(sent(&wire, 0x14), 0);
+        for late in [(ApprovalPress::Other, 1), (ApprovalPress::Enter, 0)] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+            let (_, _, enter) = approving(&screen);
+            assert!(!press(&screen, late.0, enter + late.1));
+            assert!(!press(&screen, ApprovalPress::Enter, enter - 1));
+            assert!(confirmed(&screen) && screen.attempt.active());
+        }
+        // Once committed, an earlier key read too late changes nothing.
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+        let (_, _, enter) = approving(&screen);
+        assert!(screen.attempt.commit());
+        assert!(!press(&screen, ApprovalPress::Other, enter - 1));
+        assert!(confirmed(&screen));
+    }
+
+    /// A live boot's whole-disk installation keeps its fresh Enter after
+    /// complete presentation, and no approval press confirms or ends it.
+    #[test]
+    fn a_disk_installation_waits_for_fresh_enter_and_takes_no_approval_press() {
         for preserve in [false, true] {
             let mut screen = Screen::new();
             Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
@@ -3033,8 +3097,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .after;
-            for digit in *b"23456789" {
-                assert!(!press(&screen, digit, completed + 1));
+            for approval in [ApprovalPress::Enter, ApprovalPress::Other] {
+                assert!(!press(&screen, approval, completed + APPROVAL_SETTLE));
             }
             assert!(!confirmed(&screen) && screen.attempt.active());
             screen
@@ -3209,21 +3273,18 @@ mod tests {
         }
     }
 
-    // Elevation consent: the approval key.
+    // Elevation consent: the approving Enter.
 
     const ELEVATIONS: &[Elevation] = &[Elevation::Rollback, Elevation::Hostname];
 
-    /// Root's description of `elevation` for the owner, carrying `key`.
-    fn elevation(elevation: Elevation, key: &[u8; 2]) -> Request {
-        let key = crate::authority::consent::ApprovalKey::new(*key).unwrap();
+    /// Root's description of `elevation` for the owner.
+    fn elevation(elevation: Elevation) -> Request {
         let operation = match elevation {
             Elevation::Rollback => Operation::DeployRollback {
-                key,
                 current: "a".repeat(64),
                 previous: "b".repeat(64),
             },
             Elevation::Hostname => Operation::SetHostname {
-                key,
                 requester: 1000,
                 old: "td".into(),
                 new: "td-laptop".into(),
@@ -3396,12 +3457,12 @@ mod tests {
         (client, wire, shown)
     }
 
-    /// The evdev adapter's offer of `digit` pressed at `at`: whether it
-    /// ended the request.
-    fn press(screen: &Screen, digit: u8, at: u128) -> bool {
+    /// The evdev adapter's offer of `approval` pressed at `at`: whether
+    /// it ended the request.
+    fn press(screen: &Screen, approval: ApprovalPress, at: u128) -> bool {
         screen
             .attempt
-            .approve(&crate::input::test_origin(), digit, at)
+            .approve(&crate::input::test_origin(), approval, at)
             .unwrap()
     }
 
@@ -3409,24 +3470,22 @@ mod tests {
         screen.attempt.confirmed.load(Ordering::SeqCst)
     }
 
-    /// Each elevation's prompt commits once, only after its two digits are
-    /// typed in order on the presented prompt, and the commit is root's
-    /// exact description, so it carries the key typed. The same digit
-    /// twice is two presses. Root's success shows each one's own screen.
+    /// Each elevation's prompt commits once, only after an approving Enter
+    /// on the presented prompt, and the commit is root's exact
+    /// description. Root's success shows each one's own screen.
     #[test]
-    fn each_elevation_commits_only_after_its_key_is_typed_in_order() {
-        for (elevation, key, request) in [
-            (Elevation::Rollback, b"47", vec![0x1d]),
-            (Elevation::Hostname, b"44", vec![0x1e]),
+    fn each_elevation_commits_only_after_an_approving_enter() {
+        for (elevation, request) in [
+            (Elevation::Rollback, vec![0x1d]),
+            (Elevation::Hostname, vec![0x1e]),
         ] {
             let screen = elevation_screen(elevation);
-            let described = super::tests::elevation(elevation, key);
+            let described = super::tests::elevation(elevation);
             let invitation = status(5, &described);
             let (mut client, mut wire, shown) = presented_elevation(
                 &screen,
                 &described,
                 vec![
-                    invitation.clone(),
                     invitation.clone(),
                     invitation,
                     vec![0x94],
@@ -3434,13 +3493,15 @@ mod tests {
                 ],
             );
             assert_eq!(wire.calls[0], request);
-            // Invited to commit, the client waits for the key.
-            client.tick(&mut wire).unwrap();
-            assert!(!press(&screen, key[0], shown + 1));
-            assert!(!confirmed(&screen) && screen.attempt.active());
+            // Invited to commit, the client waits for the approval.
             client.tick(&mut wire).unwrap();
             assert_eq!(sent(&wire, 0x14), 0);
-            assert!(!press(&screen, key[1], shown + 2));
+            assert!(!confirmed(&screen) && screen.attempt.active());
+            assert!(!press(
+                &screen,
+                ApprovalPress::Enter,
+                shown + APPROVAL_SETTLE
+            ));
             assert!(confirmed(&screen));
             client.tick(&mut wire).unwrap();
             let commits: Vec<_> = wire
@@ -3449,7 +3510,6 @@ mod tests {
                 .filter(|call| call.first() == Some(&0x14))
                 .collect();
             assert_eq!(commits, [&description(&[0x14], &described)]);
-            assert_eq!(commits[0][46..48], key[..]);
             assert!(client.pending.as_ref().unwrap().committed);
             client.tick(&mut wire).unwrap();
             assert!(client.pending.is_none());
@@ -3527,16 +3587,17 @@ mod tests {
         }
     }
 
-    /// Enter never confirms an elevation, nor a digit anything without a
-    /// key: a disk installation, or a write.
+    /// The whole-disk installation's Enter never confirms an elevation, nor
+    /// an approval press a prompt that awaits none: a disk installation,
+    /// or a write.
     #[test]
-    fn enter_never_confirms_an_elevation_nor_a_digit_a_keyless_prompt() {
+    fn install_enter_never_confirms_an_elevation_nor_a_press_a_prompt_awaiting_none() {
         for &elevation in ELEVATIONS {
             let screen = elevation_screen(elevation);
-            let described = super::tests::elevation(elevation, b"47");
+            let described = super::tests::elevation(elevation);
             let (mut client, mut wire, shown) =
                 presented_elevation(&screen, &described, vec![status(5, &described)]);
-            for at in [shown + 1, shown + 2, u128::MAX] {
+            for at in [shown + 1, shown + APPROVAL_SETTLE, u128::MAX] {
                 screen
                     .attempt
                     .confirm_install(&crate::input::test_origin(), at)
@@ -3552,85 +3613,93 @@ mod tests {
                 Selection::Install,
                 disk(crate::authority::consent::Storage::DeviceBound),
             ),
-            (Selection::Write, update(b"47")),
+            (Selection::Write, update()),
         ] {
             let mut screen = Screen::new();
             Arc::get_mut(&mut screen.attempt).unwrap().selection = selection;
             screen.attempt.present(request).unwrap();
-            for digit in *b"23456789" {
-                assert!(!press(&screen, digit, u128::MAX));
+            for approval in [ApprovalPress::Enter, ApprovalPress::Other] {
+                assert!(!press(&screen, approval, u128::MAX));
             }
             assert!(!confirmed(&screen) && screen.attempt.active());
         }
     }
 
-    /// A digit stamped before the prompt was on glass, or the second before
-    /// the first, neither advances nor ends the request, right or wrong.
+    /// A press stamped before the prompt was on glass counts for nothing,
+    /// Enter or not; the first counted press decides, and once Enter
+    /// approved, a later press, any key, changes nothing.
     #[test]
-    fn a_digit_stamped_before_its_turn_neither_advances_nor_ends() {
+    fn a_press_before_the_prompt_was_on_glass_counts_for_nothing() {
         for &elevation in ELEVATIONS {
             let screen = elevation_screen(elevation);
             // Selected, not yet presented: nothing to answer.
-            assert!(!press(&screen, b'4', u128::MAX));
-            assert!(!press(&screen, b'9', u128::MAX));
-            let described = super::tests::elevation(elevation, b"47");
+            assert!(!press(&screen, ApprovalPress::Enter, u128::MAX));
+            assert!(!press(&screen, ApprovalPress::Other, u128::MAX));
+            let described = super::tests::elevation(elevation);
             let (_client, _wire, shown) = presented_elevation(&screen, &described, vec![]);
-            for (digit, at) in [(b'4', shown), (b'4', shown - 1), (b'9', shown), (b'9', 0)] {
-                assert!(!press(&screen, digit, at));
+            for (approval, at) in [
+                (ApprovalPress::Enter, shown),
+                (ApprovalPress::Enter, shown - 1),
+                (ApprovalPress::Other, shown),
+                (ApprovalPress::Other, 0),
+            ] {
+                assert!(!press(&screen, approval, at));
             }
             assert!(screen.attempt.active());
-            assert_eq!(
-                screen
+            assert!(
+                !screen
                     .attempt
                     .presentation
                     .lock()
                     .unwrap()
                     .as_ref()
                     .unwrap()
-                    .typed,
-                0
+                    .decided
             );
-            assert!(!press(&screen, b'4', shown + 5));
-            // The second digit must be later than the first.
-            for (digit, at) in [(b'7', shown + 5), (b'9', shown + 5), (b'7', shown + 4)] {
-                assert!(!press(&screen, digit, at));
-            }
-            assert!(!confirmed(&screen) && screen.attempt.active());
-            assert!(!press(&screen, b'7', shown + 6));
+            assert!(!press(
+                &screen,
+                ApprovalPress::Enter,
+                shown + APPROVAL_SETTLE
+            ));
             assert!(confirmed(&screen));
-            // A third digit has no position, right or wrong.
-            assert!(!press(&screen, b'9', shown + 7));
-            assert!(screen.attempt.active());
+            // Decided: a later press, Enter or another key, has no say.
+            assert!(!press(
+                &screen,
+                ApprovalPress::Other,
+                shown + APPROVAL_SETTLE + 1
+            ));
+            assert!(confirmed(&screen) && screen.attempt.active());
         }
     }
 
-    /// A counted digit from 2 to 9 that does not match, at either position,
-    /// ends the request unapproved: the attempt is cancelled, the client
-    /// cancels with root and never commits. 0, 1 and anything else are no
-    /// digit of the key's alphabet and end nothing.
+    /// The first counted press, if it is another key or an Enter inside
+    /// the settle, ends the request unapproved: the attempt is cancelled,
+    /// the client cancels with root and never commits, and a settled Enter
+    /// after it changes nothing.
     #[test]
-    fn a_wrong_digit_at_either_position_ends_the_request() {
+    fn a_first_press_other_than_a_settled_enter_ends_the_request() {
         for &elevation in ELEVATIONS {
-            for typed_first in [false, true] {
+            for (first, at) in [
+                (ApprovalPress::Other, 1),
+                (ApprovalPress::Other, APPROVAL_SETTLE),
+                (ApprovalPress::Enter, 1),
+                (ApprovalPress::Enter, APPROVAL_SETTLE - 1),
+            ] {
                 let screen = elevation_screen(elevation);
-                let described = super::tests::elevation(elevation, b"47");
+                let described = super::tests::elevation(elevation);
                 let (mut client, mut wire, shown) = presented_elevation(
                     &screen,
                     &described,
                     vec![vec![0x95, 0], status(7, &described)],
                 );
-                for digit in [b'0', b'1', b'a', 0x34 + 0x80, b'\n'] {
-                    assert!(!press(&screen, digit, shown + 1));
-                }
-                if typed_first {
-                    assert!(!press(&screen, b'4', shown + 1));
-                }
                 assert!(screen.attempt.active());
-                assert!(press(&screen, b'8', shown + 2));
+                assert!(press(&screen, first, shown + at));
                 assert!(!screen.attempt.active() && !confirmed(&screen));
-                // The right digits after it change nothing.
-                assert!(!press(&screen, b'4', shown + 3));
-                assert!(!press(&screen, b'7', shown + 4));
+                assert!(!press(
+                    &screen,
+                    ApprovalPress::Enter,
+                    shown + APPROVAL_SETTLE + 1
+                ));
                 assert!(!confirmed(&screen));
                 client.tick(&mut wire).unwrap();
                 assert!(client.pending.is_none());
@@ -3641,13 +3710,19 @@ mod tests {
     }
 
     /// A prompt replaced by a notice, withdrawn or draining, or a cancelled
-    /// attempt, takes no digit: none advances, ends or confirms.
+    /// attempt, takes no press: none approves, ends or confirms.
     #[test]
-    fn a_hidden_prompt_or_cancelled_attempt_takes_no_digit() {
+    fn a_hidden_prompt_or_cancelled_attempt_takes_no_press() {
+        let presses = |shown: u128| {
+            [
+                (ApprovalPress::Other, shown + 1),
+                (ApprovalPress::Enter, shown + APPROVAL_SETTLE),
+            ]
+        };
         for &elevation in ELEVATIONS {
             for case in 0..3 {
                 let screen = elevation_screen(elevation);
-                let described = super::tests::elevation(elevation, b"47");
+                let described = super::tests::elevation(elevation);
                 let (_client, _wire, shown) = presented_elevation(&screen, &described, vec![]);
                 let mut runtime = screen.attempt.runtime.lock().unwrap();
                 match case {
@@ -3667,18 +3742,19 @@ mod tests {
                     }
                 }
                 drop(runtime);
-                for (digit, at) in [(b'4', shown + 1), (b'7', shown + 2), (b'9', shown + 3)] {
-                    assert!(!press(&screen, digit, at));
+                for (approval, at) in presses(shown) {
+                    assert!(!press(&screen, approval, at));
                 }
                 assert!(!confirmed(&screen) && screen.attempt.active());
                 assert!(!screen.attempt.commit());
             }
             let screen = elevation_screen(elevation);
-            let described = super::tests::elevation(elevation, b"47");
+            let described = super::tests::elevation(elevation);
             let (_client, _wire, shown) = presented_elevation(&screen, &described, vec![]);
             screen.attempt.cancel();
-            assert!(!press(&screen, b'4', shown + 1));
-            assert!(!press(&screen, b'7', shown + 2));
+            for (approval, at) in presses(shown) {
+                assert!(!press(&screen, approval, at));
+            }
             assert!(!confirmed(&screen));
         }
     }
@@ -3692,26 +3768,25 @@ mod tests {
             [42; 32],
             1001,
             Operation::DeployRollback {
-                key: crate::authority::consent::ApprovalKey::new(*b"47").unwrap(),
                 current: "a".repeat(64),
                 previous: "b".repeat(64),
             },
         )
         .unwrap();
-        let update = update(b"47");
+        let update = update();
         for (selection, described) in [
             (
                 Selection::Elevation(Elevation::Rollback),
-                elevation(Elevation::Hostname, b"47"),
+                elevation(Elevation::Hostname),
             ),
             (
                 Selection::Elevation(Elevation::Hostname),
-                elevation(Elevation::Rollback, b"47"),
+                elevation(Elevation::Rollback),
             ),
             (Selection::Elevation(Elevation::Rollback), other_owner),
             (Selection::Elevation(Elevation::Rollback), update),
-            (Selection::Install, elevation(Elevation::Rollback, b"47")),
-            (Selection::Write, elevation(Elevation::Hostname, b"47")),
+            (Selection::Install, elevation(Elevation::Rollback)),
+            (Selection::Write, elevation(Elevation::Hostname)),
         ] {
             let mut screen = Screen::new();
             Arc::get_mut(&mut screen.attempt).unwrap().selection = selection;
@@ -4383,25 +4458,16 @@ mod tests {
             step,
         })
     }
-    /// The key root drew for this operation's disclosure step.
-    const DISCLOSURE: &[u8; 2] = b"63";
-    fn disclosure() -> ApprovalKey {
-        ApprovalKey::new(*DISCLOSURE).unwrap()
-    }
-    /// With root's key on its disclosure step.
+    /// Its first step discloses.
     fn enroll_step(after: u8, key: u8, step: LoginStep) -> Request {
-        login(
-            Operation::LoginEnroll {
-                account: 1000,
-                before: 0,
-                after,
-                key,
-                step,
-                approval: None,
-                proof: None,
-            }
-            .disclosed(disclosure()),
-        )
+        login(Operation::LoginEnroll {
+            account: 1000,
+            before: 0,
+            after,
+            key,
+            step,
+            proof: None,
+        })
     }
     fn add_step(step: LoginStep) -> Request {
         login(Operation::LoginAdd {
@@ -4419,7 +4485,6 @@ mod tests {
             after,
             key: 1,
             step,
-            approval: None,
             proof: None,
         }
     }
@@ -4439,7 +4504,6 @@ mod tests {
             after: 1,
             removed: removal(),
             step,
-            approval: None,
             proof: None,
         }
     }
@@ -4460,7 +4524,6 @@ mod tests {
                 after,
                 key,
                 step,
-                approval: None,
                 proof: Some(proof),
             },
             Operation::LoginAdd {
@@ -4489,12 +4552,11 @@ mod tests {
                 after,
                 removed,
                 step,
-                approval: None,
                 proof: Some(proof),
             },
             other => other,
         };
-        login(operation.disclosed(disclosure()))
+        login(operation)
     }
     fn removal() -> Vec<Slot> {
         vec![
@@ -4510,18 +4572,14 @@ mod tests {
     }
     /// Leaving one key: its identify discloses.
     fn remove_step(step: LoginStep) -> Request {
-        login(
-            Operation::LoginRemove {
-                account: 1000,
-                before: 3,
-                after: 1,
-                removed: removal(),
-                step,
-                approval: None,
-                proof: None,
-            }
-            .disclosed(disclosure()),
-        )
+        login(Operation::LoginRemove {
+            account: 1000,
+            before: 3,
+            after: 1,
+            removed: removal(),
+            step,
+            proof: None,
+        })
     }
     fn new_key(key: Fingerprint) -> [LoginStep; 5] {
         [
@@ -4595,7 +4653,6 @@ mod tests {
                             after,
                             key,
                             step,
-                            approval: None,
                             proof: None,
                         },
                         *proof,
@@ -4687,9 +4744,9 @@ mod tests {
             vec![0x11],
         ];
         for step in steps.iter().take(count) {
-            // A disclosure is presented at one poll and, its key typed,
+            // A disclosure is presented at one poll and, approved,
             // acknowledged at the next.
-            if approval_key(step).is_some() {
+            if step.awaits_approval() {
                 replies.push(status(4, step));
                 calls.push(vec![0x11]);
             }
@@ -4940,7 +4997,6 @@ mod tests {
             NONCE,
             1000,
             Operation::SelectorUpdate {
-                key: ApprovalKey::new(*b"47").unwrap(),
                 form,
                 current: "ab".repeat(32),
             },
@@ -5191,12 +5247,10 @@ mod tests {
                 login(Operation::RecoveryRemove {
                     account: 1000,
                     step: LoginStep::DiskIdentify,
-                    approval: Some(ApprovalKey::new(*b"69").unwrap()),
                 }),
                 login(Operation::RecoveryRemove {
                     account: 1000,
                     step: authorize,
-                    approval: None,
                 }),
             ],
             // A TPM clear replaces a pending PIN change.
@@ -5281,12 +5335,10 @@ mod tests {
             assert_eq!(wire.calls, calls, "{selection:?}");
             let secrets = steps.iter().filter(|step| asks_pin(step)).count();
             assert_eq!(sent(&wire, 0x1c), secrets, "{selection:?}");
-            // Only tag 21's identify step is keyed, as a login disclosure.
-            let keyed = selection == LoginSelection::Protector(Managed::RecoveryRemove);
-            assert_eq!(
-                approval_key(&steps[0]),
-                keyed.then(|| ApprovalKey::new(*b"69").unwrap())
-            );
+            // Only tag 21's identify step awaits approval, as a login
+            // disclosure.
+            let disclosing = selection == LoginSelection::Protector(Managed::RecoveryRemove);
+            assert_eq!(steps[0].awaits_approval(), disclosing);
             assert_eq!(screen.shown(), Some(Notice::Login(selection.success(None))));
             assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
         }
@@ -5499,18 +5551,7 @@ mod tests {
             assert!(refused(&selection, &before, status(3, &other[0])));
             assert!(!refused(&selection, &before, status(3, first)));
         }
-        // A removal's next step past another position than the typed one;
-        // consent itself refuses tag 21's identify step without its key.
-        assert!(Request::new(
-            NONCE,
-            1000,
-            Operation::RecoveryRemove {
-                account: 1000,
-                step: LoginStep::DiskIdentify,
-                approval: None,
-            }
-        )
-        .is_err());
+        // A removal's next step past another position than the typed one.
         let removal = LoginSelection::Protector(Managed::Remove {
             proof: Proof::DiskKey,
         });
@@ -5746,13 +5787,10 @@ mod tests {
             count,
             current: "ab".repeat(32),
             step,
-            approval: (step == UpgradeStep::Review).then(|| ApprovalKey::new(*b"47").unwrap()),
         })
     }
     fn upgrade_cancel() -> Request {
-        login(Operation::UpgradeCancel {
-            key: ApprovalKey::new(*b"58").unwrap(),
-        })
+        login(Operation::UpgradeCancel)
     }
     fn upgrades() -> Vec<LoginSelection> {
         [
@@ -5978,10 +6016,9 @@ mod tests {
         // One description.
         assert!(!run(&received, status(3, &upgrade_cancel_other())).0);
     }
+    /// Another cancellation, under another nonce.
     fn upgrade_cancel_other() -> Request {
-        login(Operation::UpgradeCancel {
-            key: ApprovalKey::new(*b"69").unwrap(),
-        })
+        Request::new([7; 32], 1000, Operation::UpgradeCancel).unwrap()
     }
 
     /// Every upgrade end's and success's rows fit the narrowest chrome,
@@ -6054,10 +6091,10 @@ mod tests {
         }
     }
 
-    /// A disclosure's typed key confirms only its own prompt: the next
-    /// login step's presentation clears the confirmation with the key.
+    /// A disclosure's approving Enter confirms only its own prompt: the
+    /// next login step's presentation clears the confirmation with it.
     #[test]
-    fn a_typed_disclosure_key_does_not_outlive_its_prompt() {
+    fn a_disclosures_approval_does_not_outlive_its_prompt() {
         let origin = crate::input::test_origin();
         let selection = LoginSelection::Enroll(2);
         let screen = Screen::login(selection.clone());
@@ -6074,9 +6111,10 @@ mod tests {
             .as_ref()
             .unwrap()
             .after;
-        for (at, digit) in (after + 1..).zip(*DISCLOSURE) {
-            assert!(!screen.attempt.approve(&origin, digit, at).unwrap());
-        }
+        assert!(!screen
+            .attempt
+            .approve(&origin, ApprovalPress::Enter, after + APPROVAL_SETTLE)
+            .unwrap());
         assert!(confirmed(&screen) && screen.attempt.approved(&steps[0]));
         assert_eq!(
             screen.attempt.present(steps[1].clone()),
@@ -6087,14 +6125,15 @@ mod tests {
         assert!(screen.attempt.presentation.lock().unwrap().is_none());
     }
 
-    /// A login disclosure step's receipt follows only its typed key
+    /// A login disclosure step's receipt follows only an approving Enter
     /// (TOKEN-LOGIN.md increment 5's A4): root's `04` polls draw nothing
-    /// until then, Enter confirms nothing, and a digit stamped at the
-    /// prompt's own sample counts for nothing. The receipt then carries
-    /// the exact description, and the next step's follows its
-    /// presentation. A wrong digit cancels instead.
+    /// until then, the whole-disk installation's Enter confirms nothing,
+    /// and a press stamped at the prompt's own sample counts for nothing.
+    /// The receipt then carries the exact description, and the next
+    /// step's follows its presentation. Another key first, or an Enter
+    /// inside the settle, cancels instead.
     #[test]
-    fn a_disclosure_steps_receipt_waits_for_its_typed_key() {
+    fn a_disclosure_steps_receipt_waits_for_an_approving_enter() {
         let origin = crate::input::test_origin();
         for selection in [
             LoginSelection::Enroll(1),
@@ -6104,8 +6143,8 @@ mod tests {
             let screen = Screen::login(selection.clone());
             let steps = steps(&selection);
             let first = &steps[0];
-            assert_eq!(approval_key(first), Some(disclosure()));
-            assert_eq!(approval_key(&steps[1]), None);
+            assert!(first.awaits_approval());
+            assert!(!steps[1].awaits_approval());
             let (mut replies, _) = presented(&selection, 0);
             replies.extend([status(4, first), status(4, first)]);
             let mut root = wire(replies);
@@ -6125,17 +6164,21 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .after;
-            screen.attempt.confirm_install(&origin, after + 1).unwrap();
+            screen
+                .attempt
+                .confirm_install(&origin, after + APPROVAL_SETTLE)
+                .unwrap();
             assert!(!screen
                 .attempt
-                .approve(&origin, DISCLOSURE[0], after)
+                .approve(&origin, ApprovalPress::Enter, after)
                 .unwrap());
             root.replies.push_back(status(4, first));
             client.tick(&mut root).unwrap();
             assert_eq!(sent(&root, 0x13), 0);
-            for (at, digit) in (after + 1..).zip(*DISCLOSURE) {
-                assert!(!screen.attempt.approve(&origin, digit, at).unwrap());
-            }
+            assert!(!screen
+                .attempt
+                .approve(&origin, ApprovalPress::Enter, after + APPROVAL_SETTLE)
+                .unwrap());
             root.replies.extend([
                 status(4, first),
                 vec![0x93],
@@ -6155,8 +6198,12 @@ mod tests {
                     &description(&[0x13], &steps[1])
                 ]
             );
-            // A wrong digit at either position ends it with `15`.
-            for typed in [&b"9"[..], &[DISCLOSURE[0], b'9']] {
+            // Another key first, or an Enter inside the settle, ends it
+            // with `15`.
+            for (press, at) in [
+                (ApprovalPress::Other, APPROVAL_SETTLE),
+                (ApprovalPress::Enter, APPROVAL_SETTLE - 1),
+            ] {
                 let screen = Screen::login(selection.clone());
                 let (mut replies, _) = presented(&selection, 0);
                 replies.push(status(4, first));
@@ -6168,7 +6215,6 @@ mod tests {
                 while !wire.replies.is_empty() {
                     client.tick(&mut wire).unwrap();
                 }
-                let (last, before) = typed.split_last().unwrap();
                 let after = screen
                     .attempt
                     .presentation
@@ -6177,10 +6223,7 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .after;
-                for (at, digit) in (after + 1..).zip(before) {
-                    assert!(!screen.attempt.approve(&origin, *digit, at).unwrap());
-                }
-                assert!(screen.attempt.approve(&origin, *last, after + 10).unwrap());
+                assert!(screen.attempt.approve(&origin, press, after + at).unwrap());
                 wire.replies.extend([vec![0x95, 0], status(3, first)]);
                 client.tick(&mut wire).unwrap();
                 assert_eq!(sent(&wire, 0x15), 1);
@@ -7795,10 +7838,8 @@ mod tests {
                         })
                         .collect(),
                     step,
-                    approval: None,
                     proof: None,
-                }
-                .disclosed(disclosure()),
+                },
             )
             .unwrap()
         };

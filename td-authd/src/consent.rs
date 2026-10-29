@@ -6,7 +6,7 @@ use std::time::Duration;
 // this module, so a hostname description admits exactly firstboot's names.
 use super::hostname::Hostname;
 
-const MAGIC: &[u8; 8] = b"TDCONS01";
+const MAGIC: &[u8; 8] = b"TDCONS02";
 const MAX_BYTES: usize = 256;
 // Whole-disk installation summary bounds, in displayed (escaped) bytes.
 pub const DISK_NAME_BYTES: usize = 31;
@@ -83,7 +83,7 @@ pub const LOGIN_CEREMONY: Duration = Duration::from_secs(120);
 pub const LOGIN_TWO_CEREMONIES: Duration = Duration::from_secs(240);
 /// Added to the ceiling of an operation that shows a disclosure, every
 /// first enrollment and a removal leaving at most one key: the person
-/// reads it and types its approval key before any token I/O, and that
+/// reads it and approves it with Enter before any token I/O, and that
 /// time does not come out of a ceremony's.
 pub const LOGIN_READING: Duration = Duration::from_secs(120);
 /// A two-key first enrollment's ceiling: two ceremonies and the reading.
@@ -198,7 +198,7 @@ impl SelectorForm {
 }
 
 /// A selector update's ceiling, root's and the worker's: 120 seconds for
-/// the worker's reads and the approval key, 120 for the writes
+/// the worker's reads and the approval, 120 for the writes
 /// (td-authd/DESIGN.md, amendment 10).
 pub const SELECTOR_UPDATE_CEILING: Duration = Duration::from_secs(240);
 
@@ -458,7 +458,7 @@ impl Removal {
 const CEREMONY: &[u8] = &[8, 3, 4, 5, 6];
 
 /// One presented step of an upgrade: its review, which discloses and
-/// carries the approval key, or a step of a new key's ceremony.
+/// awaits approval, or a step of a new key's ceremony.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpgradeStep {
     Review,
@@ -506,28 +506,6 @@ fn upgrade_following(count: u8, (key, byte): (u8, u8)) -> Option<(u8, u8)> {
 /// 48 of margin in 8-pixel Unifont cells (td-compositor/src/attention.rs).
 /// Every login row fits, so wrapping never splits a fingerprint.
 pub const PROMPT_COLUMNS: usize = 34;
-
-/// The approval key an elevation prompt, an update's and a login
-/// disclosure step's ask for: two ASCII digits, each `2` to `9`, typed in
-/// order (td-authd/DESIGN.md, "Elevation operations"). No other value can
-/// be constructed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ApprovalKey([u8; 2]);
-
-impl ApprovalKey {
-    pub fn new(digits: [u8; 2]) -> Result<Self, String> {
-        if digits.iter().all(|digit| (b'2'..=b'9').contains(digit)) {
-            Ok(Self(digits))
-        } else {
-            Err("invalid consent approval key".into())
-        }
-    }
-
-    /// The two ASCII digits, in the order they are typed.
-    pub fn digits(self) -> [u8; 2] {
-        self.0
-    }
-}
 
 /// One key a removal names: its 1-based position in the record's canonical
 /// slot order, which the key-management screen's digits also name, and its
@@ -719,8 +697,6 @@ struct Login<'a> {
     key: u8,
     removed: &'a [Slot],
     step: LoginStep,
-    /// A disclosure step's approval key, on no other step.
-    approval: Option<ApprovalKey>,
     /// The disk proof authorizing it, in every step of tags 13 to 15.
     proof: Option<Proof>,
 }
@@ -760,7 +736,6 @@ impl Login<'_> {
             && self.steps().contains(&self.step.byte())
             // A proof is made once, before an enrollment's first key.
             && (!self.step.proves() || self.key == 1)
-            && self.approval.is_some() == self.discloses()
     }
 
     fn steps(&self) -> &'static [u8] {
@@ -768,7 +743,7 @@ impl Login<'_> {
     }
 
     /// Whether this step carries a disclosure (td-login/TOKEN-LOGIN.md,
-    /// "Enrollment, addition and removal"), and so the approval key: the
+    /// "Enrollment, addition and removal"), and so awaits approval: the
     /// operation's first step, of a first enrollment's first key (connect,
     /// or its disk proof's first step) and of a removal that leaves at most
     /// one key (identify, or its disk proof's first step). Each comes
@@ -944,7 +919,6 @@ fn hex_digit(byte: u8) -> Option<u8> {
 pub enum Operation {
     /// `deploy-publish`: install a locally built deployment as current.
     Install {
-        key: ApprovalKey,
         deployment: String,
         requester: u32,
     },
@@ -987,15 +961,13 @@ pub enum Operation {
         step: LoginStep,
     },
     /// First enrollment of `after` keys; `key` is the one this step creates.
-    /// `approval` is the disclosure's key, on the operation's first step
-    /// only. `proof`, in every step, is the disk proof authorizing it.
+    /// `proof`, in every step, is the disk proof authorizing it.
     LoginEnroll {
         account: u32,
         before: u8,
         after: u8,
         key: u8,
         step: LoginStep,
-        approval: Option<ApprovalKey>,
         proof: Option<Proof>,
     },
     LoginAdd {
@@ -1005,57 +977,46 @@ pub enum Operation {
         step: LoginStep,
         proof: Option<Proof>,
     },
-    /// `removed` is in strictly increasing slot position. `approval` is the
-    /// disclosure's key, on the first step of a removal that leaves at most
-    /// one key only.
+    /// `removed` is in strictly increasing slot position.
     LoginRemove {
         account: u32,
         before: u8,
         after: u8,
         removed: Vec<Slot>,
         step: LoginStep,
-        approval: Option<ApprovalKey>,
         proof: Option<Proof>,
     },
     /// `deploy-rollback`: move `current` back to `previous`, the pair the
     /// two boot selectors name.
     DeployRollback {
-        key: ApprovalKey,
         current: String,
         previous: String,
     },
     /// `set-hostname`: replace the configured name `old` with `new`.
     SetHostname {
-        key: ApprovalKey,
         requester: u32,
         old: String,
         new: String,
     },
     /// Storage operation `01`: write the running deployment `current`'s
-    /// kernel and selector to the ESP in `form`. One step, confirmed by
-    /// typing `key`.
+    /// kernel and selector to the ESP in `form`. One step.
     SelectorUpdate {
-        key: ApprovalKey,
         form: SelectorForm,
         current: String,
     },
     /// Storage operation `02`: phase 1 of the re-encrypting upgrade to
     /// `shape`, enrolling `count` new keys, writing the running
-    /// deployment `current`'s selector. `approval` is the review's key,
-    /// on the review only.
+    /// deployment `current`'s selector.
     Upgrade {
         account: u32,
         shape: UpgradeShape,
         count: u8,
         current: String,
         step: UpgradeStep,
-        approval: Option<ApprovalKey>,
     },
     /// Storage operation `03`: the upgrade's cancellation in state U0.
-    /// One step, confirmed by typing `key`.
-    UpgradeCancel {
-        key: ApprovalKey,
-    },
+    /// One step.
+    UpgradeCancel,
     /// Storage operation `04`, tag 19: one FIDO2 token in `role`.
     ProtectorAdd {
         account: u32,
@@ -1071,12 +1032,10 @@ pub enum Operation {
         step: LoginStep,
     },
     /// Storage operation `06`, tag 21: the recovery key's removal, always
-    /// by a disk security key. `approval` is the disclosure's key, on its
-    /// identify step only.
+    /// by a disk security key. Its identify step discloses.
     RecoveryRemove {
         account: u32,
         step: LoginStep,
-        approval: Option<ApprovalKey>,
     },
     /// Storage operations `07` to `09`, tags 22 to 24: `request`, in place
     /// of the pending one.
@@ -1214,14 +1173,9 @@ impl Protected {
 
     /// Root's first description for `managed` (amendment 10): the proof's
     /// first step, a removal's choose step over this volume's protectors,
-    /// or tag 21's identify step carrying `approval`; a request names the
+    /// or tag 21's identify step; a request names the
     /// pending one. The `21` detail instead when the volume cannot take it.
-    pub fn first(
-        &self,
-        account: u32,
-        managed: Managed,
-        approval: Option<ApprovalKey>,
-    ) -> Result<Operation, u8> {
+    pub fn first(&self, account: u32, managed: Managed) -> Result<Operation, u8> {
         if let Some(detail) = self.refusal(managed) {
             return Err(detail);
         }
@@ -1245,7 +1199,6 @@ impl Protected {
             Managed::RecoveryRemove => Operation::RecoveryRemove {
                 account,
                 step: LoginStep::DiskIdentify,
-                approval,
             },
             Managed::Request { proof, request } => Operation::ProtectorRequest {
                 account,
@@ -1258,8 +1211,8 @@ impl Protected {
     }
 
     /// Whether `request` is root's first description over this volume,
-    /// as the storage worker checks it: exactly `first`'s, with its own
-    /// approval key. `Last` when only the commit follows, a request proven
+    /// as the storage worker checks it: exactly `first`'s. `Last` when
+    /// only the commit follows, a request proven
     /// by the recovery key.
     pub fn admits(&self, request: &Request) -> Result<Admitted, String> {
         let managed = match request.operation() {
@@ -1279,7 +1232,7 @@ impl Protected {
             .operation
             .protector()
             .ok_or("not a protector operation step")?;
-        match self.first(protector.account, managed, protector.approval) {
+        match self.first(protector.account, managed) {
             Ok(first) if first == *request.operation() => Ok(match protector.following() {
                 Some(_) => Admitted::Next,
                 None => Admitted::Last,
@@ -1298,7 +1251,6 @@ struct Protector<'a> {
     proof: Proof,
     step: LoginStep,
     removal: Option<&'a Removal>,
-    approval: Option<ApprovalKey>,
 }
 
 impl Protector<'_> {
@@ -1358,10 +1310,7 @@ impl Protector<'_> {
             }
             None => true,
         };
-        self.account == owner
-            && self.steps().contains(&self.step.byte())
-            && chosen
-            && (self.tag != 21 || self.approval.is_some() == (self.step == LoginStep::DiskIdentify))
+        self.account == owner && self.steps().contains(&self.step.byte()) && chosen
     }
 
     fn ceiling(&self) -> Duration {
@@ -1381,7 +1330,6 @@ impl Operation {
             proof: *proof,
             step: *step,
             removal: None,
-            approval: None,
         };
         Some(match self {
             Self::ProtectorAdd {
@@ -1399,14 +1347,7 @@ impl Operation {
                 removal: Some(removal),
                 ..view(20, account, proof, step)
             },
-            Self::RecoveryRemove {
-                account,
-                step,
-                approval,
-            } => Protector {
-                approval: *approval,
-                ..view(21, account, &Proof::DiskKey, step)
-            },
+            Self::RecoveryRemove { account, step } => view(21, account, &Proof::DiskKey, step),
             Self::ProtectorRequest {
                 account,
                 proof,
@@ -1419,8 +1360,7 @@ impl Operation {
     }
 
     /// Whether `other` is the same protector operation at another step:
-    /// every field but the step, the chosen position and the disclosure's
-    /// key.
+    /// every field but the step and the chosen position.
     fn same_protector(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -1484,7 +1424,6 @@ impl Operation {
                 key,
                 removed,
                 step: *step,
-                approval: None,
                 proof: None,
             };
         Some(match self {
@@ -1500,10 +1439,8 @@ impl Operation {
                 after,
                 key,
                 step,
-                approval,
                 proof,
             } => Login {
-                approval: *approval,
                 proof: *proof,
                 ..login(
                     LoginKind::Enroll,
@@ -1531,10 +1468,8 @@ impl Operation {
                 after,
                 removed,
                 step,
-                approval,
                 proof,
             } => Login {
-                approval: *approval,
                 proof: *proof,
                 ..login(
                     LoginKind::Remove,
@@ -1548,52 +1483,6 @@ impl Operation {
             },
             _ => return None,
         })
-    }
-
-    /// This login step with `key` as its approval key when the step
-    /// carries a disclosure, as root draws one for each such step; every
-    /// other step and operation unchanged.
-    pub fn disclosed(self, key: ApprovalKey) -> Self {
-        if !self.login().is_some_and(|login| login.discloses()) {
-            return self;
-        }
-        match self {
-            Self::LoginEnroll {
-                account,
-                before,
-                after,
-                key: ordinal,
-                step,
-                approval: _,
-                proof,
-            } => Self::LoginEnroll {
-                account,
-                before,
-                after,
-                key: ordinal,
-                step,
-                approval: Some(key),
-                proof,
-            },
-            Self::LoginRemove {
-                account,
-                before,
-                after,
-                removed,
-                step,
-                approval: _,
-                proof,
-            } => Self::LoginRemove {
-                account,
-                before,
-                after,
-                removed,
-                step,
-                approval: Some(key),
-                proof,
-            },
-            other => other,
-        }
     }
 }
 
@@ -1621,7 +1510,6 @@ impl Request {
         }
         match &operation {
             Operation::Install {
-                key: _,
                 deployment,
                 requester,
             } if !deployment_id(deployment) || *requester != owner => {
@@ -1670,11 +1558,9 @@ impl Request {
             {
                 return Err("invalid consent credential target".into());
             }
-            Operation::DeployRollback {
-                key: _,
-                current,
-                previous,
-            } if !deployment_id(current) || !deployment_id(previous) || current == previous => {
+            Operation::DeployRollback { current, previous }
+                if !deployment_id(current) || !deployment_id(previous) || current == previous =>
+            {
                 return Err("invalid consent rollback pair".into());
             }
             Operation::SelectorUpdate { current, .. } if !deployment_id(current) => {
@@ -1686,11 +1572,9 @@ impl Request {
                 count,
                 current,
                 step,
-                approval,
             } if *account != owner
                 || !shape.takes(*count)
                 || !deployment_id(current)
-                || approval.is_some() != (*step == UpgradeStep::Review)
                 || match step {
                     UpgradeStep::Review => false,
                     UpgradeStep::Key { key, step } => {
@@ -1701,7 +1585,6 @@ impl Request {
                 return Err("invalid consent upgrade".into());
             }
             Operation::SetHostname {
-                key: _,
                 requester,
                 old,
                 new,
@@ -1765,13 +1648,6 @@ impl Request {
     /// The disk proof a protector-management description carries.
     pub fn protector_proof(&self) -> Option<Proof> {
         self.operation.protector().map(|protector| protector.proof)
-    }
-
-    /// The approval key tag 21's identify step carries.
-    pub fn protector_approval(&self) -> Option<ApprovalKey> {
-        self.operation
-            .protector()
-            .and_then(|protector| protector.approval)
     }
 
     /// Tag 20's view of the volume.
@@ -1874,10 +1750,22 @@ impl Request {
         Ok(admitted)
     }
 
-    /// The approval key a login disclosure step carries; none on every
-    /// other step and description.
-    pub fn login_approval(&self) -> Option<ApprovalKey> {
-        self.operation.login().and_then(|login| login.approval)
+    /// Whether this description waits for the person's Enter at secure
+    /// attention before its receipt or commit: an update, a rollback, a
+    /// hostname change, a selector update, an upgrade's review or
+    /// cancellation, a login operation's disclosure step and tag 21's
+    /// identify step. Every other description and step does not.
+    pub fn awaits_approval(&self) -> bool {
+        match &self.operation {
+            Operation::Install { .. }
+            | Operation::DeployRollback { .. }
+            | Operation::SetHostname { .. }
+            | Operation::SelectorUpdate { .. }
+            | Operation::UpgradeCancel => true,
+            Operation::Upgrade { step, .. } => *step == UpgradeStep::Review,
+            Operation::RecoveryRemove { step, .. } => *step == LoginStep::DiskIdentify,
+            operation => operation.login().is_some_and(|login| login.discloses()),
+        }
     }
 
     /// A login operation's ceiling, root's and the worker's alike, fixed by
@@ -1893,7 +1781,7 @@ impl Request {
         match self.operation {
             Operation::SelectorUpdate { .. } => Some(SELECTOR_UPDATE_CEILING),
             Operation::Upgrade { count, .. } => Some(upgrade_ceiling(count)),
-            Operation::UpgradeCancel { .. } => Some(UPGRADE_CANCEL_CEILING),
+            Operation::UpgradeCancel => Some(UPGRADE_CANCEL_CEILING),
             Operation::ProtectorAdd { .. }
             | Operation::ProtectorRemove { .. }
             | Operation::RecoveryRemove { .. }
@@ -2195,15 +2083,6 @@ impl Request {
         }
     }
 
-    /// The approval key an upgrade's review or its cancellation carries.
-    pub fn upgrade_approval(&self) -> Option<ApprovalKey> {
-        match self.operation {
-            Operation::Upgrade { approval, .. } => approval,
-            Operation::UpgradeCancel { key } => Some(key),
-            _ => None,
-        }
-    }
-
     /// The shape of an upgrade's first presentation: its review. `Last`
     /// when it enrolls no new key, so only its commit follows.
     pub fn upgrade_start(&self) -> Result<Admitted, String> {
@@ -2314,12 +2193,10 @@ impl Request {
         bytes.extend_from_slice(&self.owner.to_be_bytes());
         match &self.operation {
             Operation::Install {
-                key,
                 deployment,
                 requester,
             } => {
                 bytes.push(5);
-                bytes.extend_from_slice(&key.digits());
                 bytes.extend_from_slice(&requester.to_be_bytes());
                 bytes.extend_from_slice(deployment.as_bytes());
             }
@@ -2428,38 +2305,26 @@ impl Request {
                     if let Some(retries) = login.step.retries() {
                         bytes.push(retries);
                     }
-                    // Last, since only the step and counts say it belongs.
-                    if let Some(approval) = login.approval {
-                        bytes.extend_from_slice(&approval.digits());
-                    }
                 }
             }
-            Operation::DeployRollback {
-                key,
-                current,
-                previous,
-            } => {
+            Operation::DeployRollback { current, previous } => {
                 bytes.push(11);
-                bytes.extend_from_slice(&key.digits());
                 bytes.extend_from_slice(current.as_bytes());
                 bytes.extend_from_slice(previous.as_bytes());
             }
             Operation::SetHostname {
-                key,
                 requester,
                 old,
                 new,
             } => {
                 bytes.push(12);
-                bytes.extend_from_slice(&key.digits());
                 bytes.extend_from_slice(&requester.to_be_bytes());
                 // Construction bounds both names to 63 bytes.
                 put_text(&mut bytes, old);
                 put_text(&mut bytes, new);
             }
-            Operation::SelectorUpdate { key, form, current } => {
+            Operation::SelectorUpdate { form, current } => {
                 bytes.push(16);
-                bytes.extend_from_slice(&key.digits());
                 bytes.push(form.byte());
                 bytes.extend_from_slice(current.as_bytes());
             }
@@ -2469,7 +2334,6 @@ impl Request {
                 count,
                 current,
                 step,
-                approval,
             } => {
                 bytes.push(17);
                 bytes.extend_from_slice(&account.to_be_bytes());
@@ -2487,14 +2351,8 @@ impl Request {
                         bytes.push(retries);
                     }
                 }
-                if let Some(approval) = approval {
-                    bytes.extend_from_slice(&approval.digits());
-                }
             }
-            Operation::UpgradeCancel { key } => {
-                bytes.push(18);
-                bytes.extend_from_slice(&key.digits());
-            }
+            Operation::UpgradeCancel => bytes.push(18),
             Operation::ProtectorAdd { .. }
             | Operation::ProtectorRemove { .. }
             | Operation::RecoveryRemove { .. }
@@ -2531,19 +2389,17 @@ impl Request {
                     if let Some(retries) = protector.step.retries() {
                         bytes.push(retries);
                     }
-                    if let Some(approval) = protector.approval {
-                        bytes.extend_from_slice(&approval.digits());
-                    }
                 }
             }
         }
         bytes
     }
 
-    /// A selector update's approval key; none on every other description.
-    pub fn selector_update(&self) -> Option<(ApprovalKey, SelectorForm, &str)> {
+    /// A selector update's form and deployment; none on every other
+    /// description.
+    pub fn selector_update(&self) -> Option<(SelectorForm, &str)> {
         match &self.operation {
-            Operation::SelectorUpdate { key, form, current } => Some((*key, *form, current)),
+            Operation::SelectorUpdate { form, current } => Some((*form, current)),
             _ => None,
         }
     }
@@ -2564,7 +2420,6 @@ impl Request {
         let operation_tag = input.byte()?;
         let operation = match operation_tag {
             5 => Operation::Install {
-                key: input.approval_key()?,
                 requester: input.number()?,
                 deployment: input.deployment()?,
             },
@@ -2649,7 +2504,7 @@ impl Request {
                 };
                 let before = input.byte()?;
                 let after = input.byte()?;
-                let operation = match tag {
+                match tag {
                     7 => Operation::LoginUnlock {
                         account,
                         before,
@@ -2664,7 +2519,6 @@ impl Request {
                             after,
                             key,
                             step: input.login_step()?,
-                            approval: None,
                             proof,
                         }
                     }
@@ -2694,46 +2548,31 @@ impl Request {
                             after,
                             removed,
                             step: input.login_step()?,
-                            approval: None,
                             proof,
                         }
                     }
-                };
-                // A disclosure step's key ends the value: the step and the
-                // counts alone say it belongs, and on any other step two
-                // more bytes are trailing.
-                if operation.login().is_some_and(|login| login.discloses()) {
-                    operation.disclosed(input.approval_key()?)
-                } else {
-                    operation
                 }
             }
             11 => {
-                let key = input.approval_key()?;
                 let current = input.deployment()?;
                 Operation::DeployRollback {
-                    key,
                     current,
                     previous: input.deployment()?,
                 }
             }
             12 => {
-                let key = input.approval_key()?;
                 let requester = input.number()?;
                 let old = input.text()?;
                 Operation::SetHostname {
-                    key,
                     requester,
                     old,
                     new: input.text()?,
                 }
             }
             16 => {
-                let key = input.approval_key()?;
                 let form = SelectorForm::from_byte(input.byte()?)
                     .ok_or("invalid consent selector update form")?;
                 Operation::SelectorUpdate {
-                    key,
                     form,
                     current: input.deployment()?,
                 }
@@ -2744,20 +2583,17 @@ impl Request {
                     .ok_or("invalid consent upgrade shape")?;
                 let count = input.byte()?;
                 let current = input.deployment()?;
-                let (step, approval) = match input.byte()? {
+                let step = match input.byte()? {
                     0 => {
                         if input.byte()? != REVIEW {
                             return Err("invalid consent upgrade review".into());
                         }
-                        (UpgradeStep::Review, Some(input.approval_key()?))
+                        UpgradeStep::Review
                     }
-                    key => (
-                        UpgradeStep::Key {
-                            key,
-                            step: input.login_step()?,
-                        },
-                        None,
-                    ),
+                    key => UpgradeStep::Key {
+                        key,
+                        step: input.login_step()?,
+                    },
                 };
                 Operation::Upgrade {
                     account,
@@ -2765,12 +2601,9 @@ impl Request {
                     count,
                     current,
                     step,
-                    approval,
                 }
             }
-            18 => Operation::UpgradeCancel {
-                key: input.approval_key()?,
-            },
+            18 => Operation::UpgradeCancel,
             tag @ 19..=24 => {
                 let account = input.number()?;
                 let proof = if tag == 21 {
@@ -2821,21 +2654,10 @@ impl Request {
                             step: input.login_step()?,
                         }
                     }
-                    21 => {
-                        let step = input.login_step()?;
-                        // The identify step's key ends the value, as a
-                        // login disclosure step's does.
-                        let approval = if step == LoginStep::DiskIdentify {
-                            Some(input.approval_key()?)
-                        } else {
-                            None
-                        };
-                        Operation::RecoveryRemove {
-                            account,
-                            step,
-                            approval,
-                        }
-                    }
+                    21 => Operation::RecoveryRemove {
+                        account,
+                        step: input.login_step()?,
+                    },
                     _ => {
                         let pending = match input.byte()? {
                             0 => None,
@@ -2870,14 +2692,12 @@ impl Request {
             format!("SESSION USER {}", self.owner),
         ];
         match &self.operation {
-            Operation::Install {
-                key, deployment, ..
-            } => {
+            Operation::Install { deployment, .. } => {
                 lines.push("INSTALL BUILT SYSTEM".into());
                 lines.push(format!("DEPLOYMENT: {deployment}"));
                 lines.push("PREVIOUS SYSTEM KEPT FOR ROLLBACK".into());
                 lines.push("RESTART REQUIRED TO USE THIS SYSTEM".into());
-                approval_lines(&mut lines, *key);
+                approval_lines(&mut lines);
             }
             Operation::InstallDisk {
                 requester: _,
@@ -3017,19 +2837,14 @@ impl Request {
                     login_lines(&mut lines, &login);
                 }
             }
-            Operation::DeployRollback {
-                key,
-                current,
-                previous,
-            } => {
+            Operation::DeployRollback { current, previous } => {
                 lines.push("ROLL BACK TO THE PREVIOUS SYSTEM".into());
                 lines.push(format!("CURRENT: {current}"));
                 lines.push(format!("PREVIOUS: {previous}"));
                 lines.push("TAKES EFFECT AT THE NEXT RESTART".into());
-                approval_lines(&mut lines, *key);
+                approval_lines(&mut lines);
             }
             Operation::SetHostname {
-                key,
                 requester,
                 old,
                 new,
@@ -3039,44 +2854,33 @@ impl Request {
                 lines.push(format!("OLD NAME: {old}"));
                 lines.push(format!("NEW NAME: {new}"));
                 lines.push("A RESTART COMPLETES THE CHANGE".into());
-                approval_lines(&mut lines, *key);
+                approval_lines(&mut lines);
             }
-            Operation::SelectorUpdate { key, form, current } => {
+            Operation::SelectorUpdate { form, current } => {
                 lines.push("UPDATE THE BOOT SELECTOR ON DISK".into());
                 lines.push("FROM THE RUNNING SYSTEM".into());
                 lines.push(format!("DEPLOYMENT: {current}"));
                 lines.extend(form.rows().map(String::from));
-                approval_lines(&mut lines, *key);
+                approval_lines(&mut lines);
             }
             Operation::Upgrade {
                 shape,
                 count,
                 current,
                 step,
-                approval,
                 ..
-            } => upgrade_lines(&mut lines, *shape, *count, current, *step, *approval),
-            Operation::UpgradeCancel { key } => {
+            } => upgrade_lines(&mut lines, *shape, *count, current, *step),
+            Operation::UpgradeCancel => {
                 lines.extend(UPGRADE_CANCEL.iter().map(|row| row.to_string()));
-                approval_lines(&mut lines, *key);
+                approval_lines(&mut lines);
             }
             Operation::ProtectorAdd { .. }
             | Operation::ProtectorRemove { .. }
             | Operation::RecoveryRemove { .. }
             | Operation::ProtectorRequest { .. } => protector_lines(&mut lines, &self.operation),
         }
-        // A key's rows carry their own Escape.
-        if !matches!(
-            self.operation,
-            Operation::Install { .. }
-                | Operation::InstallDisk { .. }
-                | Operation::DeployRollback { .. }
-                | Operation::SetHostname { .. }
-                | Operation::SelectorUpdate { .. }
-        ) && self.login_approval().is_none()
-            && self.upgrade_approval().is_none()
-            && self.protector_approval().is_none()
-        {
+        // Approval rows carry their own Escape.
+        if !matches!(self.operation, Operation::InstallDisk { .. }) && !self.awaits_approval() {
             lines.push("ESC TO CANCEL".into());
         }
         lines
@@ -3164,7 +2968,7 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
     }
     // A removal of every key says so on each step; its disclosure step
     // says it last, as the disclosure's first row.
-    if login.kind == LoginKind::Remove && login.after == 0 && login.approval.is_none() {
+    if login.kind == LoginKind::Remove && login.after == 0 && !login.discloses() {
         lines.push(NO_KEY.into());
     }
     if let Some(proof) = login.proof {
@@ -3187,7 +2991,7 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
         step => step_rows(lines, step, "LOGIN"),
     }
     pin_rows(lines, login.step);
-    if let Some(key) = login.approval {
+    if login.discloses() {
         let disclosure: &[&[&str]] = match (login.kind, login.after) {
             (LoginKind::Enroll, 1) => &[ENROLLMENT_DISCLOSURE, ONE_KEY_DISCLOSURE],
             (LoginKind::Enroll, _) => &[ENROLLMENT_DISCLOSURE],
@@ -3200,12 +3004,12 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
                 .flat_map(|rows| rows.iter())
                 .map(|row| row.to_string()),
         );
-        approval_lines(lines, key);
+        approval_lines(lines);
     }
 }
 
 /// An upgrade's rows: its shape and count, then the review's ID and
-/// disclosure with the approval key, or a key step's rows as a first
+/// disclosure with the approval rows, or a key step's rows as a first
 /// enrollment's, without the ID its bytes bind.
 fn upgrade_lines(
     lines: &mut Vec<String>,
@@ -3213,7 +3017,6 @@ fn upgrade_lines(
     count: u8,
     current: &str,
     step: UpgradeStep,
-    approval: Option<ApprovalKey>,
 ) {
     match shape {
         UpgradeShape::Tpm => {
@@ -3240,9 +3043,7 @@ fn upgrade_lines(
             if shape == UpgradeShape::Fido2 {
                 lines.extend(FIDO2_TRADE_OFFS.iter().map(|row| row.to_string()));
             }
-            if let Some(key) = approval {
-                approval_lines(lines, key);
-            }
+            approval_lines(lines);
         }
         UpgradeStep::Key { key, step } => {
             lines.push(format!("NEW KEY {key} OF {count}"));
@@ -3307,7 +3108,7 @@ fn pin_rows(lines: &mut Vec<String>, step: LoginStep) {
 /// A protector operation's rows (amendment 10, "Rows"): the operation's,
 /// a request's pending row, the proof's, then the step's; a removal's
 /// list at its choose step; tag 21's disclosure at its identify step,
-/// with the approval key's rows last, as on every prompt.
+/// with the approval rows last, as on every prompt.
 fn protector_lines(lines: &mut Vec<String>, operation: &Operation) {
     let Some(protector) = operation.protector() else {
         return;
@@ -3340,7 +3141,7 @@ fn protector_lines(lines: &mut Vec<String>, operation: &Operation) {
         }
         Operation::RecoveryRemove { .. } => {
             lines.push("REMOVE THE DISK RECOVERY KEY".into());
-            if protector.approval.is_some() {
+            if protector.step == LoginStep::DiskIdentify {
                 lines.extend(RECOVERY_REMOVAL.iter().map(|row| row.to_string()));
             }
         }
@@ -3366,8 +3167,10 @@ fn protector_lines(lines: &mut Vec<String>, operation: &Operation) {
         step => step_rows(lines, step, "DISK"),
     }
     pin_rows(lines, protector.step);
-    if let Some(key) = protector.approval {
-        approval_lines(lines, key);
+    if matches!(operation, Operation::RecoveryRemove { .. })
+        && protector.step == LoginStep::DiskIdentify
+    {
+        approval_lines(lines);
     }
 }
 
@@ -3399,7 +3202,7 @@ const FIDO2_TRADE_OFFS: &[&str] = &[
     "CAN ROLL BACK WITH ITS FLASH",
 ];
 
-/// The cancellation's rows, before its approval key's.
+/// The cancellation's rows, before its approval rows.
 const UPGRADE_CANCEL: &[&str] = &[
     "CANCEL PROTECTING THE DISK",
     "THE NEXT BOOT MAY NEED",
@@ -3436,17 +3239,16 @@ const NO_KEY_DISCLOSURE: &[&str] = &[
     "OPEN SSH SESSIONS END NOW",
 ];
 
-/// The approval key's rows, last on an elevation prompt, which carry its
-/// Escape. Each fits `PROMPT_COLUMNS`, so wrapping never splits the key.
-fn approval_lines(lines: &mut Vec<String>, key: ApprovalKey) {
-    let [first, second] = key.digits();
-    lines.push(format!(
-        "APPROVE: TYPE {} THEN {}",
-        char::from(first),
-        char::from(second)
-    ));
+/// The approval rows, last on a prompt that awaits approval, which carry
+/// its Escape. Each fits `PROMPT_COLUMNS`.
+fn approval_lines(lines: &mut Vec<String>) {
+    lines.push(APPROVE_ROW.into());
     lines.push("ESC: CANCEL".into());
 }
+
+/// The row asking for approval: Enter, pressed first, after the prompt
+/// has settled (td-compositor/DESIGN.md, "Elevation consent").
+pub const APPROVE_ROW: &str = "ENTER: APPROVE";
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -3516,13 +3318,6 @@ impl<'a> Input<'a> {
                 .try_into()
                 .map_err(|_| "truncated consent number")?,
         ))
-    }
-    fn approval_key(&mut self) -> Result<ApprovalKey, String> {
-        ApprovalKey::new(
-            self.take(2)?
-                .try_into()
-                .map_err(|_| "truncated consent approval key")?,
-        )
     }
     fn deployment(&mut self) -> Result<String, String> {
         String::from_utf8(self.take(64)?.to_vec())
@@ -3666,31 +3461,15 @@ mod tests {
     const CURRENT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const PREVIOUS: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
-    fn approval(digits: &[u8; 2]) -> ApprovalKey {
-        ApprovalKey::new(*digits).unwrap()
-    }
-
     fn rollback(current: &str, previous: &str) -> Operation {
         Operation::DeployRollback {
-            key: approval(b"47"),
             current: current.into(),
             previous: previous.into(),
         }
     }
 
-    fn approval_key(request: &Request) -> Option<ApprovalKey> {
-        match request.operation() {
-            Operation::Install { key, .. }
-            | Operation::DeployRollback { key, .. }
-            | Operation::SetHostname { key, .. }
-            | Operation::SelectorUpdate { key, .. } => Some(*key),
-            _ => None,
-        }
-    }
-
     fn selector_update(form: SelectorForm, current: &str) -> Operation {
         Operation::SelectorUpdate {
-            key: approval(b"58"),
             form,
             current: current.into(),
         }
@@ -3703,7 +3482,6 @@ mod tests {
             count,
             current: CURRENT.into(),
             step,
-            approval: (step == UpgradeStep::Review).then(|| approval(b"58")),
         }
     }
 
@@ -3742,7 +3520,6 @@ mod tests {
 
     fn rename(requester: u32, old: &str, new: &str) -> Operation {
         Operation::SetHostname {
-            key: approval(b"29"),
             requester,
             old: old.into(),
             new: new.into(),
@@ -3751,15 +3528,13 @@ mod tests {
 
     fn install(deployment: &str, requester: u32) -> Operation {
         Operation::Install {
-            key: approval(b"58"),
             deployment: deployment.into(),
             requester,
         }
     }
 
-    /// Tag 5 carries the approval key right after its tag byte, then the
-    /// requester and one canonical ID, 115 bytes in all; its rows end with
-    /// the key's, and no row offers Enter.
+    /// Tag 5 carries the requester and one canonical ID, 113 bytes in
+    /// all; its rows end with the approval rows.
     #[test]
     fn installation_has_one_canonical_id_and_the_requester_must_be_its_owner() {
         for id in [
@@ -3773,11 +3548,11 @@ mod tests {
         }
         assert!(Request::new([1; 32], 1000, install(&"a".repeat(64), 1001)).is_err());
         let request = Request::new([1; 32], 1000, install(&"a".repeat(64), 1000)).unwrap();
-        let mut literal = b"TDCONS01".to_vec();
+        let mut literal = b"TDCONS02".to_vec();
         literal.extend([1; 32]);
-        literal.extend([0, 0, 3, 232, 5, b'5', b'8', 0, 0, 3, 232]);
+        literal.extend([0, 0, 3, 232, 5, 0, 0, 3, 232]);
         literal.extend([b'a'; 64]);
-        assert_eq!(literal.len(), 115);
+        assert_eq!(literal.len(), 113);
         assert_eq!(request.encode(), literal);
         assert_eq!(Request::decode(&literal).unwrap(), request);
         assert_eq!(
@@ -3789,33 +3564,32 @@ mod tests {
                 format!("DEPLOYMENT: {}", "a".repeat(64)),
                 "PREVIOUS SYSTEM KEPT FOR ROLLBACK".into(),
                 "RESTART REQUIRED TO USE THIS SYSTEM".into(),
-                "APPROVE: TYPE 5 THEN 8".into(),
+                "ENTER: APPROVE".into(),
                 "ESC: CANCEL".into(),
             ]
         );
-        assert!(!request.lines().iter().any(|line| line.contains("ENTER")));
-        // L4's keyless tag-5 value no longer decodes.
-        let mut keyless = b"TDCONS01".to_vec();
-        keyless.extend([1; 32]);
-        keyless.extend([0, 0, 3, 232, 5, 0, 0, 3, 232]);
-        keyless.extend([b'a'; 64]);
+        // A keyed TDCONS01 value no longer decodes.
+        let mut keyed = b"TDCONS01".to_vec();
+        keyed.extend([1; 32]);
+        keyed.extend([0, 0, 3, 232, 5, b'5', b'8', 0, 0, 3, 232]);
+        keyed.extend([b'a'; 64]);
         assert_eq!(
-            Request::decode(&keyless).err().unwrap(),
-            "invalid consent approval key"
+            Request::decode(&keyed).err().unwrap(),
+            "unsupported consent request version"
         );
     }
 
-    /// The literal tag-11 and tag-12 values: the key right after the tag
-    /// byte, then the fields in their order, and each one's rows.
+    /// The literal tag-11 and tag-12 values: the fields in their order
+    /// right after the tag byte, and each one's rows.
     #[test]
     fn elevation_descriptions_have_independent_literal_encodings_and_rows() {
         let request = Request::new([1; 32], 1000, rollback(CURRENT, PREVIOUS)).unwrap();
-        let mut literal = b"TDCONS01".to_vec();
+        let mut literal = b"TDCONS02".to_vec();
         literal.extend([1; 32]);
-        literal.extend([0, 0, 3, 232, 11, b'4', b'7']);
+        literal.extend([0, 0, 3, 232, 11]);
         literal.extend(CURRENT.bytes());
         literal.extend(PREVIOUS.bytes());
-        assert_eq!(literal.len(), 175);
+        assert_eq!(literal.len(), 173);
         assert_eq!(request.encode(), literal);
         assert_eq!(Request::decode(&literal).unwrap(), request);
         assert_eq!(
@@ -3827,15 +3601,15 @@ mod tests {
                 format!("CURRENT: {CURRENT}"),
                 format!("PREVIOUS: {PREVIOUS}"),
                 "TAKES EFFECT AT THE NEXT RESTART".into(),
-                "APPROVE: TYPE 4 THEN 7".into(),
+                "ENTER: APPROVE".into(),
                 "ESC: CANCEL".into(),
             ]
         );
 
         let request = Request::new([1; 32], 1000, rename(1000, "td", "my-laptop")).unwrap();
-        let mut literal = b"TDCONS01".to_vec();
+        let mut literal = b"TDCONS02".to_vec();
         literal.extend([1; 32]);
-        literal.extend([0, 0, 3, 232, 12, b'2', b'9', 0, 0, 3, 232, 2]);
+        literal.extend([0, 0, 3, 232, 12, 0, 0, 3, 232, 2]);
         literal.extend(b"td");
         literal.push(9);
         literal.extend(b"my-laptop");
@@ -3851,17 +3625,16 @@ mod tests {
                 "OLD NAME: td",
                 "NEW NAME: my-laptop",
                 "A RESTART COMPLETES THE CHANGE",
-                "APPROVE: TYPE 2 THEN 9",
+                "ENTER: APPROVE",
                 "ESC: CANCEL",
             ]
         );
     }
 
-    /// Bytes 45 and 46 are the key, in typing order, for every tag that
-    /// carries one: a swapped pair is the other key, never the same one or
-    /// a refusal.
+    /// Every elevation awaits approval and ends with the approval rows;
+    /// a byte where a key used to follow the tag is now the next field's.
     #[test]
-    fn the_approval_key_follows_the_tag_byte_in_typing_order() {
+    fn elevations_await_approval_and_end_with_its_rows() {
         for operation in [
             install(CURRENT, 1000),
             rollback(CURRENT, PREVIOUS),
@@ -3869,75 +3642,20 @@ mod tests {
             selector_update(SelectorForm::Staged, CURRENT),
         ] {
             let request = Request::new([1; 32], 1000, operation).unwrap();
-            let bytes = request.encode();
-            let key = approval_key(&request).unwrap();
-            assert_eq!(bytes[45..47], key.digits());
-            let mut swapped = bytes.clone();
-            swapped.swap(45, 46);
-            let decoded = Request::decode(&swapped).unwrap();
-            let [first, second] = key.digits();
-            assert_eq!(approval_key(&decoded).unwrap().digits(), [second, first]);
-            assert_eq!(
-                decoded.lines().iter().rev().nth(1).unwrap(),
-                &format!(
-                    "APPROVE: TYPE {} THEN {}",
-                    char::from(second),
-                    char::from(first)
-                )
-            );
-        }
-    }
-
-    /// Exactly the 64 keys of two digits from 2 to 9 exist, and a decoder
-    /// refuses every other byte at either position of every tag carrying
-    /// one.
-    #[test]
-    fn every_approval_digit_outside_two_to_nine_refuses() {
-        let mut admitted = 0;
-        for first in 0..=255u8 {
-            for second in 0..=255u8 {
-                let key = ApprovalKey::new([first, second]);
-                let digits = (b'2'..=b'9').contains(&first) && (b'2'..=b'9').contains(&second);
-                assert_eq!(key.is_ok(), digits, "{first} {second}");
-                if digits {
-                    admitted += 1;
-                    assert_eq!(key.unwrap().digits(), [first, second]);
-                }
-            }
-        }
-        assert_eq!(admitted, 64);
-        for operation in [
-            install(CURRENT, 1000),
-            rollback(CURRENT, PREVIOUS),
-            rename(1000, "td", "my-laptop"),
-            selector_update(SelectorForm::Staged, CURRENT),
-        ] {
-            let bytes = Request::new([1; 32], 1000, operation).unwrap().encode();
-            for index in [45, 46] {
-                for byte in 0..=255u8 {
-                    let mut changed = bytes.clone();
-                    changed[index] = byte;
-                    let decoded = Request::decode(&changed);
-                    if (b'2'..=b'9').contains(&byte) {
-                        assert!(decoded.is_ok(), "{index} {byte}");
-                    } else {
-                        assert_eq!(
-                            decoded.err().unwrap(),
-                            "invalid consent approval key",
-                            "{index} {byte}"
-                        );
-                    }
-                }
-            }
+            assert!(request.awaits_approval());
+            let lines = request.lines();
+            assert_eq!(lines[lines.len() - 2..], ["ENTER: APPROVE", "ESC: CANCEL"]);
+            assert!(!lines.iter().any(|line| line.contains("TYPE")));
+            assert_eq!(Request::decode(&request.encode()).unwrap(), request);
         }
     }
 
     /// Tag 17: the account, shape, count and running deployment's ID,
-    /// then the step, 119 bytes for the review and 122 at the widest; tag
-    /// 18: the key alone, 47 bytes (td-authd/DESIGN.md, amendment 10).
+    /// then the step, 117 bytes for the review and 122 at the widest; tag
+    /// 18: the tag alone, 45 bytes (td-authd/DESIGN.md, amendment 10).
     #[test]
     fn an_upgrade_and_its_cancellation_encode_exactly() {
-        let mut header = b"TDCONS01".to_vec();
+        let mut header = b"TDCONS02".to_vec();
         header.extend([1; 32]);
         header.extend(1000u32.to_be_bytes());
         assert_eq!(header.len(), 44);
@@ -3952,11 +3670,11 @@ mod tests {
         literal.extend(1000u32.to_be_bytes());
         literal.extend([1, 2]);
         literal.extend(CURRENT.as_bytes());
-        literal.extend([0, 12, b'5', b'8']);
-        assert_eq!(literal.len(), 119);
+        literal.extend([0, 12]);
+        assert_eq!(literal.len(), 117);
         assert_eq!(review.encode(), literal);
         assert_eq!(Request::decode(&literal).unwrap(), review);
-        assert_eq!(review.upgrade_approval(), Some(approval(b"58")));
+        assert!(review.awaits_approval());
         assert!(!review.is_login());
         // The widest value: a prove or repeat step.
         let prove = Request::new(
@@ -3984,27 +3702,20 @@ mod tests {
         assert_eq!(literal.len(), 122);
         assert_eq!(prove.encode(), literal);
         assert_eq!(Request::decode(&literal).unwrap(), prove);
-        assert_eq!(prove.upgrade_approval(), None);
+        assert!(!prove.awaits_approval());
         for step in upgrade_steps(2) {
             let request = Request::new([1; 32], 1000, upgrade(UpgradeShape::Tpm, 2, step)).unwrap();
             assert!(request.encode().len() <= 122);
             assert_eq!(Request::decode(&request.encode()).unwrap(), request);
             assert_eq!(request.upgrade_step(), Some(step));
         }
-        let cancel = Request::new(
-            [1; 32],
-            1000,
-            Operation::UpgradeCancel {
-                key: approval(b"47"),
-            },
-        )
-        .unwrap();
+        let cancel = Request::new([1; 32], 1000, Operation::UpgradeCancel).unwrap();
         let mut literal = header;
-        literal.extend([18, b'4', b'7']);
-        assert_eq!(literal.len(), 47);
+        literal.push(18);
+        assert_eq!(literal.len(), 45);
         assert_eq!(cancel.encode(), literal);
         assert_eq!(Request::decode(&literal).unwrap(), cancel);
-        assert_eq!(cancel.upgrade_approval(), Some(approval(b"47")));
+        assert!(cancel.awaits_approval());
         assert_eq!(cancel.upgrade_step(), None);
         assert_eq!(cancel.ceiling(), Some(UPGRADE_CANCEL_CEILING));
         for end in 0..literal.len() {
@@ -4042,7 +3753,7 @@ mod tests {
             rows.extend(disclosure.map(String::from));
             rows.push(asks.into());
             rows.extend(more.iter().map(|row| row.to_string()));
-            rows.extend(["APPROVE: TYPE 5 THEN 8".into(), "ESC: CANCEL".into()]);
+            rows.extend(["ENTER: APPROVE".into(), "ESC: CANCEL".into()]);
             rows
         };
         let tpm = ["PROTECT THE DISK: TPM AND PIN", "NEW RECOVERY KEYS: 0"];
@@ -4137,14 +3848,7 @@ mod tests {
                 }
             }
         }
-        let cancel = Request::new(
-            [1; 32],
-            1000,
-            Operation::UpgradeCancel {
-                key: approval(b"47"),
-            },
-        )
-        .unwrap();
+        let cancel = Request::new([1; 32], 1000, Operation::UpgradeCancel).unwrap();
         assert_eq!(
             cancel.lines(),
             [
@@ -4153,7 +3857,7 @@ mod tests {
                 "CANCEL PROTECTING THE DISK",
                 "THE NEXT BOOT MAY NEED",
                 "THE RECOVERY KEY AND A RESEAL",
-                "APPROVE: TYPE 4 THEN 7",
+                "ENTER: APPROVE",
                 "ESC: CANCEL",
             ]
         );
@@ -4170,17 +3874,11 @@ mod tests {
                 assert_eq!(made.is_ok(), counts.contains(&count), "{shape:?} {count}");
             }
         }
-        // The review carries the approval key and a key step none.
-        let mut bare = upgrade(UpgradeShape::Tpm, 1, UpgradeStep::Review);
-        if let Operation::Upgrade { approval, .. } = &mut bare {
-            *approval = None;
-        }
-        assert!(new(1000, bare).is_err());
-        let mut keyed = upgrade(UpgradeShape::Tpm, 1, key_step(1, LoginStep::Connect));
-        if let Operation::Upgrade { approval: key, .. } = &mut keyed {
-            *key = Some(approval(b"58"));
-        }
-        assert!(new(1000, keyed).is_err());
+        // The review awaits approval and a key step does not.
+        let review = new(1000, upgrade(UpgradeShape::Tpm, 1, UpgradeStep::Review)).unwrap();
+        assert!(review.awaits_approval());
+        let connect = upgrade(UpgradeShape::Tpm, 1, key_step(1, LoginStep::Connect));
+        assert!(!new(1000, connect).unwrap().awaits_approval());
         // A key step names a new key and a ceremony step.
         for (key, step) in [
             (0, LoginStep::Connect),
@@ -4329,14 +4027,7 @@ mod tests {
         );
         assert!(prove.upgrade_successor(&blocked).is_err());
         // Neither a login step nor a cancellation is an upgrade's.
-        let cancel = Request::new(
-            [1; 32],
-            1000,
-            Operation::UpgradeCancel {
-                key: approval(b"47"),
-            },
-        )
-        .unwrap();
+        let cancel = Request::new([1; 32], 1000, Operation::UpgradeCancel).unwrap();
         assert!(cancel.upgrade_start().is_err());
         assert!(review.upgrade_successor(&cancel).is_err());
         // The ceilings: 240 seconds and 120 more per new key.
@@ -4414,18 +4105,16 @@ mod tests {
             ),
         ] {
             let request = Request::new([1; 32], 1000, selector_update(form, CURRENT)).unwrap();
-            let mut literal = b"TDCONS01".to_vec();
+            let mut literal = b"TDCONS02".to_vec();
             literal.extend([1; 32]);
             literal.extend(1000u32.to_be_bytes());
-            literal.extend([16, b'5', b'8', byte]);
+            literal.extend([16, byte]);
             literal.extend(CURRENT.as_bytes());
-            assert_eq!(literal.len(), 112);
+            assert_eq!(literal.len(), 110);
             assert_eq!(request.encode(), literal);
             assert_eq!(Request::decode(&literal).unwrap(), request);
-            assert_eq!(
-                request.selector_update(),
-                Some((approval(b"58"), form, CURRENT))
-            );
+            assert_eq!(request.selector_update(), Some((form, CURRENT)));
+            assert!(request.awaits_approval());
             assert!(!request.is_login());
             assert_eq!(
                 request.lines(),
@@ -4437,7 +4126,7 @@ mod tests {
                     &format!("DEPLOYMENT: {CURRENT}"),
                     rows[0],
                     rows[1],
-                    "APPROVE: TYPE 5 THEN 8",
+                    "ENTER: APPROVE",
                     "ESC: CANCEL",
                 ]
             );
@@ -4451,7 +4140,7 @@ mod tests {
         .encode();
         for form in [0, 4, 0xff] {
             let mut bad = bytes.clone();
-            bad[47] = form;
+            bad[45] = form;
             assert_eq!(
                 Request::decode(&bad).err().unwrap(),
                 "invalid consent selector update form"
@@ -4459,14 +4148,14 @@ mod tests {
         }
         for byte in *b"Ag\n" {
             let mut bad = bytes.clone();
-            bad[48] = byte;
+            bad[46] = byte;
             assert_eq!(
                 Request::decode(&bad).err().unwrap(),
                 "invalid consent selector update deployment"
             );
         }
         assert_eq!(
-            Request::decode(&bytes[..111]).err().unwrap(),
+            Request::decode(&bytes[..109]).err().unwrap(),
             "truncated consent request"
         );
         let mut long = bytes.clone();
@@ -4517,7 +4206,7 @@ mod tests {
             .unwrap()
             .encode();
         // Each ID's first byte, uppercase, outside hex, or not UTF-8.
-        for index in [47, 111] {
+        for index in [45, 109] {
             for byte in [b'A', b'g', b'\n', 0xff] {
                 let mut bad = bytes.clone();
                 bad[index] = byte;
@@ -4525,13 +4214,13 @@ mod tests {
             }
         }
         let mut same = bytes.clone();
-        same[111..175].copy_from_slice(CURRENT.as_bytes());
+        same[109..173].copy_from_slice(CURRENT.as_bytes());
         assert_eq!(
             Request::decode(&same).err().unwrap(),
             "invalid consent rollback pair"
         );
         assert_eq!(
-            Request::decode(&bytes[..174]).err().unwrap(),
+            Request::decode(&bytes[..172]).err().unwrap(),
             "truncated consent request"
         );
         let mut long = bytes.clone();
@@ -4543,7 +4232,7 @@ mod tests {
     }
 
     /// Both names are what `Hostname::parse` admits, they differ, and the
-    /// requester is the owner. The widest value is 179 bytes.
+    /// requester is the owner. The widest value is 177 bytes.
     #[test]
     fn a_hostname_change_names_two_canonical_names_for_its_owner() {
         let widest = Request::new(
@@ -4552,11 +4241,11 @@ mod tests {
             rename(1000, &"a".repeat(63), &"b".repeat(63)),
         )
         .unwrap();
-        assert_eq!(widest.encode().len(), 179);
+        assert_eq!(widest.encode().len(), 177);
         assert!(widest.encode().len() <= MAX_BYTES);
         assert_eq!(Request::decode(&widest.encode()).unwrap(), widest);
         let narrowest = Request::new([1; 32], 1000, rename(1000, "a", "b")).unwrap();
-        assert_eq!(narrowest.encode().len(), 55);
+        assert_eq!(narrowest.encode().len(), 53);
         for name in [
             String::new(),
             "a".repeat(64),
@@ -4586,20 +4275,20 @@ mod tests {
                 "invalid consent hostname change"
             );
         }
-        // Decoded: td -> my-laptop, with the requester at bytes 47 to 50,
-        // the old name's length at 51 and the new name's length at 54.
+        // Decoded: td -> my-laptop, with the requester at bytes 45 to 48,
+        // the old name's length at 49 and the new name's length at 52.
         let bytes = Request::new([1; 32], 1000, rename(1000, "td", "my-laptop"))
             .unwrap()
             .encode();
         for (index, byte, refusal) in [
-            (49, 4, "invalid consent hostname change"),
-            (52, b'T', "invalid consent hostname change"),
-            (52, b'1', "invalid consent hostname change"),
-            (53, b'-', "invalid consent hostname change"),
-            (55, b'.', "invalid consent hostname change"),
-            (60, 0xff, "invalid consent text"),
-            (54, 10, "truncated consent request"),
-            (54, 8, "trailing consent request bytes"),
+            (47, 4, "invalid consent hostname change"),
+            (50, b'T', "invalid consent hostname change"),
+            (50, b'1', "invalid consent hostname change"),
+            (51, b'-', "invalid consent hostname change"),
+            (53, b'.', "invalid consent hostname change"),
+            (58, 0xff, "invalid consent text"),
+            (52, 10, "truncated consent request"),
+            (52, 8, "trailing consent request bytes"),
         ] {
             let mut bad = bytes.clone();
             bad[index] = byte;
@@ -4609,12 +4298,12 @@ mod tests {
                 "{index} {byte}"
             );
         }
-        let mut same = bytes[..51].to_vec();
+        let mut same = bytes[..49].to_vec();
         same.extend([2, b't', b'd', 2, b't', b'd']);
-        let mut empty_old = bytes[..51].to_vec();
+        let mut empty_old = bytes[..49].to_vec();
         empty_old.extend([0, 9]);
         empty_old.extend(b"my-laptop");
-        let mut empty_new = bytes[..54].to_vec();
+        let mut empty_new = bytes[..52].to_vec();
         empty_new.push(0);
         for bad in [same, empty_old, empty_new] {
             assert_eq!(
@@ -4623,8 +4312,8 @@ mod tests {
             );
         }
         let mut long = widest.encode();
-        long[115] = 64;
-        long.insert(116, b'b');
+        long[113] = 64;
+        long.insert(114, b'b');
         assert_eq!(
             Request::decode(&long).err().unwrap(),
             "invalid consent hostname change"
@@ -4637,19 +4326,16 @@ mod tests {
         );
     }
 
-    /// Each fixed row fits the narrowest prompt, so wrapping never splits
-    /// the key, and the key's two rows close the prompt in place of the
-    /// generic Escape row.
+    /// Each fixed row fits the narrowest prompt, and the two approval rows
+    /// close the prompt in place of the generic Escape row.
     #[test]
-    fn elevation_rows_end_with_the_key_and_its_escape() {
-        // An installation's rows predate the key; its key rows fit as the
-        // others' do.
+    fn elevation_rows_end_with_enter_and_escape() {
         let lines = Request::new([1; 32], 65533, install(CURRENT, 65533))
             .unwrap()
             .lines();
         assert_eq!(lines[lines.len() - 1], "ESC: CANCEL");
-        assert!(lines[lines.len() - 2].starts_with("APPROVE: TYPE "));
-        assert!(lines[lines.len() - 2].len() <= PROMPT_COLUMNS);
+        assert_eq!(lines[lines.len() - 2], APPROVE_ROW);
+        assert!(APPROVE_ROW.len() <= PROMPT_COLUMNS);
         assert!(!lines.iter().any(|line| line == "ESC TO CANCEL"));
         for operation in [
             rollback(CURRENT, PREVIOUS),
@@ -4658,7 +4344,7 @@ mod tests {
             let request = Request::new([1; 32], 65533, operation).unwrap();
             let lines = request.lines();
             assert_eq!(lines[lines.len() - 1], "ESC: CANCEL");
-            assert!(lines[lines.len() - 2].starts_with("APPROVE: TYPE "));
+            assert_eq!(lines[lines.len() - 2], APPROVE_ROW);
             assert!(!lines.iter().any(|line| line == "ESC TO CANCEL"));
             for line in &lines {
                 let argument = ["CURRENT: ", "PREVIOUS: ", "OLD NAME: ", "NEW NAME: "]
@@ -4778,7 +4464,7 @@ mod tests {
                 "ENTER: ERASE AND INSTALL   ESC: CANCEL",
             ]
         );
-        let mut literal = b"TDCONS01".to_vec();
+        let mut literal = b"TDCONS02".to_vec();
         literal.extend([7; 32]);
         literal.extend([0, 0, 3, 232, 6, 0, 0, 3, 232]);
         literal.extend(512_110_190_592_u64.to_be_bytes());
@@ -4973,7 +4659,6 @@ mod tests {
     fn every_operation_roundtrips_and_refuses_truncation_or_trailing_bytes() {
         let mut operations = vec![
             Operation::Install {
-                key: ApprovalKey::new(*b"92").unwrap(),
                 deployment: "ab".repeat(32),
                 requester: 1000,
             },
@@ -5051,7 +4736,7 @@ mod tests {
             },
         )
         .unwrap();
-        let mut literal = b"TDCONS01".to_vec();
+        let mut literal = b"TDCONS02".to_vec();
         literal.extend([42; 32]);
         literal.extend([0, 0, 3, 232, 2, 2]);
         assert_eq!(request.encode(), literal);
@@ -5260,7 +4945,6 @@ mod tests {
                             after,
                             removed: removed.clone(),
                             step,
-                            approval: None,
                             proof: None,
                         });
                     }
@@ -5274,24 +4958,14 @@ mod tests {
                         after,
                         key,
                         step,
-                        approval: None,
                         proof: None,
                     });
                 }
             }
         }
-        // Each disclosure step with its key.
-        let mut operations: Vec<Operation> = operations
-            .into_iter()
-            .map(|operation| operation.disclosed(disclosure()))
-            .collect();
+        let mut operations: Vec<Operation> = operations.into_iter().collect();
         operations.retain(|operation| Request::new([1; 32], 1000, operation.clone()).is_ok());
         operations
-    }
-
-    /// The key every test disclosure step carries.
-    fn disclosure() -> ApprovalKey {
-        approval(b"36")
     }
 
     fn login(operation: Operation) -> Request {
@@ -5299,7 +4973,7 @@ mod tests {
     }
 
     fn header(tag: u8) -> Vec<u8> {
-        let mut literal = b"TDCONS01".to_vec();
+        let mut literal = b"TDCONS02".to_vec();
         literal.extend([9; 32]);
         literal.extend([0, 0, 3, 232, tag, 0, 0, 3, 232]);
         literal
@@ -5323,10 +4997,8 @@ mod tests {
             after,
             key,
             step,
-            approval: None,
             proof: None,
         }
-        .disclosed(disclosure())
     }
 
     /// A removal from a three-key record, with the key on its disclosure
@@ -5338,10 +5010,8 @@ mod tests {
             after: 3 - removed.len() as u8,
             removed,
             step,
-            approval: None,
             proof: None,
         }
-        .disclosed(disclosure())
     }
 
     fn unlock(step: LoginStep) -> Operation {
@@ -5363,11 +5033,7 @@ mod tests {
                 7,
                 vec![2, 2, 7, 0x3f, 0xa2, 0xc1, 0xd0, 8],
             ),
-            (
-                enroll(2, 1, LoginStep::Connect),
-                8,
-                vec![0, 2, 1, 8, b'3', b'6'],
-            ),
+            (enroll(2, 1, LoginStep::Connect), 8, vec![0, 2, 1, 8]),
             (
                 enroll(2, 2, LoginStep::Create { retries: 7 }),
                 8,
@@ -5398,9 +5064,7 @@ mod tests {
             (
                 remove(vec![slot(1, B), slot(3, A)], LoginStep::Identify),
                 10,
-                vec![
-                    3, 1, 2, 1, 1, 2, 3, 4, 3, 0x3f, 0xa2, 0xc1, 0xd0, 1, b'3', b'6',
-                ],
+                vec![3, 1, 2, 1, 1, 2, 3, 4, 3, 0x3f, 0xa2, 0xc1, 0xd0, 1],
             ),
             (
                 Operation::LoginRemove {
@@ -5409,7 +5073,6 @@ mod tests {
                     after: 0,
                     removed: vec![slot(1, A)],
                     step: LoginStep::Authorize { key: A, retries: 0 },
-                    approval: None,
                     proof: None,
                 },
                 10,
@@ -5438,10 +5101,9 @@ mod tests {
     type Vector = (Operation, u8, Vec<u8>, usize, Vec<&'static str>);
 
     /// The four disclosure steps (td-login/TOKEN-LOGIN.md increment 5's
-    /// A4), each with its key as the value's last two bytes, its width,
-    /// and its rows: the step's, the disclosure, then the key's.
+    /// A4), each with its width and its rows: the step's, the disclosure,
+    /// then the approval rows.
     fn disclosure_vectors() -> Vec<Vector> {
-        let key = Some(approval(b"92"));
         let enrollment = [
             "BOOT AND LOCK NEED A KEY AND PIN",
             "CONSOLE AND SSH SESSIONS END NOW",
@@ -5455,7 +5117,7 @@ mod tests {
             "HERE, WHICH ALSO BYPASSES THE LOCK",
             "A BACKUP KEY CAN BE ADDED LATER",
         ];
-        let keyed = ["APPROVE: TYPE 9 THEN 2", "ESC: CANCEL"];
+        let keyed = ["ENTER: APPROVE", "ESC: CANCEL"];
         let header = ["TD SECURE ATTENTION", "SESSION USER 1000"];
         let enroll = |after| Operation::LoginEnroll {
             account: 1000,
@@ -5463,7 +5125,6 @@ mod tests {
             after,
             key: 1,
             step: LoginStep::Connect,
-            approval: key,
             proof: None,
         };
         let remove = |before, removed: Vec<Slot>| Operation::LoginRemove {
@@ -5472,7 +5133,6 @@ mod tests {
             after: before - removed.len() as u8,
             removed,
             step: LoginStep::Identify,
-            approval: key,
             proof: None,
         };
         let rows = |head: &[&'static str], tail: &[&[&'static str]]| {
@@ -5486,8 +5146,8 @@ mod tests {
             (
                 enroll(1),
                 8,
-                vec![0, 1, 1, 8, b'9', b'2'],
-                55,
+                vec![0, 1, 1, 8],
+                53,
                 rows(
                     &[
                         "ENROLL LOGIN KEYS (0 -> 1 KEY)",
@@ -5501,8 +5161,8 @@ mod tests {
             (
                 enroll(2),
                 8,
-                vec![0, 2, 1, 8, b'9', b'2'],
-                55,
+                vec![0, 2, 1, 8],
+                53,
                 rows(
                     &[
                         "ENROLL LOGIN KEYS (0 -> 2 KEYS)",
@@ -5516,10 +5176,8 @@ mod tests {
             (
                 remove(3, vec![slot(1, B), slot(3, A)]),
                 10,
-                vec![
-                    3, 1, 2, 1, 1, 2, 3, 4, 3, 0x3f, 0xa2, 0xc1, 0xd0, 1, b'9', b'2',
-                ],
-                65,
+                vec![3, 1, 2, 1, 1, 2, 3, 4, 3, 0x3f, 0xa2, 0xc1, 0xd0, 1],
+                63,
                 rows(
                     &[
                         "REMOVE 2 LOGIN KEYS (3 -> 1 KEY)",
@@ -5533,10 +5191,8 @@ mod tests {
             (
                 remove(2, vec![slot(1, B), slot(2, A)]),
                 10,
-                vec![
-                    2, 0, 2, 1, 1, 2, 3, 4, 2, 0x3f, 0xa2, 0xc1, 0xd0, 1, b'9', b'2',
-                ],
-                65,
+                vec![2, 0, 2, 1, 1, 2, 3, 4, 2, 0x3f, 0xa2, 0xc1, 0xd0, 1],
+                63,
                 rows(
                     &[
                         "REMOVE 2 LOGIN KEYS (2 -> 0 KEYS)",
@@ -5555,48 +5211,6 @@ mod tests {
         ]
     }
 
-    /// `operation` with its approval field set to `approval`, whatever its
-    /// step; an operation without the field unchanged.
-    fn keyed(operation: Operation, approval: Option<ApprovalKey>) -> Operation {
-        match operation {
-            Operation::LoginEnroll {
-                account,
-                before,
-                after,
-                key,
-                step,
-                approval: _,
-                proof,
-            } => Operation::LoginEnroll {
-                account,
-                before,
-                after,
-                key,
-                step,
-                approval,
-                proof,
-            },
-            Operation::LoginRemove {
-                account,
-                before,
-                after,
-                removed,
-                step,
-                approval: _,
-                proof,
-            } => Operation::LoginRemove {
-                account,
-                before,
-                after,
-                removed,
-                step,
-                approval,
-                proof,
-            },
-            other => other,
-        }
-    }
-
     #[test]
     fn each_disclosure_step_has_an_independent_literal_encoding_and_rows() {
         for (operation, tag, tail, width, rows) in disclosure_vectors() {
@@ -5606,60 +5220,21 @@ mod tests {
             assert_eq!(literal.len(), width);
             assert_eq!(request.encode(), literal, "{request:?}");
             assert_eq!(Request::decode(&literal).unwrap(), request);
-            assert_eq!(request.login_approval(), Some(approval(b"92")));
+            assert!(request.awaits_approval());
             assert_eq!(request.lines(), rows);
             for row in &rows {
                 assert!(row.len() <= PROMPT_COLUMNS, "{row:?}");
             }
-            // The decoder requires the key: without it, or with one byte
-            // of it, the value is cut; construction without it refuses.
-            for cut in [1, 2] {
-                assert_eq!(
-                    Request::decode(&literal[..literal.len() - cut])
-                        .err()
-                        .unwrap(),
-                    "truncated consent request"
-                );
+            for end in 0..literal.len() {
+                assert!(Request::decode(&literal[..end]).is_err(), "{end}");
             }
-            let keyless = keyed(request.operation().clone(), None);
-            assert_eq!(
-                Request::new([9; 32], 1000, keyless.clone()).err().unwrap(),
-                "invalid consent login operation"
-            );
-            // Root's draw attaches the key here, and only here.
-            assert_eq!(login(keyless.disclosed(approval(b"92"))), request);
-            // Each digit is 2 to 9, in typing order.
-            for index in [literal.len() - 2, literal.len() - 1] {
-                for byte in 0..=255u8 {
-                    let mut changed = literal.clone();
-                    changed[index] = byte;
-                    let decoded = Request::decode(&changed);
-                    if (b'2'..=b'9').contains(&byte) {
-                        assert!(decoded.is_ok(), "{index} {byte}");
-                    } else {
-                        assert_eq!(
-                            decoded.err().unwrap(),
-                            "invalid consent approval key",
-                            "{index} {byte}"
-                        );
-                    }
-                }
-            }
-            let mut swapped = literal.clone();
-            swapped.swap(literal.len() - 2, literal.len() - 1);
-            let swapped = Request::decode(&swapped).unwrap();
-            assert_eq!(swapped.login_approval(), Some(approval(b"29")));
-            assert_eq!(
-                swapped.lines().iter().rev().nth(1).unwrap(),
-                "APPROVE: TYPE 2 THEN 9"
-            );
         }
     }
 
-    /// No other step carries a key: two more bytes are trailing, and
-    /// construction with one refuses.
+    /// No other step awaits approval, and a former key's two bytes are
+    /// trailing after any step.
     #[test]
-    fn only_a_disclosure_step_carries_the_key() {
+    fn only_a_disclosure_step_awaits_approval() {
         let keyless = [
             enroll(2, 2, LoginStep::Connect),
             enroll(1, 1, LoginStep::Create { retries: 8 }),
@@ -5675,7 +5250,6 @@ mod tests {
                 after: 0,
                 removed: vec![slot(1, A)],
                 step: LoginStep::Authorize { key: A, retries: 8 },
-                approval: None,
                 proof: None,
             },
             add(LoginStep::Identify),
@@ -5684,8 +5258,7 @@ mod tests {
         ];
         for operation in keyless {
             let request = login(operation.clone());
-            assert_eq!(request.login_approval(), None);
-            assert_eq!(operation.clone().disclosed(approval(b"92")), operation);
+            assert!(!request.awaits_approval());
             let mut bytes = request.encode();
             bytes.extend(b"92");
             assert_eq!(
@@ -5693,16 +5266,8 @@ mod tests {
                 "trailing consent request bytes",
                 "{operation:?}"
             );
-            // Unlock and addition have no field for one.
-            let keyed = keyed(operation.clone(), Some(approval(b"92")));
-            if keyed != operation {
-                assert_eq!(
-                    Request::new([9; 32], 1000, keyed).err().unwrap(),
-                    "invalid consent login operation"
-                );
-            }
         }
-        // Exactly the disclosure steps carry it among every login step.
+        // Exactly the disclosure steps await it among every login step.
         for operation in every_login_operation() {
             let request = login(operation.clone());
             let disclosure = match (&operation, place(&request)) {
@@ -5710,19 +5275,15 @@ mod tests {
                 (Operation::LoginRemove { after, .. }, ("identify", _)) => *after <= 1,
                 _ => false,
             };
-            assert_eq!(
-                request.login_approval().is_some(),
-                disclosure,
-                "{operation:?}"
-            );
+            assert_eq!(request.awaits_approval(), disclosure, "{operation:?}");
             let lines = request.lines();
             if disclosure {
-                assert_eq!(lines[lines.len() - 2], "APPROVE: TYPE 3 THEN 6");
+                assert_eq!(lines[lines.len() - 2], "ENTER: APPROVE");
                 assert_eq!(lines[lines.len() - 1], "ESC: CANCEL");
                 assert!(!lines.iter().any(|line| line == "ESC TO CANCEL"));
             } else {
                 assert_eq!(lines[lines.len() - 1], "ESC TO CANCEL");
-                assert!(!lines.iter().any(|line| line.starts_with("APPROVE")));
+                assert!(!lines.iter().any(|line| line == "ENTER: APPROVE"));
             }
         }
     }
@@ -5799,10 +5360,6 @@ mod tests {
                 bytes.extend(A);
             }
             bytes.push(1);
-            // Leaving at most one key, identify discloses.
-            if before.saturating_sub(positions.len() as u8) <= 1 {
-                bytes.extend(b"36");
-            }
             Request::decode(&bytes)
         };
         assert!(removal(3, &[1, 3]).is_ok());
@@ -5851,7 +5408,6 @@ mod tests {
                 after: 2,
                 key: 1,
                 step: LoginStep::Connect,
-                approval: None,
                 proof: None,
             },
             enroll(3, 1, LoginStep::Connect),
@@ -5888,7 +5444,6 @@ mod tests {
                 after: 0,
                 removed: vec![slot(1, A)],
                 step: LoginStep::Identify,
-                approval: None,
                 proof: None,
             },
             Operation::LoginRemove {
@@ -5897,7 +5452,6 @@ mod tests {
                 after: 0,
                 removed: vec![slot(1, A), slot(1, A)],
                 step: LoginStep::Identify,
-                approval: None,
                 proof: None,
             },
             Operation::LoginRemove {
@@ -5906,7 +5460,6 @@ mod tests {
                 after: 8,
                 removed: vec![slot(1, A)],
                 step: LoginStep::Identify,
-                approval: None,
                 proof: None,
             },
         ];
@@ -5934,7 +5487,6 @@ mod tests {
                 key: [0xff; 4],
                 retries: 255,
             },
-            approval: None,
             proof: None,
         });
         // Header 45, account and counts 6, the set 1 + 8 * 5, the step 1 + 4 + 1.
@@ -5948,30 +5500,25 @@ mod tests {
         assert_eq!(widest, Some(98));
         // The widest disclosure step, a removal of eight keys at its
         // identify, carries the key and stays below it.
-        let identify = login(
-            Operation::LoginRemove {
-                account: 1000,
-                before: LOGIN_KEYS,
-                after: 0,
-                removed: (1..=LOGIN_KEYS)
-                    .map(|position| slot(position, [0xff; 4]))
-                    .collect(),
-                step: LoginStep::Identify,
-                approval: None,
-                proof: None,
-            }
-            .disclosed(disclosure()),
-        );
-        // Header 45, account and counts 6, the set 1 + 8 * 5, the step 1,
-        // the key 2.
-        assert_eq!(identify.encode().len(), 95);
+        let identify = login(Operation::LoginRemove {
+            account: 1000,
+            before: LOGIN_KEYS,
+            after: 0,
+            removed: (1..=LOGIN_KEYS)
+                .map(|position| slot(position, [0xff; 4]))
+                .collect(),
+            step: LoginStep::Identify,
+            proof: None,
+        });
+        // Header 45, account and counts 6, the set 1 + 8 * 5, the step 1.
+        assert_eq!(identify.encode().len(), 93);
         let widest = every_login_operation()
             .into_iter()
             .map(login)
-            .filter(|request| request.login_approval().is_some())
+            .filter(|request| request.awaits_approval())
             .map(|request| request.encode().len())
             .max();
-        assert_eq!(widest, Some(95));
+        assert_eq!(widest, Some(93));
     }
 
     /// No login row wraps at the renderer's narrowest output, even with the
@@ -6588,7 +6135,6 @@ mod tests {
                     after: 3,
                     removed: Vec::new(),
                     step: LoginStep::Authorize { key: N, retries: 8 },
-                    approval: None,
                     proof: None,
                 },
             ),
@@ -6608,7 +6154,6 @@ mod tests {
                     after: 2,
                     removed,
                     step: LoginStep::Authorize { key: B, retries: 8 },
-                    approval: None,
                     proof: None,
                 },
             )
@@ -7039,7 +6584,6 @@ mod tests {
                     key: [6; 4],
                     retries: 2
                 },
-                approval: None,
                 proof: None,
             })[2..],
             [
@@ -7075,7 +6619,6 @@ mod tests {
                 after,
                 key,
                 step,
-                approval: None,
                 proof: Some(proof),
             },
             Operation::LoginAdd {
@@ -7104,12 +6647,10 @@ mod tests {
                 after,
                 removed,
                 step,
-                approval: None,
                 proof: Some(proof),
             },
             other => other,
         }
-        .disclosed(disclosure())
     }
 
     const PROOFS: &[Proof] = &[Proof::RecoveryKey, Proof::DiskKey];
@@ -7149,7 +6690,6 @@ mod tests {
                             after,
                             key,
                             step,
-                            approval: None,
                             proof,
                         },
                         Operation::LoginAdd {
@@ -7178,12 +6718,11 @@ mod tests {
                             after,
                             removed,
                             step,
-                            approval: None,
                             proof,
                         },
                         other => other,
                     };
-                    operations.push(stepped.disclosed(disclosure()));
+                    operations.push(stepped);
                 }
             }
         }
@@ -7196,12 +6735,12 @@ mod tests {
     #[test]
     fn each_disk_proof_has_an_independent_literal_encoding_and_rows() {
         // Account 1000, the proof byte, the counts, the operation's own
-        // field, the step, and a disclosure step's key.
+        // field and the step.
         let cases: Vec<(Operation, u8, Vec<u8>, &[&str])> = vec![
             (
                 proven(enroll(2, 1, LoginStep::RecoveryKey), Proof::RecoveryKey),
                 13,
-                vec![1, 0, 2, 1, 9, b'3', b'6'],
+                vec![1, 0, 2, 1, 9],
                 &[
                     "ENROLL LOGIN KEYS (0 -> 2 KEYS)",
                     "NEW KEY 1 OF 2",
@@ -7213,7 +6752,7 @@ mod tests {
                     "SSH ONLY FOR THE PRIMARY ACCOUNT",
                     "ADMINISTRATION NEEDS A LOGIN",
                     "PIN SET ON ANOTHER LAYOUT MAY FAIL",
-                    "APPROVE: TYPE 3 THEN 6",
+                    "ENTER: APPROVE",
                     "ESC: CANCEL",
                 ],
             ),
@@ -7281,9 +6820,7 @@ mod tests {
                     Proof::DiskKey,
                 ),
                 15,
-                vec![
-                    2, 3, 1, 2, 1, 1, 2, 3, 4, 3, 0x3f, 0xa2, 0xc1, 0xd0, 10, b'3', b'6',
-                ],
+                vec![2, 3, 1, 2, 1, 1, 2, 3, 4, 3, 0x3f, 0xa2, 0xc1, 0xd0, 10],
                 &[
                     "REMOVE 2 LOGIN KEYS (3 -> 1 KEY)",
                     "ACCOUNT UID 1000",
@@ -7294,7 +6831,7 @@ mod tests {
                     "RECOVERY NEEDS BOOTING OTHER CODE",
                     "HERE, WHICH ALSO BYPASSES THE LOCK",
                     "A BACKUP KEY CAN BE ADDED LATER",
-                    "APPROVE: TYPE 3 THEN 6",
+                    "ENTER: APPROVE",
                     "ESC: CANCEL",
                 ],
             ),
@@ -7332,14 +6869,14 @@ mod tests {
             (9, &[2, 3, 9][..]),
             (9, &[2, 3, 10]),
             (9, &[2, 3, 11, 1, 2, 3, 4, 8]),
-            (8, &[0, 1, 1, 9, b'3', b'6']),
+            (8, &[0, 1, 1, 9]),
             (10, &[3, 2, 1, 2, 1, 2, 3, 4, 10]),
             (7, &[2, 2, 9]),
             (14, &[1, 2, 3, 1]),
             (14, &[1, 2, 3, 2, 1, 2, 3, 4, 8]),
             (14, &[1, 2, 3, 10]),
             (14, &[2, 2, 3, 9]),
-            (13, &[2, 0, 1, 1, 1, b'3', b'6']),
+            (13, &[2, 0, 1, 1, 1]),
             (15, &[1, 3, 2, 1, 2, 1, 2, 3, 4, 1]),
             (15, &[2, 3, 2, 1, 2, 1, 2, 3, 4, 2, 1, 2, 3, 4, 8]),
             // A proof is made once, at the first key.
@@ -7394,7 +6931,6 @@ mod tests {
                     key: [0xff; 4],
                     retries: 255,
                 },
-                approval: None,
                 proof: None,
             },
             Proof::DiskKey,
@@ -7430,11 +6966,7 @@ mod tests {
                 Operation::LoginRemove { after, .. } => *after <= 1,
                 _ => false,
             };
-            assert_eq!(
-                request.login_approval().is_some(),
-                start && reads,
-                "{operation:?}"
-            );
+            assert_eq!(request.awaits_approval(), start && reads, "{operation:?}");
             if start {
                 assert!(request.login_step().is_some_and(LoginStep::proves));
             }
@@ -7806,10 +7338,6 @@ mod tests {
         const NEW: Fingerprint = [0xee, 0xee, 0xee, 0xee];
         const PROOFS: &[Proof] = &[Proof::RecoveryKey, Proof::DiskKey];
 
-        fn key() -> ApprovalKey {
-            ApprovalKey::new(*b"47").unwrap()
-        }
-
         fn request(operation: Operation) -> Result<Request, String> {
             Request::new(NONCE, 1000, operation)
         }
@@ -7870,7 +7398,6 @@ mod tests {
         fn recovery(step: LoginStep) -> Operation {
             Operation::RecoveryRemove {
                 account: 1000,
-                approval: (step == LoginStep::DiskIdentify).then(key),
                 step,
             }
         }
@@ -7987,7 +7514,7 @@ mod tests {
 
         #[test]
         fn every_step_has_an_independent_literal_encoding() {
-            let mut header = b"TDCONS01".to_vec();
+            let mut header = b"TDCONS02".to_vec();
             header.extend([9; 32]);
             header.extend([0, 0, 3, 232]);
             let literal = |tail: &[u8]| [header.as_slice(), tail].concat();
@@ -8018,7 +7545,7 @@ mod tests {
                 ),
                 (
                     recovery(LoginStep::DiskIdentify),
-                    literal(&[21, 0, 0, 3, 232, 10, b'4', b'7']),
+                    literal(&[21, 0, 0, 3, 232, 10]),
                 ),
                 (
                     Operation::ProtectorRequest {
@@ -8067,7 +7594,7 @@ mod tests {
                 (remove(Proof::DiskKey, four(4), authorize(A)), 81),
                 (remove(Proof::DiskKey, four(0), LoginStep::Choose), 76),
                 (recovery(authorize(A)), 55),
-                (recovery(LoginStep::DiskIdentify), 52),
+                (recovery(LoginStep::DiskIdentify), 50),
                 (ask(DiskRequest::Reenroll, Proof::DiskKey, authorize(A)), 57),
             ] {
                 assert_eq!(ok(operation).encode().len(), bytes);
@@ -8117,15 +7644,9 @@ mod tests {
                 list.tokens = vec![token(DiskRole::Primary, A); count];
                 assert!(request(remove(Proof::DiskKey, list, LoginStep::Choose)).is_err());
             }
-            // Tag 21's key on its identify step alone.
-            for (step, approval) in [(LoginStep::DiskIdentify, None), (authorize(A), Some(key()))] {
-                assert!(request(Operation::RecoveryRemove {
-                    account: 1000,
-                    step,
-                    approval
-                })
-                .is_err());
-            }
+            // Tag 21 awaits approval at its identify step alone.
+            assert!(ok(recovery(LoginStep::DiskIdentify)).awaits_approval());
+            assert!(!ok(recovery(authorize(A))).awaits_approval());
         }
 
         #[test]
@@ -8271,7 +7792,7 @@ mod tests {
             ));
             assert!(prove.protector_successor(&other).is_err());
             // Other kinds are no protector steps.
-            let selector = ok(Operation::UpgradeCancel { key: key() });
+            let selector = ok(Operation::UpgradeCancel);
             assert!(selector.protector_successor(&pin).is_err());
             assert!(tpm().admits(&selector).is_err());
         }
@@ -8359,9 +7880,7 @@ mod tests {
 
         #[test]
         fn the_first_description_is_the_baselines() {
-            let first = |protected: &Protected, managed| {
-                protected.first(1000, managed, Some(key())).map(ok)
-            };
+            let first = |protected: &Protected, managed| protected.first(1000, managed).map(ok);
             let disk = Proof::DiskKey;
             let typed = Proof::RecoveryKey;
             // Root's, which the worker admits; anything else it does not.
@@ -8544,13 +8063,8 @@ mod tests {
             assert_eq!(refusal(&single, Managed::Remove { proof: disk }), Some(0));
             assert_eq!(refusal(&single, Managed::Remove { proof: typed }), None);
             assert_eq!(refusal(&fido(), ask(DiskRequest::PinChange)), Some(3));
-            assert!(fido()
-                .first(1000, Managed::RecoveryRemove, Some(key()))
-                .is_ok());
-            assert_eq!(
-                tpm().first(1000, Managed::RecoveryRemove, Some(key())),
-                Err(2)
-            );
+            assert!(fido().first(1000, Managed::RecoveryRemove).is_ok());
+            assert_eq!(tpm().first(1000, Managed::RecoveryRemove), Err(2));
             // The operation's detail, not the proof's, where both apply.
             assert_eq!(
                 refusal(&unmarked, Managed::Remove { proof: typed }),
@@ -8604,7 +8118,6 @@ mod tests {
                         key: 1,
                         step: choose,
                     },
-                    approval: None,
                 },
                 add(Proof::DiskKey, choose),
                 recovery(choose),
@@ -8966,7 +8479,7 @@ mod tests {
                     "LOSING THEM ALL LOSES THE DATA",
                     "AUTHORIZED BY A DISK SECURITY KEY",
                     "CONNECT ONE DISK SECURITY KEY ONLY",
-                    "APPROVE: TYPE 4 THEN 7",
+                    "ENTER: APPROVE",
                     "ESC: CANCEL",
                 ]
             );
@@ -9073,11 +8586,8 @@ mod tests {
             assert_eq!(choose.ceremony_step(), Some(LoginStep::Choose));
             assert_eq!(choose.removal(), Some(&tpm_removal(0)));
             assert_eq!(choose.protector_proof(), Some(Proof::DiskKey));
-            assert_eq!(
-                ok(recovery(LoginStep::DiskIdentify)).protector_approval(),
-                Some(key())
-            );
-            assert_eq!(ok(recovery(authorize(A))).protector_approval(), None);
+            assert!(ok(recovery(LoginStep::DiskIdentify)).awaits_approval());
+            assert!(!ok(recovery(authorize(A))).awaits_approval());
             for proof in PROOFS {
                 assert_eq!(
                     ok(ask(DiskRequest::TpmClear, *proof, first_proof(*proof))).protector_step(),

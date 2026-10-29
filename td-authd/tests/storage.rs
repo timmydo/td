@@ -29,18 +29,12 @@ pub(crate) fn fixture(script: &str) -> Command {
     command
 }
 
-/// The key `Storage::scripted` draws.
-pub(crate) fn approval() -> ApprovalKey {
-    ApprovalKey::new(*b"36").unwrap()
-}
-
 /// Root's description for `form` over `ID`.
 pub(crate) fn update(form: SelectorForm) -> Request {
     Request::new(
         NONCE,
         1000,
         Operation::SelectorUpdate {
-            key: approval(),
             form,
             current: "ab".repeat(32),
         },
@@ -60,7 +54,6 @@ pub(crate) fn upgrade_at(shape: UpgradeShape, count: u8, step: UpgradeStep) -> R
             count,
             current: "ab".repeat(32),
             step,
-            approval: (step == UpgradeStep::Review).then(approval),
         },
     )
     .unwrap()
@@ -93,7 +86,7 @@ pub(crate) fn ceremony_steps(count: u8) -> Vec<UpgradeStep> {
 
 /// Root's cancellation description.
 pub(crate) fn cancellation() -> Request {
-    Request::new(NONCE, 1000, Operation::UpgradeCancel { key: approval() }).unwrap()
+    Request::new(NONCE, 1000, Operation::UpgradeCancel).unwrap()
 }
 
 /// A baseline frame: the volume byte, a recovery-key marker, the tokens,
@@ -1338,20 +1331,19 @@ fn removal() -> Vec<Request> {
     ]
 }
 
-fn recovery_removing(step: LoginStep, keyed: bool) -> Request {
+fn recovery_removing(step: LoginStep) -> Request {
     described(Operation::RecoveryRemove {
         account: 1000,
         step,
-        approval: keyed.then(approval),
     })
 }
 
-/// The recovery key's removal: tag 21's identify step with its key, then
+/// The recovery key's removal: tag 21's identify step, then
 /// the first primary key's authorize step.
 fn recovery_removal() -> Vec<Request> {
     vec![
-        recovery_removing(LoginStep::DiskIdentify, true),
-        recovery_removing(LoginStep::DiskAuthorize { key: P, retries: 8 }, false),
+        recovery_removing(LoginStep::DiskIdentify),
+        recovery_removing(LoginStep::DiskAuthorize { key: P, retries: 8 }),
     ]
 }
 

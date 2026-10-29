@@ -455,18 +455,15 @@ fn commit_transfers_one_held_directory_and_completion_needs_the_child_exit() {
     }
 }
 
-/// Tag 5 carries a fresh approval key, each digit 2 to 9, beside a fresh
-/// nonce; L4's keyless description is gone.
+/// Tag 5 carries a fresh nonce and awaits the person's approval.
 #[test]
-fn each_installation_draws_its_own_nonce_and_key() {
+fn each_installation_draws_its_own_nonce() {
     let fixture = Fixture::new();
-    let mut keys = std::collections::BTreeSet::new();
     let mut nonces = std::collections::BTreeSet::new();
     for _ in 0..64 {
         let installation = fixture.installation();
         let request = installation.request();
         let Description::Install {
-            key,
             deployment,
             requester,
         } = request.operation()
@@ -474,18 +471,10 @@ fn each_installation_draws_its_own_nonce_and_key() {
             panic!("not an installation");
         };
         assert_eq!((deployment.as_str(), *requester), (fixture.id(), 1000));
-        assert!(key
-            .digits()
-            .iter()
-            .all(|digit| (b'2'..=b'9').contains(digit)));
-        keys.insert(key.digits());
+        assert!(request.awaits_approval());
         nonces.insert(*request.nonce());
     }
     assert_eq!(nonces.len(), 64);
-    assert!(keys.len() > 1, "the key never varied");
-    for (bytes, key) in [([0, 7], *b"29"), ([8, 255], *b"29"), ([3, 4], *b"56")] {
-        assert_eq!(approval_key(bytes).unwrap().digits(), key);
-    }
 }
 
 /// The intake refuses within the backoff with 03 and writes nothing;

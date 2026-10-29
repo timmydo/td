@@ -1,9 +1,9 @@
 //! `deploy-rollback` (td-authd/DESIGN.md, "Elevation operations"): request
 //! `1d` describes the pair the two boot selectors name, read through the
-//! held volume, with a fresh nonce and approval key; after the person's
+//! held volume, with a fresh nonce; after the person's
 //! commit, root runs the one fixed td-boot helper on exactly that pair.
 
-use crate::consent::{ApprovalKey, Operation, Request};
+use crate::consent::{Operation, Request};
 use crate::elevation::{self, Table};
 use crate::login_tier;
 use crate::unlock::Event;
@@ -88,12 +88,6 @@ pub(crate) fn admit(
     Selectors::read(volume).map_err(|_| Refusal::Selectors)
 }
 
-/// Each digit `2` plus its own random byte modulo 8: 256 is a multiple of
-/// 8, so every digit is equally likely.
-fn approval_key(bytes: [u8; 2]) -> Result<ApprovalKey, String> {
-    ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))
-}
-
 pub(crate) struct Rollback {
     request: Request,
     selectors: Selectors,
@@ -106,30 +100,20 @@ pub(crate) struct Rollback {
 
 impl Rollback {
     /// The description of `selectors` for `owner`, under a fresh nonce
-    /// and approval key, each drawn from `/dev/urandom`.
+    /// drawn from `/dev/urandom`.
     pub fn start(owner: u32, selectors: Selectors) -> Result<Self, String> {
         let mut nonce = [0; 32];
-        let mut key = [0; 2];
         File::open("/dev/urandom")
-            .and_then(|mut random| {
-                random.read_exact(&mut nonce)?;
-                random.read_exact(&mut key)
-            })
-            .map_err(|e| format!("draw the rollback's nonce and key: {e}"))?;
-        Self::drawn(owner, selectors, nonce, key)
+            .and_then(|mut random| random.read_exact(&mut nonce))
+            .map_err(|e| format!("draw the rollback's nonce: {e}"))?;
+        Self::drawn(owner, selectors, nonce)
     }
 
-    fn drawn(
-        owner: u32,
-        selectors: Selectors,
-        nonce: [u8; 32],
-        key: [u8; 2],
-    ) -> Result<Self, String> {
+    fn drawn(owner: u32, selectors: Selectors, nonce: [u8; 32]) -> Result<Self, String> {
         let request = Request::new(
             nonce,
             owner,
             Operation::DeployRollback {
-                key: approval_key(key)?,
                 current: selectors.current.clone(),
                 previous: selectors.previous.clone(),
             },

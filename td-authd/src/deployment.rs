@@ -1,9 +1,9 @@
-//! One queued local build and one installation confirmed by its approval
-//! key: `deploy-publish` (td-authd/DESIGN.md, "Consent for a locally built
+//! One queued local build and one installation approved at secure
+//! attention: `deploy-publish` (td-authd/DESIGN.md, "Consent for a locally built
 //! system" and "Elevation operations").
 
 use crate::backoff::{self, Backoff, Refused, Row, BACKING_OFF, REFUSED};
-use crate::consent::{self, ApprovalKey, Operation as Description, Request};
+use crate::consent::{self, Operation as Description, Request};
 use crate::elevation::{Operation::DeployPublish, Table};
 use crate::login_tier;
 use crate::secret_sys as sys;
@@ -543,11 +543,6 @@ pub(crate) fn request(source: &str, deployment: &str) -> Result<(), String> {
     }
 }
 
-/// Each digit `2` plus its own random byte modulo 8, as the rollback's.
-fn approval_key(bytes: [u8; 2]) -> Result<ApprovalKey, String> {
-    ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))
-}
-
 pub(crate) struct Installation {
     request: Request,
     source: Option<File>,
@@ -559,25 +554,19 @@ pub(crate) struct Installation {
     result: Option<bool>,
 }
 impl Installation {
-    /// Tag 5 for `ready` under a fresh nonce and approval key, each drawn
-    /// from `/dev/urandom`.
+    /// Tag 5 for `ready` under a fresh nonce drawn from `/dev/urandom`.
     fn start(owner: u32, ready: Ready, backoff: Backoff) -> Result<Self, String> {
         if owner != 1000 {
             return Err("unsupported installation owner".into());
         }
         let mut nonce = [0; 32];
-        let mut key = [0; 2];
         File::open("/dev/urandom")
-            .and_then(|mut random| {
-                random.read_exact(&mut nonce)?;
-                random.read_exact(&mut key)
-            })
-            .map_err(|e| format!("draw the installation's nonce and key: {e}"))?;
+            .and_then(|mut random| random.read_exact(&mut nonce))
+            .map_err(|e| format!("draw the installation's nonce: {e}"))?;
         let request = Request::new(
             nonce,
             owner,
             Description::Install {
-                key: approval_key(key)?,
                 deployment: ready.deployment,
                 requester: owner,
             },

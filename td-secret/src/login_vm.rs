@@ -1221,20 +1221,6 @@ impl Host {
 
     /// Asks the host to see screen `name` and waits for its answer.
     fn screen(&mut self, name: &str, arguments: &[&str]) {
-        let read = self.ask(name, arguments);
-        assert_eq!(read, None, "screen {name} answered with a reading");
-    }
-
-    /// Asks the host to see screen `name` and returns what it read off
-    /// the screen, which it answers with.
-    fn read(&mut self, name: &str, arguments: &[&str]) -> String {
-        self.ask(name, arguments)
-            .unwrap_or_else(|| panic!("screen {name} answered without a reading"))
-    }
-
-    /// Asks for screen `name` and waits for the host's answer, which
-    /// carries one word it read off that screen or none.
-    fn ask(&mut self, name: &str, arguments: &[&str]) -> Option<String> {
         // A line of its own even after another program's unfinished one
         // on the console, such as a client's message as its compositor
         // dies.
@@ -1264,14 +1250,7 @@ impl Host {
                 let line = String::from_utf8_lossy(&line);
                 let line = line.trim();
                 if line == answer {
-                    return None;
-                }
-                if let Some(word) = line
-                    .strip_prefix(&answer)
-                    .and_then(|rest| rest.strip_prefix(' '))
-                    .filter(|word| !word.is_empty() && !word.contains(' '))
-                {
-                    return Some(word.to_string());
+                    return;
                 }
                 assert!(!line.starts_with(SHOWN), "{line:?} answered {request:?}");
             }

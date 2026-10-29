@@ -410,9 +410,9 @@ not a pathname. It is not an elevation command or a user consent flow.
 The authority must admit and present the exact manifest ID before invoking
 it. `./update` (or `./update install`) builds the current checkout and queues
 that operation through td-authd as `deploy-publish`, which the principal
-table must grant. Physical I selects it, and its root-drawn approval
-key, typed after complete presentation, confirms it; Enter does not, as
-specified in td-authd/DESIGN.md.
+table must grant. Physical I selects it, and Enter, pressed first after
+complete presentation, confirms it, as specified in
+td-compositor/DESIGN.md, "Elevation consent".
 
 The helper reads a bounded manifest through the supplied directory,
 compares its SHA-256 with the approved ID, and pins all three regular
@@ -1677,14 +1677,14 @@ is `18`, then:
 - `00` and the running deployment's 32-byte manifest ID when it is
   `current`, acknowledged and with no pending attempt, or `01` alone.
 
-Root's first frame is a TDCONS01 description: tag 16 for a selector
+Root's first frame is a TDCONS02 description: tag 16 for a selector
 update, tag 17's review for an upgrade, tag 18 for its cancellation,
 tags 13 to 15 at their proof's first step for a disk proof, or tags 19
 to 24 at their first step for protector management.
 The worker requires it to be what its baseline admits, as root does,
 or fails as INTERNAL before any I/O, and repeats it exactly as its
-first `10`, a selector update's after the reads below, so the key's
-consent time holds no I/O.
+first `10`, a selector update's after the reads below, so the approval's
+time holds no I/O.
 
 - **Selector update** (tag 16). The form must be the one the volume byte
   gives and the ID the baseline's. Before its first `10` it reads
@@ -1848,7 +1848,7 @@ consent time holds no I/O.
   proof's first step for the worker's account, one its own baseline
   offers (consent's `proof_start`: a `recovery-key` marker, or a fido2
   token), or the worker fails as INTERNAL before presenting it; it then
-  presents that step, waiting for the typed approval key where the step
+  presents that step, waiting for its approving Enter where the step
   discloses, and narrows its deadline to the description's ceiling.
   With the recovery key: after the recovery-key step's `11` it takes
   one `16`, parses it with td-protector's recovery-key codec (`25` on a

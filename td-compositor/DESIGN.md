@@ -6089,7 +6089,8 @@ so this is plain file reads and no new syscall.
 
 An excluded device's keys never select (U, R, E, X, W, I, K, B, and the
 key-management screen's 1, 2, A, D, digits and Enter) and never confirm
-(Enter, or an approval key's digit, "Elevation consent" below). Its
+(Enter, "Elevation consent" below), and are not counted as a prompt's
+first press. Its
 held keys neither stop another keyboard's fresh press of the same key
 nor count as modifiers while attention is up. Its presses
 and releases are still tracked, so the release drain waits for them, and
@@ -6317,73 +6318,88 @@ change's, `HOSTNAME SAVED` above `A RESTART COMPLETES THE CHANGE`; the
 failure (`07`) of either shows `REQUEST FAILED`. Nothing restarts the
 machine.
 
-The prompt shows the description's rows and then the approval key it
-carries, two digits from 2 to 9, as the keys to press in order, with
-Escape to cancel. Confirmation generalises "Physical installation
+The prompt shows the description's rows and then `ENTER: APPROVE` and
+`ESC: CANCEL`. Confirmation generalises "Physical installation
 confirmation" above. The completed presentation carries a
 CLOCK_MONOTONIC sample taken after successful full-frame submission, and
-only the evdev adapter can offer the selected Attempt a press. A digit
-counts only when it is a number-row key, pressed on a device secure
-attention reads, of a key no other such device holds, with no Control,
-Alt or Super held (Shift is allowed, for layouts that shift digits),
-stamped strictly later than that sample, while the exact request is
-still visible outside drain and the attention lifetime remains. The
-second digit must be a fresh press after the first, stamped strictly
-later than it, so a repeat never supplies it; the same digit twice is
-two presses. A counted digit that matches its position advances; the
-second completes the key, and the existing atomic cancellation/commit
-transition then consumes the confirmation before sending the exact
-commit, root's description and so the key it carries, as for an
-installation. A counted digit from 2 to 9 that does not match, at
-either position, ends the request unapproved, as Escape does: the
-attempt cancels with root (`15`) and the screen drains, showing
-`RELEASE KEYS AND BUTTONS` until the digit is released. Presses from
-two keyboards are taken in the order their reports are read, not by
-timestamp, so the right digits typed across two keyboards within
-milliseconds can end the request as a wrong digit; that fails safe.
+only the evdev adapter can offer the selected Attempt a press. A press
+counts when it is a key press, not a repeat or release, on a device
+secure attention reads, of a key no such device already holds, stamped
+strictly later than that sample, while the exact request is still
+visible outside drain and the attention lifetime remains, and it is not
+the press that made the selection. Modifier keys themselves (Shift,
+Control, Alt, Super) are not counted, nor are the brightness keys and
+codes outside the keymap, which secure attention never reads; every
+other key counts, Caps Lock and Num Lock included. The first counted
+press decides:
+`KEY_ENTER` with no Control, Alt or Super held, stamped at least 500 ms
+(`APPROVAL_SETTLE`) after the sample, approves, and the existing atomic
+cancellation/commit transition then consumes the confirmation before
+sending the exact commit, root's description, as for an installation.
+Any other first counted press ends the request unapproved, as Escape
+does: another key, keypad Enter, an Enter inside the 500 ms, or an Enter
+with Control, Alt or Super held. The attempt cancels with root (`15`)
+and the screen drains, showing `RELEASE KEYS AND BUTTONS` until the key
+is released. Escape and a modifier pressed alone are not that first
+press: Escape cancels as it always does. Presses from two keyboards are
+taken in the order their reports are read, so the first counted press is
+the first delivered, with one exception: until the commit, or for a
+login disclosure step until the next step is presented, a key other than
+Enter stamped before the approving Enter, read after it from another
+keyboard, withdraws the approval and ends the request the same way. A
+receipt already sent is then abandoned with `15`, as Escape abandons
+one. The commit and
+that withdrawal take the attempt from active by one atomic transition
+each, so exactly one of them happens. Otherwise, once the first counted
+press has decided, later presses neither approve nor end the request.
 
-An update's prompt takes its key under the same rules. Everything else
-neither advances nor ends the request: Enter, which never confirms; a
-digit stamped before presentation, or held from before it; 0, 1 and the
-keypad; a digit under Control, Alt or Super; repeats and held logical
-keys; a digit after the key is complete; and injected, automation,
-control, Wayland and bridge input. A security key's own keyboard neither
-advances nor ends the key, though its Escape still cancels. A replaced
-or hidden prompt confirms nothing.
+The settle discards an Enter already in flight when the prompt appears;
+it does not answer a habituated Enter on a prompt the person opened
+(APPLICATIONS.md §L.1, "The v1 operations", Consent). The first-press
+rule is what keeps a security key's OTP interface from approving where
+its exclusion fails: it types modhex letters before its Enter, and its
+first letter ends the request. Nothing else approves or ends the
+request: a press stamped before presentation or held from before it,
+repeats and held logical keys, and injected, automation, control,
+Wayland and bridge input. A security key's own keyboard neither approves
+nor counts, though its Escape still cancels. A replaced or hidden prompt
+confirms nothing.
 
 Host tests drive a rollback's, a hostname change's and an update's
 prompt against a scripted authority to its one commit and its success
-screen, an update's Enter confirming nothing and its wrong digit ending
-it, a disk installation's Enter confirming and no digit, through each
-`9d` and `9e` answer above and request 19's `99 02`, and the `1f`
-decoder, the `H` row's forms and the menu taking the answer held as it
-opens; device-dispatcher tests cover `B`'s and `H`'s selection,
-the digits offered, the drain after a wrong one, a security key's own
-keyboard and the lock surface. Source pins hold what they cannot: that
-no test-only switch decides `B` or `H`, and that only the evdev target
-offers the attempt a digit, and that Enter answers a disk installation
-alone. `qemu-deploy-rollback` reads a booted system's rollback and
-hostname prompts and their keys and the `H` row off the screen and shows
-that Enter and a wrong digit commit nothing and that production's
-control socket refuses key requests outright (td-authd/DESIGN.md,
-"Elevation operations"); `qemu-update` reads an update's key and shows
-Enter installing nothing (td-update/DESIGN.md).
+screen, an Enter inside the settle and a letter first each ending it, an
+earlier-stamped letter read after the approving Enter withdrawing it
+before the commit and not after, a disk installation's Enter confirming, through each `9d` and `9e` answer
+above and request 19's `99 02`, and the `1f` decoder, the `H` row's
+forms and the menu taking the answer held as it opens; device-dispatcher
+tests cover `B`'s and `H`'s selection, the first-press rule, the drain
+after a press that ends the request, a security key's own keyboard and
+the lock surface. Source pins hold what they cannot: that no test-only
+switch decides `B` or `H`, that only the evdev target offers the
+attempt a press, and that the rule above is the only approval.
+`qemu-deploy-rollback` reads a booted system's rollback and hostname
+prompts and the `H` row off the screen and shows that injected input
+and a non-Enter key first commit nothing and that production's control
+socket refuses key requests outright (td-authd/DESIGN.md, "Elevation
+operations"); `qemu-update` approves an update with Enter
+(td-update/DESIGN.md). Both press Enter about 700 ms after the prompt
+is on glass, since QEMU's key timing cannot place a press inside the
+500 ms settle; host tests alone hold the settle.
 
-The approval key appears only on the private prompt, so ordinary
-rendering never carries it. The login-key disclosures, enrollment's and
-the one-key and remove-every-key removal disclosures (TOKEN-LOGIN.md
-increment 5's A4), take it, live since that increment's A5 admits a
-write. Each is typed on the operation's
-first step, which carries the disclosure, under the rules above, and
-confirms that step's presentation receipt rather than a commit: the
-client presents the step at root's first `04`, sends nothing while
-root's later `04` polls find the key untyped, and sends the receipt, the
-exact description and so its key, at the first poll after the second
-digit. Enter, a digit before presentation and a wrong digit act as on
-an elevation's prompt, the wrong digit cancelling with `15` and
+The login-key disclosures, enrollment's and the one-key and
+remove-every-key removal disclosures (TOKEN-LOGIN.md increment 5's A4),
+take the same Enter, live since that increment's A5 admits a write. It
+is pressed on the operation's first step, which carries the disclosure,
+under the rules above while no PIN field is open, and confirms that
+step's presentation receipt rather than a commit: the client presents
+the step at root's first `04`, sends nothing while root's later `04`
+polls find it unapproved, and sends the receipt, the exact description,
+at the first poll after the approving Enter. A PIN field's own Enter
+submits the field and never counts as approval. A press that ends the
+request acts as on an elevation's prompt, cancelling with `15` and
 draining; every other login step's receipt still follows its
-presentation, and the step after a disclosure carries no key. A live
-boot's whole-disk installation keeps its fresh Enter.
+presentation. A live boot's whole-disk installation keeps its fresh
+Enter.
 
 A disclosure prompt is taller than any other login prompt authorized
 by an enrolled key. With its
@@ -6397,15 +6413,19 @@ one-key enrollment's refuses as any prompt that cannot hold its rows
 does, and the operation fails before any token I/O, while a two-key
 enrollment's, 14 rows, fits. Any login step whose prompt an output
 cannot hold whole ends the operation with `THIS SCREEN IS TOO SMALL /
-FOR THIS PROMPT` rather than the generic failure. A disclosure's typed
-key confirms only its own prompt: the next step's presentation clears
-the confirmation with the key. Device-dispatcher tests type a two-key
-enrollment's key through `read_device` with Enter, the keypad, 1, a
-digit under Control, a repeat, a digit another read keyboard holds and a
-security key's own keyboard typing nothing, and a wrong digit at either
-position ending it with a drain; host tests drive each disclosure's
-receipt against a scripted authority, and the whole status sequence of
-every operation types the key.
+FOR THIS PROMPT` rather than the generic failure. A disclosure's Enter
+confirms only its own prompt: the next step's presentation clears the
+confirmation. Device-dispatcher tests approve a two-key enrollment's
+disclosure through `read_device`, with a letter first, a digit, keypad
+Enter and Enter under Control ending it with a drain, and Shift alone,
+a repeat, an Enter another read keyboard holds and a security key's own
+keyboard counting nothing. Every dispatcher press is stamped far past
+the settle; the settle itself is held by the client's host tests, and
+the withdrawal by an earlier-stamped key by its host test of an update's
+prompt. Login disclosures reach the same `approve()`; no host test
+withdraws one. Host tests also drive each
+disclosure's receipt against a scripted authority, and the whole status
+sequence of every operation approves with Enter.
 
 ### Login-key operations
 
@@ -6464,7 +6484,7 @@ checks root's descriptions without the record or the device:
   reaps the worker. Presenting it still needs `04` and committing it a
   receipt, so admitting it under `03` lets nothing through;
 - a disclosure step's receipt (TOKEN-LOGIN.md increment 5's A4) is
-  sent only once its approval key is typed ("Elevation consent"); every
+  sent only once its Enter approves ("Elevation consent"); every
   other step's receipt follows its presentation;
 - in an addition, the new key's prove, repeat and probe never name the
   key the authorize step named: a rule spanning more than one step,
@@ -6718,13 +6738,12 @@ operation: `91 0b` until the worker's baseline, then root's tag 16
 description, which must keep the nonce and owner 1000 and carry the
 selected operation; any other description, a second one or one before
 the nonce is a violation that ends the paired generation. Root's `04`
-presents it, its approval key's rows replacing the generic Escape row;
-the key is typed under "Elevation consent"'s rules, and the receipt,
-the exact description, is sent only after its second digit. Root's
-`05` then asks for the commit, which the client sends at once, since
-the key was the consent; a `05` before the receipt is a violation.
-Enter confirms nothing and a wrong digit ends the request, as on an
-elevation's prompt. Success (`06`) shows `BOOT SELECTOR UPDATED` and
+presents it, its `ENTER: APPROVE` row replacing the generic Escape row;
+it is approved under "Elevation consent"'s rules, and the receipt, the
+exact description, is sent only after the approving Enter. Root's `05`
+then asks for the commit, which the client sends at once, since the
+Enter was the consent; a `05` before the receipt is a violation. A press
+that ends the request ends it as on an elevation's prompt. Success (`06`) shows `BOOT SELECTOR UPDATED` and
 the form's row: `THE NEXT BOOT ASKS FOR THE DISK PIN` (staged), `THE
 NEXT BOOT NEEDS THE RECOVERY KEY` (direct, device-bound) or nothing more
 (direct, FIDO2 primary). An end shows its kind's text:
@@ -6764,8 +6783,8 @@ the storage screen and cancels nothing at root, since nothing was sent.
 key's own keyboard covers as it covers `B` and `H`. `a0 00` and `a0 01`
 are the selector update's. Root's first description, tag 17's review,
 must keep the nonce, owner and account 1000 and the chosen shape and
-count; it is presented with its approval key's rows as tag 16's is, and
-its receipt sent only after the key's second digit. Every tag 17 prompt
+count; it is presented with the approval rows as tag 16's is, and its
+receipt sent only after the approving Enter. Every tag 17 prompt
 that cannot hold its rows, and a PIN step's field, at the doubled scale
 is prepared at the single scale, as a disk proof's is
 (`Prepared::with_time` learns tag 17 beside `login_proof`), and only
@@ -6848,8 +6867,8 @@ authorization screen is a disk proof's without `K`: `AUTHORIZE WITH:`,
   except one. A TPM clear's security-key PIN step falls back at
   800x600, with or without a pending request.
 - A proof step is presented as a disk proof's, and a new key's step as
-  an upgrade's. Tag 21's identify step is keyed as a login disclosure
-  step is, its receipt sent only after the key's second digit.
+  an upgrade's. Tag 21's identify step awaits approval as a login
+  disclosure step does, its receipt sent only after the approving Enter.
 - A removal's choose step opens a one-digit field on root's `0c`. Its
   row is `TYPE A NUMBER FROM THE LIST`; once sent, `KEY CHOSEN`. A
   digit naming a removable token, by consent's `Removal::removable` over
@@ -6973,9 +6992,9 @@ Host tests drive a selector update's whole status sequence to each
 form's success and every end in the table (the upgrade's and the
 cancellation's, once implemented, each shape and count's whole
 sequence, the shape and count screens, every end where root can and
-cannot send it, and the tag 17 fallback at 1024x768 and 800x600), a
-key typed before
-presentation and a wrong digit, the storage screen's choices and their
+cannot send it, and the tag 17 fallback at 1024x768 and 800x600),
+an Enter before presentation or inside the settle and a letter first,
+the storage screen's choices and their
 refusal outside attention, before the screen is on glass and from a
 security key's own keyboard, the protected byte's choices and their
 absence, `R` and `S` in a build without disk proofs, each disk proof's
@@ -7197,7 +7216,7 @@ excluded from every selection, confirmation and field below.
 
 1. **One operation per lifetime (3).** Implemented for the key-management
    screen and the lock surface, whose chord opens a login unlock with no
-   selection at all. A disclosure's approval key ("Elevation consent")
+   selection at all. A disclosure's Enter ("Elevation consent")
    confirms its operation at its first step (TOKEN-LOGIN.md increment
    5's A4), implemented and live since that increment's A5.
 2. **The PIN field (3).** Implemented: "The PIN field" above.

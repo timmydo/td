@@ -383,7 +383,7 @@ elevation or authentication. See `td-install/INSTALLER.md`.
 Principle 7 is a target, not a current claim. The stock VM writes an
 empty shadow field for `tester` and auto-logs in. Root is locked (`!`)
 and there is no `su`; no console or SSH login reaches root.
-Administration is the session owner's approval-key operations; without
+Administration is the session owner's consent operations; without
 consent, recovery is td-boot's automatic rollback or physical access
 (`APPLICATIONS.md` §L.1, "Recovery").
 The paired compositor and `td-authd` provide physical secure attention,

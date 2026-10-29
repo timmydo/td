@@ -8870,13 +8870,13 @@ Windows' secure desktop lacks. A fake prompt can be drawn at any time but
 cannot receive the reserved combination, so an imitation harvests
 nothing.
 
-**The approval key is randomized, and that is not a refinement.** If any
-keystroke approves, a rogue application draws "Press Enter to continue",
-waits for the primed user, and fires its request so the compositor reads
-that Enter as consent. A minimum display time does not help — the user
-is already reaching. So the prompt names a key chosen at random per
-request, which a fake prompt cannot know and a primed reflex supplies
-only by chance ("The v1 operations", Consent).
+**Approval is Enter, by the repository owner's choice.** The prompt
+asks for nothing a fake prompt could not also ask for: Enter, pressed
+first and after a short settle ("The v1 operations", Consent). What
+stands between a rogue application and consent is the reserved
+combination the person presses themselves and the selection letter after
+it; a reflexive Enter that lands on a real prompt the person opened
+approves it.
 
 **A security key remains optional and stronger**: a full assertion over a
 domain-separated, versioned, length-prefixed canonical encoding of the
@@ -8900,7 +8900,7 @@ required before enabling consent or a WebAuthn grant.
 **Current credential consent is specified in §W.4.** Physical selection,
 immutable presentation and a token assertion now mediate credential writes,
 enrollment and release. The broader operation vocabulary here remains a
-target; the compositor's randomized-key confirmation is live for
+target; the compositor's Enter confirmation is live for
 `deploy-rollback`, `set-hostname` and `deploy-publish`, the elevations
 production performs (L3 to L5 below).
 The kernel now carries USB PCI xHCI, generic HID,
@@ -8917,7 +8917,7 @@ keyboard events never prove a FIDO assertion.
 It says what the first operations are and why; the elevation
 increments below (L1 to L7) build them, and each part stays a target
 until the increment named for it lands with its evidence. So far the
-consent descriptions (L1), the compositor's approval-key confirmation
+consent descriptions (L1), the compositor's Enter confirmation
 (L2), `deploy-rollback` with the principal table (L3), `set-hostname`
 with its intake and backoff (L4) and `deploy-publish` with the update
 queue's backoff (L5) exist: all three operations are live. The protocol,
@@ -8957,24 +8957,36 @@ that restart `/etc/hostname` and the kernel name disagree, and the
 prompt says a restart completes the change.
 
 **Consent.** The same for every v1 operation: Ctrl+Alt+Esc, the menu's
-letter, the request's rows, then a per-request random approval key of
-two digits, each 2 to 9, typed in order. Root draws the key and carries
-it in the description only the compositor's private prompt shows, so the
-requester never sees it. Enter never confirms, and neither does a press
-before the prompt is on glass or any injected input
-(`td-compositor/DESIGN.md`, "Elevation consent"). A wrong digit
-at either position ends the request, so a guess is one try per presented
-request, right one time in 64, and a queued request's retries are
-bounded by its intake's backoff. The key's job is to defeat a habituated
-or primed reflex, which no fixed key can. The alphabet also keeps a
-security key's OTP interface from approving even where the compositor
+letter, the request's rows, then Enter. The first counted key press after
+the prompt is on glass decides: Enter at least 500 ms after presentation,
+with no Ctrl, Alt or Super held, approves; any other key, or an Enter
+inside those 500 ms, ends the request as Escape does. Only a fresh
+physical press from a keyboard secure attention reads counts; a press
+before the prompt is on glass, a key held from before it, a repeat and
+any injected input never approve; modifiers alone and the brightness
+keys are not counted, every other key is. Presses are taken in the
+order they are read, except that another keyboard's key other than
+Enter, stamped before an approving Enter and read before the commit (or
+a login step's successor), still ends the request
+(`td-compositor/DESIGN.md`, "Elevation consent"). A queued request's
+retries are bounded by its intake's backoff.
+
+What this gives up is any defence against a habituated or primed Enter
+on a prompt the person opened: a fixed key cannot tell a reflex from a
+decision, and the settle only stops an Enter already in flight when the
+prompt appears. What remains is that the person must invoke the
+reserved combination and choose the operation's letter, that the
+prompt shows the exact request root will perform, and that nothing but
+a fresh press on a readable keyboard approves. The first-key rule keeps
+a security key's OTP interface from approving even where the compositor
 fails to exclude it (`td-compositor/DESIGN.md`, "A security key's own
-keyboard"): it types modhex letters and Enter, never a digit 2 to 9.
-What such a missed device keeps is selecting `B`, `H` or `I`, all
-modhex, and, if its static-password slot was reprogrammed to type fixed
-digits, one guess per request like any other. Consent is the same with or
-without an enrolled login key: a login-key assertion over the request is
-deferred, and nothing here claims one.
+keyboard"): it types modhex letters before its Enter, so its first
+letter ends the request. That exclusion now carries more weight: a
+missed device whose static-password slot was reprogrammed to type a bare
+Enter would approve a prompt the person opened. What such a device
+keeps besides is selecting `B`, `H` or `I`, all modhex. Consent is the
+same with or without an enrolled login key: a login-key assertion over
+the request is deferred, and nothing here claims one.
 
 **Backoff.** Every intake a requester can queue on rate-limits
 unapproved requests with a backoff that survives a new generation and a
@@ -9019,27 +9031,25 @@ release (`td-install/ENCRYPTION.md`). `td-login/TOKEN-LOGIN.md`'s
 root cannot use blocks updates and renames until it is repaired the same
 way (`td-authd/DESIGN.md`, "Elevation operations", Backoff).
 
-**Update installation and login-key disclosures take the approval key.**
-Since L5 `I` selects a queued update, `deploy-publish` in the principal
-table, and its approval key, typed on the fully presented prompt,
-installs it; Enter does not (`td-compositor/DESIGN.md`, "Physical
-installation confirmation"). The login-key disclosures, enrollment's and
-the one-key and remove-every-key removal disclosures
-(`td-login/TOKEN-LOGIN.md`, increment 5's A4), take the approval key
-on the operation's first step, live since that increment's A5 admits
-a write. The live medium's whole-disk installation, which `I`
-selects on a live boot, keeps its fresh Enter: it runs on the live
-medium, before any installed principal exists, so there is no principal
-table to consult. It keeps Enter's weaker answer to a reflex press,
-which the approval key closes on the installed system.
+**Update installation and login-key disclosures take Enter.** Since L5
+`I` selects a queued update, `deploy-publish` in the principal table,
+and Enter on the fully presented prompt, under Consent's first-key rule,
+installs it (`td-compositor/DESIGN.md`, "Elevation consent"). The
+login-key disclosures, enrollment's and the one-key and remove-every-key
+removal disclosures (`td-login/TOKEN-LOGIN.md`, increment 5's A4), take
+the same Enter on the operation's first step, live since that
+increment's A5 admits a write. The live medium's whole-disk
+installation, which `I` selects on a live boot, keeps its own fresh
+Enter: it runs on the live medium, before any installed principal
+exists, so there is no principal table to consult.
 
 #### Threats a consent dialog invites
 
 | threat | answer |
 |---|---|
 | **Prompt fatigue** — a rogue app requests repeatedly until the user approves to stop it | Rate-limit every intake a requester can queue on, with a durable backoff and a denial count ("The v1 operations", Backoff); and above all keep the legitimate prompt RARE, which is why application launch never routes through it |
-| **Confused timing** — a request fired as the user reaches to approve another | Requests QUEUE rather than stack, the prompt names the requester, and a new request cannot replace a displayed one. The randomized key is what actually answers this |
-| **Fake prompt to train the habit** | An imitation cannot learn the randomized key and cannot receive the keystroke while the real prompt holds input. NOT answered by "a touch goes to the token regardless of what is on screen" — that same fact is the hidraw race above |
+| **Confused timing** — a request fired as the user reaches to approve another | Requests QUEUE rather than stack, the prompt names the requester, and a new request cannot replace a displayed one. A prompt appears only after the person's own reserved combination and letter, and the 500 ms settle discards an Enter already in flight; a reflex Enter after that approves ("The v1 operations", Consent) |
+| **Fake prompt to train the habit** | An imitation cannot receive the keystroke while the real prompt holds input, and the real prompt opens only from the reserved combination. A habit of pressing Enter is not answered: approval is Enter by choice ("The v1 operations", Consent). NOT answered by "a touch goes to the token regardless of what is on screen" — that same fact is the hidraw race above |
 | **Input-focus theft** | Exclusive input for the prompt's lifetime; no client receives those events at all |
 | **Elevate-a-shell** | Structurally impossible — no operation returns a process, and the table is enumerated |
 | **Replay of a captured approval** | The assertion covers requester, operation, pinned arguments and a nonce, **length-prefixed rather than concatenated** (or `("a","bc")` and `("ab","c")` collide), and the nonce is consumed before the operation starts |
@@ -9094,7 +9104,7 @@ Administration is the session owner's three consent operations: since L3
 `deploy-rollback` returns the machine to its previous deployment, since
 L4 `set-hostname` renames it, and since L5 `deploy-publish` installs a
 locally built update. Each is one enumerated operation that root
-performs after the approval key, and none raises privilege beyond it
+performs after its Enter, and none raises privilege beyond it
 ("The v1 operations"). When consent is unavailable, recovery is the
 automatic rollback or physical access ("The v1 operations", Recovery).
 The server profile (`server-x86-64`, td-svc/DESIGN.md §10, "Profiles")
@@ -9175,11 +9185,11 @@ landed.
 
 - **L0**, documents only: this specification. Nothing ships.
 - **L1**, the consent codec, inert: consent tags 11 (`deploy-rollback`)
-  and 12 (`set-hostname`) and the two-byte approval-key field
-  (`td-authd/DESIGN.md`, "Elevation operations"). It amends
+  and 12 (`set-hostname`) (`td-authd/DESIGN.md`, "Elevation
+  operations"). It amends
   `td-secret/DESIGN.md` (tags its workers reject), whose shared codec
   then decodes both tags. After L0.
-- **L2**, the compositor's approval-key confirmation, inert: freshness
+- **L2**, the compositor's elevation confirmation, inert: freshness
   rules generalised from physical installation confirmation, and the
   menu letter `B`, which production refuses until L3
   (`td-compositor/DESIGN.md`, "Elevation consent"). After L1.
@@ -9188,7 +9198,8 @@ landed.
   the menu's `B` row, the compositor's reading of `9d` and the success
   screen,
   the spawn with td-boot's new CURRENT and PREVIOUS operands, a QEMU
-  phase that reads the key off the screen, and integration evidence. It
+  phase that approves on the presented prompt, and integration
+  evidence. It
   amends `UNSAFE.md` §16, whose confinement-pinned fixed child argv the
   td-boot spawn joins, and `td-secret/DESIGN.md` (`login_tier.rs`'s
   selector reader in td-authd). After L2.
@@ -9199,7 +9210,7 @@ landed.
   intake is a further `secret_sys.rs` transport consumer),
   `td-secret/DESIGN.md`'s consumers of that transport, and
   `td-install/INSTALLER.md`'s hostname contract. After L3.
-- **L5**, update installation moves from Enter to the approval key,
+- **L5**, update installation moves to the elevation confirmation,
   atomically, gains the update queue's backoff and becomes
   `deploy-publish` in the principal table; the live disk installation
   keeps Enter. It amends td-authd's "Consent for a locally built system"

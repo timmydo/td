@@ -565,8 +565,8 @@ behavior substitutes for that authorization.
 Local system installation is a separate named root operation,
 `deploy-publish`, which the principal table must grant the account. The
 paired compositor selects one queued build with physical I and presents
-its full manifest ID; the root-drawn approval key, typed after complete
-presentation, authorizes only that installation, and Enter does not.
+its full manifest ID; Enter, pressed first and at least 500 ms after
+complete presentation, authorizes only that installation.
 td-authd passes its pinned source directory to the fixed
 installed helper, which verifies it and uses the existing boot
 transaction. td-login does not elevate the

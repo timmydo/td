@@ -5,10 +5,9 @@
 //! disk proof.
 
 use crate::consent::{
-    upgrade_ceiling, Admitted, ApprovalKey, DiskProofs, DiskRequest, DiskRole, Fingerprint,
-    LoginStep, Managed, Operation, Proof, Protected, Request, SelectorForm, UpgradeShape,
-    UpgradeStep, PROTECTOR_CEILING, REQUEST_CEILING, SELECTOR_UPDATE_CEILING,
-    UPGRADE_CANCEL_CEILING,
+    upgrade_ceiling, Admitted, DiskProofs, DiskRequest, DiskRole, Fingerprint, LoginStep, Managed,
+    Operation, Proof, Protected, Request, SelectorForm, UpgradeShape, UpgradeStep,
+    PROTECTOR_CEILING, REQUEST_CEILING, SELECTOR_UPDATE_CEILING, UPGRADE_CANCEL_CEILING,
 };
 use crate::login::{End, Pin, CANCELLED, INTERNAL, TIMEOUT};
 use crate::login_status::login_state;
@@ -398,7 +397,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The selector update's description from the baseline, or the storage
 /// worker's kind that ends it before any description.
-fn selector_update(baseline: &Baseline, key: ApprovalKey) -> Result<Operation, u8> {
+fn selector_update(baseline: &Baseline) -> Result<Operation, u8> {
     let form = match baseline.volume {
         Volume::None | Volume::Refused => return Err(VOLUME),
         Volume::Upgrading => return Err(STATE),
@@ -408,7 +407,6 @@ fn selector_update(baseline: &Baseline, key: ApprovalKey) -> Result<Operation, u
     };
     let current = baseline.current.ok_or(NOT_CURRENT)?;
     Ok(Operation::SelectorUpdate {
-        key,
         form,
         current: hex(&current),
     })
@@ -421,7 +419,6 @@ fn upgrade(
     owner: u32,
     shape: UpgradeShape,
     count: u8,
-    key: ApprovalKey,
 ) -> Result<Operation, u8> {
     match baseline.volume {
         Volume::None | Volume::Refused => return Err(VOLUME),
@@ -435,22 +432,16 @@ fn upgrade(
         count,
         current: hex(&current),
         step: UpgradeStep::Review,
-        approval: Some(key),
     })
 }
 
 /// Tag 18 from the baseline: it takes an upgrading volume only.
-fn upgrade_cancel(baseline: &Baseline, key: ApprovalKey) -> Result<Operation, u8> {
+fn upgrade_cancel(baseline: &Baseline) -> Result<Operation, u8> {
     match baseline.volume {
         Volume::None | Volume::Refused => Err(VOLUME),
         Volume::DeviceBound | Volume::TpmPrimary | Volume::Fido2Primary => Err(STATE),
-        Volume::Upgrading => Ok(Operation::UpgradeCancel { key }),
+        Volume::Upgrading => Ok(Operation::UpgradeCancel),
     }
-}
-
-/// Each digit `2` plus its own random byte modulo 8, as an elevation's.
-fn approval_key(bytes: [u8; 2]) -> Result<ApprovalKey, String> {
-    ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))
 }
 
 /// The fixed worker: root's `td-install` verb, with the launch the login
@@ -498,7 +489,6 @@ enum Phase {
 pub(crate) struct Storage {
     owner: u32,
     nonce: [u8; 32],
-    approval: ApprovalKey,
     selection: Selection,
     /// The baseline's fido2 tokens, an upgrade's steps are admitted
     /// against, and the credentials earlier new keys' ceremonies created,
@@ -564,12 +554,8 @@ impl Storage {
         command: Command,
     ) -> Result<Self, String> {
         let mut nonce = [0; 32];
-        let mut key = [0; 2];
         File::open("/dev/urandom")
-            .and_then(|mut random| {
-                random.read_exact(&mut nonce)?;
-                random.read_exact(&mut key)
-            })
+            .and_then(|mut random| random.read_exact(&mut nonce))
             .map_err(|_| "read storage request randomness")?;
         if nonce == [0; 32] {
             return Err("zero storage request nonce".into());
@@ -579,23 +565,10 @@ impl Storage {
             .ok_or("storage deadline overflow")?;
         if !enrolled {
             return Ok(Self::unstarted(
-                owner,
-                nonce,
-                approval_key(key)?,
-                selection,
-                deadline,
-                UNENROLLED,
+                owner, nonce, selection, deadline, UNENROLLED,
             ));
         }
-        Self::spawn(
-            owner,
-            nonce,
-            approval_key(key)?,
-            selection,
-            deadline,
-            None,
-            command,
-        )
+        Self::spawn(owner, nonce, selection, deadline, None, command)
     }
 
     /// A login operation's disk proof (amendment 10): `first`, its first
@@ -629,8 +602,6 @@ impl Storage {
         if first.login_proof().is_none() || first.nonce() != &nonce {
             return Err("a disk proof begins at its proof's first step".into());
         }
-        // The disclosure's key is the login operation's, on `first`.
-        let approval = ApprovalKey::new(*b"22")?;
         let proof = DiskProof {
             first: first.clone(),
             login: login.to_vec(),
@@ -641,7 +612,6 @@ impl Storage {
         Self::spawn(
             owner,
             nonce,
-            approval,
             Selection::SelectorUpdate,
             deadline,
             Some(proof),
@@ -654,7 +624,6 @@ impl Storage {
     fn spawn(
         owner: u32,
         nonce: [u8; 32],
-        approval: ApprovalKey,
         selection: Selection,
         deadline: Instant,
         proof: Option<DiskProof>,
@@ -666,7 +635,7 @@ impl Storage {
             .stdin(Stdio::from(OwnedFd::from(child)))
             .spawn()
             .map_err(|e| format!("start storage worker: {e}"))?;
-        let mut storage = Self::unstarted(owner, nonce, approval, selection, deadline, INTERNAL);
+        let mut storage = Self::unstarted(owner, nonce, selection, deadline, INTERNAL);
         storage.child = Some(child);
         storage.wire = Some(wire);
         storage.phase = Phase::Baseline;
@@ -680,7 +649,6 @@ impl Storage {
     fn unstarted(
         owner: u32,
         nonce: [u8; 32],
-        approval: ApprovalKey,
         selection: Selection,
         deadline: Instant,
         kind: u8,
@@ -693,7 +661,6 @@ impl Storage {
         Self {
             owner,
             nonce,
-            approval,
             selection,
             tokens: Vec::new(),
             made: Vec::new(),
@@ -727,20 +694,16 @@ impl Storage {
         self.request.as_ref()
     }
 
-    /// The receipt follows the approval key, which the person may type at
-    /// any time before root's deadline: one at or after it ends the
+    /// The receipt follows the person's approval, which may come at any
+    /// time before root's deadline: one at or after it ends the
     /// operation as TIMEOUT, and one for an operation already ended is
     /// dropped, as a login disclosure's is.
     pub fn presented(&mut self, request: &Request) -> Result<(), String> {
         let now = Instant::now();
-        // A step carries a key where it discloses: a proof's first, an
+        // A step awaits approval where it discloses: a proof's first, an
         // upgrade's review, tag 21's identify step, and the selector
         // update's and the cancellation's description.
-        let keyed = request.login_approval().is_some()
-            || request.upgrade_approval().is_some()
-            || request.protector_approval().is_some()
-            || request.selector_update().is_some();
-        if keyed && self.request.as_ref() == Some(request) {
+        if request.awaits_approval() && self.request.as_ref() == Some(request) {
             if matches!(self.phase, Phase::Stopping | Phase::Done) {
                 return Ok(());
             }
@@ -1048,13 +1011,9 @@ impl Storage {
         }
         let operation = match self.selection {
             Selection::Protector(managed) => return self.begin_protector(baseline, managed),
-            Selection::Upgrade { shape, count } => {
-                upgrade(&baseline, self.owner, shape, count, self.approval)
-            }
-            Selection::UpgradeCancel => upgrade_cancel(&baseline, self.approval),
-            Selection::SelectorUpdate | Selection::Later(_) => {
-                selector_update(&baseline, self.approval)
-            }
+            Selection::Upgrade { shape, count } => upgrade(&baseline, self.owner, shape, count),
+            Selection::UpgradeCancel => upgrade_cancel(&baseline),
+            Selection::SelectorUpdate | Selection::Later(_) => selector_update(&baseline),
         };
         let operation = match operation {
             Ok(operation) => operation,
@@ -1087,7 +1046,7 @@ impl Storage {
             (Volume::None | Volume::Refused, _) => Err((VOLUME, 0)),
             (_, None) => Err((STATE, 0)),
             (_, Some(protected)) => protected
-                .first(self.owner, managed, Some(self.approval))
+                .first(self.owner, managed)
                 .map_err(|detail| (STATE, detail)),
         };
         let (operation, protected) = match (first, baseline.protected) {
@@ -1176,7 +1135,7 @@ impl Storage {
                 return Err("storage worker changed root's description".into());
             }
             // Only root's first step can disclose.
-            self.acknowledgement_deadline = Some(if invitation.login_approval().is_some() {
+            self.acknowledgement_deadline = Some(if invitation.awaits_approval() {
                 self.deadline
             } else {
                 deadline_after(ACK_TIME)?
@@ -1237,9 +1196,9 @@ impl Storage {
         }
         self.acknowledgement_deadline = Some(if self.phase == Phase::Description {
             self.phase = Phase::Presented;
-            // The approval key is typed against the operation's deadline;
-            // protector management's first step carries one only at tag 21.
-            if self.protected.is_some() && invitation.protector_approval().is_none() {
+            // Approval is given against the operation's deadline;
+            // protector management's first step awaits it only at tag 21.
+            if self.protected.is_some() && !invitation.awaits_approval() {
                 deadline_after(ACK_TIME)?
             } else {
                 self.deadline
@@ -1407,7 +1366,6 @@ impl Storage {
         Self::spawn(
             1000,
             [42; 32],
-            tests::approval(),
             Selection::SelectorUpdate,
             deadline,
             None,
@@ -1423,7 +1381,6 @@ impl Storage {
     ) -> Result<Self, String> {
         let mut storage = Self::launch(1000, selection, enrolled, tests::fixture(script))?;
         storage.nonce = [42; 32];
-        storage.approval = tests::approval();
         Ok(storage)
     }
 

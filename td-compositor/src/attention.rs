@@ -936,47 +936,35 @@ mod tests {
         );
     }
 
-    /// The approval-key prompts, rollback with both IDs, a hostname change
-    /// with both names at 63 bytes and an update with its full ID, are
-    /// shown whole with a time line from 800x600, and 320x200, which cannot
-    /// hold their wrapped arguments, refuses rather than clips. The key is
-    /// on the prompt.
+    /// The prompts awaiting approval, rollback with both IDs, a hostname
+    /// change with both names at 63 bytes and an update with its full ID,
+    /// are shown whole with a time line from 800x600, and 320x200, which
+    /// cannot hold their wrapped arguments, refuses rather than clips.
     #[test]
     fn the_widest_elevation_prompts_fit_an_800_by_600_output() {
-        use crate::authority::consent::ApprovalKey;
-        let prompts = |digits: &[u8; 2]| {
-            let key = ApprovalKey::new(*digits).unwrap();
-            [
-                Operation::DeployRollback {
-                    key,
-                    current: "a".repeat(64),
-                    previous: "b".repeat(64),
-                },
-                Operation::SetHostname {
-                    key,
-                    requester: 65533,
-                    old: "a".repeat(63),
-                    new: "b".repeat(63),
-                },
-                Operation::Install {
-                    key,
-                    deployment: "c".repeat(64),
-                    requester: 65533,
-                },
-            ]
-            .map(|operation| Request::new([1; 32], 65533, operation).unwrap())
-        };
-        for (request, swapped) in prompts(b"47").into_iter().zip(prompts(b"74")) {
+        let prompts = [
+            Operation::DeployRollback {
+                current: "a".repeat(64),
+                previous: "b".repeat(64),
+            },
+            Operation::SetHostname {
+                requester: 65533,
+                old: "a".repeat(63),
+                new: "b".repeat(63),
+            },
+            Operation::Install {
+                deployment: "c".repeat(64),
+                requester: 65533,
+            },
+        ]
+        .map(|operation| Request::new([1; 32], 65533, operation).unwrap());
+        for request in prompts {
             assert!(Prepared::with_time(request.clone(), 800, 600, 3200, Some(120)).is_ok());
             assert_eq!(
-                Prepared::with_time(request.clone(), 320, 200, 1280, Some(120))
+                Prepared::with_time(request, 320, 200, 1280, Some(120))
                     .err()
                     .unwrap(),
                 "output cannot hold every trusted prompt argument"
-            );
-            assert_ne!(
-                Prepared::new(request, 800, 600, 3200).unwrap().pixels,
-                Prepared::new(swapped, 800, 600, 3200).unwrap().pixels
             );
         }
     }
@@ -985,20 +973,17 @@ mod tests {
     /// each with its whole time line: the tallest, a one-key enrollment's
     /// and a removal of seven of eight keys, are shown whole from 1024x768
     /// and at 640x480, a two-key enrollment's from 800x600; the one-key
-    /// enrollment's refuses 800x600 rather than clips. The key is on the
-    /// prompt.
+    /// enrollment's refuses 800x600 rather than clips.
     #[test]
     fn the_login_disclosure_prompts_fit_a_1024_by_768_output() {
-        use crate::authority::consent::{ApprovalKey, LoginStep, Slot, LOGIN_KEYS};
-        let disclosures = |digits: &[u8; 2]| {
-            let key = ApprovalKey::new(*digits).unwrap();
+        use crate::authority::consent::{LoginStep, Slot, LOGIN_KEYS};
+        let disclosures = || {
             let enroll = |after| Operation::LoginEnroll {
                 account: 65533,
                 before: 0,
                 after,
                 key: 1,
                 step: LoginStep::Connect,
-                approval: Some(key),
                 proof: None,
             };
             let remove = |removed: u8| Operation::LoginRemove {
@@ -1012,7 +997,6 @@ mod tests {
                     })
                     .collect(),
                 step: LoginStep::Identify,
-                approval: Some(key),
                 proof: None,
             };
             [
@@ -1027,16 +1011,12 @@ mod tests {
             let ceiling = request.login_ceiling().unwrap().as_secs();
             Prepared::with_time(request.clone(), width, height, width * 4, Some(ceiling))
         };
-        for (request, swapped) in disclosures(b"47").into_iter().zip(disclosures(b"74")) {
+        for request in disclosures() {
             for (width, height) in [(1024, 768), (1366, 768), (1280, 800), (640, 480)] {
                 assert!(prompt(&request, width, height).is_ok(), "{width}x{height}");
             }
-            assert_ne!(
-                prompt(&request, 1024, 768).unwrap().pixels,
-                prompt(&swapped, 1024, 768).unwrap().pixels
-            );
         }
-        let [one, two, ..] = disclosures(b"47");
+        let [one, two, ..] = disclosures();
         assert!(prompt(&two, 800, 600).is_ok());
         assert_eq!(
             prompt(&one, 800, 600).err().unwrap(),
@@ -1071,7 +1051,6 @@ mod tests {
                     key: [0xff; 4],
                     retries: 255,
                 },
-                approval: None,
                 proof: None,
             },
         )
@@ -1412,7 +1391,7 @@ mod tests {
     /// outputs, and every key step is prepared, a PIN step with its field.
     #[test]
     fn an_upgrade_prompt_falls_back_to_the_single_scale_only_where_it_must() {
-        use crate::authority::consent::{ApprovalKey, LoginStep, UpgradeShape, UpgradeStep};
+        use crate::authority::consent::{LoginStep, UpgradeShape, UpgradeStep};
         let upgrade = |shape, count, step| {
             Request::new(
                 [1; 32],
@@ -1423,8 +1402,6 @@ mod tests {
                     count,
                     current: "ab".repeat(32),
                     step,
-                    approval: (step == UpgradeStep::Review)
-                        .then(|| ApprovalKey::new(*b"47").unwrap()),
                 },
             )
             .unwrap()
@@ -1482,7 +1459,7 @@ mod tests {
     #[test]
     fn a_protector_prompt_is_prepared_with_its_field() {
         use crate::authority::consent::{
-            ApprovalKey, DiskRole, DiskToken, LoginStep, Proof, Removal, UpgradeShape,
+            DiskRole, DiskToken, LoginStep, Proof, Removal, UpgradeShape,
         };
         let removal = |chosen| Removal {
             shape: UpgradeShape::Fido2,
@@ -1521,7 +1498,6 @@ mod tests {
             Operation::RecoveryRemove {
                 account: 1000,
                 step: LoginStep::DiskIdentify,
-                approval: Some(ApprovalKey::new(*b"47").unwrap()),
             },
         ];
         for step in [
@@ -2208,7 +2184,6 @@ mod tests {
                             after,
                             key: created,
                             step,
-                            approval: None,
                             proof: None,
                         });
                     }
@@ -2221,7 +2196,6 @@ mod tests {
                                 .map(|position| Slot { position, key })
                                 .collect(),
                             step,
-                            approval: None,
                             proof: None,
                         });
                     }
@@ -2296,15 +2270,13 @@ mod tests {
     /// one-key enrollment's first step, and a recovery-key removal leaving
     /// one key.
     fn tallest_proof_steps() -> Vec<Request> {
-        use crate::authority::consent::{ApprovalKey, LoginStep, Proof, Slot};
-        let approval = Some(ApprovalKey::new(*b"99").unwrap());
+        use crate::authority::consent::{LoginStep, Proof, Slot};
         let enroll = |step, proof| Operation::LoginEnroll {
             account: 65533,
             before: 0,
             after: 1,
             key: 1,
             step,
-            approval,
             proof: Some(proof),
         };
         [
@@ -2321,7 +2293,6 @@ mod tests {
                     })
                     .collect(),
                 step: LoginStep::RecoveryKey,
-                approval,
                 proof: Some(Proof::RecoveryKey),
             },
         ]
@@ -2388,7 +2359,6 @@ mod tests {
                 after: 1,
                 key: 1,
                 step: crate::authority::consent::LoginStep::Connect,
-                approval: Some(crate::authority::consent::ApprovalKey::new(*b"99").unwrap()),
                 proof: None,
             },
         )
@@ -2406,7 +2376,6 @@ mod tests {
         use crate::authority::consent::{LoginStep, Proof, Slot, LOGIN_KEYS};
         let step = LoginStep::RecoveryKey;
         let proof = Some(Proof::RecoveryKey);
-        let approval = Some(crate::authority::consent::ApprovalKey::new(*b"99").unwrap());
         let removed: Vec<Slot> = (1..=LOGIN_KEYS)
             .map(|position| Slot {
                 position,
@@ -2420,7 +2389,6 @@ mod tests {
                 after: 2,
                 key: 1,
                 step,
-                approval,
                 proof,
             },
             Operation::LoginAdd {
@@ -2436,7 +2404,6 @@ mod tests {
                 after: 1,
                 removed: removed[..7].to_vec(),
                 step,
-                approval,
                 proof,
             },
             Operation::LoginRemove {
@@ -2445,7 +2412,6 @@ mod tests {
                 after: 6,
                 removed: removed[..2].to_vec(),
                 step,
-                approval: None,
                 proof,
             },
         ]

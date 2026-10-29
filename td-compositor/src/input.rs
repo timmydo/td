@@ -113,6 +113,17 @@ const KEY_DOWN: u16 = 108;
 const KEY_PRINT: u16 = 210;
 const KEY_LEFTMETA: u16 = 125;
 const KEY_RIGHTMETA: u16 = 126;
+/// Held, not pressed: none is a press a prompt awaiting approval counts.
+const MODIFIER_KEYS: &[u16] = &[
+    KEY_LEFTSHIFT,
+    KEY_RIGHTSHIFT,
+    KEY_LEFTCTRL,
+    KEY_RIGHTCTRL,
+    KEY_LEFTALT,
+    KEY_RIGHTALT,
+    KEY_LEFTMETA,
+    KEY_RIGHTMETA,
+];
 const BTN_MOUSE: u16 = 0x110;
 /// The first mouse button is the left one.
 const BTN_LEFT: u16 = BTN_MOUSE;
@@ -378,9 +389,10 @@ struct KeyDecision {
     /// A screen of the attention lifetime that selects nothing yet.
     notice: Option<crate::attention::Notice>,
     confirm_install: Option<u128>,
-    /// An approval-key digit (`approval_digit`) and its evdev time. The
-    /// attempt takes it only for its presented update or elevation prompt.
-    approval: Option<(u8, u128)>,
+    /// A press a prompt awaiting approval counts (`approval_press`) and
+    /// its evdev time. The attempt takes only the first after its prompt
+    /// was on glass.
+    approval: Option<(crate::secret_client::ApprovalPress, u128)>,
     /// A key for the PIN field and its evdev time. The attempt takes it only
     /// while its field is open and was on glass before the press.
     field: Option<(crate::secret_client::FieldKey, u128)>,
@@ -504,8 +516,8 @@ impl KeyBindings {
             {
                 decision.field = self.field_key(event.code).map(|key| (key, event.timestamp));
                 decision.approval = self
-                    .approval_digit(event.code)
-                    .map(|digit| (digit, event.timestamp));
+                    .approval_press(event.code)
+                    .map(|press| (press, event.timestamp));
             }
             if self.attention == AttentionState::Open
                 && readable
@@ -1016,21 +1028,24 @@ impl KeyBindings {
         None
     }
 
-    /// An approval-key digit for a fresh press from a device secure
-    /// attention reads: a number-row 2 to 9, as its ASCII digit, with no
-    /// Control, Alt or Super held on such a device. Shift is allowed, for
-    /// layouts that shift digits; 0, 1 and the keypad are none.
-    fn approval_digit(&self, code: u16) -> Option<u8> {
-        let held = |left, right| self.attention_pressed(left) || self.attention_pressed(right);
-        if held(KEY_LEFTCTRL, KEY_RIGHTCTRL)
-            || held(KEY_LEFTALT, KEY_RIGHTALT)
-            || held(KEY_LEFTMETA, KEY_RIGHTMETA)
-            || !(KEY_2..=KEY_9).contains(&code)
-        {
+    /// What a fresh press from a device secure attention reads is to a
+    /// prompt awaiting approval: Enter, with no Control, Alt or Super held
+    /// on such a device, or any other key. A modifier alone is neither, and
+    /// Escape is the drain's.
+    fn approval_press(&self, code: u16) -> Option<crate::secret_client::ApprovalPress> {
+        use crate::secret_client::ApprovalPress;
+        if code == KEY_ESC || MODIFIER_KEYS.contains(&code) {
             return None;
         }
-        let offset = u8::try_from(code.checked_sub(KEY_2)?).ok()?;
-        b'2'.checked_add(offset)
+        let held = |left, right| self.attention_pressed(left) || self.attention_pressed(right);
+        let modified = held(KEY_LEFTCTRL, KEY_RIGHTCTRL)
+            || held(KEY_LEFTALT, KEY_RIGHTALT)
+            || held(KEY_LEFTMETA, KEY_RIGHTMETA);
+        Some(if code == KEY_ENTER && !modified {
+            ApprovalPress::Enter
+        } else {
+            ApprovalPress::Other
+        })
     }
 
     /// Whether root's last `1a` answer locks: enrolled or unavailable.
@@ -1776,10 +1791,14 @@ trait InputTarget {
     fn confirm_install(&mut self, _timestamp: u128) -> Result<(), String> {
         Ok(())
     }
-    /// An approval-key digit for the attempt's presented update or
-    /// elevation prompt: answers whether it ended the request. A target
-    /// with no attempt takes none.
-    fn approval_digit(&mut self, _digit: u8, _timestamp: u128) -> Result<bool, String> {
+    /// A press for the attempt's presented prompt awaiting approval:
+    /// answers whether it ended the request. A target with no attempt
+    /// takes none.
+    fn approval_press(
+        &mut self,
+        _press: crate::secret_client::ApprovalPress,
+        _timestamp: u128,
+    ) -> Result<bool, String> {
         Ok(false)
     }
     fn secret_request(&mut self, _role: crate::secret_client::Selection) -> Result<(), String> {
@@ -2757,9 +2776,13 @@ impl InputTarget for LiveInputTarget {
         }
         Ok(())
     }
-    fn approval_digit(&mut self, digit: u8, timestamp: u128) -> Result<bool, String> {
+    fn approval_press(
+        &mut self,
+        press: crate::secret_client::ApprovalPress,
+        timestamp: u128,
+    ) -> Result<bool, String> {
         match &self.secret_attempt {
-            Some(attempt) => attempt.approve(&EvdevOrigin { _private: () }, digit, timestamp),
+            Some(attempt) => attempt.approve(&EvdevOrigin { _private: () }, press, timestamp),
             None => Ok(false),
         }
     }
@@ -3397,8 +3420,8 @@ fn apply_locked<T: InputTarget>(
         && decision.brightness.is_none()
         && decision.notice.is_none()
         && decision.confirm_install.is_none()
-        // Redundant today, since each approval digit also yields a field
-        // byte, but kept so a digit never falls through as nothing.
+        // A counted press other than a PIN byte, so it never falls through
+        // as nothing.
         && decision.approval.is_none()
         && decision.field.is_none()
         && decision.command.is_none()
@@ -3550,10 +3573,10 @@ fn deliver_key_decision<T: InputTarget>(
     if let Some(timestamp) = decision.confirm_install {
         runtime.confirm_install(timestamp)?;
     }
-    // A wrong digit ended the request unapproved: the screen drains, as
-    // Escape's does.
-    if let Some((digit, timestamp)) = decision.approval {
-        if runtime.approval_digit(digit, timestamp)? && bindings.attention == AttentionState::Open {
+    // A press other than an approving Enter ended the request unapproved:
+    // the screen drains, as Escape's does.
+    if let Some((press, timestamp)) = decision.approval {
+        if runtime.approval_press(press, timestamp)? && bindings.attention == AttentionState::Open {
             bindings.attention = AttentionState::Draining;
             runtime.drain_attention()?;
         }
@@ -4660,7 +4683,7 @@ mod tests {
             "Command::new",
             "enable_attention(",
             ".attention(",
-            // No injected digit reaches an approval key.
+            // No injected press reaches an approval.
             "approv",
         ] {
             assert!(!source.contains(forbidden), "{forbidden}");
@@ -5917,9 +5940,9 @@ mod tests {
         notices_owed: bool,
         clock: Arc<crate::runtime::PresentationClock>,
         confirmations: Vec<u128>,
-        /// Each approval-key digit offered, with its evdev time.
-        approvals: Vec<(u8, u128)>,
-        /// The attempt answers that each offered digit ended its request.
+        /// Each approval press offered, with its evdev time.
+        approvals: Vec<(crate::secret_client::ApprovalPress, u128)>,
+        /// The attempt answers that each offered press ended its request.
         approval_ends: bool,
         attention_cutoff: u128,
         attention_error: Option<String>,
@@ -5986,8 +6009,12 @@ mod tests {
             Ok(())
         }
 
-        fn approval_digit(&mut self, digit: u8, timestamp: u128) -> Result<bool, String> {
-            self.approvals.push((digit, timestamp));
+        fn approval_press(
+            &mut self,
+            press: crate::secret_client::ApprovalPress,
+            timestamp: u128,
+        ) -> Result<bool, String> {
+            self.approvals.push((press, timestamp));
             Ok(self.approval_ends)
         }
 
@@ -11427,7 +11454,7 @@ mod tests {
         assert_eq!(target.confirmations, [102_000_000]);
     }
 
-    // Elevation consent: `B` and the approval key.
+    // Elevation consent: `B` and the approving Enter.
 
     /// Bindings on the open session, where `B` asks root for a rollback.
     fn rollback_bindings() -> Mutex<KeyBindings> {
@@ -11577,14 +11604,16 @@ mod tests {
         assert!(target.notices.is_empty());
     }
 
-    /// After the lifetime's selection, only a fresh number-row 2 to 9 from
-    /// a device secure attention reads, with no Control, Alt or Super held
-    /// on such a device, is offered as an approval-key digit, with its
-    /// evdev time; Shift is allowed. 0, 1, the keypad, Enter, repeats, a
-    /// digit another read device holds and a security key's own keyboard
-    /// offer none, nor does a digit before the selection.
+    /// After the lifetime's selection, every fresh press from a device
+    /// secure attention reads is offered for approval with its evdev time:
+    /// Enter, under no Control, Alt or Super held on such a device, as
+    /// Enter, and any other key, Enter under one of those and the keypad's
+    /// Enter, as another key. A modifier alone, Escape, a repeat, a key
+    /// another read device holds and a security key's own keyboard offer
+    /// none, nor does a press before the selection.
     #[test]
-    fn only_fresh_number_row_digits_from_a_read_keyboard_are_offered() {
+    fn only_fresh_presses_from_a_read_keyboard_are_offered_for_approval() {
+        use crate::secret_client::ApprovalPress::{Enter, Other};
         use crate::secret_client::{Elevation, Selection};
         const KEY: usize = 2;
         let mut bindings = KeyBindings {
@@ -11609,7 +11638,7 @@ mod tests {
             }
         }
         // Outside attention, and on the menu before the selection.
-        stroke(&mut bindings, &mut target, 0, KEY_4, 1);
+        stroke(&mut bindings, &mut target, 0, KEY_ENTER, 1);
         for (code, value) in [
             (KEY_LEFTCTRL, KEY_PRESS),
             (KEY_LEFTALT, KEY_PRESS),
@@ -11620,21 +11649,20 @@ mod tests {
         ] {
             deliver(&mut bindings, &mut target, 0, key(code, value));
         }
-        stroke(&mut bindings, &mut target, 0, KEY_4, 10);
+        stroke(&mut bindings, &mut target, 0, KEY_ENTER, 10);
         stroke(&mut bindings, &mut target, 0, KEY_B, 12);
-        // None of these is a digit of the key's alphabet.
+        // Enter, then keys that are not it.
         for (code, millis) in [
-            (KEY_KP4, 20),
-            (KEY_KP7, 22),
-            (KEY_KP2, 24),
-            (KEY_0, 26),
-            (KEY_1, 28),
-            (KEY_ENTER, 30),
-            (KEY_KPENTER, 32),
+            (KEY_ENTER, 20),
+            (KEY_A, 22),
+            (KEY_4, 24),
+            (KEY_KPENTER, 26),
+            (KEY_SPACE, 28),
         ] {
             stroke(&mut bindings, &mut target, 0, code, millis);
         }
-        // Under Control, Alt or Super, from either side.
+        // Each modifier alone offers nothing; under Control, Alt or Super,
+        // from either side, Enter is another key.
         for (modifier, millis) in [
             (KEY_LEFTCTRL, 40),
             (KEY_RIGHTCTRL, 44),
@@ -11644,12 +11672,12 @@ mod tests {
             (KEY_RIGHTMETA, 60),
         ] {
             deliver(&mut bindings, &mut target, 0, key(modifier, KEY_PRESS));
-            stroke(&mut bindings, &mut target, 0, KEY_4, millis);
+            stroke(&mut bindings, &mut target, 0, KEY_ENTER, millis);
             deliver(&mut bindings, &mut target, 0, key(modifier, KEY_RELEASE));
         }
-        // Under Shift it counts.
+        // Under Shift it is Enter.
         deliver(&mut bindings, &mut target, 0, key(KEY_LEFTSHIFT, KEY_PRESS));
-        stroke(&mut bindings, &mut target, 0, KEY_4, 70);
+        stroke(&mut bindings, &mut target, 0, KEY_ENTER, 70);
         deliver(
             &mut bindings,
             &mut target,
@@ -11662,7 +11690,7 @@ mod tests {
                 &mut bindings,
                 &mut target,
                 0,
-                at_millis(key(KEY_7, value), millis),
+                at_millis(key(KEY_ENTER, value), millis),
             );
         }
         // Held on one read keyboard, the other's press is no fresh press.
@@ -11676,12 +11704,15 @@ mod tests {
                 &mut bindings,
                 &mut target,
                 device,
-                at_millis(key(KEY_5, value), millis),
+                at_millis(key(KEY_ENTER, value), millis),
             );
         }
-        // A security key's own keyboard types none, and its Control held
-        // is no modifier here.
-        for (code, millis) in (KEY_2..=KEY_9).zip((100..).step_by(2)) {
+        // A security key's own keyboard offers none, modhex and Enter as
+        // its OTP types them, and its Control held is no modifier here.
+        for (code, millis) in [KEY_C, KEY_B, KEY_D, KEY_ENTER]
+            .into_iter()
+            .zip((100..).step_by(2))
+        {
             stroke(&mut bindings, &mut target, KEY, code, millis);
         }
         deliver(
@@ -11690,40 +11721,35 @@ mod tests {
             KEY,
             key(KEY_LEFTCTRL, KEY_PRESS),
         );
-        stroke(&mut bindings, &mut target, 0, KEY_6, 120);
+        stroke(&mut bindings, &mut target, 0, KEY_ENTER, 120);
         deliver(
             &mut bindings,
             &mut target,
             KEY,
             key(KEY_LEFTCTRL, KEY_RELEASE),
         );
-        // Each number-row digit from 2 to 9.
-        for (code, millis) in (KEY_2..=KEY_9).zip((130..).step_by(2)) {
-            stroke(&mut bindings, &mut target, 0, code, millis);
-        }
         let ms = |millis: u128| millis * 1_000_000;
-        let mut offered = vec![
-            (b'4', ms(70)),
-            (b'7', ms(80)),
-            (b'5', ms(90)),
-            (b'6', ms(120)),
-        ];
-        offered.extend((b'2'..=b'9').zip((130..).step_by(2).map(ms)));
+        let mut offered = vec![(Enter, ms(20))];
+        offered.extend([22, 24, 26, 28, 40, 44, 48, 52, 56, 60].map(|at| (Other, ms(at))));
+        offered.extend([70, 80, 90, 120].map(|at| (Enter, ms(at))));
         assert_eq!(target.approvals, offered);
         assert_eq!(
             target.secret_roles,
             [Selection::Elevation(Elevation::Rollback)]
         );
-        // Enter went where it always goes, and confirms no elevation.
-        assert_eq!(target.confirmations, [ms(30)]);
+        // A whole-disk installation's Enter is offered as it always was.
+        assert_eq!(
+            target.confirmations,
+            [20, 40, 44, 48, 52, 56, 60, 70, 80, 90, 120].map(ms)
+        );
         assert_eq!(target.draining_events, 0);
     }
 
-    /// A digit the attempt says ended its request drains the screen as
-    /// Escape does: capture holds until the digit is released, then
-    /// attention closes. A digit that did not end it changes nothing.
+    /// A press the attempt says ended its request drains the screen as
+    /// Escape does: capture holds until the key is released, then
+    /// attention closes. A press that did not end it changes nothing.
     #[test]
-    fn a_digit_that_ends_the_request_drains_the_screen_as_escape_does() {
+    fn a_press_that_ends_the_request_drains_the_screen_as_escape_does() {
         let mut bindings = rollback_bindings().into_inner().unwrap();
         let mut target = RecordingTarget::default();
         for (code, value) in [
@@ -11758,11 +11784,11 @@ mod tests {
         assert_eq!(target.approvals.len(), 2);
     }
 
-    /// A security key's own keyboard neither selects `B` or `H` nor types
-    /// an approval-key digit; the keyboard's do, and the key's Escape still
-    /// cancels.
+    /// A security key's own keyboard neither selects `B` or `H` nor offers
+    /// a press for approval, its OTP's modhex and Enter among them; the
+    /// keyboard's do, and the key's Escape still cancels.
     #[test]
-    fn a_security_keys_keyboard_cannot_select_b_or_type_the_key() {
+    fn a_security_keys_keyboard_cannot_select_b_or_approve() {
         use crate::secret_client::{Elevation, Selection};
         const KEY: usize = 1;
         let target = Mutex::new(RecordingTarget::default());
@@ -11784,9 +11810,14 @@ mod tests {
             assert!(target.approvals.is_empty());
         }
         read_reports(&target, &bindings, 0, &presses(&[KEY_B], 30));
-        read_reports(&target, &bindings, KEY, &presses(&[KEY_4, KEY_7], 40));
+        read_reports(
+            &target,
+            &bindings,
+            KEY,
+            &presses(&[KEY_C, KEY_B, KEY_D, KEY_ENTER], 40),
+        );
         assert!(target.lock().unwrap().approvals.is_empty());
-        read_reports(&target, &bindings, 0, &presses(&[KEY_4], 50));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 50));
         read_reports(&target, &bindings, KEY, &presses(&[KEY_ESC], 60));
         let target = target.lock().unwrap();
         assert_eq!(
@@ -11794,7 +11825,10 @@ mod tests {
             [Selection::Elevation(Elevation::Rollback)]
         );
         assert!(target.notices.is_empty());
-        assert_eq!(target.approvals, [(b'4', 50_000_000)]);
+        assert_eq!(
+            target.approvals,
+            [(crate::secret_client::ApprovalPress::Enter, 50_000_000)]
+        );
         assert_eq!(target.draining_events, 1);
         assert_eq!(target.attention_events, [true, false]);
     }
@@ -15322,8 +15356,8 @@ mod tests {
         }
     }
 
-    /// A two-key enrollment's first step, its disclosure, carrying the
-    /// approval key `44`.
+    /// A two-key enrollment's first step, its disclosure, which awaits
+    /// approval.
     fn disclosure() -> crate::authority::consent::Request {
         crate::authority::consent::Request::new(
             LOCK_NONCE,
@@ -15334,7 +15368,6 @@ mod tests {
                 after: 2,
                 key: 1,
                 step: crate::authority::consent::LoginStep::Connect,
-                approval: Some(crate::authority::consent::ApprovalKey::new(*b"44").unwrap()),
                 proof: None,
             },
         )
@@ -15390,8 +15423,25 @@ mod tests {
     /// while that device stays connected: a whole read's end releases
     /// what it holds.
     fn hold(seat: &LockedSeat, device: usize, code: u16, value: i32, millis: u32) {
+        hold_at(
+            seat,
+            device,
+            later(vec![at_millis(key(code, value), millis), syn(millis)]),
+        );
+    }
+
+    /// The same, stamped `millis` after boot: before any prompt was on glass.
+    fn hold_early(seat: &LockedSeat, device: usize, code: u16, value: i32, millis: u32) {
+        hold_at(
+            seat,
+            device,
+            vec![at_millis(key(code, value), millis), syn(millis)],
+        );
+    }
+
+    fn hold_at(seat: &LockedSeat, device: usize, events: Vec<Event>) {
         let mut pointer = PointerMotion::default();
-        for event in later(vec![at_millis(key(code, value), millis), syn(millis)]) {
+        for event in events {
             apply(
                 seat.target.as_ref(),
                 event,
@@ -15406,82 +15456,69 @@ mod tests {
 
     /// TOKEN-LOGIN.md increment 5's A4, through the whole device
     /// dispatcher: a login disclosure step's receipt goes to root only
-    /// once its approval key is typed under "Elevation consent"'s rules.
-    /// Enter, the keypad, 1, a digit under Control, a repeat, a digit
-    /// another read keyboard holds and a security key's own keyboard type
-    /// none of it; two fresh presses of the right digits send the exact
-    /// description as the receipt, once.
+    /// once Enter approves it under "Elevation consent"'s rules. A security
+    /// key's own keyboard, its OTP's modhex and Enter among them, Shift
+    /// alone, a repeat with no press of its own and an Enter another read
+    /// keyboard holds count for nothing; a fresh Enter sends the exact
+    /// description as the receipt, once, and a later Enter sends nothing
+    /// more.
     #[test]
-    fn a_login_disclosure_is_acknowledged_only_after_its_typed_key() {
+    fn a_login_disclosure_is_acknowledged_only_after_an_approving_enter() {
         const KEY: usize = 1;
         let (seat, mut client, mut root) = disclosed(&[KEY]);
         assert!(!receipt(&mut client, &mut root));
-        seat.press(&[KEY_ENTER, KEY_KPENTER, KEY_KP4, KEY_1], 30);
-        seat.read(KEY, 40, presses(&[KEY_4, KEY_4], 41));
+        seat.read(KEY, 30, presses(&[KEY_C, KEY_B, KEY_D, KEY_ENTER], 31));
         seat.read(
             0,
-            50,
+            40,
             vec![
-                at_millis(key(KEY_LEFTCTRL, KEY_PRESS), 51),
-                syn(51),
-                at_millis(key(KEY_4, KEY_PRESS), 52),
-                syn(52),
-                at_millis(key(KEY_4, KEY_RELEASE), 53),
-                syn(53),
-                at_millis(key(KEY_LEFTCTRL, KEY_RELEASE), 54),
-                syn(54),
+                at_millis(key(KEY_LEFTSHIFT, KEY_PRESS), 41),
+                syn(41),
+                at_millis(key(KEY_LEFTSHIFT, KEY_RELEASE), 42),
+                syn(42),
             ],
         );
         assert!(seat.attention_open());
         assert!(!receipt(&mut client, &mut root));
-        // The first digit, then its repeats, which supply no second.
-        seat.read(
-            0,
-            60,
-            vec![
-                at_millis(key(KEY_4, KEY_PRESS), 61),
-                syn(61),
-                at_millis(key(KEY_4, KEY_REPEAT), 62),
-                syn(62),
-                at_millis(key(KEY_4, KEY_REPEAT), 63),
-                syn(63),
-                at_millis(key(KEY_4, KEY_RELEASE), 64),
-                syn(64),
-            ],
-        );
-        assert!(!receipt(&mut client, &mut root));
-        // Held on another read keyboard, pressed there under Control, a
-        // press is no fresh one.
-        hold(&seat, 2, KEY_LEFTCTRL, KEY_PRESS, 65);
-        hold(&seat, 2, KEY_4, KEY_PRESS, 66);
-        hold(&seat, 2, KEY_LEFTCTRL, KEY_RELEASE, 67);
-        hold(&seat, 0, KEY_4, KEY_PRESS, 70);
-        hold(&seat, 0, KEY_4, KEY_RELEASE, 71);
-        hold(&seat, 2, KEY_4, KEY_RELEASE, 72);
+        hold(&seat, 0, KEY_ENTER, KEY_REPEAT, 43);
+        // Held on another read keyboard since before the prompt was on
+        // glass, Enter is no fresh press on this one.
+        hold_early(&seat, 2, KEY_ENTER, KEY_PRESS, 1);
+        hold(&seat, 0, KEY_ENTER, KEY_PRESS, 44);
+        hold(&seat, 0, KEY_ENTER, KEY_RELEASE, 45);
+        hold_early(&seat, 2, KEY_ENTER, KEY_RELEASE, 2);
         assert!(seat.attention_open());
         assert!(!receipt(&mut client, &mut root));
-        // The second, a fresh press: the receipt, the description itself.
-        seat.press(&[KEY_4], 80);
+        seat.press(&[KEY_ENTER], 50);
         assert!(receipt(&mut client, &mut root));
         assert_eq!(
             root.calls.last().unwrap(),
             &[&[0x13][..], &disclosure().encode()].concat()
         );
+        // Decided, a later Enter sends nothing more.
+        seat.press(&[KEY_ENTER], 60);
         assert_eq!(root.sent(0x13), 1);
         assert_eq!(root.sent(0x15), 0);
         assert!(seat.attention_open());
     }
 
-    /// A wrong digit, at either position, ends the disclosure
+    /// A first press that does not approve, another key, a digit, the
+    /// keypad's Enter or Enter under Control, ends the disclosure
     /// unacknowledged as Escape does: `15` to root, and the screen drains
-    /// until the digit is released.
+    /// until the keys are released.
     #[test]
-    fn a_wrong_digit_ends_a_login_disclosure_with_a_drain() {
-        for wrong in [&[KEY_5][..], &[KEY_4, KEY_9]] {
+    fn a_first_press_other_than_enter_ends_a_login_disclosure_with_a_drain() {
+        for (modifier, last) in [
+            (None, KEY_A),
+            (None, KEY_4),
+            (None, KEY_KPENTER),
+            (Some(KEY_LEFTCTRL), KEY_ENTER),
+        ] {
             let (seat, mut client, mut root) = disclosed(&[]);
-            let (last, typed) = wrong.split_last().unwrap();
-            seat.press(typed, 30);
-            hold(&seat, 0, *last, KEY_PRESS, 41);
+            if let Some(modifier) = modifier {
+                hold(&seat, 0, modifier, KEY_PRESS, 40);
+            }
+            hold(&seat, 0, last, KEY_PRESS, 41);
             assert!(seat.bindings.lock().unwrap().attention == AttentionState::Draining);
             root.replies.extend([
                 vec![0x95, 0],
@@ -15491,7 +15528,10 @@ mod tests {
             assert!(root.replies.is_empty());
             assert_eq!(root.sent(0x15), 1);
             assert_eq!(root.sent(0x13), 0);
-            hold(&seat, 0, *last, KEY_RELEASE, 42);
+            hold(&seat, 0, last, KEY_RELEASE, 42);
+            if let Some(modifier) = modifier {
+                hold(&seat, 0, modifier, KEY_RELEASE, 43);
+            }
             assert!(!seat.attention_open());
         }
     }
@@ -15527,7 +15567,6 @@ mod tests {
                     key: ENROLLED[0],
                 }],
                 step,
-                approval: None,
                 proof: None,
             },
         )

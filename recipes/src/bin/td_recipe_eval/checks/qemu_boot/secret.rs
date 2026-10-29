@@ -349,7 +349,6 @@ pub(crate) fn run(
         order: fixture::LOGIN_DESKTOP_SCREENS,
         keep: Some(&keep),
         wake: None,
-        reads: &[],
     };
     for ((name, test), is_tpm) in cases {
         let emulator = match (is_tpm, tpm, tpm_scratch.as_ref()) {

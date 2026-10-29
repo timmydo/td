@@ -10291,9 +10291,7 @@ mod tests {
     /// and an addition's connect step only by its create step.
     #[test]
     fn a_recovery_removal_and_an_addition_admit_only_their_successors() {
-        use crate::authority::consent::{
-            ApprovalKey, DiskRole, LoginStep, Operation, Proof, Request,
-        };
+        use crate::authority::consent::{DiskRole, LoginStep, Operation, Proof, Request};
         let authorize = LoginStep::DiskAuthorize {
             key: [2; 4],
             retries: 8,
@@ -10305,8 +10303,6 @@ mod tests {
                 Operation::RecoveryRemove {
                     account: 1000,
                     step,
-                    approval: (step == LoginStep::DiskIdentify)
-                        .then(|| ApprovalKey::new(*b"47").unwrap()),
                 },
             )
             .unwrap()
@@ -10360,9 +10356,7 @@ mod tests {
     /// and each key step by its successor, under tag 17's rule.
     #[test]
     fn an_upgrade_prompt_admits_only_its_successor() {
-        use crate::authority::consent::{
-            ApprovalKey, LoginStep, Operation, Request, UpgradeShape, UpgradeStep,
-        };
+        use crate::authority::consent::{LoginStep, Operation, Request, UpgradeShape, UpgradeStep};
         let step = |step| {
             Request::new(
                 [7; 32],
@@ -10373,8 +10367,6 @@ mod tests {
                     count: 1,
                     current: "ab".repeat(32),
                     step,
-                    approval: (step == UpgradeStep::Review)
-                        .then(|| ApprovalKey::new(*b"47").unwrap()),
                 },
             )
             .unwrap()

@@ -303,19 +303,10 @@ fn rollback_admits_by_table_then_selectors_before_any_description() {
         .unwrap();
     assert_eq!(answer[0], 0x92);
     let described = Description::decode(&answer[1..]).unwrap();
-    let Operation::DeployRollback {
-        key,
-        current,
-        previous,
-    } = described.operation()
-    else {
+    let Operation::DeployRollback { current, previous } = described.operation() else {
         panic!("not a rollback");
     };
     assert_eq!((current, previous), (&a, &b));
-    assert!(key
-        .digits()
-        .iter()
-        .all(|digit| (b'2'..=b'9').contains(digit)));
     assert_eq!(described.owner(), 1000);
     // The slot is held: another selection, of any kind, is busy.
     assert_eq!(
@@ -351,9 +342,9 @@ fn rollback_admits_by_table_then_selectors_before_any_description() {
 /// then the principal table for the owner, then the queued request and the
 /// table for its requester, each refused with its `9e` byte before any
 /// description; admitted, tag 12, counted by the backoff before it is
-/// answered. A wrong digit, which the compositor sends as a cancellation,
-/// writes nothing; a new request's commit saves the name and clears the
-/// count. `1f` says what waits and the count throughout.
+/// answered. A first key other than Enter, which the compositor sends as
+/// a cancellation, writes nothing; a new request's commit saves the name
+/// and clears the count. `1f` says what waits and the count throughout.
 #[test]
 fn a_hostname_change_is_admitted_by_the_table_then_described_then_saved_once() {
     use crate::elevation::tests::V1;
@@ -409,7 +400,6 @@ fn a_hostname_change_is_admitted_by_the_table_then_described_then_saved_once() {
     assert_eq!(answer[0], 0x92);
     let described = Description::decode(&answer[1..]).unwrap();
     let Operation::SetHostname {
-        key,
         requester,
         old,
         new,
@@ -421,10 +411,6 @@ fn a_hostname_change_is_admitted_by_the_table_then_described_then_saved_once() {
         (old.as_str(), new.as_str(), *requester),
         ("td", "my-laptop", 1000)
     );
-    assert!(key
-        .digits()
-        .iter()
-        .all(|digit| (b'2'..=b'9').contains(digit)));
     assert_eq!(described.owner(), 1000);
     // Counted once, at admission, and still open.
     assert_eq!(fixture.backoff().read().unwrap().count(), 1);
@@ -440,8 +426,8 @@ fn a_hostname_change_is_admitted_by_the_table_then_described_then_saved_once() {
             .unwrap(),
         [0x9d, 0]
     );
-    // A wrong digit ends it as Escape does: nothing is written, the count
-    // stays, and the requester reads 00.
+    // A first key other than Enter ends it as Escape does: nothing is
+    // written, the count stays, and the requester reads 00.
     assert_eq!(&poll_until(&mut session, 4)[2..], described.encode());
     session
         .answer(Request::Presented(described.clone()))
@@ -1378,7 +1364,7 @@ fn a_late_disclosure_receipt_is_answered_and_the_generation_lives_on() {
     let reply = login_event(&mut session);
     assert_eq!(reply[1], 4);
     let connect = Description::decode(&reply[2..]).unwrap();
-    assert!(connect.login_approval().is_some());
+    assert!(connect.awaits_approval());
     match session.operation.as_mut().unwrap() {
         Active::Login(op) => op.expire(),
         _ => panic!("expected a login worker"),
@@ -1633,7 +1619,6 @@ fn an_update_that_cannot_read_the_record_is_refused_before_any_description() {
             assert_eq!(answer[0], 0x92, "{case}");
             let description = Description::decode(&answer[1..]).unwrap();
             let Operation::Install {
-                key: _,
                 deployment,
                 requester,
             } = description.operation()
@@ -1809,7 +1794,6 @@ fn root_login_supervision_meets_the_production_worker() {
             after: 1,
             key: 1,
             step: crate::consent::LoginStep::Connect,
-            approval: Some(_),
             proof: None,
         }
     ));
@@ -1822,7 +1806,7 @@ fn root_login_supervision_meets_the_production_worker() {
 /// table's `deploy-publish` row for the owner, before the queued update is
 /// taken or any description exists; a miss, or a table that cannot be
 /// read, answers 99 02 and leaves the request queued for a granted
-/// selection, whose tag 5 carries the approval key. A live boot's disk
+/// selection, whose tag 5 awaits approval. A live boot's disk
 /// review consults no table (`select_disk`).
 #[test]
 fn an_update_needs_the_deploy_publish_row_before_any_description() {
@@ -1848,13 +1832,8 @@ fn an_update_needs_the_deploy_publish_row_before_any_description() {
     let answer = session.begin_install(v1).unwrap();
     assert_eq!(answer[0], 0x92);
     let described = Description::decode(&answer[1..]).unwrap();
-    let Operation::Install { key, .. } = described.operation() else {
-        panic!("not an installation");
-    };
-    assert!(key
-        .digits()
-        .iter()
-        .all(|digit| (b'2'..=b'9').contains(digit)));
+    assert!(matches!(described.operation(), Operation::Install { .. }));
+    assert!(described.awaits_approval());
     session.close_with(|_| fixture("cleanup_child")).unwrap();
 }
 

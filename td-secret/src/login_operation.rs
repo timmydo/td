@@ -623,15 +623,15 @@ impl Ceremony<'_> {
 
     /// Presents root's own first step, then requires the record unchanged
     /// before any token I/O. Only that step can carry a disclosure, whose
-    /// acknowledgement waits for the person to type its approval key. A
+    /// acknowledgement waits for the person to approve it with Enter. A
     /// disk proof's step was presented and proved before root sent it, so
     /// only the record is read.
     fn begin(&mut self, wire: &mut Wire) -> Result<(), Failure> {
         if self.proven {
             return self.unchanged();
         }
-        let acknowledged = if self.current.login_approval().is_some() {
-            wire.acknowledge_typed(0x10, 0x11, &self.current)
+        let acknowledged = if self.current.awaits_approval() {
+            wire.acknowledge_approved(0x10, 0x11, &self.current)
         } else {
             wire.acknowledge(0x10, 0x11, &self.current)
         };
@@ -1017,7 +1017,7 @@ impl Ceremony<'_> {
 }
 
 /// The operation with its step, and an enrollment's new-key ordinal,
-/// replaced; no later step carries the first step's approval key.
+/// replaced.
 fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operation, Failure> {
     Ok(match operation.clone() {
         Operation::LoginUnlock {
@@ -1043,7 +1043,6 @@ fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operat
             after,
             key: ordinal,
             step,
-            approval: None,
             proof,
         },
         Operation::LoginAdd {
@@ -1072,7 +1071,6 @@ fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operat
             after,
             removed,
             step,
-            approval: None,
             proof,
         },
         _ => return Err(Failure::Internal),
@@ -1218,7 +1216,7 @@ fn token(error: LoginError, reported: Option<u8>, wire: &Wire) -> Failure {
 mod tests {
     use super::*;
     use crate::consent::{
-        ApprovalKey, LOGIN_CEREMONY, LOGIN_READING, LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT,
+        LOGIN_CEREMONY, LOGIN_READING, LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT,
     };
     use crate::crypto;
     use crate::fido_cbor::{self as cbor, Value};
@@ -1675,7 +1673,7 @@ mod tests {
         /// guest swaps its keys at a connect step.
         admitted: Option<OnStep>,
         /// Holds the acknowledgement of root's own first step this long, as
-        /// a person reading a disclosure and typing its key does, sending
+        /// a person reading a disclosure and approving it does, sending
         /// it only if the worker has not ended the operation by then.
         typing: Option<Duration>,
         /// Holds root's first description this long, as root does while a
@@ -1931,12 +1929,6 @@ mod tests {
         step(count, LoginStep::Unlock { key, retries })
     }
 
-    /// The key root draws for each disclosure step here.
-    fn disclosure() -> ApprovalKey {
-        ApprovalKey::new(*b"58").unwrap()
-    }
-
-    /// With root's key on its disclosure step.
     fn enrolling(after: u8, key: u8, step: LoginStep) -> Operation {
         Operation::LoginEnroll {
             account: UID,
@@ -1944,10 +1936,8 @@ mod tests {
             after,
             key,
             step,
-            approval: None,
             proof: None,
         }
-        .disclosed(disclosure())
     }
 
     fn adding(before: u8, step: LoginStep) -> Operation {
@@ -1960,7 +1950,6 @@ mod tests {
         }
     }
 
-    /// With root's key on its disclosure step.
     fn removing(before: u8, removed: &[Slot], step: LoginStep) -> Operation {
         Operation::LoginRemove {
             account: UID,
@@ -1968,14 +1957,11 @@ mod tests {
             after: before - removed.len() as u8,
             removed: removed.to_vec(),
             step,
-            approval: None,
             proof: None,
         }
-        .disclosed(disclosure())
     }
 
-    /// `operation` authorized by `proof`, with root's key where its first
-    /// step discloses.
+    /// `operation` authorized by `proof`.
     fn proving(operation: Operation, proof: Proof) -> Operation {
         match operation {
             Operation::LoginEnroll {
@@ -1991,7 +1977,6 @@ mod tests {
                 after,
                 key,
                 step,
-                approval: None,
                 proof: Some(proof),
             },
             Operation::LoginAdd {
@@ -2020,12 +2005,10 @@ mod tests {
                 after,
                 removed,
                 step,
-                approval: None,
                 proof: Some(proof),
             },
             other => other,
         }
-        .disclosed(disclosure())
     }
 
     /// A disk authorize step for a header token, which no login slot names.
@@ -3481,12 +3464,12 @@ mod tests {
             )
         );
         assert_eq!(by.device.transcript().len(), start);
-        // Leaving one key discloses, carries root's key, and proceeds.
+        // Leaving one key discloses, awaits approval, and proceeds.
         let mut positions = vec![position(&keys[1]), position(&keys[2])];
         positions.sort();
         let removed = slots(&order, &positions);
         let identify = login(removing(3, &removed, LoginStep::Identify));
-        assert_eq!(identify.login_approval(), Some(disclosure()));
+        assert!(identify.awaits_approval());
         let (result, seen) = unlock(
             &fixture,
             &[&by.device],
@@ -4556,9 +4539,7 @@ mod tests {
         assert_eq!(result, Ok(()));
         let id = newest(&new);
         // The proof's step carried the disclosure; the connect does not.
-        assert!(login(make(1, LoginStep::RecoveryKey))
-            .login_approval()
-            .is_some());
+        assert!(login(make(1, LoginStep::RecoveryKey)).awaits_approval());
         let mut frames = vec![
             vec![0x18, 0],
             invitation(0x10, &login(make(1, LoginStep::Connect))),

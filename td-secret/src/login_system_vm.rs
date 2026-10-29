@@ -4,8 +4,8 @@
 // keyboard and UHID keys, with no TPM. One test, booted once per phase on
 // one disposable volume (`PHASES`, which recipes/src/fixtures/secret_vm.rs
 // pins); the host checks the display at each screen the guest names, as
-// login-desktop's does, reads each disclosure's approval key off it for
-// the guest to type, wakes the guest from the suspend to RAM it asks for
+// login-desktop's does, the guest approving each disclosure with Enter,
+// wakes the guest from the suspend to RAM it asks for
 // and cuts its power where it says.
 
 use super::*;
@@ -839,27 +839,14 @@ fn held_login() -> Vec<Member> {
     members
 }
 
-/// The approval key the guest's own copy of a disclosure carries: root
-/// draws the real one, which the host reads off the screen.
-fn placeholder() -> ApprovalKey {
-    ApprovalKey::new(*b"22").unwrap()
-}
-
 /// A step's rows as root describes it, consent's own lines, named to the
-/// host with each space as `_` and a disclosure's key row, root's own
-/// draw, as `KEY`.
+/// host with each space as `_`.
 fn rows(operation: Operation) -> Vec<String> {
-    Request::new([1; 32], UID, operation.disclosed(placeholder()))
+    Request::new([1; 32], UID, operation)
         .unwrap()
         .lines()
         .into_iter()
-        .map(|row| {
-            if row.starts_with("APPROVE: TYPE ") {
-                "KEY".into()
-            } else {
-                row.replace(' ', "_")
-            }
-        })
+        .map(|row| row.replace(' ', "_"))
         .collect()
 }
 
@@ -867,8 +854,7 @@ fn words(rows: &[String]) -> Vec<&str> {
     rows.iter().map(String::as_str).collect()
 }
 
-/// Types decimal digits on the number row: an approval key, or removal
-/// positions.
+/// Types decimal digits on the number row: removal positions.
 fn type_digits(keyboard: &mut Keyboard, text: &str) {
     for usage in digits(text.as_bytes()) {
         keyboard.key(usage);
@@ -884,15 +870,13 @@ fn manage(host: &mut Host, keyboard: &mut Keyboard, choice: u8) {
     keyboard.key(choice);
 }
 
-/// A disclosure step's prompt, its approval key read off the screen by
-/// the host and typed, which is that step's receipt.
+/// A disclosure step's prompt, checked by the host, then Enter once the
+/// compositor's settle period after presentation has passed, which is
+/// that step's receipt.
 fn approve(host: &mut Host, keyboard: &mut Keyboard, operation: Operation) {
-    let key = host.read("disclosure", &words(&rows(operation)));
-    assert!(
-        key.len() == 2 && key.bytes().all(|digit| (b'2'..=b'9').contains(&digit)),
-        "the approval key {key:?}"
-    );
-    type_digits(keyboard, &key);
+    host.screen("disclosure", &words(&rows(operation)));
+    std::thread::sleep(Duration::from_secs(1));
+    keyboard.key(ENTER);
 }
 
 /// A PIN step of `operation`: its prompt with the field empty, the PIN
@@ -965,7 +949,7 @@ fn held(keys: &[&Virtual]) {
 }
 
 /// A first enrollment of `keys` from the desktop: `1` or `2`, the
-/// disclosure on the first key's connect step and its approval key, then
+/// disclosure on the first key's connect step approved by Enter, then
 /// each key connected alone, the next once the previous key is removed,
 /// and its ceremony. Returns after the last key's last touch, that key
 /// still connected: the commit, publication and cutover follow on their
@@ -978,7 +962,6 @@ fn enroll(host: &mut Host, keyboard: &mut Keyboard, keys: &[&Virtual]) -> Plugge
         after,
         key,
         step,
-        approval: None,
         proof: None,
     };
     held(keys);
@@ -1048,7 +1031,7 @@ fn slots_of(keys: &[&Virtual]) -> Vec<Slot> {
 }
 
 /// A removal of `removed` from `before` keys, authorized by `by`: `D`,
-/// the positions typed and Enter, the disclosure with its approval key,
+/// the positions typed and Enter, the disclosure approved by Enter,
 /// and the authorize step's PIN and touch. Returns with `by` connected:
 /// the commit follows on its own.
 fn remove(
@@ -1079,7 +1062,6 @@ fn remove(
         after,
         removed: removed.to_vec(),
         step,
-        approval: None,
         proof: None,
     };
     approve(host, keyboard, removing(LoginStep::Identify));

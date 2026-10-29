@@ -908,9 +908,9 @@ pub fn qemu_boot_live_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::live::run(&runner)
 }
 
-/// `deploy-rollback` through the approval key (td-authd/DESIGN.md,
-/// "Elevation operations"): the system image on a two-deployment fixture
-/// volume, its prompt read off the screen, and the reboot it selects.
+/// `deploy-rollback` approved by Enter (td-authd/DESIGN.md, "Elevation
+/// operations"): the system image on a two-deployment fixture volume, its
+/// prompt read off the screen, and the reboot it selects.
 pub fn qemu_deploy_rollback_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
     if args.len() > 1 || args.first().is_some_and(|value| value != STEM) {

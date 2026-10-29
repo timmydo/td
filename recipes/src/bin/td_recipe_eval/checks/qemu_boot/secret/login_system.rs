@@ -2,11 +2,11 @@
 //! TPM-free full-system login guest. The test-only system image boots
 //! once per phase on one disposable volume whose files are guest root's,
 //! on a q35 machine whose ACPI offers suspend to RAM, its one ignored test
-//! asking for the display checks below over ttyS0. The host reads each
-//! login disclosure's approval key off the screen and answers with it,
-//! and cuts the power of the phase that asks for a cut.
+//! asking for the display checks below over ttyS0, the guest approving
+//! each login disclosure with Enter once the host has seen it, and the
+//! host cuts the power of the phase that asks for a cut.
 
-use super::super::guest_screens::{Check, GuestScreens, Holds, Reads, Screen, Wake};
+use super::super::guest_screens::{Check, GuestScreens, Holds, Screen, Wake};
 use super::*;
 
 /// The lock surface's and the attention screen's rows for each cause the
@@ -28,7 +28,7 @@ const MENU: &[&str] = &[
     "B: ROLL BACK TO THE PREVIOUS SYSTEM",
     "H: NO HOSTNAME CHANGE WAITING",
     "S: DISK ENCRYPTION",
-    "F: RESTART  P: POWER OFF",
+    "F: RESTART  P: POWER OFF  Z: SLEEP",
     "ESC TO RETURN",
 ];
 /// Every phase boots within this, its locked phase's steps included.
@@ -246,48 +246,15 @@ fn step_touch(pixels: &[u8], arguments: &[&str]) -> Result<bool, String> {
     prompt_matches(pixels, &named_rows(arguments)?, Some(("TOUCH YOUR KEY", 0)))
 }
 
-/// `disclosure ROW...`, the approval key's row named `KEY`: a disclosure
-/// step's prompt, every pixel, and the key root drew for it, which only
-/// the screen shows: one of the 64, or an error when its row shows two.
-fn disclosure_key(pixels: &[u8], arguments: &[&str]) -> Result<Option<String>, String> {
-    let mut lines = named_rows(arguments)?;
-    let mut keyed = lines.iter().enumerate().filter(|(_, row)| *row == "KEY");
-    let (Some((at, _)), None) = (keyed.next(), keyed.next()) else {
-        return Err("a disclosure names exactly one KEY row".into());
-    };
-    let top = prompt_top(lines.len())?;
-    let mut shown = None;
-    for first in b'2'..=b'9' {
-        for second in b'2'..=b'9' {
-            let row = format!(
-                "APPROVE: TYPE {} THEN {}",
-                char::from(first),
-                char::from(second)
-            );
-            if super::super::update::row_matches(pixels, top + at * PROMPT_PITCH, &row)?
-                && shown.replace((row, [first, second])).is_some()
-            {
-                return Err("the disclosure's key row matches two keys".into());
-            }
-        }
-    }
-    let Some((row, key)) = shown else {
-        return Ok(None);
-    };
-    if let Some(line) = lines.get_mut(at) {
-        *line = row;
-    }
-    Ok(prompt_matches(pixels, &lines, None)?.then(|| String::from_utf8_lossy(&key).into_owned()))
-}
-
+/// `disclosure ROW...`: a disclosure step's prompt, every pixel, its
+/// last rows Enter's and Escape's, which the guest then presses Enter on.
 fn disclosure(pixels: &[u8], arguments: &[&str]) -> Result<bool, String> {
-    Ok(disclosure_key(pixels, arguments)?.is_some())
-}
-
-/// The key a disclosure its check accepted shows, which the host answers
-/// with.
-fn disclosed(pixels: &[u8], arguments: &[&str]) -> Result<String, String> {
-    disclosure_key(pixels, arguments)?.ok_or_else(|| "the accepted disclosure shows no key".into())
+    let lines = named_rows(arguments)?;
+    let tail: Vec<&str> = lines.iter().rev().take(2).map(String::as_str).collect();
+    if tail != ["ESC: CANCEL", super::super::update::APPROVE_ROW] {
+        return Err("a disclosure ends with Enter's row and Escape's".into());
+    }
+    prompt_matches(pixels, &lines, None)
 }
 
 /// Each screen's check and hold: while locked, only what may show while
@@ -459,10 +426,6 @@ fn login_system_checks(install: Check<'_>) -> Vec<Screen<'_>> {
     ]
 }
 
-/// The screens whose answers carry what the host read: a disclosure's
-/// approval key, which the guest then types.
-const READS: &[(&str, Reads<'static>)] = &[("disclosure", &disclosed)];
-
 /// Whether a phase's serial greeter logs in: on the unenrolled boots and
 /// after a cutover back to the unenrolled state. Every phase prints the
 /// greeter's refusal exactly once: at an enrolled boot, or after the
@@ -582,7 +545,6 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 holds: &locked_or_inactive,
                 inactive: &inactive,
             }),
-            reads: READS,
         };
         let tokens = format!("td.hid-fixture=1 td.login-system={phase}");
         let cut = *phase == fixture::LOGIN_SYSTEM_CUT_PHASE;
@@ -648,8 +610,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
     println!(
         "PASS: a full TPM-free system refused a first enrollment while previous lacked the tier \
-         marker, enrolled two keys through the attention screen, its disclosure's approval key \
-         read off the screen, and the cutover ended a held serial session with a process \
+         marker, enrolled two keys through the attention screen, its disclosure approved by \
+         Enter once seen, and the cutover ended a held serial session with a process \
          ignoring TERM and an open SSH session, every process of both containments, the \
          greeter refusing; root SSH refused before and after; booted locked behind its client \
          with the serial greeter refused, the enforced SSH form and boot health complete, \
@@ -770,12 +732,8 @@ mod tests {
                 "locked"
             ]
         );
-        // Only the disclosure's answer carries a word, the key the host
-        // read; the guest reads it there alone.
-        assert_eq!(READS.len(), 1);
-        assert_eq!(READS[0].0, "disclosure");
-        assert_eq!(source.matches("host.read(").count(), 1);
-        assert_eq!(source.matches("host.read(\"disclosure\"").count(), 1);
+        // No answer carries a word: the guest reads nothing off the host.
+        assert_eq!(source.matches("host.read(").count(), 0);
         let cut = format!("const CUT: &str = \"{}\";", fixture::LOGIN_SYSTEM_CUT);
         assert_eq!(source.matches(&cut).count(), 1, "{cut}");
         assert!(fixture::LOGIN_SYSTEM_PHASES.contains(&fixture::LOGIN_SYSTEM_CUT_PHASE));
@@ -965,8 +923,8 @@ mod tests {
 
     /// The key-management screens: each notice matches its own screen,
     /// `removing` its count and choice, and a prompt its rows, its time
-    /// line and its field; a disclosure's key is read off its row, and a
-    /// row that is not one key is no disclosure.
+    /// line and its field; a disclosure ends with Enter's and Escape's
+    /// rows, and one asking for a typed key is no disclosure.
     #[test]
     fn key_management_screens_match_their_rows_and_read_the_key() {
         let keys = frame(&attention(KEYS));
@@ -1006,28 +964,27 @@ mod tests {
             "CONSOLE_LOGIN_AND_THE_ORDINARY",
             "SSH_POLICY_RETURN",
             "OPEN_SSH_SESSIONS_END_NOW",
-            "KEY",
+            "ENTER:_APPROVE",
             "ESC:_CANCEL",
         ];
-        let shown: Vec<String> = rows
-            .iter()
-            .map(|row| match *row {
-                "KEY" => "APPROVE: TYPE 4 THEN 7".to_string(),
-                row => row.replace('_', " "),
-            })
-            .collect();
+        let shown: Vec<String> = rows.iter().map(|row| row.replace('_', " ")).collect();
         let screen = prompt_frame(&shown, 233, None);
-        assert_eq!(disclosure_key(&screen, &rows), Ok(Some("47".into())));
-        assert_eq!(disclosed(&screen, &rows), Ok("47".into()));
         assert_eq!(disclosure(&screen, &rows), Ok(true));
-        // Another row, or no key row at all, is not this screen.
+        // Another row is not this screen.
         let mut other = rows.to_vec();
         other[2] = "REMOVE_A_LOGIN_KEY_(2_->_1_KEY)";
-        assert_eq!(disclosure_key(&screen, &other), Ok(None));
-        assert!(disclosed(&screen, &other).is_err());
-        assert!(disclosure_key(&screen, &rows[..10]).is_err());
-        let doubled = [rows.to_vec(), vec!["KEY"]].concat();
-        assert!(disclosure_key(&screen, &doubled).is_err());
+        assert_eq!(disclosure(&screen, &other), Ok(false));
+        // A prompt asking for a typed key is not a disclosure.
+        let mut keyed = shown.clone();
+        keyed[10] = "APPROVE: TYPE 4 THEN 7".into();
+        assert_eq!(
+            disclosure(&prompt_frame(&keyed, 233, None), &rows),
+            Ok(false)
+        );
+        // Rows that do not end with Enter's and Escape's are refused.
+        assert!(disclosure(&screen, &rows[..10]).is_err());
+        let swapped = [&rows[..10], &["ESC:_CANCEL", "ENTER:_APPROVE"][..]].concat();
+        assert!(disclosure(&screen, &swapped).is_err());
         // A step's rows, its field's masks and its touch request.
         let plain = &rows[..6];
         let lines: Vec<String> = plain.iter().map(|row| row.replace('_', " ")).collect();

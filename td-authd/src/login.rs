@@ -2,8 +2,8 @@
 //! login-operation` (td-login/TOKEN-LOGIN.md): root's side of its frames.
 
 use crate::consent::{
-    Admitted, ApprovalKey, Fingerprint, LoginStep, Operation, Proof, Request, Slot, LOGIN_CEREMONY,
-    LOGIN_KEYS, LOGIN_LONGEST, LOGIN_READING, LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT,
+    Admitted, Fingerprint, LoginStep, Operation, Proof, Request, Slot, LOGIN_CEREMONY, LOGIN_KEYS,
+    LOGIN_LONGEST, LOGIN_READING, LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT,
 };
 use crate::login_status::login_state::Owner;
 use crate::unlock::{command, deadline_after, Event, Wire};
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 /// Margin against the worker's five-second acknowledgement window. A
 /// disclosure step's has the operation deadline instead: the person reads
-/// it and types its approval key, with no token I/O open.
+/// it and approves it with Enter, with no token I/O open.
 const ACK_TIME: Duration = Duration::from_secs(3);
 /// The worker's PIN frame: its tag and at most 63 PIN bytes.
 const PIN_FRAME: usize = 64;
@@ -149,14 +149,12 @@ impl Selection {
         }
     }
 
-    /// The operation at its first step against the worker's baseline, with
-    /// `key` when that step carries a disclosure, or the kind that refuses
-    /// it before any description reaches the worker.
+    /// The operation at its first step against the worker's baseline, or
+    /// the kind that refuses it before any description reaches the worker.
     fn operation(
         &self,
         owner: u32,
         baseline: &[Fingerprint],
-        key: ApprovalKey,
         protected: bool,
     ) -> Result<Operation, u8> {
         let (selection, proof) = match self {
@@ -181,7 +179,6 @@ impl Selection {
                 after: *after,
                 key: 1,
                 step: first(LoginStep::Connect),
-                approval: None,
                 proof,
             },
             _ if count == 0 => return Err(NO_RECORD),
@@ -212,13 +209,10 @@ impl Selection {
                     .ok_or(SELECTION)?,
                 removed: removed.clone(),
                 step: first(LoginStep::Identify),
-                approval: None,
                 proof,
             },
         };
-        // A first enrollment's first step, and a removal's that leaves at
-        // most one key, carries a disclosure; consent says which.
-        Ok(operation.disclosed(key))
+        Ok(operation)
     }
 }
 
@@ -234,27 +228,16 @@ pub(crate) fn protected(root: &Path, owner: Owner) -> bool {
             .map_or(true, |found| found.is_some())
 }
 
-/// Each digit `2` plus its own random byte modulo 8, as an elevation's: 256
-/// is a multiple of 8, so every digit is equally likely.
-fn approval_key(bytes: [u8; 2]) -> Result<ApprovalKey, String> {
-    ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))
-}
-
-/// A login operation's nonce and the key its disclosure step carries,
-/// drawn together.
-pub(crate) fn draw() -> Result<([u8; 32], ApprovalKey), String> {
+/// A login operation's nonce.
+pub(crate) fn draw() -> Result<[u8; 32], String> {
     let mut nonce = [0; 32];
-    let mut key = [0; 2];
     File::open("/dev/urandom")
-        .and_then(|mut random| {
-            random.read_exact(&mut nonce)?;
-            random.read_exact(&mut key)
-        })
+        .and_then(|mut random| random.read_exact(&mut nonce))
         .map_err(|_| "read login request randomness")?;
     if nonce == [0; 32] {
         return Err("zero login request nonce".into());
     }
-    Ok((nonce, approval_key(key)?))
+    Ok(nonce)
 }
 
 /// A PIN on its way to the worker, zeroed when dropped.
@@ -339,8 +322,6 @@ enum Phase {
 pub(crate) struct Login {
     owner: u32,
     nonce: [u8; 32],
-    /// The key a disclosure step carries, drawn beside the nonce.
-    approval: ApprovalKey,
     selection: Selection,
     /// Whether the protected marker was found, or could not be read, when
     /// the operation started.
@@ -402,11 +383,10 @@ fn failure(frame: &[u8]) -> Option<(u8, u8)> {
 impl Login {
     /// Call only after root startup and paired-session admission.
     pub fn start(owner: u32, selection: Selection) -> Result<Self, String> {
-        let (nonce, approval) = draw()?;
+        let nonce = draw()?;
         Self::begin_with(
             owner,
             nonce,
-            approval,
             selection,
             protected(Path::new("/"), Owner::ROOT),
         )
@@ -417,7 +397,6 @@ impl Login {
     pub(crate) fn begin_with(
         owner: u32,
         nonce: [u8; 32],
-        approval: ApprovalKey,
         selection: Selection,
         protected: bool,
     ) -> Result<Self, String> {
@@ -427,7 +406,6 @@ impl Login {
         Self::spawn(
             owner,
             nonce,
-            approval,
             selection,
             protected,
             command("login-operation", owner),
@@ -439,7 +417,6 @@ impl Login {
     pub(crate) fn spawn(
         owner: u32,
         nonce: [u8; 32],
-        approval: ApprovalKey,
         selection: Selection,
         protected: bool,
         mut command: Command,
@@ -457,7 +434,6 @@ impl Login {
         Ok(Self {
             owner,
             nonce,
-            approval,
             selection,
             protected,
             child: Some(child),
@@ -535,8 +511,8 @@ impl Login {
         Ok(())
     }
 
-    /// A disclosure step's receipt follows its approval key, which the
-    /// person may type at any time before root's deadline: one at or after
+    /// A disclosure step's receipt follows the person's approval, which
+    /// may come at any time before root's deadline: one at or after
     /// it ends the operation as TIMEOUT, and one for an operation already
     /// ended is dropped, each as a late PIN is, so the generation goes on.
     pub fn presented(&mut self, request: &Request) -> Result<(), String> {
@@ -547,7 +523,7 @@ impl Login {
     /// disclosure's deadline and the acknowledgement's: a receipt that
     /// crosses the deadline between two reads would otherwise be stale.
     fn presented_at(&mut self, request: &Request, now: Instant) -> Result<(), String> {
-        if request.login_approval().is_some() && self.request.as_ref() == Some(request) {
+        if request.awaits_approval() && self.request.as_ref() == Some(request) {
             if matches!(self.phase, Phase::Stopping | Phase::Done) {
                 return Ok(());
             }
@@ -770,25 +746,24 @@ impl Login {
     fn begin(&mut self, frame: &[u8]) -> Result<Event, String> {
         let baseline = baseline(frame).ok_or("malformed login baseline")?;
         let proof = self.selection.proof();
-        let refused =
-            match self
-                .selection
-                .operation(self.owner, &baseline, self.approval, self.protected)
-            {
-                Err(kind) => Err(kind),
-                Ok(operation) => if proof.is_some() {
-                    Request::begin_proof_shape(self.nonce, self.owner, operation, &baseline)
-                } else {
-                    Request::begin_login(self.nonce, self.owner, operation, &baseline)
+        let refused = match self
+            .selection
+            .operation(self.owner, &baseline, self.protected)
+        {
+            Err(kind) => Err(kind),
+            Ok(operation) => if proof.is_some() {
+                Request::begin_proof_shape(self.nonce, self.owner, operation, &baseline)
+            } else {
+                Request::begin_login(self.nonce, self.owner, operation, &baseline)
+            }
+            .map_err(|_| match self.selection {
+                Selection::Remove(_) => SELECTION,
+                Selection::Proven(_, ref inner) if matches!(**inner, Selection::Remove(_)) => {
+                    SELECTION
                 }
-                .map_err(|_| match self.selection {
-                    Selection::Remove(_) => SELECTION,
-                    Selection::Proven(_, ref inner) if matches!(**inner, Selection::Remove(_)) => {
-                        SELECTION
-                    }
-                    _ => INTERNAL,
-                }),
-            };
+                _ => INTERNAL,
+            }),
+        };
         let request = match refused {
             Ok(request) => request,
             Err(kind) => {
@@ -852,7 +827,7 @@ impl Login {
         }
         // Only root's own first step can disclose.
         self.acknowledgement_deadline = Some(match &self.request {
-            Some(request) if request.login_approval().is_some() => self.deadline,
+            Some(request) if request.awaits_approval() => self.deadline,
             _ => deadline_after(ACK_TIME)?,
         });
         self.round = frame;
@@ -952,26 +927,12 @@ impl Drop for Login {
 impl Login {
     /// A scripted worker: `login::tests::scripted_worker` playing `script`.
     pub(crate) fn scripted(selection: Selection, script: &str) -> Result<Self, String> {
-        Self::spawn(
-            1000,
-            [42; 32],
-            tests::approval(),
-            selection,
-            false,
-            tests::fixture(script),
-        )
+        Self::spawn(1000, [42; 32], selection, false, tests::fixture(script))
     }
 
     /// The same on a protected machine.
     pub(crate) fn scripted_protected(selection: Selection, script: &str) -> Result<Self, String> {
-        Self::spawn(
-            1000,
-            [42; 32],
-            tests::approval(),
-            selection,
-            true,
-            tests::fixture(script),
-        )
+        Self::spawn(1000, [42; 32], selection, true, tests::fixture(script))
     }
 
     pub(crate) fn fixture_pid(&self) -> Option<u32> {

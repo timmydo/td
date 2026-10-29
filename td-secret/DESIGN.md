@@ -1364,7 +1364,7 @@ Frames have a big-endian u16 length and 1..289 payload bytes, with one
 five-second deadline spanning header and payload and an overall 120-second
 operation deadline derived from the HID session lifetime. These are
 cooperative checks; the parent must also enforce the child lifetime if
-TPM I/O blocks. The first frame is the canonical TDCONS01 description
+TPM I/O blocks. The first frame is the canonical TDCONS02 description
 of an Unlock operation for the configured UID. Other operations refuse.
 After startup and endpoint admission, before receiving the first frame,
 the child clears any previous volatile key. Malformed input and an initial
@@ -1823,9 +1823,9 @@ The shared named transport also serves td-authd's local installation intake,
 specified in its design and UNSAFE.md section 16. That consumer rejects all
 incoming rights and retains only sender pidfds. It adds no raw operations or
 credential access. Consent tag 5 describes a system installation,
-`deploy-publish`, confirmed since L5 by its approval key; secret workers
-reject it, and that key cannot substitute for a token-bound secret
-operation.
+`deploy-publish`, confirmed since L5 by Enter on its prompt; secret
+workers reject it, and that confirmation cannot substitute for a
+token-bound secret operation.
 
 Consent tags 11 and 12 describe the elevation operations `deploy-rollback`
 and `set-hostname` (td-authd/DESIGN.md, "Elevation operations").
@@ -2275,11 +2275,11 @@ description, `11` and `13` acknowledgements and `16` a PIN after each
 PIN step's acknowledgement. `17` stays store inspection's. A disclosure
 step's `11` (TOKEN-LOGIN.md increment 5's A4) is waited for until the
 operation's deadline rather than the five seconds above, since the
-person reads the disclosure and types its approval key before root
+person reads the disclosure and approves it with Enter before root
 acknowledges and no token I/O is open meanwhile. That step is the
-first, root's own description with root's key, which the worker repeats
-exactly after deriving the same step from the decoded operation; every
-step it derives later carries no key.
+first, root's own description, which the worker repeats exactly after
+deriving the same step from the decoded operation; no step it derives
+later awaits approval.
 
 1. After startup it requires no active swap and a zero core-dump soft
    limit, as the named-write worker does, since it will hold a PIN and an
@@ -2291,7 +2291,7 @@ step it derives later carries no key.
    `begin_login` and `admit_login_step` take. An unavailable state sends
    its failure instead, so no description is ever admitted against it.
    The worker keeps the record it read, and checks against that.
-2. Root's first frame is the TDCONS01 description of a login operation
+2. Root's first frame is the TDCONS02 description of a login operation
    for this account. Another owner or operation, or one that
    `begin_login` refuses against the worker's own baseline or does not
    reproduce, is INTERNAL. An unlock, addition or removal against an
@@ -2999,10 +2999,9 @@ whose rows the guest names from consent's own `Request::lines` for the
 step it expects, each space written `_`, and which the host checks row
 by row with the time line (1 to 360 seconds) and, for the PIN steps,
 the field's text and masks, every other pixel the ground. `disclosure`
-is such a prompt whose approval-key row the guest names `KEY`: the host
-finds the one key of the 64 whose `APPROVE: TYPE X THEN Y` row the
-frame shows, checks the whole prompt with it, and answers `TD-LOGIN-SHOWN
-disclosure XY`, the only answer that carries a word; the guest types it.
+is such a prompt, ending with its `ENTER: APPROVE` and `ESC: CANCEL`
+rows, which the host checks whole; a second later the guest presses
+Enter.
 Every key-management screen holds the lock palette, since a cutover
 follows each write. Every hold of a lock screen admits the lock palette and
 QEMU's own frame for no scanout, black with its grey "Display output is

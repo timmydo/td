@@ -154,9 +154,9 @@ hash its bounded regular manifest and invoke only installed
 `/bin/td-authd request-update SOURCE ID`. The root intake independently pins
 and checks the source before acknowledging it, and refuses while its
 backoff runs after an unapproved request, which the client says. The user
-then presses Ctrl+Alt+Escape and I and, after reviewing the full ID, types
-the two-digit approval key the prompt shows; Enter does not install.
-Escape or a wrong digit cancels before commitment. The installation state
+then presses Ctrl+Alt+Escape and I and, after reviewing the full ID,
+presses Enter. Escape, or any other key pressed first, cancels before
+commitment. The installation state
 machine and its uncertain-result policy are normative in
 `td-authd/DESIGN.md`; no automatic retry or reboot follows.
 
@@ -222,24 +222,22 @@ Inside the disposable overlay, the oracle changes the updater's HELP text
 to a unique marker and leaves a unique user file. It runs `./update`,
 waits for the installation request, uses QMP physical keys to open secure
 attention and select I, then checks the complete expected deployment ID,
-owner, operation, rollback/restart notice and the approval key's rows
-against the actual 1280x800 framebuffer, reading the key, one of the 64,
-off them. The expected text is independent of the compositor's
+owner, operation, rollback/restart notice and the approval rows
+against the actual 1280x800 framebuffer. The expected text is independent of the compositor's
 description builder; ASCII pixels are bound to its pinned font. The
 preceding attention menu is checked against its separate small chrome
 font before I is sent. The variable countdown and cursor are excluded.
-Only after the full prompt matches does the oracle send Enter, which
-must leave the same prompt for two seconds; then Escape. This first
-request must end unsuccessful with both deployment selectors unchanged,
-so an Enter that committed, whose prompt stays up while the helper
-copies, fails here. It counted, and only a commit clears the count: by
+Only after the full prompt matches does the oracle press a key other
+than Enter, which must end the request. This first request must end
+unsuccessful with both deployment selectors unchanged, so a press that
+committed fails here. It counted, and only a commit clears the count: by
 the guest's clock, inside the 210 seconds from its admission, less a
 ten-second margin, a direct `td-authd request-update` must be refused as
 backing off, and a cancellation that outlasts that window fails as slow.
 The oracle then waits the window out.
 
 A second `./update` must request the same successor, which the oracle
-installs by typing the key read off its prompt, sending no Enter.
+installs by pressing Enter once the full prompt matches.
 Success must publish that successor as current and the initial
 deployment as previous. A host test pins this order, since the oracle
 needs an operator's installation. After an

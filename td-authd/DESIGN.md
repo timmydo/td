@@ -1236,7 +1236,7 @@ and protected mounts at or below it are refused.
 ## Immutable consent description prerequisite
 
 `consent.rs` supplies a bounded, immutable public description for the
-trusted renderer. The canonical wire value is `TDCONS01`, a nonzero 32-byte
+trusted renderer. The canonical wire value is `TDCONS02`, a nonzero 32-byte
 operation nonce, a big-endian u32 human UID, and a one-byte operation.
 Enrollment (1) adds platform profile 1 (TPM PCR 7), the recovery policy (1
 second token, 0 explicitly unrecoverable, matching TDENROL1) and step (1
@@ -1311,10 +1311,7 @@ identify, unlock for unlock; identify, authorize for removal; identify,
 authorize, connect, create, prove, repeat, probe for addition; and connect,
 create, prove, repeat, probe for each new key of an enrollment in turn. A
 step outside its operation's list refuses. The widest login value, a
-removal of eight keys at its authorize step, is 98 bytes. A disclosure
-step (TOKEN-LOGIN.md increment 5's A4) also ends with the two
-approval-key bytes ("Elevation operations"); the widest of those, the
-identify step of a removal of eight keys, is 95.
+removal of eight keys at its authorize step, is 98 bytes.
 
 Step admission has two parts. The descriptions alone decide a step's
 shape, which a reader without the record or the device can check, as
@@ -1427,8 +1424,8 @@ PIN, THEN TOUCH THE KEY`. Unlock alone omits its count, which it does not
 change and which its bytes still bind: the lock surface shows the prompt
 to whoever is at the machine. A disclosure step's rows end with its
 disclosure, whose rows include `LOGIN WILL NOT NEED A KEY` for a removal
-leaving none, then the approval key's rows, which replace the generic
-Escape row ("Elevation operations").
+leaving none, then the approval rows, which replace the generic Escape
+row ("Elevation operations").
 
 These are structural checks, not caller admission or proof of
 randomness. The private root unlock and enrollment workers in
@@ -1948,15 +1945,14 @@ operations"), leaving the request queued; then no ready request answers
 99 00. On an enrolled or unavailable machine, a queued deployment that
 cannot read the login record answers 99 01 and is retired with
 completion byte 00 ("Login keys and session lock", amendment 8). A
-selection holds the directory File, draws a fresh 32-byte nonce and the
-two-byte approval key from `/dev/urandom` and answers 92 DESCRIPTION.
-The description is consent tag 5: owner, nonce, key, requester UID and
-full deployment ID. It shares one operation slot with secret operations
+selection holds the directory File, draws a fresh 32-byte nonce from
+`/dev/urandom` and answers 92 DESCRIPTION. The description is consent
+tag 5: owner, nonce, requester UID and full deployment ID. It shares one operation slot with secret operations
 and read-only inspection. The root installation controller accepts exact
 presentation (13) and then one exact commit (14), within 120 seconds of
-selection, each carrying the description and so its key. The compositor
-sends commit only after the key is typed on the fully presented prompt
-(td-compositor/DESIGN.md, "Elevation consent"); Enter confirms nothing.
+selection, each carrying the description. The compositor sends commit
+only after Enter approves the fully presented prompt
+(td-compositor/DESIGN.md, "Elevation consent").
 Root rechecks the submitting process immediately beforehand. Keyboard
 confirmation authorizes this installation only; it cannot release
 secrets or authorize protector changes.
@@ -1977,7 +1973,8 @@ for its completion read. Only a successful helper exit permits public byte 01
 and private completion; failure returns byte 00. Missing completion is an
 uncertain result and never causes automatic retry. Restart is explicit.
 
-Before commit, Escape, a wrong digit, requester loss or expiry cancels
+Before commit, Escape, a press that ends the prompt, requester loss or
+expiry cancels
 without launching, and the request has counted.
 On failed-generation teardown, the controller kills and reaps its direct
 helper before secret-session cleanup. This alone cannot prove that the
@@ -1991,16 +1988,15 @@ Host tests drive the queue's backoff (a request admitted only once
 counted, 03 within the backoff with nothing written, 04 for a manifest
 that does not check or a table that does not grant the requester,
 uncounted, or for a backoff root cannot read or write, until a write
-succeeds), each description's fresh nonce and key, request 19's 99 02
+succeeds), each description's fresh nonce, request 19's 99 02
 for a table without the owner's `deploy-publish` row or none at all,
 before the queue is touched, and only a commit clearing the count,
 before the helper starts or instead of it. Confinement pins hold the
 queue's backoff row and table, the grant and then the write ending
-admission, the reply byte, the key's draw, the clear before the spawn,
-and the table before the queue in request 19. `qemu-update`
-(td-update/DESIGN.md) reads the key off a booted system's prompt, shows
-a cancelled request refusing the next inside its window and Enter
-installing nothing, and types the key.
+admission, the reply byte, the clear before the spawn, and the table
+before the queue in request 19. `qemu-update` (td-update/DESIGN.md)
+reads a booted system's prompt, shows a cancelled request refusing the
+next inside its window, and approves with Enter.
 
 ## Whole-disk installation intake
 
@@ -2081,11 +2077,11 @@ staged into the target authority recipe.
 Implemented and live: `deploy-rollback` (L3), from the principal table
 and request `1d` through its commit and td-boot's checked pair;
 `set-hostname` (L4), from its intake and backoff through request `1e`'s
-commit and the canonical write; and `deploy-publish` (L5), tag 5's key
-bytes, the table's row for request 19 and the update queue's backoff
-("Consent for a locally built system"). Since TOKEN-LOGIN.md increment
-5's A4 the login tags' disclosure steps carry the key too, live since
-its A5 admits a write.
+commit and the canonical write; and `deploy-publish` (L5), tag 5, the
+table's row for request 19 and the update queue's backoff ("Consent for
+a locally built system"). Since TOKEN-LOGIN.md increment 5's A4 the
+login tags' disclosure steps await the same approval, live since its A5
+admits a write.
 APPLICATIONS.md §L.1, "The v1 operations", says what
 `deploy-rollback`, `set-hostname` and `deploy-publish` are and why,
 and its "Elevation increments" which commit lands each part;
@@ -2096,51 +2092,43 @@ commit routes `20` there too ("Login keys and session lock", amendment
 10).
 
 **Consent tags.** Tags 11 (`deploy-rollback`) and 12 (`set-hostname`)
-follow the login tags. Each carries, right after its tag byte, the
-two-byte approval key: two ASCII digits, each `2` to `9` (0x32 to 0x39),
-every other value refused by the decoder. Root draws each digit from its
-own byte of `/dev/urandom` as `2` plus the byte modulo 8; 256 is a
-multiple of 8, so every digit is equally likely and no byte is rejected.
-The key is never derived from the nonce.
+follow the login tags. No consent description carries an approval key:
+the prompt approves with Enter (`td-compositor/DESIGN.md`, "Elevation
+consent").
 
-- Tag 11 then carries the current and the previous deployment ID, each
-  64 lowercase hexadecimal bytes as tag 5 carries one, and the two
-  differ: 175 bytes in all.
-- Tag 12 then carries a big-endian u32 requester, which must equal the
-  owner, then the old and the new name, each a one-byte length and 1 to
-  63 bytes that `Hostname::parse` (`td-firstboot/src/hostname.rs`)
-  admits, and the two differ: at most 179 bytes.
+- Tag 11 carries, right after its tag byte, the current and the previous
+  deployment ID, each 64 lowercase hexadecimal bytes as tag 5 carries
+  one, and the two differ: 173 bytes in all.
+- Tag 12 carries a big-endian u32 requester, which must equal the owner,
+  then the old and the new name, each a one-byte length and 1 to 63
+  bytes that `Hostname::parse` (`td-firstboot/src/hostname.rs`) admits,
+  and the two differ: at most 177 bytes.
 
 Both stay under the 256-byte bound. Each renders its operation, both IDs
 or the requester and both names, and that a restart completes it, then
-ends its description with the key's rows, `APPROVE: TYPE 4 THEN 7` and
-`ESC: CANCEL`, in place of the generic Escape row; every fixed row fits
-the narrowest prompt, so wrapping never splits the key. Since L5 tag 5
-carries the same two bytes after its tag byte, before its requester and
-ID, 115 bytes in all, and its rows end with the same key rows; its
-restart row, 35 columns, wraps at the narrowest prompt, above them, so
-the key is still never split. Tag 6, the live disk installation,
-carries none. Since TOKEN-LOGIN.md increment 5's A4 a login
-description that carries a disclosure ends with the same two bytes, and
-no other does. Those are the first step of a first enrollment (8), its
-first `connect`, of either count, and the first step of a removal (10),
-its `identify`, when the removal leaves at most one key. On those steps
-the bytes are the value's last two, after the step's, because the
-decoder knows only from the step and the counts whether they belong: it
-requires them there and refuses them anywhere else as trailing bytes.
-Each such step is presented before any token I/O, and its disclosure is
-the whole operation's, so one key confirms the operation and no later
-step carries one. Root draws the key as above, beside the operation's
-nonce when `1b` starts it, and consent's `Operation::disclosed` puts it
-on root's own first step exactly when that step discloses; the worker
-receives that description and must repeat it exactly, so the key is
-root's alone and the worker never derives one. The step's rows end with
-the disclosure, `TOKEN-LOGIN.md`'s ("Enrollment, addition and removal")
-in rows that fit the narrowest prompt, then the key's rows in place of
-the generic Escape row. The compositor sends that step's presentation
-receipt, which carries the exact description and so the key, only once
-the key is typed. The widest login value is unchanged (above): its
-authorize step carries no key.
+ends its description with the approval rows, `ENTER: APPROVE` and `ESC:
+CANCEL`, in place of the generic Escape row. Tag 5 carries its
+requester and ID after its tag byte, 113 bytes in all, and its rows end
+with the same approval rows. Tag 6, the live disk installation, keeps
+its own `ENTER:` row.
+
+`consent::Request::awaits_approval` names the requests and steps whose
+prompt takes that approval, the one predicate root, the compositor, the
+workers and td-install ask: tags 5, 11, 12, 16, 18, tag 17's review,
+tag 21's identify step and, since TOKEN-LOGIN.md increment 5's A4, a
+login description that carries a disclosure. Those are the first step
+of a first enrollment (8), its first `connect`, of either count, and the
+first step of a removal (10), its `identify`, when the removal leaves at
+most one key. Each such step is presented before any token I/O, and its
+disclosure is the whole operation's, so one approval confirms the
+operation and no later step awaits one; consent's
+`Login::discloses` marks root's own first step exactly when that
+step discloses, and the worker receives that description and must repeat
+it exactly. The step's rows end with the disclosure,
+`TOKEN-LOGIN.md`'s ("Enrollment, addition and removal") in rows that fit
+the narrowest prompt, then the approval rows in place of the generic
+Escape row. The compositor sends that step's presentation receipt,
+which carries the exact description, only once Enter approves it.
 
 **Requests.** `1d` asks for a rollback and `1e` selects the queued
 hostname request; neither takes an operand. Each answers `92` and the
@@ -2155,9 +2143,9 @@ refused owner reads no volume; request 19 on an installed system
 consults its `deploy-publish` row the same way and answers a miss with
 `99 02`, beside `99 00` (nothing ready or busy) and `99 01` (cannot read
 the login record). Presentation (`13`), then one commit (`14`), each with the
-exact description and so its key, follow within 120 seconds of selection
-and are answered `93` and `94`, as for request 19. The compositor sends
-commit only after the key is typed on the fully presented prompt. Root
+exact description, follow within 120 seconds of selection and are
+answered `93` and `94`, as for request 19. The compositor sends commit
+only after Enter approves the fully presented prompt. Root
 cannot observe those presses: it trusts the paired compositor for them,
 as it trusts that compositor's Enter for a live boot's disk review. Root
 rechecks the
@@ -2230,17 +2218,17 @@ td-authd never reboots.
 
 Host tests drive the table's grammar and file checks, the table's
 refusal before the selectors, both before a description, each `9d`
-answer, the key's digits, exact presentation before one commit, a pair
+answer, exact presentation before one commit, a pair
 moved after selection starting no helper, the helper's argv and its
 reaping; confinement pins hold the fixed argv, the empty environment,
 the second read and the selector reader's one use. `qemu-deploy-rollback`
 (an integration-tier oracle) boots the system image on a volume whose
-`current` and `previous` differ, reads the prompt and its key off the
-screen, shows that Enter and a wrong digit commit nothing and leave
+`current` and `previous` differ, reads the prompt off the screen, shows
+that a key other than Enter pressed first commits nothing and leaves
 both selectors, and that the control socket refuses key requests
 outright (input automation is off in production; the compositor's
-source pins hold that no injected digit reaches the prompt when it is
-on), types the key, and boots `previous` next.
+source pins hold that no injected press reaches the prompt when it is
+on), approves with Enter, and boots `previous` next.
 
 **`set-hostname` intake.** On an installed system Prepare binds
 `/run/td-authd/1000/hostname` beside the update intake, with the same
@@ -2287,7 +2275,7 @@ byte, with a deadline 180 seconds on, the request's selection and
 consent windows, plus the delay, and clears it only on approval. The
 bound is approximate: sending the admission byte, within the five-second
 admission, can start the selection window up to five seconds after the
-write. So however a request ends, declined, expired, a wrong key,
+write. So however a request ends, declined, expired, ended by a key,
 requester loss, a failure before its prompt, or a teardown or crash of
 the authority before or after selection, it has counted; a crash between
 the write and the admission byte counts a request the client never heard
@@ -2346,15 +2334,15 @@ admission and kept across a teardown before selection, a failed write
 refusing until one succeeds, a deadline cut to its bound, a malformed
 backoff refusing the intake and answering `1f`'s `02`, the table before
 any description and the
-requester before the old name is read, the key's digits, a wrong or
-missing key writing nothing, one commit writing once, and a saved name
+requester before the old name is read, a cancelled or uncommitted
+request writing nothing, one commit writing once, and a saved name
 changed since selection left alone; confinement pins hold the socket,
 greeting, write path and order, and that the intake spawns nothing and
 names no kernel hostname interface. `qemu-deploy-rollback` then, as UID
 1000, sees a malformed name refused, requests a name and sees a second
 request turned away while it waits, reads tag 12's old and new names
-and its key off the screen, types a wrong digit and sees the request
-end unwritten with the menu's count at 1 and a new request refused with
+off the screen, presses a key other than Enter first and sees the
+request end unwritten with the menu's count at 1 and a new request refused with
 `03`, reboots and sees the count survive. By the guest's clock it
 requires `03` for every request made before the 210 seconds from the
 first admission end, less a margin, and admission only after; when the
@@ -2557,10 +2545,10 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    enrollment 240. An operation that shows a disclosure (TOKEN-LOGIN.md
    increment 5's A4), every first enrollment and a removal leaving at
    most one key, adds a 120-second reading allowance, so reading it and
-   typing its approval key take nothing from the ceremonies: a one-key
-   enrollment and such a removal 240 seconds, a two-key enrollment 360.
-   The allowance is shared slack rather than reserved: a key typed at
-   once leaves the ceremonies the whole ceiling, and the slot may be held
+   approving it take nothing from the ceremonies: a one-key enrollment
+   and such a removal 240 seconds, a two-key enrollment 360. The
+   allowance is shared slack rather than reserved: an approval at once
+   leaves the ceremonies the whole ceiling, and the slot may be held
    that long, while each token session keeps its own bound.
    The ceiling is consent's `login_ceiling`, so root, the worker and the
    compositor's attempt lifetime agree. Root does not know a removal's
@@ -3051,8 +3039,8 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     each new key's connect, create, prove, repeat and probe, for an
     addition by the new key's, and for a removal by nothing, its last
     proof step being `Last`. An enrollment's first step is its proof's
-    first, which then carries the disclosure and its key, and no
-    connect does; a removal leaving one key discloses on its proof's
+    first, which then carries the disclosure and awaits approval, and
+    no connect does; a removal leaving one key discloses on its proof's
     first step. Tags 8 to 10 never carry a proof step, and 13 to 15
     never identify or authorize. Recovery key and disk authorize ask for
     a secret (`asks_pin`), the first the recovery key, the second the
@@ -3065,20 +3053,19 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     step's two rows. The widest such value, a removal of eight keys at
     its disk authorize step, is 99 bytes.
 
-    Tag 16 is the selector update: right after its tag byte the two-byte
-    approval key, as tags 5, 11 and 12 carry it, then one form byte, `1`
-    direct on a device-bound volume, `2` direct on a FIDO2-primary
-    volume or `3` staged on a TPM-primary volume, any other refused,
-    then the 64 lowercase hexadecimal bytes of the running deployment's
-    manifest ID, which is `current`'s: 112 bytes in all. It has one step
-    and no step byte: its description is presented once, its key typed
-    confirms that presentation, and it is `Last`. Its rows are `UPDATE
+    Tag 16 is the selector update: right after its tag byte one form
+    byte, `1` direct on a device-bound volume, `2` direct on a
+    FIDO2-primary volume or `3` staged on a TPM-primary volume, any
+    other refused, then the 64 lowercase hexadecimal bytes of the running
+    deployment's manifest ID, which is `current`'s: 110 bytes in all. It
+    has one step and no step byte: its description is presented once,
+    Enter approving that presentation, and it is `Last`. Its rows are `UPDATE
     THE BOOT SELECTOR ON DISK`, `FROM THE RUNNING SYSTEM` and the ID's
     rows as tag 5 shows them, then the form's two: `THE NEXT BOOT ASKS
     FOR THE DISK PIN` and `AND COMPLETES THE UPDATE` (3), `THE NEXT BOOT
     NEEDS THE RECOVERY KEY` and `AND A CONFIRMED RESEAL` (1), or `EVERY
     BOOT ASKS FOR A SECURITY KEY` and `AS IT DOES NOW` (2); then the
-    key's rows.
+    approval rows.
 
     Tag 17 is the upgrade. Right after its tag byte come the big-endian
     u32 account, which must equal the owner; the shape byte, `1` TPM
@@ -3088,13 +3075,13 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     carries it. Then the step: one key byte, `0` for the review and 1
     through the count for that new key's ceremony, the step byte and
     the step's fields. A new step joins the table above, review (12, no
-    fields), which ends with the two approval-key bytes; the key steps
+    fields), which awaits approval; the key steps
     are connect, create, prove, repeat and probe with their login
     fields. The only order is the review, then for each new key in turn
     its connect, create, prove, repeat and probe; the last step is the
     review when the count is 0 and the last key's probe otherwise, and a
     repeat or probe names the credential its prove named. The widest
-    value, a prove or repeat step, is 122 bytes, and the review 119. The
+    value, a prove or repeat step, is 122 bytes, and the review 117. The
     rows are `PROTECT THE DISK: TPM AND PIN` or `PROTECT THE DISK:
     SECURITY KEYS`, then `NEW RECOVERY KEYS: N` (TPM) or `NEW PRIMARY
     KEYS: N` (FIDO2), then the step's. The review's are the ID's rows
@@ -3107,7 +3094,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     PIN` (TPM) or `AND FOR THESE KEYS` (FIDO2), then for the FIDO2 shape
     its trade-offs, `AN ALTERED BOOT CAN TAKE THE DISK`, `FROM ONE USE
     OF A KEY AND PIN`, `WHILE A FIRMWARE TPM GUESS COUNT` and `CAN ROLL
-    BACK WITH ITS FLASH`, and last the approval key's rows. A key
+    BACK WITH ITS FLASH`, and last the approval rows. A key
     step's are a first enrollment's, `NEW KEY K OF N` and the step's own
     rows, but for the create step's `CREATE A DISK CREDENTIAL`, without
     the ID, which its bytes still bind and the review showed. Every row
@@ -3115,12 +3102,11 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     `PROMPT_COLUMNS`, and none uses an apostrophe or a parenthesis.
     Create, prove and repeat ask for the new key's PIN (`asks_pin`).
 
-    Tag 18 is the upgrade's cancellation: right after its tag byte the
-    two-byte approval key, 47 bytes in all, one step and no step byte,
-    `Last`, as tag 16's. Its rows are `CANCEL PROTECTING THE DISK`, `THE
+    Tag 18 is the upgrade's cancellation: nothing after its tag byte, 45
+    bytes in all, one step and no step byte, `Last`, as tag 16's. Its rows are `CANCEL PROTECTING THE DISK`, `THE
     NEXT BOOT MAY NEED` and `THE RECOVERY KEY AND A RESEAL`, since the
     selector phase 1 wrote may no longer match the device-bound seal,
-    then the key's rows.
+    then the approval rows.
 
     **Tags 19 to 24** are protector management's, one per operation
     byte:
@@ -3186,7 +3172,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     | --- | --- | --- |
     | 19 | the proof steps, then the new key's connect, create, prove, repeat and probe | probe |
     | 20 | choose, then the proof steps | the last proof step |
-    | 21 | disk identify, which carries the disclosure and ends with the two approval-key bytes after the step's fields, as a login disclosure step does; then disk authorize | disk authorize |
+    | 21 | disk identify, which carries the disclosure and awaits approval, as a login disclosure step does; then disk authorize | disk authorize |
     | 22 to 24 | the proof steps | the last proof step |
 
     **Widest values.**
@@ -3197,7 +3183,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     | 20 | disk authorize, with four tokens | 81 |
     | 20 | choose, with four tokens | 76 |
     | 21 | disk authorize | 55 |
-    | 21 | disk identify | 52 |
+    | 21 | disk identify | 50 |
     | 22 to 24 | disk authorize | 57 |
 
     **Rows.** A description shows, in order: the operation's rows below;
@@ -3207,7 +3193,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     proof step and tag 17 a new key's step, with `CREATE A DISK
     CREDENTIAL` at create; tag 19's connect step after a disk key's
     proof first shows `REMOVE THE AUTHORIZING KEY`, as tag 14's does.
-    Last, tag 21's identify step shows the approval key's rows. Every
+    Last, tag 21's identify step shows the approval rows. Every
     row is within `PROMPT_COLUMNS` and uses no apostrophe, comma or
     parenthesis. The one exception is a PIN step's fixed row `ENTER ITS
     PIN, THEN TOUCH THE KEY`.
@@ -3216,7 +3202,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     | --- | --- |
     | 19 | `ADD A DISK SECURITY KEY`; `AS A PRIMARY KEY` or `AS A RECOVERY KEY` |
     | 20 | `REMOVE A DISK SECURITY KEY`; at the choose step, the list below; at every later step, the chosen token as `REMOVES 2: RECOVERY KEY 1a2b3c4d` (its position, role and fingerprint, since two tokens may share a fingerprint) |
-    | 21 | `REMOVE THE DISK RECOVERY KEY`; at its identify step, the disclosure `AFTER THIS ONLY THE SECURITY KEYS`, `ON THE DISK CAN OPEN IT` and `LOSING THEM ALL LOSES THE DATA`; the approval key's rows come last, after the step's |
+    | 21 | `REMOVE THE DISK RECOVERY KEY`; at its identify step, the disclosure `AFTER THIS ONLY THE SECURITY KEYS`, `ON THE DISK CAN OPEN IT` and `LOSING THEM ALL LOSES THE DATA`; the approval rows come last, after the step's |
     | 22 | `REQUEST A DISK PIN CHANGE`, `THE NEXT BOOT BY THE PIN`, `ASKS FOR A NEW PIN` |
     | 23 | `REQUEST A TPM CLEAR`, `THE NEXT BOOT ASKS TO CLEAR`, `THE TPM AND ALL ITS KEYS`, `BOOTS AFTER NEED A SECURITY KEY`, `OR THE RECOVERY KEY` (the two boots that take the lockout and offer the reseal) |
     | 24 | `REQUEST TPM RE-ENROLLMENT`, `THE NEXT BOOT BY A SECURITY KEY`, `OR RECOVERY KEY ASKS TO RE-ENROLL` |
@@ -3243,17 +3229,17 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     the direct form itself, and `22` for a running deployment that is
     not an acknowledged `current` with no pending attempt. An
     unencrypted volume takes no selector update: none of ENCRYPTION.md's
-    forms names one. Otherwise it draws the approval
-    key and sends tag 16's description; the worker repeats it as its one
-    step, which root presents (`91 04`) and acknowledges once the
-    compositor's receipt arrives, sent only after the key is typed; then
+    forms names one. Otherwise it sends tag 16's description; the worker
+    repeats it as its one step, which root presents (`91 04`) and
+    acknowledges once the compositor's receipt arrives, sent only after
+    Enter approves it; then
     the commit round, in which the worker stages or writes the pair
     (ENCRYPTION.md, "Selector update"). Its ceiling is 240 seconds,
-    fixed at the selection: 120 for the worker's reads and the key, which
+    fixed at the selection: 120 for the worker's reads and the approval, which
     the worker presents only once its reads are done, and 120 for the
     writes, which the worker begins only with 120 seconds of its
     deadline left (its commit margin). Root enforces only the whole 240
-    seconds, accepting the typed key's receipt until then; the split is
+    seconds, accepting the approved receipt until then; the split is
     the worker's, which answers a receipt with under 120 seconds left
     with `08` before its commit invitation. After root's `13` an outcome
     other than `14` and a successful exit is uncertain (`91 0e`), as a
@@ -3277,10 +3263,10 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     encrypted td volume or a refused header, `21` for any other state)
     and an acknowledged `current` with no pending attempt (`22`); root
     ends the operation with that kind before any description. It then
-    draws the approval key and sends tag 17's review; the worker repeats
-    it, after its reads, as its first `10`, which root presents (`91
-    04`) and acknowledges once the compositor's receipt arrives, sent
-    only after the key is typed. The worker's reads may end it first,
+    sends tag 17's review; the worker repeats it, after its reads, as its
+    first `10`, which root presents (`91 04`) and acknowledges once the
+    compositor's receipt arrives, sent only after Enter approves it.
+    The worker's reads may end it first,
     with `20`, `21`, `23`, `24`, `28` for a header that is not the one
     its baseline read, definite since nothing is written, or, for the
     TPM shape, `27`, which root forwards as it forwards a selector
@@ -3305,8 +3291,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 
     **The cancellation.** `20 03` takes no operand. Root starts the
     storage worker, whose baseline must show an upgrading volume (`20`
-    as above, `21` for any other state), draws the approval key and
-    sends tag 18; the worker repeats it once its read of the header
+    as above, `21` for any other state), and sends tag 18; the worker repeats it once its read of the header
     finds the upgrade cancellable, still in state U0 (`21` otherwise,
     `20` for a header gone or refused, or `28`, definite, for one that
     is not the baseline's), which root forwards, and the presentation,
@@ -3335,8 +3320,8 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 
     Otherwise root builds the first description from the baseline: the
     proof's first step, the choose step for a removal, or tag 21's
-    identify step with an approval key root draws, as for a login
-    disclosure. Consent's `Protected` holds the baseline's protected
+    identify step, awaiting approval as a login disclosure does.
+    Consent's `Protected` holds the baseline's protected
     volume:
     `refusal` gives the detail, `first` the description, and `admits`
     is the worker's check that root's description is that one. The
@@ -3514,7 +3499,7 @@ operations, within three seconds of the invitation against the
 worker's five. A disclosure step (TOKEN-LOGIN.md increment
 5's A4) is the exception: root waits for the compositor's `13`, and the
 worker for root's `11`, until the operation's deadline, since no token
-I/O is open while the person reads and types the key. A disclosure
+I/O is open while the person reads and approves. A disclosure
 step's `13` that arrives at or after root's deadline ends the operation
 as TIMEOUT, and the generation continues, as a late `1c` does; one for
 an operation that has already ended is answered and dropped, as such a

@@ -41,10 +41,8 @@ pub(crate) fn remove_by(proof: Proof, step: LoginStep) -> Operation {
             key: B,
         }],
         step,
-        approval: None,
         proof: Some(proof),
     }
-    .disclosed(crate::login::tests::approval())
 }
 
 pub(crate) fn described(operation: Operation) -> Request {
@@ -64,12 +62,10 @@ fn start(
     login: &'static str,
     storage: &'static str,
 ) -> Proving {
-    let approval = crate::login::tests::approval();
     Proving::begin(1000, NONCE, protected, selection, |owner, selection| {
         Login::spawn(
             owner,
             NONCE,
-            approval,
             selection,
             true,
             crate::login::tests::fixture(login),
@@ -164,7 +160,7 @@ fn a_disk_key_removal_commits_over_its_authorize_step() {
     ));
     let identify = described(remove_by(Proof::DiskKey, LoginStep::DiskIdentify));
     // The first step carries the disclosure's key.
-    assert!(identify.login_approval().is_some());
+    assert!(identify.awaits_approval());
     assert_eq!(presented, [identify, authorize.clone()]);
     assert_eq!(proving.request(), Some(&authorize));
 }

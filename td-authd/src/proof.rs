@@ -50,10 +50,10 @@ impl Proving {
     /// is set decodes. On a machine that is not protected it ends as `86`
     /// before any worker starts.
     pub fn start(owner: u32, selection: Selection) -> Result<Self, String> {
-        let (nonce, approval) = login::draw()?;
+        let nonce = login::draw()?;
         let protected = login::protected(Path::new("/"), Owner::ROOT);
         Self::begin(owner, nonce, protected, selection, |owner, selection| {
-            Login::begin_with(owner, nonce, approval, selection, true)
+            Login::begin_with(owner, nonce, selection, true)
         })
         .map(|proving| proving.storage_with(Box::new(Storage::start_proof)))
     }

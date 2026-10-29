@@ -4,7 +4,7 @@
 //! key; after the person's commit root saves the new name canonically.
 
 use crate::backoff::{self, Backoff, Entry, Refused, Row, BACKING_OFF, REFUSED};
-use crate::consent::{ApprovalKey, Operation, Request};
+use crate::consent::{Operation, Request};
 use crate::deployment::{bind_intake, unlink_intake};
 use crate::elevation::{self, Table};
 use crate::hostname::Hostname;
@@ -558,11 +558,6 @@ pub(crate) fn request(name: &str) -> Result<(), String> {
     }
 }
 
-/// Each digit `2` plus its own random byte modulo 8, as the rollback's.
-fn approval_key(bytes: [u8; 2]) -> Result<ApprovalKey, String> {
-    ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))
-}
-
 pub(crate) struct Change {
     request: Request,
     saved: PathBuf,
@@ -575,18 +570,14 @@ pub(crate) struct Change {
 }
 
 impl Change {
-    /// Tag 12 for `ready` beside `old`, under a fresh nonce and approval
-    /// key, each drawn from `/dev/urandom`.
+    /// Tag 12 for `ready` beside `old`, under a fresh nonce drawn from
+    /// `/dev/urandom`.
     fn start(owner: u32, ready: Ready, old: Hostname, places: &Places) -> Result<Self, String> {
         let mut nonce = [0; 32];
-        let mut key = [0; 2];
         File::open("/dev/urandom")
-            .and_then(|mut random| {
-                random.read_exact(&mut nonce)?;
-                random.read_exact(&mut key)
-            })
-            .map_err(|e| format!("draw the hostname change's nonce and key: {e}"))?;
-        Self::drawn(owner, ready, old, places, nonce, key)
+            .and_then(|mut random| random.read_exact(&mut nonce))
+            .map_err(|e| format!("draw the hostname change's nonce: {e}"))?;
+        Self::drawn(owner, ready, old, places, nonce)
     }
 
     fn drawn(
@@ -595,13 +586,11 @@ impl Change {
         old: Hostname,
         places: &Places,
         nonce: [u8; 32],
-        key: [u8; 2],
     ) -> Result<Self, String> {
         let request = Request::new(
             nonce,
             owner,
             Operation::SetHostname {
-                key: approval_key(key)?,
                 requester: ready.requester,
                 old: old.name().into(),
                 new: ready.name.name().into(),

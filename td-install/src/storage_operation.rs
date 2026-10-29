@@ -7,7 +7,7 @@
 //! in production runs it.
 //!
 //! The worker reads everything an update needs before it presents the
-//! description, so the approval key's time holds no I/O, and after root's
+//! description, so the approval's time holds no I/O, and after root's
 //! commit acknowledgement it re-reads the header, the deployment's
 //! standing and the ESP's `EFI/BOOT` sector before its first write: a
 //! change there is `28`, definite because nothing was written, and the
@@ -611,9 +611,7 @@ fn perform<H: Host, K: Keys>(
         Operation::Upgrade { .. } => {
             return operation.upgrade(wire, host, keys, started, margin, prepare, entropy)
         }
-        Operation::UpgradeCancel { .. } => {
-            return operation.cancel(wire, host, started, margin, entropy)
-        }
+        Operation::UpgradeCancel => return operation.cancel(wire, host, started, margin, entropy),
         Operation::ProtectorAdd { .. }
         | Operation::ProtectorRemove { .. }
         | Operation::RecoveryRemove { .. }
@@ -1030,7 +1028,6 @@ impl Ceremony<'_> {
                         key: self.key,
                         step,
                     },
-                    approval: None,
                 },
             )
             .map_err(|_| Failure::Internal)?,
@@ -1133,8 +1130,8 @@ impl Proved<'_> {
             .map_err(|_| Failure::Internal)?;
         let ceiling = self.request.login_ceiling().ok_or(Failure::Internal)?;
         wire.limit(started.checked_add(ceiling).ok_or(Failure::Internal)?);
-        // A disclosure's approval key is typed before root acknowledges.
-        let wait = self.request.login_approval().map(|_| wire.bound());
+        // A disclosure is approved with Enter before root acknowledges.
+        let wait = self.request.awaits_approval().then(|| wire.bound());
         let round = entropy().map_err(|_| Failure::Internal)?;
         wire.exchange(PRESENT, PRESENTED, round, &self.request.encode(), wait)
             .map_err(|_| framing(wire))?;
@@ -1341,8 +1338,8 @@ impl Managed<'_> {
             recovery_key: protected.marker,
             tokens: &fingerprints,
         };
-        // A disclosure's approval key is typed before root acknowledges.
-        let wait = self.request.protector_approval().map(|_| wire.bound());
+        // A disclosure is approved with Enter before root acknowledges.
+        let wait = self.request.awaits_approval().then(|| wire.bound());
         let round = entropy().map_err(|_| Failure::Internal)?;
         wire.exchange(PRESENT, PRESENTED, round, &self.request.encode(), wait)
             .map_err(|_| framing(wire))?;
@@ -1738,11 +1735,7 @@ fn stepped(request: &Request, step: LoginStep) -> Result<Request, Failure> {
             removal,
             step,
         },
-        Operation::RecoveryRemove { account, .. } => Operation::RecoveryRemove {
-            account,
-            step,
-            approval: None,
-        },
+        Operation::RecoveryRemove { account, .. } => Operation::RecoveryRemove { account, step },
         Operation::ProtectorRequest {
             account,
             proof,
@@ -1769,7 +1762,6 @@ fn stepped(request: &Request, step: LoginStep) -> Result<Request, Failure> {
             after,
             key,
             step,
-            approval: None,
             proof,
         },
         Operation::LoginAdd {
@@ -1798,7 +1790,6 @@ fn stepped(request: &Request, step: LoginStep) -> Result<Request, Failure> {
             after,
             removed,
             step,
-            approval: None,
             proof,
         },
         _ => return Err(Failure::Internal),
@@ -2660,7 +2651,6 @@ mod tests {
         clippy::panic
     )]
     use super::*;
-    use crate::consent::ApprovalKey;
     use std::cell::RefCell;
     use std::io::Write as _;
     use std::os::unix::net::UnixStream;
@@ -3224,7 +3214,6 @@ mod tests {
             NONCE,
             1000,
             Operation::SelectorUpdate {
-                key: ApprovalKey::new(*b"36").unwrap(),
                 form,
                 current: hex(id),
             },
@@ -3435,21 +3424,13 @@ mod tests {
                 count,
                 current: hex(&ID),
                 step: UpgradeStep::Review,
-                approval: Some(ApprovalKey::new(*b"47").unwrap()),
             },
         )
         .unwrap()
     }
 
     fn cancel_request() -> Request {
-        Request::new(
-            NONCE,
-            1000,
-            Operation::UpgradeCancel {
-                key: ApprovalKey::new(*b"47").unwrap(),
-            },
-        )
-        .unwrap()
+        Request::new(NONCE, 1000, Operation::UpgradeCancel).unwrap()
     }
 
     /// Runs `description` against `host` with `keys`, a PIN for each PIN
@@ -3669,7 +3650,6 @@ mod tests {
                     key: 1,
                     step: LoginStep::Connect,
                 },
-                approval: None,
             },
         )
         .unwrap();
@@ -3682,7 +3662,6 @@ mod tests {
                 count: 1,
                 current: hex(&[0xcd; 32]),
                 step: UpgradeStep::Review,
-                approval: Some(ApprovalKey::new(*b"47").unwrap()),
             },
         )
         .unwrap();
@@ -3960,7 +3939,6 @@ mod tests {
             NONCE,
             1001,
             Operation::SelectorUpdate {
-                key: ApprovalKey::new(*b"36").unwrap(),
                 form: SelectorForm::Staged,
                 current: hex(&ID),
             },
@@ -3988,7 +3966,7 @@ mod tests {
                 Some(ID),
                 update(SelectorForm::Staged, &ID).encode(),
             ),
-            (tpm_header(), Some(ID), b"TDCONS01".to_vec()),
+            (tpm_header(), Some(ID), b"TDCONS02".to_vec()),
         ] {
             let mut host = Fake::new(Some(Ok(read)));
             host.standings = vec![standing];
@@ -4932,7 +4910,6 @@ mod tests {
         let first = managed(Operation::RecoveryRemove {
             account: 1000,
             step: LoginStep::DiskIdentify,
-            approval: Some(ApprovalKey::new(*b"47").unwrap()),
         });
         let mut keys = Scripted::selecting(0);
         let run = manage_run(fido_host(), &mut keys, &first, vec![b"1234".to_vec()]);
@@ -5001,7 +4978,6 @@ mod tests {
         let fido_removal = managed(Operation::RecoveryRemove {
             account: 1000,
             step: LoginStep::DiskIdentify,
-            approval: Some(ApprovalKey::new(*b"47").unwrap()),
         });
         for (read, request) in [
             (tpm_protected(false), primary),

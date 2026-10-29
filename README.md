@@ -167,8 +167,8 @@ The updater builds the recipe graph with the installed toolchain and the
 pinned Debian build root. The first build fetches declared sources and
 builds the graph locally; later builds reuse local outputs. When
 installation is requested, press Ctrl+Alt+Escape, then I. Review the
-deployment ID and type the two digits the prompt shows to approve, or press
-Escape to cancel; Enter does not approve. A request left unapproved makes
+deployment ID and press Enter to approve, or Escape to cancel; any other
+key pressed first also cancels. A request left unapproved makes
 the next wait, longer each time. The authorized operation verifies and
 installs the successor. Restart explicitly to boot it; the previous
 deployment remains available for recovery. Use `./update build` to stop

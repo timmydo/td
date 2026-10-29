@@ -525,10 +525,9 @@ impl Guest {
     }
 
     /// Ctrl+Alt+Esc, the menu, and `B`: the rollback prompt for exactly
-    /// this pair, and the key it shows. A busy slot, which a request that
-    /// just ended holds until its end is delivered, is closed and asked
-    /// again.
-    fn rollback_prompt(&mut self, path: &Path, current: &str, previous: &str) -> Result<[u8; 2]> {
+    /// this pair, asking for Enter. A busy slot, which a request that just
+    /// ended holds until its end is delivered, is closed and asked again.
+    fn rollback_prompt(&mut self, path: &Path, current: &str, previous: &str) -> Result<()> {
         for _ in 0..20 {
             self.key(&["ctrl", "alt", "esc"])?;
             let end = self.exchange_deadline()?;
@@ -540,15 +539,15 @@ impl Guest {
                 |pixels| menu_pixels_match(pixels),
             )?;
             self.key(&["b"])?;
-            let mut key = None;
+            let mut shown = false;
             let mut busy = false;
             self.screen_until(path, Duration::from_secs(20), "rollback prompt", |pixels| {
-                key = rollback_prompt_key(pixels, current, previous)?;
+                shown = rollback_prompt_shown(pixels, current, previous)?;
                 busy = menu_row_matches(pixels, 312, BUSY_NOTICE)?;
-                Ok(key.is_some() || busy)
+                Ok(shown || busy)
             })?;
-            if let Some(key) = key {
-                return Ok(key);
+            if shown {
+                return Ok(());
             }
             self.key(&["esc"])?;
             thread::sleep(Duration::from_secs(2));
@@ -584,7 +583,11 @@ impl Guest {
                     Ok(menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?
                         && menu_row_matches(pixels, 564, "B: ROLL BACK TO THE PREVIOUS SYSTEM")?
                         && menu_row_matches(pixels, HOSTNAME_ROW + 36, "S: DISK ENCRYPTION")?
-                        && menu_row_matches(pixels, HOSTNAME_ROW + 72, "F: RESTART  P: POWER OFF")?
+                        && menu_row_matches(
+                            pixels,
+                            HOSTNAME_ROW + 72,
+                            "F: RESTART  P: POWER OFF  Z: SLEEP",
+                        )?
                         && menu_row_matches(pixels, HOSTNAME_ROW + 108, "ESC TO RETURN")?)
                 },
             )?;
@@ -598,27 +601,21 @@ impl Guest {
     }
 
     /// The menu showing a waiting change, and `H`: the prompt for exactly
-    /// this change, and its key. A slot still held by a request that just
-    /// ended answers `9e 00`, which is closed and asked again.
-    fn hostname_prompt(
-        &mut self,
-        path: &Path,
-        old: &str,
-        new: &str,
-        denied: u8,
-    ) -> Result<[u8; 2]> {
+    /// this change, asking for Enter. A slot still held by a request that
+    /// just ended answers `9e 00`, which is closed and asked again.
+    fn hostname_prompt(&mut self, path: &Path, old: &str, new: &str, denied: u8) -> Result<()> {
         for _ in 0..20 {
             self.hostname_menu(path, &hostname_row(HOSTNAME_WAITING, denied))?;
             self.key(&["h"])?;
-            let mut key = None;
+            let mut shown = false;
             let mut none = false;
             self.screen_until(path, Duration::from_secs(20), "hostname prompt", |pixels| {
-                key = hostname_prompt_key(pixels, old, new)?;
+                shown = hostname_prompt_shown(pixels, old, new)?;
                 none = menu_row_matches(pixels, 312, NO_HOSTNAME_NOTICE)?;
-                Ok(key.is_some() || none)
+                Ok(shown || none)
             })?;
-            if let Some(key) = key {
-                return Ok(key);
+            if shown {
+                return Ok(());
             }
             self.key(&["esc"])?;
             thread::sleep(Duration::from_secs(2));
@@ -679,19 +676,18 @@ impl Guest {
         }
     }
 
-    /// For two seconds every capture is still the prompt with `key`.
+    /// For two seconds every capture is still the prompt for this pair.
     fn hold_rollback_prompt(
         &mut self,
         path: &Path,
         current: &str,
         previous: &str,
-        key: [u8; 2],
         after: &str,
     ) -> Result<()> {
         let end = Instant::now() + Duration::from_secs(2);
         let mut left = false;
         self.screen_until(path, Duration::from_secs(4), after, |pixels| {
-            left = rollback_prompt_key(pixels, current, previous)? != Some(key);
+            left = !rollback_prompt_shown(pixels, current, previous)?;
             Ok(left || Instant::now() >= end)
         })?;
         if left {
@@ -733,8 +729,8 @@ impl Guest {
     }
 
     /// Ctrl+Alt+Esc, the menu, and `I`: the installation prompt for
-    /// exactly deployment `id`, and the approval key it shows.
-    fn prompt(&mut self, id: &str, path: &Path) -> Result<[u8; 2]> {
+    /// exactly deployment `id`, asking for Enter.
+    fn prompt(&mut self, id: &str, path: &Path) -> Result<()> {
         self.key(&["ctrl", "alt", "esc"])?;
         let end = self.deadline.min(Instant::now() + Duration::from_secs(20));
         let exchange = self.exchange_deadline()?;
@@ -760,38 +756,30 @@ impl Guest {
             thread::sleep(Duration::from_millis(100));
         }
         self.key(&["i"])?;
-        let mut key = None;
         self.screen_until(
             path,
             Duration::from_secs(20),
             "the full expected installation prompt",
-            |pixels| {
-                key = install_prompt_key(pixels, id)?;
-                Ok(key.is_some())
-            },
-        )?;
-        key.ok_or_else(|| "the installation prompt showed no key".into())
+            |pixels| install_prompt_shown(pixels, id),
+        )
+        .map(drop)
     }
 
-    /// For two seconds every capture is still the installation prompt for
-    /// `id` with `key`.
-    fn hold_install_prompt(
-        &mut self,
-        path: &Path,
-        id: &str,
-        key: [u8; 2],
-        after: &str,
-    ) -> Result<()> {
-        let end = Instant::now() + Duration::from_secs(2);
-        let mut left = false;
-        self.screen_until(path, Duration::from_secs(4), after, |pixels| {
-            left = install_prompt_key(pixels, id)? != Some(key);
-            Ok(left || Instant::now() >= end)
-        })?;
-        if left {
-            return Err(format!("the installation prompt left after {after}"));
-        }
-        Ok(())
+    /// Approve the prompt on screen: a plain Enter, once the compositor's
+    /// settle has passed (td-compositor/DESIGN.md, "Elevation consent").
+    /// The prompt was presented before the capture that showed it, so
+    /// waiting `APPROVAL_WAIT` from here is past the settle.
+    fn approve(&mut self) -> Result<()> {
+        thread::sleep(APPROVAL_WAIT);
+        self.key(&["ret"])
+    }
+
+    /// A letter on a prompt that awaits approval, once the prompt has been
+    /// on glass long enough that the press is stamped after it: it ends
+    /// the request.
+    fn decline(&mut self) -> Result<()> {
+        thread::sleep(APPROVAL_WAIT);
+        self.key(&[OTHER_KEY])
     }
 }
 
@@ -849,9 +837,9 @@ const EDGE: u64 = 10;
 /// The first `set-hostname` phase (td-authd/DESIGN.md, "Elevation
 /// operations"), as UID 1000 on a guest named `old`: a malformed name is
 /// refused by the client; a request waits and a second is turned away
-/// while it does; `H` shows tag 12 with both names and the key; a wrong
-/// digit ends it unwritten, the menu's count reads 1, and the backoff
-/// refuses a new request at once. The guest's clock just after the first
+/// while it does; `H` shows tag 12 with both names asking for Enter; a
+/// letter pressed first ends it unwritten, the menu's count reads 1, and
+/// the backoff refuses a new request at once. The guest's clock just after the first
 /// admission, from which the refusal runs.
 fn hostname_denied(guest: &mut Guest, work: &Path, old: &str) -> Result<u64> {
     let capture = work.join("hostname.ppm");
@@ -878,20 +866,15 @@ fn hostname_denied(guest: &mut Guest, work: &Path, old: &str) -> Result<u64> {
         }
         Requested::Waiting(_) => return Err("a second request was admitted while one waits".into()),
     }
-    let key = guest.hostname_prompt(&capture, old, NEW_HOSTNAME, 0)?;
-    println!(
-        "[qemu-deploy-rollback] H shows tag 12 for {old} to {NEW_HOSTNAME}; key {}",
-        String::from_utf8_lossy(&key)
-    );
-    let [first_digit, _] = key;
-    let (wrong, _) = digit_key(other_digit(first_digit))?;
-    guest.key(&[wrong])?;
+    guest.hostname_prompt(&capture, old, NEW_HOSTNAME, 0)?;
+    println!("[qemu-deploy-rollback] H shows tag 12 for {old} to {NEW_HOSTNAME}, asking for Enter");
+    guest.decline()?;
     guest.screen_until(
         &capture,
         Duration::from_secs(20),
-        "the end of a wrong key's hostname request",
+        "the end of a hostname request a letter answered",
         |pixels| {
-            Ok(hostname_prompt_key(pixels, old, NEW_HOSTNAME)?.is_none()
+            Ok(!hostname_prompt_shown(pixels, old, NEW_HOSTNAME)?
                 && !row_matches(pixels, HOSTNAME_TOP, "TD SECURE ATTENTION")?)
         },
     )?;
@@ -902,11 +885,11 @@ fn hostname_denied(guest: &mut Guest, work: &Path, old: &str) -> Result<u64> {
             .any(|line| line.contains("declined, expired or failed"))
     {
         return Err(format!(
-            "the wrong key's client did not report failure: {lines:?}"
+            "the client a letter answered did not report failure: {lines:?}"
         ));
     }
     if names(guest)? != (old.to_string(), old.to_string()) {
-        return Err("a wrong digit changed the hostname".into());
+        return Err("a letter pressed first changed the hostname".into());
     }
     guest.hostname_menu(&capture, &hostname_row(HOSTNAME_EMPTY, 1))?;
     guest.key(&["esc"])?;
@@ -915,8 +898,8 @@ fn hostname_denied(guest: &mut Guest, work: &Path, old: &str) -> Result<u64> {
         _ => return Err("the backoff did not refuse a request within its window".into()),
     }
     println!(
-        "[qemu-deploy-rollback] a wrong digit ended the hostname request unwritten; \
-         the count reads 1 and the backoff refused the next request"
+        "[qemu-deploy-rollback] a letter pressed first ended the hostname request \
+         unwritten; the count reads 1 and the backoff refused the next request"
     );
     Ok(admitted)
 }
@@ -928,7 +911,7 @@ fn hostname_denied(guest: &mut Guest, work: &Path, old: &str) -> Result<u64> {
 /// off, root's own reason, and none after it; the first is required to
 /// come inside it, so at least one is refused, and a reboot that outlasts
 /// the window fails as a slow boot rather than as a missing refusal. The
-/// admitted request's key, typed, saves the name, which `/etc/hostname`
+/// admitted request, approved by Enter, saves the name, which `/etc/hostname`
 /// reads at once while the kernel keeps `old`, and clears the count.
 fn hostname_approved(guest: &mut Guest, work: &Path, old: &str, admitted: u64) -> Result<()> {
     let capture = work.join("hostname.ppm");
@@ -967,11 +950,8 @@ fn hostname_approved(guest: &mut Guest, work: &Path, old: &str, admitted: u64) -
         }
     };
     println!("[qemu-deploy-rollback] the backoff refused {refused} requests after the reboot");
-    let key = guest.hostname_prompt(&capture, old, NEW_HOSTNAME, 1)?;
-    for digit in key {
-        let (name, _) = digit_key(digit)?;
-        guest.key(&[name])?;
-    }
+    guest.hostname_prompt(&capture, old, NEW_HOSTNAME, 1)?;
+    guest.approve()?;
     guest.screen_until(
         &capture,
         Duration::from_secs(60),
@@ -995,10 +975,7 @@ fn hostname_approved(guest: &mut Guest, work: &Path, old: &str, admitted: u64) -
     }
     guest.hostname_menu(&capture, HOSTNAME_EMPTY)?;
     guest.key(&["esc"])?;
-    println!(
-        "[qemu-deploy-rollback] the typed key {} saved {NEW_HOSTNAME} and cleared the count",
-        String::from_utf8_lossy(&key)
-    );
+    println!("[qemu-deploy-rollback] Enter saved {NEW_HOSTNAME} and cleared the count");
     Ok(())
 }
 
@@ -1060,6 +1037,15 @@ const INSTALL_TOP: usize = 224;
 /// running.
 const UPDATE_BACKING_OFF: &str = "the installation queue is backing off after unapproved requests";
 const PROMPT_PITCH: usize = 40;
+/// The row every prompt that awaits approval shows above Escape's
+/// (td-authd/src/consent.rs `APPROVE_ROW`).
+pub(super) const APPROVE_ROW: &str = "ENTER: APPROVE";
+/// How long after a prompt shows before its approving Enter: the
+/// compositor's 500 ms settle, and margin for the capture that showed it.
+const APPROVAL_WAIT: Duration = Duration::from_millis(700);
+/// The key pressed first to end a request: a letter, so neither Enter nor
+/// Escape, and no selection key on any screen it reaches.
+const OTHER_KEY: &str = "q";
 const BUSY_NOTICE: &str = "PREVIOUS REQUEST IS STILL FINISHING";
 const ROLLED_BACK_NOTICE: &str = "ROLLED BACK - RESTART TO BOOT IT";
 /// The menu's `H` row, below `B` (td-compositor/DESIGN.md, "Elevation
@@ -1079,14 +1065,12 @@ const CLIENT_OUTPUT: &str = "/var/home/tester/td-hostname-request";
 /// The compositor's control socket, which answers `td-ctl` for the session.
 const CONTROL_SOCKET: &str = "/run/td-compositor/1000/td-control";
 
-/// Whether `pixels` are the rollback prompt for exactly this pair, and if
-/// so the approval key its key row shows: one of the 64 keys, or an error
-/// when the row matches more than one.
-fn rollback_prompt_key(pixels: &[u8], current: &str, previous: &str) -> Result<Option<[u8; 2]>> {
+/// Whether `pixels` are the rollback prompt for exactly this pair.
+fn rollback_prompt_shown(pixels: &[u8], current: &str, previous: &str) -> Result<bool> {
     if !canonical_id(current) || !canonical_id(previous) {
         return Err("invalid expected rollback pair".into());
     }
-    prompt_key(
+    prompt_shown(
         pixels,
         ROLLBACK_TOP,
         &[
@@ -1099,9 +1083,9 @@ fn rollback_prompt_key(pixels: &[u8], current: &str, previous: &str) -> Result<O
 }
 
 /// Whether `pixels` are the hostname prompt (tag 12) for exactly this
-/// change, and if so the approval key it shows.
-fn hostname_prompt_key(pixels: &[u8], old: &str, new: &str) -> Result<Option<[u8; 2]>> {
-    prompt_key(
+/// change.
+fn hostname_prompt_shown(pixels: &[u8], old: &str, new: &str) -> Result<bool> {
+    prompt_shown(
         pixels,
         HOSTNAME_TOP,
         &[
@@ -1115,12 +1099,12 @@ fn hostname_prompt_key(pixels: &[u8], old: &str, new: &str) -> Result<Option<[u8
 }
 
 /// Whether `pixels` are the installation prompt (tag 5) for exactly
-/// deployment `id`, and if so the approval key it shows.
-fn install_prompt_key(pixels: &[u8], id: &str) -> Result<Option<[u8; 2]>> {
+/// deployment `id`.
+fn install_prompt_shown(pixels: &[u8], id: &str) -> Result<bool> {
     if !canonical_id(id) {
         return Err("invalid expected deployment ID".into());
     }
-    prompt_key(
+    prompt_shown(
         pixels,
         INSTALL_TOP,
         &[
@@ -1133,58 +1117,19 @@ fn install_prompt_key(pixels: &[u8], id: &str) -> Result<Option<[u8; 2]>> {
 }
 
 /// An elevation prompt from `top`: the title, the session row, `rows`,
-/// the key row and Escape's; the time line below is not read. The key is
-/// one of the 64, or an error when the row matches more than one.
-fn prompt_key(pixels: &[u8], top: usize, rows: &[&str]) -> Result<Option<[u8; 2]>> {
-    let key_row = rows.len() + 2;
+/// Enter's row and Escape's; the time line below is not read.
+fn prompt_shown(pixels: &[u8], top: usize, rows: &[&str]) -> Result<bool> {
     for (row, text) in ["TD SECURE ATTENTION", "SESSION USER 1000"]
         .iter()
         .chain(rows)
+        .chain([&APPROVE_ROW, &"ESC: CANCEL"])
         .enumerate()
-        .chain(std::iter::once((key_row + 1, &"ESC: CANCEL")))
     {
         if !row_matches(pixels, top + row * PROMPT_PITCH, text)? {
-            return Ok(None);
+            return Ok(false);
         }
     }
-    let mut shown = None;
-    for first in b'2'..=b'9' {
-        for second in b'2'..=b'9' {
-            let text = format!(
-                "APPROVE: TYPE {} THEN {}",
-                char::from(first),
-                char::from(second)
-            );
-            if row_matches(pixels, top + key_row * PROMPT_PITCH, &text)?
-                && shown.replace([first, second]).is_some()
-            {
-                return Err("the prompt's key row matches two keys".into());
-            }
-        }
-    }
-    Ok(shown)
-}
-
-/// A digit's QMP key name and its evdev code (`KEY_2` is 3).
-fn digit_key(digit: u8) -> Result<(&'static str, u8)> {
-    const NAMES: &[&str] = &["2", "3", "4", "5", "6", "7", "8", "9"];
-    let index = digit
-        .checked_sub(b'2')
-        .filter(|index| *index < 8)
-        .ok_or("approval-key digits are 2 to 9")?;
-    let name = NAMES
-        .get(usize::from(index))
-        .ok_or("approval-key digits are 2 to 9")?;
-    Ok((name, index + 3))
-}
-
-/// A digit from 2 to 9 other than `digit`.
-fn other_digit(digit: u8) -> u8 {
-    if digit == b'2' {
-        b'3'
-    } else {
-        b'2'
-    }
+    Ok(true)
 }
 
 fn selectors(guest: &mut Guest) -> Result<(String, String)> {
@@ -1200,25 +1145,21 @@ fn unchanged(guest: &mut Guest, current: &str, previous: &str, after: &str) -> R
 
 /// The `deploy-rollback` phase (td-authd/DESIGN.md, "Elevation
 /// operations"): on a guest whose selectors name `current` and `previous`,
-/// the prompt names exactly that pair; Enter, the control socket's key
-/// requests (the right first digit, then a wrong one) and a physical wrong
-/// digit commit nothing and leave both selectors, the wrong digit ending
-/// the request; a new request's key, read off the screen and typed,
-/// makes `previous` current and shows the success screen.
+/// the prompt names exactly that pair and asks for Enter; the control
+/// socket's Enter and letter requests are refused and commit nothing; a
+/// letter pressed first ends the request and leaves both selectors; a new
+/// request, approved by Enter, makes `previous` current and shows the
+/// success screen.
 fn deploy_rollback(guest: &mut Guest, work: &Path, current: &str, previous: &str) -> Result<()> {
     let capture = work.join("rollback.ppm");
     unchanged(guest, current, previous, "the boot")?;
-    let key = guest.rollback_prompt(&capture, current, previous)?;
+    guest.rollback_prompt(&capture, current, previous)?;
     println!(
-        "[qemu-deploy-rollback] prompt names current {current} and previous {previous}; key {}",
-        String::from_utf8_lossy(&key)
+        "[qemu-deploy-rollback] prompt names current {current} and previous {previous}, \
+         asking for Enter"
     );
-    guest.key(&["ret"])?;
-    guest.hold_rollback_prompt(&capture, current, previous, key, "Enter")?;
-    unchanged(guest, current, previous, "Enter")?;
-    let [first, _] = key;
-    for digit in [first, other_digit(first)] {
-        let (_, code) = digit_key(digit)?;
+    // KEY_ENTER, then KEY_Q, as the control socket's key requests.
+    for code in [28, 16] {
         for state in ["down", "up"] {
             let answer = guest.scalar(
                 &format!(
@@ -1235,28 +1176,26 @@ fn deploy_rollback(guest: &mut Guest, work: &Path, current: &str, previous: &str
             }
         }
     }
-    guest.hold_rollback_prompt(&capture, current, previous, key, "injected digits")?;
-    unchanged(guest, current, previous, "injected digits")?;
-    println!("[qemu-deploy-rollback] Enter and injected digits left the prompt and both selectors");
-    let (wrong, _) = digit_key(other_digit(first))?;
-    guest.key(&[wrong])?;
+    guest.hold_rollback_prompt(&capture, current, previous, "injected keys")?;
+    unchanged(guest, current, previous, "injected keys")?;
+    println!("[qemu-deploy-rollback] injected Enter and letter left the prompt and both selectors");
+    guest.decline()?;
     guest.screen_until(
         &capture,
         Duration::from_secs(20),
-        "the end of a wrong key's request",
+        "the end of a request a letter answered",
         |pixels| {
-            Ok(rollback_prompt_key(pixels, current, previous)?.is_none()
+            Ok(!rollback_prompt_shown(pixels, current, previous)?
                 && !row_matches(pixels, ROLLBACK_TOP, "TD SECURE ATTENTION")?
                 && !menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?)
         },
     )?;
-    unchanged(guest, current, previous, "a wrong digit")?;
-    println!("[qemu-deploy-rollback] a wrong digit ended the request and left both selectors");
-    let key = guest.rollback_prompt(&capture, current, previous)?;
-    for digit in key {
-        let (name, _) = digit_key(digit)?;
-        guest.key(&[name])?;
-    }
+    unchanged(guest, current, previous, "a letter pressed first")?;
+    println!(
+        "[qemu-deploy-rollback] a letter pressed first ended the request and left both selectors"
+    );
+    guest.rollback_prompt(&capture, current, previous)?;
+    guest.approve()?;
     guest.screen_until(
         &capture,
         Duration::from_secs(60),
@@ -1269,10 +1208,7 @@ fn deploy_rollback(guest: &mut Guest, work: &Path, current: &str, previous: &str
     guest.key(&["esc"])?;
     unchanged(guest, previous, previous, "the approved rollback")
         .map_err(|_| "the approved rollback did not make previous current".to_string())?;
-    println!(
-        "[qemu-deploy-rollback] the typed key {} rolled back to {previous}",
-        String::from_utf8_lossy(&key)
-    );
+    println!("[qemu-deploy-rollback] Enter rolled back to {previous}");
     Ok(())
 }
 
@@ -1410,11 +1346,11 @@ pub(crate) fn run_deploy_rollback(runner: &crate::check_runner::RecipeCheckRunne
         return Err(error);
     }
     println!(
-        "[qemu-deploy-rollback] PASS (KVM): request 1d's prompt named the pair; Enter, \
-         control-socket digits and a wrong digit committed nothing; the typed key rolled \
+        "[qemu-deploy-rollback] PASS (KVM): request 1d's prompt named the pair; \
+         control-socket keys and a letter pressed first committed nothing; Enter rolled \
          back and the next boot selected {previous}; request 1e's prompt named both names, \
-         a wrong digit wrote nothing and counted, the backoff refused and survived a \
-         reboot, the typed key saved {NEW_HOSTNAME} and the next boot reported it"
+         a letter pressed first wrote nothing and counted, the backoff refused and \
+         survived a reboot, Enter saved {NEW_HOSTNAME} and the next boot reported it"
     );
     Ok(())
 }
@@ -1723,39 +1659,29 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
     if initial == successor {
         return Err("native update did not produce a distinct deployment".into());
     }
-    // Enter goes only to the attempt then cancelled: an Enter that
-    // committed would keep its prompt while the helper copies, but this
-    // attempt must still end unsuccessful, leave both selectors, and keep
-    // its backoff count, which only a commit clears and the refusal below
-    // needs.
+    // A letter pressed first ends the first attempt: it must end
+    // unsuccessful, leave both selectors, and keep its backoff count,
+    // which only a commit clears and the refusal below needs.
     let capture = options.work.join("cancel.ppm");
-    let key = guest.prompt(&successor, &capture)?;
-    println!(
-        "[qemu-update] prompt names {successor}; key {}",
-        String::from_utf8_lossy(&key)
-    );
-    guest.key(&["ret"])?;
-    guest.hold_install_prompt(&capture, &successor, key, "Enter")?;
-    guest.key(&["esc"])?;
+    guest.prompt(&successor, &capture)?;
+    println!("[qemu-update] prompt names {successor}, asking for Enter");
+    guest.decline()?;
     guest.update_done(1, false)?;
     if selector(&mut guest, "current")? != initial || selector(&mut guest, "previous")? != previous
     {
-        return Err("Enter and the cancellation changed the deployment selectors".into());
+        return Err("a letter pressed first changed the deployment selectors".into());
     }
     update_backoff(&mut guest, &successor, admitted)?;
     println!(
-        "[qemu-update] Enter installed nothing; the cancellation kept both selectors and the \
-         backoff count; requesting installation"
+        "[qemu-update] a letter pressed first installed nothing; the ended request kept both \
+         selectors and the backoff count; requesting installation"
     );
     if guest.update_ready(2)? != successor {
         return Err("unchanged checkout produced a different deployment".into());
     }
-    let key = guest.prompt(&successor, &options.work.join("install.ppm"))?;
-    println!("[qemu-update] typing key {}", String::from_utf8_lossy(&key));
-    for digit in key {
-        let (name, _) = digit_key(digit)?;
-        guest.key(&[name])?;
-    }
+    guest.prompt(&successor, &options.work.join("install.ppm"))?;
+    println!("[qemu-update] approving with Enter");
+    guest.approve()?;
     guest.update_done(2, true)?;
     if selector(&mut guest, "current")? != successor || selector(&mut guest, "previous")? != initial
     {
@@ -1778,11 +1704,11 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
     if options.rollback {
         rollback(&options, deadline, &initial, &successor, &source, &token)?;
     }
-    let report = format!("initial={initial}\nsuccessor={successor}\nsource={source}\ncancel_preserved_selectors=true\nbackoff_refused_within_window=true\nphysical_prompt_verified=true\nenter_refused=true\napproval_key_installed=true\ninstalled_and_booted=true\nuser_data_preserved=true\nautomatic_rollback_verified={}\naccelerator={}\n", options.rollback, options.accel);
+    let report = format!("initial={initial}\nsuccessor={successor}\nsource={source}\nletter_preserved_selectors=true\nbackoff_refused_within_window=true\nphysical_prompt_verified=true\nother_key_ended=true\nenter_installed=true\ninstalled_and_booted=true\nuser_data_preserved=true\nautomatic_rollback_verified={}\naccelerator={}\n", options.rollback, options.accel);
     private_file(&options.work.join("result.txt"))?
         .write_all(report.as_bytes())
         .map_err(|e| format!("write oracle result: {e}"))?;
-    println!("[qemu-update] PASS: native build, cancellation, backoff, Enter refused, key-confirmed installation, reboot and persistence");
+    println!("[qemu-update] PASS: native build, a letter ending the request, backoff, Enter-approved installation, reboot and persistence");
     Ok(())
 }
 
@@ -2094,9 +2020,9 @@ pub(super) fn menu_pixels_match(pixels: &[u8]) -> Result<bool> {
 }
 
 /// Whether a capture's pixels are the trusted installation prompt for
-/// deployment `id`, its approval key whichever of the 64 it shows.
+/// deployment `id`, asking for Enter.
 pub(super) fn prompt_pixels_match(pixels: &[u8], id: &str) -> Result<bool> {
-    Ok(install_prompt_key(pixels, id)?.is_some())
+    install_prompt_shown(pixels, id)
 }
 
 #[cfg(test)]
@@ -2252,10 +2178,7 @@ mod tests {
 
     /// The installation prompt as td-authd renders tag 5 and the
     /// compositor centres it with its time line.
-    fn install_rows(id: &str, key: &str) -> Vec<(usize, String)> {
-        let [first, second] = key.as_bytes() else {
-            panic!("a key is two digits");
-        };
+    fn install_rows(id: &str) -> Vec<(usize, String)> {
         [
             "TD SECURE ATTENTION".to_string(),
             "SESSION USER 1000".into(),
@@ -2263,11 +2186,7 @@ mod tests {
             format!("DEPLOYMENT: {id}"),
             "PREVIOUS SYSTEM KEPT FOR ROLLBACK".into(),
             "RESTART REQUIRED TO USE THIS SYSTEM".into(),
-            format!(
-                "APPROVE: TYPE {} THEN {}",
-                char::from(*first),
-                char::from(*second)
-            ),
+            APPROVE_ROW.into(),
             "ESC: CANCEL".into(),
             "TIME LEFT WHEN SHOWN: 120 S".into(),
         ]
@@ -2579,10 +2498,7 @@ mod tests {
 
     /// The rollback prompt as td-authd renders tag 11 and the compositor
     /// centres it with its time line.
-    fn rollback_rows(current: &str, previous: &str, key: &str) -> Vec<(usize, String)> {
-        let [first, second] = key.as_bytes() else {
-            panic!("a key is two digits");
-        };
+    fn rollback_rows(current: &str, previous: &str) -> Vec<(usize, String)> {
         [
             "TD SECURE ATTENTION".to_string(),
             "SESSION USER 1000".into(),
@@ -2590,11 +2506,7 @@ mod tests {
             format!("CURRENT: {current}"),
             format!("PREVIOUS: {previous}"),
             "TAKES EFFECT AT THE NEXT RESTART".into(),
-            format!(
-                "APPROVE: TYPE {} THEN {}",
-                char::from(*first),
-                char::from(*second)
-            ),
+            APPROVE_ROW.into(),
             "ESC: CANCEL".into(),
             "TIME LEFT WHEN SHOWN: 120 S".into(),
         ]
@@ -2605,57 +2517,36 @@ mod tests {
     }
 
     #[test]
-    fn the_rollback_prompt_is_read_for_its_pair_and_key() {
+    fn the_rollback_prompt_is_read_for_its_pair() {
         let (current, previous) = ("ab".repeat(32), "cd".repeat(32));
-        for key in ["47", "22", "99", "28", "83"] {
-            let pixels = unifont_pixels(&rollback_rows(&current, &previous, key));
-            assert_eq!(
-                rollback_prompt_key(&pixels, &current, &previous).unwrap(),
-                Some(<[u8; 2]>::try_from(key.as_bytes()).unwrap()),
-                "{key}"
-            );
-            // Another pair, or this one swapped, is not this prompt.
-            assert_eq!(
-                rollback_prompt_key(&pixels, &previous, &current).unwrap(),
-                None
-            );
-            assert_eq!(
-                rollback_prompt_key(&pixels, &current, &"ef".repeat(32)).unwrap(),
-                None
-            );
-        }
-        // Every row but the time line is required.
+        let pixels = unifont_pixels(&rollback_rows(&current, &previous));
+        assert!(rollback_prompt_shown(&pixels, &current, &previous).unwrap());
+        // Another pair, or this one swapped, is not this prompt.
+        assert!(!rollback_prompt_shown(&pixels, &previous, &current).unwrap());
+        assert!(!rollback_prompt_shown(&pixels, &current, &"ef".repeat(32)).unwrap());
+        // Every row but the time line is required, Enter's among them.
         for missing in 0..8 {
-            let mut rows = rollback_rows(&current, &previous, "47");
+            let mut rows = rollback_rows(&current, &previous);
             rows.remove(missing);
             let pixels = unifont_pixels(&rows);
-            assert_eq!(
-                rollback_prompt_key(&pixels, &current, &previous).unwrap(),
-                None,
+            assert!(
+                !rollback_prompt_shown(&pixels, &current, &previous).unwrap(),
                 "row {missing}"
             );
         }
-        // A digit outside the alphabet is no key.
-        let pixels = unifont_pixels(&rollback_rows(&current, &previous, "17"));
-        assert_eq!(
-            rollback_prompt_key(&pixels, &current, &previous).unwrap(),
-            None
-        );
+        // A prompt asking for a typed key is not this one.
+        let mut keyed = rollback_rows(&current, &previous);
+        keyed[6].1 = "APPROVE: TYPE 4 THEN 7".into();
+        assert!(!rollback_prompt_shown(&unifont_pixels(&keyed), &current, &previous).unwrap());
         // The installation prompt is not a rollback's.
-        let install = unifont_pixels(&install_rows(&current, "47"));
-        assert_eq!(
-            rollback_prompt_key(&install, &current, &previous).unwrap(),
-            None
-        );
-        assert!(rollback_prompt_key(&pixels, "AB", &previous).is_err());
+        let install = unifont_pixels(&install_rows(&current));
+        assert!(!rollback_prompt_shown(&install, &current, &previous).unwrap());
+        assert!(rollback_prompt_shown(&pixels, "AB", &previous).is_err());
     }
 
     /// The hostname prompt as td-authd renders tag 12 and the compositor
     /// centres it with its time line.
-    fn hostname_rows(old: &str, new: &str, key: &str) -> Vec<(usize, String)> {
-        let [first, second] = key.as_bytes() else {
-            panic!("a key is two digits");
-        };
+    fn hostname_rows(old: &str, new: &str) -> Vec<(usize, String)> {
         [
             "TD SECURE ATTENTION".to_string(),
             "SESSION USER 1000".into(),
@@ -2664,11 +2555,7 @@ mod tests {
             format!("OLD NAME: {old}"),
             format!("NEW NAME: {new}"),
             "A RESTART COMPLETES THE CHANGE".into(),
-            format!(
-                "APPROVE: TYPE {} THEN {}",
-                char::from(*first),
-                char::from(*second)
-            ),
+            APPROVE_ROW.into(),
             "ESC: CANCEL".into(),
             "TIME LEFT WHEN SHOWN: 120 S".into(),
         ]
@@ -2679,60 +2566,38 @@ mod tests {
     }
 
     #[test]
-    fn the_hostname_prompt_is_read_for_its_names_and_key() {
-        for key in ["47", "22", "99", "28"] {
-            let pixels = unifont_pixels(&hostname_rows("td", NEW_HOSTNAME, key));
-            assert_eq!(
-                hostname_prompt_key(&pixels, "td", NEW_HOSTNAME).unwrap(),
-                Some(<[u8; 2]>::try_from(key.as_bytes()).unwrap()),
-                "{key}"
-            );
-            // The names swapped, or another new name, are not this prompt.
-            assert_eq!(
-                hostname_prompt_key(&pixels, NEW_HOSTNAME, "td").unwrap(),
-                None
-            );
-            assert_eq!(
-                hostname_prompt_key(&pixels, "td", "td-other").unwrap(),
-                None
-            );
-        }
+    fn the_hostname_prompt_is_read_for_its_names() {
+        let pixels = unifont_pixels(&hostname_rows("td", NEW_HOSTNAME));
+        assert!(hostname_prompt_shown(&pixels, "td", NEW_HOSTNAME).unwrap());
+        // The names swapped, or another new name, are not this prompt.
+        assert!(!hostname_prompt_shown(&pixels, NEW_HOSTNAME, "td").unwrap());
+        assert!(!hostname_prompt_shown(&pixels, "td", "td-other").unwrap());
         for missing in 0..9 {
-            let mut rows = hostname_rows("td", NEW_HOSTNAME, "47");
+            let mut rows = hostname_rows("td", NEW_HOSTNAME);
             rows.remove(missing);
-            assert_eq!(
-                hostname_prompt_key(&unifont_pixels(&rows), "td", NEW_HOSTNAME).unwrap(),
-                None,
+            assert!(
+                !hostname_prompt_shown(&unifont_pixels(&rows), "td", NEW_HOSTNAME).unwrap(),
                 "row {missing}"
             );
         }
         // A rollback's prompt is not a hostname's, nor the reverse.
         let (current, previous) = ("ab".repeat(32), "cd".repeat(32));
-        let rollback = unifont_pixels(&rollback_rows(&current, &previous, "47"));
-        assert_eq!(
-            hostname_prompt_key(&rollback, "td", NEW_HOSTNAME).unwrap(),
-            None
-        );
-        let pixels = unifont_pixels(&hostname_rows("td", NEW_HOSTNAME, "47"));
-        assert_eq!(
-            rollback_prompt_key(&pixels, &current, &previous).unwrap(),
-            None
-        );
+        let rollback = unifont_pixels(&rollback_rows(&current, &previous));
+        assert!(!hostname_prompt_shown(&rollback, "td", NEW_HOSTNAME).unwrap());
+        assert!(!rollback_prompt_shown(&pixels, &current, &previous).unwrap());
     }
 
+    /// The key that ends a request is pressed through QMP as a letter:
+    /// neither Enter nor Escape, nor a selection key of the menu or
+    /// prompts it can reach.
     #[test]
-    fn approval_digits_are_typed_as_their_number_row_keys() {
-        for (digit, name, code) in [(b'2', "2", 3), (b'5', "5", 6), (b'9', "9", 10)] {
-            assert_eq!(digit_key(digit).unwrap(), (name, code));
+    fn the_ending_key_is_a_letter_no_screen_selects_with() {
+        assert_eq!(OTHER_KEY.len(), 1);
+        assert!(OTHER_KEY.bytes().all(|byte| byte.is_ascii_lowercase()));
+        for selection in ["i", "b", "h", "s", "f", "p", "l"] {
+            assert_ne!(OTHER_KEY, selection);
         }
-        for digit in [b'0', b'1', b':', b'a'] {
-            assert!(digit_key(digit).is_err());
-        }
-        for digit in b'2'..=b'9' {
-            let other = other_digit(digit);
-            assert_ne!(other, digit);
-            assert!(digit_key(other).is_ok());
-        }
+        assert!(APPROVAL_WAIT >= Duration::from_millis(600));
     }
 
     /// The rows read here are the ones td-authd and the compositor draw.
@@ -2744,7 +2609,7 @@ mod tests {
             "format!(\"CURRENT: {current}\")",
             "format!(\"PREVIOUS: {previous}\")",
             "\"TAKES EFFECT AT THE NEXT RESTART\"",
-            "\"APPROVE: TYPE {} THEN {}\"",
+            "pub const APPROVE_ROW: &str = \"ENTER: APPROVE\";",
             "\"ESC: CANCEL\"",
         ] {
             assert!(consent.contains(row), "{row}");
@@ -2850,36 +2715,26 @@ mod tests {
         assert!(menu_row_matches(&pixels, top, "a").is_err());
     }
 
-    /// The installation prompt (tag 5, since L5) is read for its full
-    /// deployment ID and its approval key, every row but the time line
-    /// required; L4's Enter row is no prompt at all.
+    /// The installation prompt (tag 5) is read for its full deployment ID
+    /// and Enter's row, every row but the time line required; the Enter
+    /// row of the prompt L4 showed is no prompt at all.
     #[test]
-    fn the_installation_prompt_is_read_for_its_id_and_key() {
+    fn the_installation_prompt_is_read_for_its_id() {
         let id = "ab".repeat(32);
-        for key in ["47", "22", "99", "58"] {
-            let pixels = unifont_pixels(&install_rows(&id, key));
-            assert_eq!(
-                install_prompt_key(&pixels, &id).unwrap(),
-                Some(<[u8; 2]>::try_from(key.as_bytes()).unwrap()),
-                "{key}"
-            );
-            assert!(prompt_pixels_match(&pixels, &id).unwrap());
-            assert_eq!(install_prompt_key(&pixels, &"cd".repeat(32)).unwrap(), None);
-        }
+        let pixels = unifont_pixels(&install_rows(&id));
+        assert!(install_prompt_shown(&pixels, &id).unwrap());
+        assert!(prompt_pixels_match(&pixels, &id).unwrap());
+        assert!(!install_prompt_shown(&pixels, &"cd".repeat(32)).unwrap());
         for missing in 0..8 {
-            let mut rows = install_rows(&id, "47");
+            let mut rows = install_rows(&id);
             rows.remove(missing);
-            assert_eq!(
-                install_prompt_key(&unifont_pixels(&rows), &id).unwrap(),
-                None,
+            assert!(
+                !install_prompt_shown(&unifont_pixels(&rows), &id).unwrap(),
                 "row {missing}"
             );
         }
-        let pixels = unifont_pixels(&install_rows(&id, "17"));
-        assert_eq!(install_prompt_key(&pixels, &id).unwrap(), None);
-        // The prompt Enter confirmed until L4: its last rows moved up one
-        // and carried no key.
-        let mut enter: Vec<(usize, String)> = install_rows(&id, "47")
+        // The prompt Enter confirmed until L4: its last rows moved up one.
+        let mut enter: Vec<(usize, String)> = install_rows(&id)
             .into_iter()
             .take(6)
             .map(|(top, text)| (top + 20, text))
@@ -2887,18 +2742,17 @@ mod tests {
         enter.push((484, "ENTER: INSTALL   ESC: CANCEL".into()));
         assert!(!prompt_pixels_match(&unifont_pixels(&enter), &id).unwrap());
         // A rollback's prompt is not an installation's.
-        let rollback = unifont_pixels(&rollback_rows(&id, &"cd".repeat(32), "47"));
-        assert_eq!(install_prompt_key(&rollback, &id).unwrap(), None);
-        assert!(install_prompt_key(&pixels, "AB").is_err());
+        let rollback = unifont_pixels(&rollback_rows(&id, &"cd".repeat(32)));
+        assert!(!install_prompt_shown(&rollback, &id).unwrap());
+        assert!(install_prompt_shown(&pixels, "AB").is_err());
     }
 
     /// qemu-update cannot run without an operator's installation, so its
-    /// order is pinned here: Enter reaches only the first attempt, which
-    /// must then end unsuccessful by Escape with both selectors and the
-    /// backoff's refusal intact; the second attempt is installed by its
-    /// key alone.
+    /// order is pinned here: a letter pressed first ends the first attempt
+    /// unsuccessful with both selectors and the backoff's refusal intact;
+    /// the second attempt is installed by Enter alone.
     #[test]
-    fn the_update_leg_sends_enter_only_to_the_cancelled_attempt() {
+    fn the_update_leg_ends_one_attempt_by_a_letter_and_approves_the_next() {
         let source = include_str!("update.rs");
         let run = source.split("\npub(crate) fn run_cli(").nth(1).unwrap();
         let run = run.split("\n}\n").next().unwrap();
@@ -2908,21 +2762,21 @@ mod tests {
         };
         let order = [
             "guest.update_ready(1)?",
-            "guest.key(&[\"ret\"])?;",
-            "guest.hold_install_prompt(&capture, &successor, key, \"Enter\")?;",
-            "guest.key(&[\"esc\"])?;",
+            "guest.decline()?;",
             "guest.update_done(1, false)?;",
-            "\"Enter and the cancellation changed the deployment selectors\"",
+            "\"a letter pressed first changed the deployment selectors\"",
             "update_backoff(&mut guest, &successor, admitted)?;",
             "guest.update_ready(2)?",
-            "for digit in key {",
+            "guest.approve()?;",
             "guest.update_done(2, true)?;",
         ];
         for pair in order.windows(2) {
             assert!(at(pair[0]) < at(pair[1]), "{} before {}", pair[0], pair[1]);
         }
-        assert!(run.contains("approval_key_installed=true"));
-        assert!(run.contains("enter_refused=true"));
+        assert!(run.contains("enter_installed=true"));
+        assert!(run.contains("other_key_ended=true"));
+        assert!(run.contains("letter_preserved_selectors=true"));
+        assert!(!run.contains("\"ret\""));
     }
 
     #[test]
@@ -2931,9 +2785,7 @@ mod tests {
         let path = std::env::var("TD_UPDATE_PROMPT_CAPTURE").unwrap();
         let id = std::env::var("TD_UPDATE_PROMPT_ID").unwrap();
         let bytes = read_capture(Path::new(&path)).unwrap();
-        assert!(install_prompt_key(ppm(&bytes).unwrap(), &id)
-            .unwrap()
-            .is_some());
+        assert!(install_prompt_shown(ppm(&bytes).unwrap(), &id).unwrap());
     }
 
     #[test]

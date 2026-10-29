@@ -421,10 +421,10 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        // Python hashlib over the literal domain and independently encoded TDCONS01.
+        // Python hashlib over the literal domain and independently encoded TDCONS02.
         assert_eq!(
             actual,
-            "2a71ece890ccff196c08b780f5f6de9943f23fee7496f80a58191f774ab081cb"
+            "52b881a027c30fdbecf87efdb794f01fed5b9ba6e079f0faaa530e89f0b1e541"
         );
         assert_ne!(
             challenge(&second.description(Enrollment::CreatePrimary).unwrap()),

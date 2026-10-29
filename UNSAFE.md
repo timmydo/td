@@ -1158,9 +1158,9 @@ and add no scoped allow. Source confinement pins the clock, operand widths,
 request, syscall, and caller modules. Input selects the clock; runtime
 orders its cutoff sample after ordinary-screen restoration, exercised by
 its transition tests. The presentation sample bounds a disk installation's
-Enter confirmation and every approval-key digit, an update's included: only
-a later physical evdev timestamp can confirm the still-visible exact
-request. No clock or request value changes.
+Enter confirmation and every elevation's approving Enter, an update's
+included: only a later physical evdev timestamp can confirm the
+still-visible exact request. No clock or request value changes.
 
 
 ## 7. `td-util` — the diagnostics multicall

@@ -137,7 +137,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x557b5639ae259fd7,
+        0x65764dc8997178b0,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -167,17 +167,15 @@ fn the_production_source_and_raw_boundary_are_closed() {
     for forbidden in ["lock-session", "Command::new(", "unlock-operation", "/bin/"] {
         assert!(!login.contains(forbidden), "login.rs: {forbidden}");
     }
-    // A disclosure's key (TOKEN-LOGIN.md increment 5's A4): drawn beside
-    // the nonce, as an elevation's, and put on root's own first step, which
-    // consent alone decides discloses; its receipt waits for root's
-    // deadline.
+    // A disclosure step (TOKEN-LOGIN.md increment 5's A4), which consent
+    // alone decides, awaits the person's Enter: its receipt waits for
+    // root's deadline. Only the nonce is drawn; no approval key exists.
     assert_eq!(login.matches("File::open(\"/dev/urandom\")").count(), 1);
-    assert!(login.contains("ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))"));
-    assert_eq!(login.matches("approval_key(key)?").count(), 1);
-    assert_eq!(login.matches(".disclosed(").count(), 1);
-    assert!(login.contains(
-        "            Some(request) if request.login_approval().is_some() => self.deadline,\n"
-    ));
+    for gone in ["ApprovalKey", "approval_key", ".disclosed(", "% 8"] {
+        assert!(!login.contains(gone), "login.rs: {gone}");
+    }
+    assert!(login
+        .contains("            Some(request) if request.awaits_approval() => self.deadline,\n"));
     // Root's operation deadline is the description's ceiling, the worker's
     // and the compositor's, reading allowance included; the clock is read
     // once per receipt.
@@ -189,7 +187,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(login.matches("Instant::now()").count(), 7);
     assert_eq!(
         fingerprint(login),
-        0x881f86541dc72e1f,
+        0x66fba2fcb04b1842,
         "login worker supervisor changed"
     );
     assert_eq!(
@@ -252,7 +250,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!session.contains("::launch("));
     assert_eq!(
         fingerprint(storage),
-        0x38c4d28aece89d9b,
+        0x6efc37146ff88255,
         "storage worker supervisor changed"
     );
     assert_eq!(
@@ -292,7 +290,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(
         proof
-            .matches("Login::begin_with(owner, nonce, approval, selection, true)")
+            .matches("Login::begin_with(owner, nonce, selection, true)")
             .count(),
         1
     );
@@ -310,7 +308,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     );
     assert_eq!(
         fingerprint(proof),
-        0x4f704b3fa38bb7e8,
+        0x490367828e8f787d,
         "disk proof orchestrator changed"
     );
     // Amendment 9: only an installed boot's Prepare consumes the admission
@@ -478,13 +476,12 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // operations"): the update queue's own backoff row and the production
     // table, the table's grant checked and the backoff written before the
     // admission byte as admission's last steps, a refusal's byte sent
-    // before the connection closes; a key drawn beside the nonce; and at
+    // before the connection closes; only a nonce drawn; and at
     // commit the confirmation consumed, then the backoff cleared, before
     // the one helper starts.
     for pin in [
         "            backoff: Backoff::system(Row::Update),\n            table: Table::load,",
-        "ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))",
-        "                key: approval_key(key)?,",
+        "            .and_then(|mut random| random.read_exact(&mut nonce))",
         "                    Err(refused) => {\n                        let _ = self.stream.write(&[refused.byte()]);\n                        return Err(error(refused));\n                    }",
         "        self.committed = true;\n        // The approval clears the queue's backoff; one root cannot clear\n        // fails the installation before anything starts, said on the\n        // authority's standard error as admission's refusal is.\n        if let Err(why) = self.backoff.approved() {\n            let _ = writeln!(\n                io::stderr(),\n                \"td-authd: update installation failed: clear the backoff: {why}\"\n            );\n            self.result = Some(false);\n            return Ok(());\n        }\n        let child = spawn(source, deployment);",
     ] {
@@ -492,6 +489,16 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     let admit = installation.split("\nfn admit(").nth(1).unwrap();
     let admit = admit.split("\n}\n").next().unwrap();
+    for (name, source) in [
+        ("deployment.rs", installation),
+        ("rollback.rs", include_str!("../src/rollback.rs")),
+        ("set_hostname.rs", include_str!("../src/set_hostname.rs")),
+        ("storage.rs", include_str!("../src/storage.rs")),
+    ] {
+        for gone in ["ApprovalKey", "approval_key", "% 8"] {
+            assert!(!source.contains(gone), "{name}: {gone}");
+        }
+    }
     assert!(admit.ends_with(
         "    if !table()\n        .map_err(Refused::Other)?\n        .grants(owner, DeployPublish)\n    {\n        return Err(Refused::Other(\n            \"the principal table does not grant the requester\".into(),\n        ));\n    }\n    backoff.admitted(entry, now).map_err(unusable)?;\n    Ok(ready)"
     ));
@@ -543,7 +550,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(rollback.contains(
         "    if !table.is_ok_and(|table| table.grants(owner, elevation::Operation::DeployRollback)) {\n        return Err(Refusal::Principal);\n    }\n    Selectors::read(volume).map_err(|_| Refusal::Selectors)\n"
     ));
-    assert!(rollback.contains("ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))"));
+    assert!(rollback.contains("            .and_then(|mut random| random.read_exact(&mut nonce))"));
     for forbidden in [
         "send_descriptor(",
         "sys::",
@@ -594,7 +601,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "        self.committed = true;\n        self.result = Some(save(&self.saved, self.owner, &self.backoff, old, new).is_ok());",
         "    backoff.approved()?;\n    let saved = saved::read_hostname(path, owner)?",
         "    saved::write_hostname(path, &Hostname::parse(new)?)",
-        "ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))",
+        "            .and_then(|mut random| random.read_exact(&mut nonce))",
     ] {
         assert!(rename.contains(pin), "set_hostname.rs: {pin}");
     }
@@ -1334,11 +1341,11 @@ const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
 const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
 
-const INSTALLATION_FINGERPRINT: u64 = 0x580cef152d0817d5;
+const INSTALLATION_FINGERPRINT: u64 = 0xabb4e7cd418585ae;
 const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0xb0d5ccf021f64f9d;
-const ROLLBACK_FINGERPRINT: u64 = 0xcd1fcb60e072626d;
+const ROLLBACK_FINGERPRINT: u64 = 0xf96a32041165e345;
 const ELEVATION_FINGERPRINT: u64 = 0x3a8baf08764bbaaf;
-const SET_HOSTNAME_FINGERPRINT: u64 = 0x739785d15e0c7fa8;
+const SET_HOSTNAME_FINGERPRINT: u64 = 0xd57d16b51535bb95;
 const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const REVOCATION_FINGERPRINT: u64 = 0xae6413da1bcf5b12;

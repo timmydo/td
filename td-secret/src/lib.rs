@@ -240,7 +240,7 @@ mod fido_virtual;
 #[allow(dead_code, reason = "the virtual authenticator signs with this copy")]
 mod p256_signer;
 
-/// Valid descriptions for `owner` of the operations the approval key
+/// Valid descriptions for `owner` of the operations an Enter approval
 /// confirms, consent tags 5 (`deploy-publish`), 11 and 12, and of the
 /// storage operations', 16, 17 (the upgrade's review and a PIN step), 18
 /// and protector management's 19 to 24.
@@ -248,26 +248,21 @@ mod p256_signer;
 /// none, so every worker's operation match must refuse them.
 #[cfg(test)]
 fn elevation_descriptions(owner: u32) -> Vec<Vec<u8>> {
-    let key = consent::ApprovalKey::new(*b"47").unwrap();
     [
         consent::Operation::Install {
-            key,
             deployment: "c".repeat(64),
             requester: owner,
         },
         consent::Operation::DeployRollback {
-            key,
             current: "a".repeat(64),
             previous: "b".repeat(64),
         },
         consent::Operation::SetHostname {
-            key,
             requester: owner,
             old: "td".into(),
             new: "my-laptop".into(),
         },
         consent::Operation::SelectorUpdate {
-            key,
             form: consent::SelectorForm::Staged,
             current: "a".repeat(64),
         },
@@ -277,7 +272,6 @@ fn elevation_descriptions(owner: u32) -> Vec<Vec<u8>> {
             count: 1,
             current: "a".repeat(64),
             step: consent::UpgradeStep::Review,
-            approval: Some(key),
         },
         consent::Operation::Upgrade {
             account: owner,
@@ -288,9 +282,8 @@ fn elevation_descriptions(owner: u32) -> Vec<Vec<u8>> {
                 key: 1,
                 step: consent::LoginStep::Create { retries: 8 },
             },
-            approval: None,
         },
-        consent::Operation::UpgradeCancel { key },
+        consent::Operation::UpgradeCancel,
         consent::Operation::ProtectorAdd {
             account: owner,
             proof: consent::Proof::RecoveryKey,
@@ -315,7 +308,6 @@ fn elevation_descriptions(owner: u32) -> Vec<Vec<u8>> {
         consent::Operation::RecoveryRemove {
             account: owner,
             step: consent::LoginStep::DiskIdentify,
-            approval: Some(key),
         },
         consent::Operation::ProtectorRequest {
             account: owner,
@@ -382,23 +374,23 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("operation.rs")),
-            0xfc3b30153d22e6a8
+            0x2b0eb90995185a22
         );
         // The endpoint td-install's storage worker shares.
-        assert_eq!(fingerprint(include_str!("frames.rs")), 0x7bf3cff3187f78a5);
+        assert_eq!(fingerprint(include_str!("frames.rs")), 0x80a06523824bb152);
         assert_eq!(
             fingerprint(include_str!("login_operation.rs")),
-            0x5efd886d482f8abe
+            0x7be38a0c43f62487
         );
         assert_eq!(
             fingerprint(include_str!("write_operation.rs")),
-            0x5991b168732f47ac
+            0x0de90e50f55c5610
         );
         assert_eq!(
             fingerprint(include_str!("enrollment_operation.rs")),
-            0x44a7a283c11747d6
+            0x5e3fb383c97e2405
         );
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x557b5639ae259fd7, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x65764dc8997178b0, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
         // The shared consent's hostname rules: firstboot's one copy.
         let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
         assert!(production.contains(

@@ -52,11 +52,6 @@ fn adding(before: u8, step: LoginStep) -> Operation {
     }
 }
 
-/// The key `Login::scripted` draws for every disclosure step.
-pub(crate) fn approval() -> ApprovalKey {
-    ApprovalKey::new(*b"47").unwrap()
-}
-
 /// With root's key on its disclosure step.
 fn enrolling(after: u8, key: u8, step: LoginStep) -> Operation {
     Operation::LoginEnroll {
@@ -65,10 +60,8 @@ fn enrolling(after: u8, key: u8, step: LoginStep) -> Operation {
         after,
         key,
         step,
-        approval: None,
         proof: None,
     }
-    .disclosed(approval())
 }
 
 /// With root's key on its disclosure step.
@@ -79,10 +72,8 @@ fn removing(before: u8, removed: &[Slot], step: LoginStep) -> Operation {
         after: before - removed.len() as u8,
         removed: removed.to_vec(),
         step,
-        approval: None,
         proof: None,
     }
-    .disclosed(approval())
 }
 
 fn request(operation: Operation) -> Request {
@@ -780,7 +771,7 @@ fn a_protected_machine_refuses_enrollment_and_the_last_key_removal() {
     }
     // A removal leaving one key discloses, as anywhere else.
     let selection = remove(&[(1, A), (2, B)]);
-    let operation = selection.operation(1000, &[A, B, C], approval(), true);
+    let operation = selection.operation(1000, &[A, B, C], true);
     assert!(matches!(
         operation,
         Ok(Operation::LoginRemove { after: 1, .. })
@@ -946,9 +937,7 @@ fn deadlines_are_the_workers_ceilings_counted_from_before_its_start() {
             Selection::Enroll(_) => &[],
             _ => &[A, B, C],
         };
-        let operation = selection
-            .operation(1000, baseline, approval(), false)
-            .unwrap();
+        let operation = selection.operation(1000, baseline, false).unwrap();
         let request = Request::begin_login(NONCE, 1000, operation, baseline).unwrap();
         assert_eq!(request.login_ceiling(), Some(ceiling));
         let before = Instant::now();
@@ -1292,36 +1281,21 @@ fn root_puts_its_key_on_exactly_the_disclosure_steps() {
         (Selection::Unlock, &three, false),
         (Selection::Add, &three, false),
     ] {
-        let operation = selection
-            .operation(1000, baseline, approval(), false)
-            .unwrap();
+        let operation = selection.operation(1000, baseline, false).unwrap();
         let request = Request::begin_login(NONCE, 1000, operation, baseline).unwrap();
-        assert_eq!(
-            request.login_approval(),
-            disclosed.then(approval),
-            "{selection:?}"
-        );
+        assert_eq!(request.awaits_approval(), disclosed, "{selection:?}");
     }
-    // Each digit is 2 plus its own byte modulo 8: every byte maps, and
-    // every digit is equally likely.
-    let mut counts = [0; 8];
-    for byte in 0..=255u8 {
-        let digits = approval_key([byte, !byte]).unwrap().digits();
-        assert_eq!(digits, [b'2' + byte % 8, b'2' + !byte % 8]);
-        counts[usize::from(digits[0] - b'2')] += 1;
-    }
-    assert_eq!(counts, [32; 8]);
 }
 
-/// The person reads a disclosure and types its key before the receipt
+/// The person reads a disclosure and approves it before the receipt
 /// comes, so root waits for it until its own deadline, not the three
-/// seconds any other step has: a key typed after ten seconds proceeds.
+/// seconds any other step has: an approval after ten seconds proceeds.
 #[test]
 fn a_disclosure_receipt_waits_for_the_operation_deadline() {
     let mut login = scripted(Selection::Enroll(1), "enroll-disclosure");
     let connect = presenting(&mut login);
     assert_eq!(connect, request(enrolling(1, 1, LoginStep::Connect)));
-    assert_eq!(connect.login_approval(), Some(approval()));
+    assert!(connect.awaits_approval());
     assert_eq!(login.acknowledgement_deadline, Some(login.deadline));
     let typed = Instant::now() + Duration::from_secs(10);
     while Instant::now() < typed {
@@ -1335,7 +1309,7 @@ fn a_disclosure_receipt_waits_for_the_operation_deadline() {
         create,
         request(enrolling(1, 1, LoginStep::Create { retries: 8 }))
     );
-    assert_eq!(create.login_approval(), None);
+    assert!(!create.awaits_approval());
     assert!(login.acknowledgement_deadline.unwrap() <= Instant::now() + ACK_TIME);
     login.cancel().unwrap();
     assert_eq!(drive(&mut login).0, ended(false, CANCELLED, 0));

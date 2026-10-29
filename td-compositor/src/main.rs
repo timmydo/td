@@ -1339,7 +1339,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0x557b5639ae259fd7,
+            0x65764dc8997178b0,
             "shared consent changed: reconcile td-secret/src/lib.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
@@ -3422,16 +3422,14 @@ pub struct MappedRegion {
 
     /// Elevation consent (DESIGN.md, "Elevation consent"): `B` asks root
     /// for a rollback in every build, since L3, and `H` for the queued
-    /// hostname change, since L4; and an elevation's or, since L5, an
-    /// update's one commit, root's exact description and so its key,
-    /// follows only the two digits the evdev adapter offers, as, since
-    /// TOKEN-LOGIN.md increment 5's A4, a login disclosure step's
-    /// receipt does. What a
-    /// runtime test cannot see is held here: that no test-only switch
-    /// decides `B` or `H`, and that no other path confirms; Enter confirms
-    /// only a live boot's whole-disk installation.
+    /// hostname change, since L4; and an elevation's or an update's one
+    /// commit, root's exact description, follows only the approving Enter
+    /// the evdev adapter offers, as a login disclosure step's receipt
+    /// does. What a runtime test cannot see is held here: that no
+    /// test-only switch decides `B` or `H`, that the first counted press
+    /// alone decides, and that no other path confirms.
     #[test]
-    fn b_and_h_select_elevations_and_only_the_typed_key_commits_one() {
+    fn b_and_h_select_elevations_and_only_an_approving_enter_commits_one() {
         let input = production(include_str!("input.rs"));
         let client = production(include_str!("secret_client.rs"));
         let body = |source: &'static str, head: &str| -> &'static str {
@@ -3456,21 +3454,28 @@ pub struct MappedRegion {
         assert_eq!(occurrences(input, "Elevation::Hostname"), 1);
         assert_eq!(occurrences(input, "rollback_wired"), 0);
         assert_eq!(occurrences(input, "rollback: bool"), 0);
-        // A digit is a fresh number-row 2 to 9 under no Control, Alt or
-        // Super, offered only on the open screen after the selection.
-        let digit = body(
+        // A counted press is any fresh key but a modifier or Escape, and it
+        // is Enter only under no Control, Alt or Super, offered only on the
+        // open screen after the selection.
+        let press = body(
             input,
-            "    fn approval_digit(&self, code: u16) -> Option<u8> {\n",
+            "    fn approval_press(&self, code: u16) -> Option<crate::secret_client::ApprovalPress> {\n",
         );
-        assert!(digit.contains(
-            "        if held(KEY_LEFTCTRL, KEY_RIGHTCTRL)\n            \
-             || held(KEY_LEFTALT, KEY_RIGHTALT)\n            \
-             || held(KEY_LEFTMETA, KEY_RIGHTMETA)\n            \
-             || !(KEY_2..=KEY_9).contains(&code)\n"
+        assert!(press.contains(
+            "        if code == KEY_ESC || MODIFIER_KEYS.contains(&code) {\n            \
+             return None;\n        }\n"
         ));
-        assert!(!digit.contains("KEY_KP"));
+        assert!(press.contains(
+            "        let modified = held(KEY_LEFTCTRL, KEY_RIGHTCTRL)\n            \
+             || held(KEY_LEFTALT, KEY_RIGHTALT)\n            \
+             || held(KEY_LEFTMETA, KEY_RIGHTMETA);\n        \
+             Some(if code == KEY_ENTER && !modified {\n            \
+             ApprovalPress::Enter\n        } else {\n            \
+             ApprovalPress::Other\n        })"
+        ));
+        assert!(!press.contains("KEY_KP"));
         let feed = body(input, "    fn feed_device(");
-        assert_eq!(occurrences(feed, ".approval_digit(event.code)"), 1);
+        assert_eq!(occurrences(feed, ".approval_press(event.code)"), 1);
         assert!(feed.contains(
             "            if self.attention == AttentionState::Open\n                \
              && readable\n                && chosen\n                \
@@ -3487,24 +3492,30 @@ pub struct MappedRegion {
             .unwrap()
             .1;
         assert!(target.contains(
-            "            Some(attempt) => attempt.approve(&EvdevOrigin { _private: () }, digit, timestamp),\n"
+            "            Some(attempt) => attempt.approve(&EvdevOrigin { _private: () }, press, timestamp),\n"
         ));
         assert!(input.contains(
-            "    fn approval_digit(&mut self, _digit: u8, _timestamp: u128) -> Result<bool, String> {\n        \
-             Ok(false)\n    }\n"
+            "    fn approval_press(\n        &mut self,\n        \
+             _press: crate::secret_client::ApprovalPress,\n        \
+             _timestamp: u128,\n    ) -> Result<bool, String> {\n        Ok(false)\n    }\n"
         ));
         for (name, source) in std::iter::once(("main.rs", MAIN)).chain(OTHER.iter().copied()) {
             let source = source
                 .split_once("\n#[cfg(test)]\nmod tests {")
                 .map_or(source, |(body, _)| body);
             if !matches!(name, "input.rs" | "secret_client.rs") {
-                for reach in ["approve(", "approval_digit(", "Elevation::"] {
+                for reach in [
+                    "approve(",
+                    "approval_press(",
+                    "ApprovalPress",
+                    "Elevation::",
+                ] {
                     assert!(!source.contains(reach), "{name}: {reach}");
                 }
             }
         }
         // The client: an elevation or an update commits only once
-        // confirmed, and only the second matching digit, or a whole-disk
+        // confirmed, and only an approving Enter, or a whole-disk
         // installation's Enter, confirms.
         assert!(client.contains(
             "    fn confirms(&self) -> bool {\n        \
@@ -3515,48 +3526,53 @@ pub struct MappedRegion {
              return false;\n        }\n"
         ));
         assert_eq!(occurrences(client, "confirmed.store(true"), 2);
+        assert!(client.contains("pub(crate) const APPROVAL_SETTLE: u128 = 500_000_000;\n"));
         let approve = body(client, "    pub fn approve(");
+        // The first counted press on that exact prompt decides it, once;
+        // after an approving Enter only a key stamped before it, read before
+        // the commit, can still end it.
         assert!(approve.contains(
-            "            let wrong = digit != *expected;\n            if !wrong {\n                \
-             presented.typed += 1;\n                presented.after = timestamp;\n                \
-             if presented.typed == digits.len() {\n                    \
-             self.confirmed.store(true, Ordering::SeqCst);\n"
+            "            let Some(presented) = presentation.as_mut().filter(|presented| {\n                \
+             presented.request.awaits_approval() && self.answers(&runtime, presented, timestamp)\n            \
+             }) else {\n"
         ));
-        assert!(
-            approve.contains(".filter(|presented| self.answers(&runtime, presented, timestamp))")
-        );
-        // Since L5 an update takes the key, and since TOKEN-LOGIN.md
-        // increment 5's A4 a login disclosure step, from the one key
-        // reader, and Enter answers a whole-disk installation alone.
+        assert!(approve.contains(
+            "            if presented.decided {\n                \
+             let earlier = press == ApprovalPress::Other\n                    \
+             && presented.approved_at.is_some_and(|at| timestamp < at);\n                \
+             if !earlier {\n                    return Ok(false);\n                }\n"
+        ));
+        assert!(approve.contains(
+            "                if self\n                    .state\n                    \
+             .compare_exchange(ACTIVE, CANCELLED, Ordering::SeqCst, Ordering::SeqCst)\n                    \
+             .is_err()\n                {\n                    return Ok(false);\n                }\n"
+        ));
+        assert!(approve.contains(
+            "            presented.decided = true;\n            \
+             let settled = presented\n                .after\n                \
+             .checked_add(APPROVAL_SETTLE)\n                \
+             .is_some_and(|settled| timestamp >= settled);\n            \
+             let approved = press == ApprovalPress::Enter && settled;\n            \
+             if approved {\n                \
+             presented.approved_at = Some(timestamp);\n                \
+             self.confirmed.store(true, Ordering::SeqCst);\n            }\n            !approved\n"
+        ));
+        assert!(approve.contains("        if ended {\n            self.cancel();\n        }\n"));
         assert!(approve.contains(
             "        if !matches!(\n            self.selection,\n            \
              Selection::Install | Selection::Elevation(_) | Selection::Login(_)\n        \
-             ) || !(b'2'..=b'9').contains(&digit)\n"
+             ) || !self.active()\n"
         ));
-        assert!(approve
-            .contains("            let Some(key) = approval_key(&presented.request) else {\n"));
-        assert!(client.contains(
-            "fn approval_key(request: &Request) -> Option<ApprovalKey> {\n    \
-             match request.operation() {\n        \
-             Operation::Install { key, .. } => Some(*key),\n        \
-             Operation::LoginEnroll { approval, .. } | Operation::LoginRemove { approval, .. } => {\n            \
-             *approval\n        }\n        \
-             Operation::SelectorUpdate { key, .. } | Operation::UpgradeCancel { key } => Some(*key),\n        \
-             Operation::Upgrade { approval, .. } | Operation::RecoveryRemove { approval, .. } => {\n            \
-             *approval\n        }\n        \
-             _ => Elevation::of(request).map(|(_, key)| key),\n    }\n}\n"
-        ));
-        // The reader, the digit's check, a presented prompt's keeping and
-        // a login step's receipt.
-        assert_eq!(occurrences(client, "approval_key("), 4);
-        // A login disclosure step's receipt goes only once its key is
-        // typed on that exact prompt; any other step's follows its
-        // presentation.
+        // Root's description alone says which prompts await approval: the
+        // presented prompt's keeping, the press's check and a login step's
+        // receipt.
+        assert_eq!(occurrences(client, "awaits_approval()"), 3);
+        // A login disclosure step's receipt goes only once Enter approved
+        // that exact prompt; any other step's follows its presentation.
         let tick = body(client, "    fn tick_login(");
         assert!(tick.contains(
             "                if login.shown.as_ref() == Some(&description)\n                    \
-             && (approval_key(&description).is_none()\n                        \
-             || login.attempt.approved(&description))\n                    \
+             && (!description.awaits_approval() || login.attempt.approved(&description))\n                    \
              && login.attempt.active()\n"
         ));
         assert_eq!(occurrences(client, ".approved("), 1);
