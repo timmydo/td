@@ -6953,6 +6953,7 @@ mod tests {
                 Bound::Command(Command::ToggleFullscreen) => "TOGGLE FULLSCREEN",
                 Bound::Command(Command::ToggleGrouped) => "GROUP A COLUMN",
                 Bound::Launch(LaunchRequest::Terminal) => "NEW TERMINAL",
+                Bound::Launch(LaunchRequest::Sandbox) => "td-term (sandbox)",
                 Bound::Launch(LaunchRequest::UiDemo) => "OPEN UI CLIENT",
                 Bound::Launch(LaunchRequest::TaskManager) => "TASK MANAGER",
                 Bound::Launch(LaunchRequest::Editor) => "TEXT EDITOR",

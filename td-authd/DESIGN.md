@@ -687,9 +687,9 @@ receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
 terminal-exec UID GENERATION HANDLE
-[task|taskmgr|editor|photo|review|dua|agent|software [APP]]` in a new
+[task|sandbox|taskmgr|editor|photo|review|dua|agent|software [APP]]` in a new
 process group. The optional literal selects requests `04`, `07` through
-`0c` and `22`; it is not a pathname. `APP` follows `software` alone,
+`0c`, `22` and `27`; it is not a pathname. `APP` follows `software` alone,
 for a `22` that names one.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
@@ -818,6 +818,14 @@ TDLA003, because `1c` carries a PIN; `0c` through `0f`, `22` through
 `24` and `22`'s name were added within it later, and `0d` and `0f` took
 their names within it. Both peers again ship together, without
 negotiation.
+
+Request `27` is the sandbox terminal: the same unprivileged terminal path
+with the fixed additional arguments `--command /bin/td-sandbox shell default`.
+It carries no operands, path or profile name. td-sandbox opens the caller's
+existing default profile and confines its shell; the authority reads none of
+that mutable policy and grants no new privilege. The image seeds the profile
+as the primary user before the compositor starts (td-sandbox/DESIGN.md).
+The additive request ships with its compositor peer within TDLA003.
 
 For terminal requests it execs `/bin/td-term run --socket
 /run/td-compositor/UID/wayland-0 --ready-socket

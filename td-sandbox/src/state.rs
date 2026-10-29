@@ -62,6 +62,15 @@ fn open_private(path: &Path) -> io::Result<File> {
 
 impl State {
     pub fn create(base: &Path, name_: &str) -> io::Result<()> {
+        Self::create_initial(base, name_, "format=1\nnetwork=off\n", None)
+    }
+
+    fn create_initial(
+        base: &Path,
+        name_: &str,
+        policy: &str,
+        shared: Option<&Path>,
+    ) -> io::Result<()> {
         name(name_)?;
         let root = base.join(name_);
         fs::DirBuilder::new().mode(0o700).create(&root)?;
@@ -69,14 +78,34 @@ impl State {
             fs::DirBuilder::new()
                 .mode(0o700)
                 .create(root.join("home"))?;
+            if let Some(shared) = shared {
+                std::os::unix::fs::symlink(shared, root.join("home/sandbox"))?;
+            }
             let mut file = open_private(&root.join("policy"))?;
-            file.write_all(b"format=1\nnetwork=off\n")?;
+            file.write_all(policy.as_bytes())?;
             file.sync_all()
         })();
         if result.is_err() {
             let _ = fs::remove_dir_all(&root);
         }
         result
+    }
+
+    /// Seed only a missing profile; existing policy belongs to the user.
+    pub fn init_default(base: &Path, account_home: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(base.join("default")) {
+            Ok(_) => return Self::open(base, "default").map(|_| ()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let shared = account_home.join("sandbox");
+        td_fs::private_dir(&shared)?;
+        let shared = fs::canonicalize(shared)?;
+        if shared.starts_with(base) || base.starts_with(&shared) {
+            return Err(io::Error::other("default share overlaps sandbox storage"));
+        }
+        let policy = format!("format=1\nnetwork=off\nwrite={}\n", text(&shared)?);
+        Self::create_initial(base, "default", &policy, Some(&shared))
     }
 
     pub fn open(base: &Path, name_: &str) -> io::Result<Self> {
@@ -167,6 +196,55 @@ fn parse(policy: &str) -> io::Result<(bool, Vec<(PathBuf, bool)>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_seeds_the_share_once_and_preserves_user_changes() -> io::Result<()> {
+        let home = td_fs::TempDir::new("sandbox-default")?;
+        let base = home.join(".local/share/td-sandbox");
+        td_fs::private_dir(&base)?;
+        State::init_default(&base, &home)?;
+        let shared = fs::canonicalize(home.join("sandbox"))?;
+        td_fs::check_private_dir(&shared)?;
+        let mut state = State::open(&base, "default")?;
+        assert!(!state.network);
+        assert_eq!(state.shares, [(shared.clone(), true)]);
+        assert_eq!(fs::read_link(state.home.join("sandbox"))?, shared);
+        fs::write(state.home.join("sandbox/from-private-home"), "shared")?;
+        assert_eq!(
+            fs::read_to_string(home.join("sandbox/from-private-home"))?,
+            "shared"
+        );
+        state.network = true;
+        state.shares.clear();
+        state.save()?;
+        fs::write(state.home.join("keep"), "private")?;
+        drop(state);
+        State::init_default(&base, &home)?;
+        let state = State::open(&base, "default")?;
+        assert!(state.network);
+        assert!(state.shares.is_empty());
+        assert_eq!(fs::read_to_string(state.home.join("keep"))?, "private");
+        Ok(())
+    }
+
+    #[test]
+    fn default_refuses_links_and_incomplete_existing_profiles() -> io::Result<()> {
+        let home = td_fs::TempDir::new("sandbox-default-invalid")?;
+        let other = td_fs::TempDir::new("sandbox-default-outside")?;
+        let base = home.join("state");
+        td_fs::private_dir(&base)?;
+        std::os::unix::fs::symlink(other.path(), home.join("sandbox"))?;
+        assert!(State::init_default(&base, &home).is_err());
+        assert!(!base.join("default").exists());
+        fs::remove_file(home.join("sandbox"))?;
+        std::os::unix::fs::symlink(other.path(), base.join("default"))?;
+        assert!(State::init_default(&base, &home).is_err());
+        fs::remove_file(base.join("default"))?;
+        td_fs::private_dir(&base.join("default"))?;
+        assert!(State::init_default(&base, &home).is_err());
+        assert!(!base.join("default/policy").exists());
+        Ok(())
+    }
+
     #[test]
     fn state_is_private_and_serialized() -> io::Result<()> {
         let base = td_fs::TempDir::new("sandbox-state")?;

@@ -1420,3 +1420,41 @@ fn a_start_in_flight_stays_asked_across_a_switch() {
     assert!(probe.asked);
     assert_eq!(probe.answer("firefox", false), UnitState::Starting);
 }
+
+#[test]
+fn sandbox_request_is_a_fixed_unprivileged_terminal_command() {
+    assert_eq!(request(&[0x27]).unwrap(), Request::Start(Program::Sandbox));
+    assert!(request(&[0x27, 1]).is_err());
+    assert_eq!(Program::Sandbox.selection(), Some("sandbox"));
+    assert_eq!(Program::from_selection("sandbox"), Some(Program::Sandbox));
+    let command = terminal_command(
+        1000,
+        "0123456789abcdef0123456789abcdef",
+        7,
+        Program::Sandbox,
+        None,
+        || Ok(primary("renamed")),
+    )
+    .unwrap();
+    assert_eq!(command.get_program(), "/bin/td-term");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            "run",
+            "--socket",
+            "/run/td-compositor/1000/wayland-0",
+            "--ready-socket",
+            "/run/user/1000/td-auth-terminal-0123456789abcdef0123456789abcdef-7.ready",
+            "--command",
+            "/bin/td-sandbox",
+            "shell",
+            "default",
+        ]
+    );
+    assert!(
+        terminal_command(1000, "g", 1, Program::Sandbox, Some("other"), || Ok(
+            primary("renamed")
+        ))
+        .is_err()
+    );
+}

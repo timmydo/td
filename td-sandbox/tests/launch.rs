@@ -426,3 +426,49 @@ fn inherited_stdin_fixture() -> io::Result<()> {
 fn sleeping_descendant_fixture() {
     std::thread::sleep(std::time::Duration::from_secs(60));
 }
+
+#[test]
+#[ignore = "requires built TD_SANDBOX_TEST_JAIL, user namespaces, TMPDIR under worktree scratch"]
+fn default_profile_shares_only_the_sandbox_folder() -> io::Result<()> {
+    let root = td_fs::TempDir::new("sandbox-default-live")?;
+    let jail = PathBuf::from(
+        std::env::var_os("TD_SANDBOX_TEST_JAIL")
+            .ok_or_else(|| io::Error::other("TD_SANDBOX_TEST_JAIL missing"))?,
+    );
+    passed(call(&root, &jail, &["init-default"])?)?;
+    let home = root.join(".local/share/td-sandbox/default/home");
+    fs::write(root.join("secret"), "ungranted")?;
+    fs::write(home.join("host-home"), root.to_string_lossy().as_bytes())?;
+    fs::copy(std::env::current_exe()?, home.join("probe"))?;
+    let output = passed(call(
+        &root,
+        &jail,
+        &[
+            "run",
+            "default",
+            "--",
+            "./probe",
+            "--exact",
+            "default_inside_fixture",
+            "--ignored",
+            "--nocapture",
+        ],
+    )?)?;
+    assert!(output.contains("default-share-ok"), "{output}");
+    assert_eq!(fs::read_to_string(root.join("sandbox/written"))?, "shared");
+    passed(call(&root, &jail, &["init-default"])?)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "executed only inside the default sandbox"]
+fn default_inside_fixture() -> io::Result<()> {
+    let home =
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME missing"))?);
+    let host = PathBuf::from(fs::read_to_string(home.join("host-home"))?);
+    assert!(!host.join("secret").exists());
+    assert!(!host.join(".local/share/td-sandbox/default/policy").exists());
+    fs::write(home.join("sandbox/written"), "shared")?;
+    println!("default-share-ok");
+    Ok(())
+}

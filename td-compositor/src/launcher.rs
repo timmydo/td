@@ -45,6 +45,7 @@ pub enum LauncherAction {
 pub enum LaunchRequest {
     UiDemo,
     Terminal,
+    Sandbox,
     TaskManager,
     Editor,
     Photo,
@@ -64,6 +65,7 @@ impl LaunchRequest {
     /// authority starts as the human: the desktop programs the image ships.
     fn authority_program(self) -> Option<crate::authority::Program> {
         match self {
+            Self::Sandbox => Some(crate::authority::Program::Sandbox),
             Self::TaskManager => Some(crate::authority::Program::TaskManager),
             Self::Editor => Some(crate::authority::Program::Editor),
             Self::Photo => Some(crate::authority::Program::Photo),
@@ -106,6 +108,11 @@ const SOFTWARE_ENTRY: Entry = Entry {
 // The image's desktop programs, each a fixed authority request: shown only
 // when the compositor has that authority, as the task manager is.
 const AUTHORITY_ENTRIES: &[Entry] = &[
+    Entry {
+        label: "td-term (sandbox)",
+        search: "td-term (sandbox) private home shell terminal",
+        request: Some(LaunchRequest::Sandbox),
+    },
     Entry {
         label: "TASK MANAGER",
         search: "task manager processes cpu memory network disk",
@@ -861,7 +868,8 @@ pub(crate) fn launch_command(
         std::process::id()
     ));
     let program = match request {
-        LaunchRequest::TaskManager
+        LaunchRequest::Sandbox
+        | LaunchRequest::TaskManager
         | LaunchRequest::Editor
         | LaunchRequest::Photo
         | LaunchRequest::Review
@@ -1713,6 +1721,7 @@ mod authority_entry_tests {
     const FIXED: &[&str] = &[
         "NEW TERMINAL",
         "SOFTWARE",
+        "td-term (sandbox)",
         "TASK MANAGER",
         "TEXT EDITOR",
         "PHOTOS",
@@ -1878,6 +1887,7 @@ mod authority_entry_tests {
         launcher.apply(LauncherAction::Open);
         assert_eq!(launcher.matched_labels(), FIXED);
         for (word, label, request) in [
+            ("sandbox", "td-term (sandbox)", LaunchRequest::Sandbox),
             ("process", "TASK MANAGER", LaunchRequest::TaskManager),
             ("editor", "TEXT EDITOR", LaunchRequest::Editor),
             ("picture", "PHOTOS", LaunchRequest::Photo),
@@ -1977,6 +1987,7 @@ mod authority_entry_tests {
             terminal: PathBuf::from("/bin/td-term"),
         };
         for request in [
+            LaunchRequest::Sandbox,
             LaunchRequest::TaskManager,
             LaunchRequest::Editor,
             LaunchRequest::Photo,

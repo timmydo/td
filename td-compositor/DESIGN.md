@@ -5802,6 +5802,13 @@ at most one status read a second whatever the rate. The image selects this
 client through the paired service at UID 993. The direct launcher remains
 available for host development.
 
+The authority card also offers `td-term (sandbox)`, searchable by sandbox,
+private home or terminal. It sends the operand-free request `27` for a fixed
+human terminal running `/bin/td-sandbox shell default`. The same worker,
+readiness probe and bounded process handles track it. No profile policy,
+program path or command arguments come from the compositor. Host direct
+mode does not offer this authority-only entry.
+
 Before opening the framebuffer or starting any worker, the client verifies one
 thread, identical service uid/gid columns in 1..=999, and only inherited fd
 0/1/2. It checks their existence before descriptor enumeration can reuse a

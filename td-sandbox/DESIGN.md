@@ -68,6 +68,36 @@ sockets a user explicitly shares. Off is not a hostile-kernel attack-surface
 minimization profile. Resource caps are inherited; td-jail prints its existing
 aggregate-memory/task/CPU-cap limitation.
 
+## Image default profile
+
+On installed and live desktop boots, the `sandbox-default` oneshot runs
+`td-sandbox init-default` through `td-login exec-primary`, after firstboot.
+It creates `default` with network off and one writable grant, the primary
+account's `~/sandbox` (created 0700). Its private home contains a `sandbox`
+symlink to that grant's original absolute path. This is the only automatic
+share; the account name is resolved at boot, never fixed to the image seed.
+The command also works explicitly for other users on a host.
+
+An existing valid profile is left unchanged, including its networking and
+removed grants. An existing share directory must be private and owned by
+the caller; symlinks are refused. An incomplete or invalid existing profile
+fails closed rather than being repaired or replaced. Creation writes the
+link and complete initial policy before reporting success; a crash during
+creation may require the user to remove the incomplete profile. Ordinary
+creation errors clean up only the newly created profile, never the share.
+Concurrent creation is exclusive through directory creation; a loser fails
+without replacing the winner.
+
+The image compositor offers `td-term (sandbox)`. Its fixed authority request
+starts a human-owned td-term with literal command `/bin/td-sandbox shell
+default`, using the normal terminal readiness and process tracking. The
+terminal remains outside the jail; its shell is inside. The launcher never
+initializes or rewrites a profile. Boot orders the compositor after default
+provisioning but does not require provisioning success, so a damaged profile
+cannot prevent the desktop opening. A deleted default is seeded on the next
+boot; customized existing profiles are preserved. Live media state lasts only
+as long as that live home does.
+
 ## Process and terminal ownership
 
 The outer launcher runs td-jail with an unnamed connected stream socket on

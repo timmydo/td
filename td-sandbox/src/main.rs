@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 const HELP: &str = "td-sandbox [--jail PATH] COMMAND\n\
+  init-default                seed default with writable ~/sandbox once\n\
   create NAME                 create a private home (network off)\n\
   list                        list environments\n\
   inspect NAME                show home, network and folder grants\n\
@@ -64,6 +65,14 @@ fn run() -> io::Result<u8> {
         return Ok(0);
     }
     let base = state::base()?;
+    if command == "init-default" {
+        if args.next().is_some() {
+            return Err(error(HELP));
+        }
+        let home = std::env::var_os("HOME").ok_or_else(|| error("HOME is unset"))?;
+        state::State::init_default(&base, Path::new(&home))?;
+        return Ok(0);
+    }
     if command == "list" {
         if args.next().is_some() {
             return Err(error(HELP));

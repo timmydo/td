@@ -1407,6 +1407,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 const TD_SVC_UNITS: &[&str] = &[
     "hostname",
     "td-firstboot",
+    "sandbox-default",
     "release-source",
     "rootcheck",
     "profiler",
@@ -1775,6 +1776,16 @@ fn build_desktop_td_svc_conf() -> String {
          after=hostname\n\
          timeout={firstboot}\n\
          \n\
+         [sandbox-default]\n\
+         type=oneshot\n\
+         cgroup=session\n\
+         exec=/bin/td-login exec-primary -- /bin/td-sandbox init-default\n\
+         after=td-firstboot\n\
+         requires=td-firstboot\n\
+         timeout=30\n\
+         log=/var/log/svc/sandbox-default.log\n\
+         console=yes\n\
+         \n\
          [release-source]\n\
          type=oneshot\n\
          cgroup=session\n\
@@ -2024,7 +2035,7 @@ fn build_desktop_td_svc_conf() -> String {
          cgroup=service\n\
          exec=/bin/td-authd terminal-serve --primary --peer-uid {compositor_uid}\n\
          pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --card /dev/dri/card0 --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
-         after=seat\n\
+         after=seat,sandbox-default\n\
          requires=seat\n\
          ready=/bin/td-login exec-primary -- /bin/td-compositor probe {wayland_socket}\n\
          ready-timeout=30\n\
@@ -9025,6 +9036,30 @@ mod tests {
     }
 
     #[test]
+    fn default_sandbox_is_seeded_as_primary_on_live_and_installed_boots() {
+        assert_eq!(
+            unit_key("sandbox-default", "exec").as_deref(),
+            Some("/bin/td-login exec-primary -- /bin/td-sandbox init-default")
+        );
+        assert_eq!(
+            unit_key("sandbox-default", "type").as_deref(),
+            Some("oneshot")
+        );
+        assert_eq!(
+            unit_key("sandbox-default", "cgroup").as_deref(),
+            Some("session")
+        );
+        assert_eq!(
+            unit_key("sandbox-default", "requires").as_deref(),
+            Some("td-firstboot")
+        );
+        assert_eq!(unit_key("sandbox-default", "unless-exists"), None);
+        assert!(ordered_before("td-firstboot", "sandbox-default"));
+        assert!(ordered_before("sandbox-default", "wayland"));
+        assert_eq!(unit_key("wayland", "requires").as_deref(), Some("seat"));
+    }
+
+    #[test]
     fn vm_guest_helper_runs_without_root_in_the_standard_image() {
         assert_eq!(
             unit_key("vm-guest", "exec").as_deref(),
@@ -9112,7 +9147,8 @@ mod tests {
             ("firefox-handoff", vec!["td-firstboot"]),
             ("portal", vec!["busd", "portal-files", "firefox-handoff"]),
             ("portal-evidence", vec!["portal", "firefox-tls-setup"]),
-            ("wayland", vec!["seat"]),
+            ("wayland", vec!["seat", "sandbox-default"]),
+            ("sandbox-default", vec!["td-firstboot"]),
             ("terminal", vec!["wayland"]),
             ("applications-workspace", vec!["terminal"]),
             (

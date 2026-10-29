@@ -319,12 +319,15 @@ fn terminal_command(
         "--ready-socket",
         &format!("/run/user/{uid}/td-auth-terminal-{generation}-{handle}.ready"),
     ]);
-    if terminal != Program::Home {
+    if terminal == Program::Task {
         command
             .arg("--working-directory")
             .arg(account()?.home().join("src/td-vm/work"));
     }
     match terminal {
+        Program::Sandbox => {
+            command.args(["--command", "/bin/td-sandbox", "shell", "default"]);
+        }
         Program::Home | Program::Task => {}
         // Desktop programs returned above; listed so a new kind is a decision.
         Program::TaskManager
@@ -722,6 +725,7 @@ impl UnitProbe {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Program {
     Home,
+    Sandbox,
     Task,
     TaskManager,
     Editor,
@@ -736,6 +740,7 @@ impl Program {
     fn selection(self) -> Option<&'static str> {
         match self {
             Self::Home => None,
+            Self::Sandbox => Some("sandbox"),
             Self::Task => Some("task"),
             Self::TaskManager => Some("taskmgr"),
             Self::Editor => Some("editor"),
@@ -751,6 +756,7 @@ impl Program {
     /// to it by a round-trip test.
     fn from_selection(literal: &str) -> Option<Self> {
         Some(match literal {
+            "sandbox" => Self::Sandbox,
             "task" => Self::Task,
             "taskmgr" => Self::TaskManager,
             "editor" => Self::Editor,
@@ -774,7 +780,7 @@ impl Program {
             Self::Dua => Some("/bin/td-dua"),
             Self::Agent => Some("/bin/td-agent"),
             Self::Software => Some("/bin/td-software"),
-            Self::Home | Self::Task => None,
+            Self::Home | Self::Task | Self::Sandbox => None,
         }
     }
 
@@ -784,6 +790,7 @@ impl Program {
         match self {
             Self::Review => &["--choose-repo"],
             Self::Home
+            | Self::Sandbox
             | Self::Task
             | Self::TaskManager
             | Self::Editor
@@ -811,6 +818,7 @@ impl Program {
                 format!("/run/td-compositor/{uid}/td-control"),
             )],
             Self::Home
+            | Self::Sandbox
             | Self::Task
             | Self::TaskManager
             | Self::Editor
@@ -827,7 +835,7 @@ impl Program {
     fn starts_in_account_home(self) -> bool {
         match self {
             Self::Editor | Self::Photo | Self::Review | Self::Dua | Self::Agent => true,
-            Self::Home | Self::Task | Self::TaskManager | Self::Software => false,
+            Self::Home | Self::Sandbox | Self::Task | Self::TaskManager | Self::Software => false,
         }
     }
 }
@@ -836,6 +844,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
     match bytes {
         [1] => Ok(Request::Start(Program::Home)),
         [4] => Ok(Request::Start(Program::Task)),
+        [0x27] => Ok(Request::Start(Program::Sandbox)),
         // 5 started the retired Codex agent and 6 the retired Claude Code;
         // both stay unassigned.
         [7] => Ok(Request::Start(Program::TaskManager)),
