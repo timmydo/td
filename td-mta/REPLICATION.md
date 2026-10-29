@@ -20,6 +20,9 @@ Session and Mailbox rights must agree with method-level mutation refusal;
 td-mail must suppress unsupported actions rather than repeatedly trying them.
 Users can retain a separate cloud account configuration for writes and sending.
 
+See [REPLICA-OPERATIONS.md](REPLICA-OPERATIONS.md) for routine local operations
+and the distinction between synchronization, integrity and recovery evidence.
+
 ## Storage and identity
 
 Reuse the core account, mailbox, thread, Email, immutable body, membership and
