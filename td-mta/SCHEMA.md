@@ -503,8 +503,8 @@ Gateway TLS identity. It still obeys local-recipient and resource limits.
 ## 8. Listener roles
 
 Require 1..16 `[listener "NAME"]` stanzas with required `kind` and `bind`.
-Kinds are `direct_smtp`, `gateway_smtp`, `https`, `http01` and
-`loopback_smtp_fixture`. At least one SMTP role and one HTTPS listener are
+Kinds are `direct_smtp`, `gateway_smtp`, `https`, `http01`,
+`loopback_smtp_fixture` and `local_jmap`. At least one SMTP role and one HTTPS listener are
 required by this file schema. POSTGRES.md section 15 describes a separate
 role-selection preparation API; no new file stanza or serving mode selects
 it. No SMTP submission, implicit inbound submission, IMAP or POP role exists
@@ -518,6 +518,13 @@ in this schema.
 | `gateway` | Profile name; required for network gateway SMTP, forbidden otherwise |
 | `session_limit` | Integer 1..smtp_sessions; required for SMTP roles, forbidden otherwise |
 | `per_peer_limit` | Integer 1..session_limit and at most smtp_per_peer; required for SMTP roles, forbidden otherwise |
+
+`local_jmap` binds a private Unix pathname rather than a TCP address.
+Its logical origin must be exactly `http://localhost` without aliases; no
+certificate is required or permitted. The selected-profile API counts it as
+JMAP. It cannot share a profile with network HTTPS. CONFIG.md owns the path,
+ownership, mode, locking and cleanup contract. This grants no plaintext TCP
+mode and no exemption from account authentication.
 
 Direct/gateway listeners emit their own `server_name` in the SMTP greeting and
 EHLO response; it may differ from the global hostname. It also supplies that

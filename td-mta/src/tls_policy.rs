@@ -640,7 +640,7 @@ fn listener_binding(row: listener::Listener<'_>) -> Result<Binding, Error> {
     Ok(Binding::Listener(ListenerBinding {
         name: owned(row.name)?,
         kind: row.kind,
-        bind: row.bind,
+        bind: row.bind.tcp().ok_or(Error::Invalid)?,
         server: row.server_name.map(owned).transpose()?,
         server_aliases: owned(row.server_name_aliases)?,
         certificate: row.certificate.map(owned).transpose()?,
@@ -765,6 +765,7 @@ fn build<R: Read>(
         if matches!(
             row.kind,
             listener::Kind::Http01
+                | listener::Kind::LocalJmap
                 | listener::Kind::LoopbackSmtpFixture
                 | listener::Kind::GatewaySmtp
         ) {

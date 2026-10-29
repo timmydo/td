@@ -238,7 +238,7 @@ impl Session {
         }
     }
     pub fn origin(&self) -> Result<Origin<'_>, Error> {
-        Origin::parse(&self.origin).map_err(|_| Error::Invalid)
+        Origin::parse_jmap(&self.origin).map_err(|_| Error::Invalid)
     }
     pub fn concurrency(&self) -> Concurrency {
         self.concurrency
@@ -304,7 +304,7 @@ mod tests {
         requests: usize,
     ) -> Session {
         Session::mail_access(
-            Origin::parse(origin).unwrap(),
+            Origin::parse_jmap(origin).unwrap(),
             account,
             &limits.plan().unwrap(),
             Concurrency { uploads, requests },
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn read_only_session_advertises_and_enforces_closed_read_surface() {
         let session = Session::mail_read_only(
-            Origin::parse("https://mail.example.test").unwrap(),
+            Origin::parse_jmap("https://mail.example.test").unwrap(),
             account(),
             &Limits::default().plan().unwrap(),
             Concurrency {
@@ -427,7 +427,7 @@ mod tests {
         let limits = Limits::default();
         let read = build("https://mail.test", account(), limits, 1, 2);
         let send = Session::mail_submission(
-            Origin::parse("https://mail.test").unwrap(),
+            Origin::parse_jmap("https://mail.test").unwrap(),
             account(),
             &limits.plan().unwrap(),
             Concurrency {
@@ -561,7 +561,7 @@ mod tests {
         for (uploads, requests) in [(0, 1), (1, 0), (over, 1), (1, over)] {
             assert_eq!(
                 Session::mail_access(
-                    Origin::parse("https://mail.test").unwrap(),
+                    Origin::parse_jmap("https://mail.test").unwrap(),
                     account,
                     &plan,
                     Concurrency { uploads, requests }
@@ -577,7 +577,7 @@ mod tests {
         ] {
             assert_eq!(
                 Session::mail_access(
-                    Origin::parse("https://mail.test").unwrap(),
+                    Origin::parse_jmap("https://mail.test").unwrap(),
                     AccountView {
                         name: &name,
                         ..account
@@ -644,7 +644,7 @@ mod tests {
         for username in ["x".repeat(255), "\u{fdd0}".into()] {
             assert_eq!(
                 Session::mail_access(
-                    Origin::parse(&origin).unwrap(),
+                    Origin::parse_jmap(&origin).unwrap(),
                     AccountView {
                         username: &username,
                         ..account()
@@ -675,7 +675,7 @@ mod flag_profile_tests {
         .plan()
         .unwrap();
         let session = Session::mail_access(
-            Origin::parse("https://mail.example").unwrap(),
+            Origin::parse_jmap("https://mail.example").unwrap(),
             AccountView {
                 id: crate::ids::AccountId::from_bytes([1; 16]),
                 username: "user",

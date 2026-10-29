@@ -318,8 +318,14 @@ fn validate_links(
             let profile = certificate_index(views.certificates, profile, l.location)?;
             *used.get_mut(usize::from(profile)).ok_or_else(invariant)? = true;
         }
-        if l.kind == listener::Kind::Https
-            && origins.iter().any(|origin| l.bind.port() != origin.port())
+        if (l.kind == listener::Kind::LocalJmap && !origin.is_local())
+            || (l.kind == listener::Kind::Https
+                && (origin.is_local()
+                    || origins.iter().any(|origin| {
+                        l.bind
+                            .tcp()
+                            .is_none_or(|address| address.port() != origin.port())
+                    })))
         {
             return Err(conflict(Code::OriginPort, l.location, origin_at));
         }
@@ -644,7 +650,7 @@ impl fmt::Debug for RequiredName<'_> {
 }
 impl<'s, 't> View<'s, 't> {
     pub fn origin(self) -> Result<Origin<'t>, Error> {
-        Origin::parse(read(
+        Origin::parse_jmap(read(
             self.text,
             self.records.owner,
             *self.records.origins.first().ok_or_else(invariant)?,
@@ -663,7 +669,7 @@ impl<'s, 't> View<'s, 't> {
             .ok_or_else(invariant)?
         {
             output.push(
-                Origin::parse(read(self.text, self.records.owner, *span)?)
+                Origin::parse_jmap(read(self.text, self.records.owner, *span)?)
                     .map_err(|_| invariant())?,
             );
         }
@@ -985,7 +991,7 @@ mod tests {
         let records = bind(
             &mut arena,
             &mut bindings,
-            Origin::parse(origin).unwrap(),
+            Origin::parse_jmap(origin).unwrap(),
             at(901),
             inputs,
         )?;
@@ -1196,7 +1202,7 @@ mod tests {
             let result = bind(
                 &mut arena,
                 &mut slots,
-                Origin::parse(ORIGIN).unwrap(),
+                Origin::parse_jmap(ORIGIN).unwrap(),
                 at(901),
                 inputs,
             );
@@ -1258,7 +1264,7 @@ mod tests {
                 bind(
                     &mut arena,
                     &mut slots,
-                    Origin::parse(ORIGIN).unwrap(),
+                    Origin::parse_jmap(ORIGIN).unwrap(),
                     at(901),
                     inputs
                 )
@@ -1275,7 +1281,7 @@ mod tests {
         let records = bind(
             &mut arena,
             &mut slots,
-            Origin::parse("https://JMAP.Example.test:443/").unwrap(),
+            Origin::parse_jmap("https://JMAP.Example.test:443/").unwrap(),
             at(901),
             inputs,
         )
@@ -1326,7 +1332,7 @@ mod tests {
             let records = bind(
                 &mut arena,
                 &mut slots,
-                Origin::parse(ORIGIN).unwrap(),
+                Origin::parse_jmap(ORIGIN).unwrap(),
                 at(901),
                 inputs,
             )
@@ -1349,7 +1355,7 @@ mod tests {
             bind(
                 &mut arena,
                 &mut slots,
-                Origin::parse(ORIGIN).unwrap(),
+                Origin::parse_jmap(ORIGIN).unwrap(),
                 at(901),
                 inputs
             )
@@ -1427,7 +1433,7 @@ mod tests {
         let r = bind(
             &mut arena,
             &mut slots,
-            Origin::parse("https://MTA-STS.Example.test").unwrap(),
+            Origin::parse_jmap("https://MTA-STS.Example.test").unwrap(),
             at(901),
             inputs,
         )
@@ -1445,7 +1451,7 @@ mod tests {
             bind(
                 &mut arena,
                 &mut slots,
-                Origin::parse(ORIGIN).unwrap(),
+                Origin::parse_jmap(ORIGIN).unwrap(),
                 at(901),
                 inputs
             )
@@ -1468,7 +1474,7 @@ mod tests {
             bind(
                 &mut arena,
                 &mut slots,
-                Origin::parse(ORIGIN).unwrap(),
+                Origin::parse_jmap(ORIGIN).unwrap(),
                 at(901),
                 inputs
             )
@@ -1522,7 +1528,7 @@ mod tests {
             let result = bind(
                 &mut arena,
                 &mut slots,
-                Origin::parse(ORIGIN).unwrap(),
+                Origin::parse_jmap(ORIGIN).unwrap(),
                 at(901),
                 inputs,
             );

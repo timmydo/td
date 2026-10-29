@@ -290,7 +290,7 @@ impl ServerNames {
             .map_err(|_| invariant())
     }
     fn origin(&self) -> Result<Origin<'_>, Error> {
-        Origin::parse(
+        Origin::parse_jmap(
             std::str::from_utf8(self.origin.get(..self.origin_len).ok_or_else(invariant)?)
                 .map_err(|_| invariant())?,
         )
@@ -539,11 +539,6 @@ impl<'a, 'w> Builder<'a, 'w> {
             .outbound
             .finish()
             .map_err(Error::from_outbound)?;
-        let certificates = self
-            .targets
-            .certificates
-            .finish_for_roles(roles)
-            .map_err(Error::from_certificate)?;
         let gateways = self
             .targets
             .gateways
@@ -554,6 +549,13 @@ impl<'a, 'w> Builder<'a, 'w> {
             .listeners
             .finish_for_roles(resources.resources(), roles)
             .map_err(Error::from_listener)?;
+        let certificates = self
+            .targets
+            .certificates
+            .finish_with_certificate_requirement(
+                roles.receive() || listeners.requires_certificate(),
+            )
+            .map_err(Error::from_certificate)?;
         let graph = graph::bind_for_roles(
             &mut self.arena,
             self.targets.bindings,
@@ -770,7 +772,7 @@ fn apply_context(
             let hostname = c.required_text("hostname")?;
             values::dns_name(hostname).map_err(|_| c.value_error("hostname"))?;
             let origin = c.required_text("jmap_origin")?;
-            let primary = Origin::parse(origin).map_err(|_| c.value_error("jmap_origin"))?;
+            let primary = Origin::parse_jmap(origin).map_err(|_| c.value_error("jmap_origin"))?;
             let aliases = c.text("jmap_origin_aliases")?.unwrap_or("");
             super::endpoint::jmap_origins(primary, aliases)
                 .map_err(|_| c.value_error("jmap_origin_aliases"))?;
@@ -1005,6 +1007,7 @@ fn apply_context(
                 "direct_smtp" => listener::Kind::DirectSmtp,
                 "gateway_smtp" => listener::Kind::GatewaySmtp,
                 "https" => listener::Kind::Https,
+                "local_jmap" => listener::Kind::LocalJmap,
                 "http01" => listener::Kind::Http01,
                 "loopback_smtp_fixture" => listener::Kind::LoopbackSmtpFixture,
                 _ => return Err(c.value_error("kind")),

@@ -3,10 +3,10 @@ use crate::{
     admission::timers::{self, TimeoutPlan},
     config::{
         endpoint::Origin,
-        listener::{Kind, Listener},
+        listener::{Bind, Kind, Listener},
     },
     generations::GenerationLease,
-    http_auth::{self, Attempts},
+    http_auth::{self, Attempts, PeerAddress},
     http_request::{self, HeadReader, HEAD_BYTES, QUANTUM},
     https_upload,
     limits::ResourcePlan,
@@ -21,7 +21,7 @@ use crate::{
     transport::TcpTransport,
 };
 use std::{
-    net::{IpAddr, TcpListener, TcpStream},
+    net::{TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex, TryLockError,
@@ -36,8 +36,30 @@ const DRAIN_BYTES: usize = 64 * 1024;
 const DRAIN_SECONDS: u64 = 5;
 
 pub struct BoundListener {
-    socket: TcpListener,
-    policy: TlsPolicyId,
+    socket: ListenerSocket,
+    policy: Option<TlsPolicyId>,
+}
+// Sixteen cold listener slots retain their bounded path and lock inline.
+#[allow(clippy::large_enum_variant)]
+enum ListenerSocket {
+    Tcp(TcpListener),
+    Unix(crate::unix_listener::PrivateListener),
+}
+enum Accepted {
+    Tcp(TcpStream),
+    Unix(std::os::unix::net::UnixStream),
+}
+impl ListenerSocket {
+    fn accept(&self) -> std::io::Result<(Accepted, PeerAddress)> {
+        match self {
+            Self::Tcp(listener) => listener.accept().map(|(stream, address)| {
+                (Accepted::Tcp(stream), PeerAddress::Network(address.ip()))
+            }),
+            Self::Unix(listener) => listener
+                .accept()
+                .map(|stream| (Accepted::Unix(stream), PeerAddress::Local)),
+        }
+    }
 }
 impl BoundListener {
     pub fn new(
@@ -45,10 +67,11 @@ impl BoundListener {
         row: Listener<'_>,
         policies: &GenerationLease<TlsPolicies>,
     ) -> Result<Self, Error> {
+        let bind = row.bind.tcp().ok_or(Error::Invalid)?;
         if row.kind != Kind::Https
-            || (row.bind.is_ipv6() && !crate::transport::ipv6_only(&socket)?)
-            || row.bind.port() == 0
-            || socket.local_addr()? != row.bind
+            || (bind.is_ipv6() && !crate::transport::ipv6_only(&socket)?)
+            || bind.port() == 0
+            || socket.local_addr()? != bind
         {
             return Err(Error::Invalid);
         }
@@ -57,7 +80,33 @@ impl BoundListener {
             return Err(Error::Forbidden);
         }
         socket.set_nonblocking(true)?;
-        Ok(Self { socket, policy })
+        Ok(Self {
+            socket: ListenerSocket::Tcp(socket),
+            policy: Some(policy),
+        })
+    }
+    pub fn local(row: Listener<'_>) -> Result<Self, Error> {
+        if row.kind != Kind::LocalJmap || row.certificate.is_some() {
+            return Err(Error::Invalid);
+        }
+        let Bind::Unix(path) = row.bind else {
+            return Err(Error::Invalid);
+        };
+        let path = td_fs::SocketPath::new(std::path::Path::new(path))?;
+        Ok(Self {
+            socket: ListenerSocket::Unix(crate::unix_listener::PrivateListener::bind(path)?),
+            policy: None,
+        })
+    }
+    fn check_certificate(
+        &self,
+        policies: &GenerationLease<TlsPolicies>,
+        utc_ms: i64,
+    ) -> Result<(), Error> {
+        if let Some(policy) = self.policy {
+            TlsPolicies::check_receiving_certificate(policies, policy, utc_ms)?;
+        }
+        Ok(())
     }
 }
 #[derive(Clone, Copy, PartialEq)]
@@ -81,12 +130,12 @@ struct Client {
     keep_alive: bool,
     requests: usize,
     origin: usize,
-    peer: IpAddr,
+    peer: PeerAddress,
     phase: Phase,
     pending: Option<TcpStream>,
     wire: Option<(Wire, Wire)>,
-    policy: TlsPolicyId,
-    connection: Option<TlsConnection<Wire>>,
+    policy: Option<TlsPolicyId>,
+    connection: Option<Connection>,
     head: HeadReader<Box<[u8]>>,
     input: Box<[u8]>,
     input_used: usize,
@@ -103,6 +152,58 @@ struct Client {
     absolute: Deadline,
     phase_deadline: Deadline,
     idle: Deadline,
+}
+// Preserve the existing inline TLS reservation without another allocation.
+#[allow(clippy::large_enum_variant)]
+enum Connection {
+    Tls(TlsConnection<Wire>),
+    Local(crate::unix_transport::UnixTransport),
+}
+impl Connection {
+    fn wait_handshake_input(&mut self, until: Instant) -> Result<bool, Error> {
+        match self {
+            Self::Tls(connection) => connection.wait_handshake_input(until),
+            Self::Local(_) => Err(Error::Invalid),
+        }
+    }
+    fn handshake(&mut self, deadline: Deadline) -> Result<Handshake, Error> {
+        match self {
+            Self::Tls(connection) => connection.handshake(deadline),
+            Self::Local(_) => Err(Error::Invalid),
+        }
+    }
+}
+impl Transport for Connection {
+    fn read(&mut self, bytes: &mut [u8]) -> Result<IoProgress, Error> {
+        match self {
+            Self::Tls(c) => c.read(bytes),
+            Self::Local(c) => c.read(bytes),
+        }
+    }
+    fn write(&mut self, bytes: &[u8]) -> Result<IoProgress, Error> {
+        match self {
+            Self::Tls(c) => c.write(bytes),
+            Self::Local(c) => c.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> Result<FlushProgress, Error> {
+        match self {
+            Self::Tls(c) => c.flush(),
+            Self::Local(c) => c.flush(),
+        }
+    }
+    fn close(&mut self) -> Result<FlushProgress, Error> {
+        match self {
+            Self::Tls(c) => c.close(),
+            Self::Local(c) => c.close(),
+        }
+    }
+    fn abort(&mut self) {
+        match self {
+            Self::Tls(c) => c.abort(),
+            Self::Local(c) => c.abort(),
+        }
+    }
 }
 struct EventState {
     stream: crate::jmap_events::Stream,
@@ -279,14 +380,11 @@ impl Https<'_> {
         })
     }
     fn request_origin(&self, head: &http_request::Head<'_>) -> Result<usize, u16> {
-        let authority = if let Some(target) = head.target_origin {
+        let (authority, scheme) = if let Some(target) = head.target_origin {
             let (scheme, authority) = target.split_once("://").ok_or(421u16)?;
-            if !scheme.eq_ignore_ascii_case("https") {
-                return Err(421);
-            }
-            authority
+            (authority, Some(scheme))
         } else {
-            head.host
+            (head.host, None)
         };
         let index = self
             .origins
@@ -294,10 +392,14 @@ impl Https<'_> {
             .position(|origin| http_auth::same_authority(*origin, authority))
             .ok_or(421u16)?;
         let origin = self.origins.get(index).ok_or(421u16)?;
-        if head
-            .origin
-            .is_some_and(|value| !Origin::parse(value).is_ok_and(|value| origin.same_origin(value)))
-        {
+        if scheme.is_some_and(|scheme| {
+            !scheme.eq_ignore_ascii_case(if origin.is_local() { "http" } else { "https" })
+        }) {
+            return Err(421);
+        }
+        if head.origin.is_some_and(|value| {
+            !Origin::parse_jmap(value).is_ok_and(|value| origin.same_origin(value))
+        }) {
             return Err(403);
         }
         Ok(index)
@@ -317,6 +419,14 @@ impl Https<'_> {
                     .any(|prior| prior.same_origin(*origin))
             })
             || self.backends.len() > crate::config::identities::MAX_ACCOUNTS * self.origins.len()
+        {
+            return Err(Error::Invalid);
+        }
+        if self.listeners.iter().any(|listener| {
+            self.origins
+                .iter()
+                .any(|origin| origin.is_local() != listener.policy.is_none())
+        }) || (self.origins.iter().any(|origin| origin.is_local()) && self.origins.len() != 1)
         {
             return Err(Error::Invalid);
         }
@@ -719,7 +829,7 @@ impl Https<'_> {
             let (input, output) = client.wire.take().ok_or(Error::Invalid)?;
             let prepared = match TlsPolicies::reserve_session(
                 self.policies.clone(),
-                client.policy,
+                client.policy.ok_or(Error::Invalid)?,
                 self.handshakes,
                 input,
                 output,
@@ -737,7 +847,7 @@ impl Https<'_> {
             };
             let plain = TcpTransport::from_stream(client.pending.take().ok_or(Error::Invalid)?)?;
             let reserved = prepared.construct().map_err(|refusal| refusal.error())?;
-            client.connection = Some(
+            client.connection = Some(Connection::Tls(
                 reserved
                     .handoff(
                         plain,
@@ -747,7 +857,7 @@ impl Https<'_> {
                         client.phase_deadline,
                     )
                     .map_err(|refusal| refusal.error())?,
-            );
+            ));
         }
         let connection = client.connection.as_mut().ok_or(Error::Invalid)?;
         let result = connection.handshake(client.phase_deadline)?;
@@ -774,11 +884,7 @@ impl Https<'_> {
         control: &Control,
     ) -> Result<(), Error> {
         for listener in self.listeners {
-            TlsPolicies::check_receiving_certificate(
-                self.policies,
-                listener.policy,
-                self.clock.sample()?.utc_ms,
-            )?;
+            listener.check_certificate(self.policies, self.clock.sample()?.utc_ms)?;
         }
         self.ready.store(true, Ordering::Release);
         let mut attempts = Attempts::default();
@@ -796,11 +902,7 @@ impl Https<'_> {
             }
             let time = self.clock.sample()?;
             for listener in self.listeners {
-                TlsPolicies::check_receiving_certificate(
-                    self.policies,
-                    listener.policy,
-                    time.utc_ms,
-                )?;
+                listener.check_certificate(self.policies, time.utc_ms)?;
             }
             for offset in 0..slots.len() {
                 let index = (cursor + offset) % slots.len();
@@ -879,7 +981,7 @@ impl Https<'_> {
                 let Some((index, mut slot)) = free else {
                     break;
                 };
-                let (socket, address) = match listener.socket.accept() {
+                let (socket, peer) = match listener.socket.accept() {
                     Ok(pair) => pair,
                     Err(error)
                         if matches!(
@@ -905,7 +1007,7 @@ impl Https<'_> {
                 *peers.get_mut(index).ok_or(Error::Invalid)? = None;
                 if peers
                     .iter()
-                    .filter(|peer| **peer == Some(address.ip()))
+                    .filter(|existing| **existing == Some(peer))
                     .count()
                     >= PER_PEER
                 {
@@ -918,21 +1020,21 @@ impl Https<'_> {
                     );
                     continue;
                 }
-                if socket.set_nonblocking(true).is_err() {
-                    continue;
-                }
                 let allocated = (|| {
-                    let input = buffer::<TLS_WIRE_BYTES>()?;
-                    let output = buffer::<TLS_WIRE_BYTES>()?;
+                    let wire = if matches!(socket, Accepted::Tcp(_)) {
+                        Some((buffer::<TLS_WIRE_BYTES>()?, buffer::<TLS_WIRE_BYTES>()?))
+                    } else {
+                        None
+                    };
                     let head: Box<[u8]> = buffer::<HEAD_BYTES>()?;
                     let input_plain: Box<[u8]> = buffer::<QUANTUM>()?;
                     let mut response = Vec::new();
                     response
                         .try_reserve_exact(512)
                         .map_err(|_| Error::Capacity)?;
-                    Ok::<_, Error>((input, output, head, input_plain, response))
+                    Ok::<_, Error>((wire, head, input_plain, response))
                 })();
-                let (input, output, head, input_plain, response) = match allocated {
+                let (wire, head, input_plain, response) = match allocated {
                     Ok(buffers) => buffers,
                     Err(_) => {
                         accept_after =
@@ -942,20 +1044,50 @@ impl Https<'_> {
                 };
                 let now = self.clock.sample()?.monotonic;
                 let absolute = deadline(now, timers::SESSION_SECONDS)?;
-                let phase_deadline =
-                    deadline(now, self.timeouts.limits().handshake_seconds)?.min(absolute);
+                let (phase, pending, connection, seconds) = match socket {
+                    Accepted::Tcp(socket) => {
+                        if socket.set_nonblocking(true).is_err() {
+                            continue;
+                        }
+                        (
+                            Phase::Tls,
+                            Some(socket),
+                            None,
+                            self.timeouts.limits().handshake_seconds,
+                        )
+                    }
+                    Accepted::Unix(socket) => {
+                        let connection =
+                            match crate::unix_transport::UnixTransport::from_stream(socket) {
+                                Ok(connection) => connection,
+                                Err(_) => continue,
+                            };
+                        (
+                            Phase::Head,
+                            None,
+                            Some(Connection::Local(connection)),
+                            self.timeouts.limits().header_seconds,
+                        )
+                    }
+                };
+                let phase_deadline = deadline(now, seconds)?.min(absolute);
+                let idle = if phase == Phase::Head {
+                    deadline(now, self.timeouts.limits().header_idle_seconds)?.min(phase_deadline)
+                } else {
+                    phase_deadline
+                };
                 let client = Client {
                     timing: None,
                     response_outcome: crate::performance::Outcome::Failed,
                     keep_alive: false,
                     requests: 0,
                     origin: 0,
-                    peer: address.ip(),
-                    phase: Phase::Tls,
-                    pending: Some(socket),
-                    wire: Some((input, output)),
+                    peer,
+                    phase,
+                    pending,
+                    wire,
                     policy: listener.policy,
-                    connection: None,
+                    connection,
                     head: HeadReader::new(head),
                     input: input_plain,
                     input_used: 0,
@@ -971,9 +1103,9 @@ impl Https<'_> {
                     stop_after_response: false,
                     absolute,
                     phase_deadline,
-                    idle: phase_deadline,
+                    idle,
                 };
-                *peers.get_mut(index).ok_or(Error::Invalid)? = Some(address.ip());
+                *peers.get_mut(index).ok_or(Error::Invalid)? = Some(peer);
                 *slot = Some(client);
                 for worker in tls_workers {
                     worker.thread().unpark();

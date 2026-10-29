@@ -203,6 +203,7 @@ pub mod tls_policy;
 pub mod transmitted_copy;
 pub mod transmitted_headers;
 pub mod transport;
+pub mod unix_listener;
 pub mod unix_transport;
 pub use td_mime::unicode;
 pub mod wire;

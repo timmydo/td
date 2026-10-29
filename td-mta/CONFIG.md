@@ -608,6 +608,12 @@ authority or permission to follow an endpoint.
 no query. Its canonical writer emits lowercase host, omits port 443 and omits
 the terminal slash. `HttpsUri::origin` exposes its origin, and both types
 share `Origin::same_origin` for comparisons. The host accessor still returns the original borrowed case.
+For a `local_jmap` listener only, `Origin::parse_jmap` also accepts the exact
+logical origin `http://localhost` (with an optional terminal slash). It has
+port 80, no aliases and a distinct scheme in origin comparisons. This is
+HTTP carried by a private pathname socket, not permission for plaintext TCP.
+`Origin::parse` and `HttpsUri` remain HTTPS-only, including replication sources
+and ACME URLs.
 Both writers append to `bounded::TextBuffer` atomically: a capacity failure
 restores visible length, not overwritten tail bytes. Their private formatting
 implementations do bounded work and allocate nothing.
@@ -1005,8 +1011,8 @@ runtime authority.
 ## Structural listener records
 
 M04b2c3c4a implements `config::listener` for complete typed listener inputs.
-The five kinds are direct SMTP, gateway SMTP, HTTPS, HTTP-01 and an explicit
-plaintext loopback SMTP fixture. Required and forbidden fields follow
+The kinds are direct SMTP, gateway SMTP, HTTPS, HTTP-01, an explicit
+plaintext loopback SMTP fixture, and private Unix JMAP (`local_jmap`). Required and forbidden fields follow
 SCHEMA.md's role matrix; a missing field and a supplied forbidden field have
 distinct fixed codes and a static field identifier. Direct/gateway server
 names receive shared DNS validation and lowercase storage. Certificate and
@@ -1014,7 +1020,29 @@ gateway references receive profile-name validation only; their existence and
 compatibility use M04b2c3c4b below. The source dispatcher still owns
 unknown fields, duplicates within a stanza, scalar types and reader EOF.
 
-Each bind is a parsed numeric socket endpoint. Loopback fixtures require
+Network binds are parsed numeric socket endpoints. A `local_jmap` bind is
+an absolute canonical UTF-8 pathname of at most 107 bytes, without dot,
+parent or empty components. It forbids certificate, server-name, gateway
+and SMTP limit fields. Duplicate socket paths conflict. It satisfies the
+selected JMAP role without a certificate profile; network HTTPS and SMTP
+retain their certificate requirements. The graph requires `http://localhost`
+for local JMAP and HTTPS origins for network JMAP, so one profile cannot mix
+them.
+
+The local listener requires an existing current-user mode-0700 parent
+with trusted physical ancestors, holds that directory's private `LOCK` for
+its lifetime, and creates a mode-0600 socket. Give each listener a dedicated
+directory, separate from PostgreSQL and control sockets. Only after locking
+may it remove an owned stale socket; other existing objects refuse startup.
+Cleanup unlinks only its own socket inode. Each local listener retains one
+socket descriptor plus directory and lock descriptors (at most 16 listeners);
+no per-connection TLS wire buffers are allocated. Root and same-UID namespace writers
+remain trusted. A local connection enters the existing bounded HTTP engine
+directly, without a TLS session or certificate check. Account authentication,
+origin checks, deadlines, admission limits and read-only enforcement remain
+mandatory; local peers share their own attempt bucket, distinct from IP peers.
+
+ Loopback fixtures require
 127.0.0.0/8 or ::1, and HTTP-01 requires port 80. Duplicate listener names
 and conflicting binds retain both declaration coordinates. On the same
 address family and port, identical addresses or either unspecified address

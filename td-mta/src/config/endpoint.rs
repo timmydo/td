@@ -136,6 +136,7 @@ impl<'a> HttpsUri<'a> {
         Origin {
             host: self.host,
             port: self.port,
+            local: false,
         }
     }
     pub fn same_origin(self, other: Self) -> bool {
@@ -164,6 +165,7 @@ impl<'a> HttpsUri<'a> {
 pub struct Origin<'a> {
     host: &'a str,
     port: u16,
+    local: bool,
 }
 impl fmt::Debug for Origin<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -171,6 +173,16 @@ impl fmt::Debug for Origin<'_> {
     }
 }
 impl<'a> Origin<'a> {
+    pub fn parse_jmap(input: &'a str) -> Result<Self, Code> {
+        if matches!(input, "http://localhost" | "http://localhost/") {
+            return Ok(Self {
+                host: "localhost",
+                port: 80,
+                local: true,
+            });
+        }
+        Self::parse(input)
+    }
     pub fn parse(input: &'a str) -> Result<Self, Code> {
         let uri = HttpsUri::parse(input).map_err(|_| Code::Origin)?;
         if !matches!(uri.target, "" | "/") {
@@ -179,6 +191,7 @@ impl<'a> Origin<'a> {
         Ok(Self {
             host: uri.host,
             port: uri.port,
+            local: false,
         })
     }
     pub fn host(self) -> &'a str {
@@ -188,7 +201,12 @@ impl<'a> Origin<'a> {
         self.port
     }
     pub fn same_origin(self, other: Self) -> bool {
-        self.port == other.port && self.host.eq_ignore_ascii_case(other.host)
+        self.local == other.local
+            && self.port == other.port
+            && self.host.eq_ignore_ascii_case(other.host)
+    }
+    pub fn is_local(self) -> bool {
+        self.local
     }
     /// Atomic bounded append; a capacity failure exposes no partial origin.
     pub fn write_canonical(
@@ -208,7 +226,9 @@ pub fn jmap_origins<'a>(primary: Origin<'a>, aliases: &'a str) -> Result<Vec<Ori
     origins.push(primary);
     for text in aliases.split_ascii_whitespace() {
         let origin = Origin::parse(text)?;
-        if origins.len() >= MAX_JMAP_ORIGINS
+        if primary.is_local()
+            || origin.is_local()
+            || origins.len() >= MAX_JMAP_ORIGINS
             || origin.port() != primary.port()
             || origins.iter().any(|prior| origin.same_origin(*prior))
         {
@@ -223,11 +243,11 @@ struct OriginDisplay<'a>(Origin<'a>);
 impl fmt::Display for OriginDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use fmt::Write;
-        f.write_str("https://")?;
+        f.write_str(if self.0.local { "http://" } else { "https://" })?;
         for b in self.0.host.bytes() {
             f.write_char(char::from(b.to_ascii_lowercase()))?;
         }
-        if self.0.port != 443 {
+        if self.0.port != if self.0.local { 80 } else { 443 } {
             write!(f, ":{}", self.0.port)?;
         }
         Ok(())
@@ -606,6 +626,28 @@ mod tests {
             assert_eq!(code.name(), name);
             assert_eq!(code.to_string(), name);
             assert!(std::error::Error::source(&code).is_none());
+        }
+    }
+    #[test]
+    fn local_origin_is_explicit_and_never_an_https_uri() {
+        let local = Origin::parse_jmap("http://localhost/").unwrap();
+        assert!(local.is_local());
+        assert_eq!(local.port(), 80);
+        assert!(!local.same_origin(Origin::parse("https://localhost").unwrap()));
+        assert!(HttpsUri::parse("http://localhost").is_err());
+        assert!(jmap_origins(local, "https://elsewhere.test").is_err());
+        let mut bytes = [0; 64];
+        let mut output = bounded::TextBuffer::new(&mut bytes);
+        local.write_canonical(&mut output).unwrap();
+        assert_eq!(output.as_str().unwrap(), "http://localhost");
+        for value in [
+            "http://elsewhere.test",
+            "http://127.0.0.1",
+            "http://localhost:80",
+            "http://localhost/path",
+            "http://localhost?query",
+        ] {
+            assert!(Origin::parse(value).is_err(), "{value}");
         }
     }
 }

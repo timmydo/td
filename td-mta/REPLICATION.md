@@ -728,13 +728,18 @@ role memberships and elevated role attributes refuse qualification, including
 writes to replica progress and receipts. Schema ownership, replication
 publication, local credential provisioning and mail serving use distinct roles.
 
-## Loopback read service
+## Local read service
 
 A provisioned replica can run `td-mta serve --read-only --connection-file
 READER_FILE --profile NAME --runtime PRIVATE_RUNTIME --scratch PRIVATE_SCRATCH`.
 The reader login must have exactly the restricted grants above. The selected
-profile must have only the JMAP role, with loopback HTTPS listeners and local
-file-mode certificates. SMTP, relay, HTTP-01 and ACME profiles refuse before
+profile must have only the JMAP role, with either private `local_jmap` Unix
+listeners or loopback HTTPS listeners and local file-mode certificates.
+Unix JMAP requires no server certificate or renewal; it uses the fixed logical
+origin `http://localhost` over the private socket. The authenticated read-only
+API is identical on both transports. CONFIG.md specifies socket admission.
+The installed replica setup and td-mail transport selection switch separately;
+merely enabling server support does not migrate existing installations. SMTP, relay, HTTP-01 and ACME profiles refuse before
 listener startup. Omitting `--read-only` retains ordinary primary qualification
 and refuses this database. A writable publisher login cannot stand in for the
 reader login.

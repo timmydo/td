@@ -9,6 +9,7 @@ pub enum Kind {
     DirectSmtp,
     GatewaySmtp,
     Https,
+    LocalJmap,
     Http01,
     LoopbackSmtpFixture,
 }
@@ -18,6 +19,7 @@ impl Kind {
             Self::DirectSmtp => "direct_smtp",
             Self::GatewaySmtp => "gateway_smtp",
             Self::Https => "https",
+            Self::LocalJmap => "local_jmap",
             Self::Http01 => "http01",
             Self::LoopbackSmtpFixture => "loopback_smtp_fixture",
         }
@@ -161,6 +163,29 @@ impl fmt::Debug for Input<'_> {
         f.write_str("ListenerInput(<redacted>)")
     }
 }
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum Bind<'a> {
+    Tcp(SocketAddr),
+    Unix(&'a str),
+}
+impl fmt::Debug for Bind<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ListenerBind(<redacted>)")
+    }
+}
+impl Bind<'_> {
+    pub fn tcp(self) -> Option<SocketAddr> {
+        match self {
+            Self::Tcp(address) => Some(address),
+            Self::Unix(_) => None,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum StoredBind {
+    Tcp(SocketAddr),
+    Unix(text::Span),
+}
 #[derive(Clone, Copy)]
 pub struct Slot {
     name: text::Span,
@@ -168,7 +193,7 @@ pub struct Slot {
     server_aliases: text::Span,
     certificate: text::Span,
     gateway: text::Span,
-    bind: Option<SocketAddr>,
+    bind: Option<StoredBind>,
     kind: Kind,
     sessions: usize,
     per_peer: usize,
@@ -256,8 +281,16 @@ impl<'a> Builder<'a> {
         if self.count >= self.slots.len() {
             return Err(err(Code::Capacity, None, Some(at)));
         }
-        let bind = endpoint::numeric_endpoint(input.bind)
-            .map_err(|_| err(Code::Endpoint, Some(Field::Bind), Some(at)))?;
+        let bind = if input.kind == Kind::LocalJmap {
+            td_fs::SocketPath::new(std::path::Path::new(input.bind))
+                .map_err(|_| err(Code::Endpoint, Some(Field::Bind), Some(at)))?;
+            Bind::Unix(input.bind)
+        } else {
+            Bind::Tcp(
+                endpoint::numeric_endpoint(input.bind)
+                    .map_err(|_| err(Code::Endpoint, Some(Field::Bind), Some(at)))?,
+            )
+        };
         let named_smtp = matches!(input.kind, Kind::DirectSmtp | Kind::GatewaySmtp);
         let has_certificate = named_smtp || input.kind == Kind::Https;
         required(
@@ -348,15 +381,21 @@ impl<'a> Builder<'a> {
         if per_peer > sessions {
             return Err(err(Code::Range, Some(Field::PerPeerLimit), Some(at)));
         }
-        if input.kind == Kind::LoopbackSmtpFixture && !bind.ip().is_loopback() {
+        if input.kind == Kind::LoopbackSmtpFixture
+            && !bind.tcp().is_some_and(|address| address.ip().is_loopback())
+        {
             return Err(err(Code::Loopback, Some(Field::Bind), Some(at)));
         }
-        if input.kind == Kind::Http01 && bind.port() != 80 {
+        if input.kind == Kind::Http01 && !bind.tcp().is_some_and(|address| address.port() == 80) {
             return Err(err(Code::Http01Port, Some(Field::Bind), Some(at)));
         }
         for old in used {
-            let old_bind = old.bind.ok_or_else(invariant)?;
-            if binds_overlap(old_bind, bind) {
+            let overlap = match (old.bind.ok_or_else(invariant)?, bind) {
+                (StoredBind::Tcp(a), Bind::Tcp(b)) => binds_overlap(a, b),
+                (StoredBind::Unix(a), Bind::Unix(b)) => read(view, self.owner, a)? == b,
+                _ => false,
+            };
+            if overlap {
                 return Err(conflict(
                     Code::BindConflict,
                     Field::Bind,
@@ -365,6 +404,10 @@ impl<'a> Builder<'a> {
                 ));
             }
         }
+        let bind = match bind {
+            Bind::Tcp(address) => StoredBind::Tcp(address),
+            Bind::Unix(path) => StoredBind::Unix(store(arena, path, Field::Bind, at)?),
+        };
         let name = store(arena, name, Field::Name, at)?;
         let server = match input.server_name {
             Some(host) => {
@@ -420,14 +463,14 @@ impl<'a> Builder<'a> {
         let mut has_https = false;
         for slot in slots {
             let enabled = match slot.kind {
-                Kind::Https => roles.jmap(),
+                Kind::Https | Kind::LocalJmap => roles.jmap(),
                 Kind::Http01 => roles.receive() || roles.jmap(),
                 Kind::DirectSmtp | Kind::GatewaySmtp | Kind::LoopbackSmtpFixture => roles.receive(),
             };
             if !enabled {
                 return Err(err(Code::DisabledRole, None, slot.location));
             }
-            has_https |= slot.kind == Kind::Https;
+            has_https |= matches!(slot.kind, Kind::Https | Kind::LocalJmap);
             if slot.kind.is_smtp() {
                 has_smtp = true;
                 if slot.sessions > plan.limits().smtp_sessions {
@@ -522,6 +565,14 @@ impl fmt::Debug for Records<'_> {
     }
 }
 impl Records<'_> {
+    pub(crate) fn requires_certificate(&self) -> bool {
+        self.slots.iter().any(|slot| {
+            matches!(
+                slot.kind,
+                Kind::Https | Kind::DirectSmtp | Kind::GatewaySmtp
+            )
+        })
+    }
     pub fn view_live<'s, 't>(&'s self, text: &'t text::Builder<'_>) -> Result<View<'s, 't>, Error> {
         self.view(text.borrowed_view().map_err(|_| invariant())?)
     }
@@ -551,7 +602,7 @@ impl fmt::Debug for View<'_, '_> {
 pub struct Listener<'t> {
     pub name: &'t str,
     pub kind: Kind,
-    pub bind: SocketAddr,
+    pub bind: Bind<'t>,
     pub server_name: Option<&'t str>,
     pub server_name_aliases: &'t str,
     pub certificate: Option<&'t str>,
@@ -590,7 +641,10 @@ impl<'t> View<'_, 't> {
         Ok(Some(Listener {
             name: read(self.text, self.owner, s.name)?,
             kind: s.kind,
-            bind: s.bind.ok_or_else(invariant)?,
+            bind: match s.bind.ok_or_else(invariant)? {
+                StoredBind::Tcp(address) => Bind::Tcp(address),
+                StoredBind::Unix(path) => Bind::Unix(read(self.text, self.owner, path)?),
+            },
             server_name: if named_smtp {
                 Some(read(self.text, self.owner, s.server)?)
             } else {
@@ -769,7 +823,7 @@ mod tests {
                         "loopback_smtp_fixture"
                     ][i]
                 );
-                assert_eq!(l.bind, bind.parse().unwrap());
+                assert_eq!(l.bind, Bind::Tcp(bind.parse().unwrap()));
                 assert_eq!(l.location, at(i as u32 + 1));
                 let named = matches!(kind, Kind::DirectSmtp | Kind::GatewaySmtp);
                 assert_eq!(l.server_name, named.then_some("mail.example.test"));
@@ -1397,6 +1451,70 @@ mod tests {
         assert_eq!(
             records.view_live(&reused).unwrap_err().code,
             Code::ForeignArena
+        );
+    }
+    #[test]
+    fn local_listener_is_a_certificate_free_jmap_role() {
+        let _lock = lock();
+        let mut storage = Storage::new();
+        let mut arena = text::Builder::new(&mut storage.bytes).unwrap();
+        let mut builder = Builder::new(&arena, &mut storage.slots).unwrap();
+        builder
+            .listener(
+                &mut arena,
+                "local",
+                input(Kind::LocalJmap, "/private/jmap/socket"),
+                at(1),
+            )
+            .unwrap();
+        let records = builder
+            .finish_for_roles(
+                &Limits::default().plan().unwrap(),
+                super::super::profile::Roles::from_bits(2).unwrap(),
+            )
+            .unwrap();
+        assert!(!records.requires_certificate());
+        let row = records
+            .view_live(&arena)
+            .unwrap()
+            .listener(0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.bind, Bind::Unix("/private/jmap/socket"));
+        assert!(row.certificate.is_none());
+        assert!(row.session_limit.is_none());
+    }
+    #[test]
+    fn local_listener_refuses_tcp_paths_and_certificate_fields() {
+        let _lock = lock();
+        for path in [
+            "127.0.0.1:443",
+            "relative/socket",
+            "/private/../socket",
+            "/private//socket",
+        ] {
+            let mut storage = Storage::new();
+            let mut arena = text::Builder::new(&mut storage.bytes).unwrap();
+            let mut builder = Builder::new(&arena, &mut storage.slots).unwrap();
+            assert_eq!(
+                builder
+                    .listener(&mut arena, "local", input(Kind::LocalJmap, path), at(1))
+                    .unwrap_err()
+                    .code,
+                Code::Endpoint
+            );
+        }
+        let mut storage = Storage::new();
+        let mut arena = text::Builder::new(&mut storage.bytes).unwrap();
+        let mut builder = Builder::new(&arena, &mut storage.slots).unwrap();
+        let mut row = input(Kind::LocalJmap, "/private/socket");
+        row.certificate = Some("public");
+        assert_eq!(
+            builder
+                .listener(&mut arena, "local", row, at(1))
+                .unwrap_err()
+                .code,
+            Code::Forbidden
         );
     }
 }

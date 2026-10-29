@@ -2881,6 +2881,19 @@ expired idle sessions locally, without SQL or a background task. POSTGRES.md sec
 session, protocol and cleanup bounds. Mutations retain their existing separate
 publication and uncertain-COMMIT paths.
 
+## Private Unix JMAP
+
+A `local_jmap` listener serves the existing authenticated HTTP/JMAP engine
+through a current-user mode-0600 pathname socket in a mode-0700 directory.
+It does not open a TCP listener, manufacture TLS verification, or require a
+certificate. CONFIG.md and SCHEMA.md own declaration and lifetime exclusion.
+Its fixed logical origin is `http://localhost`; network JMAP continues to
+require HTTPS. Local peers share a bounded authentication-attempt bucket.
+All account authorization, durable-write, body integrity and read-only
+replica rules are unchanged. The transport choice does not select replica
+mode or grant write authority. Clients must explicitly bind this logical
+origin to the configured private socket, without DNS or TCP fallback.
+
 ## Native ACME deployment profile
 
 [ACME.md](ACME.md) owns the implemented single-endpoint native HTTP-01 worker,

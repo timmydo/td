@@ -190,13 +190,20 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                     .listener(index)
                     .map_err(|_| config_failure("configuration", "invariant"))?
                     .ok_or_else(|| config_failure("configuration", "invariant"))?;
-                if options.read_only && (row.kind != Kind::Https || !row.bind.ip().is_loopback()) {
-                    return Err(config_failure("listeners", "replica-loopback-https-only"));
+                if options.read_only
+                    && !(row.kind == Kind::LocalJmap
+                        || (row.kind == Kind::Https
+                            && row
+                                .bind
+                                .tcp()
+                                .is_some_and(|address| address.ip().is_loopback())))
+                {
+                    return Err(config_failure("listeners", "replica-local-jmap-only"));
                 }
                 match row.kind {
                     Kind::DirectSmtp => direct.push(row),
-                    Kind::Https if mailbox_access => https_rows.push(row),
-                    Kind::Https if !mailbox_access => (),
+                    Kind::Https | Kind::LocalJmap if mailbox_access => https_rows.push(row),
+                    Kind::Https | Kind::LocalJmap if !mailbox_access => (),
                     Kind::Http01 => (),
                     _ => return Err(config_failure("listeners", "unsupported-listener")),
                 }
@@ -240,7 +247,12 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                 .try_reserve_exact(direct.len())
                 .map_err(|_| config_failure("listeners", "capacity"))?;
             for row in direct {
-                let socket = super::listener_sys::bind(row.bind).map_err(|error| {
+                let socket = super::listener_sys::bind(
+                    row.bind
+                        .tcp()
+                        .ok_or_else(|| config_failure("listeners", "tcp-required"))?,
+                )
+                .map_err(|error| {
                     config_failure(
                         "listen",
                         match error.kind() {
@@ -257,8 +269,19 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
             }
             let mut https_listeners = Vec::new();
             for row in https_rows {
-                let socket = super::listener_sys::bind(row.bind)
-                    .map_err(|_| config_failure("https-listen", "io"))?;
+                if row.kind == Kind::LocalJmap {
+                    https_listeners.push(
+                        td_mta::https::BoundListener::local(row)
+                            .map_err(|error| adapter("jmap-listen", error))?,
+                    );
+                    continue;
+                }
+                let socket = super::listener_sys::bind(
+                    row.bind
+                        .tcp()
+                        .ok_or_else(|| config_failure("listeners", "tcp-required"))?,
+                )
+                .map_err(|_| config_failure("https-listen", "io"))?;
                 https_listeners.push(
                     td_mta::https::BoundListener::new(socket, row, &policies)
                         .map_err(|error| adapter("https-listen", error))?,

@@ -4,8 +4,8 @@ use std::{
     fs,
     io::{self, Read, Write},
     os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
-        net::{UnixListener, UnixStream},
+        fs::{FileTypeExt, MetadataExt},
+        net::UnixStream,
     },
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
@@ -13,7 +13,7 @@ use std::{
 };
 use td_mta::{
     smtp_receiving::{Control, State},
-    store_fs::{LockedRoot, PrivateRoot},
+    store_fs::PrivateRoot,
 };
 
 const NAME: &str = "smtp-control.sock";
@@ -21,56 +21,16 @@ const TURN: Duration = Duration::from_millis(100);
 const EXCHANGE: Duration = Duration::from_secs(2);
 
 pub(super) struct Endpoint {
-    listener: UnixListener,
-    path: PathBuf,
-    device: u64,
-    inode: u64,
-    _root: LockedRoot,
+    listener: td_mta::unix_listener::PrivateListener,
 }
 impl Endpoint {
     pub(super) fn bind(root: PrivateRoot, path: &str) -> Result<Self, ConfigFailure> {
         check_runtime_path(path)?;
         let root = lock_root(root, "control-lock")?;
-        let path = PathBuf::from(path).join(NAME);
-        let owner = root
-            .root()
-            .directory()
-            .metadata()
-            .map_err(io_failure)?
-            .uid();
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_socket() && metadata.uid() == owner => {
-                fs::remove_file(&path).map_err(io_failure)?;
-            }
-            Ok(_) => return Err(config_failure("control", "socket-policy")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-            Err(error) => return Err(io_failure(error)),
-        }
-        let listener = UnixListener::bind(&path).map_err(io_failure)?;
-        let metadata = fs::symlink_metadata(&path).map_err(io_failure)?;
-        let endpoint = Self {
-            listener,
-            path,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            _root: root,
-        };
-        fs::set_permissions(&endpoint.path, fs::Permissions::from_mode(0o600))
-            .map_err(io_failure)?;
-        endpoint
-            .listener
-            .set_nonblocking(true)
-            .map_err(io_failure)?;
-        let metadata = fs::symlink_metadata(&endpoint.path).map_err(io_failure)?;
-        if !metadata.file_type().is_socket()
-            || metadata.uid() != owner
-            || metadata.mode() & 0o7777 != 0o600
-            || metadata.dev() != endpoint.device
-            || metadata.ino() != endpoint.inode
-        {
-            return Err(config_failure("control", "socket-policy"));
-        }
-        Ok(endpoint)
+        let path = td_fs::SocketPath::new(&PathBuf::from(path).join(NAME)).map_err(io_failure)?;
+        let listener = td_mta::unix_listener::PrivateListener::bind_locked(path, root)
+            .map_err(|_| config_failure("control", "socket-policy"))?;
+        Ok(Self { listener })
     }
 
     pub(super) fn run(
@@ -90,7 +50,7 @@ impl Endpoint {
                 continue;
             }
             match self.listener.accept() {
-                Ok((mut stream, _)) => {
+                Ok(mut stream) => {
                     // One private operator request; neither storage nor SMTP waits on it.
                     let _ = exchange_queue(&mut stream, control, mailbox_access, queue);
                 }
@@ -113,18 +73,6 @@ impl Endpoint {
         Ok(())
     }
 }
-impl Drop for Endpoint {
-    fn drop(&mut self) {
-        if fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
-            metadata.file_type().is_socket()
-                && metadata.dev() == self.device
-                && metadata.ino() == self.inode
-        }) {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
 pub(super) fn check_runtime_path(path: &str) -> Result<(), ConfigFailure> {
     if path
         .len()

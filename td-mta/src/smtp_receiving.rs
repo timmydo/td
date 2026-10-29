@@ -201,10 +201,11 @@ impl<'a> BoundListener<'a> {
         row: Listener<'a>,
         policies: &GenerationLease<TlsPolicies>,
     ) -> Result<Self, Error> {
+        let bind = row.bind.tcp().ok_or(Error::Invalid)?;
         if row.kind != Kind::DirectSmtp
-            || (row.bind.is_ipv6() && !crate::transport::ipv6_only(&socket)?)
-            || row.bind.port() == 0
-            || socket.local_addr().map_err(Error::from)? != row.bind
+            || (bind.is_ipv6() && !crate::transport::ipv6_only(&socket)?)
+            || bind.port() == 0
+            || socket.local_addr().map_err(Error::from)? != bind
         {
             return Err(Error::Invalid);
         }

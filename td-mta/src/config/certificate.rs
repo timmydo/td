@@ -290,10 +290,16 @@ impl<'a> Builder<'a> {
         self,
         roles: super::profile::Roles,
     ) -> Result<Records<'a>, Error> {
+        self.finish_with_certificate_requirement(roles.receive() || roles.jmap())
+    }
+    pub(crate) fn finish_with_certificate_requirement(
+        self,
+        required: bool,
+    ) -> Result<Records<'a>, Error> {
         if let Some(e) = self.failure {
             return Err(e);
         }
-        if self.count == 0 && (roles.receive() || roles.jmap()) {
+        if self.count == 0 && required {
             return Err(err(Code::MissingProfiles, None));
         }
         let slots = self.slots.get(..self.count).ok_or_else(invariant)?;

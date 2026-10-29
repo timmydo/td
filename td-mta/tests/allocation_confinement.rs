@@ -142,7 +142,9 @@ fn scan(root: &Path, path: &Path) {
             "td-mta/src/serve.rs" => {
                 assert_eq!(
                     source
-                        .matches("super::listener_sys::bind(row.bind)")
+                        .split_whitespace()
+                        .collect::<String>()
+                        .matches("super::listener_sys::bind(row.bind.tcp().ok_or_else(||config_failure(\"listeners\",\"tcp-required\"))?,)")
                         .count(),
                     2
                 );

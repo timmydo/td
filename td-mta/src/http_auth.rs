@@ -5,6 +5,16 @@ use crate::{
     ports::{Deadline, Error},
 };
 use std::net::IpAddr;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerAddress {
+    Network(IpAddr),
+    Local,
+}
+impl From<IpAddr> for PeerAddress {
+    fn from(address: IpAddr) -> Self {
+        Self::Network(address)
+    }
+}
 
 const DECODED: usize = 254 + 1 + 97;
 struct Credentials([u8; DECODED]);
@@ -36,7 +46,7 @@ impl BasicCredentials {
     }
 }
 
-/// Parse only after the actual TLS handshake, configured-origin checks and
+/// Parse only after TLS or private Unix socket admission, configured-origin checks and
 /// attempt admission. The caller must authenticate these bytes against its
 /// storage backend; successful parsing grants no authority.
 pub fn parse_basic(header: Option<&str>) -> Option<BasicCredentials> {
@@ -71,7 +81,7 @@ pub struct Principal {
     pub device: DeviceId,
 }
 
-/// Call only after the actual TLS handshake and configured-origin checks.
+/// Call only after TLS or private Unix socket admission and configured-origin checks.
 /// This observation is not a mutation guard or permanent connection authority.
 pub trait Authenticator: Sync {
     /// Called periodically on the fixed authentication worker, outside slots.
@@ -144,7 +154,7 @@ pub fn same_authority(origin: Origin<'_>, host: &str) -> bool {
             Ok(port) => (name, port),
             Err(_) => return false,
         },
-        None => (host, 443),
+        None => (host, if origin.is_local() { 80 } else { 443 }),
     };
     name.eq_ignore_ascii_case(origin.host()) && port == origin.port()
 }
@@ -154,13 +164,13 @@ const GLOBAL_ATTEMPTS: u16 = 64;
 const PEER_ATTEMPTS: u16 = 8;
 #[derive(Clone, Copy)]
 struct Peer {
-    address: IpAddr,
+    address: PeerAddress,
     attempts: u16,
 }
 /// One charged attempt; only a successful authentication returns its peer charge.
 /// Not Clone or Copy: completion cannot refund the same reservation twice.
 pub(crate) struct Attempt {
-    address: IpAddr,
+    address: PeerAddress,
     second: u64,
 }
 /// Fixed one-second windows. Never evict an unexpired peer to admit a new one.
@@ -179,7 +189,12 @@ impl Default for Attempts {
     }
 }
 impl Attempts {
-    pub(crate) fn reserve(&mut self, address: IpAddr, monotonic_ms: u64) -> Option<Attempt> {
+    pub(crate) fn reserve(
+        &mut self,
+        address: impl Into<PeerAddress>,
+        monotonic_ms: u64,
+    ) -> Option<Attempt> {
+        let address = address.into();
         self.admit(address, monotonic_ms).then_some(Attempt {
             address,
             second: monotonic_ms / 1000,
@@ -198,7 +213,8 @@ impl Attempts {
             peer.attempts = peer.attempts.saturating_sub(1);
         }
     }
-    pub fn admit(&mut self, address: IpAddr, monotonic_ms: u64) -> bool {
+    pub fn admit(&mut self, address: impl Into<PeerAddress>, monotonic_ms: u64) -> bool {
+        let address = address.into();
         let admitted = self.try_admit(address, monotonic_ms);
         if !admitted {
             crate::performance::record(
@@ -209,7 +225,7 @@ impl Attempts {
         }
         admitted
     }
-    fn try_admit(&mut self, address: IpAddr, monotonic_ms: u64) -> bool {
+    fn try_admit(&mut self, address: PeerAddress, monotonic_ms: u64) -> bool {
         let second = monotonic_ms / 1000;
         if second < self.second {
             return false;
@@ -358,5 +374,20 @@ mod tests {
         attempts.authenticated(old);
         assert!(attempts.reserve(ip, 1000).is_none());
         assert!(attempts.reserve(ip, 999).is_none());
+    }
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn local_authority_and_attempts_do_not_impersonate_network_peers() {
+        let local = Origin::parse_jmap("http://localhost").unwrap();
+        assert!(same_authority(local, "localhost"));
+        assert!(same_authority(local, "localhost:80"));
+        assert!(!same_authority(local, "localhost:443"));
+        assert!(!same_authority(local, "elsewhere.test"));
+        let mut attempts = Attempts::default();
+        for _ in 0..PEER_ATTEMPTS {
+            assert!(attempts.admit(PeerAddress::Local, 1000));
+        }
+        assert!(!attempts.admit(PeerAddress::Local, 1000));
+        assert!(attempts.admit("127.0.0.1".parse::<IpAddr>().unwrap(), 1000));
     }
 }

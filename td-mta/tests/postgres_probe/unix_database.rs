@@ -8,6 +8,7 @@ fn local_database_keeps_scram_and_publication_without_certificates() {
 }
 
 pub(super) fn exercise() {
+    private_listener_lifetime_and_permissions();
     let mut fixture = Fixture::new();
     fixture.stop();
     for name in ["server.crt", "server.key", "root.der"] {
@@ -63,4 +64,38 @@ pub(super) fn exercise() {
     }
     fixture.start_unix("scram-sha-256");
     assert_eq!(probe(&request(), &trust, deadline()).unwrap(), status);
+}
+
+fn private_listener_lifetime_and_permissions() {
+    use std::os::unix::net::UnixListener;
+    use td_mta::ports::Error;
+    use td_mta::unix_listener::PrivateListener;
+    let root = td_fs::TempDir::new("jmap-listener").unwrap();
+    let socket = root.path().join("socket");
+    let path = td_fs::SocketPath::new(&socket).unwrap();
+    let listener = PrivateListener::bind(path).unwrap();
+    assert_eq!(listener.path(), socket);
+    td_fs::check_private_socket(&socket).unwrap();
+    assert!(matches!(PrivateListener::bind(path), Err(Error::Busy)));
+    let client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let accepted = listener.accept().unwrap();
+    drop((client, accepted, listener));
+    assert!(!socket.exists());
+
+    let stale = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    drop(stale);
+    let listener = PrivateListener::bind(path).unwrap();
+    fs::remove_file(&socket).unwrap();
+    fs::write(&socket, b"replacement must survive cleanup").unwrap();
+    drop(listener);
+    assert_eq!(
+        fs::read(&socket).unwrap(),
+        b"replacement must survive cleanup"
+    );
+    assert!(matches!(PrivateListener::bind(path), Err(Error::Forbidden)));
+    fs::remove_file(&socket).unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(PrivateListener::bind(path).is_err());
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
 }
