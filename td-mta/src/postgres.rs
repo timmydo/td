@@ -13,6 +13,7 @@ mod audit;
 mod blob_audit;
 mod blob_scrub;
 mod configuration;
+mod configuration_snapshot;
 mod device_create;
 mod device_list;
 mod device_revoke;
@@ -150,6 +151,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     }
     if command.as_deref() == Some(OsStr::new("device-list")) {
         return device_list::run(args);
+    }
+    if command.as_deref() == Some(OsStr::new("config-snapshot")) {
+        return configuration_snapshot::run(args);
     }
     if let Some(operation) = command.as_deref().and_then(configuration::Operation::parse) {
         return configuration::run(operation, args);

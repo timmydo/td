@@ -558,16 +558,19 @@ fn uri_path(path: &Path) -> Result<String> {
 }
 
 fn postgres_program() -> Result<PathBuf> {
+    host_program("postgres")
+}
+fn host_program(name: &str) -> Result<PathBuf> {
     let path = std::env::var_os("PATH").ok_or("PATH is missing")?;
     for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("postgres");
+        let candidate = dir.join(name);
         if candidate.is_absolute()
             && fs::metadata(&candidate).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0)
         {
             return Ok(candidate);
         }
     }
-    Err("postgres must be in an absolute PATH directory".into())
+    Err(format!("{name} must be in an absolute PATH directory"))
 }
 
 fn database_services(p: &Setup<'_>, postgres: &Path, name: &str) -> Result<()> {
@@ -639,6 +642,7 @@ fn source_args(p: &Setup<'_>, replica: &Replica) -> Result<Vec<String>> {
 fn replica_services(
     p: &Setup<'_>,
     postgres: &Path,
+    openssl: &Path,
     replica: &Replica,
     epoch: &str,
     account: &str,
@@ -731,6 +735,30 @@ fn replica_services(
         "copy-arguments.json",
         Json::Arr(copy.into_iter().map(Json::Str).collect()).to_canonical(),
     )?;
+    super::install_mta_operations::configure(
+        &[
+            "--prefix".into(),
+            text(&p.s.prefix)?.into(),
+            "--state-dir".into(),
+            text(&p.s.root)?.into(),
+            "--postgres-tls-dir".into(),
+            text(&p.path("tls"))?.into(),
+            "--postgres-data-dir".into(),
+            text(&p.path("postgres"))?.into(),
+            "--postgres-port".into(),
+            p.s.pg_port.to_string(),
+            "--postgres-bin".into(),
+            text(postgres.parent().ok_or("PostgreSQL directory missing")?)?.into(),
+            "--openssl-bin".into(),
+            text(&openssl)?.into(),
+            "--replica-root".into(),
+            text(&p.s.root)?.into(),
+            "--replica-https-port".into(),
+            p.s.https_port.to_string(),
+        ],
+        text(&p.s.root)?,
+    )?;
+    let renewal_services = p.s.prefix.join("share/td-mta/services");
     let mut start = String::from("Replica preparation complete. Services are stopped; no full copy is claimed.\nUse ONE supervisor. Replica service names differ from ordinary local mail.\n\nSystemd:\n");
     for name in [
         "td-mta-replica-postgres",
@@ -756,7 +784,8 @@ fn replica_services(
     start.push_str("  herd start td-mta-replica\n  herd start td-mta-replica-sync\n\nFor a manual bounded batch, stop the sync service first:\n  ");
     start.push_str(&copy_command);
     start.push_str(&format!("\n\nHistorical synchronization status (not copy completeness or process liveness):\n  {} postgres replica-follow-status --state-dir {} --epoch {} --account {}\n", shell(&bin), shell(&state), shell(Path::new(epoch)), shell(Path::new(account))));
-    start.push_str(&format!("\n\nLocal client:\n  td-net launch --allow-loopback td-mail --config={}\n\nThe local credential is independent of the upstream password.\nThe sync service continues copying when started; certificate renewal and recovery promotion are not automated.\nLeaf certificates expire in 90 days; see DEPLOYMENT.md before expiry.\nThe unused relay configuration is required by the shared config grammar; no relay service runs.\nProtect this directory: it holds full mail, passwords and private keys.\n", shell(&p.path("mail.toml"))));
+    start.push_str(&format!("\n\nLocal client:\n  td-net launch --allow-loopback td-mail --config={}\n\nThe local credential is independent of the upstream password.\nThe sync service continues copying when started. Enable the generated daily local TLS renewal job below; recovery promotion remains manual.\nThe unused relay configuration is required by the shared config grammar; no relay service runs.\nProtect this directory: it holds full mail, passwords and private keys.\n", shell(&p.path("mail.toml"))));
+    start.push_str(&format!("\nDaily PostgreSQL and JMAP certificate renewal (enable with the same supervisor):\n  systemctl --user link {} {}\n  systemctl --user daemon-reload\n  systemctl --user enable --now td-mta-maint-replica-tls-renew.timer\n\nShepherd (also retain this definition in Guix Home):\n  herd load root {}\n  herd start td-mta-maint-replica-tls-renew\n", shell(&renewal_services.join("td-mta-maint-replica-tls-renew.service")),shell(&renewal_services.join("td-mta-maint-replica-tls-renew.timer")),shell(&renewal_services.join("td-mta-maint-replica-tls-renew.scm"))));
     p.write("START.txt", start)
 }
 
@@ -1100,7 +1129,14 @@ COMMIT;
     };
     p.write("mail.toml", format!("[account.{client_account}]\nwell_known_url = \"https://localhost:{}/.well-known/jmap\"\nusername = {}\npassword_command = {}\ntls_ca_file = {}\n[mail]\nreply_from = {}\n", s.https_port, toml(&s.account), toml(&password_command), toml(text(&p.path("tls/ca.pem"))?), toml(&s.account)))?;
     if let Some(replica) = &s.replica {
-        replica_services(&p, &postgres, replica, &epoch, &account)?;
+        replica_services(
+            &p,
+            &postgres,
+            &host_program("openssl")?,
+            replica,
+            &epoch,
+            &account,
+        )?;
         println!(
             "Replica setup complete: {} (services stopped; initial copy pending)",
             s.root.display()
@@ -1227,7 +1263,8 @@ mod tests {
     #[test]
     fn replica_services_separate_reader_from_copy_and_generate_no_smtp_units() {
         let temp = crate::test_temp::TempDir::new("replica-setup-services").unwrap();
-        let s = settings_mode(&replica_args(temp.path()), "/home/test", true).unwrap();
+        let mut s = settings_mode(&replica_args(temp.path()), "/home/test", true).unwrap();
+        s.prefix = temp.path().join("prefix");
         let p = Setup { s: &s, serial: 0 };
         directory(&p.path("services"), 0o700).unwrap();
         p.write("source-epoch", "11111111111111111111111111111111")
@@ -1235,6 +1272,7 @@ mod tests {
         replica_services(
             &p,
             Path::new("/host/bin/postgres"),
+            Path::new("/host/bin/openssl"),
             s.replica.as_ref().unwrap(),
             "22222222222222222222222222222222",
             "33333333333333333333333333333333",
@@ -1252,6 +1290,17 @@ mod tests {
         assert!(scm.contains("#:requirement '(td-mta-replica-postgres)"));
         let files = fs::read_dir(p.path("services")).unwrap().count();
         assert_eq!(files, 6);
+        let renewal = fs::read_to_string(
+            s.prefix
+                .join("share/td-mta/services/td-mta-maint-replica-tls-renew.service"),
+        )
+        .unwrap();
+        assert!(renewal.contains("--replica-root"));
+        assert!(renewal.contains("--https-port"));
+        assert!(!renewal.contains("--force"));
+        assert!(fs::read_to_string(p.path("START.txt"))
+            .unwrap()
+            .contains("td-mta-maint-replica-tls-renew.timer"));
         let sync = fs::read_to_string(p.path("services/td-mta-replica-sync.service")).unwrap();
         assert!(sync.contains("replica-follow"));
         assert!(sync.contains("runtime-connection"));

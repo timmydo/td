@@ -555,7 +555,12 @@ fn command_output_with_timeout(
         assert!(Instant::now() < stop, "probe command timed out");
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(fs::metadata(&output_path).unwrap().len() < 1024);
+    let output_limit = if arguments.get(1) == Some(&"config-snapshot") {
+        13 * 1024 * 1024
+    } else {
+        1024
+    };
+    assert!(fs::metadata(&output_path).unwrap().len() < output_limit);
     let text = fs::read_to_string(output_path).unwrap();
     assert!(!text.contains(std::str::from_utf8(PASSWORD).unwrap()));
     assert!(!text.contains("postgresql://"));
@@ -3914,9 +3919,45 @@ per_peer_limit = 1
             _
         )))
     ));
+    // Passive repair export survives missing materials, but still checks sources.
+    let sources = versions::read_sources(&request, &trust, deadline(), epoch, version).unwrap();
+    let (stored_shared, stored_profiles) = sources.parts().unwrap();
+    assert!(!stored_shared.is_empty());
+    assert!(!stored_profiles.is_empty());
+    let snapshot = command_output(
+        &[
+            "postgres",
+            "config-snapshot",
+            "--connection-file",
+            connection.to_str().unwrap(),
+            "--epoch",
+            &epoch.to_string(),
+        ],
+        fixture.root.path(),
+        0,
+    );
+    let snapshot = td_json::parse(&snapshot).unwrap();
+    assert_eq!(
+        snapshot.get("selected").and_then(td_json::Json::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        snapshot
+            .get("content_validated")
+            .and_then(td_json::Json::as_bool),
+        Some(false)
+    );
+    assert!(snapshot
+        .get("profiles")
+        .and_then(td_json::Json::as_arr)
+        .is_some_and(|p| !p.is_empty()));
     sql(&fixture, "UPDATE td_mta.config_version_chunks SET bytes=pg_catalog.set_byte(bytes,0,0) WHERE version_id=decode(repeat('0b',16),'hex') AND ordinal=0");
     assert_eq!(
         versions::read(&request, &trust, deadline(), epoch, version).err(),
+        Some(versions::Error::Integrity)
+    );
+    assert_eq!(
+        versions::read_sources(&request, &trust, deadline(), epoch, version).err(),
         Some(versions::Error::Integrity)
     );
 }
@@ -3934,7 +3975,12 @@ fn configuration_commands_keep_versions_explicit_and_refusals_redacted() {
         .next()
         .unwrap();
     assert_eq!(Version::parse(version).unwrap().to_string(), version);
-    for operation in ["config-version", "config-import", "config-check"] {
+    for operation in [
+        "config-version",
+        "config-import",
+        "config-check",
+        "config-snapshot",
+    ] {
         let text = command_output(
             &["postgres", operation, "--password", "private-secret"],
             root.path(),

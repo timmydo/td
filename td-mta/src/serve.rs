@@ -459,9 +459,6 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                 let certificate_worker = std::thread::Builder::new()
                     .name("certificate-watch".into())
                     .spawn_scoped(scope, || {
-                        if managed_names.is_empty() {
-                            return;
-                        }
                         let mut next = std::time::Instant::now();
                         while !control.stop_requested() {
                             if std::time::Instant::now() < next {
@@ -484,6 +481,21 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                                 for address in addresses {
                                     let mut request = loaded.bootstrap.request(address);
                                     request.mode = mode;
+                                    let selected = match td_mta::postgres_selection::observe(
+                                        &request,
+                                        &loaded.trust,
+                                        until,
+                                        binding.epoch(),
+                                    ) {
+                                        Ok(selected) => selected,
+                                        Err(_) => continue,
+                                    };
+                                    if selected != Some(binding.selection()) {
+                                        return Some(true);
+                                    }
+                                    if managed_names.is_empty() {
+                                        return Some(false);
+                                    }
                                     if let Ok(mut revisions) = td_mta::postgres_acme::generations(
                                         &request,
                                         &loaded.trust,
@@ -491,13 +503,12 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                                         binding.epoch(),
                                     ) {
                                         revisions.retain(|(name, _)| managed_names.contains(name));
-                                        return Some(revisions);
+                                        return Some(revisions != certificate_revisions);
                                     }
                                 }
                                 None
                             })();
-                            if observation
-                                .is_some_and(|revisions| revisions != certificate_revisions)
+                            if observation.is_some_and(|changed| changed)
                                 && !control.stop_requested()
                             {
                                 reload.store(true, Ordering::Release);

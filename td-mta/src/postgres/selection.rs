@@ -197,7 +197,7 @@ fn fixed(error: Error) -> (&'static str, &'static str) {
         AttemptError::Transport => ("selection", "transport"),
     }
 }
-fn classify(error: Error) -> AttemptError {
+pub(super) fn classify(error: Error) -> AttemptError {
     match error {
         Error::Connection(error) => td_mta::postgres_schema::Error::Connection(error).into(),
         Error::Schema(error) => error.into(),

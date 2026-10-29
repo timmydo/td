@@ -144,6 +144,33 @@ pub fn read(
     epoch: StoreEpoch,
     version: Version,
 ) -> Result<Candidate, Error> {
+    let sources = read_sources(request, trust, deadline, epoch, version)?;
+    let (shared, profiles) = sources.parts()?;
+    configuration::prepare(request, trust, deadline, epoch, shared, &profiles)
+        .map_err(Error::Validation)
+}
+
+/// Integrity-checked source bytes, not validated material or runtime authority.
+/// This passive owner permits repairing a configuration with expired materials.
+pub struct Sources {
+    epoch: StoreEpoch,
+    bytes: Vec<u8>,
+}
+impl Sources {
+    pub fn parts(&self) -> Result<(&[u8], Vec<Profile<'_>>), Error> {
+        decode(&self.bytes, self.epoch)
+    }
+}
+
+/// Read bounded immutable sources without resolving or validating materials.
+/// Callers must prepare and validate a new candidate before selecting it.
+pub fn read_sources(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    epoch: StoreEpoch,
+    version: Version,
+) -> Result<Sources, Error> {
     let bytes = postgres_probe::with_configuration_client(request, trust, deadline, move |client| {
         Box::pin(async move {
             let receipt = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
@@ -179,9 +206,8 @@ pub fn read(
             Ok(bytes)
         })
     }).map_err(Error::Connection)??;
-    let (shared, profiles) = decode(&bytes, epoch)?;
-    configuration::prepare(request, trust, deadline, epoch, shared, &profiles)
-        .map_err(Error::Validation)
+    decode(&bytes, epoch)?;
+    Ok(Sources { epoch, bytes })
 }
 
 fn take<'a>(bytes: &mut &'a [u8], count: usize) -> Result<&'a [u8], Error> {

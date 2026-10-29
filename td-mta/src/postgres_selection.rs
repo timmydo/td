@@ -286,7 +286,7 @@ pub fn read(
 }
 
 /// One passive primary observation; never a runtime policy guard.
-pub(crate) fn observe(
+pub fn observe(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,

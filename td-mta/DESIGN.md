@@ -2945,3 +2945,9 @@ Owner-side periodic integrity scrubbing verifies complete bodies in bounded
 read-only pages, separately from interactive reads. POSTGRES.md owns its
 snapshot, progress and failure contract; DEPLOYMENT.md owns explicit schedule
 activation. It never repairs mail or enables itself during serving.
+
+Local file-certificate profiles also observe the selected configuration
+generation in the existing 30-second certificate watcher. A definite change
+requests the same bounded drain and reload as a managed certificate change;
+a failed observation does not claim a change. This includes idle read-only
+replicas, so certificate activation does not depend on client traffic.

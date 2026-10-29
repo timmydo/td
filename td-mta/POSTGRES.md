@@ -1200,6 +1200,23 @@ previous publication rolled back. Never allocate another ID to hide an
 uncertain result. These owner commands do not supply runtime privileges,
 listener activation or PostgreSQL serving admission.
 
+`config-snapshot --connection-file PATH --epoch HEX` is an owner-side,
+passive repair export. It observes the selected generation/version and reads
+that immutable source set under one absolute deadline, checking the epoch,
+bounds, chunk sequence, digest and canonical source inventory. It emits the
+shared source and each profile's name, role bits and source in JSON. Sources
+remain bounded to 2 MiB before JSON escaping (at most sixfold expansion).
+Protect redirected output as configuration data: it includes addresses and
+material references, though it does not resolve passwords or keys.
+
+Unlike `config-check`, this export does not resolve materials or validate
+certificate expiry, so an operator can repair an expired configuration. Its
+`content_validated` and `profile_activated` fields are always false. An empty
+selection reports `selected=false` without sources. A concurrent selection
+can supersede the observed generation; use that exact generation for the
+existing compare-and-select procedure, never as current serving authority.
+All candidate imports and selection validation remain mandatory.
+
 ## 27. Durable account bootstrap
 
 Schema version 6 adds owner-private account_bootstraps receipts. The inert

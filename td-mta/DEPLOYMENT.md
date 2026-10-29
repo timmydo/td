@@ -695,7 +695,7 @@ one being served. It never restarts PostgreSQL or mail services.
 
 One private lock excludes overlapping invocations. Tool output is bounded to
 64 KiB per command, diagnostics to 16 KiB, and execution to 30 seconds per
-command, at most 32 commands. Reserved `renew-work` scratch is reclaimed on
+command, at most 64 commands. Reserved `renew-work` scratch is reclaimed on
 normal return and after interruption; unexpected entries refuse cleanup.
 Private `renew-last-error` retains a tool diagnostic until a successful run.
 Supervisor results also cover validation failures before a tool can run.
@@ -725,6 +725,65 @@ immutable certificate materials already imported into td-mta, a public ACME
 profile, another account's trust, or the CA. Installations using the same old
 leaf for mail listeners must separately update those stored materials using
 the procedure below. Failure notifications and CA rotation remain explicit.
+
+## Automatic replica PostgreSQL and JMAP renewal
+
+New `--setup-replica` installations also generate the daily
+`td-mta-maint-replica-tls-renew` job and print activation commands in
+`START.txt`. Enable it with the same systemd or Shepherd supervisor as the
+replica. Guix Home users must include its generated service definition in
+their retained Home configuration. Generation alone does not enable a job.
+
+For an existing setup replica, add `--replica-root ROOT` and
+`--replica-https-port PORT` to the operations-services command above, using
+its own prefix, TLS/data directories and PostgreSQL port. This retains the
+host operator helper and generates the same job. The installed td-mta must
+support `postgres config-snapshot`. To exercise renewal immediately, run the
+retained operator directly:
+
+```text
+PREFIX/bin/td-mta-operator install-td-mta --postgres-tls-renew \
+  --tls-dir ROOT/tls --data-dir ROOT/postgres \
+  --postgres-bin /absolute/postgresql/bin --openssl-bin /absolute/openssl \
+  --port 35433 --replica-root ROOT --mail-bin PREFIX/bin/td-mta \
+  --https-port 54444 --force
+```
+
+Replace ROOT and PREFIX with absolute paths. Omit `--force` from schedules.
+The existing CA and server key stay unchanged: td-mail needs no new trust
+file. After renewing and verifying PostgreSQL, the helper passively exports
+the selected configuration from the database. It supports the setup replica's
+single `frontend` JMAP profile and exact retained local key/chain references.
+Other configurations refuse rather than being reconstructed from stale setup
+files. All unrelated source bytes are preserved. It imports a fresh immutable
+chain and configuration version, then selects using the observed generation.
+Concurrent configuration changes cause a conflict, never an overwrite.
+
+The private `tls/mail-renew.json` journal and `tls/mail-renew-request` retain
+candidate identity and the exact selection request before publication. Retry
+without `--force` after interruption or uncertainty. A still-valid pending
+leaf is reused even inside the 30-day renewal window; a pending leaf that
+has already expired refuses before replacing it and requires explicit
+recovery. Keep the journal for that recovery. A retry recognizes an
+already-selected candidate; it never invents a different candidate to hide an
+uncertain commit. Do not delete pending records to bypass a conflict. Inspect
+manual configuration changes first. The service checks its selected configuration every 30 seconds, including
+idle file-certificate replicas, then drains and reloads when it changes. Success requires a new verified
+JMAP handshake presenting the selected certificate and a final selection
+observation. Only then are the setup's chain/version hints advanced and the
+pending journal retired. Source TOML files remain historical setup inputs.
+
+The helper bounds sources, journal and each tool output to 64 KiB, executes
+at most 64 commands with 30-second deadlines, and retains at most 128 known
+scratch entries. The pending journal is a single fixed slot. Immutable
+configuration/material records remain database audit history; selection has
+its existing 1024-receipt ceiling (more than a century of ordinary 60-day
+renewal cycles). Repeated forced renewals consume those records sooner.
+Renewal failures return nonzero to the supervisor. `tls/renew-last-error`
+contains bounded tool diagnostics; validation and selection failures also
+appear in the job's supervisor log. Check the job's last result, both served
+certificates, and CA expiry. Scheduling does not itself deliver email alerts;
+CA rotation and notification routing remain explicit operator choices.
 
 ## Renew a local private certificate
 
