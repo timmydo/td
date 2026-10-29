@@ -165,6 +165,150 @@ home inode, personal-file contents and saved account settings. Host tests
 also cover a damaged same-ID payload, repeated reset, and a changed
 manifest's refusal before replacement.
 
+## Planned: encrypted reinstall
+
+Task #14 extends the preceding preserve mode; it is not implemented yet.
+[ENCRYPTION.md](ENCRYPTION.md#planned-encrypted-reinstall-from-live-usb)
+owns eligibility, protector transitions, interruption recovery and the
+acceptance gate. Existing unencrypted reinstall keeps its current flow.
+An encrypted disk must never be retried as Fresh install automatically.
+
+### Recovery input and review
+
+After Reinstall and disk selection, the service identifies a supported
+device-bound LUKS volume and the wizard shows Unlock existing installation.
+It offers a masked recovery-key field and Scan recovery QR code. Typed
+input uses td-protector's existing bounded recovery codec and reports only
+the erroneous group or a generic wrong-key result, never entered digits.
+Typing and scanning both produce the same recovery-key value; neither
+confirms reinstall. No copy/paste, shell command or pathname is accepted.
+The entry describes why the old recovery key is needed and that files
+will be inspected before any change. A wrong key permits retry; Escape
+cancels inspection and returns to disk selection.
+
+After successful unlock, stop capture and clear the entry and decoded
+text. Root reads the saved account, host, timezone and filesystem identity
+through the read-only mapping. The review shows those saved values and
+the disk identity, with these disclosures:
+
+- Personal files, settings, login keys and existing Wi-Fi networks stay.
+- Storage stays encrypted and the saved recovery key stays valid.
+- Both system versions, the startup kernel and selector are replaced;
+  the old system version is not kept as rollback.
+- Untokened extra passphrase slots are removed as orphaned slots; the
+  original recovery key in slot 0 is preserved.
+- The TPM protector is replaced for this computer, and its next disk
+  boot adopts the installed boot chain. Until that boot the temporary
+  first-boot protector has the limitation ENCRYPTION.md states.
+- An interruption may require booting USB and entering the same recovery
+  key again. This operation does not make a backup.
+
+Use the existing painted-for-500-ms review confirmation. There is no
+storage toggle, editable account form or newly generated recovery key.
+The final action says Reinstall. Completion asks the person to remove
+the USB and boot the disk; the service reports success only after the
+protector transition, deployment and ESP verification, and teardown.
+Backing out or disconnecting before confirmation writes nothing. After
+execution starts, cancellation stops at a safe operation boundary and
+reports incomplete installation, never applies fresh-install withdrawal.
+A disconnected UI reports an unknown outcome until status resolves it.
+
+### Service lifetime and secret transport
+
+Add versioned encrypted-inspection and unlock messages to the existing
+private installation channel. In the implementing commit, bump the
+ordinary service, plan and private review versions together wherever their
+layouts change; refuse old or mixed versions rather than interpreting a
+secret as an existing request. Do not reuse the fresh-install recovery
+key fetch/acknowledgement messages, which send a newly created key in the
+opposite direction. No secret field belongs in `Plan`, review bytes,
+status, evidence lines, diagnostics or any type with `Debug`/`Clone`.
+
+The root service retains one exclusive disk claim for the inspection and
+review session. It returns a fresh unpredictable challenge bound to that
+connection and disk observation. An unlock request carries that challenge
+and at most 256 bytes of secret entry in a dedicated zeroed-on-drop
+buffer. Framing rejects excess bytes before allocation and rejects stale,
+replayed, wrong-disk and out-of-state requests. Root parses the codec
+again and proves keyslot 0 with td-luks over inherited descriptors; a
+UI claim of successful decoding is never proof of unlock. Secret input
+and td-luks failures must not echo input or retain child output containing
+it. The worker's bounded child lifecycle applies on disconnect or expiry.
+
+Keep the successful recovery key only in root's volatile secret buffer
+until execution or abandonment, so the person enters it once per live
+attempt. Close the read-only mount and mapping after inspection, retaining
+the disk claim and the public snapshot. The review nonce binds that
+snapshot, existing encrypted storage, reinstall mode, the selected TPM
+reenrollment operation and source deployment digest. The service's
+private state binds it to the retained secret; resending public review
+bytes cannot recreate that authority. The encrypted review expires ten
+minutes after successful unlock, measured by a monotonic clock, unless
+execution has already been accepted. Expiry, Back, disk change, service
+failure and disconnect invalidate it and zero the secret. A retry after abandonment requires unlock again.
+Successful execution zeroes it after the last keyslot operation. No secret
+is saved to permit resuming a dead service.
+
+Own mounts, mappings, loops and capture handles explicitly. Teardown goes
+mount, mapping, loop, disk claim; a failed unmount keeps its backing
+resources held and reports the failure. Do not detach a busy mapping or
+recursively clean a mountpoint. Changed or missing media must invalidate
+execution even if the cached recovery key would open it. Encryption
+headers and decrypted filesystem contents remain untrusted bounded inputs.
+
+### Webcam scan
+
+The initial decoder accepts exactly the symbol td already displays:
+QR version 2, level Q, numeric payload of 48 digits, including every mask
+its encoder may select. Decode rotation and perspective, validate format,
+error correction and payload framing, then run the recovery codec. Reject
+URLs, arbitrary text, extra digits, unsupported symbols and ambiguous
+multiple valid keys. Never open a URL, import an image path, transmit a
+frame or run a general barcode program. No new dependency is approved.
+Decoder resource limits and image-processing work must be explicit and
+covered by adversarial fixtures before activation.
+
+Capture starts only after Scan is chosen and has a visible preview and
+Stop action. Discover supported video-capture devices through trusted
+sysfs/devtmpfs; the wizard cannot send root an arbitrary device path.
+Use a narrowly scoped live-installer capture helper with a pinned device
+descriptor and bounded V4L2 operations. It sends bounded frames to the
+wizard, receives no disk claim or recovery key, and exits on cancellation
+or connection loss. Grant this capability only to the installer identity,
+not every desktop client; do not add camera access to the disk service.
+The implementing increment must specify ownership, peer checks, message
+bounds, supported pixel formats and exact ioctl requests in its component
+design and UNSAFE.md, and add required UVC/kernel support explicitly.
+No camera subsystem or QR decoder currently exists for this path.
+
+Cap capture at 1280 by 720, 10 frames per second and a 60-second scan
+attempt, with no unbounded frame queue. Reuse at most two frame buffers;
+reject oversized negotiated formats before allocating. Camera error,
+absence, privacy shutter, timeout or unsupported format leaves typing
+available and changes no disk state. Display the reason and allow an
+explicit new scan. Do not silently select an infrared camera as if it
+were a working visible-light camera; offer a bounded device chooser when
+several supported cameras exist.
+
+A valid scan stops capture and fills the secret entry without displaying
+the digits; Unlock is a separate action before root tests it. This avoids
+silently choosing a background code. Zero decoded text, image-processing
+scratch and owned frames when replaced or discarded. The existing display
+pixel and kernel-buffer residue limits remain: clearing owned buffers is
+not a claim to erase compositor, driver or freed RAM copies. No frame,
+thumbnail or key is written to disk or logs. A phone showing the saved
+code keeps its own copy under the custody limits already disclosed for
+recovery-key display.
+
+Pure fixtures must cover the actual existing encoder's symbols, damaged
+and corrected codes, rotation, perspective, multiple codes, unsupported
+payloads and bounded failure on arbitrary frames. Process tests cover
+camera withdrawal, peer rejection, stale unlock messages, disconnection,
+secret lifetime and all review/cancel paths. A synthetic frame proves the
+decoder and UI flow; only hardware testing establishes the T14s webcam
+path. Ship and report typed-key support and camera support separately
+until both pass their acceptance evidence.
+
 ## User flow and authority
 
 The sequence is welcome, destination disk, account and regional settings,

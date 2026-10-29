@@ -321,6 +321,177 @@ anyone at the keyboard. Such prior compromise is outside Scope, so a
 protected-tier claim on an upgraded volume is no stronger than the
 device-bound system's integrity before the upgrade.
 
+## Planned: encrypted reinstall from live USB
+
+This is the design for task #14, not shipped behavior. The current live
+reinstall still refuses LUKS. [INSTALLER.md](INSTALLER.md#planned-encrypted-reinstall)
+owns the wizard, secret transport and camera input. This increment extends
+preserve mode to an existing device-bound td volume; it neither converts
+plaintext nor upgrades or downgrades storage. Protected-tier volumes,
+reencryption in progress, pending storage/selector operations, unknown
+protector types and unsupported layouts are refused before any write.
+An absent or unusable TPM or keyboard console also refuses this mode;
+it must never turn an existing encrypted installation into plaintext.
+Recovery-only data access without a TPM is outside this installer flow.
+
+The person boots trusted live media, selects Reinstall and the disk,
+and enters the saved recovery key once, by typing or scanning its QR.
+That key opens keyslot 0 independently of the old TPM or selector. The
+review then authorizes replacement of the system and boot files and
+reenrollment on this machine's TPM. Unlock alone authorizes only
+read-only inspection, never a persistent change. The live medium remains
+part of the trusted computing base: deployment hashes detect corruption,
+not a malicious replacement medium, and this flow authenticates neither
+the medium nor the saved account with a deployment signing key.
+
+### Identity and preservation
+
+Keep the existing GPT, ESP geometry, LUKS UUID, inner Btrfs UUID, volume
+key, data-segment geometry and keyslot 0. Require the td format's equal
+inner and outer UUIDs, labels, supported encryption parameters and
+single-device Btrfs layout. Retain all of `@var`, including the home,
+saved account settings, login-key enrollment and saved Wi-Fi, subject
+only to existing reinstall staging cleanup. Never run format, mkfs,
+reencryption, recovery-key rotation or fresh-install withdrawal here.
+No failure may zero a partition table or encryption header. The recovery
+key remains the one already saved; there is no new-key acknowledgement.
+
+The root service binds discovery and both mappings to the same held
+exclusive disk claim, through a bounded loop over its system partition.
+It selects LUKS metadata with the shared reader's checksum and sequence
+rules: one torn or invalid copy does not disqualify a valid surviving
+copy, and unequal sequences select the newest valid copy. Equal-sequence
+disagreement refuses as usual. It confirms the selected metadata through
+td-luks before planning any mutation. Read-only
+inspection uses a read-only dm-crypt mapping and the existing
+`ro,rescue=nologreplay,nodev,nosuid,noexec,subvolid=5` mount. Prove that the
+mounted filesystem has exactly that mapping as its device, and that the
+mapping's backing device and extent are exactly the held loop. Device
+names alone are not evidence of that relationship. Do not adopt a mapping
+created by another process. A writable reopen requires revalidation of
+the disk observation, GPT extents, header metadata, UUIDs and saved
+settings against the reviewed snapshot; a change requires a new review.
+
+### Commit order and protector replacement
+
+Extend td-protector's pure transition planner and descriptor-only td-luks
+runner; do not give the installer an independent token editor. A bounded
+header with recovery slot 0 and only device-bound/first-boot td tokens,
+including their interrupted-transition orphans, is eligible. Apply the
+existing four-token ceiling, slot ownership checks and metadata-confirm
+rule. A token naming slot 0 or sharing a live slot refuses mutation.
+Unknown token types and unsupported slot formats refuse the operation.
+Inherit the existing orphan definition: every untokened nonzero keyslot
+and every otherwise-valid td token naming no slot is an orphan. A
+manually added passphrase slot is indistinguishable from an interrupted
+add and is removed under that rule, after recovery is proven; the review
+must disclose this. No marker invented by the installer can establish
+that an otherwise unmarked slot belongs to an earlier reinstall.
+
+Execution has this order:
+
+1. After consent and all revalidation, test the supplied recovery key
+   against slot 0 again. Preflight space for the verified deployment,
+   both ESP files and the protector transition before changing anything.
+   Stage and verify the approved bundle and prepare the selector for the
+   unchanged UUID, as ordinary reinstall does. No secret enters staging.
+2. Generate a fresh random protector secret, seal it under the existing
+   first-boot policy (literal-zero PCR 12 alone) on this TPM, and perform
+   `verify_first_boot_object`. The live selector has already capped PCR
+   12; neither unseal nor a PCR reset is attempted. This is load and
+   policy validation, not proof of future release.
+3. Commit a free keyslot using slot 0's recovery proof, import its
+   first-boot token, read back and validate that exact token, and test
+   the new keyslot with the still-held secret. Re-test slot 0. Stop on
+   any failure; never retire the recovery slot. The same LUKS header
+   commit rules as other protector transitions apply.
+4. Retire the old td protector keyslots, each followed by its token,
+   leaving exactly slot 0 and the verified new first-boot protector.
+   This must finish before completion even if the old selector bytes
+   happen to equal the new ones: a releasing old device-bound token
+   would otherwise win selection and remove the new first-boot token.
+   Destroy the new plaintext secret after its last use.
+5. Use the existing reinstall bundle writer to replace both selections,
+   retaining `@var`; sync and unmount Btrfs. Write, sync and verify the
+   new kernel and prepared selector on the existing ESP through td-fat.
+   Close the owned mapping and loop before releasing the disk claim.
+   Completion requires every step, including cleanup, to succeed.
+6. On the installed boot, the existing first-boot transition releases
+   the new protector, seals and unseals a device-bound replacement for
+   that boot's observed PCR 4/9 and zero PCR 12, caps release, commits
+   and tests its slot/token, then retires the first-boot protector.
+   The next ordinary boot must release only the device-bound protector.
+
+Retry is recovery-authorized and derived from the actual bounded header,
+not a success flag stored on the ESP or a cached plaintext secret. A new
+live session asks for the saved recovery key again. It may remove
+recognized incomplete first-boot candidates and orphans after proving
+slot 0, using the existing verified-recovery exception to add-before-
+destroy when space is needed. It never removes slot 0 or unknown state.
+It creates and verifies a fresh candidate rather than trusting a token
+whose secret died with the previous session. Repeated interruptions must
+not exhaust slots or tokens. Failure during cleanup is retried from the
+header state and never treated as completion.
+
+| Interruption point | Preserved recovery path |
+| --- | --- |
+| Before consent | No persistent change; cancel closes inspection. |
+| Before new slot/token verification | Slot 0 still works; old protectors remain except recognized retry cleanup. |
+| During old-protector retirement | Slot 0 and the tested new candidate remain; retry finishes cleanup. |
+| During deployment or ESP replacement | Slot 0 still works from USB; retry repairs the boot files. |
+| During installed first-boot transition | Existing selector transition recovery applies; slot 0 is unchanged. |
+
+This is interruption-safe recovery of the data, not atomic replacement
+across LUKS, Btrfs and FAT. A partial ESP write may require another USB
+reinstall. If an old selector boots after the new first-boot protector
+was added, it can adopt that old chain; a subsequent new selector may
+then need the recovery key or another USB retry. No success is reported
+for that interrupted installation. Before the completed install's first
+boot, the first-boot policy has the same temporary weakness as a fresh
+install: another OS on this TPM with PCR 12 zero can release it. The
+review discloses this and asks for an immediate boot from the disk.
+Changing the TPM does not change the recovery key. Old disk/header
+backups may retain old protectors; retirement is not backup revocation.
+
+### Implementation increments and acceptance
+
+Land the following independently, keeping unavailable paths refused until
+their dependencies exist:
+
+1. Recovery-authorized reinstall planner and td-luks operations, with
+   fault injection after each header write, slot test, retirement and
+   retry cleanup. Model repeated failures, exhausted capacity, dead
+   keyslots, mismatched copies and foreign state. Assert that slot 0
+   stays usable and no unverified replacement authorizes retirement.
+2. Service, plan and typed-key wizard integration with the existing
+   preserve publisher and ESP writer. Add the new protocol version and
+   lifecycle tests from INSTALLER.md in the same increment. Keep camera
+   entry explicitly unavailable until its own support lands.
+3. Bounded webcam capture and QR decoding, including the scoped syscall
+   and kernel additions, followed by the complete graphical flow.
+   These need their owning design/UNSAFE.md amendments before code;
+   this design admits no new external dependency.
+4. A UEFI/swtpm live-USB oracle: install device-bound, keep a personal
+   canary and login/network settings, then reinstall from a newer image
+   with changed selector bytes. Require unchanged UUIDs, home inode,
+   canary and saved settings, unchanged recovery key, successful boot
+   without retyping it, and removal of old and first-boot protectors
+   after the transition. Boot once more to prove device-bound release.
+
+The oracle must also cover recovery with a different TPM, wrong keys and
+cancel with byte-identical destination disks, changed review observations,
+no TPM, unsupported/protected headers, and power cuts at each durable
+boundary followed by a USB retry. A legacy signed-deployment selector
+fixture must demonstrate the laptop migration: no installed signing key
+is required, the USB replaces that selector, and the new selector boots
+its hash-verified replacement deployment. Do not add signing to the new
+code to create that fixture. Secret-leak checks cover logs, argv,
+environment, staging, ESP and persistent files; test-only oracle secret
+channels follow the existing encrypted-install oracle's custody rules.
+Camera fixtures alone do not establish T14s compatibility: acceptance
+also requires scanning the saved code from a phone or paper using the
+laptop webcam, plus a successful typed-key reinstall on that hardware.
+
 ## Device-bound formatting
 
 Increment 5 formats device-bound volumes, and increment 7 makes them the
