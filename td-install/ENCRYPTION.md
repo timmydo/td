@@ -458,7 +458,9 @@ backups may retain old protectors; retirement is not backup revocation.
 Land the following independently, keeping unavailable paths refused until
 their dependencies exist:
 
-1. Recovery-authorized reinstall planner and td-luks operations, with
+1. **Library mechanism implemented; live service not connected.**
+   `td-protector` exposes the recovery-authorized reinstall planner and
+   executor (its DESIGN.md, "Live reinstall protector replacement"), with
    fault injection after each header write, slot test, retirement and
    retry cleanup. Model repeated failures, exhausted capacity, dead
    keyslots, mismatched copies and foreign state. Assert that slot 0

@@ -696,6 +696,93 @@ pub fn reseal<T: Tpm, C: Runner>(
     }
 }
 
+/// Replace device-bound protectors for a consented live reinstall. The caller
+/// owns the disk claim, admits its format and identity, and has closed the
+/// live boot's release cap. This function never unseals or resets the TPM.
+/// Any error may leave an incomplete transition; slot 0 is never changed.
+/// No installation service currently invokes this mechanism.
+pub fn reinstall<T: Tpm, C: Runner>(
+    header: &Header,
+    device: &Path,
+    recovery: &RecoveryKey,
+    tpm: &mut T,
+    runner: &mut C,
+) -> Result<u8, String> {
+    let policy = first_boot_policy()?;
+    let secret = Secret::generate()?;
+    let sealed = seal(tpm.open()?, &policy, &secret)?;
+    crate::verify_first_boot_object(&mut tpm.open()?, &sealed)?;
+    let plan = transition::reinstall_plan(header, &sealed).map_err(|e| e.to_string())?;
+    let metadata = runner.metadata(device).map_err(|e| e.to_string())?;
+    reinstall_metadata(&metadata)?;
+    let steps = plan.confirm(&metadata).map_err(|e| e.to_string())?;
+    let token = steps
+        .iter()
+        .find_map(|step| match step {
+            Step::ImportToken { token } => Some(token.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "reinstall plan has no new token".to_string())?;
+    let slot = token.keyslot();
+    let new = NewProtector { sealed, secret };
+    let passphrase = recovery.passphrase();
+    let keys = Keys {
+        opener: transition::RECOVERY_SLOT,
+        released: passphrase.expose(),
+        new: Some(&new),
+        new_slot: Some(slot),
+    };
+    for step in &steps {
+        run_step(step, device, &keys, runner)
+            .map_err(|e| format!("reinstall protector {} failed: {e}", describe(step)))?;
+        if matches!(step, Step::ImportToken { .. }) {
+            // A successful import is not evidence that the persisted object
+            // is the one whose load and policy were verified above.
+            let metadata = runner.metadata(device).map_err(|e| e.to_string())?;
+            verify_reinstall_token(&metadata, &token, false)?;
+        }
+    }
+    let metadata = runner.metadata(device).map_err(|e| e.to_string())?;
+    verify_reinstall_token(&metadata, &token, true)?;
+    Ok(slot)
+}
+
+fn reinstall_metadata(bytes: &[u8]) -> Result<crate::luks2::Metadata, String> {
+    let metadata = crate::luks2::metadata(bytes)?;
+    let json = td_luks::header::metadata_json(bytes)?;
+    let volume = td_luks::header::volume(&json)?;
+    if volume.reencryption
+        || !volume.reencrypt_modes.is_empty()
+        || volume.segment.is_none()
+        || volume.bound != metadata.keyslots
+    {
+        return Err("reinstall requires all keyslots bound to the volume".into());
+    }
+    Ok(metadata)
+}
+
+fn verify_reinstall_token(bytes: &[u8], expected: &Token, complete: bool) -> Result<(), String> {
+    let metadata = reinstall_metadata(bytes)?;
+    let matching: Vec<_> = metadata
+        .tokens
+        .iter()
+        .filter(|(_, token)| token.keyslot() == expected.keyslot())
+        .collect();
+    if !metadata.foreign.is_empty()
+        || !metadata.protected.is_empty()
+        || matching.len() != 1
+        || !matching.first().is_some_and(|(_, token)| token == expected)
+        || !metadata.keyslots.contains(&transition::RECOVERY_SLOT)
+        || (complete
+            && (metadata.keyslots != [transition::RECOVERY_SLOT, expected.keyslot()]
+                || metadata.tokens.len() != 1
+                || !metadata.orphans.is_empty()))
+    {
+        return Err("reinstall protector metadata did not verify".into());
+    }
+    Ok(())
+}
+
 /// The plan's steps once cryptsetup's own metadata confirms the header it
 /// was computed from; `None` when no plan runs this boot.
 fn confirmed_steps<C: Runner>(
@@ -985,12 +1072,20 @@ mod tests {
                 })
                 .collect();
             tokens.extend_from_slice(extra);
-            format!(
+            let json = format!(
                 "{{\n  \"keyslots\": {{\n    {}\n  }},\n  \"tokens\": {{\n    {}\n  }},\n  \"segments\": {{}},\n  \"digests\": {{}},\n  \"config\": {{}}\n}}",
                 keyslots.join(",\n    "),
                 tokens.join(",\n    ")
-            )
-            .into_bytes()
+            );
+            let bound = self
+                .keyslots
+                .keys()
+                .map(|slot| format!("\"{slot}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            json.replace("\"digests\": {}", &format!(
+                "\"digests\": {{\"0\": {{\"keyslots\":[{bound}],\"segments\":[\"0\"],\"digest\":\"model\",\"salt\":\"model\"}}}}"
+            )).into_bytes()
         }
 
         fn opens(&self, slot: u8, key: &[u8]) -> bool {
@@ -1118,6 +1213,238 @@ mod tests {
             self.refuse("dump", "dump")?;
             Ok(self.metadata.clone().unwrap_or_else(|| self.dump_with(&[])))
         }
+    }
+
+    struct ReinstallFault<'a> {
+        disk: &'a mut Disk,
+        calls: usize,
+        fail_at: usize,
+        after: bool,
+        corrupt_import: bool,
+    }
+
+    impl ReinstallFault<'_> {
+        fn before(&mut self) -> io::Result<()> {
+            self.calls += 1;
+            if self.calls == self.fail_at && !self.after {
+                return Err(io::Error::other("injected interruption"));
+            }
+            Ok(())
+        }
+        fn after(&self) -> io::Result<()> {
+            if self.calls == self.fail_at && self.after {
+                return Err(io::Error::other("injected interruption"));
+            }
+            Ok(())
+        }
+    }
+
+    impl Runner for ReinstallFault<'_> {
+        fn run(&mut self, args: &[OsString], input: &[u8]) -> io::Result<()> {
+            self.before()?;
+            self.disk.run(args, input)?;
+            if self.corrupt_import && args.first().is_some_and(|v| v == "token-import") {
+                // A successful command returning another persisted token.
+                for entry in self.disk.tokens.values_mut() {
+                    if let Entry::Td(token) = entry {
+                        if token.role() == Role::FirstBoot {
+                            let mut sealed = token.sealed().clone();
+                            sealed.private[0] ^= 1;
+                            *token = Token::new(token.keyslot(), token.role(), sealed).unwrap();
+                        }
+                    }
+                }
+            }
+            self.after()
+        }
+        fn metadata(&mut self, device: &Path) -> io::Result<Vec<u8>> {
+            self.before()?;
+            let result = self.disk.metadata(device)?;
+            self.after()?;
+            Ok(result)
+        }
+    }
+
+    fn reinstall_fixture(full: bool) -> (Scripted, Disk) {
+        let mut tpm = Scripted::new();
+        let mut disk = Disk::new(&tpm);
+        for slot in 1..=if full { 4 } else { 1 } {
+            disk.enroll(&mut tpm, slot - 1, slot, Role::DeviceBound);
+        }
+        cap(&mut tpm.client()).unwrap();
+        tpm.codes();
+        (tpm, disk)
+    }
+
+    #[test]
+    fn live_reinstall_uses_first_boot_policy_without_unseal_and_leaves_only_two_slots() {
+        let (mut tpm, mut disk) = reinstall_fixture(false);
+        let before = live_secrets();
+        let slot = reinstall(
+            &disk.header(),
+            Path::new(DEVICE),
+            &RecoveryKey::parse(RECOVERY_KEY).unwrap(),
+            &mut tpm,
+            &mut disk,
+        )
+        .unwrap();
+        assert_eq!(live_secrets(), before);
+        assert_eq!(
+            disk.shape(),
+            (vec![0, slot], vec![(1, Some(slot), Role::FirstBoot)])
+        );
+        assert!(disk.opens(0, RECOVERY_KEY));
+        let codes = tpm.codes();
+        assert!(codes.contains(&CREATE));
+        assert!(!codes.contains(&UNSEAL));
+        assert!(!codes.contains(&PCR_EXTEND));
+        assert!(!codes.contains(&PCR_READ));
+        assert!(tpm.idle());
+        assert_eq!(
+            disk.calls,
+            [
+                "dump",
+                "test 0",
+                "add 2 by 0",
+                "import 2",
+                "dump",
+                "test 2",
+                "test 0",
+                "kill 1",
+                "remove 0",
+                "dump"
+            ]
+        );
+    }
+
+    #[test]
+    fn live_reinstall_stops_on_each_runner_failure_and_retry_preserves_recovery() {
+        for full in [false, true] {
+            let (mut tpm, mut disk) = reinstall_fixture(full);
+            reinstall(
+                &disk.header(),
+                Path::new(DEVICE),
+                &RecoveryKey::parse(RECOVERY_KEY).unwrap(),
+                &mut tpm,
+                &mut disk,
+            )
+            .unwrap();
+            let calls = disk.calls.len();
+            for after in [false, true] {
+                for fail_at in 1..=calls {
+                    let (mut tpm, mut disk) = reinstall_fixture(full);
+                    let header = disk.header();
+                    let mut runner = ReinstallFault {
+                        disk: &mut disk,
+                        calls: 0,
+                        fail_at,
+                        after,
+                        corrupt_import: false,
+                    };
+                    let before = live_secrets();
+                    assert!(reinstall(
+                        &header,
+                        Path::new(DEVICE),
+                        &RecoveryKey::parse(RECOVERY_KEY).unwrap(),
+                        &mut tpm,
+                        &mut runner
+                    )
+                    .is_err());
+                    assert_eq!(runner.calls, fail_at, "continued after failure");
+                    assert_eq!(live_secrets(), before);
+                    assert!(disk.opens(0, RECOVERY_KEY));
+                    reinstall(
+                        &disk.header(),
+                        Path::new(DEVICE),
+                        &RecoveryKey::parse(RECOVERY_KEY).unwrap(),
+                        &mut tpm,
+                        &mut disk,
+                    )
+                    .unwrap();
+                    assert_eq!(disk.keyslots.len(), 2);
+                    assert_eq!(disk.tokens.len(), 1);
+                    assert!(disk.opens(0, RECOVERY_KEY));
+                    assert_eq!(live_secrets(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_reinstall_refuses_unbound_slots_and_unmarked_reencryption() {
+        for change in ["unbound", "reencrypt"] {
+            let (mut tpm, mut disk) = reinstall_fixture(false);
+            let before = disk.shape();
+            let json = String::from_utf8(disk.dump_with(&[])).unwrap();
+            let changed = if change == "unbound" {
+                json.replace("\"segments\":[\"0\"]", "\"segments\":[]")
+            } else {
+                json.replace(
+                    "\"config\": {}",
+                    r#""config": {"requirements":{"mandatory":["online-reencrypt-v2"]}}"#,
+                )
+            };
+            assert_ne!(changed, json);
+            disk.metadata = Some(changed.into_bytes());
+            assert!(reinstall(
+                &disk.header(),
+                Path::new(DEVICE),
+                &RecoveryKey::parse(RECOVERY_KEY).unwrap(),
+                &mut tpm,
+                &mut disk
+            )
+            .is_err());
+            assert_eq!(disk.shape(), before);
+            assert_eq!(disk.calls, ["dump"]);
+        }
+    }
+
+    #[test]
+    fn live_reinstall_wrong_recovery_and_changed_metadata_write_nothing() {
+        for mismatch in [false, true] {
+            let (mut tpm, mut disk) = reinstall_fixture(false);
+            let before = disk.shape();
+            let recovery = if mismatch {
+                disk.metadata = Some(b"{}".to_vec());
+                RecoveryKey::parse(RECOVERY_KEY).unwrap()
+            } else {
+                RecoveryKey::generate().unwrap()
+            };
+            assert!(reinstall(
+                &disk.header(),
+                Path::new(DEVICE),
+                &recovery,
+                &mut tpm,
+                &mut disk
+            )
+            .is_err());
+            assert_eq!(disk.shape(), before);
+            assert!(disk.calls.iter().all(|c| c == "dump" || c == "test 0"));
+        }
+    }
+
+    #[test]
+    fn live_reinstall_reads_back_the_import_before_retiring_the_old_protector() {
+        let (mut tpm, mut disk) = reinstall_fixture(false);
+        let header = disk.header();
+        let mut runner = ReinstallFault {
+            disk: &mut disk,
+            calls: 0,
+            fail_at: usize::MAX,
+            after: false,
+            corrupt_import: true,
+        };
+        assert!(reinstall(
+            &header,
+            Path::new(DEVICE),
+            &RecoveryKey::parse(RECOVERY_KEY).unwrap(),
+            &mut tpm,
+            &mut runner
+        )
+        .is_err());
+        assert!(disk.keyslots.contains_key(&1));
+        assert!(!disk.calls.iter().any(|c| c.starts_with("kill")));
+        assert!(disk.opens(0, RECOVERY_KEY));
     }
 
     /// One boot's release over the disk, with the console's lines. Every

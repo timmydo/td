@@ -453,6 +453,50 @@ the header, orphans included, is unchanged. Tests drive each plan to
 every interruption point and require the next boot's plan to complete
 it.
 
+## Live reinstall protector replacement
+
+The library mechanism for ENCRYPTION.md's planned encrypted reinstall is
+`transition::reinstall_plan` and `release::reinstall`. The live service
+still refuses encrypted preserve mode; this mechanism alone does not
+install a deployment, write an ESP or grant consent. Its caller must hold
+the disk claim, admit the volume format and identities, obtain the explicit
+reinstall approval and run only after the live selector's release cap.
+A service runner must retain its bounded child and abandonment lifecycle.
+
+The pure planner reuses the device-bound transition's allocator, orphan
+cleanup and recovery reseal retirement, but installs a first-boot token.
+It refuses every foreign or protected-tier token, including a pending
+keyslot-less FIDO2 token, and keeps the existing shared-slot and slot-0
+refusals. The executor confirms the initial token/slot view through the
+runner's metadata and requires every keyslot to be bound to the one
+volume, with no reencryption. The real td-luks metadata command also
+admits its fixed profile before returning JSON. No slot-0-only proof of
+an unbound obsolete volume key can authorize cleanup.
+
+`release::reinstall` generates a new secret, seals it under the first-boot
+policy and validates the policy and TPM load without an unseal. It runs
+the confirmed plan with the recovery key on descriptor input, testing
+slot 0 before any mutation. At the four-token ceiling, recovery proof
+permits the existing planner's early retirement to make space; otherwise
+old protectors remain through the add. After import it reads metadata
+again and requires exactly the imported token on the new slot. Only then
+are the new slot and slot 0 tested, and old slots and tokens retired.
+A final metadata read requires exactly slot 0 and the new first-boot
+protector, no foreign, protected or orphan tokens. Every error stops the
+sequence and returns failure; it never reports a successful partial plan.
+Its secret and passphrase buffers are zeroed on return. Its runner sends
+no secret in arguments or environment and uses the existing key pipe.
+
+Retries generate a fresh candidate. The existing orphan definition and
+recovery-authorized early retirement make repeated interruptions bounded;
+slot 0 is never added, changed or removed. Pure model tests cut after each
+step and inside a slot wipe, then cut a retry again before completing.
+Runner tests fail before and after each operation, check exact readback,
+refuse changed metadata and wrong recovery, and verify no TPM unseal,
+PCR read or extension. They model header commits; actual torn-header
+selection remains td-luks's reader/writer evidence. Full USB, swtpm and
+hardware acceptance remains the installer workstream's later increment.
+
 ## Release orchestration
 
 `release::release` runs ENCRYPTION.md's release order, steps 2 to 5,

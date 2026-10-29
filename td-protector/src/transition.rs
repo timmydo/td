@@ -103,6 +103,8 @@ pub enum Refusal {
     /// plans device-bound headers only, so their tokens and keyslots stay
     /// as they are.
     NotDeviceBound,
+    /// Reinstall refuses every foreign or protected-tier token.
+    UnsupportedReinstallTokens,
     /// The header has no keyslot 0.
     NoRecoveryKeyslot,
     /// A td token names keyslot 0, which no td protector may hold.
@@ -129,6 +131,12 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotDeviceBound => write!(f, "the LUKS2 header is not a device-bound one"),
+            Self::UnsupportedReinstallTokens => {
+                write!(
+                    f,
+                    "reinstall requires only device-bound or first-boot td tokens"
+                )
+            }
             Self::NoRecoveryKeyslot => write!(f, "the LUKS2 header has no recovery keyslot 0"),
             Self::RecoveryKeyslotNamed { token } => {
                 write!(f, "td token {token} names the recovery keyslot 0")
@@ -274,6 +282,26 @@ fn retire(steps: &mut Vec<Step>, header: &Header, tokens: &[u8], by: u8) {
 /// naming keyslot 0 among them, has no plan at all, orphans included, and
 /// a plan that could not import its token refuses before any step.
 pub fn plan(header: &Header, transition: &Transition) -> Result<Plan, Refusal> {
+    plan_with_role(header, transition, Role::DeviceBound)
+}
+
+/// Recovery-authorized live reinstall. The executor must verify the imported
+/// token before the next step and stop at the first failure. Slot 0 is tested
+/// before any mutation and again before ordinary protector retirement.
+pub fn reinstall_plan(header: &Header, sealed: &SealedObject) -> Result<Plan, Refusal> {
+    if !header.foreign.is_empty() || !header.protected.is_empty() {
+        return Err(Refusal::UnsupportedReinstallTokens);
+    }
+    plan_with_role(
+        header,
+        &Transition::Reseal {
+            sealed: sealed.clone(),
+        },
+        Role::FirstBoot,
+    )
+}
+
+fn plan_with_role(header: &Header, transition: &Transition, role: Role) -> Result<Plan, Refusal> {
     check(header)?;
     let opener = match transition {
         Transition::Keep { token: number } => {
@@ -313,7 +341,7 @@ pub fn plan(header: &Header, transition: &Transition) -> Result<Plan, Refusal> {
         .collect();
     // The recovery key already opened the volume in keyslot 0.
     let mut steps = match transition {
-        Transition::Reseal { .. } => Vec::new(),
+        Transition::Reseal { .. } if role == Role::DeviceBound => Vec::new(),
         _ => vec![Step::Test { slot: opener }],
     };
     for slot in &orphan_slots {
@@ -392,11 +420,16 @@ pub fn plan(header: &Header, transition: &Transition) -> Result<Plan, Refusal> {
     let slot = (1..=MAX_SLOT)
         .find(|slot| !taken.contains(slot))
         .ok_or(Refusal::NoFreeKeyslot)?;
-    let new = Token::new(slot, Role::DeviceBound, sealed.clone()).map_err(Refusal::Sealed)?;
+    let new = Token::new(slot, role, sealed.clone()).map_err(Refusal::Sealed)?;
     retire(&mut steps, header, &early, opener);
     steps.push(Step::AddKeyslot { slot, by: opener });
     steps.push(Step::ImportToken { token: new });
     steps.push(Step::Test { slot });
+    if role == Role::FirstBoot {
+        steps.push(Step::Test {
+            slot: RECOVERY_SLOT,
+        });
+    }
     retire(&mut steps, header, &old, slot);
     Ok(done(steps))
 }
@@ -826,6 +859,154 @@ mod tests {
             };
             released.retain(|number| *number != token);
         }
+    }
+
+    fn reinstall_steps(model: &Model, key: u8) -> Vec<Step> {
+        reinstall_plan(&model.header(), &sealed(0, key))
+            .unwrap()
+            .confirm(&model.dump())
+            .unwrap()
+    }
+
+    fn reinstall_cut(model: &mut Model, steps: &[Step], key: u8, cut: Cut) {
+        for (index, step) in steps.iter().enumerate() {
+            if cut == Cut::After(index) {
+                break;
+            }
+            let input = match step.input() {
+                Input::KeyOf(RECOVERY_SLOT) => Some(RECOVERY_KEY),
+                Input::KeyOf(_) => Some(key),
+                _ => None,
+            };
+            model
+                .apply(step, input, key, cut == Cut::Inside(index))
+                .unwrap();
+            assert!(model.live(RECOVERY_SLOT, RECOVERY_KEY));
+            if cut == Cut::Inside(index) {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn reinstall_retests_recovery_and_removes_even_matching_old_protectors() {
+        let mut model = Model::new(&[0, 1], &[(0, td(1, Role::DeviceBound, 1))]);
+        let steps = reinstall_steps(&model, 200);
+        assert_eq!(steps.first(), Some(&Step::Test { slot: 0 }));
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| **s == Step::Test { slot: 0 })
+                .count(),
+            2
+        );
+        reinstall_cut(&mut model, &steps, 200, WHOLE);
+        assert_eq!(
+            model.shape(),
+            shape(&[0, 2], &[(1, td(2, Role::FirstBoot, 0))])
+        );
+        let mut next_key = 200;
+        boot(&mut model, FIRST, WHOLE, &mut next_key);
+        assert_eq!(model.tokens.len(), 1);
+        assert!(model
+            .header()
+            .tokens
+            .iter()
+            .all(|(_, t)| t.role() == Role::DeviceBound));
+        let stable = model.clone();
+        boot(&mut model, FIRST, WHOLE, &mut next_key);
+        assert_eq!(model, stable);
+    }
+
+    #[test]
+    fn reinstall_every_cut_and_repeated_cut_converges_without_losing_recovery() {
+        let fixtures = [
+            Model::new(&[0], &[]),
+            installed(),
+            Model::new(&[0, 1], &[(0, td(1, Role::DeviceBound, 1))]),
+            // Full token roster: recovery authorizes early retirement.
+            Model::new(
+                &[0, 1, 2, 3, 4],
+                &[
+                    (0, td(1, Role::DeviceBound, 1)),
+                    (1, td(2, Role::FirstBoot, 0)),
+                    (2, td(3, Role::FirstBoot, 0)),
+                    (3, td(4, Role::FirstBoot, 0)),
+                ],
+            ),
+            // Full slot roster, one live token and interrupted add orphans.
+            Model::new(
+                &(0..=MAX_SLOT).collect::<Vec<_>>(),
+                &[(0, td(1, Role::DeviceBound, 1))],
+            ),
+            Model::new(
+                &[0, 1, 3],
+                &[
+                    (0, td(1, Role::FirstBoot, 0)),
+                    (1, orphan(Role::DeviceBound)),
+                ],
+            ),
+        ];
+        for initial in fixtures {
+            let steps = reinstall_steps(&initial, 200);
+            let cuts = |steps: &[Step]| {
+                (0..=steps.len())
+                    .map(Cut::After)
+                    .chain(
+                        steps
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, step)| matches!(step, Step::KillSlot { .. }))
+                            .map(|(i, _)| Cut::Inside(i)),
+                    )
+                    .collect::<Vec<_>>()
+            };
+            for cut in cuts(&steps) {
+                let mut interrupted = initial.clone();
+                reinstall_cut(&mut interrupted, &steps, 200, cut);
+                let retry = reinstall_steps(&interrupted, 201);
+                for again in cuts(&retry) {
+                    let mut twice = interrupted.clone();
+                    reinstall_cut(&mut twice, &retry, 201, again);
+                    let finish = reinstall_steps(&twice, 202);
+                    reinstall_cut(&mut twice, &finish, 202, WHOLE);
+                    assert_eq!(twice.keyslots.len(), 2);
+                    assert_eq!(twice.tokens.len(), 1);
+                    let header = twice.header();
+                    let (_, token) = header.tokens.first().unwrap();
+                    assert_eq!(token.role(), Role::FirstBoot);
+                    assert!(twice.live(token.keyslot(), 202));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reinstall_refuses_foreign_shared_and_recovery_named_tokens() {
+        let sealed = sealed(0, 200);
+        for foreign_slot in [None, Some(0), Some(1)] {
+            let model = Model::new(&[0, 1], &[(0, foreign(foreign_slot))]);
+            assert_eq!(
+                reinstall_plan(&model.header(), &sealed),
+                Err(Refusal::UnsupportedReinstallTokens)
+            );
+        }
+        let mut header = installed().header();
+        header.tokens.push((1, header.tokens[0].1.clone()));
+        assert!(matches!(
+            reinstall_plan(&header, &sealed),
+            Err(Refusal::SharedKeyslot { .. })
+        ));
+        let model = Model::new(&[0], &[(0, td(0, Role::FirstBoot, 0))]);
+        assert!(matches!(
+            reinstall_plan(&model.header(), &sealed),
+            Err(Refusal::RecoveryKeyslotNamed { .. })
+        ));
+        let model = Model::new(&[1], &[(0, td(1, Role::FirstBoot, 0))]);
+        assert_eq!(
+            reinstall_plan(&model.header(), &sealed),
+            Err(Refusal::NoRecoveryKeyslot)
+        );
     }
 
     fn installed() -> Model {
