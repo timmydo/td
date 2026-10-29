@@ -589,7 +589,7 @@ mod crypto_boundary_tests {
                 test_dependencies.push(line);
             }
         }
-        assert_eq!(test_dependencies, [r#"td-fs = { path = "../td-fs" }"#]);
+        assert!(test_dependencies.is_empty());
         assert_eq!(
             dependencies,
             [
@@ -601,7 +601,8 @@ mod crypto_boundary_tests {
                 r#"td-html = { path = "../td-html" }"#,
                 r#"td-json = { path = "../td-json" }"#,
                 r#"td-mime = { path = "../td-mime" }"#,
-                r#"td-nfc = { path = "../td-nfc" }"#
+                r#"td-nfc = { path = "../td-nfc" }"#,
+                r#"td-fs = { path = "../td-fs" }"#
             ]
         );
     }

@@ -21,8 +21,6 @@ td-html = { path = "../td-html" }
 td-json = { path = "../td-json" }
 td-mime = { path = "../td-mime" }
 td-nfc = { path = "../td-nfc" }
-
-[dev-dependencies]
 td-fs = { path = "../td-fs" }
 
 [[test]]

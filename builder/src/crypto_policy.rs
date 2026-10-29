@@ -30,8 +30,8 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
         "td-crypto" => "bde5f0081479e0e868de9776fdc9c43d20527213e334f864f8ba1f2ff926108f",
-        "td-mta" => "b5352257e11d365d3e775f6ac5752b2f69394b2aa489caad25be68e4da8c2e62",
-        "td-fs" => "1ac91f7a8baf01070f9f51fbf6f625b637e96894174dda1dc4c1ce0e9b6ef401",
+        "td-mta" => "24f2b491cd3b9be70711ffdcd47b19baf6615a2637a411e3b1abc8235be41f6b",
+        "td-fs" => "e685546b8dc4353148f58034fc27b8bd59490281944f9226f295b5d6d72240fc",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-html" => "e4c924efdc7deab65fcc5cfa64bd5349935d5f3094e4310125ddb173af0b1c14",
         "td-json" => "2793cd9cd8ffc7bac436069324b42b503f7f3114418fc95f558fb0831060e8b3",
@@ -246,6 +246,7 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
         expected.extend(POSTGRES_ACTIVE.lines().map(str::to_owned));
         local.extend([
             "td-civil",
+            "td-fs",
             "td-header",
             "td-html",
             "td-json",
@@ -509,15 +510,17 @@ mod tests {
         let html = root.join("td-html").canonicalize().unwrap();
         let nfc = root.join("td-nfc").canonicalize().unwrap();
         let mime = root.join("td-mime").canonicalize().unwrap();
+        let fs = root.join("td-fs").canonicalize().unwrap();
         let mailgraph = format!(
-            "{graph}{POSTGRES_ACTIVE}td-civil v0.1.0 ({})|\ntd-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-html v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\n",
+            "{graph}{POSTGRES_ACTIVE}td-civil v0.1.0 ({})|\ntd-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-html v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\ntd-fs v0.1.0 ({})|\n",
             civil.display(),
             mail.display(),
             json.display(),
             header.display(),
             html.display(),
             nfc.display(),
-            mime.display()
+            mime.display(),
+            fs.display()
         );
         assert!(active_graph(
             &root,

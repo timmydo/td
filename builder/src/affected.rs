@@ -11424,16 +11424,18 @@ mod tests {
         let admitted = include_str!("../../td-mta/Cargo.toml");
         let (paths, dev_paths) = manifest_path_dependencies("td-mta", admitted).unwrap();
         assert!(paths.iter().all(|name| name.starts_with("td-")));
-        assert_eq!(dev_paths, ["td-fs"]);
+        assert!(dev_paths.is_empty());
+        assert!(paths.iter().any(|name| name == "td-fs"));
         for line in crate::crypto_policy::POSTGRES_DEPENDENCIES {
             assert!(admitted.lines().any(|candidate| candidate == *line));
             let manifest = format!("[dependencies]\n{line}\n");
             for name in ["td-aa", "td-crypto"] {
                 assert!(manifest_path_dependencies(name, &manifest).is_err());
             }
-            let dev = admitted
-                .replace(line, "")
-                .replace("[dev-dependencies]", &format!("[dev-dependencies]\n{line}"));
+            let dev = format!(
+                "{}\n[dev-dependencies]\n{line}\n",
+                admitted.replace(line, "")
+            );
             assert!(manifest_path_dependencies("td-mta", &dev).is_err());
             let changed = admitted.replace(
                 line,

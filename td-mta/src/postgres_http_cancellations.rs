@@ -259,7 +259,7 @@ fn addresses(
     loaded: &Loaded,
     executable: &Path,
     deadline: Instant,
-) -> Result<Vec<std::net::IpAddr>, ports::Error> {
+) -> Result<Vec<crate::postgres_probe::Endpoint>, ports::Error> {
     let deadline = deadline.min(
         Instant::now()
             .checked_add(Duration::from_secs(5))

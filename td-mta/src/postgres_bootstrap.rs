@@ -1,7 +1,7 @@
 //! Bounded, side-effect-free decoding of protected PostgreSQL bootstrap input.
 use std::{net::IpAddr, path::Path};
 
-use crate::postgres_probe::Request;
+use crate::postgres_probe::{Endpoint, Request};
 
 const MAX_SPECIFICATION: usize = 16 * 1024;
 
@@ -18,6 +18,7 @@ pub enum Error {
 /// Parsing neither reads files/environment nor connects to a database.
 pub struct Bootstrap {
     host: String,
+    socket: Option<td_fs::SocketPath>,
     port: u16,
     user: String,
     password: Vec<u8>,
@@ -28,7 +29,8 @@ pub struct Bootstrap {
 
 impl Bootstrap {
     /// Accept one PostgreSQL URI with explicit credentials and database.
-    /// TLS verification is mandatory even when sslmode is omitted.
+    /// TCP requires verified TLS. An empty authority host plus an absolute
+    /// `host` query selects a private Unix socket; no network fallback exists.
     pub fn parse(specification: &str, profile: &str) -> Result<Self, Error> {
         if profile.is_empty()
             || profile.len() > 64
@@ -80,16 +82,26 @@ impl Bootstrap {
         };
         // The TLS facade authenticates a DNS name, never an IP literal or
         // a URI-encoded host/socket path. Resolve this name again on reconnect.
-        if !valid_host(host) {
+        if !host.is_empty() && !valid_host(host) {
             return Err(Error::Endpoint);
         }
         let mut root_certificate = None;
-        let mut mode_seen = false;
+        let mut mode = None;
+        let mut socket_directory = None;
         if let Some(query) = query {
             for option in query.split('&') {
                 let (name, value) = option.split_once('=').ok_or(Error::TlsPolicy)?;
                 match name {
-                    "sslmode" if !mode_seen && value == "verify-full" => mode_seen = true,
+                    "sslmode" if mode.is_none() && matches!(value, "verify-full" | "disable") => {
+                        mode = Some(value)
+                    }
+                    "host" if host.is_empty() && socket_directory.is_none() => {
+                        let path = text(value, 107).map_err(|_| Error::Endpoint)?;
+                        if !Path::new(&path).is_absolute() {
+                            return Err(Error::Endpoint);
+                        }
+                        socket_directory = Some(path);
+                    }
                     "sslrootcert" if root_certificate.is_none() => {
                         let path = text(value, 4096).map_err(|_| Error::TlsPolicy)?;
                         if !Path::new(&path).is_absolute() {
@@ -101,8 +113,27 @@ impl Bootstrap {
                 }
             }
         }
+        let socket = match socket_directory {
+            Some(directory) => {
+                if root_certificate.is_some() || mode.is_some_and(|value| value != "disable") {
+                    return Err(Error::TlsPolicy);
+                }
+                let path = Path::new(&directory).join(format!(".s.PGSQL.{port}"));
+                Some(td_fs::SocketPath::new(&path).map_err(|_| Error::Endpoint)?)
+            }
+            None => {
+                if host.is_empty() {
+                    return Err(Error::Endpoint);
+                }
+                if mode.is_some_and(|value| value != "verify-full") {
+                    return Err(Error::TlsPolicy);
+                }
+                None
+            }
+        };
         Ok(Self {
             host: host.to_ascii_lowercase(),
+            socket,
             port,
             user,
             password,
@@ -112,8 +143,12 @@ impl Bootstrap {
         })
     }
 
-    pub fn host(&self) -> &str {
-        &self.host
+    pub fn host(&self) -> Option<&str> {
+        self.socket.is_none().then_some(self.host.as_str())
+    }
+
+    pub fn socket(&self) -> Option<&td_fs::SocketPath> {
+        self.socket.as_ref()
     }
 
     pub fn port(&self) -> u16 {
@@ -130,10 +165,10 @@ impl Bootstrap {
         self.root_certificate.as_deref().map(Path::new)
     }
 
-    /// The caller supplies one address resolved from host under its deadline.
-    pub fn request(&self, address: IpAddr) -> Request<'_> {
+    /// The caller supplies one endpoint admitted by the bootstrap resolver.
+    pub fn request(&self, address: Endpoint) -> Request<'_> {
         Request {
-            address: (address, self.port).into(),
+            address,
             server_name: &self.host,
             mode: crate::postgres_probe::Mode::Preparation,
             user: &self.user,
@@ -228,6 +263,43 @@ mod tests {
     const URI: &str = "postgresql://alice:secret@db.example/mail";
 
     #[test]
+    fn unix_endpoint_has_no_network_or_certificate_fallback() {
+        let bootstrap = Bootstrap::parse(
+            "postgresql://alice:secret@:35434/mail?host=%2Fhome%2Falice%2Fsocket&sslmode=disable",
+            "replica",
+        )
+        .unwrap();
+        assert_eq!(bootstrap.host(), None);
+        assert_eq!(
+            bootstrap.socket(),
+            Some(&td_fs::SocketPath::new(Path::new("/home/alice/socket/.s.PGSQL.35434")).unwrap())
+        );
+        assert_eq!(bootstrap.root_certificate(), None);
+        let request = bootstrap.request(Endpoint::Unix(*bootstrap.socket().unwrap()));
+        assert_eq!(
+            request.address,
+            Endpoint::Unix(
+                td_fs::SocketPath::new(Path::new("/home/alice/socket/.s.PGSQL.35434")).unwrap()
+            )
+        );
+        assert_eq!(request.user, "alice");
+        assert_eq!(request.password, b"secret");
+        for uri in [
+            "postgresql://alice:secret@/mail",
+            "postgresql://alice:secret@localhost/mail?host=/home/alice/socket",
+            "postgresql://alice:secret@/mail?host=relative",
+            "postgresql://alice:secret@/mail?host=/home/alice/../socket",
+            "postgresql://alice:secret@/mail?host=/home/alice/./socket",
+            "postgresql://alice:secret@/mail?host=/home/alice//socket",
+            "postgresql://alice:secret@/mail?host=/home/alice/socket&sslmode=verify-full",
+            "postgresql://alice:secret@/mail?host=/home/alice/socket&sslrootcert=/ca.pem",
+            "postgresql://alice:secret@/mail?host=/home/alice/socket&host=/other",
+        ] {
+            assert!(Bootstrap::parse(uri, "replica").is_err(), "{uri}");
+        }
+    }
+
+    #[test]
     fn cloud_and_local_names_bind_credentials_profile_and_verified_name() {
         for host in [
             "db.postgres.database.azure.com",
@@ -236,19 +308,22 @@ mod tests {
         ] {
             let spec = format!("postgresql://alice%40tenant:p%40ss%3A%2F%25@{host}:6543/mail%20box?sslmode=verify-full&sslrootcert=/private/root.pem");
             let bootstrap = Bootstrap::parse(&spec, "desktop-1").unwrap();
-            assert_eq!(bootstrap.host(), host);
+            assert_eq!(bootstrap.host(), Some(host));
             assert_eq!(bootstrap.port(), 6543);
             assert_eq!(bootstrap.profile(), "desktop-1");
             assert_eq!(
                 bootstrap.root_certificate(),
                 Some(Path::new("/private/root.pem"))
             );
-            let request = bootstrap.request(IpAddr::from([127, 0, 0, 1]));
+            let request = bootstrap.request(Endpoint::Tcp(([127, 0, 0, 1], 6543).into()));
             assert_eq!(request.user, "alice@tenant");
             assert_eq!(request.password, b"p@ss:/%");
             assert_eq!(request.database, "mail box");
             assert_eq!(request.server_name, host);
-            assert_eq!(request.address.port(), 6543);
+            assert_eq!(
+                request.address,
+                Endpoint::Tcp(([127, 0, 0, 1], 6543).into())
+            );
         }
         let bootstrap = Bootstrap::parse(URI, "cloud").unwrap();
         assert_eq!(bootstrap.port(), 5432);

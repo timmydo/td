@@ -15,6 +15,7 @@ license = "MIT"
 
 [package.metadata.td-gate]
 clippy-all-targets = true
+trusted-test-root = true
 
 [lints.clippy]
 unwrap_used = "deny"

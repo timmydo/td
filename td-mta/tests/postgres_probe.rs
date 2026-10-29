@@ -11,7 +11,7 @@ use std::{
 };
 use td_crypto::{Crypto, Provider, TrustStore, P256_PKCS8_CAPACITY};
 use td_fs::TempDir;
-use td_mta::postgres_probe::{probe, Error, Request};
+use td_mta::postgres_probe::{probe, Endpoint, Error, Request};
 
 #[path = "support/tls_certificate_fixture.rs"]
 mod certificate;
@@ -47,6 +47,9 @@ mod replica_serving;
 mod replica_source_mode;
 #[path = "postgres_probe/replication_inventory.rs"]
 mod replication_inventory;
+
+#[path = "postgres_probe/unix_database.rs"]
+mod unix_database;
 
 const PASSWORD: &[u8] = b"disposable-postgres-fixture-password";
 
@@ -209,6 +212,24 @@ impl Fixture {
             ),
         )
         .unwrap();
+        self.start_server();
+    }
+
+    fn start_unix(&mut self, authentication: &str) {
+        assert!(self.server.is_none());
+        fs::write(
+            self.data().join("pg_hba.conf"),
+            format!("local all all {authentication}\n"),
+        )
+        .unwrap();
+        fs::write(self.data().join("postgresql.conf"), format!(
+            "listen_addresses=''\nport={}\nunix_socket_directories='{}'\nunix_socket_permissions=0600\nssl=off\n",
+            self.port, self.root.display()
+        )).unwrap();
+        self.start_server();
+    }
+
+    fn start_server(&mut self) {
         let log_path = self.root.join("server.log");
         let log = File::create(&log_path).unwrap();
         self.server = Some(
@@ -253,7 +274,7 @@ impl Fixture {
 
     fn request(&self) -> Request<'_> {
         Request {
-            address: ([127, 0, 0, 1], self.port).into(),
+            address: Endpoint::Tcp(([127, 0, 0, 1], self.port).into()),
             server_name: "localhost",
             mode: td_mta::postgres_probe::Mode::Preparation,
             user: "td_probe",
@@ -2598,6 +2619,7 @@ mod serving_relay;
 #[test]
 #[ignore = "real local PostgreSQL tools required"]
 fn real_postgres_executable_receives_and_serves_database_profiles() {
+    unix_database::exercise();
     blob_scrub::real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance();
     application_logs::real_postgres_logs_bound_retention_rate_wrap_and_inspection();
     acme::real_postgres_acme_fences_ownership_and_pins_complete_pairs();
@@ -11036,9 +11058,9 @@ fn exercise_http_submission_owner(
         fixture,
         "DROP TRIGGER delay_http_submission ON td_mta.submission_receipts",
     );
-    let mut connection = loaded
-        .bootstrap
-        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let mut connection = loaded.bootstrap.request(Endpoint::Tcp(
+        ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
+    ));
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     let foreground = td_mta::postgres_read::Snapshot::open_runtime(
         &slots,
@@ -11081,9 +11103,9 @@ fn exercise_submission_reads(
         sync::QueryType,
     };
     let slots = ReadSlots::new(1).unwrap();
-    let mut connection = loaded
-        .bootstrap
-        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let mut connection = loaded.bootstrap.request(Endpoint::Tcp(
+        ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
+    ));
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     let mut view = Snapshot::open_runtime(
         &slots,
@@ -11486,9 +11508,9 @@ fn exercise_http_filing_owner(
         fixture,
         "DROP TRIGGER delay_http_filing ON td_mta.flag_receipts",
     );
-    let mut connection = loaded
-        .bootstrap
-        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let mut connection = loaded.bootstrap.request(Endpoint::Tcp(
+        ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
+    ));
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     let foreground = Snapshot::open_runtime(
         &slots,
@@ -12419,9 +12441,9 @@ fn exercise_submission_set_dispatch(
     let draft_pending = td_mta::postgres_http_drafts::Pending::default();
     let filing_pending = filing::Pending::default();
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
-    let mut connection = loaded
-        .bootstrap
-        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let mut connection = loaded.bootstrap.request(Endpoint::Tcp(
+        ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
+    ));
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     let mut buffer = [0; td_mta::wire::IdKind::WIRE_BYTES];
     let account = td_mta::wire::encode_id(binding.account(), &mut buffer)
@@ -12742,9 +12764,9 @@ fn exercise_http_upload_owner(
         fixture,
         "DROP TRIGGER delay_owned_upload ON td_mta.upload_receipts",
     );
-    let mut connection = loaded
-        .bootstrap
-        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let mut connection = loaded.bootstrap.request(Endpoint::Tcp(
+        ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
+    ));
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     let foreground = Snapshot::open_runtime(
         &slots,

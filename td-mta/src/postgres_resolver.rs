@@ -1,5 +1,6 @@
 //! Deadline-bounded system resolution in an owned, self-expiring helper.
 use crate::postgres_bootstrap::{valid_host, Bootstrap};
+use crate::postgres_probe::Endpoint;
 use std::{
     io::{self, Read, Write},
     net::{IpAddr, ToSocketAddrs},
@@ -29,11 +30,25 @@ pub fn resolve(
     executable: &Path,
     bootstrap: &Bootstrap,
     deadline: Instant,
-) -> Result<Vec<IpAddr>, Error> {
+) -> Result<Vec<Endpoint>, Error> {
+    if let Some(path) = bootstrap.socket() {
+        remaining_time(deadline)?;
+        return Ok(vec![Endpoint::Unix(*path)]);
+    }
     if !executable.is_absolute() {
         return Err(Error::Invalid);
     }
-    resolve_host(executable, bootstrap.host(), deadline)
+    resolve_host(
+        executable,
+        bootstrap.host().ok_or(Error::Invalid)?,
+        deadline,
+    )
+    .map(|addresses| {
+        addresses
+            .into_iter()
+            .map(|address| Endpoint::Tcp((address, bootstrap.port()).into()))
+            .collect()
+    })
 }
 
 /// Bounded resolution for one already-authorized service endpoint.

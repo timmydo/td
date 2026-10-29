@@ -324,7 +324,10 @@ pub fn exercise(
     let small = email("over-allowance", body, &[]);
     // Refused before any connection: an unreachable server would be Transport.
     let unreachable = Request {
-        address: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+        address: td_mta::postgres_probe::Endpoint::Tcp(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            1,
+        ))),
         server_name: request.server_name,
         user: request.user,
         database: request.database,

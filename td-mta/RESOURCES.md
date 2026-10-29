@@ -43,6 +43,7 @@ changing that validator requires an explicit atomic implementation update.
 | DNS, ACME and control scratch | 1 | 524288 | 524288 |
 | Slot queues and queue window | 1 | 131072 | 131072 |
 | Fixed worker stacks | 11 | 262144 | 2883584 |
+| Unix connector stacks | 8 | 262144 | 2097152 |
 | Main stack allowance | 1 | 1048576 | 1048576 |
 | TLS session headroom | 17 | 524288 | 8912896 |
 | TLS handshake headroom | 2 | 4194304 | 8388608 |
@@ -55,10 +56,10 @@ changing that validator requires an explicit atomic implementation update.
 | SMTP resident DATA | 4 | 33554432 | 134217728 |
 | SMTP prepared body | 1 | 33816576 | 33816576 |
 | Upload ingress and retained body | 2 | 33816576 | 67633152 |
-| **Total** | | | **427476224** |
+| **Total** | | | **429573376** |
 
-The total is approximately 407.67 MiB against a 512 MiB configured budget;
-the remaining 109394688 bytes are unassigned headroom, not another cache.
+The total is approximately 409.67 MiB against a 512 MiB configured budget;
+the remaining 107297536 bytes are unassigned headroom, not another cache.
 The default process ledger excludes database-server memory and WAL mappings.
 The two default TLS handshakes remain configurable within the process budget.
 The earlier 128 MiB workload RSS goal is exceeded by the concurrent

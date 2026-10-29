@@ -4,6 +4,7 @@ use crate::{
     ports::{Clock, Deadline, FlushProgress, IoProgress, Transport},
     tls_io::{TlsIo, TLS_WIRE_BYTES},
     transport::TcpTransport,
+    unix_transport::UnixTransport,
 };
 use std::{
     future::{poll_fn, Future},
@@ -25,11 +26,17 @@ use tokio_postgres::{
     tls, Config, SimpleQueryMessage,
 };
 
-/// The caller resolves and admits the address; TLS authenticates server_name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Endpoint {
+    Tcp(SocketAddr),
+    Unix(td_fs::SocketPath),
+}
+
+/// The caller resolves and admits the address; TCP TLS authenticates server_name.
 /// Borrowed credentials never enter diagnostics. DNS and bootstrap parsing are
 /// separate cold operations, not hidden work on this connection worker.
 pub struct Request<'a> {
-    pub address: SocketAddr,
+    pub address: Endpoint,
     pub server_name: &'a str,
     pub user: &'a str,
     pub database: &'a str,
@@ -643,7 +650,7 @@ fn connect_authenticated_until(
         .min(deadline)
         .min(Instant::now() + MAX_DURATION);
     if allowance > maximum
-        || request.server_name.is_empty()
+        || (matches!(request.address, Endpoint::Tcp(_)) && request.server_name.is_empty())
         || request.server_name.len() > 253
         || request.user.is_empty()
         || request.user.len() > 256
@@ -663,19 +670,44 @@ fn connect_authenticated_until(
     let handshake_cap = Deadline::after(now, transport_milliseconds(remaining(connect_deadline)?)?)
         .map_err(|_| Error::Invalid)?
         .min(cap);
-    let tls_clock = Arc::new(ClockHandle::new(TlsClockSource::new(clock.clone())));
-    let policy = Arc::new(
-        ClientConfig::new(trust, tls_clock, TlsProtocol::Postgres).map_err(|_| Error::Tls)?,
-    );
-    let session = TlsSession::client(policy, request.server_name).map_err(|_| Error::Tls)?;
-    let mut tcp_timing = crate::performance::Timer::start(crate::performance::Phase::DbTcp);
-    let socket = TcpStream::connect_timeout(&request.address, remaining(connect_deadline)?)
-        .map_err(|_| Error::Transport)?;
-    tcp_timing.succeeded();
-    drop(tcp_timing);
+    let (transport, session): (Box<dyn DriverTransport>, Option<TlsSession>) = match request.address
+    {
+        Endpoint::Tcp(address) => {
+            let tls_clock = Arc::new(ClockHandle::new(TlsClockSource::new(clock.clone())));
+            let policy = Arc::new(
+                ClientConfig::new(trust, tls_clock, TlsProtocol::Postgres)
+                    .map_err(|_| Error::Tls)?,
+            );
+            let session =
+                TlsSession::client(policy, request.server_name).map_err(|_| Error::Tls)?;
+            let mut tcp_timing = crate::performance::Timer::start(crate::performance::Phase::DbTcp);
+            let socket = TcpStream::connect_timeout(&address, remaining(connect_deadline)?)
+                .map_err(|_| Error::Transport)?;
+            tcp_timing.succeeded();
+            (
+                Box::new(TcpTransport::from_stream(socket).map_err(|_| Error::Transport)?),
+                Some(session),
+            )
+        }
+        Endpoint::Unix(path) => {
+            td_fs::check_private_socket(path.as_path()).map_err(|_| Error::Transport)?;
+            let socket =
+                td_fs::unix_connect_until(path.as_path(), connect_deadline).map_err(|error| {
+                    if error.kind() == io::ErrorKind::TimedOut {
+                        Error::Deadline
+                    } else {
+                        Error::Transport
+                    }
+                })?;
+            (
+                Box::new(UnixTransport::from_stream(socket).map_err(|_| Error::Transport)?),
+                None,
+            )
+        }
+    };
     let activity = Arc::new(AtomicBool::new(false));
     let socket = Arc::new(Mutex::new(DriverSocket {
-        transport: TcpTransport::from_stream(socket).map_err(|_| Error::Transport)?,
+        transport,
         deadline: connect_deadline,
     }));
     let transport = Network {
@@ -690,7 +722,11 @@ fn connect_authenticated_until(
         .password(request.password)
         .application_name("td-mta-postgres")
         .options("-c statement_timeout=5000 -c lock_timeout=1000 -c search_path=pg_catalog")
-        .ssl_mode(SslMode::Require)
+        .ssl_mode(if session.is_some() {
+            SslMode::Require
+        } else {
+            SslMode::Disable
+        })
         .ssl_negotiation(SslNegotiation::Postgres)
         .channel_binding(ChannelBinding::Disable);
     let input = if request.mode != Mode::Preparation {
@@ -699,19 +735,32 @@ fn connect_authenticated_until(
         input
     };
     let validation_window = input.window();
-    let connector = Connector {
-        session,
-        clock,
-        cap,
-        handshake_cap,
-        output_limit,
-        input,
+    let (raw, connector) = match session {
+        Some(session) => (
+            Io::new(transport, false),
+            Encryption::Tls(Box::new(Connector {
+                session,
+                clock,
+                cap,
+                handshake_cap,
+                output_limit,
+                input,
+            })),
+        ),
+        None => {
+            // Local plaintext still enforces SCRAM-only startup, framing and
+            // the exact same per-operation input/output windows as TCP TLS.
+            let mut raw = Io::new(transport, true);
+            raw.input = Some(input);
+            raw.output_left = output_limit;
+            (raw, Encryption::Local)
+        }
     };
     let waker = Waker::from(Arc::new(WorkerWake(thread::current(), activity.clone())));
     let mut context = Context::from_waker(&waker);
     let mut handshake_timing =
         crate::performance::Timer::start(crate::performance::Phase::DbHandshake);
-    let mut connect = pin!(config.connect_raw(Io::new(transport, false), connector));
+    let mut connect = pin!(config.connect_raw(raw, connector));
     let (client, connection) = loop {
         remaining(connect_deadline)?;
         activity.store(false, Ordering::Relaxed);
@@ -958,8 +1007,48 @@ impl Wake for WorkerWake {
 // TLS can consume an encrypted header and report no plaintext yet. Track
 // actual socket progress below it so the worker does not sleep on that work.
 struct DriverSocket {
-    transport: TcpTransport,
+    transport: Box<dyn DriverTransport>,
     deadline: Instant,
+}
+
+trait DriverTransport: Transport + Send {
+    fn wait_readable_slice(&mut self, until: Instant) -> Result<bool, crate::ports::Error>;
+    fn wait_readable(&mut self, until: Instant) -> Result<(), crate::ports::Error>;
+    fn write_until(
+        &mut self,
+        input: &[u8],
+        until: Instant,
+    ) -> Result<IoProgress, crate::ports::Error>;
+}
+impl DriverTransport for TcpTransport {
+    fn wait_readable_slice(&mut self, until: Instant) -> Result<bool, crate::ports::Error> {
+        self.wait_readable_slice(until)
+    }
+    fn wait_readable(&mut self, until: Instant) -> Result<(), crate::ports::Error> {
+        self.wait_readable(until)
+    }
+    fn write_until(
+        &mut self,
+        input: &[u8],
+        until: Instant,
+    ) -> Result<IoProgress, crate::ports::Error> {
+        self.write_until(input, until)
+    }
+}
+impl DriverTransport for UnixTransport {
+    fn wait_readable_slice(&mut self, until: Instant) -> Result<bool, crate::ports::Error> {
+        self.wait_readable_slice(until)
+    }
+    fn wait_readable(&mut self, until: Instant) -> Result<(), crate::ports::Error> {
+        self.wait_readable(until)
+    }
+    fn write_until(
+        &mut self,
+        input: &[u8],
+        until: Instant,
+    ) -> Result<IoProgress, crate::ports::Error> {
+        self.write_until(input, until)
+    }
 }
 
 fn wait_socket(socket: &Mutex<DriverSocket>, deadline: Instant) -> Result<(), Error> {
@@ -1042,6 +1131,22 @@ struct Connector {
     handshake_cap: Deadline,
     output_limit: usize,
     input: Input,
+}
+
+enum Encryption {
+    Tls(Box<Connector>),
+    Local,
+}
+impl tls::TlsConnect<Io<Network>> for Encryption {
+    type Stream = Io<Secure>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send>>;
+    fn connect(self, raw: Io<Network>) -> Self::Future {
+        match self {
+            Self::Tls(connector) => (*connector).connect(raw),
+            Self::Local => Box::pin(async { Err(refused()) }),
+        }
+    }
 }
 
 impl tls::TlsConnect<Io<Network>> for Connector {
@@ -1256,7 +1361,7 @@ mod tests {
         let activity = Arc::new(AtomicBool::new(false));
         let mut network = Network {
             socket: Arc::new(Mutex::new(DriverSocket {
-                transport: TcpTransport::from_stream(socket).unwrap(),
+                transport: Box::new(TcpTransport::from_stream(socket).unwrap()),
                 deadline: Instant::now() + Duration::from_secs(5),
             })),
             activity: activity.clone(),
@@ -1366,7 +1471,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let request = Request {
-            address: listener.local_addr().unwrap(),
+            address: Endpoint::Tcp(listener.local_addr().unwrap()),
             server_name: "localhost",
             mode: Mode::ReplicaRead,
             user: "reader",
@@ -1406,7 +1511,7 @@ mod tests {
             // A scheduler delay can exhaust the deadline before dialing.
         });
         let request = Request {
-            address,
+            address: Endpoint::Tcp(address),
             server_name: "localhost",
             mode: Mode::Preparation,
             user: "probe",

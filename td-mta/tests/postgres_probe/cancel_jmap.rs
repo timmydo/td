@@ -113,7 +113,9 @@ fn exercise_mode(fixture: &Fixture, context: &Context<'_>, frontend: bool) {
     let mut connection = context
         .loaded
         .bootstrap
-        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        .request(td_mta::postgres_probe::Endpoint::Tcp(
+            ([127, 0, 0, 1], context.loaded.bootstrap.port()).into(),
+        ));
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     owners::renew(
         &connection,
@@ -207,7 +209,9 @@ fn run(
     let mut connection = context
         .loaded
         .bootstrap
-        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        .request(td_mta::postgres_probe::Endpoint::Tcp(
+            ([127, 0, 0, 1], context.loaded.bootstrap.port()).into(),
+        ));
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     let snapshot = Snapshot::open_runtime(
         &slots,

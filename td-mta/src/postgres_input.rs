@@ -312,7 +312,7 @@ mod tests {
         for suffix in ["", "\n", "\r\n"] {
             let value = format!("{URI}{suffix}");
             let loaded = decode(value.as_bytes(), "desktop").unwrap();
-            assert_eq!(loaded.host(), "localhost");
+            assert_eq!(loaded.host(), Some("localhost"));
             assert_eq!(loaded.profile(), "desktop");
         }
         for suffix in ["\r", "\n\n", "\r\n\r\n", " ", "\0", "\nother"] {

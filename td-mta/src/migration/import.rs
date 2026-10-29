@@ -58,7 +58,7 @@ pub(super) fn connect(
     connection: &str,
     epoch: StoreEpoch,
     account: AccountId,
-) -> Result<(Loaded, std::net::IpAddr, database::Authority)> {
+) -> Result<(Loaded, crate::postgres_probe::Endpoint, database::Authority)> {
     let loaded = Loaded::open(connection, "migration").map_err(|_| "migration-connection-file")?;
     let executable = std::env::current_exe().map_err(|_| "migration-resolver")?;
     let addresses = crate::postgres_resolver::resolve(

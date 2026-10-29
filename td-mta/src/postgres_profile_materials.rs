@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn bounds_and_refusals_poison_the_loader_without_database_work() {
         let request = Request {
-            address: "127.0.0.1:1".parse().unwrap(),
+            address: crate::postgres_probe::Endpoint::Tcp("127.0.0.1:1".parse().unwrap()),
             server_name: "localhost",
             mode: crate::postgres_probe::Mode::Preparation,
             user: "fixture",

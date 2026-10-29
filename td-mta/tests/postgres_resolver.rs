@@ -49,6 +49,28 @@ fn real_helper_resolves_localhost_twice() {
         )
         .unwrap();
         assert!(!addresses.is_empty());
-        assert!(addresses.iter().all(|address| address.is_loopback()));
+        assert!(addresses.iter().all(|address| matches!(address, td_mta::postgres_probe::Endpoint::Tcp(value) if value.ip().is_loopback())));
     }
+}
+
+#[test]
+fn unix_bootstrap_has_one_endpoint_without_a_resolver_executable() {
+    let bootstrap = Bootstrap::parse(
+        "postgresql://fixture:unused@:35434/mail?host=/private/socket",
+        "replica",
+    )
+    .unwrap();
+    let endpoints = resolve(
+        Path::new("/nonexistent/td-mta"),
+        &bootstrap,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        endpoints,
+        [td_mta::postgres_probe::Endpoint::Unix(
+            td_fs::SocketPath::new(Path::new("/private/socket/.s.PGSQL.35434")).unwrap()
+        )]
+    );
+    assert!(resolve(Path::new("/nonexistent/td-mta"), &bootstrap, Instant::now()).is_err());
 }

@@ -69,10 +69,10 @@ profile launch without a second full MTA configuration file.
 
 Network connections require certificate-chain and endpoint-name verification;
 there is no opportunistic TLS fallback. Local TCP follows the same rule.
-A protected Unix-domain socket can be a separately explicit local transport,
-with authenticated database login and trusted socket-directory ownership.
+A protected Unix-domain socket is a separately explicit local transport,
+with SCRAM database login and trusted socket-directory ownership.
 It does not silently replace a failed TLS connection. Initial authentication
-is PostgreSQL password/SCRAM over verified TLS; cloud identity-token login is
+is PostgreSQL SCRAM over verified TLS or the private socket; cloud identity-token login is
 not required for the initial runtime integration. Resolve the configured writer endpoint
 again on reconnect, within bounded DNS and connection deadlines.
 
@@ -384,15 +384,15 @@ increments rather than implying this contract already supplies them.
 ## 8. Implemented connection probe
 
 `postgres_probe::probe` is an inert worker entry point, not service startup
-or a storage backend. Its caller supplies an admitted resolved address,
-server DNS name, borrowed credentials, trust store and absolute Instant
+or a storage backend. Its caller supplies an explicit TCP or Unix endpoint,
+server DNS name for TCP, borrowed credentials, trust store and absolute Instant
 deadline at most ten seconds away. It does not resolve DNS, read a connection
 file, load a profile, migrate a schema or retry. User/database names are
 nonempty, NUL-free and at most 256 bytes; passwords are 1..4096 bytes.
-The TLS facade validates the at-most-253-byte server name before dialing.
+The TLS facade validates the at-most-253-byte TCP server name before dialing.
 
-One worker drives connect and a fixed query through tokio-postgres with
-TLS required. The driver sends SSLRequest; td-crypto's outbound Postgres
+One worker drives connect and a fixed query through tokio-postgres. For TCP,
+TLS is required. The driver sends SSLRequest; td-crypto's outbound Postgres
 selector verifies the certificate chain and server name before startup
 credentials enter the stream. There is no plaintext fallback, direct-TLS
 ALPN, client certificate or channel-binding claim. The plaintext framing
@@ -401,12 +401,34 @@ cleartext-password, trust and other authentication methods. The pinned
 driver selects SCRAM-SHA-256 and verifies its server signature; its
 100,000-iteration ceiling bounds the server-directed password work.
 
+For an explicit Unix endpoint the same worker uses the raw socket, with
+SSL disabled only for this endpoint type. The framing guard, SCRAM sequence,
+output limits and retained-session validation windows attach before driver
+startup; skipping the TLS connector cannot bypass them. No certificate file,
+DNS lookup, TCP listener or TCP fallback is involved. Account/role, schema,
+transaction and commit-outcome handling are identical to the TCP path.
+
+Shared `td-fs` admission checks an absolute pathname of at most 107 bytes,
+with no empty, dot or parent components, symlink, or abstract namespace.
+Its direct parent must be owned by the current UID with mode 0700, and the
+socket by that UID with mode 0600. Physical ancestors must belong to root
+or this UID; shared-writable ancestors require the sticky bit, which protects
+their owned child names. Root and same-UID namespace writers remain trusted;
+these are stable-path checks, not atomic lookup against hostile same-UID code.
+Every connect rechecks the endpoint. Dialing shares one absolute deadline
+with admission to at most eight helper threads, each with a 256-KiB stack.
+A timed-out connect retains its slot until the kernel call returns; its
+late stream is closed. Repeated failures cannot accumulate unbounded threads.
+These helpers exist only while dialing Unix endpoints, with at most 2 MiB
+of requested stack reservation per process, in addition to thread overhead.
+
 The private async adapter belongs to one worker. Reads during driver polls
 remain nonblocking: the pinned driver polls reads before flushing writes, so
 blocking there could prevent the request from reaching PostgreSQL. Socket
 writes block only under the current operation deadline. After a complete
 poll without socket progress or a driver channel wakeup, the worker waits
-for socket readability with a deadline-bounded peek that consumes no bytes.
+for socket readability with a deadline-bounded TCP peek. Unix waits retain
+one consumed byte and return it before subsequent reads; no protocol byte is lost.
 The adapter restores nonblocking mode before the next driver poll. Idle
 health checks never wait for readability. One private synchronized owner
 shares this socket between the adapter and its worker; no cloned socket,
@@ -469,7 +491,7 @@ Neither the parsed value nor the connection request implements Debug.
 The initial syntax is one `postgresql://USER:PASSWORD@HOST[:PORT]/DATABASE`
 URI (`postgres://` is also accepted). Credentials and database are explicit;
 there are no environment defaults, password files, service-name expansion,
-multiple hosts or Unix-socket fallback. HOST is an ASCII DNS name, including
+multiple hosts or Unix-socket fallback. For TCP, HOST is an ASCII DNS name, including
 localhost, authenticated by the TLS facade; literal IPs, numeric address
 shorthand, numeric final labels and encoded hosts are refused. The default port is 5432. Reconnect must resolve HOST again.
 
@@ -479,6 +501,14 @@ sslmode. An absent root path means the public trust store; an explicit path
 replaces it. Unknown parameters, duplicate parameters and weaker TLS modes
 are refused, rather than forwarded to the driver. A root path here is only a
 name; its subsequent reader must enforce the protected-file policy.
+
+Local Unix syntax is `postgresql://USER:PASSWORD@[:PORT]/DATABASE?host=DIR`,
+with an empty authority host and an absolute socket directory in the `host`
+query. The socket is `DIR/.s.PGSQL.PORT`; PORT defaults to 5432. Encode URI
+separators in DIR. Only this form accepts `sslmode=disable` (also its default);
+it rejects `sslrootcert` and any other SSL mode. A `host` query cannot replace
+a nonempty authority host. Directory spelling and the resulting socket path
+must satisfy the bounds above; filesystem admission happens at connect.
 
 Input is at most 16 KiB of printable ASCII without whitespace or fragments.
 Percent escapes decode once, preserving literal plus signs. Encode URI
@@ -492,7 +522,9 @@ This decoder does not claim cloud connectivity or a supported schema.
 
 ## 10. Implemented resolver worker
 
-`postgres_resolver::resolve` accepts the parsed bootstrap, the caller's
+For an explicit Unix bootstrap, `postgres_resolver::resolve` returns the
+single typed socket endpoint under the supplied deadline, without launching
+a child. For TCP it accepts the parsed bootstrap, the caller's
 trusted absolute td-mta executable path and an absolute deadline at most five seconds
 away. It starts that executable in private resolver mode with a cleared
 environment, hostname-only stdin, bounded stdout and discarded stderr.

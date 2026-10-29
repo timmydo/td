@@ -534,11 +534,11 @@ message.
   exception is `td-crypto`'s private Rustls/AWS-LC closure: exact manifests,
   locks, root Cargo configuration and active features are pinned in `builder/src/crypto_policy.rs`.
   `td-mta` depends directly on local `td-crypto` and std-only `td-civil`, `td-header`
-  plus `td-html`, `td-json`, `td-mime` and `td-nfc`, and the approved
+  plus `td-html`, `td-json`, `td-mime`, `td-nfc` and `td-fs`, and the approved
   private `tokio-postgres` 0.7.18 closure with its runtime feature disabled.
   PostgreSQL is the sole mail backend described in `td-mta/POSTGRES.md`.
   Its exact manifest, lock and active features are pinned in the same policy.
-  Its lock includes this closure and the std-only `td-fs` test helper.
+  The std-only `td-fs` owns bounded private socket dialing and test scratch.
   All nine
   local manifests and locks are pinned. No other roster crate may depend
   on `td-crypto` or `td-mta`, directly or transitively; `td-header`,

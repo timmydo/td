@@ -107,11 +107,11 @@ administration. Local SQLite initialization, verification, backup/restore,
 file-configuration checks and file-backed device commands are removed.
 Its direct
 dependencies are the local `td-civil`, `td-crypto`, `td-header`, `td-html`,
-`td-json`, `td-mime`
-and `td-nfc` crates, plus the approved private tokio-postgres 0.7.18 closure
-with default features disabled. The sole test-only dependency is std-only
-`td-fs`, which owns disposable fixture directories. POSTGRES.md section 8
-owns the TLS/SCRAM connection probe and PostgreSQL serving contract.
+`td-json`, `td-mime`, `td-nfc` and `td-fs` crates, plus the approved private
+tokio-postgres 0.7.18 closure with default features disabled. Std-only
+`td-fs` owns bounded private Unix socket dialing and disposable fixture
+directories. POSTGRES.md section 8 owns the verified-TLS or explicit private
+Unix transport, SCRAM connection probe and PostgreSQL serving contract.
 The driver's private SCRAM
 cryptography/Unicode preparation do not replace td-crypto or td-mime.
 Application protocols, configuration and scheduling use std

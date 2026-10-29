@@ -170,7 +170,9 @@ pub(super) fn exercise(
     );
     let mut connection = loaded
         .bootstrap
-        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        .request(td_mta::postgres_probe::Endpoint::Tcp(
+            ([127, 0, 0, 1], loaded.bootstrap.port()).into(),
+        ));
     connection.mode = td_mta::postgres_probe::Mode::Runtime;
     let foreground = Snapshot::open_runtime(
         &slots,

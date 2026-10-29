@@ -402,7 +402,7 @@ mod tests {
     fn invalid_profile_inventory_refuses_before_database_work() {
         use super::*;
         let request = Request {
-            address: "127.0.0.1:1".parse().unwrap(),
+            address: crate::postgres_probe::Endpoint::Tcp("127.0.0.1:1".parse().unwrap()),
             server_name: "localhost",
             mode: crate::postgres_probe::Mode::Preparation,
             user: "fixture",

@@ -259,7 +259,7 @@ remain enforced. A plan exceeding the configured budget is refused.
 
 For example, `memory_budget_bytes=536870912` explicitly selects the default
 512-MiB planning budget. This is not an OS-enforced RSS limit. The current
-default plan is 427476224 bytes (about 407.67 MiB), including the
+default plan is 429573376 bytes (about 409.67 MiB), including the
 4-MiB index cache. Bounded folder/keyword prefix prefetch adds 128 KiB per read
 view (768 KiB at the default six views); tightly sized budgets must allow
 this additional scratch reservation. It does not raise protocol limits.
@@ -295,6 +295,12 @@ and HTTPS allowances even for a process serving only one role. It neither
 preallocates those buffers nor proves a worst-case RSS bound. Concurrent
 large-message measurements and the provisional 512-MiB recommendation are
 recorded in RESOURCES.md; retain separate operating-system headroom.
+
+Private Unix database dialing adds eight bounded 256-KiB connector stacks
+to the plan (2 MiB). A timed-out connect retains its slot until it returns,
+preventing repeated retries from creating unlimited threads. This reservation
+is included conservatively for TCP profiles too; operators with a tight
+explicit budget must include the additional 2 MiB when upgrading.
 
 ### `[disk]`
 
