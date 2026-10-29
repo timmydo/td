@@ -142,7 +142,8 @@ impl Session {
                 self.uuid.replace('-', ""),
                 std::process::id()
             );
-            let status = control.create_crypt(&name, &uuid, self.size / 512, self.raw, key)?;
+            let status =
+                control.create_crypt(&name, &uuid, self.size / 512, self.raw, key, false)?;
             let opened = (|| -> Result<File> {
                 let (_, minor) = device_number(status.device);
                 let file = File::options()
@@ -208,7 +209,7 @@ pub fn open(file: File, uuid: String, name: &str, key: &[u8]) -> Result<()> {
                 bytes: key,
             },
         )?;
-        return dm::activate(&mut session.file, name, &header.uuid, volume.bytes())
+        return dm::activate(&mut session.file, name, &header.uuid, volume.bytes(), false)
             .map_err(Failure::from);
     }
     let _names = session.names(name)?;
@@ -236,6 +237,7 @@ pub fn open(file: File, uuid: String, name: &str, key: &[u8]) -> Result<()> {
                 session.size / 512,
                 session.raw,
                 keys.new.bytes(),
+                false,
             )?;
             return dm::publish(&control, &status, name).map_err(Failure::from);
         }

@@ -498,3 +498,50 @@ fn reencryption_refuses_regular_files_before_any_mutation() {
         assert_eq!(fs::read(&disk.device).unwrap(), before);
     }
 }
+
+#[path = "../fixtures/replay.rs"]
+#[allow(dead_code, reason = "only stock initial images are needed here")]
+mod replay;
+
+#[test]
+fn read_only_activation_refuses_reencryption_without_changing_any_bytes() {
+    let disk = Disk::new("read-only-reencrypt");
+    for base in [
+        include_bytes!("../fixtures/reencrypt/checksum.base").as_slice(),
+        include_bytes!("../fixtures/reencrypt/journal.base").as_slice(),
+    ] {
+        let image = replay::initial(base).unwrap();
+        fs::write(&disk.device, &image).unwrap();
+        for args in [
+            vec!["open-read-only", disk.arg(), "volume"],
+            vec!["open-read-only", "0", disk.arg(), "volume"],
+        ] {
+            let run = td_luks(&args, RECOVERY);
+            assert_eq!(run.code, 1);
+            assert!(
+                run.stderr
+                    .contains("read-only activation refuses reencryption requirements"),
+                "{}",
+                run.stderr
+            );
+            assert_eq!(fs::read(&disk.device).unwrap(), image);
+        }
+    }
+}
+
+#[test]
+fn read_only_activation_checks_credentials_and_refuses_regular_files() {
+    let disk = Disk::new("read-only-credentials");
+    let image = include_bytes!("../fixtures/unbound.bin");
+    fs::write(&disk.device, image).unwrap();
+    for (slot, key, expected, message) in [
+        ("0", WRONG, 2, ""),
+        ("1", SECOND, 1, ""),
+        ("0", RECOVERY, 1, "activation requires a block device"),
+    ] {
+        let run = td_luks(&["open-read-only", slot, disk.arg(), "volume"], key);
+        assert_eq!(run.code, expected, "{}", run.stderr);
+        assert!(run.stderr.contains(message), "{}", run.stderr);
+        assert_eq!(fs::read(&disk.device).unwrap(), image);
+    }
+}

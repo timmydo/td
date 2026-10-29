@@ -39,6 +39,10 @@ The guest proves:
   identically after reopening with stock, covering the plain64 IV unit;
 - suspend/resume exposes the expected status, and a deliberately failing
   table load leaves no named mapping or inactive table;
+- read-only activation with and without an explicit slot reads the same
+  plaintext, reports read-only through device mapper and sysfs, refuses
+  write access and duplicate writable opens, and leaves the complete
+  backing disk byte-identical after close;
 - raw-key activation verifies the digest; explicit-slot activation works;
 - a stale symlink is replaced, while a regular mapper entry is preserved;
 - three batches of 24 concurrent raw-key opens leave exactly one

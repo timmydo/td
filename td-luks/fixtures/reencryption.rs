@@ -131,6 +131,7 @@ fn orphan() -> Result<()> {
         DATA as u64 / 512,
         raw,
         &std::array::from_fn(|i| i as u8),
+        false,
     )?;
     Ok(())
 }
@@ -209,6 +210,7 @@ fn stack_edges() -> Result<()> {
             DATA as u64 / 512,
             raw,
             &key,
+            false,
         )?;
         for helper in [&hot, &overlay] {
             symlink(

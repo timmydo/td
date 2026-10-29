@@ -465,7 +465,9 @@ their dependencies exist:
    retry cleanup. Model repeated failures, exhausted capacity, dead
    keyslots, mismatched copies and foreign state. Assert that slot 0
    stays usable and no unverified replacement authorizes retirement.
-2. Service, plan and typed-key wizard integration with the existing
+2. The read-only inspection primitive is `td-luks open-read-only`; it
+   refuses reencryption requirements without attempting recovery.
+   Service, plan and typed-key wizard integration with the existing
    preserve publisher and ESP writer. Add the new protocol version and
    lifecycle tests from INSTALLER.md in the same increment. Keep camera
    entry explicitly unavailable until its own support lands.

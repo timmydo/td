@@ -25,9 +25,14 @@ fn removable(path: &Path) -> io::Result<bool> {
     }
 }
 
-pub fn activate(file: &mut File, name: &str, uuid: &str, key: &[u8; 64]) -> io::Result<()> {
+pub fn activate(
+    file: &mut File,
+    name: &str,
+    uuid: &str,
+    key: &[u8; 64],
+    read_only: bool,
+) -> io::Result<()> {
     let path = entry(name)?;
-    let _mapping = crate::lock::mapping(name)?;
     let meta = file.metadata()?;
     if !meta.file_type().is_block_device() {
         return Err(invalid("activation requires a block device"));
@@ -38,13 +43,21 @@ pub fn activate(file: &mut File, name: &str, uuid: &str, key: &[u8; 64]) -> io::
         .filter(|n| *n > 0 && n.is_multiple_of(td_luks::write::SECTOR_SIZE))
         .ok_or_else(|| invalid("invalid encrypted data size"))?
         / 512;
+    let _mapping = crate::lock::mapping(name)?;
     let control = Control::open()?;
     if control.status(name)?.is_some() {
         return Err(invalid("mapping already exists"));
     }
     removable(&path)?;
     let uuid = format!("CRYPT-LUKS2-{}-{name}", uuid.replace('-', ""));
-    let status = control.create_crypt(name, &uuid, length, device_number(meta.rdev()), key)?;
+    let status = control.create_crypt(
+        name,
+        &uuid,
+        length,
+        device_number(meta.rdev()),
+        key,
+        read_only,
+    )?;
     publish(&control, &status, name)
 }
 

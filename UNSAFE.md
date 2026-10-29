@@ -3646,7 +3646,10 @@ No kernel-held pointer outlives the call.
 
 Activation loads aes-xts-plain64, a 64-byte key, IV offset zero, data
 sector 32768 and sector_size:4096, then resumes and checks its UUID,
-name, table and backing device. Load/resume failure clears the inactive
+name, table and backing device. Read-only activation sets
+DM_READONLY_FLAG (0x1) on TABLE_LOAD and verifies that DEV_STATUS
+reports it after resume, before publishing the mapping. Ordinary
+activation verifies the flag is clear. Load/resume failure clears the inactive
 table and removes the created device. Reencryption additionally permits
 crypt targets at validated segment offsets/IVs and linear targets over
 owned helper mappings or the raw data region. Keys still enter only the

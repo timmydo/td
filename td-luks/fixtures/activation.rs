@@ -3,6 +3,10 @@
 use std::fs::{self, File};
 use std::os::unix::fs::MetadataExt;
 #[path = "../bin/dm_sys.rs"]
+#[allow(
+    dead_code,
+    reason = "activation oracle does not exercise reencryption helpers"
+)]
 mod dm_sys;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -151,7 +155,7 @@ fn guest() -> Result<()> {
         return Err("stock plaintext differs".into());
     }
     if control
-        .create_crypt("failed", uuid, length, (4095, 1048575), &key)
+        .create_crypt("failed", uuid, length, (4095, 1048575), &key, false)
         .is_ok()
     {
         return Err("bad backing device accepted".into());
@@ -164,6 +168,63 @@ fn guest() -> Result<()> {
         return Err("close left mapper entry".into());
     }
     td(&["status", "stock"], None, 4)?;
+    let before_inspection = fs::read("/dev/vda")?;
+    td(
+        &["open-read-only", "0", "/dev/vda", "inspect"],
+        Some("/second"),
+        2,
+    )?;
+    if control.status("inspect")?.is_some() {
+        return Err("wrong key created inspection mapping".into());
+    }
+    for args in [
+        vec!["open-read-only", "/dev/vda", "inspect"],
+        vec!["open-read-only", "0", "/dev/vda", "inspect"],
+    ] {
+        td(&args, Some("/key"), 0)?;
+        let status = control
+            .status("inspect")?
+            .ok_or("missing inspection mapping")?;
+        let (major, minor) = dm_sys::device_number(status.device);
+        if !status.read_only
+            || fs::read_to_string(format!("/sys/dev/block/{major}:{minor}/ro"))?.trim() != "1"
+            || !control.matches_crypt("inspect", length, device, &key)?
+        {
+            return Err("inspection mapping is not read-only with the expected table".into());
+        }
+        File::open("/dev/mapper/inspect")?.read_exact(&mut actual)?;
+        if actual != plain {
+            return Err("inspection plaintext differs".into());
+        }
+        match File::options().write(true).open("/dev/mapper/inspect") {
+            Err(error) if matches!(error.raw_os_error(), Some(13 | 30)) => {}
+            Err(error) => {
+                return Err(format!("unexpected inspection write-open error: {error}").into())
+            }
+            Ok(mut file) => {
+                let result = file.write_all(&[0xa5; 4096]).and_then(|()| file.sync_all());
+                match result {
+                    Err(error) if matches!(error.raw_os_error(), Some(1 | 5 | 13 | 30)) => {}
+                    other => return Err(format!("inspection mapping write: {other:?}").into()),
+                }
+            }
+        }
+        td(&["open", "/dev/vda", "inspect"], Some("/key"), 1)?;
+        if !control
+            .status("inspect")?
+            .ok_or("inspection mapping disappeared")?
+            .read_only
+        {
+            return Err("duplicate writable open changed inspection mode".into());
+        }
+        td(&["close", "inspect"], None, 0)?;
+        if control.status("inspect")?.is_some()
+            || fs::symlink_metadata("/dev/mapper/inspect").is_ok()
+            || fs::read("/dev/vda")? != before_inspection
+        {
+            return Err("inspection changed disk bytes or leaked a mapping".into());
+        }
+    }
     fs::write("/wrong-volume-key", [0u8; 64])?;
     td(
         &["open-volume-key", "/dev/vda", "raw", "/wrong-volume-key"],

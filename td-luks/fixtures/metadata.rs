@@ -142,6 +142,7 @@ fn guest() -> Result<()> {
                 DATA as u64 / 512,
                 device,
                 key.bytes(),
+                false,
             )?;
             let (_, minor) = dm_sys::device_number(status.device);
             let mut output = File::options()

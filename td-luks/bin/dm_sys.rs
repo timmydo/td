@@ -21,6 +21,7 @@ const MIN_REPLY: usize = 305;
 const CAPACITY: usize = 65536;
 const TARGET: usize = 40;
 type TargetParameters<'a> = (u64, u64, &'a str, &'a [u8]);
+const READ_ONLY: u32 = 1;
 const SUSPEND: u32 = 1 << 1;
 const STATUS_TABLE: u32 = 1 << 4;
 const ACTIVE: u32 = 1 << 5;
@@ -344,6 +345,7 @@ pub struct Status {
     pub uuid: String,
     pub active: bool,
     pub suspended: bool,
+    pub read_only: bool,
 }
 pub struct Control {
     file: File,
@@ -408,6 +410,7 @@ impl Control {
             uuid: p.string(176, 129)?.into(),
             active: flags & ACTIVE != 0,
             suspended: flags & SUSPEND != 0,
+            read_only: flags & READ_ONLY != 0,
         }))
     }
     pub fn set_suspended(&self, name: &str, suspend: bool) -> io::Result<()> {
@@ -473,10 +476,20 @@ impl Control {
         uuid: &str,
         targets: &[Target<'_>],
     ) -> io::Result<Status> {
+        self.create_table_mode(name, uuid, targets, false)
+    }
+    fn create_table_mode(
+        &self,
+        name: &str,
+        uuid: &str,
+        targets: &[Target<'_>],
+        read_only: bool,
+    ) -> io::Result<Status> {
         if !valid_name(name) {
             return Err(invalid("invalid mapping name"));
         }
         let mut table = Packet::table(name, targets)?;
+        table.u32(28, SECURE_DATA | if read_only { READ_ONLY } else { 0 })?;
         let mut create = Packet::new(name)?;
         create.text(176, 129, uuid)?;
         self.invoke(Request::Create, &mut create)?;
@@ -488,6 +501,7 @@ impl Control {
                 .ok_or_else(|| invalid("created mapping disappeared"))?;
             if !status.active
                 || status.suspended
+                || status.read_only != read_only
                 || status.uuid != uuid
                 || status.name != name
                 || !self.matches_table(name, targets)?
@@ -543,8 +557,9 @@ impl Control {
         length: u64,
         device: (u32, u32),
         key: &[u8; 64],
+        read_only: bool,
     ) -> io::Result<Status> {
-        self.create_table(
+        self.create_table_mode(
             name,
             uuid,
             &[Target {
@@ -554,6 +569,7 @@ impl Control {
                 offset: 32768,
                 kind: Kind::Crypt { key, iv: 0 },
             }],
+            read_only,
         )
     }
 }

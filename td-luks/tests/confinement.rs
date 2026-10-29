@@ -70,7 +70,7 @@ fn device_mapper_is_the_only_program_syscall_surface() {
         .map(|b| format!("{b:02x}"))
         .collect();
     assert_eq!(
-        hash, "8c80a7ab8a55cfda32084b92cc272cab42ebbb72f8bb90fc474e360942f9109f",
+        hash, "c16ec8147d985a611795c36c2783d0b1bdf16e46e21c80616733158f4e57c32e",
         "review the complete syscall surface and amend UNSAFE.md before changing this pin"
     );
 }

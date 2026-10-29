@@ -112,6 +112,7 @@ td-luks takes no option that would select a different profile.
 | `luksKillSlot DEVICE SLOT` | `kill-slot SLOT DEVICE` |
 | `luksDump --dump-json-metadata` | `metadata DEVICE` |
 | `luksDump --dump-volume-key --volume-key-file F` | `volume-key DEVICE FILE` |
+| `open --readonly [--key-slot N]` | `open-read-only [SLOT] DEVICE NAME` |
 | `open [--key-slot N]` | `open [SLOT] DEVICE NAME` |
 | `open --volume-key-file F` | `open-volume-key DEVICE NAME KEY-FILE` |
 | `open --test-passphrase --key-slot N [--header H]` | `test SLOT DEVICE [HEADER]` |
@@ -407,6 +408,15 @@ td-boot's admission (td-boot/src/volume.rs) reads only `dm/uuid`,
 `dm/name` and `slaves/`. The table's exactness is held by the interop
 oracle, which compares `DM_TABLE_STATUS` output for a volume each
 program activates.
+
+`open-read-only` has the same passphrase and optional keyslot contract
+as `open`, but sets DM_READONLY_FLAG on TABLE_LOAD. After resume,
+DEV_STATUS must report read-only before publication; ordinary activation
+requires the flag clear. The encrypted data and header remain unchanged.
+A header with reencryption requirements is refused before reencryption
+recovery or activation: even opening an interrupted volume may write.
+This command supplies the encrypted reinstall inspection prerequisite;
+the installer still owns disk admission, exclusive claims and consent.
 
 ### `/dev/mapper` entries
 

@@ -54,6 +54,7 @@ const USAGE: &str = "usage: td-luks format UUID LABEL DEVICE
        td-luks volume-key DEVICE FILE
        td-luks test SLOT DEVICE [HEADER]
        td-luks open [SLOT] DEVICE NAME
+       td-luks open-read-only [SLOT] DEVICE NAME
        td-luks open-volume-key DEVICE NAME KEY-FILE
        td-luks close NAME
        td-luks status NAME
@@ -122,6 +123,7 @@ enum Verb {
         name: String,
     },
     Open {
+        read_only: bool,
         slot: Option<u8>,
         device: PathBuf,
         name: String,
@@ -248,12 +250,14 @@ fn parse(args: &[OsString]) -> Result<Verb, Failure> {
             device: path(device),
             name: name(mapping)?,
         },
-        ("open", [device, mapping]) => Verb::Open {
+        ("open" | "open-read-only", [device, mapping]) => Verb::Open {
+            read_only: verb == "open-read-only",
             slot: None,
             device: path(device),
             name: name(mapping)?,
         },
-        ("open", [number, device, mapping]) => Verb::Open {
+        ("open" | "open-read-only", [number, device, mapping]) => Verb::Open {
+            read_only: verb == "open-read-only",
             slot: Some(slot(number)?),
             device: path(device),
             name: name(mapping)?,
@@ -383,7 +387,12 @@ fn run(verb: Verb) -> Result<(), Failure> {
             let key = stdin()?;
             reencrypt::run(&device, &name, &key.0, None)?;
         }
-        Verb::Open { slot, device, name } => {
+        Verb::Open {
+            read_only,
+            slot,
+            device,
+            name,
+        } => {
             let key = stdin()?;
             activate(
                 &device,
@@ -392,11 +401,12 @@ fn run(verb: Verb) -> Result<(), Failure> {
                     slot,
                     bytes: &key.0,
                 },
+                read_only,
             )?;
         }
         Verb::OpenVolumeKey { device, name, file } => {
             let key = bounded(open(&file)?, "volume key")?;
-            activate(&device, &name, write::ActivationKey::Volume(&key.0))?;
+            activate(&device, &name, write::ActivationKey::Volume(&key.0), false)?;
         }
         Verb::Close { name } => dm::close(&name).map_err(dm_failure)?,
         Verb::Status { name } => {
@@ -520,11 +530,17 @@ fn activate(
     device: &Path,
     name: &str,
     credential: write::ActivationKey<'_>,
+    read_only: bool,
 ) -> Result<(), Failure> {
     let (mut file, initial_lock) = lock::discover(device)?;
     let copy = td_luks::header::read_copy(&mut file)?;
     let (json, _) = copy.json()?;
     if json.get_path(&["config", "requirements"]).is_some() {
+        if read_only {
+            return Err(Failure::new(
+                "read-only activation refuses reencryption requirements",
+            ));
+        }
         let write::ActivationKey::Passphrase { slot: None, bytes } = credential else {
             return Err(Failure::new(
                 "reencryption activation requires a passphrase with no explicit slot",
@@ -534,7 +550,7 @@ fn activate(
         return reencrypt::open(file, copy.identity.uuid, name, bytes);
     }
     let (header, key) = write::activation(&mut file, credential)?;
-    dm::activate(&mut file, name, &header.uuid, key.bytes()).map_err(dm_failure)
+    dm::activate(&mut file, name, &header.uuid, key.bytes(), read_only).map_err(dm_failure)
 }
 
 /// The volume key into a new file of mode 0400, which must not exist;
@@ -622,6 +638,24 @@ mod tests {
                 header: Some("/tmp/header".into()),
             }
         );
+        for verb in ["open", "open-read-only"] {
+            for (tail, slot) in [
+                (vec!["/dev/sda2", "name"], None),
+                (vec!["0", "/dev/sda2", "name"], Some(0)),
+            ] {
+                let mut input = vec![verb];
+                input.extend(tail);
+                assert_eq!(
+                    parse(&args(&input)).ok().unwrap(),
+                    Verb::Open {
+                        read_only: verb == "open-read-only",
+                        slot,
+                        device: "/dev/sda2".into(),
+                        name: "name".into(),
+                    }
+                );
+            }
+        }
         for (mode, resilience) in [
             ("checksum", td_luks::reencrypt::Resilience::Checksum),
             ("journal", td_luks::reencrypt::Resilience::Journal),
@@ -649,6 +683,10 @@ mod tests {
         );
         for refused in [
             &[][..],
+            &["open-read-only", "/dev/sda2"][..],
+            &["open-read-only", "32", "/dev/sda2", "name"][..],
+            &["open-read-only", "0", "/dev/sda2", "../name"][..],
+            &["open-read-only", "0", "/dev/sda2", "name", "extra"][..],
             &["reencrypt", "0", "none", "/dev/sda2", "name"][..],
             &["reencrypt", "32", "checksum", "/dev/sda2", "name"][..],
             &["reencrypt", "0", "checksum", "/dev/sda2"][..],
