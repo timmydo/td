@@ -7647,3 +7647,9 @@ trusted main and reboot without further physical consent. It takes the
 same presented, fresh Enter as other elevations; success displays REMOTE
 ADMIN KEY ENROLLED. This does not replace an existing admin key.
 `td-update/ADMIN.md` owns the remote workflow and its authorization policy.
+
+Notebook token descriptions use the shared consent tag 41 and its
+`asks_pin` predicate for the protected PIN field. The operation and exact
+step are rendered by the shared codec; ordinary notebook windows never
+receive PIN input. This description support alone exposes no new action
+on the attention screen; notebook supervision must admit the operation.

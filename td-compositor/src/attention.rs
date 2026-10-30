@@ -293,7 +293,7 @@ impl Prepared {
                 }
             }
         }
-        let field_rows = if request.ceremony_step().is_some_and(|step| step.asks_pin()) {
+        let field_rows = if request.asks_pin() {
             let recovery = request.asks_recovery_key();
             let choose =
                 request.protector_step() == Some(crate::authority::consent::LoginStep::Choose);

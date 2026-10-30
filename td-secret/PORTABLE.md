@@ -1464,3 +1464,35 @@ The diskless `qemu-secret --case notebook-service` fixture launches the
 production worker through td-login as UID/GID 989 with a root-only shadow
 file. It checks heartbeat and empty-vault inspection replies, then observes
 process exit after closing the authority endpoint. It needs no TPM or token.
+
+### Root notebook token exchange
+
+`td-secret notebook-token --uid OWNER` is a root-only, single-threaded
+worker on an inherited root socketpair. It opens no vault. Before USB I/O
+it decodes one complete token request, verifies its SHA-256 against a
+canonical tag-41 consent description, and requires that exact description's
+acknowledgement. The purpose, role, method and whole notebook operation are
+bound independently; an assertion cannot become enrollment. Creation with
+one key explicitly discloses unrecoverability. The root launcher remains
+responsible for admitting the notebook operation and owning the single
+hardware slot; knowing these bytes is not admission to that slot.
+
+The worker shares the notebook u32 framing, bounded additionally by a
+120-second absolute lifetime. Its initial frame holds a length-prefixed
+consent description and length-prefixed service token request. Presentation
+`40` holds the description; acknowledgement `41` must repeat it exactly.
+PIN `42` holds that same description and a bounded 4–63 byte printable
+ASCII PIN. Step zero requires explicit approval, then an assertion has
+step one, or enrollment has step two followed by proof step three. No
+repeat, skip or substitution is accepted. Every phase retains the nonce,
+owner, method, action, purpose, role and both digests. Enrollment purposes
+retain their labels through the independent repeat assertion; the method
+selects its assertion PIN step. PINs remain in clearing
+buffers and never enter diagnostics or the notebook service.
+
+Only the existing root-admitted FIDO transport and portable lifecycle
+transaction perform device I/O. There must be exactly one admitted key.
+Successful `44` carries the verified service result as one length-prefixed
+field; any error ends the worker without a result. Neither this worker nor
+the new consent codec activates a desktop endpoint. Root supervision and
+the trusted notebook client must be connected before td-pass admits td.

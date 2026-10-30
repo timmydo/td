@@ -317,6 +317,10 @@ pub fn recipe() -> Recipe {
             include_str!("../../../td-secret/src/portable_service.rs"),
         ),
         (
+            "{src}/td-secret/src/portable_token_operation.rs",
+            include_str!("../../../td-secret/src/portable_token_operation.rs"),
+        ),
+        (
             "{src}/td-secret/src/portable_service_tokens.rs",
             include_str!("../../../td-secret/src/portable_service_tokens.rs"),
         ),

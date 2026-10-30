@@ -141,7 +141,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(time_setting.contains("#[path = \"../../td-civil/src/tzif.rs\"]"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x417b22f484b537c2,
+        0xe139a3372cd677a3,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(

@@ -17,6 +17,8 @@ pub(super) mod storage;
 pub(super) mod service;
 #[path = "portable_service_tokens.rs"]
 mod service_tokens;
+#[path = "portable_token_operation.rs"]
+pub(super) mod token_operation;
 
 use super::{crypto, fido_p256::PublicKey};
 use std::collections::BTreeSet;

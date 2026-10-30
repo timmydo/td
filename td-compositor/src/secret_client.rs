@@ -351,7 +351,7 @@ fn memory_state(swaps: io::Result<String>, limits: io::Result<String>) -> Result
 
 /// A login step's or an upgrade's new key's PIN step.
 fn asks_pin(request: &Request) -> bool {
-    request.ceremony_step().is_some_and(LoginStep::asks_pin)
+    request.asks_pin()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -927,8 +927,108 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
+/// One token exchange within a root-admitted notebook operation.
+/// Digests bind the complete GUI operation and the service token request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Notebook {
+    pub method: u8,
+    pub action: u8,
+    pub purpose: u8,
+    pub role: u8,
+    pub step: u8,
+    pub operation: [u8; 32],
+    pub token: [u8; 32],
+}
+
+impl Notebook {
+    pub fn valid(&self) -> bool {
+        let purpose = match self.action {
+            1 => self.purpose == 1,
+            2 => matches!(self.purpose, 1 | 2),
+            3 => self.purpose == 3,
+            4 => self.purpose == 9,
+            5 => matches!(self.purpose, 5 | 6),
+            6 => matches!(self.purpose, 7 | 8),
+            _ => false,
+        };
+        let enrollment = matches!(self.purpose, 1 | 2 | 6 | 8);
+        purpose
+            && (self.method == 0x31 || (self.method == 0x30 && enrollment))
+            && matches!(self.role, 1 | 2)
+            && (self.purpose != 1 || self.role == 1)
+            && (self.purpose != 2 || self.role == 2)
+            && (self.step == 0
+                || if self.method == 0x30 {
+                    matches!(self.step, 2 | 3)
+                } else {
+                    self.step == 1
+                })
+            && self.operation != [0; 32]
+            && self.token != [0; 32]
+    }
+
+    pub fn follows(&self, previous: &Self) -> bool {
+        let mut same = previous.clone();
+        same.step = self.step;
+        self == &same
+            && self.valid()
+            && matches!((previous.step, self.step), (0, 1) | (0, 2) | (2, 3))
+    }
+
+    fn lines(&self, lines: &mut Vec<String>) {
+        lines.push("PASSWORD NOTEBOOK".into());
+        lines.push(
+            match self.action {
+                1 => "CREATE VAULT WITHOUT A BACKUP KEY",
+                2 => "CREATE VAULT WITH A SEPARATE BACKUP KEY",
+                3 => "UNLOCK VAULT FOR BROWSING AND SAVING",
+                4 => "IMPORT VAULT INTO EMPTY STORAGE",
+                5 => "ADD A VAULT KEY",
+                6 => "REPLACE VAULT KEYS",
+                _ => "INVALID NOTEBOOK OPERATION",
+            }
+            .into(),
+        );
+        if self.action == 1 {
+            lines.push("LOSING THIS KEY MAKES THE VAULT UNRECOVERABLE".into());
+        }
+        lines.push(
+            if self.role == 1 {
+                "PRIMARY KEY"
+            } else {
+                "BACKUP KEY"
+            }
+            .into(),
+        );
+        lines.push(
+            match self.purpose {
+                1 | 2 | 6 | 8 => "ENROLL AND PROVE THIS KEY",
+                5 | 7 => "AUTHORIZE WITH AN EXISTING KEY",
+                _ => "USE AN ENROLLED KEY",
+            }
+            .into(),
+        );
+        if self.method == 0x31 && matches!(self.purpose, 1 | 2 | 6 | 8) {
+            lines.push("REPEAT THE ASSERTION TO VERIFY THIS NEW KEY".into());
+        }
+        if self.step == 0 {
+            approval_lines(lines);
+        } else {
+            lines.push(
+                match self.step {
+                    2 => "ENTER ITS PIN TO CREATE THE CREDENTIAL",
+                    3 => "ENTER ITS PIN AGAIN TO PROVE THE CREDENTIAL",
+                    _ => "ENTER ITS PIN, THEN TOUCH THE KEY",
+                }
+                .into(),
+            );
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
+    Notebook(Notebook),
     /// `deploy-publish`: install a locally built deployment as current.
     Install {
         deployment: String,
@@ -1529,6 +1629,9 @@ impl Request {
             return Err("invalid consent protector operation".into());
         }
         match &operation {
+            Operation::Notebook(notebook) if !notebook.valid() => {
+                return Err("invalid consent notebook operation".into());
+            }
             Operation::Install {
                 deployment,
                 requester,
@@ -1665,6 +1768,11 @@ impl Request {
 
     /// Whether the description's ceremony step asks for the recovery key,
     /// whose field and `1c` are 48 digits.
+    pub fn asks_pin(&self) -> bool {
+        self.ceremony_step().is_some_and(LoginStep::asks_pin)
+            || matches!(&self.operation, Operation::Notebook(n) if n.step != 0)
+    }
+
     pub fn asks_recovery_key(&self) -> bool {
         self.ceremony_step() == Some(LoginStep::RecoveryKey)
     }
@@ -1787,6 +1895,7 @@ impl Request {
     /// identify step. Every other description and step does not.
     pub fn awaits_approval(&self) -> bool {
         match &self.operation {
+            Operation::Notebook(n) => n.step == 0,
             Operation::Install { .. }
             | Operation::DeployRollback { .. }
             | Operation::SetHostname { .. }
@@ -2224,6 +2333,11 @@ impl Request {
         bytes.extend_from_slice(&self.nonce);
         bytes.extend_from_slice(&self.owner.to_be_bytes());
         match &self.operation {
+            Operation::Notebook(n) => {
+                bytes.extend_from_slice(&[41, n.method, n.action, n.purpose, n.role, n.step]);
+                bytes.extend_from_slice(&n.operation);
+                bytes.extend_from_slice(&n.token);
+            }
             Operation::Install {
                 deployment,
                 requester,
@@ -2606,6 +2720,21 @@ impl Request {
                 requester: input.number()?,
                 blob: input.text()?,
             },
+            41 => Operation::Notebook(Notebook {
+                method: input.byte()?,
+                action: input.byte()?,
+                purpose: input.byte()?,
+                role: input.byte()?,
+                step: input.byte()?,
+                operation: input
+                    .take(32)?
+                    .try_into()
+                    .map_err(|_| "notebook operation digest")?,
+                token: input
+                    .take(32)?
+                    .try_into()
+                    .map_err(|_| "notebook token digest")?,
+            }),
             39 => Operation::ManageTime {
                 requester: input.number()?,
                 setting: input.text()?,
@@ -2742,6 +2871,7 @@ impl Request {
             format!("SESSION USER {}", self.owner),
         ];
         match &self.operation {
+            Operation::Notebook(n) => n.lines(&mut lines),
             Operation::Install { deployment, .. } => {
                 lines.push("INSTALL BUILT SYSTEM".into());
                 lines.push(format!("DEPLOYMENT: {deployment}"));
@@ -8711,6 +8841,7 @@ mod admin_tests {
         let Ok(request) = request else {
             return;
         };
+        assert_eq!(request.encode().get(44), Some(&40));
         assert_eq!(Request::decode(&request.encode()), Ok(request.clone()));
         assert!(request.awaits_approval());
         assert!(request.lines().iter().any(|line| line == KEY));
@@ -8737,6 +8868,62 @@ mod admin_tests {
                 }
             )
             .is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod notebook_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+    use super::*;
+
+    #[test]
+    fn notebook_steps_round_trip_and_bind_every_immutable_argument() {
+        for (action, purpose, role) in [
+            (1, 1, 1),
+            (2, 2, 2),
+            (3, 3, 1),
+            (4, 9, 2),
+            (5, 5, 1),
+            (5, 6, 2),
+            (6, 7, 2),
+            (6, 8, 1),
+        ] {
+            let original = Notebook {
+                method: if matches!(purpose, 1 | 2 | 6 | 8) {
+                    0x30
+                } else {
+                    0x31
+                },
+                action,
+                purpose,
+                role,
+                step: 0,
+                operation: [1; 32],
+                token: [2; 32],
+            };
+            let request =
+                Request::new([3; 32], 1000, Operation::Notebook(original.clone())).unwrap();
+            assert_eq!(request.encode().get(44), Some(&41));
+            assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+            assert!(request.awaits_approval());
+            assert!(!request.asks_pin());
+            let mut next = original.clone();
+            next.step = if matches!(purpose, 1 | 2 | 6 | 8) {
+                2
+            } else {
+                1
+            };
+            assert!(next.follows(&original));
+            let pin = Request::new([3; 32], 1000, Operation::Notebook(next.clone())).unwrap();
+            assert!(pin.asks_pin());
+            assert!(!pin.awaits_approval());
+            assert_eq!(Request::decode(&pin.encode()).unwrap(), pin);
+            next.token[0] ^= 1;
+            assert!(!next.follows(&original));
+            next.token[0] ^= 1;
+            next.operation[0] ^= 1;
+            assert!(!next.follows(&original));
         }
     }
 }

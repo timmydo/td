@@ -95,6 +95,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             token_check::run()
         }
         [command] if command == "selftest" => crypto::selftest(),
+        [command, flag, uid] if command == "notebook-token" && flag == "--uid" => {
+            portable::token_operation::run(parse_uid(uid)?)
+        }
         [command, flag, uid] if command == "notebook-service" && flag == "--uid" => {
             portable::service::run(parse_uid(uid)?)
         }
@@ -394,7 +397,7 @@ mod confinement {
             fingerprint(include_str!("enrollment_operation.rs")),
             0x5e3fb383c97e2405
         );
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x417b22f484b537c2, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xe139a3372cd677a3, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
         // The shared consent's hostname rules: firstboot's one copy.
         let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
         assert!(production.contains(
@@ -596,6 +599,10 @@ mod confinement {
             ("portable_pass.rs", include_str!("portable_pass.rs")),
             ("notebook_wire.rs", include_str!("notebook_wire.rs")),
             ("portable_service.rs", include_str!("portable_service.rs")),
+            (
+                "portable_token_operation.rs",
+                include_str!("portable_token_operation.rs"),
+            ),
             (
                 "portable_service_tokens.rs",
                 include_str!("portable_service_tokens.rs"),
@@ -831,6 +838,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "portable_service.rs",
                 "portable_service_tokens.rs",
                 "portable_store.rs",
+                "portable_token_operation.rs",
                 "pty_fixture_sys.rs",
                 "scm.rs",
                 "set_client.rs",

@@ -3659,3 +3659,26 @@ this intake. This is a separate authorization from `deploy-publish`; the
 remote policy, private build identity and durable job service are specified
 in `td-update/ADMIN.md`. Tag 40 does not authorize a credential-store or
 disk-protector operation.
+
+## Notebook token descriptions
+
+Consent tag 41 describes a private notebook token exchange. After the
+common nonce and owner it carries method, action, purpose, role and step bytes,
+then two SHA-256 digests: the complete admitted notebook operation and the
+exact service token request. Actions 1 and 2 create without or with a
+backup, 3 unlocks, 4 imports, 5 adds a key, and 6 replaces keys. Purposes
+are td-secret/PORTABLE.md's lifecycle purposes (1, 2, 3, 5–9); the codec
+rejects mismatched action/purpose pairs. Roles are primary 1 and backup 2.
+Methods are enrollment 0x30 and assertion 0x31. Enrollment purposes also
+permit assertion, for the lifecycle’s independent repeatability proof.
+Step zero requires explicit Enter approval; assertion step 1 or creation
+step 2 and proof step 3 take protected PIN input. All immutable arguments
+must remain identical between steps, and no step repeats or skips.
+
+The description labels the notebook, the operation, key role, and whether
+it authorizes with an existing key or enrolls a new one. Creating without
+a backup explicitly says that losing the key makes the vault unrecoverable.
+The digests bind the operation without rendering notebook content. They
+are not authentication. Only root's admitted notebook operation may create
+this description or supply its token result. The codec and root worker are
+preparatory: no public request or standalone fallback is enabled by them.

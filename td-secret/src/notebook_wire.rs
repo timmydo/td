@@ -44,19 +44,28 @@ impl Drop for Bytes {
     }
 }
 
-pub(crate) struct Wire(UnixStream);
+pub(crate) struct Wire(UnixStream, Option<Instant>);
 impl Wire {
     pub fn new(stream: UnixStream) -> Result<Self, String> {
         stream
             .set_nonblocking(false)
             .map_err(|_| "configure notebook endpoint")?;
-        Ok(Self(stream))
+        Ok(Self(stream, None))
     }
 
-    pub fn receive(&mut self, timeout: Duration) -> Result<Bytes, String> {
+    pub fn bound(&mut self, deadline: Instant) {
+        self.1 = Some(deadline);
+    }
+
+    fn deadline(&self, timeout: Duration) -> Result<Instant, String> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or("notebook deadline overflow")?;
+        Ok(self.1.map_or(deadline, |bound| bound.min(deadline)))
+    }
+
+    pub fn receive(&mut self, timeout: Duration) -> Result<Bytes, String> {
+        let deadline = self.deadline(timeout)?;
         let mut header = [0; 4];
         self.read(&mut header, deadline)?;
         let count = u32::from_be_bytes(header) as usize;
@@ -64,9 +73,7 @@ impl Wire {
             return Err("invalid notebook frame size".into());
         }
         let mut bytes = Bytes(vec![0; count]);
-        let deadline = Instant::now()
-            .checked_add(FRAME_TIME)
-            .ok_or("notebook deadline overflow")?;
+        let deadline = self.deadline(FRAME_TIME)?;
         self.read(&mut bytes.0, deadline)?;
         Ok(bytes)
     }
@@ -91,6 +98,9 @@ impl Wire {
                 .get_mut(count..)
                 .ok_or("invalid notebook read count")?;
         }
+        if Instant::now() >= deadline {
+            return Err("notebook frame expired".into());
+        }
         Ok(())
     }
 
@@ -104,9 +114,7 @@ impl Wire {
         let header = u32::try_from(bytes.len())
             .map_err(|_| "notebook reply overflow")?
             .to_be_bytes();
-        let deadline = Instant::now()
-            .checked_add(FRAME_TIME)
-            .ok_or("notebook deadline overflow")?;
+        let deadline = self.deadline(FRAME_TIME)?;
         for mut part in [header.as_slice(), bytes] {
             while !part.is_empty() {
                 let remaining = deadline
@@ -125,6 +133,9 @@ impl Wire {
                 }
                 part = part.get(count..).ok_or("invalid notebook write count")?;
             }
+        }
+        if Instant::now() >= deadline {
+            return Err("notebook reply expired".into());
         }
         Ok(())
     }
