@@ -47,13 +47,14 @@ pub(in crate::jmap_request::dispatch) fn search_verified(
 }
 
 /// Derive fields only after complete traversal under the supplied original
-/// snapshot, work and interpretation limits. Errors expose no partial fields.
+/// snapshot, work and interpretation limits. A permanent representation bound
+/// returns None; operational failures expose no partial fields.
 pub fn collect_verified_search(
     pin: &mut PinnedBlob<'_, '_>,
     limits: &Limits,
     clock: &dyn Clock,
     work: &mut Meter,
-) -> Result<SearchFields, Error> {
+) -> Result<Option<SearchFields>, Error> {
     let mut fields = SearchFields::new();
     let result = walk(
         pin,
@@ -68,8 +69,11 @@ pub fn collect_verified_search(
         return Err(mime(stop));
     }
     charge(work, clock, 0)?;
+    if fields.representation_full() && result == Err(Error::StorageCapacity) {
+        return Ok(None);
+    }
     result?;
-    Ok(fields)
+    Ok(Some(fields))
 }
 fn search_inner(
     pin: &mut PinnedBlob<'_, '_>,
@@ -421,6 +425,7 @@ mod tests {
                 &Fixed,
                 &mut work(100_000_000),
             )
+            .unwrap()
             .unwrap();
             assert!(fields.bytes() < MESSAGE.len());
             for query in [
@@ -453,6 +458,7 @@ mod tests {
                 &Fixed,
                 &mut work(100_000_000),
             )
+            .unwrap()
             .unwrap();
             assert!(fields
                 .matches("orchard inner", &mut work(100_000_000), &Fixed)
@@ -482,6 +488,31 @@ mod tests {
                 collect_verified_search(&mut pin, &Limits::default(), &Fixed, &mut work(1)),
                 Err(Error::StorageCapacity)
             ));
+        });
+    }
+
+    #[test]
+    fn complete_collection_distinguishes_permanent_representation_limit() {
+        let line = format!("{}\r\n", "x".repeat(998));
+        let source = format!(
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n{}",
+            line.repeat(SearchFields::MAX_BYTES / 999 + 1)
+        );
+        crate::store_fs::with_pinned_fixture(source.as_bytes(), &Fixed, |mut pin| {
+            let mut budget = Meter::new(
+                td_mime::time::Deadline::at(Tick(99)),
+                Charge {
+                    records: 512 * 1024 * 1024,
+                    io_bytes: 512 * 1024 * 1024,
+                    output_bytes: 128 * 1024 * 1024,
+                    ..Charge::default()
+                },
+            );
+            assert!(matches!(
+                collect_verified_search(&mut pin, &Limits::default(), &Fixed, &mut budget),
+                Ok(None)
+            ));
+            assert!(budget.stopped().is_none());
         });
     }
     #[test]
@@ -544,6 +575,7 @@ mod tests {
                 &Fixed,
                 &mut work(64 * 1024 * 1024),
             )
+            .unwrap()
             .unwrap();
             assert!(fields
                 .matches("tailneedle", &mut work(2_000_000), &Fixed)

@@ -45,6 +45,7 @@ pub struct SearchFields {
     bytes: usize,
     new_field: bool,
     whitespace: bool,
+    representation_full: bool,
 }
 impl SearchFields {
     pub const VERSION: u32 = 1;
@@ -57,6 +58,7 @@ impl SearchFields {
             bytes: 0,
             new_field: true,
             whitespace: false,
+            representation_full: false,
         }
     }
 
@@ -66,6 +68,10 @@ impl SearchFields {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub(super) fn representation_full(&self) -> bool {
+        self.representation_full
     }
 
     /// Match already normalized fields in bounded batches without repeating
@@ -193,6 +199,7 @@ impl Sink for SearchFields {
     fn reset(&mut self) {
         self.fields.clear();
         self.bytes = 0;
+        self.representation_full = false;
         self.field();
     }
     fn field(&mut self) {
@@ -216,6 +223,7 @@ impl Sink for SearchFields {
             .checked_add(c.len_utf8())
             .ok_or(Error::StorageCapacity)?;
         if bytes > Self::MAX_BYTES || (self.new_field && self.fields.len() == Self::MAX_FIELDS) {
+            self.representation_full = true;
             return Err(Error::StorageCapacity);
         }
         work.charge(
@@ -652,7 +660,14 @@ mod tests {
             Err(Error::StorageCapacity)
         );
         assert!(fields.fields().next().is_none());
+        assert!(fields.representation_full());
         fields.reset();
+        assert!(!fields.representation_full());
+        assert_eq!(
+            fields.scalar('x', &mut work(), &Fixed),
+            Err(Error::StorageCapacity)
+        );
+        assert!(!fields.representation_full());
         for _ in 0..SearchFields::MAX_FIELDS {
             fields.text("x", &mut build, &Fixed).unwrap();
         }
@@ -660,6 +675,7 @@ mod tests {
             fields.text("x", &mut build, &Fixed),
             Err(Error::StorageCapacity)
         );
+        assert!(fields.representation_full());
         let mut expired = Meter::new(
             td_mime::time::Deadline::at(crate::ports::Tick(1)),
             Charge::default(),

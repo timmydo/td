@@ -4,6 +4,7 @@ use crate::{
     clock::RuntimeClock,
     jmap_request::dispatch::{collect_verified_search, SearchFields},
     limits::Limits,
+    ports::Error,
     store_fs::PinnedBlob,
 };
 use std::time::Instant;
@@ -26,33 +27,54 @@ pub(crate) fn digest(
     body_length: u64,
     fields: &[u8],
     deadline: Instant,
-) -> Option<[u8; 32]> {
+) -> Result<[u8; 32], Error> {
     if fields.len() > MAX_BYTES {
-        return None;
+        return Err(Error::Invalid);
     }
-    let mut hash = BulkSha256::try_new().ok()?;
-    hash.update(b"td-mta-search-fields-v1\0").ok()?;
-    hash.update(body_digest).ok()?;
-    hash.update(&body_length.to_be_bytes()).ok()?;
-    hash.update(&(fields.len() as u64).to_be_bytes()).ok()?;
+    check_deadline(deadline)?;
+    let mut hash = BulkSha256::try_new()?;
+    hash.update(b"td-mta-search-fields-v1\0")?;
+    hash.update(body_digest)?;
+    hash.update(&body_length.to_be_bytes())?;
+    hash.update(&(fields.len() as u64).to_be_bytes())?;
     for chunk in fields.chunks(65536) {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        hash.update(chunk).ok()?;
+        check_deadline(deadline)?;
+        hash.update(chunk)?;
     }
-    (Instant::now() < deadline)
-        .then(|| hash.finish().ok())
-        .flatten()
+    let result = hash.finish()?;
+    check_deadline(deadline)?;
+    Ok(result)
 }
 
-/// The administrative job supplies its original deadline. Optional extraction
-/// failure leaves no complete search row, never a successful empty index.
-pub(crate) fn prepare(pin: &mut PinnedBlob<'_, '_>, deadline: Instant) -> Option<Prepared> {
+fn check_deadline(deadline: Instant) -> Result<(), Error> {
+    if Instant::now() >= deadline {
+        Err(Error::Deadline)
+    } else {
+        Ok(())
+    }
+}
+
+fn operation(error: crate::jmap_request::dispatch::Error) -> Error {
+    use crate::jmap_request::dispatch::Error as Search;
+    match error {
+        Search::Storage(error) => error,
+        Search::ExecutionDeadline => Error::Deadline,
+        Search::StorageCapacity | Search::ResponseCapacity => Error::Capacity,
+        _ => Error::Invalid,
+    }
+}
+
+/// Only interpretation refusals and permanent representation bounds are skips.
+/// Operational failures abort the administrative transaction.
+pub(crate) fn prepare(
+    pin: &mut PinnedBlob<'_, '_>,
+    deadline: Instant,
+) -> Result<Option<Prepared>, Error> {
     use crate::ports::BlobReader;
+    check_deadline(deadline)?;
     let clock = RuntimeClock::new();
     let mut work = Meter::new(
-        clock.deadline_before(deadline).ok()?,
+        clock.deadline_before(deadline)?,
         Charge {
             io_bytes: 512 * 1024 * 1024,
             records: 64 * 1024 * 1024,
@@ -66,44 +88,56 @@ pub(crate) fn prepare(pin: &mut PinnedBlob<'_, '_>, deadline: Instant) -> Option
         mime_depth: 32,
         ..Limits::default()
     };
-    let fields = collect_verified_search(pin, &limits, &clock, &mut work)
-        .ok()?
-        .encode()
-        .ok()?;
-    pin.check_deadline().ok()?;
+    let collected = collect_verified_search(pin, &limits, &clock, &mut work);
+    pin.check_deadline()?;
+    check_deadline(deadline)?;
+    let fields = match collected {
+        Ok(Some(fields)) => fields.encode().map_err(operation)?,
+        Ok(None) | Err(crate::jmap_request::dispatch::Error::MessageInterpretation) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(operation(error)),
+    };
+    pin.check_deadline()?;
     let digest = digest(pin.digest(), pin.len(), &fields, deadline)?;
     let candidate_text = candidate_text(&fields, deadline)?;
-    Some(Prepared {
+    Ok(Some(Prepared {
         fields,
         candidate_text,
         digest,
-    })
+    }))
 }
 
 // Keep field boundaries and replace PostgreSQL text's forbidden NUL. Operands
 // containing NUL are never used as index filters; the matcher sees original fields.
-fn candidate_text(encoded: &[u8], deadline: Instant) -> Option<String> {
+fn candidate_text(encoded: &[u8], deadline: Instant) -> Result<String, Error> {
     if encoded.len() > MAX_BYTES {
-        return None;
+        return Err(Error::Invalid);
     }
+    check_deadline(deadline)?;
     let mut text = Vec::new();
-    text.try_reserve_exact(encoded.len()).ok()?;
+    text.try_reserve_exact(encoded.len())
+        .map_err(|_| Error::Capacity)?;
     let mut rest = encoded;
     let mut count = 0usize;
     while !rest.is_empty() {
-        count = count.checked_add(1)?;
-        if count > SearchFields::MAX_FIELDS || Instant::now() >= deadline {
-            return None;
+        count = count.checked_add(1).ok_or(Error::Invalid)?;
+        check_deadline(deadline)?;
+        if count > SearchFields::MAX_FIELDS {
+            return Err(Error::Invalid);
         }
-        let size = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
-        rest = rest.get(4..)?;
-        let field = rest.get(..size)?;
-        std::str::from_utf8(field).ok()?;
-        rest = rest.get(size..)?;
+        let size = u32::from_be_bytes(
+            rest.get(..4)
+                .ok_or(Error::Invalid)?
+                .try_into()
+                .map_err(|_| Error::Invalid)?,
+        ) as usize;
+        rest = rest.get(4..).ok_or(Error::Invalid)?;
+        let field = rest.get(..size).ok_or(Error::Invalid)?;
+        std::str::from_utf8(field).map_err(|_| Error::Invalid)?;
+        rest = rest.get(size..).ok_or(Error::Invalid)?;
         for chunk in field.chunks(65536) {
-            if Instant::now() >= deadline {
-                return None;
-            }
+            check_deadline(deadline)?;
             text.extend(
                 chunk
                     .iter()
@@ -112,11 +146,11 @@ fn candidate_text(encoded: &[u8], deadline: Instant) -> Option<String> {
         }
         text.push(b'\n');
     }
-    if text.len() > SearchFields::MAX_BYTES + SearchFields::MAX_FIELDS || Instant::now() >= deadline
-    {
-        return None;
+    check_deadline(deadline)?;
+    if text.len() > SearchFields::MAX_BYTES + SearchFields::MAX_FIELDS {
+        return Err(Error::Invalid);
     }
-    String::from_utf8(text).ok()
+    String::from_utf8(text).map_err(|_| Error::Invalid)
 }
 
 #[cfg(test)]
@@ -135,9 +169,9 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(3600);
         assert_eq!(
             candidate_text(&encoded(&["αβγ straße", "100%_\\", "nul\0value"]), deadline),
-            Some("αβγ straße\n100%_\\\nnul\nvalue\n".into())
+            Ok("αβγ straße\n100%_\\\nnul\nvalue\n".into())
         );
-        assert_eq!(candidate_text(&[], deadline), Some(String::new()));
+        assert_eq!(candidate_text(&[], deadline), Ok(String::new()));
     }
     #[test]
     fn candidate_text_refuses_bad_framing_utf8_and_expiry() {
@@ -147,8 +181,52 @@ mod tests {
             &[0, 0, 0, 2, b'a'][..],
             &[0, 0, 0, 1, 255][..],
         ] {
-            assert!(candidate_text(bytes, deadline).is_none());
+            assert_eq!(candidate_text(bytes, deadline), Err(Error::Invalid));
         }
-        assert!(candidate_text(&encoded(&["x"]), Instant::now()).is_none());
+        assert_eq!(
+            candidate_text(&encoded(&["x"]), Instant::now()),
+            Err(Error::Deadline)
+        );
+    }
+
+    #[test]
+    fn digest_preserves_expiry_as_an_operational_error() {
+        assert_eq!(
+            digest(&[0; 32], 0, &[], Instant::now()),
+            Err(Error::Deadline)
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(3600);
+        assert!(digest(&[0; 32], 0, &[], deadline).is_ok());
+    }
+
+    #[test]
+    fn preparation_skips_interpretation_but_refuses_expired_work() {
+        use crate::ports::{Clock, Tick, Time};
+        struct Fixed;
+        impl Clock for Fixed {
+            fn sample(&self) -> Result<Time, Error> {
+                Ok(Time {
+                    utc_ms: 0,
+                    monotonic: Tick(1),
+                })
+            }
+        }
+        crate::store_fs::with_pinned_fixture(
+            b"Content-Type: message/global\r\n\r\nbody",
+            &Fixed,
+            |mut pin| {
+                assert!(matches!(
+                    prepare(&mut pin, Instant::now()),
+                    Err(Error::Deadline)
+                ));
+                assert!(matches!(
+                    prepare(
+                        &mut pin,
+                        Instant::now() + std::time::Duration::from_secs(3600)
+                    ),
+                    Ok(None)
+                ));
+            },
+        );
     }
 }

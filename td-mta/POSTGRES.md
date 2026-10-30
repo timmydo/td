@@ -7748,6 +7748,22 @@ continue through fallback until explicit backfill; automatic preparation is
 not yet implemented. This adds stored derived text and GIN storage; it does
 not change account body quotas or promise a fixed database size.
 
+Search preparation distinguishes an interpretation refusal or a permanent
+representation limit (8 MiB normalized text or 65,536 fields) from operational
+failure. The former leaves no search row and advances the explicit backfill
+cursor as a skip; the message retains the existing read fallback. Failures
+reported by collection as operational errors, encoding/allocation failures,
+clock/deadline failure, invalid internal framing, and digest-provider errors
+abort the page instead of deleting evidence
+and reporting a skip. Final pin, clock and work checks take precedence over
+an otherwise skippable result. No partial normalized fields are published.
+This classification does not make a skipped message an empty search result
+or claim that existing compatible evidence has been audited.
+The CLI reports fixed `preparation-deadline`, `preparation-capacity` and
+`preparation-crypto` categories for the corresponding failures. Lower-level
+parser refusals retain the existing interpretation classification; this is
+not a redesign of every parser's error vocabulary.
+
 A parsed query may select one required term as a candidate filter. It must
 contain three consecutive ASCII alphanumeric characters, guaranteeing an
 extractable trigram even with a C locale, and contain no NUL. The longest

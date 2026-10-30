@@ -740,6 +740,7 @@ impl Snapshot<'_> {
                 &encoded,
                 self.deadline,
             )
+            .ok()
             .as_ref()
             .map(|hash| hash.as_slice())
                 != Some(expected.as_slice())

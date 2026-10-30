@@ -179,9 +179,11 @@ pub fn run_with_options(
                     } else {
                         None
                     };
-                    let search_fields = search
-                        .then(|| crate::postgres_search::prepare(body, deadline))
-                        .flatten();
+                    let search_fields = if search {
+                        crate::postgres_search::prepare(body, deadline)?
+                    } else {
+                        None
+                    };
                     Ok((fields, interpretation, search_fields))
                 })
                 .map_err(Error::Body)?;

@@ -101,6 +101,15 @@ pub(super) fn run(args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> 
                     AttemptError::from(postgres_schema::Error::Connection(error))
                 }
                 Error::Schema(error) => AttemptError::from(error),
+                Error::Body(td_mta::postgres_body::Error::Read(td_mta::ports::Error::Deadline)) => {
+                    AttemptError::Failed("summary-backfill", "preparation-deadline")
+                }
+                Error::Body(td_mta::postgres_body::Error::Read(td_mta::ports::Error::Capacity)) => {
+                    AttemptError::Failed("summary-backfill", "preparation-capacity")
+                }
+                Error::Body(td_mta::postgres_body::Error::Read(td_mta::ports::Error::Crypto)) => {
+                    AttemptError::Failed("summary-backfill", "preparation-crypto")
+                }
                 Error::Body(_) => AttemptError::Failed("summary-backfill", "body-check-failed"),
                 Error::Owner => AttemptError::Failed("summary-backfill", "owner-required"),
                 Error::Invalid => AttemptError::Failed("summary-backfill", "invalid-state"),
