@@ -193,6 +193,7 @@ pub struct JmapSession {
     /// The core capability's `maxSizeUpload`, when the session names it.
     pub max_size_upload: Option<u64>,
     pub max_objects_in_set: Option<u64>,
+    pub max_objects_in_get: Option<u64>,
     pub primary_accounts: HashMap<String, String>,
     pub accounts: HashMap<String, JmapAccount>,
 }
@@ -211,23 +212,28 @@ impl JmapSession {
                 out
             }
         };
-        let (max_size_upload, max_objects_in_set) = match present(obj, "capabilities") {
-            None => (None, None),
-            Some(capabilities) => {
-                match present(object(capabilities, "capabilities")?, CORE_CAPABILITY) {
-                    None => (None, None),
-                    Some(core) => {
-                        let core = object(core, CORE_CAPABILITY)?;
-                        (
-                            opt_u64(core, "maxSizeUpload")?,
-                            opt_u64(core, "maxObjectsInSet")?,
-                        )
+        let (max_size_upload, max_objects_in_set, max_objects_in_get) =
+            match present(obj, "capabilities") {
+                None => (None, None, None),
+                Some(capabilities) => {
+                    match present(object(capabilities, "capabilities")?, CORE_CAPABILITY) {
+                        None => (None, None, None),
+                        Some(core) => {
+                            let core = object(core, CORE_CAPABILITY)?;
+                            (
+                                opt_u64(core, "maxSizeUpload")?,
+                                opt_u64(core, "maxObjectsInSet")?,
+                                opt_u64(core, "maxObjectsInGet")?,
+                            )
+                        }
                     }
                 }
-            }
-        };
+            };
         if max_objects_in_set == Some(0) {
             return Err("maxObjectsInSet must be positive".into());
+        }
+        if max_objects_in_get == Some(0) {
+            return Err("maxObjectsInGet must be positive".into());
         }
         Ok(JmapSession {
             username: req_str(obj, "username")?,
@@ -236,6 +242,7 @@ impl JmapSession {
             upload_url: opt_str(obj, "uploadUrl")?,
             max_size_upload,
             max_objects_in_set,
+            max_objects_in_get,
             primary_accounts: def_string_map(obj, "primaryAccounts")?,
             accounts,
         })
@@ -900,6 +907,30 @@ impl ThreadGetResponse {
 mod tests {
     use super::*;
     use td_json::json;
+
+    #[test]
+    fn get_object_limit_is_optional_but_positive_when_supplied() {
+        for (limit, expected) in [
+            (Json::Null, None),
+            (json!(1), Some(1)),
+            (json!(256), Some(256)),
+            (json!(u64::MAX), Some(u64::MAX)),
+        ] {
+            let session = JmapSession::from_json(&json!({
+                "username":"test", "apiUrl":"https://example.test/api",
+                "capabilities": {CORE_CAPABILITY: {"maxObjectsInGet": limit}}
+            }))
+            .unwrap();
+            assert_eq!(session.max_objects_in_get, expected);
+        }
+        for limit in [json!(0), json!(-1), json!(1.5), json!("256"), json!(true)] {
+            assert!(JmapSession::from_json(&json!({
+                "username":"test", "apiUrl":"https://example.test/api",
+                "capabilities": {CORE_CAPABILITY: {"maxObjectsInGet": limit}}
+            }))
+            .is_err());
+        }
+    }
 
     #[test]
     fn set_object_limit_is_optional_but_positive_when_supplied() {

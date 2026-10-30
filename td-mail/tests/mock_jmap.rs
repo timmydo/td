@@ -71,6 +71,7 @@ impl EmailRecord {
 
 struct MockState {
     read_only: bool,
+    max_objects_in_get: Option<usize>,
     mailboxes: Vec<Value>,
     mailbox_creates: Vec<String>,
     mailbox_create_refused: bool,
@@ -196,6 +197,7 @@ impl MockState {
 
         Self {
             read_only: false,
+            max_objects_in_get: Some(256),
             mailboxes: json!([
                 {
                     "id": "mbox-inbox",
@@ -793,6 +795,10 @@ impl MockJmapServer {
         self.state.lock().unwrap().read_only = true;
     }
 
+    pub fn advertise_get_limit(&self, maximum: Option<usize>) {
+        self.state.lock().unwrap().max_objects_in_get = maximum;
+    }
+
     pub fn limit_read_batch(&self, maximum: usize) {
         self.state.lock().unwrap().read_batch_limit = Some(maximum);
     }
@@ -1059,7 +1065,8 @@ impl MockJmapServer {
         }
         let (status, response_body, content_type) =
             if method == "GET" && path.contains("/.well-known/jmap") {
-                let (s, b) = Self::handle_session(port, state.lock().unwrap().read_only);
+                let guard = state.lock().unwrap();
+                let (s, b) = Self::handle_session(port, guard.read_only, guard.max_objects_in_get);
                 (s, b, "application/json")
             } else if method == "POST" && path.contains("/api") {
                 let (s, b) = Self::handle_api(&body, state);
@@ -1137,14 +1144,14 @@ impl MockJmapServer {
         }
     }
 
-    fn handle_session(port: u16, read_only: bool) -> (String, String) {
+    fn handle_session(port: u16, read_only: bool, max_get: Option<usize>) -> (String, String) {
         let session = json!({
             "username": "test@example.com",
             "apiUrl": format!("http://127.0.0.1:{}/api", port),
             "downloadUrl": format!("http://127.0.0.1:{}/download/{{accountId}}/{{blobId}}/{{name}}?type={{type}}", port),
             "uploadUrl": format!("http://127.0.0.1:{}/upload/{{accountId}}/", port),
             "capabilities": {
-                "urn:ietf:params:jmap:core": { "maxSizeUpload": 1000000, "maxObjectsInSet": 64 },
+                "urn:ietf:params:jmap:core": { "maxSizeUpload": 1000000, "maxObjectsInSet": 64, "maxObjectsInGet": max_get },
                 "urn:ietf:params:jmap:mail": {},
                 "urn:ietf:params:jmap:submission": { "maxDelayedSend": 0 }
             },

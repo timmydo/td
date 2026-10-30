@@ -366,6 +366,7 @@ pub struct JmapClient {
     /// The session's `maxSizeUpload`, when it names one.
     max_size_upload: Option<u64>,
     max_objects_in_set: usize,
+    max_objects_in_get: usize,
     /// Whether the session lists mail submission for the account.
     submission: bool,
     read_only: bool,
@@ -400,6 +401,7 @@ impl JmapClient {
             upload_url: None,
             max_size_upload: None,
             max_objects_in_set: FLAG_BATCH_MAX,
+            max_objects_in_get: METADATA_GET_BATCH_MAX,
             submission: false,
             read_only: false,
         }
@@ -672,6 +674,10 @@ impl JmapClient {
                 .max_objects_in_set
                 .unwrap_or(FLAG_BATCH_MAX as u64)
                 .clamp(1, FLAG_BATCH_MAX as u64) as usize,
+            max_objects_in_get: session
+                .max_objects_in_get
+                .unwrap_or(50)
+                .clamp(1, METADATA_GET_BATCH_MAX as u64) as usize,
             submission,
             read_only,
         };
@@ -1088,7 +1094,12 @@ impl JmapClient {
         }
         properties.extend(extra_properties.iter().map(String::as_str));
         let mut emails = Vec::new();
-        for chunk in ids.chunks(50) {
+        let batch_size = if bodies {
+            self.max_objects_in_get.min(50)
+        } else {
+            self.max_objects_in_get
+        };
+        for chunk in ids.chunks(batch_size) {
             if let Some(mut batch) = self.read_projection(chunk, &properties, bodies)? {
                 emails.append(&mut batch);
                 continue;
@@ -1939,7 +1950,7 @@ impl JmapClient {
             }
         }
         let mut submissions = Vec::new();
-        for batch in ids.chunks(50) {
+        for batch in ids.chunks(self.max_objects_in_get.min(50)) {
             let response = self.call(JmapRequest {
                 using: using.clone(),
                 method_calls: vec![MethodCall(
@@ -2001,7 +2012,7 @@ impl JmapClient {
         let ids: std::collections::BTreeSet<&String> = ids.iter().collect();
         let ids: Vec<&String> = ids.into_iter().collect();
         let mut emails = Vec::new();
-        for batch in ids.chunks(50) {
+        for batch in ids.chunks(self.max_objects_in_get.min(50)) {
             let response = self.call(JmapRequest {
                 using: vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
                 method_calls: vec![MethodCall(
@@ -2167,7 +2178,7 @@ impl JmapClient {
 
     pub fn get_email_keywords(&self, ids: &[String]) -> Result<Vec<Email>, JmapError> {
         let mut result = Vec::new();
-        for chunk in ids.chunks(METADATA_GET_BATCH_MAX) {
+        for chunk in ids.chunks(self.max_objects_in_get) {
             result.extend(self.get_email_keywords_batch(chunk)?);
         }
         Ok(result)
@@ -2212,7 +2223,7 @@ impl JmapClient {
 
     pub fn get_threads(&self, ids: &[String]) -> Result<Vec<super::types::Thread>, JmapError> {
         let mut result = Vec::new();
-        for chunk in ids.chunks(METADATA_GET_BATCH_MAX) {
+        for chunk in ids.chunks(self.max_objects_in_get) {
             result.extend(self.get_threads_batch(chunk)?);
         }
         Ok(result)

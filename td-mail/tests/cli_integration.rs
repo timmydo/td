@@ -2318,6 +2318,41 @@ fn test_invalid_filing_id_refuses_before_sending_or_writing_a_record() {
 }
 
 #[test]
+fn summary_batches_follow_advertised_get_limit() {
+    for (advertised, expected) in [
+        (Some(256), vec![256]),
+        (Some(1000), vec![256]),
+        (Some(32), vec![32; 8]),
+        (Some(100), vec![100, 100, 56]),
+        (None, vec![50, 50, 50, 50, 50, 6]),
+    ] {
+        let mut h = CliHarness::start();
+        h.server().seed_large_thread(300);
+        h.server().advertise_get_limit(advertised);
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        let response = h.send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox", "headers_only":true, "limit":256}));
+        assert!(response["ok"].is_true(), "{response}");
+        assert_eq!(response["emails"].as_array().unwrap().len(), 256);
+        let calls = h.server().read_calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["properties"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.as_str() == Some("subject")))
+                .map(|call| call["ids"].as_array().unwrap().len())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(calls
+            .iter()
+            .all(|call| call["fetchTextBodyValues"].as_bool() != Some(true)));
+    }
+}
+
+#[test]
 fn summary_listing_fetches_body_on_open_and_keeps_it_on_refresh() {
     let mut h = CliHarness::start();
     assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());

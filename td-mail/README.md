@@ -576,8 +576,11 @@ Authentication, transport and other storage errors remain errors. A
 `serverFail/storageWorkLimit` on a multi-message read splits its ID batch
 in half, preserving the requested fields and order. Splitting stops at one
 message: a singleton refusal is still an error, never an unreadable placeholder.
-Each original batch has at most 50 IDs, so work-limit recovery performs at
-most 99 read requests, including the original, and logs every split. Interpretation refusal during
+Summary and stored-metadata reads use the advertised `maxObjectsInGet`,
+capped at 256 IDs; absent limits use 50. Body-bearing reads retain a
+50-ID ceiling and also respect a smaller advertised limit. Work-limit
+recovery performs at most `2 * batch_size - 1` read requests (511 for
+a 256-ID summary batch), including the original, and logs every split. Interpretation refusal during
 recovery still uses the separate single-message isolation below. Only
 read projections use this recovery; mutations are never replayed by it.
 
@@ -588,7 +591,7 @@ CLI JSON also exposes the original `blob_id`. Pass that value to
 Each refresh currently repeats isolation: one unreadable message in a full
 50-message batch costs 52 requests. This bounded linear recovery is the
 initial read milestone, with no negative-result cache or bisection yet.
-Ordinary message reads use batches of 50 IDs. Recovery adds at most one full
+Body-bearing message reads use batches of at most 50 IDs. Recovery adds at most one full
 and one stored-only request per ID after the failed batch; additional header
 properties are omitted from stored-only recovery. Thread reading uses
 `Thread/get` membership followed by those batches, without a 500-message cut. Raw spam-training fetches still require UTF-8;

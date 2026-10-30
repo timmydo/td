@@ -2111,7 +2111,23 @@ fn backend_loop(
                         if (origin == "cli.summaries" || !origin.starts_with("cli")) && !apply_rules
                         {
                             let mut summaries = Vec::new();
-                            for (index, chunk) in query.ids.chunks(EMAIL_GET_CHUNK_SIZE).enumerate()
+                            let preview_size = if can_serve_cached_first {
+                                query.ids.len().min(EMAIL_GET_CHUNK_SIZE)
+                            } else {
+                                0
+                            };
+                            let first = query
+                                .ids
+                                .get(..preview_size)
+                                .ok_or("Invalid preview range")?;
+                            let remaining = query
+                                .ids
+                                .get(preview_size..)
+                                .ok_or("Invalid summary range")?;
+                            for (index, chunk) in [first, remaining]
+                                .into_iter()
+                                .filter(|ids| !ids.is_empty())
+                                .enumerate()
                             {
                                 summaries.extend(
                                     client
