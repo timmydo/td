@@ -178,8 +178,9 @@ An encrypted disk must never be retried as Fresh install automatically.
 
 After Reinstall and disk selection, the service identifies a supported
 device-bound LUKS volume and the wizard shows Unlock existing installation.
-It offers a masked recovery-key field and Scan recovery QR code. Typed
-input uses td-protector's existing bounded recovery codec and reports only
+It shows the recovery-key digits and separators as they are typed, so
+the person can compare each group with the saved key. Scan recovery QR
+code remains the planned alternative. Typed input uses td-protector's existing bounded recovery codec and reports only
 the erroneous group or a generic wrong-key result, never entered digits.
 Typing and scanning both produce the same recovery-key value; neither
 confirms reinstall. No copy/paste, shell command or pathname is accepted.
@@ -221,7 +222,10 @@ Unlock requests use tag `0x0c`, the 32-byte challenge and up to 256 entry
 bytes; replies use `0x87`, a fresh challenge and one retry boolean. Locked
 status is code 7. Refusals 18 and 19 mean rejected recovery key and unsupported
 encrypted reinstall. Root checks the tag-specific bound before allocating
-the body. No secret is echoed. td-luks children discard both output streams,
+the body. Only the entry field displays the typed digits; status, evidence,
+diagnostics and service replies never echo them. Painting borrows the
+wiped entry buffer without allocating a separate text copy. td-luks
+children discard both output streams,
 are killed and reaped after 60 seconds, and during inspection also abandon
 when the peer closes or pipelines another request. Mount and unmount children have a 60-second limit; the deployment
 publisher has a 30-minute limit. Cleanup ignores peer
@@ -305,8 +309,7 @@ explicit new scan. Do not silently select an infrared camera as if it
 were a working visible-light camera; offer a bounded device chooser when
 several supported cameras exist.
 
-A valid scan stops capture and fills the secret entry without displaying
-the digits; Unlock is a separate action before root tests it. This avoids
+A valid scan stops capture and fills the visible recovery entry; Unlock is a separate action before root tests it. This avoids
 silently choosing a background code. Zero decoded text, image-processing
 scratch and owned frames when replaced or discarded. The existing display
 pixel and kernel-buffer residue limits remain: clearing owned buffers is

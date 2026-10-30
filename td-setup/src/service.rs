@@ -350,7 +350,7 @@ fn idle(stream: &mut UnixStream) -> Result<(), String> {
 }
 
 /// The review execute last named, and its storage.
-/// A masked recovery entry; the window cannot construct protocol requests.
+/// A wiped recovery entry; the window cannot construct protocol requests.
 pub(crate) struct Entry(protocol::UnlockEntry);
 impl Entry {
     pub(crate) fn new() -> Result<Self, String> {

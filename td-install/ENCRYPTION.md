@@ -516,6 +516,11 @@ migration, saved login/network enrollment, all reinstall interruption
 boundaries, graphical recovery entry or hardware acceptance. Those remain
 separate acceptance obligations above.
 
+The laptop owner reports a successful typed-key reinstall from a locally
+built ISO on the T14s. The exact ISO revision and a complete preservation
+and cold-boot checklist were not recorded, so this is user-reported
+hardware evidence for that path, not the complete acceptance record.
+
 Camera fixtures alone do not establish T14s compatibility: acceptance
 also requires scanning the saved code from a phone or paper using the
 laptop webcam, plus a successful typed-key reinstall on that hardware.

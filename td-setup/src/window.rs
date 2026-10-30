@@ -1878,16 +1878,18 @@ impl Window {
             (Page::Recovery(KeyStep::Shown), Some(key)) => Some((key.display(), key.code())),
             _ => None,
         };
-        let masked = wizard
+        // Borrow the wiped entry directly; painting must not make a String
+        // copy of the recovery key that outlives its secret buffer.
+        let entry = wizard
             .unlock_entry
             .as_ref()
-            .map(|entry| "*".repeat(entry.as_bytes().len().min(55)))
+            .and_then(|entry| std::str::from_utf8(entry.as_bytes()).ok())
             .unwrap_or_default();
         let key_page = match wizard.page {
             Page::Unlock => Some(RecoveryPage::new(
                 surface,
                 recovery::Step::Unlock {
-                    masked: &masked,
+                    entry,
                     notice: wizard.notice,
                 },
             )),
@@ -2170,7 +2172,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_entry_is_masked_validated_and_discarded_on_retry_and_back() {
+    fn recovery_entry_is_validated_kept_out_of_evidence_and_discarded_on_retry_and_back() {
         let mut wizard = Wizard::new();
         wizard.key("r");
         wizard.sent(Asked::Disks);

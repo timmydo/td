@@ -3,7 +3,7 @@
 //! records"): the key the service sends once, held in memory only and
 //! zeroed on drop; its display, beside a QR code of its 48 digits a phone
 //! can keep; and the step that asks the person to say they kept it. Nobody
-//! types a new key; reinstall accepts an existing key in a masked entry. This file alone names the disk protector's crate,
+//! types a new key; reinstall accepts an existing key in a visible entry. This file alone names the disk protector's crate,
 //! and only that codec (tests/confinement.rs). Nothing here prints, logs or
 //! copies the digits anywhere but the page.
 
@@ -116,7 +116,7 @@ impl Shown {
 /// Which recovery-key view to paint.
 pub enum Step<'a> {
     Unlock {
-        masked: &'a str,
+        entry: &'a str,
         notice: Option<&'a str>,
     },
     /// The key is asked for and not yet here.
@@ -187,7 +187,7 @@ impl Composition for RecoveryPage<'_> {
         fill(self.surface.bounds(), CHROME, damage, sink);
         let surface = self.surface;
         let footer = match &self.step {
-            Step::Unlock { masked, notice } => {
+            Step::Unlock { entry, notice } => {
                 row(surface, 1, "Unlock existing installation", damage, sink);
                 row(
                     surface,
@@ -196,7 +196,7 @@ impl Composition for RecoveryPage<'_> {
                     damage,
                     sink,
                 );
-                row(surface, 5, masked, damage, sink);
+                row(surface, 5, entry, damage, sink);
                 row(
                     surface,
                     7,
@@ -427,6 +427,29 @@ mod tests {
             }
         });
         text
+    }
+
+    #[test]
+    fn unlock_shows_partial_and_complete_entries_at_each_supported_scale() {
+        for screen in [
+            surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT),
+            Surface::new(1504, 960, Scale::new(2).unwrap()).unwrap(),
+        ] {
+            for entry in ["000013-005", SHOWN, std::str::from_utf8(KEY).unwrap()] {
+                let page = RecoveryPage::new(
+                    screen,
+                    Step::Unlock {
+                        entry,
+                        notice: None,
+                    },
+                )
+                .unwrap();
+                let text = glyphs(&page, screen);
+                assert!(text.contains(entry), "the typed entry must be readable");
+                assert!(!text.contains('*'), "the entry must not be masked");
+                assert!(text.contains("Return to unlock"));
+            }
+        }
     }
 
     #[test]
