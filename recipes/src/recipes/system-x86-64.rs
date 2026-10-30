@@ -5163,6 +5163,7 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         "{in:fd}".into(),
         "{in:openssh-x86-64}".into(),
         "{in:git-x86-64}".into(),
+        "{in:curl-x86-64}".into(),
         "{in:gcc-runtime}".into(),
         "{in:zlib-x86-64}".into(),
         "{in:td-link-runtime}".into(),
@@ -5213,6 +5214,7 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         ("rg", "{in:ripgrep}/bin/rg"),
         ("fd", "{in:fd}/bin/fd"),
         ("git", "{in:git-x86-64}/bin/git"),
+        ("curl", "{in:curl-x86-64}/bin/curl"),
         ("git-receive-pack", "{in:git-x86-64}/bin/git-receive-pack"),
         (
             "git-upload-archive",
@@ -6372,6 +6374,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "ripgrep",
                 "fd",
                 "git-x86-64",
+                "curl-x86-64",
                 "ca-certificates",
                 "tzdata",
                 "jetbrains-mono-nerd-font",
@@ -9812,6 +9815,7 @@ mod tests {
             "{in:fd}".to_string(),
             "{in:openssh-x86-64}".to_string(),
             "{in:git-x86-64}".to_string(),
+            "{in:curl-x86-64}".to_string(),
             "{in:gcc-runtime}".to_string(),
             "{in:zlib-x86-64}".to_string(),
             "{in:td-link-runtime}".to_string(),
@@ -9867,6 +9871,7 @@ mod tests {
             ("rg", "{in:ripgrep}/bin/rg"),
             ("fd", "{in:fd}/bin/fd"),
             ("git", "{in:git-x86-64}/bin/git"),
+            ("curl", "{in:curl-x86-64}/bin/curl"),
             ("git-receive-pack", "{in:git-x86-64}/bin/git-receive-pack"),
             (
                 "git-upload-archive",
@@ -16819,6 +16824,7 @@ mod server_tests {
             sorted,
             [
                 "ca-certificates",
+                "curl-x86-64",
                 "fd",
                 "gcc-runtime",
                 "git-x86-64",

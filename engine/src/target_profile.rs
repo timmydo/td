@@ -150,7 +150,13 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
 
 /// Build-root outputs that link gcc-runtime's start files and libgcc in
 /// place of GCC's.
-pub const BUILD_ROOT_LINKED: &[&str] = &["zlib-x86-64", "openssh-x86-64", "git-x86-64", "td-link"];
+pub const BUILD_ROOT_LINKED: &[&str] = &[
+    "zlib-x86-64",
+    "openssh-x86-64",
+    "git-x86-64",
+    "curl-x86-64",
+    "td-link",
+];
 
 /// Conservative transitive assembly boundaries for a linked output. Every
 /// split target may contain glibc startup code; one linked in the build root

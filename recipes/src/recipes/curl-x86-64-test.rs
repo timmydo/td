@@ -70,6 +70,23 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", PATH),
     ]);
+    for boundary in [
+        "exception.0.source=glibc-x86-64",
+        "exception.1.source=gcc-runtime",
+    ] {
+        steps.push(
+            Step::run(
+                "{root}",
+                &[
+                    "/usr/bin/grep",
+                    "-Fx",
+                    boundary,
+                    "{in:curl-x86-64}/lib/debug/.td-assembly-exception",
+                ],
+            )
+            .env("PATH", PATH),
+        );
+    }
     steps.push(Step::WriteFile {
         path: "{root}/curl-test.c".into(),
         content: r#"#include <curl/curl.h>
@@ -79,6 +96,8 @@ pub fn recipe() -> Recipe {
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <pthread.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -298,6 +317,67 @@ static CURLcode perform_transfer(SSL_CTX *server_context, const char *hostname,
     return result;
 }
 
+/* Exercise the installed CLI against the same private TLS fixture. */
+extern char **environ;
+static int cli_transfer(const char *program, SSL_CTX *server_context,
+        const char *hostname, const char *ca_pem, size_t ca_length,
+        int expected) {
+    const char *ca_path = "curl-cli-ca.pem";
+    const char *body_path = "curl-cli-body";
+    FILE *ca = fopen(ca_path, "wb");
+    if (ca == NULL)
+        return 0;
+    int written = fwrite(ca_pem, 1, ca_length, ca) == ca_length;
+    if (fclose(ca) != 0 || !written)
+        return 0;
+    unlink(body_path);
+    char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    int listener = open_listener(socket_path, sizeof(socket_path));
+    if (listener < 0)
+        return 0;
+    char url[256];
+    int length = snprintf(url, sizeof(url), "https://%s/", hostname);
+    if (length < 0 || (size_t)length >= sizeof(url)) {
+        close(listener);
+        unlink(socket_path);
+        return 0;
+    }
+    struct server_state state = {server_context, listener, expected == 0, 0};
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, serve_https, &state) != 0) {
+        close(listener);
+        unlink(socket_path);
+        return 0;
+    }
+    char *args[] = {(char *)program, "-q", "-fsSL", "--proxy", "",
+        "--max-time", "5", "--unix-socket", socket_path,
+        "--cacert", (char *)ca_path, "-o", (char *)body_path, url, NULL};
+    pid_t child;
+    int status = 0;
+    int ok = posix_spawn(&child, program, NULL, NULL, args, environ) == 0;
+    if (ok)
+        ok = waitpid(child, &status, 0) == child &&
+            WIFEXITED(status) && WEXITSTATUS(status) == expected;
+    shutdown(listener, SHUT_RDWR);
+    close(listener);
+    pthread_join(thread, NULL);
+    unlink(socket_path);
+    unlink(ca_path);
+    if (ok && expected == 0) {
+        FILE *body = fopen(body_path, "rb");
+        char bytes[32] = {0};
+        ok = body != NULL;
+        if (body != NULL) {
+            size_t count = fread(bytes, 1, sizeof(bytes), body);
+            ok = count == 11 && memcmp(bytes, "td-curl-ok\n", 11) == 0;
+            if (fclose(body) != 0)
+                ok = 0;
+        }
+    }
+    unlink(body_path);
+    return ok && state.ok;
+}
+
 static const char *shown(const char *value) {
     return value == NULL ? "<null>" : value;
 }
@@ -309,7 +389,9 @@ static int fail_text(const char *label, const char *expected,
     return code;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc != 2)
+        return 16;
     signal(SIGPIPE, SIG_IGN);
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
         fputs("curl global initialization failed\n", stderr);
@@ -437,6 +519,16 @@ int main(void) {
         return 15;
     }
 
+    if (!cli_transfer(argv[1], server_context, "localhost", trusted_pem,
+            trusted_length, 0) ||
+        !cli_transfer(argv[1], server_context, "wrong.example", trusted_pem,
+            trusted_length, CURLE_PEER_FAILED_VERIFICATION) ||
+        !cli_transfer(argv[1], server_context, "localhost", unrelated_pem,
+            unrelated_length, CURLE_PEER_FAILED_VERIFICATION)) {
+        fputs("installed curl CLI HTTPS fixture failed\n", stderr);
+        return 17;
+    }
+
     SSL_CTX_free(server_context);
     X509_free(server_certificate);
     X509_free(unrelated_certificate);
@@ -499,7 +591,7 @@ int main(void) {
             &[
                 SH,
                 "-c",
-                "actual=$('{root}/curl-test'); status=$?; \
+                "actual=$('{root}/curl-test' '{in:curl-x86-64}/bin/curl'); status=$?; \
                  if test \"$status\" -ne 0; then echo \"curl HTTPS probe failed with status $status\" >&2; exit \"$status\"; fi; \
                  test \"$actual\" = 'curl 8.23.0 verified HTTPS and rejected hostname/trust failures' || { echo \"unexpected curl result: $actual\" >&2; exit 1; }",
             ],

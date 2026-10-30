@@ -1,9 +1,11 @@
-use crate::shared::{build_root_static_cc, unpack_into, BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
+use crate::shared::{
+    build_root_link_map_check, build_root_static_cc, unpack_into, LinkedLibc, BUILD_ROOT_PATH,
+    BUILD_ROOT_SH as SH,
+};
 use crate::types::{Recipe, Step};
 
-// Static libcurl for Git's HTTP and HTTPS transports. This is intentionally a
-// library-only output: td does not need a second interactive downloader, and a
-// narrow protocol/dependency surface makes the eventual Git closure auditable.
+// Static HTTP(S)-only curl CLI and libcurl for Git's transports.
+// Both use the same narrow, reviewed protocol and dependency surface.
 // It compiles in the Debian build root against td glibc
 // (`build_root_static_cc`); Git's link consumes the archive.
 pub fn recipe() -> Recipe {
@@ -94,7 +96,10 @@ pub fn recipe() -> Recipe {
         .env("RANLIB", "/usr/bin/ranlib")
         .env("NM", "/usr/bin/nm")
         .env("CPPFLAGS", &format!("-I{tls}/include -I{zlib}/include"))
-        .env("LDFLAGS", &format!("-L{tls}/lib -L{zlib}/lib"))
+        .env(
+            "LDFLAGS",
+            &format!("-L{tls}/lib -L{zlib}/lib -Wl,--build-id=sha1"),
+        )
         .env("CFLAGS", &cflags)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
@@ -115,6 +120,42 @@ pub fn recipe() -> Recipe {
         .env("SHELL", SH)
         .env("SOURCE_DATE_EPOCH", "1"),
     );
+    steps.push(
+        Step::run(
+            "{src}",
+            &[
+                "/usr/bin/make",
+                "-j{jobs}",
+                "-C",
+                "src",
+                "curl",
+                &format!("SHELL={SH}"),
+            ],
+        )
+        .env("PATH", &path)
+        .env("CONFIG_SHELL", SH)
+        .env("SHELL", SH)
+        .env("TD_LINK_MAP", "{root}/curl.map")
+        .env("SOURCE_DATE_EPOCH", "1"),
+    );
+    steps.push(build_root_link_map_check(
+        "{src}/src",
+        "{root}/curl.map",
+        "curl",
+        &["gcc-runtime", "libressl-x86-64", "zlib-x86-64"],
+        LinkedLibc::Archive,
+    ));
+    steps.push(Step::MkDir {
+        path: "{out}/bin".into(),
+    });
+    steps.push(Step::CopyFiles {
+        files: vec!["{src}/src/curl".into()],
+        dest: "{out}/bin".into(),
+    });
+    steps.push(Step::Require {
+        paths: vec!["{out}/bin/curl".into()],
+        exec: true,
+    });
     steps.push(Step::MkDir {
         path: "{out}/lib".into(),
     });
@@ -154,6 +195,16 @@ pub fn recipe() -> Recipe {
             "{out}/include/curl/curl.h".into(),
             "{out}/include/curl/curlver.h".into(),
             "{out}/include/curl/easy.h".into(),
+        ],
+        exec: false,
+    });
+
+    steps.push(Step::assert_static(&["{out}/bin/curl"]));
+    steps.push(Step::split_debug_tree("{out}", "/usr/bin/objcopy"));
+    steps.push(Step::Require {
+        paths: vec![
+            "{out}/lib/debug/bin/curl.debug".into(),
+            "{out}/lib/debug/.td-assembly-exception".into(),
         ],
         exec: false,
     });
