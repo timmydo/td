@@ -57,7 +57,7 @@ fn plan() -> Plan {
     .unwrap()
 }
 fn plan_bytes() -> Vec<u8> {
-    let mut bytes = b"TDPLAN04".to_vec();
+    let mut bytes = b"TDPLAN05".to_vec();
     bytes.extend([1; 32]);
     bytes.extend([2; 32]);
     bytes.extend(uuid());
@@ -134,7 +134,7 @@ fn replies() -> Vec<Reply> {
 
 #[test]
 fn wire_bytes_are_independently_specified() {
-    assert_eq!(GREETING, b"TDINS09\n");
+    assert_eq!(GREETING, b"TDINS10\n");
     let mut propose = vec![0x02];
     propose.extend(DESTINATION);
     propose.extend(SETTINGS);
@@ -167,8 +167,8 @@ fn wire_bytes_are_independently_specified() {
         &acknowledge,
     ];
     for (request, bytes) in requests().iter().zip(expected) {
-        assert_eq!(request.encode(), bytes, "{request:?}");
-        assert_eq!(&Request::decode(bytes).unwrap(), request);
+        assert_eq!(request.encode(), bytes);
+        assert_eq!(Request::decode(bytes).unwrap().encode(), request.encode());
     }
 
     let mut destinations = b"\x81TDCAND01\x01".to_vec();
@@ -256,7 +256,10 @@ fn wire_bytes_are_independently_specified() {
 #[test]
 fn every_message_round_trips_and_codes_are_dense() {
     for request in requests() {
-        assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+        assert_eq!(
+            Request::decode(&request.encode()).unwrap().encode(),
+            request.encode()
+        );
     }
     for reply in replies() {
         assert_eq!(Reply::decode(&reply.encode()).unwrap(), reply);
@@ -270,7 +273,7 @@ fn every_message_round_trips_and_codes_are_dense() {
     let expect = |count: u8| (1..=count).collect::<Vec<_>>();
     assert_eq!(
         codes(Refusal::ALL.iter().map(|&r| Reply::Refused(r)).collect()),
-        expect(16)
+        (1..=16).chain([18, 19]).collect::<Vec<_>>()
     );
     let status = |state| Reply::Status(state);
     assert_eq!(
@@ -353,14 +356,17 @@ fn maximal_messages_fit_their_direction_bounds() {
     // Propose carries the person's choice, one byte, and no storage: the
     // service names device-bound storage only from its probes.
     assert_eq!(propose.encode().len(), 1105);
-    assert_eq!(Request::decode(&propose.encode()).unwrap(), propose);
+    assert_eq!(
+        Request::decode(&propose.encode()).unwrap().encode(),
+        propose.encode()
+    );
     let mut choice = propose.encode();
     for code in 2..=255 {
         if let Some(last) = choice.last_mut() {
             *last = code;
         }
         assert_eq!(
-            Request::decode(&choice).unwrap_err(),
+            Request::decode(&choice).err().unwrap(),
             "invalid proposal storage choice",
             "{code}"
         );
@@ -379,7 +385,10 @@ fn maximal_messages_fit_their_direction_bounds() {
     let execute = Request::Execute(plan.clone());
     assert_eq!(execute.encode().len(), 1195);
     assert!(execute.encode().len() <= MAX_REQUEST_BYTES);
-    assert_eq!(Request::decode(&execute.encode()).unwrap(), execute);
+    assert_eq!(
+        Request::decode(&execute.encode()).unwrap().encode(),
+        execute.encode()
+    );
     let reviewed = Reply::Reviewed(Box::new(plan));
     assert_eq!(reviewed.encode().len(), 1195);
     assert_eq!(Reply::decode(&reviewed.encode()).unwrap(), reviewed);
@@ -447,7 +456,7 @@ fn oversize_refuses_before_parsing() {
     let mut request = vec![0x01];
     request.resize(MAX_REQUEST_BYTES + 1, 0);
     assert_eq!(
-        Request::decode(&request).unwrap_err(),
+        Request::decode(&request).err().unwrap(),
         "installation request exceeds wire bound"
     );
     let mut reply = vec![0x83, 0];
@@ -487,11 +496,11 @@ fn every_truncation_and_extension_refuses() {
 #[test]
 fn unknown_tags_codes_and_zero_nonces_refuse() {
     for tag in 0..=255u8 {
-        let known_request = (0x01..=0x0b).contains(&tag);
-        let known_reply = (0x81..=0x86).contains(&tag);
+        let known_request = (0x01..=0x0c).contains(&tag);
+        let known_reply = (0x81..=0x87).contains(&tag);
         if !known_request {
             assert_eq!(
-                Request::decode(&[tag]).unwrap_err(),
+                Request::decode(&[tag]).err().unwrap(),
                 "unknown installation request",
                 "{tag}"
             );
@@ -510,7 +519,7 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
         bytes.extend(detail);
         Reply::decode(&bytes)
     };
-    for code in 7..=255 {
+    for code in 8..=255 {
         assert_eq!(
             status(code, None).unwrap_err(),
             "unknown installation state"
@@ -529,7 +538,7 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
             );
         }
     }
-    for code in (0..=255).filter(|c| *c == 0 || *c > 17) {
+    for code in (0..=255).filter(|c| *c == 0 || *c == 17 || *c > 19) {
         assert_eq!(
             Reply::decode(&[0x84, code]).unwrap_err(),
             "unknown installation refusal"
@@ -552,11 +561,11 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
     zero_key.extend(KEY);
     for error in [
         Reply::decode(&zero_status).unwrap_err(),
-        Request::decode(&zero_withdraw).unwrap_err(),
-        Request::decode(&zero_restart).unwrap_err(),
-        Request::decode(&zero_power_off).unwrap_err(),
-        Request::decode(&zero_recovery).unwrap_err(),
-        Request::decode(&zero_acknowledge).unwrap_err(),
+        Request::decode(&zero_withdraw).err().unwrap(),
+        Request::decode(&zero_restart).err().unwrap(),
+        Request::decode(&zero_power_off).err().unwrap(),
+        Request::decode(&zero_recovery).err().unwrap(),
+        Request::decode(&zero_acknowledge).err().unwrap(),
         Reply::decode(&zero_key).unwrap_err(),
     ] {
         assert_eq!(error, "installation review nonce cannot be zero");
@@ -567,7 +576,7 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
 #[test]
 fn directions_are_disjoint() {
     for request in requests() {
-        assert!(Reply::decode(&request.encode()).is_err(), "{request:?}");
+        assert!(Reply::decode(&request.encode()).is_err());
     }
     for reply in replies() {
         assert!(Request::decode(&reply.encode()).is_err(), "{reply:?}");
@@ -576,7 +585,7 @@ fn directions_are_disjoint() {
 
 #[test]
 fn only_this_version_is_admitted() {
-    assert!(check_greeting(b"TDINS09\n").is_ok());
+    assert!(check_greeting(b"TDINS10\n").is_ok());
     for other in [
         b"TDINS08\n",
         b"TDINS07\n",
@@ -587,7 +596,7 @@ fn only_this_version_is_admitted() {
         b"TDINS02\n",
         b"TDAT001\n",
         b"TDUPD01\n",
-        b"TDINS09\0",
+        b"TDINS10\0",
     ] {
         assert_eq!(
             check_greeting(other).unwrap_err(),
@@ -649,7 +658,7 @@ fn propose_reuses_field_admission() {
     let mut bad_name = bytes.clone();
     bad_name[name + 2] = b'/';
     assert_eq!(
-        Request::decode(&bad_name).unwrap_err(),
+        Request::decode(&bad_name).err().unwrap(),
         "invalid installation destination kernel name"
     );
     let mut bad_sector = bytes.clone();
@@ -659,7 +668,7 @@ fn propose_reuses_field_admission() {
     let mut spaced = bytes.clone();
     spaced[settings_at + 3] = b' ';
     assert_eq!(
-        Request::decode(&spaced).unwrap_err(),
+        Request::decode(&spaced).err().unwrap(),
         "plan choice cannot contain spaces"
     );
     let mut long = bytes[..settings_at].to_vec();
@@ -667,7 +676,7 @@ fn propose_reuses_field_admission() {
     long.extend([b'a'; 33]);
     long.extend(&SETTINGS[7..]);
     assert_eq!(
-        Request::decode(&long).unwrap_err(),
+        Request::decode(&long).err().unwrap(),
         "invalid request string length"
     );
 }
@@ -722,7 +731,7 @@ fn replies_pair_only_with_their_requests() {
             assert_eq!(
                 reply.answers(&request),
                 expected(&request, &reply),
-                "{request:?} {reply:?}"
+                "{reply:?}"
             );
         }
     }
@@ -734,9 +743,42 @@ fn reinstall_carries_only_the_disk_not_replacement_account_settings() {
     let bytes = request.encode();
     assert_eq!(bytes[0], 0x0b);
     assert_eq!(&bytes[1..], DESTINATION);
-    assert_eq!(Request::decode(&bytes).unwrap(), request);
+    assert_eq!(Request::decode(&bytes).unwrap().encode(), request.encode());
     assert!(Reply::Reviewed(Box::new(plan().preserving())).answers(&request));
     let mut excess = bytes;
     excess.extend(SETTINGS);
     assert!(Request::decode(&excess).is_err());
+}
+
+#[test]
+fn unlock_entry_and_wire_bounds_are_independent_of_public_plan_bounds() {
+    use td_install::installation_protocol::{request_bound, UnlockEntry};
+    assert!(UnlockEntry::new(&[b'1'; 257]).is_err());
+    let entry = UnlockEntry::new(&[b'1'; 256]).unwrap();
+    let message = Request::Unlock(nonce(), entry).encode();
+    assert_eq!(message.len(), 289);
+    assert_eq!(message[0], 0x0c);
+    assert_eq!(&message[1..33], &[7; 32]);
+    assert_eq!(Request::decode(&message).unwrap().encode(), message);
+    assert!(request_bound(0x0c, 290).is_err());
+    assert!(request_bound(0x0c, 32).is_err());
+    assert!(request_bound(0x0c, 33).is_ok());
+    let mut excess = message.clone();
+    excess.push(b'1');
+    assert!(Request::decode(&excess).is_err());
+    for retry in [false, true] {
+        let mut bytes = vec![0x87];
+        bytes.extend([7; 32]);
+        bytes.push(u8::from(retry));
+        assert_eq!(Reply::Unlock(nonce(), retry).encode(), bytes);
+        assert_eq!(
+            Reply::decode(&bytes).unwrap(),
+            Reply::Unlock(nonce(), retry)
+        );
+    }
+    let mut entry = UnlockEntry::new(b"123").unwrap();
+    entry.pop();
+    assert_eq!(entry.as_bytes(), b"12");
+    entry.push(b'4').unwrap();
+    assert_eq!(entry.as_bytes(), b"124");
 }

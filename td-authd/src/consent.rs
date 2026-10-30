@@ -2750,6 +2750,11 @@ impl Request {
                     }
                     .into(),
                 );
+                if *preserve && *storage == Storage::DeviceBound {
+                    lines.push("TPM PROTECTOR REPLACED; SAVED RECOVERY KEY KEPT".into());
+                    lines.push("EXTRA PASSPHRASE SLOTS REMOVED".into());
+                    lines.push("BOOT DISK NEXT TO BIND THE NEW TPM PROTECTOR".into());
+                }
                 lines.push(
                     if *preserve {
                         "ENTER: REINSTALL   ESC: CANCEL"
@@ -4374,6 +4379,29 @@ mod tests {
             .lines()
             .iter()
             .any(|line| line.contains("ERASE") || line.contains("AUTOMATIC LOGIN")));
+    }
+
+    #[test]
+    fn encrypted_reinstall_discloses_protector_replacement_and_retained_recovery() {
+        let mut operation = disk(None, None);
+        if let Operation::InstallDisk {
+            preserve, storage, ..
+        } = &mut operation
+        {
+            *preserve = true;
+            *storage = Storage::DeviceBound;
+        }
+        let lines = Request::new([1; 32], 1000, operation).unwrap().lines();
+        assert!(lines
+            .iter()
+            .any(|line| line == "TPM PROTECTOR REPLACED; SAVED RECOVERY KEY KEPT"));
+        assert!(lines
+            .iter()
+            .any(|line| line == "EXTRA PASSPHRASE SLOTS REMOVED"));
+        assert!(lines
+            .iter()
+            .any(|line| line == "BOOT DISK NEXT TO BIND THE NEW TPM PROTECTOR"));
+        assert!(!lines.iter().any(|line| line.contains("ERASE")));
     }
 
     fn disk(model: Option<Label>, serial: Option<Label>) -> Operation {

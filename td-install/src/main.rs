@@ -1032,7 +1032,7 @@ fn refuse(
 }
 
 impl installation_service::Host for LiveHost {
-    type Claim = File;
+    type Claim = reinstall::Claim;
 
     fn candidates(
         &mut self,
@@ -1101,8 +1101,9 @@ impl installation_service::Host for LiveHost {
     fn claim(
         &mut self,
         destination: &installation_plan::Destination,
-    ) -> Result<File, installation_protocol::Refusal> {
+    ) -> Result<Self::Claim, installation_protocol::Refusal> {
         inventory::claim_destination(destination)
+            .map(reinstall::Claim::from)
             .map_err(|error| refuse(claim_refusal(error.kind()), error))
     }
 
@@ -1119,7 +1120,7 @@ impl installation_service::Host for LiveHost {
 
     fn existing(
         &mut self,
-        claim: &mut File,
+        claim: &mut Self::Claim,
     ) -> Result<([u8; 16], installation_plan::Settings), installation_protocol::Refusal> {
         let fail = |error| refuse(installation_protocol::Refusal::SourceUnavailable, error);
         let (nonce, _) = self.entropy().map_err(fail)?;
@@ -1129,6 +1130,32 @@ impl installation_service::Host for LiveHost {
         let result = result.map_err(fail)?;
         removed.map_err(fail)?;
         Ok(result)
+    }
+
+    fn encrypted(
+        &mut self,
+        claim: &mut Self::Claim,
+    ) -> Result<bool, installation_protocol::Refusal> {
+        reinstall::encrypted(&mut claim.disk)
+            .map_err(|_| installation_protocol::Refusal::EncryptedUnsupported)
+    }
+
+    fn unlock(
+        &mut self,
+        claim: &mut Self::Claim,
+        entry: &[u8],
+        peer: Option<&std::os::unix::net::UnixStream>,
+    ) -> Result<([u8; 16], installation_plan::Settings), installation_protocol::Refusal> {
+        use installation_protocol::Refusal;
+        let (nonce, _) = self.entropy().map_err(|_| Refusal::SourceUnavailable)?;
+        let workspace =
+            Workspace::create(Path::new("/run"), &nonce).map_err(|_| Refusal::SourceUnavailable)?;
+        let result = reinstall::unlock(claim, &self.root, &workspace, entry, peer);
+        if workspace.remove().is_err() {
+            claim.unlocked = None;
+            return Err(Refusal::SourceUnavailable);
+        }
+        result
     }
 
     fn check_fit(
@@ -1163,7 +1190,11 @@ impl installation_service::Host for LiveHost {
             .map_err(|error| refuse(Refusal::SourceUnavailable, error))
     }
 
-    fn recheck(&mut self, destination: &installation_plan::Destination, claim: &mut File) -> bool {
+    fn recheck(
+        &mut self,
+        destination: &installation_plan::Destination,
+        claim: &mut Self::Claim,
+    ) -> bool {
         match inventory::recheck_claim_destination(destination, claim) {
             Ok(()) => true,
             Err(error) => {
@@ -2048,11 +2079,11 @@ fn canonical_uuid(bytes: &[u8; 16]) -> String {
 
 use installation_service::Acknowledgement;
 
-impl installation_service::Execute<File> for LiveExecution {
+impl installation_service::Execute<reinstall::Claim> for LiveExecution {
     fn execute(
         &self,
         plan: &installation_plan::Plan,
-        claim: File,
+        claim: reinstall::Claim,
         progress: &mut dyn FnMut(installation_protocol::Phase),
         recovery: &mut dyn FnMut(installation_protocol::RecoveryDigits) -> Acknowledgement,
     ) -> Result<(), installation_protocol::Failure> {
@@ -2064,12 +2095,13 @@ impl installation_service::Execute<File> for LiveExecution {
         // or a name an earlier execution left.
         let workspace = Workspace::create(&self.run, plan.nonce())
             .map_err(|error| report((installation_protocol::Failure::InsufficientSpace, error)))?;
+        let reinstall::Claim { disk, unlocked } = claim;
         let outcome = if plan.mode() == installation_plan::Mode::Preserve {
-            reinstall::execute(self, plan, claim, &workspace, progress)
+            reinstall::execute(self, plan, disk, unlocked, &workspace, progress)
                 .map(|()| None)
                 .map_err(|error| (installation_protocol::Failure::WriteFailed, error))
         } else {
-            self.install(plan, claim, &workspace, progress)
+            self.install(plan, disk, &workspace, progress)
         };
         // Before the acknowledgement: nothing after verifying boot needs it.
         if let Err(error) = workspace.remove() {
@@ -11528,7 +11560,7 @@ mod tests {
             // No execution these tests reach gets as far as an acknowledgement.
             let outcome = self.execution.execute(
                 &self.plan,
-                claim,
+                claim.into(),
                 &mut |phase| phases.push(phase),
                 &mut |_| panic!("a recovery key was handed over"),
             );

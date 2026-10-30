@@ -360,7 +360,7 @@ the bound digest before activation. The runner refuses `kill-slot` and
 td-luks independently authenticates the operation and refuses empty input.
 
 `run_bounded` is `run` for a child that holds a secret past its caller's
-control: it keeps no output, the child's standard output being null,
+control: it keeps no output, both child output streams being null,
 and polls the child's exit every 10 ms until it exits, a deadline passes
 or a caller's `abandoned` says the caller is gone. Past either of those
 it kills the child and reaps it before returning `Expired` or
@@ -456,8 +456,9 @@ it.
 ## Live reinstall protector replacement
 
 The library mechanism for ENCRYPTION.md's planned encrypted reinstall is
-`transition::reinstall_plan` and `release::reinstall`. The live service
-still refuses encrypted preserve mode; this mechanism alone does not
+`transition::reinstall_eligible`, `transition::reinstall_plan` and
+`release::reinstall`. Eligibility is the nonmutating token/slot admission
+shared with the live service before recovery entry. The mechanism alone does not
 install a deployment, write an ESP or grant consent. Its caller must hold
 the disk claim, admit the volume format and identities, obtain the explicit
 reinstall approval and run only after the live selector's release cap.
@@ -469,8 +470,8 @@ It refuses every foreign or protected-tier token, including a pending
 keyslot-less FIDO2 token, and keeps the existing shared-slot and slot-0
 refusals. The executor confirms the initial token/slot view through the
 runner's metadata and requires every keyslot to be bound to the one
-volume, with no reencryption. The real td-luks metadata command also
-admits its fixed profile before returning JSON. No slot-0-only proof of
+volume, with no reencryption. The td-luks metadata command and the shared profile reader used by the
+live reinstall runner also admit the fixed profile before returning JSON. No slot-0-only proof of
 an unbound obsolete volume key can authorize cleanup.
 
 `release::reinstall` generates a new secret, seals it under the first-boot

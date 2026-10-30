@@ -67,6 +67,12 @@ pub(super) fn install(device: &str, cut: bool, channel: Option<&Path>) -> Result
             samples.luks.len()
         ),
     )?;
+    // A low-space refusal leaves the header untouched. Two successful
+    // preserving replacements exercise both free-slot choices and leave
+    // the original fixture's final 0/1 shape for its independent host parser.
+    for pass in 0..3 {
+        reinstall(device, &uuid, &key, deployment, pass)?;
+    }
     if bound_loops()? != loops {
         return Err("the installation left a loop device bound".into());
     }
@@ -101,6 +107,281 @@ pub(super) fn install(device: &str, cut: bool, channel: Option<&Path>) -> Result
         format_args!("{ENCRYPTED_MARKER} {uuid} {device}"),
     )?;
     report(std::io::stdout(), format_args!("{ENCRYPTED_END_MARKER}"))
+}
+
+/// Exercise the production recovery unlock and preserving writer, keeping a
+/// file under @var and the original slot-zero encrypted area byte for byte.
+fn reinstall(
+    device: &str,
+    uuid: &str,
+    key: &RecoveryDigits,
+    deployment: [u8; 32],
+    pass: u8,
+) -> Result<(), String> {
+    let seed = pass == 0;
+    let low_space = pass == 0;
+    applet(&["reread-partitions", device])?;
+    let (_, volume) = partitions(device)?;
+    let area = || -> Result<Vec<u8>, String> {
+        let mut disk = File::open(&volume).map_err(|e| e.to_string())?;
+        disk.seek(SeekFrom::Start(32768))
+            .map_err(|e| e.to_string())?;
+        let mut bytes = vec![0; 258048];
+        disk.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+        Ok(bytes)
+    };
+    let before = area()?;
+    // Take exactly both header copies, without scanning the payload.
+    let header = || -> Result<Vec<u8>, String> {
+        let mut bytes = vec![0; 32768];
+        File::open(&volume)
+            .and_then(|mut file| file.read_exact(&mut bytes))
+            .map_err(|e| e.to_string())?;
+        Ok(bytes)
+    };
+    let original_header = header()?;
+    let retained = |create: bool| -> Result<(), String> {
+        if luks(&["open", "0", &volume, MAPPING], key.as_bytes())? != Some(0) {
+            return Err("fixture cannot open saved recovery slot".into());
+        }
+        let mapped = format!("/dev/mapper/{MAPPING}");
+        command("/bin/td-boot", &["mount-var", &mapped, "/state"])?;
+        let home = format!("/state/home/{USERNAME}");
+        if create {
+            fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+            std::os::unix::fs::chown(&home, Some(1000), Some(1000)).map_err(|e| e.to_string())?;
+        }
+        let file = format!("{home}/reinstall-kept");
+        let result = if create {
+            fs::write(&file, b"personal file survives encrypted reinstall\n")
+                .map_err(|e| e.to_string())
+        } else {
+            read(Path::new(&file), 128).and_then(|bytes| {
+                if bytes == b"personal file survives encrypted reinstall\n" {
+                    Ok(())
+                } else {
+                    Err("personal file changed".into())
+                }
+            })
+        };
+        if low_space && create {
+            let payloads = ["bzImage", "initramfs.cpio", "root.erofs", "manifest"]
+                .iter()
+                .try_fold(0u64, |sum, name| {
+                    fs::metadata(Path::new("/source").join(name)).map(|m| sum + m.len())
+                })
+                .map_err(|e| e.to_string())?;
+            let output = Command::new("/root-image/bin/df")
+                .args(["--block-size=1", "--output=avail", "/state"])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                return Err("fixture space query failed".into());
+            }
+            let available: u64 = std::str::from_utf8(&output.stdout)
+                .ok()
+                .and_then(|s| s.lines().last())
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or("fixture space query malformed")?;
+            let mut remaining = available
+                .checked_sub(payloads + 64 * 1024 * 1024)
+                .ok_or("fixture lacks staging headroom")?;
+            let mut filler = File::create("/state/reinstall-space").map_err(|e| e.to_string())?;
+            let block = vec![0x5a; 1024 * 1024];
+            while remaining != 0 {
+                let count = remaining.min(block.len() as u64) as usize;
+                filler
+                    .write_all(block.get(..count).ok_or("filler range")?)
+                    .map_err(|e| e.to_string())?;
+                remaining -= count as u64;
+            }
+            filler.sync_all().map_err(|e| e.to_string())?;
+        } else if low_space {
+            fs::remove_file("/state/reinstall-space").map_err(|e| e.to_string())?;
+        }
+        let unmounted = applet(&["umount", "/state"]);
+        let closed = luks(&["close", MAPPING], &[]);
+        result?;
+        unmounted?;
+        if closed? != Some(0) {
+            return Err("fixture mapping survived close".into());
+        }
+        Ok(())
+    };
+    if seed {
+        retained(true)?;
+    }
+    if pass == 2 {
+        let mut primary = fs::OpenOptions::new()
+            .write(true)
+            .open(&volume)
+            .map_err(|e| e.to_string())?;
+        primary
+            .write_all(b"broken")
+            .and_then(|()| primary.sync_all())
+            .map_err(|e| e.to_string())?;
+    }
+    let mut service = Service::start(if low_space {
+        Stdio::piped()
+    } else {
+        Stdio::inherit()
+    })?;
+    let diagnostics = service.child.stderr.take();
+    let driven = (|| {
+        let mut greeting = [0; 8];
+        service
+            .installer
+            .read_exact(&mut greeting)
+            .map_err(|e| e.to_string())?;
+        installation_protocol::check_greeting(&greeting)?;
+        service
+            .installer
+            .write_all(installation_protocol::GREETING)
+            .map_err(|e| e.to_string())?;
+        service
+            .authority
+            .read_exact(&mut greeting)
+            .map_err(|e| e.to_string())?;
+        installation_consent::check_greeting(&greeting)?;
+        service
+            .authority
+            .write_all(installation_consent::GREETING)
+            .map_err(|e| e.to_string())?;
+        let Reply::Destinations(disks) = exchange(&mut service.installer, &Request::Destinations)?
+        else {
+            return Err("reinstall discovery refused".into());
+        };
+        let disk = disks
+            .as_slice()
+            .iter()
+            .find(|disk| Some(disk.name()) == device.strip_prefix("/dev/"))
+            .ok_or("reinstall disk absent")?
+            .clone();
+        let Reply::Unlock(challenge, false) =
+            exchange(&mut service.installer, &Request::Reinstall(disk.clone()))?
+        else {
+            return Err("reinstall did not request recovery".into());
+        };
+        let mut wrong_digits = *key.as_bytes();
+        let first = wrong_digits.get_mut(..6).ok_or("missing key group")?;
+        let replacement = if first == b"000000" {
+            b"000013"
+        } else {
+            b"000000"
+        };
+        first.copy_from_slice(replacement);
+        let wrong = installation_protocol::UnlockEntry::new(&wrong_digits);
+        installation_protocol::scrub(&mut wrong_digits);
+        let wrong = wrong?;
+        let Reply::Unlock(retry, true) =
+            exchange(&mut service.installer, &Request::Unlock(challenge, wrong))?
+        else {
+            return Err("wrong recovery entry not refused".into());
+        };
+        if retry == challenge {
+            return Err("recovery challenge reused".into());
+        }
+        let request = Request::Unlock(
+            retry,
+            installation_protocol::UnlockEntry::new(key.as_bytes())?,
+        );
+        let plan = match exchange(&mut service.installer, &request)? {
+            Reply::Reviewed(plan) => plan,
+            reply => return Err(format!("encrypted inspection failed: {reply:?}")),
+        };
+        drop(request);
+        if plan.mode() != installation_plan::Mode::Preserve
+            || plan.storage() != installation_plan::Storage::DeviceBound
+            || plan.destination() != &disk
+            || plan.deployment() != &deployment
+            || plan_uuid(&plan)? != uuid
+        {
+            return Err("encrypted review changed identity".into());
+        }
+        if area()? != before {
+            return Err("inspection changed recovery slot".into());
+        }
+        let nonce = *plan.nonce();
+        if !matches!(exchange(&mut service.installer, &Request::Execute(*plan))?, Reply::Status(State::AwaitingConsent(n)) if *n.as_bytes() == nonce)
+        {
+            return Err("reinstall did not seek consent".into());
+        }
+        let installation_consent::Report::Review(review) = consent_report(&mut service.authority)?
+        else {
+            return Err("reinstall has no consent review".into());
+        };
+        if !review.preserve()
+            || review.storage() != installation_consent::Storage::DeviceBound
+            || review.nonce() != &nonce
+        {
+            return Err("reinstall consent lost encrypted preserve mode".into());
+        }
+        let bytes =
+            installation_consent::frame(&installation_consent::Answer::Consent(nonce).encode())?;
+        service
+            .authority
+            .write_all(&bytes)
+            .map_err(|e| e.to_string())?;
+        if !matches!(consent_report(&mut service.authority)?, installation_consent::Report::Started(n) if n == nonce)
+        {
+            return Err("reinstall did not start".into());
+        }
+        if low_space {
+            loop {
+                match exchange(&mut service.installer, &Request::Status)? {
+                    Reply::Status(State::Running(n, _)) if n.as_bytes() == &nonce => {
+                        std::thread::sleep(Duration::from_millis(100))
+                    }
+                    Reply::Status(State::Failed(
+                        n,
+                        installation_protocol::Failure::WriteFailed,
+                    )) if n.as_bytes() == &nonce => break,
+                    reply => return Err(format!("low-space reinstall was not refused: {reply:?}")),
+                }
+            }
+            return match consent_report(&mut service.authority)? {
+                installation_consent::Report::Finished(
+                    n,
+                    installation_consent::Outcome::Failed,
+                ) if n == nonce => Ok(()),
+                reply => Err(format!("low-space outcome differs: {reply:?}")),
+            };
+        }
+        let mut phases = Vec::new();
+        poll_installation(&mut service.installer, nonce, &mut phases, None)?;
+        if phases.contains(&Phase::RecoveryKey) {
+            return Err("reinstall requested a new recovery key".into());
+        }
+        require_finished(&mut service.authority, nonce)
+    })();
+    service.finish(driven)?;
+    if low_space {
+        let mut bytes = Vec::new();
+        diagnostics
+            .ok_or("no low-space diagnostic channel")?
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 4096
+            || !String::from_utf8_lossy(&bytes)
+                .contains("insufficient space for deployment publication and metadata reserve")
+        {
+            return Err(
+                "low-space attempt did not reach the publication capacity preflight".into(),
+            );
+        }
+    }
+    if low_space && header()? != original_header {
+        return Err("low-space refusal changed encryption metadata".into());
+    }
+    if area()? != before {
+        return Err("reinstall changed recovery slot".into());
+    }
+    retained(false)?;
+    report(
+        std::io::stdout(),
+        format_args!("TD-ENCRYPTED-REINSTALL-OK {uuid}"),
+    )
 }
 
 /// The 48 digits and a newline, in one write, to `channel`: a port only

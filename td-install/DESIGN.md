@@ -385,8 +385,9 @@ update operation below authorizes successor activation.
 
 `INSTALLER.md` "Reinstall while keeping personal files" defines the live
 preserve mode. It is separate from formatting and preserves the existing
-GPT, filesystem UUID and writable state. Its first increment refuses
-encryption. It replaces both boot selections and the ESP's kernel and
+GPT, filesystem UUID and writable state. Device-bound volumes use the
+recovery-key inspection and TPM replacement in ENCRYPTION.md; protected
+volumes and unsupported encrypted layouts are refused. It replaces both boot selections and the ESP's kernel and
 selector, and requires explicit physical consent to reinstall. An
 interrupted reset may require another USB boot; keeping personal files is
 not a claim of atomic activation across Btrfs and FAT.

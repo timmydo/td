@@ -285,13 +285,21 @@ pub fn plan(header: &Header, transition: &Transition) -> Result<Plan, Refusal> {
     plan_with_role(header, transition, Role::DeviceBound)
 }
 
-/// Recovery-authorized live reinstall. The executor must verify the imported
-/// token before the next step and stop at the first failure. Slot 0 is tested
-/// before any mutation and again before ordinary protector retirement.
-pub fn reinstall_plan(header: &Header, sealed: &SealedObject) -> Result<Plan, Refusal> {
+/// Admission for recovery-authorized live inspection, before making a
+/// new sealed object. Execution still confirms metadata and keyslot zero.
+pub fn reinstall_eligible(header: &Header) -> Result<(), Refusal> {
+    check(header)?;
     if !header.foreign.is_empty() || !header.protected.is_empty() {
         return Err(Refusal::UnsupportedReinstallTokens);
     }
+    Ok(())
+}
+
+/// Recovery-authorized live reinstall. Verify the imported token before the
+/// next step and stop at the first failure. Test slot 0 before mutation and
+/// again before ordinary protector retirement.
+pub fn reinstall_plan(header: &Header, sealed: &SealedObject) -> Result<Plan, Refusal> {
+    reinstall_eligible(header)?;
     plan_with_role(
         header,
         &Transition::Reseal {

@@ -21,6 +21,7 @@ dependencies = [
  "td-fat",
  "td-fido",
  "td-fs",
+ "td-luks",
  "td-protector",
  "td-tpm",
 ]

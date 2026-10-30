@@ -13,7 +13,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::installation_consent::{self as consent, Answer, Ended, NoConsent, Outcome, Report};
 use crate::installation_plan::{Basis, Candidates, Destination, Plan, Settings, Storage, Zones};
@@ -35,6 +35,20 @@ pub(crate) trait Host {
     /// Inspect under the claim without changing the installed filesystem.
     fn existing(&mut self, _claim: &mut Self::Claim) -> Result<([u8; 16], Settings), Refusal> {
         Err(Refusal::SourceUnavailable)
+    }
+    /// Eligibility only; never unlock or mutate while discovering storage.
+    fn encrypted(&mut self, _claim: &mut Self::Claim) -> Result<bool, Refusal> {
+        Ok(false)
+    }
+    /// Inspect with recovery slot zero and retain the secret privately in
+    /// the claim only after successful read-only inspection.
+    fn unlock(
+        &mut self,
+        _claim: &mut Self::Claim,
+        _entry: &[u8],
+        _peer: Option<&UnixStream>,
+    ) -> Result<([u8; 16], Settings), Refusal> {
+        Err(Refusal::EncryptedUnsupported)
     }
     /// The verified deployment manifest digest.
     fn validate_source(&mut self) -> Result<[u8; 32], Refusal>;
@@ -107,6 +121,12 @@ struct Recovery {
 
 enum Held<C> {
     Idle,
+    Locked {
+        nonce: ReviewNonce,
+        destination: Destination,
+        deployment: [u8; 32],
+        claim: C,
+    },
     Reviewed {
         plan: Box<Plan>,
         claim: C,
@@ -140,6 +160,8 @@ pub(crate) struct Service<H: Host, E> {
     execution: Option<Arc<E>>,
     /// Whether td-authd's consent channel is open; only with an execution.
     consent: bool,
+    review_deadline: Option<Instant>,
+    peer: Option<UnixStream>,
     /// Reports for td-authd, in order.
     reports: Vec<Report>,
 }
@@ -152,6 +174,8 @@ impl<H: Host> Service<H, NoExecution> {
             held: Held::Idle,
             execution: None,
             consent: false,
+            review_deadline: None,
+            peer: None,
             reports: Vec::new(),
         }
     }
@@ -164,6 +188,8 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             held: Held::Idle,
             execution: Some(Arc::new(execution)),
             consent: false,
+            review_deadline: None,
+            peer: None,
             reports: Vec::new(),
         }
     }
@@ -171,6 +197,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
     pub(crate) fn state(&self) -> State {
         match &self.held {
             Held::Idle => State::Idle,
+            Held::Locked { nonce, .. } => State::Locked(*nonce),
             Held::Reviewed { plan, .. } => State::Reviewed(ReviewNonce::from(&**plan)),
             Held::AwaitingConsent { plan, .. } => {
                 State::AwaitingConsent(ReviewNonce::from(&**plan))
@@ -185,9 +212,11 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
 
     /// One reply per request. An error ends the service and its claim.
     pub(crate) fn answer(&mut self, request: Request) -> io::Result<Reply> {
+        self.expire();
         Ok(match request {
+            Request::Unlock(nonce, entry) => self.unlock(nonce, entry.as_bytes())?,
             Request::Reinstall(destination) => match self.propose(destination, None)? {
-                Ok(plan) => Reply::Reviewed(Box::new(plan)),
+                Ok(reply) => reply,
                 Err(refusal) => Reply::Refused(refusal),
             },
             Request::Status => Reply::Status(self.state()),
@@ -200,7 +229,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
                 settings,
                 unencrypted,
             } => match self.propose(destination, Some((settings, unencrypted)))? {
-                Ok(plan) => Reply::Reviewed(Box::new(plan)),
+                Ok(reply) => reply,
                 Err(refusal) => Reply::Refused(refusal),
             },
             Request::Execute(plan) => self.execute(&plan),
@@ -230,7 +259,8 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
                 }
             }
             Held::Running(..) => Reply::Refused(Refusal::Busy),
-            Held::Idle
+            Held::Locked { .. }
+            | Held::Idle
             | Held::Reviewed { .. }
             | Held::AwaitingConsent { .. }
             | Held::Complete(_)
@@ -252,7 +282,8 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
                 recovery
             }
             Held::Running(..) => return Reply::Refused(Refusal::Busy),
-            Held::Idle
+            Held::Locked { .. }
+            | Held::Idle
             | Held::Reviewed { .. }
             | Held::AwaitingConsent { .. }
             | Held::Complete(_)
@@ -307,7 +338,8 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             },
             Held::Complete(_) => Reply::Refused(Refusal::StaleReview),
             Held::Running(..) | Held::Recovering(..) => Reply::Refused(Refusal::Busy),
-            Held::Idle
+            Held::Locked { .. }
+            | Held::Idle
             | Held::Reviewed { .. }
             | Held::AwaitingConsent { .. }
             | Held::Failed(..)
@@ -316,21 +348,23 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
     }
 
     /// A fresh installation's settings come with the person's storage
-    /// choice; a reinstall has neither and keeps unencrypted storage.
+    /// choice; a reinstall has neither and keeps its existing storage.
     fn propose(
         &mut self,
         destination: Destination,
         fresh: Option<(Settings, bool)>,
-    ) -> io::Result<Result<Plan, Refusal>> {
+    ) -> io::Result<Result<Reply, Refusal>> {
         match &self.held {
             // One boot installs once.
-            Held::Reviewed { .. }
+            Held::Locked { .. }
+            | Held::Reviewed { .. }
             | Held::AwaitingConsent { .. }
             | Held::Running(..)
             | Held::Recovering(..)
             | Held::Complete(_) => return Ok(Err(Refusal::Busy)),
             Held::Idle | Held::Failed(..) | Held::Abandoned(..) => {}
         }
+        self.review_deadline = None;
         if let Some((settings, _)) = &fresh {
             if let Err(refusal) = self.host.check_settings(settings) {
                 return Ok(Err(refusal));
@@ -355,6 +389,25 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             Err(refusal) => return Ok(Err(refusal)),
         };
         let (nonce, uuid) = self.host.entropy()?;
+        if fresh.is_none() {
+            match self.host.encrypted(&mut claim) {
+                Ok(true) => {
+                    if self.host.basis().storage() != Storage::DeviceBound {
+                        return Ok(Err(Refusal::EncryptedUnsupported));
+                    }
+                    let nonce = ReviewNonce::new(nonce).map_err(invalid)?;
+                    self.held = Held::Locked {
+                        nonce,
+                        destination,
+                        deployment,
+                        claim,
+                    };
+                    return Ok(Ok(Reply::Unlock(nonce, false)));
+                }
+                Ok(false) => {}
+                Err(refusal) => return Ok(Err(refusal)),
+            }
+        }
         let preserve = fresh.is_none();
         let unencrypted = fresh.as_ref().is_some_and(|(_, unencrypted)| *unencrypted);
         let (uuid, settings, basis) = match fresh {
@@ -391,7 +444,85 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             plan: Box::new(plan.clone()),
             claim,
         };
-        Ok(Ok(plan))
+        Ok(Ok(Reply::Reviewed(Box::new(plan))))
+    }
+
+    fn expire(&mut self) {
+        if self
+            .review_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.review_deadline = None;
+            if let Held::Reviewed { plan, .. } = &self.held {
+                self.held = Held::Abandoned(ReviewNonce::from(&**plan), Abandon::ConsentExpired);
+            }
+        }
+    }
+
+    fn unlock(&mut self, supplied: ReviewNonce, entry: &[u8]) -> io::Result<Reply> {
+        let Held::Locked { nonce, .. } = &self.held else {
+            return Ok(Reply::Refused(Refusal::NoReview));
+        };
+        if *nonce != supplied {
+            return Ok(Reply::Refused(Refusal::StaleReview));
+        }
+        // Consume before authenticating: even a rejected entry needs a fresh
+        // challenge, and no public message can recreate a retained secret.
+        let Held::Locked {
+            destination,
+            deployment,
+            mut claim,
+            ..
+        } = std::mem::replace(&mut self.held, Held::Idle)
+        else {
+            return Ok(Reply::Refused(Refusal::NoReview));
+        };
+        if !self.host.recheck(&destination, &mut claim) {
+            return Ok(Reply::Refused(Refusal::DestinationChanged));
+        }
+        let (nonce, _) = self.host.entropy()?;
+        let nonce = ReviewNonce::new(nonce).map_err(invalid)?;
+        let (uuid, settings) = match self.host.unlock(&mut claim, entry, self.peer.as_ref()) {
+            Ok(observed) => observed,
+            Err(Refusal::RecoveryKeyRejected) => {
+                self.held = Held::Locked {
+                    nonce,
+                    destination,
+                    deployment,
+                    claim,
+                };
+                return Ok(Reply::Unlock(nonce, true));
+            }
+            Err(refusal) => return Ok(Reply::Refused(refusal)),
+        };
+        if let Err(refusal) = self.host.check_settings(&settings) {
+            return Ok(Reply::Refused(refusal));
+        }
+        let plan = Plan::new(
+            *nonce.as_bytes(),
+            destination,
+            deployment,
+            uuid,
+            self.host.basis(),
+            settings,
+        )
+        .map_err(invalid)?
+        .preserving();
+        if let Err(refusal) = self.host.check_fit(&plan) {
+            return Ok(Reply::Refused(refusal));
+        }
+        if !self.host.recheck(plan.destination(), &mut claim) {
+            return Ok(Reply::Refused(Refusal::DestinationChanged));
+        }
+        self.review_deadline = Instant::now().checked_add(Duration::from_secs(600));
+        if self.review_deadline.is_none() {
+            return Err(invalid("review deadline overflow".into()));
+        }
+        self.held = Held::Reviewed {
+            plan: Box::new(plan.clone()),
+            claim,
+        };
+        Ok(Reply::Reviewed(Box::new(plan)))
     }
 
     fn execute(&mut self, echoed: &Plan) -> Reply {
@@ -400,9 +531,11 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             Held::AwaitingConsent { .. } | Held::Running(..) | Held::Recovering(..) => {
                 return Reply::Refused(Refusal::Busy)
             }
-            Held::Idle | Held::Complete(_) | Held::Failed(..) | Held::Abandoned(..) => {
-                return Reply::Refused(Refusal::NoReview)
-            }
+            Held::Locked { .. }
+            | Held::Idle
+            | Held::Complete(_)
+            | Held::Failed(..)
+            | Held::Abandoned(..) => return Reply::Refused(Refusal::NoReview),
         };
         if **plan != *echoed {
             return Reply::Refused(Refusal::StaleReview);
@@ -425,19 +558,29 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
         let Held::Reviewed { plan, claim } = std::mem::replace(&mut self.held, Held::Idle) else {
             return Reply::Refused(Refusal::NoReview);
         };
+        self.review_deadline = None;
         self.held = Held::AwaitingConsent { plan, claim };
         self.reports.push(Report::Review(Box::new(review)));
         Reply::Status(State::AwaitingConsent(nonce))
     }
 
     fn withdraw(&mut self, nonce: ReviewNonce) -> Reply {
+        if let Held::Locked { nonce: held, .. } = &self.held {
+            if *held != nonce {
+                return Reply::Refused(Refusal::StaleReview);
+            }
+            self.held = Held::Abandoned(nonce, Abandon::Withdrawn);
+            return Reply::Status(self.state());
+        }
         let (plan, sent) = match &self.held {
             Held::Reviewed { plan, .. } => (plan, false),
             Held::AwaitingConsent { plan, .. } => (plan, true),
             Held::Running(..) | Held::Recovering(..) => return Reply::Refused(Refusal::Busy),
-            Held::Idle | Held::Complete(_) | Held::Failed(..) | Held::Abandoned(..) => {
-                return Reply::Refused(Refusal::NoReview)
-            }
+            Held::Locked { .. }
+            | Held::Idle
+            | Held::Complete(_)
+            | Held::Failed(..)
+            | Held::Abandoned(..) => return Reply::Refused(Refusal::NoReview),
         };
         if ReviewNonce::from(&**plan) != nonce {
             return Reply::Refused(Refusal::StaleReview);
@@ -446,6 +589,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             self.reports
                 .push(Report::Ended(*nonce.as_bytes(), Ended::Withdrawn));
         }
+        self.review_deadline = None;
         self.held = Held::Abandoned(nonce, Abandon::Withdrawn);
         Reply::Status(self.state())
     }
@@ -522,6 +666,9 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
     /// running.
     pub(crate) fn installer_lost(&mut self) -> bool {
         match &self.held {
+            Held::Locked { nonce, .. } => {
+                self.held = Held::Abandoned(*nonce, Abandon::Withdrawn);
+            }
             Held::Running(..) => return true,
             Held::Recovering(nonce, _) => {
                 let nonce = *nonce;
@@ -657,6 +804,7 @@ where
     stream.read_exact(&mut greeting)?;
     check_greeting(&greeting).map_err(invalid)?;
     stream.set_write_timeout(Some(PEER_TIMEOUT))?;
+    service.peer = Some(stream.try_clone()?);
     let (events, inbox) = mpsc::channel();
     // The installer reader reads one request, then waits for its reply to
     // be written, so an installer that does not read cannot queue more.
@@ -682,8 +830,13 @@ where
     }
     let mut installer_result = None;
     let result = loop {
-        let Ok(event) = inbox.recv() else {
-            break Err(invalid("service events ended".into()));
+        service.expire();
+        let event = match inbox.recv_timeout(Duration::from_millis(250)) {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(invalid("service events ended".into()))
+            }
         };
         match event {
             // Once the installer is gone, a running installation is all
@@ -901,11 +1054,17 @@ fn read_request(stream: &mut UnixStream) -> io::Result<Option<Request>> {
         return Ok(None);
     };
     let length = payload_len(header, MAX_REQUEST_BYTES).map_err(invalid)?;
-    let mut payload = vec![0; length];
-    // No request carries recovery digits; a frame cut short is zeroed all
-    // the same, as every request is.
+    let mut tag = [0];
+    stream.read_exact(&mut tag)?;
+    crate::installation_protocol::request_bound(tag.into_iter().next().unwrap_or_default(), length)
+        .map_err(invalid)?;
+    let mut payload = Vec::from(tag);
+    payload.resize(length, 0);
+    let body = payload
+        .get_mut(1..)
+        .ok_or_else(|| invalid("short request".into()))?;
     let request = stream
-        .read_exact(&mut payload)
+        .read_exact(body)
         .and_then(|()| Request::decode(&payload).map(Some).map_err(invalid));
     scrub(&mut payload);
     request
@@ -984,6 +1143,142 @@ mod tests {
         Settings::new("alice", "td-laptop", "us", "Etc/UTC").unwrap()
     }
 
+    fn locked() -> (Service<Fake, NoExecution>, ReviewNonce) {
+        let mut host = Fake::new();
+        host.encrypted = true;
+        host.basis = Basis::new(true, true);
+        let disk = host.disks[0].clone();
+        let mut service = Service::new(host);
+        let Reply::Unlock(nonce, false) = service.answer(Request::Reinstall(disk)).unwrap() else {
+            panic!("no unlock challenge")
+        };
+        (service, nonce)
+    }
+
+    fn unlock_request(nonce: ReviewNonce, entry: &[u8]) -> Request {
+        Request::Unlock(
+            nonce,
+            crate::installation_protocol::UnlockEntry::new(entry).unwrap(),
+        )
+    }
+
+    #[test]
+    fn encrypted_unlock_retries_change_challenge_and_never_authorize_execution() {
+        let (mut service, first) = locked();
+        assert_eq!(service.host.log.lock().unwrap().live, 1);
+        let Reply::Unlock(second, true) = service.answer(unlock_request(first, b"wrong")).unwrap()
+        else {
+            panic!("no retry")
+        };
+        assert_ne!(first, second);
+        assert_eq!(
+            service.answer(unlock_request(first, b"correct")).unwrap(),
+            Reply::Refused(Refusal::StaleReview)
+        );
+        assert_eq!(
+            service.answer(Request::RecoveryKey(second)).unwrap(),
+            Reply::Refused(Refusal::NoReview)
+        );
+        let Reply::Reviewed(plan) = service.answer(unlock_request(second, b"correct")).unwrap()
+        else {
+            panic!("no review")
+        };
+        assert_eq!(plan.mode(), crate::installation_plan::Mode::Preserve);
+        assert_eq!(plan.storage(), Storage::DeviceBound);
+        assert!(!plan.encode().windows(7).any(|bytes| bytes == b"correct"));
+        assert_eq!(
+            service.answer(unlock_request(second, b"correct")).unwrap(),
+            Reply::Refused(Refusal::NoReview)
+        );
+        assert_eq!(
+            service.answer(Request::Execute(*plan)).unwrap(),
+            Reply::Refused(Refusal::ConsentUnavailable)
+        );
+    }
+
+    #[test]
+    fn encrypted_claim_is_released_on_back_disconnect_expiry_or_disk_change() {
+        for stage in 0..4 {
+            let (mut service, nonce) = locked();
+            let log = service.host.log.clone();
+            match stage {
+                0 => {
+                    service.answer(Request::Withdraw(nonce)).unwrap();
+                }
+                1 => {
+                    assert!(!service.installer_lost());
+                }
+                2 => {
+                    let Reply::Reviewed(plan) =
+                        service.answer(unlock_request(nonce, b"correct")).unwrap()
+                    else {
+                        panic!()
+                    };
+                    service.review_deadline = Some(Instant::now());
+                    assert_eq!(
+                        service.answer(Request::Execute(*plan)).unwrap(),
+                        Reply::Refused(Refusal::NoReview)
+                    );
+                    assert!(matches!(
+                        service.state(),
+                        State::Abandoned(_, Abandon::ConsentExpired)
+                    ));
+                }
+                _ => {
+                    service.host.rechecks.push(false);
+                    assert_eq!(
+                        service.answer(unlock_request(nonce, b"correct")).unwrap(),
+                        Reply::Refused(Refusal::DestinationChanged)
+                    );
+                    assert!(!log.lock().unwrap().calls.contains(&"unlock"));
+                }
+            }
+            assert_eq!(log.lock().unwrap().live, 0);
+        }
+    }
+
+    #[test]
+    fn withdrawing_an_encrypted_review_does_not_expire_its_successor() {
+        let (mut service, nonce) = locked();
+        let Reply::Reviewed(plan) = service.answer(unlock_request(nonce, b"correct")).unwrap()
+        else {
+            panic!()
+        };
+        service
+            .answer(Request::Withdraw(ReviewNonce::from(&*plan)))
+            .unwrap();
+        assert!(service.review_deadline.is_none());
+        service.host.encrypted = false;
+        let disk = service.host.disks[0].clone();
+        let Reply::Reviewed(plan) = service.answer(Request::Reinstall(disk)).unwrap() else {
+            panic!()
+        };
+        service.expire();
+        assert_eq!(service.state(), State::Reviewed(ReviewNonce::from(&*plan)));
+    }
+
+    #[test]
+    fn encrypted_reinstall_requires_both_tpm_and_keyboard() {
+        for basis in [
+            Basis::default(),
+            Basis::new(true, false),
+            Basis::new(false, true),
+        ] {
+            let mut host = Fake::new();
+            host.encrypted = true;
+            host.basis = basis;
+            let disk = host.disks[0].clone();
+            let log = host.log.clone();
+            let mut service = Service::new(host);
+            assert_eq!(
+                service.answer(Request::Reinstall(disk)).unwrap(),
+                Reply::Refused(Refusal::EncryptedUnsupported)
+            );
+            assert_eq!(log.lock().unwrap().live, 0);
+            assert!(!log.lock().unwrap().calls.contains(&"existing"));
+        }
+    }
+
     /// Records every host call; `live` counts claims not yet dropped.
     #[derive(Default)]
     struct Log {
@@ -1010,6 +1305,7 @@ mod tests {
         drawn: u8,
         end: Result<(), Refusal>,
         basis: Basis,
+        encrypted: bool,
     }
     impl Fake {
         fn new() -> Self {
@@ -1026,6 +1322,7 @@ mod tests {
                 drawn: 0,
                 end: Ok(()),
                 basis: Basis::default(),
+                encrypted: false,
             }
         }
         fn call(&self, name: &'static str) {
@@ -1061,6 +1358,21 @@ mod tests {
             uuid[6] = 0x42;
             uuid[8] = 0x82;
             Ok((uuid, settings()))
+        }
+        fn encrypted(&mut self, _: &mut Claim) -> Result<bool, Refusal> {
+            Ok(self.encrypted)
+        }
+        fn unlock(
+            &mut self,
+            claim: &mut Claim,
+            entry: &[u8],
+            _: Option<&UnixStream>,
+        ) -> Result<([u8; 16], Settings), Refusal> {
+            self.call("unlock");
+            if entry != b"correct" {
+                return Err(Refusal::RecoveryKeyRejected);
+            }
+            self.existing(claim)
         }
         fn validate_source(&mut self) -> Result<[u8; 32], Refusal> {
             self.call("source");

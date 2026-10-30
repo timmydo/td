@@ -61,6 +61,7 @@ const IDLE_CHECK: Duration = Duration::from_millis(250);
 /// What the service answered, as the window needs it.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Answer {
+    Unlock([u8; 32], bool),
     /// Its eligible disks, freshly observed.
     Destinations(Vec<Destination>),
     /// The time zones it would admit, in ascending order.
@@ -166,6 +167,10 @@ impl Service {
     /// saved settings and personal files.
     pub fn reinstall(&mut self, destination: Destination) -> Result<(), String> {
         self.send(Request::Reinstall(destination))
+    }
+
+    pub(crate) fn unlock(&mut self, nonce: [u8; 32], entry: Entry) -> Result<(), String> {
+        self.send(Request::Unlock(ReviewNonce::new(nonce)?, entry.0))
     }
 
     /// Proposes installing to `destination` with `settings`, unencrypted
@@ -345,7 +350,27 @@ fn idle(stream: &mut UnixStream) -> Result<(), String> {
 }
 
 /// The review execute last named, and its storage.
-type Executed = Option<(ReviewNonce, Storage)>;
+/// A masked recovery entry; the window cannot construct protocol requests.
+pub(crate) struct Entry(protocol::UnlockEntry);
+impl Entry {
+    pub(crate) fn new() -> Result<Self, String> {
+        protocol::UnlockEntry::new(&[]).map(Self)
+    }
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+    pub(crate) fn push(&mut self, byte: u8) -> Result<(), String> {
+        self.0.push(byte)
+    }
+    pub(crate) fn pop(&mut self) {
+        self.0.pop();
+    }
+}
+pub(crate) fn scrub_entry(bytes: &mut [u8]) {
+    protocol::scrub(bytes);
+}
+
+type Executed = Option<(ReviewNonce, Storage, td_install::installation_plan::Mode)>;
 
 fn exchange(
     stream: &mut UnixStream,
@@ -353,7 +378,7 @@ fn exchange(
     executed: &mut Executed,
 ) -> Result<Answer, String> {
     if let Request::Execute(plan) = request {
-        *executed = Some((ReviewNonce::from(plan), plan.storage()));
+        *executed = Some((ReviewNonce::from(plan), plan.storage(), plan.mode()));
     }
     // No request carries recovery digits; the encoded message and its
     // frame are zeroed all the same, sent or not.
@@ -383,6 +408,18 @@ fn exchange(
     // that does not answer what was sent ends the connection, and with it
     // any review the service holds.
     match (request, reply) {
+        (Request::Reinstall(_) | Request::Unlock(..), Reply::Unlock(nonce, retry)) => {
+            Ok(Answer::Unlock(*nonce.as_bytes(), retry))
+        }
+        (Request::Unlock(..), Reply::Reviewed(plan)) => {
+            if plan.mode() != td_install::installation_plan::Mode::Preserve
+                || plan.storage() != Storage::DeviceBound
+                || plan.basis().storage() != Storage::DeviceBound
+            {
+                return Err("invalid encrypted reinstall review".into());
+            }
+            Ok(Answer::Reviewed(plan))
+        }
         // A reinstall carries no choice, so its storage is its basis's.
         (Request::Reinstall(destination), Reply::Reviewed(plan)) => {
             if plan.destination() != destination
@@ -478,7 +515,7 @@ fn exchange(
         (_, Reply::Refused(refusal)) => Ok(Answer::Refused(refusal_text(refusal))),
         // Only propose is answered with a review and the recovery-key
         // request with a key, and both are matched above.
-        (_, Reply::Reviewed(_) | Reply::RecoveryKey(..)) => {
+        (_, Reply::Reviewed(_) | Reply::RecoveryKey(..) | Reply::Unlock(..)) => {
             Err("installer service reply is not one this installer reads".into())
         }
     }
@@ -486,7 +523,12 @@ fn exchange(
 
 /// Whether the review `nonce` names was executed here as device-bound.
 fn bound(executed: Executed, nonce: ReviewNonce) -> bool {
-    executed == Some((nonce, Storage::DeviceBound))
+    executed
+        == Some((
+            nonce,
+            Storage::DeviceBound,
+            td_install::installation_plan::Mode::Erase,
+        ))
 }
 
 /// The recovery-key phase and its failure are a device-bound
@@ -497,6 +539,7 @@ fn standing(state: State, executed: Executed) -> Result<Standing, String> {
         return Ok(Standing::Idle);
     };
     let stage = match state {
+        State::Locked(_) => return Ok(Standing::Idle),
         State::Idle | State::Reviewed(_) => Stage::Reviewed,
         State::AwaitingConsent(_) => Stage::AwaitingConsent,
         State::Running(_, phase) => Stage::Running(match phase {
@@ -568,6 +611,8 @@ fn refusal_text(refusal: Refusal) -> &'static str {
         Refusal::ConsentUnavailable => "trusted consent is unavailable",
         Refusal::TimezonesUnavailable => "the time zones could not be read",
         Refusal::PowerUnavailable => "the computer could not be restarted or powered off",
+        Refusal::RecoveryKeyRejected => "the recovery key did not unlock the installation",
+        Refusal::EncryptedUnsupported => "this encrypted installation cannot be reinstalled here",
         Refusal::RecoveryKeySent => "the recovery key was already shown",
     }
 }
@@ -690,7 +735,7 @@ pub(crate) mod tests {
                 finishing = Some(false);
                 framed(&Reply::Status(State::Running(nonce, Phase::RecoveryKey)))
             }
-            Request::RecoveryKey(_) | Request::AcknowledgeRecovery(_) => {
+            Request::Unlock(..) | Request::RecoveryKey(_) | Request::AcknowledgeRecovery(_) => {
                 framed(&Reply::Refused(Refusal::Busy))
             }
             _ => listing(request),
@@ -733,7 +778,7 @@ pub(crate) mod tests {
             ))),
             Request::Status => framed(&Reply::Status(State::Idle)),
             Request::End(_, nonce) => framed(&Reply::Status(State::Complete(*nonce))),
-            Request::RecoveryKey(_) | Request::AcknowledgeRecovery(_) => {
+            Request::Unlock(..) | Request::RecoveryKey(_) | Request::AcknowledgeRecovery(_) => {
                 framed(&Reply::Refused(Refusal::NoReview))
             }
         }

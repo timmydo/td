@@ -323,8 +323,9 @@ device-bound system's integrity before the upgrade.
 
 ## Planned: encrypted reinstall from live USB
 
-This is the design for task #14, not shipped behavior. The current live
-reinstall still refuses LUKS. [INSTALLER.md](INSTALLER.md#planned-encrypted-reinstall)
+Task #14 now has the typed-key service and runtime path described here.
+Camera input and the complete migration acceptance oracle remain pending;
+this is not yet a laptop acceptance claim. [INSTALLER.md](INSTALLER.md#planned-encrypted-reinstall)
 owns the wizard, secret transport and camera input. This increment extends
 preserve mode to an existing device-bound td volume; it neither converts
 plaintext nor upgrades or downgrades storage. Protected-tier volumes,
@@ -361,8 +362,8 @@ exclusive disk claim, through a bounded loop over its system partition.
 It selects LUKS metadata with the shared reader's checksum and sequence
 rules: one torn or invalid copy does not disqualify a valid surviving
 copy, and unequal sequences select the newest valid copy. Equal-sequence
-disagreement refuses as usual. It confirms the selected metadata through
-td-luks before planning any mutation. Read-only
+disagreement refuses as usual. It confirms the selected metadata through the shared td-luks profile
+reader before planning any mutation. Read-only
 inspection uses a read-only dm-crypt mapping and the existing
 `ro,rescue=nologreplay,nodev,nosuid,noexec,subvolid=5` mount. Prove that the
 mounted filesystem has exactly that mapping as its device, and that the
@@ -393,6 +394,10 @@ Execution has this order:
 1. After consent and all revalidation, test the supplied recovery key
    against slot 0 again. Preflight space for the verified deployment,
    both ESP files and the protector transition before changing anything.
+   After staging, query the mounted filesystem through the existing uutils
+   `df` applet and require space for the publisher's second complete copy
+   plus a 32 MiB metadata reserve before protector mutation. This is an
+   admission estimate, not a guarantee against later filesystem errors.
    Stage and verify the approved bundle and prepare the selector for the
    unchanged UUID, as ordinary reinstall does. No secret enters staging.
 2. Generate a fresh random protector secret, seal it under the existing

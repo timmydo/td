@@ -150,8 +150,8 @@ Protocol request `0x0b` carries a destination observation only. Root supplies
 the saved settings and UUID. Preserve plans have the unencrypted storage and
 zero basis; these are existing-storage facts, not a new TPM probe decision.
 The private consent review appends a boolean preserve byte after storage,
-and its greeting is `TDINA03\n`. The ordinary service greeting is
-`TDINS09\n`. The mode is part of the reviewed plan and exact Execute bytes.
+and its greeting is `TDINA04\n`. The ordinary service greeting is
+`TDINS10\n`. The mode is part of the reviewed plan and exact Execute bytes.
 
 The private staged manifest must hash to the deployment ID bound by the
 reviewed plan, and full staged payload verification follows, so changing
@@ -167,7 +167,8 @@ manifest's refusal before replacement.
 
 ## Planned: encrypted reinstall
 
-Task #14 extends the preceding preserve mode; it is not implemented yet.
+Task #14 extends the preceding preserve mode. The typed-key path is
+implemented; webcam scanning and migration acceptance remain pending.
 [ENCRYPTION.md](ENCRYPTION.md#planned-encrypted-reinstall-from-live-usb)
 owns eligibility, protector transitions, interruption recovery and the
 acceptance gate. Existing unencrypted reinstall keeps its current flow.
@@ -212,6 +213,20 @@ Backing out or disconnecting before confirmation writes nothing. After
 execution starts, cancellation stops at a safe operation boundary and
 reports incomplete installation, never applies fresh-install withdrawal.
 A disconnected UI reports an unknown outcome until status resolves it.
+
+The typed-key path is implemented; Scan remains unavailable until the
+capture and decoder increment. The entry owns a fixed 256-byte wiped buffer,
+and accepts digits, separators and Backspace. Both ends validate the codec.
+Unlock requests use tag `0x0c`, the 32-byte challenge and up to 256 entry
+bytes; replies use `0x87`, a fresh challenge and one retry boolean. Locked
+status is code 7. Refusals 18 and 19 mean rejected recovery key and unsupported
+encrypted reinstall. Root checks the tag-specific bound before allocating
+the body. No secret is echoed. td-luks children discard both output streams,
+are killed and reaped after 60 seconds, and during inspection also abandon
+when the peer closes or pipelines another request. Mount and unmount children have a 60-second limit; the deployment
+publisher has a 30-minute limit. Cleanup ignores peer
+loss so it still closes the owned mapping. The service checks review expiry
+every 250 ms while idle.
 
 ### Service lifetime and secret transport
 
@@ -933,7 +948,7 @@ representations and trailing bytes. The complete framing is checked
 before allocating field strings. No native-endian numbers, JSON numeric
 rounding or path resolution enters the codec. The field order is:
 
-- Eight bytes `TDPLAN04`, nonce (32), deployment digest (32), UUID (16),
+- Eight bytes `TDPLAN05`, nonce (32), deployment digest (32), UUID (16),
   mode (one byte: 0 erase, 1 preserve).
 - Big-endian major/minor (u32 each), sequence/capacity (u64 each), sector
   size (u32), removable (one byte, exactly zero or one), storage (one
@@ -988,7 +1003,7 @@ and an ending complete, for its nonce; any other answer ends its
 connection, and with it, until an installation starts, the review and
 claim.
 
-Both ends first send and require the eight bytes `TDINS09\n`. Any change to
+Both ends first send and require the eight bytes `TDINS10\n`. Any change to
 a message or its bytes changes this greeting; there is no negotiation. Each
 message then travels in one frame: a big-endian u32 length and that many
 payload bytes. `payload_len` admits a nonzero length within the direction's
@@ -1011,7 +1026,7 @@ Requests carry no path, executable, mount option, source or consent:
   plan carries the service's observation, never UI-supplied values. The
   service chooses the nonce and volume UUID, validates the source,
   claims the disk and checks that the disk holds the deployment.
-- `0x03` execute: the complete `TDPLAN04` record the installer reviewed. It
+- `0x03` execute: the complete `TDPLAN05` record the installer reviewed. It
   asks the service to seek consent for the review it retains, and is
   refused unless the record equals that review. Equality is a
   precondition, never consent: consent reaches root only from the
@@ -1032,7 +1047,7 @@ Requests carry no path, executable, mount option, source or consent:
 Replies set the high bit, so no request decodes as a reply or the reverse:
 
 - `0x81` destinations: a `TDCAND01` record.
-- `0x82` reviewed: the service's `TDPLAN04` record, made while it holds
+- `0x82` reviewed: the service's `TDPLAN05` record, made while it holds
   the destination claim. Its nonce names the review.
 - `0x83` status: a state byte, then for every state but idle the nonzero
   review nonce, then for running, failed and abandoned one detail code.
@@ -1113,18 +1128,12 @@ retries a destructive operation after a reconnect or restart.
 
 ### Device-bound records
 
-These records carry device-bound storage. They landed at once, in
-ENCRYPTION.md increment 5, as the greeting `TDINS05\n`, the consent
-channel's `TDINA03\n` and the plan's magic `TDPLAN02`; the earlier
-versions are refused, not negotiated. `TDINS05` is `TDINS04` (power off,
-request `0x08`, included) with the additions below, so the recovery
-requests take the next free tags. Increment 7's probe commit then made
-them `TDINS07` and `TDPLAN04` with the plan's basis byte ("Storage
-choice"); `TDINA03` is unchanged. `TDINS08` replaced the type-back with
-an acknowledgement that carries no digit, and retired refusal 17.
-`TDINS09` added propose's storage choice byte; the plan's bytes are
-unchanged under `TDPLAN04`, and it now admits unencrypted storage with
-any basis.
+The current service greeting is `TDINS10\n`, the private consent greeting
+is `TDINA04\n`, and the plan magic is `TDPLAN05`. Earlier versions are
+refused, not negotiated. Recovery fetch and acknowledgement belong only
+to fresh device-bound installs. Encrypted preserve mode uses the separate
+unlock challenge, retains the saved recovery key, and never enters the
+new-key phase. Refusal 17 remains retired.
 
 - The plan gains one storage byte after the removable flag: 0 unencrypted
   or 1 device-bound, any other value refused. It is the storage the
@@ -1203,12 +1212,12 @@ unencrypted storage where they allow device-bound.
 The plan carries one byte after the storage byte, the storage basis: bit
 0 set when the service's TPM probe passed and bit 1 when its
 keyboard-console probe passed (ENCRYPTION.md "Activation" defines both),
-any other bit refused. The plan's magic is `TDPLAN04`, its maximal
-record 1194 bytes, and the greeting then `TDINS07` (now `TDINS09`), the
+any other bit refused. The plan's magic is `TDPLAN05`, its maximal
+record 1194 bytes, and the greeting `TDINS10`, the
 earlier versions refused rather than negotiated; a propose request
 carries no basis and no storage, only the person's choice of unencrypted
-storage (`TDINS09`). The consent channel's review report keeps its
-storage byte alone and its `TDINA03`. `serve` runs both probes at every
+storage (`TDINS10`). The consent channel's review report keeps its
+storage byte alone and its `TDINA04`. `serve` runs both probes at every
 start, once each, after admission and before its greeting, writes the
 cause of each that fails to standard error, and records them in every
 plan. The TPM's read has a 3-second deadline (`TPM_PROBE_DEADLINE`) so
@@ -1224,7 +1233,7 @@ the read returns, up to the kernel's two-minute command duration;
 td-authd does not wait on it, but admits no new wizard connection while
 the old service is still stopping, so a reconnect can wait that long.
 
-Every plan names device-bound storage exactly when its basis has both
+Every fresh-install plan names device-bound storage exactly when its basis has both
 bits and its proposal did not choose unencrypted storage, and
 unencrypted storage otherwise (`Basis::storage`, `Plan::unencrypted`);
 nothing refuses for a missing TPM or keyboard console. The plan's
@@ -1232,13 +1241,13 @@ storage byte is that storage: a plan naming device-bound storage with a
 basis that does not is refused, and one naming unencrypted storage is
 admitted with any basis, which it keeps, so the review and the consent
 channel show what the probes found beside what was chosen. The encoding
-and `TDPLAN04` are unchanged; `TDINS09` admits the newly possible
+and `TDPLAN05` are unchanged; `TDINS10` admits the newly possible
 record. td-authd starts the service with no storage operand, for there
 is none, and its consent summary shows the plan's storage ("ENCRYPTED TO
 THIS COMPUTER, AUTOMATIC LOGIN" or "UNENCRYPTED STORAGE, AUTOMATIC
 LOGIN"; td-authd/DESIGN.md "Immutable consent description
 prerequisite"). td-setup follows a device-bound review it executed
-through the recovery-key phase.
+through the recovery-key phase only for fresh installs.
 
 The review page shows the storage on a detail row (`Storage: encrypted
 to this computer`, `Storage: not encrypted, as chosen` or `Storage: not
@@ -1439,7 +1448,7 @@ live boot (td-authd/DESIGN.md "Whole-disk installation intake") as one end
 of a socketpair on the service's standard output, where the service opens
 it.
 
-Both ends first send and require `TDINA03\n`, which changes with any message
+Both ends first send and require `TDINA04\n`, which changes with any message
 or its bytes. Each message then travels in one frame: a big-endian u32
 length, nonzero and at most 1024, then that many payload bytes. A payload
 is a tag byte and its body, with trailing bytes refused. Every nonce is a

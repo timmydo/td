@@ -10,7 +10,7 @@ use crate::installation_plan::{
 
 /// Sent and required by both ends before the first frame. A change to any
 /// message or its bytes changes the greeting; there is no negotiation.
-pub const GREETING: &[u8; 8] = b"TDINS09\n";
+pub const GREETING: &[u8; 8] = b"TDINS10\n";
 /// Root admits only this much from the unprivileged side.
 pub const MAX_REQUEST_BYTES: usize = 1 + MAX_BYTES;
 pub const MAX_REPLY_BYTES: usize = 1 + if MAX_CANDIDATE_BYTES > MAX_ZONE_BYTES {
@@ -30,6 +30,9 @@ const POWER_OFF: u8 = 0x08;
 const RECOVERY_KEY: u8 = 0x09;
 const ACKNOWLEDGE_RECOVERY: u8 = 0x0a;
 const REINSTALL: u8 = 0x0b;
+const UNLOCK: u8 = 0x0c;
+const UNLOCK_REPLY: u8 = 0x87;
+pub const MAX_UNLOCK_ENTRY: usize = 256;
 // Replies set the high bit, so a reflected frame never decodes.
 const DESTINATIONS_REPLY: u8 = 0x81;
 const REVIEWED: u8 = 0x82;
@@ -67,6 +70,62 @@ pub fn payload_len(header: [u8; 4], limit: usize) -> Result<usize, String> {
         Ok(length) if length != 0 && length <= limit => Ok(length),
         _ => Err("installation frame outside its bound".into()),
     }
+}
+
+/// Recovery input is never clonable or printable. Allocation stays fixed
+/// while editing so removed digits cannot survive in a freed buffer.
+pub struct UnlockEntry {
+    bytes: Box<[u8; MAX_UNLOCK_ENTRY]>,
+    len: usize,
+}
+
+impl UnlockEntry {
+    pub fn new(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_UNLOCK_ENTRY {
+            return Err("recovery entry exceeds its bound".into());
+        }
+        let mut entry = Self {
+            bytes: Box::new([0; MAX_UNLOCK_ENTRY]),
+            len: 0,
+        };
+        for byte in bytes {
+            entry.push(*byte)?;
+        }
+        Ok(entry)
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or_default()
+    }
+    pub fn push(&mut self, byte: u8) -> Result<(), String> {
+        let at = self
+            .bytes
+            .get_mut(self.len)
+            .ok_or("recovery entry exceeds its bound")?;
+        *at = byte;
+        self.len += 1;
+        Ok(())
+    }
+    pub fn pop(&mut self) {
+        if let Some(len) = self.len.checked_sub(1) {
+            if let Some(byte) = self.bytes.get_mut(len) {
+                *byte = 0;
+            }
+            self.len = len;
+        }
+    }
+}
+impl Drop for UnlockEntry {
+    fn drop(&mut self) {
+        scrub(self.bytes.as_mut_slice());
+    }
+}
+
+/// Check a secret-bearing frame's tighter limit before allocating its body.
+pub fn request_bound(tag: u8, length: usize) -> Result<(), String> {
+    if tag == UNLOCK && !(33..=33 + MAX_UNLOCK_ENTRY).contains(&length) {
+        return Err("unlock frame outside its bound".into());
+    }
+    Ok(())
 }
 
 /// Names one review the service retains: the nonce of its plan.
@@ -316,6 +375,8 @@ pub enum Refusal {
     PowerUnavailable,
     /// The recovery key was already sent; the service sends it once.
     RecoveryKeySent,
+    RecoveryKeyRejected,
+    EncryptedUnsupported,
 }
 
 impl Refusal {
@@ -336,6 +397,8 @@ impl Refusal {
         Self::TimezonesUnavailable,
         Self::PowerUnavailable,
         Self::RecoveryKeySent,
+        Self::RecoveryKeyRejected,
+        Self::EncryptedUnsupported,
     ];
 
     fn code(self) -> u8 {
@@ -356,6 +419,8 @@ impl Refusal {
             Self::TimezonesUnavailable => 14,
             Self::PowerUnavailable => 15,
             Self::RecoveryKeySent => 16,
+            Self::RecoveryKeyRejected => 18,
+            Self::EncryptedUnsupported => 19,
         }
     }
 
@@ -379,6 +444,8 @@ impl Refusal {
             14 => Ok(Self::TimezonesUnavailable),
             15 => Ok(Self::PowerUnavailable),
             16 => Ok(Self::RecoveryKeySent),
+            18 => Ok(Self::RecoveryKeyRejected),
+            19 => Ok(Self::EncryptedUnsupported),
             // 17 was a typed-back key that did not match; there is no type-back.
             _ => Err("unknown installation refusal".into()),
         }
@@ -387,8 +454,8 @@ impl Refusal {
 
 /// What the installer asks. None of it names a path, executable, source or
 /// consent.
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
+    Unlock(ReviewNonce, UnlockEntry),
     /// Read existing settings and propose replacement without formatting.
     Reinstall(Destination),
     /// Eligible whole disks, as the service observes them.
@@ -439,6 +506,12 @@ impl Request {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
+            Self::Unlock(nonce, entry) => {
+                out.reserve_exact(33 + entry.as_bytes().len());
+                out.push(UNLOCK);
+                out.extend_from_slice(nonce.as_bytes());
+                out.extend_from_slice(entry.as_bytes());
+            }
             Self::Reinstall(destination) => {
                 out.push(REINSTALL);
                 put_destination(&mut out, destination);
@@ -489,7 +562,13 @@ impl Request {
         }
         let (&tag, body) = bytes.split_first().ok_or("empty installation request")?;
         let mut reader = Reader::new(body, "request");
+        request_bound(tag, bytes.len())?;
         let request = match tag {
+            UNLOCK => {
+                let nonce = ReviewNonce::new(reader.array()?)?;
+                let entry = UnlockEntry::new(body.get(32..).ok_or("short unlock request")?)?;
+                return Ok(Self::Unlock(nonce, entry));
+            }
             REINSTALL => Self::Reinstall(read_destination(&mut reader)?),
             DESTINATIONS => Self::Destinations,
             PROPOSE => Self::Propose {
@@ -520,6 +599,7 @@ impl Request {
 /// The service's view of the one review it may hold.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum State {
+    Locked(ReviewNonce),
     Idle,
     /// Reviewed and claimed; nothing written.
     Reviewed(ReviewNonce),
@@ -538,7 +618,8 @@ impl State {
     pub fn review(&self) -> Option<ReviewNonce> {
         match *self {
             Self::Idle => None,
-            Self::Reviewed(nonce)
+            Self::Locked(nonce)
+            | Self::Reviewed(nonce)
             | Self::AwaitingConsent(nonce)
             | Self::Running(nonce, _)
             | Self::Complete(nonce)
@@ -550,6 +631,8 @@ impl State {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Reply {
+    /// A fresh one-use unlock challenge; the flag reports a rejected entry.
+    Unlock(ReviewNonce, bool),
     Destinations(Candidates),
     /// The service's review, made while it holds the destination claim.
     Reviewed(Box<Plan>),
@@ -564,6 +647,11 @@ impl Reply {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
+            Self::Unlock(nonce, retry) => {
+                out.push(UNLOCK_REPLY);
+                out.extend_from_slice(nonce.as_bytes());
+                out.push(u8::from(*retry));
+            }
             Self::Destinations(candidates) => {
                 out.push(DESTINATIONS_REPLY);
                 out.extend_from_slice(&candidates.encode());
@@ -576,6 +664,7 @@ impl Reply {
                 out.push(STATUS_REPLY);
                 let (code, detail) = match *state {
                     State::Idle => (0, None),
+                    State::Locked(_) => (7, None),
                     State::Reviewed(_) => (1, None),
                     State::AwaitingConsent(_) => (2, None),
                     State::Running(_, phase) => (3, Some(phase.code())),
@@ -614,6 +703,17 @@ impl Reply {
         }
         let (&tag, body) = bytes.split_first().ok_or("empty installation reply")?;
         let reply = match tag {
+            UNLOCK_REPLY => {
+                let mut reader = Reader::new(body, "unlock reply");
+                let nonce = ReviewNonce::new(reader.array()?)?;
+                let retry = match byte(&mut reader)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err("invalid unlock retry flag".into()),
+                };
+                reader.finish()?;
+                Self::Unlock(nonce, retry)
+            }
             DESTINATIONS_REPLY => Self::Destinations(Candidates::decode(body)?),
             REVIEWED => Self::Reviewed(Box::new(Plan::decode(body)?)),
             STATUS_REPLY => Self::Status(read_state(body)?),
@@ -640,7 +740,10 @@ impl Reply {
     /// compares the review nonce and the proposed or echoed fields.
     pub fn answers(&self, request: &Request) -> bool {
         match request {
-            Request::Reinstall(_) => matches!(self, Self::Reviewed(_) | Self::Refused(_)),
+            Request::Reinstall(_) | Request::Unlock(..) => matches!(
+                self,
+                Self::Reviewed(_) | Self::Unlock(..) | Self::Refused(_)
+            ),
             Request::Destinations => matches!(self, Self::Destinations(_) | Self::Refused(_)),
             Request::Propose { .. } => matches!(self, Self::Reviewed(_) | Self::Refused(_)),
             Request::Execute(_)
@@ -665,6 +768,7 @@ fn read_state(body: &[u8]) -> Result<State, String> {
     } else {
         let nonce = ReviewNonce::new(reader.array()?)?;
         match code {
+            7 => State::Locked(nonce),
             1 => State::Reviewed(nonce),
             2 => State::AwaitingConsent(nonce),
             3 => State::Running(nonce, Phase::from_code(byte(&mut reader)?)?),

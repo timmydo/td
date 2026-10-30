@@ -260,7 +260,7 @@ fn deployment_id_requires_exact_lowercase_manifest_digest() {
 #[test]
 fn wire_order_is_independently_specified_and_lossless() {
     let p = plan();
-    let mut bytes = b"TDPLAN04".to_vec();
+    let mut bytes = b"TDPLAN05".to_vec();
     bytes.extend([1; 32]);
     bytes.extend([2; 32]);
     bytes.extend(uuid());
@@ -313,7 +313,7 @@ fn every_truncation_and_extension_refuses() {
         Plan::decode(&oversized).unwrap_err(),
         "installation plan exceeds wire bound"
     );
-    for version in [b'3', b'5'] {
+    for version in [b'4', b'6'] {
         let mut wrong_version = bytes.clone();
         wrong_version[7] = version;
         assert_eq!(

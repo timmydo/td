@@ -8,7 +8,7 @@
 
 /// Sent and required by both ends before the first frame. A change to any
 /// message or its bytes changes the greeting; there is no negotiation.
-pub const GREETING: &[u8; 8] = b"TDINA03\n";
+pub const GREETING: &[u8; 8] = b"TDINA04\n";
 pub const MAX_MESSAGE_BYTES: usize = 1024;
 
 const NONCE_BYTES: usize = 32;

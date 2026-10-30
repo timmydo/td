@@ -131,6 +131,22 @@ impl Seek for Window<'_> {
     }
 }
 
+impl td_luks::write::Medium for Window<'_> {
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> io::Result<usize> {
+        self.seek(SeekFrom::Start(offset))?;
+        self.read(out)
+    }
+    fn write_at(&mut self, _: u64, _: &[u8]) -> io::Result<()> {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+    fn sync(&mut self) -> io::Result<()> {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+    fn size(&mut self) -> io::Result<u64> {
+        Ok(self.len)
+    }
+}
+
 /// The header as formatted: read from a valid primary copy no older than
 /// the secondary, with the plan's UUID and the label, keyslots 0 and 1
 /// alone, exactly the token imported as token 0, and no orphan. The reader

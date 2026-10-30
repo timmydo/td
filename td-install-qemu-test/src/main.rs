@@ -525,7 +525,7 @@ fn frame_observed_plan(destination: &[u8], deployment: [u8; 32]) -> Result<Vec<u
         .split_at_checked(4 + 4 + 8 + 8 + 4 + 1)
         .ok_or("observed destination is truncated")?;
     let mut bytes = Vec::with_capacity(256);
-    bytes.extend_from_slice(b"TDPLAN04");
+    bytes.extend_from_slice(b"TDPLAN05");
     bytes.extend_from_slice(&[1; 32]);
     bytes.extend_from_slice(&deployment);
     let mut uuid = [0; 16];

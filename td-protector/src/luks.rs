@@ -401,7 +401,7 @@ impl Luks {
             .env_clear()
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|error| invalid(format!("cannot run {}: {error}", self.program.display())))?;
         loop {

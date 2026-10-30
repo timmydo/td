@@ -619,6 +619,8 @@ pub fn recipe() -> Recipe {
                 "--extern",
                 "td_protector={root}/libtd_protector.rlib",
                 "--extern",
+                "td_luks={root}/libtd_luks.rlib",
+                "--extern",
                 "td_tpm={root}/libtd_tpm.rlib",
                 // td-protector's own dependency, td-json, is found here.
                 "-L",

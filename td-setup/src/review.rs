@@ -269,7 +269,17 @@ impl ReviewPage {
             push_lines_with(&mut lines, &line, columns, continuation);
         }
         let paragraphs = if plan.mode() == td_install::installation_plan::Mode::Preserve {
-            &[][..]
+            if plan.storage() == Storage::DeviceBound {
+                &[
+                    "Your personal files, account, login keys and Wi-Fi networks stay. Storage remains encrypted and your saved recovery key remains valid.",
+                    "Reinstall replaces both system versions, the startup kernel and selector. The old version will not remain as rollback.",
+                    "The TPM protector is replaced for this computer. Extra passphrase slots are removed; recovery slot zero is preserved.",
+                    "Boot from the disk immediately afterward. Until its first boot, another operating system on this TPM may release the temporary protector.",
+                    "An interruption may require USB reinstall with the same recovery key. This does not make a backup.",
+                ][..]
+            } else {
+                &[][..]
+            }
         } else {
             match plan.storage() {
                 Storage::DeviceBound => DEVICE_BOUND_DETAILS,

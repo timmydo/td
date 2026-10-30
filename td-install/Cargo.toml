@@ -27,6 +27,7 @@ path = "src/main.rs"
 # selector update over td-fat's ESP reader and writer, and its disk proof's
 # security key over td-fido's disk flows, each an rlib in the recipe.
 [dependencies]
+td-luks = { path = "../td-luks" }
 td-fat = { path = "../td-fat" }
 td-fido = { path = "../td-fido" }
 td-protector = { path = "../td-protector" }

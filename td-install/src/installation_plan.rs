@@ -3,7 +3,7 @@
 /// Input admission ceiling, checked before parsing or allocating fields.
 /// The largest current valid encoding is 1194 bytes.
 pub const MAX_BYTES: usize = 2048;
-const MAGIC: &[u8; 8] = b"TDPLAN04";
+const MAGIC: &[u8; 8] = b"TDPLAN05";
 const CANDIDATES_MAGIC: &[u8; 8] = b"TDCAND01";
 const ZONES_MAGIC: &[u8; 8] = b"TDZONE01";
 pub const MAX_CANDIDATES: usize = 64;

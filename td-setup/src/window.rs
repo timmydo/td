@@ -99,6 +99,7 @@ enum Target {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Page {
+    Unlock,
     Welcome,
     /// Asked for disks; no answer yet.
     Waiting,
@@ -132,6 +133,7 @@ enum KeyStep {
 /// A request sent to the service whose answer is awaited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Asked {
+    Unlock,
     Disks,
     Zones,
     Review,
@@ -283,8 +285,10 @@ const POLL: u64 = 500;
 /// a list index and a draft is typed text, not claims: the service
 /// rechecks everything it is sent, and only its review is shown for
 /// review.
-#[derive(Debug)]
 struct Wizard {
+    unlock_entry: Option<crate::service::Entry>,
+    challenge: Option<[u8; 32]>,
+    unlock_send: bool,
     preserve: bool,
     /// The person chose unencrypted storage on a review; kept, as the
     /// drafts are, for every later proposal until chosen otherwise.
@@ -347,6 +351,9 @@ struct Wizard {
 impl Wizard {
     fn new() -> Self {
         Self {
+            unlock_entry: None,
+            challenge: None,
+            unlock_send: false,
             preserve: false,
             unencrypted: false,
             reinstall: None,
@@ -382,6 +389,41 @@ impl Wizard {
 
     fn key(&mut self, chord: &str) -> Action {
         match (&self.page, chord) {
+            (Page::Unlock, "Escape") => {
+                self.awaited = false;
+                self.unlock_entry = None;
+                self.unlock_send = false;
+                self.withdraw = self.challenge.take();
+                self.page = Page::Destinations;
+            }
+            (Page::Unlock, "Return") if self.asked.is_none() && self.unlock_entry.is_some() => {
+                if !self
+                    .unlock_entry
+                    .as_ref()
+                    .is_some_and(|entry| recovery::valid_entry(entry.as_bytes()))
+                {
+                    self.notice = Some("Enter the complete saved recovery key.");
+                    return Action::None;
+                }
+                self.unlock_send = true;
+                self.notice = Some("Unlocking the existing installation...");
+            }
+            (Page::Unlock, _) => {
+                if self.asked.is_none() && !self.unlock_send {
+                    if let Some(entry) = &mut self.unlock_entry {
+                        if chord == "Backspace" {
+                            entry.pop();
+                        } else if chord.len() == 1
+                            && chord.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+                        {
+                            if let Some(byte) = chord.bytes().next() {
+                                let _ = entry.push(byte);
+                            }
+                        }
+                    }
+                }
+            }
+
             // A new installation starts with the probes' storage.
             (Page::Welcome, "Return") => {
                 self.preserve = false;
@@ -585,7 +627,7 @@ impl Wizard {
             Page::Recovery(KeyStep::Shown) => &[7],
             Page::Recovery(KeyStep::Kept) => &[8],
             // These take no key.
-            Page::Progress(_) | Page::Recovery(KeyStep::Asking) => &[],
+            Page::Unlock | Page::Progress(_) | Page::Recovery(KeyStep::Asking) => &[],
         };
         let mut ordered = Vec::with_capacity(sections.len());
         ordered.extend(
@@ -603,6 +645,10 @@ impl Wizard {
     fn steps(&self) -> Steps {
         const BACK: Option<&str> = Some("Back");
         match &self.page {
+            Page::Unlock => Steps {
+                back: BACK,
+                next: Some(("Unlock", self.asked.is_none() && !self.unlock_send)),
+            },
             Page::Welcome => crate::nav::WELCOME,
             Page::Waiting | Page::Unavailable | Page::Refused(_) => Steps {
                 back: BACK,
@@ -619,7 +665,11 @@ impl Wizard {
             Page::Review => Steps {
                 back: BACK,
                 next: Some((
-                    "Install",
+                    if self.preserve {
+                        "Reinstall"
+                    } else {
+                        "Install"
+                    },
                     self.execute.is_none() && self.executing.is_none(),
                 )),
             },
@@ -738,6 +788,7 @@ impl Wizard {
             return Some(Asked::Withdraw);
         }
         match (&self.page, self.catalog) {
+            (Page::Unlock, _) if self.unlock_send => Some(Asked::Unlock),
             (Page::Destinations, _) if self.reinstall.is_some() => Some(Asked::Review),
             (Page::Waiting, _) => Some(Asked::Disks),
             (Page::Settings, Catalog::Unasked) => Some(Asked::Zones),
@@ -776,11 +827,37 @@ impl Wizard {
             (Some(Asked::Zones), Ok(Answer::Refused(reason))) => {
                 self.catalog = Catalog::Refused(reason);
             }
-            (Some(Asked::Review), Ok(Answer::Reviewed(plan))) => {
+            (Some(Asked::Review) | Some(Asked::Unlock), Ok(Answer::Unlock(nonce, retry))) => {
+                if self.awaited && (self.page == Page::Destinations || self.page == Page::Unlock) {
+                    self.awaited = false;
+                    self.challenge = Some(nonce);
+                    self.unlock_send = false;
+                    self.unlock_entry = crate::service::Entry::new().ok();
+                    self.notice = retry
+                        .then_some("The recovery key did not unlock this installation. Try again.");
+                    self.page = Page::Unlock;
+                } else {
+                    self.withdraw = Some(nonce);
+                }
+            }
+            (Some(Asked::Review) | Some(Asked::Unlock), Ok(Answer::Reviewed(plan))) => {
                 if std::mem::take(&mut self.awaited)
                     && (self.page == Page::Settings
-                        || (self.page == Page::Destinations && self.preserve))
+                        || ((self.page == Page::Destinations || self.page == Page::Unlock)
+                            && self.preserve))
                 {
+                    if self.preserve
+                        && self.selected.and_then(|index| self.disks.get(index))
+                            != Some(plan.destination())
+                    {
+                        self.withdraw = Some(*plan.nonce());
+                        self.unlock_entry = None;
+                        self.page = Page::Refused("The reviewed disk changed.");
+                        return;
+                    }
+                    self.unlock_entry = None;
+                    self.challenge = None;
+                    self.unlock_send = false;
                     self.notice = None;
                     self.plan = Some(plan);
                     self.review_page = 0;
@@ -789,8 +866,12 @@ impl Wizard {
                     self.withdraw = Some(*plan.nonce());
                 }
             }
-            (Some(Asked::Review), Ok(Answer::Refused(reason))) if self.awaited => {
+            (Some(Asked::Review) | Some(Asked::Unlock), Ok(Answer::Refused(reason)))
+                if self.awaited =>
+            {
                 self.awaited = false;
+                self.unlock_entry = None;
+                self.challenge = None;
                 self.notice = Some(reason);
                 if self.preserve {
                     self.page = Page::Refused(reason);
@@ -978,6 +1059,9 @@ impl Wizard {
     /// review its claim, so they go too. The drafts stay, and so does a
     /// catalog already listed.
     fn lost(&mut self) {
+        self.unlock_entry = None;
+        self.challenge = None;
+        self.unlock_send = false;
         self.disks.clear();
         self.selected = None;
         self.first = 0;
@@ -1038,7 +1122,7 @@ impl Wizard {
     fn sent(&mut self, asked: Asked) {
         self.asked = Some(asked);
         match asked {
-            Asked::Review => self.awaited = true,
+            Asked::Review | Asked::Unlock => self.awaited = true,
             Asked::Status => self.poll_due = false,
             Asked::RecoveryKey => self.key_asked = true,
             Asked::Acknowledge => {
@@ -1054,6 +1138,7 @@ impl Wizard {
     fn state(&self) -> String {
         let mut state = String::from("page=");
         match &self.page {
+            Page::Unlock => state.push_str("unlock"),
             Page::Welcome => state.push_str("welcome"),
             Page::Waiting => state.push_str("waiting"),
             Page::Unavailable => state.push_str("unavailable"),
@@ -1252,6 +1337,13 @@ impl Front {
                     service.execute(*plan)
                 }
                 None => return,
+            },
+            Asked::Unlock => match (self.wizard.challenge, self.wizard.unlock_entry.take()) {
+                (Some(nonce), Some(entry)) => {
+                    self.wizard.unlock_send = false;
+                    service.unlock(nonce, entry)
+                }
+                _ => return,
             },
             Asked::Status => service.status(),
             Asked::End => match (self.wizard.completed, self.wizard.power) {
@@ -1668,6 +1760,15 @@ impl Window {
     /// key may repeat the chord: the list's while it scrolls, a page's
     /// for the keys `repeats` names.
     fn chord(&mut self, chord: String) -> Result<bool> {
+        if self.front.wizard.page == Page::Unlock {
+            let mut bytes = chord.into_bytes();
+            if let Ok(chord) = std::str::from_utf8(&bytes) {
+                self.front.key(chord, Path::new(SOCKET));
+            }
+            crate::service::scrub_entry(&mut bytes);
+            self.dirty = true;
+            return Ok(false);
+        }
         // A key between a press and its release leaves nothing to act on.
         self.pressed = None;
         let mut repeat = false;
@@ -1749,7 +1850,8 @@ impl Window {
         // The destination step's page, built first so the list position
         // it settles on is kept for the next turn.
         let destination = match &wizard.page {
-            Page::Welcome
+            Page::Unlock
+            | Page::Welcome
             | Page::Settings
             | Page::Review
             | Page::Progress(_)
@@ -1776,7 +1878,19 @@ impl Window {
             (Page::Recovery(KeyStep::Shown), Some(key)) => Some((key.display(), key.code())),
             _ => None,
         };
+        let masked = wizard
+            .unlock_entry
+            .as_ref()
+            .map(|entry| "*".repeat(entry.as_bytes().len().min(55)))
+            .unwrap_or_default();
         let key_page = match wizard.page {
+            Page::Unlock => Some(RecoveryPage::new(
+                surface,
+                recovery::Step::Unlock {
+                    masked: &masked,
+                    notice: wizard.notice,
+                },
+            )),
             Page::Recovery(step) => {
                 let step = match (step, &shown) {
                     (KeyStep::Shown, Some((shown, code))) => recovery::Step::Shown {
@@ -1796,10 +1910,10 @@ impl Window {
             Page::Progress(progress) => {
                 // Consent to a device-bound review says the person returns
                 // here for its recovery key.
-                let key = wizard
-                    .plan
-                    .as_ref()
-                    .is_some_and(|plan| plan.storage() == Storage::DeviceBound);
+                let key = wizard.plan.as_ref().is_some_and(|plan| {
+                    plan.storage() == Storage::DeviceBound
+                        && plan.mode() != td_install::installation_plan::Mode::Preserve
+                });
                 Some(
                     ProgressPage::new(surface, progress)
                         .map(|view| Box::new(view.with_recovery_key(key)) as Box<dyn Composition>),
@@ -2053,6 +2167,80 @@ mod tests {
         assert!(wizard.preserve);
         assert!(wizard.execute.is_none());
         assert!(wizard.proposal.is_none());
+    }
+
+    #[test]
+    fn recovery_entry_is_masked_validated_and_discarded_on_retry_and_back() {
+        let mut wizard = Wizard::new();
+        wizard.key("r");
+        wizard.sent(Asked::Disks);
+        wizard.answered(Ok(Answer::Destinations(vec![disk("vda")])));
+        wizard.key("Down");
+        wizard.key("Return");
+        wizard.sent(Asked::Review);
+        wizard.answered(Ok(Answer::Unlock([3; 32], false)));
+        assert_eq!(wizard.page, Page::Unlock);
+        wizard.key("Return");
+        assert!(!wizard.unlock_send);
+        wizard.key("Ctrl+v");
+        assert!(wizard.unlock_entry.as_ref().unwrap().as_bytes().is_empty());
+        for byte in KEY {
+            wizard.key(&char::from(*byte).to_string());
+        }
+        assert!(recovery::valid_entry(
+            wizard.unlock_entry.as_ref().unwrap().as_bytes()
+        ));
+        assert!(!wizard.state().contains(std::str::from_utf8(KEY).unwrap()));
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), Some(Asked::Unlock));
+        wizard.sent(Asked::Unlock);
+        wizard.answered(Ok(Answer::Unlock([4; 32], true)));
+        assert!(wizard.unlock_entry.as_ref().unwrap().as_bytes().is_empty());
+        assert_eq!(wizard.challenge, Some([4; 32]));
+        wizard.key("Escape");
+        assert!(wizard.unlock_entry.is_none());
+        assert!(wizard.challenge.is_none());
+        assert_eq!(wizard.withdraw, Some([4; 32]));
+        assert_eq!(wizard.page, Page::Destinations);
+    }
+
+    #[test]
+    fn recovery_back_ignores_late_unlock_and_review_replies() {
+        for reviewed in [false, true] {
+            let mut wizard = Wizard::new();
+            wizard.preserve = true;
+            wizard.page = Page::Unlock;
+            wizard.challenge = Some([3; 32]);
+            wizard.awaited = true;
+            wizard.asked = Some(Asked::Unlock);
+            wizard.disks = vec![disk("vda")];
+            wizard.selected = Some(0);
+            wizard.key("Escape");
+            let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC").unwrap();
+            let plan =
+                crate::service::tests::plan(wizard.disks.first().unwrap(), &settings).preserving();
+            let nonce = if reviewed { *plan.nonce() } else { [4; 32] };
+            wizard.answered(Ok(if reviewed {
+                Answer::Reviewed(Box::new(plan))
+            } else {
+                Answer::Unlock(nonce, true)
+            }));
+            assert_eq!(wizard.page, Page::Destinations);
+            assert_eq!(wizard.withdraw, Some(nonce));
+            assert!(wizard.unlock_entry.is_none());
+            assert!(wizard.plan.is_none());
+        }
+    }
+
+    #[test]
+    fn recovery_entry_uses_the_toolkits_backspace_spelling() {
+        let mut wizard = Wizard::new();
+        wizard.page = Page::Unlock;
+        wizard.unlock_entry = Some(crate::service::Entry::new().unwrap());
+        wizard.key("1");
+        wizard.key("2");
+        wizard.key("Backspace");
+        assert_eq!(wizard.unlock_entry.as_ref().unwrap().as_bytes(), b"1");
     }
 
     #[test]

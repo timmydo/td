@@ -3,7 +3,7 @@
 //! records"): the key the service sends once, held in memory only and
 //! zeroed on drop; its display, beside a QR code of its 48 digits a phone
 //! can keep; and the step that asks the person to say they kept it. Nobody
-//! types any part of it. This file alone names the disk protector's crate,
+//! types a new key; reinstall accepts an existing key in a masked entry. This file alone names the disk protector's crate,
 //! and only that codec (tests/confinement.rs). Nothing here prints, logs or
 //! copies the digits anywhere but the page.
 
@@ -46,6 +46,11 @@ const LAST_ROW: usize = 14;
 /// records").
 pub const CLOSING: &str =
     "Closing this window now withdraws the installation; the disk will not start.";
+
+/// Validate a typed existing key without retaining another copy.
+pub(crate) fn valid_entry(entry: &[u8]) -> bool {
+    RecoveryKey::parse(entry).is_ok()
+}
 
 /// A recovery key the installer service sent: its 48 digits, every group's
 /// value and check digit admitted, in one allocation zeroed on drop. It is
@@ -110,6 +115,10 @@ impl Shown {
 
 /// Which recovery-key view to paint.
 pub enum Step<'a> {
+    Unlock {
+        masked: &'a str,
+        notice: Option<&'a str>,
+    },
     /// The key is asked for and not yet here.
     Asking,
     /// The key, in its display form, and its QR code.
@@ -178,6 +187,42 @@ impl Composition for RecoveryPage<'_> {
         fill(self.surface.bounds(), CHROME, damage, sink);
         let surface = self.surface;
         let footer = match &self.step {
+            Step::Unlock { masked, notice } => {
+                row(surface, 1, "Unlock existing installation", damage, sink);
+                row(
+                    surface,
+                    3,
+                    "Type the saved recovery key. Hyphens between groups are optional.",
+                    damage,
+                    sink,
+                );
+                row(surface, 5, masked, damage, sink);
+                row(
+                    surface,
+                    7,
+                    "Unlock inspects your installation without changing the disk.",
+                    damage,
+                    sink,
+                );
+                row(
+                    surface,
+                    8,
+                    "You will review and confirm reinstall separately.",
+                    damage,
+                    sink,
+                );
+                row(
+                    surface,
+                    10,
+                    "Camera scanning is not available yet.",
+                    damage,
+                    sink,
+                );
+                if let Some(notice) = notice {
+                    row(surface, 12, notice, damage, sink);
+                }
+                "Return to unlock · Escape to cancel"
+            }
             Step::Asking => {
                 row(surface, 1, "Recovery key", damage, sink);
                 row(

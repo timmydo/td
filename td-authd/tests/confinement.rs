@@ -137,7 +137,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x65764dc8997178b0,
+        0x857afb30436d7d7b,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -1351,4 +1351,4 @@ const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const REVOCATION_FINGERPRINT: u64 = 0xae6413da1bcf5b12;
 const SHARED_CUTOVER_FINGERPRINT: u64 = 0x358939aac41ef40a;
 const DISK_INSTALL_FINGERPRINT: u64 = 0x45e5e48767f17d03;
-const CONSENT_CODEC_FINGERPRINT: u64 = 0x282490be2a44c4e5;
+const CONSENT_CODEC_FINGERPRINT: u64 = 0x855c6ad96aa12772;
