@@ -457,6 +457,29 @@ scoped pass is journaled under its scope, so
 one. `TD_CHECK_FULL` runs every check in full, scope or not, and
 `td-builder check recipe-checks` on its own has no scope.
 
+Cargo reader selection distinguishes an initial source-file edit from a
+whole-crate dependency change. A reader naming shared files only through literal imports (including
+escaped source fixtures) runs only when those files or their resolved
+literal embeds change. Runtime path uses retain the whole-crate edge.
+Consumer-local `include!` inputs are followed with their original file
+directories, including non-`.rs` files; text and byte includes remain data.
+Top-level literal `#[path]` modules are followed recursively; other module
+forms, computed paths, missing files, symlinks and bounded-scan exhaustion
+retain the whole-crate edge. One host feature exception permits an inactive
+`cfg_attr(feature = "target-recipe", path = ...)` alternative: the manifest
+must declare only the empty `target-recipe` feature, no defaults or other
+features, and no native fixture feature may be selected. Roster path
+dependencies cannot activate features, and host commands enable none in
+this shape. Any other feature arrangement keeps missing paths broad.
+Cargo dependencies and native-tool consumers
+always retain it. Only existing `src/*.rs` changes take this narrower first
+hop; manifests, deletions and other paths retain the old closure. Once a
+reader is selected, its downstream readers run by the whole-crate rule,
+including a cycle back to an initially changed crate. Workspace checks and
+recipe-check scope are unchanged. Paths the mapping ignores, including
+documentation, do not broaden a mixed code diff. Thus a private SSH-policy
+edit in firstboot does not run consumers of its shared hostname parser.
+
 A flat recipe definition at `recipes/src/recipes/<stem>.rs` also runs
 the builder/recipes/engine workspace legs and repository formatting,
 without unchanged standalone crate legs. Its stem starts with a lowercase

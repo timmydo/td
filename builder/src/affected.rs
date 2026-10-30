@@ -34,6 +34,8 @@
     clippy::indexing_slicing
 )] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
+mod source_reads;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -4863,7 +4865,7 @@ fn manifest_target_paths(text: &str) -> Vec<String> {
 /// and either is this scan reading less than it reports. The root itself is
 /// opened by `read_dir`, which follows a link there and so reads more, not
 /// less.
-fn sources_under(dir: &Path, required: bool) -> Result<String, String> {
+fn source_files_under(dir: &Path, required: bool) -> Result<Vec<PathBuf>, String> {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(d) = pending.pop() {
@@ -4895,6 +4897,12 @@ fn sources_under(dir: &Path, required: bool) -> Result<String, String> {
     if required && files.is_empty() {
         return Err(format!("no sources under {}", dir.display()));
     }
+    Ok(files)
+}
+
+#[cfg(test)]
+fn sources_under(dir: &Path, required: bool) -> Result<String, String> {
+    let files = source_files_under(dir, required)?;
     let mut out = String::new();
     for f in &files {
         let raw = std::fs::read_to_string(f)
@@ -4905,34 +4913,50 @@ fn sources_under(dir: &Path, required: bool) -> Result<String, String> {
     Ok(out)
 }
 
-/// The complete source and manifest inputs used by reader selection.
-fn crate_reader_inputs(root: &Path, reader: &GateCrate) -> Result<(String, String), String> {
+/// Retain origins so local includes outside the ordinary .rs walk can be read.
+fn crate_reader_files(root: &Path, reader: &GateCrate) -> Result<(Vec<PathBuf>, String), String> {
     let base = root.join(&reader.name);
-    let mut text = sources_under(&base.join("src"), true)?;
+    let mut files = source_files_under(&base.join("src"), true)?;
     for sub in ["tests", "examples", "benches"] {
-        text.push_str(&sources_under(&base.join(sub), false)?);
+        files.extend(source_files_under(&base.join(sub), false)?);
     }
     let build_rs = base.join("build.rs");
     if build_rs.is_file() {
-        let raw = std::fs::read_to_string(&build_rs)
-            .map_err(|e| format!("{} could not be read: {e}", build_rs.display()))?;
-        text.push_str(&strip_line_comments(&raw));
-        text.push('\n');
+        files.push(build_rs);
     }
     let manifest_path = base.join("Cargo.toml");
     let manifest = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("{} could not be read: {e}", manifest_path.display()))?;
-    // Inspect every declared path: `src/../tools/x.rs` leaves the walked tree.
-    // A missing declared file is an error; a directory is a path dependency.
     for target in manifest_target_paths(&manifest) {
-        let p = base.join(&target);
-        match std::fs::metadata(&p) {
+        let path = base.join(target);
+        match std::fs::metadata(&path) {
             Ok(meta) if meta.is_dir() => continue,
-            Ok(_) => {}
-            Err(e) => return Err(format!("{} could not be inspected: {e}", p.display())),
+            Ok(_) => files.push(path),
+            Err(e) => return Err(format!("{} could not be inspected: {e}", path.display())),
         }
-        let raw = std::fs::read_to_string(&p)
-            .map_err(|e| format!("{} could not be read: {e}", p.display()))?;
+    }
+    Ok((files, manifest))
+}
+
+/// The complete source and manifest inputs used by reader selection, and
+/// whether local embedded inputs were resolved well enough to narrow an edge.
+fn crate_reader_scope_inputs(
+    root: &Path,
+    reader: &GateCrate,
+) -> Result<(String, String, bool), String> {
+    let (files, manifest) = crate_reader_files(root, reader)?;
+    let inactive = reader.native_fixture_feature.is_none()
+        && source_reads::host_target_recipe_inactive(&manifest);
+    let (text, complete) = source_reads::consumer_inputs(root, &reader.name, files, inactive)?;
+    Ok((text, manifest, complete))
+}
+
+fn crate_reader_inputs(root: &Path, reader: &GateCrate) -> Result<(String, String), String> {
+    let (files, manifest) = crate_reader_files(root, reader)?;
+    let mut text = String::new();
+    for path in files {
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("{} could not be read: {e}", path.display()))?;
         text.push_str(&strip_line_comments(&raw));
         text.push('\n');
     }
@@ -5139,6 +5163,20 @@ const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[(
 fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, String> {
     let all = cargo_test_cmds_all(root)?;
     let roster = discover_gate_crates(root)?;
+    // A documentation-only path must not broaden a mixed code diff either.
+    let routing_roster = Ok(roster.clone());
+    let active: Vec<String> = changed
+        .iter()
+        .filter(|path| {
+            let mut selection = Selection::default();
+            map_path(root, &routing_roster, path, &mut selection);
+            !selection.preflights.is_empty()
+                || !selection.targets.is_empty()
+                || !selection.notes.is_empty()
+        })
+        .cloned()
+        .collect();
+    let changed = active.as_slice();
     let Some(mut selected) = changed_roster_crates(&roster, changed) else {
         return Ok(all);
     };
@@ -5152,7 +5190,7 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
         }
     }
     let readers = graph.readers;
-    close_over_readers(&mut selected, &readers);
+    close_over_changed_readers(root, &roster, &mut selected, &readers, changed)?;
     // A workspace path beside the one crate still owes its workspace legs.
     let workspace = changed.iter().any(|p| workspace_only_change(p));
     let exempt = match selected.as_slice() {
@@ -5205,6 +5243,7 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
 /// opt in take. A change to one of these takes every crate's legs; any
 /// other builder file is the builder's own, and its workspace legs test it.
 const CRATE_LEG_SOURCES: &[&str] = &[
+    "builder/src/affected/source_reads.rs",
     "builder/src/affected.rs",
     "builder/src/check_loop.rs",
     "builder/src/crypto_build.rs",
@@ -5284,6 +5323,68 @@ fn changed_roster_crates(roster: &[GateCrate], changed: &[String]) -> Option<Vec
     (workspace_only || !selected.is_empty()).then_some(selected)
 }
 
+/// Only the initial changed source files have a precise scope. Once a
+/// consumer is affected, its whole output may change, so subsequent hops
+/// retain the existing crate-wide closure, including cycles back to a seed.
+fn close_over_changed_readers(
+    root: &Path,
+    roster: &[GateCrate],
+    selected: &mut Vec<String>,
+    readers: &[(String, Vec<String>)],
+    changed: &[String],
+) -> Result<(), String> {
+    let mut pending: Vec<(String, bool)> = selected.iter().map(|s| (s.clone(), true)).collect();
+    let mut full = Vec::new();
+    let mut inputs = std::collections::BTreeMap::new();
+    while let Some((donor, precise)) = pending.pop() {
+        if full.contains(&donor) {
+            continue;
+        }
+        if !precise {
+            full.push(donor.clone());
+        }
+        let prefix = format!("{donor}/");
+        let paths: Vec<String> = changed
+            .iter()
+            .filter(|p| p.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let precise = precise
+            && !paths.is_empty()
+            && paths.iter().all(|p| {
+                p.starts_with(&format!("{donor}/src/"))
+                    && p.ends_with(".rs")
+                    && root.join(p).is_file()
+            });
+        for (_, consumers) in readers.iter().filter(|(name, _)| name == &donor) {
+            for consumer in consumers {
+                let Some(reader) = roster.iter().find(|c| c.name == *consumer) else {
+                    return Err(format!("reader {consumer} is outside the crate roster"));
+                };
+                if precise {
+                    if !inputs.contains_key(consumer) {
+                        inputs.insert(consumer.clone(), crate_reader_scope_inputs(root, reader)?);
+                    }
+                    let Some((text, manifest, complete)) = inputs.get(consumer) else {
+                        return Err(format!("missing reader inputs for {consumer}"));
+                    };
+                    let whole = !complete
+                        || manifest_names(manifest, &donor)
+                        || (reader.native_compositor_tests && donor == "td-compositor")
+                        || (consumer == "td-mta" && donor == "td-mail");
+                    if !whole && !source_reads::may_read_changed(root, text, &donor, &paths)? {
+                        continue;
+                    }
+                }
+                push_unique(selected, consumer);
+                pending.push((consumer.clone(), false));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 /// Close `selected` over the reader graph: a crate pushed here is itself
 /// looked up in turn, since a reader of a reader saw the change too.
 fn close_over_readers(selected: &mut Vec<String>, readers: &[(String, Vec<String>)]) {
@@ -8932,6 +9033,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn private_ssh_policy_edits_do_not_select_mail_or_ui_suites() {
+        let root = repo_root();
+        if discover_gate_crates(&root).is_err() {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        }
+        for changed in [
+            vec!["td-firstboot/src/ssh_policy.rs"],
+            vec!["td-firstboot/src/main.rs"],
+            vec![
+                "td-firstboot/src/ssh_policy.rs",
+                "td-firstboot/src/main.rs",
+                "td-login/TOKEN-LOGIN.md",
+                "recipes/src/recipes/system-x86-64.rs",
+                "recipes/src/recipes/openssh-x86-64-test.rs",
+            ],
+        ] {
+            let paths: Vec<String> = changed.iter().map(|p| p.to_string()).collect();
+            let cmds = cargo_test_cmds(&root, &paths).unwrap();
+            let mut selected: Vec<&str> =
+                cmds.iter().filter_map(|c| cmd_manifest_crate(c)).collect();
+            selected.sort_unstable();
+            selected.dedup();
+            assert_eq!(selected, ["td-firstboot"], "{paths:?}");
+            assert!(cmds.iter().any(|c| c.contains("--workspace")));
+        }
+        let shared = cargo_test_cmds(&root, &["td-firstboot/src/hostname.rs".into()]).unwrap();
+        assert!(shared
+            .iter()
+            .any(|c| cmd_manifest_crate(c) == Some("td-compositor")));
+    }
+
+    #[test]
+    fn a_shared_reader_reached_again_gets_its_full_dependency_closure() {
+        let root = crate::test_temp::TempDir::new("td-reader-scope-cycle").unwrap();
+        for (name, source, dependency) in [
+            ("td-aa", "include_str!(\"../../td-bb/src/lib.rs\");", ""),
+            ("td-bb", "include_str!(\"../../td-aa/src/shared.rs\");", ""),
+            ("td-cc", "include_str!(\"../../td-aa/src/private.rs\");", ""),
+            (
+                "td-dd",
+                "fn main() {}",
+                "[dependencies]\ntd-aa = { path = \"../td-aa\" }\n",
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(name).join("src")).unwrap();
+            std::fs::write(
+                root.join(name).join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n{dependency}"),
+            )
+            .unwrap();
+            std::fs::write(root.join(name).join("src/lib.rs"), source).unwrap();
+        }
+        for file in ["shared.rs", "private.rs", "other.rs"] {
+            std::fs::write(root.join("td-aa/src").join(file), "fn value() {}\n").unwrap();
+        }
+        let selected = |path: &str| {
+            let cmds = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
+            let mut names: Vec<String> = cmds
+                .iter()
+                .filter_map(|c| cmd_manifest_crate(c).map(str::to_string))
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+        assert_eq!(
+            selected("td-aa/src/shared.rs"),
+            ["td-aa", "td-bb", "td-cc", "td-dd"]
+        );
+        assert_eq!(selected("td-aa/src/other.rs"), ["td-aa", "td-dd"]);
+        assert_eq!(
+            selected("td-aa/Cargo.toml"),
+            ["td-aa", "td-bb", "td-cc", "td-dd"]
+        );
+    }
+
     /// Every roster crate must narrow to commands of both KINDS for itself.
     /// Without this the filter could yield a list without one, and a
     /// preflight over it would exit 0 having tested that crate not at all;
@@ -9084,7 +9263,7 @@ mod tests {
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
-            names(&one("td-busd/src/wire.rs")),
+            names(&one("td-busd/Cargo.toml")),
             [
                 "td-agent",
                 "td-audio",

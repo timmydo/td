@@ -82,6 +82,73 @@ pub fn embed_literals(code: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// Literal embeds whose markers are code, rather than text inside a string
+/// or character literal. The caller has already stripped comments.
+pub fn code_embed_literals(code: &str) -> Vec<(usize, String)> {
+    let bare = blank_literals(code);
+    embed_literals(code)
+        .into_iter()
+        .filter(|(at, _)| bare.get(*at..).is_some_and(|rest| !rest.starts_with(' ')))
+        .collect()
+}
+
+/// Whether path or conditional attributes occur in a nested scope whose
+/// module directory cannot be resolved against the containing file alone.
+pub fn has_nested_path_attribute(code: &str) -> bool {
+    let bare = blank_literals(code);
+    ["#[path", "#[cfg_attr"].iter().any(|marker| {
+        bare.match_indices(marker)
+            .any(|(at, _)| !is_top_level(&bare, at))
+    })
+}
+
+fn is_top_level(bare: &str, at: usize) -> bool {
+    bare.get(..at)
+        .unwrap_or("")
+        .chars()
+        .fold(0usize, |depth, c| match c {
+            '(' | '[' | '{' => depth.saturating_add(1),
+            ')' | ']' | '}' => depth.saturating_sub(1),
+            _ => depth,
+        })
+        == 0
+}
+
+/// Whether a module reads another file without a top-level literal path
+/// attribute this scanner can resolve. Attributes between the path and its
+/// module do not change that path. Inline-module path bases stay uncertain.
+pub fn has_unresolved_modules(code: &str) -> bool {
+    let mut resolved = Vec::new();
+    let bare = blank_literals(code);
+    for (at, _) in code_embed_literals(code) {
+        let Some(rest) = code.get(at..).and_then(|s| s.strip_prefix("#[path")) else {
+            continue;
+        };
+        if !is_top_level(&bare, at) {
+            continue;
+        }
+        let Some(value) = rest.trim_start().strip_prefix('=').map(str::trim_start) else {
+            continue;
+        };
+        let Some((_, len)) = string_literal_span(value) else {
+            continue;
+        };
+        let Some(tail) = value.get(len..) else {
+            continue;
+        };
+        let Some(after) = tail.trim_start().strip_prefix(']') else {
+            continue;
+        };
+        let from = code.len().saturating_sub(after.len());
+        if let Some(end) = module_body_at(code, from) {
+            if code.get(end..).is_some_and(|s| s.starts_with(';')) {
+                resolved.push((at, end));
+            }
+        }
+    }
+    declares_out_of_line_module(&blank(code, &resolved))
+}
+
 /// The byte spans of `code` (comments cut) that an exact `#[cfg(test)]`
 /// gates over a MODULE: an attribute first on its line, outside string and
 /// char literals, whose item — past any further attributes and a
@@ -233,9 +300,18 @@ pub fn production_code(text: &str) -> String {
 /// spaces, one per byte, so what is left keeps its token boundaries and
 /// every byte offset.
 fn blank(code: &str, spans: &[(usize, usize)]) -> String {
+    let mut ordered = spans.to_vec();
+    ordered.sort_unstable();
+    let mut remaining = ordered.iter().peekable();
     let mut out = String::with_capacity(code.len());
     for (i, c) in code.char_indices() {
-        if spans.iter().any(|(s, e)| *s <= i && i <= *e) {
+        while remaining.peek().is_some_and(|(_, end)| *end < i) {
+            remaining.next();
+        }
+        if remaining
+            .peek()
+            .is_some_and(|(start, end)| *start <= i && i <= *end)
+        {
             (0..c.len_utf8()).for_each(|_| out.push(' '));
         } else {
             out.push(c);
@@ -735,6 +811,45 @@ pub fn block_end(code: &str, open: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordered_blank_preserves_overlaps_and_utf8_offsets() {
+        let code = "aébcdefgh";
+        let spans = [(6, 7), (1, 4), (3, 6), (2, 2), (0, 0)];
+        let mut expected = String::new();
+        for (at, c) in code.char_indices() {
+            if spans.iter().any(|(start, end)| *start <= at && at <= *end) {
+                expected.extend(std::iter::repeat_n(' ', c.len_utf8()));
+            } else {
+                expected.push(c);
+            }
+        }
+        assert_eq!(super::blank(code, &spans), expected);
+    }
+
+    #[test]
+    fn code_embeds_exclude_source_fixtures_and_modules_keep_their_bases() {
+        let code = r##"const EXAMPLE: &str = r#"include!("fake.inc")"#;
+#[path = "real.inc"]
+#[allow(dead_code)]
+mod real;
+"##;
+        assert_eq!(
+            super::code_embed_literals(code)
+                .iter()
+                .map(|(_, path)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["real.inc"]
+        );
+        assert!(!super::has_unresolved_modules(code));
+        assert!(super::has_unresolved_modules(
+            "mod nested {\n#[path = \"real.inc\"]\nmod child;\n}"
+        ));
+        assert!(super::has_unresolved_modules("mod child;"));
+        assert!(super::has_unresolved_modules(
+            "#[cfg_attr(test, path = \"real.inc\")] mod child;"
+        ));
+    }
+
     use super::*;
 
     // Inputs are assembled at run time: a `td-<name>/` spelled here would
