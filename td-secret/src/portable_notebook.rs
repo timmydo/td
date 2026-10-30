@@ -3,7 +3,7 @@
 //! the session's unlock.
 
 use super::lifecycle::{Directory, Error, Session};
-use super::{Entry, Notebook, MAX_BODY, MAX_ENTRIES, MAX_PLAIN, MAX_TITLE};
+use super::{Entry, MailBinding, Notebook, MAX_BODY, MAX_ENTRIES, MAX_PASSWORD, MAX_TITLE};
 use std::io::Read;
 
 pub(super) type EntryId = [u8; 16];
@@ -17,6 +17,7 @@ pub(super) enum EntryError {
     Duplicate,
     Body,
     Full,
+    Credential,
 }
 
 pub(super) struct Summary<'a> {
@@ -79,6 +80,17 @@ pub(super) enum Change {
         id: EntryId,
         base: u64,
     },
+    Password {
+        id: EntryId,
+        base: u64,
+        password: Option<Text>,
+    },
+    Binding {
+        id: EntryId,
+        base: u64,
+        binding: MailBinding,
+        allow: bool,
+    },
 }
 
 /// The identity and revision a successful change committed.
@@ -99,10 +111,12 @@ fn title_error(entries: &[Entry], skip: Option<usize>, title: &str) -> Option<En
         .then_some(EntryError::Duplicate)
 }
 
+#[cfg(test)]
 fn plaintext_size(entries: &[Entry]) -> Option<usize> {
-    entries.iter().try_fold(4usize, |size, entry| {
-        size.checked_add(32 + entry.title().len() + entry.body().len())
-    })
+    let copy = Notebook {
+        entries: entries.iter().map(Entry::copy).collect(),
+    };
+    copy.validate().ok()
 }
 
 impl Session {
@@ -150,27 +164,16 @@ impl Session {
         if changes.is_empty() {
             return Ok(Vec::new());
         }
-        let mut entries: Vec<Entry> = self
-            .notebook()
-            .entries
-            .iter()
-            .map(|entry| {
-                Entry::new(
-                    entry.id,
-                    entry.revision,
-                    entry.title().to_owned(),
-                    entry.body().to_vec(),
-                )
-            })
-            .collect();
+        let mut entries: Vec<Entry> = self.notebook().entries.iter().map(Entry::copy).collect();
         let mut committed = Vec::with_capacity(changes.len());
         for change in changes {
             committed.push(apply_one(&mut entries, change, random)?);
         }
-        if plaintext_size(&entries).is_none_or(|size| size > MAX_PLAIN) {
+        let notebook = Notebook { entries };
+        if notebook.validate().is_err() {
             return Err(Error::Entry(EntryError::Full));
         }
-        self.save(directory, &Notebook { entries }, revoked, random)?;
+        self.save(directory, &notebook, revoked, random)?;
         Ok(committed)
     }
 }
@@ -256,6 +259,52 @@ fn apply_one(
                 revision: Some(revision),
             }
         }
+        Change::Password { id, base, password } => {
+            let index = find(entries, &id, base)?;
+            if password
+                .as_ref()
+                .is_some_and(|text| text.as_str().is_empty() || text.as_str().len() > MAX_PASSWORD)
+            {
+                return Err(Error::Entry(EntryError::Credential));
+            }
+            let revision = next(base)?;
+            let entry = entries
+                .get_mut(index)
+                .ok_or(Error::Entry(EntryError::Missing))?;
+            entry.replace_password(password.map(|text| text.take().into_bytes()));
+            entry.revision = revision;
+            Committed {
+                id,
+                revision: Some(revision),
+            }
+        }
+        Change::Binding {
+            id,
+            base,
+            binding,
+            allow,
+        } => {
+            let index = find(entries, &id, base)?;
+            if allow
+                && entries
+                    .iter()
+                    .any(|entry| entry.id != id && entry.bindings().contains(&binding))
+            {
+                return Err(Error::Entry(EntryError::Credential));
+            }
+            let revision = next(base)?;
+            let entry = entries
+                .get_mut(index)
+                .ok_or(Error::Entry(EntryError::Missing))?;
+            entry
+                .set_binding(binding, allow)
+                .map_err(|_| Error::Entry(EntryError::Credential))?;
+            entry.revision = revision;
+            Committed {
+                id,
+                revision: Some(revision),
+            }
+        }
         Change::Delete { id, base } => {
             let index = find(entries, &id, base)?;
             entries.remove(index);
@@ -273,6 +322,7 @@ fn next(base: u64) -> Result<u64, Error> {
 mod tests {
     use super::*;
     use crate::portable::lifecycle::tests::{created, unlocked, Bench, Place, Random};
+    use crate::portable::MAX_PLAIN;
 
     struct Fixture {
         place: Place,
@@ -310,6 +360,62 @@ mod tests {
             })
             .unwrap()
         }
+    }
+
+    #[test]
+    fn credential_changes_keep_notes_and_survive_reopen_without_reauthorization() {
+        let mut fixture = Fixture::new();
+        let entry = fixture.create("Mail", "notes stay notes");
+        let binding = MailBinding::new(
+            "personal".into(),
+            "https://mail.example/jmap".into(),
+            "alice".into(),
+        )
+        .unwrap();
+        fixture
+            .apply(Change::Password {
+                id: entry.id,
+                base: 1,
+                password: Some("token".into()),
+            })
+            .unwrap();
+        fixture
+            .apply(Change::Binding {
+                id: entry.id,
+                base: 2,
+                binding: binding.clone(),
+                allow: true,
+            })
+            .unwrap();
+        let before = fixture.place.bytes();
+        assert!(fixture
+            .apply(Change::Password {
+                id: entry.id,
+                base: 1,
+                password: None
+            })
+            .is_err());
+        assert_eq!(fixture.place.bytes(), before);
+        fixture
+            .apply(Change::Edit {
+                id: entry.id,
+                base: 3,
+                title: "Renamed".into(),
+                body: "new notes".into(),
+            })
+            .unwrap();
+        let Fixture {
+            place,
+            mut bench,
+            session,
+            ..
+        } = fixture;
+        drop(session);
+        let session = unlocked(&place, &mut bench, 0);
+        let saved = session.entry(&entry.id).unwrap();
+        assert_eq!(saved.body(), b"new notes");
+        assert_eq!(saved.password(), Some(b"token".as_slice()));
+        assert!(saved.bindings().contains(&binding));
     }
 
     #[test]

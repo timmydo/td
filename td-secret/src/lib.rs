@@ -469,12 +469,18 @@ mod confinement {
             .unwrap();
         assert_eq!(portable.matches("pub mod ").count(), 1);
         assert!(portable.contains("pub mod pass;"));
-        // pass defines what it exposes; it re-exports and nests nothing.
+        // The only re-export is the bounded mail-binding value, never a key or backend.
         let pass = include_str!("portable_pass.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();
-        for widening in ["pub use", "pub mod", "pub(crate)", "macro_export"] {
+        assert_eq!(
+            pass.lines()
+                .filter(|line| line.starts_with("pub use "))
+                .collect::<Vec<_>>(),
+            ["pub use super::MailBinding;"]
+        );
+        for widening in ["pub mod", "pub(crate)", "macro_export"] {
             assert!(!pass.contains(widening), "{widening}");
         }
         let main = include_str!("main.rs");

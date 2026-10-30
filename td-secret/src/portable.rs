@@ -26,6 +26,62 @@ const BODY: &[u8] = b"td-secret/portable/body/v2\0";
 const MAX_ENTRIES: usize = 1024;
 const MAX_TITLE: usize = 512;
 const MAX_BODY: usize = 64 * 1024;
+const MAX_PASSWORD: usize = 4096;
+const MAX_BINDINGS: usize = 16;
+const CREDENTIAL_EXTENSION: &[u8; 8] = b"TDCRED01";
+
+/// An approved mail account and destination, never a caller's app identity.
+/// Stored encrypted with the entry; only the trusted binding UI may create it.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MailBinding {
+    account: String,
+    server: String,
+    username: String,
+}
+
+impl MailBinding {
+    pub fn new(account: String, server: String, username: String) -> Result<Self> {
+        let binding = Self {
+            account,
+            server,
+            username,
+        };
+        for (value, limit) in [
+            (&binding.account, 256),
+            (&binding.server, 2048),
+            (&binding.username, 1024),
+        ] {
+            if value.is_empty() || value.len() > limit || value.chars().any(char::is_control) {
+                return Err("invalid mail credential binding".into());
+            }
+        }
+        Ok(binding)
+    }
+
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    fn encoded_size(&self) -> usize {
+        12 + self.account.len() + self.server.len() + self.username.len()
+    }
+}
+
+impl Drop for MailBinding {
+    fn drop(&mut self) {
+        for field in [&mut self.account, &mut self.server, &mut self.username] {
+            let mut bytes = std::mem::take(field).into_bytes();
+            bytes.fill(0);
+            std::hint::black_box(&mut bytes);
+        }
+    }
+}
 const MAX_PLAIN: usize = 4 * 1024 * 1024;
 const MAX_SLOTS: usize = 8;
 const MAX_CREDENTIAL: usize = 1024;
@@ -71,6 +127,8 @@ pub(super) struct Entry {
     pub revision: u64,
     title: String,
     body: Vec<u8>,
+    password: Option<Vec<u8>>,
+    bindings: Vec<MailBinding>,
 }
 
 impl Entry {
@@ -80,6 +138,8 @@ impl Entry {
             revision,
             title,
             body,
+            password: None,
+            bindings: Vec::new(),
         }
     }
 
@@ -89,6 +149,50 @@ impl Entry {
 
     pub fn body(&self) -> &[u8] {
         &self.body
+    }
+
+    pub fn password(&self) -> Option<&[u8]> {
+        self.password.as_deref()
+    }
+    pub fn bindings(&self) -> &[MailBinding] {
+        &self.bindings
+    }
+
+    pub fn copy(&self) -> Self {
+        Self {
+            id: self.id,
+            revision: self.revision,
+            title: self.title.clone(),
+            body: self.body.clone(),
+            password: self.password.clone(),
+            bindings: self.bindings.clone(),
+        }
+    }
+
+    pub fn replace_password(&mut self, password: Option<Vec<u8>>) {
+        if let Some(mut old) = self.password.take() {
+            old.fill(0);
+            std::hint::black_box(&mut old);
+        }
+        self.password = password;
+        if self.password.is_none() {
+            self.bindings.clear();
+        }
+    }
+
+    pub fn set_binding(&mut self, binding: MailBinding, allow: bool) -> Result<()> {
+        if let Some(index) = self.bindings.iter().position(|old| old == &binding) {
+            if !allow {
+                self.bindings.remove(index);
+            }
+        } else if allow {
+            if self.password.is_none() || self.bindings.len() >= MAX_BINDINGS {
+                return Err("credential missing or binding limit reached".into());
+            }
+            self.bindings.push(binding);
+            self.bindings.sort();
+        }
+        Ok(())
     }
 
     pub fn replace_text(&mut self, title: String, body: Vec<u8>) {
@@ -110,6 +214,7 @@ impl Entry {
 impl Drop for Entry {
     fn drop(&mut self) {
         self.clear_text();
+        self.replace_password(None);
     }
 }
 
@@ -125,6 +230,11 @@ impl Notebook {
         let mut ids = BTreeSet::new();
         let mut titles = BTreeSet::new();
         let mut size = 4usize;
+        let extended = self.entries.iter().any(|entry| entry.password.is_some());
+        let mut bindings = BTreeSet::new();
+        if extended {
+            size += 12;
+        }
         for entry in &self.entries {
             if entry.revision == 0
                 || entry.title.is_empty()
@@ -136,6 +246,35 @@ impl Notebook {
                 || !titles.insert(entry.title.as_str())
             {
                 return Err("invalid or duplicate portable entry".into());
+            }
+            if entry.password.as_ref().is_some_and(|password| {
+                password.is_empty()
+                    || password.len() > MAX_PASSWORD
+                    || std::str::from_utf8(password).is_err()
+            }) || (entry.password.is_none() && !entry.bindings.is_empty())
+                || entry.bindings.len() > MAX_BINDINGS
+                || entry
+                    .bindings
+                    .windows(2)
+                    .any(|pair| pair.first() >= pair.get(1))
+                || entry
+                    .bindings
+                    .iter()
+                    .any(|binding| !bindings.insert(binding))
+            {
+                return Err("invalid or duplicate portable credential binding".into());
+            }
+            if extended {
+                size = size
+                    .checked_add(
+                        8 + entry.password.as_ref().map_or(0, Vec::len)
+                            + entry
+                                .bindings
+                                .iter()
+                                .map(MailBinding::encoded_size)
+                                .sum::<usize>(),
+                    )
+                    .ok_or("portable credential size overflow")?;
             }
             size = size
                 .checked_add(32 + entry.title.len() + entry.body.len())
@@ -154,6 +293,19 @@ impl Notebook {
             out.0.extend_from_slice(&entry.revision.to_be_bytes());
             put_field(&mut out.0, entry.title.as_bytes())?;
             put_field(&mut out.0, &entry.body)?;
+        }
+        if self.entries.iter().any(|entry| entry.password.is_some()) {
+            out.0.extend_from_slice(CREDENTIAL_EXTENSION);
+            put_u32(&mut out.0, self.entries.len())?;
+            for entry in &self.entries {
+                put_field(&mut out.0, entry.password.as_deref().unwrap_or(&[]))?;
+                put_u32(&mut out.0, entry.bindings.len())?;
+                for binding in &entry.bindings {
+                    put_field(&mut out.0, binding.account.as_bytes())?;
+                    put_field(&mut out.0, binding.server.as_bytes())?;
+                    put_field(&mut out.0, binding.username.as_bytes())?;
+                }
+            }
         }
         Ok(out)
     }
@@ -179,7 +331,43 @@ impl Notebook {
                 revision,
                 title: title.to_owned(),
                 body: body.to_vec(),
+                password: None,
+                bindings: Vec::new(),
             });
+        }
+        if !reader.0.is_empty() {
+            if reader.take(8)? != CREDENTIAL_EXTENSION || reader.count(MAX_ENTRIES)? != count {
+                return Err("invalid portable credential extension".into());
+            }
+            for entry in &mut notebook.entries {
+                let password = reader.field(MAX_PASSWORD)?;
+                if !password.is_empty() {
+                    entry.password = Some(password.to_vec());
+                }
+                let count = reader.count(MAX_BINDINGS)?;
+                for _ in 0..count {
+                    let mut text = |limit| -> Result<&str> {
+                        std::str::from_utf8(reader.field(limit)?)
+                            .map_err(|_| "invalid credential binding text".into())
+                    };
+                    // Validate every borrowed field before copying plaintext.
+                    let account = text(256)?;
+                    let server = text(2048)?;
+                    let username = text(1024)?;
+                    entry.bindings.push(MailBinding::new(
+                        account.to_owned(),
+                        server.to_owned(),
+                        username.to_owned(),
+                    )?);
+                }
+            }
+            if !notebook
+                .entries
+                .iter()
+                .any(|entry| entry.password.is_some())
+            {
+                return Err("empty portable credential extension".into());
+            }
         }
         reader.end()?;
         notebook.validate()?;
@@ -735,6 +923,76 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn mail_binding() -> MailBinding {
+        MailBinding::new(
+            "personal".into(),
+            "https://mail.example/.well-known/jmap".into(),
+            "alice".into(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn credential_extension_is_separate_authenticated_and_backward_readable() {
+        let original = notebook();
+        let legacy = original.encode().unwrap();
+        assert!(Notebook::decode(&legacy.0).unwrap().entries[0]
+            .password()
+            .is_none());
+        let mut changed = notebook();
+        changed.entries[0].replace_password(Some(b"exact-token\n".to_vec()));
+        changed.entries[0]
+            .set_binding(mail_binding(), true)
+            .unwrap();
+        let encoded = changed.encode().unwrap();
+        assert_eq!(encoded.0.len(), changed.validate().unwrap());
+        assert!(encoded.0.starts_with(&legacy.0));
+        for length in legacy.0.len() + 1..encoded.0.len() {
+            assert!(Notebook::decode(&encoded.0[..length]).is_err(), "{length}");
+        }
+        let vault = LockedVault::create(&changed, &protectors(), &mut random()).unwrap();
+        for (name, key) in [(b"primary".as_slice(), 0x11), (b"backup".as_slice(), 0x22)] {
+            let opened = vault.open(name, &Secret32([key; 32])).unwrap();
+            let entry = &opened.notebook.entries[0];
+            assert_eq!(entry.body(), original.entries[0].body());
+            assert_eq!(entry.password(), Some(b"exact-token\n".as_slice()));
+            assert!(entry.bindings().contains(&mail_binding()));
+        }
+        // The extension is inside the authenticated ciphertext, not an
+        // unauthenticated hint beside the envelope.
+        let mut corrupt = vault.bytes().to_vec();
+        let end = corrupt.len() - 17;
+        corrupt[end] ^= 1;
+        assert!(LockedVault::decode(&corrupt)
+            .unwrap()
+            .open(b"primary", &Secret32([0x11; 32]))
+            .is_err());
+    }
+
+    #[test]
+    fn credentials_and_bindings_are_bounded_and_unambiguous() {
+        let mut value = notebook();
+        for password in [Vec::new(), vec![b'x'; MAX_PASSWORD + 1], vec![0xff]] {
+            value.entries[0].replace_password(Some(password));
+            assert!(value.encode().is_err());
+        }
+        value.entries[0].replace_password(Some(vec![b'x'; MAX_PASSWORD]));
+        value.entries[0].set_binding(mail_binding(), true).unwrap();
+        assert!(value.encode().is_ok());
+        let mut duplicate = value.entries[0].copy();
+        duplicate.id = [42; 16];
+        duplicate.replace_text("second".into(), Vec::new());
+        value.entries.push(duplicate);
+        assert!(value.encode().is_err());
+        value.entries[1].set_binding(mail_binding(), false).unwrap();
+        assert!(value.encode().is_ok());
+        value.entries[0].replace_password(None);
+        assert!(value.entries[0].bindings().is_empty());
+        for (account, server, username) in [("", "s", "u"), ("a", "s\n", "u"), ("a", "s", "")] {
+            assert!(MailBinding::new(account.into(), server.into(), username.into()).is_err());
+        }
+    }
+
     fn random() -> Cursor<Vec<u8>> {
         Cursor::new((0u8..=255).cycle().take(1024).collect())
     }
@@ -746,6 +1004,8 @@ mod tests {
                 revision: 1,
                 title: "Email/Personal".into(),
                 body: b"username: alice\npassword: example\r\n".to_vec(),
+                password: None,
+                bindings: Vec::new(),
             }],
         }
     }
@@ -1314,6 +1574,8 @@ mod tests {
                 revision: 1,
                 title,
                 body: vec![b'x'; body_size],
+                password: None,
+                bindings: Vec::new(),
             });
             remaining -= overhead + body_size;
             number += 1;

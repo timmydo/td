@@ -204,6 +204,7 @@ impl std::fmt::Display for Failure {
                 EntryError::Duplicate => "another entry has this title",
                 EntryError::Body => "the entry is too large",
                 EntryError::Full => "the notebook is full",
+                EntryError::Credential => "invalid credential or conflicting account binding",
             }),
             Error::Uncertain => f.write_str(
                 "the save may or may not have been published; lock and unlock to see the vault",
@@ -254,6 +255,8 @@ fn token_text(error: &TokenError) -> &'static str {
     }
 }
 
+pub use super::MailBinding;
+
 /// An entry as the notebook list shows it.
 pub struct Summary<'a> {
     pub id: EntryId,
@@ -267,6 +270,8 @@ pub struct Entry<'a> {
     pub revision: u64,
     pub title: &'a str,
     pub body: &'a [u8],
+    pub password: Option<&'a [u8]>,
+    pub bindings: &'a [MailBinding],
 }
 
 /// A change against the revision the caller last read. Its text is
@@ -291,6 +296,17 @@ pub enum Change {
         id: EntryId,
         base: u64,
     },
+    Password {
+        id: EntryId,
+        base: u64,
+        password: Option<String>,
+    },
+    Binding {
+        id: EntryId,
+        base: u64,
+        binding: MailBinding,
+        allow: bool,
+    },
 }
 
 impl Drop for Change {
@@ -301,7 +317,12 @@ impl Drop for Change {
                 wipe(body);
             }
             Self::Rename { title, .. } => wipe(title),
-            Self::Delete { .. } => {}
+            Self::Password { password, .. } => {
+                if let Some(password) = password {
+                    wipe(password);
+                }
+            }
+            Self::Delete { .. } | Self::Binding { .. } => {}
         }
     }
 }
@@ -338,6 +359,22 @@ impl From<Change> for notebook::Change {
                 base: *base,
                 title: Text::new(take(title)),
             },
+            Change::Password { id, base, password } => Self::Password {
+                id: *id,
+                base: *base,
+                password: password.take().map(Text::new),
+            },
+            Change::Binding {
+                id,
+                base,
+                binding,
+                allow,
+            } => Self::Binding {
+                id: *id,
+                base: *base,
+                binding: binding.clone(),
+                allow: *allow,
+            },
             Change::Delete { id, base } => Self::Delete {
                 id: *id,
                 base: *base,
@@ -373,6 +410,8 @@ impl Vault {
             revision: entry.revision,
             title: entry.title(),
             body: entry.body(),
+            password: entry.password(),
+            bindings: entry.bindings(),
         })
     }
 

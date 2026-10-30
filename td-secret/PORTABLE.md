@@ -283,6 +283,47 @@ valid-point substitutions against both wrapper and body authentication,
 and refusal of old/unknown versions. These are cryptographic
 and structural tests, not physical enrollment or recovery evidence.
 
+### Credential fields and remembered mail bindings
+
+An entry may carry one explicit UTF-8 password/token of 1 through 4096
+bytes, independently of its freeform notes. No line of an existing note
+becomes a password implicitly. The bytes are preserved exactly. Removing
+the password also removes its bindings; editing or renaming notes preserves
+both. All changes use the existing entry revision and atomic encrypted
+publication. Neither a password nor a binding is plaintext on disk.
+
+A remembered mail binding consists of the exact account name, configured
+server/discovery URL and username. Their nonempty UTF-8 bounds are 256,
+2048 and 1024 bytes, respectively, with control characters refused. Each
+entry admits at most 16 bindings, sorted and unique, and one binding may
+name at most one entry in a vault. Changing a destination or username needs
+a new approval. The binding contains no caller-provided application identity:
+the trusted service must independently admit the mail instance before lookup.
+The value type is the notebook API's only re-export and exposes no key or
+backend authority.
+
+These fields use an authenticated optional notebook extension. The version-2
+envelope, token wrappers and cryptographic domains are unchanged. After the
+existing entries, an extended notebook carries eight bytes `TDCRED01`, a
+big-endian u32 equal to the preceding entry count, then, in that same order,
+each entry's u32 password length and bytes (zero means absent), u32 binding
+count, and each binding's three u32-length-prefixed UTF-8 strings. An
+extension without any password, unknown marker, count mismatch, duplicate
+binding, unsorted binding or trailing bytes is refused. The 4 MiB total
+plaintext limit includes every extension byte. A notebook without these
+fields keeps its original encoding and independent cryptographic vectors.
+An older reader rejects the extension as trailing plaintext rather than
+silently discarding credentials on save. New readers accept old notebooks;
+adding a credential needs no token re-enrollment or loss of notes.
+
+Entry copies retain the fields in clearing owners. Replacing or removing a
+password clears the outgoing buffer, and dropping an entry clears its
+password, notes, title and binding strings. As with the existing notebook,
+this is best-effort clearing, not a claim about compiler or recipient copies.
+The storage/API prerequisite does not itself expose credentials to apps;
+trusted launch admission, secure-attention authorization, session revocation
+and the app-facing transport remain required before the workflow is usable.
+
 ### Implemented ciphertext publication prerequisite
 
 `src/portable_store.rs`, a private child of the envelope module, owns short
@@ -1149,8 +1190,8 @@ the supported host.
 td-secret is a library crate with a binary that only calls its `run`.
 Its one other public module is `pass` (`src/portable_pass.rs`), the
 notebook API td-pass links for standalone mode; nothing else in the
-crate is public, `pass` re-exports nothing, and a confinement test pins
-both.
+crate is public. `pass` re-exports only the validated `MailBinding`
+value type; a confinement test pins both boundaries.
 
 - **Host.** `Host::open` applies the host adapter's process protection
   and admits the account's vault directory, refusing a host that cannot
