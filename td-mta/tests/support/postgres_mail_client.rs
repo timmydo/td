@@ -415,7 +415,7 @@ pub(super) fn exercise(
             let listing = client.ask(json!({"command":"list_mailboxes"}));
             assert!(listing["ok"].is_true(), "{listing}");
             assert!(!listing["mailboxes"].as_array().unwrap().iter().any(|folder| folder["id"].as_str()==Some(archive_wire)));
-            exercise_queries(&mut client, fixture, request, trust, &cloud_binding, (inbox_wire,
+            exercise_queries(&mut client, fixture, request, trust, &cloud_binding, (&backend, device.device_id(), device.password()), (inbox_wire,
                 listing["mailboxes"].as_array().unwrap().iter().find(|folder| folder["name"].as_str()==Some("Child")).unwrap()["id"].as_str().unwrap(), email["id"].as_str().unwrap()));
             exercise_header_rules(fixture, &config, &runtime, inbox_wire, email["id"].as_str().unwrap());
             let usage_before = sql(fixture, "SELECT body_bytes||':'||blob_count FROM td_mta.account_usage");
@@ -992,6 +992,11 @@ fn exercise_queries(
     request: &Request<'_>,
     trust: &TrustStore,
     binding: &Binding,
+    context: (
+        &td_mta::postgres_http_api::Service<'_, '_, '_>,
+        td_mta::ids::DeviceId,
+        &[u8],
+    ),
     ids: (&str, &str, &str),
 ) {
     let (inbox, other, original) = ids;
@@ -1304,6 +1309,121 @@ fn exercise_queries(
     );
     sql(fixture, &damage);
     check(client.ask(query("tailneedle")), 0, &[wire]);
+
+    // A malformed multipart container remains stored, but cannot be indexed.
+    let broken = b"Subject: Unsearchable fixture\r\nContent-Type: multipart/mixed; boundary=x\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nhidden text\r\n--x--\r\n";
+    let broken = postgres_receiving::prepare(
+        binding,
+        &postgres_receiving::Message {
+            bytes: broken,
+            hostname: "localhost",
+            extended: true,
+            header_bytes: 65536,
+            received_at: 1_704_067_201_000,
+            receipt: SmtpReceipt {
+                peer: "192.0.2.1".parse().unwrap(),
+                tls: ReceiptTls::Tls13,
+                gateway: None,
+                ehlo: "sender.example.test",
+                reverse_path: "sender@example.test",
+                recipients,
+            },
+        },
+        deadline(),
+    )
+    .unwrap();
+    postgres_receiving::publish(request, trust, deadline(), &broken).unwrap();
+    let partial = client.ask(query("tailneedle"));
+    check(partial.clone(), 0, &[wire]);
+    assert_eq!(partial["search_skipped"].as_u64(), Some(1), "{partial}");
+    assert!(partial["results_incomplete"].is_true(), "{partial}");
+    assert!(partial["total"].is_null(), "{partial}");
+    let empty = client.ask(query("missing-partial-search-term"));
+    check(empty.clone(), 0, &[]);
+    assert!(empty["results_incomplete"].is_true(), "{empty}");
+    assert_eq!(empty["search_skipped"].as_u64(), Some(1));
+    let (backend, device, password) = context;
+    use td_mta::https_upload::Backend;
+    let credentials = http_fixture::credentials(password);
+    let mut account_buffer = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let account = td_mta::wire::encode_id(binding.account(), &mut account_buffer).unwrap();
+    for (partial, position) in [(false, 0), (true, 0), (true, 1)] {
+        let mut using = vec![td_mta::jmap_request::CORE, td_mta::jmap_request::MAIL];
+        if partial {
+            using.push(td_mta::jmap_request::PARTIAL_SEARCH);
+        }
+        let body = json!({"using":using, "methodCalls":[["Email/query",
+            {"accountId":account, "filter":{"inMailbox":inbox,"text":"tailneedle"},
+            "sort":[{"property":"receivedAt","isAscending":false}],
+            "limit":1,"position":position,"calculateTotal":true},"query"]]})
+        .to_string();
+        let mut transport = http_fixture::Wire {
+            input: body.as_bytes().to_vec(),
+            position: 0,
+            output: Vec::new(),
+            fail_write: false,
+        };
+        backend
+            .api(
+                td_mta::https_api::Request {
+                    keep_alive: false,
+                    device,
+                    credentials: &credentials,
+                    framing: td_mta::http_request::Framing::Length(body.len() as u64),
+                    prefix: &[],
+                    expect_continue: false,
+                    deadline: Deadline::after(backend.clock.sample().unwrap().monotonic, 10_000)
+                        .unwrap(),
+                },
+                &mut transport,
+                &Control::default(),
+            )
+            .unwrap();
+        let response = String::from_utf8(transport.output).unwrap();
+        let (headers, response) = response.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK"));
+        let response = td_json::parse(response).unwrap();
+        let method = &response["methodResponses"][0];
+        if partial {
+            assert_eq!(method[0].as_str(), Some("Email/query"), "{response}");
+            assert_eq!(method[1]["searchSkipped"].as_u64(), Some(1), "{response}");
+            assert!(method[1].get("total").is_none(), "{response}");
+            assert_eq!(
+                method[1]["ids"],
+                if position == 0 {
+                    json!([wire])
+                } else {
+                    json!([])
+                }
+            );
+        } else {
+            assert_eq!(method[0].as_str(), Some("error"), "{response}");
+            assert_eq!(
+                method[1]["description"].as_str(),
+                Some("messageInterpretation"),
+                "{response}"
+            );
+        }
+    }
+    let broken_blob = sql(
+        fixture,
+        &format!(
+            "SELECT encode(blob_id,'hex') FROM td_mta.emails WHERE id=decode('{}','hex')",
+            broken.email()
+        ),
+    );
+    let corrupt = format!("UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,get_byte(bytes,0)#1) WHERE blob_id=decode('{broken_blob}','hex') AND ordinal=0");
+    sql(fixture, &corrupt);
+    let refused = client.ask(query("tailneedle"));
+    assert!(
+        !refused["ok"].is_true(),
+        "corruption must not become partial success: {refused}"
+    );
+    sql(fixture, &corrupt);
+    let mut broken_wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let broken_wire = td_mta::wire::encode_id(broken.email(), &mut broken_wire).unwrap();
+    let deleted = client.ask(json!({"command":"destroy","id":broken_wire}));
+    assert!(deleted["results"][0]["ok"].is_true(), "{deleted}");
     let deleted = client.ask(json!({"command":"destroy", "id":wire}));
     assert!(deleted["results"][0]["ok"].is_true(), "{deleted}");
     assert_eq!(

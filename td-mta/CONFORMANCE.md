@@ -226,8 +226,8 @@ POLICY.md specifies these choices and their independent CASES.md oracles:
 - Accepted mail may exceed interpretation limits. Default Email/get batches
   can fail, while explicit stored-metadata/top-level-header projections and
   raw download remain available as applicable. M14/M22 must implement td-mail's
-  bounded isolation/placeholder recovery and show content-search failure
-  honestly. Third-party MUAs without that recovery may not display such mail.
+  bounded isolation/placeholder recovery and show content-search refusal
+  honestly, or an explicitly negotiated incomplete-results warning. Third-party MUAs without that recovery may not display such mail.
   SearchSnippet uses its standard per-email null/null fallback.
 - Email/copy cannot succeed with one account: RFC 8620 requires a distinct
   source and destination. Test invalidArguments/fromAccountNotFound/
@@ -291,7 +291,9 @@ messages while a matching draft remains in the recorded Drafts folder.
 POLICY.md adds a third client acceptance gap: Email/get's method-level failure
 on one opaque message must not hide a whole listing. M14/M22 add bounded
 metadata fallback, per-ID isolation and raw download/export, without inventing
-empty successful body data. A failing body search remains a visible failure.
+empty successful body data. A failing body search remains a visible failure unless the client explicitly
+negotiates partial search; that mode exposes skipped interpretations and never
+claims complete results or suppresses corruption/work-limit failures.
 
 ## Release evidence
 
@@ -757,3 +759,13 @@ archive restore containing pg_trgm, and initialization by a database owner
 without superuser/role-creation/database-creation privileges. These fixtures
 prove the exercised plans and flows, not universal planner choices or a latency
 guarantee. New messages still require explicit backfill to acquire index rows.
+
+
+Partial-search native coverage inserts a malformed multipart message beside a
+known match. Ordinary JMAP search refuses; capability opt-in returns known IDs
+with `searchSkipped`, without an exact total, including empty and paginated
+results. td-mail surfaces the warning through its CLI. Corrupting that skipped
+message still fails the query; restoring and deleting it restores normal search.
+Client unit fixtures retain the warning across pages without double-counting,
+clear it on a fresh complete response, reject malformed counts/exact partial
+totals, and keep filtered results out of the complete folder cache.

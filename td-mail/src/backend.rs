@@ -182,6 +182,8 @@ pub enum BackendResponse {
         total: Option<u32>,
         position: u32,
         loaded: u32,
+        search_skipped: u32,
+        filtered: bool,
         thread_counts: HashMap<String, (usize, usize)>,
     },
     ThreadEmails {
@@ -1010,6 +1012,8 @@ fn handle_offline_command(
                 || received_before.is_some()
             {
                 let _ = resp_tx.send(BackendResponse::Emails {
+                    search_skipped: 0,
+                    filtered: false,
                     mailbox_id: mailbox_id.clone(),
                     emails: Err(offline_error("search and pagination not available", reason)),
                     total: None,
@@ -1032,6 +1036,8 @@ fn handle_offline_command(
                         Ok(cached_emails)
                     };
                     let _ = resp_tx.send(BackendResponse::Emails {
+                        search_skipped: 0,
+                        filtered: false,
                         mailbox_id: mailbox_id.clone(),
                         emails,
                         total: None,
@@ -1041,6 +1047,8 @@ fn handle_offline_command(
                     });
                 } else {
                     let _ = resp_tx.send(BackendResponse::Emails {
+                        search_skipped: 0,
+                        filtered: false,
                         mailbox_id: mailbox_id.clone(),
                         emails: Ok(Vec::new()),
                         total: Some(0),
@@ -1051,6 +1059,8 @@ fn handle_offline_command(
                 }
             } else {
                 let _ = resp_tx.send(BackendResponse::Emails {
+                    search_skipped: 0,
+                    filtered: false,
                     mailbox_id: mailbox_id.clone(),
                     emails: Err(offline_error("cache unavailable", reason)),
                     total: None,
@@ -2071,6 +2081,8 @@ fn backend_loop(
                                 .map(|m| m.total_emails);
                             let cached_loaded = cached_emails.len() as u32;
                             let _ = resp_tx.send(BackendResponse::Emails {
+                                search_skipped: 0,
+                                filtered: false,
                                 mailbox_id: mailbox_id.clone(),
                                 emails: Ok(cached_emails),
                                 total: cached_total,
@@ -2095,6 +2107,7 @@ fn backend_loop(
                         )
                         .map_err(|e| e.to_string())?;
                     let total = query.total;
+                    let search_skipped = query.search_skipped;
                     let position = query.position;
                     let loaded = query.ids.len() as u32;
                     let mailbox_name = cached_mailboxes
@@ -2329,14 +2342,27 @@ fn backend_loop(
                         }
                     }
 
-                    Ok((emails, total, position, loaded, thread_counts))
+                    Ok((
+                        emails,
+                        total,
+                        position,
+                        loaded,
+                        thread_counts,
+                        search_skipped,
+                    ))
                 })();
 
-                let (emails, total, position, loaded, thread_counts) = match result {
-                    Ok((emails, total, position, loaded, thread_counts)) => {
-                        (Ok(emails), total, position, loaded, thread_counts)
-                    }
-                    Err(e) => (Err(e), None, position, 0, HashMap::new()),
+                let (emails, total, position, loaded, thread_counts, search_skipped) = match result
+                {
+                    Ok((emails, total, position, loaded, thread_counts, search_skipped)) => (
+                        Ok(emails),
+                        total,
+                        position,
+                        loaded,
+                        thread_counts,
+                        search_skipped,
+                    ),
+                    Err(e) => (Err(e), None, position, 0, HashMap::new(), 0),
                 };
 
                 if !origin.starts_with("cli") && cache.is_some() {
@@ -2346,6 +2372,10 @@ fn backend_loop(
                 }
 
                 let _ = resp_tx.send(BackendResponse::Emails {
+                    filtered: search_query.is_some()
+                        || received_after.is_some()
+                        || received_before.is_some(),
+                    search_skipped,
                     mailbox_id,
                     emails,
                     total,

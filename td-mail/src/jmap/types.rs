@@ -181,6 +181,7 @@ fn opt_list<T>(
 
 /// The capability an account that sends mail carries (RFC 8621 §7).
 pub const SUBMISSION_CAPABILITY: &str = "urn:ietf:params:jmap:submission";
+pub const PARTIAL_SEARCH_CAPABILITY: &str = "https://timmydouglas.com/ns/mail-search-partial";
 const CORE_CAPABILITY: &str = "urn:ietf:params:jmap:core";
 
 // JMAP Session (from .well-known/jmap)
@@ -507,18 +508,25 @@ pub struct EmailQueryResponse {
     pub ids: Vec<String>,
     pub position: u32,
     pub total: Option<u32>,
+    pub search_skipped: u32,
 }
 
 impl EmailQueryResponse {
     pub fn from_json(value: &Json) -> Result<Self, JsonError> {
         let obj = object(value, "EmailQueryResponse")?;
         let ids = present(obj, "ids").ok_or_else(|| missing("ids"))?;
+        let search_skipped = def_u32(obj, "searchSkipped")?;
+        let total = opt_u32(obj, "total")?;
+        if search_skipped != 0 && total.is_some() {
+            return Err("Incomplete search cannot claim an exact total".into());
+        }
         Ok(EmailQueryResponse {
             account_id: req_str(obj, "accountId")?,
             query_state: req_str(obj, "queryState")?,
             ids: strs(ids, "ids")?,
             position: def_u32(obj, "position")?,
-            total: opt_u32(obj, "total")?,
+            total,
+            search_skipped,
         })
     }
 }
@@ -527,6 +535,7 @@ impl EmailQueryResponse {
 pub struct EmailQueryResult {
     pub ids: Vec<String>,
     pub total: Option<u32>,
+    pub search_skipped: u32,
     pub position: u32,
 }
 
@@ -1315,5 +1324,29 @@ mod tests {
             email: None,
         };
         assert_eq!(format!("{}", addr), "(unknown)");
+    }
+    #[test]
+    fn incomplete_query_reports_are_typed_and_cannot_claim_a_total() {
+        let base = json!({"accountId":"a", "queryState":"q", "ids":["one"], "position":0});
+        assert_eq!(
+            EmailQueryResponse::from_json(&base).unwrap().search_skipped,
+            0
+        );
+        for count in [0, 3] {
+            let value = json!({"accountId":"a", "queryState":"q", "ids":["one"], "position":0, "searchSkipped":count});
+            assert_eq!(
+                EmailQueryResponse::from_json(&value)
+                    .unwrap()
+                    .search_skipped,
+                count
+            );
+        }
+        for value in [
+            json!({"accountId":"a", "queryState":"q", "ids":[], "searchSkipped":1, "total":0}),
+            json!({"accountId":"a", "queryState":"q", "ids":[], "searchSkipped":-1}),
+            json!({"accountId":"a", "queryState":"q", "ids":[], "searchSkipped":"3"}),
+        ] {
+            assert!(EmailQueryResponse::from_json(&value).is_err());
+        }
     }
 }

@@ -908,6 +908,8 @@ mod tests {
 
     fn emails(mailbox_id: &str, list: Vec<Email>) -> BackendResponse {
         BackendResponse::Emails {
+            search_skipped: 0,
+            filtered: false,
             mailbox_id: mailbox_id.to_string(),
             emails: Ok(list),
             total: None,
@@ -1152,6 +1154,8 @@ mod tests {
 
     fn page(mailbox_id: &str, list: Vec<Email>, position: u32, loaded: u32) -> BackendResponse {
         BackendResponse::Emails {
+            search_skipped: 0,
+            filtered: false,
             mailbox_id: mailbox_id.to_string(),
             emails: Ok(list),
             total: None,

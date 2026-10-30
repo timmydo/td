@@ -49,7 +49,7 @@ mod push;
 mod replica;
 #[path = "thread_get.rs"]
 mod thread_get;
-use super::{MAIL, REPLICATION, SUBMISSION};
+use super::{MAIL, PARTIAL_SEARCH, REPLICATION, SUBMISSION};
 #[path = "identity_get.rs"]
 mod identity_get;
 #[path = "submission_get.rs"]
@@ -896,12 +896,14 @@ fn run_inner<'state, 'c, 's, 'sr, 'a>(
     let mut mail = false;
     let mut submission = false;
     let mut replication = false;
+    let mut partial_search = false;
     for capability in request.using {
         retention.admit_work_turn().map_err(Error::Storage)?;
         core |= capability.as_string_bytes() == Some(CORE.as_bytes());
         mail |= capability.as_string_bytes() == Some(MAIL.as_bytes());
         submission |= capability.as_string_bytes() == Some(SUBMISSION.as_bytes());
         replication |= capability.as_string_bytes() == Some(REPLICATION.as_bytes());
+        partial_search |= capability.as_string_bytes() == Some(PARTIAL_SEARCH.as_bytes());
     }
     let mut calls = Vec::new();
     calls
@@ -925,6 +927,7 @@ fn run_inner<'state, 'c, 's, 'sr, 'a>(
         read: read.as_mut().map(|view| reborrow_read(&mut **view)),
         email_updates,
         submission,
+        partial_search,
         submissions,
         implicit: None,
     };
@@ -1032,6 +1035,7 @@ struct Worker<'io, 'c, 's, 'sr, 'a> {
     read: Option<&'io mut dyn MailRead>,
     email_updates: bool,
     submission: bool,
+    partial_search: bool,
     submissions: Option<SubmissionAccess<'io>>,
     implicit: Option<(&'static str, Range<u64>)>,
 }
@@ -1793,6 +1797,7 @@ pub(super) mod tests {
                 read: None,
                 email_updates: false,
                 submission: false,
+                partial_search: false,
                 submissions: None,
                 implicit: None,
             };
@@ -2205,6 +2210,7 @@ pub(super) mod tests {
                 read: None,
                 email_updates: false,
                 submission: false,
+                partial_search: false,
                 submissions: None,
                 implicit: None,
             };

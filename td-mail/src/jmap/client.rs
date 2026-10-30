@@ -369,6 +369,7 @@ pub struct JmapClient {
     max_objects_in_get: usize,
     /// Whether the session lists mail submission for the account.
     submission: bool,
+    partial_search: bool,
     read_only: bool,
 }
 
@@ -403,6 +404,7 @@ impl JmapClient {
             max_objects_in_set: FLAG_BATCH_MAX,
             max_objects_in_get: METADATA_GET_BATCH_MAX,
             submission: false,
+            partial_search: false,
             read_only: false,
         }
     }
@@ -656,6 +658,12 @@ impl JmapClient {
             .ok_or_else(|| JmapError::Api("Selected mail account is absent".into()))?
             .is_read_only;
         let submission = session.submits(&account_id);
+        let partial_search = session.accounts.get(&account_id).is_some_and(|account| {
+            account
+                .capabilities
+                .iter()
+                .any(|uri| uri == PARTIAL_SEARCH_CAPABILITY)
+        });
         log_info!(
             "[JMAP] Mail submission for account {}: {}",
             account_id,
@@ -679,6 +687,7 @@ impl JmapClient {
                 .unwrap_or(50)
                 .clamp(1, METADATA_GET_BATCH_MAX as u64) as usize,
             submission,
+            partial_search,
             read_only,
         };
 
@@ -963,8 +972,13 @@ impl JmapClient {
             })
         };
 
+        let partial = self.partial_search && search_text.is_some();
+        let mut using = vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"];
+        if partial {
+            using.push(PARTIAL_SEARCH_CAPABILITY);
+        }
         let request = JmapRequest {
-            using: vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            using,
             method_calls: vec![MethodCall(
                 "Email/query",
                 json!({
@@ -985,6 +999,17 @@ impl JmapClient {
             if method_response.0 == "Email/query" {
                 let query_response =
                     EmailQueryResponse::from_json(&method_response.1).map_err(JmapError::Parse)?;
+                if query_response.search_skipped != 0 {
+                    if !partial {
+                        return Err(JmapError::Api(
+                            "Unexpected incomplete search response".into(),
+                        ));
+                    }
+                    log_warn!(
+                        "[JMAP] Search results incomplete: {} messages could not be searched",
+                        query_response.search_skipped
+                    );
+                }
                 log_info!(
                     "[JMAP] Email/query returned {} email IDs (total: {:?})",
                     query_response.ids.len(),
@@ -994,6 +1019,7 @@ impl JmapClient {
                     ids: query_response.ids,
                     total: query_response.total,
                     position: query_response.position,
+                    search_skipped: query_response.search_skipped,
                 });
             }
             return Err(Self::method_error("Email/query", method_response));
@@ -1037,10 +1063,14 @@ impl JmapClient {
             if method_response.0 == "Email/query" {
                 let query_response =
                     EmailQueryResponse::from_json(&method_response.1).map_err(JmapError::Parse)?;
+                if query_response.search_skipped != 0 {
+                    return Err(JmapError::Api("Incomplete mailbox inventory".into()));
+                }
                 return Ok(EmailQueryResult {
                     ids: query_response.ids,
                     total: query_response.total,
                     position: query_response.position,
+                    search_skipped: 0,
                 });
             }
             return Err(Self::method_error("Email/query", method_response));

@@ -202,7 +202,7 @@ impl Worker<'_, '_, '_, '_, '_> {
         query: crate::postgres_read::EmailQuery,
         search: &mut super::email_search::Search,
         limits: &crate::limits::Limits,
-    ) -> Result<crate::postgres_read::EmailPage, Error> {
+    ) -> Result<(crate::postgres_read::EmailPage, u64), Error> {
         use crate::postgres_read::EmailPage;
         let mut timer = crate::performance::Timer::start(crate::performance::Phase::JmapSearch);
         if search.matched() {
@@ -210,7 +210,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             if result.is_ok() {
                 timer.succeeded();
             }
-            return result;
+            return result.map(|page| (page, 0));
         }
         let (clock, mut work) = self
             .retention
@@ -233,7 +233,7 @@ impl Worker<'_, '_, '_, '_, '_> {
             None
         };
         let batch = if pattern.is_some() { 256 } else { 32 };
-        let (mut offset, mut matches) = (0u64, 0u64);
+        let (mut offset, mut matches, mut skipped) = (0u64, 0u64, 0u64);
         while query.calculate_total || result.ids.len() < query.limit {
             self.check()?;
             super::email_search::charge(&mut work, clock.as_ref(), batch as u64)?;
@@ -254,7 +254,16 @@ impl Worker<'_, '_, '_, '_, '_> {
                 .ok_or(Error::StorageCapacity)?;
             for id in page.ids {
                 self.check()?;
-                if view.search_email(id, limits, search, clock.as_ref(), &mut work)? {
+                let matched = match view.search_email(id, limits, search, clock.as_ref(), &mut work)
+                {
+                    Ok(matched) => matched,
+                    Err(Error::MessageInterpretation) if self.partial_search => {
+                        skipped = skipped.checked_add(1).ok_or(Error::StorageCapacity)?;
+                        false
+                    }
+                    Err(error) => return Err(error),
+                };
+                if matched {
                     if matches >= query.position && result.ids.len() < query.limit {
                         result.ids.push(id);
                     }
@@ -268,13 +277,13 @@ impl Worker<'_, '_, '_, '_, '_> {
                 break;
             }
         }
-        if query.calculate_total {
+        if query.calculate_total && skipped == 0 {
             result.total = Some(matches);
         }
         view.check()?;
         super::email_search::charge(&mut work, clock.as_ref(), 0)?;
         timer.succeeded();
-        Ok(result)
+        Ok((result, skipped))
     }
 
     pub(super) fn email_query(
@@ -313,16 +322,16 @@ impl Worker<'_, '_, '_, '_, '_> {
             limit: arguments.limit,
             calculate_total: arguments.total,
         };
-        let result = if let Some(mut search) = arguments.search {
+        let (result, skipped) = if let Some(mut search) = arguments.search {
             self.search_page(view, query, &mut search, limits)?
         } else {
-            view.query(query)?
+            (view.query(query)?, 0)
         };
         let state = QueryState::current(view.identity(), QueryType::Email);
         if result.state != state
             || result.position != arguments.position
             || result.ids.len() > arguments.limit
-            || result.total.is_some() != arguments.total
+            || (result.total.is_some() != arguments.total && skipped == 0)
         {
             return Err(Error::State);
         }
@@ -345,6 +354,10 @@ impl Worker<'_, '_, '_, '_, '_> {
         if let Some(total) = result.total {
             self.append(br#","total":"#)?;
             self.append(total.to_string().as_bytes())?;
+        }
+        if self.partial_search {
+            self.append(br#","searchSkipped":"#)?;
+            self.append(skipped.to_string().as_bytes())?;
         }
         self.append(br#","ids":["#)?;
         let mut first = true;

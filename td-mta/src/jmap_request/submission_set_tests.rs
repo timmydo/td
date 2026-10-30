@@ -485,6 +485,7 @@ fn output_capacity_and_wrong_typed_overlays_refuse_before_effects() {
                 read: None,
                 email_updates: false,
                 submission: true,
+                partial_search: false,
                 submissions: Some(SubmissionAccess {
                     creator: &service,
                     canceler: Some(&service),

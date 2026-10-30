@@ -913,7 +913,9 @@ impl View for MailboxListView {
                 position,
                 loaded,
                 thread_counts,
-            } => {
+                filtered,
+                ..
+            } if !*filtered => {
                 if let Ok(emails) = emails {
                     let now = SystemTime::now();
                     let entry = self
@@ -1553,5 +1555,25 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("press s"), "{text}");
+    }
+    #[test]
+    fn filtered_results_do_not_replace_the_folder_cache() {
+        let (mut view, _) = make_view();
+        let page = |filtered, skipped| BackendResponse::Emails {
+            mailbox_id: "m1".into(),
+            emails: Ok(Vec::new()),
+            total: None,
+            position: 0,
+            loaded: 0,
+            thread_counts: HashMap::new(),
+            search_skipped: skipped,
+            filtered,
+        };
+        view.on_response(&page(true, 0));
+        assert!(view.email_cache.is_empty());
+        view.on_response(&page(true, 2));
+        assert!(view.email_cache.is_empty());
+        view.on_response(&page(false, 0));
+        assert!(view.email_cache.contains_key("m1"));
     }
 }

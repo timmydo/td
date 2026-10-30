@@ -3312,6 +3312,8 @@ mod frame_tests {
             extra: std::collections::HashMap::new(),
         };
         let answer = |inbox: &str, email| BackendResponse::Emails {
+            search_skipped: 0,
+            filtered: false,
             mailbox_id: inbox.to_string(),
             emails: Ok(vec![email]),
             total: None,

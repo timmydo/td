@@ -26,8 +26,18 @@ shows the active query. Searches go to the account's JMAP server with the
 current mailbox and date filters, and pagination retains those filters.
 Matching behavior depends on the server; td-mta supports case-insensitive
 substring terms and quoted phrases across its documented searchable fields.
-An empty result is distinct from a refused search: server errors such as
-`storageWorkLimit` or `messageInterpretation` are shown with their reason.
+When td-mta advertises its partial-search capability, td-mail opts in for text
+searches. Malformed or unsupported messages may be skipped, while known matches
+remain visible with a persistent `Results incomplete` warning and skipped count.
+An empty partial result does not mean the folder has no matches. Pagination
+retains the warning; filtered results never replace the complete folder cache.
+The CLI's `query_emails` and `triage_suggest` responses include `search_skipped`
+and `results_incomplete`. Skips are also logged without message contents.
+
+Without that capability, interpretation failures retain the server's strict
+behavior. Corruption, database failures and exhausted work/deadline limits
+remain explicit errors even with partial search; they never become empty or
+partial successful results.
 
 ## Reading attachments
 

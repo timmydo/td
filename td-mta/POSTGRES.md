@@ -7756,3 +7756,35 @@ Schema-39 binaries cannot serve schema 40. Backups and restores must include
 the whole database, including `td_mta_trgm` and the extension declaration;
 restoring only the `td_mta` schema is insufficient. The restored PostgreSQL
 installation must supply the same extension version before mail is activated.
+
+
+## Explicit partial-search results
+
+The session advertises `https://timmydouglas.com/ns/mail-search-partial`
+globally and for its account. A request must name it in `using` to permit
+Email/query text search to continue past a per-message `messageInterpretation`
+refusal. Without that opt-in, the same refusal fails the whole method. This
+changes neither parser acceptance nor stored search evidence: an unsearchable
+message remains unindexed and its original body remains available.
+
+An opted-in Email/query response includes unsigned `searchSkipped`: the number
+of unsearchable candidate messages encountered while computing that page,
+including the matched prefix preceding its requested position. Counts on later
+pages overlap and must not be added together. A positive count makes the
+returned IDs explicitly incomplete; omit `total` even when calculateTotal was
+requested. Position and ordering apply to known matches. A page that ends before
+examining the remaining candidates cannot certify those later messages as
+searchable, even when its own count is zero. Non-search queries report zero.
+
+Only the per-message interpretation refusal is skippable. Body integrity,
+storage, database, deadline and exhausted work/output bounds still fail the
+request. The original authenticated snapshot and method meter remain in force;
+skipping a message renews neither. No unsearchable message becomes an empty
+successful search row, a proven nonmatch or an index-completeness receipt.
+The capability is an explicit query-mode distinction; successful matching,
+ordering and immutable interpretation versions are unchanged.
+
+The td-mail client opts in only for text queries on an advertising account,
+rejects unsolicited partial inventory, and shows known matches with a persistent
+incomplete-results warning. Its filtered list responses do not replace the
+unfiltered folder cache. CLI results and warning logs expose the skipped count.

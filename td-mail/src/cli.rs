@@ -500,6 +500,7 @@ fn cmd_query_emails(state: &mut CliState, input: &Value) -> Value {
             position,
             loaded,
             thread_counts,
+            search_skipped,
             ..
         }) => {
             let headers_only = input
@@ -528,6 +529,8 @@ fn cmd_query_emails(state: &mut CliState, input: &Value) -> Value {
                 "position": position,
                 "loaded": loaded,
                 "thread_counts": tc,
+                "search_skipped": search_skipped,
+                "results_incomplete": search_skipped != 0,
             }))
         }
         Ok(BackendResponse::Emails { emails: Err(e), .. }) => err_response(&e),
@@ -1038,10 +1041,12 @@ fn cmd_triage_suggest(state: &mut CliState, input: &Value) -> Value {
         return err_response(&e);
     }
 
-    let emails = match state.recv_resp() {
+    let (emails, search_skipped) = match state.recv_resp() {
         Ok(BackendResponse::Emails {
-            emails: Ok(list), ..
-        }) => list,
+            emails: Ok(list),
+            search_skipped,
+            ..
+        }) => (list, search_skipped),
         Ok(BackendResponse::Emails { emails: Err(e), .. }) => return err_response(&e),
         Ok(_) => return err_response("unexpected response from backend"),
         Err(e) => return err_response(&e),
@@ -1110,6 +1115,8 @@ fn cmd_triage_suggest(state: &mut CliState, input: &Value) -> Value {
 
     ok_response(json!({
         "plan_id": plan_id,
+        "search_skipped": search_skipped,
+        "results_incomplete": search_skipped != 0,
         "mailbox_id": mailbox_id,
         "archive": serialize_items(&archive),
         "trash": serialize_items(&trash),

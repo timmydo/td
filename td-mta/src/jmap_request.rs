@@ -15,6 +15,7 @@ pub mod wire;
 pub const CORE: &str = "urn:ietf:params:jmap:core";
 pub const MAIL: &str = "urn:ietf:params:jmap:mail";
 pub const REPLICATION: &str = "https://timmydouglas.com/ns/td-mta/replication";
+pub const PARTIAL_SEARCH: &str = "https://timmydouglas.com/ns/mail-search-partial";
 pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 
 /// Redacted classifications, with internal parser ceilings kept separate from

@@ -95,6 +95,7 @@ pub struct EmailListView {
     search_mode: bool,
     search_input: String,
     active_search: Option<String>,
+    search_skipped: u32,
     status_message: Option<String>,
     next_write_op_id: u64,
     pending_write_ops: HashMap<u64, PendingWriteOp>,
@@ -146,6 +147,7 @@ impl EmailListView {
             search_mode: false,
             search_input: String::new(),
             active_search: None,
+            search_skipped: 0,
             status_message: None,
             next_write_op_id: 1,
             pending_write_ops: HashMap::new(),
@@ -160,6 +162,7 @@ impl EmailListView {
 
     pub fn apply_cached_state(&mut self, state: &CachedEmailListState) {
         self.emails = state.emails.clone();
+        self.search_skipped = 0;
         self.total = state.total;
         self.next_query_position = state.next_query_position;
         self.last_loaded_count = state.last_loaded_count;
@@ -309,6 +312,14 @@ impl EmailListView {
                 None => self.mailbox_name.clone(),
             }
         };
+        let base = if self.search_skipped != 0 {
+            format!(
+                "Results incomplete: {} messages could not be searched | {base}",
+                self.search_skipped
+            )
+        } else {
+            base
+        };
         match self.last_refreshed {
             Some(ts) => format!("{} (refreshed {})", base, format_system_time(ts)),
             None => base,
@@ -339,7 +350,14 @@ impl EmailListView {
             return Body::message(error.clone());
         }
         if self.emails.is_empty() {
-            return Body::message("No messages.".to_string());
+            return Body::message(
+                if self.search_skipped != 0 {
+                    "No matches found among searchable messages."
+                } else {
+                    "No messages."
+                }
+                .to_string(),
+            );
         }
         Body::List {
             total: self.emails.len(),
@@ -1158,6 +1176,8 @@ impl View for EmailListView {
                 position,
                 loaded,
                 thread_counts,
+                search_skipped,
+                ..
             } if *mailbox_id == self.mailbox_id => {
                 self.loading = false;
                 self.loading_more = false;
@@ -1166,6 +1186,11 @@ impl View for EmailListView {
                 self.next_query_position = position.saturating_add(*loaded);
                 match emails {
                     Ok(emails) => {
+                        self.search_skipped = if *position == 0 {
+                            *search_skipped
+                        } else {
+                            self.search_skipped.max(*search_skipped)
+                        };
                         self.last_refreshed = Some(SystemTime::now());
                         if *position == 0 {
                             // A list response can precede mutations queued from its preview.
@@ -2017,6 +2042,8 @@ mod tests {
         assert_eq!(view.last_loaded_count, 0);
         assert!(view.last_refreshed.is_none());
         let final_response = BackendResponse::Emails {
+            filtered: false,
+            search_skipped: 0,
             mailbox_id: view.mailbox_id.clone(),
             emails: Ok(vec![make_email("final", "final-thread")]),
             total: Some(100),
@@ -2112,6 +2139,8 @@ mod tests {
                 .collect();
             assert_eq!(operations.len(), 2);
             let completed = BackendResponse::Emails {
+                filtered: false,
+                search_skipped: 0,
                 mailbox_id: view.mailbox_id.clone(),
                 emails: Ok(vec![make_email("preview", "preview-thread")]),
                 total: Some(1),
@@ -2153,5 +2182,36 @@ mod tests {
                     .is_some_and(|message| message.contains("refused")));
             }
         }
+    }
+    #[test]
+    fn incomplete_search_keeps_matches_and_warning_across_pages() {
+        let (mut view, _) = make_view();
+        view.active_search = Some("invoice".into());
+        let response = |position, skipped, emails| BackendResponse::Emails {
+            mailbox_id: view.mailbox_id.clone(),
+            emails: Ok(emails),
+            total: None,
+            position,
+            loaded: 1,
+            thread_counts: HashMap::new(),
+            search_skipped: skipped,
+            filtered: true,
+        };
+        let first = response(0, 2, vec![make_email("one", "thread-one")]);
+        let next = response(1, 2, vec![make_email("two", "thread-two")]);
+        let empty = response(0, 3, Vec::new());
+        let complete = response(0, 0, vec![make_email("one", "thread-one")]);
+        assert!(view.on_response(&first));
+        assert_eq!(view.emails.len(), 1);
+        assert!(view.title().starts_with("Results incomplete: 2"));
+        assert!(view.error.is_none());
+        assert!(view.on_response(&next));
+        assert_eq!(view.emails.len(), 2);
+        assert!(view.title().starts_with("Results incomplete: 2"));
+        assert!(view.on_response(&empty));
+        assert!(view.title().starts_with("Results incomplete: 3"));
+        assert!(view.emails.is_empty());
+        assert!(view.on_response(&complete));
+        assert!(!view.title().contains("Results incomplete"));
     }
 }

@@ -691,7 +691,11 @@ URLs or extract binary documents. Exhaustion of a required nested parse is a
 method error, never a nonmatch. Attachment filenames are included in text
 search, not body search. Unknown charsets use section 2's fallback, never
 silently skip their bytes. An unparseable body needed by a filter is a method
-failure, not a nonmatch.
+failure, not a nonmatch. The explicit partial-search capability in POSTGRES.md
+may instead return known matches with a skipped-message count and no exact
+total. It never labels the refused message a proven nonmatch or relaxes parsing,
+body integrity, storage, deadline or work limits. Without capability opt-in,
+the whole method still fails.
 
 Email preview retains at most 256 Unicode scalars of projected plaintext.
 Collapse SP, HT, CR, LF, VT, FF, U+00A0, NEL, LINE SEPARATOR and PARAGRAPH

@@ -2283,6 +2283,11 @@ ordering with an ID tie-break and a committed snapshot. Do not silently truncate
 results or report an exact total before computing it. Exhausted work/time
 budgets return the appropriate explicit error; attachment binary contents are
 not decoded as documents. Index build, rebuild and query must obey section 5.
+Clients may explicitly negotiate partial-search results as specified in
+POSTGRES.md. Only per-message interpretation refusals may then be skipped,
+with an explicit skipped count and no exact total; ordinary search remains
+strict. Corruption, storage failures and exhausted budgets still fail the
+method. The parser and stored search evidence retain their original rules.
 
 Email/query accepts the identity predicate `minSize: 0` for account-wide
 migration inventory. Positive minimum sizes remain unsupported filters;

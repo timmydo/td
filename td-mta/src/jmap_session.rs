@@ -140,7 +140,7 @@ impl Session {
                 ",\"maxCallsInRequest\":{}",
                 ",\"maxObjectsInGet\":{}",
                 ",\"maxObjectsInSet\":{}",
-                ",\"collationAlgorithms\":[]}},\"urn:ietf:params:jmap:mail\":{{}},\"{replication}\":{{}}{submission_global}}}",
+                ",\"collationAlgorithms\":[]}},\"urn:ietf:params:jmap:mail\":{{}},\"{replication}\":{{}},\"{partial_search}\":{{}}{submission_global}}}",
                 ",\"accounts\":{{\"{}\":{{\"name\":",
             ),
             limits.message_bytes,
@@ -156,6 +156,7 @@ impl Session {
                 .min(crate::store_fs::MAX_EMAIL_DESTROYS),
             id,
             replication = crate::jmap_request::REPLICATION,
+            partial_search = crate::jmap_request::PARTIAL_SEARCH,
             submission_global = if submission { ",\"urn:ietf:params:jmap:submission\":{}" } else { "" },
         ))
         .map_err(|_| Error::Capacity)?;
@@ -166,13 +167,14 @@ impl Session {
             "\"urn:ietf:params:jmap:core\":{{}},\"urn:ietf:params:jmap:mail\":{{",
             "\"maxMailboxesPerEmail\":null,\"maxMailboxDepth\":null,",
             "\"maxSizeMailboxName\":{},\"maxSizeAttachmentsPerEmail\":{},",
-            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":{may_create}}},\"{replication}\":{{\"inventoryBaseFence\":true,\"maxInventoryIds\":{inventory_limit},\"maxMetadataIds\":{metadata_limit}}}{submission_account}}}}}}}",
+            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":{may_create}}},\"{replication}\":{{\"inventoryBaseFence\":true,\"maxInventoryIds\":{inventory_limit},\"maxMetadataIds\":{metadata_limit}}},\"{partial_search}\":{{}}{submission_account}}}}}}}",
             ",\"primaryAccounts\":{{\"urn:ietf:params:jmap:mail\":\"{}\""
         ),
             crate::format::row::MAX_MAILBOX_NAME,
             limits.message_bytes,
             id,
             replication = crate::jmap_request::REPLICATION,
+            partial_search = crate::jmap_request::PARTIAL_SEARCH,
             read_only = read_only,
             may_create = !read_only,
             inventory_limit = limits.query_page.min(crate::postgres_read::MAX_REPLICA_INVENTORY_PAGE),
@@ -230,11 +232,11 @@ impl Session {
     }
     /// The request parser accepts exactly the capabilities in this document.
     pub fn capabilities(&self) -> &'static [&'static str] {
-        use crate::jmap_request::{CORE, MAIL, REPLICATION, SUBMISSION};
+        use crate::jmap_request::{CORE, MAIL, PARTIAL_SEARCH, REPLICATION, SUBMISSION};
         if self.submission {
-            &[CORE, MAIL, SUBMISSION, REPLICATION]
+            &[CORE, MAIL, SUBMISSION, REPLICATION, PARTIAL_SEARCH]
         } else {
-            &[CORE, MAIL, REPLICATION]
+            &[CORE, MAIL, REPLICATION, PARTIAL_SEARCH]
         }
     }
     pub fn origin(&self) -> Result<Origin<'_>, Error> {
@@ -376,7 +378,7 @@ mod tests {
         assert_eq!(core["maxObjectsInGet"].as_u64(), Some(256));
         assert_eq!(core["maxObjectsInSet"].as_u64(), Some(256));
         assert!(core["collationAlgorithms"].as_array().unwrap().is_empty());
-        assert_eq!(value["capabilities"].as_object().unwrap().len(), 3);
+        assert_eq!(value["capabilities"].as_object().unwrap().len(), 4);
         assert_eq!(value["accounts"].as_object().unwrap().len(), 1);
         let object = &value["accounts"]["a07070707070707070707070707070707"];
         assert_eq!(object["name"].as_str(), Some("Personal mail"));
