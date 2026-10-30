@@ -75,7 +75,19 @@ which fetch the running deployment's pinned Rust toolchain on first use.
 Cargo compilation are offline. A failed download stops before a deployment
 is built or activated. The compiler links through `/bin/cc`, td-link. It selects the native GNU target
 explicitly and keeps control-plane build outputs under
-`.td-build-cache/update-tools`. These locally compiled helpers retain
+`.td-build-cache/update-tools/<runtime-key>`. The key hashes the resolved
+installed Cargo, rustc and cc paths, which name immutable store outputs
+and their compiler/runtime closures. A reinstall or update changing those
+paths gets a separate cache: Cargo alone cannot detect a replaced loader
+behind `/bin/cc`, and an old build script may no longer execute. Existing
+caches are retained, never deleted by this selection. Missing tool paths
+fail before compilation. This is cache separation, not artifact verification;
+Cargo still owns source and compiler invalidation within a runtime.
+The builder uses the same key for the recipe evaluator's native Cargo
+target directory; source warming can rebuild that evaluator independently.
+Its completed static executable retains the existing content-bound memo
+and can still be reused without provisioning a compiler.
+These locally compiled helpers retain
 control-plane roles; this does not admit them as target recipe tools.
 
 Before the evaluator runs, the installed `/bin/td-feed` fetches the

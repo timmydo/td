@@ -1161,6 +1161,9 @@ fn build_recipe_eval(root: &Path, base: &Path, penv: &ProvisionEnv) -> Result<Pa
     let flags = control_plane_flags(penv, &cc)?;
     let base = std::fs::canonicalize(base)
         .map_err(|error| format!("resolve {}: {error}", base.display()))?;
+    let target_dir = base
+        .join("target")
+        .join(td_engine::native_cache::key(&[&cargo, &rustc, &cc])?);
     let home = base.join("home");
     std::fs::create_dir_all(&home)
         .map_err(|error| format!("create evaluator home {}: {error}", home.display()))?;
@@ -1182,7 +1185,7 @@ fn build_recipe_eval(root: &Path, base: &Path, penv: &ProvisionEnv) -> Result<Pa
         ])
         .arg(root.join("recipes/Cargo.toml"))
         .arg("--target-dir")
-        .arg(base.join("target"))
+        .arg(&target_dir)
         .current_dir(root)
         .env(
             "PATH",
@@ -1213,10 +1216,7 @@ fn build_recipe_eval(root: &Path, base: &Path, penv: &ProvisionEnv) -> Result<Pa
             base.join("build.log").display()
         ));
     }
-    let binary = base
-        .join("target")
-        .join(target)
-        .join("release/td-recipe-eval");
+    let binary = target_dir.join(target).join("release/td-recipe-eval");
     if !is_exec(&binary) {
         return Err(format!("evaluator is not executable: {}", binary.display()));
     }

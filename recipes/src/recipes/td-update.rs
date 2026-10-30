@@ -5,6 +5,8 @@ const APPLY_RS: &str = include_str!("../../../td-update/src/apply.rs");
 const UPSTREAM_RS: &str = include_str!("../../../td-update/src/upstream.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
+const NATIVE_CACHE_RS: &str = include_str!("../../../engine/src/native_cache.rs");
+const TEMP_DIR_RS: &str = include_str!("../../../td-fs/src/temp_dir.rs");
 const PRIVATE_DIR_RS: &str = include_str!("../../../td-fs/src/private_dir.rs");
 
 const BOOT_INFO_RS: &str = include_str!("../../../engine/src/boot_info.rs");
@@ -68,6 +70,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-fs/src/private_dir.rs".into(),
             content: PRIVATE_DIR_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-fs/src/temp_dir.rs".into(),
+            content: TEMP_DIR_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/native_cache.rs".into(),
+            content: NATIVE_CACHE_RS.into(),
             exec: false,
         },
         target_rustc(

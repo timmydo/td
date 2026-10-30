@@ -15,6 +15,8 @@ mod boot_info_source;
 #[path = "../../engine/src/cpio.rs"]
 #[allow(dead_code, reason = "the updater writes a data appendix")]
 mod cpio;
+#[path = "../../engine/src/native_cache.rs"]
+mod native_cache;
 #[path = "../../td-boot/src/protocol.rs"]
 #[allow(dead_code, reason = "shared boot deployment contract")]
 mod protocol;
@@ -23,6 +25,10 @@ mod protocol;
 mod sha256;
 #[path = "../../td-fs/src/private_dir.rs"]
 mod td_fs;
+#[cfg(test)]
+#[path = "../../td-fs/src/temp_dir.rs"]
+#[allow(dead_code, reason = "shared test scratch owner")]
+mod temp_dir;
 mod upstream;
 
 type Result<T> = std::result::Result<T, String>;
@@ -340,11 +346,19 @@ fn success(command: &mut Command, action: &str) -> Result<()> {
 
 fn build(root: &Path, home: &Path) -> Result<PathBuf> {
     let source = boot_info_source::capture(root)?;
+    let target = root
+        .join(".td-build-cache/update-tools")
+        .join(native_cache::key(&[
+            Path::new("/bin/cargo"),
+            Path::new("/bin/rustc"),
+            Path::new("/bin/cc"),
+        ])?);
     let deployment = build_with_tools(
         root,
         home,
         Path::new("/bin/cargo"),
         Path::new("/bin/td-feed"),
+        &target,
     )?;
     let info = boot_info_source::finish(root, &source)?;
     let parent = root.join(".td-build-cache/update-deployments");
@@ -355,7 +369,13 @@ fn build(root: &Path, home: &Path) -> Result<PathBuf> {
     Ok(output)
 }
 
-fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Result<PathBuf> {
+fn build_with_tools(
+    root: &Path,
+    home: &Path,
+    cargo: &Path,
+    feed: &Path,
+    target: &Path,
+) -> Result<PathBuf> {
     for path in [
         "builder/Cargo.toml",
         "recipes/Cargo.toml",
@@ -367,7 +387,6 @@ fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Resu
             return Err("run ./update build from the td checkout root".into());
         }
     }
-    let target = root.join(".td-build-cache/update-tools");
     eprintln!("td-update: preparing build tools from this checkout");
     success(
         command(cargo, root, home)
@@ -385,7 +404,7 @@ fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Resu
                 TARGET,
                 "--target-dir",
             ])
-            .arg(&target)
+            .arg(target)
             .env("RUSTC", "/bin/rustc")
             .env("RUSTDOC", "/bin/rustdoc"),
         "build native update tools",
@@ -566,7 +585,6 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn host_git() -> PathBuf {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -575,17 +593,11 @@ mod tests {
             .expect("host Git")
     }
 
-    struct Fixture(PathBuf);
+    struct Fixture(PathBuf, #[allow(dead_code)] Option<temp_dir::TempDir>);
     impl Fixture {
         fn new() -> Self {
-            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "td-update-{}-{}",
-                std::process::id(),
-                SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&root).unwrap();
-            Self(root)
+            let owned = temp_dir::TempDir::new("td-update").unwrap();
+            Self(owned.path().to_path_buf(), Some(owned))
         }
         fn git(&self, args: &[&str]) -> String {
             let output = Command::new("git")
@@ -632,12 +644,6 @@ mod tests {
             source
         }
     }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
     #[ignore = "requires host rustc"]
     fn build_uses_fresh_helpers_and_stops_at_each_failed_phase() {
@@ -714,7 +720,13 @@ fn main() {
         ] {
             fs::write(fixture.0.join("calls"), "").unwrap();
             fs::write(fixture.0.join("fail-phase"), failure).unwrap();
-            let result = build_with_tools(&fixture.0, &fixture.0, &cargo, &feed);
+            let result = build_with_tools(
+                &fixture.0,
+                &fixture.0,
+                &cargo,
+                &feed,
+                &fixture.0.join(".td-build-cache/update-tools"),
+            );
             assert_eq!(result.is_ok(), failure.is_empty(), "{result:?}");
             if failure == "build-run" {
                 let error = result.as_ref().unwrap_err();
@@ -723,6 +735,40 @@ fn main() {
             }
             assert_eq!(fs::read_to_string(fixture.0.join("calls")).unwrap(), calls);
         }
+    }
+
+    #[test]
+    fn native_cache_separates_reinstalled_runtime_and_preserves_old_outputs() {
+        let fixture = Fixture::new();
+        let old = fixture.0.join("old-linker");
+        let new = fixture.0.join("new-linker");
+        let cc = fixture.0.join("cc");
+        fs::write(&old, "old runtime closure").unwrap();
+        fs::write(&new, "new runtime closure").unwrap();
+        symlink(&old, &cc).unwrap();
+        let before = native_cache::key(&[&cc])
+            .map(|key| fixture.0.join(".td-build-cache/update-tools").join(key))
+            .unwrap();
+        fs::create_dir_all(&before).unwrap();
+        fs::write(before.join("build-script"), "missing old loader").unwrap();
+        assert_eq!(
+            native_cache::key(&[&cc])
+                .map(|key| fixture.0.join(".td-build-cache/update-tools").join(key))
+                .unwrap(),
+            before
+        );
+        fs::remove_file(&cc).unwrap();
+        symlink(&new, &cc).unwrap();
+        let after = native_cache::key(&[&cc])
+            .map(|key| fixture.0.join(".td-build-cache/update-tools").join(key))
+            .unwrap();
+        assert_ne!(after, before);
+        assert!(!after.exists());
+        assert!(before.join("build-script").exists());
+        fs::remove_file(&new).unwrap();
+        assert!(native_cache::key(&[&cc])
+            .map(|key| fixture.0.join(".td-build-cache/update-tools").join(key))
+            .is_err());
     }
 
     #[test]
@@ -882,7 +928,7 @@ fn main() {
             initialize(&source, &home.0, &host_git()).unwrap(),
             Initialization::Created
         );
-        let checkout = Fixture(home.0.join("src/td"));
+        let checkout = Fixture(home.0.join("src/td"), None);
         assert_eq!(
             checkout.git(&["branch", "--show-current"]),
             "releases/stable\n"
@@ -956,7 +1002,7 @@ fn main() {
                 fs::metadata(home.0.join("src")).unwrap().mode() & 0o777,
                 original_parent_mode.unwrap_or(0o700)
             );
-            let checkout = Fixture(home.0.join("src/td"));
+            let checkout = Fixture(home.0.join("src/td"), None);
             assert_eq!(
                 checkout.git(&["rev-parse", "HEAD"]),
                 repository.git(&["rev-parse", "HEAD"])
