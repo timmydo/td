@@ -520,6 +520,12 @@ impl App {
                 self.phase = Phase::Refused(text.clone());
                 self.say(text);
             }
+            Reply::TrustedAttention { op } => {
+                if self.busy.as_ref().map(Busy::op) == Some(op) {
+                    self.end_prompt();
+                    self.say("Press Ctrl+Alt+Esc, then N to authorize the notebook operation");
+                }
+            }
             Reply::Ask { op, ask } => {
                 if self.busy.as_ref().map(Busy::op) != Some(op) {
                     self.out.push(Out::Answer(op, Answer::Decline));

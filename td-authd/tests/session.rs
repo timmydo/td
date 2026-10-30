@@ -2519,3 +2519,53 @@ fn suspend_requires_idle_preparation_and_a_lock_for_enforced_login() {
     assert!(session.suspending.is_none());
     assert_eq!(session.suspend_status().unwrap(), [0xa5, 2]);
 }
+
+#[test]
+fn notebook_lock_is_idempotent_and_takes_no_operation_slot() {
+    let mut session = quiet();
+    let (bridge, pids) = crate::notebook::tests::bridge();
+    session.notebook = Some(bridge);
+    assert_eq!(Request::decode(&[0x2b]).unwrap(), Request::NotebookLock);
+    assert!(!Request::NotebookLock.takes_slot());
+    for _ in 0..2 {
+        assert_eq!(
+            session
+                .answer_with(
+                    Request::NotebookLock,
+                    |_| panic!("cleanup"),
+                    unexpected_begin
+                )
+                .unwrap(),
+            [0xab]
+        );
+    }
+    assert!(session.notebook.is_none());
+    assert!(session.operation.is_none());
+    for pid in pids {
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+}
+
+#[test]
+fn notebook_lock_stops_an_active_ceremony_and_both_private_processes() {
+    let mut session = quiet();
+    let (ceremony, pids) = crate::notebook::tests::ceremony();
+    session.operation = Some(Active::Notebook(Box::new(ceremony)));
+    assert_eq!(
+        session
+            .answer_with(
+                Request::NotebookLock,
+                |_| panic!("cleanup"),
+                unexpected_begin
+            )
+            .unwrap(),
+        [0xab]
+    );
+    for pid in pids {
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+    assert!(matches!(
+        session.operation.as_mut().unwrap().poll().unwrap(),
+        Event::Failed(_)
+    ));
+}

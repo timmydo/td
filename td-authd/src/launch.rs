@@ -348,6 +348,24 @@ fn valid_selection(name: &str) -> bool {
 }
 
 /// Runs only after td-login dropped credentials, before any terminal code.
+pub(crate) fn notebook_ui(arguments: &[String]) -> Result<(), String> {
+    let [owner] = arguments else {
+        return Err("notebook-ui requires an owner".into());
+    };
+    let uid = number(owner, 1000..=1000)?;
+    require_session_process(
+        uid,
+        &bounded_file("/proc/self/status")?,
+        &bounded_file("/proc/self/cgroup")?,
+    )?;
+    let mut command = Command::new("/bin/td-pass");
+    command.arg("--trusted").env(
+        "WAYLAND_DISPLAY",
+        format!("/run/td-compositor/{uid}/wayland-0"),
+    );
+    Err(format!("exec notebook window: {}", command.exec()))
+}
+
 pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
     let (uid, generation, handle, terminal, select) = terminal_arguments(arguments)?;
     require_session_process(
@@ -867,7 +885,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
-        [0x10..=0x21 | 0x25 | 0x26, ..] => {
+        [0x10..=0x21 | 0x25 | 0x26 | 0x28..=0x2b, ..] => {
             Ok(Request::Secret(crate::session::Request::decode(bytes)?))
         }
         [0x24, operands @ ..] => Ok(Request::Software(crate::software::Request::decode(

@@ -49,6 +49,10 @@ const CLEANUP_TIME: Duration = Duration::from_secs(2);
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Request {
     Prepare,
+    NotebookOpen,
+    NotebookBegin,
+    NotebookState,
+    NotebookLock,
     Poll,
     Inspect,
     Write,
@@ -85,7 +89,8 @@ impl Request {
     fn takes_slot(&self) -> bool {
         matches!(
             self,
-            Self::Inspect
+            Self::NotebookBegin
+                | Self::Inspect
                 | Self::Write
                 | Self::Install
                 | Self::Begin(_)
@@ -102,6 +107,10 @@ impl Request {
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         match bytes {
             [0x10] => Ok(Self::Prepare),
+            [0x28] => Ok(Self::NotebookOpen),
+            [0x29] => Ok(Self::NotebookBegin),
+            [0x2a] => Ok(Self::NotebookState),
+            [0x2b] => Ok(Self::NotebookLock),
             [0x11] => Ok(Self::Poll),
             [0x17] => Ok(Self::Inspect),
             [0x18] => Ok(Self::Write),
@@ -160,6 +169,7 @@ impl Start {
 }
 
 enum Active {
+    Notebook(Box<crate::notebook::Ceremony>),
     Secret(Box<Unlock>),
     Install(Box<crate::deployment::Installation>),
     /// A login-key worker shares the one operation slot.
@@ -176,6 +186,7 @@ impl Active {
     /// None only for a login operation awaiting its worker's baseline.
     fn description(&self) -> Option<&Description> {
         match self {
+            Self::Notebook(op) => op.request(),
             Self::Secret(op) => Some(op.request()),
             Self::Install(op) => Some(op.request()),
             Self::Login(op) => op.request(),
@@ -187,6 +198,7 @@ impl Active {
     }
     fn nonce(&self) -> &[u8; 32] {
         match self {
+            Self::Notebook(op) => op.nonce(),
             Self::Secret(op) => op.request().nonce(),
             Self::Install(op) => op.request().nonce(),
             Self::Login(op) => op.nonce(),
@@ -198,6 +210,7 @@ impl Active {
     }
     fn presented(&mut self, request: &Description) -> Result<(), String> {
         match self {
+            Self::Notebook(op) => op.presented(request),
             Self::Secret(op) => op.presented(request),
             Self::Install(op) => op.presented(request),
             Self::Login(op) => op.presented(request),
@@ -209,6 +222,7 @@ impl Active {
     }
     fn commit(&mut self, request: &Description) -> Result<(), String> {
         match self {
+            Self::Notebook(op) => op.commit(request),
             Self::Secret(op) => op.commit(request),
             Self::Install(op) => op.commit(request),
             Self::Login(op) => op.commit(request),
@@ -220,6 +234,7 @@ impl Active {
     }
     fn cancel(&mut self, reason: &str) -> Result<(), String> {
         match self {
+            Self::Notebook(op) => op.cancel(),
             Self::Secret(op) => op.cancel(reason),
             Self::Install(op) => op.cancel(reason),
             // Every login cancellation is the person's: kill, reap, no relock.
@@ -232,6 +247,7 @@ impl Active {
     }
     fn poll(&mut self) -> Result<Event, String> {
         match self {
+            Self::Notebook(op) => op.poll(),
             Self::Secret(op) => op.poll(),
             Self::Install(op) => op.poll(),
             Self::Login(op) => op.poll(),
@@ -243,6 +259,7 @@ impl Active {
     }
     fn reap_for_teardown(self) -> Result<(), String> {
         match self {
+            Self::Notebook(op) => op.reap_for_teardown(),
             Self::Secret(op) => op.reap_for_teardown(),
             Self::Install(op) => op.reap_for_teardown(),
             // The setup intake owns the service and stops it at teardown.
@@ -331,6 +348,7 @@ impl Drop for Cleanup {
 
 pub(crate) struct Session {
     owner: u32,
+    notebook: Option<crate::notebook::Bridge>,
     intake: Option<crate::secret_intake::Intake>,
     writing: bool,
     installations: Option<crate::deployment::Intake>,
@@ -369,6 +387,7 @@ impl Session {
         }
         Ok(Self {
             owner,
+            notebook: None,
             intake: None,
             writing: false,
             installations: None,
@@ -452,6 +471,62 @@ impl Session {
                 self.tick()?;
                 self.reply()
             }
+            Request::NotebookLock => {
+                self.notebook = None;
+                if let Some(Active::Notebook(operation)) = &mut self.operation {
+                    operation.cancel()?;
+                }
+                Ok(vec![0xab])
+            }
+            Request::NotebookOpen => {
+                if !self.prepared || self.cleanup.is_some() || self.suspending.is_some() {
+                    return Ok(vec![0xa8, 1]);
+                }
+                if self.notebook.is_none() && !matches!(self.operation, Some(Active::Notebook(_))) {
+                    match crate::notebook::Bridge::start(self.owner) {
+                        Ok(bridge) => self.notebook = Some(bridge),
+                        Err(_) => return Ok(vec![0xa8, 1]),
+                    }
+                }
+                Ok(vec![0xa8, 0])
+            }
+            Request::NotebookState => {
+                self.tick()?;
+                Ok(vec![
+                    0xaa,
+                    u8::from(self.notebook.as_ref().is_some_and(|b| b.pending())),
+                ])
+            }
+            Request::NotebookBegin => {
+                self.tick()?;
+                if self.prepared
+                    && self.cleanup.is_none()
+                    && self.operation.is_none()
+                    && self.inspection.is_none()
+                    && self.notebook.is_none()
+                {
+                    self.notebook = match crate::notebook::Bridge::start(self.owner) {
+                        Ok(bridge) => Some(bridge),
+                        Err(_) => return Ok(vec![0xa9, 2]),
+                    };
+                    return Ok(vec![0xa9, 0]);
+                }
+                if !self.prepared
+                    || self.cleanup.is_some()
+                    || self.operation.is_some()
+                    || self.inspection.is_some()
+                    || !self.notebook.as_ref().is_some_and(|b| b.pending())
+                {
+                    return Ok(vec![0xa9, 0]);
+                }
+                let bridge = self.notebook.take().ok_or("missing notebook")?;
+                let operation = bridge.begin()?;
+                let mut reply = vec![0xa9, 1];
+                reply.extend_from_slice(operation.nonce());
+                self.operation = Some(Active::Notebook(Box::new(operation)));
+                self.event = Some(Event::Waiting);
+                Ok(reply)
+            }
             Request::Inspect => self.inspect_with(Inspection::start),
             Request::Write => self.begin_write(),
             Request::Install => self.begin_install(crate::elevation::Table::load),
@@ -505,6 +580,7 @@ impl Session {
             }
             Request::Pin(description, pin) => {
                 let queued = match &mut self.operation {
+                    Some(Active::Notebook(operation)) => operation.pin(&description, pin)?,
                     Some(Active::Login(operation)) => operation.pin(&description, pin)?,
                     Some(Active::Proof(operation)) => operation.pin(&description, pin)?,
                     // An upgrade's new key's PIN steps, and protector
@@ -629,6 +705,7 @@ impl Session {
         {
             return Ok(vec![0xa5, 2]);
         }
+        self.notebook = None;
         match start() {
             Ok(helper) => {
                 self.suspending = Some(helper);
@@ -945,6 +1022,13 @@ impl Session {
 
     /// Terminal traffic also advances watchdogs without consuming events.
     pub fn tick(&mut self) -> Result<(), String> {
+        if self
+            .notebook
+            .as_mut()
+            .is_some_and(|bridge| bridge.poll().is_err())
+        {
+            self.notebook = None;
+        }
         if let Some(intake) = &mut self.intake {
             intake.tick();
         }
@@ -1104,6 +1188,9 @@ impl Session {
             // However it ended, the next `1a` reads the login state afresh,
             // and the revocation check begins before this status is sent.
             let login = matches!(operation, Active::Login(_) | Active::Proof(_));
+            if let Some(Active::Notebook(operation)) = &mut self.operation {
+                self.notebook = operation.take_bridge();
+            }
             self.operation = None;
             self.event = None;
             if login {
@@ -1135,6 +1222,7 @@ impl Session {
                 return Err(why);
             }
         }
+        self.notebook = None;
         self.intake = None;
         self.installations = None;
         self.hostnames = None;

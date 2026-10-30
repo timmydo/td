@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 #[path = "../../td-firstboot/src/principals.rs"]
 #[allow(dead_code, reason = "shared immutable installed-account admission")]
-mod principals;
+pub(crate) mod principals;
 
 const ADMISSION_TIME: Duration = Duration::from_secs(5);
 const QUEUE_TIME: Duration = Duration::from_secs(60);

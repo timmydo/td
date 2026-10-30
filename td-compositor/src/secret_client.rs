@@ -480,6 +480,7 @@ struct Presented {
 /// A login-key operation (td-login/TOKEN-LOGIN.md): root's request `1b`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LoginSelection {
+    Notebook,
     Unlock,
     /// First enrollment of one or two keys.
     Enroll(u8),
@@ -514,6 +515,7 @@ impl LoginSelection {
     /// The bytes td-authd's `login::Selection::decode` reads, after `1b`.
     fn request(&self) -> Result<Vec<u8>, String> {
         Ok(match self {
+            Self::Notebook => vec![0x29],
             Self::Proven(proof, inner) => match (inner.as_ref(), inner.request()?.as_slice()) {
                 (Self::Enroll(_) | Self::Add | Self::Remove(..), [0x1b, rest @ ..]) => {
                     [&[0x1b, 0x0b, proof.byte()][..], rest].concat()
@@ -567,6 +569,7 @@ impl LoginSelection {
     /// and the reading allowance when the operation discloses.
     fn ceiling(&self) -> Duration {
         match self {
+            Self::Notebook => crate::authority::consent::NOTEBOOK_CEILING,
             Self::Unlock => LOGIN_CEREMONY,
             Self::Remove(_, after) if *after > 1 => LOGIN_CEREMONY,
             Self::Remove(..) | Self::Enroll(1) => LOGIN_CEREMONY.saturating_add(LOGIN_READING),
@@ -607,6 +610,9 @@ impl LoginSelection {
     /// Root's answer byte to the selection: `9b` for a login operation,
     /// `a0` for a storage operation.
     fn answer(&self) -> u8 {
+        if *self == Self::Notebook {
+            return 0xa9;
+        }
         if self.storage() {
             0xa0
         } else {
@@ -688,6 +694,7 @@ impl LoginSelection {
     /// boot does.
     fn success(&self, request: Option<&Request>) -> &'static [&'static str] {
         match self {
+            Self::Notebook => &["NOTEBOOK OPERATION FINISHED"],
             Self::Unlock => &["SESSION UNLOCKED"],
             Self::Enroll(_) => &["LOGIN KEYS ENROLLED"],
             Self::Add => &["LOGIN KEY ADDED"],
@@ -1667,6 +1674,13 @@ impl Client {
         // this build's (td-authd/DESIGN.md amendment 10).
         let answer = selection.answer();
         let nonce = match response.as_slice() {
+            [0xa9, 2] if answer == 0xa9 => return attempt.notice(Notice::NotAvailable),
+            [0xa9, 0] if answer == 0xa9 => {
+                return attempt.notice(Notice::Login(&[
+                    "CHOOSE AN OPERATION IN THE NOTEBOOK WINDOW",
+                    "THEN RETURN HERE AND PRESS N",
+                ]))
+            }
             [0xa0, 0] if answer == 0xa0 => return attempt.notice(Notice::NotAvailable),
             [tag, 1, nonce @ ..] if *tag == answer => {
                 <[u8; 32]>::try_from(nonce).map_err(|_| "invalid login operation start")?
@@ -1694,7 +1708,123 @@ impl Client {
         Ok(())
     }
 
+    fn tick_notebook(&mut self, wire: &mut impl Exchange) -> Result<(), String> {
+        let Some(pending) = &mut self.login else {
+            return Ok(());
+        };
+        if !pending.attempt.active() && !pending.cancelled {
+            pending.abandon(wire)?;
+        }
+        let response = wire.exchange(&[0x11])?;
+        let [0x91, status, rest @ ..] = response.as_slice() else {
+            return Err("invalid notebook status".into());
+        };
+        if *status == 0x0b && rest.is_empty() && pending.request.is_none() {
+            return Ok(());
+        }
+        if matches!(*status, 6 | 7) {
+            if !rest.is_empty() {
+                let description = Request::decode(rest)?;
+                if description.nonce() != &pending.nonce
+                    || description.owner() != 1000
+                    || !matches!(description.operation(), Operation::Notebook(_))
+                {
+                    return Err("notebook end changed its identity".into());
+                }
+            }
+            pending.attempt.close_field();
+            let attempt = Arc::clone(&pending.attempt);
+            self.login = None;
+            return attempt.notice(Notice::Login(if *status == 6 {
+                &["NOTEBOOK OPERATION FINISHED"]
+            } else {
+                &["NOTEBOOK CANCELLED OR FAILED", "VAULT LOCKED"]
+            }));
+        }
+        let description = Request::decode(rest)?;
+        let Operation::Notebook(next) = description.operation() else {
+            return Err("notebook status names another operation".into());
+        };
+        if description.nonce() != &pending.nonce || description.owner() != 1000 {
+            return Err("notebook status changed identity".into());
+        }
+        if pending.request.as_ref() != Some(&description) {
+            if !matches!(*status, 3 | 4) {
+                return Err("notebook step was not presented".into());
+            }
+            if let Some(current) = &pending.request {
+                let Operation::Notebook(before) = current.operation() else {
+                    return Err("missing notebook binding".into());
+                };
+                let same_operation =
+                    before.operation == next.operation && before.action == next.action;
+                let repeated_exchange = next.step == 0
+                    && matches!((before.method, before.step), (0x30, 3) | (0x31, 1))
+                    && pending.pin_sent;
+                if pending.receipt.as_ref() != Some(current)
+                    || (current.asks_pin() && !pending.pin_sent)
+                    || !same_operation
+                    || !(next.follows(before) || repeated_exchange)
+                {
+                    return Err("notebook skipped or changed a presented step".into());
+                }
+            } else if next.step != 0 {
+                return Err("notebook omitted initial approval".into());
+            }
+            pending.attempt.close_field();
+            pending.request = Some(description.clone());
+            pending.receipt = None;
+            pending.shown = None;
+            pending.field = false;
+            pending.pin_sent = false;
+        }
+        let presented = pending.receipt.as_ref() == Some(&description);
+        match *status {
+            3 => {}
+            4 if !pending.cancelled && !presented => {
+                if pending.shown.is_none() {
+                    match pending.attempt.present(description.clone()) {
+                        Ok(receipt) if receipt == description && pending.attempt.active() => {
+                            pending.shown = Some(receipt)
+                        }
+                        _ => return pending.abandon(wire),
+                    }
+                }
+                if (!description.awaits_approval() || pending.attempt.approved(&description))
+                    && pending.attempt.active()
+                {
+                    let mut receipt = vec![0x13];
+                    receipt.extend_from_slice(&description.encode());
+                    if wire.exchange(&receipt)? != [0x93] {
+                        return Err("invalid notebook receipt acknowledgement".into());
+                    }
+                    pending.receipt = pending.shown.take();
+                }
+            }
+            0x0c if presented
+                && !pending.cancelled
+                && description.asks_pin()
+                && !pending.pin_sent =>
+            {
+                if pending.field {
+                    pending.send_pin(wire, &description)?;
+                } else {
+                    pending.open_field(wire, self.memory, &description)?;
+                }
+            }
+            _ => return Err("out-of-order notebook status".into()),
+        }
+        Ok(())
+    }
+
     fn tick_login(&mut self, wire: &mut impl Exchange) -> Result<(), String> {
+        if self
+            .login
+            .as_ref()
+            .is_some_and(|p| p.selection == LoginSelection::Notebook)
+        {
+            return self.tick_notebook(wire);
+        }
         let memory = self.memory;
         let Some(login) = &mut self.login else {
             return Ok(());
@@ -2694,6 +2824,98 @@ mod tests {
     impl Drop for Screen {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn notebook_attention_requires_approval_then_a_bound_protected_pin() {
+        for changed in [false, true] {
+            let temp = crate::temp_dir::TempDir::new("td-notebook-attention").unwrap();
+            let path = temp.path().join("frame");
+            let mut runtime = Runtime::new(
+                crate::framebuffer::Framebuffer::test_file(&path, 800, 600, 3200).unwrap(),
+            );
+            runtime.enable_attention(true);
+            runtime
+                .attention(&crate::input::test_origin(), true)
+                .unwrap();
+            let screen = Screen {
+                path,
+                attempt: Attempt::new(
+                    crate::input::test_origin(),
+                    Arc::new(Mutex::new(runtime)),
+                    Selection::Login(LoginSelection::Notebook),
+                ),
+            };
+            let before = Request::new(
+                NONCE,
+                1000,
+                Operation::Notebook(crate::authority::consent::Notebook {
+                    method: 0x31,
+                    action: 3,
+                    purpose: 3,
+                    role: 1,
+                    step: 0,
+                    operation: [2; 32],
+                    token: [3; 32],
+                }),
+            )
+            .unwrap();
+            let Operation::Notebook(mut binding) = before.operation().clone() else {
+                panic!();
+            };
+            binding.step = 1;
+            if changed {
+                binding.operation[0] ^= 1;
+            }
+            let pin = Request::new(NONCE, 1000, Operation::Notebook(binding)).unwrap();
+            let mut replies = VecDeque::from([
+                [&[0xa9, 1][..], &NONCE].concat(),
+                vec![0x91, 0x0b],
+                status(4, &before),
+                status(4, &before),
+                vec![0x93],
+                status(4, &pin),
+            ]);
+            if !changed {
+                replies.extend([
+                    vec![0x93],
+                    status(0x0c, &pin),
+                    status(0x0c, &pin),
+                    vec![0x9c, 0],
+                    status(6, &pin),
+                ]);
+            }
+            let mut wire = Wire {
+                replies,
+                calls: Vec::new(),
+                typist: Some(Arc::clone(&screen.attempt)),
+            };
+            let mut client = Client::trusting_memory();
+            client
+                .start(&mut wire, Arc::clone(&screen.attempt))
+                .unwrap();
+            let mut refused = false;
+            for _ in 0..20 {
+                if client.tick(&mut wire).is_err() {
+                    refused = true;
+                    break;
+                }
+                if client.login.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(refused, changed);
+            assert_eq!(
+                wire.calls
+                    .iter()
+                    .filter(|c| c.first() == Some(&0x1c))
+                    .count(),
+                usize::from(!changed)
+            );
+            if !changed {
+                assert!(wire.calls.contains(&pin_request(&pin, PIN)));
+            }
         }
     }
 
@@ -4607,6 +4829,7 @@ mod tests {
     /// Each operation's steps in their only order, as root presents them.
     fn steps(selection: &LoginSelection) -> Vec<Request> {
         match selection {
+            LoginSelection::Notebook => panic!("notebook tests drive their own"),
             LoginSelection::Unlock => vec![
                 unlock_step(LoginStep::Identify),
                 unlock_step(LoginStep::Unlock {
@@ -6759,7 +6982,8 @@ mod tests {
                 LoginSelection::Enroll(_) => (0x82, 0),
                 LoginSelection::Add => (0x81, 0),
                 LoginSelection::Remove(..) => (0x83, 0),
-                LoginSelection::SelectorUpdate
+                LoginSelection::Notebook
+                | LoginSelection::SelectorUpdate
                 | LoginSelection::Upgrade { .. }
                 | LoginSelection::UpgradeCancel
                 | LoginSelection::Protector(_)
@@ -6770,7 +6994,8 @@ mod tests {
             match selection {
                 LoginSelection::Enroll(_) => ends.insert((0x84, 0)),
                 LoginSelection::Remove(..) => ends.insert((0x85, 0)),
-                LoginSelection::Unlock
+                LoginSelection::Notebook
+                | LoginSelection::Unlock
                 | LoginSelection::Add
                 | LoginSelection::SelectorUpdate
                 | LoginSelection::Upgrade { .. }

@@ -747,6 +747,7 @@ type Watcher = Arc<dyn Fn(&Answer) + Send + Sync>;
 
 #[derive(Default)]
 struct Shared {
+    notebook_lock: bool,
     answer: Option<Answer>,
     watcher: Option<Watcher>,
 }
@@ -758,6 +759,24 @@ struct Shared {
 pub(crate) struct Login(Arc<Mutex<Shared>>);
 
 impl Login {
+    pub(crate) fn lock_notebook(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .notebook_lock = true;
+    }
+
+    fn revoke_notebook(&self, wire: &mut impl Exchange) -> Result<(), String> {
+        let pending = {
+            let mut shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            std::mem::take(&mut shared.notebook_lock)
+        };
+        if pending && wire.exchange(&[0x2b])? != [0xab] {
+            return Err("authority refused notebook lock".into());
+        }
+        Ok(())
+    }
+
     /// The last answer's state; none before the first answer, and in the
     /// direct profile, which has no authority.
     pub(crate) fn state(&self) -> Option<LoginState> {
@@ -1427,6 +1446,7 @@ fn worker(
     let mut secrets = crate::secret_client::Client::default();
     loop {
         let work = receive.recv_timeout(login.wait());
+        login.login.revoke_notebook(&mut wire)?;
         secrets.set_revocation(login.revocation());
         match work {
             Ok(Work::Secret(attempt)) => secrets.start(&mut wire, attempt)?,
@@ -1473,6 +1493,22 @@ fn worker(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    #[test]
+    fn a_session_lock_revokes_the_notebook_even_after_repeated_lock_events() {
+        let login = Login::default();
+        let mut wire = wire(vec![vec![0xab], vec![0xab], vec![0]]);
+        login.lock_notebook();
+        login.lock_notebook();
+        login.revoke_notebook(&mut wire).unwrap();
+        login.revoke_notebook(&mut wire).unwrap();
+        assert_eq!(wire.requests, [vec![0x2b]]);
+        login.lock_notebook();
+        login.revoke_notebook(&mut wire).unwrap();
+        login.lock_notebook();
+        assert!(login.revoke_notebook(&mut wire).is_err());
+        assert_eq!(wire.requests, [vec![0x2b], vec![0x2b], vec![0x2b]]);
+    }
 
     struct Wire {
         requests: Vec<Vec<u8>>,

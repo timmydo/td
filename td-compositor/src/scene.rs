@@ -3461,6 +3461,14 @@ impl Scene {
             // successor carries device data root admits, so only its shape
             // is checked here; an enrollment's is derived.
             let follows = match self.attention_request() {
+                Some(previous)
+                    if matches!(
+                        previous.operation(),
+                        crate::authority::consent::Operation::Notebook(_)
+                    ) =>
+                {
+                    previous.notebook_successor(&request)
+                }
                 Some(previous) if previous.is_login() => previous.login_successor(&request).is_ok(),
                 Some(previous) if previous.upgrade_step().is_some() => {
                     previous.upgrade_successor(&request).is_ok()

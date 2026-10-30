@@ -927,6 +927,8 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
+pub const NOTEBOOK_CEILING: Duration = Duration::from_secs(600);
+
 /// One token exchange within a root-admitted notebook operation.
 /// Digests bind the complete GUI operation and the service token request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1768,6 +1770,23 @@ impl Request {
 
     /// Whether the description's ceremony step asks for the recovery key,
     /// whose field and `1c` are 48 digits.
+    /// Notebook transition shape; receipts and PIN delivery are checked by
+    /// the authority and the physical-input controller, not this codec.
+    pub fn notebook_successor(&self, next: &Self) -> bool {
+        match (&self.operation, &next.operation) {
+            (Operation::Notebook(before), Operation::Notebook(after)) => {
+                self.owner == next.owner
+                    && self.nonce == next.nonce
+                    && before.action == after.action
+                    && before.operation == after.operation
+                    && (after.follows(before)
+                        || (after.step == 0
+                            && matches!((before.method, before.step), (0x30, 3) | (0x31, 1))))
+            }
+            _ => false,
+        }
+    }
+
     pub fn asks_pin(&self) -> bool {
         self.ceremony_step().is_some_and(LoginStep::asks_pin)
             || matches!(&self.operation, Operation::Notebook(n) if n.step != 0)
@@ -1920,6 +1939,7 @@ impl Request {
     /// upgrade's or its cancellation's.
     pub fn ceiling(&self) -> Option<Duration> {
         match self.operation {
+            Operation::Notebook(_) => Some(NOTEBOOK_CEILING),
             Operation::SelectorUpdate { .. } => Some(SELECTOR_UPDATE_CEILING),
             Operation::Upgrade { count, .. } => Some(upgrade_ceiling(count)),
             Operation::UpgradeCancel => Some(UPGRADE_CANCEL_CEILING),

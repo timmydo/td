@@ -197,6 +197,9 @@ pub struct Failure {
 
 #[derive(Debug)]
 pub enum Reply {
+    TrustedAttention {
+        op: Op,
+    },
     /// The enrolled keys, `None` when the account holds no vault yet.
     Opened {
         keys: Option<Vec<KeyLabel>>,

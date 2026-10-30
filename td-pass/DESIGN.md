@@ -90,10 +90,11 @@ and cryptographic details stay out of the notebook flow.
 
 `src/main.rs` dispatches td-secret's token worker before anything else,
 then answers `--help`, then admits a mode from os-release: an `ID` or
-`ID_LIKE` naming td is refused, since td mode's service is not reached
-by this build, and an unreadable or repeated identity admits nothing;
-any other system runs standalone. No refusal falls back to the other
-mode.
+`ID_LIKE` naming td requires the trusted service. Only root's fixed
+`--trusted` launch reaches that backend; it admits its inherited root-owned
+socketpair and protects memory before creating window threads or opening
+Wayland. An unreadable or repeated identity admits nothing. Other systems
+run standalone. No refusal falls back to another mode.
 
 - **Swap.** td-secret admits swap that keeps pages in memory, zram
   without a writeback device. Other active swap opens nothing: the vault
@@ -384,7 +385,7 @@ Native compositor cases run the binary under a real headless
 td-compositor and type through its seat
 (`tests/support/native_compositor.rs`). With the shipped backend, the
 window maps, takes the keyboard and closes on Ctrl+Q, whatever the host
-lets its vault do, and on td it refuses with td mode's reason. The rest
+lets its vault do, and an ordinary invocation on td requires its trusted launcher. The rest
 run over a test vault, `src/backend/fixture.rs`, which the `test-vault`
 feature mounts in place of the vault thread's td-secret calls and host
 watch, and which no recipe enables: two synthetic entries under one
@@ -489,7 +490,7 @@ built with the target's frame pointers, and its output carries the
 build-ID-matched, symbols-only debug companion. The system image copies
 the whole output and links `/bin/td-pass` to it, so the image's
 deployment index covers it and the same executable can be carried to a
-foreign host. On td itself the window refuses until td mode is built;
+foreign host. On td the window requires the private trusted launch;
 the token worker's entry, dispatched before mode admission, still runs
 there with only the caller's own device access, as on any host.
 `td-pass-test` requires the binary, asserts its static shape and runs
@@ -508,3 +509,32 @@ builds td-photo and td-editor, and installs it to run by name from
 `~/.local/bin`; that copy is a development build, not the recipe's
 static artifact, and it starts its token worker from its own executable
 as the image's does.
+
+## Trusted td backend
+
+Physical secure attention, Ctrl+Alt+Esc followed by N, opens the notebook
+through td-authd. The GUI runs as the primary human; the vault service runs
+as that owner's reserved notebook identity. Root creates both private
+socketpairs and validates the account registry before dropping credentials.
+There is no pathname listener, caller-selected program, or UID-only vault
+admission. The GUI accepts only root's inherited endpoint, with one thread,
+all UID/GID columns 1000, no effective capabilities, and no extra inherited
+descriptors. Its transport rechecks protected memory and accepts no swap
+exception. Closing it shuts down the socket, including the inherited stdin
+alias, so root observes revocation even if the process remains alive.
+
+Browsing and edits use the service protocol. A hardware operation first
+asks the person to return to secure attention and press N. Its PIN fields
+exist only there; the ordinary window shows a waiting status and receives
+no PIN or vault key. Creation, unlock, key addition/replacement, encrypted
+export and encrypted-copy import use the same lifecycle as standalone mode.
+Encrypted import/export file access stays in the human's GUI process.
+The shell-based password-store importer is unavailable in trusted mode.
+
+Root owns session lock, suspend, generation loss and GUI-loss revocation.
+A cancellation closes the notebook window and destroys its vault session.
+The service has a fifteen-minute absolute unlock ceiling; root closes the
+window when its heartbeat observes expiry. No host logind watcher or
+standalone token worker is started by this backend. Ordinary human-account
+software remains inside the desktop trust boundary; this does not claim to
+protect plaintext from an already compromised kernel or trusted compositor.

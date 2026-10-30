@@ -1180,7 +1180,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0xfe63f0609dcaad5a;
+    const AUTHORITY_FINGERPRINT: u64 = 0xdf9ff87d1611e26d;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -1339,7 +1339,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0xe139a3372cd677a3,
+            0xaab473803ba3e97e,
             "shared consent changed: reconcile td-secret/src/lib.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
@@ -3213,6 +3213,7 @@ pub struct MappedRegion {
             .split_once("    let locked = target.lock_screen();\n")
             .unwrap();
         assert!(!before.contains('?') && !before.contains("return"));
+        assert!(before.contains("bindings.login.lock_notebook();"));
         assert!(after.contains("    drained?;\n    let presentation = locked?;\n"));
         assert_eq!(occurrences(body, "return"), 0);
         // Its one caller: a key decision.
@@ -3566,7 +3567,7 @@ pub struct MappedRegion {
         // Root's description alone says which prompts await approval: the
         // presented prompt's keeping, the press's check and a login step's
         // receipt.
-        assert_eq!(occurrences(client, "awaits_approval()"), 3);
+        assert_eq!(occurrences(client, "awaits_approval()"), 4);
         // A login disclosure step's receipt goes only once Enter approved
         // that exact prompt; any other step's follows its presentation.
         let tick = body(client, "    fn tick_login(");
@@ -3575,7 +3576,7 @@ pub struct MappedRegion {
              && (!description.awaits_approval() || login.attempt.approved(&description))\n                    \
              && login.attempt.active()\n"
         ));
-        assert_eq!(occurrences(client, ".approved("), 1);
+        assert_eq!(occurrences(client, ".approved("), 2);
         let approved = body(client, "    fn approved(");
         assert!(approved.contains(
             "        self.confirmed.load(Ordering::SeqCst)\n            \

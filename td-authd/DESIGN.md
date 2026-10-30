@@ -3680,5 +3680,42 @@ it authorizes with an existing key or enrolls a new one. Creating without
 a backup explicitly says that losing the key makes the vault unrecoverable.
 The digests bind the operation without rendering notebook content. They
 are not authentication. Only root's admitted notebook operation may create
-this description or supply its token result. The codec and root worker are
-preparatory: no public request or standalone fallback is enabled by them.
+this description or supply its token result. No public listener or
+standalone fallback supplies notebook credentials.
+
+
+The paired session's requests 28, 29 and 2a open the notebook, select its
+pending hardware operation, and query whether one waits. Their replies are
+`a8 00/01`, `a9 01 NONCE`, `a9 00` (nothing selected), `a9 02`
+(launch unavailable), and `aa BOOL`. Selecting with no
+window opens it and starts no token operation. Selecting while another
+operation owns the slot starts nothing. The fixed human GUI command is
+`td-login exec-as PRIMARY -- /bin/td-authd notebook-ui 1000`; the checked
+helper sets only the fixed Wayland endpoint and execs `/bin/td-pass
+--trusted`. The service command is `td-login exec-service-as tdv1000 --
+/bin/td-secret notebook-service --uid 1000`. Account validation remains
+root-side. Both channels are root-created unnamed socketpairs.
+
+Request 2b revokes the notebook without taking the operation slot and
+replies ab only after stopping its processes. Every physical screen-lock
+path queues this revocation independently of the bounded launch queue;
+the authority worker sends it before handling further queued work.
+Repeated lock events coalesce. A failed exchange ends the paired session.
+An active notebook operation is cancelled; other operations are untouched.
+
+One immutable GUI request waits for physical selection before root sends
+it to the service. Root hashes it and retains its action across every token
+exchange, each additionally bound to the service's exact request. Root's
+nonblocking worker supervisor checks every presentation transition and PIN
+receipt, bounds each frame, and accepts a result only after a successful
+worker exit and clean EOF. Failure, cancellation or unexpected bytes clear
+the result and stop/reap the worker. No new operation starts until the old
+worker is gone. The overall notebook ceremony has a ten-minute deadline;
+each token worker retains its own 120-second ceiling.
+
+Only the pinned window may browse, edit, import/export or set bindings.
+It cannot submit the service's credential-only tag 12 or token replies.
+A separate admitted mail capability is required for tag 12; the browsing
+channel is never its substitute. Root sends idle heartbeats, ends the
+window on an expired vault, and destroys the GUI and service on session
+teardown or before suspend. No descriptor survives to the next generation.

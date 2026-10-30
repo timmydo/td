@@ -21,7 +21,7 @@ use std::process::ExitCode;
 const HELP: &str = "usage: td-pass\n\
     A two-pane encrypted notebook over td-secret's portable vault, \
     opened with a FIDO2 key and its PIN. It runs standalone on a foreign \
-    Wayland desktop; on td it refuses until td mode is built.";
+    Wayland desktop. On td, press Ctrl+Alt+Esc then N to open it through the trusted vault service.";
 
 fn main() -> ExitCode {
     // An argument that is not text is no worker's and no window's.
@@ -41,11 +41,22 @@ fn main() -> ExitCode {
                 .map_err(|error| format!("cannot write the usage: {error}")),
         );
     }
+    if args == ["--trusted"] {
+        return exit(match mode::admit(os_release().as_deref()) {
+            Ok(mode::Mode::TrustedRequired) => {
+                backend::Trusted::open().and_then(|trusted| window::run_with(Some(trusted)))
+            }
+            _ => Err("trusted notebook mode requires td and its private root launch".into()),
+        });
+    }
     if !args.is_empty() {
         return exit(Err("usage: td-pass".to_owned()));
     }
     match mode::admit(os_release().as_deref()) {
-        Ok(mode::Mode::Standalone) => exit(window::run()),
+        Ok(mode::Mode::Standalone) => exit(window::run_with(None)),
+        Ok(mode::Mode::TrustedRequired) => exit(Err(
+            "open td-pass through td’s trusted notebook launcher".into(),
+        )),
         Err(reason) => exit(Err(reason.to_owned())),
     }
 }

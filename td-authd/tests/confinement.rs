@@ -43,6 +43,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "login_status.rs",
             "main.rs",
             "mount_sys.rs",
+            "notebook.rs",
+            "notebook_token.rs",
             "portal_files.rs",
             "primary_account.rs",
             "proof.rs",
@@ -65,6 +67,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("application_cache.rs", 0),
         ("application_files.rs", 0),
         ("main.rs", 1),
+        ("notebook.rs", 0),
+        ("notebook_token.rs", 0),
         ("channel.rs", 0),
         ("consent.rs", 0),
         ("deployment.rs", 0),
@@ -127,6 +131,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "set_hostname.rs"
                     | "revocation.rs"
                     | "inspection.rs"
+                    | "notebook.rs"
+                    | "notebook_token.rs"
             ) && ["::Command", "::thread", ".spawn(", ".exec("]
                 .contains(&forbidden);
             let mapping_child_api = matches!(name, "portal_files.rs" | "application_files.rs")
@@ -141,7 +147,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(time_setting.contains("#[path = \"../../td-civil/src/tzif.rs\"]"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xe139a3372cd677a3,
+        0xaab473803ba3e97e,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -1129,9 +1135,9 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(launch.matches("thread::sleep(").count(), 1);
     assert_eq!(launch.matches(".spawn(").count(), 1);
-    assert_eq!(launch.matches(".exec()").count(), 1);
+    assert_eq!(launch.matches(".exec()").count(), 2);
     assert_eq!(launch.matches(".process_group(0)").count(), 1);
-    assert_eq!(launch.matches("Command::new(").count(), 6);
+    assert_eq!(launch.matches("Command::new(").count(), 7);
     // The root commands a peer can cause beside the credential helper:
     // its supervisor starting an application's unit or the fixed update
     // unit, and reading an application unit's status line. The name is
@@ -1340,12 +1346,12 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const CACHE_FINGERPRINT: u64 = 0xca9ca5668a3cec8c;
 const SOFTWARE_FINGERPRINT: u64 = 0xedb33f4ba9468adf;
-const LAUNCH_FINGERPRINT: u64 = 0xd13265deca4b163b;
-const MAIN_FINGERPRINT: u64 = 0x82f121e795754496;
-const SESSION_FINGERPRINT: u64 = 0x658a4d40a463fc4c;
+const LAUNCH_FINGERPRINT: u64 = 0x917d816a91d3a16e;
+const MAIN_FINGERPRINT: u64 = 0x27810a2741db3785;
+const SESSION_FINGERPRINT: u64 = 0x451ab28c09802bb7;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
-const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
+const INTAKE_FINGERPRINT: u64 = 0xad60fdb29c45fd9b;
 const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
 
 const INSTALLATION_FINGERPRINT: u64 = 0xabb4e7cd418585ae;

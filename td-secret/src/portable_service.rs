@@ -80,6 +80,12 @@ impl Backend {
                 } else {
                     out.push(0)?;
                 }
+                field(
+                    &mut out,
+                    self.session
+                        .as_ref()
+                        .map_or(&[], |session| session.credential()),
+                )?;
             }
             2 => {
                 let backup = input.boolean()?;
@@ -336,6 +342,18 @@ pub(crate) fn run(owner: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn service_replies_use_clearing_growth() {
+        for source in [
+            include_str!("portable_service.rs"),
+            include_str!("portable_service_tokens.rs"),
+        ] {
+            let source = source.split("#[cfg(test)]").next().unwrap();
+            assert!(!source.contains("out.0.extend"));
+            assert!(!source.contains("out.0.push"));
+        }
+    }
+
     use super::super::lifecycle::tests::{Bench, Random as TestRandom};
     use super::*;
     use crate::test_temp::TempDir;
@@ -428,7 +446,10 @@ mod tests {
         wire.send(&[13]).unwrap();
         assert_eq!(wire.receive(Duration::from_secs(5)).unwrap().0, [0, 0]);
         wire.send(&[1]).unwrap();
-        assert_eq!(wire.receive(Duration::from_secs(5)).unwrap().0, [0, 0]);
+        assert_eq!(
+            wire.receive(Duration::from_secs(5)).unwrap().0,
+            [0, 0, 0, 0, 0, 0]
+        );
         drop(wire);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

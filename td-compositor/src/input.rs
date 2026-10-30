@@ -954,6 +954,9 @@ impl KeyBindings {
                 decision.notice = Some(Notice::PowerConfirm(choice));
                 None
             }
+            KEY_N => Some(Selection::Login(
+                crate::secret_client::LoginSelection::Notebook,
+            )),
             KEY_W => Some(Selection::Write),
             KEY_I => Some(Selection::Install),
             KEY_U => Some(Selection::Unlock(Role::Primary)),
@@ -2132,6 +2135,7 @@ fn lock_session<T: InputTarget>(
     // The lock never waits on the drain's paint: a drain that failed to
     // paint left the scene draining, and the session locks all the same,
     // so no error below leads back to an unlocked desktop.
+    bindings.login.lock_notebook();
     let locked = target.lock_screen();
     if target.session_locked() {
         bindings.settle_launcher(Some(false));

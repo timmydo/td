@@ -175,7 +175,11 @@ impl Prepared {
         if !doubled
             || (request.login_proof().is_none()
                 && request.upgrade_step().is_none()
-                && request.protector_step().is_none())
+                && request.protector_step().is_none()
+                && !matches!(
+                    request.operation(),
+                    crate::authority::consent::Operation::Notebook(_)
+                ))
         {
             let scale = if doubled { 2 } else { 1 };
             return Self::at_scale(request, width, height, stride, remaining, scale);
@@ -736,7 +740,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
             "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
             "W: REVIEW PENDING CREDENTIAL WRITE",
             "I: REVIEW PENDING SYSTEM INSTALLATION",
-            "K: LOGIN KEYS",
+            "K: LOGIN KEYS  N: PASSWORD NOTEBOOK",
             "L: LOCK SCREEN",
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
         ],
@@ -1136,7 +1140,7 @@ mod tests {
             "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
             "W: REVIEW PENDING CREDENTIAL WRITE",
             "I: REVIEW PENDING SYSTEM INSTALLATION",
-            "K: LOGIN KEYS",
+            "K: LOGIN KEYS  N: PASSWORD NOTEBOOK",
             "L: LOCK SCREEN",
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
             "H: NO SETTINGS WAITING",

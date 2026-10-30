@@ -90,6 +90,10 @@ pub(super) fn startup() -> Result<UnixStream, String> {
     operation_endpoint(None)
 }
 
+pub(super) fn notebook_client_startup() -> Result<UnixStream, String> {
+    operation_endpoint(Some(1000))
+}
+
 pub(super) fn service_startup(uid: u32) -> Result<UnixStream, String> {
     if !(1..=999).contains(&uid) {
         return Err("invalid notebook service identity".into());
@@ -107,7 +111,9 @@ fn operation_endpoint(service: Option<u32>) -> Result<UnixStream, String> {
         let expected = uid.to_string();
         if value("Gid:").map(|s| s.split_whitespace().collect::<Vec<_>>())
             != Some(vec![expected.as_str(); 4])
-            || value("Groups:").is_none_or(|s| s.split_whitespace().any(|group| group != expected))
+            || (uid != 1000
+                && value("Groups:")
+                    .is_none_or(|s| s.split_whitespace().any(|group| group != expected)))
             || value("CapEff:").map(str::trim) != Some("0000000000000000")
         {
             return Err("notebook service retained other credentials".into());

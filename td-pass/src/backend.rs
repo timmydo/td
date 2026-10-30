@@ -11,6 +11,7 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
+pub use pass::Trusted;
 use td_secret::pass;
 
 use crate::plain::{Bytes, Text};
@@ -44,13 +45,18 @@ pub struct Client {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-pub fn start() -> Result<Client, String> {
+mod trusted;
+
+pub fn start(trusted: Option<pass::Trusted>) -> Result<Client, String> {
     let (jobs, job_rx) = mpsc::channel();
     let (answers, answer_rx) = mpsc::channel();
     let (reply_tx, replies) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("vault".to_owned())
-        .spawn(move || vault(&job_rx, &answer_rx, &reply_tx))
+        .spawn(move || match trusted {
+            Some(transport) => trusted::serve(transport, &job_rx, &reply_tx),
+            None => vault(&job_rx, &answer_rx, &reply_tx),
+        })
         .map_err(|error| format!("td-pass cannot start its vault thread: {error}"))?;
     Ok(Client {
         jobs,
@@ -126,7 +132,16 @@ pub struct Host {
 /// seconds); a host that allows more gets thirty.
 const DELAY_HOLD: Duration = Duration::from_secs(30);
 
-pub fn watch_host() -> Host {
+pub fn watch_host(trusted: bool) -> Host {
+    if trusted {
+        return Host {
+            starting: None,
+            events: None,
+            delays: Vec::new(),
+            undelayed: false,
+            note: Some(HostEvent::Watched),
+        };
+    }
     let (started, starting) = mpsc::channel();
     // A thread that cannot start drops its sender, which reads as
     // unwatched on the first poll.

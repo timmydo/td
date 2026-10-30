@@ -381,7 +381,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("operation.rs")),
-            0x6ecde1db329c57af
+            0x5e81f437a3424fcb
         );
         // The endpoint td-install's storage worker shares.
         assert_eq!(fingerprint(include_str!("frames.rs")), 0xfc5f01f8e2193d8d);
@@ -397,7 +397,7 @@ mod confinement {
             fingerprint(include_str!("enrollment_operation.rs")),
             0x5e3fb383c97e2405
         );
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xe139a3372cd677a3, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xaab473803ba3e97e, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
         // The shared consent's hostname rules: firstboot's one copy.
         let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
         assert!(production.contains(

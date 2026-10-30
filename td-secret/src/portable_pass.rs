@@ -67,6 +67,20 @@ pub struct Key {
 }
 
 impl Key {
+    pub fn from_credential(role: KeyRole, credential: &[u8]) -> Result<Self, String> {
+        if credential.is_empty() || credential.len() > super::MAX_CREDENTIAL {
+            return Err("invalid notebook credential metadata".into());
+        }
+        Ok(Self {
+            role,
+            credential: credential.to_vec(),
+        })
+    }
+
+    pub fn credential(&self) -> &[u8] {
+        &self.credential
+    }
+
     pub fn role(&self) -> KeyRole {
         self.role
     }
@@ -920,6 +934,48 @@ impl HostEvents {
                 HostEvent::Lost(reason)
             }
         })
+    }
+}
+
+/// Root-launched notebook transport. It opens no vault and no token.
+/// Admission must happen before the window creates any thread or other fd.
+pub struct Trusted {
+    wire: crate::notebook_wire::PendingWire,
+    protected: host::Protected,
+}
+
+/// One private notebook response, cleared when its caller is finished.
+pub struct TrustedMessage(crate::notebook_wire::Bytes);
+impl TrustedMessage {
+    pub fn bytes(&self) -> &[u8] {
+        &self.0 .0
+    }
+}
+
+impl Trusted {
+    pub fn open() -> Result<Self, String> {
+        let endpoint = crate::operation::notebook_client_startup()?;
+        let protected = host::protect_service()?;
+        Ok(Self {
+            wire: crate::notebook_wire::PendingWire::new(endpoint)?,
+            protected,
+        })
+    }
+
+    pub fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.protected.recheck()?;
+        self.wire.queue(crate::notebook_wire::Bytes(bytes.to_vec()))
+    }
+
+    pub fn poll(&mut self) -> Result<Option<TrustedMessage>, String> {
+        self.protected.recheck()?;
+        self.wire.poll().map(|message| message.map(TrustedMessage))
+    }
+}
+
+impl Drop for Trusted {
+    fn drop(&mut self) {
+        self.wire.close();
     }
 }
 

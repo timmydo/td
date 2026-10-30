@@ -7651,5 +7651,7 @@ ADMIN KEY ENROLLED. This does not replace an existing admin key.
 Notebook token descriptions use the shared consent tag 41 and its
 `asks_pin` predicate for the protected PIN field. The operation and exact
 step are rendered by the shared codec; ordinary notebook windows never
-receive PIN input. This description support alone exposes no new action
-on the attention screen; notebook supervision must admit the operation.
+receive PIN input. The attention menu's N opens the notebook or selects its pending
+operation in the one authority slot. Each exchange requires its own physical
+approval; each PIN remains bound to the exact acknowledged description.
+Notebook completion never unlocks the login screen.

@@ -1,12 +1,13 @@
 //! Mode admission: which backend this system may use. td mode belongs to
-//! td's admitted vault service, which this build does not reach, so on td
-//! the notebook refuses rather than falling back to standalone mode.
+//! td's admitted vault service; an ordinary invocation on td must not
+//! fall back to standalone mode.
 
 /// The backend this system admits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
     /// A foreign desktop: the notebook runs td-secret's vault privately.
     Standalone,
+    TrustedRequired,
 }
 
 /// Admits a mode from the os-release text, or says why none is admitted.
@@ -33,7 +34,7 @@ pub fn admit(os_release: Option<&str>) -> Result<Mode, &'static str> {
     }
     let td = id == Some("td") || like.is_some_and(|like| like.split(' ').any(|word| word == "td"));
     if td {
-        return Err("td-pass needs td's vault service on td, which this build does not reach");
+        return Ok(Mode::TrustedRequired);
     }
     Ok(Mode::Standalone)
 }
@@ -62,7 +63,7 @@ mod tests {
             "ID='td'\n",
             "ID=tdlike\nID_LIKE=\"debian td\"\n",
         ] {
-            assert!(admit(Some(text)).is_err(), "{text}");
+            assert_eq!(admit(Some(text)), Ok(Mode::TrustedRequired), "{text}");
         }
         for text in [
             "NAME=\"Guix System\"\nID=guix\n",

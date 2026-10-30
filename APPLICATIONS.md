@@ -8533,8 +8533,10 @@ The shipped preceding deployment assigns no account or group to 989; older
 readers do not enforce notebook reservations against newly tailored images.
 The account has `/bin/false`, `!td-service`, no supplementary groups, and a
 mode-0700 home at `/var/lib/td/notebooks/1000`. Firstboot prepares and syncs
-this storage only after reservation enrollment. This identity prerequisite
-does not itself start a service or authorize vault release.
+this storage only after reservation enrollment. td-authd starts the fixed
+vault service and human notebook window on separate inherited socketpairs.
+Physical secure attention selects token operations; account ownership alone
+never admits a vault client. See td-secret/PORTABLE.md and td-pass/DESIGN.md.
 
 The broker runs separately from the human account. Its lineage walk
 reads non-ptrace-gated PID/PPID/start-time fields and retained pidfds,

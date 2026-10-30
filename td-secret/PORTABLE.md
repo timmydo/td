@@ -1409,9 +1409,9 @@ effective capabilities and one thread. The endpoint is a capability handed
 out by the trusted launcher; there is no public notebook listener and no
 UID-only browsing admission. Root-only shadow validation belongs to the launcher before its credential
 drop; the worker reads only the immutable public registry.
-The current worker implements the backend side;
-authority launch, trusted token mediation and the td-pass client remain
-integration work. Standalone mode on td remains refused.
+The paired authority launches the pinned service and td-pass window,
+mediates token operations through secure attention, and destroys both at
+session revocation. Standalone mode on td remains refused.
 
 The worker owns mode-0700 `/var/lib/td/notebooks/OWNER`, under the dedicated
 service identity rather than the human or portal. It applies non-dumpability,
@@ -1430,6 +1430,10 @@ or terminate the worker on session lock, suspend, generation loss or client
 loss. A vault session also expires after fifteen minutes, without heartbeat
 renewal. This ceiling is checked before each request; the authority owns
 cancellation of an operation in flight.
+
+Keys replies include the current session credential as a bounded field,
+empty while locked, so replacement never guesses which enrolled key now
+authorizes further changes.
 
 The private request tags are: 1 keys, 2 create, 3 unlock, 4 list, 5 read,
 6 edit, 7 encrypted export, 8 encrypted import, 9 add key, 10 replace keys,
@@ -1493,6 +1497,6 @@ buffers and never enter diagnostics or the notebook service.
 Only the existing root-admitted FIDO transport and portable lifecycle
 transaction perform device I/O. There must be exactly one admitted key.
 Successful `44` carries the verified service result as one length-prefixed
-field; any error ends the worker without a result. Neither this worker nor
-the new consent codec activates a desktop endpoint. Root supervision and
-the trusted notebook client must be connected before td-pass admits td.
+field; any error ends the worker without a result. Root supervises this worker in the one operation slot; only successful
+exit plus a clean channel end releases its result to the dedicated service.
+The td-pass client reaches the backend only through root's fixed launch.

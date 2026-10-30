@@ -29,6 +29,7 @@ const FILES: &[&str] = &[
     "app/tests.rs",
     "backend.rs",
     "backend/fixture.rs",
+    "backend/trusted.rs",
     "files.rs",
     "frames.rs",
     "main.rs",
@@ -40,7 +41,7 @@ const FILES: &[&str] = &[
 ];
 
 /// Files that hold notebook state or text and reach nothing but memory.
-const PURE: [&str; 8] = [
+const PURE: &[&str] = &[
     "app/input.rs",
     "app/layout.rs",
     "app/mod.rs",
@@ -272,7 +273,10 @@ fn only_the_backend_holds_the_vault_and_only_the_window_the_compositor() {
     assert!(window.contains("crate::files::store_folder()"));
     assert!(window.contains("crate::files::list_folder(&folder, ceiling)"));
     for &name in FILES {
-        if !matches!(name, "backend.rs" | "window.rs" | "main.rs" | "files.rs") {
+        if !matches!(
+            name,
+            "backend.rs" | "backend/trusted.rs" | "window.rs" | "main.rs" | "files.rs"
+        ) {
             assert!(!source(name).contains("files::"), "{name}");
         }
     }
@@ -434,7 +438,8 @@ fn the_test_vault_is_built_only_by_its_feature() {
     gated("use fixture::watch;");
     assert_eq!(backend.matches("fixture").count(), 3);
     assert!(backend.contains("#[cfg(not(feature = \"test-vault\"))]\nuse serve as vault;\n"));
-    assert!(backend.contains(".spawn(move || vault(&job_rx, &answer_rx, &reply_tx))"));
+    assert!(backend.contains("None => vault(&job_rx, &answer_rx, &reply_tx),"));
+    assert!(backend.contains("Some(transport) => trusted::serve(transport, &job_rx, &reply_tx),"));
     assert!(backend.contains("let _ = started.send(watch());"));
     for &name in FILES {
         if !matches!(name, "backend.rs" | "backend/fixture.rs" | "main.rs") {

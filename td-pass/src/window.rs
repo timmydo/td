@@ -209,7 +209,8 @@ fn frame_directory() -> Result<PathBuf, String> {
 
 /// Runs the notebook on the compositor the environment names until its
 /// window closes.
-pub fn run() -> Result<(), String> {
+pub fn run_with(trusted: Option<crate::backend::Trusted>) -> Result<(), String> {
+    let is_trusted = trusted.is_some();
     let frames = frame_directory()?;
     let endpoint = td_ui::wayland::endpoint(
         std::env::var_os("WAYLAND_SOCKET"),
@@ -220,8 +221,8 @@ pub fn run() -> Result<(), String> {
     let (lister, listings) = start_lister()?;
     let mut session = Session {
         app: App::new()?,
-        client: crate::backend::start()?,
-        host: crate::backend::watch_host(),
+        client: crate::backend::start(trusted)?,
+        host: crate::backend::watch_host(is_trusted),
         lister,
         listings,
     };

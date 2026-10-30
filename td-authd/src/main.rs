@@ -49,6 +49,11 @@ mod login_status;
 )]
 mod login_tier;
 mod mount_sys;
+mod notebook;
+mod notebook_token;
+#[path = "../../td-secret/src/notebook_wire.rs"]
+#[allow(dead_code, reason = "shared notebook transport halves")]
+mod notebook_wire;
 mod portal_files;
 mod primary_account;
 mod proof;
@@ -150,6 +155,9 @@ fn run(arguments: &[String]) -> Result<(), String> {
                 .write_all(&output)
                 .and_then(|()| stdout.flush())
                 .map_err(|e| format!("write application cache answer: {e}"));
+        }
+        if verb == "notebook-ui" {
+            return launch::notebook_ui(rest);
         }
         if verb == "terminal-exec" {
             return launch::terminal_exec(rest);

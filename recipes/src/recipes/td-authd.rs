@@ -3,6 +3,14 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const SOURCES: &[(&str, &str)] = &[
     (
+        "src/notebook.rs",
+        include_str!("../../../td-authd/src/notebook.rs"),
+    ),
+    (
+        "src/notebook_token.rs",
+        include_str!("../../../td-authd/src/notebook_token.rs"),
+    ),
+    (
         "src/suspend.rs",
         include_str!("../../../td-authd/src/suspend.rs"),
     ),
@@ -293,6 +301,10 @@ pub fn recipe() -> Recipe {
         (
             "{src}/td-firstboot/src/cutover.rs",
             include_str!("../../../td-firstboot/src/cutover.rs"),
+        ),
+        (
+            "{src}/td-secret/src/notebook_wire.rs",
+            include_str!("../../../td-secret/src/notebook_wire.rs"),
         ),
         (
             "{src}/td-secret/src/login_state.rs",
