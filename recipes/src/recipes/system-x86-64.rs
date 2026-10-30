@@ -11939,9 +11939,13 @@ mod tests {
                 })
                 .collect();
             assert_eq!(admitted, admission, "{form:?}");
-            assert!(
-                !config.lines().any(|line| line.starts_with("Subsystem ")),
-                "the minimal server profile must not expose the unneeded SFTP subsystem"
+            assert_eq!(
+                config
+                    .lines()
+                    .filter(|line| line.starts_with("Subsystem "))
+                    .collect::<Vec<_>>(),
+                ["Subsystem sftp internal-sftp"],
+                "incoming file transfers use the built-in SFTP handler"
             );
             let remote = match form {
                 ssh_policy::Form::Ordinary => " .ssh/authorized_keys",

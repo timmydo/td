@@ -2458,7 +2458,8 @@ mod ssh_forms {
     }
 
     /// The policy as rendered before the login-key tier and APPLICATIONS.md
-    /// §L.1's L7, for `alice`, written out independently of the formatter.
+    /// §L.1's L7, plus the SFTP subsystem, for `alice`, written out
+    /// independently of the formatter.
     const BEFORE: &str = "Port 22\n\
         ListenAddress 0.0.0.0\n\
         HostKey /etc/ssh/ssh_host_ed25519_key\n\
@@ -2486,6 +2487,7 @@ mod ssh_forms {
         LoginGraceTime 30\n\
         MaxAuthTries 3\n\
         MaxSessions 4\n\
+        Subsystem sftp internal-sftp\n\
         PidFile /run/sshd.pid\n\
         Match User alice\n\
         \tAuthorizedKeysFile /run/td-ssh-selftest-authorized_keys\n";

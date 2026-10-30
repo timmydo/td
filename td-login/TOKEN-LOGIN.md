@@ -735,6 +735,13 @@ path, is refused as `THREAT-MODEL.md` §3 specifies.
 
 ## SSH
 
+Both policy forms enable `Subsystem sftp internal-sftp` before any
+`Match` block. Incoming SFTP and modern `scp` transfers run in OpenSSH
+as the authenticated account, with its ordinary filesystem permissions.
+No separate SFTP server executable is needed; the image still ships no
+`scp` or `sftp` client. Subsystem requests use the same key admission
+and enrollment cutover as shell sessions.
+
 On a verifiably unenrolled machine, the primary account can authorize
 remote Ed25519 keys in its own `~/.ssh/authorized_keys`. OpenSSH resolves
 that relative path against the account database home, not an environment

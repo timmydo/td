@@ -159,6 +159,8 @@ pub fn recipe() -> Recipe {
                          printf '%s\\n' \"$policy\" | grep -q -x -F \
                              \"AuthorizedKeysFile $expected\" || \
                              {{ printf '%s\\n' \"unexpected authorization for $user\" \"$policy\" >&2; exit 1; }}; \
+                         printf '%s\\n' \"$policy\" | grep -q -x -F \
+                             'Subsystem sftp internal-sftp' || exit 1; \
                          admitted=$(printf '%s\\n' \"$policy\" | grep -E '^(PermitRootLogin|AllowUsers|DenyUsers|AllowGroups|DenyGroups) ') || exit 1; \
                          test \"$admitted\" = \"$admission\" || \
                              {{ printf '%s\\n' \"unexpected admission in $form for $user\" \"$admitted\" >&2; exit 1; }}; \
@@ -178,7 +180,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: OpenSSH Portable 10.6p1 provides the bounded ssh/sshd/ssh-keygen profile configured for seccomp_filter, with Ed25519, ML-KEM/SNTRUP/Curve25519 KEX, and ChaCha20-Poly1305; the built daemon checks the shared primary-account configuration, in its ordinary and enforced forms and their server variants, with an ephemeral test host key, ordinary-only owner-managed remote keys, the server's root-owned provisioned keys in both its forms, distinct primary/persistent authorization paths for loopback and remote addresses, and each form's effective PermitRootLogin (no, in both forms) and AllowUsers lines for each user (sshd -T reports the configuration; it attempts no login); every shipped ELF uses only td glibc, is built with _FORTIFY_SOURCE and has a debug companion; libcrypto, libcrypt, zlib, and agent/PKCS#11/FIDO/SCP/SFTP-server binaries are absent\n".into(),
+        content: "PASS: OpenSSH Portable 10.6p1 provides the bounded ssh/sshd/ssh-keygen profile configured for seccomp_filter, with Ed25519, ML-KEM/SNTRUP/Curve25519 KEX, and ChaCha20-Poly1305; the built daemon checks the shared primary-account configuration, in its ordinary and enforced forms and their server variants, with an ephemeral test host key, ordinary-only owner-managed remote keys, the server's root-owned provisioned keys in both its forms, distinct primary/persistent authorization paths for loopback and remote addresses, the built-in SFTP subsystem, and each form's effective PermitRootLogin (no, in both forms) and AllowUsers lines for each user (sshd -T reports the configuration; it attempts no login); every shipped ELF uses only td glibc, is built with _FORTIFY_SOURCE and has a debug companion; libcrypto, libcrypt, zlib, and agent/PKCS#11/FIDO/SCP/SFTP-server binaries are absent\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
