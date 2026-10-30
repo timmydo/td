@@ -125,10 +125,20 @@ pub(super) const SECTIONS: &[(&str, Rows)] = &[
     (
         "Title",
         &[
-            ("Return/Tab", "go to the text"),
+            ("Return/Tab", "go to the password/token"),
             ("S-Tab", "go back to the titles"),
             ("Escape", "put the saved title back"),
             ("C-c/C-x/C-v", "copy, cut or paste"),
+        ],
+    ),
+    (
+        "Password/token",
+        &[
+            ("C-r", "reveal or mask the password/token"),
+            ("Return/Tab", "go to the notes"),
+            ("S-Tab", "go back to the title"),
+            ("Escape", "restore and mask the saved value"),
+            ("C-c/C-x/C-v", "copy/cut when revealed, or paste"),
         ],
     ),
     (
@@ -172,7 +182,15 @@ impl App {
             Phase::Importing { .. } => current.push("Restoring a copy"),
             Phase::Unlocked(notebook) if notebook.keys.showing => {
                 current.push("Keys view");
-                idle = &["Notebook", "Search", "Titles", "Title", "Text", "Find"];
+                idle = &[
+                    "Notebook",
+                    "Search",
+                    "Titles",
+                    "Title",
+                    "Password/token",
+                    "Text",
+                    "Find",
+                ];
             }
             Phase::Unlocked(_) => {
                 current.push(match self.focus {
@@ -180,6 +198,7 @@ impl App {
                     Focus::Search => "Search",
                     Focus::List => "Titles",
                     Focus::Title => "Title",
+                    Focus::Password => "Password/token",
                     Focus::Editor => "Text",
                     Focus::Find => "Find",
                 });
@@ -422,7 +441,7 @@ impl App {
             },
             Focus::List => self.list_key(chord),
             Focus::Title => match chord {
-                "Return" | "Tab" => self.set_focus(Focus::Editor),
+                "Return" | "Tab" => self.set_focus(Focus::Password),
                 "S-Tab" => self.set_focus(Focus::List),
                 "Escape" => {
                     if let Some(notebook) = self.notebook() {
@@ -434,6 +453,28 @@ impl App {
                 }
                 _ => {
                     self.field_key(Focus::Title, chord, clipboard);
+                }
+            },
+            Focus::Password => match chord {
+                "Return" | "Tab" => self.set_focus(Focus::Editor),
+                "S-Tab" => self.set_focus(Focus::Title),
+                "C-r" => {
+                    if let Some(n) = self.notebook() {
+                        n.password.set_masked(!n.password.masked());
+                    }
+                    self.redraw = true;
+                }
+                "Escape" => {
+                    if let Some(n) = self.notebook() {
+                        if let Some(open) = &n.open {
+                            let _ = n.password.set_text(open.saved_password.as_str());
+                        }
+                        n.password.set_masked(true);
+                    }
+                    self.redraw = true;
+                }
+                _ => {
+                    self.field_key(Focus::Password, chord, clipboard);
                 }
             },
             Focus::Find => match chord {
@@ -596,6 +637,7 @@ impl App {
         match focus {
             Focus::Search => Some(&mut notebook.search),
             Focus::Title => Some(&mut notebook.title),
+            Focus::Password => Some(&mut notebook.password),
             Focus::Find => Some(&mut notebook.find),
             _ => None,
         }
@@ -768,7 +810,13 @@ impl App {
 
     fn cycle(&mut self, forward: bool) {
         let finding = self.notebook().is_some_and(|notebook| notebook.finding);
-        let mut order = vec![Focus::Search, Focus::List, Focus::Title, Focus::Editor];
+        let mut order = vec![
+            Focus::Search,
+            Focus::List,
+            Focus::Title,
+            Focus::Password,
+            Focus::Editor,
+        ];
         if finding {
             order.push(Focus::Find);
         }
@@ -1007,6 +1055,7 @@ impl App {
                 let entry = match focus {
                     Focus::Search => panes.search,
                     Focus::Title => panes.title,
+                    Focus::Password => panes.password,
                     Focus::Find => panes.find,
                     _ => None,
                 };
@@ -1099,6 +1148,7 @@ impl App {
                 for (focus, entry) in [
                     (Focus::Search, panes.search),
                     (Focus::Title, panes.title),
+                    (Focus::Password, panes.password),
                     (Focus::Find, panes.find),
                 ] {
                     let Some(entry) = entry.filter(|entry| entry.rect().contains(x, y)) else {
@@ -1197,6 +1247,7 @@ impl App {
             for (model, field) in [
                 (&mut notebook.search, panes.search),
                 (&mut notebook.title, panes.title),
+                (&mut notebook.password, panes.password),
                 (&mut notebook.find, panes.find),
             ] {
                 if let Some(field) = field {

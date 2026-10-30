@@ -37,6 +37,7 @@ struct Entry {
     revision: u64,
     title: String,
     body: Vec<u8>,
+    password: Text,
 }
 
 /// The host's lock is not watched here; the window says so.
@@ -112,6 +113,7 @@ pub(super) fn serve(
                         revision: entry.revision,
                         title: Text::new(entry.title.clone()),
                         body: Bytes::copy(&entry.body),
+                        password: entry.password.clone(),
                     }
                 }
                 _ => Reply::Missing { id },
@@ -224,6 +226,10 @@ impl Vault<'_> {
         next: &mut u8,
     ) -> Result<(EntryId, Option<u64>), Failure> {
         let (id, base) = match &change {
+            Change::Credential { id, base, .. } => {
+                self.note("credential form");
+                (*id, *base)
+            }
             Change::Create { title, body } => {
                 self.note(&format!("create {:?} {:?}", title.as_str(), body.as_str()));
                 (None, 0)
@@ -283,6 +289,50 @@ impl Vault<'_> {
             self.hold(op)?;
         }
         match (change, position.flatten()) {
+            (
+                Change::Credential {
+                    id: None,
+                    title,
+                    body,
+                    password,
+                    ..
+                },
+                _,
+            ) => {
+                let id = [*next; 16];
+                *next = next
+                    .checked_add(1)
+                    .ok_or_else(|| failure("the test vault is full"))?;
+                entries.push(Entry {
+                    id,
+                    revision: 1,
+                    title: title.take(),
+                    body: body.unwrap_or_default().take().into_bytes(),
+                    password,
+                });
+                Ok((id, Some(1)))
+            }
+            (
+                Change::Credential {
+                    title,
+                    body,
+                    password,
+                    ..
+                },
+                Some(at),
+            ) => {
+                let entry = entries
+                    .get_mut(at)
+                    .ok_or_else(|| failure("the entry is gone"))?;
+                let revision = next_revision(entry.revision)?;
+                entry.title = title.take();
+                if let Some(body) = body {
+                    entry.body = body.take().into_bytes();
+                }
+                entry.password = password;
+                entry.revision = revision;
+                Ok((entry.id, Some(revision)))
+            }
             (Change::Create { title, body }, _) => {
                 let id = [*next; 16];
                 *next = next
@@ -293,6 +343,7 @@ impl Vault<'_> {
                     revision: 1,
                     title: title.take(),
                     body: body.take().into_bytes(),
+                    password: Text::default(),
                 });
                 Ok((id, Some(1)))
             }
@@ -357,6 +408,7 @@ fn entry(id: u8, title: &str, body: &str) -> Entry {
         revision: 1,
         title: title.to_owned(),
         body: body.as_bytes().to_vec(),
+        password: Text::default(),
     }
 }
 

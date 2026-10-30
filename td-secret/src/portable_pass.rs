@@ -291,6 +291,13 @@ pub struct Entry<'a> {
 /// A change against the revision the caller last read. Its text is
 /// cleared when it is dropped: unapplied, refused or saved.
 pub enum Change {
+    Credential {
+        id: Option<EntryId>,
+        base: u64,
+        title: String,
+        body: Option<String>,
+        password: Option<String>,
+    },
     Create {
         title: String,
         body: String,
@@ -326,6 +333,20 @@ pub enum Change {
 impl Drop for Change {
     fn drop(&mut self) {
         match self {
+            Self::Credential {
+                title,
+                body,
+                password,
+                ..
+            } => {
+                wipe(title);
+                if let Some(body) = body {
+                    wipe(body);
+                }
+                if let Some(password) = password {
+                    wipe(password);
+                }
+            }
             Self::Create { title, body } | Self::Edit { title, body, .. } => {
                 wipe(title);
                 wipe(body);
@@ -353,6 +374,19 @@ impl From<Change> for notebook::Change {
         // The text moves into clearing owners; what drops here is empty.
         let take = std::mem::take;
         match &mut change {
+            Change::Credential {
+                id,
+                base,
+                title,
+                body,
+                password,
+            } => Self::Credential {
+                id: *id,
+                base: *base,
+                title: Text::new(take(title)),
+                body: body.take().map(Text::new),
+                password: password.take().map(Text::new),
+            },
             Change::Create { title, body } => Self::Create {
                 title: Text::new(take(title)),
                 body: Text::new(take(body)),

@@ -81,6 +81,13 @@ pub struct Item {
 /// A change against the entry revision the window last read.
 #[derive(Debug)]
 pub enum Change {
+    Credential {
+        id: Option<EntryId>,
+        base: u64,
+        title: Text,
+        body: Option<Text>,
+        password: Text,
+    },
     Create {
         title: Text,
         body: Text,
@@ -227,6 +234,7 @@ pub enum Reply {
         revision: u64,
         title: Text,
         body: Bytes,
+        password: Text,
     },
     /// The entry asked for is gone.
     Missing {

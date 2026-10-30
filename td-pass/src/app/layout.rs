@@ -46,6 +46,8 @@ pub struct Panes {
     pub search: Option<TextEntry>,
     pub list: Option<List>,
     pub title: Option<TextEntry>,
+    pub password: Option<TextEntry>,
+    pub password_label: Rect,
     /// The editor pane's outline, a bezel a scaled pixel wide round
     /// `pane`, as the fields and the list carry theirs.
     pub frame: Rect,
@@ -103,11 +105,31 @@ pub fn panes(surface: Surface, finding: bool) -> Panes {
     let left = (width / 3).max((20 * CELL_WIDTH) as i64 * s).min(width);
     let right_width = width - left;
     let find_height = if finding { row } else { 0 };
-    let frame = rect(left, body.y + row, right_width, height - row - find_height);
+    let frame = rect(
+        left,
+        body.y + 2 * row,
+        right_width,
+        height - 2 * row - find_height,
+    );
     Panes {
         search: TextEntry::new(surface, rect(0, body.y, left, row)),
         list: List::new(surface, rect(0, body.y + row, left, height - row)),
         title: TextEntry::new(surface, rect(left, body.y, right_width, row)),
+        password_label: rect(
+            left,
+            body.y + row,
+            ((17 * CELL_WIDTH) as i64 * s).min(right_width),
+            row,
+        ),
+        password: TextEntry::new(
+            surface,
+            rect(
+                left + (17 * CELL_WIDTH) as i64 * s,
+                body.y + row,
+                right_width - (17 * CELL_WIDTH) as i64 * s,
+                row,
+            ),
+        ),
         frame,
         pane: rect(
             frame.x + s,
@@ -297,7 +319,9 @@ mod tests {
             let frame = split.frame;
             assert_eq!((frame.x, frame.width), (title.x, title.width));
             assert_eq!(frame.x + i64::from(frame.width), i64::from(body.width));
-            assert_eq!(frame.y, title.y + i64::from(title.height));
+            let password = split.password.unwrap().rect();
+            assert_eq!(password.y, title.y + i64::from(title.height));
+            assert_eq!(frame.y, password.y + i64::from(password.height));
             assert_eq!(find.y, frame.y + i64::from(frame.height));
             // The pane lies a scaled pixel inside its outline on every side.
             let pane = split.pane;

@@ -197,6 +197,7 @@ fn open(app: &mut App, board: &mut Board, chord: &str, body: &str) {
         revision: 1,
         title,
         body: Bytes::copy(body.as_bytes()),
+        password: Text::default(),
     });
 }
 
@@ -427,6 +428,8 @@ fn a_new_entry_needs_a_title_and_saves_as_a_creation() {
     assert_eq!(app.status, "An entry needs a title");
     typed(&mut app, &mut board, "Wifi");
     key(&mut app, &mut board, "Return");
+    assert_eq!(app.focus, Focus::Password);
+    key(&mut app, &mut board, "Tab");
     typed(&mut app, &mut board, "pass");
     key(&mut app, &mut board, "C-s");
     let out = app.take_out();
@@ -844,6 +847,7 @@ fn new_and_another_entry_wait_for_a_save_in_flight() {
     assert!(app.status.starts_with("Wait"));
     key(&mut app, &mut board, "S-F6");
     key(&mut app, &mut board, "S-F6");
+    key(&mut app, &mut board, "S-F6");
     assert_eq!(app.focus, Focus::List);
     key(&mut app, &mut board, "Down");
     assert!(app.dialog.is_none());
@@ -865,6 +869,7 @@ fn a_read_answered_after_edits_keeps_the_edited_entry() {
     ));
     key(&mut app, &mut board, "F6");
     key(&mut app, &mut board, "F6");
+    key(&mut app, &mut board, "F6");
     assert_eq!(app.focus, Focus::Editor);
     typed(&mut app, &mut board, "x");
     // No save can start for an entry about to be replaced.
@@ -876,6 +881,7 @@ fn a_read_answered_after_edits_keeps_the_edited_entry() {
         revision: 1,
         title: Text::new("Mail".to_owned()),
         body: Bytes::copy(b"other"),
+        password: Text::default(),
     });
     let open = notebook(&app).open.as_ref().unwrap();
     assert_eq!(open.id, Some([1; 16]));
@@ -2782,7 +2788,7 @@ fn the_key_list_puts_what_has_the_keyboard_first() {
         keys: Some(vec![label(Role::Primary, "0a0b0c0d")]),
     });
     let locked = titles(&app);
-    assert_eq!(locked.len(), 14);
+    assert_eq!(locked.len(), 15);
     assert_eq!(locked[0], "Locked");
     let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
     assert_eq!(&titles(&app)[..2], ["Search", "Notebook"]);
@@ -2799,8 +2805,16 @@ fn the_key_list_puts_what_has_the_keyboard_first() {
     let shown = titles(&app);
     assert_eq!(shown[0], "Keys view");
     assert_eq!(
-        shown[shown.len() - 6..],
-        ["Notebook", "Search", "Titles", "Title", "Text", "Find"]
+        shown[shown.len() - 7..],
+        [
+            "Notebook",
+            "Search",
+            "Titles",
+            "Title",
+            "Password/token",
+            "Text",
+            "Find"
+        ]
     );
     key(&mut app, &mut board, "Delete");
     assert!(app.dialog.is_some());
@@ -3375,4 +3389,86 @@ fn a_window_too_short_to_avoid_the_pointer_still_asks_the_next_question() {
     // The answer given is kept and the next title is asked about.
     assert!(app.dialog.is_some());
     assert_eq!(app.store.as_ref().unwrap().replace, [true]);
+}
+
+#[test]
+fn password_field_masks_and_saves_separately_from_notes() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Mail")]);
+    key(&mut app, &mut board, "Return");
+    open(&mut app, &mut board, "Down", "notes remain");
+    app.set_focus(Focus::Password);
+    typed(&mut app, &mut board, "secret-token");
+    assert!(notebook(&app).password.masked());
+    assert!(app.dirty());
+    key(&mut app, &mut board, "C-a");
+    key(&mut app, &mut board, "C-c");
+    assert!(board.copies.is_empty());
+    key(&mut app, &mut board, "C-r");
+    key(&mut app, &mut board, "C-c");
+    assert_eq!(board.copies, ["secret-token"]);
+    key(&mut app, &mut board, "C-s");
+    let out = app.take_out();
+    let op = op_of(&out);
+    assert!(
+        matches!(&out[..], [Out::Send(Command::Apply { change: Change::Credential { id: Some(id), base: 1, body: None, password, .. }, .. })] if *id == [1;16] && password.as_str() == "secret-token")
+    );
+    typed(&mut app, &mut board, "later-token");
+    app.reply(Reply::Committed {
+        op,
+        id: [1; 16],
+        revision: Some(2),
+    });
+    assert!(app.dirty());
+    assert_eq!(
+        notebook(&app)
+            .open
+            .as_ref()
+            .unwrap()
+            .saved_password
+            .as_str(),
+        "secret-token"
+    );
+    assert_eq!(text(&app), "notes remain");
+    key(&mut app, &mut board, "Escape");
+    assert_eq!(notebook(&app).password.text(), "secret-token");
+    assert!(notebook(&app).password.masked());
+    assert!(!app.dirty());
+    app.clear();
+    assert!(!matches!(app.phase, Phase::Unlocked(_)));
+}
+
+#[test]
+fn long_passwords_keep_the_caret_visible_during_edit_and_resize() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Mail")]);
+    key(&mut app, &mut board, "Return");
+    open(&mut app, &mut board, "Down", "notes");
+    app.input(
+        Input::Resize(Surface::new(640, 480, td_ui::raster::Scale::default()).unwrap()),
+        &mut board,
+    );
+    app.set_focus(Focus::Password);
+    typed(&mut app, &mut board, &"a".repeat(200));
+    let visible = |app: &App| {
+        let field = layout::panes(app.surface, false).password.unwrap();
+        let model = &notebook(app).password;
+        assert!(model.first() <= model.caret());
+        assert!(model.caret() <= model.first() + field.columns());
+    };
+    visible(&app);
+    assert!(notebook(&app).password.first() > 0);
+    key(&mut app, &mut board, "C-r");
+    key(&mut app, &mut board, "Home");
+    visible(&app);
+    assert_eq!(notebook(&app).password.first(), 0);
+    key(&mut app, &mut board, "End");
+    visible(&app);
+    for width in [520, 800, 600] {
+        app.input(
+            Input::Resize(Surface::new(width, 480, td_ui::raster::Scale::default()).unwrap()),
+            &mut board,
+        );
+        visible(&app);
+    }
 }

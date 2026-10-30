@@ -61,6 +61,13 @@ impl Drop for Text {
 
 /// A change against the entry revision the caller last read.
 pub(super) enum Change {
+    Credential {
+        id: Option<EntryId>,
+        base: u64,
+        title: Text,
+        body: Option<Text>,
+        password: Option<Text>,
+    },
     Create {
         title: Text,
         body: Text,
@@ -195,6 +202,40 @@ fn apply_one(
         Ok(index)
     };
     Ok(match change {
+        Change::Credential {
+            id,
+            base,
+            title,
+            body,
+            password,
+        } => {
+            if password
+                .as_ref()
+                .is_some_and(|text| text.as_str().is_empty() || text.as_str().len() > MAX_PASSWORD)
+            {
+                return Err(Error::Entry(EntryError::Credential));
+            }
+            let change = match (id, body) {
+                (None, body) => Change::Create {
+                    title,
+                    body: body.unwrap_or_else(|| Text::new(String::new())),
+                },
+                (Some(id), Some(body)) => Change::Edit {
+                    id,
+                    base,
+                    title,
+                    body,
+                },
+                (Some(id), None) => Change::Rename { id, base, title },
+            };
+            let committed = apply_one(entries, change, random)?;
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == committed.id)
+                .ok_or(Error::Entry(EntryError::Missing))?;
+            entry.replace_password(password.map(|text| text.take().into_bytes()));
+            committed
+        }
         Change::Create { title, body } => {
             if entries.len() >= MAX_ENTRIES {
                 return Err(Error::Entry(EntryError::Full));
@@ -360,6 +401,56 @@ mod tests {
             })
             .unwrap()
         }
+    }
+
+    #[test]
+    fn credential_form_saves_atomically_and_keeps_omitted_notes() {
+        let mut f = Fixture::new();
+        let created = f
+            .apply(Change::Credential {
+                id: None,
+                base: 0,
+                title: "Mail".into(),
+                body: Some("notes".into()),
+                password: Some("token".into()),
+            })
+            .unwrap();
+        assert_eq!(created.revision, Some(1));
+        let before = f.place.bytes();
+        assert!(f
+            .apply(Change::Credential {
+                id: Some(created.id),
+                base: 1,
+                title: "new".into(),
+                body: Some("new notes".into()),
+                password: Some(Text::new("x".repeat(MAX_PASSWORD + 1)))
+            })
+            .is_err());
+        assert_eq!(f.place.bytes(), before);
+        assert_eq!(f.session.entry(&created.id).unwrap().title(), "Mail");
+        f.apply(Change::Credential {
+            id: Some(created.id),
+            base: 1,
+            title: "Mail renamed".into(),
+            body: None,
+            password: Some("replacement".into()),
+        })
+        .unwrap();
+        let entry = f.session.entry(&created.id).unwrap();
+        assert_eq!(entry.revision, 2);
+        assert_eq!(entry.body(), b"notes");
+        assert_eq!(entry.password(), Some(b"replacement".as_slice()));
+        let before = f.place.bytes();
+        assert!(f
+            .apply(Change::Credential {
+                id: Some(created.id),
+                base: 1,
+                title: "stale".into(),
+                body: None,
+                password: None
+            })
+            .is_err());
+        assert_eq!(f.place.bytes(), before);
     }
 
     #[test]

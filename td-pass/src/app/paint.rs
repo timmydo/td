@@ -437,6 +437,25 @@ impl Frame<'_> {
                 sink,
             );
         }
+        line(
+            surface,
+            panes.password_label,
+            "Password/token",
+            CHROME,
+            damage,
+            sink,
+        );
+        if let Some(entry) = panes.password {
+            entry.emit(
+                notebook.password.field(
+                    "Password/token (Ctrl+R reveals)",
+                    caret(Focus::Password),
+                    app.caret_visible,
+                ),
+                damage,
+                sink,
+            );
+        }
         if panes.pane.width == 0 || panes.pane.height == 0 {
             // No room inside the bezel: the editor refused the frame and
             // would paint at its old place, over the bezel.

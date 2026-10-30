@@ -307,6 +307,9 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                     revision: entry.revision,
                     title: Text::new(entry.title.to_owned()),
                     body: Bytes::copy(entry.body),
+                    password: Text::new(
+                        String::from_utf8_lossy(entry.password.unwrap_or_default()).into_owned(),
+                    ),
                 },
                 None => Reply::Missing { id },
             },
@@ -669,6 +672,19 @@ fn items(vault: &pass::Vault) -> Vec<Item> {
 
 fn convert(change: Change) -> pass::Change {
     match change {
+        Change::Credential {
+            id,
+            base,
+            title,
+            body,
+            password,
+        } => pass::Change::Credential {
+            id,
+            base,
+            title: title.take(),
+            body: body.map(Text::take),
+            password: (!password.as_str().is_empty()).then(|| password.take()),
+        },
         Change::Create { title, body } => pass::Change::Create {
             title: title.take(),
             body: body.take(),

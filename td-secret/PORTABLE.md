@@ -1500,3 +1500,12 @@ Successful `44` carries the verified service result as one length-prefixed
 field; any error ends the worker without a result. Root supervises this worker in the one operation slot; only successful
 exit plus a clean channel end releases its result to the dedicated service.
 The td-pass client reaches the backend only through root's fixed launch.
+
+The notebook credential-form change saves title, optional replacement notes
+and optional password as one entry revision and one vault transaction.
+Omitted notes preserve their exact bytes, including values the GUI cannot
+edit; an absent password clears it and its bindings. Password validation
+precedes entry mutation, and failed or stale changes publish nothing.
+Private service edit tag 6 selects this form with a presence-tagged entry
+ID, base revision, title, presence-tagged notes and a password field (empty
+means absent). The ordinary notes-only edits retain their old semantics.

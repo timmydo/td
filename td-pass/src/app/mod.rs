@@ -82,6 +82,7 @@ pub enum Focus {
     Search,
     List,
     Title,
+    Password,
     Editor,
     Find,
 }
@@ -145,6 +146,7 @@ struct Open {
     id: Option<EntryId>,
     revision: u64,
     saved_title: Text,
+    saved_password: Text,
     tab: Option<TabId>,
 }
 
@@ -167,6 +169,7 @@ struct Notebook {
     search: EntryModel,
     list: ListModel,
     title: EntryModel,
+    password: EntryModel,
     find: EntryModel,
     finding: bool,
     open: Option<Open>,
@@ -221,6 +224,7 @@ enum Busy {
         /// be told from the edits it carries.
         revision: Option<u64>,
         title: Text,
+        password: Text,
         then: Option<Then>,
     },
     Delete {
@@ -600,7 +604,8 @@ impl App {
                 revision,
                 title,
                 body,
-            } => self.show(id, revision, title, body),
+                password,
+            } => self.show(id, revision, title, body, password),
             Reply::Missing { id } => {
                 if let Some(notebook) = self.notebook() {
                     if notebook.reading == Some(id) {
@@ -866,6 +871,7 @@ impl App {
             tab,
             revision,
             title,
+            password,
             ..
         }) = &self.busy
         else {
@@ -878,7 +884,10 @@ impl App {
                 .is_ok_and(|document| Some(document.revision()) != *revision)
         });
         let renamed = match &self.phase {
-            Phase::Unlocked(notebook) => notebook.title.text() != title.as_str(),
+            Phase::Unlocked(notebook) => {
+                notebook.title.text() != title.as_str()
+                    || notebook.password.text() != password.as_str()
+            }
             _ => false,
         };
         body || renamed
@@ -949,6 +958,7 @@ impl App {
                 tab,
                 point,
                 title,
+                password,
                 then,
                 ..
             }) => {
@@ -974,6 +984,7 @@ impl App {
                     open.id = Some(id);
                     open.revision = revision;
                     open.saved_title = title;
+                    open.saved_password = password;
                 }
                 self.refilter(None);
                 self.say("Saved");
@@ -997,6 +1008,8 @@ impl App {
                     if open {
                         notebook.open = None;
                         notebook.title.clear();
+                        notebook.password.clear();
+                        notebook.password.set_masked(true);
                     }
                 }
                 self.refilter(None);
@@ -1008,7 +1021,7 @@ impl App {
     }
 
     /// An entry read for the pane: shown when it is still the one asked.
-    fn show(&mut self, id: EntryId, revision: u64, title: Text, body: Bytes) {
+    fn show(&mut self, id: EntryId, revision: u64, title: Text, body: Bytes, password: Text) {
         let Some(notebook) = self.notebook() else {
             return;
         };
@@ -1028,10 +1041,22 @@ impl App {
             return;
         };
         let _ = notebook.title.set_text(title.as_str());
+        if notebook.password.set_text(password.as_str()).is_err() {
+            notebook.open = None;
+            notebook.title.clear();
+            notebook.password.clear();
+            if let Some(tab) = tab {
+                self.discard_tab(tab);
+            }
+            self.say("This password/token cannot be shown in a single-line field");
+            return;
+        }
+        notebook.password.set_masked(true);
         notebook.open = Some(Open {
             id: Some(id),
             revision,
             saved_title: title,
+            saved_password: password,
             tab,
         });
         self.refilter(Some(id));
@@ -1083,7 +1108,10 @@ impl App {
     /// Closes the open entry's document, giving up its changes; a paste
     /// asked for into it or its title no longer has a place.
     fn close_document(&mut self) {
-        if matches!(self.paste, Some(Target::Pane | Target::Field(Focus::Title))) {
+        if matches!(
+            self.paste,
+            Some(Target::Pane | Target::Field(Focus::Title | Focus::Password))
+        ) {
             self.paste = None;
         }
         let tab = self
@@ -1124,7 +1152,9 @@ impl App {
     }
 
     fn dirty(&self) -> bool {
-        self.body_dirty() || self.title_dirty()
+        self.body_dirty()
+            || self.title_dirty()
+            || matches!(&self.phase, Phase::Unlocked(n) if n.open.as_ref().is_some_and(|o| o.saved_password.as_str() != n.password.text()))
     }
 
     /// Shows the entries the search matches, keeping `keep` selected when
@@ -1184,6 +1214,7 @@ impl App {
                 for (model, field) in [
                     (&mut notebook.search, panes.search),
                     (&mut notebook.title, panes.title),
+                    (&mut notebook.password, panes.password),
                     (&mut notebook.find, panes.find),
                 ] {
                     if let Some(field) = field {
@@ -1464,11 +1495,14 @@ impl App {
             return;
         };
         notebook.title.clear();
+        notebook.password.clear();
+        notebook.password.set_masked(true);
         notebook.reading = None;
         notebook.open = Some(Open {
             id: None,
             revision: 0,
             saved_title: Text::default(),
+            saved_password: Text::default(),
             tab,
         });
         if let Some(list) = layout::panes(surface, notebook.finding).list {
@@ -1526,44 +1560,63 @@ impl App {
             }
             _ => None,
         };
-        let (point, change) = match (id, snapshot) {
-            (None, Some((point, body))) => (
-                Some(point),
-                Change::Create {
-                    title: title.clone(),
-                    body,
-                },
-            ),
-            (None, None) => (
-                None,
-                Change::Create {
-                    title: title.clone(),
-                    body: Text::default(),
-                },
-            ),
-            (Some(id), Some((point, body))) => (
-                Some(point),
-                Change::Edit {
+        let password = Text::new(notebook.password.text().to_owned());
+        let password_dirty = password.as_str() != open.saved_password.as_str();
+        let (point, change) = if password_dirty {
+            let (point, body) = match snapshot {
+                Some((point, body)) => (Some(point), Some(body)),
+                None => (None, None),
+            };
+            (
+                point,
+                Change::Credential {
                     id,
                     base,
                     title: title.clone(),
                     body,
+                    password: password.clone(),
                 },
-            ),
-            (Some(id), None) if title_dirty => (
-                None,
-                Change::Rename {
-                    id,
-                    base,
-                    title: title.clone(),
-                },
-            ),
-            (Some(_), None) => {
-                self.say("Nothing to save");
-                if let Some(then) = then {
-                    self.run(then);
+            )
+        } else {
+            match (id, snapshot) {
+                (None, Some((point, body))) => (
+                    Some(point),
+                    Change::Create {
+                        title: title.clone(),
+                        body,
+                    },
+                ),
+                (None, None) => (
+                    None,
+                    Change::Create {
+                        title: title.clone(),
+                        body: Text::default(),
+                    },
+                ),
+                (Some(id), Some((point, body))) => (
+                    Some(point),
+                    Change::Edit {
+                        id,
+                        base,
+                        title: title.clone(),
+                        body,
+                    },
+                ),
+                (Some(id), None) if title_dirty => (
+                    None,
+                    Change::Rename {
+                        id,
+                        base,
+                        title: title.clone(),
+                    },
+                ),
+                (Some(_), None) => {
+                    self.say("Nothing to save");
+                    if let Some(then) = then {
+                        self.run(then);
+                    }
+                    return;
                 }
-                return;
             }
         };
         let op = self.op();
@@ -1582,6 +1635,7 @@ impl App {
             point,
             revision,
             title,
+            password,
             then,
         });
         self.say("Saving");
@@ -2375,6 +2429,8 @@ impl App {
         if let Some(notebook) = self.notebook() {
             notebook.open = None;
             notebook.title.clear();
+            notebook.password.clear();
+            notebook.password.set_masked(true);
         }
         self.refilter(None);
     }
@@ -2432,6 +2488,12 @@ fn notebook(entries: Vec<Item>) -> Result<Notebook, String> {
         search: field()?,
         list: ListModel::with_margin(1),
         title: field()?,
+        password: {
+            let mut field =
+                EntryModel::new(4096).map_err(|_| "td-pass cannot hold a password field")?;
+            field.set_masked(true);
+            field
+        },
         find: field()?,
         finding: false,
         open: None,

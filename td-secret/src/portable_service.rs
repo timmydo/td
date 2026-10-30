@@ -260,6 +260,29 @@ fn put_binding(out: &mut Bytes, binding: &MailBinding) -> Result<(), String> {
 
 fn change(input: &mut Reader<'_>) -> Result<Change, String> {
     match input.byte()? {
+        6 => {
+            let id = if input.boolean()? {
+                Some(input.array()?)
+            } else {
+                None
+            };
+            let base = input.number()?;
+            let title = Text::new(input.text(MAX_TITLE)?.to_owned());
+            let body = if input.boolean()? {
+                Some(Text::new(input.text(MAX_BODY)?.to_owned()))
+            } else {
+                None
+            };
+            let password = input.text(super::MAX_PASSWORD)?;
+            let password = (!password.is_empty()).then(|| Text::new(password.to_owned()));
+            Ok(Change::Credential {
+                id,
+                base,
+                title,
+                body,
+                password,
+            })
+        }
         1 => {
             let title = Text::new(input.text(MAX_TITLE)?.to_owned());
             let body = Text::new(input.text(MAX_BODY)?.to_owned());

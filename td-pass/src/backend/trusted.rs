@@ -180,7 +180,7 @@ impl Backend {
                 let revision = input.number()?;
                 let title = Text::new(input.text(crate::protocol::MAX_TITLE)?.to_owned());
                 let body = Bytes::copy(input.field(crate::protocol::MAX_BODY)?);
-                let _password = input.field(4096)?;
+                let password = Text::new(input.text(4096)?.to_owned());
                 let count = input.byte()?;
                 if count > 16 {
                     return Err("too many notebook bindings".into());
@@ -196,11 +196,32 @@ impl Backend {
                     revision,
                     title,
                     body,
+                    password,
                 })
             }
             Command::Apply { op, change } => {
                 let mut request = Frame(vec![6]);
                 match change {
+                    Change::Credential {
+                        id,
+                        base,
+                        title,
+                        body,
+                        password,
+                    } => {
+                        request.push(6)?;
+                        request.push(u8::from(id.is_some()))?;
+                        if let Some(id) = id {
+                            request.extend(&id)?;
+                        }
+                        request.extend(&base.to_be_bytes())?;
+                        field(&mut request, title.as_str().as_bytes())?;
+                        request.push(u8::from(body.is_some()))?;
+                        if let Some(body) = body {
+                            field(&mut request, body.as_str().as_bytes())?;
+                        }
+                        field(&mut request, password.as_str().as_bytes())?;
+                    }
                     Change::Create { title, body } => {
                         request.push(1)?;
                         field(&mut request, title.as_str().as_bytes())?;

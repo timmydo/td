@@ -18,8 +18,17 @@ available without occupying the text area.
 The status row distinguishes locked, unlocked, saving, saved, unsaved and
 failed operations. Failure text contains no password, PIN or token output.
 
-Contents are freeform text. No username/password schema, first-line password
-convention, pass CLI, browser extension or Git synchronization is required.
+Each entry has independent freeform notes and an optional password/token
+field (at most 4096 UTF-8 bytes). The field is masked on entry selection;
+Ctrl+R while focused reveals or masks it. Masked values cannot be copied
+or cut. F6 and Tab navigation include the field between title and notes.
+Save commits the title, changed notes and changed password in one revision-
+checked transaction; clearing a password also clears its remembered mail
+bindings. Edits made while saving remain unsaved after acknowledgement.
+The field and saved snapshot are clearing owners and are dropped on lock.
+A stored value that cannot fit the single-line field refuses that entry's
+editor rather than silently changing it. No first-line password convention,
+pass CLI, browser extension or Git synchronization is required.
 Copy and paste operate on the selection, preserving bytes: a copy carries
 the entry's stored line endings, pasted text takes the entry's one ending,
 and a paste holding another control character but tab, or invalid UTF-8,
