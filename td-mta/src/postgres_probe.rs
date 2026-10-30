@@ -484,7 +484,7 @@ pub(crate) fn with_search_backfill_worker<T>(
         request,
         trust,
         deadline,
-        16 * 1024 * 1024,
+        24 * 1024 * 1024,
         Input::body(),
         MAX_BODY_DURATION,
     )?;

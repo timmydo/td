@@ -449,7 +449,9 @@ Compare `search_fields`, `jmap_search` and `body_verify` counter deltas around
 the same scoped search before and after backfill. Cache hits avoid repeated
 MIME decoding and full-body reads after validating retained search evidence.
 Missing or invalid evidence uses verified-body fallback. Large searches can
-still exceed request work or connection bounds; this is not a full-text index.
+still exceed request work or connection bounds. Schema 40 uses pg_trgm for
+eligible literal terms, then checks candidates with the existing matcher;
+unindexed messages and ineligible terms retain bounded fallback.
 The first implementation has no automatic search-row preparation or scheduled
 rebuild, so new messages use parser fallback until an explicit backfill.
 

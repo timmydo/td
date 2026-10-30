@@ -2022,3 +2022,12 @@ tightly sized memory budget must allow this additional increase. The 512-MiB
 default and protocol concurrency limits remain the same. Configurations using
 different header, MIME-part or nesting limits use verified parsing rather than
 the fixed-version persisted interpretation.
+
+
+Schema-40 indexed search leaves serving memory reservations unchanged. The
+owner-only `summary-backfill --search` connection allows 24 MiB of output
+framing instead of 16 MiB, and its aggregate derived-output page cap is
+17,301,504 bytes for encoded fields plus candidate text. Candidate construction
+retains encoded fields and at most one equally bounded text buffer after
+releasing decoded fields. Stored candidate text and its GIN index consume
+additional database space; these are not additions to account body quotas.

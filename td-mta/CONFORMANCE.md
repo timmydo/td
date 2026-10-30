@@ -738,3 +738,22 @@ initialization and repeated initialization without progress reset, dedicated
 runtime copy versus owner refusal, historical JSON progress, and refusal of a
 world-readable source password. CLI parser cases reject missing binding,
 secret-on-command-line options, duplicate flags and out-of-range copy budgets.
+
+
+## Indexed-search qualification
+
+The native td-mail read fixture checks schema-40 indexed candidates with
+Unicode, literal percent/underscore/backslash operands, phrases and conjunctions.
+It retains missing-evidence fallback and selected-field corruption checks;
+qualified fields may answer a search while a raw-body download refuses damaged
+chunks. A separate PostgreSQL plan fixture seeds 5,000 messages under the
+production schema and checks that date- and mailbox-scoped queries do not
+materialize unrelated candidate rows, with and without indexed evidence and
+in both date orders and both standard-string settings. Its assertions use
+row counts, not elapsed time.
+
+Native schema coverage includes the prior-version upgrade ladder, a whole-DB
+archive restore containing pg_trgm, and initialization by a database owner
+without superuser/role-creation/database-creation privileges. These fixtures
+prove the exercised plans and flows, not universal planner choices or a latency
+guarantee. New messages still require explicit backfill to acquire index rows.

@@ -227,17 +227,26 @@ impl Worker<'_, '_, '_, '_, '_> {
             .ids
             .try_reserve_exact(query.limit)
             .map_err(|_| Error::StorageCapacity)?;
+        let pattern = if crate::postgres_search::compatible(limits) {
+            search.candidate_pattern()?
+        } else {
+            None
+        };
+        let batch = if pattern.is_some() { 256 } else { 32 };
         let (mut offset, mut matches) = (0u64, 0u64);
         while query.calculate_total || result.ids.len() < query.limit {
             self.check()?;
-            super::email_search::charge(&mut work, clock.as_ref(), 32)?;
-            let page = view.query(crate::postgres_read::EmailQuery {
-                position: offset,
-                limit: 32,
-                calculate_total: false,
-                ..query
-            })?;
-            if page.state != result.state || page.position != offset || page.ids.len() > 32 {
+            super::email_search::charge(&mut work, clock.as_ref(), batch as u64)?;
+            let page = view.search_candidates(
+                crate::postgres_read::EmailQuery {
+                    position: offset,
+                    limit: batch,
+                    calculate_total: false,
+                    ..query
+                },
+                pattern.as_deref(),
+            )?;
+            if page.state != result.state || page.position != offset || page.ids.len() > batch {
                 return Err(Error::State);
             }
             offset = offset

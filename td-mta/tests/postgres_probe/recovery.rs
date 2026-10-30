@@ -70,7 +70,10 @@ INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals
         "pg_dump",
         &["-Fc", "-f", dump.to_str().unwrap(), "postgres"],
     );
-    sql(&fixture, "DROP SCHEMA td_mta CASCADE");
+    sql(
+        &fixture,
+        "DROP SCHEMA td_mta CASCADE; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm",
+    );
     tool(
         "pg_restore",
         &[

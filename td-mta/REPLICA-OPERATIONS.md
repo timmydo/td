@@ -166,6 +166,8 @@ query, summary batches, message opening, and search separately. State whether
 server caches are already warm and how many readers are active. Report samples,
 median and tail observations; performance targets are not load-sensitive gate
 assertions. A broad text search can still hit the bounded search work limit:
-current search scans candidates, using qualified stored fields when available
-and verifying bodies on fallback. Do not describe that refusal as an empty result or
+search uses indexed candidates for eligible terms when schema-40 search
+backfill is complete, uses qualified stored fields when available, and verifies
+bodies on fallback. Unindexed rows remain candidates; short or ineligible
+terms retain the bounded scan. Do not describe that refusal as an empty result or
 silently raise the work limit to conceal it.

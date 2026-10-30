@@ -953,3 +953,20 @@ status and a manual copy command to use with the worker stopped.
 Services are not enabled automatically. Initial preparation is not a complete
 copy. No SMTP, relay or local TLS renewal service is generated. [REPLICATION.md](REPLICATION.md#fresh-local-provisioning) records the
 copy, credential and recovery boundaries.
+
+
+## Indexed-search extension prerequisite
+
+Schema 40 needs PostgreSQL 17's bundled `pg_trgm` 1.6 extension files on each
+server or restore host. Check `pg_available_extension_versions` before an
+upgrade. Packaging varies by host: the retained PostgreSQL installations used
+by the Azure deployment and local Guix replica already include these files.
+The owner migration creates the extension in private `td_mta_trgm`; serving
+credentials do not install extensions. An existing conflicting extension or
+namespace needs operator reconciliation before retrying the migration.
+
+Use a whole-database backup and restore, including the extension declaration
+and its namespace. Run the normal fenced schema upgrade, then resumable
+`summary-backfill --search` to index existing messages. New messages retain
+bounded fallback until backfilled. See POSTGRES.md's indexed-search contract
+for literal matching, negative-evidence trust and resource limits.

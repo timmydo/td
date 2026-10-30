@@ -468,6 +468,11 @@ trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Erro
         &mut self,
         query: crate::postgres_read::EmailQuery,
     ) -> Result<crate::postgres_read::EmailPage, Error>;
+    fn search_candidates(
+        &mut self,
+        query: crate::postgres_read::EmailQuery,
+        pattern: Option<&str>,
+    ) -> Result<crate::postgres_read::EmailPage, Error>;
     fn query_submissions(
         &mut self,
         query: crate::postgres_read::SubmissionQuery,
@@ -590,6 +595,14 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
         query: crate::postgres_read::EmailQuery,
     ) -> Result<crate::postgres_read::EmailPage, Error> {
         self.query_emails(query).map_err(postgres_read_error)
+    }
+    fn search_candidates(
+        &mut self,
+        query: crate::postgres_read::EmailQuery,
+        pattern: Option<&str>,
+    ) -> Result<crate::postgres_read::EmailPage, Error> {
+        self.search_candidates(query, pattern)
+            .map_err(postgres_read_error)
     }
     fn query_submissions(
         &mut self,

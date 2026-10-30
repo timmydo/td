@@ -1047,6 +1047,36 @@ impl Snapshot<'_> {
     /// Order received dates in the requested direction and equal dates by ID
     /// ascending, matching the existing td-mail query interpretation.
     pub fn query_emails(&mut self, query: EmailQuery) -> Result<EmailPage, Error> {
+        self.query_emails_filtered(query, None)
+    }
+    pub(crate) fn search_candidates(
+        &mut self,
+        query: EmailQuery,
+        pattern: Option<&str>,
+    ) -> Result<EmailPage, Error> {
+        if query.calculate_total {
+            return self.retain(Err(Error::Invalid));
+        }
+        let pattern = if let Some(pattern) = pattern {
+            if pattern.len() > 20482 || pattern.contains('\0') {
+                return self.retain(Err(Error::Invalid));
+            }
+            let mut owned = String::new();
+            owned
+                .try_reserve_exact(pattern.len())
+                .map_err(|_| Error::Capacity)?;
+            owned.push_str(pattern);
+            Some(owned)
+        } else {
+            None
+        };
+        self.query_emails_filtered(query, pattern)
+    }
+    fn query_emails_filtered(
+        &mut self,
+        query: EmailQuery,
+        pattern: Option<String>,
+    ) -> Result<EmailPage, Error> {
         self.check()?;
         if query.limit > MAX_EMAIL_PAGE {
             return self.retain(Err(Error::Capacity));
@@ -1074,12 +1104,18 @@ impl Snapshot<'_> {
             }
             let Ok(position)=i64::try_from(query.position) else { return Ok(page); };
             let limit=i64::try_from(query.limit+1).map_err(|_|Error::Capacity)?;
-            let sql=if query.ascending {
-                "SELECT e.id,e.received_at,e.changed,m.changed FROM td_mta.emails e LEFT JOIN td_mta.memberships m ON m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2 WHERE e.account=$1 AND ($2::bytea IS NULL OR m.email_id IS NOT NULL) AND ($5::bigint IS NULL OR e.received_at >= $5) AND ($6::bigint IS NULL OR e.received_at < $6) ORDER BY e.received_at ASC,e.id ASC LIMIT $3 OFFSET $4"
-            } else {
-                "SELECT e.id,e.received_at,e.changed,m.changed FROM td_mta.emails e LEFT JOIN td_mta.memberships m ON m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2 WHERE e.account=$1 AND ($2::bytea IS NULL OR m.email_id IS NOT NULL) AND ($5::bigint IS NULL OR e.received_at >= $5) AND ($6::bigint IS NULL OR e.received_at < $6) ORDER BY e.received_at DESC,e.id ASC LIMIT $3 OFFSET $4"
+            let sql = match (pattern.is_some(), query.ascending) {
+                (false, true) => r#"SELECT e.id,e.received_at,e.changed,m.changed FROM td_mta.emails e LEFT JOIN td_mta.memberships m ON m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2 WHERE e.account=$1 AND ($2::bytea IS NULL OR m.email_id IS NOT NULL) AND ($5::bigint IS NULL OR e.received_at >= $5) AND ($6::bigint IS NULL OR e.received_at < $6) ORDER BY e.received_at ASC,e.id ASC LIMIT $3 OFFSET $4"#,
+                (false, false) => r#"SELECT e.id,e.received_at,e.changed,m.changed FROM td_mta.emails e LEFT JOIN td_mta.memberships m ON m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2 WHERE e.account=$1 AND ($2::bytea IS NULL OR m.email_id IS NOT NULL) AND ($5::bigint IS NULL OR e.received_at >= $5) AND ($6::bigint IS NULL OR e.received_at < $6) ORDER BY e.received_at DESC,e.id ASC LIMIT $3 OFFSET $4"#,
+                (true, true) => include_str!("postgres_search_candidates_asc.sql"),
+                (true, false) => include_str!("postgres_search_candidates_desc.sql"),
             };
-            let rows=client.query_typed(sql,&[(&account,Type::BYTEA),(&mailbox,Type::BYTEA),(&limit,Type::INT8),(&position,Type::INT8),(&query.after,Type::INT8),(&query.before,Type::INT8)]).await.map_err(|_|Error::Database)?;
+            let parameters: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 8] = [
+                (&account,Type::BYTEA),(&mailbox,Type::BYTEA),(&limit,Type::INT8),
+                (&position,Type::INT8),(&query.after,Type::INT8),(&query.before,Type::INT8),
+                (&pattern,Type::TEXT),(&crate::postgres_search::VERSION,Type::INT4)];
+            let parameters = parameters.get(..if pattern.is_some() { 8 } else { 6 }).ok_or(Error::Invalid)?;
+            let rows=client.query_typed(sql,parameters).await.map_err(|_|Error::Database)?;
             page.ids.try_reserve_exact(query.limit).map_err(|_|Error::Capacity)?;
             page.has_more=rows.len()>query.limit;
             let mut previous:Option<(i64,[u8;16])>=None;

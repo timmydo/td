@@ -1197,7 +1197,7 @@ fn exercise_queries(
         &[],
     );
 
-    let large = format!("Subject: Large search corpus\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nearlyneedle\r\n{}tailneedle\r\n", format!("{}\r\n", "x".repeat(998)).repeat(1050));
+    let large = format!("Subject: Large search corpus\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nearlyneedle\r\n{}tailneedle café 100%_literal\\value\r\n", format!("{}\r\n", "x".repeat(998)).repeat(1050));
     let delivery = postgres_receiving::prepare(
         binding,
         &postgres_receiving::Message {
@@ -1262,6 +1262,16 @@ fn exercise_queries(
     for text in ["earlyneedle", "tailneedle", "earlyneedle tailneedle"] {
         check(client.ask(query(text)), 0, &[wire]);
     }
+    for text in [
+        "CAFÉ",
+        "100%_literal\\value",
+        "\"tailneedle café\"",
+        "corpus tailneedle",
+    ] {
+        check(client.ask(query(text)), 0, &[wire]);
+    }
+    check(client.ask(query("earlyneedle absent")), 0, &[]);
+    check(client.ask(query("100_literal")), 0, &[]);
     check(client.ask(query("absent-search-term")), 0, &[]);
     check(client.ask(query("\"corpus earlyneedle\"")), 0, &[]);
     let blob = sql(

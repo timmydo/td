@@ -267,6 +267,45 @@ impl Sink for Search {
     }
 }
 impl Search {
+    /// One literal term is a necessary condition; the field matcher decides
+    /// the full query. NUL cannot enter PostgreSQL text parameters.
+    pub(super) fn candidate_pattern(&self) -> Result<Option<String>, Error> {
+        let Some(pattern) = self
+            .patterns
+            .iter()
+            // Guarantee at least one extractable trigram even in a C locale.
+            .filter(|pattern| {
+                !pattern.text.contains(&'\0')
+                    && pattern
+                        .text
+                        .windows(3)
+                        .any(|window| window.iter().all(char::is_ascii_alphanumeric))
+            })
+            .max_by_key(|pattern| pattern.text.len())
+        else {
+            return Ok(None);
+        };
+        let size = pattern
+            .text
+            .iter()
+            .try_fold(2usize, |size, c| {
+                size.checked_add(c.len_utf8() + usize::from(matches!(c, '%' | '_' | '\\')))
+            })
+            .ok_or(Error::StorageCapacity)?;
+        let mut output = String::new();
+        output
+            .try_reserve_exact(size)
+            .map_err(|_| Error::StorageCapacity)?;
+        output.push('%');
+        for c in &pattern.text {
+            if matches!(c, '%' | '_' | '\\') {
+                output.push('\\');
+            }
+            output.push(*c);
+        }
+        output.push('%');
+        Ok(Some(output))
+    }
     pub(super) fn parse(text: &str) -> Result<Self, Error> {
         if text.len() > 4096 {
             return Err(Error::UnsupportedFilter);
@@ -462,6 +501,40 @@ impl Worker<'_, '_, '_, '_, '_> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn index_pattern_is_one_normalized_literal_term() {
+        let search = super::Search::parse("short \"LONG PHRASE\"").unwrap();
+        assert_eq!(
+            search.candidate_pattern().unwrap(),
+            Some("%long phrase%".into())
+        );
+        let search = super::Search::parse("αΒΓ 100%_\\literal").unwrap();
+        assert_eq!(
+            search.candidate_pattern().unwrap(),
+            Some("%100\\%\\_\\\\literal%".into())
+        );
+        assert_eq!(
+            super::Search::parse("αΒΓ")
+                .unwrap()
+                .candidate_pattern()
+                .unwrap(),
+            None
+        );
+        for term in ["", "ab", "ab\0cd", "%%%", "a_b", "αβγ"] {
+            assert!(super::Search::parse(term)
+                .unwrap()
+                .candidate_pattern()
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(
+            super::Search::parse("ab\0cd needle")
+                .unwrap()
+                .candidate_pattern()
+                .unwrap(),
+            Some("%needle%".into())
+        );
+    }
     use super::*;
     struct Fixed;
     impl Clock for Fixed {

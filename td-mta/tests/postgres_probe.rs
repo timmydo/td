@@ -343,11 +343,22 @@ fn wait_command(child: &mut ProbeChild) {
 }
 
 fn sql(fixture: &Fixture, query: &str) -> String {
+    sql_bounded(fixture, query, 4096)
+}
+
+fn sql_bounded(fixture: &Fixture, query: &str, maximum: u64) -> String {
+    sql_commands_bounded(fixture, &[query], maximum)
+}
+
+fn sql_commands_bounded(fixture: &Fixture, queries: &[&str], maximum: u64) -> String {
+    let mut command = sql_command(fixture);
+    for query in queries {
+        command.args(["-c", query]);
+    }
     let path = fixture.root.join("sql-result");
     let output = File::create(&path).unwrap();
     let mut child = ProbeChild(
-        sql_command(fixture)
-            .args(["-c", query])
+        command
             .stdout(output.try_clone().unwrap())
             .stderr(output)
             .spawn()
@@ -358,18 +369,18 @@ fn sql(fixture: &Fixture, query: &str) -> String {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(
                 status.success(),
-                "SQL {query}: {}",
+                "SQL {queries:?}: {}",
                 fs::read_to_string(&path).unwrap()
             );
             break;
         }
         assert!(
             Instant::now() < stop,
-            "SQL fixture command timed out: {query}"
+            "SQL fixture command timed out: {queries:?}"
         );
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(fs::metadata(&path).unwrap().len() < 4096);
+    assert!(fs::metadata(&path).unwrap().len() < maximum);
     fs::read_to_string(path).unwrap().trim().to_owned()
 }
 
@@ -442,7 +453,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 39);
+    assert_eq!(receipt.version, 40);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -660,7 +671,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":39"));
+    assert!(initialized.contains("\"schema_version\":40"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -905,7 +916,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=39",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=40",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -913,7 +924,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=39 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=40 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -1095,7 +1106,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 39);
+    assert_eq!(receipt.version, 40);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1804,7 +1815,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
     for previous_version in [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27, 28, 31, 32, 33, 34, 35, 36, 37, 38,
+        27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 39,
     ] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
@@ -1847,6 +1858,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_replica_source.sql"),
             include_str!("../src/postgres_replica_progress.sql"),
             include_str!("../src/postgres_replica_effects.sql"),
+            include_str!("../src/postgres_replica_mailboxes.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1906,7 +1918,9 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             38 => "replica_mailbox_observation",
             _ => "flag_receipts",
         };
-        if previous_version == 8 {
+        if previous_version == 39 {
+            sql(&fixture, "CREATE SCHEMA td_mta_trgm");
+        } else if previous_version == 8 {
             sql(&fixture, "INSERT INTO td_mta.accounts VALUES(decode(repeat('7f',16),'hex'),decode('0000000000000001','hex'),decode('0000000000000000','hex')); INSERT INTO td_mta.flag_receipts VALUES(decode(repeat('7f',16),'hex'),decode(repeat('01',16),'hex'),decode(repeat('02',32),'hex'),decode('0000000000000001','hex'),decode('0000000000000001','hex')); ALTER TABLE td_mta.flag_receipts ADD COLUMN results bytea");
         } else if previous_version == 31 {
             sql(&fixture, "ALTER TABLE td_mta.blob_chunks RENAME CONSTRAINT blob_chunks_ordinal_check TO obstructed_ordinal_check");
@@ -1929,6 +1943,8 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
                 &fixture,
                 "ALTER TABLE td_mta.flag_receipts DROP COLUMN results",
             );
+        } else if previous_version == 39 {
+            sql(&fixture, "DROP SCHEMA td_mta_trgm");
         } else if previous_version == 31 {
             assert!(sql(&fixture, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='td_mta.blobs'::regclass AND conname='blobs_length_check'").contains("33554432"));
             sql(&fixture, "ALTER TABLE td_mta.blob_chunks RENAME CONSTRAINT obstructed_ordinal_check TO blob_chunks_ordinal_check");
@@ -1961,7 +1977,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 39);
+        assert_eq!(receipt.version, 40);
         assert_eq!(
             sql(
                 &fixture,
@@ -2024,6 +2040,31 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             receipt
         );
     }
+}
+
+#[test]
+#[ignore = "real PostgreSQL 17 with pg_trgm 1.6 required"]
+fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
+    let fixture = Fixture::new();
+    sql(&fixture, &format!(
+        "CREATE ROLE search_owner LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD '{}'; ALTER DATABASE postgres OWNER TO search_owner",
+        std::str::from_utf8(PASSWORD).unwrap()));
+    let owner = Request {
+        user: "search_owner",
+        ..fixture.request()
+    };
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let receipt = td_mta::postgres_schema::initialize(&owner, &trust, deadline()).unwrap();
+    assert_eq!(receipt.version, 40);
+    assert_eq!(sql(&fixture,
+        "SELECT e.extversion||':'||r.rolname||':'||n.nspname FROM pg_extension e JOIN pg_roles r ON r.oid=e.extowner JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_trgm'"),
+        "1.6:search_owner:td_mta_trgm");
+    assert_eq!(sql(&fixture,
+        "SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication FROM pg_roles WHERE rolname='search_owner'"), "f");
+    assert_eq!(
+        td_mta::postgres_schema::inspect(&owner, &trust, deadline()).unwrap(),
+        receipt
+    );
 }
 
 #[test]
@@ -2611,6 +2652,9 @@ mod multi_receiving;
 #[path = "postgres_probe/multi_relay.rs"]
 mod multi_relay;
 
+#[path = "postgres_probe/search_index.rs"]
+mod search_index;
+
 #[path = "postgres_probe/serving.rs"]
 mod serving;
 #[path = "postgres_probe/serving_relay.rs"]
@@ -2620,6 +2664,8 @@ mod serving_relay;
 #[ignore = "real local PostgreSQL tools required"]
 fn real_postgres_executable_receives_and_serves_database_profiles() {
     unix_database::exercise();
+    real_postgres_search_extension_installs_as_unprivileged_database_owner();
+    search_index::scoped_candidates_do_not_materialize_the_account();
     blob_scrub::real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance();
     application_logs::real_postgres_logs_bound_retention_rate_wrap_and_inspection();
     acme::real_postgres_acme_fences_ownership_and_pins_complete_pairs();

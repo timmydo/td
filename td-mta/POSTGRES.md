@@ -7520,9 +7520,10 @@ After qualifying its version, body identity, framing and field digest in the
 authenticated snapshot, search matches these fields without rereading the
 original body. This grants no body pin and is not a body-integrity audit;
 raw downloads and explicit scrubs retain their original verification.
-Missing, incompatible, malformed or checksum-invalid evidence falls back
-to the original parser; it never means no match. Database errors still fail
-the request.
+For a selected candidate, missing, incompatible, malformed or checksum-invalid
+evidence falls back to the original parser; it never means no match.
+Database errors still fail the request. The indexed candidate contract below
+separately defines the trust placed in rows excluded by the index.
 
 Reads use the authenticated snapshot, bounded metadata and at most 132 chunks
 of 64 KiB. Before loading fields the original method meter is charged four
@@ -7549,19 +7550,23 @@ decoding samples the monotonic work clock at the existing fixed scalar-batch
 boundary, with original source checks before batches and on completion; UTC
 sampling is not needed for work admission. Existing cursor, verified-body
 page cap, transaction and known-COMMIT publication rules apply. Search output
-has a separate 8,650,752-byte aggregate page cap. Each interpretation has
+has a separate 17,301,504-byte aggregate page cap for encoded fields plus
+candidate text. Each interpretation has
 512 MiB of I/O work, 64 Mi records and 128 MiB of output work under the original
 finite operation deadline; these are work allowances, not resident buffers.
-The dedicated owner connection allows 16 MiB of output framing, while runtime
-connection bounds remain unchanged. A refused interpretation removes obsolete
+The dedicated owner connection allows 24 MiB of output framing for encoded
+fields and candidate text, while runtime connection bounds remain unchanged.
+Candidate text is built from encoded fields after releasing the decoded
+collector, with one additional allocation bounded by the encoded length. A refused interpretation removes obsolete
 search evidence and increments `searches_skipped`; successful writes increment
 `searches_written`. A timeout or transaction failure yields no usable cursor.
 
 This increment requires explicit owner backfill. Publication does not yet
 prepare search rows, and there is no scheduled rebuild. New or oversized
 messages retain the existing search behavior. This cache avoids repeated MIME
-interpretation and whole-body reads for qualified rows. It is not an inverted index and does not eliminate bounded
-candidate scans; uncached rows still require whole-body verification.
+interpretation and whole-body reads for qualified rows. Schema 40 additionally
+narrows candidates through the index below; unindexed or incompatible rows
+retain bounded fallback and may still exhaust the original method allowance.
 Schema-34 binaries cannot serve schema 35; upgrade with fencing and a
 consistent pre-upgrade backup.
 
@@ -7691,3 +7696,63 @@ explicit 256-folder union capacity boundary. The operation never removes Email
 memberships to force a folder deletion or claims completeness while retirement
 is pending. A schema-38 binary cannot serve schema 39; retain a consistent
 backup and use the fenced upgrade procedure. No replica service is activated.
+
+
+## Indexed search candidates
+
+Schema 40 requires PostgreSQL 17's trusted `pg_trgm` extension, version 1.6.
+The owner migration creates it in a private `td_mta_trgm` schema, with no
+PUBLIC schema privileges, and adds a GIN index on `blob_search.candidate_text`
+under deterministic `C` collation. The extension must be available in the
+server installation; initialization or upgrade fails atomically if it is
+missing or an existing extension/schema conflicts. There is no download or
+runtime DDL. This is an explicitly approved server extension dependency,
+not a Rust dependency. Runtime SQL uses ordinary LIKE, not similarity search
+or caller-selected operators, and needs no namespace creation privileges.
+
+The nullable candidate text joins the complete normalized fields with LF
+boundaries and replaces NUL with LF because PostgreSQL text excludes NUL.
+It is at most 8 MiB plus 65,536 boundary bytes. Owner search backfill writes
+fields, digest and candidate text in the same transaction. Existing rows
+start with NULL candidate text and require another `--search` backfill.
+No partial or refused interpretation produces an indexed row. New arrivals
+continue through fallback until explicit backfill; automatic preparation is
+not yet implemented. This adds stored derived text and GIN storage; it does
+not change account body quotas or promise a fixed database size.
+
+A parsed query may select one required term as a candidate filter. It must
+contain three consecutive ASCII alphanumeric characters, guaranteeing an
+extractable trigram even with a C locale, and contain no NUL. The longest
+eligible term is encoded as a literal LIKE substring, escaping percent,
+underscore and backslash. Other terms, short or punctuation-only searches,
+and non-ASCII-only terms still use the existing matcher; without an eligible
+term the query retains the bounded scan. Configurations with incompatible
+interpretation limits also retain that scan.
+
+Within the original authenticated snapshot, each candidate page combines
+indexed matches with every blob lacking compatible indexed evidence. Both
+branches apply mailbox/date scope before combining rows; they never materialize
+account-wide candidates before narrowing a scoped search. Indexed pages hold
+at most 256 candidates; unindexed scans retain their 32-candidate page bound. Version,
+body length and digest mismatches, absent rows and NULL candidate text enter
+fallback; they are never silently omitted. The branches are disjoint and
+retain account/mailbox/date scope, ordering, candidate offset and final result
+pagination. Both branches execute under the original database deadline.
+Every selected candidate then runs the existing field-local matcher against
+qualified complete fields, or verified-body fallback. The LIKE filter alone
+never authorizes a match, so phrases and multi-term semantics are unchanged.
+
+Like ordinary indexed metadata, negative candidate evidence trusts the stored
+projection and PostgreSQL's index correctness. A query does not hash every
+excluded row or audit its body; doing so would defeat the index. Candidate
+field validation detects corruption in loaded evidence, not arbitrary damage
+to excluded text. This is not a current-body or complete-index integrity
+certificate. Explicit search backfill rebuilds the projection from fully
+verified bodies. Raw downloads and whole-body scrubs retain their existing
+verification boundaries.
+
+Upgrade only with all instances fenced and a consistent pre-upgrade backup.
+Schema-39 binaries cannot serve schema 40. Backups and restores must include
+the whole database, including `td_mta_trgm` and the extension declaration;
+restoring only the `td_mta` schema is insufficient. The restored PostgreSQL
+installation must supply the same extension version before mail is activated.

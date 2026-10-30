@@ -2309,7 +2309,10 @@ partial traversal cannot become an empty result. Matching preserves field
 boundaries and charges bounded batches against the original method meter.
 POSTGRES.md owns the cache, owner rebuilding and fallback rules. New arrivals
 currently use uncached interpretation until an owner rebuild prepares them.
-This remains a bounded scan, not a full-text index or throughput claim.
+Schema 40 can narrow that scan using pg_trgm over a stored candidate
+projection, followed by the same field matcher. Missing indexed evidence
+retains bounded fallback. POSTGRES.md owns index qualification, negative
+metadata trust, extension setup and upgrade/restore requirements.
 
 ## 11. Submission and retry semantics
 

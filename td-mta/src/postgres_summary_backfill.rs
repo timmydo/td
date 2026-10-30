@@ -196,8 +196,10 @@ pub fn run_with_options(
                 report.done = false;
                 break;
             }
-            let search_size = search_fields.as_ref().map_or(0, |value| value.fields.len());
-            if search_bytes + search_size > crate::postgres_search::MAX_BYTES {
+            let search_size = search_fields
+                .as_ref()
+                .map_or(0, |value| value.fields.len() + value.candidate_text.len());
+            if search_bytes + search_size > 2 * crate::postgres_search::MAX_BYTES {
                 report.done = false;
                 break;
             }
@@ -221,7 +223,7 @@ pub fn run_with_options(
             }
             if let Some(value) = search_fields {
                 worker.run(move |client| Box::pin(async move {
-                    client.execute_typed("INSERT INTO td_mta.blob_search(account,blob_id,version,body_length,body_digest,fields,fields_digest) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account,blob_id) DO UPDATE SET version=EXCLUDED.version,body_length=EXCLUDED.body_length,body_digest=EXCLUDED.body_digest,fields=EXCLUDED.fields,fields_digest=EXCLUDED.fields_digest", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&crate::postgres_search::VERSION, Type::INT4), (&(metadata.body.length as i64), Type::INT8), (&metadata.body.digest.as_slice(), Type::BYTEA), (&value.fields, Type::BYTEA), (&value.digest.as_slice(), Type::BYTEA)]).await
+                    client.execute_typed("INSERT INTO td_mta.blob_search(account,blob_id,version,body_length,body_digest,fields,fields_digest,candidate_text) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(account,blob_id) DO UPDATE SET version=EXCLUDED.version,body_length=EXCLUDED.body_length,body_digest=EXCLUDED.body_digest,fields=EXCLUDED.fields,fields_digest=EXCLUDED.fields_digest,candidate_text=EXCLUDED.candidate_text", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&crate::postgres_search::VERSION, Type::INT4), (&(metadata.body.length as i64), Type::INT8), (&metadata.body.digest.as_slice(), Type::BYTEA), (&value.fields, Type::BYTEA), (&value.digest.as_slice(), Type::BYTEA), (&value.candidate_text, Type::TEXT)]).await
                 })).map_err(Error::Connection)?.map_err(|_| Error::Database)?;
                 report.searches_written += 1;
             } else if search {
