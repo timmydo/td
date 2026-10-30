@@ -252,24 +252,27 @@ impl Worker<'_, '_, '_, '_, '_> {
             offset = offset
                 .checked_add(page.ids.len() as u64)
                 .ok_or(Error::StorageCapacity)?;
-            for id in page.ids {
-                self.check()?;
-                let matched = match view.search_email(id, limits, search, clock.as_ref(), &mut work)
-                {
-                    Ok(matched) => matched,
-                    Err(Error::MessageInterpretation) if self.partial_search => {
-                        skipped = skipped.checked_add(1).ok_or(Error::StorageCapacity)?;
-                        false
-                    }
-                    Err(error) => return Err(error),
-                };
-                if matched {
-                    if matches >= query.position && result.ids.len() < query.limit {
-                        result.ids.push(id);
-                    }
-                    matches = matches.checked_add(1).ok_or(Error::StorageCapacity)?;
-                    if !query.calculate_total && result.ids.len() == query.limit {
-                        break;
+            'candidates: for window in page.ids.chunks(crate::postgres_body::MAX_METADATA_IDS) {
+                view.prefetch_metadata(window, crate::email_response::Stored::id_only())?;
+                for &id in window {
+                    self.check()?;
+                    let matched =
+                        match view.search_email(id, limits, search, clock.as_ref(), &mut work) {
+                            Ok(matched) => matched,
+                            Err(Error::MessageInterpretation) if self.partial_search => {
+                                skipped = skipped.checked_add(1).ok_or(Error::StorageCapacity)?;
+                                false
+                            }
+                            Err(error) => return Err(error),
+                        };
+                    if matched {
+                        if matches >= query.position && result.ids.len() < query.limit {
+                            result.ids.push(id);
+                        }
+                        matches = matches.checked_add(1).ok_or(Error::StorageCapacity)?;
+                        if !query.calculate_total && result.ids.len() == query.limit {
+                            break 'candidates;
+                        }
                     }
                 }
             }

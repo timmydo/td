@@ -1435,6 +1435,101 @@ fn exercise_queries(
         ),
         "0"
     );
+    // Cross two passive-prefetch boundaries without timing assertions.
+    let mut batch_ids = Vec::new();
+    for index in 0..33 {
+        let message =
+            format!("Subject: batchneedle {index}\r\n\r\nBounded search window {index}.\r\n");
+        let item = postgres_receiving::prepare(
+            binding,
+            &postgres_receiving::Message {
+                bytes: message.as_bytes(),
+                hostname: "localhost",
+                extended: true,
+                header_bytes: 65536,
+                received_at: 1_704_067_200_000 + index,
+                receipt: SmtpReceipt {
+                    peer: "192.0.2.1".parse().unwrap(),
+                    tls: ReceiptTls::Tls13,
+                    gateway: None,
+                    ehlo: "sender.example.test",
+                    reverse_path: "sender@example.test",
+                    recipients,
+                },
+            },
+            deadline(),
+        )
+        .unwrap();
+        postgres_receiving::publish(request, trust, deadline(), &item).unwrap();
+        let mut bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        batch_ids.push(
+            td_mta::wire::encode_id(item.email(), &mut bytes)
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let mut after = None;
+    loop {
+        let page = td_mta::postgres_summary_backfill::run_with_options(
+            &fixture.request(),
+            trust,
+            deadline(),
+            binding.epoch(),
+            binding.account(),
+            td_mta::postgres_summary_backfill::Options {
+                after,
+                maximum: 16,
+                structure: false,
+                search: true,
+            },
+        )
+        .unwrap();
+        if page.done {
+            break;
+        }
+        assert_ne!(page.after, after);
+        after = page.after;
+    }
+    sql(fixture, "ALTER SYSTEM SET log_statement='all'");
+    sql(fixture, "SELECT pg_reload_conf()");
+    while sql(fixture, "SHOW log_statement") != "all" {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let log_start = fs::metadata(fixture.root.join("server.log")).unwrap().len() as usize;
+    batch_ids.reverse();
+    let expected: Vec<&str> = batch_ids.iter().map(String::as_str).collect();
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "limit":33, "headers_only":true, "search":"batchneedle"})),
+        0,
+        &expected,
+    );
+    let log = fs::read(fixture.root.join("server.log")).unwrap();
+    let log = std::str::from_utf8(&log[log_start..]).unwrap();
+    let descriptor_queries = log
+        .lines()
+        .filter(|line| {
+            line.contains("execute ")
+                && line.contains("octet_length(fields)")
+                && line.contains("FROM td_mta.blob_search")
+        })
+        .count();
+    assert_eq!(
+        descriptor_queries, 3,
+        "33 candidates should use three descriptor windows"
+    );
+    check(
+        client.ask(json!({"command":"query_emails", "mailbox_id":inbox,
+        "limit":17, "position":16, "headers_only":true, "search":"batchneedle"})),
+        16,
+        &expected[16..],
+    );
+    sql(fixture, "ALTER SYSTEM RESET log_statement");
+    sql(fixture, "SELECT pg_reload_conf()");
+    for id in batch_ids {
+        let deleted = client.ask(json!({"command":"destroy", "id":id}));
+        assert!(deleted["results"][0]["ok"].is_true(), "{deleted}");
+    }
 }
 
 fn exercise_send(

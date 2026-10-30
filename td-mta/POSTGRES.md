@@ -7545,7 +7545,16 @@ Database errors still fail the request. The indexed candidate contract below
 separately defines the trust placed in rows excluded by the index.
 
 Reads use the authenticated snapshot, bounded metadata and at most 132 chunks
-of 64 KiB. Before loading fields the original method meter is charged four
+of 64 KiB. Candidate interpretation prefetches passive Email metadata in
+windows of at most sixteen IDs. Search descriptors (version, body identity,
+encoded length and field digest) are read once per window with explicit
+negative entries for missing evidence, deduplicated by blob. Replacing the
+metadata window drops these descriptors; they never survive the snapshot.
+Passive window validation can inspect candidates beyond an early match, but
+encoded fields and bodies are loaded only for the candidate being matched.
+No mailbox or keyword values are prefetched for search. Descriptor batching
+neither authorizes body reads nor changes verification or work charges.
+Before loading fields the original method meter is charged four
 times the encoded length in I/O units for transfer, copying, hashing and
 decoding, and one plus the 4096-byte batch count in records, even if matching
 later stops early. Decoding additionally charges one record and checks the

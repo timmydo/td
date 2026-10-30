@@ -14,6 +14,9 @@ use std::time::Instant;
 use td_crypto::TrustStore;
 use tokio_postgres::types::Type;
 
+#[path = "postgres_read_search.rs"]
+mod search_reads;
+
 #[path = "postgres_read_values.rs"]
 mod value_reads;
 
@@ -146,6 +149,7 @@ pub struct Snapshot<'a> {
     metadata: Option<Metadata>,
     metadata_window: MetadataWindow,
     summary_window: Option<Vec<tokio_postgres::Row>>,
+    search_window: Option<search_reads::Window>,
     value_window: value_reads::Window,
     _worker_thread: std::marker::PhantomData<std::rc::Rc<()>>,
     _permit: Option<ReadPermit<'a>>,
@@ -353,6 +357,7 @@ impl<'a> Snapshot<'a> {
             metadata: None,
             metadata_window: [None; postgres_body::MAX_METADATA_IDS],
             summary_window: None,
+            search_window: None,
             value_window: value_reads::Window::default(),
             _worker_thread: std::marker::PhantomData,
             _permit: permit,
@@ -603,6 +608,7 @@ impl Snapshot<'_> {
         let window = self.retain(result)?;
         self.metadata_window = window;
         self.summary_window = None;
+        self.search_window = None;
         self.value_window = value_reads::Window::default();
         self.metadata = None;
         Ok(())
@@ -679,26 +685,16 @@ impl Snapshot<'_> {
         }
         let account = self.identity.account;
         let blob = metadata.blob;
-        let result = self.worker.run(|client| Box::pin(async move {
-            client.query_typed_opt("SELECT body_length,body_digest,octet_length(fields),fields_digest FROM td_mta.blob_search WHERE account=$1 AND blob_id=$2 AND version=$3", &[(&account.as_bytes().as_slice(),Type::BYTEA),(&blob.as_bytes().as_slice(),Type::BYTEA),(&postgres_search::VERSION,Type::INT4)]).await.map_err(|_| Error::Database)
-        })).map_err(Error::Connection).and_then(|row| row);
-        let Some(row) = self.retain(result)? else {
+        let Some(descriptor) = self.search_descriptor(blob)? else {
             return Ok(None);
         };
-        let length: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
-        let body_digest: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
-        let size: i32 = row.try_get(2).map_err(|_| Error::Integrity)?;
-        let expected: &[u8] = row.try_get(3).map_err(|_| Error::Integrity)?;
-        let Ok(size) = usize::try_from(size) else {
-            return Ok(None);
-        };
-        if u64::try_from(length).ok() != Some(metadata.body.length)
-            || body_digest != metadata.body.digest
-            || size > postgres_search::MAX_BYTES
-            || expected.len() != 32
+        if descriptor.length != metadata.body.length
+            || descriptor.body_digest != metadata.body.digest
         {
             return Ok(None);
         }
+        let size = descriptor.size;
+        let expected = descriptor.expected;
         let count = size.div_ceil(65536) as i32;
         // Charge all retained bytes before transfer/hash/decode, even when
         // matching later succeeds in the first field or batch.
@@ -746,7 +742,7 @@ impl Snapshot<'_> {
             )
             .as_ref()
             .map(|hash| hash.as_slice())
-                != Some(expected)
+                != Some(expected.as_slice())
         {
             self.check()?;
             return Ok(None);

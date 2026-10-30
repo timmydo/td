@@ -3410,7 +3410,8 @@ per_peer_limit = 1
         assert!(!output.contains("relay-user"));
         output
     };
-    assert!(invoke("config-check", &shared_file, 1).contains("configuration-missing"));
+    let missing = invoke("config-check", &shared_file, 1);
+    assert!(missing.contains("configuration-missing"), "{missing}");
     let imported = invoke("config-import", &shared_file, 0);
     assert!(
         imported.contains("\"profiles\":2,\"content_validated\":true,\"profile_activated\":false")
