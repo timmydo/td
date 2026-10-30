@@ -51,6 +51,9 @@ mod replication_inventory;
 #[path = "postgres_probe/unix_database.rs"]
 mod unix_database;
 
+#[path = "postgres_probe/search_prepare.rs"]
+mod search_prepare;
+
 const PASSWORD: &[u8] = b"disposable-postgres-fixture-password";
 
 /// The directory of PATH's `initdb`, which must also hold `postgres`,
@@ -2693,6 +2696,7 @@ fn real_postgres_deletion_releases_last_owner_bodies_and_retains_outcomes() {
 fn real_postgres_td_mail_reads_and_downloads() {
     exercise_configuration(ConfigurationExercise::Query);
     exercise_configuration(ConfigurationExercise::Client);
+    search_prepare::exercise();
 }
 
 #[test]

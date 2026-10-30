@@ -9,6 +9,7 @@ use crate::{
 };
 use std::time::Instant;
 use td_crypto::{BulkSha256, Digest};
+use tokio_postgres::{types::Type, Client};
 
 pub(crate) const VERSION: i32 = SearchFields::VERSION as i32;
 pub(crate) const MAX_BYTES: usize = SearchFields::MAX_ENCODED;
@@ -16,6 +17,31 @@ pub(crate) struct Prepared {
     pub(crate) fields: Vec<u8>,
     pub(crate) candidate_text: String,
     pub(crate) digest: [u8; 32],
+}
+
+pub(crate) async fn store(
+    client: &Client,
+    metadata: crate::postgres_body::BlobMetadata,
+    value: Option<Prepared>,
+) -> Result<bool, tokio_postgres::Error> {
+    let account = metadata.identity.account;
+    let blob = metadata.blob;
+    if let Some(value) = value {
+        client.execute_typed("INSERT INTO td_mta.blob_search(account,blob_id,version,body_length,body_digest,fields,fields_digest,candidate_text) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(account,blob_id) DO UPDATE SET version=EXCLUDED.version,body_length=EXCLUDED.body_length,body_digest=EXCLUDED.body_digest,fields=EXCLUDED.fields,fields_digest=EXCLUDED.fields_digest,candidate_text=EXCLUDED.candidate_text", &[(&account.as_bytes().as_slice(), Type::BYTEA), (&blob.as_bytes().as_slice(), Type::BYTEA), (&VERSION, Type::INT4), (&(metadata.body.length as i64), Type::INT8), (&metadata.body.digest.as_slice(), Type::BYTEA), (&value.fields, Type::BYTEA), (&value.digest.as_slice(), Type::BYTEA), (&value.candidate_text, Type::TEXT)]).await?;
+        Ok(true)
+    } else {
+        // A refused rebuild must not retain earlier, incompatible evidence.
+        client
+            .execute_typed(
+                "DELETE FROM td_mta.blob_search WHERE account=$1 AND blob_id=$2",
+                &[
+                    (&account.as_bytes().as_slice(), Type::BYTEA),
+                    (&blob.as_bytes().as_slice(), Type::BYTEA),
+                ],
+            )
+            .await?;
+        Ok(false)
+    }
 }
 
 pub(crate) fn compatible(limits: &Limits) -> bool {

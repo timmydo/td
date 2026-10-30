@@ -7589,7 +7589,7 @@ collector, with one additional allocation bounded by the encoded length. A refus
 search evidence and increments `searches_skipped`; successful writes increment
 `searches_written`. A timeout or transaction failure yields no usable cursor.
 
-This increment requires explicit owner backfill. Publication does not yet
+Search preparation requires an explicit owner command. Publication does not yet
 prepare search rows, and there is no scheduled rebuild. New or oversized
 messages retain the existing search behavior. This cache avoids repeated MIME
 interpretation and whole-body reads for qualified rows. Schema 40 additionally
@@ -7597,6 +7597,43 @@ narrows candidates through the index below; unindexed or incompatible rows
 retain bounded fallback and may still exhaust the original method allowance.
 Schema-34 binaries cannot serve schema 35; upgrade with fencing and a
 consistent pre-upgrade backup.
+
+### Missing-search preparation pages
+
+`postgres search-prepare-page --connection-file FILE --epoch HEX`
+prepares missing search evidence across accounts. `--limit N` selects one
+through sixteen bodies (default sixteen). Optional `--after ACCOUNT:BLOB`
+requires `--through ACCOUNT:BLOB`, with after no greater than through.
+Keys are pairs of canonical hexadecimal IDs ordered by account, then blob.
+The first page without through captures the greatest current blob key,
+including unreferenced blobs. Continuations retain that upper bound; arrivals
+behind the cursor or above the bound await a fresh cycle. Pages are separate
+repeatable-read snapshots, not a source-completeness certificate.
+
+Only Email-referenced blobs lacking a row with the current parser version,
+matching body length and digest, and non-NULL candidate text are selected.
+Empty candidate text qualifies. This is preparation, not an audit of existing
+fields or candidate text; explicit `summary-backfill --search` remains the
+repair operation. The query may examine a large already-prepared prefix:
+the statement deadline bounds discovery, not a constant row-work allowance.
+
+Each owner-only page verifies at most 64 MiB of bodies and retains at most
+17,301,504 bytes of encoded search fields plus candidate text across writes.
+One body is interpreted at a time. A fully verified body deferred by the
+encoded-output bound counts in `verified_bytes` but does not advance `after`.
+The page uses the existing bounded search-backfill connection and interpretation
+allowances. Its CLI has a shared ten-second connection/operation deadline.
+Permanent interpretation refusals advance as skips and remove incompatible
+evidence; operational failures and corruption abort the page. No such failure
+is reported as a skipped message.
+
+The JSON receipt contains store epoch, search version, scanned/written/skipped
+counts, verified bytes, after/through keys and done. It is emitted only after
+known synchronous COMMIT. A connection failure during COMMIT reports
+`commit-unknown`, without a usable continuation. Callers persist progress only
+after success and bind it to epoch and search version. Done ends this bounded
+cycle; it does not mean that every message has searchable content. This command
+adds no scheduler or durable progress file.
 
 
 ## Replica source mode

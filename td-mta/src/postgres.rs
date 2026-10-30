@@ -26,6 +26,7 @@ mod replica;
 mod replica_source;
 mod scrub;
 mod scrub_state;
+mod search_prepare;
 mod selection;
 mod summary_backfill;
 mod usage;
@@ -103,6 +104,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     }
     if command.as_deref() == Some(OsStr::new("summary-backfill")) {
         return summary_backfill::run(args);
+    }
+    if command.as_deref() == Some(OsStr::new("search-prepare-page")) {
+        return search_prepare::run(args);
     }
     if let Some(command) = command.as_deref().and_then(account_admin::Command::parse) {
         return account_admin::run(command, args);

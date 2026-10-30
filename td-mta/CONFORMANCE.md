@@ -760,6 +760,14 @@ without superuser/role-creation/database-creation privileges. These fixtures
 prove the exercised plans and flows, not universal planner choices or a latency
 guarantee. New messages still require explicit backfill to acquire index rows.
 
+The native read fixture also exercises owner-only missing-search pages across
+accounts: frozen upper bounds, arrivals outside the continuation, unreferenced
+blobs, incompatible versions and identities, NULL versus empty candidate text,
+and compatible evidence that is deliberately not audited. Corruption rolls back
+earlier writes in the page. Two 48 MiB bodies prove the 64 MiB page bound;
+a deferred trigger terminates its own backend at COMMIT to check an unknown
+outcome without timing assertions. Runtime mode and a nonowner login are refused.
+
 
 Partial-search native coverage inserts a malformed multipart message beside a
 known match. Ordinary JMAP search refuses; capability opt-in returns known IDs
