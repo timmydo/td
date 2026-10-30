@@ -70,8 +70,12 @@ pub(super) fn install(device: &str, cut: bool, channel: Option<&Path>) -> Result
     // A low-space refusal leaves the header untouched. Two successful
     // preserving replacements exercise both free-slot choices and leave
     // the original fixture's final 0/1 shape for its independent host parser.
-    for pass in 0..3 {
-        reinstall(device, &uuid, &key, deployment, pass)?;
+    // The boot oracle needs a fresh @var: first boot must create its home.
+    // Its own reinstall legs run only after that initial boot has completed.
+    if channel.is_none() {
+        for pass in 0..3 {
+            reinstall(device, &uuid, &key, deployment, pass, pass == 0)?;
+        }
     }
     if bound_loops()? != loops {
         return Err("the installation left a loop device bound".into());
@@ -109,6 +113,37 @@ pub(super) fn install(device: &str, cut: bool, channel: Option<&Path>) -> Result
     report(std::io::stdout(), format_args!("{ENCRYPTED_END_MARKER}"))
 }
 
+/// Reinstall a disk that the host already booted and populated. The saved
+/// recovery key arrives only in this disposable guest's private initramfs.
+pub(super) fn reinstall_booted(device: &str) -> Result<(), String> {
+    mount_source(device)?;
+    let (deployment, id) = source_deployment()?;
+    mount_system_root()?;
+    bind_root_store()?;
+    record_deployment(&id)?;
+    let key = super::encrypted_boot::recovery_key()?;
+    let uuid = configured_uuid()?;
+    let loops = bound_loops()?;
+    let sampler = Sampler::start()?;
+    let result = reinstall(device, &uuid, &key, deployment, 1, true);
+    let samples = sampler.finish()?;
+    result?;
+    let needles = Needles::new(&key);
+    if samples.cmdlines.iter().any(|line| needles.found_in(line))
+        || samples.environments != 0
+        || samples.luks.is_empty()
+    {
+        return Err("reinstall process secret-custody check failed".into());
+    }
+    if bound_loops()? != loops {
+        return Err("reinstall left a loop device bound".into());
+    }
+    drop(key);
+    command("/bin/umount", &["/td/store"])?;
+    applet(&["sync"])?;
+    report(std::io::stdout(), format_args!("{ENCRYPTED_END_MARKER}"))
+}
+
 /// Exercise the production recovery unlock and preserving writer, keeping a
 /// file under @var and the original slot-zero encrypted area byte for byte.
 fn reinstall(
@@ -117,8 +152,8 @@ fn reinstall(
     key: &RecoveryDigits,
     deployment: [u8; 32],
     pass: u8,
+    seed: bool,
 ) -> Result<(), String> {
-    let seed = pass == 0;
     let low_space = pass == 0;
     applet(&["reread-partitions", device])?;
     let (_, volume) = partitions(device)?;

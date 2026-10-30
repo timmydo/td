@@ -47,7 +47,7 @@ const ORPHANED_TOKEN: &str = "0";
 
 /// The recovery key the host placed in this leg's initramfs, removed from
 /// the root once read.
-fn recovery_key() -> Result<RecoveryDigits, String> {
+pub(super) fn recovery_key() -> Result<RecoveryDigits, String> {
     let path = Path::new("/").join(ORACLE_RECOVERY_KEY);
     let mut bytes = read(&path, RECOVERY_DIGITS as u64)?;
     let key = RecoveryDigits::new(&bytes);

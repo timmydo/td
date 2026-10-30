@@ -199,6 +199,9 @@ enum Leg {
     /// The second boot releases the device-bound protector with no
     /// interaction and reads the file back.
     SecondBoot,
+    /// Reinstall the booted disk with the same TPM or a replacement TPM,
+    /// then prove first-boot conversion and unattended device-bound release.
+    Reinstall { fresh_tpm: bool },
     /// A copy of the installed disk, power cut when the selector reports
     /// the commit, then booted to completion.
     Interrupted(Commit),
@@ -221,6 +224,8 @@ const LEGS: &[Leg] = &[
     Leg::Install,
     Leg::FirstBoot,
     Leg::SecondBoot,
+    Leg::Reinstall { fresh_tpm: false },
+    Leg::Reinstall { fresh_tpm: true },
     Leg::Interrupted(Commit::Keyslot),
     Leg::Interrupted(Commit::Token),
     Leg::Interrupted(Commit::Test),
@@ -972,6 +977,9 @@ struct Machine<'a> {
     /// The whole raw consoles of every boot, the installation's first,
     /// for the inspection leg's search.
     consoles: Vec<u8>,
+    /// Captured once from the first installed boot, before later reports.
+    home_inode: Option<String>,
+    host_key: Option<String>,
 }
 
 impl Machine<'_> {
@@ -1109,6 +1117,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> 
             (Leg::SecondBoot, Some(machine), Some((disk, _))) => {
                 second_boot(runner, machine, disk, "second-boot")?
             }
+            (Leg::Reinstall { fresh_tpm }, Some(machine), Some((disk, _))) => {
+                reinstall(runner, machine, disk, fresh_tpm)?
+            }
             (Leg::Interrupted(commit), Some(machine), Some((_, pristine))) => {
                 interrupted(runner, machine, pristine, commit)?
             }
@@ -1233,6 +1244,8 @@ fn wizard(runner: &RecipeCheckRunner, bench: &Bench, tpm: &Path) -> Result<Strin
         uuid,
         key,
         consoles: raw,
+        home_inode: None,
+        host_key: None,
     };
     let first = first_boot(runner, &mut machine, &disk, "wizard-first-boot")?;
     let second = second_boot(runner, &mut machine, &disk, "wizard-second-boot")?;
@@ -1325,6 +1338,14 @@ fn install_leg<'a>(
         "   [{LABEL}] installation elapsed: {:.2}s; volume {uuid}",
         result.elapsed.as_secs_f64()
     );
+    // A harmless old boot-chain fixture: the next two boots seal and
+    // release against these changed bytes. Reinstall must replace both.
+    change_esp_file(
+        &disk.path,
+        &["EFI", "BOOT", "BOOTX64.EFI"],
+        change_pe_timestamp,
+    )?;
+    change_esp_file(&disk.path, &["EFI", "BOOT", "INITRD"], change_cpio_mtime)?;
     Ok((
         disk,
         Machine {
@@ -1334,6 +1355,8 @@ fn install_leg<'a>(
             uuid,
             key,
             consoles: raw,
+            home_inode: None,
+            host_key: None,
         },
     ))
 }
@@ -1393,7 +1416,8 @@ fn first_boot(
         "first boot",
     )?;
     install::validate_installed_as(&result, &volume_device(disk), &machine.installed(), true)?;
-    install::reported_home_inode(&result.console, &nonce)?;
+    machine.home_inode = Some(install::reported_home_inode(&result.console, &nonce)?);
+    machine.host_key = result.evidence.host_key.clone();
     let state = encrypted::image_header(&disk.path, &machine.uuid)?;
     if state != converged() {
         return Err(format!(
@@ -1415,7 +1439,10 @@ fn second_boot(
     leg: &str,
 ) -> Result<String, String> {
     let nonce = nonce(&machine.uuid);
-    let kept = install::reported_home_inode(&String::from_utf8_lossy(&machine.consoles), &nonce)?;
+    let kept = machine
+        .home_inode
+        .clone()
+        .ok_or("first boot recorded no home inode")?;
     let installed = machine.installed();
     let steps = install::session_steps(&installed, &nonce, Some(&kept))?;
     let (result, result_raw) = machine.boot_installed(
@@ -1453,6 +1480,168 @@ fn second_boot(
         "device-bound protector released with no interaction, the home's file read back; \
          {data} ciphertext bytes hold no plaintext marker or the file's nonce"
     ))
+}
+
+/// Read one boot file through the host's independent FAT reader.
+fn esp_file(path: &Path, name: &str) -> Result<Vec<u8>, String> {
+    let image = File::open(path).map_err(|error| format!("open ESP image: {error}"))?;
+    let (offset, size) = fat_file(
+        &image,
+        td_boot_protocol::PARTITION_ALIGN_BYTES,
+        &["EFI", "BOOT", name],
+    )?;
+    encrypted::read_at(&image, offset, size)
+}
+
+fn reinstall(
+    runner: &RecipeCheckRunner,
+    machine: &mut Machine<'_>,
+    installed: &TargetDisk,
+    fresh_tpm: bool,
+) -> Result<String, String> {
+    let leg = if fresh_tpm {
+        "reinstall-fresh-tpm"
+    } else {
+        "reinstall-same-tpm"
+    };
+    let disk = installed.copy_to(&machine.bench.scratch.dir, &format!("{leg}.img"))?;
+    if encrypted::image_header(&disk.path, &machine.uuid)? != converged() {
+        return Err("reinstall fixture is not a booted device-bound disk".into());
+    }
+    let old_kernel = esp_file(&disk.path, "BOOTX64.EFI")?;
+    let old_selector = esp_file(&disk.path, "INITRD")?;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let fresh = if fresh_tpm {
+        Some(Scratch {
+            dir: create_qmp_scratch_dir(&env::temp_dir(), &SEQ)?,
+        })
+    } else {
+        None
+    };
+    let state = fresh
+        .as_ref()
+        .map_or(machine.state.dir.as_path(), |fresh| fresh.dir.as_path());
+    let state = state.to_path_buf();
+    let iso = machine.bench.medium(
+        "encrypted-reinstall",
+        vec![
+            (
+                protocol::ORACLE_RECOVERY_KEY.into(),
+                0o400,
+                machine.key.digits().to_vec(),
+            ),
+            (
+                "etc/td/volume-uuid".into(),
+                0o400,
+                format!("{}\n", machine.uuid).into_bytes(),
+            ),
+        ],
+    )?;
+    let vars = machine.bench.vars(leg)?;
+    let console = console_path(machine.bench, leg);
+    let emulator = machine.emulator(&state, leg)?;
+    let booted = machine.bench.host().boot_with(
+        &iso,
+        &vars,
+        &disk,
+        protocol::ENCRYPTED_END_MARKER,
+        Some(emulator.socket.as_path()),
+        None,
+        Some(&console),
+        Devices::ALL,
+    );
+    // The disposable medium holds the key and goes even on a guest failure.
+    encrypted::remove(&iso)?;
+    let raw = take_console(&console);
+    let result = booted.map_err(|error| encrypted::redacted(&emulator.diagnostic(&error)))?;
+    let raw = raw?;
+    emulator.finish()?;
+    encrypted::remove(&vars)?;
+    machine.keep(runner, leg, &result, &raw)?;
+    let marker = format!("TD-ENCRYPTED-REINSTALL-OK {}", machine.uuid);
+    if !result.evidence.target
+        || result
+            .console
+            .lines()
+            .filter(|line| line.trim_end() == marker)
+            .count()
+            != 1
+    {
+        return Err(format!(
+            "{leg}: the guest did not complete preserving reinstall"
+        ));
+    }
+    let expected = HeaderState {
+        keyslots: vec![0, 1],
+        tokens: vec![td_token(0, "first-boot", &[1])],
+    };
+    let after = encrypted::image_header(&disk.path, &machine.uuid)?;
+    if after != expected {
+        return Err(format!(
+            "{leg}: old protectors survived: {}",
+            after.describe()
+        ));
+    }
+    let kernel = esp_file(&disk.path, "BOOTX64.EFI")?;
+    let selector = esp_file(&disk.path, "INITRD")?;
+    if kernel == old_kernel
+        || selector == old_selector
+        || kernel != install::read(&machine.bench.kernel)?
+    {
+        return Err(format!("{leg}: the kernel and selector were not replaced"));
+    }
+    let nonce = nonce(&machine.uuid);
+    let kept = machine
+        .home_inode
+        .clone()
+        .ok_or("first boot recorded no home inode")?;
+    for first in [true, false] {
+        let name = format!("{leg}-{}", if first { "first" } else { "second" });
+        let steps = install::session_steps(&machine.installed(), &nonce, Some(&kept))?;
+        let (result, raw) = machine.boot_installed(
+            &disk,
+            &state,
+            &name,
+            SYSTEM_BOOT_SUCCESS_MARKER,
+            true,
+            Some(&steps),
+            Extra::default(),
+        )?;
+        machine.keep(runner, &name, &result, &raw)?;
+        let expected = if first {
+            let mut lines = vec![FIRST_BOOT_RELEASED, CAP_CLOSED];
+            lines.extend_from_slice(FIRST_BOOT_STEPS);
+            lines
+        } else {
+            vec![
+                DEVICE_BOUND_RELEASED,
+                CAP_CLOSED,
+                "td-boot: transition step 1/1: keyslot 2 tested",
+            ]
+        };
+        require_release(
+            &result,
+            &machine.uuid,
+            &expected,
+            2,
+            &[(1, "device-bound")],
+            &name,
+        )?;
+        install::validate_installed_as(
+            &result,
+            &volume_device(&disk),
+            &machine.installed(),
+            false,
+        )?;
+        if machine.host_key.is_none() || result.evidence.host_key != machine.host_key {
+            return Err(format!("{name}: reinstall changed the SSH host identity"));
+        }
+        if encrypted::image_header(&disk.path, &machine.uuid)? != converged() {
+            return Err(format!("{name}: first-boot protector was not retired"));
+        }
+    }
+    let searched = retire_copy(runner, machine, &disk, leg)?;
+    Ok(format!("saved key authorized reinstall; both boot files replaced; home inode and canary retained; first-boot conversion and second cold boot unattended; {searched}"))
 }
 
 fn interrupted(
@@ -2075,7 +2264,11 @@ mod tests {
                 1
             );
         }
-        assert_eq!(LEGS.len(), 15);
+        assert_eq!(LEGS.len(), 17);
+        for fresh_tpm in [false, true] {
+            assert!(at(Leg::SecondBoot) < at(Leg::Reinstall { fresh_tpm }));
+            assert!(at(Leg::Reinstall { fresh_tpm }) < at(Leg::Inspect));
+        }
         // The changed initramfs answers recovery on the VT, every other
         // changed chain on the serial line.
         for change in [Change::SelectorImage, Change::LoadOption, Change::FreshTpm] {

@@ -497,6 +497,25 @@ its hash-verified replacement deployment. Do not add signing to the new
 code to create that fixture. Secret-leak checks cover logs, argv,
 environment, staging, ESP and persistent files; test-only oracle secret
 channels follow the existing encrypted-install oracle's custody rules.
+The boot oracle's reinstall legs start from an installed system that has
+already completed two boots. Harmless PE timestamp and cpio mtime changes
+make its old measured kernel and selector differ from the live payload;
+the initial boots seal and release against those old bytes. On separate
+disk copies, the original TPM and a fresh TPM each authorize preserving
+reinstall with the saved recovery key. The guest retains its personal
+file and recovery-slot ciphertext; the host requires both boot files to
+change, exactly one first-boot protector, and no old device-bound token.
+Two unattended installed boots then require first-boot conversion followed
+by device-bound release, the original home inode and canary, and removal
+of the first-boot token. The ordinary secret scan covers each resulting
+disk, its decrypted volume and the accumulated consoles.
+
+These legs use the production selector with harmless byte changes, not a
+legacy signature-enforcing selector. They do not establish signed-selector
+migration, saved login/network enrollment, all reinstall interruption
+boundaries, graphical recovery entry or hardware acceptance. Those remain
+separate acceptance obligations above.
+
 Camera fixtures alone do not establish T14s compatibility: acceptance
 also requires scanning the saved code from a phone or paper using the
 laptop webcam, plus a successful typed-key reinstall on that hardware.

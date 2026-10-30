@@ -2011,6 +2011,7 @@ fn run() -> Result<(), String> {
             encrypted::install(&target()?, false, Some(&encrypted_boot::key_channel()?))
         }
         b"encrypted-inspect\n" => encrypted_boot::inspect(&target()?),
+        b"encrypted-reinstall\n" => encrypted::reinstall_booted(&target()?),
         b"encrypted-headers\n" => encrypted_boot::build_headers(&target()?),
         b"install-no-tpm\n" => encrypted::review_without_tpm(&target()?),
         b"install-no-console\n" => encrypted::install_without_console(&target()?),
