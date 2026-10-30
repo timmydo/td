@@ -7589,8 +7589,8 @@ collector, with one additional allocation bounded by the encoded length. A refus
 search evidence and increments `searches_skipped`; successful writes increment
 `searches_written`. A timeout or transaction failure yields no usable cursor.
 
-Search preparation requires an explicit owner command. Publication does not yet
-prepare search rows, and there is no scheduled rebuild. New or oversized
+Search preparation runs through owner commands, optionally scheduled as below.
+Publication does not yet prepare search rows. New or oversized
 messages retain the existing search behavior. This cache avoids repeated MIME
 interpretation and whole-body reads for qualified rows. Schema 40 additionally
 narrows candidates through the index below; unindexed or incompatible rows
@@ -7632,8 +7632,37 @@ counts, verified bytes, after/through keys and done. It is emitted only after
 known synchronous COMMIT. A connection failure during COMMIT reports
 `commit-unknown`, without a usable continuation. Callers persist progress only
 after success and bind it to epoch and search version. Done ends this bounded
-cycle; it does not mean that every message has searchable content. This command
-adds no scheduler or durable progress file.
+cycle; it does not mean that every message has searchable content. This page
+command writes no durable progress file.
+
+### Scheduled search preparation
+
+`postgres search-prepare --state-dir PATH --epoch HEX --connection-file FILE`
+runs one sixteen-body missing-search page. A dedicated private directory holds
+an atomically replaced, synced progress file under the existing exclusive
+operational-state lock. State binds the store epoch and search interpretation
+version; mismatches refuse rather than silently reusing a cursor. A cycle
+retains its upper bound, counts and last confirmed cursor. After completion,
+invocations wait five minutes before starting another cycle. Unsupported
+interpretations remain explicit skips and can be retried in later cycles.
+They neither block preparation of other messages nor certify completeness.
+
+Before database work the job persists an in-flight marker. Only a known result
+clears it: a successful page advances progress; a known pre-COMMIT failure
+retains the cursor and records operational failure. Unknown COMMIT, process
+termination or failure to save a result leaves an uncertainty marker. The job
+then refuses automatic replay. `postgres search-prepare-resume` with the same
+state, epoch and connection arguments verifies the database epoch and explicitly
+authorizes replay from the last confirmed cursor. Repeating derived writes is
+safe; this command does not claim the previous transaction rolled back. Status
+remains unhealthy until a successful preparation page clears operational failure.
+
+`postgres search-prepare-status --state-dir PATH --epoch HEX` needs no database
+credentials. It reports counts, timestamps, continuation and in-flight/failure
+flags. Health requires a completed cycle within a day and no unresolved failure
+or uncertainty. Status and workers persist clock observations and refuse clock
+rollback. File loss removes freshness evidence; it is not interpreted as a
+completed cycle. DEPLOYMENT.md describes optional supervisor generation.
 
 
 ## Replica source mode
@@ -7781,8 +7810,8 @@ It is at most 8 MiB plus 65,536 boundary bytes. Owner search backfill writes
 fields, digest and candidate text in the same transaction. Existing rows
 start with NULL candidate text and require another `--search` backfill.
 No partial or refused interpretation produces an indexed row. New arrivals
-continue through fallback until explicit backfill; automatic preparation is
-not yet implemented. This adds stored derived text and GIN storage; it does
+continue through fallback until explicit or scheduled preparation. This adds
+stored derived text and GIN storage; it does
 not change account body quotas or promise a fixed database size.
 
 Search preparation distinguishes an interpretation refusal or a permanent

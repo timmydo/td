@@ -10,6 +10,7 @@ use std::process::ExitCode;
 const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PATH [--prefix PATH]
   [--mail-profile NAME ...]
   [--scrub-connection-file OWNER_PATH --scrub-epoch HEX --scrub-state-dir PATH]
+  [--search-connection-file OWNER_PATH --search-epoch HEX --search-state-dir PATH]
   [--certificate-profile NAME ... --connection-file PATH]
   [--tls-certificate PATH ... --openssl-bin PATH]
   [--backup-service-file PATH --backup-service NAME --backup-destination PATH
@@ -19,7 +20,8 @@ const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PA
    --postgres-bin PATH --openssl-bin PATH [--tool-library-dir PATH]]
 
 Generates independent systemd timers and Shepherd timed services, without starting
-anything. Body scrubbing runs one bounded page per minute, starts a new cycle
+anything. Search preparation runs one bounded page per minute, waits five minutes
+after each cycle, and has a separate freshness check. Body scrubbing runs one bounded page per minute, starts a new cycle
 a day after completion, and has a separate freshness check. Mail, certificate and backup freshness checks run every 15 minutes;
 backups and private PostgreSQL leaf renewal run daily at 03:15 in the supervisor's local timezone. Certificate checks
 require 30 days remaining; backups must be at most two days old. PostgreSQL 17
@@ -37,6 +39,7 @@ struct Options {
     openssl: Option<PathBuf>,
     backup: Option<Backup>,
     scrub: Option<Scrub>,
+    search: Option<Scrub>,
     renewal: Option<Renewal>,
 }
 struct Scrub {
@@ -91,6 +94,9 @@ fn options(args: &[String], home: &str) -> Result<Options> {
             | "--scrub-connection-file"
             | "--scrub-epoch"
             | "--scrub-state-dir"
+            | "--search-connection-file"
+            | "--search-epoch"
+            | "--search-state-dir"
             | "--backup-service-file"
             | "--backup-service"
             | "--backup-destination"
@@ -132,6 +138,36 @@ fn options(args: &[String], home: &str) -> Result<Options> {
             connection: required("--scrub-connection-file")?,
             epoch: (*epoch).into(),
             state: required("--scrub-state-dir")?,
+        })
+    } else {
+        None
+    };
+    let search = if [
+        "--search-connection-file",
+        "--search-epoch",
+        "--search-state-dir",
+    ]
+    .iter()
+    .any(|key| values.contains_key(key))
+    {
+        let epoch = values
+            .get("--search-epoch")
+            .ok_or("missing --search-epoch")?;
+        if epoch.len() != 32
+            || !epoch
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("invalid search epoch".into());
+        }
+        let state = required("--search-state-dir")?;
+        if state == required("--state-dir")? || scrub.as_ref().is_some_and(|v| v.state == state) {
+            return Err("search progress needs a dedicated state directory".into());
+        }
+        Some(Scrub {
+            connection: required("--search-connection-file")?,
+            epoch: (*epoch).into(),
+            state,
         })
     } else {
         None
@@ -263,6 +299,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         && certificates.is_empty()
         && tls.is_empty()
         && scrub.is_none()
+        && search.is_none()
         && backup.is_none()
         && renewal.is_none()
     {
@@ -278,6 +315,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         openssl,
         backup,
         scrub,
+        search,
         renewal,
     })
 }
@@ -431,6 +469,25 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
         }
         add("scrub-status".into(), argv, vec![], Schedule::QuarterHour);
     }
+    if let Some(search) = &opts.search {
+        let mut argv = vec![
+            text(&bin)?.into(),
+            "postgres".into(),
+            "search-prepare".into(),
+            "--state-dir".into(),
+            text(&search.state)?.into(),
+            "--epoch".into(),
+            search.epoch.clone(),
+            "--connection-file".into(),
+            text(&search.connection)?.into(),
+        ];
+        add("search".into(), argv.clone(), vec![], Schedule::Minute);
+        argv.truncate(7);
+        if let Some(command) = argv.get_mut(2) {
+            *command = "search-prepare-status".into();
+        }
+        add("search-status".into(), argv, vec![], Schedule::QuarterHour);
+    }
     let mut names = BTreeSet::new();
     if jobs.iter().any(|j| !names.insert(&j.name)) {
         return Err("colliding operation names".into());
@@ -524,6 +581,9 @@ fn install(opts: &Options) -> Result<()> {
     }
     if let Some(scrub) = &opts.scrub {
         directory(&scrub.state, 0o700)?;
+    }
+    if let Some(search) = &opts.search {
+        directory(&search.state, 0o700)?;
     }
     directory(&opts.state, 0o700)?;
     directory(&opts.state.join(".operations"), 0o700)?;
@@ -821,6 +881,50 @@ mod tests {
         assert!(install(&opts).is_err());
         assert_eq!(fs::read_to_string(unit).unwrap(), "operator edit");
         assert!(!services.join("td-mta-maint-mail-frontend.timer").exists());
+    }
+    #[test]
+    fn search_has_separate_worker_and_credential_free_status() {
+        let base = args(&[
+            "--state-dir",
+            "/state",
+            "--search-connection-file",
+            "/private/owner",
+            "--search-state-dir",
+            "/private/search",
+            "--search-epoch",
+            "01010101010101010101010101010101",
+        ]);
+        let opts = options(&base, "/home/a").unwrap();
+        let jobs = jobs(&opts).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs[0].argv.iter().any(|v| v == "search-prepare"));
+        assert!(jobs[1].argv.iter().any(|v| v == "search-prepare-status"));
+        assert!(!jobs[1].argv.iter().any(|v| v == "--connection-file"));
+        let worker = files(&jobs[0], &opts.state).unwrap();
+        assert!(worker[1].1.contains("OnUnitActiveSec=1min"));
+        assert!(worker[2].1.contains("#:minutes '(0 1 2 3"));
+        assert!(files(&jobs[1], &opts.state).unwrap()[1]
+            .1
+            .contains("OnUnitActiveSec=15min"));
+        for omitted in 1..4 {
+            let input = base
+                .chunks_exact(2)
+                .enumerate()
+                .filter(|(i, _)| *i != omitted)
+                .flat_map(|(_, pair)| pair.iter().cloned())
+                .collect::<Vec<_>>();
+            assert!(options(&input, "/home/a").is_err());
+        }
+        let mut conflict = base.clone();
+        conflict.extend(args(&[
+            "--scrub-connection-file",
+            "/private/owner",
+            "--scrub-state-dir",
+            "/private/search",
+            "--scrub-epoch",
+            "01010101010101010101010101010101",
+        ]));
+        assert!(options(&conflict, "/home/a").is_err());
     }
     #[test]
     fn scrub_has_separate_bounded_worker_and_credential_free_status() {

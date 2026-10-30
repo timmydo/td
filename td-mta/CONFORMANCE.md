@@ -758,7 +758,8 @@ Native schema coverage includes the prior-version upgrade ladder, a whole-DB
 archive restore containing pg_trgm, and initialization by a database owner
 without superuser/role-creation/database-creation privileges. These fixtures
 prove the exercised plans and flows, not universal planner choices or a latency
-guarantee. New messages still require explicit backfill to acquire index rows.
+guarantee. New messages require explicit or scheduled preparation to acquire
+index rows.
 
 The native read fixture also exercises owner-only missing-search pages across
 accounts: frozen upper bounds, arrivals outside the continuation, unreferenced
@@ -767,6 +768,13 @@ and compatible evidence that is deliberately not audited. Corruption rolls back
 earlier writes in the page. Two 48 MiB bodies prove the 64 MiB page bound;
 a deferred trigger terminates its own backend at COMMIT to check an unknown
 outcome without timing assertions. Runtime mode and a nonowner login are refused.
+
+Scheduled preparation is exercised through the real command binary: initial
+unhealthy status, successful preparation, the waiting phase, and a deferred
+trigger causing unknown COMMIT. A subsequent invocation refuses replay until
+the explicit resume command succeeds; status remains unhealthy until a page
+completes. A world-readable state file is refused. Unit cases cover epoch and
+search-version binding, clock rollback and generated systemd/Shepherd schedules.
 
 
 Partial-search native coverage inserts a malformed multipart message beside a

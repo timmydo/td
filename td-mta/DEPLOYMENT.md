@@ -968,5 +968,55 @@ namespace needs operator reconciliation before retrying the migration.
 Use a whole-database backup and restore, including the extension declaration
 and its namespace. Run the normal fenced schema upgrade, then resumable
 `summary-backfill --search` to index existing messages. New messages retain
-bounded fallback until backfilled. See POSTGRES.md's indexed-search contract
+bounded fallback until explicitly or automatically prepared. See POSTGRES.md's indexed-search contract
 for literal matching, negative-evidence trust and resource limits.
+
+## Automatic search preparation
+
+Generate optional systemd timers and Shepherd timed services with the ordinary
+installer, using owner credentials and a dedicated private progress directory:
+
+```text
+./install-td-mta --operations-services \
+  --prefix /home/alice/.local \
+  --state-dir /home/alice/.local/state/td-mta \
+  --search-connection-file /home/alice/.config/td-mta/owner-connection \
+  --search-epoch STORE_EPOCH_HEX \
+  --search-state-dir /home/alice/.local/state/td-mta-search
+```
+
+This generates `td-mta-maint-search` and `td-mta-maint-search-status`
+definitions under the prefix's `share/td-mta/services`; activate them through
+the same supervisor procedure as the other operation services. Generation
+does not start services or reconfigure Guix Home. Keep the Shepherd definitions
+in the user's existing Home source when adopting them there.
+
+The worker prepares at most sixteen missing bodies / 64 MiB per minute,
+continuing a finite cross-account cycle and waiting five minutes between
+completed cycles. It works on a primary or read-only application replica using
+that database's owner connection. It changes derived search evidence, not mail
+content or source synchronization progress. For a large initial corpus, the
+explicit bounded backfill remains the faster operator-driven preparation path.
+
+Status runs every fifteen minutes without credentials. A successful cycle may
+include skipped unsupported messages, which stay visible in the reported counts
+and retain partial-search behavior. Operational failures, uncertainty or no
+completed cycle within a day make status fail. The supervisor records JSON
+output and exit status; mailbox alert routing remains a separate configuration.
+
+If a worker reports `search-commit-unknown`, inspect its journal and the database
+first. Preserve the progress file. To authorize safe replay of derived writes
+from its last confirmed cursor, run:
+
+```text
+/home/alice/.local/bin/td-mta postgres search-prepare-resume \
+  --state-dir /home/alice/.local/state/td-mta-search \
+  --epoch STORE_EPOCH_HEX \
+  --connection-file /home/alice/.config/td-mta/owner-connection
+```
+
+The command verifies the epoch and does not claim the interrupted transaction
+rolled back. The next scheduled page clears failure status only after success.
+An epoch or search-version mismatch requires preserving the old evidence and
+provisioning a fresh dedicated progress directory. No certificates or packages
+are needed beyond the existing PostgreSQL installation and schema-40 extension.

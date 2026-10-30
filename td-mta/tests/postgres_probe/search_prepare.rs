@@ -244,6 +244,7 @@ pub(super) fn exercise() {
         Err(preparation::Error::Owner)
     ));
 
+    scheduled(&fixture, epoch, good);
     large(&fixture, key(5, 10));
     large(&fixture, key(5, 20));
     let bounded = run(Options {
@@ -279,4 +280,98 @@ pub(super) fn exercise() {
         Err(preparation::Error::Indeterminate)
     ));
     sql(&fixture,"DROP TRIGGER end_search_commit ON td_mta.blob_search; DROP FUNCTION public.end_search_commit()");
+}
+
+fn scheduled(fixture: &Fixture, epoch: td_mta::ids::StoreEpoch, good: &[u8]) {
+    let ca = fixture.root.join("search-ca.pem");
+    fs::write(&ca, &fixture.ca).unwrap();
+    let connection = fixture.root.join("search-owner");
+    fs::write(
+        &connection,
+        format!(
+            "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+            std::str::from_utf8(PASSWORD).unwrap(),
+            fixture.port,
+            ca.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&connection, fs::Permissions::from_mode(0o600)).unwrap();
+    let state = fixture.root.join("search-state");
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let invoke = |command: &str, expected| {
+        let epoch = epoch.to_string();
+        let mut args = vec![
+            "postgres",
+            command,
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--epoch",
+            &epoch,
+        ];
+        if command != "search-prepare-status" {
+            args.extend(["--connection-file", connection.to_str().unwrap()]);
+        }
+        let output = command_output(&args, fixture.root.path(), expected);
+        td_json::parse(&output).unwrap()
+    };
+    invoke("search-prepare-status", 1);
+    seed(fixture, key(4, 20), good, true);
+    let prepared = invoke("search-prepare", 0);
+    assert_eq!(
+        prepared.get("phase").and_then(td_json::Json::as_str),
+        Some("complete")
+    );
+    assert_eq!(
+        prepared
+            .get("progress")
+            .and_then(|p| p.get("written"))
+            .and_then(td_json::Json::as_u64),
+        Some(1)
+    );
+    invoke("search-prepare-status", 0);
+    assert_eq!(
+        invoke("search-prepare", 0)
+            .get("phase")
+            .and_then(td_json::Json::as_str),
+        Some("waiting")
+    );
+    invoke("search-prepare-resume", 1);
+    fs::remove_file(state.join("state.json")).unwrap();
+    seed(fixture, key(4, 30), good, true);
+    sql(fixture,"CREATE FUNCTION public.end_search_job_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_terminate_backend(pg_catalog.pg_backend_pid()); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER end_search_job_commit AFTER INSERT OR UPDATE ON td_mta.blob_search DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.end_search_job_commit()");
+    assert_eq!(
+        invoke("search-prepare", 1)
+            .get("error")
+            .and_then(td_json::Json::as_str),
+        Some("commit-unknown")
+    );
+    assert_eq!(
+        invoke("search-prepare-status", 1)
+            .get("progress")
+            .and_then(|p| p.get("in_flight"))
+            .and_then(td_json::Json::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        invoke("search-prepare", 1)
+            .get("error")
+            .and_then(td_json::Json::as_str),
+        Some("search-commit-unknown")
+    );
+    sql(fixture,"DROP TRIGGER end_search_job_commit ON td_mta.blob_search; DROP FUNCTION public.end_search_job_commit()");
+    invoke("search-prepare-resume", 0);
+    invoke("search-prepare-status", 1);
+    let resumed = invoke("search-prepare", 0);
+    assert_eq!(
+        resumed
+            .get("progress")
+            .and_then(|p| p.get("written"))
+            .and_then(td_json::Json::as_u64),
+        Some(1)
+    );
+    invoke("search-prepare-status", 0);
+    fs::set_permissions(state.join("state.json"), fs::Permissions::from_mode(0o644)).unwrap();
+    invoke("search-prepare-status", 1);
 }
