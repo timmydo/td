@@ -241,16 +241,23 @@ impl Fixture {
                 .spawn()
                 .unwrap(),
         );
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Crash recovery and filesystem synchronization are fixture setup,
+        // not a serving-latency assertion; allow the same slack as initdb.
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            assert!(self.server.as_mut().unwrap().try_wait().unwrap().is_none());
-            if fs::read_to_string(&log_path)
-                .unwrap()
-                .contains("database system is ready to accept connections")
-            {
+            let status = self.server.as_mut().unwrap().try_wait().unwrap();
+            let diagnostic = fs::read_to_string(&log_path).unwrap();
+            assert!(
+                status.is_none(),
+                "PostgreSQL exited: {status:?}\n{diagnostic}"
+            );
+            if diagnostic.contains("database system is ready to accept connections") {
                 break;
             }
-            assert!(Instant::now() < deadline, "PostgreSQL startup timed out");
+            assert!(
+                Instant::now() < deadline,
+                "PostgreSQL startup timed out\n{diagnostic}"
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -530,7 +537,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        34
+        40
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -2065,6 +2072,88 @@ fn real_postgres_search_extension_installs_as_unprivileged_database_owner() {
         td_mta::postgres_schema::inspect(&owner, &trust, deadline()).unwrap(),
         receipt
     );
+    // Even a superuser using a different identity is not the explicit owner.
+    assert_eq!(
+        td_mta::postgres_schema::upgrade(&fixture.request(), &trust, deadline()),
+        Err(td_mta::postgres_schema::Error::Owner)
+    );
+    sql(&fixture, "DROP INDEX td_mta.blob_search_candidates; ALTER TABLE td_mta.blob_search DROP COLUMN candidate_text; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DELETE FROM td_mta.schema_migrations WHERE version=40; ALTER DATABASE postgres OWNER TO td_probe; REVOKE TEMP ON DATABASE postgres FROM PUBLIC; GRANT CREATE ON DATABASE postgres TO search_owner");
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT has_database_privilege('search_owner','postgres','TEMP')"
+        ),
+        "f"
+    );
+    assert_eq!(
+        td_mta::postgres_schema::upgrade(&owner, &trust, deadline()).unwrap(),
+        receipt
+    );
+}
+
+#[test]
+#[ignore = "real PostgreSQL 17 with pg_trgm 1.6 required"]
+fn real_postgres_schema_upgrade_preserves_explicit_service_grants() {
+    use td_mta::postgres_schema::{self, Error};
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let receipt = postgres_schema::initialize(&fixture.request(), &trust, deadline()).unwrap();
+    sql(&fixture, "CREATE ROLE service_reader; GRANT USAGE ON SCHEMA td_mta TO service_reader; GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO service_reader; GRANT UPDATE (store_epoch) ON td_mta.schema_migrations TO service_reader; REVOKE TEMP ON DATABASE postgres FROM PUBLIC");
+    let grants = sql_bounded(&fixture, "SELECT c.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname='td_mta' ORDER BY 1,2,3,4,5", 65536);
+    let rewind = "DROP INDEX td_mta.blob_search_candidates; ALTER TABLE td_mta.blob_search DROP COLUMN candidate_text; DROP EXTENSION pg_trgm; DROP SCHEMA td_mta_trgm; DELETE FROM td_mta.schema_migrations WHERE version=40";
+    sql(&fixture, rewind);
+    sql(&fixture, "GRANT USAGE ON SCHEMA td_mta TO PUBLIC");
+    assert_eq!(
+        postgres_schema::upgrade(&fixture.request(), &trust, deadline()),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT max(version) FROM td_mta.schema_migrations"
+        ),
+        "39"
+    );
+    sql(&fixture, "REVOKE USAGE ON SCHEMA td_mta FROM PUBLIC; ALTER DEFAULT PRIVILEGES GRANT USAGE ON SCHEMAS TO service_reader");
+    assert_eq!(
+        postgres_schema::upgrade(&fixture.request(), &trust, deadline()),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT max(version) FROM td_mta.schema_migrations"
+        ),
+        "39"
+    );
+    sql(
+        &fixture,
+        "ALTER DEFAULT PRIVILEGES REVOKE USAGE ON SCHEMAS FROM service_reader",
+    );
+    sql(&fixture, "DO $$ DECLARE i integer; columns text; names text; BEGIN SELECT string_agg('c'||n||' integer',','),string_agg('c'||n,',') INTO columns,names FROM generate_series(1,1400) n; FOR i IN 1..3 LOOP EXECUTE 'CREATE TABLE td_mta.acl_overflow_'||i||' ('||columns||')'; EXECUTE 'GRANT SELECT ('||names||') ON td_mta.acl_overflow_'||i||' TO service_reader'; END LOOP; END $$");
+    assert_eq!(
+        postgres_schema::upgrade(&fixture.request(), &trust, deadline()),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT max(version) FROM td_mta.schema_migrations"
+        ),
+        "39"
+    );
+    // Keep 3,900 column grants to exercise both inventories near their bound.
+    sql(&fixture, "DO $$ DECLARE i integer; names text; BEGIN SELECT string_agg('c'||n,',') INTO names FROM generate_series(1301,1400) n; FOR i IN 1..3 LOOP EXECUTE 'REVOKE SELECT ('||names||') ON td_mta.acl_overflow_'||i||' FROM service_reader'; END LOOP; END $$");
+    assert_eq!(
+        postgres_schema::upgrade(&fixture.request(), &trust, deadline()).unwrap(),
+        receipt
+    );
+    sql(
+        &fixture,
+        "DROP TABLE td_mta.acl_overflow_1,td_mta.acl_overflow_2,td_mta.acl_overflow_3",
+    );
+    assert_eq!(sql_bounded(&fixture, "SELECT c.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname='td_mta' ORDER BY 1,2,3,4,5", 65536), grants);
+    assert_eq!(sql(&fixture, "SELECT has_column_privilege('service_reader','td_mta.schema_migrations','store_epoch','UPDATE'),has_table_privilege('service_reader','td_mta.blob_search','SELECT'),has_schema_privilege('service_reader','td_mta','USAGE')"), "t|t|t");
 }
 
 #[test]
@@ -2665,6 +2754,7 @@ mod serving_relay;
 fn real_postgres_executable_receives_and_serves_database_profiles() {
     unix_database::exercise();
     real_postgres_search_extension_installs_as_unprivileged_database_owner();
+    real_postgres_schema_upgrade_preserves_explicit_service_grants();
     search_index::scoped_candidates_do_not_materialize_the_account();
     blob_scrub::real_postgres_blob_scrub_pages_keep_corruption_visible_and_advance();
     application_logs::real_postgres_logs_bound_retention_rate_wrap_and_inspection();

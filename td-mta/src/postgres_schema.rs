@@ -56,18 +56,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("postgres_search_index.sql"),
 ];
 const VERSION: u32 = 40;
-const PRIVATE_ACL: &str = "SELECT NOT EXISTS (
-    SELECT 1 FROM pg_catalog.pg_namespace n,
-    LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl,
-        pg_catalog.acldefault('n', n.nspowner))) a
-    WHERE n.nspname = 'td_mta' AND a.grantee <> n.nspowner
-) AND NOT EXISTS (
-    SELECT 1 FROM pg_catalog.pg_class c
-    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace,
-    LATERAL pg_catalog.aclexplode(COALESCE(c.relacl,
-        pg_catalog.acldefault('r', c.relowner))) a
-    WHERE n.nspname = 'td_mta' AND a.grantee <> c.relowner
-)";
+#[path = "postgres_schema_acl.rs"]
+mod acl;
 // Shared by every future serving connection and explicit schema operation.
 pub const MIGRATION_KEY: i64 = 0x7464_6d74_6100_0001;
 
@@ -75,6 +65,7 @@ pub const MIGRATION_KEY: i64 = 0x7464_6d74_6100_0001;
 pub enum Error {
     Connection(postgres_probe::Error),
     Version,
+    Owner,
     Busy,
     Exists,
     Invalid,
@@ -125,6 +116,9 @@ fn write_schema(
     deadline: Instant,
     fresh_epoch: Option<StoreEpoch>,
 ) -> Result<Receipt, Error> {
+    if request.mode != postgres_probe::Mode::Preparation {
+        return Err(Error::Owner);
+    }
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_schema_client(request, trust, deadline, move |client| {
@@ -146,21 +140,27 @@ fn write_schema(
             if !locked {
                 return Err(Error::Busy);
             }
-            let (start, epoch) = if let Some(epoch) = fresh_epoch {
+            let (start, epoch, grants) = if let Some(epoch) = fresh_epoch {
                 let exists: bool = client.query_one("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = 'td_mta')", &[])
                     .await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Invalid)?;
                 if exists {
                     return Err(Error::Exists);
                 }
-                (0, epoch)
+                (0, epoch, Vec::new())
             } else {
                 let receipt = ledger(client, false).await?;
+                acl::owner(client).await?;
                 if receipt.version == VERSION {
+                    client
+                        .batch_execute("ROLLBACK")
+                        .await
+                        .map_err(|_| Error::Database)?;
                     return Ok(receipt);
                 }
                 (
                     usize::try_from(receipt.version).map_err(|_| Error::Version)?,
                     receipt.store_epoch,
+                    acl::read(client).await?,
                 )
             };
             for (index, ddl) in MIGRATIONS.iter().enumerate().skip(start) {
@@ -170,20 +170,14 @@ fn write_schema(
                     .batch_execute(ddl)
                     .await
                     .map_err(|_| Error::Database)?;
-                let private: bool = client
-                    .query_one(PRIVATE_ACL, &[])
-                    .await
-                    .map_err(|_| Error::Database)?
-                    .try_get(0)
-                    .map_err(|_| Error::Invalid)?;
-                if !private {
-                    return Err(Error::Invalid);
-                }
                 let rows = client.execute("INSERT INTO td_mta.schema_migrations (version, checksum, store_epoch) VALUES ($1, $2, $3)", &[&version, &checksum.as_slice(), &epoch.as_bytes().as_slice()])
                     .await.map_err(|_| Error::Database)?;
                 if rows != 1 {
                     return Err(Error::Invalid);
                 }
+            }
+            if !acl::preserves(&grants, &acl::read(client).await?) {
+                return Err(Error::Invalid);
             }
             marker.store(true, Ordering::Relaxed);
             client

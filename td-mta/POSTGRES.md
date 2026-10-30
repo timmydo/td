@@ -664,8 +664,7 @@ version 18 adds src/postgres_attempt_recovery.sql.
 New initialization applies all eighteen in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
-Explicit runtime grants and configuration-driven service admission remain
-runtime integration work.
+Explicit service grants are installed separately after initialization.
 
 `postgres_schema::upgrade` uses an explicit owner credential and the same
 exclusive transaction migration lock. It validates all existing checksums
@@ -675,12 +674,33 @@ Unknown, missing, changed or inconsistent ledger history refuses. Migration
 preserves the epoch and commits the DDL and ledger row together. A failed
 migration rolls back, leaving the prior version intact; an old version
 cannot serve current operations. Post-COMMIT uncertainty has the same no-replay
-rule as initialization.
+rule as initialization. The connection must use preparation mode and the
+session user must own both the `td_mta` namespace and its ordinary permanent
+`schema_migrations` table, including for a compatible current-version receipt.
+
+An upgrade inventories existing explicit nonowner schema, relation and column
+ACL entries in `td_mta` and `td_mta_trgm`, with at most 4096 entries before and
+after the migration transaction. PUBLIC entries or overflow refuse. Before
+COMMIT, every final entry must match an original object class/OID, column
+number, grantor, grantee, privilege and grant option; revocation and removal of
+a grant option are allowed. New objects cannot inherit service access from
+default privileges. Initialization has an empty baseline. These inventories
+use bounded typed rows and require no database TEMP privilege. Current-version
+receipts validate ownership and ledger history, not the ACL inventory.
+
+This preserves explicit grants, not all effective access: role membership,
+ownership, database privileges and routine/type ACLs are outside this check.
+The bundled extension's routine defaults are outside its scope; its private
+namespace remains the access boundary. Table-wide grants naturally cover new
+columns. Stop all database users and administrative grant changes throughout
+the upgrade; the migration lock does not serialize arbitrary administrator
+DDL. Add any required grants for newly created tables explicitly afterward,
+then run runtime qualification before restarting services.
 
 The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
-permits 512 input frames for the twelve migrations and their ledger writes;
-probe, inspection and material operations retain 128. The per-frame 128 KiB
+permits 10240 input frames for migrations, ledger writes and both bounded ACL
+inventories; probe, inspection and material operations retain 128. The per-frame 128 KiB
 and total 1 MiB input bounds, authentication checks and terminal budget
 refusal are unchanged. Schema operations permit 128 KiB of post-TLS output,
 including startup/authentication and statement names. Driver statement names
@@ -2177,10 +2197,10 @@ This is a fresh-role setup, not repair of inherited or preexisting grants.
 Validate with the runtime connection specification afterward. Owner commands
 retain their separate credential. Drain/stop serving instances before changing
 their runtime role or privilege contract; reconnect requalifies it. Before a
-schema upgrade, drain/stop all
-instances and revoke runtime schema/table/column grants; the existing private
-migration ACL check still applies. Reapply the new version's exact grants and
-recheck before restart. Do not install default privileges on future tables.
+schema upgrade, drain/stop all instances and maintenance jobs. Existing explicit
+schema/table/column grants are preserved under the owner migration ACL check.
+Apply any additional grants required by the new version and recheck before
+restart. Do not install default privileges on future tables.
 
 The cold check uses the existing bounded listing transport (512 frames,
 1 MiB input, 64 KiB output), retaining the original ten-second maximum
@@ -3359,8 +3379,8 @@ selection and deployment qualification remain unchanged.
 ## 110. Durable outgoing DATA phases
 
 Schema 19 retains one phase receipt per account, attempt and target phase.
-Fresh initialization permits at most 1024 inbound protocol frames for the
-complete migration ledger; byte and individual-frame ceilings stay unchanged.
+Fresh initialization uses the bounded schema transport described in the owner
+migration contract; byte and individual-frame ceilings stay unchanged.
 The prepared phase publisher checks current configuration, account and route
 ownership in their existing lock order, then the exact active attempt's boot,
 claim, destination and fencing generation. Body publication accepts one
@@ -6612,10 +6632,9 @@ delayed deletion COMMIT exercises owner settlement and one history row.
 `postgres_logs.sql` adds `application_log_state` and `application_logs`.
 Both require runtime SELECT/INSERT/UPDATE/DELETE, without ownership, DDL,
 TRUNCATE or grant options; existing owner/runtime separation is unchanged.
-Stop all service instances for the explicit schema upgrade, revoke runtime
-schema/table/column privileges as required by `schema-upgrade`, upgrade with
-the owner connection, reapply the exact runtime grants (including these two
-tables), run `runtime-check`, and restart on the matching executable. Never
+Stop all service instances for the explicit schema upgrade, upgrade with
+the owner connection preserving existing explicit grants, add grants on these two
+tables, run `runtime-check`, and restart on the matching executable. Never
 edit an existing migration checksum. Mail tables and retained mail are unchanged.
 
 OBSERVABILITY.md owns the 30-day age policy, fixed ring, rate/byte limits,

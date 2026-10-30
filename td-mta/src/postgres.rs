@@ -340,6 +340,7 @@ fn classify(error: postgres_schema::Error) -> (&'static str, &'static str) {
                 Error::Database => "schema-operation-failed",
                 Error::Crypto => "crypto",
                 Error::Indeterminate => "indeterminate-do-not-retry",
+                Error::Owner => "owner-required",
                 Error::Connection(_) => "connection-or-authentication",
             },
         ),

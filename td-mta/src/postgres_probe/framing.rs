@@ -30,7 +30,8 @@ impl Input {
 
     pub(super) fn schema() -> Self {
         Self {
-            frames: 1024,
+            // Two bounded ACL inventories plus migration and ledger replies.
+            frames: 10240,
             ..Self::new()
         }
     }
@@ -669,7 +670,7 @@ mod tests {
     #[test]
     fn schema_command_budget_is_finite_and_keeps_other_input_limits() {
         let mut input = Input::schema();
-        for _ in 0..1024 {
+        for _ in 0..10240 {
             assert!(input.accept(&frame(b'N', b"\0")).is_ok());
         }
         assert!(input.accept(&frame(b'N', b"\0")).is_err());

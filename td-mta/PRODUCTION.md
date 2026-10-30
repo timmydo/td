@@ -379,9 +379,12 @@ must be compared before replacement. Do not silently overwrite those units.
 Schema 33 adds `blob_summaries`. This is a schema update, so the binary-only
 activation procedure above is insufficient. Follow POSTGRES.md's explicit
 owner migration procedure: verify a backup, stop all five MTA processes and
-other database maintenance jobs, retain and revoke runtime schema/table/column
-grants, upgrade with the candidate binary and owner connection, then restore
-runtime grants including SELECT/INSERT/UPDATE/DELETE on `blob_summaries`.
+other database maintenance jobs, upgrade with the candidate binary and owner
+connection preserving existing explicit service grants, then add
+SELECT/INSERT/UPDATE/DELETE on `blob_summaries` for the runtime role. The upgrader
+rejects PUBLIC access, expanded explicit grants and more than 4096 nonowner
+schema/table/column ACL entries; do not change grants concurrently. Newly added
+tables still require their explicit grants before runtime qualification.
 Run candidate `schema-inspect`, `runtime-check` and `config-check` before
 starting the candidate. Keep the schema-32 backup and old binary together as
 pre-upgrade recovery evidence; restoring that backup after new mail arrives
