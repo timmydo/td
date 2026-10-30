@@ -21,6 +21,10 @@ impl Worker<'_, '_, '_, '_, '_> {
         requested
             .try_reserve_exact(maximum)
             .map_err(|_| Error::ResponseCapacity)?;
+        let mut local_ids = Vec::<[u8; 16]>::new();
+        local_ids
+            .try_reserve_exact(maximum)
+            .map_err(|_| Error::ResponseCapacity)?;
         if let Some(ids) = ids {
             let mut children = Children::new(ids.range, scan::Kind::Array)?;
             let mut count = 0usize;
@@ -30,29 +34,36 @@ impl Worker<'_, '_, '_, '_, '_> {
                     .filter(|n| *n <= maximum)
                     .ok_or(Error::RequestTooLarge)?;
                 let name = self.push_string(&item)?;
-                let id = name.wire_id()?.local();
-                let mut duplicate = false;
-                for old in &requested {
-                    self.check()?;
-                    let duplicate_name = match (old.id, id) {
-                        (Some(left), Some(right)) => left == right,
-                        (None, None) => {
-                            let range = old.name.clone().ok_or(Error::State)?;
-                            self.push_string(&Item {
+                let id: Option<T> = name.wire_id()?.local();
+                self.check()?;
+                let duplicate = if let Some(id) = id {
+                    match local_ids.binary_search(id.storage_bytes()) {
+                        Ok(_) => true,
+                        Err(position) => {
+                            local_ids.insert(position, *id.storage_bytes());
+                            false
+                        }
+                    }
+                } else {
+                    let mut duplicate = false;
+                    for old in requested.iter().filter(|old| old.id.is_none()) {
+                        self.check()?;
+                        let range = old.name.clone().ok_or(Error::State)?;
+                        if self
+                            .push_string(&Item {
                                 key: Name::new(),
                                 kind: scan::Kind::String,
                                 range,
                             })?
                             .bytes()
-                                == name.bytes()
+                            == name.bytes()
+                        {
+                            duplicate = true;
+                            break;
                         }
-                        _ => false,
-                    };
-                    if duplicate_name {
-                        duplicate = true;
-                        break;
                     }
-                }
+                    duplicate
+                };
                 if !duplicate {
                     requested.push(Requested {
                         name: Some(item.range),
@@ -83,5 +94,17 @@ impl Worker<'_, '_, '_, '_, '_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn local_lookup_fits_the_existing_method_object_reservation() {
+        assert!(
+            std::mem::size_of::<super::Requested<crate::ids::EmailId>>()
+                + std::mem::size_of::<[u8; 16]>()
+                <= crate::limits::METHOD_OBJECT_BYTES
+        );
     }
 }

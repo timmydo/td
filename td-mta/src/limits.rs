@@ -12,6 +12,8 @@ pub const OUTBOUND_RECIPIENT_BATCH: usize = 100;
 /// Owned operation offsets/ordinal/type/kind, including Option layout.
 pub const OPERATION_SLOT_BYTES: usize = 32;
 pub const CHANGE_SLOT_BYTES: usize = 24;
+/// Retained request IDs and their bounded duplicate lookup scratch.
+pub(crate) const METHOD_OBJECT_BYTES: usize = 128;
 /// Separate bounded row/result, key, cursor and retained change scratch.
 pub const READ_VIEW_SCRATCH_BYTES: usize = 420 * KIB;
 /// Planned provider session ceiling, not a measured worst-case bound.
@@ -284,7 +286,7 @@ impl Limits {
         let response_ids = product(
             "method object scratch",
             self.objects_per_method.max(self.query_page),
-            128,
+            METHOD_OBJECT_BYTES,
         )?;
 
         let reservations = [

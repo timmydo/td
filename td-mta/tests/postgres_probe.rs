@@ -6399,15 +6399,19 @@ fn exercise_read_dispatch(
     } else {
         (&second, &first)
     };
-    let window_missing: Vec<_> = (0..33_u128)
+    let window_missing: Vec<_> = (0..192_u128)
+        .rev()
         .map(|n| format!("e{:032x}", 0xed00 + n))
         .collect();
-    let window_not_found = window_missing
+    let mut window_not_found = window_missing
         .iter()
         .map(|id| format!("\"{id}\""))
         .collect::<Vec<_>>()
         .join(",");
-    let window_ids = format!("\"{second}\",{window_not_found},\"{first}\",\"{second}\"");
+    window_not_found.push_str(",\"foreign\"");
+    let window_ids = format!(
+        "\"{second}\",{window_not_found},\"{first}\",\"{second}\",\"foreign\",\"\\u0066oreign\""
+    );
     let input = format!(
         r##"{{"using":["{CORE}","{MAIL}","{SUBMISSION}"],"methodCalls":[
         ["Mailbox/get",{{"accountId":"{account}","ids":["{mailbox}","{mailbox}","{missing}"],"properties":["name","totalEmails","myRights"]}},"a"],

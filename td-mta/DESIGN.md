@@ -2004,6 +2004,14 @@ probes without extending snapshot authority.
 
 ## 10. HTTP and JMAP
 
+Typed `/get` ID planning preserves first-request order and counts every
+input toward the method limit, including duplicates. Local IDs use a
+separate sorted lookup of their 16-byte storage keys; its allocation fits
+the existing per-object scratch reservation. Admission is checked before
+each bounded lookup and insertion. Foreign IDs retain decoded-string
+comparison and admission checks between comparisons, so escaped spellings
+of the same unknown ID still produce one `notFound` entry.
+
 The `http_request` module implements transport-independent HTTP/1.1 request
 framing. Its head storage may be borrowed or owned; the HTTPS runtime uses
 owned bounded buffers without self-referential state. A caller-owned head
