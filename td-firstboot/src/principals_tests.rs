@@ -565,3 +565,32 @@ fn account_fixtures_do_not_share_a_root_when_clock_values_repeat() {
     assert!(first.0.join("etc/passwd").is_file());
     assert!(second.0.join("etc/passwd").is_file());
 }
+
+#[test]
+fn notebook_account_cannot_log_in_alias_another_role_or_join_groups() {
+    let table = TABLE.replacen("application", "notebook\t1000\t987\napplication", 1);
+    let registry = Registry::parse(&table).unwrap();
+    let passwd = format!("{PASSWD}tdv1000:x:987:987:Vault:/var/lib/td/notebooks/1000:/bin/false\n");
+    let group = format!("{GROUP}tdv1000:x:987:\n");
+    let shadow = format!("{SHADOW}tdv1000:!td-service:0:0:99999:7:::\n");
+    registry.verify_accounts(&passwd, &group, &shadow).unwrap();
+    for changed in [
+        passwd.replace("tdv1000", "other-vault"),
+        passwd.replace("/bin/false", "/bin/sh"),
+    ] {
+        assert!(registry.verify_accounts(&changed, &group, &shadow).is_err());
+    }
+    assert!(registry
+        .verify_accounts(&passwd, &group, &shadow.replace("!td-service", "!"))
+        .is_err());
+    assert!(registry
+        .verify_accounts(
+            &passwd,
+            &group.replace("wheel:x:10:tester", "wheel:x:10:tester,tdv1000"),
+            &shadow
+        )
+        .is_err());
+    assert!(registry
+        .check_primary_name(&passwd, &group, &shadow, "tdv9999")
+        .is_err());
+}

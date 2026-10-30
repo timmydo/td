@@ -87,10 +87,32 @@ impl Drop for Credential {
 
 pub(super) fn startup() -> Result<UnixStream, String> {
     store::require_root()?;
+    operation_endpoint(None)
+}
+
+pub(super) fn service_startup(uid: u32) -> Result<UnixStream, String> {
+    if !(1..=999).contains(&uid) {
+        return Err("invalid notebook service identity".into());
+    }
+    operation_endpoint(Some(uid))
+}
+
+fn operation_endpoint(service: Option<u32>) -> Result<UnixStream, String> {
     let mut status = String::new();
     File::open("/proc/self/status")
         .and_then(|file| file.take(8193).read_to_string(&mut status))
         .map_err(|_| "read operation process identity")?;
+    if let Some(uid) = service {
+        let value = |name: &str| status.lines().find_map(|line| line.strip_prefix(name));
+        let expected = uid.to_string();
+        if value("Gid:").map(|s| s.split_whitespace().collect::<Vec<_>>())
+            != Some(vec![expected.as_str(); 4])
+            || value("Groups:").is_none_or(|s| s.split_whitespace().any(|group| group != expected))
+            || value("CapEff:").map(str::trim) != Some("0000000000000000")
+        {
+            return Err("notebook service retained other credentials".into());
+        }
+    }
     let input = std::fs::metadata("/proc/self/fd/0").map_err(|_| "missing operation endpoint")?;
     let log = |fd: u8| {
         std::fs::metadata(format!("/proc/self/fd/{fd}"))
@@ -109,11 +131,15 @@ pub(super) fn startup() -> Result<UnixStream, String> {
                 .file_name(),
         );
     }
-    frames::endpoint(frames::Process {
+    let process = frames::Process {
         status,
         descriptors,
         open,
-    })
+    };
+    match service {
+        Some(uid) => frames::endpoint_for(process, uid),
+        None => frames::endpoint(process),
+    }
 }
 
 fn description(bytes: &[u8], owner: u32) -> Result<consent::Request, String> {

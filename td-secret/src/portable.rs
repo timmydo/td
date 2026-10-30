@@ -13,6 +13,11 @@ pub mod pass;
 #[path = "portable_store.rs"]
 pub(super) mod storage;
 
+#[path = "portable_service.rs"]
+pub(super) mod service;
+#[path = "portable_service_tokens.rs"]
+mod service_tokens;
+
 use super::{crypto, fido_p256::PublicKey};
 use std::collections::BTreeSet;
 use std::io::Read;

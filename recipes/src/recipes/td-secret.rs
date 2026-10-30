@@ -309,6 +309,18 @@ pub fn recipe() -> Recipe {
             include_str!("../../../td-secret/src/portable_pass.rs"),
         ),
         (
+            "{src}/td-secret/src/notebook_wire.rs",
+            include_str!("../../../td-secret/src/notebook_wire.rs"),
+        ),
+        (
+            "{src}/td-secret/src/portable_service.rs",
+            include_str!("../../../td-secret/src/portable_service.rs"),
+        ),
+        (
+            "{src}/td-secret/src/portable_service_tokens.rs",
+            include_str!("../../../td-secret/src/portable_service_tokens.rs"),
+        ),
+        (
             "{src}/td-secret/src/portable_store.rs",
             include_str!("../../../td-secret/src/portable_store.rs"),
         ),
@@ -707,7 +719,7 @@ mod tests {
             }
         }
         let mut embedded: Vec<_> = MODULES.iter().map(|(name, _)| *name).collect();
-        embedded.extend(["principals", "hostname"]);
+        embedded.extend(["principals", "hostname", "notebook_wire"]);
         declared.sort_unstable();
         embedded.sort_unstable();
         assert_eq!(declared, embedded);

@@ -8519,6 +8519,23 @@ middle.
 | `td-audio` | **`audio`** | §K.5 — dedicated audio uid |
 | the app | 1000, identity-mapped | upstream's model; see below |
 
+The personal notebook reserves UID/GID 989 (`tdv1000`) separately from
+both the human and the existing portal. The principal table admits optional
+`notebook OWNER UID` tab-separated rows after sessions and before
+applications. Notebook UIDs occupy the service range, must not alias any
+other principal, and remain reserved after removal.
+`principals-notebooks.tsv` keeps the complete retained reservation set; the
+original `principals.tsv` keeps its legacy session/application rows so a
+previous deployment can still boot. New readers merge both under the existing
+lock, publish and sync the complete record first, then the legacy projection.
+An interrupted second publication is repaired without losing reservations.
+The shipped preceding deployment assigns no account or group to 989; older
+readers do not enforce notebook reservations against newly tailored images.
+The account has `/bin/false`, `!td-service`, no supplementary groups, and a
+mode-0700 home at `/var/lib/td/notebooks/1000`. Firstboot prepares and syncs
+this storage only after reservation enrollment. This identity prerequisite
+does not itself start a service or authorize vault release.
+
 The broker runs separately from the human account. Its lineage walk
 reads non-ptrace-gated PID/PPID/start-time fields and retained pidfds,
 without opening a peer's root or application files. The mapped EXTERNAL

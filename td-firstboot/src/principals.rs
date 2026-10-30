@@ -298,14 +298,17 @@ impl Registry {
         primary_account::validate_name(name).map_err(|error| error.to_string())?;
         let primary = primary_account::parse(passwd).map_err(|error| error.to_string())?;
         self.verify_retained_accounts(self, passwd, group, shadow)?;
-        if ["tda", "tdb", "tdc", "tdi", "tdp"].iter().any(|prefix| {
-            name.strip_prefix(prefix).is_some_and(|suffix| {
-                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        if ["tda", "tdb", "tdc", "tdi", "tdp", "tdv"]
+            .iter()
+            .any(|prefix| {
+                name.strip_prefix(prefix).is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
             })
-        }) || self
-            .account_names()
-            .values()
-            .any(|reserved| reserved == name)
+            || self
+                .account_names()
+                .values()
+                .any(|reserved| reserved == name)
         {
             return Err("primary name is reserved for a service or application".into());
         }
@@ -479,6 +482,9 @@ impl Registry {
                 names.insert(uid, format!("td{role}{}", session.owner));
             }
         }
+        for (owner, uid) in self.notebooks() {
+            names.insert(uid, format!("tdv{owner}"));
+        }
         for application in self.applications() {
             names.insert(application.uid, format!("tda{}", application.uid));
         }
@@ -530,6 +536,9 @@ impl Registry {
             .any(|session| !seen_uids.contains(&session.owner))
         {
             return Err("principal session has no human account".into());
+        }
+        if active.notebooks().any(|(_, uid)| !seen_uids.contains(&uid)) {
+            return Err("active notebook service has no reserved account".into());
         }
         let mut seen_gids = BTreeSet::new();
         let mut group_names = BTreeSet::new();

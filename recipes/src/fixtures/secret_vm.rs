@@ -27,6 +27,11 @@ pub const CASES: &[(&str, &str)] = &[
         "session::tests::root_login_supervision_meets_the_production_worker",
     ),
 ];
+/// Private notebook service startup, without a TPM or security key.
+pub const NOTEBOOK_CASES: &[(&str, &str)] = &[(
+    "notebook-service",
+    "portable::service::tests::qemu_reserved_identity_serves_with_root_only_shadow",
+)];
 pub const TPM_CASES: &[(&str, &str)] = &[
     (
         "tpm-seal",
@@ -494,6 +499,7 @@ fn run() -> Result<(), String> {
                 .iter()
                 .chain(FIDO_CASES)
                 .chain(LOGIN_CASES)
+                .chain(NOTEBOOK_CASES)
                 .chain(std::iter::once(&LOGIN_CUT_CASE))
                 .map(|(name, test)| (*name, *test, "/bin/td-secret-tests")),
         )

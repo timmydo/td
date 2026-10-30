@@ -331,6 +331,7 @@ pub(crate) fn run(
     let cases = fixture::CASES
         .iter()
         .chain(fixture::LOGIN_CASES)
+        .chain(fixture::NOTEBOOK_CASES)
         .map(|case| (case, false))
         .chain(
             fixture::TPM_CASES
@@ -393,7 +394,10 @@ pub(crate) fn run(
                 mem: "512",
                 target_marker: fixture::PASS,
                 kill_on_marker: false,
-                extra_append: if name.starts_with("fido-") || name.starts_with("login-") {
+                extra_append: if name.starts_with("fido-")
+                    || name.starts_with("login-")
+                    || name.starts_with("notebook-")
+                {
                     "td.hid-fixture=1"
                 } else if is_tpm {
                     "td.tpm-fixture=1"
@@ -1032,6 +1036,7 @@ fn selected(name: &str, tpm: bool) -> Result<(), String> {
     let plain = fixture::CASES
         .iter()
         .chain(fixture::LOGIN_CASES)
+        .chain(fixture::NOTEBOOK_CASES)
         .chain(std::iter::once(&fixture::LOGIN_CUT_CASE))
         .any(|(case, _)| *case == name);
     let needs_tpm = fixture::TPM_CASES
@@ -1334,10 +1339,14 @@ mod tests {
             .chain(fixture::TPM_CASES)
             .chain(fixture::FIDO_CASES)
             .chain(fixture::LOGIN_CASES)
+            .chain(fixture::NOTEBOOK_CASES)
             .chain(std::iter::once(&fixture::LOGIN_CUT_CASE))
             .map(|(name, _)| name)
             .collect();
-        assert_eq!(all.len(), 5 + 4 + 11 + 12 + 1);
+        assert_eq!(
+            all.len(),
+            5 + 4 + 11 + 12 + 1 + fixture::NOTEBOOK_CASES.len()
+        );
         assert!(fixture::LOGIN_CASES
             .iter()
             .all(|(name, _)| name.starts_with("login-")));

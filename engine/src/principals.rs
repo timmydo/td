@@ -28,6 +28,7 @@ pub struct Application {
 pub struct Registry {
     sessions: BTreeMap<u32, Session>,
     applications: BTreeMap<(u32, String), Application>,
+    notebooks: BTreeMap<u32, u32>,
 }
 
 pub(crate) fn decimal(value: &str, range: std::ops::RangeInclusive<u32>) -> Result<u32, String> {
@@ -52,6 +53,11 @@ impl Registry {
         self.sessions.values()
     }
 
+    /// Reserved private notebook service identities, keyed by human owner.
+    pub fn notebooks(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.notebooks.iter().map(|(owner, uid)| (*owner, *uid))
+    }
+
     pub fn applications(&self) -> impl Iterator<Item = &Application> {
         self.applications.values()
     }
@@ -66,10 +72,12 @@ impl Registry {
         let mut registry = Self {
             sessions: BTreeMap::new(),
             applications: BTreeMap::new(),
+            notebooks: BTreeMap::new(),
         };
         let mut assigned = BTreeSet::new();
         let mut previous_session = None;
         let mut previous_application = None;
+        let mut previous_notebook = None;
         for (index, row) in rows.split_terminator('\n').enumerate() {
             if index >= MAX_ROWS {
                 return Err("principal table exceeds 256 rows".into());
@@ -82,6 +90,7 @@ impl Registry {
                     let broker = decimal(broker, 1..=999)?;
                     let portal = decimal(portal, 1..=999)?;
                     if previous_application.is_some()
+                        || previous_notebook.is_some()
                         || previous_session.is_some_and(|previous| previous >= owner)
                     {
                         return Err("principal sessions are duplicate or unsorted".into());
@@ -101,6 +110,19 @@ impl Registry {
                         },
                     );
                     previous_session = Some(owner);
+                }
+                ["notebook", owner, uid] => {
+                    let owner = decimal(owner, 1000..=65533)?;
+                    let uid = decimal(uid, 1..=999)?;
+                    if !registry.sessions.contains_key(&owner)
+                        || previous_application.is_some()
+                        || previous_notebook.is_some_and(|previous| previous >= owner)
+                        || !assigned.insert(uid)
+                    {
+                        return Err("invalid, unordered or reused notebook identity".into());
+                    }
+                    registry.notebooks.insert(owner, uid);
+                    previous_notebook = Some(owner);
                 }
                 ["application", owner, application, uid] => {
                     let owner = decimal(owner, 1000..=65533)?;
@@ -169,6 +191,12 @@ impl Registry {
             }
             retained.sessions.insert(*owner, session.clone());
         }
+        for (owner, uid) in &desired.notebooks {
+            if self.notebooks.get(owner).is_some_and(|prior| prior != uid) {
+                return Err("deployment changes an enrolled notebook identity".into());
+            }
+            retained.notebooks.insert(*owner, *uid);
+        }
         for (key, application) in &desired.applications {
             if self
                 .applications
@@ -185,6 +213,13 @@ impl Registry {
         Self::parse(&retained.encode())
     }
 
+    /// The retained ledger older deployments understand.
+    pub fn legacy(&self) -> Self {
+        let mut legacy = self.clone();
+        legacy.notebooks.clear();
+        legacy
+    }
+
     pub fn encode(&self) -> String {
         let mut text = MAGIC.to_string();
         for session in self.sessions.values() {
@@ -192,6 +227,9 @@ impl Registry {
                 "session\t{}\t{}\t{}\t{}\n",
                 session.owner, session.compositor, session.broker, session.portal
             ));
+        }
+        for (owner, uid) in self.notebooks() {
+            text.push_str(&format!("notebook\t{owner}\t{uid}\n"));
         }
         for application in self.applications.values() {
             text.push_str(&format!(
@@ -210,6 +248,37 @@ mod tests {
     use super::*;
 
     const TABLE: &str = "td-principals-v1\nsession\t1000\t993\t991\t989\nsession\t1001\t992\t990\t988\napplication\t1000\tfirefox\t65536\napplication\t1000\tmail\t65538\napplication\t1001\tmail\t65537\n";
+
+    #[test]
+    fn notebook_reservations_are_private_stable_and_retained() {
+        let prior = Registry::parse(TABLE).unwrap();
+        let with = |row: &str| TABLE.replacen("application", &format!("{row}application"), 1);
+        let text = with("notebook\t1000\t987\nnotebook\t1001\t986\n");
+        let current = Registry::parse(&text).unwrap();
+        assert_eq!(
+            current.notebooks().collect::<Vec<_>>(),
+            [(1000, 987), (1001, 986)]
+        );
+        assert_eq!(current.encode(), text);
+        assert_eq!(prior.enroll(&current).unwrap(), current);
+        assert_eq!(current.enroll(&prior).unwrap(), current);
+        let changed = Registry::parse(&text.replace("1000\t987", "1000\t985")).unwrap();
+        assert!(current.enroll(&changed).is_err());
+        let recycled = Registry::parse(&with("notebook\t1001\t987\n")).unwrap();
+        assert!(current.enroll(&recycled).is_err());
+        for row in [
+            "notebook\t1002\t987\n",
+            "notebook\t1000\t993\n",
+            "notebook\t1000\t0\n",
+            "notebook\t1000\t1000\n",
+            "notebook\t1000\t0987\n",
+            "notebook\t1000\t987\nnotebook\t1000\t986\n",
+            "notebook\t1001\t987\nnotebook\t1000\t986\n",
+        ] {
+            assert!(Registry::parse(&with(row)).is_err(), "{row}");
+        }
+        assert!(Registry::parse(&format!("{TABLE}notebook\t1000\t987\n")).is_err());
+    }
 
     #[test]
     fn application_identity_is_scoped_to_its_human_and_exact_name() {

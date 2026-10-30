@@ -47,6 +47,7 @@ mod message;
 mod name;
 // The private worker endpoint, shared with td-install's storage worker.
 mod frames;
+mod notebook_wire;
 mod operation;
 mod pin_sys;
 mod pin_terminal;
@@ -94,6 +95,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             token_check::run()
         }
         [command] if command == "selftest" => crypto::selftest(),
+        [command, flag, uid] if command == "notebook-service" && flag == "--uid" => {
+            portable::service::run(parse_uid(uid)?)
+        }
         [command, flag, uid] if command == "write-operation" && flag == "--uid" => {
             write_operation::run(parse_uid(uid)?)
         }
@@ -374,10 +378,10 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("operation.rs")),
-            0x2b0eb90995185a22
+            0x6ecde1db329c57af
         );
         // The endpoint td-install's storage worker shares.
-        assert_eq!(fingerprint(include_str!("frames.rs")), 0x80a06523824bb152);
+        assert_eq!(fingerprint(include_str!("frames.rs")), 0xfc5f01f8e2193d8d);
         assert_eq!(
             fingerprint(include_str!("login_operation.rs")),
             0x7be38a0c43f62487
@@ -590,6 +594,12 @@ mod confinement {
             ("portable_host.rs", include_str!("portable_host.rs")),
             ("portable_notebook.rs", include_str!("portable_notebook.rs")),
             ("portable_pass.rs", include_str!("portable_pass.rs")),
+            ("notebook_wire.rs", include_str!("notebook_wire.rs")),
+            ("portable_service.rs", include_str!("portable_service.rs")),
+            (
+                "portable_service_tokens.rs",
+                include_str!("portable_service_tokens.rs"),
+            ),
             ("portable_store.rs", include_str!("portable_store.rs")),
             ("fido_device.rs", include_str!("fido_device.rs")),
             ("fido_metadata.rs", include_str!("fido_metadata.rs")),
@@ -808,6 +818,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "login_vm.rs",
                 "main.rs",
                 "memory.rs",
+                "notebook_wire.rs",
                 "operation.rs",
                 "pin_sys.rs",
                 "pin_terminal.rs",
@@ -817,6 +828,8 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "portable_lifecycle.rs",
                 "portable_notebook.rs",
                 "portable_pass.rs",
+                "portable_service.rs",
+                "portable_service_tokens.rs",
                 "portable_store.rs",
                 "pty_fixture_sys.rs",
                 "scm.rs",

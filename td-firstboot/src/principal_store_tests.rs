@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod notebook_temp;
 use std::fs::DirBuilder;
 use std::os::unix::fs::DirBuilderExt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -328,4 +330,38 @@ fn portal_runtime_repeats_privately_and_refuses_redirects() {
     assert!(runtime_child_mode(parent, "redirected", owner, 0o700).is_err());
     fs::set_permissions(parent.path("portal"), Permissions::from_mode(0o777)).unwrap();
     assert!(runtime_child_mode(parent, "portal", owner, 0o700).is_err());
+}
+
+#[test]
+fn notebook_ledger_preserves_legacy_boots_and_recovers_partial_publication() {
+    let temp = notebook_temp::TempDir::new("td-notebook-ledger").unwrap();
+    let metadata = fs::metadata(temp.path()).unwrap();
+    let directory = Directory::open(temp.path(), metadata.uid(), metadata.gid()).unwrap();
+    let original = app("mail", 65537);
+    directory.enroll(&original).unwrap();
+    let desired = Registry::parse(
+        &original
+            .encode()
+            .replace("application", "notebook\t1000\t989\napplication"),
+    )
+    .unwrap();
+    directory.enroll(&desired).unwrap();
+    assert_eq!(directory.read(LEDGER).unwrap().unwrap(), original.encode());
+    assert_eq!(directory.verify_enrolled(&desired).unwrap(), desired);
+    // A previous deployment may update its own known ledger. New boots
+    // merge it without discarding either new or older reservations.
+    let older = app("news", 65538).enroll(&original).unwrap();
+    directory.publish(LEDGER, STAGED, &older.encode()).unwrap();
+    let combined = desired.enroll(&older).unwrap();
+    assert_eq!(directory.enroll(&original).unwrap(), combined);
+    // Crash after the full record's rename, before the legacy rename.
+    fs::remove_file(directory.path(LEDGER)).unwrap();
+    assert_eq!(directory.enroll(&desired).unwrap(), combined);
+    assert_eq!(
+        directory.read(LEDGER).unwrap().unwrap(),
+        combined.legacy().encode()
+    );
+    let reused = Registry::parse(&original.encode().replace("\t991\n", "\t989\n")).unwrap();
+    assert!(directory.enroll(&reused).is_err());
+    temp.cleanup().unwrap();
 }

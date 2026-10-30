@@ -12,6 +12,8 @@ const LIMIT: u64 = MAX_BYTES as u64;
 const RUNTIME_NAME: &str = "td-bus";
 const LEDGER: &str = "principals.tsv";
 const STAGED: &str = ".principals.next";
+const NOTEBOOK_LEDGER: &str = "principals-notebooks.tsv";
+const NOTEBOOK_STAGED: &str = ".principals-notebooks.next";
 const LOCK: &str = ".principals.lock";
 
 /// Publish broker runtimes only after the durable identity reservation passed.
@@ -41,6 +43,20 @@ pub(crate) fn prepare_portal_runtimes(registry: &Registry) -> Result<(), String>
         )?;
     }
     Ok(())
+}
+
+/// Private vault storage is outside every human and application home.
+/// The retained reservation is published before these directories exist.
+pub(crate) fn prepare_notebooks(registry: &Registry) -> Result<(), String> {
+    let var = Directory::open(Path::new("/var"), 0, 0)?;
+    let lib = var.child("lib")?;
+    let td = lib.child("td")?;
+    let base = runtime_child(&td, "notebooks", (0, 0))?;
+    for (owner, uid) in registry.notebooks() {
+        runtime_child_mode(&base, &owner.to_string(), (uid, uid), 0o700)?.sync()?;
+    }
+    base.sync()?;
+    td.sync()
 }
 
 /// Private client endpoints exist only for an installed application account.
@@ -240,8 +256,22 @@ impl Directory {
         Ok(file)
     }
 
+    fn retained(&self) -> Result<Option<Registry>, String> {
+        let mut retained: Option<Registry> = None;
+        for name in [LEDGER, NOTEBOOK_LEDGER] {
+            if let Some(text) = self.read(name)? {
+                let record = Registry::parse(&text)?;
+                retained = Some(match retained {
+                    Some(prior) => prior.enroll(&record)?,
+                    None => record,
+                });
+            }
+        }
+        Ok(retained)
+    }
+
     fn verify_enrolled(&self, desired: &Registry) -> Result<Registry, String> {
-        let prior = Registry::parse(&self.read(LEDGER)?.ok_or("principal ledger is absent")?)?;
+        let prior = self.retained()?.ok_or("principal ledger is absent")?;
         if prior.enroll(desired)? != prior {
             return Err("deployment identities have not been enrolled".into());
         }
@@ -259,43 +289,47 @@ impl Directory {
         validate: impl FnOnce(&Registry) -> Result<(), String>,
     ) -> Result<Registry, String> {
         let _lock = self.lock()?;
-        let previous = self
-            .read(LEDGER)?
-            .map(|text| Registry::parse(&text))
-            .transpose()?;
+        let previous = self.retained()?;
         let retained = match &previous {
             Some(prior) => prior.enroll(desired)?,
             None => desired.clone(),
         };
         validate(&retained)?;
-        // A crash before rename may leave this private staging file. Never
-        // follow a substitute or unlink a path with unverified ownership.
-        if self.private_scratch(STAGED, LIMIT)?.is_some() {
-            fs::remove_file(self.path(STAGED))
-                .map_err(|error| format!("remove stale principal staging: {error}"))?;
+        // Publish the full reservation first. A crash cannot release it;
+        // retry merges both records. Older boots read only the legacy file.
+        if retained.notebooks().next().is_some() {
+            self.publish(NOTEBOOK_LEDGER, NOTEBOOK_STAGED, &retained.encode())?;
+        }
+        self.publish(LEDGER, STAGED, &retained.legacy().encode())?;
+        Ok(retained)
+    }
+
+    fn publish(&self, name: &str, staged: &str, text: &str) -> Result<(), String> {
+        // Refuse substituted scratch before removing an interrupted write.
+        if self.private_scratch(staged, LIMIT)?.is_some() {
+            fs::remove_file(self.path(staged)).map_err(|error| error.to_string())?;
             self.sync()?;
         }
-        if previous.as_ref() == Some(&retained) {
-            self.sync()?;
-            return Ok(retained);
+        if self.read(name)?.as_deref() == Some(text) {
+            return self.sync();
         }
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-            .open(self.path(STAGED))
+            .open(self.path(staged))
             .map_err(|error| format!("create principal staging: {error}"))?;
         // Exact mode even when an inherited umask removes owner bits.
         file.set_permissions(Permissions::from_mode(0o600))
             .map_err(|error| error.to_string())?;
         self.validate(&file)?;
         let result = (|| {
-            file.write_all(retained.encode().as_bytes())
+            file.write_all(text.as_bytes())
                 .map_err(|error| format!("write principal ledger: {error}"))?;
             file.sync_all()
                 .map_err(|error| format!("sync principal ledger: {error}"))?;
-            fs::rename(self.path(STAGED), self.path(LEDGER))
+            fs::rename(self.path(staged), self.path(name))
                 .map_err(|error| format!("publish principal ledger: {error}"))?;
             self.sync()
         })();
@@ -303,10 +337,9 @@ impl Directory {
             // The lock excludes protocol writers and the protected directory
             // excludes unprivileged replacement. Before rename this is our
             // staged inode; after rename the name is absent.
-            let _ = fs::remove_file(self.path(STAGED));
+            let _ = fs::remove_file(self.path(staged));
         }
-        result?;
-        Ok(retained)
+        result
     }
 }
 

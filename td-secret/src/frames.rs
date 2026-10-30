@@ -279,13 +279,25 @@ pub(crate) struct Process {
 /// to 2 inherited, every user ID root, and an unnamed socketpair on
 /// standard input.
 pub(crate) fn endpoint(process: Process) -> Result<UnixStream, String> {
+    endpoint_for(process, 0)
+}
+
+/// An immutable registry supplies the notebook service UID; the inherited
+/// unnamed socket must still belong to root. No public listener is admitted.
+pub(crate) fn endpoint_for(process: Process, uid: u32) -> Result<UnixStream, String> {
+    let expected = uid.to_string();
     let uids = process
         .status
         .lines()
         .find_map(|line| line.strip_prefix("Uid:"))
         .map(|ids| ids.split_whitespace().collect::<Vec<_>>());
-    if uids.as_deref() != Some(&["0", "0", "0", "0"][..]) {
-        return Err("token operation requires every user ID to be root".into());
+    if uids.as_deref() != Some(&[expected.as_str(); 4][..]) {
+        return Err(if uid == 0 {
+            "token operation requires every user ID to be root"
+        } else {
+            "notebook operation has the wrong service identity"
+        }
+        .into());
     }
     if process.status.len() > 8192
         || !process.status.lines().any(|line| {

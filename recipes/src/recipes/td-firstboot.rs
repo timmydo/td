@@ -185,6 +185,11 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     steps.push(Step::WriteFile {
+        path: "{src}/td-fs/src/temp_dir.rs".into(),
+        content: include_str!("../../../td-fs/src/temp_dir.rs").into(),
+        exec: false,
+    });
+    steps.push(Step::WriteFile {
         path: "{src}/engine/src/principals.rs".into(),
         content: include_str!("../../../engine/src/principals.rs").into(),
         exec: false,

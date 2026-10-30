@@ -1397,3 +1397,70 @@ selection/edit/save/copy/paste/lock, not just headless model state. Record
 hardware model/firmware, both independently usable tokens and fresh-machine
 restore. Mock or software-token results alone cannot label the target ready
 for the user's only copy of real credentials.
+
+
+### Private td notebook service
+
+`td-secret notebook-service --uid OWNER` runs only under that owner's
+reserved notebook account, with an inherited root-owned unnamed socketpair
+on stdin and no other inherited descriptors beyond independent stdout and
+stderr. Startup verifies all UID/GID columns, supplementary groups, absent
+effective capabilities and one thread. The endpoint is a capability handed
+out by the trusted launcher; there is no public notebook listener and no
+UID-only browsing admission. Root-only shadow validation belongs to the launcher before its credential
+drop; the worker reads only the immutable public registry.
+The current worker implements the backend side;
+authority launch, trusted token mediation and the td-pass client remain
+integration work. Standalone mode on td remains refused.
+
+The worker owns mode-0700 `/var/lib/td/notebooks/OWNER`, under the dedicated
+service identity rather than the human or portal. It applies non-dumpability,
+a zero core limit and refusal of storage-backed swap before opening the vault,
+and rechecks memory before every request. There is no accepted-swap override.
+The encrypted store and token lifecycle are the same implementation as the
+portable notebook; no plaintext keys enter the browsing protocol.
+
+Private messages use a big-endian u32 byte length, bounded at 4 MiB plus
+16384 bytes, with bounded length-prefixed UTF-8 fields and no trailing bytes.
+Frames and constructed replies own clearing buffers. Growth copies into a
+new allocation and clears the old allocation before releasing it. A 30-second silence
+closes the worker; each frame body and each complete write has a five-second
+monotonic deadline. The authority must keep the connection alive and close
+or terminate the worker on session lock, suspend, generation loss or client
+loss. A vault session also expires after fifteen minutes, without heartbeat
+renewal. This ceiling is checked before each request; the authority owns
+cancellation of an operation in flight.
+
+The private request tags are: 1 keys, 2 create, 3 unlock, 4 list, 5 read,
+6 edit, 7 encrypted export, 8 encrypted import, 9 add key, 10 replace keys,
+11 lock, 12 mail credential, 13 heartbeat and 14 remembered binding. Tag 6
+admits create, edit, rename, delete and password changes, never a binding.
+The authority must admit only the pinned notebook instance to browsing and
+binding requests. Only an independently admitted mail instance may cause a
+credential request; its exact account, configured server and username select
+an already remembered binding, not an arbitrary entry ID. A missing binding,
+a locked vault or an uncertain publication releases nothing. Tag 12 returns
+only the explicit password/token field, never notes, entry lists or vault
+keys. This separation is a requirement on the authority adapter, not a claim
+that this codec authenticates callers.
+
+Token operations leave the worker through its private authority connection:
+`30` enrollment and `31` assertion carry purpose, role, fresh operation-bound
+challenges and bounded public credential metadata. Matching replies carry
+only verified token results into clearing owners. The backend does not open
+USB nodes or receive PINs. Missing, malformed or timed-out token replies end
+the service and its unlocked session. The authority adapter must own the
+exclusive token slot and physical secure-attention presentation; no caller
+outside that private root-created connection may supply these replies.
+
+Synthetic-token tests cover locked and absent-binding refusal, exact matching
+of all three binding fields, independent notes and password text, reopening
+with the backup key, expiry, malformed requests before token or disk effects,
+and locking after an uncertain save. Socket fixtures cover oversized frames
+and partial-frame disconnect. These are backend tests, not live hardware or
+end-to-end trusted desktop acceptance.
+
+The diskless `qemu-secret --case notebook-service` fixture launches the
+production worker through td-login as UID/GID 989 with a root-only shadow
+file. It checks heartbeat and empty-vault inspection replies, then observes
+process exit after closing the authority endpoint. It needs no TPM or token.

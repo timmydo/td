@@ -238,6 +238,9 @@ const BROKER_RESERVED_UID: u32 = td_engine::permissions::TD_BROKER_UID;
 const BROKER_USER: &str = "tdb1000";
 const BROKER_RUNTIME: &str = td_engine::permissions::TD_BUS_RUNTIME_PATH;
 const PORTAL_RESERVED_UID: u32 = 991;
+const NOTEBOOK_RESERVED_UID: u32 = 989;
+const NOTEBOOK_USER: &str = "tdv1000";
+const NOTEBOOK_HOME: &str = "/var/lib/td/notebooks/1000";
 const PORTAL_USER: &str = "tdp1000";
 const PORTAL_RUNTIME: &str = "/run/td-portal/1000";
 /// The live installer wizard's identity: only it reaches td-authd's setup
@@ -475,6 +478,9 @@ fn valid_home(uid: u32, home: &str) -> bool {
     if uid == AUDIO_UID {
         return home == AUDIO_RUNTIME;
     }
+    if uid == NOTEBOOK_RESERVED_UID {
+        return home == NOTEBOOK_HOME;
+    }
     if uid == PORTAL_RESERVED_UID {
         return home == PORTAL_RUNTIME;
     }
@@ -555,6 +561,17 @@ const SYSTEM: SystemDef = SystemDef {
     users: &[
         ROOT_ACCOUNT,
         PROFILER_ACCOUNT,
+        User {
+            name: NOTEBOOK_USER,
+            uid: NOTEBOOK_RESERVED_UID,
+            gid: NOTEBOOK_RESERVED_UID,
+            gecos: "Personal Vault",
+            home: NOTEBOOK_HOME,
+            shell: "/bin/false",
+            groups: &[],
+            passwordless: false,
+            service_only: true,
+        },
         User {
             name: PORTAL_USER,
             uid: PORTAL_RESERVED_UID,
@@ -4452,7 +4469,7 @@ fn build_elevation_table() -> String {
 
 fn build_principals(sys: &SystemDef) -> String {
     let mut text = format!(
-        "td-principals-v1\nsession\t{UI_UID}\t{COMPOSITOR_RESERVED_UID}\t{BROKER_RESERVED_UID}\t{PORTAL_RESERVED_UID}\n"
+        "td-principals-v1\nsession\t{UI_UID}\t{COMPOSITOR_RESERVED_UID}\t{BROKER_RESERVED_UID}\t{PORTAL_RESERVED_UID}\nnotebook\t{UI_UID}\t{NOTEBOOK_RESERVED_UID}\n"
     );
     let mut applications: Vec<&ShippedApplication> = sys.applications.iter().collect();
     applications.sort_by_key(|application| application.name);
@@ -8350,6 +8367,7 @@ mod tests {
         assert_eq!(
             service_accounts,
             [
+                NOTEBOOK_USER,
                 PORTAL_USER,
                 BROKER_USER,
                 COMPOSITOR_USER,

@@ -422,6 +422,7 @@ fn run_with_primary(
         principal_store::provision(&desired).map_err(Failure::Failed)?;
         principal_store::prepare_broker_runtimes(&desired).map_err(Failure::Failed)?;
         principal_store::prepare_portal_runtimes(&desired).map_err(Failure::Failed)?;
+        principal_store::prepare_notebooks(&desired).map_err(Failure::Failed)?;
         credentials::isolate_stores(&config.state, &desired)?;
         for application in desired.active_applications().map_err(Failure::Failed)? {
             let former = applications

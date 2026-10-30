@@ -55,6 +55,16 @@ pub(super) fn protect(accepted: Vec<String>) -> Result<Protected, Refusal> {
     Ok(Protected { accepted })
 }
 
+/// The admitted td service accepts no storage-backed swap exception.
+/// Its caller has already verified the reserved account and root endpoint.
+pub(super) fn protect_service() -> Result<Protected, String> {
+    memory(&[]).map_err(|_| "notebook service requires protected memory")?;
+    crate::pin_sys::protect_process().map_err(|_| "disable notebook service dumps")?;
+    Ok(Protected {
+        accepted: Vec::new(),
+    })
+}
+
 /// The core-dump soft limit is zero, and no swap device can put memory on
 /// storage that `accepted` does not name.
 fn memory(accepted: &[String]) -> Result<(), Refusal> {

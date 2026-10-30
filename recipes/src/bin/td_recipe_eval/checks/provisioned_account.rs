@@ -34,7 +34,7 @@ const MAX_KEYS: usize = 64;
 const MAX_COMMENT: usize = 256;
 /// The account forms td-firstboot reserves for sessions and applications:
 /// one of these followed by decimal digits.
-const RESERVED_ACCOUNT_PREFIXES: &[&str] = &["tda", "tdb", "tdc", "tdi", "tdp"];
+const RESERVED_ACCOUNT_PREFIXES: &[&str] = &["tda", "tdb", "tdc", "tdi", "tdp", "tdv"];
 
 pub(crate) struct ProvisionedAccount {
     name: String,
@@ -259,17 +259,18 @@ mod tests {
         }
         assert!(others > 4, "{others}");
         for name in [
-            "root", "sshd", "wheel", "tda1000", "tdb1", "tdc2", "tdi3", "tdp4", "", "Ada", "1ada",
+            "root", "sshd", "wheel", "tda1000", "tdb1", "tdc2", "tdi3", "tdp4", "tdv1000", "",
+            "Ada", "1ada",
         ] {
             assert!(check_name(STEM, name).is_err(), "{name:?}");
         }
         assert!(
             include_str!("../../../../../td-firstboot/src/principals.rs")
-                .contains(r#"if ["tda", "tdb", "tdc", "tdi", "tdp"].iter().any(|prefix| {"#)
+                .contains(r#"if ["tda", "tdb", "tdc", "tdi", "tdp", "tdv"]"#)
         );
         assert_eq!(
             RESERVED_ACCOUNT_PREFIXES,
-            ["tda", "tdb", "tdc", "tdi", "tdp"]
+            ["tda", "tdb", "tdc", "tdi", "tdp", "tdv"]
         );
         assert!(check_name("td-no-such-recipe", "ada").is_err());
     }

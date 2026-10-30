@@ -2766,6 +2766,16 @@ vault's standalone host adapter calls the same protection, under the same
 swap and core-limit requirements, before any PIN or vault key enters an
 ordinary desktop account's process; it adds no syscall or request.
 
+The private notebook service uses that same process protection through
+`portable_host.rs`, after its immutable service-identity and inherited
+root-owned socket admission. It accepts no storage-swap override. Its
+`notebook_wire.rs` framing, private token-result adapter and service engine
+use only safe std and add no syscall or descriptor-adoption site. The shared
+`frames.rs` endpoint helper also admits an explicitly reserved non-root
+service UID; the existing token and storage workers still require UID zero.
+The notebook startup additionally verifies GIDs, supplementary groups and
+zero effective capabilities before duplicating stdin.
+
 Only `pin_terminal.rs` calls the terminal wrappers; only `token_check.rs`
 and `portable_host.rs` call process protection. No descriptor adoption,
 mapping, signal handler or general request interface is added. Tests pin
