@@ -155,7 +155,15 @@ const MODULES: &[(&str, &str)] = &[
 /// `target-recipe` side of each `cfg_attr` mount names.
 const STAGED_FILES: &[(&str, &str)] = &[
     (
-        "auth/consent.rs",
+        "td-time/src/request.rs",
+        include_str!("../../../td-time/src/request.rs"),
+    ),
+    (
+        "td-civil/src/tzif.rs",
+        include_str!("../../../td-civil/src/tzif.rs"),
+    ),
+    (
+        "td-authd/src/consent.rs",
         include_str!("../../../td-authd/src/consent.rs"),
     ),
     (
@@ -225,7 +233,13 @@ pub fn recipe() -> Recipe {
             exec: false,
         });
     }
-    for directory in ["{src}/auth", "{src}/tests"] {
+    for directory in [
+        "{src}/auth",
+        "{src}/tests",
+        "{src}/td-authd/src",
+        "{src}/td-time/src",
+        "{src}/td-civil/src",
+    ] {
         steps.push(Step::MkDir {
             path: directory.into(),
         });
@@ -401,7 +415,7 @@ mod tests {
         for path in [
             "auth/channel.rs",
             "auth/sys.rs",
-            "auth/consent.rs",
+            "td-authd/src/consent.rs",
             "auth/primary_account.rs",
             "auth/hostname.rs",
         ] {
@@ -410,7 +424,7 @@ mod tests {
         let recipe = recipe();
         for (path, expected) in [
             (
-                "{src}/auth/consent.rs",
+                "{src}/td-authd/src/consent.rs",
                 include_str!("../../../td-authd/src/consent.rs"),
             ),
             (

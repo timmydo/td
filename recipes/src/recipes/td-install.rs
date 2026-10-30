@@ -187,6 +187,22 @@ pub fn recipe() -> Recipe {
     // only names the right file if `main.rs` sits at `td-install/src/`.
     let mut steps = vec![
         Step::MkDir {
+            path: "{src}/td-time/src".into(),
+        },
+        Step::MkDir {
+            path: "{src}/td-civil/src".into(),
+        },
+        Step::WriteFile {
+            path: "{src}/td-time/src/request.rs".into(),
+            content: include_str!("../../../td-time/src/request.rs").into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-civil/src/tzif.rs".into(),
+            content: include_str!("../../../td-civil/src/tzif.rs").into(),
+            exec: false,
+        },
+        Step::MkDir {
             path: "{out}/bin".into(),
         },
         Step::MkDir {

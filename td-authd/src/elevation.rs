@@ -23,16 +23,23 @@ const DIRECTORY_ONLY: i32 = 0x10000;
 pub(crate) enum Operation {
     DeployRollback,
     SetHostname,
+    ManageTime,
     DeployPublish,
 }
 
 impl Operation {
-    const ALL: &'static [Self] = &[Self::DeployRollback, Self::SetHostname, Self::DeployPublish];
+    const ALL: &'static [Self] = &[
+        Self::DeployRollback,
+        Self::SetHostname,
+        Self::DeployPublish,
+        Self::ManageTime,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             Self::DeployRollback => "deploy-rollback",
             Self::SetHostname => "set-hostname",
+            Self::ManageTime => "manage-time",
             Self::DeployPublish => "deploy-publish",
         }
     }

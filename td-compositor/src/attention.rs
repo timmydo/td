@@ -33,6 +33,7 @@ pub(crate) enum Notice {
     NoHostname,
     /// Root's success for `set-hostname`.
     HostnameSaved,
+    TimeSaved,
     /// A committed device-bound disk installation, before its recovery key:
     /// the screen then closes by itself (secret_client).
     Returning,
@@ -649,9 +650,9 @@ fn wrap(text: &str, columns: usize) -> Vec<String> {
 /// request while root cannot read or write its backoff.
 fn hostname_row(intake: HostnameIntake) -> String {
     let state = match intake.queue() {
-        Queue::Refusing => return "H: REFUSED - HOSTNAME BACKOFF UNUSABLE".into(),
-        Queue::Waiting => "H: REVIEW HOSTNAME CHANGE",
-        Queue::Empty => "H: NO HOSTNAME CHANGE WAITING",
+        Queue::Refusing => return "H: REFUSED - SETTINGS BACKOFF UNUSABLE".into(),
+        Queue::Waiting => "H: REVIEW HOSTNAME/TIME",
+        Queue::Empty => "H: NO SETTINGS WAITING",
     };
     match intake.denied() {
         0 => state.into(),
@@ -679,8 +680,9 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::RolledBack => "ROLLED BACK - RESTART TO BOOT IT",
         Notice::ElevationRefused => "REFUSED BY THE ELEVATION TABLE",
         Notice::NoPrevious => "NO PREVIOUS SYSTEM TO ROLL BACK TO",
-        Notice::NoHostname => "NO HOSTNAME CHANGE IS READY TO REVIEW",
+        Notice::NoHostname => "NO HOSTNAME OR TIME CHANGE IS READY",
         Notice::HostnameSaved => "HOSTNAME SAVED",
+        Notice::TimeSaved => "TIME SETTINGS SAVED",
         Notice::Returning => RETURNING_NOTICE,
         Notice::Stored => "CREDENTIAL STORED",
         Notice::NoWrite => "NO READY CREDENTIAL WRITE - RUN TD-SECRET SET FIRST",
@@ -1131,7 +1133,7 @@ mod tests {
             "K: LOGIN KEYS",
             "L: LOCK SCREEN",
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
-            "H: NO HOSTNAME CHANGE WAITING",
+            "H: NO SETTINGS WAITING",
             "S: DISK ENCRYPTION",
             "F: RESTART  P: POWER OFF  Z: SLEEP",
             "ESC TO RETURN",
@@ -1195,18 +1197,12 @@ mod tests {
     fn the_h_row_says_what_waits_and_the_denial_count() {
         let row = |answer: &[u8]| hostname_row(HostnameIntake::decode(answer).unwrap());
         for (answer, text) in [
-            (&[0x9f, 0, 0][..], "H: NO HOSTNAME CHANGE WAITING"),
-            (
-                &[0x9f, 0, 1][..],
-                "H: NO HOSTNAME CHANGE WAITING - 1 DENIED",
-            ),
-            (
-                &[0x9f, 0, 255][..],
-                "H: NO HOSTNAME CHANGE WAITING - 255 DENIED",
-            ),
-            (&[0x9f, 1, 0][..], "H: REVIEW HOSTNAME CHANGE"),
-            (&[0x9f, 1, 12][..], "H: REVIEW HOSTNAME CHANGE - 12 DENIED"),
-            (&[0x9f, 2, 0][..], "H: REFUSED - HOSTNAME BACKOFF UNUSABLE"),
+            (&[0x9f, 0, 0][..], "H: NO SETTINGS WAITING"),
+            (&[0x9f, 0, 1][..], "H: NO SETTINGS WAITING - 1 DENIED"),
+            (&[0x9f, 0, 255][..], "H: NO SETTINGS WAITING - 255 DENIED"),
+            (&[0x9f, 1, 0][..], "H: REVIEW HOSTNAME/TIME"),
+            (&[0x9f, 1, 12][..], "H: REVIEW HOSTNAME/TIME - 12 DENIED"),
+            (&[0x9f, 2, 0][..], "H: REFUSED - SETTINGS BACKOFF UNUSABLE"),
         ] {
             assert_eq!(row(answer), text);
             assert!(text.len() <= layout(320, 200).1, "{text}");
@@ -1357,6 +1353,7 @@ mod tests {
         Notice::NoPrevious,
         Notice::NoHostname,
         Notice::HostnameSaved,
+        Notice::TimeSaved,
         Notice::Returning,
         Notice::Enrolled,
         Notice::Unenrolled,

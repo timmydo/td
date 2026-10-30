@@ -3613,3 +3613,31 @@ selected update's `give_up` field, which production sets only from
 request inside the receive; and the marker read afresh through the
 held directory, never a link, a FIFO, another owner's file or one past
 its bound.
+
+## Time settings through the protected settings intake
+
+`td-time` shares the existing hostname intake, greeting, pidfd-bound sender,
+queue and backoff. The length byte now admits at most 79 payload bytes.
+Ordinary hostname requests retain their grammar. A `time ` prefix selects
+only the bounded canonical codec in `td-time/src/request.rs`: exact UTC,
+a timezone identifier, or automatic on/off. Both admission and selection
+require the distinct `manage-time` principal grant. Selection checks the
+owner's grant before consuming the queued request. The H attention row
+reviews either kind; there is no new public root execution endpoint.
+
+Tag 39 carries a requester u32 equal to the owner and one length-prefixed
+canonical setting. It stays below the existing description bound and awaits
+ordinary Enter approval. No request can change clocks before both matching
+presentation and commit. Commitment is consumed first, clears the common
+backoff, and starts only `/bin/td-time apply ACTION VALUE`, with a cleared
+environment, cwd `/`, null stdin and a bounded stdout pipe. Inspection owns
+its ten-second monotonic deadline and teardown. Helper failure or a lost
+receipt never retries the change. The system-clock and RTC outcomes remain
+separate in `td-time status`; `td-time/DESIGN.md` owns persistence and sync.
+The static image table grants the primary owner `manage-time` after its
+three existing operations. The public client is `td-authd time ACTION VALUE`.
+
+Power helper failures report launch errors, monotonic deadline expiry, or
+helper failure/disconnection on the authority's diagnostic stream. Wall-clock
+correction does not alter that two-second Instant deadline. A timeout leaves
+the power outcome unknown; it is not evidence that the request was rejected.

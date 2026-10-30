@@ -4,10 +4,12 @@
 //! key; after the person's commit root saves the new name canonically.
 
 use crate::backoff::{self, Backoff, Entry, Refused, Row, BACKING_OFF, REFUSED};
+use crate::consent::time_setting;
 use crate::consent::{Operation, Request};
 use crate::deployment::{bind_intake, unlink_intake};
 use crate::elevation::{self, Table};
 use crate::hostname::Hostname;
+use crate::inspection::Inspection;
 use crate::saved;
 use crate::secret_sys as sys;
 use crate::unlock::Event;
@@ -17,7 +19,31 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Setting(String);
+impl Setting {
+    fn parse(text: &str) -> Result<Self, String> {
+        if let Some(value) = text.strip_prefix("time ") {
+            time_setting::Change::decode(value)?;
+        } else {
+            Hostname::parse(text)?;
+        }
+        Ok(Self(text.into()))
+    }
+    fn name(&self) -> &str {
+        &self.0
+    }
+    fn operation(&self) -> elevation::Operation {
+        if self.0.starts_with("time ") {
+            elevation::Operation::ManageTime
+        } else {
+            elevation::Operation::SetHostname
+        }
+    }
+}
 
 const SOCKET: &str = "/run/td-authd/1000/hostname";
 const GREETING: &[u8; 8] = b"TDHST01\n";
@@ -105,18 +131,22 @@ impl Places {
         }
     }
 
-    fn saved(&self) -> Result<Hostname, String> {
-        saved::read_hostname(&self.saved, self.owner)?.ok_or_else(|| "no saved hostname".into())
+    fn saved(&self) -> Result<Setting, String> {
+        let name = saved::read_hostname(&self.saved, self.owner)?.ok_or("no saved hostname")?;
+        Setting::parse(name.name())
     }
 }
 
 /// An admitted request: the name and the requester's UID.
 pub(crate) struct Ready {
-    name: Hostname,
+    name: Setting,
     requester: u32,
 }
 
 impl Ready {
+    pub fn operation(&self) -> elevation::Operation {
+        self.name.operation()
+    }
     pub fn requester(&self) -> u32 {
         self.requester
     }
@@ -135,7 +165,7 @@ struct Pending {
     greeting: usize,
     bytes: Vec<u8>,
     peer: Option<Peer>,
-    name: Option<Hostname>,
+    name: Option<Setting>,
     acknowledged: bool,
     selected: bool,
     deadline: Option<Instant>,
@@ -152,7 +182,7 @@ impl Pending {
             stream,
             owner,
             greeting: 0,
-            bytes: Vec::with_capacity(64),
+            bytes: Vec::with_capacity(80),
             peer: None,
             name: None,
             acknowledged: false,
@@ -203,7 +233,7 @@ impl Pending {
     /// One length byte, then 1 to 63 name bytes `Hostname::parse` admits;
     /// `admit` then decides: its success sends admission byte 02, and its
     /// refusal that refusal's byte before the connection closes.
-    fn poll(&mut self, admit: impl FnOnce(&Hostname) -> Result<(), Refused>) -> io::Result<()> {
+    fn poll(&mut self, admit: impl FnOnce(&Setting) -> Result<(), Refused>) -> io::Result<()> {
         let mut admit = Some(admit);
         self.live()?;
         for _ in 0..4 {
@@ -248,7 +278,7 @@ impl Pending {
                 };
             }
             let expected = match self.bytes.first() {
-                Some(&length) if (1..=63).contains(&length) => usize::from(length) + 1,
+                Some(&length) if (1..=79).contains(&length) => usize::from(length) + 1,
                 Some(_) => return Err(error("invalid hostname request length")),
                 None => 1,
             };
@@ -259,7 +289,7 @@ impl Pending {
                         .ok_or_else(|| error("missing hostname"))?,
                 )
                 .map_err(error)?;
-                let name = Hostname::parse(text).map_err(error)?;
+                let name = Setting::parse(text).map_err(error)?;
                 let admit = admit
                     .take()
                     .ok_or_else(|| error("hostname admitted twice"))?;
@@ -270,7 +300,7 @@ impl Pending {
                 self.name = Some(name);
                 return self.live();
             }
-            let mut bytes = [0; 64];
+            let mut bytes = [0; 80];
             let remaining = expected
                 .checked_sub(self.bytes.len())
                 .ok_or_else(|| error("invalid hostname cursor"))?;
@@ -303,7 +333,7 @@ fn admit(
     places: &Places,
     status: &mut Status,
     requester: u32,
-    name: &Hostname,
+    name: &Setting,
 ) -> Result<(), Refused> {
     let now = backoff::now();
     status.entry = places.backoff.read();
@@ -323,14 +353,16 @@ fn admit(
     if entry.refuses(now) {
         return Err(Refused::Backoff);
     }
-    if &places.saved().map_err(Refused::Other)? == name {
+    if name.operation() == elevation::Operation::SetHostname
+        && &places.saved().map_err(Refused::Other)? == name
+    {
         return Err(Refused::Other(
             "the requested name is the saved name".into(),
         ));
     }
     if !(places.table)()
         .map_err(Refused::Other)?
-        .grants(requester, elevation::Operation::SetHostname)
+        .grants(requester, name.operation())
     {
         return Err(Refused::Other(
             "the principal table does not grant the requester".into(),
@@ -430,6 +462,10 @@ impl Intake {
         }
     }
 
+    pub fn queued_operation(&self) -> Option<elevation::Operation> {
+        self.pending.as_ref()?.name.as_ref().map(Setting::operation)
+    }
+
     pub fn select(&mut self) -> Result<Ready, String> {
         self.tick();
         let pending = self.pending.as_mut().ok_or("no pending hostname change")?;
@@ -444,7 +480,7 @@ impl Intake {
             .map(|peer| peer.credentials.uid)
             .ok_or("hostname request without a sender")?;
         let ready = Ready {
-            name: Hostname::parse(name.name())?,
+            name: Setting::parse(name.name())?,
             requester,
         };
         pending.selected = true;
@@ -489,7 +525,7 @@ impl Drop for Intake {
 }
 
 pub(crate) fn request(name: &str) -> Result<(), String> {
-    let name = Hostname::parse(name)?;
+    let name = Setting::parse(name)?;
     let mut stream = UnixStream::connect(SOCKET)
         .map_err(|e| format!("connect to the hostname authority: {e}"))?;
     if sys::peer_uid(&stream).map_err(|e| e.to_string())? != 0 {
@@ -508,7 +544,7 @@ pub(crate) fn request(name: &str) -> Result<(), String> {
     if &greeting != GREETING {
         return Err("unsupported hostname authority".into());
     }
-    let mut bytes = Vec::with_capacity(64);
+    let mut bytes = Vec::with_capacity(80);
     bytes.push(u8::try_from(name.name().len()).map_err(|e| e.to_string())?);
     bytes.extend_from_slice(name.name().as_bytes());
     stream.write_all(&bytes).map_err(|e| e.to_string())?;
@@ -536,7 +572,7 @@ pub(crate) fn request(name: &str) -> Result<(), String> {
     }
     writeln!(
         io::stdout(),
-        "A hostname change to {} waits. Press Ctrl+Alt+Escape, then H to review it.",
+        "A settings change to {} waits. Press Ctrl+Alt+Escape, then H to review it.",
         name.name()
     )
     .map_err(|e| e.to_string())?;
@@ -549,7 +585,7 @@ pub(crate) fn request(name: &str) -> Result<(), String> {
     if reply == [1] {
         writeln!(
             io::stdout(),
-            "Hostname saved as {}. A restart completes the change.",
+            "Settings change completed: {}. Hostname changes require a restart.",
             name.name()
         )
         .map_err(|e| e.to_string())
@@ -567,12 +603,13 @@ pub(crate) struct Change {
     committed: bool,
     deadline: Instant,
     result: Option<bool>,
+    helper: Option<Inspection>,
 }
 
 impl Change {
     /// Tag 12 for `ready` beside `old`, under a fresh nonce drawn from
     /// `/dev/urandom`.
-    fn start(owner: u32, ready: Ready, old: Hostname, places: &Places) -> Result<Self, String> {
+    fn start(owner: u32, ready: Ready, old: Setting, places: &Places) -> Result<Self, String> {
         let mut nonce = [0; 32];
         File::open("/dev/urandom")
             .and_then(|mut random| random.read_exact(&mut nonce))
@@ -583,17 +620,24 @@ impl Change {
     fn drawn(
         owner: u32,
         ready: Ready,
-        old: Hostname,
+        old: Setting,
         places: &Places,
         nonce: [u8; 32],
     ) -> Result<Self, String> {
         let request = Request::new(
             nonce,
             owner,
-            Operation::SetHostname {
-                requester: ready.requester,
-                old: old.name().into(),
-                new: ready.name.name().into(),
+            if let Some(setting) = ready.name.name().strip_prefix("time ") {
+                Operation::ManageTime {
+                    requester: ready.requester,
+                    setting: setting.into(),
+                }
+            } else {
+                Operation::SetHostname {
+                    requester: ready.requester,
+                    old: old.name().into(),
+                    new: ready.name.name().into(),
+                }
             },
         )?;
         Ok(Self {
@@ -607,6 +651,7 @@ impl Change {
                 .checked_add(CONSENT)
                 .ok_or("hostname change deadline overflow")?,
             result: None,
+            helper: None,
         })
     }
 
@@ -642,6 +687,17 @@ impl Change {
         if !self.presented {
             return Err("hostname change was not presented".into());
         }
+        if let Operation::ManageTime { setting, .. } = self.request.operation() {
+            let change = time_setting::Change::decode(setting)?;
+            self.committed = true;
+            self.result = Some(false);
+            self.backoff.approved()?;
+            let mut command = Command::new("/bin/td-time");
+            command.args(["apply", change.action(), &change.value()?]);
+            self.helper = Some(Inspection::printing(command, 511, Duration::from_secs(10))?);
+            self.result = None;
+            return Ok(());
+        }
         let Operation::SetHostname { old, new, .. } = self.request.operation() else {
             return Err("invalid hostname description".into());
         };
@@ -658,6 +714,15 @@ impl Change {
     }
 
     pub fn poll(&mut self) -> Result<Event, String> {
+        if let Some(helper) = &mut self.helper {
+            match helper.finished()? {
+                None => return Ok(Event::Waiting),
+                Some(result) => {
+                    self.result = Some(result.is_some());
+                    self.helper = None;
+                }
+            }
+        }
         if !self.committed && Instant::now() >= self.deadline {
             self.cancel()?;
         }

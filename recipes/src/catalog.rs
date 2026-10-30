@@ -525,6 +525,7 @@ mod tests {
                 "td-software",
                 "td-taskmgr",
                 "td-term",
+                "td-time",
                 "uutils",
             ]
         );
@@ -672,6 +673,7 @@ mod tests {
                 "td-taskmgr",
                 "td-term",
                 "td-test-compositor",
+                "td-time",
                 "td-toml",
                 "td-tpm",
                 "td-ui",

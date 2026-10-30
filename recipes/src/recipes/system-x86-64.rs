@@ -1407,6 +1407,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 const TD_SVC_UNITS: &[&str] = &[
     "hostname",
     "td-firstboot",
+    "time",
     "sandbox-default",
     "release-source",
     "rootcheck",
@@ -1775,6 +1776,14 @@ fn build_desktop_td_svc_conf() -> String {
          exec=/bin/td-firstboot provision --application-primary --enroll-principals\n\
          after=hostname\n\
          timeout={firstboot}\n\
+         \n\
+         [time]\n\
+         type=daemon\n\
+         exec=/bin/td-time serve\n\
+         after=td-firstboot\n\
+         requires=td-firstboot\n\
+         restart=on-failure\n\
+         log=/var/log/svc/time.log\n\
          \n\
          [sandbox-default]\n\
          type=oneshot\n\
@@ -4112,6 +4121,12 @@ const MUTABLE_ETC: &[MutableEtc] = &[
               no choice and td-jail keeps the application's existing UTC default",
     },
     MutableEtc {
+        etc: "localtime",
+        target: "/var/lib/td/localtime",
+        state: State::OptionalPersistent,
+        why: "td-time publishes validated TZif data for the selected timezone",
+    },
+    MutableEtc {
         etc: "resolv.conf",
         target: "/run/resolv.conf",
         state: State::Volatile,
@@ -4429,7 +4444,9 @@ fn build_firefox_tls_ready() -> String {
 /// The v1 row: the session owner may perform every v1 operation. td-authd
 /// consults it before any prompt, for `deploy-rollback` from L3.
 fn build_elevation_table() -> String {
-    format!("td-elevation-v1\n{UI_UID}\tdeploy-rollback\tset-hostname\tdeploy-publish\n")
+    format!(
+        "td-elevation-v1\n{UI_UID}\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\n"
+    )
 }
 
 fn build_principals(sys: &SystemDef) -> String {
@@ -4881,6 +4898,14 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     // on a server. td-term's terminfo entry stays: an SSH client running in
     // td-term names TERM=td-term.
     if sys.desktop() {
+        steps.push(Step::CopyTree {
+            from: "{in:td-time}".into(),
+            dest: "{root}/real-root{in:td-time}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-time}/bin/td-time".into(),
+            link: "{root}/real-root/bin/td-time".into(),
+        });
         steps.push(Step::CopyTree {
             from: "{in:td-taskmgr}".into(),
             dest: "{root}/real-root{in:td-taskmgr}".into(),
@@ -6076,6 +6101,7 @@ const DESKTOP_INPUTS: &[&str] = &[
     "jetbrains-mono-nerd-font",
     "td-authd",
     "td-taskmgr",
+    "td-time",
     "td-review",
     "td-agent",
     "td-sandbox",
@@ -6391,6 +6417,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "td-svc",
                 "td-profiler",
                 "td-taskmgr",
+                "td-time",
                 "td-review",
                 "td-agent",
                 "td-sandbox",
@@ -9605,7 +9632,7 @@ mod tests {
         assert_eq!(ELEVATION_TABLE, "/etc/td-elevation.tsv");
         assert_eq!(
             build_elevation_table(),
-            "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\n"
+            "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\n"
         );
         assert!(etc_files(&SYSTEM)
             .unwrap()
@@ -11520,9 +11547,11 @@ mod tests {
             .iter()
             .filter(|entry| entry.state == State::OptionalPersistent)
             .collect();
-        assert_eq!(optional.len(), 1);
+        assert_eq!(optional.len(), 2);
         assert_eq!(optional[0].etc, "timezone");
         assert_eq!(optional[0].target, "/var/lib/td/timezone");
+        assert_eq!(optional[1].etc, "localtime");
+        assert_eq!(optional[1].target, "/var/lib/td/localtime");
         assert!(include_str!("../../../td-install/src/main.rs")
             .contains("const TIMEZONE_STATE_RELATIVE: &str = \"lib/td/timezone\";"));
         let check = build_mutable_etc_check();
@@ -16880,6 +16909,7 @@ mod server_tests {
             "td-vm-guest",
             "td-term",
             "td-taskmgr",
+            "td-time",
             "td-review",
             "td-agent",
             "td-sandbox",

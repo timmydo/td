@@ -96,6 +96,12 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
      td-authd request-update SOURCE DEPLOYMENT-ID | td-authd request-hostname NAME";
 
 fn run(arguments: &[String]) -> Result<(), String> {
+    if let [verb, action, value] = arguments {
+        if verb == "time" {
+            let change = consent::time_setting::Change::parse(action, value)?;
+            return set_hostname::request(&format!("time {}", change.encode()?));
+        }
+    }
     if arguments == ["suspend-system"] {
         return suspend::run();
     }

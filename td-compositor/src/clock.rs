@@ -1,4 +1,4 @@
-//! One immutable timezone snapshot per compositor session.
+//! Validated timezone snapshots; the status bar reloads when the setting changes.
 
 use crate::timezone::{civil_from_days, Zone, MAX_BYTES};
 use std::fs::{self, File};
@@ -18,16 +18,32 @@ pub enum Clock {
 
 impl Clock {
     pub fn load(setting: &Path, zoneinfo: &Path) -> Result<Self, String> {
-        let metadata = match fs::metadata(setting) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::Utc),
-            Err(error) => return Err(format!("read timezone setting: {error}")),
-        };
-        if !metadata.is_file() {
-            return Err("timezone setting is not a regular file".into());
+        Self::load_snapshot(setting, zoneinfo).map(|(clock, _)| clock)
+    }
+
+    pub fn load_snapshot(
+        setting: &Path,
+        zoneinfo: &Path,
+    ) -> Result<(Self, Option<Vec<u8>>), String> {
+        let selected = Self::selection(setting)?;
+        let clock = Self::from_selection(selected.as_deref(), zoneinfo)?;
+        Ok((clock, selected))
+    }
+
+    fn selection(setting: &Path) -> Result<Option<Vec<u8>>, String> {
+        match fs::metadata(setting) {
+            Ok(metadata) if metadata.is_file() => read_bounded(setting, 65).map(Some),
+            Ok(_) => Err("timezone setting is not a regular file".into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("read timezone setting: {error}")),
         }
-        let bytes = read_bounded(setting, 65)?;
-        let name = std::str::from_utf8(&bytes).map_err(|_| "timezone setting is not UTF-8")?;
+    }
+
+    fn from_selection(selected: Option<&[u8]>, zoneinfo: &Path) -> Result<Self, String> {
+        let Some(bytes) = selected else {
+            return Ok(Self::Utc);
+        };
+        let name = std::str::from_utf8(bytes).map_err(|_| "timezone setting is not UTF-8")?;
         let name = name.strip_suffix('\n').unwrap_or(name);
         let components: Vec<_> = name.split('/').collect();
         if name.len() > 64
@@ -59,6 +75,26 @@ impl Clock {
             name: name.to_owned(),
             zone,
         })
+    }
+
+    pub fn reload_if_changed(
+        &mut self,
+        previous: &mut Option<Vec<u8>>,
+        setting: &Path,
+        zones: &Path,
+    ) {
+        let selected = match Self::selection(setting) {
+            Ok(selected) => selected,
+            Err(_) => {
+                *self = Self::Unavailable;
+                *previous = None;
+                return;
+            }
+        };
+        if &selected != previous || matches!(self, Self::Unavailable) {
+            *self = Self::from_selection(selected.as_deref(), zones).unwrap_or(Self::Unavailable);
+            *previous = selected;
+        }
     }
 
     pub fn stamp(&self, epoch: Option<u64>) -> String {
@@ -144,7 +180,7 @@ struct Civil {
     second: i64,
 }
 
-fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
     let file = File::open(path).map_err(|error| format!("open timezone data: {error}"))?;
     if !file
         .metadata()
@@ -169,20 +205,16 @@ mod tests {
     use super::*;
     use crate::timezone::fixture;
     use std::os::unix::fs::symlink;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    struct Scratch(std::path::PathBuf);
+    struct Scratch(
+        std::path::PathBuf,
+        #[allow(dead_code)] crate::temp_dir::TempDir,
+    );
     impl Scratch {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "td-clock-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            Self(path)
+            let owned = crate::temp_dir::TempDir::new("td-clock").unwrap();
+            Self(owned.path().into(), owned)
         }
+
         fn setting(&self) -> std::path::PathBuf {
             self.0.join("timezone")
         }
@@ -202,10 +234,25 @@ mod tests {
             fs::write(self.setting(), b"Europe/London\n").unwrap();
         }
     }
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+
+    #[test]
+    fn a_changed_setting_updates_display_without_changing_the_sampled_instant() {
+        let scratch = Scratch::new();
+        scratch.seed();
+        let (mut clock, mut previous) =
+            Clock::load_snapshot(&scratch.setting(), &scratch.zones()).unwrap();
+        assert_eq!(previous.as_deref(), Some(b"Europe/London\n".as_slice()));
+        let epoch = 4_118_083_200;
+        assert_eq!(clock.stamp(Some(epoch)), "2100-07-01 01:00:00 UTC+01:00");
+        fs::remove_file(scratch.setting()).unwrap();
+        clock.reload_if_changed(&mut previous, &scratch.setting(), &scratch.zones());
+        assert_eq!(clock.stamp(Some(epoch)), "2100-07-01 00:00:00 UTC");
+        fs::write(scratch.setting(), "invalid").unwrap();
+        clock.reload_if_changed(&mut previous, &scratch.setting(), &scratch.zones());
+        assert!(matches!(clock, Clock::Unavailable));
+        fs::write(scratch.setting(), "Europe/London\n").unwrap();
+        clock.reload_if_changed(&mut previous, &scratch.setting(), &scratch.zones());
+        assert_eq!(clock.stamp(Some(epoch)), "2100-07-01 01:00:00 UTC+01:00");
     }
 
     #[test]

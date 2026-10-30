@@ -8359,6 +8359,16 @@ mod tests {
             [].as_slice(),
         ),
         (
+            "request.rs",
+            include_str!("../../td-time/src/request.rs"),
+            [].as_slice(),
+        ),
+        (
+            "tzif.rs",
+            include_str!("../../td-civil/src/tzif.rs"),
+            [].as_slice(),
+        ),
+        (
             "frames.rs",
             include_str!("../../td-secret/src/frames.rs"),
             [].as_slice(),
@@ -8398,8 +8408,6 @@ mod tests {
         // attribute's own path out of one. Everything below reads code
         // instead, and reads it off `plain_source`, which drops both.
         let text = uncommented(include_str!("main.rs"));
-        let source = unspaced(&text);
-        let source = source.as_str();
         let labels: Vec<&str> = compiled_files().map(|(label, _, _)| label).collect();
         // The TABLE's own body, because `include_str!` below has to bind a
         // declaration to the file the guards read and a `contains` over the
@@ -8431,41 +8439,67 @@ mod tests {
             }
             unspaced(tail.get(..end).unwrap_or_default())
         };
+        let mut declarations_by_file = std::collections::BTreeMap::new();
         let mut declared = 0usize;
-        let mut from = 0usize;
-        while let Some(at) = source.get(from..).and_then(|rest| index_of(rest, MARKER)) {
-            let start = from.saturating_add(at).saturating_add(MARKER.len());
-            let rest = source.get(start..).unwrap_or_default();
-            // Advanced BEFORE the shape test below, which may skip this
-            // occurrence — a `continue` past the cursor is a loop that never
-            // ends, and this one hung the suite until it was moved up.
-            from = start;
-            // The attribute's own shape, not merely its name: unspaced, a
-            // declaration is `#[path="…"]` and this test's own prose about
-            // `#[path]` is not. Written as a prefix test rather than by
-            // trimming, or the prose matches and the path read is garbage —
-            // which is how this was caught.
-            let Some(quoted) = rest.strip_prefix("=\"") else {
-                continue;
-            };
-            let path = quoted.split('"').next().unwrap_or_default();
-            let name = path.rsplit('/').next().unwrap_or_default();
-            assert!(
-                labels.contains(&name),
-                "{path} is compiled into this binary and scanned by neither guard"
-            );
-            // …and the guard reads THAT file rather than one with the same
-            // basename. `compiled_files` names each by its `include_str!`
-            // argument, so requiring the declared path to appear as one is
-            // what ties the two together: review pointed out that moving a
-            // declaration to `../../alternate/gpt.rs` still matches the
-            // `gpt.rs` label while the guards go on reading the original.
-            assert!(
-                table_body.contains(&format!("include_str!(\"{path}\")")),
-                "{path} is compiled in, but the guards read a different file \
+        for (label, contents, _) in compiled_files() {
+            let source = unspaced(&uncommented(contents));
+            let mut count = 0usize;
+            let mut from = 0usize;
+            while let Some(at) = source.get(from..).and_then(|rest| index_of(rest, MARKER)) {
+                let start = from.saturating_add(at).saturating_add(MARKER.len());
+                let rest = source.get(start..).unwrap_or_default();
+                // Advanced BEFORE the shape test below, which may skip this
+                // occurrence — a `continue` past the cursor is a loop that never
+                // ends, and this one hung the suite until it was moved up.
+                from = start;
+                // The attribute's own shape, not merely its name: unspaced, a
+                // declaration is `#[path="…"]` and this test's own prose about
+                // `#[path]` is not. Written as a prefix test rather than by
+                // trimming, or the prose matches and the path read is garbage —
+                // which is how this was caught.
+                let Some(quoted) = rest.strip_prefix("=\"") else {
+                    continue;
+                };
+                let path = quoted.split('"').next().unwrap_or_default();
+                // These sibling src directories resolve their two parent
+                // components to the same repository root as this file.
+                // Other nested paths need an explicit resolution contract.
+                if label != "main.rs" {
+                    assert!(
+                        matches!(
+                            (label, path),
+                            ("consent.rs", "../../td-time/src/request.rs")
+                                | ("request.rs", "../../td-civil/src/tzif.rs")
+                        ),
+                        "unreviewed nested source path: {label}: {path}"
+                    );
+                }
+                let name = path.rsplit('/').next().unwrap_or_default();
+                // The only nested chain starts at this exact root edge;
+                // moving its parent would change relative path resolution.
+                if name == "consent.rs" {
+                    assert_eq!(label, "main.rs");
+                    assert_eq!(path, "../../td-authd/src/consent.rs");
+                }
+                assert!(
+                    labels.contains(&name),
+                    "{path} is compiled into this binary and scanned by neither guard"
+                );
+                // …and the guard reads THAT file rather than one with the same
+                // basename. `compiled_files` names each by its `include_str!`
+                // argument, so requiring the declared path to appear as one is
+                // what ties the two together: review pointed out that moving a
+                // declaration to `../../alternate/gpt.rs` still matches the
+                // `gpt.rs` label while the guards go on reading the original.
+                assert!(
+                    table_body.contains(&format!("include_str!(\"{path}\")")),
+                    "{path} is compiled in, but the guards read a different file \
                  of that name"
-            );
-            declared = declared.saturating_add(1);
+                );
+                count += 1;
+            }
+            declarations_by_file.insert(label, count);
+            declared += count;
         }
         // …and the list holds nothing ELSE, or a file could be dropped from
         // the crate while its entry went on standing in for it.
@@ -8537,13 +8571,13 @@ mod tests {
                 "{label} defines a macro, which can assemble a lint \
                  suppression the allow scan cannot read"
             );
-            // …and no module of its own. `main.rs` declares the seven; any
-            // other file declaring one compiles another source.
+            // Every module declaration must have a counted path, including
+            // the shared consent parser's nested calendar module.
             let mods = declarations(&plain_file)
                 .into_iter()
                 .filter(|(keyword, head)| *keyword == "mod" && head.trim_end().ends_with(';'))
                 .count();
-            let want = if label == "main.rs" { declared } else { 0 };
+            let want = declarations_by_file.get(label).copied().unwrap_or(0);
             assert_eq!(
                 mods, want,
                 "{label} declares {mods} file modules against {want} `#[path]` \

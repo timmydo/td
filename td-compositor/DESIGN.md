@@ -446,8 +446,9 @@ than an oversight, and nothing is lost but pixels — `draw_text_clipped` clips.
 The fix, when it matters, is dropping whole FIELDS rather than clipping a
 glyph, which is also what would keep the clock while the workspaces grow.
 
-The clock reads the optional persistent `/etc/timezone` setting once when
-its worker starts, before taking the runtime lock. Absence selects UTC.
+The clock reads the optional persistent `/etc/timezone` setting when
+its worker starts and checks its bounded bytes on each status tick, before
+taking the runtime lock. Changed bytes reload the validated zone immediately. Absence selects UTC.
 A selected IANA name resolves beneath the deployment's `/etc/zoneinfo`;
 the root may be a store symlink, but each descendant must be a directory
 or a regular leaf. Setting and zone reads are bounded to 65 bytes and
@@ -475,10 +476,9 @@ POSIX month/week/weekday, Julian and ordinal rules include southern and
 negative DST, all-year DST, fractional offsets and v3 signed transition
 hours. Recurrence is evaluated beyond the recorded transitions instead
 of freezing the last offset. Missing future information and the `-00`
-placeholder remain unknown. Parsed rules are owned for the session;
-there is no per-tick file I/O, environment `TZ` lookup, subprocess, or
-process-global timezone mutation. A later setting change takes effect
-when the compositor restarts.
+placeholder remain unknown. Parsed rules are retained until the setting changes;
+there is no environment `TZ` lookup, subprocess, or process-global
+timezone mutation. A refused replacement displays an unavailable clock.
 
 The date is proleptic Gregorian and supports a local date before the
 Unix epoch, such as the previous evening west of Greenwich. The

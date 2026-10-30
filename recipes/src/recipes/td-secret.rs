@@ -211,7 +211,16 @@ const MODULES: &[(&str, &str)] = &[
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
 
-    let mut steps = Vec::new();
+    let mut steps = vec![
+        Step::MkDir {
+            path: "{src}/td-time/src".into(),
+        },
+        Step::WriteFile {
+            path: "{src}/td-time/src/request.rs".into(),
+            content: include_str!("../../../td-time/src/request.rs").into(),
+            exec: false,
+        },
+    ];
     for directory in [
         "{src}/td-secret/src",
         "{src}/td-secret/tests",

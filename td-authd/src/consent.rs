@@ -5,6 +5,8 @@ use std::time::Duration;
 // Every includer declares the shared `td-firstboot/src/hostname.rs` beside
 // this module, so a hostname description admits exactly firstboot's names.
 use super::hostname::Hostname;
+#[path = "../../td-time/src/request.rs"]
+pub mod time_setting;
 
 const MAGIC: &[u8; 8] = b"TDCONS02";
 const MAX_BYTES: usize = 256;
@@ -998,6 +1000,10 @@ pub enum Operation {
         old: String,
         new: String,
     },
+    ManageTime {
+        requester: u32,
+        setting: String,
+    },
     /// Storage operation `01`: write the running deployment `current`'s
     /// kernel and selector to the ESP in `form`. One step.
     SelectorUpdate {
@@ -1584,6 +1590,11 @@ impl Request {
             {
                 return Err("invalid consent upgrade".into());
             }
+            Operation::ManageTime { requester, setting }
+                if *requester != owner || time_setting::Change::decode(setting).is_err() =>
+            {
+                return Err("invalid consent time change".into());
+            }
             Operation::SetHostname {
                 requester,
                 old,
@@ -1760,6 +1771,7 @@ impl Request {
             Operation::Install { .. }
             | Operation::DeployRollback { .. }
             | Operation::SetHostname { .. }
+            | Operation::ManageTime { .. }
             | Operation::SelectorUpdate { .. }
             | Operation::UpgradeCancel => true,
             Operation::Upgrade { step, .. } => *step == UpgradeStep::Review,
@@ -2312,6 +2324,11 @@ impl Request {
                 bytes.extend_from_slice(current.as_bytes());
                 bytes.extend_from_slice(previous.as_bytes());
             }
+            Operation::ManageTime { requester, setting } => {
+                bytes.push(39);
+                bytes.extend_from_slice(&requester.to_be_bytes());
+                put_text(&mut bytes, setting);
+            }
             Operation::SetHostname {
                 requester,
                 old,
@@ -2560,6 +2577,10 @@ impl Request {
                     previous: input.deployment()?,
                 }
             }
+            39 => Operation::ManageTime {
+                requester: input.number()?,
+                setting: input.text()?,
+            },
             12 => {
                 let requester = input.number()?;
                 let old = input.text()?;
@@ -2847,6 +2868,14 @@ impl Request {
                 lines.push(format!("CURRENT: {current}"));
                 lines.push(format!("PREVIOUS: {previous}"));
                 lines.push("TAKES EFFECT AT THE NEXT RESTART".into());
+                approval_lines(&mut lines);
+            }
+            Operation::ManageTime { requester, setting } => {
+                lines.push("CHANGE TIME SETTINGS".into());
+                lines.push(format!("REQUESTER UID {requester}"));
+                lines.push(format!("REQUEST: {setting}"));
+                lines.push("CLOCK AND HARDWARE CLOCK USE UTC".into());
+                lines.push("AUTOMATIC SYNC CAN ADJUST MANUAL TIME".into());
                 approval_lines(&mut lines);
             }
             Operation::SetHostname {

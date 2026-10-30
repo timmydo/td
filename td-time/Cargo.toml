@@ -1,0 +1,31 @@
+[package]
+name = "td-time"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Clock status and bounded time synchronization for td"
+
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[dev-dependencies]
+td-fs = { path = "../td-fs" }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[[example]]
+name = "clock-vm"
+path = "fixtures/clock_vm.rs"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"

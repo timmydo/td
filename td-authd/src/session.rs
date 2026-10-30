@@ -15,8 +15,31 @@ use std::time::{Duration, Instant};
 fn power_request(choice: crate::consent::Power) -> Option<Vec<u8>> {
     let mut command = Command::new("/bin/td-svc");
     command.arg(choice.verb());
-    let mut helper = Inspection::printing(command, 128, Duration::from_secs(2)).ok()?;
+    use std::io::Write;
+    let mut helper = match Inspection::printing(command, 128, Duration::from_secs(2)) {
+        Ok(helper) => helper,
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "td-authd: power {} helper did not start: {error}",
+                choice.verb()
+            );
+            return None;
+        }
+    };
     let reply = helper.wait();
+    if reply.is_none() {
+        let reason = if helper.missed() {
+            "monotonic two-second timeout; outcome unknown"
+        } else {
+            "supervisor helper failed or disconnected"
+        };
+        let _ = writeln!(
+            std::io::stderr(),
+            "td-authd: power {}: {reason}",
+            choice.verb()
+        );
+    }
     helper.reap_within(Duration::from_millis(50));
     reply
 }
@@ -739,7 +762,6 @@ impl Session {
         &mut self,
         table: impl FnOnce() -> Result<crate::elevation::Table, String>,
     ) -> Result<Vec<u8>, String> {
-        use crate::elevation::Operation::SetHostname;
         use crate::set_hostname::Refusal;
         if !self.prepared
             || self.cleanup.is_some()
@@ -754,13 +776,18 @@ impl Session {
         let Ok(table) = table() else {
             return Ok(Refusal::Principal.answer());
         };
-        if !table.grants(self.owner, SetHostname) {
+        if intake
+            .queued_operation()
+            .is_some_and(|operation| !table.grants(self.owner, operation))
+        {
             return Ok(Refusal::Principal.answer());
         }
         let Ok(ready) = intake.select() else {
             return Ok(Refusal::Nothing.answer());
         };
-        if !table.grants(ready.requester(), SetHostname) {
+        if !table.grants(self.owner, ready.operation())
+            || !table.grants(ready.requester(), ready.operation())
+        {
             intake.finish(false);
             return Ok(Refusal::Principal.answer());
         }

@@ -18,7 +18,7 @@ td-mail-source td-mail td-civil,td-encoding,td-fetch-client,td-fs,td-html,td-jso
 td-net-source net engine,td-fs,td-civil
 td-news-source td-news td-civil,td-fetch-client,td-html,td-json,td-kv,td-toml,td-ui,td-compositor
 td-open-source td-open td-busd,td-secret
-td-pass-source td-pass td-secret,td-ui,td-compositor,td-authd,td-busd,td-firstboot,engine,td-tpm,td-fido,td-test-compositor,td-fs,td-civil
+td-pass-source td-pass td-secret,td-ui,td-compositor,td-authd,td-busd,td-firstboot,engine,td-tpm,td-fido,td-test-compositor,td-fs,td-civil,td-time
 td-photo-source td-photo td-civil,td-fs,td-jpeg,td-ui,td-compositor,td-test-compositor
 td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-ui,td-tpm,td-fido,td-test-compositor
 td-review-source td-review td-fs,td-ui,td-compositor
@@ -27,3 +27,4 @@ td-setup-source td-setup td-install,td-ui,td-compositor,td-protector,td-luks,td-
 td-software-source td-software td-civil,td-fs,td-ui,td-compositor,engine
 td-taskmgr-source td-taskmgr td-ui,td-compositor,td-fs,td-test-compositor
 td-term-source td-term td-fs,td-ui,td-compositor
+td-time-source td-time td-civil,td-fs,engine

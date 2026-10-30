@@ -770,9 +770,10 @@ mod tests {
             "\"{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {suffix}\""
         ));
         let bar = include_str!("../../../../../../td-compositor/src/bar.rs");
-        assert!(
-            bar.contains("Clock::load(Path::new(\"/etc/timezone\"), Path::new(\"/etc/zoneinfo\"))")
-        );
+        let compact: String = bar.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains(
+            "Clock::load_snapshot(Path::new(\"/etc/timezone\"),Path::new(\"/etc/zoneinfo\"),)"
+        ));
         // The lines the installed-boot oracle reads are the ones written.
         assert!(bar.contains("\"\\ntd-compositor: clock zone {name}\\n\""));
         let profile = include_str!("../../../../../../td-firstboot/src/primary_profile.rs");

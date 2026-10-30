@@ -8479,6 +8479,7 @@ mod tests {
                 "td-svc",
                 "td-taskmgr",
                 "td-term",
+                "td-time",
                 "td-txt",
                 "td-update",
                 "td-util",

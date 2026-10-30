@@ -693,11 +693,14 @@ pub fn start(
     thread::Builder::new()
         .name("td-status-bar".to_string())
         .spawn(move || {
-            let clock = match Clock::load(Path::new("/etc/timezone"), Path::new("/etc/zoneinfo")) {
+            let (mut clock, mut timezone_name) = match Clock::load_snapshot(
+                Path::new("/etc/timezone"),
+                Path::new("/etc/zoneinfo"),
+            ) {
                 Ok(clock) => clock,
                 Err(error) => {
                     eprintln!("td-compositor: status bar: {error}");
-                    Clock::Unavailable
+                    (Clock::Unavailable, None)
                 }
             };
             // One write beginning a line of its own, as the boot markers are:
@@ -709,6 +712,11 @@ pub fn start(
             drop(out);
             let mut reported = Reported::default();
             loop {
+                clock.reload_if_changed(
+                    &mut timezone_name,
+                    Path::new("/etc/timezone"),
+                    Path::new("/etc/zoneinfo"),
+                );
                 // A paint failure is REPORTED, never fatal: the bar is the
                 // least important thing on the screen and must not take the
                 // session down with it.

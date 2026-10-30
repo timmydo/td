@@ -632,7 +632,7 @@ impl Guest {
             "(/bin/td-authd request-hostname {name}; echo TD-HOSTNAME-CLIENT=$?) > {output} 2>&1 & true"
         ))?;
         let waits = format!(
-            "A hostname change to {name} waits. Press Ctrl+Alt+Escape, then H to review it."
+            "A settings change to {name} waits. Press Ctrl+Alt+Escape, then H to review it."
         );
         let end = Instant::now() + Duration::from_secs(30);
         loop {
@@ -964,7 +964,8 @@ fn hostname_approved(guest: &mut Guest, work: &Path, old: &str, admitted: u64) -
     )?;
     guest.key(&["esc"])?;
     let (status, lines) = guest.client_result(&waiting)?;
-    let saved = format!("Hostname saved as {NEW_HOSTNAME}. A restart completes the change.");
+    let saved =
+        format!("Settings change completed: {NEW_HOSTNAME}. Hostname changes require a restart.");
     if status != "0" || !lines.contains(&saved) {
         return Err(format!(
             "the approved client did not report the save: {lines:?}"
@@ -1051,9 +1052,9 @@ const ROLLED_BACK_NOTICE: &str = "ROLLED BACK - RESTART TO BOOT IT";
 /// The menu's `H` row, below `B` (td-compositor/DESIGN.md, "Elevation
 /// consent"), and its two queue states.
 const HOSTNAME_ROW: usize = 600;
-const HOSTNAME_EMPTY: &str = "H: NO HOSTNAME CHANGE WAITING";
-const HOSTNAME_WAITING: &str = "H: REVIEW HOSTNAME CHANGE";
-const NO_HOSTNAME_NOTICE: &str = "NO HOSTNAME CHANGE IS READY TO REVIEW";
+const HOSTNAME_EMPTY: &str = "H: NO SETTINGS WAITING";
+const HOSTNAME_WAITING: &str = "H: REVIEW HOSTNAME/TIME";
+const NO_HOSTNAME_NOTICE: &str = "NO HOSTNAME OR TIME CHANGE IS READY";
 const HOSTNAME_SAVED_NOTICE: &str = "HOSTNAME SAVED";
 const RESTART_COMPLETES: &str = "A RESTART COMPLETES THE CHANGE";
 /// The name the oracle asks for; the fixture boots as `td`.
@@ -1814,6 +1815,7 @@ const MENU_GLYPHS: &[[u8; 7]] = &[
     [31, 1, 2, 4, 8, 8, 8],
     [14, 17, 17, 14, 17, 17, 14],
     [14, 17, 17, 15, 1, 1, 14],
+    [1, 2, 2, 4, 8, 8, 16],
 ];
 
 /// The chrome face's rows for `character`, top first, five bits each.
@@ -1824,6 +1826,7 @@ fn chrome_glyph(character: u8) -> Result<&'static [u8; 7]> {
         b'A'..=b'Z' => usize::from(character - b'A') + 2,
         b'-' => 28,
         b'+' => 29,
+        b'/' => 40,
         b'0'..=b'9' => usize::from(character - b'0') + 30,
         _ => return Err("unsupported chrome glyph".into()),
     };
@@ -2256,7 +2259,7 @@ mod tests {
     #[test]
     fn chrome_glyphs_are_the_compositors() {
         let chrome = include_str!("../../../../../../td-compositor/src/ui.rs");
-        for character in b" :ABCDEFGHIJKLMNOPQRSTUVWXYZ-+0123456789" {
+        for character in b" :ABCDEFGHIJKLMNOPQRSTUVWXYZ-+0123456789/" {
             let rows = chrome_glyph(*character).unwrap();
             let line = format!(
                 "b'{}' => [{}],",
@@ -2638,13 +2641,13 @@ mod tests {
         assert!(attention.contains("denied => format!(\"{state} - {denied} DENIED\"),"));
         assert_eq!(
             hostname_row(HOSTNAME_EMPTY, 3),
-            "H: NO HOSTNAME CHANGE WAITING - 3 DENIED"
+            "H: NO SETTINGS WAITING - 3 DENIED"
         );
         // The client's lines the oracle waits on and the refusals it reads.
         let client = include_str!("../../../../../../td-authd/src/set_hostname.rs");
         for line in [
-            "\"A hostname change to {} waits. Press Ctrl+Alt+Escape, then H to review it.\"",
-            "\"Hostname saved as {}. A restart completes the change.\"",
+            "\"A settings change to {} waits. Press Ctrl+Alt+Escape, then H to review it.\"",
+            "\"Settings change completed: {}. Hostname changes require a restart.\"",
             "\"hostname admission unavailable (busy or disconnected): {e}\"",
             "\"hostname change was not admitted: the intake is backing off \\\n                 after unapproved requests\"",
             "\"hostname change was declined, expired or failed\"",

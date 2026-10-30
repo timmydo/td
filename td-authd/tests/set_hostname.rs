@@ -410,13 +410,13 @@ fn the_description_names_both_names_and_writes_nothing() {
 fn drawn(fixture: &Fixture) -> Change {
     let places = fixture.places(granted);
     let ready = Ready {
-        name: Hostname::parse("my-laptop").unwrap(),
+        name: Setting::parse("my-laptop").unwrap(),
         requester: fixture.uid(),
     };
     Change::drawn(
         fixture.uid(),
         ready,
-        Hostname::parse("td").unwrap(),
+        Setting::parse("td").unwrap(),
         &places,
         [9; 32],
     )
@@ -593,4 +593,70 @@ fn the_client_refuses_a_malformed_name_before_connecting() {
     }
     assert_eq!(Refusal::Nothing.answer(), [0x9e, 0]);
     assert_eq!(Refusal::Principal.answer(), [0x9e, 1]);
+}
+
+#[test]
+fn time_settings_bind_exact_values_and_cancellation_never_starts_the_helper() {
+    for setting in [
+        "set 2026-10-30T06:11:04Z",
+        "timezone America/Los_Angeles",
+        "automatic off",
+    ] {
+        let fixture = Fixture::new("td");
+        let (mut intake, _client) = queued(&fixture, &format!("time {setting}"));
+        let ready = intake.select().unwrap();
+        assert_eq!(ready.operation(), elevation::Operation::ManageTime);
+        let mut change = intake.describe(fixture.uid(), ready).unwrap();
+        let request = change.request().clone();
+        assert!(request.awaits_approval());
+        assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+        assert_eq!(
+            request.operation(),
+            &Operation::ManageTime {
+                requester: fixture.uid(),
+                setting: setting.into()
+            }
+        );
+        assert!(change.commit(&request).is_err());
+        assert!(change.helper.is_none());
+        change.presented(&request).unwrap();
+        let wrong = Request::new(
+            *request.nonce(),
+            fixture.uid(),
+            Operation::ManageTime {
+                requester: fixture.uid(),
+                setting: "automatic on".into(),
+            },
+        )
+        .unwrap();
+        assert!(change.commit(&wrong).is_err());
+        assert!(change.helper.is_none());
+        change.cancel().unwrap();
+        assert!(change.commit(&request).is_err());
+        assert!(matches!(change.poll().unwrap(), Event::Failed(_)));
+        assert!(change.helper.is_none());
+        assert_eq!(fixture.saved(), b"td\n");
+    }
+}
+
+#[test]
+fn time_settings_have_a_distinct_principal_and_refuse_malformed_values() {
+    assert_eq!(
+        Setting::parse("laptop").unwrap().operation(),
+        elevation::Operation::SetHostname
+    );
+    assert_eq!(
+        Setting::parse("time automatic on").unwrap().operation(),
+        elevation::Operation::ManageTime
+    );
+    for text in [
+        "time set 2026-02-29T00:00:00Z",
+        "time timezone ../UTC",
+        "time automatic yes",
+        "time automatic off\n",
+    ] {
+        assert!(Setting::parse(text).is_err());
+    }
+    let table = Table::parse("td-elevation-v1\n1000\tset-hostname\n").unwrap();
+    assert!(!table.grants(1000, elevation::Operation::ManageTime));
 }

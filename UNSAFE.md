@@ -13,8 +13,8 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 `sandbox.rs`. Those three files carry `#![allow(unsafe_code)]` so builder
 can stay `libc`-free. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-FOUR
-numbered target-side exceptions, TWENTY-TWO of them live, each a standalone
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-FIVE
+numbered target-side exceptions, TWENTY-THREE of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
 `#[allow]` around its recorded raw Linux boundary (the crate itself
 `#![deny(unsafe_code)]`s); the seventeenth and eighteenth are retired and
@@ -51,7 +51,7 @@ value-pinned requests, and `poll(2)` — recorded twice because the
 one-package locks the gate required of a root crate when the two were
 imported left no shared crate to put it in; both now draw in a td-ui
 window and forbid `unsafe` crate-wide, so §17 and §18 are retired and the
-roster counts twenty-two live surfaces in twenty-four numbered entries. The
+roster counts twenty-three live surfaces in twenty-five numbered entries. The
 twentieth, `td-taskmgr`, has one function-scoped instruction for
 process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
@@ -66,7 +66,9 @@ is specified in [td-crypto/DESIGN.md](td-crypto/DESIGN.md). Test allocators
 remain separate. The twenty-third, `td-open`, compiles §12's module to send one
 file's descriptor to the portal and adopts none. The twenty-fourth,
 `td-luks`, keeps its library safe and confines device-mapper activation
-to one function-scoped ioctl instruction in its binary.
+to one function-scoped ioctl instruction in its binary. The twenty-fifth,
+`td-time`, confines system and RTC clock writes to one function-scoped
+instruction in its binary.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -202,6 +204,8 @@ one.
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
 | 22 | `td-mta` | binary-only `rt_sigprocmask(2)` with SIG_BLOCK and `rt_sigtimedwait(2)` with zero timeout, both pinned to SIGINT/SIGTERM; IPv6-only `socket(2)`, `setsockopt(2)` with fixed SO_REUSEADDR/IPV6_V6ONLY, `bind(2)`, `listen(2)` and one fresh descriptor adoption; see [§22](#22-td-mta--termination-signals-and-private-postgresql-backend) |
 | 23 | `td-open` | the shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` module of §12, called only to send one descriptor; no adoption or disposal call — see [§23](#23-td-open--one-descriptor-to-the-portal) |
+| 24 | `td-luks` | device-mapper ioctl requests; see §24 |
+| 25 | `td-time` | CLOCK_REALTIME clock_settime and RTC_SET_TIME ioctl; see §25 |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -3016,7 +3020,10 @@ then sets mode 0700 again with std's path-based `set_permissions`.
 Otherwise both write files only through `td-firstboot/src/saved.rs`,
 compiled by `#[path]`: safe std's removal of a leftover temporary,
 create-new temporary, permissions, sync and rename, with no owner
-change. Nothing here spawns a process, calls `sethostname` or writes
+change. The time-setting extension additionally starts only the fixed `/bin/td-time`
+helper through the existing bounded Inspection launcher after matching consent;
+its typed operands are the shared time codec's action and canonical value.
+The shared settings intake itself never calls `sethostname` or writes
 `/proc/sys/kernel`. Confinement tests pin the three sources, the socket,
 greeting and write paths, the directory creation and its permissions
 call, the backoff's write before admission, the order of consume, clear
@@ -3693,6 +3700,31 @@ as guest PID 1; host preparation adds no target input or syscall surface.
 covering both resilience modes, stock interruption prefixes, live process
 kills, concurrent data I/O, UUID exclusion and helper cleanup. Its host
 owns a bounded QEMU child and temporary image; it does not issue ioctls.
+
+## 25. `td-time` — UTC system and hardware clock writes
+
+The library forbids unsafe code. The Linux x86-64 binary denies it,
+with one function-scoped allowance around one private syscall instruction
+in `clock_sys.rs`. Its two wrappers admit only clock_settime(227) with
+CLOCK_REALTIME(0), a live sixteen-byte pair of signed seconds/nanoseconds,
+and ioctl(16) with RTC_SET_TIME(0x4024700a), a borrowed RTC File and a live
+36-byte array of nine signed calendar fields in Linux rtc_time order.
+Both wrappers validate the supported 2020 through 2099 range; unused
+fields are zero. The assembly accounts for rcx/r11 and memory effects.
+There is no caller-selected clock, request, pointer or raw descriptor,
+no mapping, adoption, FFI or process-wide environment mutation. Safe std
+owns device opens, lock files, processes, bounded network I/O and status.
+The safe runtime validates `/dev/rtc0` against sysfs's device number and
+reads the RTC back through sysfs after writing. A failure is reported
+separately from a successful system-clock correction.
+
+Only the binary's runtime calls the wrappers, after either physical
+consent or the automatic synchronization policy. Confinement tests pin
+the complete raw module, instruction/allowance counts, constants, argument
+layouts and caller inventory. Host tests never issue clock_settime or a
+real RTC write. The QEMU oracle owns the mutable clocks. Any additional
+syscall, request, clock ID, caller or allowance amends this section and
+`td-time/DESIGN.md` in the same landing.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 

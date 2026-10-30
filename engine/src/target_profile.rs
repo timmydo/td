@@ -141,6 +141,7 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-svc",
     "td-taskmgr",
     "td-term",
+    "td-time",
     "td-txt",
     "td-update",
     "td-util",

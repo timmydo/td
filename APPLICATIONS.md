@@ -8920,7 +8920,8 @@ until the increment named for it lands with its evidence. So far the
 consent descriptions (L1), the compositor's Enter confirmation
 (L2), `deploy-rollback` with the principal table (L3), `set-hostname`
 with its intake and backoff (L4) and `deploy-publish` with the update
-queue's backoff (L5) exist: all three operations are live. The protocol,
+queue's backoff (L5) exist. Time management shares the protected settings
+queue and has its own `manage-time` grant. The protocol,
 encodings and write rules are in
 `td-authd/DESIGN.md`, "Elevation operations"; which key presses
 confirm is in `td-compositor/DESIGN.md`, "Elevation consent".
@@ -8930,6 +8931,7 @@ confirm is in `td-compositor/DESIGN.md`, "Elevation consent".
 | `deploy-rollback` | the attention menu's `B`; there is no requester process | the full current and previous deployment IDs, which root reads from the `boot/current` and `boot/previous` selectors under the read-only `/run/td-volume/td` | `/bin/td-boot on-volume rollback /run/td-update CURRENT PREVIOUS` |
 | `set-hostname` | a typed public intake modelled on the update queue, with a notice; the attention menu's `H` selects it | the new name, a `Hostname` parsed by the shared `td-firstboot/src/hostname.rs`, beside the old name | root writes `/var/lib/td/hostname` canonically |
 | `deploy-publish` | the update queue (request 19), with a notice, and the menu's `I` | the full deployment ID of a locally built system | `/bin/td-update apply-operation ID` |
+| `manage-time` | `td-time` queues a typed settings request; the menu's `H` selects it | exact UTC timestamp, timezone identifier, or automatic on/off | `/bin/td-time apply ACTION VALUE` |
 
 **`deploy-rollback`.** The person opens secure attention and presses
 `B`; nothing outside the compositor asks, so there is no requester to
@@ -9001,7 +9003,9 @@ table, or no row granting the operation to the session owner and, for a
 queued request, to its requester, refuses with a named diagnostic
 (property 4). Its v1 row is "UID 1000 may perform every v1 operation":
 `deploy-rollback` from L3, `set-hostname` from L4 and `deploy-publish`,
-today's update installation, from L5. A machine with other rows builds
+today's update installation, from L5, followed by `manage-time`. The latter
+authorizes one reviewed setting, never arbitrary root execution;
+`td-time/DESIGN.md` defines clock and RTC policy. A machine with other rows builds
 them into its own image; no user's home or setting adds one.
 
 **Live installation.** Trusted boot media uses the isolated installer's
