@@ -166,6 +166,6 @@ query, summary batches, message opening, and search separately. State whether
 server caches are already warm and how many readers are active. Report samples,
 median and tail observations; performance targets are not load-sensitive gate
 assertions. A broad text search can still hit the bounded search work limit:
-current search scans candidates and verifies bodies even when derived search
-fields are available. Do not describe that refusal as an empty result or
+current search scans candidates, using qualified stored fields when available
+and verifying bodies on fallback. Do not describe that refusal as an empty result or
 silently raise the work limit to conceal it.

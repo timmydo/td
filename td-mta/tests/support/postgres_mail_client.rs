@@ -1281,10 +1281,16 @@ fn exercise_queries(
     sql(fixture, &damage);
     let damage = format!("UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,get_byte(bytes,0)#1) WHERE blob_id=decode('{blob}','hex') AND ordinal=0");
     sql(fixture, &damage);
-    let refused = client.ask(query("tailneedle"));
+    // Derived search fields do not grant authority to download raw bodies.
+    check(client.ask(query("tailneedle")), 0, &[wire]);
+    let blob_id = td_mta::ids::BlobId::parse(&blob).unwrap();
+    let mut blob_wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let blob_wire = td_mta::wire::encode_id(blob_id, &mut blob_wire).unwrap();
+    let refused = client.ask(json!({"command":"download_attachment",
+        "blob_id":blob_wire, "name":"damaged.eml", "content_type":"message/rfc822"}));
     assert!(
         !refused["ok"].is_true(),
-        "cached fields still require whole-body integrity: {refused}"
+        "raw download must verify bodies: {refused}"
     );
     sql(fixture, &damage);
     check(client.ask(query("tailneedle")), 0, &[wire]);

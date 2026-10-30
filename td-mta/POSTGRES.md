@@ -2605,10 +2605,10 @@ notFound; cached headers grant neither account access nor body-pin authority.
 
 A hit reuses historical interpretation of the same immutable blob. It does not
 re-read chunks or detect subsequent corruption of an unrequested tail. Full
-body projections, previews, searches, raw downloads and attachment downloads
-still verify current requested bytes. Qualified MIME projections may use
-chunk verification as specified below; searches and downloads retain full
-verification. Header-cache misses preserve whole-body precharge and verification. Hits charge bounded lookup and copy/output work
+body projections, previews, raw downloads and attachment downloads still
+verify current requested bytes. Qualified MIME projections may use chunk
+verification as specified below. Qualified stored search fields may answer
+without body reads; search fallback and downloads retain full verification. Header-cache misses preserve whole-body precharge and verification. Hits charge bounded lookup and copy/output work
 and check the original snapshot, retention and method deadlines. Cache output
 remains provisional until normal final snapshot validation and response
 publication.
@@ -7308,9 +7308,10 @@ No body chunks are read or body I/O precharged for a summary hit.
 
 These rows are historical interpretation evidence, like the existing memory
 cache, not current body integrity evidence. They neither create a body pin nor
-detect subsequent corruption of an unrequested attachment. Full body, preview,
-search and download paths retain current verification; qualified body-bearing
-Email/get may use the chunk-verification contract below. Account/blob foreign
+detect subsequent corruption of an unrequested attachment. Body projections,
+previews and downloads retain current verification; qualified body-bearing
+Email/get may use the chunk-verification contract below. Search may use the
+qualified stored-field contract below without body reads. Account/blob foreign
 keys and cascading deletion remove summaries when the authoritative blob is
 removed. There is no external cache service, credential cache or shared mutable
 response object.
@@ -7394,8 +7395,8 @@ result is promoted into the fully verified header cache.
 
 `structure_reuse` counts successful qualified table reuse. `chunk_verify`
 measures requested batch SQL, framing and hash verification, distinct from
-`body_verify` for complete-body reads. Raw and attachment downloads, search
-and integrity auditing retain full-body verification. Periodic integrity
+`body_verify` for complete-body reads. Raw and attachment downloads, uncached
+search fallback and integrity auditing retain full-body verification. Periodic integrity
 scrubbing is an independently activated operator schedule described below.
 
 `summary-backfill --structure` additionally rebuilds MIME evidence under the
@@ -7514,11 +7515,14 @@ binds parser version, original body length and SHA-256. A separate SHA-256
 covers the domain `td-mta-search-fields-v1` followed by NUL, original digest,
 big-endian u64 body length, big-endian u64 encoded length and encoded fields.
 This is corruption detection, not a MAC or protection against the database
-owner. Like summaries, the row is derived interpretation evidence. It grants
-no body pin: search still verifies the entire original body for every
-candidate before using retained fields. Missing, incompatible, malformed or
-checksum-invalid evidence falls back to the original parser; it never means
-no match. Database errors still fail the request.
+owner. Like summaries, the row is trusted derived interpretation evidence.
+After qualifying its version, body identity, framing and field digest in the
+authenticated snapshot, search matches these fields without rereading the
+original body. This grants no body pin and is not a body-integrity audit;
+raw downloads and explicit scrubs retain their original verification.
+Missing, incompatible, malformed or checksum-invalid evidence falls back
+to the original parser; it never means no match. Database errors still fail
+the request.
 
 Reads use the authenticated snapshot, bounded metadata and at most 132 chunks
 of 64 KiB. Before loading fields the original method meter is charged four
@@ -7529,9 +7533,11 @@ method deadline before each field descriptor and allocation. A work refusal
 remains an explicit error, not permission to retry the uncached path. Normalized matching processes at most 4096 UTF-8 bytes per batch,
 charging one work record and `bytes * (1 + 2 * pattern_count)` I/O units before
 matching, with deadline checks on both sides. One method meter covers all
-candidates. Early matching is safe only because collection already validated
-the entire interpretation. Phrase boundaries, ordering, pagination, totals
-and explicit resource refusals remain unchanged. The resource plan reserves
+candidates. Only uncached fallback prepays whole-body verification work;
+retained-field reads pay their encoded transfer, hash, decode and matching
+charges instead. Early matching is safe only because collection already
+validated the entire interpretation. Phrase boundaries, ordering, pagination,
+totals and explicit resource refusals remain unchanged. The resource plan reserves
 an additional 20 MiB for each body/search job, including encoded/decoded
 buffers and field descriptors; CONFIG.md records the default-plan increase.
 
@@ -7554,9 +7560,10 @@ search evidence and increments `searches_skipped`; successful writes increment
 This increment requires explicit owner backfill. Publication does not yet
 prepare search rows, and there is no scheduled rebuild. New or oversized
 messages retain the existing search behavior. This cache avoids repeated MIME
-interpretation; it is not an inverted index and does not eliminate full-body
-reads or bounded candidate scans. Schema-34 binaries cannot serve schema 35;
-upgrade with fencing and a consistent pre-upgrade backup.
+interpretation and whole-body reads for qualified rows. It is not an inverted index and does not eliminate bounded
+candidate scans; uncached rows still require whole-body verification.
+Schema-34 binaries cannot serve schema 35; upgrade with fencing and a
+consistent pre-upgrade backup.
 
 
 ## Replica source mode

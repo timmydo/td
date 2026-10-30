@@ -547,13 +547,30 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
         } else {
             crate::performance::Outcome::Unavailable
         });
+        if let Some(fields) = fields {
+            let result = fields.matches_search(search, work, clock)?;
+            self.check().map_err(postgres_read_error)?;
+            return Ok(result);
+        }
+        if metadata.body.length > crate::postgres_body::MAX_BODY_BYTES {
+            return Err(Error::StorageCapacity);
+        }
+        let turns = metadata.body.length.div_ceil(4096);
+        work.charge(
+            clock.monotonic().map_err(Error::Storage)?,
+            crate::admission::work::Charge {
+                io_bytes: turns.checked_mul(4096).ok_or(Error::StorageCapacity)?,
+                records: turns,
+                ..Default::default()
+            },
+        )
+        .map_err(|stop| match stop {
+            crate::admission::work::Stop::Deadline => Error::ExecutionDeadline,
+            _ => Error::StorageCapacity,
+        })?;
         let mut result = Err(Error::State);
         self.with_interpreted_body(id, |_, pin| {
-            result = if let Some(fields) = &fields {
-                fields.matches_search(search, work, clock)
-            } else {
-                email_get::search_verified(pin, limits, search, clock, work)
-            };
+            result = email_get::search_verified(pin, limits, search, clock, work);
             Ok(())
         })
         .map_err(postgres_read_error)?;

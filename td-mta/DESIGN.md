@@ -1667,14 +1667,16 @@ commit uncertainty, recovery and database administration. Immutable bodies and
 metadata are published together. Full length and digest verification grants
 body custody only within the original live snapshot. Passive historical audit
 reports grant neither current freshness nor body-read authority.
-Persisted common-header summaries and worker-local header projections are
-the narrow exception: a previously fully
+Persisted common-header summaries and worker-local header projections permit
+a narrow exception: a previously fully
 verified immutable blob may supply cached serialized headers after fresh
 snapshot authentication and exact account/epoch/blob/length/digest matching.
 Mutable Email fields always come from the new snapshot. This historical
 header evidence does not detect later corruption in an unrequested body tail
-and grants no body pin. Full body, preview, search and download paths retain
-current verification. POSTGRES.md section 73 owns cache admission and lifetime; its persistent
+and grants no body pin. Qualified stored search fields likewise answer
+searches without current body verification, under the digest/version and
+fallback contract in POSTGRES.md. Body projections, previews and downloads
+retain their documented current-byte verification. POSTGRES.md section 73 owns cache admission and lifetime; its persistent
 summary section owns digest/version binding, publication and rebuilding.
 
 
@@ -2300,8 +2302,8 @@ The six-boundary nesting limit, aggregate part/header ceilings, original
 work meter and header budget apply across the traversal. POLICY.md owns
 supported sources and explicit refusal of other embedded-message encodings.
 Schema 35 optionally retains complete normalized search fields per blob. A
-compatible, digest-bound row replaces repeated interpretation, but every
-candidate still verifies its full original body. Collection uses the same
+compatible, digest-bound row replaces repeated interpretation and body reads;
+only the uncached fallback verifies its full original body. Collection uses the same
 parser and completes every supported source before publishing evidence;
 partial traversal cannot become an empty result. Matching preserves field
 boundaries and charges bounded batches against the original method meter.

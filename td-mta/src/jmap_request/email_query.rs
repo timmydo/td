@@ -216,10 +216,6 @@ impl Worker<'_, '_, '_, '_, '_> {
             .retention
             .method_body_context(self.execution)
             .map_err(Error::Storage)?;
-        let mut row = Vec::new();
-        row.try_reserve_exact(crate::format::MAX_VALUE_BYTES)
-            .map_err(|_| Error::StorageCapacity)?;
-        row.resize(crate::format::MAX_VALUE_BYTES, 0);
         let mut result = EmailPage {
             state: QueryState::current(view.identity(), QueryType::Email),
             position: query.position,
@@ -249,26 +245,6 @@ impl Worker<'_, '_, '_, '_, '_> {
                 .ok_or(Error::StorageCapacity)?;
             for id in page.ids {
                 self.check()?;
-                let metadata = view
-                    .email_metadata(id, &mut row)
-                    .map_err(super::postgres_read_error)?
-                    .ok_or(Error::State)?;
-                if metadata.size > crate::postgres_body::MAX_BODY_BYTES {
-                    return Err(Error::StorageCapacity);
-                }
-                let turns = metadata.size.div_ceil(4096);
-                work.charge(
-                    clock.sample().map_err(Error::Storage)?.monotonic,
-                    crate::admission::work::Charge {
-                        io_bytes: turns.checked_mul(4096).ok_or(Error::StorageCapacity)?,
-                        records: turns,
-                        ..Default::default()
-                    },
-                )
-                .map_err(|stop| match stop {
-                    crate::admission::work::Stop::Deadline => Error::ExecutionDeadline,
-                    _ => Error::StorageCapacity,
-                })?;
                 if view.search_email(id, limits, search, clock.as_ref(), &mut work)? {
                     if matches >= query.position && result.ids.len() < query.limit {
                         result.ids.push(id);

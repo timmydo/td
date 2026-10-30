@@ -447,7 +447,8 @@ kinds of evidence need rebuilding.
 
 Compare `search_fields`, `jmap_search` and `body_verify` counter deltas around
 the same scoped search before and after backfill. Cache hits avoid repeated
-MIME decoding but still verify the complete original body. Large searches can
+MIME decoding and full-body reads after validating retained search evidence.
+Missing or invalid evidence uses verified-body fallback. Large searches can
 still exceed request work or connection bounds; this is not a full-text index.
 The first implementation has no automatic search-row preparation or scheduled
 rebuild, so new messages use parser fallback until an explicit backfill.

@@ -27,6 +27,12 @@ pin constructors retain the original snapshot, sticky failures and deadline.
 MIME processing cannot extend that lifetime or combine snapshots. Shared MIME
 code does not open a database or grant storage authority.
 
+Qualified derived search fields, like stored header summaries, may answer
+metadata searches without opening a body pin. Their body identity and field
+checksum bind them to the authenticated snapshot; they do not prove the
+current integrity of unread body chunks. Missing or invalid evidence falls
+back to verified body interpretation under the same method work budget.
+
 Device authentication and publication checks belong to the PostgreSQL
 transaction paths. Passive request/result structures in `store_fs::mutations`
 convey no authentication or mutation authority. PostgreSQL commit uncertainty
