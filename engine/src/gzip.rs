@@ -36,6 +36,10 @@ const CODE_LENGTH_ORDER: [usize; 19] = [
 ];
 
 pub fn decompress_file(path: &Path) -> Result<Vec<u8>, String> {
+    decompress_file_with_limit(path, MAX_GZIP_OUTPUT_BYTES)
+}
+
+pub fn decompress_file_with_limit(path: &Path, max_output_bytes: usize) -> Result<Vec<u8>, String> {
     let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let len = file
         .metadata()
@@ -68,7 +72,8 @@ pub fn decompress_file(path: &Path) -> Result<Vec<u8>, String> {
             MAX_GZIP_INPUT_BYTES
         ));
     }
-    decompress_bytes(&input).map_err(|e| format!("decompress {}: {e}", path.display()))
+    decompress_bytes_with_limit(&input, max_output_bytes)
+        .map_err(|e| format!("decompress {}: {e}", path.display()))
 }
 
 pub fn decompress_bytes(input: &[u8]) -> Result<Vec<u8>, String> {

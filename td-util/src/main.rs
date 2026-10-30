@@ -27,7 +27,8 @@
 //! and the initramfs build drive. Each takes the subset those callers use and
 //! refuses the rest rather than guessing at it. `gzip` decodes with the engine's
 //! inflater and CRC, included below, so one decoder serves source preparation
-//! and this.
+//! and this. `tar` extracts plain or gzip archives with the engine's shared
+//! parser; its `--help` states the supported flags and resource limits.
 //!
 //! Almost everything here is safe `std`: `/proc` and `/dev/kmsg` are ordinary
 //! files, and the build tools walk, read and spawn through `std`. `less` is
@@ -91,6 +92,10 @@ mod procfs;
 mod ps;
 mod sleep;
 mod sys;
+mod tar;
+#[path = "../../engine/src/tar_extract.rs"]
+#[allow(dead_code)]
+mod tar_extract;
 mod term;
 mod test;
 mod uname;
@@ -129,6 +134,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("readlink", fileops::readlink),
     ("rm", fileops::rm),
     ("sleep", sleep::run),
+    ("tar", tar::run),
     ("test", test::run),
     ("uname", uname::run),
     ("which", which::run),
@@ -356,6 +362,10 @@ mod confinement {
     /// attribute that reaches each. Nothing else may leave `src/`.
     const ENGINE: &[(&str, &str)] = &[
         (
+            "tar_extract.rs",
+            concat!("#[", "path=\"../../engine/src/tar_extract.rs\"]"),
+        ),
+        (
             "crc32.rs",
             concat!("#[", "path=\"../../engine/src/crc32.rs\"]"),
         ),
@@ -400,8 +410,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            25,
-            "expected twenty-five modules in src/ beside the crate root"
+            26,
+            "expected twenty-six modules in src/ beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -451,6 +461,7 @@ mod confinement {
                 "ps.rs",
                 "sleep.rs",
                 "sys.rs",
+                "tar.rs",
                 "term.rs",
                 "test.rs",
                 "uname.rs",

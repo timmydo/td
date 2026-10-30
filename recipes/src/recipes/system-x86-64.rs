@@ -1004,7 +1004,7 @@ fn td_init_probe(applet: &str, probe: &Probe) -> String {
 /// needed. `shape_check` probes each name against the packed binary's own `--list`, so an
 /// entry td-util does not serve reds the build rather than shipping a `/bin` name that
 /// dispatches to nothing.
-const TD_UTIL_APPLETS: &[&str] = &["clear", "which", "free", "ps", "dmesg", "less"];
+const TD_UTIL_APPLETS: &[&str] = &["clear", "which", "free", "ps", "dmesg", "less", "tar"];
 
 /// The core file/text userland, served by the uutils `coreutils` multicall (#547). Every
 /// name must be a coreutils utility the built binary implements. Unlike td-util's, the
@@ -3463,6 +3463,7 @@ fn build_sandbox_kernel_probes() -> String {
 /// it a tty. An operand ties the probe to nothing but itself.
 fn td_util_probe_args(applet: &str) -> &'static str {
     match applet {
+        "tar" => " --help",
         "which" => " sh",
         "less" => " /etc/os-release",
         _ => "",

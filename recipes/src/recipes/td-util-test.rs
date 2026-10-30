@@ -94,11 +94,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-util --list failed' >&2; exit 1; }}; \
-                     for a in cat chmod chown clear cmp cpio diff dmesg free gen_init_cpio gunzip gzip less ln mkdir mv od printf ps readlink rm sleep test uname which zcat; do \
+                     for a in cat chmod chown clear cmp cpio diff dmesg free gen_init_cpio gunzip gzip less ln mkdir mv od printf ps readlink rm sleep tar test uname which zcat; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-util does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 28 ] || {{ echo \"td-util serves $n applets, expected exactly 28 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 29 ] || {{ echo \"td-util serves $n applets, expected exactly 29 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -188,8 +188,66 @@ pub fn recipe() -> Recipe {
     // trimmed. The other two build-tool applets are left to the crate's
     // process tests, which the in-sandbox cargo gate runs: their names are
     // the retired findutils words, which the ladder guard refuses in any Run
-    // argv, so this text names them nowhere — the count of 28 above pins
+    // argv, so this text names them nowhere — the count of 29 above pins
     // that they are served.
+    // The build root creates an independent ustar fixture; the realized target
+    // binary extracts both its plain and gzip forms.
+    for dir in ["tar-source", "tar-plain", "tar-gzip"] {
+        steps.push(Step::MkDir {
+            path: format!("{{root}}/{dir}"),
+        });
+    }
+    steps.push(Step::WriteFile {
+        path: "{root}/tar-source/data".into(),
+        content: "archive fixture\n".into(),
+        exec: false,
+    });
+    steps.push(
+        Step::run("{root}", &["/usr/bin/chmod", "0755", "tar-source/data"]).env("PATH", PATH),
+    );
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                "/usr/bin/tar",
+                "--format=ustar",
+                "-cf",
+                "fixture.tar",
+                "-C",
+                "tar-source",
+                "data",
+            ],
+        )
+        .env("PATH", PATH),
+    );
+    steps.push(
+        Step::run(
+            "{root}",
+            &[bin, "tar", "-xf", "fixture.tar", "-C", "tar-plain"],
+        )
+        .env("PATH", PATH),
+    );
+    steps.push(Step::run("{root}", &["/usr/bin/gzip", "fixture.tar"]).env("PATH", PATH));
+    steps.push(
+        Step::run(
+            "{root}",
+            &[bin, "tar", "-xzf", "fixture.tar.gz", "-C", "tar-gzip"],
+        )
+        .env("PATH", PATH),
+    );
+    for dir in ["tar-plain", "tar-gzip"] {
+        steps.push(
+            Step::run(
+                "{root}",
+                &["/usr/bin/cmp", "tar-source/data", &format!("{dir}/data")],
+            )
+            .env("PATH", PATH),
+        );
+        steps.push(Step::Require {
+            paths: vec![format!("{{root}}/{dir}/data")],
+            exec: true,
+        });
+    }
     steps.extend(unpack_into("td-util-test-source", "{root}/zlib"));
     steps.extend(build_root_static_cc());
     // Compiled apart, so the link map loads the object from the build
@@ -307,7 +365,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly twenty-eight applets, among them cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gen_init_cpio/gunzip/gzip/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sleep/test/uname/which/zcat, dispatches through both the argv[0] and `td-util <applet>` forms, renames with mv and refuses its unimplemented forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), interoperates with zlib's minigzip, GNU gzip and a GNU cpio newc archive, and parses /proc for free/ps/uname where /proc is mounted\n".into(),
+        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly twenty-nine applets, among them cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gen_init_cpio/gunzip/gzip/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sleep/tar/test/uname/which/zcat, dispatches through both the argv[0] and `td-util <applet>` forms, renames with mv and refuses its unimplemented forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), interoperates with zlib's minigzip, GNU gzip and a GNU cpio newc archive, and parses /proc for free/ps/uname where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -322,7 +380,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics, pager and initramfs userland multicall plus build tools: cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gunzip/gzip/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sleep/test/uname/which/zcat and two more, statically linked by the pinned Rust toolchain through td-link against td glibc), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
+echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics, pager and initramfs userland multicall plus build tools: cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gunzip/gzip/less/ln/mkdir/mv/od/printf/ps/readlink/rm/sleep/tar/test/uname/which/zcat and two more, statically linked by the pinned Rust toolchain through td-link against td glibc), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-util-test 1
 "#,

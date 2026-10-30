@@ -1230,13 +1230,14 @@ terminal, which the gate has none of.
 
 Every other applet td-util serves is safe `std`: `/proc` and `/dev/kmsg`
 read as ordinary files, and the build-tool applets (`find`, `xargs`,
-`cmp`, `diff`, `od`, `uname`, `gzip`, `cpio`, `gen_init_cpio`) walk,
+`cmp`, `diff`, `od`, `uname`, `gzip`, `tar`, `cpio`, `gen_init_cpio`) walk,
 read, write and spawn through `std::fs` and `std::process`. That is what
 keeps the surface at one syscall.
 
-Two modules are not td-util's own: `main.rs` reaches the engine's CRC
-and inflater by `#[path = "../../engine/src/crc32.rs"]` and
-`#[path = "../../engine/src/gzip.rs"]`. Those two attributes are the
+Three modules are not td-util's own: `main.rs` reaches the engine's CRC,
+inflater and tar extractor by `#[path = "../../engine/src/crc32.rs"]`,
+`#[path = "../../engine/src/gzip.rs"]` and
+`#[path = "../../engine/src/tar_extract.rs"]`. Those three attributes are the
 only decoupling constructs the confinement scan admits, each pinned
 verbatim and removed exactly once before the scan refuses the rest,
 and the engine files themselves are scanned: no `unsafe` and no

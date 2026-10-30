@@ -100,6 +100,7 @@ const MODULES: &[(&str, &str)] = &[
     ("ps", include_str!("../../../td-util/src/ps.rs")),
     ("sleep", include_str!("../../../td-util/src/sleep.rs")),
     ("sys", include_str!("../../../td-util/src/sys.rs")),
+    ("tar", include_str!("../../../td-util/src/tar.rs")),
     ("term", include_str!("../../../td-util/src/term.rs")),
     ("test", include_str!("../../../td-util/src/test.rs")),
     ("uname", include_str!("../../../td-util/src/uname.rs")),
@@ -113,6 +114,11 @@ const MODULES: &[(&str, &str)] = &[
 // Each with its staged path spelled out: builder/src/affected.rs reads this
 // text for the destination of every `#[path]` include it routes here.
 const ENGINE: &[(&str, &str, &str)] = &[
+    (
+        "tar_extract",
+        "{src}/engine/src/tar_extract.rs",
+        include_str!("../../../engine/src/tar_extract.rs"),
+    ),
     (
         "crc32",
         "{src}/engine/src/crc32.rs",
