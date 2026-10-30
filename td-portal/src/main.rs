@@ -2855,8 +2855,8 @@ fn credentials_app_id(
     let Some(app) = app_id else {
         return Ok(None);
     };
-    let expected = policy.and_then(|policy| uid.and_then(|uid| policy.for_uid(uid)));
-    if !expected.is_some_and(|rule| rule.application == app) {
+    let expected = policy.and_then(|policy| policy.for_name(&app));
+    if !expected.is_some_and(|rule| Some(rule.uid) == uid) {
         return Err(io::Error::other(
             "broker UID and application do not match the immutable assignment",
         ));
@@ -3879,6 +3879,30 @@ mod tests {
             ).unwrap()),
             ..ServiceState::default()
         }
+    }
+
+    #[test]
+    fn personal_credential_identity_still_requires_the_broker_application_name() {
+        let policy =
+            app_policy::Policy::parse("td-bus-applications-v1\t1000\n1000\tmail\t\n1000\tnews\t\n")
+                .unwrap();
+        for (uid, name, expected) in [
+            (1000, Some("mail"), Some("mail")),
+            (1000, Some("news"), Some("news")),
+            (1000, None, None),
+        ] {
+            let bytes = credentials_reply(41, uid, name);
+            let (reply, _) = message::decode(&bytes, 0).unwrap();
+            assert_eq!(
+                credentials_app_id(&reply, Some(&policy))
+                    .unwrap()
+                    .as_deref(),
+                expected
+            );
+        }
+        let bytes = credentials_reply(41, 65537, Some("mail"));
+        let (reply, _) = message::decode(&bytes, 0).unwrap();
+        assert!(credentials_app_id(&reply, Some(&policy)).is_err());
     }
 
     #[test]

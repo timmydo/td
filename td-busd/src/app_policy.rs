@@ -38,9 +38,9 @@ impl Policy {
         let mut uids = BTreeSet::new();
         let mut names = BTreeSet::new();
         for rule in &mut rules {
-            if !(65536..=2147483647).contains(&rule.uid)
+            if (rule.uid != owner && !(65536..=2147483647).contains(&rule.uid))
                 || !application_name(&rule.application)
-                || !uids.insert(rule.uid)
+                || (rule.uid != owner && !uids.insert(rule.uid))
                 || !names.insert(rule.application.clone())
                 || rule.owned.len() > MAX_OWNED
                 || rule.owned.iter().any(|name| !owned_grant(name))
@@ -126,7 +126,9 @@ impl Policy {
     }
 
     pub fn for_uid(&self, uid: u32) -> Option<&Rule> {
-        self.rules.iter().find(|rule| rule.uid == uid)
+        self.rules
+            .iter()
+            .find(|rule| uid != self.owner && rule.uid == uid)
     }
 
     pub fn for_name(&self, name: &str) -> Option<&Rule> {
@@ -375,6 +377,21 @@ mod tests {
     }
 
     #[test]
+    fn personal_applications_share_the_human_uid_but_keep_distinct_registered_names() {
+        let policy = Policy::parse(
+            "td-bus-applications-v1\t1000\n65536\tfirefox\t\n1000\tmail\t\n1000\tnews\t\n",
+        )
+        .unwrap();
+        assert!(policy.for_uid(1000).is_none());
+        for app in ["mail", "news"] {
+            policy.registration(1000, app, &[], &[]).unwrap();
+            assert!(policy.registration(65536, app, &[], &[]).is_err());
+        }
+        assert!(policy.registration(1000, "firefox", &[], &[]).is_err());
+        assert!(policy.registration(1000, "absent", &[], &[]).is_err());
+    }
+
+    #[test]
     fn canonical_policy_binds_kernel_identity_and_exact_grants() {
         let policy = Policy::parse(TABLE).unwrap();
         assert_eq!(policy.to_tsv(), TABLE);
@@ -437,7 +454,7 @@ mod tests {
         for text in [
             TABLE.replace("65537", "65536"),
             TABLE.replace("\tmail\t", "\tfirefox\t"),
-            TABLE.replace("65537", "1000"),
+            TABLE.replace("65537", "1001"),
             TABLE.replace("firefox", "app..name"),
             TABLE.replace("firefox", &"a".repeat(33)),
             TABLE.replace("firefox", "App"),

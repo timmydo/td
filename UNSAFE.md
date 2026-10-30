@@ -3089,7 +3089,7 @@ and propagation fields. It does not clear an inherited read-only attribute;
 a resulting read-only view fails the required writable-view check. The two
 public wrappers select these fixed values; no caller supplies a flags word.
 The shared namespace helper may map human UID/GID 1000 to the immutable,
-actively enrolled Firefox or mail application UID for its fixed Downloads
+actively enrolled Firefox application UID for its fixed Downloads
 grant. It may also map that Firefox UID/GID to portal UID/GID 991
 for the portal's writable handoff view of Firefox's private `Opened`
 directory, the one use of the writable profile with a portal destination.
@@ -3100,7 +3100,7 @@ The wrappers accept neither paths nor flags. Safe std owns all descriptors
 and closes the detached mount on failure. No descriptor from this boundary
 is received over D-Bus or the attention channel. The production consumer
 selects the fixed human Downloads source and read-only portal destination;
-the application consumer selects only Firefox/mail Downloads beneath that
+the application consumer selects only Firefox Downloads beneath that
 assigned application's private home; the handoff consumer
 selects only Firefox's `Opened` directory and the fixed portal destination.
 No consumer provides a general mount operation or accepts a path from an

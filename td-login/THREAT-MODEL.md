@@ -544,16 +544,20 @@ success td-svc requires before startup. The portal consumes UID/GID 991;
 firstboot transfers credential-store ownership to it before human
 sessions and clears volatile releases independently of application-home
 validation. Sealed stores remain locked until a presented token operation
-succeeds; file and TPM-only stores cannot serve application credentials. Stock application assignments are active service accounts.
-The broker loads an immutable deployment table binding each reserved
-application UID to one installed name and exact bus grants. An
-application UID outside a jail receives registration authority only; its
-name is not exposed as a jailed portal identity until lineage is proven.
-Human-UID launchers cannot register applications. Each application owns
-a private home under `/var/lib/td/applications/APP_UID`, its runtime and
-cgroup. The root application launcher consumes the service-only class
-defined here and requires exact post-switch credentials and cgroup
-placement. `td-authd/DESIGN.md` specifies that reservation contract. The
+succeeds; file and TPM-only stores cannot serve application credentials. Foreign application assignments are active service accounts.
+The broker loads an immutable deployment table binding each installed name
+to its execution UID and exact bus grants. Personal mail and news share the
+human UID, but each requires registered jail lineage before its name is
+exposed to the portal. An unconfined human connection has no application
+identity. Only names explicitly assigned to the human UID may be registered
+by that UID. Foreign applications retain their private homes under
+`/var/lib/td/applications/APP_UID`, runtimes and cgroups. Personal
+applications use the human home only through the jail's per-application
+state and explicit configuration grants; an escape from that jail would
+have human-UID authority. The root launcher checks both the retained UID
+reservation and the immutable execution assignment, then uses `exec-primary`
+for personal applications or the service-only class for foreign ones.
+`td-authd/DESIGN.md` specifies this reservation and launch contract. The
 image's paired td-authd terminal launcher uses ordinary `exec-as` after
 a read-only reservation check and private-channel authentication. It
 fixes the human account in root-owned service configuration and replaces

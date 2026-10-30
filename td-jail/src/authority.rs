@@ -373,11 +373,7 @@ pub(crate) fn require_application_account(name: &str) -> io::Result<()> {
 /// The one rule every product-launch check applies: the human session's
 /// policy assigns `uid` to `name`.
 fn application_account(uid: u32, name: &str, policy: &crate::app_policy::Policy) -> io::Result<()> {
-    if policy.owner() == 1000
-        && policy
-            .for_uid(uid)
-            .is_some_and(|rule| rule.application == name)
-    {
+    if policy.owner() == 1000 && policy.for_name(name).is_some_and(|rule| rule.uid == uid) {
         return Ok(());
     }
     Err(io::Error::new(
@@ -395,10 +391,11 @@ where
     require_application_account(name)?;
     let identity = effective_identity()?;
     let mut config = target_config()?;
-    config.real_home = Some(PathBuf::from(format!(
-        "/var/lib/td/applications/{}",
-        identity.0
-    )));
+    config.real_home = Some(if identity.0 == APPLICATION_UID {
+        crate::primary_account::load()?.home()
+    } else {
+        PathBuf::from(format!("/var/lib/td/applications/{}", identity.0))
+    });
     resolve_with_config(
         name,
         arguments,
@@ -1877,7 +1874,7 @@ fn human_projection(mountinfo: &str, home: &Path) -> io::Result<Option<(PathBuf,
         .ok_or_else(|| invalid("invalid private application home"))?;
     let policy = crate::app_policy::load().map_err(invalid)?;
     let component = match policy.for_uid(uid).map(|rule| rule.application.as_str()) {
-        Some("firefox" | "mail") => "Downloads",
+        Some("firefox") => "Downloads",
         _ => return Ok(None),
     };
     let view = home.join(component);
@@ -2116,6 +2113,12 @@ fn require_grant_target(target: &Path) -> io::Result<()> {
             target.display()
         )));
     }
+    let config = Path::new("/home/td/.config");
+    if path_is_same_or_child(config, target) {
+        return Err(invalid(
+            "filesystem permission target overlaps reserved jail tree /home/td/.config",
+        ));
+    }
     for reserved in [
         "/app",
         "/usr",
@@ -2130,7 +2133,6 @@ fn require_grant_target(target: &Path) -> io::Result<()> {
         "/.flatpak-info",
         "/oldroot",
         "/root-write-probe",
-        "/home/td/.config",
         "/home/td/.cache",
         "/home/td/.local/share",
         "/home/td/.local/state",
@@ -3719,6 +3721,10 @@ pub(crate) fn test_validate_application_name(name: &str) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod grant_temp;
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
@@ -3806,6 +3812,26 @@ mod tests {
         ] {
             assert!(!private_application_home(Path::new(path)));
         }
+    }
+
+    #[test]
+    fn personal_names_share_only_the_assigned_human_identity_and_runtime() {
+        let policy = crate::app_policy::Policy::parse(
+            "td-bus-applications-v1\t1000\n65536\tfirefox\t\n1000\tmail\t\n1000\tnews\t\n",
+        )
+        .unwrap();
+        for name in ["mail", "news"] {
+            application_account(1000, name, &policy).unwrap();
+            assert_eq!(
+                application_session(1000, name, &policy).unwrap().2,
+                Path::new("/run/user/1000")
+            );
+            for uid in [0, 991, 1001, 65536, 65537, 65538] {
+                assert!(application_account(uid, name, &policy).is_err());
+            }
+        }
+        assert!(application_account(1000, "firefox", &policy).is_err());
+        assert!(application_account(1000, "absent", &policy).is_err());
     }
 
     #[test]
@@ -4669,7 +4695,8 @@ mod tests {
     fn filesystem_grants_resolve_create_merge_deny_and_reserved_aliases() {
         use std::os::unix::fs::symlink;
 
-        let root = TestDirectory::new("authority-grants").unwrap();
+        let guard = super::grant_temp::TempDir::new("authority-grants").unwrap();
+        let root = guard.path();
         for directory in [
             root.join("home"),
             root.join("home/state-root"),
@@ -4814,6 +4841,15 @@ mod tests {
             .to_string()
             .contains("overlaps reserved jail tree"));
         assert!(!real_home.join(".config").exists());
+        let personal = PermissionPolicy::new()
+            .with_filesystem("~/.config/td-mail", FilesystemAccess::ReadWrite, true)
+            .unwrap();
+        let grants = resolve(&personal).unwrap();
+        assert_eq!(grants.len(), 1);
+        let grant = grants.first().unwrap();
+        assert_eq!(grant.source, real_home.join(".config/td-mail"));
+        assert_eq!(grant.target, Path::new("/home/td/.config/td-mail"));
+        assert!(!real_home.join(".config/td-news").exists());
 
         let preflight_create = real_home.join("A-PreflightCreate");
         let invalid_after_create = PermissionPolicy::new()

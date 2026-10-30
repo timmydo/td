@@ -965,7 +965,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(
         fingerprint(application),
-        0x0b78b4bfef189288,
+        0x92d1b77af83e2e8d,
         "application launch controller changed"
     );
     for forbidden in [
@@ -1279,7 +1279,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(files.matches("admitted_uid(\"firefox\")").count(), 1);
     assert_eq!(files.matches("mount_sys::publish(").count(), 2);
     let application_files = include_str!("../src/application_files.rs");
-    assert_eq!(fingerprint(application_files), 0x6187f5c8cee99126);
+    assert_eq!(fingerprint(application_files), 0x93ebcf68b60f3614);
     assert_eq!(
         application_files
             .matches("mount_sys::clone_directory(")

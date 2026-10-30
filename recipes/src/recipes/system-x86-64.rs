@@ -1472,10 +1472,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "busd",
     "fetchd",
     "egressd",
-    "mail-fetch",
-    "news-fetch",
     "firefox-files",
-    "mail-files",
     "fetch-evidence",
     "portal-files",
     "firefox-handoff",
@@ -1987,37 +1984,10 @@ fn build_desktop_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
-         [mail-fetch]\n\
-         type=daemon\n\
-         cgroup=session\n\
-         exec=/bin/td-login exec-service-as tda65537 -- /bin/td-fetchd run --socket /run/user/65537/td-fetch/socket\n\
-         after=td-firstboot,netup\n\
-         requires=td-firstboot\n\
-         ready=/bin/td-login exec-service-as tda65537 -- /bin/td-fetchd probe /run/user/65537/td-fetch/socket\n\
-         ready-timeout=30\n\
-         restart=always\n\
-         \n\
-         [news-fetch]\n\
-         type=daemon\n\
-         cgroup=session\n\
-         exec=/bin/td-login exec-service-as tda65538 -- /bin/td-fetchd run --socket /run/user/65538/td-fetch/socket\n\
-         after=td-firstboot,netup\n\
-         requires=td-firstboot\n\
-         ready=/bin/td-login exec-service-as tda65538 -- /bin/td-fetchd probe /run/user/65538/td-fetch/socket\n\
-         ready-timeout=30\n\
-         restart=always\n\
-         \n\
          [firefox-files]\n\
          type=oneshot\n\
          exec=/bin/td-authd prepare-application-files firefox\n\
          after=td-firstboot\n\
-         requires=td-firstboot\n\
-         timeout=30\n\
-         \n\
-         [mail-files]\n\
-         type=oneshot\n\
-         exec=/bin/td-authd prepare-application-files mail\n\
-         after=td-firstboot,firefox-files\n\
          requires=td-firstboot\n\
          timeout=30\n\
          \n\
@@ -2166,8 +2136,8 @@ fn build_desktop_td_svc_conf() -> String {
          cgroup=session\n\
          unless-exists={live_medium}\n\
          exec=/bin/td-authd application-start {ui_uid} {mail_name} direct --\n\
-         after=busd,portal,mail-fetch,mail-files,applications-workspace,firefox-tls-setup\n\
-         requires=wayland,busd,mail-fetch,mail-files,td-firstboot\n\
+         after=busd,portal,fetchd,applications-workspace,firefox-tls-setup\n\
+         requires=wayland,busd,fetchd,td-firstboot\n\
          ready=/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{mail_program} title=\"'\n\
          ready-timeout=30\n\
          restart=never\n\
@@ -2184,7 +2154,7 @@ fn build_desktop_td_svc_conf() -> String {
          [mail-evidence]\n\
          type=oneshot\n\
          unless-exists={live_medium}\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-service-as tda65537 -- /bin/td-jail --probe-process-token {mail_name} {mail_program} && /bin/echo {mail_marker}'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-primary -- /bin/td-jail --probe-process-token {mail_name} {mail_program} && /bin/echo {mail_marker}'\n\
          after=mail,firefox-tls-setup\n\
          requires=mail\n\
          timeout={application_evidence}\n\
@@ -2199,8 +2169,8 @@ fn build_desktop_td_svc_conf() -> String {
          cgroup=session\n\
          unless-exists={live_medium}\n\
          exec=/bin/td-authd application-start {ui_uid} {news_name} direct --\n\
-         after=busd,news-fetch,applications-workspace\n\
-         requires=wayland,busd,news-fetch,td-firstboot\n\
+         after=busd,fetchd,applications-workspace\n\
+         requires=wayland,busd,fetchd,td-firstboot\n\
          ready=/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{news_program} title=\"'\n\
          ready-timeout=30\n\
          restart=never\n\
@@ -2209,7 +2179,7 @@ fn build_desktop_td_svc_conf() -> String {
          [news-evidence]\n\
          type=oneshot\n\
          unless-exists={live_medium}\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-service-as tda65538 -- /bin/td-jail --probe-process-token {news_name} {news_program} && /bin/echo {news_marker}'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-primary -- /bin/td-jail --probe-process-token {news_name} {news_program} && /bin/echo {news_marker}'\n\
          after=news,firefox-tls-setup\n\
          requires=news\n\
          timeout={application_evidence}\n\
@@ -2883,7 +2853,6 @@ fn build_shutdown(sys: &SystemDef) -> String {
          ok=1\n\
          /bin/td-init sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
          /bin/td-authd release-application-files firefox || {{ echo 'td-shutdown: Firefox file release failed' >&2; ok=0; }}\n\
-         /bin/td-authd release-application-files mail || {{ echo 'td-shutdown: Mail file release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-portal-files || {{ echo 'td-shutdown: portal file release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-portal-handoff || {{ echo 'td-shutdown: portal handoff release failed' >&2; ok=0; }}\n\
          if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then\n\
@@ -4537,7 +4506,11 @@ fn build_bus_application_policy(sys: &SystemDef) -> Result<String, String> {
             .map(|(name, _)| name.to_string())
             .collect();
         rules.push(bus_application_policy::Rule {
-            uid: application.external_uid,
+            uid: if matches!(application.name, TD_MAIL_NAME | TD_NEWS_NAME) {
+                UI_UID
+            } else {
+                application.external_uid
+            },
             application: application.name.into(),
             owned,
         });
@@ -8022,7 +7995,6 @@ mod tests {
             assert_eq!(unit, name, "the unit is named by the launcher");
             let program = entry_program(entry);
             let exec = unit_key(unit, "exec").unwrap_or_default();
-            let uid = if name == "mail" { 65537 } else { 65538 };
             let ready = unit_key(unit, "ready").unwrap_or_default();
             // A td-ui window of its own, launched direct as Firefox is;
             // ready is the compositor's report naming its toplevel by
@@ -8037,7 +8009,7 @@ mod tests {
                     "/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{WINDOW_RECORD}{program} title=\"'"
                 )
             );
-            assert_eq!(unit_key(&format!("{name}-fetch"), "exec"), Some(format!("/bin/td-login exec-service-as tda{uid} -- /bin/td-fetchd run --socket /run/user/{uid}/td-fetch/socket")));
+            assert_eq!(unit_key("fetchd", "exec"), Some(format!("/bin/td-login exec-primary -- /bin/td-fetchd run --socket /run/user/{UI_UID}/td-fetch/socket")));
             assert_eq!(unit_key(unit, "type").as_deref(), Some("daemon"), "{unit}");
             assert_eq!(
                 unit_key(unit, "restart").as_deref(),
@@ -8052,9 +8024,9 @@ mod tests {
             assert_eq!(
                 unit_key(unit, "requires").as_deref(),
                 Some(if name == "mail" {
-                    "wayland,busd,mail-fetch,mail-files,td-firstboot"
+                    "wayland,busd,fetchd,td-firstboot"
                 } else {
-                    "wayland,busd,news-fetch,td-firstboot"
+                    "wayland,busd,fetchd,td-firstboot"
                 }),
                 "{unit}"
             );
@@ -8068,13 +8040,12 @@ mod tests {
                     vec![
                         "busd",
                         "portal",
-                        "mail-fetch",
-                        "mail-files",
+                        "fetchd",
                         "applications-workspace",
                         "firefox-tls-setup",
                     ]
                 } else {
-                    vec!["busd", "news-fetch", "applications-workspace"]
+                    vec!["busd", "fetchd", "applications-workspace"]
                 },
                 "{unit}"
             );
@@ -8234,10 +8205,9 @@ mod tests {
             .next()
             .unwrap();
         let shutdown = build_shutdown(&SYSTEM);
-        for (app, variant, location, consumer) in [
-            ("firefox", "FirefoxDownloads", "xdg-download", "firefox"),
-            ("mail", "MailDownloads", "xdg-download", "mail"),
-        ] {
+        for (app, variant, location, consumer) in
+            [("firefox", "FirefoxDownloads", "xdg-download", "firefox")]
+        {
             let recipe = crate::catalog::lookup(app).unwrap();
             let permissions = recipe.application_permissions.as_ref().unwrap();
             assert!(
@@ -8261,8 +8231,8 @@ mod tests {
                 .any(|unit| unit == format!("{app}-files")));
             assert!(shutdown.contains(&format!("/bin/td-authd release-application-files {app} ||")));
         }
-        assert_eq!(helper.matches("=> Ok(Self::").count(), 2);
-        assert!(helper.contains("Self::FirefoxDownloads | Self::MailDownloads => \"Downloads\""));
+        assert_eq!(helper.matches("=> Ok(Self::").count(), 1);
+        assert!(helper.contains("Self::FirefoxDownloads => \"Downloads\""));
         let projection = jail
             .split("let component = match ")
             .nth(1)
@@ -8270,9 +8240,8 @@ mod tests {
             .split("};")
             .next()
             .unwrap();
-        assert!(projection.contains("Some(\"firefox\" | \"mail\") => \"Downloads\""));
+        assert!(projection.contains("Some(\"firefox\") => \"Downloads\""));
         assert_eq!(projection.matches("Some(").count(), 1);
-        assert!(unit_after("mail-files").contains(&"firefox-files".to_string()));
     }
 
     /// The stock compositor uses only the fixed root terminal authority.
@@ -8291,7 +8260,8 @@ mod tests {
             format!("/run/td-compositor/{UI_UID}/td-control")
         );
         let jail = include_str!("../../../td-jail/src/authority.rs");
-        assert!(jail.contains(&format!("if policy.owner() == {UI_UID}\n        && policy")));
+        assert!(jail.contains(&format!("if policy.owner() == {UI_UID}")));
+        assert!(jail.contains(".for_name(name).is_some_and(|rule| rule.uid == uid)"));
         let account = crate::primary_account::parse(&build_passwd(&SYSTEM)).unwrap();
         assert_eq!(crate::primary_account::UID, UI_UID);
         assert_eq!(account.name(), UI_USER);
@@ -9242,10 +9212,7 @@ mod tests {
             ("busd", vec!["seat"]),
             ("fetchd", vec!["seat", "netup"]),
             ("egressd", vec!["seat", "netup"]),
-            ("mail-fetch", vec!["td-firstboot", "netup"]),
-            ("news-fetch", vec!["td-firstboot", "netup"]),
             ("firefox-files", vec!["td-firstboot"]),
-            ("mail-files", vec!["td-firstboot", "firefox-files"]),
             ("fetch-evidence", vec!["fetchd", "firefox-tls-setup"]),
             ("portal-files", vec!["td-firstboot"]),
             ("firefox-handoff", vec!["td-firstboot"]),
@@ -9260,14 +9227,13 @@ mod tests {
                 vec![
                     "busd",
                     "portal",
-                    "mail-fetch",
-                    "mail-files",
+                    "fetchd",
                     "applications-workspace",
                     "firefox-tls-setup",
                 ],
             ),
             ("mail-evidence", vec!["mail", "firefox-tls-setup"]),
-            ("news", vec!["busd", "news-fetch", "applications-workspace"]),
+            ("news", vec!["busd", "fetchd", "applications-workspace"]),
             ("news-evidence", vec!["news", "firefox-tls-setup"]),
             ("shell-workspace", vec!["mail", "news"]),
             (
@@ -9654,11 +9620,17 @@ mod tests {
         assert_eq!(policy.owner(), UI_UID);
         let principals = build_principals(&SYSTEM);
         for application in SYSTEM.applications {
-            let rule = policy.for_uid(application.external_uid).unwrap();
+            let rule = policy.for_name(application.name).unwrap();
+            let expected_uid = if matches!(application.name, TD_MAIL_NAME | TD_NEWS_NAME) {
+                UI_UID
+            } else {
+                application.external_uid
+            };
+            assert_eq!(rule.uid, expected_uid);
             assert_eq!(rule.application, application.name);
             assert!(principals.contains(&format!(
                 "application\t{UI_UID}\t{}\t{}\n",
-                application.name, rule.uid
+                application.name, application.external_uid
             )));
             let permissions = (application.package_recipe)()
                 .application_permissions

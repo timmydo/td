@@ -61,11 +61,13 @@ impl Request {
 
     fn helper(&self, uid: u32) -> Command {
         let mut command = Command::new("/bin/td-login");
+        if uid == self.owner {
+            command.args(["exec-primary", "--"]);
+        } else {
+            command.args(["exec-service-as", &format!("tda{uid}"), "--"]);
+        }
         command
             .args([
-                "exec-service-as",
-                &format!("tda{uid}"),
-                "--",
                 "/bin/td-authd",
                 "application-exec",
                 &uid.to_string(),
@@ -80,20 +82,29 @@ impl Request {
 
     /// td-jail selects the application by its argv[0], so the launch needs
     /// no `/bin/APP` link.
-    fn application(&self, uid: u32) -> Command {
+    fn application(&self, uid: u32) -> Result<Command, String> {
+        let (home, user) = if uid == self.owner {
+            let account = crate::primary_account::load().map_err(|error| error.to_string())?;
+            (account.home(), account.name().to_owned())
+        } else {
+            (
+                format!("/var/lib/td/applications/{uid}").into(),
+                format!("tda{uid}"),
+            )
+        };
         let mut command = Command::new("/bin/td-jail");
         command
             .arg0(&self.name)
             .args(&self.arguments)
             .env_clear()
             .current_dir("/")
-            .env("HOME", format!("/var/lib/td/applications/{uid}"))
-            .env("USER", format!("tda{uid}"))
-            .env("LOGNAME", format!("tda{uid}"))
+            .env("HOME", home)
+            .env("USER", &user)
+            .env("LOGNAME", &user)
             .env("SHELL", "/bin/false")
             .env("PATH", "/bin")
             .env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"));
-        command
+        Ok(command)
     }
 }
 
@@ -105,12 +116,20 @@ impl Drop for CheckedChild {
     }
 }
 
+fn launch_uid(text: &str) -> Result<u32, String> {
+    if text == "1000" {
+        Ok(1000)
+    } else {
+        decimal(text, APPLICATION_UIDS)
+    }
+}
+
 fn reply_uid(text: &str) -> Result<u32, String> {
     let number = text
         .strip_prefix(REPLY)
         .and_then(|s| s.strip_suffix('\n'))
         .ok_or("invalid application admission response")?;
-    decimal(number, APPLICATION_UIDS)
+    launch_uid(number)
 }
 
 fn admit(owner: u32, name: &str) -> Result<u32, String> {
@@ -231,7 +250,7 @@ fn require_process(uid: u32, status: &str, cgroup: &str) -> Result<(), String> {
         .lines()
         .find_map(|line| line.strip_prefix("Groups:"))
         .ok_or("application process lacks its group set")?;
-    if groups.split_ascii_whitespace().collect::<Vec<_>>() != [expected.as_str()] {
+    if uid != 1000 && groups.split_ascii_whitespace().collect::<Vec<_>>() != [expected.as_str()] {
         return Err("application process has extra or missing groups".into());
     }
     for key in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
@@ -244,7 +263,8 @@ fn require_process(uid: u32, status: &str, cgroup: &str) -> Result<(), String> {
             return Err("application process retained capabilities".into());
         }
     }
-    if cgroup != format!("0::/td-app-{uid}/session\n") {
+    let role = if uid == 1000 { "user" } else { "app" };
+    if cgroup != format!("0::/td-{role}-{uid}/session\n") {
         return Err("application process is outside its assigned session cgroup".into());
     }
     Ok(())
@@ -254,7 +274,7 @@ pub(crate) fn exec(arguments: &[String]) -> Result<(), String> {
     let (uid, rest) = arguments
         .split_first()
         .ok_or("application-exec requires UID and request")?;
-    let uid = decimal(uid, APPLICATION_UIDS)?;
+    let uid = launch_uid(uid)?;
     let request = Request::parse(rest)?;
     require_process(
         uid,
@@ -263,7 +283,7 @@ pub(crate) fn exec(arguments: &[String]) -> Result<(), String> {
     )?;
     Err(format!(
         "exec application: {}",
-        request.application(uid).exec()
+        request.application(uid)?.exec()
     ))
 }
 
@@ -379,7 +399,7 @@ mod tests {
                 "literal;argument"
             ]
         );
-        let command = request.application(65537);
+        let command = request.application(65537).unwrap();
         assert_eq!(command.get_program(), "/bin/td-jail");
         assert_eq!(
             command
@@ -424,6 +444,30 @@ mod tests {
     }
 
     #[test]
+    fn personal_launch_uses_the_human_helper_and_session_delegation() {
+        let request = Request::parse(&request()).unwrap();
+        let helper = request.helper(1000);
+        let args: Vec<_> = helper.get_args().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(
+            args.get(..3),
+            Some(["exec-primary", "--", "/bin/td-authd"].as_slice())
+        );
+        assert_eq!(
+            reply_uid("TD-LAUNCH-APPLICATION-CHECK-OK\t1000\n").unwrap(),
+            1000
+        );
+        let status = "Uid: 1000 1000 1000 1000\nGid: 1000 1000 1000 1000\nGroups: 1000\nCapInh: 0000000000000000\nCapPrm: 0000000000000000\nCapEff: 0000000000000000\nCapAmb: 0000000000000000\n";
+        require_process(1000, status, "0::/td-user-1000/session\n").unwrap();
+        assert!(require_process(1000, status, "0::/td-app-1000/session\n").is_err());
+        assert!(require_process(
+            1000,
+            &status.replace("Gid: 1000", "Gid: 0"),
+            "0::/td-user-1000/session\n"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn replies_are_one_exact_bounded_canonical_application_identity() {
         assert_eq!(
             reply_uid("TD-LAUNCH-APPLICATION-CHECK-OK\t65537\n").unwrap(),
@@ -431,7 +475,7 @@ mod tests {
         );
         for text in [
             "65537\n",
-            "TD-LAUNCH-APPLICATION-CHECK-OK\t1000\n",
+            "TD-LAUNCH-APPLICATION-CHECK-OK\t1001\n",
             "TD-LAUNCH-APPLICATION-CHECK-OK\t065537\n",
             "TD-LAUNCH-APPLICATION-CHECK-OK\t65537\nextra",
         ] {

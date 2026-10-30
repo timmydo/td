@@ -231,10 +231,10 @@ Updates rewrite the encrypted bundle atomically and never persist a
 plaintext key. There is no additional daemon or external service.
 
 Release requires the presented FIDO2 operation described below. The portal
-service can read the released key and credentials. Each
-application registers only from its assigned external UID and reads its
-private state; human-UID launchers cannot impersonate it through the
-broker. TPM possession is not user identity. PCR
+service can read the released key and credentials. Each application registers from its assigned UID and binds identity to
+its jailed child. Foreign applications retain separate service UIDs; mail
+and news share the human UID, so human-account software remains trusted.
+An unconfined connection has no broker application identity. TPM possession is not user identity. PCR
 changes after release do not revoke already released bytes. Memory
 zeroing remains best effort. The kernel, root, DMA and physical TPM-bus
 interception are outside this increment's boundary; its TPM sessions are

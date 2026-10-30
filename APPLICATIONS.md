@@ -3289,7 +3289,15 @@ revalidated afterward. Targets in the fresh root are checked component by
 component and may not replace or overlap `/app`, `/usr`, `/opt`, `/run`,
 `/proc`, `/sys`, `/dev`, `/tmp`, `/var/tmp`, `/etc`, `/boot`, `/.flatpak-info`,
 `/oldroot`, `/root-write-probe`, the private-home root, or its fixed config,
-cache, data and local-state mounts. Directory grants are recursive binds.
+cache, data and local-state mounts. A grant may mount a child of the
+private configuration directory, but may not replace that directory or an
+ancestor. Mail and news use this to mount just `~/.config/td-mail` or
+`~/.config/td-news`, read/write, from the real human home. Firstboot writes
+missing templates there and preserves existing files. There is no migration
+or fallback to the old configuration under private application homes.
+Their cache, data and state stay under the human's `~/.td/app/NAME`; only
+mail also receives the human Downloads grant. No other home subtree is
+mounted. Directory grants are recursive binds.
 Every mount at or below a granted target is enumerated from mountinfo and
 remounted `nosuid,nodev,noexec`; a read-only grant additionally makes every
 nested mount read-only, deepest first. Stage 1 and stage 2 independently
@@ -4028,9 +4036,9 @@ agree with its kernel UID's name and grants; disagreement fails closed. `Unknown
 lineage stays denied. UID mapping for EXTERNAL claims never selects this
 role. Generic host/test brokers retain their caller-supplied registry.
 
-Application UIDs and private state are active. Human-UID processes
-cannot register an application; the stock registry requires its assigned
-external UID. Root's trusted portal connection cannot register an app
+Application identities and private state are active. The stock registry
+requires the UID assigned to the name: the human UID for personal mail/news
+and a dedicated service UID for foreign applications. Root's trusted portal connection cannot register an app
 either. This policy table is rebuilt for the selected deployment; the
 persistent UID reservation ledger also retains removed assignments and
 does not grant them access to a deployment where they are absent.
@@ -4861,8 +4869,9 @@ there. It is not a secret — the difference from a name is that a peer
 which may not use an interface is better told so than left calling a
 method that appears not to exist — and it is the interface that CREATES
 confinement records. A jailed peer may not rewrite its own instance.
-Human-UID registration is refused; a dedicated application UID is bound
-to its immutable name and grants.
+Unconfined human launchers can register only their explicitly assigned
+personal application names. Dedicated application UIDs remain bound to
+their immutable name and grants.
 
 What the filter depended on had already landed, which is what made this
 increment reviewable on its own: the registration protocol and the
@@ -5190,9 +5199,9 @@ at boot does it.** Every jailed application is a registered instance and
 reports `td.AppId`. A deployment application UID outside a jail is a
 registration-only `Launcher`; ordinary human-UID processes with proved
 unconfined lineage remain `Unconfined`. The stock policy fixes installed
-names and grants for each assigned external UID. Human-UID launchers
-cannot register an installed application; an application launcher can
-register only its own assigned identity.
+names and grants for each assigned execution UID. A launcher may register
+only names assigned to its UID, including personal applications assigned
+to the human owner. Confined callers cannot register another instance.
 
 **What the launcher sends is fixed by its own grammar, not by anything
 the application controls.** The **app id is the application's td name** —
@@ -8549,29 +8558,35 @@ remains accessible; its immutability prevents modification. The portal owns
 the credential store and has a read-only mapped Downloads grant, with no
 access to the remaining private human home.
 
-Applications run under distinct external service UIDs: Firefox 65536,
-mail 65537 and news 65538. The immutable identity registry and retained
-ledger bind those assignments to the human session; retired UIDs are
-never reassigned, so Claude Code's 65539 stays reserved on every install
-that enrolled it (§W.9, "Removed: Claude Code"). Root-configured units
-invoke `td-authd application-start`, which selects the enrolled account,
-uses td-login's checked credential drop, and verifies the application
-cgroup before exec.
+Firefox runs under external service UID 65536. The source-built mail and
+news applications run as the login user, UID 1000, inside td-jail. Their
+former 65537 and 65538 account rows remain reserved and are never reused;
+firstboot prepares neither private homes nor service runtimes for those
+personal applications. The immutable bus table names the actual launch UID
+for each installed application. Root-configured units invoke
+`td-authd application-start`, which checks the enrolled account reservation
+and this table, then uses td-login's checked credential drop. Personal
+applications use `exec-primary` and `/td-user-1000/session`; foreign
+applications use `exec-service-as` and their application session cgroup.
 No caller may choose an executable or UID through that operation. There
 is no public launch listener.
 
 The jail maps each external UID to 1000 inside its private namespace.
 The broker checks AUTH EXTERNAL against that kernel mapping and permits
 registration only for the immutable name and exact grants assigned to the
-external UID. Human-UID registration is refused. A service UID outside a
+external UID. The human UID may register only names explicitly assigned
+to it by the deployment; the name and proven jail lineage still distinguish
+mail from news. An unconfined human connection has no application identity.
+A service UID outside a
 registered jail has registration authority, without a portal app identity.
-Lineage still fixes the instance; escaping an application does not acquire
-the human account or another application's assigned identity.
+Lineage still fixes the instance. Escaping a foreign application does not
+acquire the human account. Personal applications share the human identity;
+their home isolation depends on the jail boundary, not a separate host UID.
 
-Firstboot migrates legacy application state into mode-0700
+For applications assigned service UIDs, firstboot migrates legacy state into mode-0700
 `/var/lib/td/applications/APP_UID`, creates the corresponding service
 runtime and cgroup, and removes the old application directory. The root
-filesystem helper publishes only Firefox and mail Downloads views of the
+filesystem helper publishes only a Firefox Downloads view of the
 human's corresponding directory. These writable idmapped
 mounts preserve mode-0600 files and map new writes back to human ownership.
 They are nosuid,nodev,noexec; they grant no other human directory. Jail
@@ -10106,7 +10121,7 @@ credential service described here acquires no personal-vault authority.
 
 Unenrolled stores use the increment-(a) backend: one per-user store at
 `/var/lib/td/secrets/<uid>` beside the machine identity. `td-firstboot`
-creates the master and the initial `mail/main` placeholder. The
+creates the master for an empty store; it inserts no credential. The
 mode-0700 directory and mode-0600 files belong to the session's
 dedicated portal UID (991 for human UID 1000); credentials use
 ChaCha20-Poly1305 and per-application HKDF keys. Firstboot transfers
@@ -10114,9 +10129,9 @@ existing stores before human sessions, with a restartable root-owned
 intermediate leaf; logical UID and credential bytes remain unchanged.
 The file-backed master remains an interim backend: an offline disk
 reader can recover it. This backend provides no TPM protection,
-authenticated session lock or token recovery. Application registration
-requires each application's own external UID; the human UID cannot
-impersonate an installed application.
+authenticated session lock or token recovery. Application registration binds the installed name and its assigned UID to
+proven jail lineage. An unconfined human connection has no application identity; personal
+applications share that UID and trust human-account software.
 
 **Applications receive credentials, not encryption keys.** td owns the
 `td.Secret1` interface on the activated `org.freedesktop.portal.Desktop`
@@ -10141,9 +10156,8 @@ receipt logging remains available after an enrolled session is unlocked. The tok
 proof of a client's read. The shipped helper's ordering and live transfer
 tests establish the read-before-acknowledgement behavior.
 
-The provisioned configuration lives in the application account's private
-home, which the human session cannot write, so td-mail sets the
-placeholder up itself. For an account whose server is an RFC 2606
+The provisioned configuration lives in the human's `~/.config/td-mail`,
+mounted read/write into its jail. td-mail can set the placeholder up itself. For an account whose server is an RFC 2606
 example name, td-mail still asks the portal for the credential, so the
 unenrolled boot's refusal above is unchanged, but never contacts the
 server. Its window says so, and `s` opens a two-field form (server host
@@ -10160,15 +10174,10 @@ the window shows the enrollment, unlock and `td-secret set` steps above
 with the portal's reason, and `a` connects again; it names no root
 path.
 
-Firstboot writes the placeholder into the store before creating portal-mode
-configuration. It imports an existing credential at the formerly provisioned
-mail password path, durably switches that configuration, and removes the
-plaintext file. It never replaces an existing stored credential with a
-placeholder. Missing legacy credentials, renamed accounts, custom or ambiguous credential
-sources, conflicting existing credentials and malformed files cause an explicit
-refusal; source data is retained for operator resolution. Migration is
-restartable after any completed publication. There is no dual plaintext
-fallback in the shipped td-mail client.
+Firstboot creates an empty portal-owned credential store for explicit token
+enrollment and writes a missing mail configuration in the human home. It
+preserves existing configuration and provisions no placeholder credential.
+It neither imports nor removes files from retired private app config paths.
 
 **One-operation writer.** `td-secret set [--recovery] <application>/<name>`
 reads 1..4096 exact bytes from redirected stdin and sends one immutable
@@ -10180,7 +10189,7 @@ and token role are presented before one fresh assertion; the matching commit
 permits one atomic encrypted-record replacement. An existing session release
 cannot authorize a write. Cancellation preserves that release; generation
 teardown still clears it. The former root-console `set --uid` bypass is
-removed. Firstboot remains the initial unenrolled-placeholder writer.
+removed. Firstboot initializes only the empty unenrolled store.
 
 **Hardware enrollment and session release.** Physical Ctrl+Alt+Esc opens
 the trusted screen. E selects enrollment with a second recovery token;
@@ -10240,8 +10249,9 @@ durable ledger. The root-configured `td-authd application-start`
 prerequisite can consume an activated application account through
 td-login and requires its assigned cgroup before executing the fixed
 application command. It has no public request endpoint. Stock
-application units now consume those accounts and require successful
-firstboot; grant-bearing units also require successful root filesystem
+foreign application units consume those accounts and require successful
+firstboot; personal mail/news units use the checked human assignment.
+Foreign grant-bearing units also require successful root filesystem
 preparation.
 
 The paired compositor's physical attention screen selects enrollment and
@@ -10504,16 +10514,12 @@ webpki-roots, and no decoder. So:
    and `td-boot/` trees and the committed lock's vendor closure: the
    first target-built control-plane program, and the one target network
    client. The human `[fetchd]` remains at `/run/user/1000/td-fetch/socket`.
-   Mail and news use separate `[mail-fetch]` and `[news-fetch]` units
-   after firstboot and netup, at `/run/user/APP_UID/td-fetch/socket`,
-   `restart=always`, in a directory of its own that it makes, mode
-   0700, so that the jail binds the directory rather than the socket
-   inode and a restart's fresh socket is the one a running jail
-   connects to; the socket is mode 0600, and that is the whole of the
-   authentication: the tier forbids `unsafe`, so peer credentials are
-   not read. Each application runtime is mode 0700 and only that
-   application UID can reach its service. The human and sibling
-   applications cannot access its socket or daemon memory.
+   Mail and news share this human fetch service. Its directory is mode
+   0700 and its socket mode 0600. The jail mounts only that directory,
+   so reconnecting after a service restart reaches the new socket inode.
+   These personal applications share the human UID; they do not have
+   separate host-UID isolation from this daemon. The portal and foreign
+   application UIDs cannot access its private socket or memory.
 2. The grant is `sockets=fetch`, beside `sockets=wayland`. §C's mount
    plan step 12 binds the `td-fetch` directory into the jail's runtime
    directory when it is granted, read-only like the bus and as a

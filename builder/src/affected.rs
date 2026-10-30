@@ -6439,6 +6439,7 @@ mod tests {
             [
                 "td-audio",
                 "td-compositor",
+                "td-firstboot",
                 "td-jail",
                 "td-login",
                 "td-open",

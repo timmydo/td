@@ -42,6 +42,10 @@ pub(crate) const MAIN_RS: &str = include_str!("../../../td-firstboot/src/main.rs
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
     (
+        "app_policy",
+        include_str!("../../../td-busd/src/app_policy.rs"),
+    ),
+    (
         "primary_profile",
         include_str!("../../../td-firstboot/src/primary_profile.rs"),
     ),
@@ -140,6 +144,7 @@ pub fn recipe() -> Recipe {
     let mut steps = Vec::new();
     for directory in [
         "{src}/td-firstboot/src",
+        "{src}/td-busd/src",
         "{src}/td-secret/src",
         "{src}/td-authd/src",
         "{src}/engine/src",
@@ -163,6 +168,7 @@ pub fn recipe() -> Recipe {
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
             path: match *name {
+                "app_policy" => "{src}/td-busd/src/app_policy.rs".into(),
                 "fido_cbor" => "{src}/td-fido/src/fido_cbor.rs".into(),
                 "fido_ctap" => "{src}/td-fido/src/fido_ctap.rs".into(),
                 "fido_enroll" => "{src}/td-fido/src/fido_enroll.rs".into(),
@@ -358,7 +364,7 @@ pub fn recipe() -> Recipe {
     }
     steps.push(Step::WriteFile {
         path: "{src}/principal-tests.rs".into(),
-        content: "#![allow(dead_code)]\nconst DEFAULT_STATE_DIR: &str = \"/var/lib/td\";\n#[path = \"td-firstboot/src/principals.rs\"] mod principals;\n#[path = \"td-firstboot/src/principal_store.rs\"] mod principal_store;\n".into(),
+        content: "#![allow(dead_code)]\nconst DEFAULT_STATE_DIR: &str = \"/var/lib/td\";\n#[path = \"td-busd/src/app_policy.rs\"] mod app_policy;\n#[path = \"td-firstboot/src/principals.rs\"] mod principals;\n#[path = \"td-firstboot/src/principal_store.rs\"] mod principal_store;\n".into(),
         exec: false,
     });
     steps.push(
@@ -436,22 +442,19 @@ mod tests {
         }
     }
 
-    /// The application state root is a contract between td-jail's own constant,
-    /// the jail configuration text every image compiles, and the separate
-    /// td-firstboot crate that provisions beneath it. The third is read back
-    /// out of the embedded source the way the markers are.
     #[test]
-    fn the_shipped_binary_provisions_under_the_state_root_the_ladder_declares() {
-        let state_root = crate::shared::TD_APPLICATION_CONFIG_TEXT
-            .lines()
-            .find_map(|line| line.strip_prefix("state-root="))
-            .expect("the jail configuration text names a state root");
-        assert_eq!(
-            source_const(MAIN_RS, "APPLICATION_STATE_ROOT"),
-            Some(state_root),
-            "td-firstboot's `APPLICATION_STATE_ROOT` and the jail's state root have drifted; \
-             the first configuration would land where no jail looks"
-        );
+    fn templates_match_the_personal_configuration_grants() {
+        let root = source_const(MAIN_RS, "APPLICATION_CONFIG_ROOT").unwrap();
+        for name in ["mail", "news"] {
+            let permissions = crate::catalog::lookup(name)
+                .unwrap()
+                .application_permissions
+                .unwrap();
+            assert!(permissions
+                .to_keyfile()
+                .lines()
+                .any(|line| line == format!("~/{root}/td-{name}=rw:create")));
+        }
     }
 
     /// `mod NAME;` and the files written beside `main.rs` must be the same set: a

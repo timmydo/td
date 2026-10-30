@@ -206,7 +206,7 @@ pub fn recipe() -> Recipe {
     );
 
     // The applications' first configuration. The flag pair adds the
-    // mail and news configurations under the login user's td-jail state: once,
+    // mail and news configurations under the login user's configuration home: once,
     // owned by that user, in the modes the jail insists on, and without turning
     // a stable identity into a first boot. The sandbox user's own uid is the
     // owner td-firstboot is given, so the chown root performs at boot runs here
@@ -232,34 +232,34 @@ pub fn recipe() -> Recipe {
                        {{ echo 'provision with the application pair failed; its own diagnostic:' >&2; cat \"$err\" >&2; exit 1; }}; \
                      printf '%s\\n' \"$out\" | grep -q -x -F TD-FIRSTBOOT-STABLE-OK || \
                        {{ echo \"provisioning the applications turned a stable identity into something else: $out\" >&2; exit 1; }}; \
-                     for f in mail/config/td-mail/config.toml news/config/td-news/config.toml; do \
-                       [ -f \"$home/.td/app/$f\" ] || {{ echo \"td-firstboot did not provision $f\" >&2; exit 1; }}; \
-                       got=$(ls -l \"$home/.td/app/$f\" | cut -c1-10); \
+                     for f in td-mail/config.toml td-news/config.toml; do \
+                       [ -f \"$home/.config/$f\" ] || {{ echo \"td-firstboot did not provision $f\" >&2; exit 1; }}; \
+                       got=$(ls -l \"$home/.config/$f\" | cut -c1-10); \
                        [ \"$got\" = -rw------- ] || {{ echo \"$f has mode $got, expected -rw------- - the jail binds only private state\" >&2; exit 1; }}; \
-                       set -- $(ls -ln \"$home/.td/app/$f\"); [ \"$3:$4\" = \"$owner\" ] || {{ echo \"$f is owned by $3:$4, not $owner\" >&2; exit 1; }}; \
+                       set -- $(ls -ln \"$home/.config/$f\"); [ \"$3:$4\" = \"$owner\" ] || {{ echo \"$f is owned by $3:$4, not $owner\" >&2; exit 1; }}; \
                      done; \
-                     for d in .td .td/app .td/app/mail .td/app/mail/config .td/app/mail/config/td-mail .td/app/news .td/app/news/config .td/app/news/config/td-news; do \
+                     for d in .config .config/td-mail .config/td-news; do \
                        got=$(ls -ld \"$home/$d\" | cut -c1-10); \
                        [ \"$got\" = drwx------ ] || {{ echo \"$d has mode $got, expected drwx------\" >&2; exit 1; }}; \
                        set -- $(ls -lnd \"$home/$d\"); [ \"$3:$4\" = \"$owner\" ] || {{ echo \"$d is owned by $3:$4, not $owner\" >&2; exit 1; }}; \
                      done; \
-                     grep -q -F 'secret = \"portal\"' \"$home/.td/app/mail/config/td-mail/config.toml\" || \
+                     grep -q -F 'secret = \"portal\"' \"$home/.config/td-mail/config.toml\" || \
                        {{ echo 'the mail configuration does not use the credential portal' >&2; exit 1; }}; \
-                     grep -q -x -F '[[feed]]' \"$home/.td/app/news/config/td-news/config.toml\" || \
+                     grep -q -x -F '[[feed]]' \"$home/.config/td-news/config.toml\" || \
                        {{ echo 'the news configuration has no feed, and td-news refuses to start without one' >&2; exit 1; }}; \
-                     HOME=\"$home\" XDG_CONFIG_HOME=\"$home/.td/app/mail/config\" '{mail}' --offline --cli < /dev/null > '{{root}}/td-mail.out' 2> '{{root}}/td-mail.err' || \
+                     HOME=\"$home\" XDG_CONFIG_HOME=\"$home/.config\" '{mail}' --offline --cli < /dev/null > '{{root}}/td-mail.out' 2> '{{root}}/td-mail.err' || \
                        {{ echo 'the provisioned mail configuration does not start td-mail offline; its own diagnostic:' >&2; cat '{{root}}/td-mail.err' >&2; exit 1; }}; \
-                     HOME=\"$home\" '{news}' --config \"$home/.td/app/news/config/td-news/config.toml\" --cache '{{root}}/td-news-cache' --fetch-and-quit > '{{root}}/td-news.out' 2> '{{root}}/td-news.err'; \
+                     HOME=\"$home\" '{news}' --config \"$home/.config/td-news/config.toml\" --cache '{{root}}/td-news-cache' --fetch-and-quit > '{{root}}/td-news.out' 2> '{{root}}/td-news.err'; \
                      grep -q 'Error loading config' '{{root}}/td-news.err' && \
                        {{ echo 'the provisioned news configuration does not load in td-news; its own diagnostic:' >&2; cat '{{root}}/td-news.err' >&2; exit 1; }}; \
                      grep -Eq 'Fetch error|^Fetched ' '{{root}}/td-news.err' || \
                        {{ echo 'td-news did not reach for its feeds from the provisioned configuration; its own diagnostic:' >&2; cat '{{root}}/td-news.err' >&2; exit 1; }}; \
-                     printf 'edited\\n' > \"$home/.td/app/mail/config/td-mail/config.toml\"; \
+                     printf 'edited\\n' > \"$home/.config/td-mail/config.toml\"; \
                      out=$('{bin}' provision --state-dir \"$state\" --keygen \"$stub\" --application-home \"$home\" --application-owner \"$owner\" 2>\"$err\") || \
                        {{ echo 'a later provision over edited application state failed; its own diagnostic:' >&2; cat \"$err\" >&2; exit 1; }}; \
-                     [ \"$(cat \"$home/.td/app/mail/config/td-mail/config.toml\")\" = edited ] || \
+                     [ \"$(cat \"$home/.config/td-mail/config.toml\")\" = edited ] || \
                        {{ echo 'a later provision rewrote an operator-edited application configuration' >&2; exit 1; }}; \
-                     [ ! -e \"$home/.td/app/mail/config/td-mail/password\" ] && [ ! -L \"$home/.td/app/mail/config/td-mail/password\" ] || \
+                     [ ! -e \"$home/.config/td-mail/password\" ] && [ ! -L \"$home/.config/td-mail/password\" ] || \
                        {{ echo 'a later provision recreated a plaintext password file' >&2; exit 1; }}; \
                      '{bin}' provision --state-dir \"$state\" --keygen \"$stub\" --application-home \"$home\" >/dev/null 2>&1; \
                      [ $? -eq 2 ] || {{ echo 'td-firstboot must exit 2 (usage) when --application-home comes without --application-owner' >&2; exit 1; }}; \

@@ -387,7 +387,7 @@ accidental UID recycling, not a root attacker rewriting the ledger.
 
 ### Application runtime preparation
 
-For each installed and validated application account, firstboot prepares
+For each installed and validated application assigned a service UID, firstboot prepares
 `/sys/fs/cgroup/td-app-APP_UID` after private state conversion, before its
 state-ready and enrollment markers. It requires one writable cgroup2 mount
 at the unified hierarchy root, binds its major/minor device to the opened
@@ -418,9 +418,9 @@ Firstboot then prepares root-owned mode-0755 `/run/user` and app-owned
 mode-0700 `/run/user/APP_UID` using the existing pinned runtime provisioner.
 An existing published runtime with wrong ownership or permissions refuses;
 only interrupted root-owned creation is completed. No socket is created.
-Only installed accounts consume reservations. The stock image installs
-all four application accounts and couples their root launch, socket
-admission, grants and private per-app fetch services.
+Only installed applications assigned service UIDs consume this preparation.
+Personal mail/news retain their old UID reservations but execute under the
+human account and share its runtime and fetch daemon.
 
 Before dropping credentials, td-login selects `td-user-1000/session` for
 the human and `td-app-APP_UID/session` for the reserved application UID
@@ -435,10 +435,22 @@ An activated application account's home must be exactly
 `/var/lib/td/applications/APP_UID`. The shared account validator checks this
 for retained as well as current application reservations. An absent account
 remains a reservation; its row alone creates no application state or runtime.
-The stock image activates these accounts together with the root launcher,
-cgroups, socket admission and per-application fetch services.
+The stock bus policy also permits an installed source-built personal application
+to execute as its human owner. Mail and news use this class. Their old account
+rows remain reservations but get no state migration or runtime preparation.
+Launch admission requires an active reservation and a matching immutable bus
+policy row whose UID is either the reserved service UID or the session owner.
+Personal launches use `exec-primary`, require `/td-user-1000/session`, and
+resolve the actual human home through the shared account validator. The jail
+mounts only each program's `.config/td-PROGRAM` subtree read/write and its own
+private state; mail also mounts Downloads directly. Firstboot templates use
+those real configuration paths, preserve existing files, and never read or
+migrate the old private configuration or plaintext password files.
+Firstboot separately creates a missing portal credential store, owned by
+the portal account, so secure-attention enrollment has an empty store to
+open. It inserts no placeholder mail credential and releases no key.
 
-When a deployed application account is present, firstboot prepares its home
+When a deployed application uses its service account, firstboot prepares its home
 after checking the durable registry and before reporting enrollment success.
 It requires the configured human migration home for that application's
 owner. The image invokes `td-firstboot provision --application-primary`,
@@ -952,8 +964,10 @@ the validator. Trusted root must not change the account database, deployment
 or mount hierarchy during launch. The check creates no state and does not
 substitute for successful firstboot dependency ordering.
 
-After validation the authority execs the fixed td-login `exec-service-as`
-helper for `tdaUID`, followed by its own `application-exec` wrapper. All
+After validation the authority execs the fixed td-login helper: `exec-primary`
+for a personal application assigned to the human, or `exec-service-as tdaUID`
+for an application assigned a service account. Both then execute the authority's
+own `application-exec` wrapper. All
 standard descriptors become null, the environment is cleared and cwd is `/`.
 The supervisor PID is retained across execs. No inherited root endpoint or
 log reaches application code. Root startup refusals are diagnosed; after the
@@ -961,9 +975,10 @@ handoff, failures appear as the supervised process's exit status. The fixed
 firstboot check can be run directly for detailed admission diagnostics.
 
 The unprivileged wrapper requires all four UID/GID columns to equal the
-selected application UID, exactly its primary supplementary group, empty
-inheritable/permitted/effective/ambient capabilities, and exact membership
-in `td-app-UID/session`. A diagnostic-only td-login placement failure thus
+selected execution UID and empty inheritable/permitted/effective/ambient
+capabilities. A service-account launch requires exactly its primary
+supplementary group and membership in `td-app-UID/session`; a personal
+launch retains the human's groups and requires `td-user-1000/session`. A diagnostic-only td-login placement failure thus
 cannot execute application code. This wrapper gains no privilege and is not
 an alternative application-identity authority: an app UID invoking it directly
 still has only that UID. Broker and jail activation must independently bind
@@ -973,8 +988,8 @@ The wrapper constructs only `/bin/td-jail` with APP as its argv[0], which is
 how td-jail selects the application (APPLICATIONS.md §A.0), so the launch
 needs no `/bin/APP` link; td-jail refuses a by-name launch under any UID
 other than the one the deployment assigned APP. It supplies the canonical
-private HOME and runtime, service USER/LOGNAME, `/bin/false` SHELL and
-`/bin` PATH, passes literal application arguments without a shell and sets
+HOME and USER/LOGNAME for the selected account, its private runtime,
+`/bin/false` SHELL and `/bin` PATH, passes literal application arguments without a shell and sets
 no compositor control endpoint; td-jail's product resolver fixes the
 display endpoint. There is no terminal presentation: td-term's `--command`
 cannot set its program's argv[0], so it could not name an unlinked
@@ -1174,11 +1189,11 @@ td-software/DESIGN.md §3 accepts.
 
 ## Application filesystem grants
 
-Root startup prepares two writable idmapped views: Firefox and mail
-share human Downloads, resolved through the same primary-account reader as
-portal preparation and jail admission, each below the assigned
+Root startup prepares one writable idmapped view: Firefox shares human
+Downloads, resolved through the same primary-account reader as portal
+preparation and jail admission, below the assigned
 application's private home. `prepare-application-files APP` and the matching
-shutdown operation accept only those two installed names. Active-account and
+shutdown operation accept only `firefox`. Active-account and
 durable-ledger admission select the UID; no caller supplies a path or map.
 The existing root namespace helper maps filesystem human UID/GID 1000 to
 that application identity. Mount attributes require nosuid, nodev and noexec;
@@ -1201,7 +1216,9 @@ release them before unmounting /var.
 
 Application activation uses the same immutable application policy reader in
 the broker, jail, portal, compositor and audio daemon. Broker registration
-requires the assigned external UID; human UID registration is removed.
+requires the assigned execution UID. The human UID may register the
+personal names explicitly assigned to it, but confined peers cannot
+register another instance.
 The portal validates broker-reported UID plus app name against its loaded
 policy for both credential retrieval and FileChooser. Public Wayland admits
 the human, the live installer wizard's UID 990 and assigned application
@@ -1209,9 +1226,11 @@ UIDs; audio admits the human, its own
 service and the assigned Firefox UID. Compositor control and
 readiness remain human-only, and the private portal channel remains UID 991.
 
-Mail and news fetch daemons use their own service accounts and mode-0700
-runtime directories. Credential-bearing fetch requests therefore remain
-inside the application's UID domain. The human fetch service is separate.
+Mail and news share the human fetch daemon at
+`/run/user/1000/td-fetch/socket`. Its runtime directory is mode 0700 and the
+socket mode 0600. Their jails mount only this service directory. Fetch
+requests share the human UID domain; there is no per-application host-UID
+isolation from the daemon.
 Production application units use the typed root launcher with null
 application stdio.
 Bus evidence connects as the human observer and independently checks the

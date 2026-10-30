@@ -2,7 +2,7 @@
 //! package on the data-only static runtime. It opens a td-ui window of its own at
 //! boot (`system-x86-64`'s `[mail]` unit) and reads
 //! `$XDG_CONFIG_HOME/td-mail/config.toml`, which
-//! td-firstboot provisions once under the login user's jail state. Saved
+//! td-firstboot provisions once in the login user's own configuration directory. Saved
 //! attachments land in the `xdg-download` grant, the directory Firefox shares.
 //! Composing is in td-mail's own window, in td-ui's editor pane the
 //! crate embeds (APPLICATIONS.md §W.8, "Composing in place"), so the
@@ -47,6 +47,9 @@ pub fn recipe() -> Recipe {
     let Ok(permissions) = PermissionPolicy::new()
         .with_socket(PermissionSocket::Wayland)
         .and_then(|permissions| permissions.with_socket(PermissionSocket::Fetch))
+        .and_then(|permissions| {
+            permissions.with_filesystem("~/.config/td-mail", FilesystemAccess::ReadWrite, true)
+        })
         .and_then(|permissions| {
             permissions.with_filesystem("xdg-download", FilesystemAccess::ReadWrite, true)
         })
@@ -173,7 +176,7 @@ mod tests {
         assert_eq!(permissions.session_bus().count(), 0);
         assert_eq!(
             permissions.to_keyfile(),
-            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Filesystem]\nxdg-download=rw:create\n\n[Resources]\nmemory-high=201326592\nmemory-max=268435456\npids-max=32\ncpu-max=50000 100000\n"
+            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Filesystem]\nxdg-download=rw:create\n~/.config/td-mail=rw:create\n\n[Resources]\nmemory-high=201326592\nmemory-max=268435456\npids-max=32\ncpu-max=50000 100000\n"
         );
         let steps = recipe.steps.as_ref().expect("steps");
         assert!(steps.iter().any(|step| matches!(

@@ -402,12 +402,19 @@ pub(crate) fn check_launch_application(owner: u32, name: &str) -> Result<u32, St
     let desired = Registry::load()?;
     let prior = state_directory()?.verify_enrolled(&desired)?;
     prior.verify_installed_accounts(&desired)?;
-    desired
+    let application = desired
         .active_applications()?
         .into_iter()
         .find(|application| application.owner == owner && application.name == name)
-        .map(|application| application.uid)
-        .ok_or_else(|| "application has no active account in the enrolled deployment".into())
+        .ok_or("application has no active account in the enrolled deployment")?;
+    let policy = crate::app_policy::load()?;
+    let rule = policy
+        .for_name(name)
+        .ok_or("application has no bus assignment")?;
+    if policy.owner() != owner || (rule.uid != owner && rule.uid != application.uid) {
+        return Err("application launch and retained assignments disagree".into());
+    }
+    Ok(rule.uid)
 }
 
 #[cfg(test)]

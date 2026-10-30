@@ -15,6 +15,9 @@
 //! program in the image that already has the required key implementation, so this crate
 //! stays dependency-free `std`; credential encryption shares td-secret's implementation.
 
+#[path = "../../td-busd/src/app_policy.rs"]
+#[allow(dead_code, reason = "shared immutable application assignments")]
+mod app_policy;
 mod application_runtime;
 mod application_state;
 mod cloud;
@@ -120,12 +123,9 @@ const HOST_KEY: &str = "ssh/ssh_host_ed25519_key";
 const HOST_KEY_PUB: &str = "ssh/ssh_host_ed25519_key.pub";
 const AUTHORIZED_KEYS: &str = "ssh/authorized_keys";
 
-/// td-jail's per-application state root under the login user's home
-/// (`td-jail/src/authority.rs` `STATE_ROOT`): `<home>/.td/app/<name>` holds
-/// `config`, which the jail binds at `/home/td/.config`. A file written at
-/// `config/<program>/config.toml` here is `$XDG_CONFIG_HOME/<program>/config.toml`
-/// inside the jail, which is where each application looks.
-const APPLICATION_STATE_ROOT: &str = ".td/app";
+/// The real human configuration directory. Each personal application's
+/// jail grants only its own child here, never the whole directory.
+const APPLICATION_CONFIG_ROOT: &str = ".config";
 
 /// One application's first configuration: enough for the program to
 /// start and show the operator what to edit, never a credential that works.
@@ -134,7 +134,7 @@ struct ApplicationConfig {
     application: &'static str,
     /// The program inside the jail, which names the XDG configuration directory.
     program: &'static str,
-    /// `(file name, contents)` under `config/<program>/`, every one mode 0600.
+    /// `(file name, contents)` under `.config/<program>/`, every one mode 0600.
     files: &'static [(&'static str, &'static str)],
 }
 
@@ -293,7 +293,7 @@ fn usage() -> String {
          [--application-primary | --application-home DIR --application-owner UID:GID] [--enroll-principals]\n  \
          provisions this machine's identity under {DEFAULT_STATE_DIR}: {MACHINE_ID}, \
          {HOST_KEY}(.pub), {AUTHORIZED_KEYS}; with an application selector, a first \
-         configuration under DIR/{APPLICATION_STATE_ROOT} or its validated private app home\n  \
+         configuration under DIR/{APPLICATION_CONFIG_ROOT}\n  \
          td-firstboot hostname prepares and activates the persistent hostname\n  \
          td-firstboot metadata applies an attached NoCloud seed's hostname and Ed25519 keys on a server\n  \
          td-firstboot cloud-metadata applies the hostname and Ed25519 keys of the metadata service DMI names, once the network is up\n  \
@@ -415,8 +415,6 @@ fn run_with_primary(
     // machine on the next boot.
     sync_directories(&plan.key_dir, boundary.as_deref())?;
 
-    let mut active_homes = std::collections::BTreeMap::new();
-    let mut credential_owner = applications.as_ref().map(|home| home.uid);
     if config.enroll_principals {
         let desired = principals::Registry::load().map_err(Failure::Failed)?;
         principal_store::provision(&desired).map_err(Failure::Failed)?;
@@ -424,6 +422,7 @@ fn run_with_primary(
         principal_store::prepare_portal_runtimes(&desired).map_err(Failure::Failed)?;
         principal_store::prepare_notebooks(&desired).map_err(Failure::Failed)?;
         credentials::isolate_stores(&config.state, &desired)?;
+        let policy = app_policy::load().map_err(Failure::Failed)?;
         for application in desired.active_applications().map_err(Failure::Failed)? {
             let former = applications
                 .as_ref()
@@ -433,7 +432,13 @@ fn run_with_primary(
                         "active application lacks its configured human migration home".into(),
                     )
                 })?;
-            let home = application_state::prepare(former, &application.name, application.uid)
+            if policy
+                .for_name(&application.name)
+                .is_some_and(|rule| rule.uid == application.owner)
+            {
+                continue;
+            }
+            application_state::prepare(former, &application.name, application.uid)
                 .map_err(Failure::Failed)?;
             application_runtime::prepare(application.uid).map_err(Failure::Failed)?;
             emit(&format!(
@@ -441,18 +446,6 @@ fn run_with_primary(
                 application.owner, application.name, application.uid
             ))
             .map_err(Failure::Failed)?;
-            active_homes.insert(application.name, home);
-        }
-        if let Some(home) = &applications {
-            credential_owner = Some(
-                desired
-                    .sessions()
-                    .find(|session| session.owner == home.uid)
-                    .ok_or_else(|| {
-                        Failure::Failed("credential owner has no configured session".into())
-                    })?
-                    .portal,
-            );
         }
         emit(&format!("{PRINCIPALS_MARKER}\n")).map_err(Failure::Failed)?;
     }
@@ -486,14 +479,7 @@ fn run_with_primary(
     // Active-account ownership preparation above must succeed before enrollment
     // is reported; template provisioning does not substitute for that boundary.
     if let Some(applications) = &applications {
-        let credential_owner = credential_owner
-            .ok_or_else(|| Failure::Failed("credential owner is missing".into()))?;
-        match provision_application_homes(
-            applications,
-            &config.state,
-            credential_owner,
-            &active_homes,
-        ) {
+        match provision_applications(applications) {
             Ok(outcomes) => {
                 for (application, outcome) in outcomes {
                     emit_err(&format!(
@@ -851,48 +837,8 @@ fn parse_owner(value: &str) -> Result<(u32, u32), Failure> {
 /// enrollment marker or any dependent application launch.
 fn provision_applications(
     owner: &ApplicationHome,
-    state_dir: &Path,
-    credential_owner: u32,
 ) -> Result<Vec<(&'static str, Outcome)>, Failure> {
-    provision_selected(
-        owner,
-        state_dir,
-        credential_owner,
-        owner.uid,
-        APPLICATION_CONFIGS,
-    )
-}
-
-fn provision_application_homes(
-    owner: &ApplicationHome,
-    state_dir: &Path,
-    credential_owner: u32,
-    homes: &std::collections::BTreeMap<String, ApplicationHome>,
-) -> Result<Vec<(&'static str, Outcome)>, Failure> {
-    if homes.is_empty() {
-        return provision_applications(owner, state_dir, credential_owner);
-    }
-    let mut outcomes = Vec::new();
-    for config in APPLICATION_CONFIGS {
-        let filesystem_owner = homes.get(config.application).unwrap_or(owner);
-        outcomes.extend(provision_selected(
-            filesystem_owner,
-            state_dir,
-            credential_owner,
-            owner.uid,
-            std::slice::from_ref(config),
-        )?);
-    }
-    Ok(outcomes)
-}
-
-fn provision_selected(
-    owner: &ApplicationHome,
-    state_dir: &Path,
-    credential_owner: u32,
-    logical_uid: u32,
-    configs: &[ApplicationConfig],
-) -> Result<Vec<(&'static str, Outcome)>, Failure> {
+    let configs = APPLICATION_CONFIGS;
     let home = match open_directory(&owner.home) {
         Ok(home) => home,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -933,35 +879,12 @@ fn provision_selected(
         ));
         return Ok(Vec::new());
     }
-    let mut applications = owner.home.clone();
-    let mut parent = home;
-    for component in APPLICATION_STATE_ROOT.split('/') {
-        applications.push(component);
-        parent = owned_dir(&applications, owner, &parent)?;
-    }
-    let root = parent;
+    let configuration_path = owner.home.join(APPLICATION_CONFIG_ROOT);
+    let configuration = owned_dir(&configuration_path, owner, &home)?;
     let mut outcomes = Vec::with_capacity(configs.len());
     for config in configs {
-        let mut directory = applications.join(config.application);
-        let application = owned_dir(&directory, owner, &root)?;
-        directory.push("config");
-        let configuration = owned_dir(&directory, owner, &application)?;
-        directory.push(config.program);
-        let program_dir = owned_dir(&directory, owner, &configuration)?;
-        if config.application == "mail" {
-            if let Err(Failure::Failed(reason) | Failure::Usage(reason)) = credentials::provision(
-                state_dir,
-                owner,
-                &program_dir,
-                credential_owner,
-                logical_uid,
-            ) {
-                emit_err(&format!(
-                    "td-firstboot: mail credential/configuration not provisioned: {reason}\n"
-                ));
-                continue;
-            }
-        }
+        let directory = configuration_path.join(config.program);
+        let _program_dir = owned_dir(&directory, owner, &configuration)?;
         let mut outcome = Outcome::Present;
         for (name, contents) in config.files {
             let path = directory.join(name);
@@ -2197,63 +2120,10 @@ mod tests {
         }
     }
 
-    /// The tree td-jail expects, owned by the user, written once. Run as the
-    /// current user: `chown` to one's own identity is permitted unprivileged,
-    /// which is what lets the ownership path execute here at all.
     #[test]
-    fn active_application_configs_use_private_homes_and_the_human_secret_identity() {
-        let root =
-            std::env::temp_dir().join(format!("td-firstboot-active-apps-{}", std::process::id()));
-        std::fs::create_dir(&root).unwrap();
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(root.clone());
-        let metadata = std::fs::metadata(&root).unwrap();
-        let uid = metadata.uid();
-        let gid = metadata.gid();
-        let logical = uid.checked_add(1).unwrap();
-        let human = ApplicationHome {
-            home: root.join("human"),
-            uid: logical,
-            gid: logical,
-        };
-        let mut homes = std::collections::BTreeMap::new();
-        for name in ["mail", "news"] {
-            let home = root.join(name);
-            std::fs::create_dir(&home).unwrap();
-            homes.insert(name.into(), ApplicationHome { home, uid, gid });
-        }
-        assert_eq!(
-            provision_application_homes(&human, &root, uid, &homes).unwrap(),
-            vec![("mail", Outcome::Created), ("news", Outcome::Created)]
-        );
-        assert!(!human.home.exists());
-        for name in ["mail", "news"] {
-            let directory = root.join(name).join(APPLICATION_STATE_ROOT);
-            assert!(directory.join(name).is_dir());
-            let other = if name == "mail" { "news" } else { "mail" };
-            assert!(!directory.join(other).exists());
-        }
-        let store = secret_store::Store::open_owned(
-            &root.join("secrets").join(logical.to_string()),
-            logical,
-            uid,
-            false,
-        )
-        .unwrap();
-        assert_eq!(store.get("mail", "main").unwrap().unwrap(), b"replace-me\n");
-        assert!(!root.join("secrets").join(uid.to_string()).exists());
-    }
-
-    #[test]
-    fn application_configurations_are_provisioned_once_into_the_jail_state_tree() {
-        let root =
-            std::env::temp_dir().join(format!("td-firstboot-applications-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn application_configurations_are_provisioned_once_in_the_human_home() {
+        let root_guard = td_fs::TempDir::new("td-firstboot-applications").unwrap();
+        let root = root_guard.path().to_path_buf();
         let home = root.join("home");
         std::fs::create_dir_all(&home).unwrap();
         let metadata = std::fs::metadata(&home).unwrap();
@@ -2263,14 +2133,18 @@ mod tests {
             gid: metadata.gid(),
         };
 
-        let first = provision_applications(&owner, &root, owner.uid).unwrap();
+        let retired = home.join(".td/app/mail/config/td-mail");
+        std::fs::create_dir_all(&retired).unwrap();
+        std::fs::write(retired.join("config.toml"), "retired configuration").unwrap();
+        std::fs::write(retired.join("password"), "retired password").unwrap();
+        let first = provision_applications(&owner).unwrap();
         assert_eq!(
             first,
             vec![("mail", Outcome::Created), ("news", Outcome::Created)]
         );
-        let mail = home.join(".td/app/mail/config/td-mail/config.toml");
-        let password = home.join(".td/app/mail/config/td-mail/password");
-        let news = home.join(".td/app/news/config/td-news/config.toml");
+        let mail = home.join(".config/td-mail/config.toml");
+        let password = home.join(".config/td-mail/password");
+        let news = home.join(".config/td-news/config.toml");
         for path in [&mail, &news] {
             let metadata = std::fs::metadata(path).unwrap();
             assert_eq!(
@@ -2281,21 +2155,20 @@ mod tests {
             );
             assert_eq!((metadata.uid(), metadata.gid()), (owner.uid, owner.gid));
         }
-        for directory in [
-            ".td",
-            ".td/app",
-            ".td/app/mail",
-            ".td/app/mail/config",
-            ".td/app/mail/config/td-mail",
-            ".td/app/news",
-            ".td/app/news/config",
-            ".td/app/news/config/td-news",
-        ] {
+        for directory in [".config", ".config/td-mail", ".config/td-news"] {
             let metadata = std::fs::metadata(home.join(directory)).unwrap();
             assert!(metadata.is_dir());
             assert_eq!(metadata.permissions().mode() & 0o7777, 0o700, "{directory}");
             assert_eq!((metadata.uid(), metadata.gid()), (owner.uid, owner.gid));
         }
+        assert_eq!(
+            std::fs::read_to_string(retired.join("config.toml")).unwrap(),
+            "retired configuration"
+        );
+        assert_eq!(
+            std::fs::read_to_string(retired.join("password")).unwrap(),
+            "retired password"
+        );
         assert_eq!(std::fs::read_to_string(&mail).unwrap(), MAIL_CONFIG);
         assert!(!password.exists());
         assert_eq!(std::fs::read_to_string(&news).unwrap(), NEWS_CONFIG);
@@ -2304,25 +2177,25 @@ mod tests {
         // is created without touching it.
         std::fs::write(&mail, "edited\n").unwrap();
 
-        let second = provision_applications(&owner, &root, owner.uid).unwrap();
+        let second = provision_applications(&owner).unwrap();
         assert_eq!(
             second,
             vec![("mail", Outcome::Present), ("news", Outcome::Present)]
         );
         assert_eq!(std::fs::read_to_string(&mail).unwrap(), "edited\n");
         assert!(!password.exists());
-        let third = provision_applications(&owner, &root, owner.uid).unwrap();
+        let third = provision_applications(&owner).unwrap();
         assert_eq!(
             third,
             vec![("mail", Outcome::Present), ("news", Outcome::Present)]
         );
 
-        // A mail credential failure does not withhold another application's configuration.
+        // Existing configuration is left untouched regardless of its file mode.
         std::fs::set_permissions(&mail, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::remove_file(&news).unwrap();
         assert_eq!(
-            provision_applications(&owner, &root, owner.uid).unwrap(),
-            vec![("news", Outcome::Created)]
+            provision_applications(&owner).unwrap(),
+            vec![("mail", Outcome::Present), ("news", Outcome::Created)]
         );
         assert_eq!(std::fs::read_to_string(&news).unwrap(), NEWS_CONFIG);
         assert_eq!(std::fs::read_to_string(&mail).unwrap(), "edited\n");
@@ -2332,36 +2205,30 @@ mod tests {
             uid: owner.uid.wrapping_add(1),
             ..owner.clone()
         };
-        assert_eq!(
-            provision_applications(&foreign, &root, foreign.uid).unwrap(),
-            Vec::new()
-        );
+        assert_eq!(provision_applications(&foreign).unwrap(), Vec::new());
         let absent = ApplicationHome {
             home: root.join("nobody"),
             ..owner.clone()
         };
-        assert_eq!(
-            provision_applications(&absent, &root, absent.uid).unwrap(),
-            Vec::new()
-        );
+        assert_eq!(provision_applications(&absent).unwrap(), Vec::new());
         // A symlink where a state directory should be is refused outright.
         let linked_home = root.join("linked");
         std::fs::create_dir_all(&linked_home).unwrap();
-        std::os::unix::fs::symlink(&root, linked_home.join(".td")).unwrap();
+        std::os::unix::fs::symlink(&root, linked_home.join(".config")).unwrap();
         let linked = ApplicationHome {
             home: linked_home,
             ..owner.clone()
         };
-        assert!(provision_applications(&linked, &root, linked.uid).is_err());
+        assert!(provision_applications(&linked).is_err());
         // So is a file, or anything else that is not a directory.
         let filed_home = root.join("filed");
-        std::fs::create_dir_all(filed_home.join(".td")).unwrap();
-        std::fs::write(filed_home.join(".td/app"), "").unwrap();
+        std::fs::create_dir_all(&filed_home).unwrap();
+        std::fs::write(filed_home.join(".config"), "").unwrap();
         let filed = ApplicationHome {
             home: filed_home,
             ..owner.clone()
         };
-        assert!(provision_applications(&filed, &root, filed.uid).is_err());
+        assert!(provision_applications(&filed).is_err());
         // A home that is itself a link, or a file, is skipped like an absent
         // one: the jail resolves a home through its own rules, not this one.
         std::os::unix::fs::symlink(&home, root.join("home-link")).unwrap();
@@ -2371,10 +2238,7 @@ mod tests {
                 home: root.join(odd),
                 ..owner.clone()
             };
-            assert_eq!(
-                provision_applications(&odd, &root, odd.uid).unwrap(),
-                Vec::new()
-            );
+            assert_eq!(provision_applications(&odd).unwrap(), Vec::new());
         }
         let _ = std::fs::remove_dir_all(&root);
     }

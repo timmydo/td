@@ -4,7 +4,7 @@ use super::*;
 const INPUT_READY: &str = "/run/td-secret-system-input-ready";
 const VALUE: &[u8] = b"system fixture credential";
 const REPLACEMENT: &[u8] = b"acknowledged replacement credential";
-const CONFIG: &str = "/var/lib/td/applications/65537/.td/app/mail/config/td-mail/config.toml";
+const CONFIG: &str = "/home/tester/.config/td-mail/config.toml";
 const STRIDE: usize = 1280 * 4;
 const ATTENTION_BACKGROUND: &[u8] = &[0x28, 0x20, 0x18];
 
@@ -150,8 +150,8 @@ fn restart_mail(locked: bool) {
     ready(&["mail"]);
     let output = Command::new("/bin/td-login")
         .args([
-            "exec-service-as",
-            "tda65537",
+            "exec-as",
+            "tester",
             "--",
             "/bin/td-jail",
             "--probe-process-token",
@@ -426,14 +426,10 @@ fn qemu_installed_system_secret_lifecycle() {
         assert!(!Path::new(COLD_STATE).exists());
         assert!(store::user_path(1000).join("master").exists());
         assert!(!store::user_path(1000).join("sealed").exists());
-        assert_eq!(
-            crate::owned_store(1000)
-                .unwrap()
-                .get("mail", "main")
-                .unwrap()
-                .unwrap(),
-            b"replace-me\n"
-        );
+        let store = crate::owned_store(1000).unwrap();
+        assert!(store.get("mail", "main").unwrap().is_none());
+        // The legacy-store oracle owns its sample; firstboot provisions none.
+        store.set("mail", "main", b"replace-me\n").unwrap();
         Vec::new()
     };
     assert!(fs::read_to_string(CONFIG)
