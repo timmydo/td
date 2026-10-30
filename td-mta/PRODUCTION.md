@@ -55,6 +55,52 @@ Its cluster is `/var/lib/td-mta/mail/postgres`, its configuration is
 `/opt/td-mta/postgresql/usr/lib/postgresql/17/bin`. An MTA binary update does
 not require restarting or replacing PostgreSQL.
 
+### Search planner setting
+
+The runtime login in the production mail database has this scoped setting:
+
+```sql
+ALTER ROLE td_mta_runtime IN DATABASE td_mta SET random_page_cost = 2;
+```
+
+This is an operator setting for this host, not a td-mta schema invariant or a
+recommended default for every installation. PostgreSQL's cluster default
+remains `4`; owner maintenance sessions retain that default. The setting
+applies to all runtime queries, including SMTP and relay work, when their
+database sessions next connect. Reloading PostgreSQL does not replace the
+defaults of already connected sessions. The frontend was restarted after
+applying it; other workers adopt it as their sessions reconnect.
+
+On 2026-10-30, after search backfill and vacuum/analyze, the default planner
+scanned all roughly 33,000 search rows for `guix`. The runtime-login query
+took 699–774 ms. With cost `2`, PostgreSQL chose the trigram index and took
+154–168 ms. Five subsequent HTTPS searches for the first 50 matches had a
+299 ms median, versus 863 ms before the setting, with identical ordered
+results. These are diagnostic samples, not latency guarantees or test
+thresholds. Rare, absent, common, and mailbox-scoped candidate comparisons
+also preserved results. Very broad terms can still appropriately use a
+sequential scan; no scan method is disabled.
+
+Before retuning on another host, compare bounded read-only query plans and
+end-to-end requests under its workload. Keep statement timeouts and check
+normal reads, writes and service health as well as searches. Recheck after
+large imports or backfills; statistics, index maintenance and cache state
+affect the plan. Do not infer the right value from idle memory or SSD
+branding alone.
+
+The prior role/database setting was absent. Roll back this change with:
+
+```sql
+ALTER ROLE td_mta_runtime IN DATABASE td_mta RESET random_page_cost;
+```
+
+Reconnect affected sessions and check the effective setting through a fresh
+runtime login. Execute these operator statements through a private
+connection file or protected libpq service, never a password argument.
+A database-only backup does not reproduce role/database defaults: after a
+restore, re-evaluate this setting explicitly. It is not needed for data
+correctness or schema admission.
+
 ## What updates automatically
 
 MTA software does **not** update automatically from Git. A merge, fetch or pull
