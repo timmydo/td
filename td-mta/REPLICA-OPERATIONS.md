@@ -81,6 +81,46 @@ runtime GC roots; a binary update is not a reason to replace the Home profile.
 User services start according to the user manager's login/boot policy; this
 is not automatically an unattended system service.
 
+## Search preparation and Home configuration
+
+Installations that enabled automatic search preparation also have
+`td-mta-maint-search` and `td-mta-maint-search-status`. These are optional
+scheduled jobs, separate from the three replica services. Keep both generated
+Shepherd definitions in your own Home source alongside the replica services;
+a helper that reconfigures the installed Home does not edit that source.
+Before your next reconfigure, build your Home configuration and check that
+all five service definitions remain present and that the old replica renewal
+job is absent. Retain the existing packages and runtime GC roots.
+
+Check the durable search progress independently of synchronization:
+
+```sh
+"$replica_bin" postgres search-prepare-status \
+  --state-dir "$replica_root/search-index" --epoch "$replica_epoch"
+herd status td-mta-maint-search
+herd status td-mta-maint-search-status
+```
+
+For systemd, inspect both `.timer` units and the last result of their
+`.service` units with `systemctl --user`. A scheduled job may be inactive
+between successful runs. Its durable status and supervisor log distinguish
+that normal state from failure. The generated Shepherd logs are under
+`ROOT/.operations/`; protect them along with the other private state.
+
+The worker visits missing or incompatible search evidence in bounded pages;
+it does not reread every already-prepared body each minute. A completed cycle
+can include unsupported messages. Those remain stored and cause explicitly
+incomplete search results when td-mail encounters them, not silent empty
+results. New synchronized messages can use the bounded fallback before their
+search evidence is prepared. A healthy search cycle does not establish that
+synchronization is current or that the replica is source-complete.
+
+See [automatic search preparation](DEPLOYMENT.md#automatic-search-preparation)
+for schedule generation, limits, failure status and explicit uncertainty
+recovery. Do not delete the progress file or automatically run
+`search-prepare-resume` to clear a failure. Status checks record failures;
+mailbox alert delivery requires separate operator configuration.
+
 ## Update and rollback
 
 A Git merge does not update installed binaries. For a reviewed revision with
@@ -107,8 +147,14 @@ the reader and copier, select that retained previous executable, start both,
 and repeat the checks. Preserve runtime libraries and protected configuration.
 Do not reinitialize PostgreSQL or replace the replica's epoch to fix startup.
 
+If search schedules are enabled, pause both schedules and wait for any active
+search job before switching binaries. Restart their schedules after verifying
+the reader and copier. On systemd this means stopping the timers and their
+services; on Shepherd stop the two timed services. Preserve search progress.
+
 Schema changes need an explicit compatible upgrade procedure and a retained
-backup. Stop all users of the database before upgrading; binary rollback alone
+backup. Stop all users of the database, including search preparation and other
+maintenance jobs, before upgrading; binary rollback alone
 does not undo a schema upgrade. PostgreSQL package updates are a separate
 operation. Public-server deployment and ACME renewal are independent of local
 replica updates.
