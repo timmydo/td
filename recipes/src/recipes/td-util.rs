@@ -131,6 +131,13 @@ const ENGINE: &[(&str, &str, &str)] = &[
     ),
 ];
 
+// A local std-only library, built separately so Cargo and the static recipe
+// both consume td-civil through the same crate boundary.
+const CIVIL: &[(&str, &str)] = &[
+    ("lib.rs", include_str!("../../../td-civil/src/lib.rs")),
+    ("tzif.rs", include_str!("../../../td-civil/src/tzif.rs")),
+];
+
 pub fn recipe() -> Recipe {
     build("td-util", "rust-toolchain")
 }
@@ -170,6 +177,41 @@ pub fn build(name: &str, rust: &str) -> Recipe {
             exec: false,
         });
     }
+    for (file, source) in CIVIL {
+        steps.push(Step::WriteFile {
+            path: format!("{{src}}/td-civil/src/{file}"),
+            content: (*source).into(),
+            exec: false,
+        });
+    }
+    steps.push(
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--edition",
+                "2021",
+                "--crate-name",
+                "td_civil",
+                "--crate-type",
+                "rlib",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "opt-level=s",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                "-C",
+                "panic=abort",
+                "-o",
+                "{src}/libtd_civil.rlib",
+                "{src}/td-civil/src/lib.rs",
+            ],
+        )
+        .env("SOURCE_DATE_EPOCH", "1"),
+    );
     steps.push(
         target_rustc(
             "{src}",
@@ -192,6 +234,8 @@ pub fn build(name: &str, rust: &str) -> Recipe {
                 "panic=abort",
                 "-o",
                 "{out}/bin/td-util",
+                "--extern",
+                "td_civil={src}/libtd_civil.rlib",
                 &main_rs,
             ],
         )
@@ -214,12 +258,13 @@ pub fn build(name: &str, rust: &str) -> Recipe {
 
 #[cfg(test)]
 mod tests {
-    use super::{ENGINE, MAIN_RS, MODULES};
+    use super::{CIVIL, ENGINE, MAIN_RS, MODULES};
 
     #[test]
     fn embedded_sources_do_not_contain_recipe_template_tokens() {
         let sources = std::iter::once(("main", MAIN_RS))
             .chain(MODULES.iter().copied())
+            .chain(CIVIL.iter().copied())
             .chain(ENGINE.iter().map(|(name, _, source)| (*name, *source)));
         const TOKENS: &[&str] = &[
             "{root}",
@@ -331,6 +376,11 @@ mod tests {
                 "the embedded '{name}' is not td-util/src/{name}.rs; the confinement \
                  tests read the file, the build ships these bytes"
             );
+        }
+        let civil = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../td-civil/src");
+        for (file, source) in CIVIL {
+            let on_disk = std::fs::read_to_string(civil.join(file)).unwrap();
+            assert_eq!(*source, on_disk, "the embedded td-civil {file} must match");
         }
         let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/src");
         for (name, path, source) in ENGINE {

@@ -12,6 +12,9 @@ path = "src/main.rs"
 # The confinement tests read src/ through td-source-scan's shared scans.
 # Dev-only: the recipe compiles src/main.rs with a direct rustc and no
 # `--test`, so the shipped binary never sees it.
+[dependencies]
+td-civil = { path = "../td-civil" }
+
 [dev-dependencies]
 td-fs = { path = "../td-fs" }
 td-source-scan = { path = "../td-source-scan" }

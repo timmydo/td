@@ -344,6 +344,8 @@ pub fn recipe() -> Recipe {
                          '{bin}' free -h >/dev/null || {{ echo 'td-util free -h failed' >&2; exit 1; }}; \
                          p=$('{bin}' ps) || {{ echo 'td-util ps failed' >&2; exit 1; }}; \
                          printf '%s\\n' \"$p\" | grep -qE '^ +1 ' || {{ echo 'ps did not list PID 1 — /proc scan regressed' >&2; exit 1; }}; \
+                         selected=$('{bin}' ps -p 1 -o pid= -o stat= -o lstart=) || exit 1; \
+                         printf '%s\\n' \"$selected\" | grep -qE '^1 [A-Z] [A-Z][a-z]{{2}} [A-Z][a-z]{{2}} +[0-9]{{1,2}} [0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}} [0-9]{{4}}$' || exit 1; \
                      else \
                          echo 'note: /proc not mounted in this sandbox; free/ps content asserted by the boot oracle'; \
                      fi; \

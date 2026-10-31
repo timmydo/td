@@ -502,8 +502,8 @@ mod tests {
             "no rustc step found"
         );
         // The ONLY differences may be the output path, the crate root,
-        // td-tpm's one `--extern` and the `-L dependency` that finds its
-        // td-fido; every other argument is toolchain/link configuration and
+        // each binary's named `--extern` and the `-L dependency` that finds
+        // td-tpm's td-fido; every other argument is toolchain/link configuration and
         // must match.
         let extern_at = mine
             .iter()
@@ -519,6 +519,14 @@ mod tests {
         );
         let mut mine = mine;
         mine.drain(flag_at..extern_at + 3);
+        let mut proven = proven;
+        let civil_at = proven
+            .iter()
+            .position(|arg| arg == "td_civil={src}/libtd_civil.rlib")
+            .unwrap_or_else(|| unreachable!("the td-util link names no td-civil rlib"));
+        let flag_at = civil_at.checked_sub(1).unwrap();
+        assert_eq!(proven.get(flag_at).map(String::as_str), Some("--extern"));
+        proven.drain(flag_at..=civil_at);
         let normalize = |argv: Vec<String>| -> Vec<String> {
             argv.into_iter()
                 .map(|arg| {

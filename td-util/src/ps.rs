@@ -1,12 +1,9 @@
 //! `ps` — the process table, read from /proc.
 //!
-//! Like busybox `ps` (the applet this replaces) every process is listed. POSIX's
-//! default "same controlling terminal and effective uid" restriction would need
-//! a controlling-terminal lookup this deliberately does not do, so the selection
-//! flags that ask for all processes (`-e`/`-A`, and BSD `a`/`x`) are accepted as
-//! no-ops. The format flags (`-f`, BSD `u`) are accepted too, and ignored: the
-//! column set below is fixed. That combination is what lets a script's `ps -ef`
-//! or `ps aux` keep working across the busybox cutover.
+//! The default table lists every process; legacy all-process flags remain
+//! accepted. `-p` selects positive PIDs and repeatable `-o` chooses columns.
+//! `stat` reports the kernel state letter. `lstart` uses English names and
+//! td-civil's system/TZ zone (UTC fallback), independent of locale.
 
 /// procfs reports CPU time in USER_HZ, which Linux fixes at 100 for /proc
 /// regardless of the kernel's internal CONFIG_HZ.
@@ -22,6 +19,7 @@ pub struct Proc {
     pub tty: String,
     pub state: char,
     pub ticks: u64,
+    pub start_ticks: Option<u64>,
     pub cmd: String,
 }
 
@@ -40,29 +38,174 @@ fn accept_flags(arg: &str) -> bool {
     }
 }
 
-pub fn run(args: &[String]) -> Result<u8, String> {
-    for a in args {
-        if !accept_flags(a) {
-            return Err(format!(
-                "unrecognised option '{a}'\nusage: ps [-eAf] [aux]  (all accepted and ignored; \
-                 every process is always listed in one fixed format)"
-            ));
+const USAGE: &str = "usage: ps [-eAf] [aux] [-p PID[,PID...]] [-o FIELD[=HEADER][,FIELD...]]\nfields: pid, tty, stat (state letter), time, cmd, lstart (English local start time)\nlstart uses absolute TZ file paths or /etc/localtime, falling back to UTC.";
+
+struct Column {
+    name: String,
+    header: String,
+}
+
+#[derive(Default)]
+struct Options {
+    pids: Vec<u64>,
+    all: bool,
+    columns: Vec<Column>,
+}
+
+fn options(args: &[String]) -> Result<Options, String> {
+    let mut options = Options::default();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "-p" || arg == "-o" {
+            let value = args
+                .next()
+                .ok_or_else(|| format!("{arg} requires a value\n{USAGE}"))?;
+            if arg == "-p" {
+                for part in value.split(',').flat_map(str::split_whitespace) {
+                    let pid = part
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|p| *p > 0 && *p <= i32::MAX as u32)
+                        .ok_or_else(|| format!("invalid PID '{part}'"))?;
+                    options.pids.push(u64::from(pid));
+                }
+                if value.trim().is_empty() || value.split(',').any(|v| v.trim().is_empty()) {
+                    return Err("empty PID list element".into());
+                }
+            } else {
+                for part in value.split(',') {
+                    let (name, custom) = match part.split_once('=') {
+                        Some((name, header)) => (name, Some(header)),
+                        None => (part, None),
+                    };
+                    let header = match name {
+                        "pid" => "PID",
+                        "tty" => "TTY",
+                        "stat" => "STAT",
+                        "time" => "TIME",
+                        "cmd" => "CMD",
+                        "lstart" => "STARTED",
+                        _ => return Err(format!("unknown output field '{name}'\n{USAGE}")),
+                    };
+                    options.columns.push(Column {
+                        name: name.into(),
+                        header: custom.unwrap_or(header).into(),
+                    });
+                }
+            }
+        } else if accept_flags(arg) {
+            options.all |= arg.chars().any(|c| "eAax".contains(c));
+        } else {
+            return Err(format!("unrecognised option '{arg}'\n{USAGE}"));
         }
     }
-    let mut rows = collect("/proc")?;
-    rows.sort_by_key(|p| p.pid);
-    let mut out = row("PID", "TTY", "STAT", "TIME", "CMD");
-    for p in &rows {
-        out.push_str(&row(
-            &p.pid.to_string(),
-            &p.tty,
-            &p.state.to_string(),
-            &format_time(p.ticks),
-            &p.cmd,
-        ));
+    Ok(options)
+}
+
+pub fn run(args: &[String]) -> Result<u8, String> {
+    if args.len() == 1 && args.first().is_some_and(|a| a == "--help") {
+        crate::emit(&format!("{USAGE}\n"))?;
+        return Ok(0);
     }
+    let options = options(args)?;
+    let (out, code) = render("/proc", &options, &td_civil::Zone::local())?;
     crate::emit(&out)?;
-    Ok(0)
+    Ok(code)
+}
+
+fn render(
+    proc_root: &str,
+    options: &Options,
+    zone: &td_civil::Zone,
+) -> Result<(String, u8), String> {
+    let mut rows = collect(proc_root)?;
+    rows.retain(|p| options.all || options.pids.is_empty() || options.pids.contains(&p.pid));
+    rows.sort_by_key(|p| p.pid);
+    let boot = if options.columns.iter().any(|c| c.name == "lstart") && !rows.is_empty() {
+        Some(
+            boot_time(
+                &std::fs::read_to_string(format!("{proc_root}/stat"))
+                    .map_err(|e| format!("cannot read boot time: {e}"))?,
+            )
+            .ok_or("missing or invalid boot time")?,
+        )
+    } else {
+        None
+    };
+    let mut out = String::new();
+    if options.columns.is_empty() {
+        out.push_str(&row("PID", "TTY", "STAT", "TIME", "CMD"));
+    } else if options.columns.iter().any(|c| !c.header.is_empty()) {
+        out.push_str(
+            &options
+                .columns
+                .iter()
+                .map(|c| c.header.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        out.push('\n');
+    }
+    for p in &rows {
+        if options.columns.is_empty() {
+            out.push_str(&row(
+                &p.pid.to_string(),
+                &p.tty,
+                &p.state.to_string(),
+                &format_time(p.ticks),
+                &p.cmd,
+            ));
+        } else {
+            let values = options
+                .columns
+                .iter()
+                .map(|column| {
+                    Ok(match column.name.as_str() {
+                        "pid" => p.pid.to_string(),
+                        "tty" => p.tty.clone(),
+                        "stat" => p.state.to_string(),
+                        "time" => format_time(p.ticks),
+                        "cmd" => p.cmd.clone(),
+                        "lstart" => boot
+                            .zip(p.start_ticks)
+                            .and_then(|(b, t)| start_time(b, t, zone))
+                            .ok_or_else(|| format!("cannot read start time for PID {}", p.pid))?,
+                        _ => return Err("unknown output field".into()),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            out.push_str(&values.join(" "));
+            out.push('\n');
+        }
+    }
+    Ok((out, u8::from(rows.is_empty())))
+}
+
+fn boot_time(stat: &str) -> Option<u64> {
+    for line in stat.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() == Some("btime") {
+            let value = fields.next()?.parse().ok()?;
+            return fields.next().is_none().then_some(value);
+        }
+    }
+    None
+}
+
+fn start_time(boot: u64, ticks: u64, zone: &td_civil::Zone) -> Option<String> {
+    let unix = i64::try_from(boot.checked_add(ticks / USER_HZ)?).ok()?;
+    let local = unix.checked_add(i64::from(zone.offset_at(unix)))?;
+    let c = td_civil::unix_to_civil_utc_checked(local)?;
+    const DAYS: &[&str] = &["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: &[&str] = &[
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let day = DAYS.get(usize::try_from(local.div_euclid(86400).rem_euclid(7)).ok()?)?;
+    let month = MONTHS.get(usize::from(c.month.checked_sub(1)?))?;
+    Some(format!(
+        "{day} {month} {:2} {:02}:{:02}:{:02} {:04}",
+        c.day, c.hour, c.minute, c.second, c.year
+    ))
 }
 
 /// A process that exits mid-scan makes its /proc entry vanish between readdir
@@ -92,6 +235,7 @@ fn collect(proc_root: &str) -> Result<Vec<Proc>, String> {
             tty: tty_name(parsed.tty_nr),
             state: parsed.state,
             ticks: parsed.ticks,
+            start_ticks: parsed.start_ticks,
             cmd: command(&cmdline, comm(&stat)),
         });
     }
@@ -107,6 +251,7 @@ pub struct Stat {
     pub state: char,
     pub tty_nr: u64,
     pub ticks: u64,
+    pub start_ticks: Option<u64>,
 }
 
 /// /proc/<pid>/stat is `pid (comm) state ...`. `comm` is unquoted and may itself
@@ -132,6 +277,7 @@ pub fn parse_stat(stat: &str) -> Option<Stat> {
         state: fields.first().and_then(|f| f.chars().next()).unwrap_or('?'),
         tty_nr: num(4),
         ticks: num(11).saturating_add(num(12)),
+        start_ticks: fields.get(19).and_then(|f| f.parse().ok()),
     })
 }
 
@@ -180,6 +326,75 @@ mod tests {
     // clean for local runs too.
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    #[test]
+    fn start_dates_and_bad_identity_fields() {
+        let utc = td_civil::Zone::utc();
+        assert_eq!(
+            start_time(0, 0, &utc).as_deref(),
+            Some("Thu Jan  1 00:00:00 1970")
+        );
+        assert_eq!(
+            start_time(1709164800, 12345, &utc).as_deref(),
+            Some("Thu Feb 29 00:02:03 2024")
+        );
+        assert!(start_time(u64::MAX, 100, &utc).is_none());
+        assert!(start_time(i64::MAX as u64, 0, &utc).is_none());
+        assert_eq!(parse_stat(SPACED).unwrap().start_ticks, Some(5));
+        assert_eq!(parse_stat(PARENS).unwrap().start_ticks, Some(5));
+        assert_eq!(parse_stat("1 (init) S").unwrap().start_ticks, None);
+        assert_eq!(boot_time("cpu 1 2\nbtime 123\nprocesses 2\n"), Some(123));
+        for bad in ["", "btime -1", "btime 1 2", "btime nope"] {
+            assert!(boot_time(bad).is_none());
+        }
+    }
+
+    #[test]
+    fn local_start_time_crosses_calendar_day_and_year() {
+        let mut data = Vec::new();
+        // No transitions, one fixed +05:30 type in both TZif v2 blocks.
+        for _ in 0..2 {
+            data.extend_from_slice(b"TZif2");
+            data.extend_from_slice(&[0; 15]);
+            for count in [0u32, 0, 0, 0, 1, 4] {
+                data.extend_from_slice(&count.to_be_bytes());
+            }
+            data.extend_from_slice(&19800i32.to_be_bytes());
+            data.extend_from_slice(&[0, 0]);
+            data.extend_from_slice(b"FIX\0");
+        }
+        data.extend_from_slice(b"\n<FIX>-5:30\n");
+        let zone = td_civil::Zone::from_tzif(&data).unwrap();
+        assert_eq!(
+            start_time(1704047400, 0, &zone).as_deref(),
+            Some("Mon Jan  1 00:00:00 2024")
+        );
+    }
+
+    #[test]
+    fn repeated_selection_custom_headers_and_missing_start_time() {
+        let root = td_fs::TempDir::new("td-util-ps-fields").unwrap();
+        std::fs::create_dir(root.join("42")).unwrap();
+        std::fs::write(root.join("42/stat"), SPACED).unwrap();
+        std::fs::write(root.join("stat"), "btime 0\n").unwrap();
+        let args = [
+            "-p",
+            "1,42",
+            "-p",
+            "42",
+            "-o",
+            "pid=Process,stat=",
+            "-o",
+            "lstart=",
+        ]
+        .map(String::from);
+        let opts = options(&args).unwrap();
+        let (text, code) = render(root.to_str().unwrap(), &opts, &td_civil::Zone::utc()).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(text, "Process  \n42 R Thu Jan  1 00:00:00 1970\n");
+        std::fs::write(root.join("42/stat"), "42 (gone) Z").unwrap();
+        assert!(render(root.to_str().unwrap(), &opts, &td_civil::Zone::utc()).is_err());
+    }
 
     // A real init line, plus the two shapes that break naive parsers.
     const INIT: &str = "1 (init) S 0 1 1 0 -1 4194560 1234 0 0 0 12 34 0 0 20 0 1 0 5 0 0 0 0\n";
@@ -278,8 +493,7 @@ mod tests {
     /// process must never be rendered in the `[kernel thread]` notation.
     #[test]
     fn non_utf8_proc_bytes_still_list_the_process() {
-        let root = std::env::temp_dir().join(format!("td-util-ps-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = td_fs::TempDir::new("td-util-ps").unwrap();
         for (pid, comm, cmdline) in [
             (1u32, &b"init"[..], &b"/sbin/init\0"[..]),
             (2, b"bad\xffname", b"/usr/bin/caf\xe9\0-v\0"),
@@ -312,7 +526,6 @@ mod tests {
             "cmdline arguments were lost: {:?}",
             odd.cmd
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The live /proc must always contain PID 1, and scanning it must not error.
