@@ -402,6 +402,7 @@ fn render_develops_neutral_patches_to_expected_values() {
             contrast: None,
             threads: 2,
             look: None,
+            look_intensity: 1.0,
         },
     )
     .unwrap();
@@ -432,6 +433,7 @@ fn render_develops_neutral_patches_to_expected_values() {
             contrast: None,
             threads: 1,
             look: None,
+            look_intensity: 1.0,
         },
     )
     .unwrap();
@@ -454,6 +456,7 @@ fn render_develops_neutral_patches_to_expected_values() {
             contrast: None,
             threads: 1,
             look: None,
+            look_intensity: 1.0,
         },
     )
     .unwrap();
@@ -515,6 +518,7 @@ fn the_levels_split_composes_to_render() {
                     contrast: None,
                     threads: 3,
                     look: look_opt,
+                    look_intensity: 1.0,
                 };
                 let new = develop::render(
                     &level1,
@@ -561,6 +565,7 @@ fn the_levels_split_composes_to_render() {
         contrast: None,
         threads: 1,
         look: None,
+        look_intensity: 1.0,
     };
     assert_eq!(
         level3(
@@ -604,6 +609,7 @@ fn a_crop_selects_the_oriented_region_for_every_orientation() {
         contrast: None,
         threads: 3,
         look: None,
+        look_intensity: 1.0,
     };
     // A long edge past the frame, so fit never shrinks and the compare is
     // exact; the same fractions land on pixel boundaries at either orientation.
@@ -673,6 +679,7 @@ fn a_degenerate_or_edge_crop_is_refused_not_panicked() {
         contrast: None,
         threads: 1,
         look: None,
+        look_intensity: 1.0,
     };
     let refused = |crop: [f32; 4], orientation: u16| {
         develop::render(
@@ -754,6 +761,7 @@ fn render_reduces_orients_and_refuses_bad_buffers() {
         contrast: None,
         threads: 3,
         look: None,
+        look_intensity: 1.0,
     };
     let small = develop::render(
         &level1,
@@ -942,6 +950,7 @@ fn resampler_and_demosaic_refuse_oversize_and_overflowing_axes() {
         contrast: None,
         threads: 1,
         look: None,
+        look_intensity: 1.0,
     };
     for (width, height) in [(usize::MAX, 1), (1, usize::MAX), (16385, 1), (0, 4)] {
         let bad = Level1 {
@@ -998,6 +1007,7 @@ fn work_is_the_same_on_one_thread_and_many() {
             contrast: None,
             threads,
             look: None,
+            look_intensity: 1.0,
         };
         develop::render(&one, None, 17, 8, wb, &color, &transfer, &params).unwrap()
     };
@@ -1310,6 +1320,7 @@ fn export_bands_concatenate_to_the_whole_at_every_orientation() {
         contrast: None,
         threads: 3,
         look: None,
+        look_intensity: 1.0,
     };
     let whole = |crop: Option<[f32; 4]>, orientation: u16| -> Rgb8 {
         let export = export_geometry(&source, crop, orientation).unwrap();

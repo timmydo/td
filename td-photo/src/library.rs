@@ -20,6 +20,10 @@ pub const MAX_EXPOSURE: i32 = 500;
 /// Contrast in hundredths, at most this magnitude either way: the tone
 /// curve's steepness about middle grey is `2^(contrast / 100)`.
 pub const MAX_CONTRAST: i32 = 100;
+/// The look's intensity in hundredths, from none (0) to the whole look
+/// (this, the value an absent key holds): the developed pixel is the one
+/// before the look moved this share of the way to the look's.
+pub const MAX_LOOK_INTENSITY: i32 = 100;
 /// Crop fractions are ten-thousandths of the oriented image.
 pub const CROP_UNIT: u32 = 10_000;
 /// A crop edge is at least this long (0.05 of the image).
@@ -91,15 +95,17 @@ pub enum Key {
     Contrast,
     Crop,
     Look,
+    LookIntensity,
 }
 
 impl Key {
-    pub const ALL: [Key; 5] = [
+    pub const ALL: &'static [Key] = &[
         Key::Flag,
         Key::Exposure,
         Key::Contrast,
         Key::Crop,
         Key::Look,
+        Key::LookIntensity,
     ];
 
     pub fn name(self) -> &'static str {
@@ -109,11 +115,12 @@ impl Key {
             Self::Contrast => "contrast",
             Self::Crop => "crop",
             Self::Look => "look",
+            Self::LookIntensity => "look-intensity",
         }
     }
 
     pub fn parse(name: &str) -> Option<Key> {
-        Self::ALL.into_iter().find(|key| key.name() == name)
+        Self::ALL.iter().copied().find(|key| key.name() == name)
     }
 
     /// Whether the key is a develop setting, one the history records; the
@@ -350,6 +357,20 @@ pub fn contrast_text(hundredths: i32) -> String {
     signed_text(hundredths)
 }
 
+/// The look's intensity from `D.DD`, in hundredths within
+/// `0..=MAX_LOOK_INTENSITY`.
+pub fn look_intensity(text: &str) -> Result<i32, Error> {
+    fraction(text, 2)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value <= MAX_LOOK_INTENSITY)
+        .ok_or(Error::Value(Key::LookIntensity))
+}
+
+/// The `look-intensity` value as the sidecar writes it.
+pub fn look_intensity_text(hundredths: i32) -> String {
+    signed_text(hundredths.clamp(0, MAX_LOOK_INTENSITY))
+}
+
 /// `-D.DD` or `D.DD` in hundredths, at most `max` either way; `-0.00` is
 /// not a spelling of zero.
 fn hundredths(text: &str, max: i32) -> Option<i32> {
@@ -419,6 +440,7 @@ fn check(key: Key, value: &str) -> Result<(), Error> {
         Key::Contrast => contrast(value).is_ok(),
         Key::Crop => Crop::parse(value).is_ok(),
         Key::Look => valid_look(value),
+        Key::LookIntensity => look_intensity(value).is_ok(),
     };
     if ok {
         Ok(())
@@ -431,7 +453,7 @@ fn check(key: Key, value: &str) -> Result<(), Error> {
 /// had them, then the develop history's `step-N` lines. Known keys are
 /// validated; any other line is kept verbatim and rewritten in place, so a
 /// later version's values survive this one's edit. The develop keys (exposure,
-/// contrast, crop, look) are the history's summary: what its steps that are on
+/// contrast, crop, look, look-intensity) are the history's summary: what its steps that are on
 /// fold to, rewritten from it whenever it changes, so a reader that knows only
 /// the keys sees the settings in force. A file with a history is read by it;
 /// one without and with develop keys (an earlier write) seeds a step per key,
@@ -512,7 +534,7 @@ impl Sidecar {
     /// contrast), set in place or appended, or dropped when no step sets
     /// it.
     fn derive(&mut self) {
-        for key in Key::ALL.into_iter().filter(|key| key.develops()) {
+        for key in Key::ALL.iter().copied().filter(|key| key.develops()) {
             let value = self
                 .steps
                 .iter()
@@ -633,6 +655,14 @@ impl Sidecar {
         self.get(Key::Look)
     }
 
+    /// Hundredths of the look applied, `MAX_LOOK_INTENSITY` (the whole
+    /// look) when the key is absent.
+    pub fn look_intensity(&self) -> i32 {
+        self.get(Key::LookIntensity)
+            .and_then(|value| look_intensity(value).ok())
+            .unwrap_or(MAX_LOOK_INTENSITY)
+    }
+
     /// The value a known key has, as written.
     pub fn value(&self, key: Key) -> Option<&str> {
         self.get(key)
@@ -652,7 +682,8 @@ impl Sidecar {
     /// is one step, undone as one); otherwise one is added, and a full
     /// history refuses it. A clear is its own step, never taken up and
     /// never taking a value up, so undoing it brings the value back. A
-    /// value the key already holds is no step. The keys are rewritten
+    /// value the key already holds is no step, nor is the whole look set
+    /// on an absent look intensity, which holds it. The keys are rewritten
     /// from the history. The value is held to the key's grammar, the same
     /// one `parse` holds a file to.
     pub fn set(&mut self, key: Key, value: Option<&str>) -> Result<(), Error> {
@@ -664,6 +695,13 @@ impl Sidecar {
             return Ok(());
         }
         if self.get(key) == value {
+            return Ok(());
+        }
+        // An absent intensity is the whole look already.
+        if key == Key::LookIntensity
+            && self.get(key).is_none()
+            && value.and_then(|text| look_intensity(text).ok()) == Some(MAX_LOOK_INTENSITY)
+        {
             return Ok(());
         }
         let value = value.map(str::to_string);
@@ -691,16 +729,34 @@ impl Sidecar {
         Ok(())
     }
 
-    /// Adds `delta` hundredths to the exposure or contrast, clamped to the
-    /// key's range, as `set` sets it; another key is refused as a value
-    /// outside its grammar.
+    /// Adds `delta` hundredths to the exposure, contrast or look
+    /// intensity, clamped to the key's range, as `set` sets it; another
+    /// key is refused as a value outside its grammar.
     pub fn nudge(&mut self, key: Key, delta: i32) -> Result<(), Error> {
-        let (current, max, text): (_, _, fn(i32) -> String) = match key {
-            Key::Exposure => (self.exposure(), MAX_EXPOSURE, exposure_text),
-            Key::Contrast => (self.contrast(), MAX_CONTRAST, contrast_text),
+        let (current, range, text): (_, _, fn(i32) -> String) = match key {
+            Key::Exposure => (
+                self.exposure().unwrap_or(0),
+                (-MAX_EXPOSURE, MAX_EXPOSURE),
+                exposure_text,
+            ),
+            Key::Contrast => (
+                self.contrast().unwrap_or(0),
+                (-MAX_CONTRAST, MAX_CONTRAST),
+                contrast_text,
+            ),
+            Key::LookIntensity => (
+                self.look_intensity(),
+                (0, MAX_LOOK_INTENSITY),
+                look_intensity_text,
+            ),
             _ => return Err(Error::Value(key)),
         };
-        let next = current.unwrap_or(0).saturating_add(delta).clamp(-max, max);
+        let next = current.saturating_add(delta).clamp(range.0, range.1);
+        // A clamp to the value in force is no step, even where it is the
+        // absent key's (a whole look nudged up).
+        if next == current {
+            return Ok(());
+        }
         self.set(key, Some(&text(next)))
     }
 
@@ -741,7 +797,7 @@ impl Sidecar {
     }
 
     /// Back to the camera's defaults: the history cleared, and with it
-    /// exposure, contrast, crop and look; the flag, a cull decision, and
+    /// exposure, contrast, crop, look and look intensity; the flag, a cull decision, and
     /// any unknown line kept.
     pub fn reset(&mut self) {
         self.steps.clear();

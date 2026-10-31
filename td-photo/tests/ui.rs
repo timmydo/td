@@ -52,6 +52,7 @@ const QUALITY: usize = 19;
 const EDGE: usize = 20;
 const FORMAT: usize = 21;
 const CONTRAST: usize = 22;
+const LOOK_INTENSITY: usize = 23;
 
 fn surface(width: usize, height: usize) -> Surface {
     Surface::new(width, height, Scale::new(1).unwrap()).unwrap()
@@ -273,7 +274,7 @@ fn the_key_list_groups_the_table_by_mode_under_the_chooser_while_it_is_open() {
             ("Moving around", 8),
             ("Develop", 11),
             ("History", 5),
-            ("Looks", 9),
+            ("Looks", 11),
             ("Zoom", 4),
             ("Export", 2),
             ("Roll and window", 2),
@@ -364,6 +365,7 @@ fn the_action_table_is_closed_aligned_and_reachable() {
                         "aspect",
                         "exposure",
                         "contrast",
+                        "look-intensity",
                         "quality",
                         "long-edge",
                         "format",
@@ -421,7 +423,7 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!((layout.columns, layout.rows), (4, 3));
     assert_eq!(
         c.state(),
-        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit\t92\tfull\tjpeg\t-"
+        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit\t92\tfull\tjpeg\t-\t-"
     );
     for name in ["next", "pick", "view", "first"] {
         assert_eq!(
@@ -482,12 +484,12 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!(c.action("select", &[]).unwrap_err().code(), "protocol");
     assert_eq!(
         c.photo(0).unwrap(),
-        format!("{}\t-\t-\t-\t-\tnone\t-\t-", name(0))
+        format!("{}\t-\t-\t-\t-\tnone\t-\t-\t-", name(0))
     );
     assert_eq!(
         c.photo(3).unwrap(),
         format!(
-            "{}\t-\t-\t-\t-\terror\t{}\t-",
+            "{}\t-\t-\t-\t-\terror\t{}\t-\t-",
             name(3),
             hex(b"malformed exposure value")
         )
@@ -1124,7 +1126,266 @@ fn contrast_is_nudged_and_set_in_develop_mode() {
         .map(ui::step_label)
         .collect();
     assert_eq!(labels, ["contrast -0.40"]);
-    assert!(c.photo(0).unwrap().ends_with("\t-0.40"));
+    assert!(c.photo(0).unwrap().ends_with("\t-0.40\t-"));
+}
+
+/// The look intensity: `'` and `;` nudge it a tenth and `look-intensity`
+/// sets it, in develop and with a look alone; a nudge past the whole look
+/// writes nothing, and a run of them and a set is one step.
+#[test]
+fn look_intensity_is_nudged_and_set_with_a_look() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    for chord in ["'", ";"] {
+        assert_eq!(key(&mut c, chord), Outcome::Ignored, "{chord}");
+    }
+    assert_eq!(act(&mut c, "look-intensity", &["0.50"]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    // Without a look there is nothing to take a share of.
+    for chord in ["'", ";"] {
+        assert_eq!(key(&mut c, chord), Outcome::Ignored, "{chord}");
+    }
+    assert_eq!(act(&mut c, "look-intensity", &["0.50"]), Outcome::Ignored);
+    assert_eq!(
+        c.action("look-intensity", &["1.50"]).unwrap_err(),
+        ui::Error::BadArgument
+    );
+    let (_, effects) = c.action("look", &["mono"]).unwrap();
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK_INTENSITY], "-");
+    let (outcome, effects) = c.input(Input::Key { chord: ";" }).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Nudge {
+            index: 0,
+            name: file(0),
+            key: Key::LookIntensity,
+            delta: -ui::LOOK_INTENSITY_STEP,
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK_INTENSITY], "0.90");
+    let (_, effects) = c.input(Input::Key { chord: "'" }).unwrap();
+    assert!(
+        matches!(effects.as_slice(), [Effect::Nudge { key: Key::LookIntensity, delta, .. }] if *delta == ui::LOOK_INTENSITY_STEP),
+        "{effects:?}"
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK_INTENSITY], "1.00");
+    // The whole look nudged up is no change, and no write.
+    let (_, effects) = c.input(Input::Key { chord: "'" }).unwrap();
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Ignored);
+    let (_, effects) = c.action("look-intensity", &["0.35"]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::LookIntensity,
+            value: Some("0.35".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK_INTENSITY], "0.35");
+    assert!(c.photo(0).unwrap().ends_with("\t0.35"));
+    let labels: Vec<String> = c
+        .photos()
+        .first()
+        .and_then(|photo| photo.sidecar.as_ref())
+        .unwrap()
+        .steps()
+        .iter()
+        .map(ui::step_label)
+        .collect();
+    assert_eq!(labels, ["look mono", "look-intensity 0.35"]);
+    for bad in ["1.01", "-0.10", "0.5", "x", "-"] {
+        assert_eq!(
+            c.action("look-intensity", &[bad]).unwrap_err(),
+            ui::Error::BadArgument,
+            "{bad}"
+        );
+    }
+    // In cull the keys are develop's.
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+    assert_eq!(key(&mut c, ";"), Outcome::Ignored);
+}
+
+/// The look intensity slider: in the look band after the looks, none
+/// with no look to list; flat and inert without a look on the photo; with
+/// one, a press and drag move the knob and the release commits the share
+/// at the pointer as `look-intensity` does, unless it is the one in force.
+#[test]
+fn the_look_intensity_slider_commits_on_release() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(c.layout().look_slider(&[]), None);
+    c.set_looks(some_looks());
+    let layout = c.layout();
+    let slider = layout.look_slider(&some_looks()).unwrap();
+    let band = layout.look_band();
+    assert_eq!(slider.rect().intersection(band), Some(slider.rect()));
+    assert!(slider.travel() as usize >= ui::INTENSITY_STEPS);
+    // After the last look on its row: nothing of the strip under it.
+    for button in layout.look_buttons(&some_looks()).into_iter().flatten() {
+        assert_eq!(button.rect().intersection(slider.rect()), None);
+    }
+    let mid = |c: &Controller, value: usize| {
+        let knob = c
+            .layout()
+            .look_slider(&some_looks())
+            .unwrap()
+            .knob(value, ui::INTENSITY_STEPS);
+        (
+            (knob.x + i64::from(knob.width) / 2) as u32,
+            (knob.y + i64::from(knob.height) / 2) as u32,
+        )
+    };
+    // A twentieth of the look a step, an off-step value at the nearest.
+    assert_eq!(ui::intensity_step(100), 20);
+    assert_eq!(ui::intensity_step(0), 0);
+    assert_eq!(ui::intensity_step(37), 7);
+    assert_eq!(ui::intensity_step(38), 8);
+    assert_eq!(ui::intensity_at(7), 35);
+    assert_eq!(ui::intensity_at(40), 100);
+    assert_eq!(c.intensity_value(), 20);
+    assert!(!c.intensity_enabled());
+    // Without a look the slider is inert.
+    let (x, y) = mid(&c, 8);
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    assert_eq!(c.intensity_value(), 20);
+    let flat = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+    let (_, effects) = c.action("look", &["mono"]).unwrap();
+    apply(&mut c, &effects).unwrap();
+    assert!(c.intensity_enabled());
+    assert_ne!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        flat
+    );
+    // A press on the knob in force moves nothing.
+    let (x, y) = mid(&c, 20);
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    // A press away jumps the knob, a drag takes it on (the exposure's
+    // knob stays), and the release commits.
+    let (x, y) = mid(&c, 8);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_eq!(c.intensity_value(), 8);
+    let (x, _) = mid(&c, 5);
+    assert_eq!(drag_to(&mut c, x, 300), Outcome::Changed);
+    assert_eq!(c.intensity_value(), 5);
+    assert_eq!(c.slider_value(), 50);
+    let (outcome, effects) = release(&mut c, x, 300);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::LookIntensity,
+            value: Some("0.25".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK_INTENSITY], "0.25");
+    assert_eq!(c.intensity_value(), 5);
+    // The keys move the same knob: 0.35, between steps 7 and 8, at 7;
+    // a release on the step it rounds to writes nothing.
+    let (_, effects) = c.input(Input::Key { chord: "'" }).unwrap();
+    apply(&mut c, &effects).unwrap();
+    assert_eq!(c.intensity_value(), 7);
+    let (x, y) = mid(&c, 7);
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    // A look cleared under a drag: the release writes nothing.
+    let (x, y) = mid(&c, 16);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    let (_, effects) = c.action("look", &["-"]).unwrap();
+    apply(&mut c, &effects).unwrap();
+    let (_, effects) = release(&mut c, x, y);
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(fields(&c)[LOOK_INTENSITY], "0.35");
+}
+
+/// Where the look intensity slider lies across surfaces: in the look band
+/// whenever laid, over no look button, either on the last button's row or
+/// a row of its own under it, each at some width; and none on a band cut
+/// for the view's room though its looks are laid.
+#[test]
+fn the_look_intensity_slider_takes_its_own_row_or_none() {
+    let looks = some_looks();
+    let (mut same_row, mut own_row) = (None, None);
+    for width in (400..1400).step_by(10) {
+        let layout = ui::Layout::with_looks(surface(width, 700), &looks);
+        let Some(slider) = layout.look_slider(&looks) else {
+            continue;
+        };
+        let rect = slider.rect();
+        assert_eq!(rect.intersection(layout.look_band()), Some(rect), "{width}");
+        let buttons: Vec<_> = layout.look_buttons(&looks).into_iter().flatten().collect();
+        let last = buttons.last().unwrap().rect();
+        for button in &buttons {
+            assert_eq!(button.rect().intersection(rect), None, "{width}");
+        }
+        if rect.y <= last.y && last.y < rect.y + i64::from(rect.height) {
+            assert!(rect.x > last.x, "{width}");
+            same_row = Some(width);
+        } else {
+            assert!(rect.y > last.y, "{width}: {rect:?} {last:?}");
+            own_row = Some(width);
+        }
+    }
+    assert!(same_row.is_some(), "never on the looks' row");
+    let width = own_row.expect("never on a row of its own");
+    // Shorter at that width, the band is cut for the view's room before
+    // the looks are: some height keeps every look button and lays no
+    // slider under them.
+    // (No filmstrip there: a band cut for the view's room leaves none,
+    // which tells the cut from the give-way below, which keeps one.)
+    let cut = (200..700).rev().find(|&height| {
+        let layout = ui::Layout::with_looks(surface(width, height), &looks);
+        layout.look_slider(&looks).is_none()
+            && layout.film_band().is_none()
+            && layout.look_buttons(&looks).iter().all(Option::is_some)
+    });
+    assert!(cut.is_some(), "no height at {width} cuts the slider alone");
+    // The built-in set at the default window and a little shorter: the
+    // slider after the looks on their last row, the filmstrip kept.
+    let mut builtin: Vec<String> = td_photo::look::BUILTIN
+        .iter()
+        .map(|(stem, _)| stem.to_string())
+        .collect();
+    builtin.sort();
+    for height in [600, 560, 540] {
+        let layout = ui::Layout::with_looks(surface(800, height), &builtin);
+        let slider = layout.look_slider(&builtin).expect("a slider");
+        let last = layout
+            .look_buttons(&builtin)
+            .into_iter()
+            .flatten()
+            .last()
+            .unwrap()
+            .rect();
+        assert!(
+            slider.rect().y <= last.y && slider.rect().x > last.x,
+            "{height}"
+        );
+        assert!(layout.film_band().is_some(), "{height}");
+    }
+    // Where its own row would take the filmstrip's room, it gives way:
+    // some height keeps the strip and every look and lays no slider.
+    let gives_way = (200..700).any(|height| {
+        let layout = ui::Layout::with_looks(surface(width, height), &looks);
+        layout.film_band().is_some()
+            && layout.look_slider(&looks).is_none()
+            && layout.look_buttons(&looks).iter().all(Option::is_some)
+    });
+    assert!(
+        gives_way,
+        "the slider's row never gave way to the strip at {width}"
+    );
 }
 
 /// `auto` and its key ask the adapter to measure the cursor photo and
@@ -1188,7 +1449,13 @@ fn auto_picks_asks_for_every_picks_measure() {
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     let values = |index: usize| {
         let photo = c.photo(index).unwrap();
-        photo.split('\t').rev().take(1).collect::<Vec<_>>().join("")
+        // Contrast, the field before the look intensity.
+        photo
+            .split('\t')
+            .rev()
+            .nth(1)
+            .unwrap_or_default()
+            .to_string()
     };
     assert_eq!(values(0), "0.60");
     assert_eq!(values(1), "-");
@@ -1727,14 +1994,15 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "92",
             "full",
             "jpeg",
+            "-",
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "63"]);
+    assert_eq!(&reply(2)[..2], ["ok", "66"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(
         reply(4),
-        ["ok", &name(1), "pick", "-", "-", "-", "ok", "-", "-"]
+        ["ok", &name(1), "pick", "-", "-", "-", "ok", "-", "-", "-"]
     );
     assert_eq!(
         reply(5),
@@ -1747,6 +2015,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "error",
             &hex(b"malformed exposure value"),
+            "-",
             "-"
         ]
     );
@@ -1847,6 +2116,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "error",
             &hex(b"malformed exposure value"),
+            "-",
             "-"
         ]
     );
@@ -4891,10 +5161,10 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         request(9, &["text"]),
         request(10, &["action", "export-picks"]),
     ]);
-    assert_eq!(&a[0][21..], ["92", "full", "jpeg", "-"]);
+    assert_eq!(&a[0][21..], ["92", "full", "jpeg", "-", "-"]);
     assert_eq!(&a[1][1..], ["ok", "changed"]);
     assert_eq!(&a[2][1..], ["ok", "changed"]);
-    assert_eq!(&a[3][21..], ["80", "32", "jpeg", "-"]);
+    assert_eq!(&a[3][21..], ["80", "32", "jpeg", "-", "-"]);
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
         "td-photo export 1\nformat jpeg\nquality 80\nlong-edge 32\n"
@@ -4968,17 +5238,17 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     assert!(ok, "{err}");
     assert_eq!(
         &replies[0][21..],
-        ["92", "full", "jpeg", "-"],
+        ["92", "full", "jpeg", "-", "-"],
         "the empty configuration"
     );
-    assert_eq!(&replies_env[0][21..], ["80", "32", "jpeg", "-"]);
+    assert_eq!(&replies_env[0][21..], ["80", "32", "jpeg", "-", "-"]);
     fs::write(&file, "td-photo export 1\nquality 80\nsharpen 3\n").unwrap();
     let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
     let replies = session.send(&[
         request(1, &["state"]),
         request(2, &["action", "quality", "10"]),
     ]);
-    assert_eq!(&replies[0][21..], ["92", "full", "jpeg", "-"]);
+    assert_eq!(&replies[0][21..], ["92", "full", "jpeg", "-", "-"]);
     assert_eq!(&replies[1][1..], ["ok", "changed"]);
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
@@ -4998,11 +5268,11 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         request(4, &["action", "format", "png"]),
         request(5, &["state"]),
     ]);
-    assert_eq!(&replies[0][21..], ["92", "full", "avif", "-"]);
+    assert_eq!(&replies[0][21..], ["92", "full", "avif", "-", "-"]);
     assert_eq!(&replies[1][1..], ["ok", "changed"]);
     assert_eq!(&replies[2][1..], ["ok", "ignored"]);
     assert_eq!(&replies[3][1..3], ["error", "bad-argument"]);
-    assert_eq!(&replies[4][21..], ["10", "full", "avif", "-"]);
+    assert_eq!(&replies[4][21..], ["10", "full", "avif", "-", "-"]);
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
         "td-photo export 1\nformat avif\nquality 10\nlong-edge full\n"
@@ -5012,7 +5282,7 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         request(7, &["state"]),
     ]);
     assert_eq!(&replies[0][1..], ["ok", "changed"]);
-    assert_eq!(&replies[1][21..], ["10", "full", "jpeg", "-"]);
+    assert_eq!(&replies[1][21..], ["10", "full", "jpeg", "-", "-"]);
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
     assert_eq!(
@@ -5030,9 +5300,9 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         request(2, &["action", "quality", "10"]),
         request(3, &["state"]),
     ]);
-    assert_eq!(&replies[0][21..], ["92", "full", "jpeg", "-"]);
+    assert_eq!(&replies[0][21..], ["92", "full", "jpeg", "-", "-"]);
     assert_eq!(replies[1][1..3], ["error", "refused"]);
-    assert_eq!(&replies[2][21..], ["92", "full", "jpeg", "-"]);
+    assert_eq!(&replies[2][21..], ["92", "full", "jpeg", "-", "-"]);
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
     assert_eq!(err.matches("not a regular file").count(), 2, "{err}");

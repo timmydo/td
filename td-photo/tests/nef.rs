@@ -1570,6 +1570,29 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     let plain = std::fs::read(&plain).unwrap();
     assert_eq!(flat, plain);
     assert_ne!(steep, plain);
+    // `--look-intensity` takes a share of the look: none is no look, the
+    // whole is the look, a half is neither.
+    let share_of_mono = |name: &str, intensity: &str| {
+        let out = dir.join(name);
+        let (ok, _, stderr) = run(&[
+            OsStr::new("develop"),
+            file.as_os_str(),
+            out.as_os_str(),
+            OsStr::new("--long-edge"),
+            OsStr::new("16"),
+            OsStr::new("--look"),
+            OsStr::new("mono"),
+            OsStr::new("--look-intensity"),
+            OsStr::new(intensity),
+        ]);
+        assert!(ok, "{stderr}");
+        std::fs::read(&out).unwrap()
+    };
+    assert_eq!(share_of_mono("share-none.ppm", "0.00"), plain);
+    assert_eq!(share_of_mono("share-whole.ppm", "1.00"), ppm);
+    let half = share_of_mono("share-half.ppm", "0.50");
+    assert_ne!(half, plain);
+    assert_ne!(half, ppm);
     // A crop develops a sub-region: fewer pixels on each axis than the whole
     // frame at the same long edge, so the crop is applied (5(e)). The exact
     // oriented-region mapping is pinned in tests/develop.rs.
@@ -1638,6 +1661,15 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     ]);
     assert!(!ok);
     assert!(stderr.contains("D.DD in -1.00..=1.00"), "{stderr}");
+    let (ok, _, stderr) = run(&[
+        OsStr::new("develop"),
+        file.as_os_str(),
+        x.as_os_str(),
+        OsStr::new("--look-intensity"),
+        OsStr::new("1.50"),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("D.DD in 0.00..=1.00"), "{stderr}");
     let (ok, _, stderr) = run(&[
         OsStr::new("develop"),
         file.as_os_str(),
@@ -1817,6 +1849,7 @@ fn the_command_line_exports_into_the_rolls_folder() {
             contrast: None,
             threads: 2,
             look: None,
+            look_intensity: 1.0,
         },
     )
     .unwrap();

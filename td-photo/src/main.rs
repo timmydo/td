@@ -45,11 +45,14 @@ const HELP: &str = concat!(
     "  with their geometry. --decode also decodes the raw strip and every\n",
     "  preview and prints their statistics and hashes.\n",
     "td-photo develop FILE OUT.ppm [--long-edge N] [--exposure STOPS]\n",
-    "                 [--contrast C] [--look STEM] [--crop \"X Y W H\"]\n",
+    "                 [--contrast C] [--look STEM] [--look-intensity I]\n",
+    "                 [--crop \"X Y W H\"]\n",
     "  Develops the raw to 8-bit sRGB at most N pixels on the long side\n",
     "  (default 1600) with an exposure offset in stops (default 0), the\n",
     "  contrast C (-1.00 to 1.00, the tone's steepness about grey 2^C;\n",
-    "  default 0), the look STEM (see looks; default none) and the crop\n",
+    "  default 0), the look STEM (see looks; default none) at the\n",
+    "  intensity I (0.00 to 1.00, the share of the look; default 1.00)\n",
+    "  and the crop\n",
     "  \"X Y W H\", four fractions of the oriented frame as the sidecar\n",
     "  spells it (default the whole frame), written through a fresh\n",
     "  OUT.ppm.tmp and linked into place. OUT.ppm must not exist: td-photo\n",
@@ -57,7 +60,8 @@ const HELP: &str = concat!(
     "td-photo export FILE [--format jpeg|avif] [--quality N]\n",
     "                 [--long-edge N|full]\n",
     "  Renders FILE's raw at full resolution (a bilinear demosaic, in row\n",
-    "  bands) with its sidecar's exposure, contrast, crop and look, shrinks\n",
+    "  bands) with its sidecar's exposure, contrast, crop, look and look\n",
+    "  intensity, shrinks\n",
     "  it to N pixels on the long side when --long-edge asks (default full,\n",
     "  never enlarged), and writes it as a JPEG (4:4:4; the default) or an\n",
     "  AVIF (8-bit 4:2:0) at --quality 1 to 100 (default 92) into exported/\n",
@@ -105,8 +109,8 @@ const HELP: &str = concat!(
     "  alone, and the run fails after the rest. SRC is never written.\n",
     "td-photo list ROLL [--picks | --rejects | --unflagged]\n",
     "  One line per original in ROLL: name, flag, exposure, contrast,\n",
-    "  crop, look and the sidecar's state (none, ok, or error and why),\n",
-    "  tab-separated.\n",
+    "  crop, look, look intensity and the sidecar's state (none, ok, or\n",
+    "  error and why), tab-separated.\n",
     "td-photo flag FILE pick | reject | clear\n",
     "  Sets or clears the cull flag in FILE's sidecar.\n",
     "td-photo delete-rejected ROLL\n",
@@ -119,7 +123,8 @@ const HELP: &str = concat!(
     "td-photo edit FILE [KEY VALUE ... | auto | reset | undo]\n",
     "  Prints FILE's sidecar, or sets exposure STOPS (-5.00 to 5.00),\n",
     "  contrast C (-1.00 to 1.00), crop X Y W H (fractions to four\n",
-    "  decimals), look STEM or flag pick|reject;\n",
+    "  decimals), look STEM, look-intensity I (0.00 to 1.00) or flag\n",
+    "  pick|reject;\n",
     "  a VALUE of - clears the key. A develop key set is a step of the\n",
     "  sidecar's history (step-N lines, the keys their summary); auto\n",
     "  chooses exposure and contrast from the photo's tones over its crop\n",
@@ -519,6 +524,11 @@ fn probe(path: &Path, rest: &[OsString]) -> Result<(), String> {
     Ok(())
 }
 
+/// The look's intensity, hundredths, as the share the pipeline takes.
+pub(crate) fn intensity_share(hundredths: i32) -> f32 {
+    hundredths.clamp(0, library::MAX_LOOK_INTENSITY) as f32 / library::MAX_LOOK_INTENSITY as f32
+}
+
 /// FNV-1a-64 over bytes, the hash the fixture README records.
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -537,6 +547,7 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
             "--exposure",
             "--contrast",
             "--look",
+            "--look-intensity",
             "--crop",
         ],
         &[],
@@ -562,6 +573,11 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
             .map_err(|_| format!("--contrast {text:?} is not D.DD in -1.00..=1.00"))?,
         None => 0,
     };
+    let look_intensity = match option(rest, "--look-intensity")? {
+        Some(text) => library::look_intensity(&text)
+            .map_err(|_| format!("--look-intensity {text:?} is not D.DD in 0.00..=1.00"))?,
+        None => library::MAX_LOOK_INTENSITY,
+    };
     // The look, like a bad option, is refused before the camera file is
     // read; a user look that does not parse is an error, not the built-in.
     let look = match option(rest, "--look")? {
@@ -586,6 +602,7 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
         contrast: contrast.as_ref(),
         threads,
         look: look.as_ref(),
+        look_intensity: intensity_share(look_intensity),
     };
     let (image, info) = develop_raw(path, crop, long_edge, &params)?;
     write_atomically(out, &image)?;
@@ -873,7 +890,7 @@ fn develop_raw(
 /// The developed preview the window blits into its box and `--preview`
 /// reproduces: the file at `roll/name` developed to fit `box_w` by `box_h`
 /// at the sidecar's `exposure` (hundredths of a stop), `contrast`
-/// (hundredths) and `look` stem, or
+/// (hundredths) and `look` stem at its intensity (hundredths), or
 /// `None` (a note on stderr) when it cannot be made, so the box keeps its
 /// placeholder as a grid box does for a thumbnail that cannot be made. The
 /// look stem is resolved here, off the turn loop's thread. Mirrors the
@@ -889,21 +906,21 @@ fn develop_preview(
     box_h: usize,
     exposure: i32,
     contrast: i32,
-    look: Option<&str>,
+    look: Option<(&str, i32)>,
     crop: Option<library::Crop>,
     zoom: Option<(u32, (u32, u32))>,
     threads: usize,
 ) -> Option<Rgb8> {
     let path = roll.join(name);
-    let look = match look {
-        Some(stem) => match find_look(stem) {
-            Ok(look) => Some(look),
+    let (look, intensity) = match look {
+        Some((stem, intensity)) => match find_look(stem) {
+            Ok(look) => (Some(look), intensity),
             Err(why) => {
                 note(&why);
                 return None;
             }
         },
-        None => None,
+        None => (None, library::MAX_LOOK_INTENSITY),
     };
     let long_edge = box_w.max(box_h);
     let contrast = Look::contrast(contrast);
@@ -912,6 +929,7 @@ fn develop_preview(
         contrast: contrast.as_ref(),
         threads,
         look: look.as_ref(),
+        look_intensity: intensity_share(intensity),
     };
     let crop = crop.map(crop_fractions);
     let made = match zoom {
@@ -954,7 +972,7 @@ const EXPORT_BAND_ROWS: usize = 64;
 const MAX_EXPORT_NAMES: u32 = 1000;
 
 /// One export as asked for: the original and its sidecar's exposure, contrast,
-/// crop and look as the file held them when the export was asked for, and the
+/// crop and look with its intensity as the file held them when the export was asked for, and the
 /// settings it is written with, so the verb, the replay and the window's pool
 /// job develop the same thing. The look is a stem here and resolved where the
 /// export runs.
@@ -965,6 +983,8 @@ pub(crate) struct ExportRequest {
     pub(crate) contrast: i32,
     pub(crate) crop: Option<library::Crop>,
     pub(crate) look: Option<String>,
+    /// Hundredths of the look applied.
+    pub(crate) look_intensity: i32,
     pub(crate) settings: Settings,
     /// One of the picks' batch, counted in the batch's note as it lands,
     /// rather than an export of its own.
@@ -1080,6 +1100,7 @@ pub(crate) fn auto_measure(
         contrast: None,
         threads,
         look: None,
+        look_intensity: 1.0,
     };
     let image = develop::render(
         &level1,
@@ -1190,6 +1211,7 @@ pub(crate) fn export_request(path: &Path, settings: Settings) -> Result<ExportRe
         contrast: sidecar.contrast().unwrap_or(0),
         crop: sidecar.crop(),
         look: sidecar.look().map(str::to_string),
+        look_intensity: sidecar.look_intensity(),
         settings,
         batch: false,
     })
@@ -1359,6 +1381,7 @@ pub(crate) fn export_file(
         contrast: contrast.as_ref(),
         threads,
         look: look.as_ref(),
+        look_intensity: intensity_share(request.look_intensity),
     };
     let mut write = |file: fs::File| -> Result<(), String> {
         let mut writer = BufWriter::new(file);
@@ -2666,7 +2689,9 @@ fn edit(path: &Path, rest: &[OsString]) -> Result<(), String> {
     let mut words = words.as_slice();
     while let Some((name, tail)) = words.split_first() {
         let key = Key::parse(name).ok_or_else(|| {
-            format!("{name}: not a sidecar key (flag, exposure, contrast, crop, look)")
+            format!(
+                "{name}: not a sidecar key (flag, exposure, contrast, crop, look, look-intensity)"
+            )
         })?;
         let take = match key {
             Key::Crop if tail.first() != Some(&"-") => 4,
@@ -2713,12 +2738,13 @@ fn list(roll: &Path, rest: &[OsString]) -> Result<(), String> {
         let column = |key: Key| values.value(key).unwrap_or("-").to_string();
         writeln!(
             out,
-            "{name}\t{}\t{}\t{}\t{}\t{}\t{status}",
+            "{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{status}",
             column(Key::Flag),
             column(Key::Exposure),
             column(Key::Contrast),
             column(Key::Crop),
-            column(Key::Look)
+            column(Key::Look),
+            column(Key::LookIntensity)
         )
         .map_err(|e| e.to_string())?;
     }

@@ -643,6 +643,10 @@ pub struct Params<'a> {
     pub threads: usize,
     /// Applied after the matrix and before the transfer, when given.
     pub look: Option<&'a Look>,
+    /// The share of the look applied, `0..=1`: each pixel moves this far
+    /// from the one the look was given to the one it made. 1 is the whole
+    /// look; a value outside is held to that range.
+    pub look_intensity: f32,
 }
 
 /// The axes that fit `long_edge` without enlarging, keeping aspect.
@@ -1010,7 +1014,8 @@ pub fn level2(
 
 /// Level 2 to level 3: per pixel white balance and clip at the camera
 /// white, exposure folded into the camera matrix, the contrast when there
-/// is one, the look when there is one, then the sRGB transfer to 8 bits.
+/// is one, the look when there is one at its intensity, then the sRGB
+/// transfer to 8 bits.
 /// Level 2 is already oriented, so the display buffer follows its axes.
 /// This is what an exposure, contrast or look edit reruns; level 2 is
 /// untouched.
@@ -1038,6 +1043,14 @@ pub fn level3(
     let small_ref = &level2.rgb;
     let matrix_ref = &matrix;
     let (contrast, look) = (params.contrast, params.look);
+    // NaN is held to the whole look, as no setting is.
+    let intensity = if params.look_intensity.is_nan() {
+        1.0
+    } else {
+        params.look_intensity.clamp(0.0, 1.0)
+    };
+    // No share of it is no look, and skips its cost.
+    let look = look.filter(|_| intensity > 0.0);
     let items: Vec<(usize, &mut [u8])> = out.chunks_mut(band * dw * 3).enumerate().collect();
     bands(items, threads, |(band_index, chunk)| {
         let start = band_index * band * dw * 3;
@@ -1061,6 +1074,14 @@ pub fn level3(
                 None => rgb,
             };
             let rgb = match look {
+                Some(look) if intensity < 1.0 => {
+                    let ([r, g, b], [lr, lg, lb]) = (rgb, look.apply(rgb));
+                    [
+                        r + intensity * (lr - r),
+                        g + intensity * (lg - g),
+                        b + intensity * (lb - b),
+                    ]
+                }
                 Some(look) => look.apply(rgb),
                 None => rgb,
             };

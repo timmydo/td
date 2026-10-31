@@ -694,6 +694,7 @@ fn the_contrast_is_a_tone_about_grey_before_the_look() {
                 contrast,
                 threads: 2,
                 look,
+                look_intensity: 1.0,
             },
         )
         .unwrap()
@@ -754,6 +755,7 @@ fn the_pipeline_applies_the_look_after_the_matrix() {
                 contrast: None,
                 threads: 2,
                 look,
+                look_intensity: 1.0,
             },
         )
         .unwrap()
@@ -780,6 +782,60 @@ fn the_pipeline_applies_the_look_after_the_matrix() {
     assert!(r == g && g == b, "{r} {g} {b}");
     assert!(plain.pixel(1, 1).unwrap()[0] > plain.pixel(1, 1).unwrap()[1]);
     assert_eq!(mixed.pixel(1, 0), plain.pixel(1, 0));
+}
+
+#[test]
+fn the_look_intensity_takes_a_share_of_the_look() {
+    let z8 = camera::find("NIKON CORPORATION", "NIKON Z 8").unwrap();
+    let color = camera_color(&z8.xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let wb = color.daylight;
+    let grey = |v: f32| [v / wb[0], v / wb[1], v / wb[2]];
+    let red = [0.5 / wb[0], 0.05 / wb[1], 0.05 / wb[2]];
+    let level1 = level1_of(&[grey(0.05), grey(MIDDLE_GREY), grey(0.8), red], 2, 2);
+    let mono = Look::parse(look::builtin("mono").unwrap().as_bytes()).unwrap();
+    let render = |look: Option<&Look>, look_intensity: f32| {
+        develop::render(
+            &level1,
+            None,
+            2,
+            1,
+            wb,
+            &color,
+            &transfer,
+            &Params {
+                exposure: 0.0,
+                contrast: None,
+                threads: 2,
+                look,
+                look_intensity,
+            },
+        )
+        .unwrap()
+    };
+    let plain = render(None, 1.0);
+    let whole = render(Some(&mono), 1.0);
+    // None of the look is no look; all of it is the look; a value past
+    // either end, or NaN, is held to the range, NaN to the whole.
+    assert_eq!(render(Some(&mono), 0.0), plain);
+    assert_eq!(render(Some(&mono), -0.5), plain);
+    assert_eq!(render(Some(&mono), 1.5), whole);
+    assert_eq!(render(Some(&mono), f32::NAN), whole);
+    // Without a look the intensity moves nothing.
+    assert_eq!(render(None, 0.3), plain);
+    // Half of it: the red keeps half its chroma, each channel between the
+    // two, and grey, which the mix leaves, stays where it is.
+    let half = render(Some(&mono), 0.5);
+    let (p, w, h) = (
+        plain.pixel(1, 1).unwrap(),
+        whole.pixel(1, 1).unwrap(),
+        half.pixel(1, 1).unwrap(),
+    );
+    for ((p, w), h) in p.iter().zip(w).zip(h) {
+        assert!(p.min(&w) < &h && &h < p.max(&w), "{p} {w} {h}");
+    }
+    assert!(h[0] > h[1], "{h:?}");
+    assert_eq!(half.pixel(1, 0), plain.pixel(1, 0));
 }
 
 // ------------------------------------------------------------ the binary

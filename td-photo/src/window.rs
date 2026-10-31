@@ -298,7 +298,10 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         .as_ref()
         .and_then(|sidecar| sidecar.contrast())
         .unwrap_or(0);
-    let look = photo.sidecar.as_ref().and_then(|sidecar| sidecar.look());
+    let look = photo
+        .sidecar
+        .as_ref()
+        .and_then(|sidecar| Some((sidecar.look()?, sidecar.look_intensity())));
     let crop = photo.sidecar.as_ref().and_then(|sidecar| sidecar.crop());
     let image = crate::develop_preview(
         roll,
@@ -334,10 +337,11 @@ impl Key {
 }
 
 /// What a worker develops the preview by: the roll, the photo in it, the
-/// box it fits, the sidecar's crop, exposure, contrast and look, and the
-/// zoom and its centre when the box does not fit the image, so the same
-/// photo at another box, crop, exposure, contrast, look or zoom is another
-/// develop. There is
+/// box it fits, the sidecar's crop, exposure, contrast and look with its
+/// intensity, and the zoom and its centre when the box does not fit the
+/// image, so the same photo at another box, crop, exposure, contrast, look,
+/// intensity or zoom is another develop; without a look the intensity is
+/// the whole, so a change to it alone is none. There is
 /// no generation: two requests with the same fields yield the same pixels.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Preview {
@@ -349,6 +353,8 @@ struct Preview {
     exposure: i32,
     contrast: i32,
     look: Option<String>,
+    /// Hundredths of the look applied.
+    look_intensity: i32,
     zoom: Option<(u32, (u32, u32))>,
 }
 
@@ -976,6 +982,7 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
         contrast: contrast.as_ref(),
         threads,
         look: look.as_ref(),
+        look_intensity: crate::intensity_share(preview.look_intensity),
     };
     // Level 2 to the shown frame, at this box, exposure, contrast and look.
     let frame = |level2: &develop::Level2, meta: &crate::Meta| {
@@ -2317,13 +2324,24 @@ impl Window {
 
     /// The develop the model wants now: the cursor photo fitted to the
     /// box (develop's or the single view's) at its sidecar's crop,
-    /// exposure, contrast and look, or `None` when the model shows no box.
+    /// exposure, contrast and look at its intensity, or `None` when the
+    /// model shows no box.
     fn wanted_preview(&self) -> Option<Preview> {
         let ui = &self.session.ui;
         let r#box = ui.develop_box()?;
         let index = ui.cursor()?;
         let photo = ui.photos().get(index)?;
         let roll = ui.roll()?;
+        let look = photo
+            .sidecar
+            .as_ref()
+            .and_then(|sidecar| sidecar.look())
+            .map(str::to_string);
+        // Without a look its intensity moves no pixel.
+        let look_intensity = match (&look, &photo.sidecar) {
+            (Some(_), Some(sidecar)) => sidecar.look_intensity(),
+            _ => library::MAX_LOOK_INTENSITY,
+        };
         Some(Preview {
             roll: PathBuf::from(OsStr::from_bytes(roll)),
             name: photo.name.clone(),
@@ -2347,11 +2365,8 @@ impl Window {
                 .as_ref()
                 .and_then(|sidecar| sidecar.contrast())
                 .unwrap_or(0),
-            look: photo
-                .sidecar
-                .as_ref()
-                .and_then(|sidecar| sidecar.look())
-                .map(str::to_string),
+            look,
+            look_intensity,
             zoom: ui.zoom(),
         })
     }
@@ -2752,6 +2767,7 @@ mod tests {
             exposure: 0,
             contrast: 0,
             look: None,
+            look_intensity: 100,
             zoom: None,
         }
     }
@@ -2846,6 +2862,7 @@ mod tests {
             contrast: 0,
             crop: None,
             look: None,
+            look_intensity: 100,
             settings: crate::Settings::default(),
             batch: false,
         }
@@ -3279,6 +3296,13 @@ mod tests {
         };
         assert_ne!(a_contrast, a);
         assert_eq!(memo.plan(&a_contrast).stage(), Stage::Level3);
+        // So is a look intensity edit alone.
+        let a_share = Preview {
+            look_intensity: 40,
+            ..a_edited.clone()
+        };
+        assert_ne!(a_share, a_edited);
+        assert_eq!(memo.plan(&a_share).stage(), Stage::Level3);
         // Same photo, a larger box: level 2 from the cached level 1.
         let a_big = Preview {
             box_w: 600,
@@ -3506,6 +3530,7 @@ mod tests {
             contrast: 0,
             crop: None,
             look: None,
+            look_intensity: 100,
             settings: crate::Settings::default(),
             batch: false,
         });

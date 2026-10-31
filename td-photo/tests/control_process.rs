@@ -170,6 +170,25 @@ fn preview_develop_reflects_the_sidecar() {
         box_pixels(&steeper, 800, r#box),
         "the contrast did not reach the developed pixels"
     );
+    // And a look's intensity: half the mono look is neither the colour nor
+    // the whole look's grey.
+    let with_look = |intensity: &str| {
+        std::fs::write(
+            roll.join("DSC_0001.NEF.edit"),
+            format!("td-photo edit 1\nexposure 1.50\nlook mono\n{intensity}"),
+        )
+        .unwrap();
+        preview_develop(&dir, 800, 600, &roll, 0)
+    };
+    let whole = with_look("");
+    let half = with_look("look-intensity 0.50\n");
+    for other in [&brighter, &whole] {
+        assert_ne!(
+            box_pixels(other, 800, r#box),
+            box_pixels(&half, 800, r#box),
+            "the look intensity did not reach the developed pixels"
+        );
+    }
 }
 
 #[test]

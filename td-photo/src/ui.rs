@@ -62,6 +62,8 @@ pub const EXPOSURE_FINE: i32 = 10;
 /// The contrast step, a tenth in hundredths: `2^0.1` the tone's
 /// steepness.
 pub const CONTRAST_STEP: i32 = 10;
+/// The look intensity step, a tenth of the look in hundredths.
+pub const LOOK_INTENSITY_STEP: i32 = 10;
 
 /// The mode `state` leads with: culling the roll as a grid, or developing
 /// one photo. The develop edits act on the cursor's photo; the cull view
@@ -187,8 +189,8 @@ pub enum Effect {
         key: Key,
         value: Option<String>,
     },
-    /// Add `delta` hundredths to this photo's exposure or contrast on the
-    /// file as it is then, clamped to the key's range, and settle the
+    /// Add `delta` hundredths to this photo's exposure, contrast or look
+    /// intensity on the file as it is then, clamped to the key's range, and settle the
     /// model: a delta, not an absolute, so a value changed meanwhile is
     /// added to.
     Nudge {
@@ -311,6 +313,9 @@ pub enum Action {
     AutoPicks,
     /// The Nth (from 1) of the available looks, `C-1`..`C-9`.
     LookAt(u8),
+    LookIntensityIn,
+    LookIntensityOut,
+    LookIntensity,
     ZoomFit,
     Zoom100,
     ZoomIn,
@@ -327,7 +332,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 63] = [
+    pub const ALL: &'static [Action] = &[
         Action::Open,
         Action::Choose,
         Action::Next,
@@ -378,6 +383,9 @@ impl Action {
         Action::LookAt(7),
         Action::LookAt(8),
         Action::LookAt(9),
+        Action::LookIntensityIn,
+        Action::LookIntensityOut,
+        Action::LookIntensity,
         Action::ZoomFit,
         Action::Zoom100,
         Action::ZoomIn,
@@ -447,6 +455,9 @@ impl Action {
             Self::LookAt(9) => "look-9",
             // Not an action: `parse` refuses it and dispatch ignores it.
             Self::LookAt(_) => "look-0",
+            Self::LookIntensityIn => "look-intensity-in",
+            Self::LookIntensityOut => "look-intensity-out",
+            Self::LookIntensity => "look-intensity",
             Self::ZoomFit => "zoom-fit",
             Self::Zoom100 => "zoom-100",
             Self::ZoomIn => "zoom-in",
@@ -464,7 +475,10 @@ impl Action {
     }
 
     pub fn parse(name: &str) -> Option<Action> {
-        Self::ALL.into_iter().find(|action| action.name() == name)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|action| action.name() == name)
     }
 
     /// Whether holding the key repeats the action: the cursor moves and the
@@ -518,7 +532,10 @@ impl Action {
             | Self::Auto
             | Self::AutoPicks => Group::Develop,
             Self::Reset | Self::Undo | Self::StepToggle | Self::StepDelete => Group::History,
-            Self::LookAt(_) => Group::Looks,
+            Self::LookAt(_)
+            | Self::LookIntensityIn
+            | Self::LookIntensityOut
+            | Self::LookIntensity => Group::Looks,
             Self::ZoomFit | Self::Zoom100 | Self::ZoomIn | Self::ZoomOut => Group::Zoom,
             Self::Export | Self::ExportPicks | Self::Format | Self::Quality | Self::LongEdge => {
                 Group::Export
@@ -783,7 +800,7 @@ pub const BINDINGS: &[Binding] = &[
         name: "reset",
         chord: Some("0"),
         arguments: "",
-        help: "Reset exposure, contrast, crop and look to camera defaults, clearing the history (develop mode).",
+        help: "Reset exposure, contrast, crop, look and its intensity to camera defaults, clearing the history (develop mode).",
     },
     Binding {
         name: "undo",
@@ -898,6 +915,24 @@ pub const BINDINGS: &[Binding] = &[
         chord: Some("C-9"),
         arguments: "",
         help: "Set the look to the ninth available look (develop mode).",
+    },
+    Binding {
+        name: "look-intensity-in",
+        chord: Some("'"),
+        arguments: "",
+        help: "Apply a tenth more of the look, up to the whole (develop mode, with a look).",
+    },
+    Binding {
+        name: "look-intensity-out",
+        chord: Some(";"),
+        arguments: "",
+        help: "Apply a tenth less of the look, down to none (develop mode, with a look).",
+    },
+    Binding {
+        name: "look-intensity",
+        chord: None,
+        arguments: "VALUE",
+        help: "Set the share of the look applied to VALUE, two decimals in 0.00..1.00 (develop mode, with a look); the look band's slider commits one on release.",
     },
     Binding {
         name: "zoom-fit",
@@ -1173,6 +1208,53 @@ pub fn exposure_at(value: usize) -> i32 {
     (value.min(EXPOSURE_STEPS) as i32) * 10 - library::MAX_EXPOSURE
 }
 
+/// The look intensity slider's steps: a twentieth of the look each, so
+/// value 0 is none of the look and 20 all of it, few enough to fit after
+/// the looks on their last row where a hundred would not.
+pub const INTENSITY_STEPS: usize = 20;
+const _: () = assert!(library::MAX_LOOK_INTENSITY == 5 * INTENSITY_STEPS as i32);
+
+/// The intensity slider's value for a look intensity in hundredths.
+pub fn intensity_step(hundredths: i32) -> usize {
+    (hundredths.clamp(0, library::MAX_LOOK_INTENSITY) as usize + 2) / 5
+}
+
+/// The look intensity, in hundredths, at an intensity slider value.
+pub fn intensity_at(value: usize) -> i32 {
+    (value.min(INTENSITY_STEPS) as i32) * 5
+}
+
+/// Which slider a drag moves: develop's exposure or look intensity, or
+/// the export view's quality.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dial {
+    Exposure,
+    Intensity,
+    Quality,
+}
+
+/// A slider of the given travel from `x` to `right` on the band at `y`, a
+/// `ROW` tall, when that gives each of `steps` its own column: with fewer,
+/// a press on the knob's own centre would read as another step (td-ui's
+/// `travel` contract).
+fn slider_in(surface: Surface, x: i64, y: i64, right: i64, steps: usize) -> Option<Slider> {
+    let band = ROW * surface.scale.value();
+    (right > x)
+        .then(|| {
+            Slider::new(
+                surface,
+                Rect {
+                    x,
+                    y,
+                    width: u32::try_from(right - x).ok()?,
+                    height: u32::try_from(band).ok()?,
+                },
+            )
+        })
+        .flatten()
+        .filter(|slider| slider.travel() as usize >= steps)
+}
+
 /// Where a single view paints: its region, the preview box under the
 /// text rows, and whether the facts row is among them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1323,7 +1405,21 @@ impl Layout {
             .saturating_sub(layout.tool_band().height)
             .saturating_sub(keep) as usize
             / band;
-        layout.look_rows = layout.look_strip(&labels).rows().min(spare).max(1);
+        let strip = layout.look_strip(&labels);
+        let (_, rows) = layout.lay_intensity(&strip);
+        layout.look_rows = rows.min(spare).max(1);
+        // The slider's own row gives way to the filmstrip: where it would
+        // take the strip's room, the band keeps the looks' rows alone and
+        // the intensity is the keys'.
+        if rows > strip.rows() && layout.film_band().is_none() {
+            let without = Layout {
+                look_rows: strip.rows().min(spare).max(1),
+                ..layout
+            };
+            if without.film_band().is_some() {
+                return without;
+            }
+        }
         layout
     }
 
@@ -1514,25 +1610,7 @@ impl Layout {
         let band = (ROW * s) as i64;
         let right = region.x + i64::from(region.width) - cell;
         let (after, row_y) = strip.end();
-        let lay = |x: i64, y: i64| {
-            (right > x)
-                .then(|| {
-                    Slider::new(
-                        self.surface,
-                        Rect {
-                            x,
-                            y,
-                            width: (right - x) as u32,
-                            height: band as u32,
-                        },
-                    )
-                })
-                .flatten()
-                // Every step needs its own column, or a press on the knob's
-                // own centre would read as another step (td-ui's `travel`
-                // contract).
-                .filter(|slider| slider.travel() as usize >= EXPOSURE_STEPS)
-        };
+        let lay = |x: i64, y: i64| slider_in(self.surface, x, y, right, EXPOSURE_STEPS);
         if !buttons.iter().all(Option::is_some) {
             return (
                 Tools {
@@ -1602,6 +1680,42 @@ impl Layout {
             .buttons()
             .map(|button| button.filter(|b| within(band, b.rect())))
             .collect()
+    }
+
+    /// The look intensity slider after the look strip, and the rows the
+    /// two take: from the x after the last look button to a cell short of
+    /// the band's right on that row when that gives every step its own
+    /// column, else on a row of its own across the band, else none; none
+    /// either with no look to take a share of (the strip `NO_LOOK` alone)
+    /// or when the surface cannot hold every look button.
+    fn lay_intensity(&self, strip: &Buttons<'_>) -> (Option<Slider>, usize) {
+        let band = self.look_band();
+        let rows = strip.rows();
+        if strip.buttons().count() < 2 || !strip.buttons().all(|button| button.is_some()) {
+            return (None, rows);
+        }
+        let s = self.surface.scale.value();
+        let cell = (CELL_WIDTH * s) as i64;
+        let right = band.x + i64::from(band.width) - cell;
+        let (after, row_y) = strip.end();
+        if let Some(slider) = slider_in(self.surface, after, row_y, right, INTENSITY_STEPS) {
+            return (Some(slider), rows);
+        }
+        let below = row_y.saturating_add((ROW * s) as i64);
+        match slider_in(self.surface, band.x + cell, below, right, INTENSITY_STEPS) {
+            Some(slider) => (Some(slider), rows + 1),
+            None => (None, rows),
+        }
+    }
+
+    /// The look intensity slider (`lay_intensity`) with the look band
+    /// laid for `looks`, `None` where the band cannot hold it whole (its
+    /// row cut for the view's room: the intensity is then the keys').
+    pub fn look_slider(&self, looks: &[String]) -> Option<Slider> {
+        let band = self.look_band();
+        let labels = look_labels(looks);
+        let (slider, _) = self.lay_intensity(&self.look_strip(&labels));
+        slider.filter(|slider| within(band, slider.rect()))
     }
 
     /// The area right of the history pane: where develop mode shows the
@@ -1826,11 +1940,11 @@ pub struct Controller {
     /// The first history step the pane shows, moved as little as possible
     /// to keep the selection in view.
     history_first: usize,
-    /// The exposure slider's drag (the quality slider's in the export
-    /// view): the value under the pointer since the press, painted as the
-    /// knob, committed on release. Dropped with the crop drag when the
-    /// photo, mode or surface changes.
-    slider: Option<usize>,
+    /// A slider's drag, the exposure's or the look intensity's (the
+    /// quality's in the export view): which, and the value under the
+    /// pointer since the press, painted as the knob, committed on release.
+    /// Dropped with the crop drag when the photo, mode or surface changes.
+    slider: Option<(Dial, usize)>,
     /// Whether the buttons show their chords as hints: while Alt is held
     /// (`Input::Held`), until it is released or the focus leaves. A fact
     /// the frame witnesses, so a change bumps the generation; absent from
@@ -2835,8 +2949,10 @@ impl Controller {
     /// The quality slider's value: the drag's while one is on, else the
     /// setting's.
     fn quality_value(&self) -> usize {
-        self.slider
-            .unwrap_or(usize::from(self.settings.quality.saturating_sub(1)))
+        match self.slider {
+            Some((Dial::Quality, value)) => value,
+            _ => usize::from(self.settings.quality.saturating_sub(1)),
+        }
     }
 
     /// The picks the model holds: what the export view counts and what
@@ -3576,7 +3692,7 @@ impl Controller {
     /// sidecar state), the outstanding job count, the generation, the
     /// chooser's listed folder in hex, the history's step count and the
     /// selected step, the zoom, the export quality, long edge and format,
-    /// then the photo's contrast. Absent values are `-`.
+    /// then the photo's contrast and look intensity. Absent values are `-`.
     pub fn state(&self) -> String {
         let position = self.position();
         let photo = self.cursor.and_then(|index| self.photos.get(index));
@@ -3607,13 +3723,14 @@ impl Controller {
             settings::long_edge_text(self.settings.long_edge),
             self.settings.format.name().to_string(),
             photo.map_or_else(dash, |p| p.value(Key::Contrast).to_string()),
+            photo.map_or_else(dash, |p| p.value(Key::LookIntensity).to_string()),
         ]
         .join("\t")
     }
 
     /// The `photo N` body: the Nth shown photo's name in hex, flag,
     /// exposure, crop, look, sidecar state, for a refused sidecar the
-    /// reason in hex (`-` otherwise), and contrast.
+    /// reason in hex (`-` otherwise), contrast and look intensity.
     pub fn photo(&self, position: usize) -> Result<String, Error> {
         if self.roll.is_none() {
             return Err(Error::NoRoll);
@@ -3634,6 +3751,7 @@ impl Controller {
             photo.status(),
             reason.as_str(),
             photo.value(Key::Contrast),
+            photo.value(Key::LookIntensity),
         ]
         .join("\t"))
     }
@@ -3778,6 +3896,13 @@ impl Controller {
             (Action::Uncrop, []) => return self.uncrop(effects),
             (Action::Exposure, [stops]) => return self.set_exposure(stops, effects),
             (Action::LookAt(n), []) => return self.look_at(usize::from(n), effects),
+            (Action::LookIntensityIn, []) => {
+                return self.nudge_intensity(LOOK_INTENSITY_STEP, effects)
+            }
+            (Action::LookIntensityOut, []) => {
+                return self.nudge_intensity(-LOOK_INTENSITY_STEP, effects)
+            }
+            (Action::LookIntensity, [value]) => return self.set_look_intensity(value, effects),
             (Action::ZoomFit, []) => self.set_zoom(None)?,
             (Action::Zoom100, []) => self.set_zoom(Some(100))?,
             (Action::ZoomIn, []) => self.zoom_by(ZoomStep::In)?,
@@ -3939,8 +4064,10 @@ impl Controller {
     ) -> Result<(Outcome, Vec<Effect>), Error> {
         let panel = self.layout().export_panel();
         let held = usize::from(self.settings.quality.saturating_sub(1));
-        if let Some(value) = self.slider {
-            let Some(slider) = panel.slider else {
+        if let Some((dial, value)) = self.slider {
+            // A develop slider's drag is dropped here, as `tool_pointer`
+            // drops the quality's.
+            let Some(slider) = panel.slider.filter(|_| dial == Dial::Quality) else {
                 self.slider = None;
                 return Ok((self.finish(Outcome::Changed), Vec::new()));
             };
@@ -3950,7 +4077,7 @@ impl Controller {
                     if at == value {
                         Ok((Outcome::Ignored, Vec::new()))
                     } else {
-                        self.slider = Some(at);
+                        self.slider = Some((Dial::Quality, at));
                         Ok((self.finish(Outcome::Changed), Vec::new()))
                     }
                 }
@@ -3994,7 +4121,7 @@ impl Controller {
         }
         if let Some(slider) = panel.slider.filter(|slider| slider.hit(x, y)) {
             let at = slider.value_at(x, QUALITY_STEPS);
-            self.slider = Some(at);
+            self.slider = Some((Dial::Quality, at));
             let outcome = if held == at {
                 Outcome::Ignored
             } else {
@@ -4100,10 +4227,11 @@ impl Controller {
     }
 
     /// The pointer over the tool and look bands, `None` when it is over
-    /// neither and no slider drag is on. A press on the slider starts a
-    /// drag at the value under the pointer, a move takes it along, and the
-    /// release commits the exposure through the `Edit` the `exposure`
-    /// action makes, unless it is the value in force. A press on an
+    /// neither and no slider drag is on. A press on a slider starts a drag
+    /// at the value under the pointer, a move takes it along, and the
+    /// release commits the exposure or the look intensity through the
+    /// `Edit` the `exposure` or `look-intensity` action makes, unless it is
+    /// the value in force; the intensity's only with a look. A press on an
     /// enabled button asks what the button says; on the look band's, the
     /// look it names.
     fn tool_pointer(
@@ -4117,18 +4245,26 @@ impl Controller {
         }
         let layout = self.layout();
         let tools = layout.tools();
-        if let Some(value) = self.slider {
-            let Some(slider) = tools.slider else {
+        let intensity = layout.look_slider(&self.looks);
+        if let Some((dial, value)) = self.slider {
+            // A drag of another view's slider is dropped, never committed
+            // into this one's key.
+            let (slider, steps) = match dial {
+                Dial::Intensity => (intensity, INTENSITY_STEPS),
+                Dial::Exposure => (tools.slider, EXPOSURE_STEPS),
+                Dial::Quality => (None, EXPOSURE_STEPS),
+            };
+            let Some(slider) = slider else {
                 self.slider = None;
                 return Some(Ok((self.finish(Outcome::Changed), Vec::new())));
             };
-            let at = slider.value_at(x, EXPOSURE_STEPS);
+            let at = slider.value_at(x, steps);
             return Some(match phase {
                 PointerPhase::Press | PointerPhase::Move => {
                     if at == value {
                         Ok((Outcome::Ignored, Vec::new()))
                     } else {
-                        self.slider = Some(at);
+                        self.slider = Some((dial, at));
                         Ok((self.finish(Outcome::Changed), Vec::new()))
                     }
                 }
@@ -4138,7 +4274,7 @@ impl Controller {
                         .develop_photo()
                         .ok()
                         .flatten()
-                        .map(|index| exposure_value(self.current_exposure(index)));
+                        .map(|index| self.dial_value(dial, index));
                     if held == Some(at) {
                         // Back where the knob was: a frame change only if the
                         // drag had moved it.
@@ -4157,7 +4293,14 @@ impl Controller {
                         if held != Some(value) {
                             self.bump();
                         }
-                        self.set_exposure(&library::exposure_text(exposure_at(at)), Vec::new())
+                        match dial {
+                            Dial::Intensity => self.set_look_intensity(
+                                &library::look_intensity_text(intensity_at(at)),
+                                Vec::new(),
+                            ),
+                            Dial::Exposure | Dial::Quality => self
+                                .set_exposure(&library::exposure_text(exposure_at(at)), Vec::new()),
+                        }
                     }
                 }
             });
@@ -4171,12 +4314,12 @@ impl Controller {
         }
         if let Some(slider) = tools.slider.filter(|slider| slider.hit(x, y)) {
             let at = slider.value_at(x, EXPOSURE_STEPS);
-            self.slider = Some(at);
+            self.slider = Some((Dial::Exposure, at));
             let held = self
                 .develop_photo()
                 .ok()
                 .flatten()
-                .map(|index| exposure_value(self.current_exposure(index)));
+                .map(|index| self.dial_value(Dial::Exposure, index));
             let outcome = if held == Some(at) {
                 Outcome::Ignored
             } else {
@@ -4185,6 +4328,26 @@ impl Controller {
             return Some(Ok((self.finish(outcome), Vec::new())));
         }
         let ignored = Some(Ok((Outcome::Ignored, Vec::new())));
+        // The intensity slider moves only with a look to take a share of;
+        // without one it is painted flat and a press on it is inert.
+        if let Some(slider) = intensity.filter(|slider| slider.hit(x, y)) {
+            let Some(index) = self
+                .develop_photo()
+                .ok()
+                .flatten()
+                .filter(|&index| self.current_look(index).is_some())
+            else {
+                return ignored;
+            };
+            let at = slider.value_at(x, INTENSITY_STEPS);
+            self.slider = Some((Dial::Intensity, at));
+            let outcome = if self.dial_value(Dial::Intensity, index) == at {
+                Outcome::Ignored
+            } else {
+                Outcome::Changed
+            };
+            return Some(Ok((self.finish(outcome), Vec::new())));
+        }
         let Some(index) = self.develop_photo().ok().flatten() else {
             return ignored;
         };
@@ -4236,6 +4399,23 @@ impl Controller {
             .and_then(|photo| photo.sidecar.as_ref())
             .and_then(Sidecar::exposure)
             .unwrap_or(0)
+    }
+
+    /// The cursor photo's look intensity in hundredths, the whole look
+    /// without one.
+    fn current_intensity(&self, index: usize) -> i32 {
+        self.photos
+            .get(index)
+            .and_then(|photo| photo.sidecar.as_ref())
+            .map_or(library::MAX_LOOK_INTENSITY, Sidecar::look_intensity)
+    }
+
+    /// A develop slider's value for photo `index` as its sidecar holds it.
+    fn dial_value(&self, dial: Dial, index: usize) -> usize {
+        match dial {
+            Dial::Intensity => intensity_step(self.current_intensity(index)),
+            Dial::Exposure | Dial::Quality => exposure_value(self.current_exposure(index)),
+        }
     }
 
     /// Whether each tool button is enabled, `TOOL_BUTTONS` in order: Crop
@@ -4394,11 +4574,32 @@ impl Controller {
     /// The exposure slider's value as painted: the drag's while one is
     /// on, else the cursor photo's exposure.
     pub fn slider_value(&self) -> usize {
-        self.slider.unwrap_or_else(|| {
-            self.cursor.map_or(exposure_value(0), |index| {
-                exposure_value(self.current_exposure(index))
-            })
-        })
+        match self.slider {
+            Some((Dial::Exposure, value)) => value,
+            _ => self.cursor.map_or(exposure_value(0), |index| {
+                self.dial_value(Dial::Exposure, index)
+            }),
+        }
+    }
+
+    /// The look intensity slider's value as painted: the drag's while one
+    /// is on, else the step nearest the cursor photo's intensity.
+    pub fn intensity_value(&self) -> usize {
+        match self.slider {
+            Some((Dial::Intensity, value)) => value,
+            _ => self.cursor.map_or(INTENSITY_STEPS, |index| {
+                self.dial_value(Dial::Intensity, index)
+            }),
+        }
+    }
+
+    /// Whether the look intensity slider moves: in develop with a look on
+    /// the cursor's photo.
+    pub fn intensity_enabled(&self) -> bool {
+        self.mode == Mode::Develop
+            && self
+                .cursor
+                .is_some_and(|index| self.current_look(index).is_some())
     }
 
     /// Asks for the cursor photo's crop cleared, the whole frame again:
@@ -4466,6 +4667,50 @@ impl Controller {
             },
             effects,
         )
+    }
+
+    /// Sets the cursor photo's look intensity to `value`, `D.DD` within
+    /// `0.00..=1.00`, else `BadArgument`; `Ignored` without a look, which
+    /// it would take no share of.
+    fn set_look_intensity(
+        &mut self,
+        value: &str,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        let hundredths = library::look_intensity(value).map_err(|_| Error::BadArgument)?;
+        if self.current_look(index).is_none() {
+            return Ok((Outcome::Ignored, effects));
+        }
+        let value = library::look_intensity_text(hundredths);
+        self.develop_effect(
+            index,
+            |index, name| Effect::Edit {
+                index,
+                name,
+                key: Key::LookIntensity,
+                value: Some(value),
+            },
+            effects,
+        )
+    }
+
+    /// Nudges the cursor photo's look intensity by `delta` hundredths, as
+    /// `nudge` does; `Ignored` without a look.
+    fn nudge_intensity(
+        &mut self,
+        delta: i32,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        if self.current_look(index).is_none() {
+            return Ok((Outcome::Ignored, effects));
+        }
+        self.nudge(Key::LookIntensity, delta, effects)
     }
 
     /// Asks for the cursor photo's auto exposure and contrast, measured and
@@ -5077,8 +5322,8 @@ impl Controller {
         Ok((Outcome::Changed, effects))
     }
 
-    /// Adjusts the cursor photo's exposure or contrast by `delta`
-    /// hundredths, applied to the file's value at the adapter, not the
+    /// Adjusts the cursor photo's exposure, contrast or look intensity by
+    /// `delta` hundredths, applied to the file's value at the adapter, not the
     /// model's copy, so a value changed meanwhile is added to, and a delta
     /// that clamps to no change settles as `Ignored`.
     fn nudge(
@@ -5687,7 +5932,8 @@ impl Scene<'_> {
     /// while it is on, the zoom in force) and each enabled as
     /// `tool_states` says, the exposure slider at the
     /// value in force or under the drag, then the look buttons with the
-    /// current look selected (`None` without one). While the hints are
+    /// current look selected (`None` without one) and the look intensity
+    /// slider, flat without a look. While the hints are
     /// shown each button carries its action's chord, the look buttons
     /// `look-1` through `look-9`'s for the first nine looks.
     fn bands(&self, layout: &Layout, index: usize, damage: Rect, sink: &mut dyn FnMut(Draw)) {
@@ -5730,6 +5976,15 @@ impl Scene<'_> {
                     .and_then(|action| model.hint(action));
                 button.emit_hinted(label, hint, selected, true, damage, sink);
             }
+        }
+        if let Some(slider) = layout.look_slider(&model.looks) {
+            slider.emit(
+                model.intensity_value(),
+                INTENSITY_STEPS,
+                model.intensity_enabled(),
+                damage,
+                sink,
+            );
         }
     }
 
@@ -5860,8 +6115,14 @@ impl Scene<'_> {
             sink,
         );
         if facts {
+            // The intensity only where it and a look are set, after the
+            // look it is a share of.
+            let intensity = match (photo.value(Key::Look), photo.value(Key::LookIntensity)) {
+                ("-", _) | (_, "-") => String::new(),
+                (_, value) => format!(" at {value}"),
+            };
             let facts = format!(
-                "{} | exposure {} | contrast {} | crop {} | look {} | sidecar {}",
+                "{} | exposure {} | contrast {} | crop {} | look {}{intensity} | sidecar {}",
                 photo.flag().map_or("unflagged", Flag::word),
                 photo.value(Key::Exposure),
                 photo.value(Key::Contrast),
