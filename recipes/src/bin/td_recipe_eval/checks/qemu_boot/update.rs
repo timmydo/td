@@ -586,7 +586,7 @@ impl Guest {
                         && menu_row_matches(
                             pixels,
                             HOSTNAME_ROW + 72,
-                            "F: RESTART  P: POWER OFF  Z: SLEEP",
+                            "R: REBOOT  P: POWER OFF  Z: SLEEP",
                         )?
                         && menu_row_matches(pixels, HOSTNAME_ROW + 108, "ESC TO RETURN")?)
                 },
@@ -2471,7 +2471,7 @@ mod tests {
     fn menu_notice_rows_match_the_chrome_font_with_its_punctuation() {
         for text in [
             "SYSTEM INSTALLED - RESTART TO BOOT IT",
-            "F: RESTART  P: POWER OFF",
+            "R: REBOOT  P: POWER OFF",
             "PRESS CTRL+ALT+ESC TO UNLOCK",
             ROLLED_BACK_NOTICE,
             &hostname_row(HOSTNAME_EMPTY, 1),
@@ -2597,7 +2597,7 @@ mod tests {
     fn the_ending_key_is_a_letter_no_screen_selects_with() {
         assert_eq!(OTHER_KEY.len(), 1);
         assert!(OTHER_KEY.bytes().all(|byte| byte.is_ascii_lowercase()));
-        for selection in ["i", "b", "h", "s", "f", "p", "l"] {
+        for selection in ["i", "b", "h", "s", "r", "p", "l"] {
             assert_ne!(OTHER_KEY, selection);
         }
         assert!(APPROVAL_WAIT >= Duration::from_millis(600));

@@ -10192,7 +10192,7 @@ the compositor queries admitted read-only store state. An uncertain reply
 never triggers automatic replay. A published token store remains locked
 and requires a fresh unlock operation, including after successful enrollment.
 
-U selects the primary token; R selects the enrolled recovery token. Release
+U selects the primary token; T selects the enrolled recovery token. Release
 verifies a fresh assertion bound to the immutable displayed operation before
 TPM unseal and volatile publication. Escape cancels before the private
 execution decision; after that decision, completion can race cancellation.

@@ -528,7 +528,7 @@ fn qemu_installed_system_secret_lifecycle() {
         no_release();
         close(&mut keyboard);
     }
-    select(&mut keyboard, if recover { 0x15 } else { 0x18 }); // R or U.
+    select(&mut keyboard, if recover { 0x17 } else { 0x18 }); // T or U.
     released(if written {
         REPLACEMENT
     } else if recover {

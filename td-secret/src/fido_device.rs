@@ -2160,7 +2160,7 @@ pub(crate) mod vm_tests {
             mail.retrieve("main", "unavailable");
             news.retrieve("main", "unavailable");
             assert_eq!(requests.load(Ordering::SeqCst), 0);
-            keyboard.select(if recovery { 0x15 } else { 0x18 }); // R or U.
+            keyboard.select(if recovery { 0x17 } else { 0x18 }); // T or U.
             wait("cold desktop unlock", || {
                 Path::new("/run/td-secret/1000/key").exists()
             });

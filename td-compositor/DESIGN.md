@@ -5953,8 +5953,8 @@ client directory. A bare readiness filename without a directory is refused.
 
 ## Physical secure attention
 
-The menu also offers `F: RESTART`, `P: POWER OFF` and `Z: SLEEP`. Restart
-and power off open named confirmations with an unsaved-work notice; only
+The menu uses `T` for recovery-token unlock and offers `R: REBOOT`,
+`P: POWER OFF` and `Z: SLEEP`. Restart and power off open named confirmations with an unsaved-work notice; only
 fresh Enter timestamped after
 that prompt reached the display selects the lifetime's operation. A per-prompt
 completion receipt retains that cutoff across later paints, so buffered
@@ -6051,7 +6051,7 @@ capture or synthetic-input portal is implemented by this increment. The
 lock surface ("The lock surface" below) is a private screen in each of
 these respects.
 
-A fresh physical U selects primary unlock, R recovery unlock, E enrollment
+A fresh physical U selects primary unlock, T recovery unlock, E enrollment
 with a second recovery token, X explicit unrecoverability, and W the ready
 credential write queued through `td-secret set`; I selects a queued system
 installation, K opens the key-management screen ("Login-key

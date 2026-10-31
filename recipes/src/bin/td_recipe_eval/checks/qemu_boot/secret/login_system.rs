@@ -18,7 +18,7 @@ const UNREADABLE: &[&str] = &["LOGIN KEY STATE UNAVAILABLE:", "STATE COULD NOT B
 /// No hostname change waits on this guest.
 const MENU: &[&str] = &[
     "TD SECURE ATTENTION",
-    "U: UNLOCK  R: RECOVERY TOKEN",
+    "U: UNLOCK  T: RECOVERY TOKEN",
     "E: ENROLL TWO TOKENS (HAVE BOTH READY)",
     "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
     "W: REVIEW PENDING CREDENTIAL WRITE",
@@ -28,7 +28,7 @@ const MENU: &[&str] = &[
     "B: ROLL BACK TO THE PREVIOUS SYSTEM",
     "H: NO SETTINGS WAITING",
     "S: DISK ENCRYPTION",
-    "F: RESTART  P: POWER OFF  Z: SLEEP",
+    "R: REBOOT  P: POWER OFF  Z: SLEEP",
     "ESC TO RETURN",
 ];
 /// Every phase boots within this, its locked phase's steps included.

@@ -665,7 +665,7 @@ fn hostname_row(intake: HostnameIntake) -> String {
 /// boot oracles' rows do not move.
 fn notice_rows(notice: Notice) -> Vec<String> {
     let first = match notice {
-        Notice::Menu(_) => "U: UNLOCK  R: RECOVERY TOKEN",
+        Notice::Menu(_) => "U: UNLOCK  T: RECOVERY TOKEN",
         Notice::Pending => "PREPARING REQUEST",
         Notice::PowerConfirm(crate::authority::consent::Power::Restart) => "RESTART THE COMPUTER?",
         Notice::PowerConfirm(crate::authority::consent::Power::Off) => "POWER OFF THE COMPUTER?",
@@ -801,7 +801,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
     if let Notice::Menu(intake) = notice {
         rows.push(hostname_row(intake));
         rows.push("S: DISK ENCRYPTION".into());
-        rows.push("F: RESTART  P: POWER OFF  Z: SLEEP".into());
+        rows.push("R: REBOOT  P: POWER OFF  Z: SLEEP".into());
     }
     rows
 }
@@ -1125,7 +1125,7 @@ mod tests {
     fn the_menu_keeps_its_large_output_rows_and_fits_power_choices() {
         const MENU: &[&str] = &[
             "TD SECURE ATTENTION",
-            "U: UNLOCK  R: RECOVERY TOKEN",
+            "U: UNLOCK  T: RECOVERY TOKEN",
             "E: ENROLL TWO TOKENS (HAVE BOTH READY)",
             "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL",
             "W: REVIEW PENDING CREDENTIAL WRITE",
@@ -1135,7 +1135,7 @@ mod tests {
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
             "H: NO SETTINGS WAITING",
             "S: DISK ENCRYPTION",
-            "F: RESTART  P: POWER OFF  Z: SLEEP",
+            "R: REBOOT  P: POWER OFF  Z: SLEEP",
             "ESC TO RETURN",
         ];
         for (width, height, top, scale, pitch) in [
@@ -1637,8 +1637,8 @@ mod tests {
             ["NO READY CREDENTIAL WRITE - RUN TD-SECRET SET", "FIRST"]
         );
         assert_eq!(
-            wrap("U: UNLOCK  R: RECOVERY TOKEN", 12),
-            ["U: UNLOCK", "R: RECOVERY", "TOKEN"]
+            wrap("U: UNLOCK  T: RECOVERY TOKEN", 12),
+            ["U: UNLOCK", "T: RECOVERY", "TOKEN"]
         );
         assert_eq!(wrap("ABCDEFGH", 3), ["ABC", "DEF", "GH"]);
         assert_eq!(wrap("", 3), [""]);

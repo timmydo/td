@@ -1247,7 +1247,7 @@ no application capture or consent shortcut is added.
 The recovery boot connects only the enrolled second device, requires the
 same encrypted bundle, mail configuration, durable identity ledger and
 machine identity after stock firstboot, and proves a different kernel boot
-ID. R performs exactly one fresh recovery assertion before mail retrieval.
+ID. T performs exactly one fresh recovery assertion before mail retrieval.
 Both boots require exact CTAP sequences and nonzero, globally fresh
 challenges; each cold boot starts with no release. The runner requires one
 successful ignored test, the exact supervised result line, the selected

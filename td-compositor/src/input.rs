@@ -944,8 +944,8 @@ impl KeyBindings {
                 decision.notice = Some(Notice::SleepConfirm);
                 None
             }
-            KEY_F | KEY_P => {
-                let choice = if code == KEY_F {
+            KEY_R | KEY_P => {
+                let choice = if code == KEY_R {
                     crate::authority::consent::Power::Restart
                 } else {
                     crate::authority::consent::Power::Off
@@ -957,7 +957,7 @@ impl KeyBindings {
             KEY_W => Some(Selection::Write),
             KEY_I => Some(Selection::Install),
             KEY_U => Some(Selection::Unlock(Role::Primary)),
-            KEY_R => Some(Selection::Unlock(Role::Recovery)),
+            KEY_T => Some(Selection::Unlock(Role::Recovery)),
             KEY_E => Some(Selection::Enroll(Recovery::SecondToken)),
             KEY_X => Some(Selection::Enroll(Recovery::Unrecoverable)),
             KEY_K => {
@@ -9473,8 +9473,8 @@ mod tests {
         assert!(bindings.attention != AttentionState::Closed);
         let decision = bindings.feed(key(KEY_U, KEY_RELEASE));
         deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
-        assert!(bindings.feed(key(KEY_R, KEY_PRESS)).secret.is_none());
-        bindings.feed(key(KEY_R, KEY_RELEASE));
+        assert!(bindings.feed(key(KEY_T, KEY_PRESS)).secret.is_none());
+        bindings.feed(key(KEY_T, KEY_RELEASE));
         for event in [key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE)] {
             let decision = bindings.feed(event);
             deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
@@ -9606,7 +9606,7 @@ mod tests {
         use crate::secret_client::Selection;
         for (code, selected) in [
             (KEY_U, Selection::Unlock(Role::Primary)),
-            (KEY_R, Selection::Unlock(Role::Recovery)),
+            (KEY_T, Selection::Unlock(Role::Recovery)),
             (KEY_E, Selection::Enroll(Recovery::SecondToken)),
             (KEY_X, Selection::Enroll(Recovery::Unrecoverable)),
             (KEY_W, Selection::Write),
@@ -9725,7 +9725,7 @@ mod tests {
         }
         let typed = target.lock().unwrap().keys.len();
         // A touch types modhex and Enter: nothing is selected or confirmed.
-        for code in [KEY_U, KEY_R, KEY_E, KEY_X, KEY_W, KEY_I, KEY_ENTER] {
+        for code in [KEY_U, KEY_T, KEY_E, KEY_X, KEY_W, KEY_I, KEY_ENTER] {
             for value in [KEY_PRESS, KEY_RELEASE] {
                 apply_device_event(&target, key(code, value), KEY, &bindings, &mut token).unwrap();
             }
@@ -9882,9 +9882,9 @@ mod tests {
             deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
         }
         for event in [
-            key(KEY_R, KEY_PRESS),
-            key(KEY_R, KEY_REPEAT),
-            key(KEY_R, KEY_RELEASE),
+            key(KEY_T, KEY_PRESS),
+            key(KEY_T, KEY_REPEAT),
+            key(KEY_T, KEY_RELEASE),
             key(KEY_U, KEY_PRESS),
             key(KEY_U, KEY_RELEASE),
         ] {
@@ -9900,7 +9900,7 @@ mod tests {
         assert!(target
             .keys
             .iter()
-            .all(|key| key.key != u32::from(KEY_U) && key.key != u32::from(KEY_R)));
+            .all(|key| key.key != u32::from(KEY_U) && key.key != u32::from(KEY_T)));
         for event in [key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE)] {
             let decision = bindings.feed(event);
             deliver_key_decision(&mut target, &mut bindings, decision).unwrap();
@@ -10981,7 +10981,7 @@ mod tests {
         use crate::attention::Notice;
         use crate::authority::consent::Power;
         use crate::secret_client::Selection;
-        for (code, choice) in [(KEY_F, Power::Restart), (KEY_P, Power::Off)] {
+        for (code, choice) in [(KEY_R, Power::Restart), (KEY_P, Power::Off)] {
             let target = Mutex::new(RecordingTarget::default());
             let bindings = attention_bindings(None);
             read_reports(&target, &bindings, 0, &chord_reports(10));
