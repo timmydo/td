@@ -69,6 +69,7 @@ enum SetupStep {
 /// mail and to set the account up.
 #[derive(Clone, Default)]
 pub struct AccountSetup {
+    pub notebook: bool,
     /// The server is a reserved example name: td-firstboot's placeholder.
     pub placeholder: bool,
     /// The portal's name for the account's credential, when it comes
@@ -133,6 +134,10 @@ fn placeholder_text(account: &str, setup: &AccountSetup) -> String {
          then type the account's address and press Enter. td-mail writes both \
          into its configuration and connects.\n\n",
     );
+    if setup.notebook {
+        text.push_str("Open td-pass with Ctrl+Alt+Esc then N, unlock it, select a saved entry with a password/token, and choose Mail to approve this account. Then retry here.");
+        return text;
+    }
     match &setup.portal {
         Some(name) => text.push_str(&format!(
             "The password is not typed here. td-mail asks td's credential store for \
@@ -288,7 +293,9 @@ impl MailboxListView {
             return Some(Screen::Placeholder);
         }
         let error = self.error.as_deref()?;
-        if self.setup.portal.is_some() && error.contains(crate::PORTAL_FAILURE) {
+        if (self.setup.notebook || self.setup.portal.is_some())
+            && error.contains(crate::PORTAL_FAILURE)
+        {
             return Some(Screen::Credential);
         }
         self.setup.online.then_some(Screen::Unreachable)
@@ -322,6 +329,7 @@ impl MailboxListView {
         let error = self.error.as_deref().unwrap_or_default();
         match self.screen()? {
             Screen::Placeholder => Some(placeholder_text(&self.current_account, &self.setup)),
+            Screen::Credential if self.setup.notebook => Some(format!("Open td-pass with Ctrl+Alt+Esc then N and unlock it. Select a saved entry with the account’s password/token, choose Mail, and approve this exact account, server URL, and username. Then {AGAIN} here.\n\nWhat td-mail was told: {error}")),
             Screen::Credential => {
                 let name = self.setup.portal.as_deref()?;
                 Some(credential_text(name, error))
@@ -1292,6 +1300,7 @@ mod tests {
     fn setup(placeholder: bool) -> AccountSetup {
         AccountSetup {
             placeholder,
+            notebook: false,
             portal: Some("personal".to_string()),
             server: if placeholder {
                 "https://mail.example.com/.well-known/jmap".to_string()
@@ -1506,6 +1515,7 @@ mod tests {
         // Not on the portal, the bare error stands.
         let (view, _cmd_rx) = make_view();
         let mut view = view.with_setup(AccountSetup {
+            notebook: false,
             portal: None,
             online: false,
             ..setup(false)

@@ -3,7 +3,9 @@
 use crate::consent::{Notebook, Operation, Request};
 use crate::login::Pin;
 use crate::notebook_token::Token;
-use crate::notebook_wire::{Bytes, PendingWire, Reader};
+use crate::notebook_wire::{
+    put_binding, read_binding, Bytes, MailBinding, PendingWire, Reader, MAIL_PENDING,
+};
 use crate::unlock::Event;
 use std::fs::File;
 use std::io::Read;
@@ -42,6 +44,7 @@ impl Drop for Process {
 enum Waiting {
     Gui,
     Heartbeat,
+    Mail(u64),
 }
 
 pub(crate) struct Bridge {
@@ -52,6 +55,11 @@ pub(crate) struct Bridge {
     waiting: Option<Waiting>,
     heartbeat: Instant,
     was_unlocked: bool,
+    mail_revoked: bool,
+    requests: Vec<MailBinding>,
+    mail_reply: Option<(u64, Bytes)>,
+    binding_update: Option<MailBinding>,
+    dismissed: Option<MailBinding>,
 }
 
 fn action(bytes: &[u8]) -> Option<u8> {
@@ -106,7 +114,59 @@ impl Bridge {
             waiting: None,
             heartbeat: Instant::now(),
             was_unlocked: false,
+            mail_revoked: false,
+            requests: Vec::new(),
+            mail_reply: None,
+            binding_update: None,
+            dismissed: None,
         })
+    }
+
+    pub fn requests(&mut self, requests: &[MailBinding]) {
+        if self.requests != requests {
+            self.requests = requests.iter().take(MAIL_PENDING).cloned().collect();
+        }
+    }
+    pub fn take_mail_revoked(&mut self) -> bool {
+        std::mem::take(&mut self.mail_revoked)
+    }
+    pub fn take_mail_reply(&mut self) -> Option<(u64, Bytes)> {
+        self.mail_reply.take()
+    }
+    pub fn take_dismissed(&mut self) -> Option<MailBinding> {
+        self.dismissed.take()
+    }
+    pub fn mail(&mut self, id: u64, binding: &MailBinding) -> Result<bool, String> {
+        if !self.was_unlocked
+            || self.waiting.is_some()
+            || self.pending.is_some()
+            || self.mail_reply.is_some()
+        {
+            return Ok(false);
+        }
+        let mut request = Bytes(vec![12]);
+        put_binding(&mut request, binding)?;
+        self.service.wire.queue(request)?;
+        self.waiting = Some(Waiting::Mail(id));
+        Ok(true)
+    }
+    fn send_gui(&mut self, request: Bytes) -> Result<(), String> {
+        self.binding_update = None;
+        if request.0.first() == Some(&14) {
+            let mut input = Reader::new(&request.0);
+            input.byte()?;
+            let _: [u8; 16] = input.array()?;
+            input.number()?;
+            let allow = input.boolean()?;
+            let binding = read_binding(&mut input)?;
+            input.finish()?;
+            if allow {
+                self.binding_update = Some(binding);
+            }
+        }
+        self.service.wire.queue(request)?;
+        self.waiting = Some(Waiting::Gui);
+        Ok(())
     }
 
     pub fn pending(&self) -> bool {
@@ -130,9 +190,25 @@ impl Bridge {
                     }
                 }
                 Waiting::Heartbeat => return Err("invalid notebook heartbeat".into()),
+                Waiting::Mail(id) => {
+                    let mut input = Reader::new(&reply.0);
+                    if !matches!(input.byte()?, 0 | 1) {
+                        return Err("invalid notebook mail result".into());
+                    }
+                    input.field(4096)?;
+                    input.finish()?;
+                    if self.was_unlocked {
+                        self.mail_reply = Some((id, reply));
+                    }
+                }
                 Waiting::Gui => {
                     if !matches!(reply.0.first(), Some(0 | 1)) {
                         return Err("unexpected notebook service result".into());
+                    }
+                    if reply.0.first() == Some(&0) {
+                        self.dismissed = self.binding_update.take();
+                    } else {
+                        self.binding_update = None;
                     }
                     self.gui.wire.queue(reply)?;
                 }
@@ -144,22 +220,34 @@ impl Bridge {
                 return Err("concurrent notebook window requests".into());
             }
             let tag = request.0.first().copied().ok_or("empty notebook request")?;
-            if tag == 11 {
-                self.was_unlocked = false;
-            }
-            if !matches!(tag, 1..=11 | 13 | 14) {
-                return Err("notebook window requested another capability".into());
-            }
-            if action(&request.0).is_some() {
-                self.pending = Some(request);
-                self.gui.wire.queue(Bytes(vec![0x7e]))?;
+            if tag == 15 {
+                if request.0 != [15] {
+                    return Err("invalid notebook request list".into());
+                }
+                let mut reply = Bytes(vec![0, self.requests.len() as u8]);
+                for binding in &self.requests {
+                    put_binding(&mut reply, binding)?;
+                }
+                self.gui.wire.queue(reply)?;
             } else {
-                // An outstanding heartbeat must finish before the next request.
-                if self.waiting.is_some() {
+                if tag == 11 {
+                    self.was_unlocked = false;
+                    self.mail_reply = None;
+                    self.mail_revoked = true;
+                }
+                if !matches!(tag, 1..=11 | 13 | 14) {
+                    return Err("notebook window requested another capability".into());
+                }
+                if action(&request.0).is_some() {
                     self.pending = Some(request);
+                    self.gui.wire.queue(Bytes(vec![0x7e]))?;
                 } else {
-                    self.service.wire.queue(request)?;
-                    self.waiting = Some(Waiting::Gui);
+                    // An outstanding heartbeat must finish before the next request.
+                    if self.waiting.is_some() {
+                        self.pending = Some(request);
+                    } else {
+                        self.send_gui(request)?;
+                    }
                 }
             }
         }
@@ -170,8 +258,7 @@ impl Bridge {
                 .is_some_and(|p| action(&p.0).is_none())
             {
                 let pending = self.pending.take().ok_or("missing notebook request")?;
-                self.service.wire.queue(pending)?;
-                self.waiting = Some(Waiting::Gui);
+                self.send_gui(pending)?;
             } else if self.heartbeat.elapsed() >= Duration::from_secs(10) {
                 self.service.wire.queue(Bytes(vec![13]))?;
                 self.waiting = Some(Waiting::Heartbeat);
@@ -378,8 +465,108 @@ pub(crate) mod tests {
                 waiting: None,
                 heartbeat: Instant::now(),
                 was_unlocked: true,
+                mail_revoked: false,
+                requests: Vec::new(),
+                mail_reply: None,
+                binding_update: None,
+                dismissed: None,
             },
             pids,
         )
+    }
+    #[test]
+    fn mail_replies_return_only_to_the_admitted_request_and_gui_cannot_read_them() {
+        use crate::notebook_wire::{field, Wire};
+        let (mut bridge, _) = bridge();
+        let (root, peer) = UnixStream::pair().unwrap();
+        let _service_hold =
+            std::mem::replace(&mut bridge.service.wire, PendingWire::new(root).unwrap());
+        let mut service = Wire::new(peer).unwrap();
+        let (root, peer) = UnixStream::pair().unwrap();
+        let _gui_hold = std::mem::replace(&mut bridge.gui.wire, PendingWire::new(root).unwrap());
+        let mut gui = PendingWire::new(peer).unwrap();
+        let binding = MailBinding::new(
+            "work".into(),
+            "https://mail.invalid/jmap".into(),
+            "me".into(),
+        )
+        .unwrap();
+        assert!(bridge.mail(42, &binding).unwrap());
+        assert!(!bridge.mail(43, &binding).unwrap());
+        bridge.poll().unwrap();
+        let request = service.receive(Duration::from_secs(1)).unwrap();
+        let mut input = Reader::new(&request.0);
+        assert_eq!(input.byte().unwrap(), 12);
+        assert_eq!(read_binding(&mut input).unwrap(), binding);
+        input.finish().unwrap();
+        let mut reply = Bytes(vec![0]);
+        field(&mut reply, b"secret-token").unwrap();
+        service.send(&reply.0).unwrap();
+        bridge.poll().unwrap();
+        let (id, response) = bridge.take_mail_reply().unwrap();
+        assert_eq!(id, 42);
+        assert_eq!(response.0, reply.0);
+        assert!(gui.poll().unwrap().is_none());
+        gui.queue(Bytes(vec![12])).unwrap();
+        gui.poll().unwrap();
+        assert!(bridge.poll().is_err());
+    }
+
+    #[test]
+    fn locked_bridge_refuses_mail_without_queuing_a_service_request() {
+        let (mut bridge, _) = bridge();
+        bridge.was_unlocked = false;
+        let binding = MailBinding::new(
+            "work".into(),
+            "https://mail.invalid/jmap".into(),
+            "me".into(),
+        )
+        .unwrap();
+        assert!(!bridge.mail(1, &binding).unwrap());
+        assert!(bridge.waiting.is_none());
+        assert!(!bridge.service.wire.sending());
+    }
+    #[test]
+    fn gui_lock_discards_an_inflight_mail_reply() {
+        use crate::notebook_wire::{field, Wire};
+        let (mut bridge, _) = bridge();
+        let (root, peer) = UnixStream::pair().unwrap();
+        let _service_hold =
+            std::mem::replace(&mut bridge.service.wire, PendingWire::new(root).unwrap());
+        let mut service = Wire::new(peer).unwrap();
+        let (root, peer) = UnixStream::pair().unwrap();
+        let _gui_hold = std::mem::replace(&mut bridge.gui.wire, PendingWire::new(root).unwrap());
+        let mut gui = Wire::new(peer).unwrap();
+        let binding = MailBinding::new(
+            "work".into(),
+            "https://mail.invalid/jmap".into(),
+            "me".into(),
+        )
+        .unwrap();
+        assert!(bridge.mail(42, &binding).unwrap());
+        bridge.poll().unwrap();
+        service.receive(Duration::from_secs(1)).unwrap();
+        gui.send(&[11]).unwrap();
+        bridge.poll().unwrap();
+        assert!(!bridge.was_unlocked);
+        let mut reply = Bytes(vec![0]);
+        field(&mut reply, b"secret-token").unwrap();
+        service.send(&reply.0).unwrap();
+        bridge.poll().unwrap();
+        assert!(bridge.take_mail_reply().is_none());
+        bridge.poll().unwrap();
+        assert_eq!(service.receive(Duration::from_secs(1)).unwrap().0, [11]);
+    }
+    #[test]
+    fn request_list_poll_still_schedules_due_vault_heartbeat() {
+        use crate::notebook_wire::Wire;
+        let (mut bridge, _) = bridge();
+        let (root, peer) = UnixStream::pair().unwrap();
+        let _gui_hold = std::mem::replace(&mut bridge.gui.wire, PendingWire::new(root).unwrap());
+        let mut gui = Wire::new(peer).unwrap();
+        bridge.heartbeat = Instant::now() - Duration::from_secs(11);
+        gui.send(&[15]).unwrap();
+        bridge.poll().unwrap();
+        assert!(matches!(bridge.waiting, Some(Waiting::Heartbeat)));
     }
 }

@@ -1,6 +1,7 @@
 //! td.Secret1 returns credential bytes, not the upstream Secret master key.
 
 use super::*;
+use crate::notebook_wire::{self, put_binding, Bytes, MailBinding, Reader, Wire};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -19,6 +20,7 @@ const DENIED: &str = "org.freedesktop.portal.Error.NotAllowed";
 pub(super) struct Pending {
     pub owner: String,
     name: String,
+    binding: Option<MailBinding>,
     serial: u32,
     endian: Endian,
     deadline: Instant,
@@ -28,7 +30,7 @@ pub(super) fn is_call(call: &Message<'_>) -> bool {
     call.kind == MessageType::MethodCall
         && call.fields.path == Some(PORTAL_PATH)
         && call.fields.interface == Some(SECRET_INTERFACE)
-        && call.fields.member == Some("Retrieve")
+        && matches!(call.fields.member, Some("Retrieve" | "RetrieveMail"))
 }
 
 fn error(connection: &mut Connection, pending: &Pending, name: &str, text: &str) -> io::Result<()> {
@@ -55,15 +57,30 @@ pub(super) fn begin(
         .fields
         .sender
         .ok_or_else(|| io::Error::other("Retrieve has no broker sender"))?;
-    let name = match call.args() {
-        [Value::Str(name)] if exact_signature(call, "s") && secret_store::valid_name(name) => {
-            Some(*name)
+    let (name, binding) = match (call.fields.member, call.args()) {
+        (Some("Retrieve"), [Value::Str(name)])
+            if exact_signature(call, "s") && secret_store::valid_name(name) =>
+        {
+            (Some((*name).to_owned()), None)
         }
-        _ => None,
+        (Some("RetrieveMail"), [Value::Str(account), Value::Str(server), Value::Str(username)])
+            if exact_signature(call, "sss") =>
+        {
+            match MailBinding::new(
+                (*account).to_owned(),
+                (*server).to_owned(),
+                (*username).to_owned(),
+            ) {
+                Ok(binding) => (Some((*account).to_owned()), Some(binding)),
+                Err(_) => (None, None),
+            }
+        }
+        _ => (None, None),
     };
     let pending = Pending {
         owner: owner.into(),
-        name: name.unwrap_or_default().into(),
+        name: name.clone().unwrap_or_default(),
+        binding,
         serial: call.serial,
         endian: call.endian,
         deadline: Instant::now() + EXCHANGE_TIMEOUT,
@@ -73,15 +90,20 @@ pub(super) fn begin(
             connection,
             &pending,
             "org.freedesktop.DBus.Error.InvalidArgs",
-            "Retrieve takes one credential name",
+            "Retrieve takes a credential name; RetrieveMail takes account, server and username",
         );
     }
-    if state.secrets.len() + state.secret_receipts.len() >= LIMIT
+    if state.secrets.len() + state.secret_receipts.len() + state.notebook_secrets.len() >= LIMIT
         || state.secrets.values().filter(|p| p.owner == owner).count()
             + state
                 .secret_receipts
                 .values()
                 .filter(|p| p.owner == owner)
+                .count()
+            + state
+                .notebook_secrets
+                .iter()
+                .filter(|p| p.pending.owner == owner)
                 .count()
             >= PER_OWNER
     {
@@ -132,6 +154,41 @@ pub(super) fn identity_reply(
         )?;
         return Ok(true);
     };
+    if let Some(binding) = pending.binding.clone() {
+        if app != "mail" {
+            error(
+                connection,
+                &pending,
+                DENIED,
+                "only the authenticated mail application may request notebook credentials",
+            )?;
+            return Ok(true);
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("notebook-mail".into())
+            .spawn(move || {
+                let result = notebook_credential(&binding);
+                let _ = send.send(result);
+            })
+            .is_err()
+        {
+            error(
+                connection,
+                &pending,
+                "org.freedesktop.portal.Error.Failed",
+                "notebook credential worker is unavailable",
+            )?;
+            return Ok(true);
+        }
+        state.notebook_secrets.push(NotebookPending {
+            pending,
+            app,
+            receive,
+            abandoned: false,
+        });
+        return Ok(true);
+    }
     let result = secret_store::Store::open_owned(
         &secret_store::user_path(UI_UID),
         UI_UID,
@@ -140,7 +197,7 @@ pub(super) fn identity_reply(
     )
     .and_then(|store| store.application_secret(&app, &pending.name))
     .and_then(|secret| secret.ok_or_else(|| "credential is not provisioned".into()));
-    let mut secret = match result {
+    let secret = match result {
         Ok(secret) => secret,
         Err(_) => {
             error(
@@ -155,8 +212,18 @@ pub(super) fn identity_reply(
             return Ok(true);
         }
     };
-    let file = credential_file(&secret);
-    secret.fill(0);
+    deliver(connection, state, pending, app, Bytes(secret))?;
+    Ok(true)
+}
+
+fn deliver(
+    connection: &mut Connection,
+    state: &mut ServiceState,
+    pending: Pending,
+    app: String,
+    secret: Bytes,
+) -> io::Result<()> {
+    let file = credential_file(&secret.0);
     let (file, token) = match file {
         Ok(file) => file,
         Err(_) => {
@@ -166,7 +233,7 @@ pub(super) fn identity_reply(
                 "org.freedesktop.portal.Error.Failed",
                 "credential descriptor is unavailable",
             )?;
-            return Ok(true);
+            return Ok(());
         }
     };
     state.secret_receipts.insert(
@@ -196,7 +263,7 @@ pub(super) fn identity_reply(
     let sent = sys::send_with_fd(&connection.stream, &frame, file.as_raw_fd());
     connection.stream.set_write_timeout(None)?;
     sent?;
-    Ok(true)
+    Ok(())
 }
 
 fn credential_file(secret: &[u8]) -> io::Result<(File, String)> {
@@ -217,6 +284,37 @@ fn credential_file(secret: &[u8]) -> io::Result<(File, String)> {
 }
 
 pub(super) fn expire(connection: &mut Connection, state: &mut ServiceState) -> io::Result<()> {
+    let workers = std::mem::take(&mut state.notebook_secrets);
+    for worker in workers {
+        match worker.receive.try_recv() {
+            Ok(result) if !worker.abandoned => match result {
+                Ok(secret) => deliver(connection, state, worker.pending, worker.app, secret)?,
+                Err(reason) => {
+                    error(
+                        connection,
+                        &worker.pending,
+                        "org.freedesktop.portal.Error.Failed",
+                        &reason,
+                    )?;
+                    if worker.app == "mail" && worker.pending.name == "main" {
+                        eprintln!("TD-NOTEBOOK-WITHHELD app=mail name=main");
+                    }
+                }
+            },
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => state.notebook_secrets.push(worker),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if !worker.abandoned {
+                    error(
+                        connection,
+                        &worker.pending,
+                        "org.freedesktop.portal.Error.Failed",
+                        "notebook worker ended",
+                    )?;
+                }
+            }
+        }
+    }
     let now = Instant::now();
     state
         .secret_receipts
@@ -388,6 +486,56 @@ mod tests {
             panic!("a descriptor frame");
         };
         assert_eq!((count, files.len()), (2, 0));
+    }
+
+    #[test]
+    fn notebook_requests_validate_tuple_before_querying_identity() {
+        let (mut connection, mut peer) = connection();
+        let mut state = super::super::tests::service_state();
+        for (server, valid) in [
+            ("https://mail.invalid/jmap", true),
+            ("", false),
+            ("https://mail.invalid/\n", false),
+        ] {
+            let bytes = message::Builder::method_call(
+                Endian::Little,
+                PORTAL_PATH,
+                Some(SECRET_INTERFACE),
+                "RetrieveMail",
+            )
+            .serial(1)
+            .sender(":1.9")
+            .destination(PORTAL_NAME)
+            .body("sss", |w| {
+                w.string("work")?;
+                w.string(server)?;
+                w.string("me")
+            })
+            .unwrap()
+            .encode()
+            .unwrap();
+            let (call, _) = message::decode(&bytes, 0).unwrap();
+            begin(&mut connection, &mut state, &call).unwrap();
+            let IncomingFrame::Message(frame) = read_frame(&mut peer).unwrap() else {
+                panic!("frame")
+            };
+            let (frame, _) = message::decode(&frame, 0).unwrap();
+            if valid {
+                assert_eq!(frame.fields.member, Some("GetConnectionCredentials"));
+                let pending = state.secrets.remove(&frame.serial).unwrap();
+                let binding = pending.binding.unwrap();
+                assert_eq!(binding.account(), "work");
+                assert_eq!(binding.server(), server);
+                assert_eq!(binding.username(), "me");
+            } else {
+                assert_eq!(
+                    frame.fields.error_name,
+                    Some("org.freedesktop.DBus.Error.InvalidArgs")
+                );
+            }
+            assert!(state.notebook_secrets.is_empty());
+            assert!(state.secrets.is_empty());
+        }
     }
 
     fn connection() -> (Connection, UnixStream) {
@@ -572,5 +720,75 @@ mod tests {
             assert!(!secret_store::valid_name(name));
         }
         assert!(secret_store::valid_name("main"));
+    }
+}
+
+pub(super) struct NotebookPending {
+    pending: Pending,
+    app: String,
+    receive: std::sync::mpsc::Receiver<Result<Bytes, String>>,
+    abandoned: bool,
+}
+
+pub(super) fn depart(state: &mut ServiceState, owner: &str) {
+    for worker in &mut state.notebook_secrets {
+        if worker.pending.owner == owner {
+            worker.abandoned = true;
+        }
+    }
+}
+
+fn notebook_credential(binding: &MailBinding) -> Result<Bytes, String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let end = Instant::now() + Duration::from_secs(5);
+    for path in ["/run", "/run/td-authd", "/run/td-authd/1000"] {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|_| "trusted notebook endpoint is unavailable")?;
+        if !metadata.is_dir()
+            || metadata.uid() != 0
+            || metadata.gid() != 0
+            || metadata.mode() & 0o7022 != 0
+        {
+            return Err("trusted notebook endpoint has an invalid parent".into());
+        }
+    }
+    let metadata = fs::symlink_metadata(notebook_wire::MAIL_SOCKET)
+        .map_err(|_| "open td-pass through secure attention first")?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != PORTAL_UID
+        || metadata.gid() != PORTAL_UID
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err("trusted notebook endpoint has invalid ownership".into());
+    }
+    let stream = bus_client::connect_within(
+        Path::new(notebook_wire::MAIL_SOCKET),
+        Duration::from_secs(2),
+        "notebook-connect",
+    )
+    .map_err(|_| "trusted notebook is unavailable")?;
+    let mut wire = Wire::new(stream)?;
+    wire.bound(end);
+    let mut request = Bytes(vec![1]);
+    put_binding(&mut request, binding)?;
+    wire.send(&request.0)?;
+    let response = wire.receive_bounded(Duration::from_secs(5), notebook_wire::MAIL_LIMIT)?;
+    let mut input = Reader::new(&response.0);
+    match input.byte()? {
+        0 => {
+            let secret = input.field(4096)?;
+            if secret.is_empty() {
+                return Err("notebook credential is empty".into());
+            }
+            let secret = Bytes(secret.to_vec());
+            input.finish()?;
+            Ok(secret)
+        }
+        1 => {
+            let reason = input.text(4096)?.to_owned();
+            input.finish()?;
+            Err(reason)
+        }
+        _ => Err("invalid trusted notebook response".into()),
     }
 }

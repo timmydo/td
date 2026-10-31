@@ -1366,10 +1366,10 @@ fn every_strip_has_help_before_quit_and_it_asks_for_the_key_list() {
 /// Every strip holds each of its buttons whole at the narrowest surface
 /// the tests lay one out on but the tiny one, wrapping there: Help moves
 /// the locked strip's Quit to a second row at 320 pixels, as the
-/// notebook's and the keys view's wrapped already; at 640 each is one row.
+/// notebook toolbar now needs three rows at 320 and two at 640.
 #[test]
 fn every_strip_holds_its_buttons_at_the_narrowest_width() {
-    for (width, rows) in [(320, [2, 2, 2, 1]), (640, [1, 1, 1, 1])] {
+    for (width, rows) in [(320, [3, 2, 2, 1]), (640, [2, 1, 1, 1])] {
         let surface = Surface::new(width, 240, td_ui::raster::Scale::default()).unwrap();
         let strips = [
             layout::NOTEBOOK,
@@ -3471,4 +3471,71 @@ fn long_passwords_keep_the_caret_visible_during_edit_and_resize() {
         );
         visible(&app);
     }
+}
+
+fn mail_ready() -> App {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Mail")]);
+    key(&mut app, &mut board, "Return");
+    open(&mut app, &mut board, "Down", "notes");
+    app.set_focus(Focus::Password);
+    typed(&mut app, &mut board, "token");
+    app.save(None);
+    let op = op_of(&app.take_out());
+    app.reply(Reply::Committed {
+        op,
+        id: [1; 16],
+        revision: Some(2),
+    });
+    app.take_out();
+    app
+}
+
+#[test]
+fn mail_approval_captures_the_entry_revision_and_exact_request() {
+    use crate::protocol::MailBinding;
+    let mut app = mail_ready();
+    let first = MailBinding::new(
+        "work".into(),
+        "https://one.invalid/jmap".into(),
+        "alice".into(),
+    )
+    .unwrap();
+    let second = MailBinding::new(
+        "work".into(),
+        "https://two.invalid/jmap".into(),
+        "alice".into(),
+    )
+    .unwrap();
+    app.reply(Reply::MailRequests(vec![first.clone()]));
+    app.mail(None);
+    assert!(app.dialog.is_some());
+    app.reply(Reply::MailRequests(vec![second]));
+    app.bind_mail();
+    assert!(
+        matches!(&app.take_out()[..], [Out::Send(Command::BindMail { id, base: 2, binding, .. })] if *id == [1; 16] && *binding == first)
+    );
+}
+
+#[test]
+fn mail_approval_is_discarded_by_lock_and_refuses_stale_entry() {
+    use crate::protocol::MailBinding;
+    let mut app = mail_ready();
+    let binding = MailBinding::new(
+        "work".into(),
+        "https://one.invalid/jmap".into(),
+        "alice".into(),
+    )
+    .unwrap();
+    app.reply(Reply::MailRequests(vec![binding]));
+    app.mail(None);
+    app.notebook().unwrap().open.as_mut().unwrap().revision += 1;
+    app.bind_mail();
+    assert!(app.take_out().is_empty());
+    app.mail(None);
+    app.clear();
+    assert!(app.mail_question.is_none());
+    assert!(app.mail_requests.is_empty());
+    app.bind_mail();
+    assert!(app.take_out().is_empty());
 }

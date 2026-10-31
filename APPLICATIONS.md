@@ -10115,9 +10115,9 @@ package lives rather than of how many copies of it exist.
 ### W.4 The credential manager
 
 The personal password notebook td-pass and its portable protector workstream
-are specified by `td-pass/DESIGN.md` and `td-secret/PORTABLE.md`. They extend
-td-secret in independently tested increments; the current application
-credential service described here acquires no personal-vault authority.
+are specified by `td-pass/DESIGN.md` and `td-secret/PORTABLE.md`. They extend td-secret with a dedicated service backend. The portal may
+request only a remembered mail credential through root mediation; it receives
+no vault keys, browsing capability or unlock authority.
 
 Unenrolled stores use the increment-(a) backend: one per-user store at
 `/var/lib/td/secrets/<uid>` beside the machine identity. `td-firstboot`
@@ -10144,17 +10144,19 @@ a master key, or a derived key. The upstream
 `org.freedesktop.portal.Secret` keyring-key protocol remains unexported:
 returning a credential through it would violate its contract.
 
-`td-mail` uses `secret = "portal"` with the account name as the credential
-name (`main` for the provisioned account). Its packaged `/app/bin/td-secret
-get` helper receives and reads the descriptor, acknowledges its receipt, and
-writes the credential into td-mail's captured stdout pipe. Neither td-mail
-nor td-news needs a cryptography dependency. The portal logs the mail receipt only after
-the same broker-authenticated connection acknowledges its one-use token;
-The unenrolled QEMU boot requires the exact supervised
-`portal: TD-SECRET-LOCKED app=mail name=main` refusal instead. Successful
-receipt logging remains available after an enrolled session is unlocked. The token is liveness evidence, not authorization or cryptographic
-proof of a client's read. The shipped helper's ordering and live transfer
-tests establish the read-before-acknowledgement behavior.
+`td-mail` defaults to `secret = "td-pass"`, whose exact account, configured
+server URL and username select a remembered notebook binding. Its packaged
+`/app/bin/td-secret get-mail` helper receives the descriptor, acknowledges
+its receipt, and writes the credential to td-mail's captured stdout pipe.
+Legacy `secret = "portal"` still selects the token-store credential by account
+name. Neither client needs a cryptography dependency. The portal logs receipt
+only after the same broker-authenticated connection acknowledges its one-use
+token. The unenrolled QEMU boot requires the exact supervised
+`portal: TD-NOTEBOOK-WITHHELD app=mail name=main` refusal. This marker proves
+that an authenticated request released nothing, not why the notebook was
+unavailable. A receipt is liveness evidence, not authorization or cryptographic
+proof of a client's read. The shipped helper and live transfer tests establish
+read-before-acknowledgement ordering.
 
 The provisioned configuration lives in the human's `~/.config/td-mail`,
 mounted read/write into its jail. td-mail can set the placeholder up itself. For an account whose server is an RFC 2606
@@ -10170,9 +10172,9 @@ new text whole before writing it to a sibling and renaming it into
 place. A legacy `[jmap]` section, a duplicated key, an inline table and
 an offline session are refused, and the window says why. The password
 is never typed into td-mail. When the portal refuses the credential,
-the window shows the enrollment, unlock and `td-secret set` steps above
-with the portal's reason, and `a` connects again; it names no root
-path.
+the window shows the td-pass unlock and binding steps for notebook accounts,
+or the legacy store enrollment and write steps for portal accounts, with the
+refusal reason. `a` connects again; neither flow names a root path.
 
 Firstboot creates an empty portal-owned credential store for explicit token
 enrollment and writes a missing mail configuration in the human home. It
@@ -12044,3 +12046,13 @@ file descriptor passed through the jail. Its metadata is outside every
 mounted directory, and its same-UID and host-network limitations are the
 workspace kind's. Runtime installations in its executable private home are
 not target build inputs. No foreign runtime acquisition is added here.
+
+
+For the personal mail application, `secret = "td-pass"` selects the trusted
+notebook credential path. Its packaged td-secret helper sends the exact
+account name, configured discovery URL and username through the authenticated
+secret portal. In td-pass, opened through Ctrl+Alt+Esc then N, unlock the
+notebook, select a saved entry with a password/token, choose Mail and approve
+the displayed tuple. Retry mail after approval. The binding is remembered;
+a changed tuple needs new approval. The jail needs no password-file mount,
+shell command, vault directory, or direct connection to the vault service.

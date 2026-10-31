@@ -138,16 +138,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         [command, index, inode, rdev, runtime] if command == "hid-worker-desktop" => {
             fido_device::desktop_worker(index, inode, rdev, runtime)
         }
-        [command, name] if command == "get" => {
-            let mut secret = client::retrieve(name)?;
-            use std::io::Write;
-            let mut stdout = io::stdout().lock();
-            let result = stdout
-                .write_all(&secret)
-                .and_then(|()| stdout.flush())
-                .map_err(|e| e.to_string());
-            secret.fill(0);
-            result
+        [command, name] if command == "get" => output_secret(client::retrieve(name)?),
+        [command, account, server, username] if command == "get-mail" => {
+            output_secret(client::retrieve_mail(account, server, username)?)
         }
         [command, target] if command == "set" => set_client::set(target, consent::Role::Primary),
         [command, flag, target] if command == "set" && flag == "--recovery" => {
@@ -166,6 +159,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
 /// enrollment-state inspection"): the private operation startup
 /// admission, the UID, then the whole result on the stdin socket. A
 /// failure writes nothing.
+fn output_secret(mut secret: Vec<u8>) -> Result<(), String> {
+    use std::io::Write;
+    let mut stdout = io::stdout().lock();
+    let result = stdout
+        .write_all(&secret)
+        .and_then(|()| stdout.flush())
+        .map_err(|error| error.to_string());
+    secret.fill(0);
+    std::hint::black_box(&mut secret);
+    result
+}
+
 fn inspect(uid: &str, result: impl FnOnce(u32) -> Result<Vec<u8>, String>) -> Result<(), String> {
     let endpoint = operation::startup()?;
     let bytes = result(parse_uid(uid)?)?;

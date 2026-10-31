@@ -82,6 +82,12 @@ fn the_source_inventory_is_closed() {
 fn pure_files_reach_no_system_vault_or_compositor() {
     for name in PURE {
         let text = source(name);
+        let text = if *name == "protocol.rs" {
+            assert_eq!(text.matches("td_secret").count(), 1);
+            text.replace("pub use td_secret::pass::MailBinding;", "")
+        } else {
+            text
+        };
         for denied in [
             "std::fs",
             "std::process",
@@ -172,6 +178,12 @@ fn td_ui_modules(text: &str) -> Vec<String> {
 fn only_the_backend_holds_the_vault_and_only_the_window_the_compositor() {
     for &name in FILES {
         let text = source(name);
+        let text = if name == "protocol.rs" {
+            assert_eq!(text.matches("td_secret").count(), 1);
+            text.replace("pub use td_secret::pass::MailBinding;", "")
+        } else {
+            text
+        };
         if !matches!(name, "backend.rs" | "main.rs") {
             assert!(!text.contains("td_secret"), "{name}");
         }

@@ -135,7 +135,7 @@ pub(super) fn serve(
                 vault.note("lock");
                 Reply::Locked { keys: Some(keys()) }
             }
-            Command::Apply { op, .. } => closed(op),
+            Command::BindMail { op, .. } | Command::Apply { op, .. } => closed(op),
             Command::Create { op, .. }
             | Command::Unlock { op, .. }
             | Command::AddKey { op }

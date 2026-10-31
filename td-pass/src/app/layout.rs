@@ -22,6 +22,7 @@ pub const NOTEBOOK: &[&str] = &[
     "Keys",
     "Import",
     "Lock",
+    "Mail",
     td_ui::keys::BUTTON,
     QUIT,
 ];

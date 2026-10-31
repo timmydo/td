@@ -3910,3 +3910,10 @@ direct-rustc recipe would then stage and build all of td-ui for its tests.
 td-secret's confinement test pins the instruction, both requests, the
 flags, the adoption, both scopes and the test-only declaration. It is
 absent from the production binary.
+
+
+The notebook mail intake is another safe caller of td-authd's existing
+`secret_sys::peer_uid` SO_PEERCRED surface. It compares the accepted Unix
+socket's peer UID to the fixed portal UID 991 before reading a frame. It
+adds no raw syscall or unsafe block. AppId authentication remains in the
+portal's broker query; peer UID is not treated as the mail application ID.

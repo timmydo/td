@@ -877,3 +877,12 @@ assert equality against `/proc/self/status`.
   withheld unless td-jail observes the active per-instance sibling leaf with
   the exact configured caps; that migration can succeed only when the
   td-login-started session entered the delegated subtree first.
+
+
+The trusted notebook's mail adapter admits portal UID 991 at a root-owned
+session-generation endpoint; the portal must first authenticate the caller's
+`mail` AppId through td-busd. A human UID or caller-supplied tuple alone is
+insufficient. The tuple selects only a previously approved entry password,
+while the notebook is unlocked. The adapter exposes neither notes nor vault
+keys and cannot unlock the service. Closing or locking the notebook cancels
+outstanding requests, but cannot revoke plaintext already released to mail.

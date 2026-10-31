@@ -44,6 +44,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "main.rs",
             "mount_sys.rs",
             "notebook.rs",
+            "notebook_mail.rs",
             "notebook_token.rs",
             "portal_files.rs",
             "primary_account.rs",
@@ -68,6 +69,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("application_files.rs", 0),
         ("main.rs", 1),
         ("notebook.rs", 0),
+        ("notebook_mail.rs", 0),
         ("notebook_token.rs", 0),
         ("channel.rs", 0),
         ("consent.rs", 0),
@@ -1347,8 +1349,8 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 const CACHE_FINGERPRINT: u64 = 0xca9ca5668a3cec8c;
 const SOFTWARE_FINGERPRINT: u64 = 0xedb33f4ba9468adf;
 const LAUNCH_FINGERPRINT: u64 = 0x917d816a91d3a16e;
-const MAIN_FINGERPRINT: u64 = 0x27810a2741db3785;
-const SESSION_FINGERPRINT: u64 = 0x451ab28c09802bb7;
+const MAIN_FINGERPRINT: u64 = 0x9eb9343b76372c21;
+const SESSION_FINGERPRINT: u64 = 0xbc41e16634b78938;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xad60fdb29c45fd9b;

@@ -525,8 +525,8 @@ Physical secure attention, Ctrl+Alt+Esc followed by N, opens the notebook
 through td-authd. The GUI runs as the primary human; the vault service runs
 as that owner's reserved notebook identity. Root creates both private
 socketpairs and validates the account registry before dropping credentials.
-There is no pathname listener, caller-selected program, or UID-only vault
-admission. The GUI accepts only root's inherited endpoint, with one thread,
+The GUI and vault have no pathname listener, caller-selected program, or
+UID-only vault admission. The GUI accepts only root's inherited endpoint, with one thread,
 all UID/GID columns 1000, no effective capabilities, and no extra inherited
 descriptors. Its transport rechecks protected memory and accepts no swap
 exception. Closing it shuts down the socket, including the inherited stdin
@@ -547,3 +547,27 @@ window when its heartbeat observes expiry. No host logind watcher or
 standalone token worker is started by this backend. Ordinary human-account
 software remains inside the desktop trust boundary; this does not claim to
 protect plaintext from an already compromised kernel or trusted compositor.
+
+
+### Mail credential binding
+
+The Mail toolbar action operates on a saved entry with a password/token.
+The trusted backend polls root's synthetic tag 15 for at most sixteen
+pending account/server/username tuples while unlocked. Each poll publishes
+the list anew, so local lock/unlock cannot leave a stale backend snapshot.
+Root does not forward that tag to
+the vault. A scrollable confirmation captures the exact tuple, entry ID,
+and revision; new requests cannot retarget the open confirmation. Next
+request cycles the pending tuples. Approval uses service tag 14 and its
+stale-revision check. Binding is an unlocked notebook write, not elevation.
+Lock clears the question. Clearing an entry's password revokes all its
+bindings. The password can be changed without changing its bindings.
+
+The window never receives tag-12 credential replies. Mail requests cannot
+open or unlock the notebook. The person opens it through secure attention,
+unlocks, selects an entry, approves the binding, then retries mail.
+
+The window protocol reexports only `pass::MailBinding`, the shared bounded,
+clearing tuple value; this gives it no host, transport or vault capability.
+Confinement pins that exact type-only exception. All service access remains
+in the backend thread.

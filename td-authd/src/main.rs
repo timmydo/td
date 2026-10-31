@@ -50,6 +50,7 @@ mod login_status;
 mod login_tier;
 mod mount_sys;
 mod notebook;
+mod notebook_mail;
 mod notebook_token;
 #[path = "../../td-secret/src/notebook_wire.rs"]
 #[allow(dead_code, reason = "shared notebook transport halves")]

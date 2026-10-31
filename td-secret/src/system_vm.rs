@@ -432,6 +432,17 @@ fn qemu_installed_system_secret_lifecycle() {
         store.set("mail", "main", b"replace-me\n").unwrap();
         Vec::new()
     };
+    if !recover {
+        let config = fs::read_to_string(CONFIG).unwrap();
+        assert!(config.contains("secret = \"td-pass\""));
+        // This oracle exercises the legacy token store, not the notebook.
+        fs::write(
+            CONFIG,
+            config.replace("secret = \"td-pass\"", "secret = \"portal\""),
+        )
+        .unwrap();
+        service(&["restart", "mail"]);
+    }
     assert!(fs::read_to_string(CONFIG)
         .unwrap()
         .contains("secret = \"portal\""));

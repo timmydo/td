@@ -90,6 +90,8 @@ pub enum Focus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Act {
     Save,
+    BindMail,
+    NextMail,
     Discard,
     Delete,
     Replace,
@@ -212,6 +214,7 @@ struct Interrupted {
 }
 
 enum Busy {
+    BindMail(Op),
     Unlock(Op),
     Create(Op),
     /// `tab` is the document saved: the commit is the open entry's only
@@ -300,6 +303,7 @@ impl Busy {
     fn op(&self) -> Op {
         match self {
             Self::Unlock(op)
+            | Self::BindMail(op)
             | Self::Create(op)
             | Self::Export(op)
             | Self::ReadCopy(op)
@@ -344,6 +348,9 @@ pub struct App {
     prompt: Option<Prompting>,
     dialog: Option<(Dialog, Option<Then>)>,
     dialog_revision: u64,
+    mail_requests: Vec<crate::protocol::MailBinding>,
+    mail_index: usize,
+    mail_question: Option<(EntryId, u64, crate::protocol::MailBinding)>,
     chooser: Option<Chooser>,
     next_chooser: u64,
     /// A password store read and being asked about.
@@ -397,6 +404,9 @@ impl App {
             prompt: None,
             dialog: None,
             dialog_revision: 0,
+            mail_requests: Vec::new(),
+            mail_index: 0,
+            mail_question: None,
             chooser: None,
             next_chooser: 0,
             store: None,
@@ -597,6 +607,36 @@ impl App {
                         self.clear();
                         self.say(text);
                     }
+                }
+            }
+            Reply::MailRequests(requests) => {
+                if self.mail_requests == requests {
+                    return;
+                }
+                self.mail_requests = requests;
+                if matches!(self.phase, Phase::Unlocked(_))
+                    && !self.mail_requests.is_empty()
+                    && self.busy.is_none()
+                    && self.dialog.is_none()
+                {
+                    self.say("Mail needs a credential: select a saved entry, then choose Mail");
+                }
+            }
+            Reply::MailBound { op, id, revision } => {
+                if matches!(self.busy, Some(Busy::BindMail(current)) if current == op) {
+                    self.busy = None;
+                    if let Some(notebook) = self.notebook() {
+                        if let Some(open) = &mut notebook.open {
+                            if open.id == Some(id) {
+                                open.revision = revision;
+                            }
+                        }
+                        if let Some(item) = notebook.entries.iter_mut().find(|item| item.id == id) {
+                            item.revision = revision;
+                        }
+                    }
+                    self.say("Mail binding saved; retry the account in td-mail");
+                    self.reask();
                 }
             }
             Reply::Entry {
@@ -847,7 +887,8 @@ impl App {
         self.interrupted.write |= matches!(
             self.busy,
             Some(
-                Busy::Save { .. }
+                Busy::BindMail(_)
+                    | Busy::Save { .. }
                     | Busy::Delete { .. }
                     | Busy::Keys { .. }
                     | Busy::Create(_)
@@ -1715,6 +1756,75 @@ impl App {
         self.say("Swap on storage is active, so the vault stays closed: Return asks again");
     }
 
+    fn mail(&mut self, opener: Option<(i64, i64)>) {
+        self.mail_question = None;
+        if self.busy.is_some() || self.dirty() {
+            return self.say("Save your changes and wait for them to finish first");
+        }
+        let Phase::Unlocked(notebook) = &self.phase else {
+            return;
+        };
+        let Some(open) = &notebook.open else {
+            return self.say("Select a saved entry with a password/token first");
+        };
+        let Some(id) = open.id.filter(|_| !open.saved_password.as_str().is_empty()) else {
+            return self.say("Save an entry with a password/token first");
+        };
+        if self.mail_requests.is_empty() {
+            return self
+                .say("No pending mail requests. Try connecting the account in td-mail first");
+        }
+        self.mail_index %= self.mail_requests.len();
+        let Some(binding) = self.mail_requests.get(self.mail_index).cloned() else {
+            return;
+        };
+        let details = [
+            format!("Entry: {}", open.saved_title.as_str()),
+            format!("Account: {}", binding.account()),
+            format!("Server: {}", binding.server()),
+            format!("Username: {}", binding.username()),
+            "Allow td-mail to read this entry's password/token while the notebook is unlocked. This binding is remembered. Clearing the entry's password revokes its bindings.".to_owned(),
+        ];
+        self.mail_question = Some((id, open.revision, binding));
+        self.dialog_revision += 1;
+        let revision = self.dialog_revision;
+        let model = move || {
+            let details: Vec<&str> = details.iter().map(String::as_str).collect();
+            Model::new(
+                "Allow this mail account?",
+                "Allow",
+                &details,
+                Act::BindMail,
+                revision,
+            )?
+            .with_alternate("Next request", Act::NextMail)
+        };
+        if !self.open_dialog(&model, None, opener) {
+            self.mail_question = None;
+        }
+    }
+
+    fn bind_mail(&mut self) {
+        let Some((id, base, binding)) = self.mail_question.take() else {
+            return;
+        };
+        if self.busy.is_some()
+            || self.dirty()
+            || !matches!(&self.phase, Phase::Unlocked(notebook) if notebook.open.as_ref().is_some_and(|open| open.id == Some(id) && open.revision == base))
+        {
+            return self.say("The entry changed; review the binding again");
+        }
+        let op = self.op();
+        self.busy = Some(Busy::BindMail(op));
+        self.out.push(Out::Send(Command::BindMail {
+            op,
+            id,
+            base,
+            binding,
+        }));
+        self.say("Saving mail binding");
+    }
+
     fn delete_now(&mut self) {
         let Phase::Unlocked(notebook) = &self.phase else {
             return;
@@ -2459,6 +2569,8 @@ impl App {
         self.busy = None;
         self.prompt = None;
         self.dialog = None;
+        self.mail_question = None;
+        self.mail_requests.clear();
         self.chooser = None;
         self.store = None;
         self.paste = None;

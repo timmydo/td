@@ -81,10 +81,19 @@ pub fn read_portal_credential(name: &str) -> Result<String, String> {
 }
 
 fn read_portal_credential_from(helper: &str, name: &str) -> Result<String, String> {
+    read_credential_from(helper, name, &["get", name], true)
+}
+
+fn read_credential_from(
+    helper: &str,
+    name: &str,
+    args: &[&str],
+    trim: bool,
+) -> Result<String, String> {
     // No terminal for the helper: it takes nothing from stdin, and td-mail's
     // stdin is the screen's.
     let output = Command::new(helper)
-        .args(["get", name])
+        .args(args)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("{PORTAL_FAILURE}{} did not run: {}", helper, e))?;
@@ -107,8 +116,10 @@ fn read_portal_credential_from(helper: &str, name: &str) -> Result<String, Strin
         )
     })?;
     // Trimmed in place: one buffer holds the secret, not a second copy.
-    let kept = password.trim_end_matches('\n').len();
-    password.truncate(kept);
+    if trim {
+        let kept = password.trim_end_matches('\n').len();
+        password.truncate(kept);
+    }
     Ok(password)
 }
 
@@ -116,6 +127,25 @@ fn read_portal_credential_from(helper: &str, name: &str) -> Result<String, Strin
 mod portal_tests {
     use super::read_portal_credential_from;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn notebook_helper_receives_literal_metadata_and_preserves_password_bytes() {
+        let root = td_fs::TempDir::new("mail-notebook-helper").unwrap();
+        let helper = helper(root.path(), "[ \"$#\" = 4 ] && [ \"$1\" = get-mail ] && [ \"$2\" = 'work; false' ] && [ \"$3\" = 'https://mail.invalid/jmap?x=$HOME' ] && [ \"$4\" = 'me@example.com' ] || exit 9\nprintf 'token\\n'");
+        let result = super::read_credential_from(
+            &helper,
+            "work; false",
+            &[
+                "get-mail",
+                "work; false",
+                "https://mail.invalid/jmap?x=$HOME",
+                "me@example.com",
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(result, "token\n");
+    }
 
     fn helper(dir: &std::path::Path, body: &str) -> String {
         let path = dir.join("td-secret");
@@ -199,15 +229,26 @@ mod portal_tests {
     }
 }
 
-pub fn read_password(source: &PasswordSource) -> Result<String, String> {
-    match source {
+pub fn read_password(account: &AccountConfig) -> Result<String, String> {
+    match &account.password {
         PasswordSource::Command(command) => run_password_command(command),
         PasswordSource::Portal(name) => read_portal_credential(name),
+        PasswordSource::Notebook => read_credential_from(
+            PORTAL_HELPER,
+            &account.name,
+            &[
+                "get-mail",
+                &account.name,
+                &account.well_known_url,
+                &account.username,
+            ],
+            false,
+        ),
     }
 }
 
 pub fn connect_account(account: &AccountConfig) -> Result<JmapClient, String> {
-    let password = read_password(&account.password)?;
+    let password = read_password(account)?;
     // The credential is asked for first, as for any account, so the
     // portal's answer is the same whether or not the account is set up;
     // a placeholder's server is never asked anything.

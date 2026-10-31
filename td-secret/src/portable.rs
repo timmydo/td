@@ -37,58 +37,8 @@ const MAX_PASSWORD: usize = 4096;
 const MAX_BINDINGS: usize = 16;
 const CREDENTIAL_EXTENSION: &[u8; 8] = b"TDCRED01";
 
-/// An approved mail account and destination, never a caller's app identity.
-/// Stored encrypted with the entry; only the trusted binding UI may create it.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MailBinding {
-    account: String,
-    server: String,
-    username: String,
-}
+pub use crate::notebook_wire::MailBinding;
 
-impl MailBinding {
-    pub fn new(account: String, server: String, username: String) -> Result<Self> {
-        let binding = Self {
-            account,
-            server,
-            username,
-        };
-        for (value, limit) in [
-            (&binding.account, 256),
-            (&binding.server, 2048),
-            (&binding.username, 1024),
-        ] {
-            if value.is_empty() || value.len() > limit || value.chars().any(char::is_control) {
-                return Err("invalid mail credential binding".into());
-            }
-        }
-        Ok(binding)
-    }
-
-    pub fn account(&self) -> &str {
-        &self.account
-    }
-    pub fn server(&self) -> &str {
-        &self.server
-    }
-    pub fn username(&self) -> &str {
-        &self.username
-    }
-
-    fn encoded_size(&self) -> usize {
-        12 + self.account.len() + self.server.len() + self.username.len()
-    }
-}
-
-impl Drop for MailBinding {
-    fn drop(&mut self) {
-        for field in [&mut self.account, &mut self.server, &mut self.username] {
-            let mut bytes = std::mem::take(field).into_bytes();
-            bytes.fill(0);
-            std::hint::black_box(&mut bytes);
-        }
-    }
-}
 const MAX_PLAIN: usize = 4 * 1024 * 1024;
 const MAX_SLOTS: usize = 8;
 const MAX_CREDENTIAL: usize = 1024;
@@ -308,9 +258,9 @@ impl Notebook {
                 put_field(&mut out.0, entry.password.as_deref().unwrap_or(&[]))?;
                 put_u32(&mut out.0, entry.bindings.len())?;
                 for binding in &entry.bindings {
-                    put_field(&mut out.0, binding.account.as_bytes())?;
-                    put_field(&mut out.0, binding.server.as_bytes())?;
-                    put_field(&mut out.0, binding.username.as_bytes())?;
+                    put_field(&mut out.0, binding.account().as_bytes())?;
+                    put_field(&mut out.0, binding.server().as_bytes())?;
+                    put_field(&mut out.0, binding.username().as_bytes())?;
                 }
             }
         }

@@ -87,6 +87,7 @@ impl AccountMail {
 pub enum PasswordSource {
     Command(String),
     Portal(String),
+    Notebook,
 }
 
 /// The one value `secret` takes. td-secret stores the credential as
@@ -108,9 +109,10 @@ fn password_source(
     }
     match (password_command, secret.as_deref()) {
         (Some(command), None) => Ok(PasswordSource::Command(command)),
+        (None, Some("td-pass")) => Ok(PasswordSource::Notebook),
         (None, Some(PORTAL)) => portal_name(name, section).map(PasswordSource::Portal),
         (None, Some(_)) => Err(ConfigError::Parse(format!(
-            "secret in {} takes only \"{}\"",
+            "secret in {} takes \"{}\" or \"td-pass\"",
             section, PORTAL
         ))),
         (Some(_), Some(_)) => Err(ConfigError::Parse(format!(
@@ -1634,7 +1636,7 @@ secret = "portal"
             ),
             (
                 "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\nsecret = \"hunter2\"\n",
-                "secret in [account.td] takes only \"portal\"",
+                "secret in [account.td] takes \"portal\" or \"td-pass\"",
             ),
             (
                 "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"/home/td/.config/td-mail/password\"\n",

@@ -349,6 +349,7 @@ impl Drop for Cleanup {
 pub(crate) struct Session {
     owner: u32,
     notebook: Option<crate::notebook::Bridge>,
+    notebook_mail: Option<crate::notebook_mail::Intake>,
     intake: Option<crate::secret_intake::Intake>,
     writing: bool,
     installations: Option<crate::deployment::Intake>,
@@ -388,6 +389,7 @@ impl Session {
         Ok(Self {
             owner,
             notebook: None,
+            notebook_mail: None,
             intake: None,
             writing: false,
             installations: None,
@@ -417,6 +419,7 @@ impl Session {
                 return Err("secret session already prepared or preparing".into());
             }
             self.intake = Some(crate::secret_intake::Intake::bind(self.owner)?);
+            self.notebook_mail = Some(crate::notebook_mail::Intake::bind()?);
             // A live boot installs disks, never updates itself, and
             // consumes no admission record.
             if crate::disk_install::live_boot()? {
@@ -473,6 +476,9 @@ impl Session {
             }
             Request::NotebookLock => {
                 self.notebook = None;
+                if let Some(intake) = &mut self.notebook_mail {
+                    intake.revoke();
+                }
                 if let Some(Active::Notebook(operation)) = &mut self.operation {
                     operation.cancel()?;
                 }
@@ -706,6 +712,9 @@ impl Session {
             return Ok(vec![0xa5, 2]);
         }
         self.notebook = None;
+        if let Some(intake) = &mut self.notebook_mail {
+            intake.revoke();
+        }
         match start() {
             Ok(helper) => {
                 self.suspending = Some(helper);
@@ -1028,6 +1037,35 @@ impl Session {
             .is_some_and(|bridge| bridge.poll().is_err())
         {
             self.notebook = None;
+            if let Some(intake) = &mut self.notebook_mail {
+                intake.revoke();
+            }
+        }
+        if let Some(intake) = &mut self.notebook_mail {
+            if let Some(bridge) = &mut self.notebook {
+                if bridge.take_mail_revoked() {
+                    intake.revoke();
+                }
+                if let Some((id, reply)) = bridge.take_mail_reply() {
+                    intake.reply(id, reply);
+                }
+                if let Some(binding) = bridge.take_dismissed() {
+                    intake.dismiss(&binding);
+                }
+                bridge.requests(intake.requests());
+            }
+            if let Some((id, binding)) = intake.poll() {
+                let mail_accepted = self.prepared
+                    && self.cleanup.is_none()
+                    && self.suspending.is_none()
+                    && self
+                        .notebook
+                        .as_mut()
+                        .is_some_and(|bridge| bridge.mail(id, &binding).unwrap_or(false));
+                if !mail_accepted {
+                    intake.reply(id, crate::notebook_mail::refused("Open td-pass through secure attention, unlock it, and approve this mail account; then retry mail")?);
+                }
+            }
         }
         if let Some(intake) = &mut self.intake {
             intake.tick();
@@ -1223,7 +1261,11 @@ impl Session {
             }
         }
         self.notebook = None;
+        if let Some(intake) = &mut self.notebook_mail {
+            intake.revoke();
+        }
         self.intake = None;
+        self.notebook_mail = None;
         self.installations = None;
         self.hostnames = None;
         self.renaming = false;

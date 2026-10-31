@@ -145,7 +145,7 @@ const TD_BUSD_RUNTIME_MARKER: &str = td_recipe::shared::TD_BUSD_RUNTIME_MARKER;
 /// Printed by the unprivileged live portal probe after a routed Properties.Get
 /// and Settings.ReadAll return the exact immutable session policy.
 const TD_PORTAL_RUNTIME_MARKER: &str = td_recipe::shared::TD_PORTAL_RUNTIME_MARKER;
-const TD_SECRET_CONSOLE_MARKER: &str = "portal: TD-SECRET-LOCKED app=mail name=main";
+const TD_SECRET_CONSOLE_MARKER: &str = "portal: TD-NOTEBOOK-WITHHELD app=mail name=main";
 const TD_PORTAL_CONSOLE_MARKER: &str =
     "portal-evidence: TD-PORTAL-READY namespaces=2 settings=11 version=1";
 const TD_PORTAL_REQUEST_RUNTIME_MARKER: &str = td_recipe::shared::TD_PORTAL_REQUEST_RUNTIME_MARKER;
@@ -12632,11 +12632,11 @@ mod tests {
     #[test]
     fn credential_evidence_requires_the_exact_supervised_locked_refusal() {
         for line in [
-            "TD-SECRET-LOCKED app=mail name=main",
-            "mail: TD-SECRET-LOCKED app=mail name=main",
-            "portal: TD-SECRET-LOCKED app=news name=main",
-            "portal: TD-SECRET-LOCKED app=mail name=other",
-            "portal: TD-SECRET-LOCKED app=mail name=main extra",
+            "TD-NOTEBOOK-WITHHELD app=mail name=main",
+            "mail: TD-NOTEBOOK-WITHHELD app=mail name=main",
+            "portal: TD-NOTEBOOK-WITHHELD app=news name=main",
+            "portal: TD-NOTEBOOK-WITHHELD app=mail name=other",
+            "portal: TD-NOTEBOOK-WITHHELD app=mail name=main extra",
         ] {
             let mut evidence = ConsoleEvidence::default();
             latch_console_evidence(&mut evidence, format!("\n{line}\n").as_bytes(), b"target");

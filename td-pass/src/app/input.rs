@@ -913,6 +913,11 @@ impl App {
                         self.out.push(Out::Send(Command::AcceptSwap));
                         self.say("Opening with the swap accepted for this run");
                     }
+                    (Choice::Confirmed(Act::BindMail), _) => self.bind_mail(),
+                    (Choice::Confirmed(Act::NextMail), _) => {
+                        self.mail_index = self.mail_index.saturating_add(1);
+                        self.mail(None);
+                    }
                     (Choice::Confirmed(Act::Delete), _) => self.delete_now(),
                     (Choice::Confirmed(Act::Replace), _) => self.replace_now(),
                     (Choice::Confirmed(Act::CreateWithBackup), _) => self.create_now(true),
@@ -1137,6 +1142,7 @@ impl App {
                     Some(5) => return self.show_keys(true),
                     Some(6) => return self.request(Then::Import, opener),
                     Some(7) => return self.request(Then::Lock, opener),
+                    Some(8) => return self.mail(opener),
                     _ => {}
                 }
                 let panes = layout::panes(surface, notebook.finding);

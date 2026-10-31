@@ -152,7 +152,7 @@ const APPLICATION_CONFIGS: &[ApplicationConfig] = &[
 ];
 
 /// td-mail starts offline from this and says so; the operator replaces the two
-/// placeholders, stores mail/main through td-secret, and the client reads them when it next
+/// placeholders, binds a td-pass entry, and the client reads them when it next
 /// starts. The comments name no way to start it: a user-level relaunch of an
 /// application window is deferred (APPLICATIONS.md §W.7), and the
 /// administrative escape hatch is not a flow a shipped file may depend on
@@ -165,7 +165,7 @@ const MAIL_CONFIG: &str = "\
 [account.main]
 well_known_url = \"https://mail.example.com/.well-known/jmap\"
 username = \"you@example.com\"
-secret = \"portal\"
+secret = \"td-pass\"
 ";
 
 /// td-news needs at least one feed to start. These two public feeds are

@@ -4,6 +4,86 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+/// An approved mail account and destination, never a caller's app identity.
+/// Stored encrypted with the entry; only the trusted binding UI may create it.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MailBinding {
+    account: String,
+    server: String,
+    username: String,
+}
+
+impl MailBinding {
+    pub fn new(account: String, server: String, username: String) -> Result<Self, String> {
+        let binding = Self {
+            account,
+            server,
+            username,
+        };
+        for (value, limit) in [
+            (&binding.account, 256),
+            (&binding.server, 2048),
+            (&binding.username, 1024),
+        ] {
+            if value.is_empty() || value.len() > limit || value.chars().any(char::is_control) {
+                return Err("invalid mail credential binding".into());
+            }
+        }
+        Ok(binding)
+    }
+
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn encoded_size(&self) -> usize {
+        12 + self.account.len() + self.server.len() + self.username.len()
+    }
+}
+
+impl Drop for MailBinding {
+    fn drop(&mut self) {
+        for field in [&mut self.account, &mut self.server, &mut self.username] {
+            let mut bytes = std::mem::take(field).into_bytes();
+            bytes.fill(0);
+            std::hint::black_box(&mut bytes);
+        }
+    }
+}
+impl std::fmt::Debug for MailBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MailBinding(..)")
+    }
+}
+
+#[allow(dead_code, reason = "shared portal and root notebook intake contract")]
+pub(crate) const MAIL_SOCKET: &str = "/run/td-authd/1000/notebook-mail";
+#[allow(dead_code, reason = "shared portal and root notebook intake contract")]
+pub(crate) const MAIL_LIMIT: usize = 8192;
+#[allow(dead_code, reason = "shared portal and root notebook intake contract")]
+pub(crate) const MAIL_PENDING: usize = 16;
+
+pub(crate) fn read_binding(input: &mut Reader<'_>) -> Result<MailBinding, String> {
+    MailBinding::new(
+        input.text(256)?.to_owned(),
+        input.text(2048)?.to_owned(),
+        input.text(1024)?.to_owned(),
+    )
+}
+
+pub(crate) fn put_binding(output: &mut Bytes, binding: &MailBinding) -> Result<(), String> {
+    for value in [binding.account(), binding.server(), binding.username()] {
+        field(output, value.as_bytes())?;
+    }
+    Ok(())
+}
+
 pub(crate) const LIMIT: usize = 4 * 1024 * 1024 + 16384;
 pub(crate) const IDLE: Duration = Duration::from_secs(30);
 const FRAME_TIME: Duration = Duration::from_secs(5);
@@ -65,11 +145,15 @@ impl Wire {
     }
 
     pub fn receive(&mut self, timeout: Duration) -> Result<Bytes, String> {
+        self.receive_bounded(timeout, LIMIT)
+    }
+
+    pub fn receive_bounded(&mut self, timeout: Duration, limit: usize) -> Result<Bytes, String> {
         let deadline = self.deadline(timeout)?;
         let mut header = [0; 4];
         self.read(&mut header, deadline)?;
         let count = u32::from_be_bytes(header) as usize;
-        if count == 0 || count > LIMIT {
+        if count == 0 || count > limit.min(LIMIT) {
             return Err("invalid notebook frame size".into());
         }
         let mut bytes = Bytes(vec![0; count]);
@@ -145,6 +229,7 @@ impl Wire {
 #[allow(dead_code, reason = "shared-source root supervisor half")]
 pub(crate) struct PendingWire {
     stream: UnixStream,
+    limit: usize,
     header: [u8; 4],
     header_read: usize,
     input: Bytes,
@@ -159,11 +244,19 @@ pub(crate) struct PendingWire {
 #[allow(dead_code, reason = "shared-source root supervisor half")]
 impl PendingWire {
     pub fn new(stream: UnixStream) -> Result<Self, String> {
+        Self::bounded(stream, LIMIT)
+    }
+
+    pub fn bounded(stream: UnixStream, limit: usize) -> Result<Self, String> {
+        if limit == 0 || limit > LIMIT {
+            return Err("invalid notebook transport bound".into());
+        }
         stream
             .set_nonblocking(true)
             .map_err(|_| "configure notebook supervisor endpoint")?;
         Ok(Self {
             stream,
+            limit,
             header: [0; 4],
             header_read: 0,
             input: Bytes(Vec::new()),
@@ -185,7 +278,7 @@ impl PendingWire {
     }
 
     pub fn queue(&mut self, bytes: Bytes) -> Result<(), String> {
-        if self.output.is_some() || bytes.0.is_empty() || bytes.0.len() > LIMIT {
+        if self.output.is_some() || bytes.0.is_empty() || bytes.0.len() > self.limit {
             return Err("invalid pending notebook frame".into());
         }
         self.output_header = u32::try_from(bytes.0.len())
@@ -277,7 +370,7 @@ impl PendingWire {
                 self.header_read += count;
                 if self.header_read == 4 {
                     let length = u32::from_be_bytes(self.header) as usize;
-                    if length == 0 || length > LIMIT {
+                    if length == 0 || length > self.limit {
                         return Err("invalid notebook input length".into());
                     }
                     self.input = Bytes(vec![0; length]);

@@ -1,5 +1,6 @@
 //! Bounded credential client; the broker supplies identity, never the environment.
 
+use crate::notebook_wire::MailBinding;
 use crate::{bus_client, message, name, store, sys, wire};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -25,6 +26,11 @@ impl Drop for Descriptors {
 struct Frame {
     bytes: Vec<u8>,
     fds: Descriptors,
+}
+
+enum Argument<'a> {
+    Name(&'a str),
+    Mail(&'a MailBinding),
 }
 
 struct Client {
@@ -109,6 +115,24 @@ impl Client {
         argument: Option<&str>,
         sender: Option<&str>,
     ) -> Result<Frame, String> {
+        self.call_bound(
+            destination,
+            path,
+            interface,
+            member,
+            argument.map(Argument::Name),
+            sender,
+        )
+    }
+    fn call_bound(
+        &mut self,
+        destination: &str,
+        path: &str,
+        interface: &str,
+        member: &str,
+        argument: Option<Argument<'_>>,
+        sender: Option<&str>,
+    ) -> Result<Frame, String> {
         self.serial = self
             .serial
             .checked_add(1)
@@ -117,7 +141,15 @@ impl Client {
             message::Builder::method_call(wire::Endian::Little, path, Some(interface), member)
                 .destination(destination)
                 .serial(self.serial);
-        if let Some(argument) = argument {
+        if let Some(Argument::Mail(binding)) = argument {
+            builder = builder
+                .body("sss", |writer| {
+                    writer.string(binding.account())?;
+                    writer.string(binding.server())?;
+                    writer.string(binding.username())
+                })
+                .map_err(|error| error.to_string())?;
+        } else if let Some(Argument::Name(argument)) = argument {
             builder = builder
                 .body("s", |w| w.string(argument))
                 .map_err(|e| e.to_string())?;
@@ -198,7 +230,24 @@ pub fn retrieve(name: &str) -> Result<Vec<u8>, String> {
     retrieve_at(PathBuf::from(path), name)
 }
 
+pub fn retrieve_mail(account: &str, server: &str, username: &str) -> Result<Vec<u8>, String> {
+    let binding = MailBinding::new(account.into(), server.into(), username.into())?;
+    let address = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        .map_err(|_| "no session bus in this application")?;
+    let path = bus_client::unix_path(&address)
+        .ok_or("credential client needs one absolute unix:path bus")?;
+    retrieve_target(PathBuf::from(path), None, Some(&binding))
+}
+
 fn retrieve_at(path: PathBuf, name: &str) -> Result<Vec<u8>, String> {
+    retrieve_target(path, Some(name), None)
+}
+
+fn retrieve_target(
+    path: PathBuf,
+    name: Option<&str>,
+    binding: Option<&MailBinding>,
+) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let stream = bus_client::connect_within(&path, Duration::from_secs(20), "td-secret-connect")
         .map_err(|error| {
@@ -240,12 +289,18 @@ fn retrieve_at(path: PathBuf, name: &str) -> Result<Vec<u8>, String> {
     if !name::valid_unique_name(&owner) {
         return Err("invalid credential portal identity".into());
     }
-    let mut frame = client.call(
+    let mut frame = client.call_bound(
         PORTAL,
         "/org/freedesktop/portal/desktop",
         "td.Secret1",
-        "Retrieve",
-        Some(name),
+        if binding.is_some() {
+            "RetrieveMail"
+        } else {
+            "Retrieve"
+        },
+        binding
+            .map(Argument::Mail)
+            .or_else(|| name.map(Argument::Name)),
         Some(&owner),
     )?;
     let (reply, _) =
@@ -270,7 +325,12 @@ fn retrieve_at(path: PathBuf, name: &str) -> Result<Vec<u8>, String> {
     if !metadata.is_file()
         || metadata.nlink() != 0
         || metadata.len() == 0
-        || metadata.len() > store::MAX_SECRET as u64
+        || metadata.len()
+            > if binding.is_some() {
+                4096
+            } else {
+                store::MAX_SECRET as u64
+            }
     {
         return Err("invalid credential backing file".into());
     }

@@ -4,8 +4,10 @@
 use super::host::{self, Entropy};
 use super::lifecycle::{self, Directory, Session, Tokens};
 use super::notebook::{Change, Text};
-use super::{MailBinding, MAX_BODY, MAX_CREDENTIAL, MAX_ENVELOPE, MAX_PASSWORD, MAX_TITLE};
-use crate::notebook_wire::{field, Bytes, Reader, Wire, IDLE};
+use super::{MAX_BODY, MAX_CREDENTIAL, MAX_ENVELOPE, MAX_PASSWORD, MAX_TITLE};
+use crate::notebook_wire::{
+    field, put_binding, read_binding as binding, Bytes, Reader, Wire, IDLE,
+};
 use std::io::{self, Read};
 use std::time::{Duration, Instant};
 
@@ -244,20 +246,6 @@ fn reason(error: lifecycle::Error) -> String {
     format!("notebook operation refused: {error:?}")
 }
 
-fn binding(input: &mut Reader<'_>) -> Result<MailBinding, String> {
-    let account = input.text(256)?;
-    let server = input.text(2048)?;
-    let username = input.text(1024)?;
-    MailBinding::new(account.to_owned(), server.to_owned(), username.to_owned())
-}
-
-fn put_binding(out: &mut Bytes, binding: &MailBinding) -> Result<(), String> {
-    for text in [binding.account(), binding.server(), binding.username()] {
-        field(out, text.as_bytes())?;
-    }
-    Ok(())
-}
-
 fn change(input: &mut Reader<'_>) -> Result<Change, String> {
     match input.byte()? {
         6 => {
@@ -365,6 +353,7 @@ pub(crate) fn run(owner: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::MailBinding;
     #[test]
     fn service_replies_use_clearing_growth() {
         for source in [

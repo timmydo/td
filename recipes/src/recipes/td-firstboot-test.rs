@@ -243,8 +243,8 @@ pub fn recipe() -> Recipe {
                        [ \"$got\" = drwx------ ] || {{ echo \"$d has mode $got, expected drwx------\" >&2; exit 1; }}; \
                        set -- $(ls -lnd \"$home/$d\"); [ \"$3:$4\" = \"$owner\" ] || {{ echo \"$d is owned by $3:$4, not $owner\" >&2; exit 1; }}; \
                      done; \
-                     grep -q -F 'secret = \"portal\"' \"$home/.config/td-mail/config.toml\" || \
-                       {{ echo 'the mail configuration does not use the credential portal' >&2; exit 1; }}; \
+                     grep -q -F 'secret = \"td-pass\"' \"$home/.config/td-mail/config.toml\" || \
+                       {{ echo 'the mail configuration does not use the trusted notebook' >&2; exit 1; }}; \
                      grep -q -x -F '[[feed]]' \"$home/.config/td-news/config.toml\" || \
                        {{ echo 'the news configuration has no feed, and td-news refuses to start without one' >&2; exit 1; }}; \
                      HOME=\"$home\" XDG_CONFIG_HOME=\"$home/.config\" '{mail}' --offline --cli < /dev/null > '{{root}}/td-mail.out' 2> '{{root}}/td-mail.err' || \
@@ -346,7 +346,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-firstboot is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; a first provision mints a 32-hex machine-id, an SSH host key pair, and a deny-all authorized_keys, reporting TD-FIRSTBOOT-NEW-OK; a second provision over the same state reports TD-FIRSTBOOT-STABLE-OK with an unchanged machine-id and host-key fingerprint; and it refuses (non-zero, no marker) a keygen that fails, writes nothing, or reports a malformed fingerprint, an unknown argument, a malformed machine-id, incomplete keypairs, and malformed, wrong-type, or mismatched complete host-key pairs; and with --application-home/--application-owner it provisions the mail (td-mail) and news (td-news) configurations once under HOME/.td/app as 0700 directories and 0600 files owned by that user, reports the identity STABLE rather than NEW, never rewrites an edited file and restores a missing one, refuses half the pair or a root owner (exit 2), skips an absent home with a diagnostic, and starts td-mail (offline, CLI mode) and td-news (feed load) from the provisioned files\n".into(),
+        content: "PASS: td-firstboot is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; a first provision mints a 32-hex machine-id, an SSH host key pair, and a deny-all authorized_keys, reporting TD-FIRSTBOOT-NEW-OK; a second provision over the same state reports TD-FIRSTBOOT-STABLE-OK with an unchanged machine-id and host-key fingerprint; and it refuses (non-zero, no marker) a keygen that fails, writes nothing, or reports a malformed fingerprint, an unknown argument, a malformed machine-id, incomplete keypairs, and malformed, wrong-type, or mismatched complete host-key pairs; and with --application-home/--application-owner it provisions the mail (td-mail) and news (td-news) configurations once under HOME/.config as 0700 directories and 0600 files owned by that user, reports the identity STABLE rather than NEW, never rewrites an edited file and restores a missing one, refuses half the pair or a root owner (exit 2), skips an absent home with a diagnostic, and starts td-mail (offline, CLI mode) and td-news (feed load) from the provisioned files\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -360,7 +360,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-firstboot-test: build-plan --auto builds td-firstboot (td's static per-machine identity provisioner: machine-id, SSH host key, deny-all authorized_keys under /var/lib/td, which the image's /etc reaches through reviewed per-file symlinks), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises provisioning twice to prove it mints an identity once and never re-mints it, plus its refusals; then proves the application pair provisions the mail and news configurations once, privately, under the login user's jail state, and that td-mail and td-news start from them"
+echo ">> recipe-check td-firstboot-test: build-plan --auto builds td-firstboot (td's static per-machine identity provisioner: machine-id, SSH host key, deny-all authorized_keys under /var/lib/td, which the image's /etc reaches through reviewed per-file symlinks), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises provisioning twice to prove it mints an identity once and never re-mints it, plus its refusals; then proves the application pair provisions the mail and news configurations once, privately, under the login user's configuration home, and that td-mail and td-news start from them"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-firstboot-test 1
 "#,

@@ -132,10 +132,11 @@ impl Setup {
             self.sync_interval_secs,
         )
         .with_setup(AccountSetup {
+            notebook: matches!(account.password, PasswordSource::Notebook),
             placeholder: account.placeholder(),
             portal: match &account.password {
                 PasswordSource::Portal(name) => Some(name.clone()),
-                PasswordSource::Command(_) => None,
+                PasswordSource::Command(_) | PasswordSource::Notebook => None,
             },
             server: account.well_known_url.clone(),
             username: account.username.clone(),

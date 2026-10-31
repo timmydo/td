@@ -2,8 +2,8 @@
 
 The portable personal-vault workstream for td-pass is specified separately
 in [PORTABLE.md](PORTABLE.md). It targets TPM-independent primary/backup
-FIDO2 protection and supported foreign-Linux use. Its staged prerequisites
-do not change the application credential interfaces or protection below.
+FIDO2 protection and supported foreign-Linux use. Its trusted backend adds `RetrieveMail` for remembered notebook bindings;
+the legacy `Retrieve` interface and store protection below remain separate.
 The login-key root worker and record in
 [../td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md) reuse that
 PIN/hmac-secret flow and the root-only USB transport below; they do not
@@ -62,9 +62,16 @@ The activated desktop portal serves `td.Secret1` version 1. Application
 lookup requires a valid token protector and the current volatile release;
 file and legacy TPM-only backends are refused even if their keys are readable.
 The unenrolled boot oracle requires a broker-authenticated mail refusal,
-`portal: TD-SECRET-LOCKED app=mail name=main`, instead of a credential receipt.
+`portal: TD-NOTEBOOK-WITHHELD app=mail name=main`, instead of a credential
+receipt. The explicit legacy-store VM oracle configures `secret = "portal"`
+and retains its separate `TD-SECRET-LOCKED` evidence.
 
 The interface is:
+
+- `RetrieveMail(s account, s server, s username) -> (h credential, s receipt)`
+  requires the broker-authenticated `mail` application and forwards the exact
+  tuple through the root notebook adapter described in [PORTABLE.md](PORTABLE.md).
+  It never falls back to the legacy token store.
 
 - `Retrieve(s name) -> (h credential, s receipt)` performs a broker
   `GetConnectionCredentials` lookup for the original unique sender. Only an

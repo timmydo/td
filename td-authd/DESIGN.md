@@ -3738,3 +3738,26 @@ A separate admitted mail capability is required for tag 12; the browsing
 channel is never its substitute. Root sends idle heartbeats, ends the
 window on an expired vault, and destroys the GUI and service on session
 teardown or before suspend. No descriptor survives to the next generation.
+
+
+The paired session also owns `/run/td-authd/1000/notebook-mail`, a mode-0600
+socket assigned to portal UID/GID 991 under checked root-controlled parents.
+Only a peer with that UID is admitted using the existing SO_PEERCRED wrapper.
+The portal is responsible for broker-authenticated mail application identity.
+A connection carries one tag-1 request containing the exact account, configured
+server URL and username, with an 8192-byte frame ceiling and one five-second
+deadline. At most sixteen connections and sixteen distinct pending tuples
+are retained. Root serializes admitted requests as service tag 12, only while
+the service is unlocked and idle. Its reply returns only to that connection;
+no GUI reply path carries it. Busy, locked and absent bindings release nothing.
+
+Root's synthetic GUI tag 15 lists pending tuples. Successful tag-14 binding
+and successful credential release dismiss the tuple. Pending metadata may
+survive a notebook lock in the same generation; live connections do not.
+Session teardown removes the socket only if its device/inode still match.
+The mail endpoint never accepts browsing, binding or hardware operations.
+
+The GUI's local tag-11 lock also revokes the mail intake immediately when
+consumed. Root clears buffered replies and discards a still-pending service
+credential result before queuing the vault lock; it never publishes that
+result while waiting for the lock acknowledgement.

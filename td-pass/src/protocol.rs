@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use crate::plain::{Bytes, Text};
 
+pub use td_secret::pass::MailBinding;
+
 pub type EntryId = [u8; 16];
 
 /// The largest encrypted copy, td-secret's `pass::MAX_COPY`; a file
@@ -111,6 +113,12 @@ pub enum Change {
 
 #[derive(Debug)]
 pub enum Command {
+    BindMail {
+        op: Op,
+        id: EntryId,
+        base: u64,
+        binding: MailBinding,
+    },
     /// Protect the process, admit the vault directory and list its keys.
     Open,
     /// Open again, the person having accepted the swap the last `Swap`
@@ -204,6 +212,12 @@ pub struct Failure {
 
 #[derive(Debug)]
 pub enum Reply {
+    MailRequests(Vec<MailBinding>),
+    MailBound {
+        op: Op,
+        id: EntryId,
+        revision: u64,
+    },
     TrustedAttention {
         op: Op,
     },

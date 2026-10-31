@@ -442,7 +442,15 @@ not change its destination policy: the td image service still refuses
 loopback. The host launcher installed by `./install-apps` permits local
 mail-server requests while keeping public-content fetches off loopback.
 
-Each account sets exactly one of `secret = "portal"` or `password_command`.
+Each account sets exactly one of `secret = "td-pass"`, `secret = "portal"`, or `password_command`.
+
+On td, use `secret = "td-pass"`. Try connecting the account, then open
+td-pass with Ctrl+Alt+Esc followed by N. Unlock it, select a saved entry
+with a password/token, choose Mail, and approve the exact account, server
+URL and username shown. Retry mail. The binding is remembered, but the
+notebook must be unlocked for release. Changing the URL or username needs
+a new approval. This source preserves the password exactly, including
+trailing newlines. Clearing the entry’s password revokes its bindings.
 Legacy fallback is supported via `[jmap]` with `well_known_url`, `username`, and one of those;
 its portal credential is mail/default.
 

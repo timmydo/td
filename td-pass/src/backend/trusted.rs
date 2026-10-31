@@ -172,6 +172,25 @@ impl Backend {
                 self.using = Some(key);
                 self.unlocked(op, cancel, replies)
             }
+            Command::BindMail {
+                op,
+                id,
+                base,
+                binding,
+            } => {
+                let mut request = Frame(vec![14]);
+                request.extend(&id)?;
+                request.extend(&base.to_be_bytes())?;
+                request.push(1)?;
+                field(&mut request, binding.account().as_bytes())?;
+                field(&mut request, binding.server().as_bytes())?;
+                field(&mut request, binding.username().as_bytes())?;
+                let response = self.exchange(request, op, cancel, replies)?;
+                let mut input = success(&response)?;
+                let revision = input.number()?;
+                input.finish()?;
+                Ok(Reply::MailBound { op, id, revision })
+            }
             Command::Read { id } => {
                 let mut request = Frame(vec![5]);
                 request.extend(&id)?;
@@ -356,6 +375,7 @@ fn operation(command: &Command) -> Op {
     match command {
         Command::Create { op, .. }
         | Command::Unlock { op, .. }
+        | Command::BindMail { op, .. }
         | Command::Apply { op, .. }
         | Command::AddKey { op }
         | Command::ReplaceKeys { op, .. }
@@ -376,7 +396,46 @@ pub(super) fn serve(transport: pass::Trusted, jobs: &Receiver<Job>, replies: &Se
         revision: 0,
         copy: None,
     };
-    while let Ok(job) = jobs.recv() {
+    loop {
+        let job = match jobs.recv_timeout(Duration::from_millis(750)) {
+            Ok(job) => job,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if backend.using.is_none() {
+                    continue;
+                }
+                let result = (|| {
+                    let response = backend.call(vec![15], 0, &pass::Cancel::new(), replies)?;
+                    let mut input = success(&response)?;
+                    let count = input.byte()?;
+                    if count > 16 {
+                        return Err("too many mail requests".into());
+                    }
+                    let mut requests = Vec::new();
+                    for _ in 0..count {
+                        requests.push(pass::MailBinding::new(
+                            input.text(256)?.to_owned(),
+                            input.text(2048)?.to_owned(),
+                            input.text(1024)?.to_owned(),
+                        )?);
+                    }
+                    input.finish()?;
+                    Ok::<_, String>(requests)
+                })();
+                match result {
+                    Ok(requests) => {
+                        if replies.send(Reply::MailRequests(requests)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(text) => {
+                        let _ = replies.send(Reply::Refused { text });
+                        break;
+                    }
+                }
+                continue;
+            }
+        };
         let op = operation(&job.command);
         let result = backend.command(job.command, &job.cancel, replies);
         let cancelled = job.cancel.cancelled();

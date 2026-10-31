@@ -68,6 +68,9 @@ mod handoff;
 mod message;
 #[path = "../../td-busd/src/name.rs"]
 mod name;
+#[path = "../../td-secret/src/notebook_wire.rs"]
+#[allow(dead_code, reason = "shared bounded notebook mail codec")]
+mod notebook_wire;
 mod open_uri;
 mod secret;
 #[path = "../../td-secret/src/store.rs"]
@@ -183,6 +186,7 @@ const BACKGROUND_DENIAL_BODY: &[u8] = &[
 
 const INTROSPECTION_XML: &str = r#"<node>
   <interface name="td.Secret1">
+    <method name="RetrieveMail"><arg type="s" name="account" direction="in"/><arg type="s" name="server" direction="in"/><arg type="s" name="username" direction="in"/><arg type="h" name="credential" direction="out"/><arg type="s" name="receipt" direction="out"/></method>
     <method name="Retrieve"><arg type="s" name="name" direction="in"/><arg type="h" name="credential" direction="out"/><arg type="s" name="receipt" direction="out"/></method>
     <method name="Received"><arg type="s" name="receipt" direction="in"/></method>
     <property name="version" type="u" access="read"/>
@@ -1285,6 +1289,7 @@ struct ActiveDialog {
 struct ServiceState {
     application_policy: Option<app_policy::Policy>,
     secrets: BTreeMap<u32, secret::Pending>,
+    notebook_secrets: Vec<secret::NotebookPending>,
     secret_receipts: BTreeMap<String, secret::Receipt>,
     open_uris: BTreeMap<u32, open_uri::Pending>,
     /// Expired browser calls by serial, with the browser's unique name.
@@ -1404,6 +1409,7 @@ fn consume_bus_frame(
     if let Some(owner) = departed {
         state.pending.retain(|_, pending| pending.owner != owner);
         state.secrets.retain(|_, pending| pending.owner != owner);
+        secret::depart(state, &owner);
         open_uri::depart(state, &owner);
         state
             .secret_receipts

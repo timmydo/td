@@ -1509,3 +1509,19 @@ precedes entry mutation, and failed or stale changes publish nothing.
 Private service edit tag 6 selects this form with a presence-tagged entry
 ID, base revision, title, presence-tagged notes and a password field (empty
 means absent). The ordinary notes-only edits retain their old semantics.
+
+
+### Mail portal adapter
+
+`td-secret get-mail ACCOUNT SERVER USERNAME` calls `td.Secret1.RetrieveMail`
+with three strings and consumes the portal's read-only credential descriptor.
+The request names no entry ID or application identity. The portal authenticates
+the bus sender through the broker and permits only application `mail`; sharing
+the human UID grants no application identity. It forwards the bounded tuple
+to td-authd's portal-only notebook intake. Worker threads are bounded by the
+existing per-owner and global request limits, have a five-second exchange
+ceiling, and never block the portal event loop. Departed owners receive no
+late reply. The descriptor uses the existing unlinked credential-file and
+receipt mechanism, carrying only 1..4096 UTF-8 password/token bytes. No
+newline trimming applies to this source. Released bytes cannot be recalled
+from a recipient when the notebook subsequently locks.

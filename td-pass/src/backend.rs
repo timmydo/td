@@ -81,6 +81,7 @@ impl Client {
         let cancel = pass::Cancel::new();
         if let Command::Create { op, .. }
         | Command::Unlock { op, .. }
+        | Command::BindMail { op, .. }
         | Command::Apply { op, .. }
         | Command::AddKey { op }
         | Command::ReplaceKeys { op, .. }
@@ -300,6 +301,9 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                     },
                     _ => closed(op),
                 }
+            }
+            Command::BindMail { op, .. } => {
+                refused(op, "Mail bindings require the trusted td backend")
             }
             Command::Read { id } => match vault.as_ref().and_then(|vault| vault.entry(&id)) {
                 Some(entry) => Reply::Entry {
