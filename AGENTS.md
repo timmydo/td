@@ -18,6 +18,7 @@ needs them:
 - Before changing or adding `unsafe`, read `UNSAFE.md` and the touched crate's
   normative document.
 - For login or credentials, read `td-login/THREAT-MODEL.md`.
+- For trusted-main remote administration, read `td-update/ADMIN.md`.
 - For mail serving, storage, or submission, read `td-mta/DESIGN.md`.
 - For shared MIME parsing or decoding, read `td-mime/DESIGN.md`.
 - For shared HTML rendering or text extraction, read `td-html/DESIGN.md`.
@@ -379,6 +380,13 @@ attention requirement: its isolated installer wizard confirms the exact
 reviewed disk and erase/preserve mode directly. The live wizard and its
 ordinary input are trusted for installation; this is not installed-session
 elevation or authentication. See `td-install/INSTALLER.md`.
+
+The designated remote administrator is an explicit policy exception to
+per-operation physical consent: its separately provisioned SSH key may
+request a build and installation of the fixed upstream main branch and
+rollback to the retained deployment, and orderly reboot, without another prompt. The source revision is pinned per
+job, builds use a separate unprivileged identity, and no caller-supplied
+command or source is admitted. `td-update/ADMIN.md` owns this policy.
 
 Principle 7 is a target, not a current claim. The stock VM writes an
 empty shadow field for `tester` and auto-logs in. Root is locked (`!`)

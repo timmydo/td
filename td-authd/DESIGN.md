@@ -3641,3 +3641,21 @@ Power helper failures report launch errors, monotonic deadline expiry, or
 helper failure/disconnection on the authority's diagnostic stream. Wall-clock
 correction does not alter that two-second Instant deadline. A timeout leaves
 the power outcome unknown; it is not evidence that the request was rejected.
+
+## Initial remote-administrator enrollment
+
+The settings intake also accepts `admin-key BLOB`, exactly one canonical
+68-character Ed25519 SSH blob. The `enroll-admin-key` elevation-table
+operation, granted to the primary account, selects consent tag 40 carrying
+requester UID and that blob. H presents the full key and explicitly states
+that it can install trusted main and reboot without further physical
+approval. The ordinary fresh, presented Enter confirmation, cancellation,
+requester liveness, backoff and immutable-description rules apply.
+
+After commit the fixed bounded helper is `/bin/td-admin accept-key BLOB`.
+It requires root, validates the key with installed ssh-keygen, and creates
+the root-owned key file only if none exists. No key can be replaced through
+this intake. This is a separate authorization from `deploy-publish`; the
+remote policy, private build identity and durable job service are specified
+in `td-update/ADMIN.md`. Tag 40 does not authorize a credential-store or
+disk-protector operation.

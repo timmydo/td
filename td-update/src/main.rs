@@ -6,6 +6,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
+mod admin;
 mod apply;
 #[path = "../../engine/src/boot_info.rs"]
 #[allow(dead_code, reason = "the updater writes deployment metadata")]
@@ -566,10 +567,26 @@ fn run(args: &[String]) -> Result<()> {
 }
 
 fn main() -> ExitCode {
-    match run(&std::env::args().skip(1).collect::<Vec<_>>()) {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let administrator = std::env::args().next().is_some_and(|name| {
+        Path::new(&name)
+            .file_name()
+            .is_some_and(|name| name == "td-admin")
+    });
+    let result = if administrator {
+        admin::run(&args)
+    } else {
+        run(&args)
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("td-update: {error}");
+            let name = if administrator {
+                "td-admin"
+            } else {
+                "td-update"
+            };
+            eprintln!("{name}: {error}");
             ExitCode::FAILURE
         }
     }

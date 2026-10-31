@@ -431,7 +431,9 @@ impl Elevation {
     fn of(request: &Request) -> Option<Self> {
         match request.operation() {
             Operation::DeployRollback { .. } => Some(Self::Rollback),
-            Operation::SetHostname { .. } | Operation::ManageTime { .. } => Some(Self::Hostname),
+            Operation::SetHostname { .. }
+            | Operation::ManageTime { .. }
+            | Operation::EnrollAdminKey { .. } => Some(Self::Hostname),
             _ => None,
         }
     }
@@ -2086,7 +2088,15 @@ impl Client {
                         crate::attention::Notice::RolledBack
                     } else if pending.attempt.selection == Selection::Elevation(Elevation::Hostname)
                     {
-                        if matches!(pending.request.operation(), Operation::ManageTime { .. }) {
+                        if matches!(
+                            pending.request.operation(),
+                            Operation::EnrollAdminKey { .. }
+                        ) {
+                            crate::attention::Notice::AdminKeySaved
+                        } else if matches!(
+                            pending.request.operation(),
+                            Operation::ManageTime { .. }
+                        ) {
                             crate::attention::Notice::TimeSaved
                         } else {
                             crate::attention::Notice::HostnameSaved

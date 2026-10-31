@@ -141,7 +141,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(time_setting.contains("#[path = \"../../td-civil/src/tzif.rs\"]"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x61ddd3dbfac66247,
+        0x417b22f484b537c2,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -585,7 +585,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // write refusing until one succeeds; the table for the owner before
     // the queue; and at commit, the confirmation consumed, the backoff
     // cleared, the saved name read again and written through
-    // td-firstboot's shared source. Only the time variant starts its fixed helper.
+    // td-firstboot's shared source. Only time and initial admin-key enrollment start their fixed helpers.
     let rename = include_str!("../src/set_hostname.rs")
         .split("#[cfg(test)]")
         .next()
@@ -629,7 +629,9 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(rename.matches("self.unwritten = None;").count(), 1);
     // A failed write is sticky: `1f` answers 02 while one stands.
     assert!(rename.contains("            _ => vec![0x9f, 2, 0],"));
-    assert_eq!(rename.matches("Command::new(").count(), 1);
+    assert_eq!(rename.matches("Command::new(").count(), 2);
+    assert!(rename.contains("Command::new(\"/bin/td-admin\")"));
+    assert!(rename.contains("command.args([\"accept-key\", blob]);"));
     assert!(rename.contains("Command::new(\"/bin/td-time\")"));
     for forbidden in [
         ".spawn(",
@@ -1349,8 +1351,8 @@ const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
 const INSTALLATION_FINGERPRINT: u64 = 0xabb4e7cd418585ae;
 const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0xb0d5ccf021f64f9d;
 const ROLLBACK_FINGERPRINT: u64 = 0xf96a32041165e345;
-const ELEVATION_FINGERPRINT: u64 = 0x85d0d3846c0a3f6d;
-const SET_HOSTNAME_FINGERPRINT: u64 = 0x6ead4ba02566f510;
+const ELEVATION_FINGERPRINT: u64 = 0xf4a31827aee8856a;
+const SET_HOSTNAME_FINGERPRINT: u64 = 0xf9f5a1c2a92bcfda;
 const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const REVOCATION_FINGERPRINT: u64 = 0xae6413da1bcf5b12;

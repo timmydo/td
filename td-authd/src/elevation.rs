@@ -24,6 +24,7 @@ pub(crate) enum Operation {
     DeployRollback,
     SetHostname,
     ManageTime,
+    EnrollAdminKey,
     DeployPublish,
 }
 
@@ -33,6 +34,7 @@ impl Operation {
         Self::SetHostname,
         Self::DeployPublish,
         Self::ManageTime,
+        Self::EnrollAdminKey,
     ];
 
     fn name(self) -> &'static str {
@@ -40,6 +42,7 @@ impl Operation {
             Self::DeployRollback => "deploy-rollback",
             Self::SetHostname => "set-hostname",
             Self::ManageTime => "manage-time",
+            Self::EnrollAdminKey => "enroll-admin-key",
             Self::DeployPublish => "deploy-publish",
         }
     }

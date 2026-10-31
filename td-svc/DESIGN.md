@@ -2125,3 +2125,14 @@ exist to record until `spawn` returns.
 hand-writes a record naming a live process, starts td-svc on a table holding
 that unit, and requires both that the process is gone and that the unit then
 ran — the second half being what separates evicting from refusing everything.
+
+## Trusted-main administrator
+
+The installed system runs `/bin/td-admin serve` as a root `stop=leaf` daemon
+with `restart=always`, ordered after sysinit. Its supervised leaf owns the
+nested Git, build and operation cgroups; it delegates none to the builder.
+Requested replacement and shutdown drain the whole leaf. After an
+unexpected leader exit, the new admin leader drains these subgroups itself
+before accepting requests, since the supervisor preserves descendants. Completed admin
+updates request the existing orderly reboot command by default;
+`td-update/ADMIN.md` specifies their authorization and job lifetime.

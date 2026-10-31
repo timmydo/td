@@ -26,7 +26,11 @@ use std::time::{Duration, Instant};
 pub(crate) struct Setting(String);
 impl Setting {
     fn parse(text: &str) -> Result<Self, String> {
-        if let Some(value) = text.strip_prefix("time ") {
+        if let Some(blob) = text.strip_prefix("admin-key ") {
+            if !crate::consent::admin_key(blob) {
+                return Err("invalid admin public key".into());
+            }
+        } else if let Some(value) = text.strip_prefix("time ") {
             time_setting::Change::decode(value)?;
         } else {
             Hostname::parse(text)?;
@@ -37,7 +41,9 @@ impl Setting {
         &self.0
     }
     fn operation(&self) -> elevation::Operation {
-        if self.0.starts_with("time ") {
+        if self.0.starts_with("admin-key ") {
+            elevation::Operation::EnrollAdminKey
+        } else if self.0.starts_with("time ") {
             elevation::Operation::ManageTime
         } else {
             elevation::Operation::SetHostname
@@ -627,7 +633,12 @@ impl Change {
         let request = Request::new(
             nonce,
             owner,
-            if let Some(setting) = ready.name.name().strip_prefix("time ") {
+            if let Some(blob) = ready.name.name().strip_prefix("admin-key ") {
+                Operation::EnrollAdminKey {
+                    requester: ready.requester,
+                    blob: blob.into(),
+                }
+            } else if let Some(setting) = ready.name.name().strip_prefix("time ") {
                 Operation::ManageTime {
                     requester: ready.requester,
                     setting: setting.into(),
@@ -686,6 +697,16 @@ impl Change {
         self.admit(request)?;
         if !self.presented {
             return Err("hostname change was not presented".into());
+        }
+        if let Operation::EnrollAdminKey { blob, .. } = self.request.operation() {
+            self.committed = true;
+            self.result = Some(false);
+            self.backoff.approved()?;
+            let mut command = Command::new("/bin/td-admin");
+            command.args(["accept-key", blob]);
+            self.helper = Some(Inspection::printing(command, 511, Duration::from_secs(10))?);
+            self.result = None;
+            return Ok(());
         }
         if let Operation::ManageTime { setting, .. } = self.request.operation() {
             let change = time_setting::Change::decode(setting)?;

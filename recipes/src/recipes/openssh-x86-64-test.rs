@@ -146,8 +146,9 @@ pub fn recipe() -> Recipe {
                     "for form in sshd_config sshd_config_enforced sshd_config_server \
                          sshd_config_server_enforced; do \
                      case \"$form\" in sshd_config|sshd_config_server) admission='PermitRootLogin no';; \
-                         *) admission=$(printf '%s\\n%s' 'PermitRootLogin no' 'AllowUsers alice');; esac; \
-                     for user in alice tester root; do for addr in 127.0.0.1 192.0.2.20; do \
+                         sshd_config_server_enforced) admission=$(printf '%s\\n%s' 'PermitRootLogin no' 'AllowUsers alice');; \
+                         *) admission=$(printf '%s\\n%s\\n%s' 'PermitRootLogin no' 'AllowUsers alice' 'AllowUsers td-admin');; esac; \
+                     for user in alice tester root td-admin; do for addr in 127.0.0.1 192.0.2.20; do \
                          policy=$('{openssh}/bin/sshd' -h '{{root}}/keys/id_ed25519' \
                              -T -f \"{{root}}/$form\" \
                              -C \"user=$user,host=localhost,addr=$addr\") || exit 1; \
@@ -155,12 +156,18 @@ pub fn recipe() -> Recipe {
                              sshd_config_enforced:alice) expected='{selftest}';; \
                              sshd_config_server:alice) expected='{selftest} {provisioned} {metadata} .ssh/authorized_keys';; \
                              sshd_config_server_enforced:alice) expected='{selftest} {provisioned} {metadata}';; \
+                             sshd_config:td-admin|sshd_config_enforced:td-admin) expected='/var/lib/td-admin/authorized_keys';; \
                              *) expected='{persistent}';; esac; \
                          printf '%s\\n' \"$policy\" | grep -q -x -F \
                              \"AuthorizedKeysFile $expected\" || \
                              {{ printf '%s\\n' \"unexpected authorization for $user\" \"$policy\" >&2; exit 1; }}; \
                          printf '%s\\n' \"$policy\" | grep -q -x -F \
                              'Subsystem sftp internal-sftp' || exit 1; \
+                         if [ \"$user\" = td-admin ] && {{ [ \"$form\" = sshd_config ] || [ \"$form\" = sshd_config_enforced ]; }}; then \
+                             for rule in 'ForceCommand /bin/td-admin ssh' 'PermitTTY no' 'MaxSessions 1' 'DisableForwarding yes'; do \
+                                 printf '%s\\n' \"$policy\" | grep -q -x -F \"$rule\" || exit 1; \
+                             done; \
+                         fi; \
                          admitted=$(printf '%s\\n' \"$policy\" | grep -E '^(PermitRootLogin|AllowUsers|DenyUsers|AllowGroups|DenyGroups) ') || exit 1; \
                          test \"$admitted\" = \"$admission\" || \
                              {{ printf '%s\\n' \"unexpected admission in $form for $user\" \"$admitted\" >&2; exit 1; }}; \

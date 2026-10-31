@@ -475,6 +475,12 @@ fn valid_home(uid: u32, home: &str) -> bool {
     if uid == 0 {
         return home == "/root";
     }
+    if uid == 986 {
+        return home == "/var/lib/td-admin";
+    }
+    if uid == 985 {
+        return home == "/var/lib/td-admin-build";
+    }
     if uid == AUDIO_UID {
         return home == AUDIO_RUNTIME;
     }
@@ -529,6 +535,29 @@ const PROFILER_ACCOUNT: User = User {
     service_only: false,
 };
 
+const ADMIN_ACCOUNT: User = User {
+    name: "td-admin",
+    uid: 986,
+    gid: 986,
+    gecos: "Remote Administration",
+    home: "/var/lib/td-admin",
+    shell: "/bin/td-admin",
+    groups: &[],
+    passwordless: false,
+    service_only: false,
+};
+const ADMIN_BUILD_ACCOUNT: User = User {
+    name: "td-admin-build",
+    uid: 985,
+    gid: 985,
+    gecos: "System Update Builder",
+    home: "/var/lib/td-admin-build",
+    shell: "/bin/false",
+    groups: &[],
+    passwordless: false,
+    service_only: true,
+};
+
 const PRIMARY_ACCOUNT: User = User {
     name: "tester",
     uid: 1000,
@@ -561,6 +590,8 @@ const SYSTEM: SystemDef = SystemDef {
     users: &[
         ROOT_ACCOUNT,
         PROFILER_ACCOUNT,
+        ADMIN_ACCOUNT,
+        ADMIN_BUILD_ACCOUNT,
         User {
             name: NOTEBOOK_USER,
             uid: NOTEBOOK_RESERVED_UID,
@@ -1270,7 +1301,7 @@ fn build_group(sys: &SystemDef) -> String {
 
 fn gets_generic_persistent_home_setup(user: &User) -> bool {
     // Root is handled explicitly; supervised service homes are volatile.
-    user.uid != 0 && !user.service_only
+    user.uid != 0 && user.uid != ADMIN_ACCOUNT.uid && !user.service_only
 }
 
 /// Root's generated record, which the autotest health leg requires whole.
@@ -1282,7 +1313,9 @@ fn build_shadow(sys: &SystemDef) -> String {
         // Empty password field => no password. `!` is an ordinary lock, while
         // the exact td marker is denied by every human path and admitted only
         // by exec-service-as. A fixed last-change day keeps this reproducible.
-        let pw = if u.service_only {
+        let pw = if u.uid == ADMIN_ACCOUNT.uid {
+            "td-admin-key-only"
+        } else if u.service_only {
             "!td-service"
         } else if u.passwordless {
             ""
@@ -1472,6 +1505,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "firefox-soak",
     "bootsuccess",
     "bootfail",
+    "td-admin",
     "sshd",
     "greeter",
 ];
@@ -2413,6 +2447,14 @@ fn build_desktop_td_svc_conf() -> String {
          # network-facing pre-auth process behind its dedicated locked uid,\n\
          # chroot, and seccomp filter. The immutable config names only the\n\
          # per-machine Ed25519 host key, so a missing identity is fail-closed.\n\
+         [td-admin]\n\
+         type=daemon\n\
+         exec=/bin/td-admin serve\n\
+         after={sysinit}\n\
+         restart=always\n\
+         stop=leaf\n\
+         log=/var/log/svc/td-admin.log\n\
+         \n\
          [sshd]\n\
          type=daemon\n\
          exec=/bin/sshd -D -e -f {SSHD_CONFIG}\n\
@@ -4463,7 +4505,7 @@ fn build_firefox_tls_ready() -> String {
 /// consults it before any prompt, for `deploy-rollback` from L3.
 fn build_elevation_table() -> String {
     format!(
-        "td-elevation-v1\n{UI_UID}\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\n"
+        "td-elevation-v1\n{UI_UID}\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\n"
     )
 }
 
@@ -5049,6 +5091,10 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         steps.push(Step::Symlink {
             target: "{in:td-update}/bin/td-update".into(),
             link: "{root}/real-root/bin/td-update".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-update}/bin/td-update".into(),
+            link: "{root}/real-root/bin/td-admin".into(),
         });
         // The installer core a live boot serves from, started by td-authd for
         // the installer wizard below.
@@ -8367,6 +8413,7 @@ mod tests {
         assert_eq!(
             service_accounts,
             [
+                "td-admin-build",
                 NOTEBOOK_USER,
                 PORTAL_USER,
                 BROKER_USER,
@@ -8485,7 +8532,15 @@ mod tests {
             .filter(|(_, keys)| keys.iter().any(|(k, _)| k == "stop"))
             .map(|(name, _)| name)
             .collect();
-        assert_eq!(leaf_units, ["sshd"], "another unit declares stop=");
+        assert_eq!(
+            leaf_units,
+            ["td-admin", "sshd"],
+            "another unit declares stop="
+        );
+        assert_eq!(
+            unit_key("td-admin", "exec").as_deref(),
+            Some("/bin/td-admin serve")
+        );
     }
 
     /// Every oneshot carries an explicit `timeout=`.
@@ -9266,6 +9321,7 @@ mod tests {
                     .collect(),
             ),
             ("bootfail", sysinit.to_vec()),
+            ("td-admin", sysinit.to_vec()),
             ("sshd", sysinit.to_vec()),
             ("greeter", sysinit.to_vec()),
         ];
@@ -9651,7 +9707,7 @@ mod tests {
         assert_eq!(ELEVATION_TABLE, "/etc/td-elevation.tsv");
         assert_eq!(
             build_elevation_table(),
-            "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\n"
+            "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\n"
         );
         assert!(etc_files(&SYSTEM)
             .unwrap()
@@ -10235,8 +10291,10 @@ mod tests {
             // loops); reject it.
             let packed_applet = u.shell.strip_prefix("/bin/");
             assert!(
-                packed_applet
-                    .is_some_and(|a| { TD_SH_APPLETS.contains(&a) || UUTILS_APPLETS.contains(&a) }),
+                (u.uid == ADMIN_ACCOUNT.uid && u.shell == "/bin/td-admin")
+                    || packed_applet.is_some_and(|a| {
+                        TD_SH_APPLETS.contains(&a) || UUTILS_APPLETS.contains(&a)
+                    }),
                 "user '{}' login shell '{}' must be \"/bin/<applet>\" packed by a /bin farm \
                  (td-login execs it by absolute path)",
                 u.name,
@@ -11951,11 +12009,20 @@ mod tests {
         for (form, admission) in [
             (
                 ssh_policy::Form::Ordinary,
-                &["PermitRootLogin no", "Match User alice"][..],
+                &[
+                    "PermitRootLogin no",
+                    "Match User td-admin",
+                    "Match User alice",
+                ][..],
             ),
             (
                 ssh_policy::Form::Enforced,
-                &["PermitRootLogin no", "AllowUsers alice", "Match User alice"][..],
+                &[
+                    "PermitRootLogin no",
+                    "AllowUsers alice td-admin",
+                    "Match User td-admin",
+                    "Match User alice",
+                ][..],
             ),
         ] {
             let config = ssh_policy::config("alice", form, ssh_policy::Provisioned::No);
@@ -12694,7 +12761,7 @@ mod tests {
             } else if user.uid == 0 {
                 assert!(init.contains("/sysroot/var/root"));
             } else {
-                assert!(user.service_only);
+                assert!(user.service_only || user.uid == ADMIN_ACCOUNT.uid);
                 assert!(!init.contains(&path));
             }
         }

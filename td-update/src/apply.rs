@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 // Root-private staging this operation owns; nothing else is kept there.
 const STATE: &str = "/var/lib/td-update";
 const O_PATH: i32 = 0x200000; // Linux x86-64, safe std open flag.
-const PAYLOADS: [(&str, u64); 3] = [
+const PAYLOADS: &[(&str, u64)] = &[
     ("bzImage", 256 << 20),
     ("initramfs.cpio", 512 << 20),
     ("root.erofs", 128 << 30),
@@ -29,6 +29,22 @@ pub(crate) fn run(expected: &str) -> Result<()> {
     )?);
     let _state = private_state(Path::new(STATE))?;
     apply(&source, expected, Path::new(STATE), 1000, &mut execute)
+}
+
+/// The trusted-main service installs only the stopped private builder's output.
+pub(crate) fn admin(source: &Path, expected: &str, owner: u32) -> Result<()> {
+    if io(fs::metadata("/proc/self"), "read admin identity")?.uid() != 0 {
+        return Err("admin installation requires root".into());
+    }
+    let source = io(
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(O_PATH | O_NOFOLLOW)
+            .open(source),
+        "pin admin deployment",
+    )?;
+    let _state = private_state(Path::new(STATE))?;
+    apply(&source, expected, Path::new(STATE), owner, &mut execute)
 }
 
 fn descriptor(file: &File) -> PathBuf {
@@ -229,7 +245,7 @@ fn apply(
     // Pin every payload before creating privileged state. Only these fixed
     // names may cross from the user's build into a system deployment.
     let mut inputs = Vec::new();
-    for (name, limit) in PAYLOADS {
+    for &(name, limit) in PAYLOADS {
         inputs.push((name, limit, regular(&input.join(name), requester, limit)?));
     }
     let staging = Staging::create(state)?;

@@ -52,7 +52,14 @@ pub fn config(primary_name: &str, form: Form, provisioned: Provisioned) -> Strin
     };
     let allow = match form {
         Form::Ordinary => String::new(),
-        Form::Enforced => format!("AllowUsers {primary_name}\n"),
+        Form::Enforced => match provisioned {
+            Provisioned::No => format!("AllowUsers {primary_name} td-admin\n"),
+            Provisioned::Server => format!("AllowUsers {primary_name}\n"),
+        },
+    };
+    let admin = match provisioned {
+        Provisioned::No => "Match User td-admin\n\tAuthorizedKeysFile /var/lib/td-admin/authorized_keys\n\tForceCommand /bin/td-admin ssh\n\tPermitTTY no\n\tMaxSessions 1\n",
+        Provisioned::Server => "",
     };
     let remote_keys = match form {
         Form::Ordinary => format!(" {SSHD_USER_AUTHORIZED_KEYS}"),
@@ -89,6 +96,7 @@ pub fn config(primary_name: &str, form: Form, provisioned: Provisioned) -> Strin
          MaxSessions 4\n\
          Subsystem sftp internal-sftp\n\
          PidFile /run/sshd.pid\n\
+         {admin}\
          Match User {primary_name}\n\
          \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}{provisioned_keys}{remote_keys}\n"
     )

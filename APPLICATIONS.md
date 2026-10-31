@@ -8788,6 +8788,14 @@ requester ──request──▶ td-authd (root)
                  td-authd PERFORMS the named operation itself
 ```
 
+The trusted-main remote administrative path is specified in
+`td-update/ADMIN.md`. Its separately enrolled SSH key grants fixed-policy
+updates and reboot without a compositor or fresh physical consent. This is
+an explicit exception to properties 3, 5 and 6 below, which continue to
+apply to local interactive elevation. Root SSH and arbitrary privileged
+commands remain refused. The root admin service builds as its separate
+service identity, and installs only that job's validated result.
+
 #### Six properties, each load-bearing
 
 1. **Enumerated operations, never a shell.** A fixed table of named

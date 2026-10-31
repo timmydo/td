@@ -735,6 +735,16 @@ path, is refused as `THREAT-MODEL.md` §3 specifies.
 
 ## SSH
 
+The separately enrolled remote administrator (`td-update/ADMIN.md`) is an
+explicit exception to the primary-only account rule in this section.
+`AllowUsers` in the enforced form also names `td-admin`, whose root-owned
+key file and forced fixed-command interface authorize trusted-main updates,
+rollback and reboot. This key does not unlock the primary session or access
+its credential store. Stopping sshd during a login-key cutover closes its
+connections too; admitted admin jobs belong to their separate supervised
+service and continue. A login-key change does not revoke the independent
+administrator grant. Root SSH remains refused in both forms.
+
 Both policy forms enable `Subsystem sftp internal-sftp` before any
 `Match` block. Incoming SFTP and modern `scp` transfers run in OpenSSH
 as the authenticated account, with its ordinary filesystem permissions.

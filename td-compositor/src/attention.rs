@@ -34,6 +34,7 @@ pub(crate) enum Notice {
     /// Root's success for `set-hostname`.
     HostnameSaved,
     TimeSaved,
+    AdminKeySaved,
     /// A committed device-bound disk installation, before its recovery key:
     /// the screen then closes by itself (secret_client).
     Returning,
@@ -683,6 +684,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::NoHostname => "NO HOSTNAME OR TIME CHANGE IS READY",
         Notice::HostnameSaved => "HOSTNAME SAVED",
         Notice::TimeSaved => "TIME SETTINGS SAVED",
+        Notice::AdminKeySaved => "REMOTE ADMIN KEY ENROLLED",
         Notice::Returning => RETURNING_NOTICE,
         Notice::Stored => "CREDENTIAL STORED",
         Notice::NoWrite => "NO READY CREDENTIAL WRITE - RUN TD-SECRET SET FIRST",
@@ -945,6 +947,10 @@ mod tests {
     #[test]
     fn the_widest_elevation_prompts_fit_an_800_by_600_output() {
         let prompts = [
+            Operation::EnrollAdminKey {
+                requester: 65533,
+                blob: "AAAAC3NzaC1lZDI1NTE5AAAAIGmTjqOMdHoPzoqbE+wEE5Q4aNmEGC0tgJbQOkxqdgUi".into(),
+            },
             Operation::DeployRollback {
                 current: "a".repeat(64),
                 previous: "b".repeat(64),
@@ -1354,6 +1360,7 @@ mod tests {
         Notice::NoHostname,
         Notice::HostnameSaved,
         Notice::TimeSaved,
+        Notice::AdminKeySaved,
         Notice::Returning,
         Notice::Enrolled,
         Notice::Unenrolled,

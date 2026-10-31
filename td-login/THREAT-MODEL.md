@@ -16,6 +16,16 @@ each defence rests on. It is normative: the crate's tests assert the
 invariants named here, and widening the surface means amending this file
 in the same landing.
 
+The trusted-main administrator (`td-update/ADMIN.md`) is a separate SSH
+principal, UID/GID 986, with a forced fixed-command interface and root-owned
+keys enrolled through one physical settings approval. It remains admitted in both SSH policy forms. Its shadow marker is
+`td-admin-key-only`, an unsupported hash to td-login, not an empty password
+or service marker. OpenSSH uses public-key authentication alone; td-login
+cannot authenticate that marker. The build account UID/GID 985 uses the
+existing `!td-service` path and cannot log in. Neither account belongs to
+another account's supplementary groups. The existing credential-switching
+implementation is unchanged.
+
 ## 1. Assets and adversaries
 
 Assets, in the order an attacker wants them:

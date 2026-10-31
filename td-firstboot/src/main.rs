@@ -2508,7 +2508,7 @@ mod ssh_forms {
     fn ordinary(name: &str) -> String {
         BEFORE
             .replace(ROOT_BEFORE_L7, ROOT_REFUSED)
-            .replace("Match User alice\n", &format!("Match User {name}\n"))
+            .replace("Match User alice\n", &format!("Match User td-admin\n\tAuthorizedKeysFile /var/lib/td-admin/authorized_keys\n\tForceCommand /bin/td-admin ssh\n\tPermitTTY no\n\tMaxSessions 1\nMatch User {name}\n"))
             .replace(
                 "/run/td-ssh-selftest-authorized_keys\n",
                 "/run/td-ssh-selftest-authorized_keys .ssh/authorized_keys\n",
@@ -2520,9 +2520,9 @@ mod ssh_forms {
         BEFORE
             .replace(
                 ROOT_BEFORE_L7,
-                &format!("PermitRootLogin no\nAllowUsers {name}\n"),
+                &format!("PermitRootLogin no\nAllowUsers {name} td-admin\n"),
             )
-            .replace("Match User alice\n", &format!("Match User {name}\n"))
+            .replace("Match User alice\n", &format!("Match User td-admin\n\tAuthorizedKeysFile /var/lib/td-admin/authorized_keys\n\tForceCommand /bin/td-admin ssh\n\tPermitTTY no\n\tMaxSessions 1\nMatch User {name}\n"))
     }
 
     #[test]
@@ -2562,7 +2562,7 @@ mod ssh_forms {
                 let server = ssh_policy::config(name, form, Provisioned::Server);
                 assert_eq!(
                     server,
-                    desktop.replace(
+                    desktop.replace("Match User td-admin\n\tAuthorizedKeysFile /var/lib/td-admin/authorized_keys\n\tForceCommand /bin/td-admin ssh\n\tPermitTTY no\n\tMaxSessions 1\n", "").replace(" td-admin\n", "\n").replace(
                         "/run/td-ssh-selftest-authorized_keys",
                         "/run/td-ssh-selftest-authorized_keys /var/lib/td/authorized-keys \
                          /run/td-metadata-authorized-keys"
@@ -2581,19 +2581,15 @@ mod ssh_forms {
 
     /// A root holding a valid `var/lib/td/login`, owned by the test's IDs.
     struct Root {
+        _scratch: td_fs::TempDir,
         root: PathBuf,
         owner: login_state::Owner,
     }
 
     impl Root {
         fn new() -> Self {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "td-firstboot-ssh-form-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&root);
+            let scratch = td_fs::TempDir::new("td-firstboot-ssh-form").unwrap();
+            let root = scratch.path().to_path_buf();
             std::fs::DirBuilder::new()
                 .mode(0o755)
                 .recursive(true)
@@ -2605,6 +2601,7 @@ mod ssh_forms {
                 .unwrap();
             let meta = std::fs::metadata(&root).unwrap();
             Self {
+                _scratch: scratch,
                 root,
                 owner: login_state::Owner {
                     uid: meta.uid(),
@@ -2619,15 +2616,6 @@ mod ssh_forms {
 
         fn policy(&self, name: &str) -> String {
             sshd_policy(name, &self.root, self.owner)
-        }
-    }
-
-    impl Drop for Root {
-        fn drop(&mut self) {
-            for path in [self.root.join("var/lib/td"), self.login()] {
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-            }
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -2664,7 +2652,7 @@ mod ssh_forms {
     /// follows `PermitRootLogin no`, still in the global section before the
     /// primary's `Match` block; nothing else moves.
     #[test]
-    fn the_enforced_form_refuses_root_and_admits_only_the_primary() {
+    fn the_enforced_form_refuses_root_and_admits_primary_and_restricted_admin() {
         for name in NAMES {
             let policy = ssh_policy::config(
                 name,
@@ -2685,9 +2673,9 @@ mod ssh_forms {
             };
             let root_rule = rule("PermitRootLogin ");
             let allow = rule("AllowUsers ");
-            let matched = rule("Match ");
+            let matched = rule(&format!("Match User {name}"));
             assert_eq!(lines[root_rule], "PermitRootLogin no");
-            assert_eq!(lines[allow], format!("AllowUsers {name}"));
+            assert_eq!(lines[allow], format!("AllowUsers {name} td-admin"));
             assert_eq!(lines[matched], format!("Match User {name}"));
             assert_eq!(allow, root_rule + 1);
             assert!(allow < matched, "AllowUsers must be global");
@@ -2700,10 +2688,7 @@ mod ssh_forms {
                 ssh_policy::Form::Enforced,
                 ssh_policy::Provisioned::No
             ),
-            BEFORE.replace(
-                "PermitRootLogin prohibit-password\n",
-                "PermitRootLogin no\nAllowUsers alice\n"
-            )
+            enforced("alice")
         );
     }
 
@@ -2833,7 +2818,7 @@ mod ssh_forms {
         let root = Root::new();
         std::fs::write(root.login().join("1000"), b"").unwrap();
         let policy = root.policy(primary.name());
-        assert!(policy.contains("\nAllowUsers alice\n"));
+        assert!(policy.contains("\nAllowUsers alice td-admin\n"));
         assert!(policy.contains("\nMatch User alice\n"));
         for name in NAMES {
             assert!(principals::primary_account::validate_name(name).is_ok());

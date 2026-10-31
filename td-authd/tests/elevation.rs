@@ -3,11 +3,10 @@ use super::*;
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The image's table: UID 1000 may perform every v1 operation.
 pub(crate) const V1: &str =
-    "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\n";
+    "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\n";
 
 /// A table granting `uid` every v1 operation, outside the grammar's UID
 /// range when a test runs as such a UID.
@@ -20,19 +19,15 @@ pub(crate) fn granting(uid: u32) -> Table {
 /// A private directory holding `text` as the table, mode 0444, owned as
 /// the directory is; removed on drop.
 pub(crate) struct Etc {
+    _scratch: crate::test_temp::TempDir,
     pub(crate) path: PathBuf,
     pub(crate) owner: (u32, u32),
 }
 
 impl Etc {
     pub(crate) fn new(text: Option<&str>) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "td-elevation-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
+        let scratch = crate::test_temp::TempDir::new("td-elevation").unwrap();
+        let path = scratch.path().to_path_buf();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         if let Some(text) = text {
             let table = path.join(TABLE);
@@ -41,6 +36,7 @@ impl Etc {
         }
         let metadata = fs::metadata(&path).unwrap();
         Self {
+            _scratch: scratch,
             path,
             owner: (metadata.uid(), metadata.gid()),
         }
@@ -48,12 +44,6 @@ impl Etc {
 
     pub(crate) fn load(&self) -> Result<Table, String> {
         Table::load_from(&self.path, self.owner)
-    }
-}
-
-impl Drop for Etc {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
     }
 }
 

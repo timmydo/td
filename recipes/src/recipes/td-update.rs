@@ -1,6 +1,7 @@
 use crate::shared::{split_target_debug, target_rustc};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
+const ADMIN_RS: &str = include_str!("../../../td-update/src/admin.rs");
 const APPLY_RS: &str = include_str!("../../../td-update/src/apply.rs");
 const UPSTREAM_RS: &str = include_str!("../../../td-update/src/upstream.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
@@ -21,6 +22,11 @@ pub fn recipe() -> Recipe {
     let steps = vec![
         Step::MkDir {
             path: "{out}/bin".into(),
+        },
+        Step::WriteFile {
+            path: "{src}/td-update/src/admin.rs".into(),
+            content: ADMIN_RS.into(),
+            exec: false,
         },
         Step::WriteFile {
             path: "{src}/td-update/src/main.rs".into(),
@@ -104,6 +110,10 @@ pub fn recipe() -> Recipe {
             ],
         )
         .env("SOURCE_DATE_EPOCH", "1"),
+        Step::Symlink {
+            target: "td-update".into(),
+            link: "{out}/bin/td-admin".into(),
+        },
         Step::Require {
             paths: vec!["{out}/bin/td-update".into()],
             exec: true,
@@ -118,6 +128,7 @@ pub fn recipe() -> Recipe {
         },
         Step::assert_static(&["{out}/bin/td-update"]),
         Step::run("{out}", &["{out}/bin/td-update", "--help"]),
+        Step::run("{out}", &["{out}/bin/td-admin", "--help"]),
     ];
 
     Recipe::mesboot("td-update", "0.1")
@@ -137,14 +148,8 @@ mod tests {
     #[test]
     #[ignore = "requires host rustc"]
     fn the_recipe_stages_a_complete_compilable_source_tree() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "td-update-recipe-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&root).unwrap();
+        let scratch = crate::test_temp::TempDir::new("td-update-recipe").unwrap();
+        let root = scratch.path();
         for step in recipe().steps.unwrap() {
             if let Step::WriteFile { path, content, .. } = step {
                 if let Some(relative) = path.strip_prefix("{src}/") {
@@ -164,7 +169,6 @@ mod tests {
                 "update.rmeta",
             ])
             .output();
-        let _ = std::fs::remove_dir_all(root);
         let result = result.unwrap();
         assert!(
             result.status.success(),

@@ -11,6 +11,13 @@ on-volume install`, which resolves the
 running kernel's UUID handoff inside the single writer, as specified in
 `td-install/DESIGN.md`. Restart remains explicit.
 
+## Remote administration
+
+The same installed executable provides `/bin/td-admin`; [ADMIN.md](ADMIN.md)
+owns its restricted SSH interface, trusted-main policy, separate builder,
+durable jobs and reboot-by-default behavior. This path has no secure-attention
+dependency. The local-checkout commands below retain their explicit consent.
+
 ## Initial checkout
 
 The `release-source` oneshot runs `td-update init` through the existing

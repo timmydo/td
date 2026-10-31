@@ -8,6 +8,16 @@ use super::hostname::Hostname;
 #[path = "../../td-time/src/request.rs"]
 pub mod time_setting;
 
+/// One canonical Ed25519 SSH blob. Cryptographic-format admission is also
+/// checked by the installed ssh-keygen before the root key file is published.
+pub fn admin_key(blob: &str) -> bool {
+    blob.len() == 68
+        && blob.starts_with("AAAAC3NzaC1lZDI1NTE5AAAAI")
+        && blob
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
 const MAGIC: &[u8; 8] = b"TDCONS02";
 const MAX_BYTES: usize = 256;
 // Whole-disk installation summary bounds, in displayed (escaped) bytes.
@@ -1004,6 +1014,10 @@ pub enum Operation {
         requester: u32,
         setting: String,
     },
+    EnrollAdminKey {
+        requester: u32,
+        blob: String,
+    },
     /// Storage operation `01`: write the running deployment `current`'s
     /// kernel and selector to the ESP in `form`. One step.
     SelectorUpdate {
@@ -1590,6 +1604,11 @@ impl Request {
             {
                 return Err("invalid consent upgrade".into());
             }
+            Operation::EnrollAdminKey { requester, blob }
+                if *requester != owner || !admin_key(blob) =>
+            {
+                return Err("invalid admin key enrollment".into());
+            }
             Operation::ManageTime { requester, setting }
                 if *requester != owner || time_setting::Change::decode(setting).is_err() =>
             {
@@ -1772,6 +1791,7 @@ impl Request {
             | Operation::DeployRollback { .. }
             | Operation::SetHostname { .. }
             | Operation::ManageTime { .. }
+            | Operation::EnrollAdminKey { .. }
             | Operation::SelectorUpdate { .. }
             | Operation::UpgradeCancel => true,
             Operation::Upgrade { step, .. } => *step == UpgradeStep::Review,
@@ -2324,6 +2344,11 @@ impl Request {
                 bytes.extend_from_slice(current.as_bytes());
                 bytes.extend_from_slice(previous.as_bytes());
             }
+            Operation::EnrollAdminKey { requester, blob } => {
+                bytes.push(40);
+                bytes.extend_from_slice(&requester.to_be_bytes());
+                put_text(&mut bytes, blob);
+            }
             Operation::ManageTime { requester, setting } => {
                 bytes.push(39);
                 bytes.extend_from_slice(&requester.to_be_bytes());
@@ -2577,6 +2602,10 @@ impl Request {
                     previous: input.deployment()?,
                 }
             }
+            40 => Operation::EnrollAdminKey {
+                requester: input.number()?,
+                blob: input.text()?,
+            },
             39 => Operation::ManageTime {
                 requester: input.number()?,
                 setting: input.text()?,
@@ -2868,6 +2897,15 @@ impl Request {
                 lines.push(format!("CURRENT: {current}"));
                 lines.push(format!("PREVIOUS: {previous}"));
                 lines.push("TAKES EFFECT AT THE NEXT RESTART".into());
+                approval_lines(&mut lines);
+            }
+            Operation::EnrollAdminKey { requester, blob } => {
+                lines.push("ENROLL THE FIRST REMOTE ADMIN KEY".into());
+                lines.push(format!("REQUESTER UID {requester}"));
+                lines.push("SSH ED25519 PUBLIC KEY:".into());
+                lines.push(blob.clone());
+                lines.push("CAN INSTALL TRUSTED MAIN AND REBOOT".into());
+                lines.push("WITHOUT FURTHER PHYSICAL APPROVAL".into());
                 approval_lines(&mut lines);
             }
             Operation::ManageTime { requester, setting } => {
@@ -8651,6 +8689,54 @@ mod tests {
                     Some(first_proof(*proof))
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod admin_tests {
+    use super::*;
+    const KEY: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIGmTjqOMdHoPzoqbE+wEE5Q4aNmEGC0tgJbQOkxqdgUi";
+    #[test]
+    fn admin_enrollment_binds_the_key_owner_and_physical_approval() {
+        let request = Request::new(
+            [7; 32],
+            1000,
+            Operation::EnrollAdminKey {
+                requester: 1000,
+                blob: KEY.into(),
+            },
+        );
+        assert!(request.is_ok());
+        let Ok(request) = request else {
+            return;
+        };
+        assert_eq!(Request::decode(&request.encode()), Ok(request.clone()));
+        assert!(request.awaits_approval());
+        assert!(request.lines().iter().any(|line| line == KEY));
+        assert!(request
+            .lines()
+            .iter()
+            .any(|line| line == "WITHOUT FURTHER PHYSICAL APPROVAL"));
+        assert!(Request::new(
+            [7; 32],
+            1000,
+            Operation::EnrollAdminKey {
+                requester: 1001,
+                blob: KEY.into()
+            }
+        )
+        .is_err());
+        for key in ["", "ssh-ed25519", "main", "AAAA\nAAAA"] {
+            assert!(Request::new(
+                [7; 32],
+                1000,
+                Operation::EnrollAdminKey {
+                    requester: 1000,
+                    blob: key.into()
+                }
+            )
+            .is_err());
         }
     }
 }
