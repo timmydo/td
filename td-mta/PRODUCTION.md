@@ -1,8 +1,8 @@
 # Production operations: mx.timmydouglas.com
 
 This is the operator runbook for the Azure x86-64 host shared by
-`mx.timmydouglas.com`, `mx.timmyd.info` and `mx.882015.xyz`. The inventory was
-checked on 2026-10-27. Update this document when changing its paths or services.
+`mx.timmydouglas.com`, `mx.timmyd.info` and `mx.882015.xyz`. The base inventory was
+checked on 2026-10-27; search schedules were enabled on 2026-10-30. Update this document when changing its paths or services.
 [DEPLOYMENT.md](DEPLOYMENT.md) describes installation on other hosts;
 [OBSERVABILITY.md](OBSERVABILITY.md) describes diagnostic output.
 
@@ -271,6 +271,10 @@ Updates briefly interrupt listeners. PostgreSQL and stored mail remain in
 place. Pause the aggregate health timer for this window, stop all five MTA
 processes, then switch the link. Do not continue if any service fails to stop.
 Use a unique temporary link and an atomic rename within the same directory.
+Pause both search timers and stop their service jobs before switching binaries;
+resume the timers after verifying the new release, or after a verified rollback.
+Preserve their durable progress. Schema upgrades additionally fence every
+other database user, including backup, scrub and status jobs.
 
 The activation block runs in a subshell: any failed command ends activation
 and resumes the health timer. It preserves the previous executable path in a
@@ -501,8 +505,26 @@ Missing or invalid evidence uses verified-body fallback. Large searches can
 still exceed request work or connection bounds. Schema 40 uses pg_trgm for
 eligible literal terms, then checks candidates with the existing matcher;
 unindexed messages and ineligible terms retain bounded fallback.
-The first implementation has no automatic search-row preparation or scheduled
-rebuild, so new messages use parser fallback until an explicit backfill.
+Production now runs `td-mta-maint-search.timer` once per minute and
+`td-mta-maint-search-status.timer` every fifteen minutes, with durable progress
+in `/var/lib/td-mta/search-index/`. Missing or incompatible search rows are
+prepared in bounded pages; compatible existing rows are skipped. New messages
+use bounded parser fallback until prepared. Completed cycles wait five minutes
+before starting again. Unsupported messages remain visible as explicit partial
+search results; an operational failure is not an unsupported-message skip.
+
+Check the last service result and durable progress, not only timer activity:
+
+```text
+systemctl status td-mta-maint-search.timer td-mta-maint-search-status.timer
+sudo journalctl -u td-mta-maint-search.service -u td-mta-maint-search-status.service --since today
+sudo systemctl start td-mta-maint-search-status.service
+```
+
+See [automatic search preparation](DEPLOYMENT.md#automatic-search-preparation)
+for generation, bounds and uncertainty recovery. These jobs do not replace
+integrity scrubbing or backups. Their status is local; mailbox alerts remain
+unconfigured.
 
 ## Scheduled whole-body integrity verification
 

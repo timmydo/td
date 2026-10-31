@@ -333,6 +333,37 @@ Or use the compiled release binary directly:
 ./target/release/td-mail
 ```
 
+## Updates and configuration on td
+
+On an ordinary host, `./install-apps` builds and installs the native client
+and its fetch-service launcher. Restart td-mail after updating. This does not
+update a local td-mta replica or any remote mail server. Replica owners use
+[the replica operations runbook](../td-mta/REPLICA-OPERATIONS.md); server
+operators use [the production runbook](../td-mta/PRODUCTION.md).
+
+On a td system, mail is a packaged application launched from the desktop.
+It updates with the system deployment, not with a host `./install-apps`
+installation. Use the normal `td-update` build/install and secure-attention
+approval, then boot the new deployment; an explicitly enrolled administrator
+can use the [trusted-main update interface](../td-update/ADMIN.md).
+Updating the system preserves application data and configuration.
+
+The packaged app has its own protected home. Copying a host config into the
+human user's `~/.config/td-mail` does not configure that app, and a password
+command naming `/home/USER/...` does not grant access to that file. Use the
+app's server/address setup form and its credential portal. The provisioned
+account is named `main`; its portal credential is `mail/main`. The credential
+write and release require the physical authorization described below; SSH
+access to the human account does not confer it.
+
+For a direct connection to td-mta, set the account's HTTPS discovery URL and
+username in the app, for example `https://mx.timmydouglas.com/.well-known/jmap`
+and `mail@timmydouglas.com`. Keep portal credentials in the packaged app.
+No local td-mta, PostgreSQL, Unix socket, or replica renewal service is needed.
+After connecting, verify that folders and one message load online. Keep an
+existing local-replica account distinct from a direct-server account on hosts
+that intentionally use both.
+
 ## Setup
 
 Default config path:
