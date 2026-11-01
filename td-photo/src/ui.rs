@@ -62,6 +62,8 @@ pub const EXPOSURE_FINE: i32 = 10;
 /// The contrast step, a tenth in hundredths: `2^0.1` the tone's
 /// steepness.
 pub const CONTRAST_STEP: i32 = 10;
+/// The shadows step, a twentieth in hundredths: the pane's slider step.
+pub const SHADOWS_STEP: i32 = 5;
 /// The look intensity step, a tenth of the look in hundredths.
 pub const LOOK_INTENSITY_STEP: i32 = 10;
 
@@ -189,10 +191,10 @@ pub enum Effect {
         key: Key,
         value: Option<String>,
     },
-    /// Add `delta` hundredths to this photo's exposure, contrast or look
-    /// intensity on the file as it is then, clamped to the key's range, and settle the
-    /// model: a delta, not an absolute, so a value changed meanwhile is
-    /// added to.
+    /// Add `delta` hundredths to this photo's exposure, contrast,
+    /// shadows or look intensity on the file as it is then, clamped to the
+    /// key's range, and settle the model: a delta, not an absolute, so a
+    /// value changed meanwhile is added to.
     Nudge {
         index: usize,
         name: String,
@@ -311,6 +313,8 @@ pub enum Action {
     ContrastOut,
     Contrast,
     Highlights,
+    ShadowsIn,
+    ShadowsOut,
     Shadows,
     Whites,
     Blacks,
@@ -380,6 +384,8 @@ impl Action {
         Action::ContrastOut,
         Action::Contrast,
         Action::Highlights,
+        Action::ShadowsIn,
+        Action::ShadowsOut,
         Action::Shadows,
         Action::Whites,
         Action::Blacks,
@@ -456,6 +462,8 @@ impl Action {
             Self::ContrastOut => "contrast-out",
             Self::Contrast => "contrast",
             Self::Highlights => "highlights",
+            Self::ShadowsIn => "shadows-in",
+            Self::ShadowsOut => "shadows-out",
             Self::Shadows => "shadows",
             Self::Whites => "whites",
             Self::Blacks => "blacks",
@@ -549,6 +557,8 @@ impl Action {
             | Self::ContrastOut
             | Self::Contrast
             | Self::Highlights
+            | Self::ShadowsIn
+            | Self::ShadowsOut
             | Self::Shadows
             | Self::Whites
             | Self::Blacks
@@ -880,6 +890,18 @@ pub const BINDINGS: &[Binding] = &[
         chord: None,
         arguments: "VALUE",
         help: "Set the highlights to VALUE, two decimals in -1.00..1.00: the bright tones raised or, below zero, recovered (develop mode).",
+    },
+    Binding {
+        name: "shadows-in",
+        chord: Some("s"),
+        arguments: "",
+        help: "Lift the shadows a twentieth, up to 1.00 (develop mode).",
+    },
+    Binding {
+        name: "shadows-out",
+        chord: Some("S"),
+        arguments: "",
+        help: "Deepen the shadows a twentieth, down to -1.00 (develop mode).",
     },
     Binding {
         name: "shadows",
@@ -1311,6 +1333,8 @@ const ADJUST_LABEL_CELLS: usize = 16;
 pub const ADJUST_STEPS: usize = 40;
 const _: () = assert!(library::MAX_CONTRAST == 5 * (ADJUST_STEPS / 2) as i32);
 const _: () = assert!(library::MAX_TONE == library::MAX_CONTRAST);
+// `s` and `S` land on the shadows row's steps.
+const _: () = assert!(library::MAX_TONE == SHADOWS_STEP * (ADJUST_STEPS / 2) as i32);
 const _: () = assert!(library::MAX_CLARITY == library::MAX_CONTRAST);
 
 /// A labelled slider's value for a signed value in hundredths, the
@@ -4099,6 +4123,8 @@ impl Controller {
             (Action::ContrastOut, []) => return self.nudge(Key::Contrast, -CONTRAST_STEP, effects),
             (Action::Contrast, [value]) => return self.set_contrast(value, effects),
             (Action::Highlights, [value]) => return self.set_tone(Key::Highlights, value, effects),
+            (Action::ShadowsIn, []) => return self.nudge(Key::Shadows, SHADOWS_STEP, effects),
+            (Action::ShadowsOut, []) => return self.nudge(Key::Shadows, -SHADOWS_STEP, effects),
             (Action::Shadows, [value]) => return self.set_tone(Key::Shadows, value, effects),
             (Action::Whites, [value]) => return self.set_tone(Key::Whites, value, effects),
             (Action::Blacks, [value]) => return self.set_tone(Key::Blacks, value, effects),
@@ -5736,8 +5762,8 @@ impl Controller {
         Ok((Outcome::Changed, effects))
     }
 
-    /// Adjusts the cursor photo's exposure, contrast or look intensity by
-    /// `delta` hundredths, applied to the file's value at the adapter, not the
+    /// Adjusts the cursor photo's exposure, contrast, shadows or look
+    /// intensity by `delta` hundredths, applied to the file's value at the adapter, not the
     /// model's copy, so a value changed meanwhile is added to, and a delta
     /// that clamps to no change settles as `Ignored`.
     fn nudge(

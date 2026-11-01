@@ -272,7 +272,7 @@ fn the_key_list_groups_the_table_by_mode_under_the_chooser_while_it_is_open() {
             ("Cull", 9),
             ("Modes", 3),
             ("Moving around", 8),
-            ("Develop", 12),
+            ("Develop", 14),
             ("History", 5),
             ("Looks", 11),
             ("Zoom", 4),
@@ -2147,7 +2147,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "72"]);
+    assert_eq!(&reply(2)[..2], ["ok", "74"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(
         reply(4),
@@ -6734,6 +6734,64 @@ fn the_pane_s_contrast_row_slides_and_commits_the_contrast() {
         }
     }
     assert!(none && some);
+}
+
+/// The shadows are nudged a twentieth by `s` and `S` (`shadows-in`,
+/// `shadows-out`), a develop edit of the cursor photo as contrast's are:
+/// ignored in cull, a `Nudge` of `Key::Shadows` the file adds to, its
+/// value on the pane's Shadows row, and a nudge past the end no change.
+#[test]
+fn the_shadows_are_nudged_a_twentieth_by_their_keys() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    for name in ["shadows-in", "shadows-out"] {
+        assert_eq!(act(&mut c, name, &[]), Outcome::Ignored, "{name}");
+    }
+    assert_eq!(key(&mut c, "s"), Outcome::Ignored);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let (outcome, effects) = c.action("shadows-in", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Nudge {
+            index: 0,
+            name: file(0),
+            key: Key::Shadows,
+            delta: ui::SHADOWS_STEP,
+        }]
+    );
+    assert_eq!(ui::SHADOWS_STEP, 5);
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(c.adjust_label(2), "Shadows 0.05");
+    for (chord, delta) in [
+        ("s", ui::SHADOWS_STEP),
+        ("s", ui::SHADOWS_STEP),
+        ("S", -ui::SHADOWS_STEP),
+    ] {
+        let (outcome, effects) = c.input(Input::Key { chord }).unwrap();
+        assert_eq!(outcome, Outcome::Changed);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Nudge { key: Key::Shadows, delta: d, .. }] if *d == delta),
+            "{chord}: {effects:?}"
+        );
+        apply(&mut c, &effects).unwrap();
+    }
+    assert_eq!(c.adjust_label(2), "Shadows 0.10");
+    // The run of nudges is the one shadows step.
+    let steps = c
+        .photos()
+        .first()
+        .and_then(|photo| photo.sidecar.as_ref())
+        .unwrap()
+        .steps()
+        .len();
+    assert_eq!(steps, 1);
+    // At the top a further lift writes nothing.
+    let (_, effects) = c.action("shadows", &["1.00"]).unwrap();
+    apply(&mut c, &effects).unwrap();
+    let (_, effects) = c.input(Input::Key { chord: "s" }).unwrap();
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Ignored);
+    assert_eq!(c.adjust_label(2), "Shadows 1.00");
 }
 
 /// The tonal regions: `highlights`, `shadows`, `whites` and `blacks`

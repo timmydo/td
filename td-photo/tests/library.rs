@@ -763,6 +763,37 @@ fn contrast_is_a_develop_key_nudged_within_its_range() {
     assert_eq!(sidecar.text(), "td-photo edit 1\n");
 }
 
+/// A tonal region is nudged as contrast is: added to, clamped to
+/// `-MAX_TONE..=MAX_TONE`, a run of nudges one step, and a nudge that
+/// clamps to the value in force no step.
+#[test]
+fn a_tonal_region_is_nudged_within_its_range() {
+    let mut sidecar = Sidecar::default();
+    for _ in 0..3 {
+        sidecar.nudge(Key::Shadows, 5).unwrap();
+    }
+    assert_eq!(sidecar.tone_amount(Key::Shadows), Some(15));
+    sidecar.nudge(Key::Shadows, -5).unwrap();
+    assert_eq!(
+        sidecar.text(),
+        "td-photo edit 1\nshadows 0.10\nstep-1 on shadows 0.10\n"
+    );
+    for _ in 0..30 {
+        sidecar.nudge(Key::Shadows, 5).unwrap();
+    }
+    assert_eq!(sidecar.tone_amount(Key::Shadows), Some(library::MAX_TONE));
+    let text = sidecar.text();
+    sidecar.nudge(Key::Shadows, 5).unwrap();
+    assert_eq!(sidecar.text(), text);
+    let mut floor = Sidecar::default();
+    floor.nudge(Key::Highlights, -250).unwrap();
+    assert_eq!(floor.tone_amount(Key::Highlights), Some(-library::MAX_TONE));
+    assert_eq!(
+        floor.nudge(Key::Clarity, 5),
+        Err(Error::Value(Key::Clarity))
+    );
+}
+
 /// The look's intensity is a develop key of hundredths in 0.00..=2.00,
 /// the whole look (1.00) when absent; a nudge clamps to that range, and
 /// one that clamps to the value in force is no step, as is the whole set

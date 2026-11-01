@@ -844,9 +844,10 @@ impl Sidecar {
         Ok(())
     }
 
-    /// Adds `delta` hundredths to the exposure, contrast or look
-    /// intensity, clamped to the key's range, as `set` sets it; another
-    /// key is refused as a value outside its grammar.
+    /// Adds `delta` hundredths to the exposure, contrast, a tonal region
+    /// (`Key::TONE`) or the look intensity, clamped to the key's range, as
+    /// `set` sets it; another key is refused as a value outside its
+    /// grammar.
     pub fn nudge(&mut self, key: Key, delta: i32) -> Result<(), Error> {
         let (current, range, text): (_, _, fn(i32) -> String) = match key {
             Key::Exposure => (
@@ -863,6 +864,11 @@ impl Sidecar {
                 self.look_intensity(),
                 (0, MAX_LOOK_INTENSITY),
                 look_intensity_text,
+            ),
+            _ if Key::TONE.contains(&key) => (
+                self.tone_amount(key).unwrap_or(0),
+                (-MAX_TONE, MAX_TONE),
+                tone_text,
             ),
             _ => return Err(Error::Value(key)),
         };
