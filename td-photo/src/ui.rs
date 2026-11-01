@@ -211,8 +211,9 @@ pub enum Effect {
     /// window queues them; either says how the batch goes through
     /// `set_export`, and `ignored` when the files hold no pick.
     AutoPicks,
-    /// Reset this photo's develop keys to camera defaults, keeping the
-    /// flag, on the file as it is then, and settle the model.
+    /// Reset this photo's develop keys to camera defaults (the look to
+    /// the default look, where one is set), keeping the flag, on the file
+    /// as it is then, and settle the model.
     Reset { index: usize, name: String },
     /// Take the last step of this photo's develop history back, on the
     /// file as it is then, and settle the model; a history with no step
@@ -820,7 +821,7 @@ pub const BINDINGS: &[Binding] = &[
         name: "reset",
         chord: Some("0"),
         arguments: "",
-        help: "Reset exposure, contrast, the tonal regions, clarity, crop, look and its intensity to camera defaults, clearing the history (develop mode).",
+        help: "Reset exposure, contrast, the tonal regions, clarity, crop, look and its intensity to camera defaults (the look to the default look, where one is set), clearing the history (develop mode).",
     },
     Binding {
         name: "undo",
@@ -2133,6 +2134,9 @@ pub struct Controller {
     /// each `Settings` effect it wrote): `state` fields the export view
     /// shows, kept across rolls and modes.
     settings: Settings,
+    /// The user's default look (`set_default_look`): the look a photo
+    /// whose sidecar sets none develops with (`library::effective_look`).
+    default_look: Option<String>,
 }
 
 /// A pan drag: the press anchor and the pointer's current point, both in
@@ -2691,6 +2695,7 @@ impl Controller {
             pan: None,
             extent: None,
             settings: Settings::default(),
+            default_look: None,
         }
     }
 
@@ -3085,6 +3090,25 @@ impl Controller {
         }
     }
 
+    /// The user's default look as the adapter read it at open: the look
+    /// band marks it, its intensity slides and a clear writes `look
+    /// none`, for a photo whose sidecar sets no look. `none` is no
+    /// default.
+    pub fn set_default_look(&mut self, stem: Option<String>) -> Outcome {
+        let stem = stem.filter(|stem| stem != library::NO_LOOK);
+        if self.default_look == stem {
+            return Outcome::Ignored;
+        }
+        self.default_look = stem;
+        self.bump();
+        Outcome::Changed
+    }
+
+    /// The user's default look, as `set_default_look` last settled it.
+    pub fn default_look(&self) -> Option<&str> {
+        self.default_look.as_deref()
+    }
+
     /// The export settings as the adapter settled them: the user's file
     /// at open, then each `Settings` effect as it is written. A change
     /// (`state` reports them, and the export view shows them) is a new
@@ -3304,13 +3328,16 @@ impl Controller {
             .unwrap_or(FULL_CROP)
     }
 
-    /// The cursor photo's look stem, or `None` when it has none: the row the
-    /// palette marks as current.
+    /// Photo `index`'s look stem in force, its sidecar's or the default
+    /// (`library::effective_look`), or `None`: the row the palette marks
+    /// as current.
     fn current_look(&self, index: usize) -> Option<&str> {
-        self.photos
+        let own = self
+            .photos
             .get(index)
             .and_then(|photo| photo.sidecar.as_ref())
-            .and_then(Sidecar::look)
+            .and_then(Sidecar::look);
+        library::effective_look(own, self.default_look.as_deref())
     }
 
     /// The palette's panel: the develop box's rows across the develop
@@ -5682,9 +5709,11 @@ impl Controller {
         )
     }
 
-    /// Sets the cursor photo's look to `stem`, or clears it with `-`. A
-    /// value that is not a look stem is `BadArgument`, judged here so it is
-    /// the wire's `bad-argument`, not a refused write.
+    /// Sets the cursor photo's look to `stem`, or clears it with `-`: with
+    /// a default look, to `look none`, so the photo has none rather than
+    /// the default. A value that is not a look stem is `BadArgument`,
+    /// judged here so it is the wire's `bad-argument`, not a refused
+    /// write.
     fn set_look(
         &mut self,
         stem: &str,
@@ -5694,7 +5723,9 @@ impl Controller {
             return Ok((Outcome::Ignored, effects));
         };
         let value = if stem == "-" {
-            None
+            self.default_look
+                .as_ref()
+                .map(|_| library::NO_LOOK.to_string())
         } else if library::valid_look(stem) {
             Some(stem.to_string())
         } else {
@@ -5868,8 +5899,8 @@ impl Controller {
         Ok((Outcome::Changed, effects))
     }
 
-    /// Resets the cursor photo's develop keys to camera defaults, keeping
-    /// the flag.
+    /// Resets the cursor photo's develop keys to camera defaults (the look
+    /// to the default look, where one is set), keeping the flag.
     fn reset_develop(&mut self, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
         let Some(index) = self.develop_photo()? else {
             return Ok((Outcome::Ignored, effects));

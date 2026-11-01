@@ -104,6 +104,14 @@ const HELP: &str = concat!(
     "  $XDG_CONFIG_HOME/td-photo/looks/STEM.look (~/.config/td-photo/looks/\n",
     "  when that is not absolute) and shadow built-in ones of the same\n",
     "  stem. With STEM, prints that look's text.\n",
+    "td-photo default-look [STEM | -]\n",
+    "  Prints the default look's stem (- without one), or makes STEM the\n",
+    "  default (a look that must resolve), or with - clears it; kept in\n",
+    "  $XDG_CONFIG_HOME/td-photo/default-look. A photo whose sidecar sets\n",
+    "  no look develops with the default in the window, --preview and\n",
+    "  export (the develop verb takes only --look); a sidecar's `look\n",
+    "  none` is no look over it. The window reads it when it opens and\n",
+    "  exports with what it read; a default naming no look is none.\n",
     "td-photo match-look ROLL [--name STEM]\n",
     "  Fits a look to the camera's own rendering: up to 16 of ROLL's\n",
     "  photos, spread over it, each developed plain (0 EV, nothing set)\n",
@@ -212,6 +220,11 @@ fn main() -> ExitCode {
         [verb, ..] if verb == "cache" => Err("cache needs path or clear; see --help".to_string()),
         [verb, roll, rest @ ..] if verb == "match-look" => match_look(Path::new(roll), rest),
         [verb] if verb == "match-look" => Err("match-look needs ROLL; see --help".to_string()),
+        [verb] if verb == "default-look" => default_look(None),
+        [verb, stem] if verb == "default-look" => default_look(Some(stem)),
+        [verb, ..] if verb == "default-look" => {
+            Err("default-look takes at most STEM or -; see --help".to_string())
+        }
         [verb] if verb == "looks" => looks(None),
         [verb, stem] if verb == "looks" => looks(Some(stem)),
         [verb, ..] if verb == "looks" => Err("looks takes at most STEM; see --help".to_string()),
@@ -629,7 +642,10 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
     };
     // The look, like a bad option, is refused before the camera file is
     // read; a user look that does not parse is an error, not the built-in.
+    // The verb develops with what its flags say: no default look, and
+    // `none` no look, as a sidecar's is.
     let look = match option(rest, "--look")? {
+        Some(stem) if stem == library::NO_LOOK => None,
         Some(stem) => Some(find_look(&stem)?),
         None => None,
     };
@@ -1303,10 +1319,15 @@ pub(crate) struct Exported {
 }
 
 /// The export `path` asks for, from its sidecar as the file holds it now,
-/// written with `settings`. A sidecar the reader refuses refuses the
-/// export: developing with camera defaults would silently drop the edits
-/// the file holds.
-pub(crate) fn export_request(path: &Path, settings: Settings) -> Result<ExportRequest, String> {
+/// written with `settings`, a sidecar without a look taking `default`
+/// (the caller's, so the window exports what it shows). A sidecar the
+/// reader refuses refuses the export: developing with camera defaults
+/// would silently drop the edits the file holds.
+pub(crate) fn export_request(
+    path: &Path,
+    settings: Settings,
+    default: Option<&str>,
+) -> Result<ExportRequest, String> {
     original(path)?;
     let sidecar = read_sidecar(path)?;
     Ok(ExportRequest {
@@ -1316,7 +1337,7 @@ pub(crate) fn export_request(path: &Path, settings: Settings) -> Result<ExportRe
         tone: sidecar.tone(),
         clarity: sidecar.clarity().unwrap_or(0),
         crop: sidecar.crop(),
-        look: sidecar.look().map(str::to_string),
+        look: library::effective_look(sidecar.look(), default).map(str::to_string),
         look_intensity: sidecar.look_intensity(),
         settings,
         batch: false,
@@ -1605,7 +1626,7 @@ pub(crate) fn export_file(
 /// (`export_request` and `export_file`, which the window's pool runs too).
 fn export(path: &Path, rest: &[OsString]) -> Result<(), String> {
     check_flags(rest, &["--format", "--quality", "--long-edge"], &[])?;
-    let request = export_request(path, export_settings(rest)?)?;
+    let request = export_request(path, export_settings(rest)?, read_default_look().as_deref())?;
     let started = Instant::now();
     let exported = export_file(&request, None, threads())?;
     writeln!(
@@ -1643,11 +1664,12 @@ fn export_picks(roll: &Path, rest: &[OsString]) -> Result<(), String> {
     check_flags(rest, &["--format", "--quality", "--long-edge"], &[])?;
     let settings = export_settings(rest)?;
     let picks = read_picks(roll)?;
+    let default = read_default_look();
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut failed = 0usize;
     for name in &picks {
-        let line = match export_request(&roll.join(name), settings)
+        let line = match export_request(&roll.join(name), settings, default.as_deref())
             .and_then(|request| export_file(&request, None, threads()))
         {
             Ok(exported) => format!("exported {name} -> {}", exported.out.display()),
@@ -2247,6 +2269,84 @@ fn read_settings() -> Settings {
     }
 }
 
+/// `$XDG_CONFIG_HOME/td-photo/default-look`: the look a photo whose
+/// sidecar sets none develops with in the window, `--preview` and
+/// export.
+fn default_look_path() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("default-look"))
+}
+
+/// The user's default look stem, `None` without a file or a user
+/// directory, and `None` with the reason on stderr when the file is
+/// refused: not a regular file, past `settings::MAX_BYTES`, or not the
+/// grammar (`library::parse_default_look`), or naming no look that
+/// resolves: one stale default would otherwise refuse every look-less
+/// photo's develop and export.
+pub(crate) fn read_default_look() -> Option<String> {
+    let path = default_look_path().ok()?;
+    let refused = |why: &str| {
+        note(&format!("{}: {why}; no default look", path.display()));
+        None
+    };
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_file() && meta.len() <= settings::MAX_BYTES as u64 => {}
+        Ok(meta) if meta.is_file() => return refused("too long"),
+        Ok(_) => return refused("not a regular file"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => return refused(&e.to_string()),
+    }
+    let mut bytes = Vec::new();
+    let read = fs::File::open(&path).and_then(|file| {
+        file.take(settings::MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+    });
+    if let Err(e) = read {
+        return refused(&e.to_string());
+    }
+    match library::parse_default_look(&bytes) {
+        Ok(stem) => match find_look(&stem) {
+            Ok(_) => Some(stem),
+            Err(why) => refused(&why),
+        },
+        Err(why) => refused(why),
+    }
+}
+
+/// `default-look`: with nothing, the default look's stem or `-`; with a
+/// stem, that look (resolved now, so a stem no look answers to is
+/// refused) made the default, the file replaced; with `-`, the file
+/// removed. Never a link or a folder at the file's name.
+fn default_look(arg: Option<&OsStr>) -> Result<(), String> {
+    let path = default_look_path()?;
+    let shown = match arg.map(|arg| arg.to_str().ok_or("default-look takes a stem or -")) {
+        None => read_default_look().unwrap_or_else(|| "-".to_string()),
+        Some(Err(why)) => return Err(why.to_string()),
+        Some(Ok("-")) => {
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() => {
+                    fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?
+                }
+                Ok(_) => return Err(format!("{}: not a regular file", path.display())),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+            "-".to_string()
+        }
+        Some(Ok(stem)) => {
+            find_look(stem)?;
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            }
+            if fs::symlink_metadata(&path).is_ok_and(|meta| !meta.is_file()) {
+                return Err(format!("{}: not a regular file", path.display()));
+            }
+            replace_own(&path, &library::default_look_text(stem))?;
+            stem.to_string()
+        }
+    };
+    writeln!(io::stdout().lock(), "{shown}").map_err(|e| e.to_string())
+}
+
 /// Writes the export settings to `export` in the user's td-photo
 /// directory (made as needed) as the sidecar is written (`replace_own`):
 /// the file is td-photo's own, so the last write wins.
@@ -2294,6 +2394,11 @@ fn read_look(path: &Path) -> io::Result<Vec<u8>> {
 /// without a user directory (no absolute `XDG_CONFIG_HOME` or `HOME`) the
 /// built-in set is all there is.
 fn look_text(stem: &str) -> Result<(Vec<u8>, String), String> {
+    if stem == library::NO_LOOK {
+        return Err(format!(
+            "look {stem} is no look, as a sidecar spells it; it names no file"
+        ));
+    }
     if !library::valid_look(stem) {
         return Err(format!(
             "look {stem:?} is not a look stem (1 to 64 of letters, digits, - _ and ., not starting with . and not - alone)"
@@ -2337,6 +2442,11 @@ fn find_look(stem: &str) -> Result<Look, String> {
 fn match_look(roll: &Path, rest: &[OsString]) -> Result<(), String> {
     check_flags(rest, &["--name"], &[])?;
     let stem = option(rest, "--name")?.unwrap_or_else(|| "camera-match".to_string());
+    if stem == library::NO_LOOK {
+        return Err(format!(
+            "--name {stem:?} is reserved: a sidecar's `look none` is no look"
+        ));
+    }
     if !library::valid_look(&stem) {
         return Err(format!(
             "--name {stem:?} is not a look stem (1 to 64 of letters, digits, - _ and ., not starting with . and not - alone)"
@@ -2507,7 +2617,7 @@ fn look_stems() -> Vec<String> {
         .collect();
     if let Ok(user) = looks_dir().and_then(|dir| user_looks(&dir)) {
         for (stem, _) in user {
-            if library::valid_look(&stem) {
+            if library::valid_look(&stem) && stem != library::NO_LOOK {
                 stems.insert(stem);
             }
         }
@@ -2544,6 +2654,13 @@ fn user_looks(dir: &Path) -> Result<Vec<(String, String)>, String> {
         else {
             continue;
         };
+        if stem == library::NO_LOOK {
+            looks.push((
+                stem,
+                "error reserved: a sidecar's `look none` is no look".to_string(),
+            ));
+            continue;
+        }
         if !library::valid_look(&stem) {
             looks.push((
                 format!("{stem:?}"),
@@ -3398,6 +3515,8 @@ impl Session {
         // The export settings, the user's file's or the defaults, settled
         // before the first frame.
         ui.set_settings(read_settings());
+        // The default look, read once: a change takes the next session.
+        ui.set_default_look(read_default_look());
         Session {
             ui,
             idle: true,
@@ -3807,6 +3926,13 @@ impl Session {
         self.ui.set_export(Some(format!("auto of {name} {word}")));
     }
 
+    /// The export a window asks for: the sidecar as it is now, with the
+    /// window's settings and the default look it read at open, so it
+    /// exports what it shows.
+    fn request(&self, path: &Path) -> Result<ExportRequest, String> {
+        export_request(path, self.ui.settings(), self.ui.default_look())
+    }
+
     /// Exports `name` through its sidecar as the file holds it now: the
     /// request is read here, on the dispatch, so a refused sidecar refuses
     /// the action; the export itself runs on the request when nothing
@@ -3816,7 +3942,7 @@ impl Session {
     fn export(&mut self, name: String) -> Result<Outcome, ui::Error> {
         let roll = self.ui.roll().ok_or(ui::Error::NoRoll)?;
         let original = PathBuf::from(OsStr::from_bytes(roll)).join(&name);
-        let request = match export_request(&original, self.ui.settings()) {
+        let request = match self.request(&original) {
             Ok(request) => request,
             Err(why) => {
                 note(&why);
@@ -3866,10 +3992,13 @@ impl Session {
             return Ok(Outcome::Ignored);
         }
         let settings = self.ui.settings();
+        let default = self.ui.default_look().map(str::to_string);
         let requests = picks.iter().map(|name| {
-            export_request(&roll.join(name), settings).map(|request| ExportRequest {
-                batch: true,
-                ..request
+            export_request(&roll.join(name), settings, default.as_deref()).map(|request| {
+                ExportRequest {
+                    batch: true,
+                    ..request
+                }
             })
         });
         match self.exports.as_mut() {
@@ -4173,6 +4302,37 @@ mod tests {
         auto.done = 4;
         auto.failed = 1;
         assert_eq!(auto.note(), "auto on 2 of 4 picks, 1 kept, 1 failed");
+    }
+
+    /// The window exports with the default it read at open and shows,
+    /// not the file's as it is at the export.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn the_windows_export_takes_the_default_it_shows() {
+        let temp = td_fs::TempDir::new("td-photo-window-default").unwrap();
+        let roll = temp.path().join("roll");
+        fs::create_dir_all(&roll).unwrap();
+        let photo = roll.join("DSC_0001.NEF");
+        fs::write(&photo, "DSC_0001.NEF").unwrap();
+        fs::write(
+            roll.join("DSC_0001.NEF.edit"),
+            "td-photo edit 1\nflag pick\n",
+        )
+        .unwrap();
+        let mut session = Session::new(Surface::new(800, 600, Scale::default()).unwrap());
+        session.ui.set_default_look(None);
+        assert_eq!(session.request(&photo).unwrap().look, None);
+        session.ui.set_default_look(Some("mono".to_string()));
+        assert_eq!(
+            session.request(&photo).unwrap().look.as_deref(),
+            Some("mono")
+        );
+        fs::write(
+            roll.join("DSC_0001.NEF.edit"),
+            "td-photo edit 1\nflag pick\nlook none\n",
+        )
+        .unwrap();
+        assert_eq!(session.request(&photo).unwrap().look, None);
     }
 
     /// The window's picks' auto: the picks that set neither key queued,

@@ -1416,8 +1416,14 @@ fn scratch(name: &str) -> std::path::PathBuf {
 }
 
 fn run(args: &[&std::ffi::OsStr]) -> (bool, String, String) {
+    // No user configuration: a default look or a user look of the user
+    // running the suite does not reach these exports.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_td-photo"))
         .args(args)
+        .env(
+            "XDG_CONFIG_HOME",
+            std::env::temp_dir().join(format!("td-photo-no-config-{}", std::process::id())),
+        )
         .output()
         .unwrap();
     (

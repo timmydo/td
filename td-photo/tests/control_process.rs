@@ -219,6 +219,79 @@ fn preview_develop_reflects_the_sidecar() {
             "the look intensity did not reach the developed pixels"
         );
     }
+    // A default look stands in for a sidecar that sets none, and a
+    // sidecar's `look none` keeps it out.
+    let config = dir.0.join("config");
+    std::fs::create_dir_all(config.join("td-photo")).unwrap();
+    std::fs::write(
+        config.join("td-photo/default-look"),
+        "td-photo default-look 1\nlook mono\n",
+    )
+    .unwrap();
+    let with_default = |sidecar: &str| {
+        std::fs::write(roll.join("DSC_0001.NEF.edit"), sidecar).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+            .args(["--preview", "800x600"])
+            .arg(&roll)
+            .args(["--develop", "0"])
+            .env_clear()
+            .env("XDG_CACHE_HOME", dir.0.join("cache"))
+            .env("XDG_CONFIG_HOME", &config)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        output.stdout[b"P6\n800 600\n255\n".len()..].to_vec()
+    };
+    assert_eq!(
+        box_pixels(
+            &with_default("td-photo edit 1\nexposure 1.50\n"),
+            800,
+            r#box
+        ),
+        box_pixels(&whole, 800, r#box),
+        "the default look did not stand in"
+    );
+    assert_eq!(
+        box_pixels(
+            &with_default("td-photo edit 1\nexposure 1.50\nlook none\n"),
+            800,
+            r#box
+        ),
+        box_pixels(&brighter, 800, r#box),
+        "look none did not keep the default out"
+    );
+    // The export develops with the default too: mono, so grey.
+    std::fs::write(
+        roll.join("DSC_0001.NEF.edit"),
+        "td-photo edit 1\nexposure 1.50\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+        .arg("export")
+        .arg(roll.join("DSC_0001.NEF"))
+        .env_clear()
+        .env("XDG_CACHE_HOME", dir.0.join("cache"))
+        .env("XDG_CONFIG_HOME", &config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exported = std::fs::read_dir(roll.join("exported"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|e| e == "jpg"))
+        .unwrap();
+    let image = td_jpeg::decode(&std::fs::read(exported).unwrap(), td_jpeg::Scale::Full).unwrap();
+    assert!(
+        image
+            .data
+            .chunks(3)
+            .all(|p| p[0].abs_diff(p[1]) <= 2 && p[1].abs_diff(p[2]) <= 2),
+        "the default look did not reach the export"
+    );
 }
 
 #[test]

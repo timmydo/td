@@ -1134,6 +1134,62 @@ fn contrast_is_nudged_and_set_in_develop_mode() {
     assert!(c.photo(0).unwrap().ends_with("\t-0.40\t-\t-\t-\t-\t-\t-"));
 }
 
+#[test]
+fn a_default_look_is_in_force_where_the_sidecar_sets_none() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert_eq!(
+        c.set_default_look(Some("none".to_string())),
+        Outcome::Ignored
+    );
+    assert_eq!(c.default_look(), None);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    // Without a default, no look: no intensity, and a clear writes none.
+    assert_eq!(act(&mut c, "look-intensity", &["0.50"]), Outcome::Ignored);
+    let (_, effects) = c.action("look", &["-"]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Look,
+            value: None,
+        }]
+    );
+    assert_eq!(
+        c.set_default_look(Some("velvia-like".to_string())),
+        Outcome::Changed
+    );
+    assert_eq!(c.default_look(), Some("velvia-like"));
+    // The default is the photo's look: its intensity is set.
+    let (outcome, effects) = c.action("look-intensity", &["0.50"]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::LookIntensity,
+            value: Some("0.50".to_string()),
+        }]
+    );
+    // A clear writes `look none`, so the default does not return.
+    let (_, effects) = c.action("look", &["-"]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Look,
+            value: Some("none".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(act(&mut c, "look-intensity", &["0.70"]), Outcome::Ignored);
+    // The sidecar's `look` field is the sidecar's.
+    assert_eq!(fields(&c)[LOOK], "none");
+}
+
 /// The look intensity: `'` and `;` nudge it a tenth and `look-intensity`
 /// sets it, in develop and with a look alone; a nudge past the whole look
 /// writes nothing, and a run of them and a set is one step.
@@ -2830,6 +2886,7 @@ fn the_binary_waits_previews_and_refuses_a_bad_socket() {
     let bin = env!("CARGO_BIN_EXE_td-photo");
     let output = Command::new(bin)
         .args(["--preview", "400x300"])
+        .env("XDG_CONFIG_HOME", temp.0.join("config"))
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -2842,6 +2899,7 @@ fn the_binary_waits_previews_and_refuses_a_bad_socket() {
     let output = Command::new(bin)
         .args(["--preview", "400x300", roll_s])
         .env("XDG_CACHE_HOME", temp.0.join("cache"))
+        .env("XDG_CONFIG_HOME", temp.0.join("config"))
         .output()
         .unwrap();
     assert!(

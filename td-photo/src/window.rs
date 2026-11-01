@@ -307,10 +307,14 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         .as_ref()
         .and_then(|sidecar| sidecar.clarity())
         .unwrap_or(0);
-    let look = photo
-        .sidecar
-        .as_ref()
-        .and_then(|sidecar| Some((sidecar.look()?, sidecar.look_intensity())));
+    let own = photo.sidecar.as_ref().and_then(|sidecar| sidecar.look());
+    let look = library::effective_look(own, session.ui.default_look()).map(|stem| {
+        let intensity = photo.sidecar.as_ref().map_or(
+            library::DEFAULT_LOOK_INTENSITY,
+            library::Sidecar::look_intensity,
+        );
+        (stem, intensity)
+    });
     let crop = photo.sidecar.as_ref().and_then(|sidecar| sidecar.crop());
     let image = crate::develop_preview(
         roll,
@@ -2356,11 +2360,8 @@ impl Window {
         let index = ui.cursor()?;
         let photo = ui.photos().get(index)?;
         let roll = ui.roll()?;
-        let look = photo
-            .sidecar
-            .as_ref()
-            .and_then(|sidecar| sidecar.look())
-            .map(str::to_string);
+        let own = photo.sidecar.as_ref().and_then(|sidecar| sidecar.look());
+        let look = library::effective_look(own, ui.default_look()).map(str::to_string);
         // Without a look its intensity moves no pixel.
         let look_intensity = match (&look, &photo.sidecar) {
             (Some(_), Some(sidecar)) => sidecar.look_intensity(),

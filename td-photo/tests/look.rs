@@ -1040,6 +1040,70 @@ impl Drop for Temp {
     }
 }
 
+#[test]
+fn the_default_look_is_set_shown_and_cleared() {
+    let temp = Temp::new("default");
+    let config = temp.0.join("config");
+    let looks = config.join("td-photo/looks");
+    std::fs::create_dir_all(&looks).unwrap();
+    let c = config.to_str().unwrap();
+    let file = config.join("td-photo/default-look");
+    assert_eq!(
+        td_photo(&["default-look"], Some(c), None),
+        (true, "-\n".to_string(), String::new())
+    );
+    let (ok, out, _) = td_photo(&["default-look", "mono"], Some(c), None);
+    assert!(ok && out == "mono\n");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "td-photo default-look 1\nlook mono\n"
+    );
+    assert_eq!(td_photo(&["default-look"], Some(c), None).1, "mono\n");
+    // A stem no look answers to, `none` and a bad stem are refused, and
+    // the default stays.
+    for bad in ["no-such-look", "none", ".x"] {
+        let (ok, _, err) = td_photo(&["default-look", bad], Some(c), None);
+        assert!(!ok, "{bad}");
+        assert!(!err.is_empty());
+    }
+    assert_eq!(td_photo(&["default-look"], Some(c), None).1, "mono\n");
+    // A refused file is no default, with why on stderr.
+    std::fs::write(&file, "td-photo default-look 1\nlook none\n").unwrap();
+    let (ok, out, err) = td_photo(&["default-look"], Some(c), None);
+    assert!(ok && out == "-\n");
+    assert!(err.contains("no default look"), "{err}");
+    assert!(td_photo(&["default-look", "-"], Some(c), None).0);
+    assert!(!file.exists());
+    assert!(td_photo(&["default-look", "-"], Some(c), None).0);
+    // A user look named `none` is reserved, and not listed as a look.
+    std::fs::write(looks.join("none.look"), "td-photo look 1\nsaturation 0.5\n").unwrap();
+    let (ok, out, _) = td_photo(&["looks"], Some(c), None);
+    assert!(ok);
+    assert!(out.contains("none\tuser\terror reserved"), "{out}");
+    let (ok, _, err) = td_photo(&["looks", "none"], Some(c), None);
+    assert!(!ok && err.contains("no look"), "{err}");
+    // Nor may match-look write one, refused before the roll is read.
+    let (ok, _, err) = td_photo(
+        &["match-look", "/nonexistent", "--name", "none"],
+        Some(c),
+        None,
+    );
+    assert!(!ok && err.contains("reserved"), "{err}");
+    std::fs::remove_file(looks.join("none.look")).unwrap();
+    // A default whose look has gone is none, with why, not a default
+    // every look-less photo fails on.
+    std::fs::write(looks.join("mine.look"), "td-photo look 1\nsaturation 0.5\n").unwrap();
+    assert!(td_photo(&["default-look", "mine"], Some(c), None).0);
+    assert_eq!(td_photo(&["default-look"], Some(c), None).1, "mine\n");
+    std::fs::remove_file(looks.join("mine.look")).unwrap();
+    let (ok, out, err) = td_photo(&["default-look"], Some(c), None);
+    assert!(ok && out == "-\n", "{out}");
+    assert!(
+        err.contains("mine") && err.contains("no default look"),
+        "{err}"
+    );
+}
+
 /// Runs the binary with the two directory variables as given (`None`
 /// removes one).
 fn td_photo(args: &[&str], config: Option<&str>, home: Option<&str>) -> (bool, String, String) {

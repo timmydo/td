@@ -1092,6 +1092,44 @@ fn the_tonal_regions_are_four_develop_keys() {
 }
 
 #[test]
+fn the_default_look_yields_to_the_sidecar() {
+    use td_photo::library::{default_look_text, effective_look, parse_default_look, NO_LOOK};
+    assert_eq!(NO_LOOK, "none");
+    assert_eq!(
+        effective_look(Some("mono"), Some("velvia-like")),
+        Some("mono")
+    );
+    assert_eq!(
+        effective_look(None, Some("velvia-like")),
+        Some("velvia-like")
+    );
+    assert_eq!(effective_look(Some("none"), Some("velvia-like")), None);
+    assert_eq!(effective_look(None, None), None);
+    assert_eq!(effective_look(None, Some("none")), None);
+    let text = default_look_text("camera-match");
+    assert_eq!(text, "td-photo default-look 1\nlook camera-match\n");
+    assert_eq!(
+        parse_default_look(text.as_bytes()),
+        Ok("camera-match".to_string())
+    );
+    for bad in [
+        "",
+        "td-photo default-look 2\nlook mono\n",
+        "td-photo default-look 1\n",
+        "td-photo default-look 1\nlook mono\nlook mono\n",
+        "td-photo default-look 1\nlook none\n",
+        "td-photo default-look 1\nlook -\n",
+        "td-photo default-look 1\nlook .x\n",
+        "td-photo default-look 1\nlooks mono\n",
+    ] {
+        assert!(parse_default_look(bad.as_bytes()).is_err(), "{bad:?}");
+    }
+    assert!(parse_default_look(&[0xff]).is_err());
+    // `look none` is a sidecar's to write.
+    assert!(Sidecar::parse(b"td-photo edit 1\nlook none\n").is_ok());
+}
+
+#[test]
 fn clarity_is_a_develop_key() {
     assert_eq!(Key::parse("clarity"), Some(Key::Clarity));
     assert_eq!(Key::Clarity.name(), "clarity");

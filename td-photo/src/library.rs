@@ -433,6 +433,50 @@ fn signed_text(hundredths: i32) -> String {
     format!("{sign}{}", fixed(hundredths.unsigned_abs(), 2))
 }
 
+/// The look a sidecar sets for no look at all, over the user's default
+/// look (`effective_look`): never a look file's stem.
+pub const NO_LOOK: &str = "none";
+
+/// The default look file's first line (`parse_default_look`).
+pub const DEFAULT_LOOK_HEADER: &str = "td-photo default-look 1";
+
+/// The look a photo develops with: the sidecar's (`own`), none for
+/// `NO_LOOK`, else the user's `default` when the sidecar sets none.
+pub fn effective_look<'a>(own: Option<&'a str>, default: Option<&'a str>) -> Option<&'a str> {
+    match own {
+        Some(NO_LOOK) => None,
+        Some(stem) => Some(stem),
+        None => default.filter(|stem| *stem != NO_LOOK),
+    }
+}
+
+/// The default look file's stem: `DEFAULT_LOOK_HEADER`, then one `look
+/// STEM` line, a look stem and not `NO_LOOK`; why it is refused
+/// otherwise.
+pub fn parse_default_look(bytes: &[u8]) -> Result<String, &'static str> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "not UTF-8")?;
+    let mut lines = text.lines();
+    if lines.next() != Some(DEFAULT_LOOK_HEADER) {
+        return Err("first line is not `td-photo default-look 1`");
+    }
+    let stem = match (
+        lines.next().and_then(|line| line.strip_prefix("look ")),
+        lines.next(),
+    ) {
+        (Some(stem), None) => stem,
+        _ => return Err("not one `look STEM` line after the header"),
+    };
+    if !valid_look(stem) || stem == NO_LOOK {
+        return Err("not a look stem");
+    }
+    Ok(stem.to_string())
+}
+
+/// The default look file for `stem`.
+pub fn default_look_text(stem: &str) -> String {
+    format!("{DEFAULT_LOOK_HEADER}\nlook {stem}\n")
+}
+
 /// A look's file stem: 1 to `MAX_LOOK_STEM` bytes of ASCII letters, digits,
 /// `-`, `_` and `.`, not starting with `.`.
 pub fn valid_look(stem: &str) -> bool {

@@ -125,7 +125,8 @@ modes are the photographer's order of work.
    blacks, the dark tones lifted apart from the exposure) and the clarity
    (local contrast in the midtones) are set by
    their actions and the pane's sliders, `0`
-   resets to camera defaults, and the crop and the
+   resets to camera defaults (the default look, where one is set,
+   for the look), and the crop and the
    look are set by the `crop` and `look` actions, taking the box's four
    fractions or a look's stem, and the crop
    also over the preview: a marquee tightens it to a sub-region, and a
@@ -340,7 +341,8 @@ window, all speaking the toolkit's one vocabulary.
   preview's, so adding one leaves the develop box as it was.
 - **The single view's facts** name the look as `look STEM`, followed by
   ` at I` when the photo sets a look intensity, and nothing more without a
-  look.
+  look: the sidecar's look, as `list` and `photo` give it, not a default
+  look in force.
 - **The develop controls.** Two bands lead the develop region, above the
   preview: the tool band (`Layout::tool_band`, the region's first rows)
   with `TOOL_BUTTONS` -- Crop, Uncrop, Undo, Reset, `-`, `+`, Fit, 100%
@@ -687,7 +689,7 @@ window, all speaking the toolkit's one vocabulary.
   `auto-picks`, `export`, `export-picks` (both taking `--format`,
   `--quality` and `--long-edge` on the command line, at their defaults
   without; the settings file is the window's), `thumb`, `looks`,
-  `match-look` and `cache clear`.
+  `match-look`, `default-look` and `cache clear`.
   Verbs are the batch face: they read the same sidecars and write them
   the same way, and an agent that does not need to see pixels never
   opens a window.
@@ -891,7 +893,13 @@ The library is folders of originals; there is no database.
   h` as fractions of the oriented image with four decimals, all in 0..=1, `w`
   and `h` at least 0.05; `look` is a look's file stem, 1 to 64 bytes of ASCII
   letters, digits, `-`, `_` and `.`, not starting with `.` and not the bare
-  `-`, the clear wherever a look is set; `look-intensity` is the share of the
+  `-`, the clear wherever a look is set; `look none` (`NO_LOOK`) is no
+  look at all, over the user's default look (Files), and so never a look
+  file's stem: a meaning of a known key, so a build before it reads it
+  as a stem no look answers to, showing that photo's develop as the
+  placeholder and refusing its export (failing closed, not with another
+  look), and a user look of that stem made before it is no longer
+  reached; `look-intensity` is the share of the
   look applied, `D.DD` in 0.00..=2.00 with no sign (`MAX_LOOK_INTENSITY`),
   absent the whole look (1.00, `DEFAULT_LOOK_INTENSITY`), past it each
   change the look makes carried further (Pipeline), kept whether or not
@@ -1037,6 +1045,39 @@ The library is folders of originals; there is no database.
   defaults would silently drop the edits. It is written at the export
   settings' quality and shrunk to their long edge (Colour and development,
   Export).
+- **Default look**: `$XDG_CONFIG_HOME/td-photo/default-look`
+  (`~/.config/td-photo/default-look` when that variable is not absolute),
+  `td-photo default-look 1` then one `look STEM` line, a look stem and
+  not `none` (`library::parse_default_look`), set, shown and cleared by
+  `td-photo default-look [STEM | -]` (a stem no look answers to refused
+  then), written through `replace_own` as the settings are. A photo
+  whose sidecar sets no look develops with it in the window, `--preview`
+  and export (`library::effective_look`): the sidecar's look first, its
+  `look none` no look, else the default. The `develop` verb takes its
+  look from `--look` alone (`--look none` no look). In the window the
+  default is the photo's look in force: the palette and the look band
+  mark it, its intensity is set and nudged, and a clear (`look -`, the
+  palette's) writes `look none` while a default is set, so the photo has
+  no look rather than the default again; the `edit` verb's `look -`
+  removes the key, so the default comes back there, as the batch face
+  writes what it is told. A photo cleared before a default existed has
+  no `look` line and so takes it; one whose look is the default's stem,
+  picked, keeps that look when the default changes; reset (`0`) drops
+  the look with the rest, so the photo returns to the default, not to
+  no look. The sidecar's `look` field, `list`'s column and
+  `state`/`photo` stay the sidecar's. The window reads the file when a
+  session starts (a change takes the next one) and exports with what it
+  read, so it exports what it shows; each verb reads it once per run. A
+  refused file (past `settings::MAX_BYTES`, not the grammar, not a
+  regular file, or naming a look that does not resolve) is no default,
+  with why on stderr: a stale default would otherwise refuse every
+  look-less photo. That fails open: such photos then develop and export
+  with no look, the note on stderr the only sign (a window's user may
+  not see it), where a sidecar's own stale look refuses its export. A user look file `none.look` is listed refused,
+  reserved, and is not in the palette; `match-look --name none` is
+  refused. The default is the user's, not the roll's: a roll's sidecars
+  that set no look develop otherwise on another account or after the
+  file changes, which a look written into each sidecar would not.
 - **Settings**: `$XDG_CONFIG_HOME/td-photo/export` (`~/.config/td-photo/
   export` when that variable is not absolute), the export settings the
   window keeps between sessions, UTF-8 text in the sidecar's shape
@@ -2487,6 +2528,23 @@ the mover over an injected file move that fails the sidecar's leg: the photo
 reported as moved without it, the rest going on, and the real mover refusing
 a taken name and finishing its own interrupted move.
 
+The default look: `tests/library.rs` holds `effective_look` (the
+sidecar's first, `none` no look, else the default, a default `none`
+none) and the file's grammar and refusals; `tests/look.rs` runs
+`default-look` shown, set (the file's text), refusing an unknown stem,
+`none` and a bad one with the default kept, a refused file shown as
+none with why, cleared twice, a user `none.look` listed reserved
+and refused by `looks none`, `match-look --name none` refused, and a
+default whose look was removed shown as none with why; the binary's
+unit test holds the window's export to the default it read, not the
+file's, and to a sidecar's `look none`; `tests/ui.rs` holds a default `none` no
+default, the look intensity ignored without a default and taken with
+one, a clear writing nothing without one and `look none` with one,
+and the sidecar's field kept; `tests/control_process.rs`'s `--preview`
+case develops a sidecar without a look as the default's and one with
+`look none` as no look's; `tests/nef.rs` runs its exports under an empty
+configuration.
+
 `tests/ui.rs` holds the action table to `driven::check` and to its alignment
 with `Action`, its chorded rows to the key list's sections (each keyed
 row in exactly one, its action's group's by name, in the table's order
@@ -2984,7 +3042,9 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    key raising or smoothing local contrast in the midtones about a
    blurred map of the whole frame, its action and row in the pane.
    Landed. (l) Matching the camera: `match-look`, a look fitted to the
-   roll's embedded previews. Landed.
+   roll's embedded previews. Landed. (m) The default look:
+   `default-look`, the look a sidecar without one develops with, and
+   `look none`. Landed.
 9. Later: DNG and JPEG rolls, the Nikon High
    Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.
