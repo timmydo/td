@@ -272,7 +272,7 @@ fn the_key_list_groups_the_table_by_mode_under_the_chooser_while_it_is_open() {
             ("Cull", 9),
             ("Modes", 3),
             ("Moving around", 8),
-            ("Develop", 11),
+            ("Develop", 12),
             ("History", 5),
             ("Looks", 11),
             ("Zoom", 4),
@@ -1132,6 +1132,79 @@ fn contrast_is_nudged_and_set_in_develop_mode() {
         .collect();
     assert_eq!(labels, ["contrast -0.40"]);
     assert!(c.photo(0).unwrap().ends_with("\t-0.40\t-\t-\t-\t-\t-\t-"));
+}
+
+#[test]
+fn compare_shows_the_cameras_jpeg_in_develop_until_it_is_left() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert_eq!(key(&mut c, "\\"), Outcome::Ignored);
+    assert!(!c.comparing());
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    assert_eq!(key(&mut c, "\\"), Outcome::Changed);
+    assert!(c.comparing());
+    assert_eq!(fields(&c)[ZOOM], "camera");
+    assert!(c.scene().status_line().contains("develop camera JPEG"));
+    // Held across photos, a key toggling it back.
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert!(c.comparing());
+    assert_eq!(act(&mut c, "compare", &[]), Outcome::Changed);
+    assert!(!c.comparing());
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    // Crop-adjust's handles are over the develop: it drops compare, and
+    // compare is ignored while it is up.
+    assert_eq!(act(&mut c, "compare", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert!(!c.comparing());
+    assert_eq!(act(&mut c, "compare", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    // Dropped when develop is left.
+    assert_eq!(act(&mut c, "compare", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+    assert!(!c.comparing());
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert!(!c.comparing());
+    // And when a roll opens over it: cull's zoom field is `fit`, and the
+    // next develop shows the develop.
+    assert_eq!(act(&mut c, "compare", &[]), Outcome::Changed);
+    c.open("other", b"/o", photos(2)).unwrap();
+    assert!(!c.comparing());
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert!(!c.comparing());
+}
+
+#[test]
+fn compare_shows_the_camera_at_the_fit_with_no_zoom_or_crop_drawn() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(2)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    // A zoom in force goes when compare comes.
+    assert_eq!(act(&mut c, "zoom-100", &[]), Outcome::Changed);
+    assert_ne!(fields(&c)[ZOOM], "fit");
+    assert_eq!(act(&mut c, "compare", &[]), Outcome::Changed);
+    assert_eq!(c.zoom(), None);
+    // No zoom while comparing, so none comes back hidden.
+    assert_eq!(act(&mut c, "zoom-100", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "zoom-in", &[]), Outcome::Ignored);
+    assert_eq!(c.zoom(), None);
+    // No marquee over the camera's JPEG: the canvas is not the develop's.
+    c.set_preview_fit(Some(Rect {
+        x: 200,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+    assert_eq!(press(&mut c, 400, 150), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 500, 250), Outcome::Ignored);
+    let (outcome, effects) = release(&mut c, 500, 250);
+    assert_eq!(outcome, Outcome::Ignored);
+    assert!(effects.is_empty());
+    assert_eq!(c.crop_drag(), None);
+    // Back to the develop, at the fit.
+    assert_eq!(act(&mut c, "compare", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "fit");
 }
 
 #[test]
@@ -2074,7 +2147,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "71"]);
+    assert_eq!(&reply(2)[..2], ["ok", "72"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(
         reply(4),

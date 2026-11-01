@@ -197,7 +197,8 @@ window, all speaking the toolkit's one vocabulary.
   (`look-intensity-in`, `look-intensity-out`) and absolute
   `look-intensity`, crop and `uncrop`, crop-adjust, aspect,
   the look palette (`looks`), reset, undo and the history's step toggle and
-  delete, the zoom (`zoom-fit`, `zoom-100`, `zoom-in`, `zoom-out`), export,
+  delete, the zoom (`zoom-fit`, `zoom-100`, `zoom-in`, `zoom-out`), the
+  camera's JPEG in the box (`compare`), export,
   the export view (`export-mode`), its settings (`format`, `quality`,
   `long-edge`), the picks' export (`export-picks`), and delete rejected).
   `ui::Controller` holds the model (the roll's names and sidecars, the cursor,
@@ -723,7 +724,8 @@ window, all speaking the toolkit's one vocabulary.
   window last reported it (the turn before), the frame generation, the
   chooser's listed folder in hex, then the history's step count and the
   selected step's index, then the zoom (`fit`, or the percent and the
-  centre as `PERCENT@X,Y`, `fit` in cull too), then the export quality,
+  centre as `PERCENT@X,Y`, `fit` in cull too, `camera` while the box
+  shows the camera's JPEG), then the export quality,
   the long edge (`full` or the pixels) and the format (`jpeg` or
   `avif`), then the cursor photo's contrast and its look intensity (as
   written, `-` when absent, the whole look) and its tonal regions
@@ -1904,6 +1906,26 @@ reaches the clip band below the luminance clip steps toward white in
 that channel; and previews that clip widely spend their top points on
 white.
 
+To judge a develop against the camera, `\` (`compare`) shows the
+photo's own JPEG in the develop box in place of the develop: the raw's
+embedded preview by the thumbnail rule at the box's long edge (not
+cached, not enlarged), uncropped and at the fit, so
+the comparison is of colour and tone, not framing. The status row says
+`camera JPEG` and `state`'s zoom field `camera`; it holds across
+photos, `\` again shows the develop, and leaving develop or entering
+crop-adjust (whose handles are over the develop) drops it; it is
+ignored in crop-adjust. Nothing is memoized: the develop's levels stay
+cached, so going back on the same photo reruns only the last level (a photo stepped to while
+comparing has none made yet, and develops from its decode). It is shown
+at the fit: entering it drops the zoom, the zoom actions are ignored
+under it, and the pointer draws no marquee and pans nothing over it,
+since the camera's JPEG is uncropped and need not be the develop's
+size. The window keys it by the photo and the box alone, so an edit
+made meanwhile asks for nothing new, shows it only once it has landed
+(never the develop under its label, or the other way about), and holds
+no develop of it behind a prefetch's raw decode. A raw without a
+usable preview leaves the box its placeholder with a note on stderr.
+
 ## Window
 
 The scene is `ui::Scene`, a td-ui `Composition` the controller builds over its
@@ -2086,12 +2108,14 @@ generation is submitted once. When a second consumer needs an image primitive it
 is promoted into `td_ui::raster` with a pixel oracle; until then the blitter is
 this crate's, in `ui` where its pixel oracle is, and the confinement test pins
 that the window writes frame bytes through nothing else. `td-photo --preview WxH
-[ROLL] [--develop [POSITION] [--zoom] | --single [POSITION]]` is the same
+[ROLL] [--develop [POSITION] [--zoom] [--compare] | --single
+[POSITION]]` is the same
 frame without a display,
 its thumbnails and, with `--develop`, the developed preview of the photo at
 `POSITION` (the cursor's, the first, by default) made on the calling thread,
 with `--zoom` at 100% around the centre (the `zoom-100` action, so the
-frame is the window's at that zoom), or with `--single [POSITION]` in its
+frame is the window's at that zoom), with `--compare` showing the
+camera's JPEG (the `compare` action), or with `--single [POSITION]` in its
 place the cull single view of that photo: the oracle the native test holds
 a capture to.
 
@@ -2545,6 +2569,15 @@ case develops a sidecar without a look as the default's and one with
 `look none` as no look's; `tests/nef.rs` runs its exports under an empty
 configuration.
 
+`compare` is held by `tests/ui.rs` (ignored outside develop, `\`
+toggling it, `camera` in `state`'s zoom field and `camera JPEG` on the
+status row, held across a photo step, dropped by crop-adjust and
+ignored in it, dropped on leaving develop and on an open, dropping a
+zoom in force, the zoom actions and the marquee ignored under it) and
+`tests/control_process.rs` (`--preview --develop --compare` showing the
+preview's colour in the box, absent from the develop's, and `--compare`
+refused without `--develop` and with `--single`).
+
 `tests/ui.rs` holds the action table to `driven::check` and to its alignment
 with `Action`, its chorded rows to the key list's sections (each keyed
 row in exactly one, its action's group's by name, in the table's order
@@ -2761,6 +2794,8 @@ blitting each into its strip box (`control_process.rs`), the native
 compositor leg holding the live frame to it, and `--preview --develop
 --zoom` of a frame dark but for a square at its centre showing the square
 its own size where the fit shrank it, `--zoom` refused without `--develop`;
+`--preview --develop --compare` of a raw whose preview is one flat colour
+holding that colour in the box where the develop has none;
 the export action (asking for the cursor photo in any mode by verb and by
 `e`, refused without a roll or a photo, not repeating on a held key, the
 dispatch moving nothing; the note set, shown at the row's end, a new generation
@@ -3044,7 +3079,8 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    Landed. (l) Matching the camera: `match-look`, a look fitted to the
    roll's embedded previews. Landed. (m) The default look:
    `default-look`, the look a sidecar without one develops with, and
-   `look none`. Landed.
+   `look none`. Landed. (n) Comparing with the camera: `\` shows the
+   raw's embedded JPEG in the develop box. Landed.
 9. Later: DNG and JPEG rolls, the Nikon High
    Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.

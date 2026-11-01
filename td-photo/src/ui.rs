@@ -315,6 +315,7 @@ pub enum Action {
     Whites,
     Blacks,
     Clarity,
+    Compare,
     Auto,
     AutoPicks,
     /// The Nth (from 1) of the available looks, `C-1`..`C-9`.
@@ -383,6 +384,7 @@ impl Action {
         Action::Whites,
         Action::Blacks,
         Action::Clarity,
+        Action::Compare,
         Action::Auto,
         Action::AutoPicks,
         Action::LookAt(1),
@@ -458,6 +460,7 @@ impl Action {
             Self::Whites => "whites",
             Self::Blacks => "blacks",
             Self::Clarity => "clarity",
+            Self::Compare => "compare",
             Self::Auto => "auto",
             Self::AutoPicks => "auto-picks",
             Self::LookAt(1) => "look-1",
@@ -550,6 +553,7 @@ impl Action {
             | Self::Whites
             | Self::Blacks
             | Self::Clarity
+            | Self::Compare
             | Self::Auto
             | Self::AutoPicks => Group::Develop,
             Self::Reset | Self::Undo | Self::StepToggle | Self::StepDelete => Group::History,
@@ -900,6 +904,12 @@ pub const BINDINGS: &[Binding] = &[
         chord: None,
         arguments: "VALUE",
         help: "Set the clarity to VALUE, two decimals in -1.00..1.00: local contrast in the midtones raised or, below zero, smoothed (develop mode).",
+    },
+    Binding {
+        name: "compare",
+        chord: Some("\\"),
+        arguments: "",
+        help: "Show the camera's own JPEG (the raw's embedded preview, uncropped, at the fit) in the develop box in place of the develop, or the develop again (develop mode).",
     },
     Binding {
         name: "auto",
@@ -2058,6 +2068,8 @@ pub struct Controller {
     /// develop lands, when the box itself is the fallback canvas, and from a
     /// crop-adjust toggle until the turn's end re-reports it.
     preview_fit: Option<Rect>,
+    /// The develop box shows the camera's own JPEG (`compare`).
+    comparing: bool,
     /// The crop drag in progress, in surface pixels, or `None`: set on a
     /// press inside the preview, moved, and taken on release. Held only in
     /// develop mode and dropped when the photo, mode or surface changes.
@@ -2679,6 +2691,7 @@ impl Controller {
             bytes: 0,
             jobs: 0,
             preview_fit: None,
+            comparing: false,
             drag: None,
             adjusting: false,
             aspect: Aspect::Free,
@@ -3647,10 +3660,12 @@ impl Controller {
         self.preview_fit = None;
     }
 
-    /// Back to the fit, the centre the middle again and any pan dropped:
-    /// on leaving develop, on entering crop-adjust (whose canvas is the
-    /// whole frame) and when a roll opens.
+    /// Back to the fit, the centre the middle again and any pan and the
+    /// camera's JPEG (`compare`) dropped: on leaving develop, however it is
+    /// left, on entering crop-adjust (whose canvas is the whole frame) and
+    /// when a roll opens.
     fn drop_zoom(&mut self) {
+        self.comparing = false;
         self.zoom = None;
         self.pan = None;
         self.centre = (CENTRE_UNIT / 2, CENTRE_UNIT / 2);
@@ -3904,7 +3919,11 @@ impl Controller {
                 .map_or_else(dash, |chooser| hex(&chooser.folder)),
             self.steps().len().to_string(),
             self.history_step.map_or_else(dash, |step| step.to_string()),
-            zoom_word(self.zoom()),
+            if self.comparing() {
+                "camera".to_string()
+            } else {
+                zoom_word(self.zoom())
+            },
             self.settings.quality.to_string(),
             settings::long_edge_text(self.settings.long_edge),
             self.settings.format.name().to_string(),
@@ -4109,6 +4128,7 @@ impl Controller {
             (Action::Zoom100, []) => self.set_zoom(Some(100))?,
             (Action::ZoomIn, []) => self.zoom_by(ZoomStep::In)?,
             (Action::ZoomOut, []) => self.zoom_by(ZoomStep::Out)?,
+            (Action::Compare, []) => self.toggle_compare()?,
             (Action::Export, []) => return self.export(effects),
             (Action::ExportMode, []) => self.enter_export()?,
             (Action::ExportPicks, []) => return self.export_picks(effects),
@@ -4760,8 +4780,34 @@ impl Controller {
         ))
     }
 
+    /// The develop box to the camera's own JPEG and back (`comparing`):
+    /// develop mode with a photo, not in crop-adjust (whose handles are
+    /// over the develop), held across photos until develop is left. The
+    /// camera's JPEG is shown at the fit, so the zoom goes either way
+    /// (`drop_zoom`, which drops compare too) with any drag, and the fit
+    /// reported of the other image.
+    fn toggle_compare(&mut self) -> Result<Outcome, Error> {
+        if self.develop_photo()?.is_none() || self.adjusting {
+            return Ok(Outcome::Ignored);
+        }
+        let comparing = !self.comparing;
+        self.drop_zoom();
+        self.drag = None;
+        self.preview_fit = None;
+        self.comparing = comparing;
+        Ok(Outcome::Changed)
+    }
+
+    /// Whether the develop box shows the camera's own JPEG (the raw's
+    /// embedded preview) in place of the develop (`compare`, `\`): in
+    /// develop mode alone.
+    pub fn comparing(&self) -> bool {
+        self.comparing && self.mode == Mode::Develop
+    }
+
     /// Sets the develop box's zoom, `None` to fit: only in develop mode
-    /// and outside crop-adjust, whose canvas is the whole frame (`Ignored`
+    /// and outside crop-adjust, whose canvas is the whole frame, and while
+    /// the develop is shown rather than the camera's JPEG (`Ignored`
     /// elsewhere, as the develop edits are); the zoom in force is
     /// `Ignored`. The status row names the zoom and the Fit and 100%
     /// buttons show it, so a change is a frame change before the develop
@@ -4769,7 +4815,8 @@ impl Controller {
     /// taken against is gone) and the centre held inside the image at the
     /// new zoom.
     fn set_zoom(&mut self, zoom: Option<u32>) -> Result<Outcome, Error> {
-        if self.develop_photo()?.is_none() || self.adjusting || zoom == self.zoom {
+        if self.develop_photo()?.is_none() || self.adjusting || self.comparing || zoom == self.zoom
+        {
             return Ok(Outcome::Ignored);
         }
         self.zoom = zoom;
@@ -4784,7 +4831,7 @@ impl Controller {
     /// develop of it lands the ladder has no foot and the step is
     /// `Ignored`, as a step past either end is.
     fn zoom_by(&mut self, step: ZoomStep) -> Result<Outcome, Error> {
-        if self.develop_photo()?.is_none() || self.adjusting {
+        if self.develop_photo()?.is_none() || self.adjusting || self.comparing {
             return Ok(Outcome::Ignored);
         }
         let Some(fit) = self.fit_zoom() else {
@@ -5143,7 +5190,11 @@ impl Controller {
         x: i64,
         y: i64,
     ) -> Result<(Outcome, Vec<Effect>), Error> {
-        if self.zoom.is_some() {
+        if self.comparing {
+            // The camera's JPEG is uncropped and need not be the develop's
+            // size: no crop maps onto it, and there is no zoom to pan.
+            Ok((Outcome::Ignored, Vec::new()))
+        } else if self.zoom.is_some() {
             // The zoomed box shows a window of the image, not a canvas a
             // crop maps onto: the pointer pans it.
             self.pan_pointer(phase, x, y)
@@ -5595,7 +5646,8 @@ impl Controller {
         }
         self.adjusting = !self.adjusting;
         self.drag = None;
-        // The sub-mode's canvas is the whole frame: the zoom goes with it.
+        // The sub-mode's canvas is the whole frame: the zoom goes with it,
+        // and the camera's JPEG, which the handles are not drawn over.
         self.drop_zoom();
         // The fit reported was of the frame the other crop shows: dropped
         // until the adapter reports one for this crop (its turn's end), so a
@@ -6109,7 +6161,9 @@ impl Scene<'_> {
                 } else if model.adjusting {
                     line.push_str(" crop-adjust");
                 }
-                if let Some(zoom) = model.zoom {
+                if model.comparing() {
+                    line.push_str(" camera JPEG");
+                } else if let Some(zoom) = model.zoom {
                     line.push_str(&format!(" {zoom}%"));
                 }
             }

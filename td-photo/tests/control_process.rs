@@ -527,6 +527,57 @@ fn ramp_jpeg(width: usize, height: usize) -> Vec<u8> {
 }
 
 #[test]
+fn preview_develop_compares_the_cameras_jpeg() {
+    // The embedded preview a flat colour unlike the develop: with
+    // --compare the box holds that colour, without it the develop.
+    let dir = Directory::new("td-photo-compare");
+    let roll = dir.0.join("roll");
+    std::fs::create_dir_all(&roll).unwrap();
+    let (w, h) = (16usize, 12usize);
+    let samples: Vec<u16> = (0..w * h).map(|i| 1008 + (i as u16 % 4000)).collect();
+    let colour = [0x20u8, 0xc0, 0x40];
+    std::fs::write(
+        roll.join("DSC_0000.NEF"),
+        synth_nef::nef_with_preview(w, h, &samples, &flat_jpeg(w, h, colour)),
+    )
+    .unwrap();
+    let r#box = binary_layout(800, 600)
+        .develop_box()
+        .expect("a develop box on an 800x600 surface");
+    let developed = box_pixels(&preview_develop(&dir, 800, 600, &roll, 0), 800, r#box);
+    let compared = box_pixels(
+        &preview_develop_args(&dir, 800, 600, &roll, 0, &["--compare"]),
+        800,
+        r#box,
+    );
+    let near = |p: &[u8]| p.iter().zip(colour).all(|(a, b)| a.abs_diff(b) <= 4);
+    // The 16 by 12 preview is never enlarged: it sits in the box.
+    let held = compared.chunks(3).filter(|p| near(p)).count();
+    assert!(held >= 16 * 12 / 2, "{held}");
+    assert_eq!(developed.chunks(3).filter(|p| near(p)).count(), 0);
+    // Refused without --develop, and with --single.
+    let bin = env!("CARGO_BIN_EXE_td-photo");
+    for args in [
+        vec!["--preview", "800x600", roll.to_str().unwrap(), "--compare"],
+        vec![
+            "--preview",
+            "800x600",
+            roll.to_str().unwrap(),
+            "--single",
+            "--compare",
+        ],
+    ] {
+        let output = std::process::Command::new(bin)
+            .args(&args)
+            .env("XDG_CONFIG_HOME", dir.0.join("config"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--compare needs --develop"));
+    }
+}
+
+#[test]
 fn match_look_writes_the_cameras_look_once() {
     let dir = Directory::new("td-photo-match");
     let (roll, config) = (dir.0.join("roll"), dir.0.join("config"));

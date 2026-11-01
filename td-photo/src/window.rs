@@ -131,6 +131,7 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
     let mut develop: Option<usize> = None;
     let mut single = false;
     let mut zoom = false;
+    let mut compare = false;
     let mut args = rest.iter();
     while let Some(arg) = args.next() {
         if arg == "--zoom" {
@@ -138,6 +139,11 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
                 return Err("--zoom needs --develop before it; see --help".to_string());
             }
             zoom = true;
+        } else if arg == "--compare" {
+            if develop.is_none() || single {
+                return Err("--compare needs --develop before it; see --help".to_string());
+            }
+            compare = true;
         } else if arg == "--develop" || arg == "--single" {
             if develop.is_some() {
                 return Err("--develop or --single may be given only once".to_string());
@@ -182,6 +188,12 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
                 .ui
                 .action("zoom-100", &[])
                 .map_err(|e| format!("--zoom: {e}"))?;
+        }
+        if compare {
+            session
+                .ui
+                .action("compare", &[])
+                .map_err(|e| format!("--compare: {e}"))?;
         }
     }
     let font = td_ui::font::pinned()?;
@@ -288,6 +300,21 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
     let r#box = session.ui.develop_box()?;
     let index = session.ui.cursor()?;
     let photo = session.ui.photos().get(index)?;
+    if session.ui.comparing() {
+        let path = roll.join(&photo.name);
+        return match camera_frame(
+            &path,
+            r#box.width as usize,
+            r#box.height as usize,
+            threads(),
+        ) {
+            Ok(image) => Some((r#box, image)),
+            Err(why) => {
+                note(&why);
+                None
+            }
+        };
+    }
     let exposure = photo
         .sidecar
         .as_ref()
@@ -333,6 +360,15 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
     Some((r#box, image))
 }
 
+/// The camera's own JPEG for `compare`: the raw's embedded preview by the
+/// thumbnail rule at the box's long edge (uncached: the cache holds the
+/// grid's thumbnails), shrunk to the box for a shape taller than it.
+fn camera_frame(path: &Path, box_w: usize, box_h: usize, threads: usize) -> Result<Rgb8> {
+    let made = make_thumbnail(path, box_w.max(box_h), false, threads)?;
+    develop::shrink(made.image, box_w, box_h, threads)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 // ------------------------------------------------------------------- pool
 
 /// What a thumbnail is asked for by: the roll, the name in it and the
@@ -374,6 +410,8 @@ struct Preview {
     /// Hundredths of the look applied.
     look_intensity: i32,
     zoom: Option<(u32, (u32, u32))>,
+    /// The camera's own JPEG in place of the develop (`compare`).
+    compare: bool,
 }
 
 impl Preview {
@@ -601,7 +639,8 @@ impl Queue {
     /// decoding: it waits for that, so one frame is not decoded twice.
     fn develop_waits(&self) -> bool {
         match (&self.preview, &self.prefetching) {
-            (Some((preview, Start::Decode)), Some(key)) => key.is(preview),
+            // The camera's JPEG needs no raw decode to wait for.
+            (Some((preview, Start::Decode)), Some(key)) => !preview.compare && key.is(preview),
             _ => false,
         }
     }
@@ -988,6 +1027,13 @@ fn develop_task(preview: &Preview, start: Start) -> Made {
 
 fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
     let threads = threads();
+    // The camera's JPEG is a view of the file, not of the levels: shown
+    // as a zoom's image is, nothing memoized.
+    if preview.compare {
+        let path = preview.roll.join(&preview.name);
+        let image = camera_frame(&path, preview.box_w, preview.box_h, threads)?;
+        return Ok(Made::Zoom { image });
+    }
     let long_edge = preview.box_w.max(preview.box_h);
     let crop = preview.crop.map(crate::crop_fractions);
     let look = match &preview.look {
@@ -2139,6 +2185,7 @@ impl Window {
             .as_ref()
             .filter(|(preview, _)| {
                 preview.name == wanted.name
+                    && preview.compare == wanted.compare
                     && preview.crop == wanted.crop
                     && preview.zoom == wanted.zoom
                     && (preview.box_w, preview.box_h) == (wanted.box_w, wanted.box_h)
@@ -2360,6 +2407,26 @@ impl Window {
         let index = ui.cursor()?;
         let photo = ui.photos().get(index)?;
         let roll = ui.roll()?;
+        // The camera's JPEG is the file's, whatever the edits: keyed by the
+        // photo and the box alone, so an edit while comparing asks for
+        // nothing new.
+        if ui.comparing() {
+            return Some(Preview {
+                roll: PathBuf::from(OsStr::from_bytes(roll)),
+                name: photo.name.clone(),
+                box_w: r#box.width as usize,
+                box_h: r#box.height as usize,
+                crop: None,
+                exposure: 0,
+                contrast: 0,
+                tone: crate::look::Tone::default(),
+                clarity: 0,
+                look: None,
+                look_intensity: library::DEFAULT_LOOK_INTENSITY,
+                zoom: None,
+                compare: true,
+            });
+        }
         let own = photo.sidecar.as_ref().and_then(|sidecar| sidecar.look());
         let look = library::effective_look(own, ui.default_look()).map(str::to_string);
         // Without a look its intensity moves no pixel.
@@ -2402,6 +2469,7 @@ impl Window {
             look,
             look_intensity,
             zoom: ui.zoom(),
+            compare: ui.comparing(),
         })
     }
 
@@ -2654,12 +2722,14 @@ impl Window {
         // cursor's photo, so an exposure, contrast or look edit shows the last
         // frame of that photo rather than a placeholder while the new one is
         // made, but a move to another photo shows the placeholder until its own
-        // develop lands, not the previous photo's pixels.
+        // develop lands, not the previous photo's pixels; nor is the
+        // develop shown as the camera's JPEG, or the other way about.
+        let comparing = ui.comparing();
         let develop = ui.develop_box().and_then(|r#box| {
             let name = &photos.get(ui.cursor()?)?.name;
             developed
                 .as_ref()
-                .filter(|(preview, _)| preview.name == *name)
+                .filter(|(preview, _)| preview.name == *name && preview.compare == comparing)
                 .and_then(|(_, image)| image.as_ref())
                 .map(|image| (r#box, image))
         });
@@ -2805,6 +2875,7 @@ mod tests {
             look: None,
             look_intensity: 100,
             zoom: None,
+            compare: false,
         }
     }
 
