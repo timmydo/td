@@ -1225,12 +1225,43 @@ pub fn intensity_at(value: usize) -> i32 {
     (value.min(INTENSITY_STEPS) as i32) * 5
 }
 
-/// Which slider a drag moves: develop's exposure or look intensity, or
-/// the export view's quality.
+/// A labelled slider row of the history pane: the label's cell run (the
+/// name and the value in force) and the slider after it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Adjust {
+    pub label: Rect,
+    pub slider: Slider,
+}
+
+/// The pane's labelled slider rows, in order: each one's name and the
+/// develop key it sets, a signed value in hundredths within 1.00.
+pub const ADJUSTS: &[(&str, Key)] = &[("Contrast", Key::Contrast)];
+/// A row label's width in cells: its name, a space and a signed value.
+const ADJUST_LABEL_CELLS: usize = 14;
+/// The labelled sliders' steps: a twentieth of the way from -1.00 to 1.00
+/// each (0.05), zero in the middle.
+pub const ADJUST_STEPS: usize = 40;
+const _: () = assert!(library::MAX_CONTRAST == 5 * (ADJUST_STEPS / 2) as i32);
+
+/// A labelled slider's value for a signed value in hundredths, the
+/// nearest step.
+pub fn adjust_step(hundredths: i32) -> usize {
+    (hundredths.clamp(-100, 100) + 100 + 2) as usize / 5
+}
+
+/// The signed value, in hundredths, at a labelled slider's value.
+pub fn adjust_at(value: usize) -> i32 {
+    (value.min(ADJUST_STEPS) as i32) * 5 - 100
+}
+
+/// Which slider a drag moves: develop's exposure, look intensity or a
+/// pane row's key, or the export view's quality.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Dial {
     Exposure,
     Intensity,
+    /// The pane's labelled row at this place in `ADJUSTS`.
+    Adjust(usize),
     Quality,
 }
 
@@ -1822,15 +1853,77 @@ impl Layout {
     }
 
     /// The history pane's list: the pane's width at the area's left, above
-    /// the band its buttons wrap to; `None` when the area cannot hold a row.
+    /// the labelled rows (`adjusts`) and the band its buttons wrap to;
+    /// `None` when the area cannot hold a row.
     pub fn history(&self) -> Option<List> {
         let band = self.history_strip().rect().height;
+        let rows = rows_height(self.adjust_rows(), self.surface);
         let rect = Rect {
             width: (PANE_W * self.surface.scale.value()) as u32,
-            height: self.area.height.saturating_sub(band),
+            height: self.area.height.saturating_sub(band).saturating_sub(rows),
             ..self.area
         };
         List::new(self.surface, rect)
+    }
+
+    /// How many labelled rows the pane lays: all of `ADJUSTS` where the
+    /// list above them keeps a row and each slider has a column a step
+    /// on the pane's width, else none.
+    fn adjust_rows(&self) -> usize {
+        let s = self.surface.scale.value();
+        let band = self.history_strip().rect().height;
+        let rows = rows_height(ADJUSTS.len(), self.surface);
+        let list = Rect {
+            width: (PANE_W * s) as u32,
+            height: self.area.height.saturating_sub(band).saturating_sub(rows),
+            ..self.area
+        };
+        let (x, right) = self.adjust_span();
+        let fits = List::new(self.surface, list).is_some()
+            && slider_in(self.surface, x, list.y, right, ADJUST_STEPS).is_some();
+        if fits {
+            ADJUSTS.len()
+        } else {
+            0
+        }
+    }
+
+    /// Where a labelled row's slider runs on the pane: from the label's
+    /// end to a cell short of the pane's right.
+    fn adjust_span(&self) -> (i64, i64) {
+        let s = self.surface.scale.value();
+        let cell = (CELL_WIDTH * s) as i64;
+        let x = self.area.x + cell + (ADJUST_LABEL_CELLS * CELL_WIDTH * s) as i64;
+        (x, self.area.x + (PANE_W * s) as i64 - cell)
+    }
+
+    /// The pane's labelled slider rows, `ADJUSTS` in order, stacked on the
+    /// band above its buttons (`adjust_rows`): the label from a cell in,
+    /// `ADJUST_LABEL_CELLS` cells wide, and the slider after it; `None`
+    /// each where the pane lays none.
+    pub fn adjusts(&self) -> Vec<Option<Adjust>> {
+        let mut adjusts = vec![None; ADJUSTS.len()];
+        let laid = self.adjust_rows();
+        if laid == 0 {
+            return adjusts;
+        }
+        let s = self.surface.scale.value();
+        let band = ROW * s;
+        let cell = (CELL_WIDTH * s) as i64;
+        let top = self.history_strip().rect().y - (laid * band) as i64;
+        let (x, right) = self.adjust_span();
+        for (row, slot) in adjusts.iter_mut().enumerate() {
+            let y = top + (row * band) as i64;
+            let label = Rect {
+                x: self.area.x + cell,
+                y,
+                width: (ADJUST_LABEL_CELLS * CELL_WIDTH * s) as u32,
+                height: band as u32,
+            };
+            *slot = slider_in(self.surface, x, y, right, ADJUST_STEPS)
+                .map(|slider| Adjust { label, slider });
+        }
+        adjusts
     }
 
     /// The pane's buttons on the band under its list, `HISTORY_BUTTONS` in
@@ -4147,9 +4240,11 @@ impl Controller {
     }
 
     /// The pointer over the history pane, `None` when it is not over it.
-    /// A press on a shown step selects it, on Toggle or Delete asks for
-    /// the selected step's, on Undo for the last step back; a press on
-    /// the pane's chrome, and a move or release over it, are `Ignored`.
+    /// A press on a labelled row's slider starts its drag (`adjusts`), on
+    /// a shown step selects it, on Toggle or Delete asks for the selected
+    /// step's, on Undo for the last step back; a press on the pane's
+    /// chrome or a row's label, and a move or release over it, are
+    /// `Ignored`.
     fn pane_pointer(
         &mut self,
         phase: PointerPhase,
@@ -4177,6 +4272,30 @@ impl Controller {
         }
         if phase != PointerPhase::Press {
             return Some(Ok((Outcome::Ignored, Vec::new())));
+        }
+        // A labelled row's slider: the press moves its knob and starts the
+        // drag the tool and look bands' handler then follows.
+        let adjusts = layout.adjusts();
+        if let Some((row, adjust)) = adjusts
+            .iter()
+            .enumerate()
+            .find_map(|(row, adjust)| adjust.filter(|a| a.slider.hit(x, y)).map(|a| (row, a)))
+        {
+            let at = adjust.slider.value_at(x, ADJUST_STEPS);
+            self.slider = Some((Dial::Adjust(row), at));
+            // The label shows the exact value in force, the drag its step:
+            // a press on the knob of an off-step value relabels it.
+            let holds = self
+                .develop_photo()
+                .ok()
+                .flatten()
+                .is_some_and(|index| self.dial_holds(Dial::Adjust(row), index, at));
+            let outcome = if holds {
+                Outcome::Ignored
+            } else {
+                Outcome::Changed
+            };
+            return Some(Ok((self.finish(outcome), Vec::new())));
         }
         if let Some(row) = list.hit(x, y) {
             let outcome = self.select_step(self.step_first().saturating_add(row));
@@ -4229,10 +4348,11 @@ impl Controller {
 
     /// The pointer over the tool and look bands, `None` when it is over
     /// neither and no slider drag is on. A press on a slider starts a drag
-    /// at the value under the pointer, a move takes it along, and the
-    /// release commits the exposure or the look intensity through the
-    /// `Edit` the `exposure` or `look-intensity` action makes, unless it is
-    /// the value in force; the intensity's only with a look. A press on an
+    /// at the value under the pointer (a pane row's press is the pane's),
+    /// a move takes any drag along, and the release commits the exposure,
+    /// the look intensity or the row's key through the `Edit` its action
+    /// makes, unless it is the value in force (`dial_holds`: a row's exact
+    /// value); the intensity's only with a look. A press on an
     /// enabled button asks what the button says; on the look band's, the
     /// look it names.
     fn tool_pointer(
@@ -4253,6 +4373,15 @@ impl Controller {
             let (slider, steps) = match dial {
                 Dial::Intensity => (intensity, INTENSITY_STEPS),
                 Dial::Exposure => (tools.slider, EXPOSURE_STEPS),
+                Dial::Adjust(row) => (
+                    layout
+                        .adjusts()
+                        .get(row)
+                        .copied()
+                        .flatten()
+                        .map(|adjust| adjust.slider),
+                    ADJUST_STEPS,
+                ),
                 Dial::Quality => (None, EXPOSURE_STEPS),
             };
             let Some(slider) = slider else {
@@ -4271,12 +4400,10 @@ impl Controller {
                 }
                 PointerPhase::Release => {
                     self.slider = None;
-                    let held = self
-                        .develop_photo()
-                        .ok()
-                        .flatten()
-                        .map(|index| self.dial_value(dial, index));
-                    if held == Some(at) {
+                    let index = self.develop_photo().ok().flatten();
+                    let holds = |at| index.is_some_and(|index| self.dial_holds(dial, index, at));
+                    let (holds_at, holds_value) = (holds(at), holds(value));
+                    if holds_at {
                         // Back where the knob was: a frame change only if the
                         // drag had moved it.
                         Ok((
@@ -4291,7 +4418,7 @@ impl Controller {
                         // The knob paints the held value again from here,
                         // whatever becomes of the write (a refused edit
                         // settles to no change), so the frame moves now.
-                        if held != Some(value) {
+                        if !holds_value {
                             self.bump();
                         }
                         match dial {
@@ -4299,6 +4426,7 @@ impl Controller {
                                 &library::look_intensity_text(intensity_at(at)),
                                 Vec::new(),
                             ),
+                            Dial::Adjust(row) => self.set_adjust(row, adjust_at(at)),
                             Dial::Exposure | Dial::Quality => self
                                 .set_exposure(&library::exposure_text(exposure_at(at)), Vec::new()),
                         }
@@ -4411,10 +4539,73 @@ impl Controller {
             .map_or(library::DEFAULT_LOOK_INTENSITY, Sidecar::look_intensity)
     }
 
+    /// Photo `index`'s value of the labelled row `row`'s key in
+    /// hundredths, zero when absent or past the rows.
+    fn current_adjust(&self, row: usize, index: usize) -> i32 {
+        let sidecar = self
+            .photos
+            .get(index)
+            .and_then(|photo| photo.sidecar.as_ref());
+        match ADJUSTS.get(row).map(|(_, key)| *key) {
+            Some(Key::Contrast) => sidecar.and_then(Sidecar::contrast),
+            _ => None,
+        }
+        .unwrap_or(0)
+    }
+
+    /// The labelled row `row`'s slider value as painted: the drag's while
+    /// one on it is on, else the step nearest the cursor photo's value.
+    pub fn adjust_value(&self, row: usize) -> usize {
+        match self.slider {
+            Some((Dial::Adjust(dragged), value)) if dragged == row => value,
+            _ => self.cursor.map_or(adjust_step(0), |index| {
+                self.dial_value(Dial::Adjust(row), index)
+            }),
+        }
+    }
+
+    /// The labelled row `row`'s label: its name and the value under the
+    /// drag while one on it is on, else the cursor photo's, `0.00` when
+    /// absent.
+    pub fn adjust_label(&self, row: usize) -> String {
+        let Some((name, _)) = ADJUSTS.get(row) else {
+            return String::new();
+        };
+        let hundredths = match self.slider {
+            Some((Dial::Adjust(dragged), value)) if dragged == row => adjust_at(value),
+            _ => self
+                .cursor
+                .map_or(0, |index| self.current_adjust(row, index)),
+        };
+        format!("{name} {}", library::contrast_text(hundredths))
+    }
+
+    /// Sets the labelled row `row`'s key to `hundredths` as its action
+    /// does.
+    fn set_adjust(&mut self, row: usize, hundredths: i32) -> Result<(Outcome, Vec<Effect>), Error> {
+        match ADJUSTS.get(row).map(|(_, key)| *key) {
+            Some(Key::Contrast) => {
+                self.set_contrast(&library::contrast_text(hundredths), Vec::new())
+            }
+            _ => Ok((Outcome::Ignored, Vec::new())),
+        }
+    }
+
+    /// Whether `dial` at step `at` is what photo `index` holds: for a
+    /// labelled row, whose label shows it, the exact value in force; for
+    /// the others the step it rounds to.
+    fn dial_holds(&self, dial: Dial, index: usize, at: usize) -> bool {
+        match dial {
+            Dial::Adjust(row) => adjust_at(at) == self.current_adjust(row, index),
+            _ => self.dial_value(dial, index) == at,
+        }
+    }
+
     /// A develop slider's value for photo `index` as its sidecar holds it.
     fn dial_value(&self, dial: Dial, index: usize) -> usize {
         match dial {
             Dial::Intensity => intensity_step(self.current_intensity(index)),
+            Dial::Adjust(row) => adjust_step(self.current_adjust(row, index)),
             Dial::Exposure | Dial::Quality => exposure_value(self.current_exposure(index)),
         }
     }
@@ -5886,6 +6077,26 @@ impl Scene<'_> {
                 damage,
                 sink,
             );
+        }
+        let scale = layout.surface.scale;
+        let rise = ((ROW - CELL_HEIGHT) / 2 * scale.value()) as i64;
+        for (row, adjust) in layout.adjusts().iter().enumerate() {
+            let Some(adjust) = adjust else {
+                continue;
+            };
+            let label = adjust.label;
+            text_run(
+                scale,
+                model.adjust_label(row).chars(),
+                (label.x, label.y + rise),
+                label,
+                GlyphStyle::medium(INK, CHROME),
+                damage,
+                sink,
+            );
+            adjust
+                .slider
+                .emit(model.adjust_value(row), ADJUST_STEPS, true, damage, sink);
         }
         let selected = model.history_step.is_some();
         let enabled = [selected, selected, !steps.is_empty()];

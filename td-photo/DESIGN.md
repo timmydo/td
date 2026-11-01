@@ -280,8 +280,9 @@ window, all speaking the toolkit's one vocabulary.
   history (Files, Sidecar; a run of edits to one key is the one step it
   began), and develop mode shows that history in a pane at
   the area's left (td-ui's `chrome::List`, `PANE_W` (216) reference pixels
-  wide, above a band of three buttons: Toggle, Delete, Undo, a td-ui strip
-  on the pane's width, wrapping where it is short), the steps
+  wide, above the pane's sliders (below) and a band of three buttons:
+  Toggle, Delete, Undo, a td-ui strip on the pane's width, wrapping where
+  it is short), the steps
   oldest first as `KEY VALUE` (`-` a clear; a crop as `x,y wxh` in whole
   percents, `ui::step_label`, so it fits the row), a step that is off
   dimmed, one selected. The selection is the model's (`state` reports the
@@ -305,6 +306,26 @@ window, all speaking the toolkit's one vocabulary.
   pane and its buttons are the frame's: a selection move, a step toggled and
   the list itself are witnessed by the scene, so the replay `frame` and
   `--preview` carry them.
+- **The pane's sliders.** Between the history list and its buttons the
+  pane lays labelled slider rows, one per `ui::ADJUSTS` entry in order
+  (Contrast), as an editor's adjustment panel does (`Layout::adjusts`):
+  a label `ADJUST_LABEL_CELLS` (14) cells wide from a cell in, the row's
+  name and its value in force as the sidecar spells it (`0.00` absent,
+  the drag's while one is on it, `Controller::adjust_label`), and a td-ui
+  slider after it to a cell short of the pane's right, `ADJUST_STEPS`
+  (40) steps of 0.05 from -1.00 to 1.00, zero in the middle
+  (`ui::adjust_step` placing a value at the nearest step, `ui::adjust_at`
+  reading one back). The rows are laid all or none: none where the list
+  above them would keep no row or a slider would not give each step its
+  own column, so on a short surface they give way before the list. A
+  press on a row's slider jumps its knob and starts a drag the tool
+  band's handler follows wherever the pointer goes, and the release
+  commits the row's key through the `Edit` its action makes unless the
+  knob's value is the exact value in force, so what the label shows on
+  release is what is written (an off-step value relabels to the knob's
+  step on a press; Driving); the keys move the same knob. A press on a
+  label is chrome. The rows take the pane's height, not the
+  preview's, so adding one leaves the develop box as it was.
 - **The single view's facts** name the look as `look STEM`, followed by
   ` at I` when the photo sets a look intensity, and nothing more without a
   look.
@@ -447,13 +468,19 @@ window, all speaking the toolkit's one vocabulary.
   stderr, and a batch asked for there is that roll's own. The status row
   holds one note, the picks' auto's or their export's, whichever landed
   last; each failure's reason is on stderr.
-  The sliders, the exposure's and the look intensity's alike: a
-  press on one moves the knob to the pointer's step and starts a drag that
-  follows the pointer's column wherever it goes, each step it crosses a
-  frame change and no write; its release commits the step it rests on as
-  the `exposure` or `look-intensity` action would, or writes nothing when
-  that is the step the value in force rounds to (then a frame change only if the drag had
-  moved the knob; a nudge's off-step exposure stays as it is). A release
+  The sliders, the exposure's, the look intensity's and the pane's
+  labelled rows' alike: a press on one moves the knob to the pointer's
+  step and starts a drag that follows the pointer's column wherever it
+  goes, each step it crosses a frame change and no write; its release
+  commits the step it rests on as the `exposure`, `look-intensity` or
+  row's action would, or writes nothing when
+  that is the value in force (then a frame change only if the drag had
+  moved the knob). For the exposure and the intensity that is the step
+  the value in force rounds to, so a nudge's off-step exposure stays as
+  it is; a labelled row shows its exact value, so for it that is the
+  exact value (`Controller::dial_holds`): a press on the knob of an
+  off-step 0.67 relabels it 0.65, a frame change, and a release there
+  writes 0.65, what the label showed. A release
   that commits is a frame change on its own when the knob had moved, since
   the knob paints the held value again from there whatever becomes of the
   write. The look intensity slider is painted flat (td-ui's disabled knob)
@@ -1730,8 +1757,10 @@ room) of the cursor's photo in the area right of the history pane
 (`Layout::film_band`, its boxes `Layout::film_boxes`; `Layout::develop_view` the
 rest), its status marked `develop`, with the developed preview blitted into that
 box once it is made, and the pane at the area's left: the history list
-(`Layout::history`, a `chrome::List` over the pane's width, less the band
-its buttons take) and, on the band under it, the Toggle, Delete and Undo
+(`Layout::history`, a `chrome::List` over the pane's width, less the
+labelled rows and the band its buttons take), the labelled slider rows
+under it (`Layout::adjusts`, all or none), and, on the band under them,
+the Toggle, Delete and Undo
 buttons (`Layout::history_buttons`, a `chrome::Buttons` strip on the pane's
 width, wrapping), Toggle and Delete enabled with a selection and Undo with a
 step; a surface too short for a row has neither. The box geometry
@@ -1744,8 +1773,9 @@ the image held for the other box, centred and clipped to the one in view,
 as it blits a develop held at the other crop). A press
 on a mode button changes the mode, on a filter button sets the filter, on a cell
 selects it, in develop on a history step or a filmstrip box selects it, on a
-pane, tool or look button asks what it says and on the slider starts its drag
-(see Driving), and in the single view anywhere in the area between the bands
+pane, tool or look button asks what it says and on a slider (the tool
+band's, the look band's or a pane row's) starts its drag (see Driving),
+and in the single view anywhere in the area between the bands
 returns to the grid; the status row, a strip's margin and the gap between two
 buttons, the pane's chrome, and anything off the surface, are not targets, and
 the bands are hit-tested last painted first, so on a surface too short for them
@@ -2392,6 +2422,14 @@ giving way to the filmstrip at some height, after the built-in looks on
 their last row with the strip kept at the default window, its steps
 placing an off-step intensity at the nearest, flat and inert without a look and
 committing on release with one, the exposure's knob untouched,
+the pane's Contrast row between the list and the buttons with its
+label and value, its steps placing an off-step contrast at the nearest,
+a press jumping the knob and the label, a drag off the pane taking it
+on and the release committing the `contrast` edit, the keys moving the
+same knob, a drag released over the develop box, an off-step 0.67 shown
+exactly whose knob press is a frame change relabelling it 0.65 and
+whose release writes 0.65, a press on the label inert, and the rows
+giving way while the list keeps a row on short surfaces,
 `auto` and `a` asking the adapter
 for the cursor photo's measure (ignored outside develop, one step labelled
 `auto E C`, the same values no step, one undo taking both), the replay
@@ -2747,7 +2785,9 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    `auto-picks`, `AutoPicks`, the batch note and `td-photo auto-picks ROLL`.
    Landed. (h) The look's intensity: a develop key blending the look with
    what it was given, `'` and `;`, `look-intensity`, a slider in the look
-   band. Landed.
+   band. Landed; up to twice the look after. (i) The pane's sliders:
+   labelled rows between the history and its buttons, Contrast first.
+   Landed.
 9. Later: DNG and JPEG rolls, the Nikon High
    Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.

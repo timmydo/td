@@ -6360,6 +6360,183 @@ fn with_history() -> Controller {
     c
 }
 
+/// The history pane's labelled Contrast row: the name and the value in
+/// force on the band above the buttons, its slider after the label in
+/// steps of 0.05 from -1.00 to 1.00, a press jumping the knob, a drag
+/// taking it on off the pane, and the release committing the `contrast`
+/// edit the action makes; the keys move the same knob; and the rows give
+/// way before the list's last row on a short surface.
+#[test]
+fn the_pane_s_contrast_row_slides_and_commits_the_contrast() {
+    assert_eq!(ui::adjust_step(0), 20);
+    assert_eq!(ui::adjust_step(-100), 0);
+    assert_eq!(ui::adjust_step(100), 40);
+    assert_eq!(ui::adjust_step(37), 27);
+    assert_eq!(ui::adjust_step(38), 28);
+    assert_eq!(ui::adjust_step(-150), 0);
+    assert_eq!(ui::adjust_at(27), 35);
+    assert_eq!(ui::adjust_at(0), -100);
+    assert_eq!(ui::adjust_at(60), 100);
+    assert_eq!(ui::ADJUSTS[0], ("Contrast", Key::Contrast));
+
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let layout = c.layout();
+    let list = layout.history().unwrap();
+    let adjusts = layout.adjusts();
+    let row = adjusts[0].expect("a contrast row on 800x600");
+    let buttons = layout.history_buttons();
+    let top = buttons[0].unwrap().rect().y - 2;
+    assert_eq!(row.label.y, list.rect().y + i64::from(list.rect().height));
+    assert_eq!(row.label.y + 24, top);
+    assert_eq!(row.label.x, 8);
+    assert_eq!(
+        row.slider.rect().x,
+        row.label.x + i64::from(row.label.width)
+    );
+    assert!(row.slider.rect().x + i64::from(row.slider.rect().width) <= (ui::PANE_W - 8) as i64);
+    assert!(row.slider.travel() as usize >= ui::ADJUST_STEPS);
+    assert_eq!(c.adjust_label(0), "Contrast 0.00");
+    assert_eq!(c.adjust_value(0), 20);
+    let mid = |c: &Controller, value: usize| {
+        let knob = c.layout().adjusts()[0]
+            .unwrap()
+            .slider
+            .knob(value, ui::ADJUST_STEPS);
+        (
+            (knob.x + i64::from(knob.width) / 2) as u32,
+            (knob.y + i64::from(knob.height) / 2) as u32,
+        )
+    };
+    let flat = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+    // The knob in force: nothing.
+    let (x, y) = mid(&c, 20);
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    // A press away jumps it, the label follows, a drag off the pane takes
+    // it on, and the release commits.
+    let (x, y) = mid(&c, 30);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_eq!(c.adjust_value(0), 30);
+    assert_eq!(c.adjust_label(0), "Contrast 0.50");
+    assert_ne!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        flat
+    );
+    let (x, _) = mid(&c, 28);
+    assert_eq!(drag_to(&mut c, x, 300), Outcome::Changed);
+    assert_eq!(c.adjust_label(0), "Contrast 0.40");
+    let (outcome, effects) = release(&mut c, x, 300);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Contrast,
+            value: Some("0.40".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[CONTRAST], "0.40");
+    assert_eq!(c.adjust_value(0), 28);
+    assert_eq!(c.adjust_label(0), "Contrast 0.40");
+    // The keys move the same knob: down a tenth to 0.30, step 26.
+    let (_, effects) = c.input(Input::Key { chord: "," }).unwrap();
+    apply(&mut c, &effects).unwrap();
+    assert_eq!(c.adjust_value(0), 26);
+    assert_eq!(c.adjust_label(0), "Contrast 0.30");
+    // To the far left: -1.00.
+    let (x, y) = mid(&c, 0);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    let (_, effects) = release(&mut c, x, y);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Contrast,
+            value: Some("-1.00".to_string()),
+        }]
+    );
+    apply(&mut c, &effects).unwrap();
+    // A drag that leaves the pane over the develop box and is released
+    // there: the knob held at the travel's end, 1.00 written.
+    let (x, y) = mid(&c, 20);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_eq!(drag_to(&mut c, 600, 300), Outcome::Changed);
+    assert_eq!(c.adjust_label(0), "Contrast 1.00");
+    let (_, effects) = release(&mut c, 600, 300);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Contrast,
+            value: Some("1.00".to_string()),
+        }]
+    );
+    // An off-step value in force: the label shows it exactly, a press on
+    // its knob relabels it to the step (a frame change), and a release
+    // there writes what the label shows.
+    let (_, effects) = c.action("contrast", &["0.67"]).unwrap();
+    apply(&mut c, &effects).unwrap();
+    assert_eq!(c.adjust_label(0), "Contrast 0.67");
+    assert_eq!(c.adjust_value(0), 33);
+    let before = c.generation();
+    let (x, y) = mid(&c, 33);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_ne!(c.generation(), before);
+    assert_eq!(c.adjust_label(0), "Contrast 0.65");
+    let (outcome, effects) = release(&mut c, x, y);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Contrast,
+            value: Some("0.65".to_string()),
+        }]
+    );
+    apply(&mut c, &effects).unwrap();
+    // A press on the label is chrome: no drag.
+    let label = c.layout().adjusts()[0].unwrap().label;
+    let (lx, ly) = (
+        (label.x + i64::from(label.width) / 2) as u32,
+        (label.y + i64::from(label.height) / 2) as u32,
+    );
+    assert_eq!(press(&mut c, lx, ly), Outcome::Ignored);
+    assert_eq!(release(&mut c, lx, ly), (Outcome::Ignored, vec![]));
+    assert_eq!(c.adjust_label(0), "Contrast 0.65");
+
+    // Short surfaces: the rows give way while the list keeps a row, and
+    // a row laid lies wholly between the list and the buttons.
+    let mut gave_way = false;
+    for height in (40..=600).step_by(2) {
+        let mut c = Controller::new(surface(800, height));
+        c.open("roll", b"/r", photos(1)).unwrap();
+        act(&mut c, "develop", &[]);
+        let layout = c.layout();
+        let adjusts = layout.adjusts();
+        match (layout.history(), adjusts[0]) {
+            (Some(list), Some(row)) => {
+                assert_eq!(row.label.y, list.rect().y + i64::from(list.rect().height));
+                assert!(row.slider.rect().y >= row.label.y, "{height}");
+                let rows = (24 * ui::ADJUSTS.len()) as i64;
+                let buttons = layout.history_buttons();
+                if let Some(button) = buttons[0] {
+                    assert_eq!(row.label.y + rows + 2, button.rect().y, "{height}");
+                }
+            }
+            (Some(_), None) => gave_way = true,
+            (None, row) => assert_eq!(row, None, "{height}"),
+        }
+    }
+    assert!(gave_way);
+}
+
 /// A run taking up the last step selects that step, as a step added
 /// does, wherever the selection was.
 #[test]
@@ -6530,9 +6707,11 @@ fn the_history_pane_takes_the_pointer_and_is_in_the_scene_frame() {
     assert_eq!(button(0).x, 8);
     assert_eq!(button(0).width, 64);
     assert_eq!(button(2).x + i64::from(button(2).width), 200);
+    // The labelled rows sit between the list and the buttons.
+    let rows = (ui::ADJUSTS.len() * 24) as i64;
     assert_eq!(
         button(0).y,
-        list.rect().y + i64::from(list.rect().height) + 2
+        list.rect().y + i64::from(list.rect().height) + rows + 2
     );
     assert_eq!(layout.develop_region().x, ui::PANE_W as i64);
 
