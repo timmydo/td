@@ -272,7 +272,7 @@ fn the_key_list_groups_the_table_by_mode_under_the_chooser_while_it_is_open() {
             ("Cull", 9),
             ("Modes", 3),
             ("Moving around", 8),
-            ("Develop", 14),
+            ("Develop", 16),
             ("History", 5),
             ("Looks", 13),
             ("Zoom", 4),
@@ -2283,7 +2283,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "76"]);
+    assert_eq!(&reply(2)[..2], ["ok", "78"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(
         reply(4),
@@ -6928,6 +6928,49 @@ fn the_shadows_are_nudged_a_twentieth_by_their_keys() {
     let (_, effects) = c.input(Input::Key { chord: "s" }).unwrap();
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Ignored);
     assert_eq!(c.adjust_label(2), "Shadows 1.00");
+}
+
+/// The clarity is nudged a twentieth by `k` and `K` (`clarity-in`,
+/// `clarity-out`), as the shadows are by `s` and `S`.
+#[test]
+fn the_clarity_is_nudged_a_twentieth_by_its_keys() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    for chord in ["k", "K"] {
+        assert_eq!(key(&mut c, chord), Outcome::Ignored, "{chord}");
+    }
+    for name in ["clarity-in", "clarity-out"] {
+        assert_eq!(act(&mut c, name, &[]), Outcome::Ignored, "{name}");
+    }
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(ui::CLARITY_STEP, 5);
+    for (chord, name, delta) in [
+        ("k", "clarity-in", ui::CLARITY_STEP),
+        ("k", "clarity-in", ui::CLARITY_STEP),
+        ("K", "clarity-out", -ui::CLARITY_STEP),
+    ] {
+        let (outcome, effects) = c.input(Input::Key { chord }).unwrap();
+        assert_eq!(outcome, Outcome::Changed);
+        assert_eq!(
+            effects,
+            [Effect::Nudge {
+                index: 0,
+                name: file(0),
+                key: Key::Clarity,
+                delta,
+            }],
+            "{chord}"
+        );
+        assert_eq!(c.action(name, &[]).unwrap().1, effects, "{name}");
+        apply(&mut c, &effects).unwrap();
+    }
+    assert_eq!(c.adjust_label(5), "Clarity 0.05");
+    // At the bottom a further lowering writes nothing.
+    let (_, effects) = c.action("clarity", &["-1.00"]).unwrap();
+    apply(&mut c, &effects).unwrap();
+    let (_, effects) = c.input(Input::Key { chord: "K" }).unwrap();
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Ignored);
+    assert_eq!(c.adjust_label(5), "Clarity -1.00");
 }
 
 /// The tonal regions: `highlights`, `shadows`, `whites` and `blacks`

@@ -117,15 +117,17 @@ modes are the photographer's order of work.
 3. **Develop** shows one photo developed from its raw data, entered with `d`
    on the cursor's photo and left with `Escape`. `=`/`-` move exposure by a
    third of a stop and their shifted pair `+`/`_` by a tenth, `.`/`,` move
-   contrast by a tenth, `s`/`S` lift or deepen the shadows by a
-   twentieth, `a` chooses both from the photo's tones (Auto) and
+   contrast by a tenth, `a` chooses both from the photo's tones (Auto),
+   `s`/`S` lift or deepen the shadows by a twentieth and `k`/`K` raise
+   or lower the clarity by a twentieth too, and
    `A` (in any mode) does so for every pick that has neither yet, in the
    background (`td-photo auto-picks ROLL` headless), `'`/`;` take a tenth
    more or less of the look (its intensity, from none through the whole
    to twice it), the tonal regions (highlights, shadows, whites and
    blacks, the dark tones lifted apart from the exposure) and the clarity
    (local contrast in the midtones) are set by
-   their actions and the pane's sliders (the shadows by their keys too), `0`
+   their actions and the pane's sliders (the shadows and the clarity
+   by their keys too), `0`
    resets to camera defaults (the default look, where one is set,
    for the look), and the crop and the
    look are set by the `crop` and `look` actions, taking the box's four
@@ -198,7 +200,8 @@ window, all speaking the toolkit's one vocabulary.
   unflag, the four filters, the single view and back, scroll, quit, enter
   develop and its exposure nudges and absolute `exposure`, its contrast
   nudges and absolute `contrast`, the shadows' nudges (`shadows-in`,
-  `shadows-out`), the tonal regions' absolute
+  `shadows-out`), the clarity's (`clarity-in`, `clarity-out`), the
+  tonal regions' absolute
   `highlights`, `shadows`, `whites` and `blacks`, the absolute
   `clarity`, `auto` and
   `auto-picks`, look and the
@@ -280,17 +283,20 @@ window, all speaking the toolkit's one vocabulary.
   `contrast-in`/`contrast-out` a tenth, the shadows one,
   `shadows-in`/`shadows-out` (`s`/`S`) a twentieth, `SHADOWS_STEP`, the
   pane's slider step (a const assert holds them together), so a backlit
-  face is lifted by eye a key at a time (the other tonal regions and the
-  clarity have no keys; the absolute `highlights`, `shadows`, `whites`,
-  `blacks` and `clarity` take a value as `contrast` does, and the pane's
-  rows slide them), and the look intensity one,
+  face is lifted by eye a key at a time, the clarity one,
+  `clarity-in`/`clarity-out` (`k`/`K`) a twentieth, `CLARITY_STEP`,
+  likewise its row's step (the other tonal regions have no keys; the
+  absolute `highlights`, `shadows`, `whites`, `blacks` and `clarity`
+  take a value as `contrast` does, and the pane's rows slide them), and
+  the look intensity one,
   `look-intensity-in`/`look-intensity-out` (`'`/`;`) a tenth, each a
   `Nudge` the adapter adds to the file's value as it stands
   (concurrency-correct as a flag is, not the model's copy) and clamps to
-  `MAX_EXPOSURE`, `MAX_CONTRAST`, `MAX_TONE` or `0..=MAX_LOOK_INTENSITY`
-  (`Sidecar::nudge`, which takes any of `Key::TONE`), so a step that
-  clamps to no change (twice the look nudged up, none nudged down, the
-  shadows past 1.00) writes nothing and is `ignored`, unless a file changed meanwhile
+  `MAX_EXPOSURE`, `MAX_CONTRAST`, `MAX_TONE`, `MAX_CLARITY` or
+  `0..=MAX_LOOK_INTENSITY` (`Sidecar::nudge`, which takes any of
+  `Key::TONE` and the clarity), so a step that clamps to no change
+  (twice the look nudged up, none nudged down, the shadows past 1.00)
+  writes nothing and is `ignored`, unless a file changed meanwhile
   makes the settle a change, as it does for a flag; `look` and `crop` are
   absolute values the adapter sets,
   their grammar judged in the dispatch so a stem that is not a look or a box
@@ -850,8 +856,8 @@ window, all speaking the toolkit's one vocabulary.
   cursor's moves and pages, 8 rows), Modes (`Escape` back to the grid,
   `d` into develop, `E` into the export view, 3), Cull (the flags, the
   filters, the single view, `delete-rejected`, 9), Develop (the
-  exposure, contrast, crop, look palette, shadows, compare and Auto
-  keys, `auto-picks`, 14), History (`reset`, `undo` and the step keys,
+  exposure, contrast, crop, look palette, shadows, clarity, compare and
+  Auto keys, `auto-picks`, 16), History (`reset`, `undo` and the step keys,
   then a prose row: `Down` and `Up` choose the step in develop, 5),
   Looks (`C-1`..`C-9`, then `'` and `;` for the intensity, then `D` for
   the default look and `M` for a camera match, 13), Zoom (4), Export
@@ -2657,9 +2663,9 @@ in-place rewriting around an unknown line, the canonical value spellings,
 contrast's range and its nudges and exposure's clamped as one step a run,
 the tonal regions' four keys (their names, grammar and refusals,
 `Sidecar::tone` and `tone_amount`, and `edit` and `list` with their
-columns after the look intensity), a tonal region's nudges clamped to
-`MAX_TONE` as one step a run, one past the end no change and clarity
-refused, the clarity's key (last in
+columns after the look intensity), a tonal region's and the clarity's
+nudges clamped to their range as one step a run, one past the end no
+change and the flag refused, the clarity's key (last in
 `Key::ALL`, its grammar and refusals, `Sidecar::clarity`, and `edit` and
 `list` with its column last),
 the look intensity's grammar to 2.00, its absent whole look, the whole
@@ -2842,7 +2848,9 @@ pane rows after Contrast in order with labels room for "Highlights
 -1.00" and a row's drag committing its own key, the shadows nudged a
 twentieth by `s` and `S` (ignored in cull, a `Nudge` of the shadows, a
 run one step, the value on the pane's row, a lift past 1.00 no change),
-the clarity set by
+the clarity nudged a twentieth by `k` and `K` (ignored in cull, the
+key's `Nudge` the action's, the value on the pane's row, a lowering
+past -1.00 no change), the clarity set by
 `clarity` (ignored in cull, a bad spelling `bad-argument`, its value
 last in `state` and `photo`) and its row's drag committing the clarity
 alone, the look
@@ -3240,7 +3248,9 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    `shadows-out`). Landed. (p) The default look from the window: `D`
    (`default-look`) makes the photo's look the default. Landed. (q) The
    camera match from the window: `M` (`match-look`) fits the open roll
-   on the pool into the next free `camera-match` stem. Landed.
+   on the pool into the next free `camera-match` stem. Landed. (r) The
+   clarity's keys: `k` and `K` nudge the clarity a twentieth
+   (`clarity-in`, `clarity-out`). Landed.
 9. Later: DNG and JPEG rolls, the Nikon High Efficiency codec, a
    better full-resolution demosaic, highlight reconstruction, the
    `.dtstyle` translator, and ratings.

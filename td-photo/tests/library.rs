@@ -763,8 +763,8 @@ fn contrast_is_a_develop_key_nudged_within_its_range() {
     assert_eq!(sidecar.text(), "td-photo edit 1\n");
 }
 
-/// A tonal region is nudged as contrast is: added to, clamped to
-/// `-MAX_TONE..=MAX_TONE`, a run of nudges one step, and a nudge that
+/// A tonal region and the clarity are nudged as contrast is: added to,
+/// clamped to their range, a run of nudges one step, and a nudge that
 /// clamps to the value in force no step.
 #[test]
 fn a_tonal_region_is_nudged_within_its_range() {
@@ -788,10 +788,19 @@ fn a_tonal_region_is_nudged_within_its_range() {
     let mut floor = Sidecar::default();
     floor.nudge(Key::Highlights, -250).unwrap();
     assert_eq!(floor.tone_amount(Key::Highlights), Some(-library::MAX_TONE));
-    assert_eq!(
-        floor.nudge(Key::Clarity, 5),
-        Err(Error::Value(Key::Clarity))
-    );
+    // The clarity is nudged the same way within its own range.
+    floor.nudge(Key::Clarity, 5).unwrap();
+    floor.nudge(Key::Clarity, 5).unwrap();
+    assert_eq!(floor.clarity(), Some(10));
+    // The highlights' step, then the clarity's run as one.
+    assert_eq!(floor.steps().len(), 2);
+    floor.nudge(Key::Clarity, -300).unwrap();
+    assert_eq!(floor.clarity(), Some(-library::MAX_CLARITY));
+    assert_eq!(floor.steps().len(), 2);
+    let text = floor.text();
+    floor.nudge(Key::Clarity, -5).unwrap();
+    assert_eq!(floor.text(), text);
+    assert_eq!(floor.nudge(Key::Flag, 5), Err(Error::Value(Key::Flag)));
 }
 
 /// The look's intensity is a develop key of hundredths in 0.00..=2.00,
