@@ -113,7 +113,9 @@ const HELP: &str = concat!(
     "  no look develops with the default in the window, --preview and\n",
     "  export (the develop verb takes only --look); a sidecar's `look\n",
     "  none` is no look over it. The window reads it when it opens and\n",
-    "  exports with what it read; a default naming no look is none.\n",
+    "  exports with what it holds; its D (default-look) makes the\n",
+    "  developed photo's look the default, or with that look cleared\n",
+    "  (look none) clears it. A default naming no look is none.\n",
     "td-photo match-look ROLL [--name STEM]\n",
     "  Fits a look to the camera's own rendering: up to 16 of ROLL's\n",
     "  photos, spread over it, each developed plain (0 EV, nothing set)\n",
@@ -2335,29 +2337,40 @@ fn default_look(arg: Option<&OsStr>) -> Result<(), String> {
         None => read_default_look().unwrap_or_else(|| "-".to_string()),
         Some(Err(why)) => return Err(why.to_string()),
         Some(Ok("-")) => {
-            match fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_file() => {
-                    fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?
-                }
-                Ok(_) => return Err(format!("{}: not a regular file", path.display())),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("{}: {e}", path.display())),
-            }
+            write_default_look(&path, None)?;
             "-".to_string()
         }
         Some(Ok(stem)) => {
-            find_look(stem)?;
-            if let Some(dir) = path.parent() {
-                fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            }
-            if fs::symlink_metadata(&path).is_ok_and(|meta| !meta.is_file()) {
-                return Err(format!("{}: not a regular file", path.display()));
-            }
-            replace_own(&path, &library::default_look_text(stem))?;
+            write_default_look(&path, Some(stem))?;
             stem.to_string()
         }
     };
     writeln!(io::stdout().lock(), "{shown}").map_err(|e| e.to_string())
+}
+
+/// Makes `stem` the default look at `path` (resolved first, so a stem no
+/// look answers to is refused), the file replaced, or with `None`
+/// removes the file; never a link or a folder at the name. The verb's
+/// and the window's (`Effect::DefaultLook`).
+fn write_default_look(path: &Path, stem: Option<&str>) -> Result<(), String> {
+    let Some(stem) = stem else {
+        return match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() => {
+                fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))
+            }
+            Ok(_) => Err(format!("{}: not a regular file", path.display())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        };
+    };
+    find_look(stem)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    if fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_file()) {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
+    replace_own(path, &library::default_look_text(stem))
 }
 
 /// Writes the export settings to `export` in the user's td-photo
@@ -3528,7 +3541,8 @@ impl Session {
         // The export settings, the user's file's or the defaults, settled
         // before the first frame.
         ui.set_settings(read_settings());
-        // The default look, read once: a change takes the next session.
+        // The default look at open: `D` changes it since
+        // (`save_default_look`), a change made elsewhere the next session.
         ui.set_default_look(read_default_look());
         Session {
             ui,
@@ -3644,6 +3658,7 @@ impl Session {
                 Effect::Export { name, .. } => outcome = self.export(name)?,
                 Effect::ExportPicks => outcome = self.export_picks()?,
                 Effect::Settings(settings) => outcome = self.save_settings(settings)?,
+                Effect::DefaultLook(stem) => outcome = self.save_default_look(stem)?,
                 Effect::DeleteRejected => outcome = self.delete_rejected()?,
                 Effect::List { folder, parent } => self.list(folder, parent)?,
             }
@@ -3940,7 +3955,7 @@ impl Session {
     }
 
     /// The export a window asks for: the sidecar as it is now, with the
-    /// window's settings and the default look it read at open, so it
+    /// window's settings and the default look it holds now, so it
     /// exports what it shows.
     fn request(&self, path: &Path) -> Result<ExportRequest, String> {
         export_request(path, self.ui.settings(), self.ui.default_look())
@@ -4076,6 +4091,28 @@ impl Session {
             return Err(ui::Error::Refused);
         }
         Ok(self.ui.set_settings(settings))
+    }
+
+    /// Makes `stem` the user's default look, or with `None` clears it, as
+    /// the `default-look` verb does, and settles the model: the window's
+    /// previews and exports of a photo without a look take it from here
+    /// on. A stem no look answers to, or a file that cannot be written,
+    /// is `refused` with why on stderr, the default in force kept. The
+    /// status row names the default set, or says it was cleared.
+    fn save_default_look(&mut self, stem: Option<String>) -> Result<Outcome, ui::Error> {
+        let written =
+            default_look_path().and_then(|path| write_default_look(&path, stem.as_deref()));
+        if let Err(why) = written {
+            note(&why);
+            return Err(ui::Error::Refused);
+        }
+        // The photo it was asked on already shows the look, so the row
+        // is the one sign of a change that reaches every roll.
+        self.ui.set_export(Some(match &stem {
+            Some(stem) => format!("default look {stem}"),
+            None => "default look cleared".to_string(),
+        }));
+        Ok(self.ui.set_default_look(stem))
     }
 
     /// Moves the roll's rejects into `rejected/` as the verb does, on the

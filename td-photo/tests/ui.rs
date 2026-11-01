@@ -274,7 +274,7 @@ fn the_key_list_groups_the_table_by_mode_under_the_chooser_while_it_is_open() {
             ("Moving around", 8),
             ("Develop", 14),
             ("History", 5),
-            ("Looks", 11),
+            ("Looks", 12),
             ("Zoom", 4),
             ("Export", 2),
             ("Roll and window", 2),
@@ -789,6 +789,11 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
                 outcome = c.set_settings(*settings);
                 continue;
             }
+            Effect::DefaultLook(stem) => {
+                // The adapter writes the user's file, then settles.
+                outcome = c.set_default_look(stem.clone());
+                continue;
+            }
             Effect::Open(_) | Effect::List { .. } => panic!("{effect:?}"),
         };
         if let Effect::Export { .. } = effect {
@@ -823,6 +828,7 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
             | Effect::ExportPicks
             | Effect::AutoPicks
             | Effect::Settings(_)
+            | Effect::DefaultLook(_)
             | Effect::DeleteRejected
             | Effect::List { .. } => {
                 panic!("{effect:?}")
@@ -1261,6 +1267,54 @@ fn a_default_look_is_in_force_where_the_sidecar_sets_none() {
     assert_eq!(act(&mut c, "look-intensity", &["0.70"]), Outcome::Ignored);
     // The sidecar's `look` field is the sidecar's.
     assert_eq!(fields(&c)[LOOK], "none");
+}
+
+/// `D` (`default-look`) makes the developed photo's look in force the
+/// default: ignored in cull and when the default is that already (a
+/// photo without a look of its own shows it), a `DefaultLook` of the
+/// stem the adapter writes, and with no look in force (`look none` under
+/// a default) one that clears it.
+#[test]
+fn the_photos_look_is_made_the_default_by_d() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert_eq!(key(&mut c, "D"), Outcome::Ignored);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    // No look and no default: nothing to make the default.
+    let (outcome, effects) = c.action("default-look", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Ignored);
+    assert!(effects.is_empty());
+    let (_, effects) = c.action("look", &["mono"]).unwrap();
+    apply(&mut c, &effects).unwrap();
+    let (outcome, effects) = c.input(Input::Key { chord: "D" }).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(effects, [Effect::DefaultLook(Some("mono".to_string()))]);
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(c.default_look(), Some("mono"));
+    // The same again, and the next photo showing the default: ignored.
+    assert_eq!(key(&mut c, "D"), Outcome::Ignored);
+    assert_eq!(act(&mut c, "next", &[]), Outcome::Changed);
+    assert_eq!(key(&mut c, "D"), Outcome::Ignored);
+    // Another look made the default replaces it.
+    let (_, effects) = c.action("look", &["contrast-soft"]).unwrap();
+    apply(&mut c, &effects).unwrap();
+    let (_, effects) = c.input(Input::Key { chord: "D" }).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::DefaultLook(Some("contrast-soft".to_string()))]
+    );
+    apply(&mut c, &effects).unwrap();
+    assert_eq!(c.default_look(), Some("contrast-soft"));
+    // Cleared under the default, the photo has no look: `D` clears it.
+    let (_, effects) = c.action("look", &["-"]).unwrap();
+    apply(&mut c, &effects).unwrap();
+    assert_eq!(fields(&c)[LOOK], "none");
+    let (outcome, effects) = c.input(Input::Key { chord: "D" }).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(effects, [Effect::DefaultLook(None)]);
+    apply(&mut c, &effects).unwrap();
+    assert_eq!(c.default_look(), None);
+    assert_eq!(key(&mut c, "D"), Outcome::Ignored);
 }
 
 /// The look intensity: `'` and `;` nudge it a tenth and `look-intensity`
@@ -2062,6 +2116,64 @@ fn names(dir: &Path) -> Vec<String> {
     names
 }
 
+/// The window's `default-look` writes the user's default-look file as
+/// the verb does, and the session develops with it from then on; a look
+/// that does not resolve is refused with the file kept, and with no look
+/// in force the file is removed.
+#[test]
+fn the_binary_writes_the_default_look_from_the_window() {
+    let temp = Temp::new("default-look");
+    let roll = temp.0.join("roll");
+    fs::create_dir_all(&roll).unwrap();
+    for name in ["DSC_0001.NEF", "DSC_0002.NEF"] {
+        fs::write(roll.join(name), b"not really a nef").unwrap();
+    }
+    fs::write(
+        roll.join("DSC_0002.NEF.edit"),
+        "td-photo edit 1\nlook gone\n",
+    )
+    .unwrap();
+    let roll_s = roll.to_str().unwrap();
+    let config = temp.0.join("config");
+    let env: [(&str, &Path); 1] = [("XDG_CONFIG_HOME", config.as_path())];
+    let file = config.join("td-photo").join("default-look");
+    let mut session = Replay::start_with_env(&[roll_s], &env);
+    let a = session.send(&[
+        request(1, &["action", "develop"]),
+        request(2, &["action", "look", "mono"]),
+        request(3, &["key", &hex(b"D")]),
+    ]);
+    assert_eq!(a[2], ["3", "ok", "changed"], "{a:?}");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "td-photo default-look 1\nlook mono\n"
+    );
+    // A look no file or built-in answers to is refused, the file kept.
+    let b = session.send(&[
+        request(4, &["action", "next"]),
+        request(5, &["action", "default-look"]),
+    ]);
+    assert_eq!(b[1][..3], ["5", "error", "refused"], "{b:?}");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "td-photo default-look 1\nlook mono\n"
+    );
+    // The refusal kept the default: the first photo's mono is it.
+    // Cleared under the default, the photo has none: the file goes.
+    let c = session.send(&[
+        request(6, &["action", "previous"]),
+        request(7, &["action", "default-look"]),
+        request(8, &["action", "look", "-"]),
+        request(9, &["action", "default-look"]),
+    ]);
+    assert_eq!(c[1], ["7", "ok", "ignored"], "{c:?}");
+    assert_eq!(c[3], ["9", "ok", "changed"], "{c:?}");
+    assert!(!file.exists());
+    let (ok, _, err) = session.finish();
+    assert!(ok, "{err}");
+    assert!(err.contains("look gone"), "{err}");
+}
+
 #[test]
 fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
     let temp = Temp::new("replay");
@@ -2147,7 +2259,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "74"]);
+    assert_eq!(&reply(2)[..2], ["ok", "75"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(
         reply(4),

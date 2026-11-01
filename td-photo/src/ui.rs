@@ -252,6 +252,11 @@ pub enum Effect {
     /// the model through `set_settings`; a file that cannot be written
     /// leaves the model as it was, which is `refused`.
     Settings(Settings),
+    /// Make this stem the user's default look (`None`: remove the file)
+    /// and settle the model through `set_default_look`; a stem no look
+    /// answers to, or a file that cannot be written, leaves the model as
+    /// it was, which is `refused`.
+    DefaultLook(Option<String>),
     /// Move the roll's rejects, as the files flag them then, with their
     /// sidecars into `rejected/`, and take the moved ones out of the model
     /// through `remove`.
@@ -327,6 +332,7 @@ pub enum Action {
     LookIntensityIn,
     LookIntensityOut,
     LookIntensity,
+    DefaultLook,
     ZoomFit,
     Zoom100,
     ZoomIn,
@@ -405,6 +411,7 @@ impl Action {
         Action::LookIntensityIn,
         Action::LookIntensityOut,
         Action::LookIntensity,
+        Action::DefaultLook,
         Action::ZoomFit,
         Action::Zoom100,
         Action::ZoomIn,
@@ -485,6 +492,7 @@ impl Action {
             Self::LookIntensityIn => "look-intensity-in",
             Self::LookIntensityOut => "look-intensity-out",
             Self::LookIntensity => "look-intensity",
+            Self::DefaultLook => "default-look",
             Self::ZoomFit => "zoom-fit",
             Self::Zoom100 => "zoom-100",
             Self::ZoomIn => "zoom-in",
@@ -570,7 +578,8 @@ impl Action {
             Self::LookAt(_)
             | Self::LookIntensityIn
             | Self::LookIntensityOut
-            | Self::LookIntensity => Group::Looks,
+            | Self::LookIntensity
+            | Self::DefaultLook => Group::Looks,
             Self::ZoomFit | Self::Zoom100 | Self::ZoomIn | Self::ZoomOut => Group::Zoom,
             Self::Export | Self::ExportPicks | Self::Format | Self::Quality | Self::LongEdge => {
                 Group::Export
@@ -1016,6 +1025,12 @@ pub const BINDINGS: &[Binding] = &[
         chord: None,
         arguments: "VALUE",
         help: "Set the share of the look applied to VALUE, two decimals in 0.00..2.00, 1.00 the whole look (develop mode, with a look); the look band's slider commits one on release.",
+    },
+    Binding {
+        name: "default-look",
+        chord: Some("D"),
+        arguments: "",
+        help: "Make the photo's look the default look, the one every photo whose sidecar sets none develops with, kept in the user's default-look file; on a photo whose look was cleared (look none), clear the default (develop mode).",
     },
     Binding {
         name: "zoom-fit",
@@ -3127,10 +3142,10 @@ impl Controller {
         }
     }
 
-    /// The user's default look as the adapter read it at open: the look
-    /// band marks it, its intensity slides and a clear writes `look
-    /// none`, for a photo whose sidecar sets no look. `none` is no
-    /// default.
+    /// The user's default look as the adapter read it at open, and as a
+    /// `DefaultLook` effect wrote it since: the look band marks it, its
+    /// intensity slides and a clear writes `look none`, for a photo whose
+    /// sidecar sets no look. `none` is no default.
     pub fn set_default_look(&mut self, stem: Option<String>) -> Outcome {
         let stem = stem.filter(|stem| stem != library::NO_LOOK);
         if self.default_look == stem {
@@ -4150,6 +4165,7 @@ impl Controller {
                 return self.nudge_intensity(-LOOK_INTENSITY_STEP, effects)
             }
             (Action::LookIntensity, [value]) => return self.set_look_intensity(value, effects),
+            (Action::DefaultLook, []) => return self.make_default_look(effects),
             (Action::ZoomFit, []) => self.set_zoom(None)?,
             (Action::Zoom100, []) => self.set_zoom(Some(100))?,
             (Action::ZoomIn, []) => self.zoom_by(ZoomStep::In)?,
@@ -5130,6 +5146,26 @@ impl Controller {
             },
             effects,
         )
+    }
+
+    /// Makes the cursor photo's look in force the default look, or with
+    /// none in force (`look none` under a default) clears the default:
+    /// `Ignored` when the default is that already, a photo without a look
+    /// of its own showing the default. The look is the model's, the one
+    /// the window shows, not the file's read again.
+    fn make_default_look(
+        &mut self,
+        mut effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        let look = self.current_look(index);
+        if look == self.default_look.as_deref() {
+            return Ok((Outcome::Ignored, effects));
+        }
+        effects.push(Effect::DefaultLook(look.map(str::to_string)));
+        Ok((Outcome::Changed, effects))
     }
 
     /// Nudges the cursor photo's look intensity by `delta` hundredths, as

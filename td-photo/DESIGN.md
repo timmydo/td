@@ -141,9 +141,12 @@ modes are the photographer's order of work.
    the crop drag to a ratio (free, 3:2, 4:3, 1:1 or 16:9), held in the preview's
    own pixel space, so a locked marquee, corner or edge drag keeps that ratio;
    picking a ratio only arms the lock. A look palette toggled with
-   `l` lists the available looks with the current one marked, and a press on a
-   name picks it. Two bands above the preview carry the same controls as
-   buttons: a tool band with Crop (the crop-adjust toggle, shown selected
+   `l` lists the available looks with the current one marked, and a
+   press on a name picks it. `D` makes the photo's look the default
+   look, the one every photo whose sidecar sets none develops with
+   (Files, Default look), or on a photo whose look was cleared (`look
+   none`) clears it. Two bands above the preview carry the same
+   controls as buttons: a tool band with Crop (the crop-adjust toggle, shown selected
    while it is on), Uncrop (`C`, clearing the crop), Undo, Reset, the
    exposure's `-` and `+` beside a slider over the exposure's whole range,
    and Fit and 100% (the zoom, the one in force selected), and
@@ -197,7 +200,8 @@ window, all speaking the toolkit's one vocabulary.
   `auto-picks`, look and the
   look shortcuts `look-1`..`look-9`, the look intensity's nudges
   (`look-intensity-in`, `look-intensity-out`) and absolute
-  `look-intensity`, crop and `uncrop`, crop-adjust, aspect,
+  `look-intensity`, the default look (`default-look`), crop and
+  `uncrop`, crop-adjust, aspect,
   the look palette (`looks`), reset, undo and the history's step toggle and
   delete, the zoom (`zoom-fit`, `zoom-100`, `zoom-in`, `zoom-out`), the
   camera's JPEG in the box (`compare`), export,
@@ -212,7 +216,7 @@ window, all speaking the toolkit's one vocabulary.
   a key by a delta, `Edit` a crop or look, `Reset` to camera defaults, `Undo` the
   last step, `StepToggle` and `StepDelete` a step, `Auto` that photo,
   `AutoPicks` every pick, `Export` that photo, `ExportPicks` every pick,
-  `Settings` the export settings).
+  `Settings` the export settings, `DefaultLook` the default look).
   The keyboard bindings, the pointer hit-testing, the replay stream and the
   control socket are four adapters over that one dispatcher, and nothing
   reaches the model around it. The cursor is
@@ -842,10 +846,11 @@ window, all speaking the toolkit's one vocabulary.
   `d` into develop, `E` into the export view, 3), Cull (the flags, the
   filters, the single view, `delete-rejected`, 9), Develop (the
   exposure, contrast, crop, look palette, shadows, compare and Auto
-  keys, `auto-picks`, 14), History (`reset`, `undo` and the step keys, then a prose row:
-  `Down` and `Up` choose the step in develop, 5), Looks (`C-1`..`C-9`,
-  then `'` and `;` for the intensity, 11), Zoom (4), Export (`e`, `C-e`, 2), and Roll and window (`choose`,
-  `quit`, 2). Within a section the table's rows keep its order, a
+  keys, `auto-picks`, 14), History (`reset`, `undo` and the step keys,
+  then a prose row: `Down` and `Up` choose the step in develop, 5),
+  Looks (`C-1`..`C-9`, then `'` and `;` for the intensity, then `D` for
+  the default look, 12), Zoom (4), Export (`e`, `C-e`, 2), and Roll and
+  window (`choose`, `quit`, 2). Within a section the table's rows keep its order, a
   group's prose (`Group::prose`) after them. The current mode's
   sections lead (`Group::mode`: Cull's for cull, Develop, History, Looks
   and Zoom for develop, Export's for the export view), Modes, whose keys
@@ -1057,7 +1062,9 @@ The library is folders of originals; there is no database.
   `td-photo default-look 1` then one `look STEM` line, a look stem and
   not `none` (`library::parse_default_look`), set, shown and cleared by
   `td-photo default-look [STEM | -]` (a stem no look answers to refused
-  then), written through `replace_own` as the settings are. A photo
+  then), and set or cleared by the window's `default-look` (`D`, below),
+  both through `write_default_look`, written through `replace_own` as the
+  settings are. A photo
   whose sidecar sets no look develops with it in the window, `--preview`
   and export (`library::effective_look`): the sidecar's look first, its
   `look none` no look, else the default. The `develop` verb takes its
@@ -1073,8 +1080,28 @@ The library is folders of originals; there is no database.
   the look with the rest, so the photo returns to the default, not to
   no look. The sidecar's `look` field, `list`'s column and
   `state`/`photo` stay the sidecar's. The window reads the file when a
-  session starts (a change takes the next one) and exports with what it
-  read, so it exports what it shows; each verb reads it once per run. A
+  session starts (a change made elsewhere takes the next one) and
+  exports with what it holds, so it exports what it shows; each verb
+  reads it once per run. In develop, `default-look` (`D`) makes the
+  photo's look in force the default, or with none in force (its `look
+  none` under a default) removes the file, `ignored` when the default is
+  that already, which a photo without a look of its own always shows: a
+  `DefaultLook` effect the adapter writes as the verb does
+  (`Session::save_default_look`), the stem resolved first, and only then
+  settles the model (`set_default_look`), so the look band's mark, the
+  previews of every photo without a look and the exports the window asks
+  for from then on take it; a stem no look answers to (a sidecar naming
+  a removed look) or a file that cannot be written is `refused` with why
+  on stderr, the default in force kept. The status row says `default
+  look STEM` or `default look cleared`, the one sign on screen, since
+  the photo it was asked on already shows that look. The look is the
+  model's, the one the window shows, not the file's read again, and
+  its stem alone: the photo's look intensity is the photo's, so other
+  photos take the default at their own (the whole look without one).
+  Clearing the default this way leaves that photo's `look none`, so it
+  keeps no look when a default is set again, until its look is picked
+  or reset. Exports already queued keep the default they were asked
+  with. A
   refused file (past `settings::MAX_BYTES`, not the grammar, not a
   regular file, or naming a look that does not resolve) is no default,
   with why on stderr: a stale default would otherwise refuse every
@@ -2626,7 +2653,15 @@ unit test holds the window's export to the default it read, not the
 file's, and to a sidecar's `look none`; `tests/ui.rs` holds a default `none` no
 default, the look intensity ignored without a default and taken with
 one, a clear writing nothing without one and `look none` with one,
-and the sidecar's field kept; `tests/control_process.rs`'s `--preview`
+and the sidecar's field kept, and `D` (ignored in cull, with no look
+and no default, when the default is the photo's look already and on a
+photo showing it; a `DefaultLook` of the photo's look, another
+replacing it, and of none clearing it after a clear under it), and
+the binary's `default-look` writing the file's text, refusing a look
+that does not resolve with the file and the default in force kept and
+the reason on stderr, and removing the file for a photo cleared under
+it;
+`tests/control_process.rs`'s `--preview`
 case develops a sidecar without a look as the default's and one with
 `look none` as no look's; `tests/nef.rs` runs its exports under an empty
 configuration.
@@ -3149,7 +3184,8 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    `look none`. Landed. (n) Comparing with the camera: `\` shows the
    raw's embedded JPEG in the develop box. Landed. (o) The shadows'
    keys: `s` and `S` nudge the shadows a twentieth (`shadows-in`,
-   `shadows-out`). Landed.
+   `shadows-out`). Landed. (p) The default look from the window: `D`
+   (`default-look`) makes the photo's look the default. Landed.
 9. Later: DNG and JPEG rolls, the Nikon High Efficiency codec, a
    better full-resolution demosaic, highlight reconstruction, the
    `.dtstyle` translator, and ratings.
