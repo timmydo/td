@@ -298,6 +298,10 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         .as_ref()
         .and_then(|sidecar| sidecar.contrast())
         .unwrap_or(0);
+    let tone = photo
+        .sidecar
+        .as_ref()
+        .map_or_else(crate::look::Tone::default, library::Sidecar::tone);
     let look = photo
         .sidecar
         .as_ref()
@@ -310,6 +314,7 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         r#box.height as usize,
         exposure,
         contrast,
+        tone,
         look,
         crop,
         session.ui.zoom(),
@@ -337,8 +342,8 @@ impl Key {
 }
 
 /// What a worker develops the preview by: the roll, the photo in it, the
-/// box it fits, the sidecar's crop, exposure, contrast and look with its
-/// intensity, and the zoom and its centre when the box does not fit the
+/// box it fits, the sidecar's crop, exposure, contrast, tonal regions and
+/// look with its intensity, and the zoom and its centre when the box does not fit the
 /// image, so the same photo at another box, crop, exposure, contrast, look,
 /// intensity or zoom is another develop; without a look the intensity is
 /// the whole, so a change to it alone is none. There is
@@ -352,6 +357,7 @@ struct Preview {
     crop: Option<library::Crop>,
     exposure: i32,
     contrast: i32,
+    tone: crate::look::Tone,
     look: Option<String>,
     /// Hundredths of the look applied.
     look_intensity: i32,
@@ -976,7 +982,7 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
         Some(stem) => Some(crate::find_look(stem)?),
         None => None,
     };
-    let contrast = crate::look::Look::contrast(preview.contrast);
+    let contrast = crate::look::Look::adjust(preview.contrast, preview.tone);
     let params = develop::Params {
         exposure: preview.exposure as f32 / 100.0,
         contrast: contrast.as_ref(),
@@ -2365,6 +2371,10 @@ impl Window {
                 .as_ref()
                 .and_then(|sidecar| sidecar.contrast())
                 .unwrap_or(0),
+            tone: photo
+                .sidecar
+                .as_ref()
+                .map_or_else(crate::look::Tone::default, library::Sidecar::tone),
             look,
             look_intensity,
             zoom: ui.zoom(),
@@ -2766,6 +2776,7 @@ mod tests {
             crop: None,
             exposure: 0,
             contrast: 0,
+            tone: crate::look::Tone::default(),
             look: None,
             look_intensity: 100,
             zoom: None,
@@ -2860,6 +2871,7 @@ mod tests {
             path: PathBuf::from("/td-photo/none").join(name),
             exposure: 0,
             contrast: 0,
+            tone: crate::look::Tone::default(),
             crop: None,
             look: None,
             look_intensity: 100,
@@ -3296,6 +3308,16 @@ mod tests {
         };
         assert_ne!(a_contrast, a);
         assert_eq!(memo.plan(&a_contrast).stage(), Stage::Level3);
+        // So is a tonal region's.
+        let a_tone = Preview {
+            tone: crate::look::Tone {
+                shadows: 40,
+                ..crate::look::Tone::default()
+            },
+            ..a.clone()
+        };
+        assert_ne!(a_tone, a);
+        assert_eq!(memo.plan(&a_tone).stage(), Stage::Level3);
         // So is a look intensity edit alone.
         let a_share = Preview {
             look_intensity: 40,
@@ -3528,6 +3550,7 @@ mod tests {
             path: PathBuf::from("/td-photo/no-such-roll").join("d"),
             exposure: 0,
             contrast: 0,
+            tone: crate::look::Tone::default(),
             crop: None,
             look: None,
             look_intensity: 100,

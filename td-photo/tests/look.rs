@@ -853,6 +853,162 @@ fn the_look_intensity_takes_a_share_of_the_look() {
     assert_eq!(more.pixel(1, 0), plain.pixel(1, 0));
 }
 
+/// The tonal regions' curve: the identity at all zero; rising at every
+/// extreme mix of the four, so no tone reverses; the shadows lifting or
+/// deepening the dark tones with black and white held, the highlights
+/// the bright ones, and the whites and blacks moving their ends.
+#[test]
+fn the_tonal_regions_curve_rises_and_moves_its_region() {
+    use look::{tone_curve, Tone};
+    let tone = |highlights, shadows, whites, blacks| Tone {
+        highlights,
+        shadows,
+        whites,
+        blacks,
+    };
+    let grid: Vec<f64> = (0..=2000).map(|i| f64::from(i) / 2000.0).collect();
+    let none = tone_curve(Tone::default());
+    for &y in &grid {
+        assert!((none(y) - y).abs() < 1e-12, "{y}");
+    }
+    let amounts = [-100, 0, 100];
+    for h in amounts {
+        for s in amounts {
+            for w in amounts {
+                for b in amounts {
+                    let f = tone_curve(tone(h, s, w, b));
+                    for pair in grid.windows(2) {
+                        let (Some(&y0), Some(&y1)) = (pair.first(), pair.last()) else {
+                            continue;
+                        };
+                        assert!(f(y1) >= f(y0), "{h} {s} {w} {b} at {y0}");
+                        assert!(f(y0).is_finite() && f(y0) >= 0.0);
+                    }
+                }
+            }
+        }
+    }
+    let stops = |f: &dyn Fn(f64) -> f64, y: f64| (f(y) / y).log2();
+    // Shadows: a deep shadow at least a stop up at +1.00 and down at
+    // -1.00; black and white held; a bright tone barely moved.
+    let lift = tone_curve(tone(0, 100, 0, 0));
+    let deepen = tone_curve(tone(0, -100, 0, 0));
+    assert!(stops(&lift, 0.02) > 1.0, "{}", stops(&lift, 0.02));
+    assert!(stops(&deepen, 0.02) < -1.0, "{}", stops(&deepen, 0.02));
+    for f in [&lift, &deepen] {
+        assert_eq!(f(0.0), 0.0);
+        assert!((f(1.0) - 1.0).abs() < 1e-12);
+        assert!(stops(f, 0.8).abs() < 0.15, "{}", stops(f, 0.8));
+    }
+    // Half the amount, part of the way.
+    let half = tone_curve(tone(0, 50, 0, 0));
+    assert!(stops(&half, 0.02) > 0.3 && stops(&half, 0.02) < stops(&lift, 0.02));
+    // Highlights: a bright tone down at -1.00 (recovered) and up at +1.00,
+    // the ends held, a deep shadow barely moved.
+    let recover = tone_curve(tone(-100, 0, 0, 0));
+    let raise = tone_curve(tone(100, 0, 0, 0));
+    assert!(stops(&recover, 0.5) < -0.4, "{}", stops(&recover, 0.5));
+    assert!(stops(&raise, 0.5) > 0.2, "{}", stops(&raise, 0.5));
+    for f in [&recover, &raise] {
+        assert_eq!(f(0.0), 0.0);
+        assert!((f(1.0) - 1.0).abs() < 1e-12);
+        assert!(stops(f, 0.01).abs() < 0.1, "{}", stops(f, 0.01));
+    }
+    // Whites and blacks move their ends by a quarter of the perceptual
+    // range: white to 1.25^2 or 0.75^2, black lifted to 0.25^2 or the
+    // darkest tones crushed to black.
+    assert!((tone_curve(tone(0, 0, 100, 0))(1.0) - 1.5625).abs() < 1e-12);
+    assert!((tone_curve(tone(0, 0, -100, 0))(1.0) - 0.5625).abs() < 1e-12);
+    assert_eq!(tone_curve(tone(0, 0, 100, 0))(0.0), 0.0);
+    assert!((tone_curve(tone(0, 0, 0, 100))(0.0) - 0.0625).abs() < 1e-12);
+    assert_eq!(tone_curve(tone(0, 0, 0, -100))(0.01), 0.0);
+    assert!((tone_curve(tone(0, 0, 0, -100))(1.0) - 1.0).abs() < 1e-12);
+    // Past 1.00 is held to it.
+    assert_eq!(tone_curve(tone(0, 300, 0, 0))(0.02), lift(0.02));
+}
+
+/// The photo's adjustments as one look: none at zero, the contrast and
+/// the tonal regions each an operation; the tone a luminance curve that
+/// keeps a neutral neutral, leaves luminance past white alone while white
+/// is held and scales it with a moved white, and through the pipeline
+/// lifts a deep shadow when the shadows are raised.
+#[test]
+fn the_photo_s_adjustments_are_one_look() {
+    use look::Tone;
+    let shadows = Tone {
+        shadows: 100,
+        ..Tone::default()
+    };
+    assert!(Look::adjust(0, Tone::default()).is_none());
+    assert_eq!(Look::adjust(0, shadows).unwrap().operations(), 1);
+    assert_eq!(Look::adjust(30, shadows).unwrap().operations(), 2);
+    assert_eq!(Look::adjust(30, Tone::default()), Look::contrast(30));
+    let lift = Look::adjust(0, shadows).unwrap();
+    // A dark neutral brightens and stays neutral.
+    let [r, g, b] = lift.apply([0.02, 0.02, 0.02]);
+    assert!(
+        r > 0.04 && (r - g).abs() < 1e-6 && (g - b).abs() < 1e-6,
+        "{r} {g} {b}"
+    );
+    // A dark colour brightens, keeping its channels' order.
+    let [r, g, b] = lift.apply([0.04, 0.02, 0.01]);
+    assert!(r > g && g > b && g > 0.02, "{r} {g} {b}");
+    // Past white, with white held: as it was.
+    assert_eq!(lift.apply([1.5, 1.3, 1.2]), [1.5, 1.3, 1.2]);
+    // Past white, with white moved down: scaled with it.
+    let dim = Look::adjust(
+        0,
+        Tone {
+            whites: -100,
+            ..Tone::default()
+        },
+    )
+    .unwrap();
+    let [r, g, b] = dim.apply([1.2, 1.2, 1.2]);
+    assert!((r - 1.2 * 0.5625).abs() < 1e-3 && r == g && g == b, "{r}");
+    // No luminance, or a negative or NaN one, takes the curve's black and
+    // its chroma as it was: finite for a finite pixel, black at zero.
+    assert_eq!(lift.apply([0.0, 0.0, 0.0]), [0.0, 0.0, 0.0]);
+    let negative = lift.apply([-0.05, 0.01, -0.02]);
+    assert!(negative.iter().all(|v| v.is_finite()), "{negative:?}");
+    let y = luma([-0.05, 0.01, -0.02]);
+    assert!(y < 0.0);
+    for (got, want) in negative.iter().zip([-0.05 - y, 0.01 - y, -0.02 - y]) {
+        assert!((got - want).abs() < 1e-6, "{negative:?}");
+    }
+
+    let z8 = camera::find("NIKON CORPORATION", "NIKON Z 8").unwrap();
+    let color = camera_color(&z8.xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let wb = color.daylight;
+    let grey = |v: f32| [v / wb[0], v / wb[1], v / wb[2]];
+    let level1 = level1_of(&[grey(0.02), grey(MIDDLE_GREY), grey(0.6), grey(1.0)], 2, 2);
+    let render = |adjust: Option<&Look>| {
+        develop::render(
+            &level1,
+            None,
+            2,
+            1,
+            wb,
+            &color,
+            &transfer,
+            &Params {
+                exposure: 0.0,
+                contrast: adjust,
+                threads: 2,
+                look: None,
+                look_intensity: 1.0,
+            },
+        )
+        .unwrap()
+    };
+    let plain = render(None);
+    let lifted = render(Some(&lift));
+    let (p, l) = (plain.pixel(0, 0).unwrap(), lifted.pixel(0, 0).unwrap());
+    assert!(l[1] > p[1] + 20, "{p:?} {l:?}");
+    assert_eq!(lifted.pixel(1, 1), plain.pixel(1, 1));
+}
+
 // ------------------------------------------------------------ the binary
 
 struct Temp(PathBuf);

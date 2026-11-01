@@ -611,7 +611,7 @@ fn delete_rejected_moves_rejects_with_their_sidecars_and_unlinks_nothing() {
     assert_eq!(files_under(&roll).len(), before.len());
     assert_eq!(
         td_photo(&["list", roll_s, "--rejects"]).1,
-        "DSC_0003.NEF\treject\t-\t-\t-\t-\t-\tok\n"
+        "DSC_0003.NEF\treject\t-\t-\t-\t-\t-\t-\t-\t-\t-\tok\n"
     );
     // Asked again, the kept one is kept again and nothing else moves.
     let (ok, out, _) = td_photo(&["delete-rejected", roll_s]);
@@ -834,12 +834,12 @@ fn look_intensity_goes_through_edit_and_list() {
     assert!(td_photo(&["edit", photo_s, "look", "mono", "look-intensity", "0.60"]).0);
     assert_eq!(
         td_photo(&["list", roll_s]).1,
-        "DSC_0001.NEF\t-\t-\t-\t-\tmono\t0.60\tok\n"
+        "DSC_0001.NEF\t-\t-\t-\t-\tmono\t0.60\t-\t-\t-\t-\tok\n"
     );
     assert!(td_photo(&["edit", photo_s, "look-intensity", "1.80"]).0);
     assert_eq!(
         td_photo(&["list", roll_s]).1,
-        "DSC_0001.NEF\t-\t-\t-\t-\tmono\t1.80\tok\n"
+        "DSC_0001.NEF\t-\t-\t-\t-\tmono\t1.80\t-\t-\t-\t-\tok\n"
     );
     let (ok, _, err) = td_photo(&["edit", photo_s, "look-intensity", "2.50"]);
     assert!(!ok);
@@ -847,7 +847,7 @@ fn look_intensity_goes_through_edit_and_list() {
     assert!(td_photo(&["edit", photo_s, "look-intensity", "-"]).0);
     assert_eq!(
         td_photo(&["list", roll_s]).1,
-        "DSC_0001.NEF\t-\t-\t-\t-\tmono\t-\tok\n"
+        "DSC_0001.NEF\t-\t-\t-\t-\tmono\t-\t-\t-\t-\t-\tok\n"
     );
 }
 
@@ -998,7 +998,7 @@ fn contrast_goes_through_edit_and_list() {
     assert!(td_photo(&["edit", photo_s, "contrast", "0.30"]).0);
     assert_eq!(
         td_photo(&["list", roll_s]).1,
-        "DSC_0001.NEF\t-\t-\t0.30\t-\t-\t-\tok\n"
+        "DSC_0001.NEF\t-\t-\t0.30\t-\t-\t-\t-\t-\t-\t-\tok\n"
     );
     let (ok, _, err) = td_photo(&["edit", photo_s, "contrast", "1.50"]);
     assert!(!ok);
@@ -1006,8 +1006,89 @@ fn contrast_goes_through_edit_and_list() {
     assert!(td_photo(&["edit", photo_s, "contrast", "-"]).0);
     assert_eq!(
         td_photo(&["list", roll_s]).1,
-        "DSC_0001.NEF\t-\t-\t-\t-\t-\t-\tok\n"
+        "DSC_0001.NEF\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\tok\n"
     );
+}
+
+/// The tonal regions are four develop keys of signed hundredths within
+/// 1.00, spelled as contrast is, zero when absent, read together as the
+/// sidecar's `Tone`; `edit` sets and clears them and `list` shows them
+/// after the look intensity, in `Key::TONE`'s order.
+#[test]
+fn the_tonal_regions_are_four_develop_keys() {
+    assert_eq!(
+        Key::TONE,
+        [Key::Highlights, Key::Shadows, Key::Whites, Key::Blacks]
+    );
+    for (&key, name) in Key::TONE
+        .iter()
+        .zip(["highlights", "shadows", "whites", "blacks"])
+    {
+        assert_eq!(Key::parse(name), Some(key));
+        assert_eq!(key.name(), name);
+        assert!(key.develops());
+        assert_eq!(library::tone(key, "0.50"), Ok(50));
+        assert_eq!(library::tone(key, "-1.00"), Ok(-100));
+        assert_eq!(library::tone(key, "1.00"), Ok(100));
+        for bad in ["1.01", "-1.01", "0.5", "+0.10", "x", ""] {
+            assert_eq!(library::tone(key, bad), Err(Error::Value(key)), "{bad}");
+        }
+        let text = format!("td-photo edit 1\n{name} 1.50\n");
+        assert!(Sidecar::parse(text.as_bytes()).is_err(), "{name}");
+    }
+    assert_eq!(library::tone_text(-5), "-0.05");
+    let sidecar =
+        Sidecar::parse(b"td-photo edit 1\nshadows 0.60\nblacks -0.20\nexposure 0.30\n").unwrap();
+    assert_eq!(
+        sidecar.tone(),
+        td_photo::look::Tone {
+            highlights: 0,
+            shadows: 60,
+            whites: 0,
+            blacks: -20,
+        }
+    );
+    assert_eq!(sidecar.tone_amount(Key::Shadows), Some(60));
+    assert_eq!(sidecar.tone_amount(Key::Highlights), None);
+    assert_eq!(sidecar.tone_amount(Key::Exposure), None);
+    assert_eq!(Sidecar::default().tone(), td_photo::look::Tone::default());
+
+    let temp = Temp::new("tone");
+    let roll = temp.0.join("2026/2026-09-13");
+    fs::create_dir_all(&roll).unwrap();
+    let photo = roll.join("DSC_0001.NEF");
+    fs::write(&photo, tiff_with_date("2026:09:13 22:10:05")).unwrap();
+    let (roll_s, photo_s) = (roll.to_str().unwrap(), photo.to_str().unwrap());
+    assert!(
+        td_photo(&[
+            "edit",
+            photo_s,
+            "highlights",
+            "-0.40",
+            "shadows",
+            "0.70",
+            "whites",
+            "0.10",
+            "blacks",
+            "-0.05"
+        ])
+        .0
+    );
+    assert_eq!(
+        td_photo(&["list", roll_s]).1,
+        "DSC_0001.NEF\t-\t-\t-\t-\t-\t-\t-0.40\t0.70\t0.10\t-0.05\tok\n"
+    );
+    let (ok, _, err) = td_photo(&["edit", photo_s, "shadows", "1.20"]);
+    assert!(!ok);
+    assert!(err.contains("malformed shadows value"), "{err}");
+    assert!(td_photo(&["edit", photo_s, "shadows", "-"]).0);
+    assert_eq!(
+        td_photo(&["list", roll_s]).1,
+        "DSC_0001.NEF\t-\t-\t-\t-\t-\t-\t-0.40\t-\t0.10\t-0.05\tok\n"
+    );
+    let (ok, _, err) = td_photo(&["edit", photo_s, "midtones", "0.10"]);
+    assert!(!ok);
+    assert!(err.contains("highlights, shadows, whites, blacks"), "{err}");
 }
 
 #[test]
@@ -1028,7 +1109,7 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     assert!(ok, "{err}");
     assert_eq!(
         out,
-        "DSC_0001.NEF\t-\t-\t-\t-\t-\t-\tnone\nDSC_0002.NEF\t-\t-\t-\t-\t-\t-\tnone\n"
+        "DSC_0001.NEF\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\tnone\nDSC_0002.NEF\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\tnone\n"
     );
     let sidecar = roll.join("DSC_0001.NEF.edit");
     assert!(td_photo(&["flag", photo_s, "pick"]).0);
@@ -1070,12 +1151,12 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     assert_eq!(td_photo(&["edit", photo_s]).1, text);
     assert_eq!(
         td_photo(&["list", roll_s, "--picks"]).1,
-        "DSC_0001.NEF\tpick\t-0.33\t-\t0.1000 0.0500 0.8000 0.9000\tclassic-chrome\t-\tok\n"
+        "DSC_0001.NEF\tpick\t-0.33\t-\t0.1000 0.0500 0.8000 0.9000\tclassic-chrome\t-\t-\t-\t-\t-\tok\n"
     );
     assert_eq!(td_photo(&["list", roll_s, "--rejects"]).1, "");
     assert_eq!(
         td_photo(&["list", roll_s, "--unflagged"]).1,
-        "DSC_0002.NEF\t-\t-\t-\t-\t-\t-\tnone\n"
+        "DSC_0002.NEF\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\tnone\n"
     );
     assert!(!td_photo(&["list", roll_s, "--picks", "--rejects"]).0);
     // An unknown line survives, in place, a flag change and a reset.
@@ -1122,7 +1203,7 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     fs::write(&sidecar, "td-photo edit 1\nexposure 7.00\n").unwrap();
     assert_eq!(
         td_photo(&["list", roll_s]).1,
-        "DSC_0001.NEF\t-\t-\t-\t-\t-\t-\terror malformed exposure value\nDSC_0002.NEF\t-\t-\t-\t-\t-\t-\tnone\n"
+        "DSC_0001.NEF\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\terror malformed exposure value\nDSC_0002.NEF\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\tnone\n"
     );
     let (ok, _, err) = td_photo(&["flag", photo_s, "pick"]);
     assert!(!ok);
@@ -1140,7 +1221,7 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     fs::write(&sidecar, &full).unwrap();
     assert!(td_photo(&["list", roll_s])
         .1
-        .starts_with("DSC_0001.NEF\t-\t-\t-\t-\t-\t-\tok\n"));
+        .starts_with("DSC_0001.NEF\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\tok\n"));
     let (ok, _, err) = td_photo(&["flag", photo_s, "pick"]);
     assert!(!ok);
     assert!(err.contains("over 1024 lines"), "{err}");
@@ -1149,18 +1230,18 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     fs::write(&sidecar, long(65536 - 19)).unwrap();
     assert!(td_photo(&["list", roll_s])
         .1
-        .starts_with("DSC_0001.NEF\t-\t-\t-\t-\t-\t-\tok\n"));
+        .starts_with("DSC_0001.NEF\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\tok\n"));
     fs::write(&sidecar, long(65537 - 19)).unwrap();
-    assert!(td_photo(&["list", roll_s])
-        .1
-        .starts_with("DSC_0001.NEF\t-\t-\t-\t-\t-\t-\terror sidecar over 65536 bytes\n"));
+    assert!(td_photo(&["list", roll_s]).1.starts_with(
+        "DSC_0001.NEF\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\terror sidecar over 65536 bytes\n"
+    ));
     // A sidecar's name that is not a regular file is refused unopened,
     // shown as an error, and never replaced.
     let linked = roll.join("DSC_0002.NEF.edit");
     std::os::unix::fs::symlink(roll.join("notes.txt"), &linked).unwrap();
     assert!(td_photo(&["list", roll_s])
         .1
-        .ends_with("DSC_0002.NEF\t-\t-\t-\t-\t-\t-\terror not a regular file\n"));
+        .ends_with("DSC_0002.NEF\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\terror not a regular file\n"));
     let two = roll.join("DSC_0002.NEF");
     let (ok, _, err) = td_photo(&["flag", two.to_str().unwrap(), "pick"]);
     assert!(!ok);

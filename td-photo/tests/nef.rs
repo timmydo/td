@@ -1570,6 +1570,36 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     let plain = std::fs::read(&plain).unwrap();
     assert_eq!(flat, plain);
     assert_ne!(steep, plain);
+    // Each tonal region's flag develops another frame at a nonzero
+    // amount and the plain one at zero.
+    let develop_with = |name: &str, flag: &str, amount: &str| {
+        let out = dir.join(name);
+        let (ok, _, stderr) = run(&[
+            OsStr::new("develop"),
+            file.as_os_str(),
+            out.as_os_str(),
+            OsStr::new("--long-edge"),
+            OsStr::new("16"),
+            OsStr::new(flag),
+            OsStr::new(amount),
+        ]);
+        assert!(ok, "{stderr}");
+        std::fs::read(&out).unwrap()
+    };
+    for flag in ["--highlights", "--shadows", "--whites", "--blacks"] {
+        let stem = flag.trim_start_matches('-');
+        assert_eq!(develop_with(&format!("{stem}-0.ppm"), flag, "0.00"), plain);
+        assert_ne!(
+            develop_with(&format!("{stem}-1.ppm"), flag, "1.00"),
+            plain,
+            "{flag}"
+        );
+        assert_ne!(
+            develop_with(&format!("{stem}-m.ppm"), flag, "-1.00"),
+            plain,
+            "{flag}"
+        );
+    }
     // `--look-intensity` takes a share of the look: none is no look, the
     // whole is the look, a half is neither.
     let share_of_mono = |name: &str, intensity: &str| {
@@ -1665,6 +1695,18 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     ]);
     assert!(!ok);
     assert!(stderr.contains("D.DD in -1.00..=1.00"), "{stderr}");
+    let (ok, _, stderr) = run(&[
+        OsStr::new("develop"),
+        file.as_os_str(),
+        x.as_os_str(),
+        OsStr::new("--shadows"),
+        OsStr::new("1.50"),
+    ]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("--shadows \"1.50\" is not D.DD in -1.00..=1.00"),
+        "{stderr}"
+    );
     let (ok, _, stderr) = run(&[
         OsStr::new("develop"),
         file.as_os_str(),
@@ -1937,6 +1979,22 @@ fn the_command_line_exports_into_the_rolls_folder() {
         "{} {}",
         spread(&steep.data),
         spread(&decoded.data)
+    );
+    // The shadows lifted brighten the frame: the export carries the tone.
+    std::fs::write(&sidecar, "td-photo edit 1\nshadows 1.00\n").unwrap();
+    let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("DSC_0001-7.jpg"), "{stdout}");
+    let lifted = td_jpeg::decode(
+        &std::fs::read(exported.join("DSC_0001-7.jpg")).unwrap(),
+        td_jpeg::Scale::Full,
+    )
+    .unwrap();
+    assert!(
+        mean(&lifted.data) > mean(&decoded.data),
+        "{} {}",
+        mean(&lifted.data),
+        mean(&decoded.data)
     );
     std::fs::write(
         &sidecar,

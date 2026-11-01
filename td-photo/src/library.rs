@@ -20,6 +20,9 @@ pub const MAX_EXPOSURE: i32 = 500;
 /// Contrast in hundredths, at most this magnitude either way: the tone
 /// curve's steepness about middle grey is `2^(contrast / 100)`.
 pub const MAX_CONTRAST: i32 = 100;
+/// A tonal region's amount (highlights, shadows, whites, blacks) in
+/// hundredths, at most this magnitude either way (`look::tone_curve`).
+pub const MAX_TONE: i32 = 100;
 /// The look's intensity in hundredths, from none (0) through the whole
 /// look (`DEFAULT_LOOK_INTENSITY`) to twice it (this): the developed pixel
 /// is the one before the look moved this share of the way to the look's,
@@ -99,6 +102,10 @@ pub enum Key {
     Crop,
     Look,
     LookIntensity,
+    Highlights,
+    Shadows,
+    Whites,
+    Blacks,
 }
 
 impl Key {
@@ -109,7 +116,14 @@ impl Key {
         Key::Crop,
         Key::Look,
         Key::LookIntensity,
+        Key::Highlights,
+        Key::Shadows,
+        Key::Whites,
+        Key::Blacks,
     ];
+
+    /// The tonal regions' keys, in `look::Tone`'s order.
+    pub const TONE: &'static [Key] = &[Key::Highlights, Key::Shadows, Key::Whites, Key::Blacks];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -119,6 +133,10 @@ impl Key {
             Self::Crop => "crop",
             Self::Look => "look",
             Self::LookIntensity => "look-intensity",
+            Self::Highlights => "highlights",
+            Self::Shadows => "shadows",
+            Self::Whites => "whites",
+            Self::Blacks => "blacks",
         }
     }
 
@@ -355,6 +373,17 @@ pub fn contrast(text: &str) -> Result<i32, Error> {
     hundredths(text, MAX_CONTRAST).ok_or(Error::Value(Key::Contrast))
 }
 
+/// A tonal region's amount (`key` one of `Key::TONE`) from `-D.DD` or
+/// `D.DD`, in hundredths within `MAX_TONE`, spelled as contrast is.
+pub fn tone(key: Key, text: &str) -> Result<i32, Error> {
+    hundredths(text, MAX_TONE).ok_or(Error::Value(key))
+}
+
+/// A tonal region's amount as the sidecar writes it.
+pub fn tone_text(hundredths: i32) -> String {
+    signed_text(hundredths)
+}
+
 /// The `contrast` value as the sidecar writes it.
 pub fn contrast_text(hundredths: i32) -> String {
     signed_text(hundredths)
@@ -444,6 +473,7 @@ fn check(key: Key, value: &str) -> Result<(), Error> {
         Key::Crop => Crop::parse(value).is_ok(),
         Key::Look => valid_look(value),
         Key::LookIntensity => look_intensity(value).is_ok(),
+        Key::Highlights | Key::Shadows | Key::Whites | Key::Blacks => tone(key, value).is_ok(),
     };
     if ok {
         Ok(())
@@ -455,8 +485,8 @@ fn check(key: Key, value: &str) -> Result<(), Error> {
 /// One photo's edits: the header, then `key value` lines in the order the file
 /// had them, then the develop history's `step-N` lines. Known keys are
 /// validated; any other line is kept verbatim and rewritten in place, so a
-/// later version's values survive this one's edit. The develop keys (exposure,
-/// contrast, crop, look, look-intensity) are the history's summary: what its steps that are on
+/// later version's values survive this one's edit. The develop keys (every
+/// known key but the flag) are the history's summary: what its steps that are on
 /// fold to, rewritten from it whenever it changes, so a reader that knows only
 /// the keys sees the settings in force. A file with a history is read by it;
 /// one without and with develop keys (an earlier write) seeds a step per key,
@@ -649,6 +679,26 @@ impl Sidecar {
             .and_then(|value| contrast(value).ok())
     }
 
+    /// Hundredths of a tonal region, `key` one of `Key::TONE`; `None`
+    /// when absent or another key.
+    pub fn tone_amount(&self, key: Key) -> Option<i32> {
+        Key::TONE
+            .contains(&key)
+            .then(|| self.get(key).and_then(|value| tone(key, value).ok()))
+            .flatten()
+    }
+
+    /// The tonal regions, each zero when absent.
+    pub fn tone(&self) -> crate::look::Tone {
+        let at = |key| self.tone_amount(key).unwrap_or(0);
+        crate::look::Tone {
+            highlights: at(Key::Highlights),
+            shadows: at(Key::Shadows),
+            whites: at(Key::Whites),
+            blacks: at(Key::Blacks),
+        }
+    }
+
     pub fn crop(&self) -> Option<Crop> {
         self.get(Key::Crop)
             .and_then(|value| Crop::parse(value).ok())
@@ -799,7 +849,7 @@ impl Sidecar {
     }
 
     /// Back to the camera's defaults: the history cleared, and with it
-    /// exposure, contrast, crop, look and look intensity; the flag, a cull decision, and
+    /// every develop key; the flag, a cull decision, and
     /// any unknown line kept.
     pub fn reset(&mut self) {
         self.steps.clear();

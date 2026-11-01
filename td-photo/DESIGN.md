@@ -121,7 +121,9 @@ modes are the photographer's order of work.
    `A` (in any mode) does so for every pick that has neither yet, in the
    background (`td-photo auto-picks ROLL` headless), `'`/`;` take a tenth
    more or less of the look (its intensity, from none through the whole
-   to twice it), `0`
+   to twice it), the tonal regions (highlights, shadows, whites and
+   blacks, the dark tones lifted apart from the exposure) are set by
+   their actions and the pane's sliders, `0`
    resets to camera defaults, and the crop and the
    look are set by the `crop` and `look` actions, taking the box's four
    fractions or a look's stem, and the crop
@@ -185,7 +187,9 @@ window, all speaking the toolkit's one vocabulary.
   in `ui` (open a roll, choose one, the cursor moves, select, pick, reject,
   unflag, the four filters, the single view and back, scroll, quit, enter
   develop and its exposure nudges and absolute `exposure`, its contrast
-  nudges and absolute `contrast`, `auto` and `auto-picks`, look and the
+  nudges and absolute `contrast`, the tonal regions' absolute
+  `highlights`, `shadows`, `whites` and `blacks`, `auto` and
+  `auto-picks`, look and the
   look shortcuts `look-1`..`look-9`, the look intensity's nudges
   (`look-intensity-in`, `look-intensity-out`) and absolute
   `look-intensity`, crop and `uncrop`, crop-adjust, aspect,
@@ -258,7 +262,10 @@ window, all speaking the toolkit's one vocabulary.
   and are `ignored` in develop and export. Exposure is a
   delta, `expose-in`/`expose-out` a third of a stop and
   `expose-in-fine`/`expose-out-fine` a tenth, contrast one,
-  `contrast-in`/`contrast-out` a tenth, and the look intensity one,
+  `contrast-in`/`contrast-out` a tenth (the tonal regions have no
+  keys: `highlights`, `shadows`, `whites` and `blacks` take a value as
+  `contrast` does, and the pane's rows slide them), and the look
+  intensity one,
   `look-intensity-in`/`look-intensity-out` (`'`/`;`) a tenth, each a
   `Nudge` the adapter adds to the file's value as it stands
   (concurrency-correct as a flag is, not the model's copy) and clamps to
@@ -308,16 +315,18 @@ window, all speaking the toolkit's one vocabulary.
   `--preview` carry them.
 - **The pane's sliders.** Between the history list and its buttons the
   pane lays labelled slider rows, one per `ui::ADJUSTS` entry in order
-  (Contrast), as an editor's adjustment panel does (`Layout::adjusts`):
-  a label `ADJUST_LABEL_CELLS` (14) cells wide from a cell in, the row's
+  (Contrast, Highlights, Shadows, Whites, Blacks), as an editor's
+  adjustment panel does (`Layout::adjusts`): a label
+  `ADJUST_LABEL_CELLS` (16) cells wide from a cell in, room for the
+  longest name and its least value ("Highlights -1.00"), the row's
   name and its value in force as the sidecar spells it (`0.00` absent,
   the drag's while one is on it, `Controller::adjust_label`), and a td-ui
   slider after it to a cell short of the pane's right, `ADJUST_STEPS`
   (40) steps of 0.05 from -1.00 to 1.00, zero in the middle
   (`ui::adjust_step` placing a value at the nearest step, `ui::adjust_at`
-  reading one back). The rows are laid all or none: none where the list
-  above them would keep no row or a slider would not give each step its
-  own column, so on a short surface they give way before the list. A
+  reading one back). The rows are laid in order, as many as leave the
+  list above them a row and give each slider's step its own column, so
+  on a short surface the last rows give way first and then the list. A
   press on a row's slider jumps its knob and starts a drag the tool
   band's handler follows wherever the pointer goes, and the release
   commits the row's key through the `Edit` its action makes unless the
@@ -692,8 +701,9 @@ window, all speaking the toolkit's one vocabulary.
   scene read back as a cell grid), `frame` (the frame's size and digest) and
   `frame-page` (its pixels in pages); and td-photo's own `photo N` (the Nth
   shown photo's name in hex, flag, exposure, crop, look, sidecar state, for
-  a refused sidecar the reason in hex (`-` otherwise), then contrast and
-  look intensity) and
+  a refused sidecar the reason in hex (`-` otherwise), then contrast,
+  look intensity and the tonal regions: highlights, shadows, whites,
+  blacks) and
   `wait-idle MS`: `ok idle` once no
   job is outstanding, the wants are computed for the model as it stands and
   the frame the compositor acknowledged (its frame callback) is the model's,
@@ -711,8 +721,9 @@ window, all speaking the toolkit's one vocabulary.
   centre as `PERCENT@X,Y`, `fit` in cull too), then the export quality,
   the long edge (`full` or the pixels) and the format (`jpeg` or
   `avif`), then the cursor photo's contrast and its look intensity (as
-  written, `-` when absent, the whole look), last so the fields before
-  them kept their places; `-` stands for a roll, a
+  written, `-` when absent, the whole look) and its tonal regions
+  (highlights, shadows, whites and blacks, as written), each added last
+  so the fields before them kept their places; `-` stands for a roll, a
   photo, a chooser or a selection that is absent. The mode is `cull`,
   `develop` or `export`. The generation
   moves on a change and on nothing else: not on a step at an end, a filter, view
@@ -799,7 +810,8 @@ window, all speaking the toolkit's one vocabulary.
   seam's grammar by `driven::check` in `tests/ui.rs`, which also pins that every
   action either binds a key, takes a typed argument (`look` a stem, `aspect` a
   ratio, `format` a name, `quality` and `long-edge` a size, `exposure`,
-  `contrast` and `look-intensity` a value) or is reached by
+  `contrast`, `highlights`, `shadows`, `whites`, `blacks` and
+  `look-intensity` a value) or is reached by
   the pointer
   (`select` by a press on a cell, `scroll` by the wheel, `crop` by a
   marquee or a crop-adjust handle over the develop preview) or is the
@@ -891,7 +903,12 @@ The library is folders of originals; there is no database.
   the history, keeps its summary line as an unknown line, which this
   version then seeds as a step (a file without a history), so the
   intensity returns; while other steps remain this version's fold drops
-  the stale line, and a reset or undo here clears it. A key is 1 to 32
+  the stale line, and a reset or undo here clears it. `highlights`,
+  `shadows`, `whites` and `blacks` are the tonal regions' amounts
+  (`Key::TONE`, read together as `Sidecar::tone`), each spelled as
+  contrast is, `-D.DD` or `D.DD` within 1.00 (`MAX_TONE`), absent zero;
+  a build before them keeps them as a later version's keys (below). A
+  key is 1 to 32
   bytes of lowercase ASCII letters, digits and `-`, starting with a letter, and
   a value is one or more characters with no control character and no space at
   either end: the grammar a later version's keys must keep. A line whose key is
@@ -1004,7 +1021,8 @@ The library is folders of originals; there is no database.
   (a stale one is reported, not reused or removed), synced, then linked to
   the first free name, the same publication as `develop`'s: a name that
   appears between the check and the link is skipped for the next, never
-  replaced. The export takes the sidecar's exposure, contrast, crop and look
+  replaced. The export takes the sidecar's exposure, contrast, tonal
+  regions, crop and look
   at its intensity
   as the
   file holds them; a sidecar the reader refuses, or a look it cannot find,
@@ -1247,7 +1265,26 @@ In order, per pixel, all linear `f32` until the last step:
    and a channel outside it (a bright colour past white, a negative one
    out of gamut) passed as it is, which the fixed black and white keep
    continuous, so the look after it sees what it would without
-   (`Look::contrast`); then the look, when one is applied, otherwise
+   (`Look::contrast`); then the photo's tonal regions, when any is not
+   zero (`look::tone_curve`, `Op::Tone`, the two together
+   `Look::adjust`): one rising curve over luminance, in `p = sqrt(Y)`
+   the shadows' bump `p (1 - p)^2` (peak a third of the way up; +1.00
+   lifts a deep shadow at Y 0.02 more than a stop, -1.00 deepens it),
+   the highlights' `p^3 (1 - p)` (three quarters; -1.00 recovers a
+   bright tone at Y 0.5 by about a stop, a deep shadow moved under a
+   tenth of one), then the whites' `p^3` and the blacks' `(1 - p)^3`
+   moving the white and black ends by a quarter of `p`, each map rising
+   at every amount within 1.00 so no mix of the four reverses a tone,
+   black and white held by the two bumps; the pixel is moved to the
+   curve's luminance with its chroma scaled when it darkens and kept
+   when it brightens, as a look's luminance curve does, and luminance
+   past white is scaled by the curve's white, so a curve that keeps
+   white leaves it as it was. The highlights move tones within white:
+   their bump holds white, so luminance already past it is the whites'
+   to bring back (below zero), and the highlights' recovery steepens the
+   last stretch below white (to three times at -1.00), which a
+   scene-referred highlight range past white would avoid and this does
+   not attempt; then the look, when one is applied, otherwise
    nothing, at the photo's look intensity `t`: each channel moved `t` of
    the way from the value the look was given to the one it made, `x + t
    (look(x) - x)` (`Params::look_intensity`, held to `0..=2`,
@@ -1263,7 +1300,9 @@ look's operations in file order, each a 3x3 matrix, a curve as a table over a
 log-spaced domain or a luminance mix (Looks, below); step 6 is the table. The
 cost per pixel without a contrast or a look is twelve multiplies (three for the
 white balance, nine for the matrix), a clip, three table loads and a few adds;
-the contrast adds six loads and a few multiplies, a look at other than its whole
+the contrast adds six loads and a few multiplies, the tonal regions a
+luminance, two loads and a division with a few multiplies, a look at other
+than its whole
 intensity three multiplies and six adds, and a look nine multiplies
 per matrix, six loads and a few multiplies per tone or three-channel curve, and
 a few multiplies (one division for a luminance curve) per mix or luminance
@@ -1316,7 +1355,7 @@ what an edit invalidates:
 | 2 | the crop of level 1 area-resampled to the canvas, oriented, linear `f32` | canvas x 12 bytes | current photo and canvas size |
 | 3 | display pixels, XRGB, written into the frame | canvas x 4 bytes | the frame |
 
-Exposure, contrast, look and look intensity edits recompute level 3 only
+Exposure, contrast, tonal region, look and look intensity edits recompute level 3 only
 (the window's preview key holds the intensity as the whole without a look,
 so a change to it alone develops nothing then). A crop edit recomputes
 level 2 from level 1 (tens of milliseconds across the pool) and then level
@@ -1759,7 +1798,8 @@ rest), its status marked `develop`, with the developed preview blitted into that
 box once it is made, and the pane at the area's left: the history list
 (`Layout::history`, a `chrome::List` over the pane's width, less the
 labelled rows and the band its buttons take), the labelled slider rows
-under it (`Layout::adjusts`, all or none), and, on the band under them,
+under it (`Layout::adjusts`, in order, as many as fit), and, on the
+band under them,
 the Toggle, Delete and Undo
 buttons (`Layout::history_buttons`, a `chrome::Buttons` strip on the pane's
 width, wrapping), Toggle and Delete enabled with a selection and Undo with a
@@ -2129,7 +2169,16 @@ past it refused, and a zoom past half being the doubled window's bilinear
 level 1 oriented, an odd box's region cut to its photosites exactly, a
 window past the crop refused.
 
-`tests/look.rs` holds the look format to its refusals by line (the header, a
+`tests/look.rs` holds the tonal regions' curve to the identity at zero,
+rising at every extreme mix of the four, the shadows lifting and
+deepening a deep shadow more than a stop with black, white and a bright
+tone held, the highlights recovering and raising a bright tone with a
+deep shadow held, the whites and blacks moving their ends by a quarter
+of the perceptual range, and amounts past 1.00 held; the adjustments as
+one look (none at zero, an operation each) keeping a neutral neutral
+and a colour's order, leaving luminance past white alone with white
+held and scaling it with a moved white, and lifting a deep shadow
+through the pipeline. It holds the look format to its refusals by line (the header, a
 blank line, an unknown word, a second or over-long name, every arity and range,
 a curve out of order or over the point budget, the operation budget, the size
 ceiling, and a control character or a byte that is not UTF-8 on its line) and to
@@ -2161,9 +2210,11 @@ reading anything. `tests/nef.rs`'s command case develops its synthetic frame
 with `--look mono` to a grey image, with `--contrast 0.00` to the plain frame
 and `0.80` to another, with `--look mono --look-intensity` 0.00 to the plain
 frame, 1.00 to the grey one and 0.50 and 1.50 to neither, and refuses
-`--contrast 1.50` and `--look-intensity 2.50`, and
+`--contrast 1.50` and `--look-intensity 2.50`, develops each tonal
+region's flag at 0.00 to the plain frame and at 1.00 and -1.00 to
+others and refuses `--shadows 1.50`, and
 `tests/control_process.rs`'s `--preview --develop` case holds a sidecar's
-contrast and look intensity to the develop box's pixels.
+contrast, shadows and look intensity to the develop box's pixels.
 
 `tests/auto.rs` holds the rule on grey frames: nothing to measure no choice, a
 frame at the key given a stop and one two stops darker half their distance more,
@@ -2273,6 +2324,9 @@ landing on its files and counted on after the second opened.
 `tests/library.rs` holds the sidecar grammar to its refusals by name and to
 in-place rewriting around an unknown line, the canonical value spellings,
 contrast's range and its nudges and exposure's clamped as one step a run,
+the tonal regions' four keys (their names, grammar and refusals,
+`Sidecar::tone` and `tone_amount`, and `edit` and `list` with their
+columns after the look intensity),
 the look intensity's grammar to 2.00, its absent whole look, the whole
 set on it no step, its nudges clamped to 0..=2 with one to the value in
 force no step, a step of it turned off
@@ -2412,11 +2466,15 @@ judged, `--preview` equal to the seam's frame of the empty window and of a roll
 and refused for a bad size or roll, `develop_box` the preview box only in
 develop mode, contrast nudged by `.` and `,` and set by `contrast` (ignored
 outside develop, a bad spelling `bad-argument`, a run of nudges one step,
-the value before the intensity in `state` and `photo`), the look
+the value before the intensity in `state` and `photo`), the tonal
+regions set by their actions (ignored in cull, a bad spelling
+`bad-argument`, the four values last in `state` and `photo`), their
+pane rows after Contrast in order with labels room for "Highlights
+-1.00" and a row's drag committing its own key, the look
 intensity nudged by `'` and `;` and set by `look-intensity` (ignored
 outside develop and without a look, a bad spelling `bad-argument`, a
 nudge past twice the look no write, a run and a set one step, the value
-last in `state` and `photo`), its slider in the look band after the
+after the contrast in `state` and `photo`), its slider in the look band after the
 looks and none without one to list, on its own row at some widths and
 giving way to the filmstrip at some height, after the built-in looks on
 their last row with the strip kept at the default window, its steps
@@ -2429,7 +2487,8 @@ on and the release committing the `contrast` edit, the keys moving the
 same knob, a drag released over the develop box, an off-step 0.67 shown
 exactly whose knob press is a frame change relabelling it 0.65 and
 whose release writes 0.65, a press on the label inert, and the rows
-giving way while the list keeps a row on short surfaces,
+laid in order on short surfaces, some heights laying only some, the
+last giving way first while the list keeps a row,
 `auto` and `a` asking the adapter
 for the cursor photo's measure (ignored outside develop, one step labelled
 `auto E C`, the same values no step, one undo taking both), the replay
@@ -2550,7 +2609,8 @@ and taken first once replanned, a prefetched frame joining the cache only into
 room and never evicting, evicted before a frame shown, refused for good when
 it could not decode and until the room is there when it had none, the memo
 planning each develop from what it holds (level 3 for an exposure, contrast
-or look edit, a contrast or look intensity edit alone another preview,
+or look edit, a contrast, tonal region or look intensity edit alone
+another preview,
 level 2 for a resize, level 1 for a cached photo, else a decode; a zoom of the
 current photo from its level 1 with the cached frame, without it through half
 zoom alone and past half a decode, a zoomed result leaving the fit levels
@@ -2787,7 +2847,9 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    what it was given, `'` and `;`, `look-intensity`, a slider in the look
    band. Landed; up to twice the look after. (i) The pane's sliders:
    labelled rows between the history and its buttons, Contrast first.
-   Landed.
+   Landed. (j) The tonal regions: highlights, shadows, whites and
+   blacks, four develop keys and one luminance curve after the contrast,
+   their actions and rows in the pane. Landed.
 9. Later: DNG and JPEG rolls, the Nikon High
    Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.

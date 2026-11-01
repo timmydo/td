@@ -641,8 +641,9 @@ pub const MAX_LOOK_SHARE: f32 = 2.0;
 pub struct Params<'a> {
     /// Exposure in stops.
     pub exposure: f32,
-    /// The photo's contrast (`Look::contrast`), applied after the matrix
-    /// and before the look, when given.
+    /// The photo's own adjustments, its contrast and tonal regions
+    /// (`Look::adjust`), applied after the matrix and before the look,
+    /// when given.
     pub contrast: Option<&'a Look>,
     pub threads: usize,
     /// Applied after the matrix and before the transfer, when given.

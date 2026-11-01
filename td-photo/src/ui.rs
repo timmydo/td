@@ -309,6 +309,10 @@ pub enum Action {
     ContrastIn,
     ContrastOut,
     Contrast,
+    Highlights,
+    Shadows,
+    Whites,
+    Blacks,
     Auto,
     AutoPicks,
     /// The Nth (from 1) of the available looks, `C-1`..`C-9`.
@@ -372,6 +376,10 @@ impl Action {
         Action::ContrastIn,
         Action::ContrastOut,
         Action::Contrast,
+        Action::Highlights,
+        Action::Shadows,
+        Action::Whites,
+        Action::Blacks,
         Action::Auto,
         Action::AutoPicks,
         Action::LookAt(1),
@@ -442,6 +450,10 @@ impl Action {
             Self::ContrastIn => "contrast-in",
             Self::ContrastOut => "contrast-out",
             Self::Contrast => "contrast",
+            Self::Highlights => "highlights",
+            Self::Shadows => "shadows",
+            Self::Whites => "whites",
+            Self::Blacks => "blacks",
             Self::Auto => "auto",
             Self::AutoPicks => "auto-picks",
             Self::LookAt(1) => "look-1",
@@ -529,6 +541,10 @@ impl Action {
             | Self::ContrastIn
             | Self::ContrastOut
             | Self::Contrast
+            | Self::Highlights
+            | Self::Shadows
+            | Self::Whites
+            | Self::Blacks
             | Self::Auto
             | Self::AutoPicks => Group::Develop,
             Self::Reset | Self::Undo | Self::StepToggle | Self::StepDelete => Group::History,
@@ -800,7 +816,7 @@ pub const BINDINGS: &[Binding] = &[
         name: "reset",
         chord: Some("0"),
         arguments: "",
-        help: "Reset exposure, contrast, crop, look and its intensity to camera defaults, clearing the history (develop mode).",
+        help: "Reset exposure, contrast, the tonal regions, crop, look and its intensity to camera defaults, clearing the history (develop mode).",
     },
     Binding {
         name: "undo",
@@ -849,6 +865,30 @@ pub const BINDINGS: &[Binding] = &[
         chord: None,
         arguments: "VALUE",
         help: "Set the contrast to VALUE, two decimals in -1.00..1.00, the tone's steepness about grey 2^VALUE (develop mode).",
+    },
+    Binding {
+        name: "highlights",
+        chord: None,
+        arguments: "VALUE",
+        help: "Set the highlights to VALUE, two decimals in -1.00..1.00: the bright tones raised or, below zero, recovered (develop mode).",
+    },
+    Binding {
+        name: "shadows",
+        chord: None,
+        arguments: "VALUE",
+        help: "Set the shadows to VALUE, two decimals in -1.00..1.00: the dark tones lifted or, below zero, deepened, exposure apart (develop mode).",
+    },
+    Binding {
+        name: "whites",
+        chord: None,
+        arguments: "VALUE",
+        help: "Set the whites to VALUE, two decimals in -1.00..1.00: the white end moved up or down (develop mode).",
+    },
+    Binding {
+        name: "blacks",
+        chord: None,
+        arguments: "VALUE",
+        help: "Set the blacks to VALUE, two decimals in -1.00..1.00: the black end lifted or crushed (develop mode).",
     },
     Binding {
         name: "auto",
@@ -1235,13 +1275,20 @@ pub struct Adjust {
 
 /// The pane's labelled slider rows, in order: each one's name and the
 /// develop key it sets, a signed value in hundredths within 1.00.
-pub const ADJUSTS: &[(&str, Key)] = &[("Contrast", Key::Contrast)];
+pub const ADJUSTS: &[(&str, Key)] = &[
+    ("Contrast", Key::Contrast),
+    ("Highlights", Key::Highlights),
+    ("Shadows", Key::Shadows),
+    ("Whites", Key::Whites),
+    ("Blacks", Key::Blacks),
+];
 /// A row label's width in cells: its name, a space and a signed value.
-const ADJUST_LABEL_CELLS: usize = 14;
+const ADJUST_LABEL_CELLS: usize = 16;
 /// The labelled sliders' steps: a twentieth of the way from -1.00 to 1.00
 /// each (0.05), zero in the middle.
 pub const ADJUST_STEPS: usize = 40;
 const _: () = assert!(library::MAX_CONTRAST == 5 * (ADJUST_STEPS / 2) as i32);
+const _: () = assert!(library::MAX_TONE == library::MAX_CONTRAST);
 
 /// A labelled slider's value for a signed value in hundredths, the
 /// nearest step.
@@ -1866,26 +1913,30 @@ impl Layout {
         List::new(self.surface, rect)
     }
 
-    /// How many labelled rows the pane lays: all of `ADJUSTS` where the
-    /// list above them keeps a row and each slider has a column a step
-    /// on the pane's width, else none.
+    /// How many labelled rows the pane lays, `ADJUSTS` in order: the most
+    /// that leave the list above them a row and give each slider a column
+    /// a step on the pane's width, the last giving way first.
     fn adjust_rows(&self) -> usize {
         let s = self.surface.scale.value();
         let band = self.history_strip().rect().height;
-        let rows = rows_height(ADJUSTS.len(), self.surface);
-        let list = Rect {
-            width: (PANE_W * s) as u32,
-            height: self.area.height.saturating_sub(band).saturating_sub(rows),
-            ..self.area
-        };
         let (x, right) = self.adjust_span();
-        let fits = List::new(self.surface, list).is_some()
-            && slider_in(self.surface, x, list.y, right, ADJUST_STEPS).is_some();
-        if fits {
-            ADJUSTS.len()
-        } else {
-            0
-        }
+        (0..=ADJUSTS.len())
+            .rev()
+            .find(|&laid| {
+                let list = Rect {
+                    width: (PANE_W * s) as u32,
+                    height: self
+                        .area
+                        .height
+                        .saturating_sub(band)
+                        .saturating_sub(rows_height(laid, self.surface)),
+                    ..self.area
+                };
+                laid == 0
+                    || (List::new(self.surface, list).is_some()
+                        && slider_in(self.surface, x, list.y, right, ADJUST_STEPS).is_some())
+            })
+            .unwrap_or(0)
     }
 
     /// Where a labelled row's slider runs on the pane: from the label's
@@ -1900,7 +1951,7 @@ impl Layout {
     /// The pane's labelled slider rows, `ADJUSTS` in order, stacked on the
     /// band above its buttons (`adjust_rows`): the label from a cell in,
     /// `ADJUST_LABEL_CELLS` cells wide, and the slider after it; `None`
-    /// each where the pane lays none.
+    /// for each row past those the pane lays.
     pub fn adjusts(&self) -> Vec<Option<Adjust>> {
         let mut adjusts = vec![None; ADJUSTS.len()];
         let laid = self.adjust_rows();
@@ -1912,7 +1963,7 @@ impl Layout {
         let cell = (CELL_WIDTH * s) as i64;
         let top = self.history_strip().rect().y - (laid * band) as i64;
         let (x, right) = self.adjust_span();
-        for (row, slot) in adjusts.iter_mut().enumerate() {
+        for (row, slot) in adjusts.iter_mut().enumerate().take(laid) {
             let y = top + (row * band) as i64;
             let label = Rect {
                 x: self.area.x + cell,
@@ -3786,7 +3837,8 @@ impl Controller {
     /// sidecar state), the outstanding job count, the generation, the
     /// chooser's listed folder in hex, the history's step count and the
     /// selected step, the zoom, the export quality, long edge and format,
-    /// then the photo's contrast and look intensity. Absent values are `-`.
+    /// then the photo's contrast and look intensity and its tonal regions
+    /// (highlights, shadows, whites, blacks). Absent values are `-`.
     pub fn state(&self) -> String {
         let position = self.position();
         let photo = self.cursor.and_then(|index| self.photos.get(index));
@@ -3818,13 +3870,18 @@ impl Controller {
             self.settings.format.name().to_string(),
             photo.map_or_else(dash, |p| p.value(Key::Contrast).to_string()),
             photo.map_or_else(dash, |p| p.value(Key::LookIntensity).to_string()),
+            photo.map_or_else(dash, |p| p.value(Key::Highlights).to_string()),
+            photo.map_or_else(dash, |p| p.value(Key::Shadows).to_string()),
+            photo.map_or_else(dash, |p| p.value(Key::Whites).to_string()),
+            photo.map_or_else(dash, |p| p.value(Key::Blacks).to_string()),
         ]
         .join("\t")
     }
 
     /// The `photo N` body: the Nth shown photo's name in hex, flag,
     /// exposure, crop, look, sidecar state, for a refused sidecar the
-    /// reason in hex (`-` otherwise), contrast and look intensity.
+    /// reason in hex (`-` otherwise), contrast, look intensity and the
+    /// tonal regions (highlights, shadows, whites, blacks).
     pub fn photo(&self, position: usize) -> Result<String, Error> {
         if self.roll.is_none() {
             return Err(Error::NoRoll);
@@ -3846,6 +3903,10 @@ impl Controller {
             reason.as_str(),
             photo.value(Key::Contrast),
             photo.value(Key::LookIntensity),
+            photo.value(Key::Highlights),
+            photo.value(Key::Shadows),
+            photo.value(Key::Whites),
+            photo.value(Key::Blacks),
         ]
         .join("\t"))
     }
@@ -3976,6 +4037,10 @@ impl Controller {
             (Action::ContrastIn, []) => return self.nudge(Key::Contrast, CONTRAST_STEP, effects),
             (Action::ContrastOut, []) => return self.nudge(Key::Contrast, -CONTRAST_STEP, effects),
             (Action::Contrast, [value]) => return self.set_contrast(value, effects),
+            (Action::Highlights, [value]) => return self.set_tone(Key::Highlights, value, effects),
+            (Action::Shadows, [value]) => return self.set_tone(Key::Shadows, value, effects),
+            (Action::Whites, [value]) => return self.set_tone(Key::Whites, value, effects),
+            (Action::Blacks, [value]) => return self.set_tone(Key::Blacks, value, effects),
             (Action::Auto, []) => return self.auto(effects),
             (Action::AutoPicks, []) => return self.auto_picks(effects),
             (Action::Look, [stem]) => return self.set_look(stem, effects),
@@ -4548,6 +4613,9 @@ impl Controller {
             .and_then(|photo| photo.sidecar.as_ref());
         match ADJUSTS.get(row).map(|(_, key)| *key) {
             Some(Key::Contrast) => sidecar.and_then(Sidecar::contrast),
+            Some(key) if Key::TONE.contains(&key) => {
+                sidecar.and_then(|sidecar| sidecar.tone_amount(key))
+            }
             _ => None,
         }
         .unwrap_or(0)
@@ -4586,6 +4654,9 @@ impl Controller {
         match ADJUSTS.get(row).map(|(_, key)| *key) {
             Some(Key::Contrast) => {
                 self.set_contrast(&library::contrast_text(hundredths), Vec::new())
+            }
+            Some(key) if Key::TONE.contains(&key) => {
+                self.set_tone(key, &library::tone_text(hundredths), Vec::new())
             }
             _ => Ok((Outcome::Ignored, Vec::new())),
         }
@@ -4857,6 +4928,34 @@ impl Controller {
                 index,
                 name,
                 key: Key::Contrast,
+                value: Some(value),
+            },
+            effects,
+        )
+    }
+
+    /// Sets the cursor photo's tonal region `key` (one of `Key::TONE`) to
+    /// `value`, `D.DD` within `-1.00..=1.00`, else `BadArgument`.
+    fn set_tone(
+        &mut self,
+        key: Key,
+        value: &str,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        if !Key::TONE.contains(&key) {
+            return Ok((Outcome::Ignored, effects));
+        }
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        let hundredths = library::tone(key, value).map_err(|_| Error::BadArgument)?;
+        let value = library::tone_text(hundredths);
+        self.develop_effect(
+            index,
+            |index, name| Effect::Edit {
+                index,
+                name,
+                key,
                 value: Some(value),
             },
             effects,

@@ -142,9 +142,76 @@ impl Table {
 #[derive(Clone, Debug, PartialEq)]
 enum Op {
     Primaries(Matrix),
-    Curve { channel: Channel, table: Table },
+    Curve {
+        channel: Channel,
+        table: Table,
+    },
     Saturation(f32),
     Monochrome([f32; 3]),
+    /// The photo's tonal regions (`Look::adjust`): a luminance curve, as
+    /// `Channel::Luma` is, whose luminance past white is scaled by the
+    /// curve's white, so a curve that keeps white keeps it.
+    Tone(Table),
+}
+
+/// The photo's tonal regions in hundredths, each within 1.00 either way:
+/// the highlights' and shadows' bumps over the bright and dark tones and
+/// the whites' and blacks' moves of the white and black ends. All zero is
+/// none.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct Tone {
+    pub highlights: i32,
+    pub shadows: i32,
+    pub whites: i32,
+    pub blacks: i32,
+}
+
+/// The shadows' bump at +1.00 and at -1.00, and the highlights' at -1.00
+/// and at +1.00, over `p (1 - p)^2` and `p^3 (1 - p)`: each within what
+/// keeps the map rising (slope at least 0.2), the lift and the recovery
+/// the larger.
+const SHADOWS_LIFT: f64 = 1.5;
+const SHADOWS_DEEPEN: f64 = 0.8;
+const HIGHLIGHTS_RECOVER: f64 = 2.0;
+const HIGHLIGHTS_LIFT: f64 = 0.8;
+/// The whites' and blacks' move of their end at 1.00, over `p^3` and
+/// `(1 - p)^3`: a quarter of the perceptual range, slope at least 0.25.
+const ENDS: f64 = 0.25;
+
+/// The tonal regions' curve over linear luminance in `0..=1`, the one
+/// `Look::adjust` tabulates: in `p = sqrt(Y)`, roughly perceptual, the
+/// shadows' bump `p (1 - p)^2` (peaking a third of the way up), the
+/// highlights' `p^3 (1 - p)` (three quarters, falling away fast enough
+/// below that a deep shadow barely moves), then the whites' `p^3` and the
+/// blacks' `(1 - p)^3`, each scaled by its amount, then squared back,
+/// below zero black. Each map rises at every amount within 1.00, so the
+/// four together never reverse a tone; the identity at all zero.
+pub fn tone_curve(tone: Tone) -> impl Fn(f64) -> f64 {
+    let most = crate::library::MAX_TONE;
+    let amount = |hundredths: i32| f64::from(hundredths.clamp(-most, most)) / f64::from(most);
+    let (shadows, highlights) = (amount(tone.shadows), amount(tone.highlights));
+    let (whites, blacks) = (amount(tone.whites), amount(tone.blacks));
+    let shadows = shadows
+        * if shadows > 0.0 {
+            SHADOWS_LIFT
+        } else {
+            SHADOWS_DEEPEN
+        };
+    let highlights = highlights
+        * if highlights > 0.0 {
+            HIGHLIGHTS_LIFT
+        } else {
+            HIGHLIGHTS_RECOVER
+        };
+    move |y: f64| {
+        let p = y.max(0.0).sqrt();
+        let p = p + shadows * p * (1.0 - p) * (1.0 - p);
+        let p = p + highlights * p * p * p * (1.0 - p);
+        let p = p + whites * ENDS * p * p * p;
+        let q = 1.0 - p;
+        let p = (p + blacks * ENDS * q * q * q).max(0.0);
+        p * p
+    }
 }
 
 /// A parsed look: its name, if it has one, and its operations in file
@@ -503,17 +570,25 @@ impl Look {
     /// 100)`, no toe or shoulder, clamped to the tone's range; `None` at
     /// zero, the identity.
     pub fn contrast(hundredths: i32) -> Option<Look> {
-        if hundredths == 0 {
-            return None;
-        }
-        let table = Table::build(contrast_curve(hundredths))?;
-        Some(Look {
-            name: None,
-            ops: vec![Op::Curve {
+        Self::adjust(hundredths, Tone::default())
+    }
+
+    /// The photo's own adjustments as one look: the contrast
+    /// (`Look::contrast`), then the tonal regions' curve over luminance
+    /// (`tone_curve`, `Op::Tone`), each left out at zero; `None` when both
+    /// are, the identity.
+    pub fn adjust(contrast: i32, tone: Tone) -> Option<Look> {
+        let mut ops = Vec::new();
+        if contrast != 0 {
+            ops.push(Op::Curve {
                 channel: Channel::Within,
-                table,
-            }],
-        })
+                table: Table::build(contrast_curve(contrast))?,
+            });
+        }
+        if tone != Tone::default() {
+            ops.push(Op::Tone(Table::build(tone_curve(tone))?));
+        }
+        (!ops.is_empty()).then_some(Look { name: None, ops })
     }
 
     pub fn name(&self) -> Option<&str> {
@@ -559,6 +634,18 @@ impl Look {
                 Op::Saturation(s) => {
                     let y = luma(rgb);
                     rgb.map(|v| y + s * (v - y))
+                }
+                Op::Tone(table) => {
+                    let y = luma(rgb);
+                    let target = if y > 1.0 {
+                        y * table.at(1.0)
+                    } else {
+                        table.at(y)
+                    };
+                    // As `Channel::Luma`: chroma scaled when the pixel
+                    // darkens, kept when it brightens.
+                    let factor = if y > 0.0 { (target / y).min(1.0) } else { 1.0 };
+                    rgb.map(|v| target + (v - y) * factor)
                 }
                 Op::Monochrome(w) => {
                     let y = w[0] * rgb[0] + w[1] * rgb[1] + w[2] * rgb[2];

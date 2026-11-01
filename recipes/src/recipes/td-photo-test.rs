@@ -244,7 +244,7 @@ mod tests {
         }
         assert!(main.contains("&[\"--decode\"]"));
         assert!(main.contains(
-            "&[\n            \"--long-edge\",\n            \"--exposure\",\n            \"--contrast\",\n            \"--look\",\n            \"--look-intensity\",\n            \"--crop\",\n        ]"
+            "&[\n            \"--long-edge\",\n            \"--exposure\",\n            \"--contrast\",\n            \"--highlights\",\n            \"--shadows\",\n            \"--whites\",\n            \"--blacks\",\n            \"--look\",\n            \"--look-intensity\",\n            \"--crop\",\n        ]"
         ));
         assert!(main.contains("(16..=nef::MAX_AXIS).contains(n)"));
         assert!(main.contains("(-5.0..=5.0).contains(v)"));
