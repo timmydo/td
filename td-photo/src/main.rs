@@ -126,7 +126,8 @@ const HELP: &str = concat!(
     "  whose preview or raw cannot be made is skipped with a note. Each\n",
     "  chosen raw is developed whole (seconds each for a large one). The\n",
     "  look carries the camera's brightness: at an exposure moved from 0\n",
-    "  it adds to it.\n",
+    "  it adds to it. The window's M fits the open roll the same way into\n",
+    "  the first free camera-match, camera-match-2, ... in the background.\n",
     "td-photo import SRC DEST\n",
     "  Copies every NEF under SRC (eight folders deep, links under SRC\n",
     "  not followed) into DEST/YYYY/YYYY-MM-DD/ by its capture time, or\n",
@@ -2457,17 +2458,60 @@ fn find_look(stem: &str) -> Result<Look, String> {
     Look::parse(&bytes).map_err(|e| format!("{what}: {e}"))
 }
 
-/// `match-look`: the look fitted to the camera's previews of up to
-/// `matching::MAX_PHOTOS` of `roll`'s photos (`matching::fit`), written
-/// to the user looks as `--name`'s stem, `camera-match` by default,
-/// through the process's own `STEM.look.PID.tmp` published into place,
-/// so a name taken meanwhile is refused and a write that fails leaves
-/// nothing at it. The stem, the
-/// free name and the directory are settled before anything is developed;
-/// a photo whose preview or raw cannot be made is skipped with a note.
-fn match_look(roll: &Path, rest: &[OsString]) -> Result<(), String> {
-    check_flags(rest, &["--name"], &[])?;
-    let stem = option(rest, "--name")?.unwrap_or_else(|| "camera-match".to_string());
+/// A camera match to fit (`match-look`, the verb's or the window's):
+/// the roll, the photos chosen from it, and the user look the fit is
+/// written to, settled before anything is developed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MatchRequest {
+    pub(crate) roll: PathBuf,
+    pub(crate) names: Vec<String>,
+    pub(crate) stem: String,
+    pub(crate) path: PathBuf,
+}
+
+/// A look fitted to the camera's previews: its text and what it was
+/// fitted from.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Fitted {
+    text: String,
+    photos: usize,
+    points: usize,
+    saturation: f32,
+}
+
+/// The stems the window's camera match tries, in order: `camera-match`,
+/// then `camera-match-2` up to this.
+const MAX_MATCH_STEMS: usize = 99;
+
+/// The first of `camera-match`, `camera-match-2`, ... that names no file
+/// in the user looks: the window's fit, which has no `--name`, never
+/// writes over a look, a fit of its own included.
+fn free_match_stem() -> Result<String, String> {
+    let dir = looks_dir()?;
+    for n in 1..=MAX_MATCH_STEMS {
+        let stem = match n {
+            1 => "camera-match".to_string(),
+            n => format!("camera-match-{n}"),
+        };
+        let path = dir.join(format!("{stem}.look"));
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(stem),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+            Ok(_) => {}
+        }
+    }
+    Err(format!(
+        "{}: camera-match through camera-match-{MAX_MATCH_STEMS} are all taken",
+        dir.display()
+    ))
+}
+
+/// The camera match of `roll` into the user look `stem`: a stem the
+/// sidecar grammar cannot hold, one already there, a look path that
+/// cannot be examined or a directory that cannot be made is refused,
+/// then up to `matching::MAX_PHOTOS` of the roll's photos are chosen,
+/// spread over it. Nothing is developed.
+fn match_request(roll: &Path, stem: String) -> Result<MatchRequest, String> {
     if stem == library::NO_LOOK {
         return Err(format!(
             "--name {stem:?} is reserved: a sidecar's `look none` is no look"
@@ -2493,14 +2537,33 @@ fn match_look(roll: &Path, rest: &[OsString]) -> Result<(), String> {
     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let names = read_roll(roll)?;
     // Spread over the roll: every photo when there are few enough.
-    let chosen: Vec<&String> = if names.len() <= matching::MAX_PHOTOS {
-        names.iter().collect()
+    let names: Vec<String> = if names.len() <= matching::MAX_PHOTOS {
+        names
     } else {
         (0..matching::MAX_PHOTOS)
             .filter_map(|i| names.get(i * names.len() / matching::MAX_PHOTOS))
+            .cloned()
             .collect()
     };
-    let threads = threads();
+    Ok(MatchRequest {
+        roll: roll.to_path_buf(),
+        names,
+        stem,
+        path,
+    })
+}
+
+/// Fits the look `request` asks for (`matching::fit`): each chosen photo
+/// developed plain and set beside its embedded preview, both at
+/// `matching::EDGE`; a photo whose preview or raw cannot be made is
+/// skipped with a note, and none left is refused. `stop` is asked before
+/// each photo, so a closing window abandons the fit there. Writes
+/// nothing.
+pub(crate) fn match_fit(
+    request: &MatchRequest,
+    threads: usize,
+    stop: &dyn Fn() -> bool,
+) -> Result<Fitted, String> {
     let plain = Params {
         exposure: 0.0,
         contrast: None,
@@ -2511,8 +2574,14 @@ fn match_look(roll: &Path, rest: &[OsString]) -> Result<(), String> {
         clarity_base: None,
     };
     let mut pairs = Vec::new();
-    for name in chosen {
-        let file = roll.join(name);
+    for name in &request.names {
+        if stop() {
+            return Err(format!(
+                "{}: camera match stopped: the window closed",
+                request.roll.display()
+            ));
+        }
+        let file = request.roll.join(name);
         let made = make_thumbnail(&file, matching::EDGE, false, threads).and_then(|preview| {
             let (developed, _) = develop_raw(&file, None, matching::EDGE, &plain)?;
             Ok((developed, preview.image))
@@ -2529,7 +2598,7 @@ fn match_look(roll: &Path, rest: &[OsString]) -> Result<(), String> {
     let fit = matching::fit(&refs).ok_or_else(|| {
         format!(
             "{}: no photo with both a preview and a raw to match",
-            roll.display()
+            request.roll.display()
         )
     })?;
     match fit.wanted {
@@ -2541,8 +2610,21 @@ fn match_look(roll: &Path, rest: &[OsString]) -> Result<(), String> {
         )),
         Some(_) => {}
     }
-    let text = fit.text(&matching::name(&stem));
+    let text = fit.text(&matching::name(&request.stem));
     Look::parse(text.as_bytes()).map_err(|e| format!("the fitted look is refused: {e}"))?;
+    Ok(Fitted {
+        text,
+        photos: pairs.len(),
+        points: fit.points.len(),
+        saturation: fit.saturation,
+    })
+}
+
+/// Writes `fitted` to `request`'s look path through the process's own
+/// `STEM.look.PID.tmp`, published as the develop is, so a name taken
+/// meanwhile is refused and a write that fails leaves nothing at it.
+fn write_fitted(request: &MatchRequest, fitted: &Fitted) -> Result<(), String> {
+    let path = &request.path;
     // The process's own temporary, so another run's is never touched.
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(format!(".{}.tmp", std::process::id()));
@@ -2554,16 +2636,14 @@ fn match_look(roll: &Path, rest: &[OsString]) -> Result<(), String> {
         .open(&temporary)
         .map_err(named)?;
     let written = file
-        .write_all(text.as_bytes())
+        .write_all(fitted.text.as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(named)
         .and_then(|()| {
             // The develop's publication: a link that refuses a name
             // taken meanwhile, a checked rename where there are none.
-            publish(&temporary, &path).map_err(|e| match e.kind() {
-                io::ErrorKind::AlreadyExists => {
-                    format!("{}: already there; choose another --name", path.display())
-                }
+            publish(&temporary, path).map_err(|e| match e.kind() {
+                io::ErrorKind::AlreadyExists => format!("{}: already there", path.display()),
                 _ => format!("{}: {e}", path.display()),
             })
         });
@@ -2576,14 +2656,30 @@ fn match_look(roll: &Path, rest: &[OsString]) -> Result<(), String> {
             }
         }
     }
-    written?;
+    written
+}
+
+/// `match-look`: the look fitted to the camera's previews of up to
+/// `matching::MAX_PHOTOS` of `roll`'s photos (`matching::fit`), written
+/// to the user looks as `--name`'s stem, `camera-match` by default,
+/// through the process's own `STEM.look.PID.tmp` published into place,
+/// so a name taken meanwhile is refused and a write that fails leaves
+/// nothing at it. The stem, the
+/// free name and the directory are settled before anything is developed;
+/// a photo whose preview or raw cannot be made is skipped with a note.
+fn match_look(roll: &Path, rest: &[OsString]) -> Result<(), String> {
+    check_flags(rest, &["--name"], &[])?;
+    let stem = option(rest, "--name")?.unwrap_or_else(|| "camera-match".to_string());
+    let request = match_request(roll, stem)?;
+    let fitted = match_fit(&request, threads(), &|| false)?;
+    write_fitted(&request, &fitted)?;
     writeln!(
         io::stdout().lock(),
         "wrote {} from {} photos: {} curve points, saturation {:.2}",
-        path.display(),
-        pairs.len(),
-        fit.points.len(),
-        fit.saturation
+        request.path.display(),
+        fitted.photos,
+        fitted.points,
+        fitted.saturation
     )
     .map_err(|e| e.to_string())
 }
@@ -3473,6 +3569,14 @@ struct Session {
     /// second `auto-picks` while they are out neither queues nor counts
     /// them again.
     pending: BTreeSet<PathBuf>,
+    /// Where a `MatchLook` effect's fit goes, as `autos` does: `None` fits
+    /// and writes on the request; the window sets `Some`, its pool fits,
+    /// and it writes the look as the fit lands (`match_landed`).
+    matches: Option<Vec<MatchRequest>>,
+    /// The look path of the camera match the window has queued and not
+    /// seen land: one at a time, so a second `match-look` meanwhile is
+    /// `ignored` rather than racing the first for its stem.
+    matching: Option<PathBuf>,
     /// The picks' export the window has queued and not seen land whole,
     /// for the status row's note; the replay runs a batch within the turn
     /// and keeps none. Of one roll: a roll opening leaves it to finish on
@@ -3534,9 +3638,9 @@ fn note(why: &str) {
 impl Session {
     fn new(surface: Surface) -> Session {
         let mut ui = ui::Controller::new(surface);
-        // The look palette's list, reported once as a fact: session-static, so
-        // a look added on disk mid-session appears on the next run, as the
-        // `looks` verb would show it.
+        // The look palette's list, reported as a fact: again when a camera
+        // match writes a look, while a look added on disk otherwise appears
+        // on the next run, as the `looks` verb would show it.
         ui.set_looks(look_stems());
         // The export settings, the user's file's or the defaults, settled
         // before the first frame.
@@ -3550,6 +3654,8 @@ impl Session {
             quit: false,
             exports: None,
             autos: None,
+            matches: None,
+            matching: None,
             auto_batches: BTreeMap::new(),
             pending: BTreeSet::new(),
             batch: None,
@@ -3659,6 +3765,7 @@ impl Session {
                 Effect::ExportPicks => outcome = self.export_picks()?,
                 Effect::Settings(settings) => outcome = self.save_settings(settings)?,
                 Effect::DefaultLook(stem) => outcome = self.save_default_look(stem)?,
+                Effect::MatchLook => outcome = self.match_look()?,
                 Effect::DeleteRejected => outcome = self.delete_rejected()?,
                 Effect::List { folder, parent } => self.list(folder, parent)?,
             }
@@ -4093,6 +4200,74 @@ impl Session {
         Ok(self.ui.set_settings(settings))
     }
 
+    /// Fits a look to the camera's previews of the open roll, as the
+    /// verb does, into the first free `camera-match` stem: the request
+    /// is settled here, so a looks directory that cannot be made, or no
+    /// free stem, is `refused` before anything is developed; the fit runs
+    /// on the request, and the look is written, when nothing defers it
+    /// (the replay), or is queued for the window's pool, `changed` as it
+    /// is queued, the look written as it lands (`match_landed`). One at
+    /// a time: `ignored` while the window's fit is out.
+    fn match_look(&mut self) -> Result<Outcome, ui::Error> {
+        if self.matching.is_some() {
+            // Said on the row, which a roll opened meanwhile has cleared.
+            self.ui
+                .set_export(Some("a camera match is already running".to_string()));
+            return Ok(Outcome::Ignored);
+        }
+        let roll = self.ui.roll().ok_or(ui::Error::NoRoll)?;
+        let roll = PathBuf::from(OsStr::from_bytes(roll));
+        let request = match free_match_stem().and_then(|stem| match_request(&roll, stem)) {
+            Ok(request) => request,
+            Err(why) => {
+                note(&why);
+                self.ui.set_export(Some("camera match refused".to_string()));
+                return Err(ui::Error::Refused);
+            }
+        };
+        if let Some(queue) = self.matches.as_mut() {
+            let count = request.names.len();
+            self.matching = Some(request.path.clone());
+            queue.push(request);
+            self.ui
+                .set_export(Some(format!("matching the camera over {count} photos")));
+            return Ok(Outcome::Changed);
+        }
+        let result = match_fit(&request, threads(), &|| false);
+        if self.match_landed(&request, result) {
+            Ok(Outcome::Changed)
+        } else {
+            Err(ui::Error::Refused)
+        }
+    }
+
+    /// A camera match landed: the fitted look is written (never over a
+    /// look there meanwhile) and the looks are reported again, so the
+    /// palette and the look band list it; the status row says which stem
+    /// it took, or that it failed, with why on stderr. Whether it was
+    /// written.
+    fn match_landed(&mut self, request: &MatchRequest, result: Result<Fitted, String>) -> bool {
+        if self.matching.as_ref() == Some(&request.path) {
+            self.matching = None;
+        }
+        let written = result.and_then(|fitted| write_fitted(request, &fitted).map(|()| fitted));
+        match written {
+            Ok(fitted) => {
+                self.ui.set_looks(look_stems());
+                self.ui.set_export(Some(format!(
+                    "fitted look {} from {} photos",
+                    request.stem, fitted.photos
+                )));
+                true
+            }
+            Err(why) => {
+                note(&why);
+                self.ui.set_export(Some("camera match failed".to_string()));
+                false
+            }
+        }
+    }
+
     /// Makes `stem` the user's default look, or with `None` clears it, as
     /// the `default-look` verb does, and settles the model: the window's
     /// previews and exports of a photo without a look take it from here
@@ -4352,6 +4527,54 @@ mod tests {
         auto.done = 4;
         auto.failed = 1;
         assert_eq!(auto.note(), "auto on 2 of 4 picks, 1 kept, 1 failed");
+    }
+
+    /// The window's camera match: one at a time, a second `ignored` with a
+    /// note; the guard cleared and the row noted whether the fit failed
+    /// or landed, the look written at the request's path and never over
+    /// a look there.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_landed_camera_match_writes_its_look_or_says_why_not() {
+        let temp = td_fs::TempDir::new("td-photo-match-landed").unwrap();
+        let mut session = Session::new(Surface::new(800, 600, Scale::default()).unwrap());
+        let request = MatchRequest {
+            roll: temp.path().to_path_buf(),
+            names: Vec::new(),
+            stem: "camera-match".to_string(),
+            path: temp.path().join("camera-match.look"),
+        };
+        session.matches = Some(Vec::new());
+        session.matching = Some(request.path.clone());
+        assert_eq!(session.match_look().unwrap(), Outcome::Ignored);
+        assert_eq!(
+            session.ui.export_note(),
+            Some("a camera match is already running")
+        );
+        assert!(!session.match_landed(&request, Err("why".to_string())));
+        assert_eq!(session.matching, None);
+        assert_eq!(session.ui.export_note(), Some("camera match failed"));
+        let fitted = Fitted {
+            text: "td-photo look 1\nname Camera match\nsaturation 1.20\n".to_string(),
+            photos: 2,
+            points: 3,
+            saturation: 1.2,
+        };
+        session.matching = Some(request.path.clone());
+        assert!(session.match_landed(&request, Ok(fitted.clone())));
+        assert_eq!(session.matching, None);
+        assert_eq!(fs::read_to_string(&request.path).unwrap(), fitted.text);
+        assert_eq!(
+            session.ui.export_note(),
+            Some("fitted look camera-match from 2 photos")
+        );
+        // A look there meanwhile is never written over.
+        let other = Fitted {
+            text: "td-photo look 1\nname Other\n".to_string(),
+            ..fitted.clone()
+        };
+        assert!(!session.match_landed(&request, Ok(other)));
+        assert_eq!(fs::read_to_string(&request.path).unwrap(), fitted.text);
     }
 
     /// The window exports with the default it read at open and shows,

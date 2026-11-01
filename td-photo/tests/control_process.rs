@@ -672,6 +672,124 @@ fn match_look_writes_the_cameras_look_once() {
     assert!(stderr.contains("blocked"), "{stderr}");
 }
 
+/// `td-photo --replay ARGS` over `requests` under `config`, closed when
+/// they are written: each reply's fields after `1`, and stderr.
+fn replay_under(config: &Path, args: &[&str], requests: &[&[&str]]) -> (Vec<Vec<String>>, String) {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+        .arg("--replay")
+        .args(args)
+        .env("XDG_CONFIG_HOME", config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for (id, words) in requests.iter().enumerate() {
+            let line = format!("1\t{}\t{}", id + 1, words.join("\t"));
+            stdin.write_all(&frame(line.as_bytes()).unwrap()).unwrap();
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    let mut decoder = Decoder::default();
+    let mut replies = Vec::new();
+    for byte in &output.stdout {
+        decoder.push(&[*byte]).unwrap();
+        if decoder.payload().is_some() {
+            let payload = std::mem::take(&mut decoder).finish().unwrap();
+            let line = String::from_utf8(payload).unwrap();
+            replies.push(line.split('\t').skip(1).map(str::to_string).collect());
+        }
+    }
+    (
+        replies,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// The window's `match-look` fits the open roll as the verb does, into
+/// `camera-match` and then the next free stem, never over a look there,
+/// and lists the look it wrote; a roll with nothing to match is refused
+/// with no look written.
+#[test]
+fn the_window_fits_a_camera_match_under_a_free_stem() {
+    let dir = Directory::new("td-photo-window-match");
+    let (roll, config) = (dir.0.join("roll"), dir.0.join("config"));
+    std::fs::create_dir_all(&roll).unwrap();
+    let (w, h) = (16usize, 12usize);
+    for i in 0..2u16 {
+        let samples: Vec<u16> = (0..w * h)
+            .map(|j| 1008 + (j as u16 * 37 + i * 500) % 9000)
+            .collect();
+        std::fs::write(
+            roll.join(format!("DSC_000{i}.NEF")),
+            synth_nef::nef_with_preview(w, h, &samples, &ramp_jpeg(w, h)),
+        )
+        .unwrap();
+    }
+    let looks = config.join("td-photo/looks");
+    let roll_s = roll.to_str().unwrap();
+    // The session lists the look it wrote: picked by its place among
+    // the looks, the band's order, which only a reported list holds.
+    let mut stems: Vec<&str> = td_photo::look::BUILTIN
+        .iter()
+        .map(|(stem, _)| *stem)
+        .chain(["camera-match"])
+        .collect();
+    stems.sort_unstable();
+    let place = stems.iter().position(|s| *s == "camera-match").unwrap() + 1;
+    assert!(place <= 9, "{stems:?}");
+    let pick = format!("look-{place}");
+    let (replies, stderr) = replay_under(
+        &config,
+        &[roll_s],
+        &[
+            &["action", "develop"],
+            &["action", "match-look"],
+            &["action", &pick],
+            &["photo", "0"],
+            &["action", "match-look"],
+        ],
+    );
+    assert_eq!(replies[1], ["2", "ok", "changed"], "{stderr}");
+    assert_eq!(replies[2], ["3", "ok", "changed"], "{replies:?}");
+    assert!(
+        replies[3].iter().any(|field| field == "camera-match"),
+        "{replies:?}"
+    );
+    assert_eq!(replies[4], ["5", "ok", "changed"], "{stderr}");
+    for (stem, name) in [
+        ("camera-match", "Camera match"),
+        ("camera-match-2", "Camera match (camera-match-2)"),
+    ] {
+        let text = std::fs::read(looks.join(format!("{stem}.look"))).unwrap();
+        let look = td_photo::look::Look::parse(&text).unwrap();
+        assert_eq!(look.name(), Some(name));
+    }
+    // Nothing to match: refused, no third look.
+    let bare = dir.0.join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let samples: Vec<u16> = (0..w * h).map(|j| 1008 + j as u16 * 20).collect();
+    std::fs::write(
+        bare.join("DSC_0001.NEF"),
+        synth_nef::uncompressed_nef(w, h, &samples),
+    )
+    .unwrap();
+    let (replies, stderr) = replay_under(
+        &config,
+        &[bare.to_str().unwrap()],
+        &[&["action", "match-look"]],
+    );
+    assert_eq!(replies[0][..3], ["1", "error", "refused"], "{stderr}");
+    assert!(
+        stderr.contains("no photo with both a preview and a raw"),
+        "{stderr}"
+    );
+    assert!(!looks.join("camera-match-3.look").exists());
+}
+
 #[test]
 fn preview_develop_blits_the_filmstrip_thumbnails() {
     // Three decodable NEFs whose embedded previews are flat colours: in

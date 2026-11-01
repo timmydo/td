@@ -521,8 +521,9 @@ enum Made {
 /// be made, said on stderr, which leaves the box its placeholder), the
 /// developed preview for a request, carrying what it made, an export,
 /// carrying the file's path and the frame it decoded (for the raw cache)
-/// or why it failed (said on stderr), or an auto measure, carrying what
-/// it chose or why it failed (said on stderr).
+/// or why it failed (said on stderr), an auto measure, carrying what
+/// it chose or why it failed (said on stderr), or a camera match, carrying
+/// the fitted look or why not (said by the session as it lands).
 enum Done {
     Thumb {
         key: Key,
@@ -540,6 +541,12 @@ enum Done {
         request: crate::AutoRequest,
         result: std::result::Result<(td_photo::auto::Auto, Option<crate::RawFrame>), String>,
     },
+    /// A camera match fitted, or why not (each skipped photo said on
+    /// stderr); the window writes the look.
+    Match {
+        request: crate::MatchRequest,
+        result: std::result::Result<crate::Fitted, String>,
+    },
     /// A neighbour's level 0 decoded ahead of its develop, for the raw
     /// cache; `None` when it could not be (said on stderr).
     Prefetched {
@@ -552,12 +559,13 @@ enum Done {
 /// the cached level 0 when the window held it at submission, so a photo
 /// just developed is measured or exported without the codec; weakly, so
 /// the queue keeps no frame the raw cache has let go, and one evicted
-/// while queued is decoded again. A prefetch is a neighbour's decode
-/// alone.
+/// while queued is decoded again. A camera match decodes its own raws.
+/// A prefetch is a neighbour's decode alone.
 enum Task {
     Thumb(Key),
     Develop(Preview, Start),
     Auto(crate::AutoRequest, Option<Weak<crate::RawFrame>>),
+    Match(crate::MatchRequest),
     Export(crate::ExportRequest, Option<Weak<crate::RawFrame>>),
     Prefetch(PhotoKey),
 }
@@ -590,6 +598,14 @@ struct Queue {
     /// untouched: the step is written by the window as the measure lands.
     autos: VecDeque<(crate::AutoRequest, Option<Weak<crate::RawFrame>>)>,
     measuring: Option<crate::AutoRequest>,
+    /// Camera matches asked for and not yet taken, and the one a worker
+    /// is fitting or the window has not yet collected, as the measures
+    /// are: one at a time, decoding its own raws, dropped at close with
+    /// nothing written (the look is written by the window as it lands),
+    /// and the one in flight stopped between photos once the queue
+    /// closes (`match_fit`'s stop check).
+    matches: VecDeque<crate::MatchRequest>,
+    fitting: Option<crate::MatchRequest>,
     /// The neighbours whose level 0 the window would have decoded ahead, in
     /// order, and the one a worker is decoding or the window has not yet
     /// collected: the lowest class of work, taken only when nothing wanted
@@ -654,15 +670,18 @@ impl Queue {
             + usize::from(self.exporting.is_some())
             + self.autos.len()
             + usize::from(self.measuring.is_some())
+            + self.matches.len()
+            + usize::from(self.fitting.is_some())
     }
 
     /// The next task for a worker, or `None` to wait: a thumbnail first,
     /// then the develop when no develop is already in flight, so the one
     /// raw decode is never run twice at once (and not while a prefetch
     /// decodes its photo: that frame arrives and the develop is replanned
-    /// from it), then an auto measure when none is in flight, then an
-    /// export when none is in flight, then, with nothing wanted pending
-    /// and no prefetch in flight, a prefetch. A closing queue hands out
+    /// from it), then an auto measure when none is in flight, then a
+    /// camera match when none is in flight, then an export when none is
+    /// in flight, then, with nothing wanted pending and no prefetch in
+    /// flight, a prefetch. A closing queue hands out
     /// exports alone, so what was asked for is written before the pool is
     /// joined.
     fn take(&mut self) -> Option<Task> {
@@ -683,6 +702,12 @@ impl Queue {
                     return Some(Task::Auto(request, raw));
                 }
             }
+            if self.fitting.is_none() {
+                if let Some(request) = self.matches.pop_front() {
+                    self.fitting = Some(request.clone());
+                    return Some(Task::Match(request));
+                }
+            }
         }
         if self.exporting.is_none() {
             if let Some((request, raw)) = self.exports.pop_front() {
@@ -697,6 +722,7 @@ impl Queue {
             && self.preview.is_none()
             && self.exports.is_empty()
             && self.autos.is_empty()
+            && self.matches.is_empty()
         {
             while let Some(key) = self.prefetch.pop_front() {
                 // The develop, the export or the measure in flight may be
@@ -764,8 +790,8 @@ impl Queue {
 /// thumbnail or develop result stays outstanding (in the running set, or as
 /// the develop in flight) until the window collects it, and an export until
 /// the worker sends its result, so the count never reads zero with a result
-/// made and not yet held or sent. Thumbnails run many at once; the develop
-/// and the exports run one at a time. A finished thumbnail is kept whichever
+/// made and not yet held or sent. Thumbnails run many at once; the develop,
+/// the measures, the camera matches and the exports each one at a time. A finished thumbnail is kept whichever
 /// wants asked for it, since it is the file's.
 struct Pool {
     queue: Arc<(Mutex<Queue>, Condvar)>,
@@ -870,9 +896,21 @@ impl Pool {
         Ok(outstanding)
     }
 
+    /// Queues a camera match behind any already asked for, and says how
+    /// many jobs are outstanding.
+    fn fit(&self, request: crate::MatchRequest) -> Result<usize> {
+        let outstanding = {
+            let mut queue = self.lock()?;
+            queue.matches.push_back(request);
+            queue.outstanding()
+        };
+        self.queue.1.notify_all();
+        Ok(outstanding)
+    }
+
     /// Takes what the workers made, each leaving the running set, the
-    /// develop-in-flight slot, the measuring slot or the prefetch slot as
-    /// it is taken, under
+    /// develop-in-flight slot, the measuring slot, the fitting slot or the
+    /// prefetch slot as it is taken, under
     /// the one lock, so what `outstanding` counts next is exactly what the
     /// window does not hold and no develop is planned to decode a frame
     /// on its way. An export left its slot as the worker sent it, under
@@ -890,6 +928,10 @@ impl Pool {
                 Done::Prefetched { .. } => queue.prefetch_done(),
                 Done::Auto { .. } => {
                     queue.measuring = None;
+                    measured = true;
+                }
+                Done::Match { .. } => {
+                    queue.fitting = None;
                     measured = true;
                 }
                 Done::Export { .. } => {}
@@ -914,6 +956,7 @@ impl Drop for Pool {
             queue.preview = None;
             queue.prefetch.clear();
             queue.autos.clear();
+            queue.matches.clear();
         }
         self.queue.1.notify_all();
         for thread in self.threads.drain(..) {
@@ -963,6 +1006,14 @@ fn work(queue: &(Mutex<Queue>, Condvar), done: &Sender<Done>) {
                     note(why);
                 }
                 Done::Auto { request, result }
+            }
+            Task::Match(request) => {
+                // Stopped between photos once the pool closes, so a quit
+                // waits for one develop, not the roll's; the session notes
+                // a failure as it lands, and a stopped one lands nowhere.
+                let closing = || queue.0.lock().map_or(true, |guard| guard.closing);
+                let result = crate::match_fit(&request, threads(), &closing);
+                Done::Match { request, result }
             }
             Task::Export(request, raw) => {
                 // A frame the raw cache let go while this waited is decoded
@@ -1638,6 +1689,7 @@ impl Window {
         // them each turn.
         session.exports = Some(Vec::new());
         session.autos = Some(Vec::new());
+        session.matches = Some(Vec::new());
         Ok(Window {
             client: Client::new(stream, temporary)?,
             font: td_ui::font::pinned()?,
@@ -2068,6 +2120,15 @@ impl Window {
                 .map(|frame| Arc::downgrade(&frame));
             self.pool.auto(request, raw)?;
         }
+        let matches: Vec<crate::MatchRequest> = self
+            .session
+            .matches
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default();
+        for request in matches {
+            self.pool.fit(request)?;
+        }
         let requests: Vec<crate::ExportRequest> = self
             .session
             .exports
@@ -2222,6 +2283,11 @@ impl Window {
                 Done::Develop { preview, made } => developed = Some((preview, made)),
                 Done::Export { request, result } => self.exported(request, result),
                 Done::Auto { request, result } => self.measured(request, result),
+                Done::Match { request, result } => {
+                    // The session writes the look, or notes why not on
+                    // stderr and the status row.
+                    self.session.match_landed(&request, result);
+                }
                 Done::Prefetched { key, frame } => {
                     // The frame joins the cache when its roll is still held
                     // and there is room; either way the wants are recomputed,
@@ -2666,6 +2732,9 @@ impl Window {
         if let Some(autos) = self.session.autos.as_mut() {
             autos.clear();
         }
+        if let Some(matches) = self.session.matches.as_mut() {
+            matches.clear();
+        }
         let result = match (result, self.submit_exports()) {
             (Ok(()), Err(why)) => Err(format!("exports not queued at close: {why}")),
             (result, _) => result,
@@ -3070,6 +3139,51 @@ mod tests {
         assert!(queue.drained());
     }
 
+    fn fit(stem: &str) -> crate::MatchRequest {
+        crate::MatchRequest {
+            roll: PathBuf::from("/td-photo/none"),
+            names: vec!["a.NEF".to_string()],
+            stem: stem.to_string(),
+            path: PathBuf::from(format!("/td-photo/none/{stem}.look")),
+        }
+    }
+
+    #[test]
+    fn a_camera_match_stops_between_photos_when_asked() {
+        let request = fit("camera-match");
+        let result = crate::match_fit(&request, 1, &|| true);
+        assert!(matches!(result, Err(why) if why.contains("stopped")));
+    }
+
+    #[test]
+    fn camera_matches_run_one_at_a_time_after_the_measures_and_drop_at_close() {
+        let mut queue = Queue::default();
+        queue.matches.push_back(fit("camera-match"));
+        queue.matches.push_back(fit("camera-match-2"));
+        queue.autos.push_back((auto("a.NEF"), None));
+        assert_eq!(queue.replace(Vec::new(), None), 3);
+        assert!(matches!(queue.take(), Some(Task::Auto(..))));
+        match queue.take() {
+            Some(Task::Match(request)) => assert_eq!(request.stem, "camera-match"),
+            _ => panic!("expected the first match"),
+        }
+        // Not the second while the first is out, which stays outstanding
+        // until the window collects it.
+        assert!(queue.take().is_none());
+        assert_eq!(queue.outstanding(), 3);
+        queue.fitting = None;
+        match queue.take() {
+            Some(Task::Match(request)) => assert_eq!(request.stem, "camera-match-2"),
+            _ => panic!("expected the second match"),
+        }
+        // A closing queue hands out no match and is drained without one.
+        queue.fitting = None;
+        queue.matches.push_back(fit("camera-match-3"));
+        queue.closing = true;
+        assert!(queue.take().is_none());
+        assert!(queue.drained());
+    }
+
     #[test]
     fn no_prefetch_goes_ahead_of_a_measure_or_decodes_the_measured_photo() {
         let neighbour = |name: &str| PhotoKey {
@@ -3279,6 +3393,7 @@ mod tests {
                 Done::Develop { .. }
                 | Done::Export { .. }
                 | Done::Auto { .. }
+                | Done::Match { .. }
                 | Done::Prefetched { .. } => None,
             })
             .collect();

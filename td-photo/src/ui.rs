@@ -257,6 +257,13 @@ pub enum Effect {
     /// answers to, or a file that cannot be written, leaves the model as
     /// it was, which is `refused`.
     DefaultLook(Option<String>),
+    /// Fit a look to the camera's previews of the open roll and write it
+    /// as a new user look, as the `match-look` verb does under a stem
+    /// not yet taken, then report the looks again through `set_looks`:
+    /// the replay fits within the request, the window hands the fit to
+    /// its pool and writes the look as it lands; either says what came
+    /// of it through `set_export`.
+    MatchLook,
     /// Move the roll's rejects, as the files flag them then, with their
     /// sidecars into `rejected/`, and take the moved ones out of the model
     /// through `remove`.
@@ -333,6 +340,7 @@ pub enum Action {
     LookIntensityOut,
     LookIntensity,
     DefaultLook,
+    MatchLook,
     ZoomFit,
     Zoom100,
     ZoomIn,
@@ -412,6 +420,7 @@ impl Action {
         Action::LookIntensityOut,
         Action::LookIntensity,
         Action::DefaultLook,
+        Action::MatchLook,
         Action::ZoomFit,
         Action::Zoom100,
         Action::ZoomIn,
@@ -493,6 +502,7 @@ impl Action {
             Self::LookIntensityOut => "look-intensity-out",
             Self::LookIntensity => "look-intensity",
             Self::DefaultLook => "default-look",
+            Self::MatchLook => "match-look",
             Self::ZoomFit => "zoom-fit",
             Self::Zoom100 => "zoom-100",
             Self::ZoomIn => "zoom-in",
@@ -579,7 +589,8 @@ impl Action {
             | Self::LookIntensityIn
             | Self::LookIntensityOut
             | Self::LookIntensity
-            | Self::DefaultLook => Group::Looks,
+            | Self::DefaultLook
+            | Self::MatchLook => Group::Looks,
             Self::ZoomFit | Self::Zoom100 | Self::ZoomIn | Self::ZoomOut => Group::Zoom,
             Self::Export | Self::ExportPicks | Self::Format | Self::Quality | Self::LongEdge => {
                 Group::Export
@@ -1031,6 +1042,12 @@ pub const BINDINGS: &[Binding] = &[
         chord: Some("D"),
         arguments: "",
         help: "Make the photo's look the default look, the one every photo whose sidecar sets none develops with, kept in the user's default-look file; on a photo whose look was cleared (look none), clear the default (develop mode).",
+    },
+    Binding {
+        name: "match-look",
+        chord: Some("M"),
+        arguments: "",
+        help: "Fit a look to the camera's own JPEGs from up to 16 of the roll's photos, in the background, written as a new user look (camera-match, or camera-match-2 and on when taken) and added to the looks; D then makes it the default.",
     },
     Binding {
         name: "zoom-fit",
@@ -3113,8 +3130,8 @@ impl Controller {
     /// user), as the adapter enumerated them, sorted and deduped by it: a
     /// fact absent from `state`, but one the band paints, so a list that
     /// differs from the one held bumps the generation in develop, as an
-    /// export note does. Session-static in practice, reported once when
-    /// the roll opens.
+    /// export note does. Reported when the session starts and again when
+    /// a camera match (`MatchLook`) has written a look.
     pub fn set_looks(&mut self, looks: Vec<String>) {
         if self.looks != looks {
             self.looks = looks;
@@ -4166,6 +4183,11 @@ impl Controller {
             }
             (Action::LookIntensity, [value]) => return self.set_look_intensity(value, effects),
             (Action::DefaultLook, []) => return self.make_default_look(effects),
+            (Action::MatchLook, []) => {
+                self.need_roll()?;
+                effects.push(Effect::MatchLook);
+                return Ok((Outcome::Changed, effects));
+            }
             (Action::ZoomFit, []) => self.set_zoom(None)?,
             (Action::Zoom100, []) => self.set_zoom(Some(100))?,
             (Action::ZoomIn, []) => self.zoom_by(ZoomStep::In)?,

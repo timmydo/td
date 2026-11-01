@@ -145,8 +145,12 @@ modes are the photographer's order of work.
    press on a name picks it. `D` makes the photo's look the default
    look, the one every photo whose sidecar sets none develops with
    (Files, Default look), or on a photo whose look was cleared (`look
-   none`) clears it. Two bands above the preview carry the same
-   controls as buttons: a tool band with Crop (the crop-adjust toggle, shown selected
+   none`) clears it. `M` (in any mode) fits a look to the camera's own
+   JPEGs of the open roll in the background (Looks, Matching the
+   camera) and adds it to the looks as `camera-match`, or the next free
+   `camera-match-N`. Two bands above the preview carry the same
+   controls as buttons: a tool band with Crop (the crop-adjust toggle,
+   shown selected
    while it is on), Uncrop (`C`, clearing the crop), Undo, Reset, the
    exposure's `-` and `+` beside a slider over the exposure's whole range,
    and Fit and 100% (the zoom, the one in force selected), and
@@ -200,8 +204,8 @@ window, all speaking the toolkit's one vocabulary.
   `auto-picks`, look and the
   look shortcuts `look-1`..`look-9`, the look intensity's nudges
   (`look-intensity-in`, `look-intensity-out`) and absolute
-  `look-intensity`, the default look (`default-look`), crop and
-  `uncrop`, crop-adjust, aspect,
+  `look-intensity`, the default look (`default-look`), the camera match
+  (`match-look`), crop and `uncrop`, crop-adjust, aspect,
   the look palette (`looks`), reset, undo and the history's step toggle and
   delete, the zoom (`zoom-fit`, `zoom-100`, `zoom-in`, `zoom-out`), the
   camera's JPEG in the box (`compare`), export,
@@ -216,7 +220,8 @@ window, all speaking the toolkit's one vocabulary.
   a key by a delta, `Edit` a crop or look, `Reset` to camera defaults, `Undo` the
   last step, `StepToggle` and `StepDelete` a step, `Auto` that photo,
   `AutoPicks` every pick, `Export` that photo, `ExportPicks` every pick,
-  `Settings` the export settings, `DefaultLook` the default look).
+  `Settings` the export settings, `DefaultLook` the default look,
+  `MatchLook` a camera match of the roll).
   The keyboard bindings, the pointer hit-testing, the replay stream and the
   control socket are four adapters over that one dispatcher, and nothing
   reaches the model around it. The cursor is
@@ -790,8 +795,8 @@ window, all speaking the toolkit's one vocabulary.
   So the aspect lock, the crop-adjust and look-palette sub-mode flags and the
   developed image's fitted rectangle for the drag's canvas (the window's report)
   are none of them `state` fields -- all facts like the job count, so they never
-  move the generation on their own. The available look list (reported once when
-  a session opens) is a fact too, but the look band paints it, so a list that
+  move the generation on their own. The available look list (reported when
+  a session opens and again when a camera match writes a look) is a fact too, but the look band paints it, so a list that
   differs from the one held moves the generation when develop is in view, as an
   export note does. A flag the adapter wrote answers `changed` whether or not
   the model moved, since the file did. Error codes are stable (`no-roll`,
@@ -849,8 +854,9 @@ window, all speaking the toolkit's one vocabulary.
   keys, `auto-picks`, 14), History (`reset`, `undo` and the step keys,
   then a prose row: `Down` and `Up` choose the step in develop, 5),
   Looks (`C-1`..`C-9`, then `'` and `;` for the intensity, then `D` for
-  the default look, 12), Zoom (4), Export (`e`, `C-e`, 2), and Roll and
-  window (`choose`, `quit`, 2). Within a section the table's rows keep its order, a
+  the default look and `M` for a camera match, 13), Zoom (4), Export
+  (`e`, `C-e`, 2), and Roll and window (`choose`, `quit`, 2). Within a
+  section the table's rows keep its order, a
   group's prose (`Group::prose`) after them. The current mode's
   sections lead (`Group::mode`: Cull's for cull, Develop, History, Looks
   and Zoom for develop, Export's for the export view), Modes, whose keys
@@ -1970,7 +1976,33 @@ and removed when not, so a name
 taken meanwhile is refused and a write that fails leaves nothing at
 the name; the look's name is "Camera match", with the stem in
 parentheses when it is not the default and the name has the room
-(`look::MAX_NAME`). The match is of histograms, not
+(`look::MAX_NAME`).
+
+The window's `match-look` (`M`, in any mode with a roll) is the verb
+over the open roll without `--name`: the stem is the first of
+`camera-match`, `camera-match-2` .. `camera-match-99` (`MAX_MATCH_STEMS`)
+naming no file in the user looks (`free_match_stem`), so a fit never
+writes over a look, an earlier fit included, and all of them taken is
+`refused`. The request (`MatchRequest`: the roll, the photos chosen,
+the stem and its path) is settled on the dispatch through the verb's
+`match_request`, so a directory that cannot be made is `refused` before
+anything is developed; the replay fits (`match_fit`) and writes
+(`write_fitted`) within the request, `refused` when nothing could be
+matched or the write failed, while the window hands the fit to its pool
+(Concurrency) and writes the look as the fit lands
+(`Session::match_landed`). Either way a written look is reported to the
+model with the looks listed again (`set_looks`), so the palette, the
+look band and `look-1`..`look-9` take it at once, and the status row
+says `fitted look STEM from N photos`, `camera match failed` (why on
+stderr) or, while the window's fit runs, `matching the camera over N
+photos`. One fit at a time: a `match-look` while the window's is out is
+`ignored`, the row saying `a camera match is already running` (a roll
+opened meanwhile clears the row; the fit goes on, the look being the
+user's, not the roll's). The new stem takes its place in the sorted
+list, so the looks after it on the band and on `look-1`..`look-9` move
+one place along when it lands. It fits the roll as the files hold it, not the photos' edits,
+and writes only the look: `D` on a photo showing it makes it the
+default. The match is of histograms, not
 pixels, so the preview's framing need not be the raw's. The look
 carries the camera's brightness at 0 EV: an exposure moved from 0,
 `auto`'s included, adds to it. Two limits follow from the method: the
@@ -2221,7 +2253,14 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   time, run from the level an edit invalidates (`Decode`, `Level1`, `Level2` or
   `Level3`, planned from the window's memo, so an exposure or look edit reruns
   level 3 alone and a resize level 2) — `Auto`, the measure over the crop the
-  session read on the dispatch, and `Export`, the verb's runner over the request
+  session read on the dispatch, `Match`, a camera match's fit over the photos
+  the session chose on the dispatch (taken after the measures, one at a
+  time, outstanding until collected, dropped at close with nothing written,
+  as a measure is; it decodes its own raws, not the cache's, and asks the
+  queue before each photo, so a closing pool stops the one in flight there
+  and a quit waits for one develop, not the roll's; on a pool of one
+  worker it holds the thumbnails and the develop for its whole run), and
+  `Export`, the verb's runner over the request
   the session read on the dispatch, each with the cached level 0 when the window
   held one at submission. A measure is not a want: a replacement of the wants
   leaves it queued; measures run one at a time, after a thumbnail and the
@@ -2267,7 +2306,8 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   of what is asked for (a decode once begun runs to its end, so a develop
   asked for meanwhile takes another worker), and never of the photo the
   develop, the export or the measure in flight is decoding (each caches that
-  frame as it lands), nor while a measure is queued; asked for only while the
+  frame as it lands), nor while a measure or a camera match is queued; asked
+  for only while the
   pool has a worker to spare
   (`MIN_PREFETCH_WORKERS`, 2: on one worker it would hold the develop up)
   and the raw cache has room for a frame the size of its largest without an
@@ -2472,7 +2512,20 @@ channel and ascending, the text a look, and nothing to fit `None`;
 `tests/control_process.rs` runs `match-look` over a roll of previews,
 the look written and listed, not written again over itself, `--name`
 taken and a bad stem refused, and a roll whose previews do not decode
-noting each and refused with nothing written. `tests/nef.rs`'s command case develops its synthetic frame
+noting each and refused with nothing written; and the window's
+`match-look` over `--replay`: two fits into `camera-match` and
+`camera-match-2`, each named for its stem, the first listed at once
+(picked by its place among the looks and in the photo's record), and a
+roll with nothing to match refused with no third look. `tests/ui.rs`
+holds `M` asking for a `MatchLook` in cull, develop and the export view
+and `no-roll` before a roll; the binary's unit tests hold the pool's
+queue handing out the fits one at a time after the measures and none
+from a closing queue, a fit asked to stop refused before its first
+photo, and the session's landing (a second `match-look` `ignored` with
+its note while one is out, the guard cleared and `camera match failed`
+on a failure, the look written and `fitted look camera-match from 2
+photos` on a landing, and a look there meanwhile never written over).
+`tests/nef.rs`'s command case develops its synthetic frame
 with `--look mono` to a grey image, with `--contrast 0.00` to the plain frame
 and `0.80` to another, with `--look mono --look-intensity` 0.00 to the plain
 frame, 1.00 to the grey one and 0.50 and 1.50 to neither, and refuses
@@ -3185,7 +3238,9 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    raw's embedded JPEG in the develop box. Landed. (o) The shadows'
    keys: `s` and `S` nudge the shadows a twentieth (`shadows-in`,
    `shadows-out`). Landed. (p) The default look from the window: `D`
-   (`default-look`) makes the photo's look the default. Landed.
+   (`default-look`) makes the photo's look the default. Landed. (q) The
+   camera match from the window: `M` (`match-look`) fits the open roll
+   on the pool into the next free `camera-match` stem. Landed.
 9. Later: DNG and JPEG rolls, the Nikon High Efficiency codec, a
    better full-resolution demosaic, highlight reconstruction, the
    `.dtstyle` translator, and ratings.

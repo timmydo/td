@@ -274,7 +274,7 @@ fn the_key_list_groups_the_table_by_mode_under_the_chooser_while_it_is_open() {
             ("Moving around", 8),
             ("Develop", 14),
             ("History", 5),
-            ("Looks", 12),
+            ("Looks", 13),
             ("Zoom", 4),
             ("Export", 2),
             ("Roll and window", 2),
@@ -794,6 +794,12 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
                 outcome = c.set_default_look(stem.clone());
                 continue;
             }
+            Effect::MatchLook => {
+                // The adapter fits in the background and reports.
+                c.set_export(Some("matching the camera".to_string()));
+                outcome = Outcome::Changed;
+                continue;
+            }
             Effect::Open(_) | Effect::List { .. } => panic!("{effect:?}"),
         };
         if let Effect::Export { .. } = effect {
@@ -829,6 +835,7 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
             | Effect::AutoPicks
             | Effect::Settings(_)
             | Effect::DefaultLook(_)
+            | Effect::MatchLook
             | Effect::DeleteRejected
             | Effect::List { .. } => {
                 panic!("{effect:?}")
@@ -1315,6 +1322,23 @@ fn the_photos_look_is_made_the_default_by_d() {
     apply(&mut c, &effects).unwrap();
     assert_eq!(c.default_look(), None);
     assert_eq!(key(&mut c, "D"), Outcome::Ignored);
+}
+
+/// `M` (`match-look`) asks the adapter for a camera match of the open
+/// roll in any mode, and is `no-roll` before one.
+#[test]
+fn a_camera_match_is_asked_for_by_m_in_any_mode() {
+    let mut c = Controller::new(surface(800, 600));
+    assert_eq!(c.action("match-look", &[]).unwrap_err(), ui::Error::NoRoll);
+    c.open("roll", b"/r", photos(3)).unwrap();
+    for setup in [None, Some("develop"), Some("export-mode")] {
+        if let Some(name) = setup {
+            act(&mut c, name, &[]);
+        }
+        let (outcome, effects) = c.input(Input::Key { chord: "M" }).unwrap();
+        assert_eq!(outcome, Outcome::Changed, "{setup:?}");
+        assert_eq!(effects, [Effect::MatchLook], "{setup:?}");
+    }
 }
 
 /// The look intensity: `'` and `;` nudge it a tenth and `look-intensity`
@@ -2259,7 +2283,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "75"]);
+    assert_eq!(&reply(2)[..2], ["ok", "76"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(
         reply(4),
