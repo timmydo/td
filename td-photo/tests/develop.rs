@@ -16,10 +16,10 @@ use td_photo::color::{
     self, apply, camera_color, invert, multiply, srgb_encode, Transfer, MIDDLE_GREY,
 };
 use td_photo::develop::{
-    self, bilinear, clarity_base, export_band, export_geometry, extent, fit, fit_zoom, level2,
+    self, bilinear, export_band, export_geometry, extent, fit, fit_zoom, frame_base, level2,
     level3, orient, resample, resample_u16, superpixel, viewport, viewport_framed, zoom_level2,
-    zoom_level2_full, ClarityBase, ClarityMap, Export, Level1, Level2, Params, Region, Source,
-    Viewport, Zoom, CENTRE_UNIT, HALF_ZOOM, ZOOM_STEPS,
+    zoom_level2_full, ClarityBase, ClarityMap, Export, Level1, Level2, LightingBase, LightingMap,
+    Params, Region, Source, Viewport, Zoom, CENTRE_UNIT, HALF_ZOOM, LIGHTING_ANCHOR, ZOOM_STEPS,
 };
 use td_photo::image::Rgb8;
 use td_photo::look::Look;
@@ -406,6 +406,8 @@ fn render_develops_neutral_patches_to_expected_values() {
             look_intensity: 1.0,
             clarity: 0.0,
             clarity_base: None,
+            lighting: 0.0,
+            lighting_base: None,
         },
     )
     .unwrap();
@@ -439,6 +441,8 @@ fn render_develops_neutral_patches_to_expected_values() {
             look_intensity: 1.0,
             clarity: 0.0,
             clarity_base: None,
+            lighting: 0.0,
+            lighting_base: None,
         },
     )
     .unwrap();
@@ -464,6 +468,8 @@ fn render_develops_neutral_patches_to_expected_values() {
             look_intensity: 1.0,
             clarity: 0.0,
             clarity_base: None,
+            lighting: 0.0,
+            lighting_base: None,
         },
     )
     .unwrap();
@@ -528,6 +534,8 @@ fn the_levels_split_composes_to_render() {
                     look_intensity: 1.0,
                     clarity: 0.0,
                     clarity_base: None,
+                    lighting: 0.0,
+                    lighting_base: None,
                 };
                 let new = develop::render(
                     &level1,
@@ -577,6 +585,8 @@ fn the_levels_split_composes_to_render() {
         look_intensity: 1.0,
         clarity: 0.0,
         clarity_base: None,
+        lighting: 0.0,
+        lighting_base: None,
     };
     assert_eq!(
         level3(
@@ -623,6 +633,8 @@ fn a_crop_selects_the_oriented_region_for_every_orientation() {
         look_intensity: 1.0,
         clarity: 0.0,
         clarity_base: None,
+        lighting: 0.0,
+        lighting_base: None,
     };
     // A long edge past the frame, so fit never shrinks and the compare is
     // exact; the same fractions land on pixel boundaries at either orientation.
@@ -695,6 +707,8 @@ fn a_degenerate_or_edge_crop_is_refused_not_panicked() {
         look_intensity: 1.0,
         clarity: 0.0,
         clarity_base: None,
+        lighting: 0.0,
+        lighting_base: None,
     };
     let refused = |crop: [f32; 4], orientation: u16| {
         develop::render(
@@ -779,6 +793,8 @@ fn render_reduces_orients_and_refuses_bad_buffers() {
         look_intensity: 1.0,
         clarity: 0.0,
         clarity_base: None,
+        lighting: 0.0,
+        lighting_base: None,
     };
     let small = develop::render(
         &level1,
@@ -970,6 +986,8 @@ fn resampler_and_demosaic_refuse_oversize_and_overflowing_axes() {
         look_intensity: 1.0,
         clarity: 0.0,
         clarity_base: None,
+        lighting: 0.0,
+        lighting_base: None,
     };
     for (width, height) in [(usize::MAX, 1), (1, usize::MAX), (16385, 1), (0, 4)] {
         let bad = Level1 {
@@ -1029,6 +1047,8 @@ fn work_is_the_same_on_one_thread_and_many() {
             look_intensity: 1.0,
             clarity: 0.0,
             clarity_base: None,
+            lighting: 0.0,
+            lighting_base: None,
         };
         develop::render(&one, None, 17, 8, wb, &color, &transfer, &params).unwrap()
     };
@@ -1344,6 +1364,8 @@ fn export_bands_concatenate_to_the_whole_at_every_orientation() {
         look_intensity: 1.0,
         clarity: 0.0,
         clarity_base: None,
+        lighting: 0.0,
+        lighting_base: None,
     };
     let whole = |crop: Option<[f32; 4]>, orientation: u16| -> Rgb8 {
         let export = export_geometry(&source, crop, orientation).unwrap();
@@ -1771,6 +1793,8 @@ fn clarity_params(clarity: f32) -> Params<'static> {
         look_intensity: 1.0,
         clarity,
         clarity_base: None,
+        lighting: 0.0,
+        lighting_base: None,
     }
 }
 
@@ -1866,7 +1890,10 @@ fn a_zoom_and_an_export_band_read_the_whole_frames_clarity() {
     {
         let whole = level2(&level1, crop, 100, orientation, 2).unwrap();
         let fit = level3(&whole, wb, &color, &transfer, &params).unwrap();
-        let map = clarity_base(&level1, crop, orientation, wb, &color, &params).unwrap();
+        let map = frame_base(&level1, crop, orientation, wb, &color, &params)
+            .unwrap()
+            .clarity
+            .unwrap();
         let (bw, bh) = (10usize, 8usize);
         let centre = (CENTRE_UNIT / 3, CENTRE_UNIT * 2 / 3);
         let (view, frame) =
@@ -1968,5 +1995,291 @@ fn a_zoom_and_an_export_band_read_the_whole_frames_clarity() {
         assert_eq!(data, one.data, "{size}");
     }
     let plain = band(0, export.height, &clarity_params(0.0)).unwrap();
+    assert_ne!(one.data, plain.data);
+}
+
+// ---------------------------------------------------------------- lighting
+
+fn lighting_params(lighting: f32) -> Params<'static> {
+    Params {
+        lighting,
+        ..clarity_params(0.0)
+    }
+}
+
+/// A backlit frame: a dark left part (a face against the light, with a
+/// fine texture) beside a bright right part (the sky), split at column
+/// `w / 2`, neutral under the daylight balance.
+fn backlit(w: usize, h: usize, wb: [f32; 3]) -> Level1 {
+    let mut pixels = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let v = if x < w / 2 {
+                0.02 * if (x / 2 + y / 2) % 2 == 0 { 1.2 } else { 0.85 }
+            } else {
+                0.45
+            };
+            pixels.push([v / wb[0], v / wb[1], v / wb[2]]);
+        }
+    }
+    level1_of(&pixels, w, h)
+}
+
+/// The mean green of an 8-bit image's columns `from..to`.
+fn columns_green(image: &Rgb8, from: usize, to: usize) -> f32 {
+    let mut sum = 0.0;
+    let mut count = 0.0;
+    for y in 0..image.height {
+        for x in from..to {
+            sum += f32::from(image.pixel(x, y).unwrap()[1]);
+            count += 1.0;
+        }
+    }
+    sum / count
+}
+
+#[test]
+fn lighting_lifts_the_dark_part_to_its_edge_and_holds_the_bright() {
+    let color = camera_color(&z8().xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let wb = color.daylight;
+    let (w, h) = (96usize, 64usize);
+    let whole = level2(&backlit(w, h, wb), None, w, 1, 3).unwrap();
+    let render = |params: &Params<'_>| level3(&whole, wb, &color, &transfer, params).unwrap();
+    let plain = render(&lighting_params(0.0));
+    let lit = render(&lighting_params(1.0));
+    // None, or NaN, is the plain frame; past one is held to it.
+    assert_eq!(render(&lighting_params(f32::NAN)), plain);
+    assert_eq!(render(&lighting_params(4.0)), lit);
+    // The dark part is lifted well, near its edge as far from it: the
+    // light follows the edge rather than mixing the sky in.
+    let (dark, near_dark) = (columns_green(&plain, 4, 36), columns_green(&plain, 44, 48));
+    let (lifted, near_lifted) = (columns_green(&lit, 4, 36), columns_green(&lit, 44, 48));
+    assert!(lifted > dark + 25.0, "{lifted} {dark}");
+    assert!(
+        near_lifted - near_dark > 0.75 * (lifted - dark),
+        "{near_lifted} {near_dark} {lifted} {dark}"
+    );
+    // The sky, near the edge as far from it, is held: no halo.
+    for (from, to) in [(48, 52), (60, 92)] {
+        let (sky, lit_sky) = (
+            columns_green(&plain, from, to),
+            columns_green(&lit, from, to),
+        );
+        assert!(close(lit_sky, sky, 3.0), "{from} {lit_sky} {sky}");
+    }
+    // The face's texture is lifted with it, not flattened: its local
+    // contrast in the 8-bit image grows with its level.
+    let texture = |image: &Rgb8| {
+        let row: Vec<f32> = (4..36)
+            .map(|x| f32::from(image.pixel(x, 20).unwrap()[1]))
+            .collect();
+        row.windows(2).map(|p| (p[1] - p[0]).abs()).sum::<f32>()
+    };
+    assert!(
+        texture(&lit) > texture(&plain),
+        "{} {}",
+        texture(&lit),
+        texture(&plain)
+    );
+    // Below zero the dark part is deepened.
+    let deep = render(&lighting_params(-1.0));
+    assert!(columns_green(&deep, 4, 36) < dark - 5.0);
+    // Two stops over, the sky the exposure blew is held back under
+    // white.
+    let over = |lighting| Params {
+        exposure: 2.0,
+        ..lighting_params(lighting)
+    };
+    let (sky, held) = (
+        columns_green(&render(&over(0.0)), 60, 92),
+        columns_green(&render(&over(1.0)), 60, 92),
+    );
+    assert_eq!(sky, 255.0);
+    assert!(held < 245.0 && held > 150.0, "{held}");
+    // A map that is not finite leaves every pixel as it was.
+    for bad in [f32::NAN, f32::INFINITY] {
+        let map = LightingMap {
+            width: 2,
+            height: 2,
+            a: vec![bad; 4],
+            b: vec![0.0; 4],
+        };
+        let based = Params {
+            lighting_base: Some(LightingBase {
+                map: &map,
+                frame: [0.0, 0.0, 1.0, 1.0],
+            }),
+            ..lighting_params(1.0)
+        };
+        assert_eq!(render(&based), plain);
+    }
+}
+
+/// The ends: white stays white, at no exposure and at the camera's
+/// white past it, black stays black, a highlight in a dark
+/// neighbourhood (a catchlight) is lifted short of white rather than
+/// blown, and the lift's anchor is middle grey.
+#[test]
+fn lighting_keeps_white_black_and_a_small_highlight() {
+    let color = camera_color(&z8().xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let wb = color.daylight;
+    assert!((LIGHTING_ANCHOR - td_photo::color::MIDDLE_GREY.log2()).abs() < 1e-3);
+    let (w, h) = (64usize, 48usize);
+    // A dark field with a 1-pixel highlight, a white block and a black
+    // block.
+    let mut pixels = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let v = match (x, y) {
+                (20, 20) => 0.5,
+                (x, _) if x >= 48 => 1.0,
+                (x, y) if x < 8 && y < 8 => 0.0,
+                _ => 0.01,
+            };
+            pixels.push([v / wb[0], v / wb[1], v / wb[2]]);
+        }
+    }
+    let whole = level2(&level1_of(&pixels, w, h), None, w, 1, 3).unwrap();
+    for exposure in [0.0f32, 2.0] {
+        let params = |lighting| Params {
+            exposure,
+            ..lighting_params(lighting)
+        };
+        let plain = level3(&whole, wb, &color, &transfer, &params(0.0)).unwrap();
+        let lit = level3(&whole, wb, &color, &transfer, &params(1.0)).unwrap();
+        let green = |image: &Rgb8, x, y| image.pixel(x, y).unwrap()[1];
+        assert_eq!(green(&lit, 56, 24), 255, "{exposure}");
+        assert_eq!(green(&lit, 2, 2), 0, "{exposure}");
+        assert!(green(&lit, 30, 30) > green(&plain, 30, 30), "{exposure}");
+        if exposure == 0.0 {
+            let (spot, was) = (green(&lit, 20, 20), green(&plain, 20, 20));
+            assert!(spot > was && spot < 250, "{spot} {was}");
+        }
+    }
+}
+
+#[test]
+fn a_zoom_and_an_export_band_read_the_whole_frames_lighting() {
+    let color = camera_color(&z8().xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let wb = color.daylight;
+    let (w, h) = (48usize, 36usize);
+    let level1 = backlit(w, h, wb);
+    // With clarity too, whose map the lighting lights first: the half
+    // zoom given both whole-frame maps is that window of the fit.
+    let params = Params {
+        clarity: 0.5,
+        ..lighting_params(0.8)
+    };
+    for (crop, orientation) in [1u16, 3, 6, 8]
+        .into_iter()
+        .flat_map(|o| [(None, o), (Some([0.25f32, 0.125, 0.5, 0.75]), o)])
+    {
+        let whole = level2(&level1, crop, 100, orientation, 2).unwrap();
+        let fit = level3(&whole, wb, &color, &transfer, &params).unwrap();
+        let maps = frame_base(&level1, crop, orientation, wb, &color, &params).unwrap();
+        let (clarity, lighting) = (maps.clarity.unwrap(), maps.lighting.unwrap());
+        let (bw, bh) = (10usize, 8usize);
+        let centre = (CENTRE_UNIT / 2, CENTRE_UNIT / 2);
+        let (view, frame) =
+            viewport_framed(w, h, crop, orientation, zoom(HALF_ZOOM, centre, bw, bh)).unwrap();
+        let zoomed = zoom_level2(&level1, view, orientation, 2).unwrap();
+        let based = Params {
+            clarity_base: Some(ClarityBase {
+                map: &clarity,
+                frame,
+            }),
+            lighting_base: Some(LightingBase {
+                map: &lighting,
+                frame,
+            }),
+            ..params
+        };
+        let shown = level3(&zoomed, wb, &color, &transfer, &based).unwrap();
+        let ox = (frame[0] * whole.width as f32).round() as usize;
+        let oy = (frame[1] * whole.height as f32).round() as usize;
+        for y in 0..bh {
+            for x in 0..bw {
+                let (a, b) = (
+                    shown.pixel(x, y).unwrap(),
+                    fit.pixel(ox + x, oy + y).unwrap(),
+                );
+                assert!(
+                    a.iter().zip(&b).all(|(a, b)| a.abs_diff(*b) <= 1),
+                    "{crop:?} {orientation} {x} {y} {a:?} {b:?}"
+                );
+            }
+        }
+        // Without the lighting's base the zoom lights its own window.
+        let alone = Params {
+            lighting_base: None,
+            ..based
+        };
+        assert_ne!(
+            level3(&zoomed, wb, &color, &transfer, &alone).unwrap(),
+            shown
+        );
+    }
+
+    // An export band reads the lighting map at its rows.
+    let (sw, sh) = (14usize, 10usize);
+    let decoded = frame(sw, sh, vec![1400; sw * sh]);
+    let source = Source {
+        decoded: &decoded,
+        cfa: Cfa::RGGB,
+        crop: Crop {
+            left: 1,
+            top: 1,
+            width: 12,
+            height: 8,
+        },
+        black: 1008,
+        white: 15892,
+    };
+    let export = export_geometry(&source, None, 1).unwrap();
+    // A light that darkens down the frame, so each band's lift differs.
+    let ramp = LightingMap {
+        width: 4,
+        height: 4,
+        a: vec![0.0; 16],
+        b: (0..16).map(|i| -2.0 - (i / 4) as f32).collect(),
+    };
+    let band = |first: usize, rows: usize, params: &Params<'_>| {
+        export_band(
+            &source,
+            &export,
+            first,
+            rows,
+            color.daylight,
+            &color,
+            &transfer,
+            params,
+        )
+    };
+    assert_eq!(
+        band(0, export.height, &lighting_params(1.0)).unwrap_err(),
+        develop::Error::Lighting
+    );
+    let based = Params {
+        lighting_base: Some(LightingBase {
+            map: &ramp,
+            frame: [0.0, 0.0, 1.0, 1.0],
+        }),
+        ..lighting_params(1.0)
+    };
+    let one = band(0, export.height, &based).unwrap();
+    for size in [1usize, 2, 3] {
+        let mut data = Vec::new();
+        let mut first = 0;
+        while first < export.height {
+            let rows = size.min(export.height - first);
+            data.extend(band(first, rows, &based).unwrap().data);
+            first += rows;
+        }
+        assert_eq!(data, one.data, "{size}");
+    }
+    let plain = band(0, export.height, &lighting_params(0.0)).unwrap();
     assert_ne!(one.data, plain.data);
 }

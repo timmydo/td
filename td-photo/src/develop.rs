@@ -36,6 +36,9 @@ pub enum Error {
     /// A part of the frame asked for clarity without the whole frame's
     /// base map.
     Clarity,
+    /// A part of the frame asked for lighting without the whole frame's
+    /// lighting map.
+    Lighting,
 }
 
 impl fmt::Display for Error {
@@ -45,6 +48,7 @@ impl fmt::Display for Error {
             Self::Size => "image buffer does not match its axes or exceeds the ceiling",
             Self::Levels => "white level is not above black",
             Self::Clarity => "clarity needs the whole frame's base map",
+            Self::Lighting => "lighting needs the whole frame's base map",
         })
     }
 }
@@ -476,23 +480,29 @@ pub fn export_band(
     if (width, height) != (export.width, rows) {
         return Err(Error::Size);
     }
-    // The band is rows of the whole export: its clarity reads the whole
-    // frame's map at the band's share of it, never a map of its own.
-    let params = match params.clarity_base {
-        Some(base) => Params {
-            clarity_base: Some(ClarityBase {
-                frame: [
-                    0.0,
-                    first as f32 / export.height as f32,
-                    1.0,
-                    rows as f32 / export.height as f32,
-                ],
-                ..base
-            }),
-            ..*params
-        },
-        None if clarity_amount(params.clarity) != 0.0 => return Err(Error::Clarity),
-        None => *params,
+    // The band is rows of the whole export: its clarity and lighting read
+    // the whole frame's maps at the band's share of it, never maps of its
+    // own.
+    let frame = [
+        0.0,
+        first as f32 / export.height as f32,
+        1.0,
+        rows as f32 / export.height as f32,
+    ];
+    if params.clarity_base.is_none() && amount(params.clarity) != 0.0 {
+        return Err(Error::Clarity);
+    }
+    if params.lighting_base.is_none() && amount(params.lighting) != 0.0 {
+        return Err(Error::Lighting);
+    }
+    let params = Params {
+        clarity_base: params
+            .clarity_base
+            .map(|base| ClarityBase { frame, ..base }),
+        lighting_base: params
+            .lighting_base
+            .map(|base| LightingBase { frame, ..base }),
+        ..*params
     };
     level3(&Level2 { width, height, rgb }, wb, color, transfer, &params)
 }
@@ -675,7 +685,7 @@ pub struct Params<'a> {
     /// 1. 1 is the whole look; a value outside is held to that range.
     pub look_intensity: f32,
     /// The photo's clarity, `-1..=1`: local contrast about the blurred
-    /// luminance (`clarity_map`), raised above zero and smoothed below;
+    /// luminance (`ClarityMap`), raised above zero and smoothed below;
     /// held to the range, NaN none.
     pub clarity: f32,
     /// The whole frame's clarity map and the part of the frame the level
@@ -683,6 +693,14 @@ pub struct Params<'a> {
     /// export band); without it level 3 makes the map from its own level
     /// 2, the whole frame.
     pub clarity_base: Option<ClarityBase<'a>>,
+    /// The photo's lighting, `-1..=1`: each pixel's exposure moved by the
+    /// light of its neighbourhood (`LightingMap`), dark ones lifted and,
+    /// with the exposure past zero, bright ones held back toward white,
+    /// the reverse below; held to the range, NaN none.
+    pub lighting: f32,
+    /// The whole frame's lighting map and the part of the frame the level
+    /// 2 covers, as `clarity_base` is for clarity.
+    pub lighting_base: Option<LightingBase<'a>>,
 }
 
 /// Clarity's base map's long edge: the whole cropped frame resampled to
@@ -710,13 +728,180 @@ pub struct ClarityBase<'a> {
     pub frame: [f32; 4],
 }
 
-/// The clarity amount as the pipeline applies it: held to `-1..=1`, NaN
-/// none.
-fn clarity_amount(clarity: f32) -> f32 {
-    if clarity.is_nan() {
+/// A clarity or lighting amount as the pipeline applies it: held to
+/// `-1..=1`, NaN none.
+fn amount(value: f32) -> f32 {
+    if value.is_nan() {
         0.0
     } else {
-        clarity.clamp(-1.0, 1.0)
+        value.clamp(-1.0, 1.0)
+    }
+}
+
+/// The edge-aware light of the whole cropped, oriented frame at
+/// `CLARITY_EDGE`, as a guided filter's coefficients: a pixel of log2
+/// linear luminance `l` (after the exposure, before the contrast) at a
+/// place has the light `a l + b`, `a` and `b` read there, `a` the window's
+/// variance over itself and `LIGHTING_EPS`. Across a strong edge `a`
+/// nears one, so the light follows the pixel and the lift stops at the
+/// edge rather than spilling over it as a halo; within an area varying
+/// well under a stop `a` nears zero and the light is the area's mean, so
+/// its texture is lifted whole (an area varying about a stop has `a`
+/// near a half, its local contrast eased by the lift's slope that much).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LightingMap {
+    pub width: usize,
+    pub height: usize,
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+}
+
+/// A lighting map and the part of the frame a level 2 covers, `x y w h`
+/// fractions of the oriented, cropped frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LightingBase<'a> {
+    pub map: &'a LightingMap,
+    pub frame: [f32; 4],
+}
+
+/// The frame's maps a develop of part of it reads (`frame_maps`): each
+/// made when its amount is not zero.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FrameMaps {
+    pub clarity: Option<ClarityMap>,
+    pub lighting: Option<LightingMap>,
+}
+
+/// The guided filter's window radius, a share of the map's long edge
+/// (about 13 px): the neighbourhood whose light a pixel is given.
+const LIGHTING_RADIUS: f32 = 0.04;
+/// The guided filter's regularization, in squared stops: an area whose
+/// log luminance varies less than about a stop is lit as one, more and
+/// its edges are kept.
+const LIGHTING_EPS: f32 = 1.0;
+/// The light the lift is about: middle grey, in log2
+/// (`color::MIDDLE_GREY`, which a test ties it to).
+pub const LIGHTING_ANCHOR: f32 = -2.438;
+/// The lift, stops a stop of light below the anchor, and its most.
+const LIGHTING_LIFT: f32 = 0.6;
+const LIGHTING_MOST_LIFT: f32 = 2.0;
+/// The most of a pixel's own stops under white a lift takes: a
+/// highlight in a dark neighbourhood (a catchlight, a lamp) is carried
+/// at most this share of the way to white, never past it.
+const LIGHTING_HEADROOM: f32 = 0.5;
+/// Where the hold's shoulder starts, log2: light above it, up to the
+/// camera's white at the exposure, is eased so that white lands at white.
+const LIGHTING_SHOULDER: f32 = -1.0;
+/// The most exposure the hold reads, so its slope stays finite.
+const LIGHTING_MOST_WHITE: f32 = 8.0;
+/// The least luminance the lighting takes a log of, about 12 stops
+/// under white.
+const LIGHTING_FLOOR: f32 = 1.0 / 4096.0;
+
+/// Where the camera's white lies at `exposure` stops, log2, for the hold:
+/// the exposure past zero, none for one that is not finite.
+fn lighting_white(exposure: f32) -> f32 {
+    if exposure.is_finite() {
+        exposure.clamp(0.0, LIGHTING_MOST_WHITE)
+    } else {
+        0.0
+    }
+}
+
+/// The exposure, in stops, lighting gives light `light` (log2) at amount
+/// 1, the camera's white at `white` (`lighting_white`): a lift below the
+/// anchor, `LIGHTING_LIFT` a stop to `LIGHTING_MOST_LIFT`, and a hold
+/// above `LIGHTING_SHOULDER`, the stops from it to `white` eased into
+/// those from it to zero, so the camera's white lands at white and
+/// nothing is held at an exposure of zero or less.
+fn lighting_gain(light: f32, white: f32) -> f32 {
+    let lift = (LIGHTING_LIFT * (LIGHTING_ANCHOR - light)).clamp(0.0, LIGHTING_MOST_LIFT);
+    let hold =
+        ((light - LIGHTING_SHOULDER) * white / (white - LIGHTING_SHOULDER)).clamp(0.0, white);
+    lift - hold
+}
+
+/// One pixel's lighting: its light `a l + b` from its own log luminance
+/// `l`, and the colour scaled by `2^(amount gain)`, keeping its hue in
+/// linear (a channel clipped at the encode shifts it, as an exposure's
+/// does); a raising gain held to `LIGHTING_HEADROOM` of the stops `l` lies under white. A
+/// pixel or coefficient that is not finite is left.
+fn lighting_pixel(rgb: [f32; 3], amount: f32, white: f32, a: f32, b: f32) -> [f32; 3] {
+    let y = luma(rgb);
+    if !y.is_finite() || !a.is_finite() || !b.is_finite() {
+        return rgb;
+    }
+    let own = y.max(LIGHTING_FLOOR).log2();
+    let gain = amount * lighting_gain(a * own + b, white);
+    let gain = if gain > 0.0 {
+        gain.min((-LIGHTING_HEADROOM * own).max(0.0))
+    } else {
+        gain
+    };
+    rgb.map(|v| v * gain.exp2())
+}
+
+/// The mean of each pixel's window `2 r + 1` square, cut to the image,
+/// of a `w` by `h` plane.
+fn box_mean(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let run = |line: &mut dyn Iterator<Item = f32>, len: usize| -> Vec<f32> {
+        let mut sums = Vec::with_capacity(len + 1);
+        sums.push(0.0f64);
+        let mut total = 0.0f64;
+        for v in line {
+            total += f64::from(v);
+            sums.push(total);
+        }
+        (0..len)
+            .map(|i| {
+                let (lo, hi) = (i.saturating_sub(r), (i + r + 1).min(len));
+                let sum =
+                    sums.get(hi).copied().unwrap_or(0.0) - sums.get(lo).copied().unwrap_or(0.0);
+                (sum / (hi - lo).max(1) as f64) as f32
+            })
+            .collect()
+    };
+    let mut across = Vec::with_capacity(w * h);
+    for y in 0..h {
+        let row = src.get(y * w..(y + 1) * w).unwrap_or(&[]);
+        across.extend(run(&mut row.iter().copied(), w));
+    }
+    let mut out = vec![0.0; w * h];
+    for x in 0..w {
+        let column = run(
+            &mut (0..h).map(|y| across.get(y * w + x).copied().unwrap_or(0.0)),
+            h,
+        );
+        for (y, v) in column.into_iter().enumerate() {
+            if let Some(slot) = out.get_mut(y * w + x) {
+                *slot = v;
+            }
+        }
+    }
+    out
+}
+
+/// The lighting map of a `w` by `h` plane of log2 luminance: a guided
+/// filter of it guided by itself, its coefficients averaged.
+fn lighting_of(light: &[f32], w: usize, h: usize) -> LightingMap {
+    let r = ((LIGHTING_RADIUS * w.max(h) as f32).round() as usize).max(1);
+    let mean = box_mean(light, w, h, r);
+    let squares: Vec<f32> = light.iter().map(|l| l * l).collect();
+    let mean_sq = box_mean(&squares, w, h, r);
+    let (a, b): (Vec<f32>, Vec<f32>) = mean
+        .iter()
+        .zip(&mean_sq)
+        .map(|(&m, &sq)| {
+            let variance = (sq - m * m).max(0.0);
+            let a = variance / (variance + LIGHTING_EPS);
+            (a, m - a * m)
+        })
+        .unzip();
+    LightingMap {
+        width: w,
+        height: h,
+        a: box_mean(&a, w, h, r),
+        b: box_mean(&b, w, h, r),
     }
 }
 
@@ -736,20 +921,28 @@ fn luma(rgb: [f32; 3]) -> f32 {
     LUMA[0] * rgb[0] + LUMA[1] * rgb[1] + LUMA[2] * rgb[2]
 }
 
-/// The clarity map of `whole`, a level 2 of the whole cropped frame at
-/// any size: resampled to fit `CLARITY_EDGE` (never enlarged), each pixel
-/// through the pipeline to the photo's adjustments (`params.contrast`)
-/// and its perceptual luminance taken, then a separable Gaussian blur of
-/// `CLARITY_SIGMA` of the long edge, edges held.
-pub fn clarity_map(
+/// The frame's maps of `whole`, a level 2 of the whole cropped frame at
+/// any size, resampled to fit `CLARITY_EDGE` (never enlarged), each made
+/// when `params` sets its amount. The lighting map: each pixel through
+/// the matrix and exposure, its log2 luminance (floored at
+/// `LIGHTING_FLOOR`), then `lighting_of`. The clarity map: each pixel
+/// through the pipeline to the photo's lighting and adjustments
+/// (`params.contrast`) and its perceptual luminance taken, then a
+/// separable Gaussian blur of `CLARITY_SIGMA` of the long edge, edges
+/// held.
+pub fn frame_maps(
     whole: &Level2,
     wb: [f32; 3],
     color: &CameraColor,
     params: &Params<'_>,
-) -> Result<ClarityMap, Error> {
+) -> Result<FrameMaps, Error> {
     let (w, h) = (whole.width, whole.height);
     if !pixels_ok(w, h) || whole.rgb.len() != w * h * 3 {
         return Err(Error::Size);
+    }
+    let (clarity, lighting) = (amount(params.clarity), amount(params.lighting));
+    if clarity == 0.0 && lighting == 0.0 {
+        return Ok(FrameMaps::default());
     }
     let (mw, mh) = fit(w, h, CLARITY_EDGE);
     let small = if (mw, mh) == (w, h) {
@@ -758,7 +951,7 @@ pub fn clarity_map(
         resample(&whole.rgb, w, h, mw, mh, params.threads)?
     };
     let matrix = exposed(color, params.exposure);
-    let p: Vec<f32> = small
+    let exposed: Vec<[f32; 3]> = small
         .as_chunks::<3>()
         .0
         .iter()
@@ -768,7 +961,53 @@ pub fn clarity_map(
                 (g * wb[1]).min(1.0),
                 (b * wb[2]).min(1.0),
             ];
-            let rgb = apply(&matrix, cam);
+            apply(&matrix, cam)
+        })
+        .collect();
+    let lit = (lighting != 0.0).then(|| {
+        let light: Vec<f32> = exposed
+            .iter()
+            .map(|&rgb| luma(rgb).max(LIGHTING_FLOOR).log2())
+            .collect();
+        lighting_of(&light, mw, mh)
+    });
+    let clarity = if clarity == 0.0 {
+        None
+    } else {
+        Some(clarity_plane(
+            &exposed,
+            mw,
+            mh,
+            lighting,
+            lit.as_ref(),
+            params,
+        )?)
+    };
+    Ok(FrameMaps {
+        clarity,
+        lighting: lit,
+    })
+}
+
+/// The clarity map of a `mw` by `mh` frame of exposed pixels, lit by
+/// `lit` at `lighting` when given (the map is the frame's own size).
+fn clarity_plane(
+    exposed: &[[f32; 3]],
+    mw: usize,
+    mh: usize,
+    lighting: f32,
+    lit: Option<&LightingMap>,
+    params: &Params<'_>,
+) -> Result<ClarityMap, Error> {
+    let white = lighting_white(params.exposure);
+    let p: Vec<f32> = exposed
+        .iter()
+        .enumerate()
+        .map(|(i, &rgb)| {
+            let rgb = match lit.and_then(|map| Some((*map.a.get(i)?, *map.b.get(i)?))) {
+                Some((a, b)) => lighting_pixel(rgb, lighting, white, a, b),
+                None => rgb,
+            };
             let rgb = match params.contrast {
                 Some(adjust) => adjust.apply(rgb),
                 None => rgb,
@@ -822,36 +1061,55 @@ pub fn clarity_map(
     })
 }
 
-/// The clarity map of the whole cropped frame from level 1: its level 2
-/// at `CLARITY_EDGE`, then `clarity_map`. For a render that is part of
-/// the frame (a zoom, an export).
-pub fn clarity_base(
+/// The maps of the whole cropped frame from level 1: its level 2 at
+/// `CLARITY_EDGE`, then `frame_maps`; none, and no level 2, when neither
+/// amount is set. For a render that is part of the frame (a zoom, an
+/// export).
+pub fn frame_base(
     level1: &Level1,
     crop: Option<[f32; 4]>,
     orientation: u16,
     wb: [f32; 3],
     color: &CameraColor,
     params: &Params<'_>,
-) -> Result<ClarityMap, Error> {
+) -> Result<FrameMaps, Error> {
+    if amount(params.clarity) == 0.0 && amount(params.lighting) == 0.0 {
+        return Ok(FrameMaps::default());
+    }
     let whole = level2(level1, crop, CLARITY_EDGE, orientation, params.threads)?;
-    clarity_map(&whole, wb, color, params)
+    frame_maps(&whole, wb, color, params)
+}
+
+/// A `width` by `height` plane at `x y`, fractions of the frame,
+/// bilinear between its pixel centres and held at its edges.
+fn plane_at(plane: &[f32], width: usize, height: usize, x: f32, y: f32) -> Option<f32> {
+    let axis = |f: f32, n: usize| {
+        let v = (f * n as f32 - 0.5).clamp(0.0, n.saturating_sub(1) as f32);
+        let i = v.floor() as usize;
+        (i, (i + 1).min(n.saturating_sub(1)), v - i as f32)
+    };
+    let (x0, x1, tx) = axis(x, width);
+    let (y0, y1, ty) = axis(y, height);
+    let at = |x: usize, y: usize| plane.get(y * width + x).copied();
+    let top = at(x0, y0)? + (at(x1, y0)? - at(x0, y0)?) * tx;
+    let bottom = at(x0, y1)? + (at(x1, y1)? - at(x0, y1)?) * tx;
+    Some(top + (bottom - top) * ty)
 }
 
 impl ClarityMap {
-    /// The map at `x y`, fractions of the frame, bilinear between its
-    /// pixel centres and held at its edges.
+    /// The map at `x y`, fractions of the frame.
     fn at(&self, x: f32, y: f32) -> Option<f32> {
-        let axis = |f: f32, n: usize| {
-            let v = (f * n as f32 - 0.5).clamp(0.0, n.saturating_sub(1) as f32);
-            let i = v.floor() as usize;
-            (i, (i + 1).min(n.saturating_sub(1)), v - i as f32)
-        };
-        let (x0, x1, tx) = axis(x, self.width);
-        let (y0, y1, ty) = axis(y, self.height);
-        let at = |x: usize, y: usize| self.p.get(y * self.width + x).copied();
-        let top = at(x0, y0)? + (at(x1, y0)? - at(x0, y0)?) * tx;
-        let bottom = at(x0, y1)? + (at(x1, y1)? - at(x0, y1)?) * tx;
-        Some(top + (bottom - top) * ty)
+        plane_at(&self.p, self.width, self.height, x, y)
+    }
+}
+
+impl LightingMap {
+    /// The coefficients at `x y`, fractions of the frame.
+    fn at(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        Some((
+            plane_at(&self.a, self.width, self.height, x, y)?,
+            plane_at(&self.b, self.width, self.height, x, y)?,
+        ))
     }
 }
 
@@ -1283,19 +1541,33 @@ pub fn level3(
         return Err(Error::Size);
     }
     let matrix = exposed(color, params.exposure);
-    let amount = clarity_amount(params.clarity);
-    // Without a base this level 2 is the whole frame: its own map.
-    let own;
-    let clarity = match (amount != 0.0, params.clarity_base) {
+    let white = lighting_white(params.exposure);
+    let sharpen = amount(params.clarity);
+    let lighting = amount(params.lighting);
+    // Without a base this level 2 is the whole frame: its own maps.
+    let whole = [0.0, 0.0, 1.0, 1.0];
+    let own = if (sharpen != 0.0 && params.clarity_base.is_none())
+        || (lighting != 0.0 && params.lighting_base.is_none())
+    {
+        frame_maps(level2, wb, color, params)?
+    } else {
+        FrameMaps::default()
+    };
+    let clarity = match (sharpen != 0.0, params.clarity_base) {
         (false, _) => None,
         (true, Some(base)) => Some(base),
-        (true, None) => {
-            own = clarity_map(level2, wb, color, params)?;
-            Some(ClarityBase {
-                map: &own,
-                frame: [0.0, 0.0, 1.0, 1.0],
-            })
-        }
+        (true, None) => own
+            .clarity
+            .as_ref()
+            .map(|map| ClarityBase { map, frame: whole }),
+    };
+    let lit = match (lighting != 0.0, params.lighting_base) {
+        (false, _) => None,
+        (true, Some(base)) => Some(base),
+        (true, None) => own
+            .lighting
+            .as_ref()
+            .map(|map| LightingBase { map, frame: whole }),
     };
     let mut out = vec![0u8; dw * dh * 3];
     let threads = thread_count(params.threads, dh);
@@ -1330,18 +1602,34 @@ pub fn level3(
                 (b * wb[2]).min(1.0),
             ];
             let rgb = apply(matrix_ref, cam);
+            // The pixel's place in a frame `x y w h` of the whole.
+            let place = |frame: [f32; 4]| {
+                let pixel = start / 3 + i;
+                let (x, y) = ((pixel % dw) as f32, (pixel / dw) as f32);
+                (
+                    frame[0] + (x + 0.5) / dw as f32 * frame[2],
+                    frame[1] + (y + 0.5) / dh as f32 * frame[3],
+                )
+            };
+            let rgb = match lit {
+                Some(LightingBase { map, frame }) => {
+                    let (fx, fy) = place(frame);
+                    match map.at(fx, fy) {
+                        Some((a, b)) => lighting_pixel(rgb, lighting, white, a, b),
+                        None => rgb,
+                    }
+                }
+                None => rgb,
+            };
             let rgb = match contrast {
                 Some(contrast) => contrast.apply(rgb),
                 None => rgb,
             };
             let rgb = match clarity {
                 Some(ClarityBase { map, frame }) => {
-                    let pixel = start / 3 + i;
-                    let (x, y) = ((pixel % dw) as f32, (pixel / dw) as f32);
-                    let fx = frame[0] + (x + 0.5) / dw as f32 * frame[2];
-                    let fy = frame[1] + (y + 0.5) / dh as f32 * frame[3];
+                    let (fx, fy) = place(frame);
                     match map.at(fx, fy) {
-                        Some(base) => clarity_pixel(rgb, amount, base),
+                        Some(base) => clarity_pixel(rgb, sharpen, base),
                         None => rgb,
                     }
                 }

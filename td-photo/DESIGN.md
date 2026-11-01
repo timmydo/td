@@ -118,16 +118,19 @@ modes are the photographer's order of work.
    on the cursor's photo and left with `Escape`. `=`/`-` move exposure by a
    third of a stop and their shifted pair `+`/`_` by a tenth, `.`/`,` move
    contrast by a tenth, `a` chooses both from the photo's tones (Auto),
-   `s`/`S` lift or deepen the shadows by a twentieth and `k`/`K` raise
-   or lower the clarity by a twentieth too, and
+   `s`/`S` lift or deepen the shadows by a twentieth, `k`/`K` raise
+   or lower the clarity by a twentieth too and `i`/`I` the lighting
+   (each part of the photo exposed for its own light), and
    `A` (in any mode) does so for every pick that has neither yet, in the
    background (`td-photo auto-picks ROLL` headless), `'`/`;` take a tenth
    more or less of the look (its intensity, from none through the whole
    to twice it), the tonal regions (highlights, shadows, whites and
-   blacks, the dark tones lifted apart from the exposure) and the clarity
-   (local contrast in the midtones) are set by
-   their actions and the pane's sliders (the shadows and the clarity
-   by their keys too), `0`
+   blacks, the dark tones lifted apart from the exposure), the clarity
+   (local contrast in the midtones) and the lighting (dark
+   neighbourhoods lifted and, past exposure zero, bright ones eased back
+   under white, a backlit face brought up without the sky) are set by
+   their actions and the pane's sliders (the shadows, the clarity and
+   the lighting by their keys too), `0`
    resets to camera defaults (the default look, where one is set,
    for the look), and the crop and the
    look are set by the `crop` and `look` actions, taking the box's four
@@ -201,9 +204,9 @@ window, all speaking the toolkit's one vocabulary.
   develop and its exposure nudges and absolute `exposure`, its contrast
   nudges and absolute `contrast`, the shadows' nudges (`shadows-in`,
   `shadows-out`), the clarity's (`clarity-in`, `clarity-out`), the
-  tonal regions' absolute
+  lighting's (`lighting-in`, `lighting-out`), the tonal regions' absolute
   `highlights`, `shadows`, `whites` and `blacks`, the absolute
-  `clarity`, `auto`, its spot meter `spot-auto` and
+  `clarity` and `lighting`, `auto`, its spot meter `spot-auto` and
   `auto-picks`, look and the
   look shortcuts `look-1`..`look-9`, the look intensity's nudges
   (`look-intensity-in`, `look-intensity-out`) and absolute
@@ -287,16 +290,20 @@ window, all speaking the toolkit's one vocabulary.
   pane's slider step (a const assert holds them together), so a backlit
   face is lifted by eye a key at a time, the clarity one,
   `clarity-in`/`clarity-out` (`k`/`K`) a twentieth, `CLARITY_STEP`,
-  likewise its row's step (the other tonal regions have no keys; the
-  absolute `highlights`, `shadows`, `whites`, `blacks` and `clarity`
-  take a value as `contrast` does, and the pane's rows slide them), and
+  likewise its row's step, the lighting one,
+  `lighting-in`/`lighting-out` (`i`/`I`) a twentieth, `LIGHTING_STEP`,
+  likewise (the other tonal regions have no keys; the
+  absolute `highlights`, `shadows`, `whites`, `blacks`, `clarity` and
+  `lighting` take a value as `contrast` does, and the pane's rows slide
+  them), and
   the look intensity one,
   `look-intensity-in`/`look-intensity-out` (`'`/`;`) a tenth, each a
   `Nudge` the adapter adds to the file's value as it stands
   (concurrency-correct as a flag is, not the model's copy) and clamps to
-  `MAX_EXPOSURE`, `MAX_CONTRAST`, `MAX_TONE`, `MAX_CLARITY` or
-  `0..=MAX_LOOK_INTENSITY` (`Sidecar::nudge`, which takes any of
-  `Key::TONE` and the clarity), so a step that clamps to no change
+  `MAX_EXPOSURE`, `MAX_CONTRAST`, `MAX_TONE`, `MAX_CLARITY`,
+  `MAX_LIGHTING` or `0..=MAX_LOOK_INTENSITY` (`Sidecar::nudge`, which
+  takes any of `Key::TONE`, the clarity and the lighting), so a step
+  that clamps to no change
   (twice the look nudged up, none nudged down, the shadows past 1.00)
   writes nothing and is `ignored`, unless a file changed meanwhile
   makes the settle a change, as it does for a flag; `look` and `crop` are
@@ -342,7 +349,8 @@ window, all speaking the toolkit's one vocabulary.
   `--preview` carry them.
 - **The pane's sliders.** Between the history list and its buttons the
   pane lays labelled slider rows, one per `ui::ADJUSTS` entry in order
-  (Contrast, Highlights, Shadows, Whites, Blacks, Clarity), as an editor's
+  (Contrast, Highlights, Shadows, Whites, Blacks, Clarity, Lighting), as
+  an editor's
   adjustment panel does (`Layout::adjusts`): a label
   `ADJUST_LABEL_CELLS` (16) cells wide from a cell in, room for the
   longest name and its least value ("Highlights -1.00"), the row's
@@ -753,7 +761,7 @@ window, all speaking the toolkit's one vocabulary.
   shown photo's name in hex, flag, exposure, crop, look, sidecar state, for
   a refused sidecar the reason in hex (`-` otherwise), then contrast,
   look intensity, the tonal regions: highlights, shadows, whites,
-  blacks, and the clarity) and
+  blacks, the clarity and the lighting) and
   `wait-idle MS`: `ok idle` once no
   job is outstanding, the wants are computed for the model as it stands and
   the frame the compositor acknowledged (its frame callback) is the model's,
@@ -773,8 +781,8 @@ window, all speaking the toolkit's one vocabulary.
   the long edge (`full` or the pixels) and the format (`jpeg` or
   `avif`), then the cursor photo's contrast and its look intensity (as
   written, `-` when absent, the whole look) and its tonal regions
-  (highlights, shadows, whites and blacks, as written) and its clarity
-  (as written), each added last
+  (highlights, shadows, whites and blacks, as written), its clarity
+  and its lighting (as written), each added last
   so the fields before them kept their places; `-` stands for a roll, a
   photo, a chooser or a selection that is absent. The mode is `cull`,
   `develop` or `export`. The generation
@@ -862,8 +870,8 @@ window, all speaking the toolkit's one vocabulary.
   seam's grammar by `driven::check` in `tests/ui.rs`, which also pins that every
   action either binds a key, takes a typed argument (`look` a stem, `aspect` a
   ratio, `format` a name, `quality` and `long-edge` a size, `exposure`,
-  `contrast`, `highlights`, `shadows`, `whites`, `blacks`, `clarity` and
-  `look-intensity` a value) or is reached by
+  `contrast`, `highlights`, `shadows`, `whites`, `blacks`, `clarity`,
+  `lighting` and `look-intensity` a value) or is reached by
   the pointer
   (`select` by a press on a cell, `scroll` by the wheel, `crop` by a
   marquee or a crop-adjust handle over the develop preview) or is the
@@ -880,9 +888,9 @@ window, all speaking the toolkit's one vocabulary.
   cursor's moves and pages, 8 rows), Modes (`Escape` back to the grid,
   `d` into develop, `E` into the export view, 3), Cull (the flags, the
   filters, the single view, `delete-rejected`, 9), Develop (the
-  exposure, contrast, crop, look palette, shadows, clarity, compare and
-  Auto keys, `auto-picks`, then a prose row: Control and a click meter
-  a spot, 17), History (`reset`, `undo` and the step keys,
+  exposure, contrast, crop, look palette, shadows, clarity, lighting,
+  compare and Auto keys, `auto-picks`, then a prose row: Control and a
+  click meter a spot, 19), History (`reset`, `undo` and the step keys,
   then a prose row: `Down` and `Up` choose the step in develop, 5),
   Looks (`C-1`..`C-9`, then `'` and `;` for the intensity, then `D` for
   the default look and `M` for a camera match, 13), Zoom (4), Export
@@ -971,7 +979,8 @@ The library is folders of originals; there is no database.
   a build before them keeps them as a later version's keys (below).
   `clarity` is the local contrast's amount, spelled the same within
   1.00 (`MAX_CLARITY`), absent zero, kept the same way by a build
-  before it. A
+  before it, and `lighting` the local exposure's (`MAX_LIGHTING`),
+  appended after it to `Key::ALL`, likewise. A
   key is 1 to 32
   bytes of lowercase ASCII letters, digits and `-`, starting with a letter, and
   a value is one or more characters with no control character and no space at
@@ -1086,7 +1095,7 @@ The library is folders of originals; there is no database.
   the first free name, the same publication as `develop`'s: a name that
   appears between the check and the link is skipped for the next, never
   replaced. The export takes the sidecar's exposure, contrast, tonal
-  regions, clarity, crop and look
+  regions, clarity, lighting, crop and look
   at its intensity
   as the
   file holds them; a sidecar the reader refuses, or a look it cannot find,
@@ -1385,7 +1394,61 @@ In order, per pixel, all linear `f32` until the last step:
 2. white balance multipliers, then a clip at 1.0 per channel (the camera
    white; this is what keeps clipped highlights neutral);
 3. exposure, `2^stops`;
-4. `rgb_cam` into linear sRGB primaries;
+4. `rgb_cam` into linear sRGB primaries, then the photo's lighting, when
+   it is not zero (`Params::lighting`, held to `-1..=1`, NaN none), the
+   local tone map an in-camera Active D-Lighting is: each pixel's light,
+   the log2 luminance of its neighbourhood, from the lighting map at its
+   place, gives it an exposure of the lighting times a gain: a lift
+   `min(2, 0.6 (A - L))` stops above zero for light `L` below the anchor
+   `A`, log2 of middle grey (`LIGHTING_ANCHOR`, -2.438, held to
+   `color::MIDDLE_GREY` by a test; a dark neighbourhood lifted, up to two
+   stops) less a hold `clamp((L - S) E / (E - S), 0, E)` for the
+   exposure `E` past zero (to 8) and the shoulder `S` at -1, half white:
+   the stops from the shoulder to the camera's white at that exposure
+   eased into those from the shoulder to white, so a sky the exposure
+   blew (a face spot-metered against it) comes back under white, the
+   camera's white lands at white and at an exposure of zero or less
+   nothing is held, clipped white staying white (past the shoulder the
+   light's slope is `1 / (E + 1)`, a ninth at the most exposure, so a
+   bright neighbourhood after a big push is flattened hard). Any gain
+   that raises the pixel, a lift or a negative lighting's reversed
+   hold, is held to half the stops the pixel's own luminance lies under
+   white (`LIGHTING_HEADROOM`), so a highlight in a dark neighbourhood (a
+   catchlight, a lamp) is carried at most halfway to white rather than
+   blown; a deep shadow takes the whole two stops, its noise with it,
+   and black stays black. The colour is scaled by `2^gain` so its hue
+   holds in linear (a lifted saturated colour clipped per channel at the
+   encode shifts as an exposure's does); below zero the reverse. A
+   pixel's own luminance at or below zero (a saturated blue past the
+   gamut) takes its neighbourhood's gain like any other. The light is a
+   guided filter's, edge-aware so the lift stops at an edge rather than
+   spilling over it as a halo: the map (`LightingMap`) is the
+   coefficients `a`, `b` of a guided filter of the frame's log2
+   luminance (after the exposure, floored at 2^-12) guided by itself, in
+   a window of radius 4% of the map's long edge (about 13 px at 320),
+   regularized by one squared stop and averaged over the window, and a
+   pixel's light
+   is `a l + b` with `l` its own log2 luminance and `a`, `b` read
+   bilinearly at its place, so at full size the light follows an edge
+   the map's pixels cannot resolve. `a` is the window's variance over
+   itself plus one: in an area varying well under a stop (a face's
+   skin) it is near zero, the light is the area's mean and its texture
+   is lifted whole; an area varying about a stop has `a` near a half and
+   its local contrast eased by that share of the lift's slope; across a
+   strong edge (a face against a blown sky, four stops and more) `a`
+   nears one and each side keeps its own light. An edge of two or three
+   stops between two lifted sides is the guided filter's weak case: a
+   rim about the window wide on each side, lighter on the bright side and
+   darker on the dark, up to about a third of a stop at full amount. The map is
+   made from the same 320 px frame as the clarity's, with it
+   (`develop::frame_maps`, `FrameMaps`), the clarity's map lit first, and
+   reaches a zoom and an export band as the clarity's does
+   (`develop::frame_base`, `LightingBase`), a band asked for lighting
+   without it refused (`Error::Lighting`). It comes before the contrast
+   and the tonal regions, so they shape the lit frame, as the camera's
+   own tone curve follows its D-Lighting; the frame is the crop, as for
+   the clarity. A map that is not finite at a place, or a pixel whose
+   own luminance is not, leaves the pixel;
 5. the photo's contrast, when it is not zero: the looks' `tone` sigmoid
    (Looks, below) at `contrast 2^C` with no toe or shoulder over each
    channel inside `0..=1`, so grey, black and white stay where they are,
@@ -1421,15 +1484,16 @@ In order, per pixel, all linear `f32` until the last step:
    zero local contrast rises, below it smooths toward the map (-1.00
    moving a midtone `1 / (1 + 2|d|)` of the way, all of it only as `d`
    vanishes). A map that is not finite at a place leaves the pixel as it
-   was. The map (`ClarityMap`, `clarity_map`) is
+   was. The map (`ClarityMap`, `frame_maps`) is
    the whole cropped, oriented frame resampled to fit `CLARITY_EDGE`
-   (320) and taken through steps 2 to 5's contrast and tonal regions,
+   (320) and taken through steps 2 to 5's lighting, contrast and tonal
+   regions,
    its `p` blurred by a Gaussian of 1.5% of its long edge with the
    edges held, read bilinearly. It belongs to the frame, not the
    render: a fit develop makes it from its own level 2 (the whole
    frame); a zoom and an export, which develop part of the frame,
    are given the map of the whole made from level 1
-   (`develop::clarity_base`, `ClarityBase`) with the part they cover
+   (`develop::frame_base`, `ClarityBase`) with the part they cover
    (`viewport_framed`, the band's rows), so a zoom shows the fit's
    clarity and an export's bands join without seams, and a band asked
    for clarity without one is refused (`Error::Clarity`). The blur
@@ -1460,7 +1524,9 @@ white balance, nine for the matrix), a clip, three table loads and a few adds;
 the contrast adds six loads and a few multiplies, the tonal regions a
 luminance, two loads and a division with a few multiplies, the clarity
 a luminance, a square root, two divisions, four map loads with their
-bilinear mix and a few multiplies, after a map of at most 320 pixels on the long
+bilinear mix and a few multiplies, the lighting a luminance, a log, an exp,
+eight map loads with their mix and a few multiplies, after maps of at most 320
+pixels on the long
 edge made once per develop (a fit) or per zoom and export (from level
 1), a look at other
 than its whole
@@ -1530,7 +1596,8 @@ what an edit invalidates:
 | 2 | the crop of level 1 area-resampled to the canvas, oriented, linear `f32` | canvas x 12 bytes | current photo and canvas size |
 | 3 | display pixels, XRGB, written into the frame | canvas x 4 bytes | the frame |
 
-Exposure, contrast, tonal region, clarity, look and look intensity edits recompute level 3 only
+Exposure, contrast, tonal region, clarity, lighting, look and look intensity
+edits recompute level 3 only
 (the window's preview key holds the intensity as the whole without a look,
 so a change to it alone develops nothing then). A crop edit recomputes
 level 2 from level 1 (tens of milliseconds across the pool) and then level
@@ -1561,7 +1628,8 @@ pixel: exact colour, no interpolation, a quarter of the samples), which is
 the right demosaic for every on-screen size below half resolution; export
 runs the full-resolution demosaic
 in row bands from level 0 so peak memory stays bounded by the band, not
-by an RGB frame (Export, below; a clarity set adds a level 1 first),
+by an RGB frame (Export, below; a clarity or lighting set adds a level 1
+first),
 and a zoom past `HALF_ZOOM` (50) runs it on the box's window alone. A zoomed level 2 is the window of the image the
 box shows at the zoom (`develop::viewport`: `box / (2 * zoom / 100)`
 level-1 pixels on each axis, rounded up, cut to the crop's oriented
@@ -1593,8 +1661,8 @@ window alike (the resampler's middle pass and the orient hold transient
 `td-photo export` develops from level 0 at full resolution, one band of
 output rows at a time, straight into the JPEG encoder, so the frame is
 never held as RGB at full resolution: level 0 (the decoded CFA frame,
-87 MiB on a Z 8) plus one band is the peak; with clarity set, level 1
-(65 MiB on a Z 8) is made beside level 0 first for the clarity map and
+87 MiB on a Z 8) plus one band is the peak; with clarity or lighting set,
+level 1 (65 MiB on a Z 8) is made beside level 0 first for their maps and
 dropped before the bands, so level 0 and level 1 are the peak then,
 which a map made from level 0 strided would avoid (an AVIF adds the
 AV1 encoder's batch of converted superblock rows, four a thread: 24 MiB of a Z 8 frame on eight threads
@@ -1978,7 +2046,8 @@ refused before anything is read.
 
 A camera's JPEG is more vivid than a raw developed plain: the camera
 lays a tone curve and more saturation over it (and sharpening, and on a
-Nikon Active D-Lighting, which no look reproduces). `td-photo
+Nikon Active D-Lighting, which no look reproduces; the lighting key
+is td-photo's own counterpart, set apart from the look). `td-photo
 match-look ROLL [--name STEM]` fits a look to that rendering from the
 roll's own photos (`matching`): up to `MAX_PHOTOS` (16), spread over
 the roll, each developed plain at 0 EV with nothing set and its
@@ -2512,7 +2581,22 @@ cropped, and the
 same zoom without it differing; an export band with clarity and no map
 refused (`Error::Clarity`), and with one the bands of every size
 joining to the whole, a map varying down the frame showing a band read
-at the wrong rows.
+at the wrong rows. It holds the lighting on a backlit frame (a dark
+textured half beside a bright one): the plain frame at zero and NaN,
+past one held to it, the dark half lifted well and as much near the
+edge as three quarters of that, the bright half within three levels
+near the edge and far from it (no halo), the dark texture's steps
+grown, -1.00 deepening the dark half, two stops over the bright half
+blown plain and held back under white, a map that is not finite leaving
+the frame; on a dark field with a white block, a black block and a
+one-pixel highlight, at exposure zero and two, white kept at 255, black
+at 0, the field lifted and, at zero, the highlight lifted short of
+white, and the anchor tied to `color::MIDDLE_GREY`; a half zoom with
+clarity and lighting given both whole-frame maps equal to that window
+of the fit at every orientation, whole and cropped, and different
+without the lighting's; an export band with lighting and no map
+refused (`Error::Lighting`), and with a map darkening down the frame
+the bands of every size joining to the whole.
 
 `tests/look.rs` holds the tonal regions' curve to the identity at zero,
 rising at every extreme mix of the four, the shadows lifting and
@@ -2581,9 +2665,12 @@ frame, 1.00 to the grey one and 0.50 and 1.50 to neither, and refuses
 region's flag at 0.00 to the plain frame and at 1.00 and -1.00 to
 others and refuses `--shadows 1.50`, develops `--clarity` 1.00 and
 -1.00 at a 96 pixel edge to frames other than 0.00's and refuses
-`--clarity -1.50`, and exports with the shadows lifted and with clarity;
+`--clarity -1.50`, develops `--lighting` 0.00 to the plain frame and
+1.00 and -1.00 to others and refuses `--lighting 1.50`, and exports with
+the shadows lifted, with clarity and with lighting;
 `tests/control_process.rs`'s `--preview --develop` case holds a sidecar's
-contrast, shadows, clarity and look intensity to the develop box's pixels.
+contrast, shadows, clarity, lighting and look intensity to the develop
+box's pixels.
 
 `tests/auto.rs` holds the rule on grey frames: nothing to measure no choice, a
 frame at the key given a stop and one two stops darker half their distance more,
@@ -2719,7 +2806,10 @@ the tonal regions' four keys (their names, grammar and refusals,
 columns after the look intensity), a tonal region's and the clarity's
 nudges clamped to their range as one step a run, one past the end no
 change and the flag refused, the clarity's key (last in
-`Key::ALL`, its grammar and refusals, `Sidecar::clarity`, and `edit` and
+`Key::ALL` before the lighting, its grammar and refusals,
+`Sidecar::clarity`, and `edit` and `list` with its column), the
+lighting's (last in `Key::ALL`, its grammar and refusals,
+`Sidecar::lighting`, its nudge held at 1.00 as no step, and `edit` and
 `list` with its column last),
 the look intensity's grammar to 2.00, its absent whole look, the whole
 set on it no step, its nudges clamped to 0..=2 with one to the value in
@@ -2907,7 +2997,11 @@ key's `Nudge` the action's, the value on the pane's row, a lowering
 past -1.00 no change), the clarity set by
 `clarity` (ignored in cull, a bad spelling `bad-argument`, its value
 last in `state` and `photo`) and its row's drag committing the clarity
-alone, the look
+alone, the lighting nudged a twentieth by `i` and `I` and set by
+`lighting` (ignored in cull, each key's `Nudge` the action's, a lowering
+past -1.00 no change, a bad spelling `bad-argument`, its value last in
+`state` and `photo`, its row last in the pane and its drag committing
+the lighting alone), the look
 intensity nudged by `'` and `;` and set by `look-intensity` (ignored
 outside develop and without a look, a bad spelling `bad-argument`, a
 nudge past twice the look no write, a run and a set one step, the value
@@ -3054,7 +3148,8 @@ and taken first once replanned, a prefetched frame joining the cache only into
 room and never evicting, evicted before a frame shown, refused for good when
 it could not decode and until the room is there when it had none, the memo
 planning each develop from what it holds (level 3 for an exposure, contrast
-or look edit, a contrast, tonal region, clarity or look intensity edit alone
+or look edit, a contrast, tonal region, clarity, lighting or look intensity
+edit alone
 another preview,
 level 2 for a resize, level 1 for a cached photo, else a decode; a zoom of the
 current photo from its level 1 with the cached frame, without it through half
@@ -3312,7 +3407,11 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    clarity's keys: `k` and `K` nudge the clarity a twentieth
    (`clarity-in`, `clarity-out`). Landed. (s) The spot meter:
    `spot-auto X Y`, a Control press on the develop and `edit FILE spot
-   X Y` expose for a face or any spot the user points at. Landed.
+   X Y` expose for a face or any spot the user points at. Landed. (t)
+   Lighting: an Active D-Lighting-style local tone map, a develop key
+   lifting dark neighbourhoods and holding bright ones about an
+   edge-aware map of the frame's light, its keys `i`/`I`, action and
+   pane row. Landed.
 9. Later: DNG and JPEG rolls, the Nikon High Efficiency codec, a
    better full-resolution demosaic, highlight reconstruction, the
    `.dtstyle` translator, and ratings.

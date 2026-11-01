@@ -26,6 +26,9 @@ pub const MAX_TONE: i32 = 100;
 /// Clarity in hundredths, at most this magnitude either way
 /// (`develop::Params::clarity`).
 pub const MAX_CLARITY: i32 = 100;
+/// Lighting in hundredths, at most this magnitude either way
+/// (`develop::Params::lighting`).
+pub const MAX_LIGHTING: i32 = 100;
 /// The look's intensity in hundredths, from none (0) through the whole
 /// look (`DEFAULT_LOOK_INTENSITY`) to twice it (this): the developed pixel
 /// is the one before the look moved this share of the way to the look's,
@@ -110,6 +113,7 @@ pub enum Key {
     Whites,
     Blacks,
     Clarity,
+    Lighting,
 }
 
 impl Key {
@@ -125,6 +129,7 @@ impl Key {
         Key::Whites,
         Key::Blacks,
         Key::Clarity,
+        Key::Lighting,
     ];
 
     /// The tonal regions' keys, in `look::Tone`'s order.
@@ -143,6 +148,7 @@ impl Key {
             Self::Whites => "whites",
             Self::Blacks => "blacks",
             Self::Clarity => "clarity",
+            Self::Lighting => "lighting",
         }
     }
 
@@ -391,6 +397,12 @@ pub fn clarity(text: &str) -> Result<i32, Error> {
     hundredths(text, MAX_CLARITY).ok_or(Error::Value(Key::Clarity))
 }
 
+/// Lighting from `-D.DD` or `D.DD`, in hundredths within `MAX_LIGHTING`,
+/// spelled as contrast is.
+pub fn lighting(text: &str) -> Result<i32, Error> {
+    hundredths(text, MAX_LIGHTING).ok_or(Error::Value(Key::Lighting))
+}
+
 /// A tonal region's amount as the sidecar writes it.
 pub fn tone_text(hundredths: i32) -> String {
     signed_text(hundredths)
@@ -537,6 +549,7 @@ fn check(key: Key, value: &str) -> Result<(), Error> {
         Key::LookIntensity => look_intensity(value).is_ok(),
         Key::Highlights | Key::Shadows | Key::Whites | Key::Blacks => tone(key, value).is_ok(),
         Key::Clarity => clarity(value).is_ok(),
+        Key::Lighting => lighting(value).is_ok(),
     };
     if ok {
         Ok(())
@@ -756,6 +769,12 @@ impl Sidecar {
         self.get(Key::Clarity).and_then(|value| clarity(value).ok())
     }
 
+    /// Hundredths of lighting.
+    pub fn lighting(&self) -> Option<i32> {
+        self.get(Key::Lighting)
+            .and_then(|value| lighting(value).ok())
+    }
+
     /// The tonal regions, each zero when absent.
     pub fn tone(&self) -> crate::look::Tone {
         let at = |key| self.tone_amount(key).unwrap_or(0);
@@ -851,8 +870,8 @@ impl Sidecar {
     }
 
     /// Adds `delta` hundredths to the exposure, contrast, a tonal region
-    /// (`Key::TONE`), the clarity or the look intensity, clamped to the
-    /// key's range, as
+    /// (`Key::TONE`), the clarity, the lighting or the look intensity,
+    /// clamped to the key's range, as
     /// `set` sets it; another key is refused as a value outside its
     /// grammar.
     pub fn nudge(&mut self, key: Key, delta: i32) -> Result<(), Error> {
@@ -875,6 +894,11 @@ impl Sidecar {
             Key::Clarity => (
                 self.clarity().unwrap_or(0),
                 (-MAX_CLARITY, MAX_CLARITY),
+                tone_text,
+            ),
+            Key::Lighting => (
+                self.lighting().unwrap_or(0),
+                (-MAX_LIGHTING, MAX_LIGHTING),
                 tone_text,
             ),
             _ if Key::TONE.contains(&key) => (

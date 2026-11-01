@@ -66,6 +66,8 @@ pub const CONTRAST_STEP: i32 = 10;
 pub const SHADOWS_STEP: i32 = 5;
 /// The clarity step, a twentieth in hundredths, as the shadows'.
 pub const CLARITY_STEP: i32 = 5;
+/// The lighting step, a twentieth in hundredths, as the clarity's.
+pub const LIGHTING_STEP: i32 = 5;
 /// The look intensity step, a tenth of the look in hundredths.
 pub const LOOK_INTENSITY_STEP: i32 = 10;
 
@@ -194,7 +196,7 @@ pub enum Effect {
         value: Option<String>,
     },
     /// Add `delta` hundredths to this photo's exposure, contrast,
-    /// shadows, clarity or look intensity on the file as it is then,
+    /// shadows, clarity, lighting or look intensity on the file as it is then,
     /// clamped to the key's range, and settle the model: a delta, not an
     /// absolute, so a value changed meanwhile is added to.
     Nudge {
@@ -344,6 +346,9 @@ pub enum Action {
     ClarityIn,
     ClarityOut,
     Clarity,
+    LightingIn,
+    LightingOut,
+    Lighting,
     Compare,
     Auto,
     SpotAuto,
@@ -420,6 +425,9 @@ impl Action {
         Action::ClarityIn,
         Action::ClarityOut,
         Action::Clarity,
+        Action::LightingIn,
+        Action::LightingOut,
+        Action::Lighting,
         Action::Compare,
         Action::Auto,
         Action::SpotAuto,
@@ -503,6 +511,9 @@ impl Action {
             Self::ClarityIn => "clarity-in",
             Self::ClarityOut => "clarity-out",
             Self::Clarity => "clarity",
+            Self::LightingIn => "lighting-in",
+            Self::LightingOut => "lighting-out",
+            Self::Lighting => "lighting",
             Self::Compare => "compare",
             Self::Auto => "auto",
             Self::SpotAuto => "spot-auto",
@@ -603,6 +614,9 @@ impl Action {
             | Self::ClarityIn
             | Self::ClarityOut
             | Self::Clarity
+            | Self::LightingIn
+            | Self::LightingOut
+            | Self::Lighting
             | Self::Compare
             | Self::Auto
             | Self::SpotAuto
@@ -882,7 +896,7 @@ pub const BINDINGS: &[Binding] = &[
         name: "reset",
         chord: Some("0"),
         arguments: "",
-        help: "Reset exposure, contrast, the tonal regions, clarity, crop, look and its intensity to camera defaults (the look to the default look, where one is set), clearing the history (develop mode).",
+        help: "Reset exposure, contrast, the tonal regions, clarity, lighting, crop, look and its intensity to camera defaults (the look to the default look, where one is set), clearing the history (develop mode).",
     },
     Binding {
         name: "undo",
@@ -985,6 +999,24 @@ pub const BINDINGS: &[Binding] = &[
         chord: None,
         arguments: "VALUE",
         help: "Set the clarity to VALUE, two decimals in -1.00..1.00: local contrast in the midtones raised or, below zero, smoothed (develop mode).",
+    },
+    Binding {
+        name: "lighting-in",
+        chord: Some("i"),
+        arguments: "",
+        help: "Raise the lighting a twentieth, up to 1.00: dark parts of the photo lifted, bright ones held, as a backlit face wants (develop mode).",
+    },
+    Binding {
+        name: "lighting-out",
+        chord: Some("I"),
+        arguments: "",
+        help: "Lower the lighting a twentieth, down to -1.00: dark parts deepened and bright ones lifted (develop mode).",
+    },
+    Binding {
+        name: "lighting",
+        chord: None,
+        arguments: "VALUE",
+        help: "Set the lighting to VALUE, two decimals in -1.00..1.00: each part of the photo exposed for its own light, dark neighbourhoods lifted and bright ones held or, below zero, the reverse (develop mode).",
     },
     Binding {
         name: "compare",
@@ -1402,6 +1434,7 @@ pub const ADJUSTS: &[(&str, Key)] = &[
     ("Whites", Key::Whites),
     ("Blacks", Key::Blacks),
     ("Clarity", Key::Clarity),
+    ("Lighting", Key::Lighting),
 ];
 /// A row label's width in cells: its name, a space and a signed value.
 const ADJUST_LABEL_CELLS: usize = 16;
@@ -1411,9 +1444,10 @@ pub const ADJUST_STEPS: usize = 40;
 const _: () = assert!(library::MAX_CONTRAST == 5 * (ADJUST_STEPS / 2) as i32);
 const _: () = assert!(library::MAX_TONE == library::MAX_CONTRAST);
 // `s` and `S` land on the shadows row's steps, `k` and `K` on the
-// clarity's.
+// clarity's, `i` and `I` on the lighting's.
 const _: () = assert!(library::MAX_TONE == SHADOWS_STEP * (ADJUST_STEPS / 2) as i32);
 const _: () = assert!(library::MAX_CLARITY == CLARITY_STEP * (ADJUST_STEPS / 2) as i32);
+const _: () = assert!(library::MAX_LIGHTING == LIGHTING_STEP * (ADJUST_STEPS / 2) as i32);
 const _: () = assert!(library::MAX_CLARITY == library::MAX_CONTRAST);
 
 /// A labelled slider's value for a signed value in hundredths, the
@@ -4008,8 +4042,8 @@ impl Controller {
     /// chooser's listed folder in hex, the history's step count and the
     /// selected step, the zoom, the export quality, long edge and format,
     /// then the photo's contrast and look intensity, its tonal regions
-    /// (highlights, shadows, whites, blacks) and its clarity. Absent
-    /// values are `-`.
+    /// (highlights, shadows, whites, blacks), its clarity and its
+    /// lighting. Absent values are `-`.
     pub fn state(&self) -> String {
         let position = self.position();
         let photo = self.cursor.and_then(|index| self.photos.get(index));
@@ -4050,6 +4084,7 @@ impl Controller {
             photo.map_or_else(dash, |p| p.value(Key::Whites).to_string()),
             photo.map_or_else(dash, |p| p.value(Key::Blacks).to_string()),
             photo.map_or_else(dash, |p| p.value(Key::Clarity).to_string()),
+            photo.map_or_else(dash, |p| p.value(Key::Lighting).to_string()),
         ]
         .join("\t")
     }
@@ -4057,7 +4092,7 @@ impl Controller {
     /// The `photo N` body: the Nth shown photo's name in hex, flag,
     /// exposure, crop, look, sidecar state, for a refused sidecar the
     /// reason in hex (`-` otherwise), contrast, look intensity, the tonal
-    /// regions (highlights, shadows, whites, blacks) and clarity.
+    /// regions (highlights, shadows, whites, blacks), clarity and lighting.
     pub fn photo(&self, position: usize) -> Result<String, Error> {
         if self.roll.is_none() {
             return Err(Error::NoRoll);
@@ -4084,6 +4119,7 @@ impl Controller {
             photo.value(Key::Whites),
             photo.value(Key::Blacks),
             photo.value(Key::Clarity),
+            photo.value(Key::Lighting),
         ]
         .join("\t"))
     }
@@ -4223,6 +4259,9 @@ impl Controller {
             (Action::ClarityIn, []) => return self.nudge(Key::Clarity, CLARITY_STEP, effects),
             (Action::ClarityOut, []) => return self.nudge(Key::Clarity, -CLARITY_STEP, effects),
             (Action::Clarity, [value]) => return self.set_clarity(value, effects),
+            (Action::LightingIn, []) => return self.nudge(Key::Lighting, LIGHTING_STEP, effects),
+            (Action::LightingOut, []) => return self.nudge(Key::Lighting, -LIGHTING_STEP, effects),
+            (Action::Lighting, [value]) => return self.set_lighting(value, effects),
             (Action::Auto, []) => return self.auto(effects),
             (Action::SpotAuto, [x, y]) => return self.spot_auto(x, y, effects),
             (Action::AutoPicks, []) => return self.auto_picks(effects),
@@ -4804,6 +4843,7 @@ impl Controller {
         match ADJUSTS.get(row).map(|(_, key)| *key) {
             Some(Key::Contrast) => sidecar.and_then(Sidecar::contrast),
             Some(Key::Clarity) => sidecar.and_then(Sidecar::clarity),
+            Some(Key::Lighting) => sidecar.and_then(Sidecar::lighting),
             Some(key) if Key::TONE.contains(&key) => {
                 sidecar.and_then(|sidecar| sidecar.tone_amount(key))
             }
@@ -4847,6 +4887,7 @@ impl Controller {
                 self.set_contrast(&library::contrast_text(hundredths), Vec::new())
             }
             Some(Key::Clarity) => self.set_clarity(&library::tone_text(hundredths), Vec::new()),
+            Some(Key::Lighting) => self.set_lighting(&library::tone_text(hundredths), Vec::new()),
             Some(key) if Key::TONE.contains(&key) => {
                 self.set_tone(key, &library::tone_text(hundredths), Vec::new())
             }
@@ -5171,6 +5212,30 @@ impl Controller {
                 index,
                 name,
                 key: Key::Clarity,
+                value: Some(value),
+            },
+            effects,
+        )
+    }
+
+    /// Sets the cursor photo's lighting to `value`, `D.DD` within
+    /// `-1.00..=1.00`, else `BadArgument`.
+    fn set_lighting(
+        &mut self,
+        value: &str,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        let hundredths = library::lighting(value).map_err(|_| Error::BadArgument)?;
+        let value = library::tone_text(hundredths);
+        self.develop_effect(
+            index,
+            |index, name| Effect::Edit {
+                index,
+                name,
+                key: Key::Lighting,
                 value: Some(value),
             },
             effects,
@@ -5940,8 +6005,8 @@ impl Controller {
         Ok((Outcome::Changed, effects))
     }
 
-    /// Adjusts the cursor photo's exposure, contrast, shadows, clarity or
-    /// look intensity by `delta` hundredths, applied to the file's value
+    /// Adjusts the cursor photo's exposure, contrast, shadows, clarity,
+    /// lighting or look intensity by `delta` hundredths, applied to the file's value
     /// at the adapter, not the model's copy, so a value changed meanwhile
     /// is added to, and a delta that clamps to no change settles as
     /// `Ignored`.

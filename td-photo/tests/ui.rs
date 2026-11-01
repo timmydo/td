@@ -272,7 +272,7 @@ fn the_key_list_groups_the_table_by_mode_under_the_chooser_while_it_is_open() {
             ("Cull", 9),
             ("Modes", 3),
             ("Moving around", 8),
-            ("Develop", 17),
+            ("Develop", 19),
             ("History", 5),
             ("Looks", 13),
             ("Zoom", 4),
@@ -371,6 +371,7 @@ fn the_action_table_is_closed_aligned_and_reachable() {
                         "blacks",
                         "clarity",
                         "spot-auto",
+                        "lighting",
                         "look-intensity",
                         "quality",
                         "long-edge",
@@ -429,7 +430,7 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!((layout.columns, layout.rows), (4, 3));
     assert_eq!(
         c.state(),
-        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit\t92\tfull\tjpeg\t-\t-\t-\t-\t-\t-\t-"
+        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit\t92\tfull\tjpeg\t-\t-\t-\t-\t-\t-\t-\t-"
     );
     for name in ["next", "pick", "view", "first"] {
         assert_eq!(
@@ -490,12 +491,12 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!(c.action("select", &[]).unwrap_err().code(), "protocol");
     assert_eq!(
         c.photo(0).unwrap(),
-        format!("{}\t-\t-\t-\t-\tnone\t-\t-\t-\t-\t-\t-\t-\t-", name(0))
+        format!("{}\t-\t-\t-\t-\tnone\t-\t-\t-\t-\t-\t-\t-\t-\t-", name(0))
     );
     assert_eq!(
         c.photo(3).unwrap(),
         format!(
-            "{}\t-\t-\t-\t-\terror\t{}\t-\t-\t-\t-\t-\t-\t-",
+            "{}\t-\t-\t-\t-\terror\t{}\t-\t-\t-\t-\t-\t-\t-\t-",
             name(3),
             hex(b"malformed exposure value")
         )
@@ -1152,7 +1153,10 @@ fn contrast_is_nudged_and_set_in_develop_mode() {
         .map(ui::step_label)
         .collect();
     assert_eq!(labels, ["contrast -0.40"]);
-    assert!(c.photo(0).unwrap().ends_with("\t-0.40\t-\t-\t-\t-\t-\t-"));
+    assert!(c
+        .photo(0)
+        .unwrap()
+        .ends_with("\t-0.40\t-\t-\t-\t-\t-\t-\t-"));
 }
 
 #[test]
@@ -1413,7 +1417,7 @@ fn look_intensity_is_nudged_and_set_with_a_look() {
     );
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     assert_eq!(fields(&c)[LOOK_INTENSITY], "0.35");
-    assert!(c.photo(0).unwrap().ends_with("\t0.35\t-\t-\t-\t-\t-"));
+    assert!(c.photo(0).unwrap().ends_with("\t0.35\t-\t-\t-\t-\t-\t-"));
     let labels: Vec<String> = c
         .photos()
         .first()
@@ -1801,7 +1805,7 @@ fn auto_picks_asks_for_every_picks_measure() {
         photo
             .split('\t')
             .rev()
-            .nth(6)
+            .nth(7)
             .unwrap_or_default()
             .to_string()
     };
@@ -2442,10 +2446,11 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "-",
             "-",
+            "-",
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "79"]);
+    assert_eq!(&reply(2)[..2], ["ok", "82"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(
         reply(4),
@@ -2457,6 +2462,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "-",
             "ok",
+            "-",
             "-",
             "-",
             "-",
@@ -2478,6 +2484,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "error",
             &hex(b"malformed exposure value"),
+            "-",
             "-",
             "-",
             "-",
@@ -2584,6 +2591,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "error",
             &hex(b"malformed exposure value"),
+            "-",
             "-",
             "-",
             "-",
@@ -5667,13 +5675,13 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     ]);
     assert_eq!(
         &a[0][21..],
-        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
+        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(&a[1][1..], ["ok", "changed"]);
     assert_eq!(&a[2][1..], ["ok", "changed"]);
     assert_eq!(
         &a[3][21..],
-        ["80", "32", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
+        ["80", "32", "jpeg", "-", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
@@ -5748,12 +5756,12 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     assert!(ok, "{err}");
     assert_eq!(
         &replies[0][21..],
-        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"],
+        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-", "-"],
         "the empty configuration"
     );
     assert_eq!(
         &replies_env[0][21..],
-        ["80", "32", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
+        ["80", "32", "jpeg", "-", "-", "-", "-", "-", "-", "-", "-"]
     );
     fs::write(&file, "td-photo export 1\nquality 80\nsharpen 3\n").unwrap();
     let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
@@ -5763,7 +5771,7 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     ]);
     assert_eq!(
         &replies[0][21..],
-        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
+        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(&replies[1][1..], ["ok", "changed"]);
     let (ok, _, err) = session.finish();
@@ -5786,14 +5794,14 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     ]);
     assert_eq!(
         &replies[0][21..],
-        ["92", "full", "avif", "-", "-", "-", "-", "-", "-", "-"]
+        ["92", "full", "avif", "-", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(&replies[1][1..], ["ok", "changed"]);
     assert_eq!(&replies[2][1..], ["ok", "ignored"]);
     assert_eq!(&replies[3][1..3], ["error", "bad-argument"]);
     assert_eq!(
         &replies[4][21..],
-        ["10", "full", "avif", "-", "-", "-", "-", "-", "-", "-"]
+        ["10", "full", "avif", "-", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
@@ -5806,7 +5814,7 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     assert_eq!(&replies[0][1..], ["ok", "changed"]);
     assert_eq!(
         &replies[1][21..],
-        ["10", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
+        ["10", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-", "-"]
     );
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
@@ -5827,12 +5835,12 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     ]);
     assert_eq!(
         &replies[0][21..],
-        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
+        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(replies[1][1..3], ["error", "refused"]);
     assert_eq!(
         &replies[2][21..],
-        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
+        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-", "-"]
     );
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
@@ -7201,12 +7209,12 @@ fn the_tonal_regions_are_set_and_slid_in_the_pane() {
         }
     }
     let state = c.state();
-    let tail: Vec<&str> = state.split('\t').rev().skip(1).take(4).collect();
+    let tail: Vec<&str> = state.split('\t').rev().skip(2).take(4).collect();
     assert_eq!(tail, ["-0.05", "0.10", "0.70", "-0.40"]);
     assert!(c
         .photo(0)
         .unwrap()
-        .ends_with("\t-0.40\t0.70\t0.10\t-0.05\t-"));
+        .ends_with("\t-0.40\t0.70\t0.10\t-0.05\t-\t-"));
 
     let names: Vec<&str> = ui::ADJUSTS.iter().map(|(name, _)| *name).collect();
     assert_eq!(
@@ -7217,11 +7225,12 @@ fn the_tonal_regions_are_set_and_slid_in_the_pane() {
             "Shadows",
             "Whites",
             "Blacks",
-            "Clarity"
+            "Clarity",
+            "Lighting"
         ]
     );
     let adjusts = c.layout().adjusts();
-    assert_eq!(adjusts.len(), 6);
+    assert_eq!(adjusts.len(), 7);
     for (row, adjust) in adjusts.iter().enumerate() {
         let adjust = adjust.expect("every row on 800x600");
         // A cell a character: the longest label, "Highlights -1.00", fits.
@@ -7287,8 +7296,8 @@ fn the_tonal_regions_are_set_and_slid_in_the_pane() {
             "bad-argument"
         );
     }
-    assert!(c.state().ends_with("\t0.30"));
-    assert!(c.photo(0).unwrap().ends_with("\t-0.05\t0.30"));
+    assert!(c.state().ends_with("\t0.30\t-"));
+    assert!(c.photo(0).unwrap().ends_with("\t-0.05\t0.30\t-"));
     assert_eq!(c.adjust_label(5), "Clarity 0.30");
     let (x, y) = knob(&c, 5, ui::ADJUST_STEPS);
     assert_eq!(press(&mut c, x, y), Outcome::Changed);
@@ -9910,4 +9919,86 @@ fn the_export_view_buttons_and_slider_ask_what_they_say() {
         "{text}"
     );
     assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+}
+
+/// The lighting is nudged a twentieth by `i` and `I` (`lighting-in`,
+/// `lighting-out`) and set by `lighting VALUE`, in develop alone; its row
+/// is the pane's last, its drag committing the lighting alone, and its
+/// value last in `state` and `photo`.
+#[test]
+fn the_lighting_is_nudged_set_and_slid_in_the_pane() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    for chord in ["i", "I"] {
+        assert_eq!(key(&mut c, chord), Outcome::Ignored, "{chord}");
+    }
+    for name in ["lighting-in", "lighting-out"] {
+        assert_eq!(act(&mut c, name, &[]), Outcome::Ignored, "{name}");
+    }
+    assert_eq!(act(&mut c, "lighting", &["0.50"]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(ui::LIGHTING_STEP, 5);
+    for (chord, name, delta) in [
+        ("i", "lighting-in", ui::LIGHTING_STEP),
+        ("i", "lighting-in", ui::LIGHTING_STEP),
+        ("I", "lighting-out", -ui::LIGHTING_STEP),
+    ] {
+        let (outcome, effects) = c.input(Input::Key { chord }).unwrap();
+        assert_eq!(outcome, Outcome::Changed);
+        assert_eq!(
+            effects,
+            [Effect::Nudge {
+                index: 0,
+                name: file(0),
+                key: Key::Lighting,
+                delta,
+            }],
+            "{chord}"
+        );
+        assert_eq!(c.action(name, &[]).unwrap().1, effects, "{name}");
+        apply(&mut c, &effects).unwrap();
+    }
+    assert_eq!(c.adjust_label(6), "Lighting 0.05");
+    assert!(c.state().ends_with("\t0.05"));
+    assert!(c.photo(0).unwrap().ends_with("\t-\t0.05"));
+    let (_, effects) = c.action("lighting", &["-1.00"]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Lighting,
+            value: Some("-1.00".to_string()),
+        }]
+    );
+    apply(&mut c, &effects).unwrap();
+    let (_, effects) = c.input(Input::Key { chord: "I" }).unwrap();
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Ignored);
+    assert_eq!(c.adjust_label(6), "Lighting -1.00");
+    for bad in ["1.01", "0.5", "x"] {
+        assert_eq!(
+            c.action("lighting", &[bad]).unwrap_err().code(),
+            "bad-argument"
+        );
+    }
+    let knob = c.layout().adjusts()[6]
+        .unwrap()
+        .slider
+        .knob(ui::ADJUST_STEPS, ui::ADJUST_STEPS);
+    let (x, y) = (
+        (knob.x + i64::from(knob.width) / 2) as u32,
+        (knob.y + i64::from(knob.height) / 2) as u32,
+    );
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_eq!(c.adjust_label(6), "Lighting 1.00");
+    let (_, effects) = release(&mut c, x, y);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Lighting,
+            value: Some("1.00".to_string()),
+        }]
+    );
 }

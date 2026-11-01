@@ -334,6 +334,11 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         .as_ref()
         .and_then(|sidecar| sidecar.clarity())
         .unwrap_or(0);
+    let lighting = photo
+        .sidecar
+        .as_ref()
+        .and_then(|sidecar| sidecar.lighting())
+        .unwrap_or(0);
     let own = photo.sidecar.as_ref().and_then(|sidecar| sidecar.look());
     let look = library::effective_look(own, session.ui.default_look()).map(|stem| {
         let intensity = photo.sidecar.as_ref().map_or(
@@ -352,6 +357,7 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         contrast,
         tone,
         clarity,
+        lighting,
         look,
         crop,
         session.ui.zoom(),
@@ -388,10 +394,10 @@ impl Key {
 }
 
 /// What a worker develops the preview by: the roll, the photo in it, the
-/// box it fits, the sidecar's crop, exposure, contrast, tonal regions and
-/// look with its intensity, and the zoom and its centre when the box does not fit the
-/// image, so the same photo at another box, crop, exposure, contrast, look,
-/// intensity or zoom is another develop; without a look the intensity is
+/// box it fits, the sidecar's crop, exposure, contrast, tonal regions,
+/// clarity, lighting and look with its intensity, and the zoom and its
+/// centre when the box does not fit the image, so the same photo at
+/// another box, crop or value of any of those is another develop; without a look the intensity is
 /// the whole, so a change to it alone is none. There is
 /// no generation: two requests with the same fields yield the same pixels.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -406,6 +412,8 @@ struct Preview {
     tone: crate::look::Tone,
     /// Hundredths of clarity.
     clarity: i32,
+    /// Hundredths of lighting.
+    lighting: i32,
     look: Option<String>,
     /// Hundredths of the look applied.
     look_intensity: i32,
@@ -1100,6 +1108,8 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
         look_intensity: crate::intensity_share(preview.look_intensity),
         clarity: preview.clarity as f32 / 100.0,
         clarity_base: None,
+        lighting: preview.lighting as f32 / 100.0,
+        lighting_base: None,
     };
     // Level 2 to the shown frame, at this box, exposure, contrast and look.
     let frame = |level2: &develop::Level2, meta: &crate::Meta| {
@@ -2492,6 +2502,7 @@ impl Window {
                 contrast: 0,
                 tone: crate::look::Tone::default(),
                 clarity: 0,
+                lighting: 0,
                 look: None,
                 look_intensity: library::DEFAULT_LOOK_INTENSITY,
                 zoom: None,
@@ -2536,6 +2547,11 @@ impl Window {
                 .sidecar
                 .as_ref()
                 .and_then(|sidecar| sidecar.clarity())
+                .unwrap_or(0),
+            lighting: photo
+                .sidecar
+                .as_ref()
+                .and_then(|sidecar| sidecar.lighting())
                 .unwrap_or(0),
             look,
             look_intensity,
@@ -2946,6 +2962,7 @@ mod tests {
             contrast: 0,
             tone: crate::look::Tone::default(),
             clarity: 0,
+            lighting: 0,
             look: None,
             look_intensity: 100,
             zoom: None,
@@ -3043,6 +3060,7 @@ mod tests {
             contrast: 0,
             tone: crate::look::Tone::default(),
             clarity: 0,
+            lighting: 0,
             crop: None,
             look: None,
             look_intensity: 100,
@@ -3543,6 +3561,13 @@ mod tests {
         };
         assert_ne!(a_clear, a);
         assert_eq!(memo.plan(&a_clear).stage(), Stage::Level3);
+        // And the lighting's.
+        let a_lit = Preview {
+            lighting: 30,
+            ..a.clone()
+        };
+        assert_ne!(a_lit, a);
+        assert_eq!(memo.plan(&a_lit).stage(), Stage::Level3);
         // So is a look intensity edit alone.
         let a_share = Preview {
             look_intensity: 40,
@@ -3777,6 +3802,7 @@ mod tests {
             contrast: 0,
             tone: crate::look::Tone::default(),
             clarity: 0,
+            lighting: 0,
             crop: None,
             look: None,
             look_intensity: 100,

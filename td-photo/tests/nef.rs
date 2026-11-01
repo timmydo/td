@@ -1749,6 +1749,25 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     let unclear = clear("clarity-0.ppm", "0.00");
     assert_ne!(clear("clarity-1.ppm", "1.00"), unclear);
     assert_ne!(clear("clarity-m.ppm", "-1.00"), unclear);
+    // So does the lighting's.
+    let light = |name: &str, amount: &str| {
+        let out = dir.join(name);
+        let (ok, _, stderr) = run(&[
+            OsStr::new("develop"),
+            file.as_os_str(),
+            out.as_os_str(),
+            OsStr::new("--long-edge"),
+            OsStr::new("96"),
+            OsStr::new("--lighting"),
+            OsStr::new(amount),
+        ]);
+        assert!(ok, "{stderr}");
+        std::fs::read(&out).unwrap()
+    };
+    let unlit = light("lighting-0.ppm", "0.00");
+    assert_eq!(unlit, unclear);
+    assert_ne!(light("lighting-1.ppm", "1.00"), unlit);
+    assert_ne!(light("lighting-m.ppm", "-1.00"), unlit);
     for flag in ["--highlights", "--shadows", "--whites", "--blacks"] {
         let stem = flag.trim_start_matches('-');
         assert_eq!(develop_with(&format!("{stem}-0.ppm"), flag, "0.00"), plain);
@@ -1880,6 +1899,18 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     assert!(!ok);
     assert!(
         stderr.contains("--clarity \"-1.50\" is not D.DD in -1.00..=1.00"),
+        "{stderr}"
+    );
+    let (ok, _, stderr) = run(&[
+        OsStr::new("develop"),
+        file.as_os_str(),
+        x.as_os_str(),
+        OsStr::new("--lighting"),
+        OsStr::new("1.50"),
+    ]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("--lighting \"1.50\" is not D.DD in -1.00..=1.00"),
         "{stderr}"
     );
     let (ok, _, stderr) = run(&[
@@ -2112,6 +2143,8 @@ fn the_command_line_exports_into_the_rolls_folder() {
             look_intensity: 1.0,
             clarity: 0.0,
             clarity_base: None,
+            lighting: 0.0,
+            lighting_base: None,
         },
     )
     .unwrap();
@@ -2223,6 +2256,17 @@ fn the_command_line_exports_into_the_rolls_folder() {
     )
     .unwrap();
     assert_ne!(clearer.data, decoded.data);
+    // So does the lighting, whose bands read the frame's lighting map.
+    std::fs::write(&sidecar, "td-photo edit 1\nlighting 1.00\n").unwrap();
+    let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("DSC_0001-9.jpg"), "{stdout}");
+    let lit = td_jpeg::decode(
+        &std::fs::read(exported.join("DSC_0001-9.jpg")).unwrap(),
+        td_jpeg::Scale::Full,
+    )
+    .unwrap();
+    assert_ne!(lit.data, decoded.data);
     std::fs::write(
         &sidecar,
         "td-photo edit 1\ncrop 0.2000 0.3000 0.5000 0.4000\n",
