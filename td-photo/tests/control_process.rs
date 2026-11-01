@@ -440,6 +440,114 @@ fn flat_jpeg(width: usize, height: usize, rgb: [u8; 3]) -> Vec<u8> {
     encoder.finish(&td_jpeg::InOrder).unwrap()
 }
 
+/// A baseline JPEG of a diagonal ramp, for a preview with every tone.
+fn ramp_jpeg(width: usize, height: usize) -> Vec<u8> {
+    let mut encoder = td_jpeg::Encoder::new(width, height, td_photo::jpeg::QUALITY).unwrap();
+    let rows: Vec<u8> = (0..width * height)
+        .flat_map(|i| {
+            let v = ((i % width + i / width) * 255 / (width + height)) as u8;
+            [v, v / 2 + 40, 255 - v]
+        })
+        .collect();
+    encoder.encode_rows(&rows, &td_jpeg::InOrder).unwrap();
+    encoder.finish(&td_jpeg::InOrder).unwrap()
+}
+
+#[test]
+fn match_look_writes_the_cameras_look_once() {
+    let dir = Directory::new("td-photo-match");
+    let (roll, config) = (dir.0.join("roll"), dir.0.join("config"));
+    std::fs::create_dir_all(&roll).unwrap();
+    let (w, h) = (16usize, 12usize);
+    for i in 0..3u16 {
+        let samples: Vec<u16> = (0..w * h)
+            .map(|j| 1008 + (j as u16 * 37 + i * 500) % 9000)
+            .collect();
+        std::fs::write(
+            roll.join(format!("DSC_000{i}.NEF")),
+            synth_nef::nef_with_preview(w, h, &samples, &ramp_jpeg(w, h)),
+        )
+        .unwrap();
+    }
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_CACHE_HOME", dir.0.join("cache"))
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let roll_s = roll.to_str().unwrap();
+    let (ok, stdout, stderr) = run(&["match-look", roll_s]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("from 3 photos"), "{stdout}");
+    let written = config.join("td-photo/looks/camera-match.look");
+    let look = td_photo::look::Look::parse(&std::fs::read(&written).unwrap()).unwrap();
+    assert_eq!(look.name(), Some("Camera match"));
+    // Never over a look already there, which is left as it was.
+    let before = std::fs::read(&written).unwrap();
+    let (ok, _, stderr) = run(&["match-look", roll_s]);
+    assert!(!ok);
+    assert!(stderr.contains("already there"), "{stderr}");
+    assert_eq!(std::fs::read(&written).unwrap(), before);
+    assert!(run(&["match-look", roll_s, "--name", "z8-standard"]).0);
+    let named = config.join("td-photo/looks/z8-standard.look");
+    let look = td_photo::look::Look::parse(&std::fs::read(&named).unwrap()).unwrap();
+    assert_eq!(look.name(), Some("Camera match (z8-standard)"));
+    // The temporary is gone, written or not.
+    let leftovers: Vec<_> = std::fs::read_dir(config.join("td-photo/looks"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    let (ok, _, stderr) = run(&["match-look", roll_s, "--name", ".hidden"]);
+    assert!(!ok);
+    assert!(stderr.contains("not a look stem"), "{stderr}");
+    let (ok, stdout, _) = run(&["looks"]);
+    assert!(
+        ok && stdout.contains("camera-match\tuser\tCamera match"),
+        "{stdout}"
+    );
+    // Previews that do not decode are skipped, each noted, and none is
+    // nothing to match.
+    let bare = dir.0.join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let samples: Vec<u16> = (0..w * h).map(|j| 1008 + j as u16 * 20).collect();
+    std::fs::write(
+        bare.join("DSC_0001.NEF"),
+        synth_nef::uncompressed_nef(w, h, &samples),
+    )
+    .unwrap();
+    let (ok, _, stderr) = run(&["match-look", bare.to_str().unwrap(), "--name", "none-here"]);
+    assert!(!ok);
+    assert!(stderr.contains("skipped DSC_0001.NEF"), "{stderr}");
+    assert!(
+        stderr.contains("no photo with both a preview and a raw"),
+        "{stderr}"
+    );
+    assert!(!config.join("td-photo/looks/none-here.look").exists());
+    // A looks directory that cannot be made is refused before any
+    // develop: over the roll whose photos are each skipped with a note,
+    // none is.
+    let blocked = dir.0.join("blocked");
+    std::fs::write(&blocked, b"a file").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+        .args(["match-look", bare.to_str().unwrap()])
+        .env("XDG_CONFIG_HOME", &blocked)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(!stderr.contains("skipped"), "{stderr}");
+    assert!(stderr.contains("blocked"), "{stderr}");
+}
+
 #[test]
 fn preview_develop_blits_the_filmstrip_thumbnails() {
     // Three decodable NEFs whose embedded previews are flat colours: in

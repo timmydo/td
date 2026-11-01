@@ -42,6 +42,7 @@ const PURE: &[&str] = &[
     "jpeg.rs",
     "library.rs",
     "look.rs",
+    "matching.rs",
     "nef.rs",
     "settings.rs",
     "tiff.rs",
@@ -67,6 +68,7 @@ fn source_inventory_is_closed() {
         "jpeg.rs",
         "library.rs",
         "look.rs",
+        "matching.rs",
         "nef.rs",
         "ui.rs",
     ]

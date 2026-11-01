@@ -34,7 +34,7 @@ use td_photo::look::{self, Look};
 use td_photo::nef::{self, Nef};
 use td_photo::settings::{self, Format, Settings};
 use td_photo::ui::{self, Effect, Photo};
-use td_photo::{av1, avif, camera, jpeg, tiff};
+use td_photo::{av1, avif, camera, jpeg, matching, tiff};
 
 mod window;
 
@@ -104,6 +104,17 @@ const HELP: &str = concat!(
     "  $XDG_CONFIG_HOME/td-photo/looks/STEM.look (~/.config/td-photo/looks/\n",
     "  when that is not absolute) and shadow built-in ones of the same\n",
     "  stem. With STEM, prints that look's text.\n",
+    "td-photo match-look ROLL [--name STEM]\n",
+    "  Fits a look to the camera's own rendering: up to 16 of ROLL's\n",
+    "  photos, spread over it, each developed plain (0 EV, nothing set)\n",
+    "  and set beside its embedded preview, give a tone curve on each\n",
+    "  channel through their pooled luminance quantiles and a saturation\n",
+    "  from their chroma after it. Writes it as the user look STEM\n",
+    "  (default camera-match), never over one already there; a photo\n",
+    "  whose preview or raw cannot be made is skipped with a note. Each\n",
+    "  chosen raw is developed whole (seconds each for a large one). The\n",
+    "  look carries the camera's brightness: at an exposure moved from 0\n",
+    "  it adds to it.\n",
     "td-photo import SRC DEST\n",
     "  Copies every NEF under SRC (eight folders deep, links under SRC\n",
     "  not followed) into DEST/YYYY/YYYY-MM-DD/ by its capture time, or\n",
@@ -199,6 +210,8 @@ fn main() -> ExitCode {
         [verb, sub] if verb == "cache" && sub == "path" => cache_path(),
         [verb, sub] if verb == "cache" && sub == "clear" => cache_clear(),
         [verb, ..] if verb == "cache" => Err("cache needs path or clear; see --help".to_string()),
+        [verb, roll, rest @ ..] if verb == "match-look" => match_look(Path::new(roll), rest),
+        [verb] if verb == "match-look" => Err("match-look needs ROLL; see --help".to_string()),
         [verb] if verb == "looks" => looks(None),
         [verb, stem] if verb == "looks" => looks(Some(stem)),
         [verb, ..] if verb == "looks" => Err("looks takes at most STEM; see --help".to_string()),
@@ -2311,6 +2324,132 @@ fn look_text(stem: &str) -> Result<(Vec<u8>, String), String> {
 fn find_look(stem: &str) -> Result<Look, String> {
     let (bytes, what) = look_text(stem)?;
     Look::parse(&bytes).map_err(|e| format!("{what}: {e}"))
+}
+
+/// `match-look`: the look fitted to the camera's previews of up to
+/// `matching::MAX_PHOTOS` of `roll`'s photos (`matching::fit`), written
+/// to the user looks as `--name`'s stem, `camera-match` by default,
+/// through the process's own `STEM.look.PID.tmp` published into place,
+/// so a name taken meanwhile is refused and a write that fails leaves
+/// nothing at it. The stem, the
+/// free name and the directory are settled before anything is developed;
+/// a photo whose preview or raw cannot be made is skipped with a note.
+fn match_look(roll: &Path, rest: &[OsString]) -> Result<(), String> {
+    check_flags(rest, &["--name"], &[])?;
+    let stem = option(rest, "--name")?.unwrap_or_else(|| "camera-match".to_string());
+    if !library::valid_look(&stem) {
+        return Err(format!(
+            "--name {stem:?} is not a look stem (1 to 64 of letters, digits, - _ and ., not starting with . and not - alone)"
+        ));
+    }
+    let dir = looks_dir()?;
+    let path = dir.join(format!("{stem}.look"));
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            return Err(format!(
+                "{}: already there; choose another --name",
+                path.display()
+            ))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let names = read_roll(roll)?;
+    // Spread over the roll: every photo when there are few enough.
+    let chosen: Vec<&String> = if names.len() <= matching::MAX_PHOTOS {
+        names.iter().collect()
+    } else {
+        (0..matching::MAX_PHOTOS)
+            .filter_map(|i| names.get(i * names.len() / matching::MAX_PHOTOS))
+            .collect()
+    };
+    let threads = threads();
+    let plain = Params {
+        exposure: 0.0,
+        contrast: None,
+        threads,
+        look: None,
+        look_intensity: 1.0,
+        clarity: 0.0,
+        clarity_base: None,
+    };
+    let mut pairs = Vec::new();
+    for name in chosen {
+        let file = roll.join(name);
+        let made = make_thumbnail(&file, matching::EDGE, false, threads).and_then(|preview| {
+            let (developed, _) = develop_raw(&file, None, matching::EDGE, &plain)?;
+            Ok((developed, preview.image))
+        });
+        match made {
+            Ok(pair) => pairs.push(pair),
+            // A failed write to stderr has nowhere to be reported.
+            Err(why) => {
+                let _ = writeln!(io::stderr().lock(), "td-photo: skipped {name}: {why}");
+            }
+        }
+    }
+    let refs: Vec<(&Rgb8, &Rgb8)> = pairs.iter().map(|(a, b)| (a, b)).collect();
+    let fit = matching::fit(&refs).ok_or_else(|| {
+        format!(
+            "{}: no photo with both a preview and a raw to match",
+            roll.display()
+        )
+    })?;
+    match fit.wanted {
+        None => note(
+            "too few coloured midtones to measure a saturation on (a neutral, dark or clipped roll); left at 1.00",
+        ),
+        Some(wanted) if (wanted * 100.0).round() > 200.0 => note(&format!(
+            "the camera's saturation {wanted:.2} is past the look's 2.00; held to it"
+        )),
+        Some(_) => {}
+    }
+    let text = fit.text(&matching::name(&stem));
+    Look::parse(text.as_bytes()).map_err(|e| format!("the fitted look is refused: {e}"))?;
+    // The process's own temporary, so another run's is never touched.
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".{}.tmp", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    let named = |e: io::Error| format!("{}: {e}", temporary.display());
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(named)?;
+    let written = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(named)
+        .and_then(|()| {
+            // The develop's publication: a link that refuses a name
+            // taken meanwhile, a checked rename where there are none.
+            publish(&temporary, &path).map_err(|e| match e.kind() {
+                io::ErrorKind::AlreadyExists => {
+                    format!("{}: already there; choose another --name", path.display())
+                }
+                _ => format!("{}: {e}", path.display()),
+            })
+        });
+    // Ours, made above: removed when it was not published (`publish`
+    // drops it once linked).
+    if written.is_err() {
+        if let Err(e) = fs::remove_file(&temporary) {
+            if e.kind() != io::ErrorKind::NotFound {
+                note(&format!("{}: {e}", temporary.display()));
+            }
+        }
+    }
+    written?;
+    writeln!(
+        io::stdout().lock(),
+        "wrote {} from {} photos: {} curve points, saturation {:.2}",
+        path.display(),
+        pairs.len(),
+        fit.points.len(),
+        fit.saturation
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// `looks`: one line per look, by stem, or with a stem that look's text.

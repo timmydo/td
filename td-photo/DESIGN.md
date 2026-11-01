@@ -686,8 +686,8 @@ window, all speaking the toolkit's one vocabulary.
   (get and set of a sidecar's values), `delete-rejected`, `develop`,
   `auto-picks`, `export`, `export-picks` (both taking `--format`,
   `--quality` and `--long-edge` on the command line, at their defaults
-  without; the settings file is the window's), `thumb`, `looks` and `cache
-  clear`.
+  without; the settings file is the window's), `thumb`, `looks`,
+  `match-look` and `cache clear`.
   Verbs are the batch face: they read the same sidecars and write them
   the same way, and an agent that does not need to see pixels never
   opens a window.
@@ -1803,6 +1803,66 @@ or does not parse refuses the develop by file and line and does not fall back to
 the built-in it shadows, and a stem outside the sidecar's look grammar is
 refused before anything is read.
 
+### Matching the camera
+
+A camera's JPEG is more vivid than a raw developed plain: the camera
+lays a tone curve and more saturation over it (and sharpening, and on a
+Nikon Active D-Lighting, which no look reproduces). `td-photo
+match-look ROLL [--name STEM]` fits a look to that rendering from the
+roll's own photos (`matching`): up to `MAX_PHOTOS` (16), spread over
+the roll, each developed plain at 0 EV with nothing set and its
+embedded preview made by the thumbnail rule, both at `EDGE` (256) on
+the long side. Their linear luminances, pooled over every pair, are
+matched by quantile: the curve passes through black, the developed
+luminance's quantile at each of thirteen levels (denser at the ends)
+to the preview's, and white, a quantile at or past the developed
+clip (0.98) or within 0.002 of the point before left out, so the points
+ascend and stay at most `MAX_CURVE_POINTS`. Where the developed side
+reaches its clip, a point at the clip (0.98) takes the preview's
+quantile at that rank, so a highlight the camera rolls off is matched
+up to the clip, not ramped steeply to white from the last quantile,
+and only what clipped (no detail left) rises from there to white,
+which the curve keeps. A preview that clips is
+matched as it is: the look clips there too, whatever highlight the raw
+held. The curve is written for
+each channel (`curve r`, `g`, `b`), as a camera's tone curve acts,
+rather than over luminance, whose lift keeps chroma rather than its
+share and so would need more saturation than the grammar holds. The
+saturation is then the ratio of the two sides' median chroma share,
+`(max - min) / Y` over midtone pixels (Y 0.02 to 0.8, nothing near the
+clip), the developed side's after the curve, held to `0..=2`; it makes
+up what the curve's lift took from the channels' ratios as well as the
+camera's own boost, and is left out at 1.00. A roll whose median share
+is under 0.05 on either side (snow, grey walls, documents), or no
+pixel in the band (a night roll, one clipped through), has too few
+coloured midtones to measure one on: the ratio of two noises is not taken, the
+saturation is left out and a note says so, as one does when the
+camera's ratio passed the grammar's 2.00 and was held to it. The file
+is written as the user look STEM (`camera-match` by default), created
+exclusively: an existing file at the name, or a stem the
+sidecar grammar cannot hold, or a directory that cannot be made, is
+refused before anything is developed, and a photo whose preview or raw
+cannot be read, decoded or developed is skipped with a note on stderr
+(none left is refused). The file is written through
+`STEM.look.PID.tmp`, the process's own, published as the develop's
+output is (a link, or a checked rename where the filesystem has none)
+and removed when not, so a name
+taken meanwhile is refused and a write that fails leaves nothing at
+the name; the look's name is "Camera match", with the stem in
+parentheses when it is not the default and the name has the room
+(`look::MAX_NAME`). The match is of histograms, not
+pixels, so the preview's framing need not be the raw's. The look
+carries the camera's brightness at 0 EV: an exposure moved from 0,
+`auto`'s included, adds to it. Two limits follow from the method: the
+curve is fitted on luminance and applied per channel, so a strongly
+saturated colour comes out a little darker than the luminance it was
+fitted to (under a hundredth of a stop's worth on average in a
+saturated scene); the clip point is placed by luminance but the curve
+acts on each channel, so a bright saturated colour whose one channel
+reaches the clip band below the luminance clip steps toward white in
+that channel; and previews that clip widely spend their top points on
+white.
+
 ## Window
 
 The scene is `ui::Scene`, a td-ui `Composition` the controller builds over its
@@ -2261,7 +2321,16 @@ user directory with a shadowing, a nameless, a refused, a linked and a stray
 file, a stem with a tab, a folder and a link to nothing at a built-in's stem,
 without a resolvable directory, and with a stem, and `develop --look` refusing a
 bad stem, an unknown one, an unparseable user file and a link to nothing before
-reading anything. `tests/nef.rs`'s command case develops its synthetic frame
+reading anything. `tests/matching.rs` holds the fit of an identical pair
+to the diagonal and saturation 1.00 left out, a rendering lifting
+luminance to its 0.8 power and spreading chroma by 1.3 recovered (each
+point within 3% of `x^0.8`, the look's luminance within 0.015 and its
+midtone chroma share within 8% of the rendering's), the curve on each
+channel and ascending, the text a look, and nothing to fit `None`;
+`tests/control_process.rs` runs `match-look` over a roll of previews,
+the look written and listed, not written again over itself, `--name`
+taken and a bad stem refused, and a roll whose previews do not decode
+noting each and refused with nothing written. `tests/nef.rs`'s command case develops its synthetic frame
 with `--look mono` to a grey image, with `--contrast 0.00` to the plain frame
 and `0.80` to another, with `--look mono --look-intensity` 0.00 to the plain
 frame, 1.00 to the grey one and 0.50 and 1.50 to neither, and refuses
@@ -2914,7 +2983,8 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    their actions and rows in the pane. Landed. (k) Clarity: a develop
    key raising or smoothing local contrast in the midtones about a
    blurred map of the whole frame, its action and row in the pane.
-   Landed.
+   Landed. (l) Matching the camera: `match-look`, a look fitted to the
+   roll's embedded previews. Landed.
 9. Later: DNG and JPEG rolls, the Nikon High
    Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.

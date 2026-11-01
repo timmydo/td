@@ -29,6 +29,7 @@ pub mod image;
 pub mod jpeg;
 pub mod library;
 pub mod look;
+pub mod matching;
 pub mod nef;
 pub mod settings;
 pub mod tiff;
