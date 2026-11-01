@@ -22,6 +22,7 @@ use td_ui::CELL_HEIGHT;
 use td_ui::CELL_WIDTH;
 
 use crate::develop::{self, CENTRE_UNIT, ZOOM_STEPS};
+use crate::histogram::Histogram;
 use crate::image::Rgb8;
 use crate::library::{self, Crop, Filter, Flag, Key, Sidecar, Step, StepKey};
 use crate::settings::{self, Format, Settings};
@@ -1251,6 +1252,18 @@ pub const EXPORT_PICKS: &str = "Export picks";
 /// for an exposure or look step's row (a crop's shows in whole percents,
 /// `step_label`) and for the three buttons under the list.
 pub const PANE_W: usize = 216;
+/// The histogram's band on the pane, in `ROW`s.
+pub const HISTOGRAM_ROWS: usize = 4;
+/// The histogram's colours, by the channels a stretch of a column
+/// counts: one alone, two mixed, all three grey, as an editor's
+/// overlapping channels read.
+const HISTOGRAM_RED: u32 = 0x00d0_4848;
+const HISTOGRAM_GREEN: u32 = 0x0048_b048;
+const HISTOGRAM_BLUE: u32 = 0x0048_68d8;
+const HISTOGRAM_YELLOW: u32 = 0x00c8_c048;
+const HISTOGRAM_CYAN: u32 = 0x0048_b8c8;
+const HISTOGRAM_MAGENTA: u32 = 0x00b8_58c8;
+const HISTOGRAM_ALL: u32 = 0x00a0_a0a0;
 
 /// The filmstrip band's height in reference pixels: a thumbnail and its
 /// padding, half above and half below.
@@ -1597,6 +1610,52 @@ fn look_labels(looks: &[String]) -> Vec<&str> {
 /// only the buttons on the rows that remain.
 fn within(band: Rect, rect: Rect) -> bool {
     rect.intersection(band) == Some(rect)
+}
+
+/// `histogram` in `rect` on the pane's paper: a column a pixel, each
+/// channel's height from the foot, the stretch all three reach grey, the
+/// stretch two reach their mix and the stretch one reaches its colour.
+fn paint_histogram(histogram: &Histogram, rect: Rect, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    if rect.intersection(damage).is_none() {
+        return;
+    }
+    fill(rect, PAPER, damage, sink);
+    let foot = rect.y + i64::from(rect.height);
+    let colour = |r: bool, g: bool, b: bool| match (r, g, b) {
+        (true, true, true) => HISTOGRAM_ALL,
+        (true, true, false) => HISTOGRAM_YELLOW,
+        (false, true, true) => HISTOGRAM_CYAN,
+        (true, false, true) => HISTOGRAM_MAGENTA,
+        (true, false, false) => HISTOGRAM_RED,
+        (false, true, false) => HISTOGRAM_GREEN,
+        _ => HISTOGRAM_BLUE,
+    };
+    for (x, heights) in histogram
+        .heights(rect.width as usize, rect.height)
+        .into_iter()
+        .enumerate()
+    {
+        let mut levels = heights;
+        levels.sort_unstable();
+        let mut from = 0;
+        for level in levels {
+            if level > from {
+                let [r, g, b] = heights.map(|h| h >= level);
+                fill(
+                    Rect {
+                        x: rect.x + x as i64,
+                        y: foot - i64::from(level),
+                        width: 1,
+                        height: level - from,
+                    },
+                    colour(r, g, b),
+                    damage,
+                    sink,
+                );
+                from = level;
+            }
+        }
+    }
 }
 
 /// The height of `rows` `ROW`s at the surface's scale.
@@ -2060,17 +2119,59 @@ impl Layout {
     }
 
     /// The history pane's list: the pane's width at the area's left, above
-    /// the labelled rows (`adjusts`) and the band its buttons wrap to;
-    /// `None` when the area cannot hold a row.
+    /// the histogram, the labelled rows (`adjusts`) and the band its
+    /// buttons wrap to; `None` when the area cannot hold a row.
     pub fn history(&self) -> Option<List> {
+        let above = self.list_over_adjusts();
+        let histogram = self
+            .histogram_in(above)
+            .map_or(0, |_| rows_height(HISTOGRAM_ROWS, self.surface));
+        List::new(
+            self.surface,
+            Rect {
+                height: above.height.saturating_sub(histogram),
+                ..above
+            },
+        )
+    }
+
+    /// The pane above the labelled rows and the button band: what the
+    /// list and the histogram share.
+    fn list_over_adjusts(&self) -> Rect {
         let band = self.history_strip().rect().height;
         let rows = rows_height(self.adjust_rows(), self.surface);
-        let rect = Rect {
+        Rect {
             width: (PANE_W * self.surface.scale.value()) as u32,
             height: self.area.height.saturating_sub(band).saturating_sub(rows),
             ..self.area
+        }
+    }
+
+    /// The histogram's rectangle on the pane: `HISTOGRAM_ROWS` over the
+    /// labelled rows, a cell in on each side and short of its band's top by
+    /// a quarter row, laid only when the list above it keeps a row, after
+    /// the labelled rows (which take the room first); `None` otherwise.
+    pub fn histogram(&self) -> Option<Rect> {
+        self.histogram_in(self.list_over_adjusts())
+    }
+
+    /// `histogram` over `above`, the pane above the labelled rows.
+    fn histogram_in(&self, above: Rect) -> Option<Rect> {
+        let s = self.surface.scale.value();
+        let band = rows_height(HISTOGRAM_ROWS, self.surface);
+        let list = Rect {
+            height: above.height.checked_sub(band)?,
+            ..above
         };
-        List::new(self.surface, rect)
+        List::new(self.surface, list)?;
+        let cell = (CELL_WIDTH * s) as i64;
+        let gap = (ROW * s / 4) as u32;
+        Some(Rect {
+            x: above.x + cell,
+            y: above.y + i64::from(list.height) + i64::from(gap),
+            width: above.width.checked_sub(2 * cell as u32)?,
+            height: band.checked_sub(gap)?,
+        })
     }
 
     /// How many labelled rows the pane lays, `ADJUSTS` in order: the most
@@ -2205,6 +2306,10 @@ pub struct Controller {
     /// develop lands, when the box itself is the fallback canvas, and from a
     /// crop-adjust toggle until the turn's end re-reports it.
     preview_fit: Option<Rect>,
+    /// The shown frame's histogram, as the adapter computed it of the
+    /// develop it holds for the cursor photo (`set_histogram`), painted
+    /// over the pane's labelled rows; absent from `state`.
+    histogram: Option<Histogram>,
     /// The develop box shows the camera's own JPEG (`compare`).
     comparing: bool,
     /// The crop drag in progress, in surface pixels, or `None`: set on a
@@ -2832,6 +2937,7 @@ impl Controller {
             bytes: 0,
             jobs: 0,
             preview_fit: None,
+            histogram: None,
             comparing: false,
             drag: None,
             adjusting: false,
@@ -2882,6 +2988,7 @@ impl Controller {
         self.aspect = Aspect::Free;
         self.look_list = false;
         self.preview_fit = None;
+        self.histogram = None;
         self.export = None;
         self.chooser = None;
         self.refresh_shown();
@@ -3184,6 +3291,21 @@ impl Controller {
     /// generation; the drag rectangle the model derives from it does.
     pub fn set_preview_fit(&mut self, fit: Option<Rect>) {
         self.preview_fit = fit;
+    }
+
+    /// The shown frame's histogram, as the adapter computed it of the
+    /// develop it holds for the cursor photo, `None` while it holds none:
+    /// painted, so a change is a new generation and the same one is none.
+    pub fn set_histogram(&mut self, histogram: Option<Histogram>) {
+        if self.histogram != histogram {
+            self.histogram = histogram;
+            self.bump();
+        }
+    }
+
+    /// The histogram the pane paints.
+    pub fn histogram(&self) -> Option<&Histogram> {
+        self.histogram.as_ref()
     }
 
     /// The cursor photo's oriented, cropped extent at full resolution, as
@@ -6578,6 +6700,9 @@ impl Scene<'_> {
                 damage,
                 sink,
             );
+        }
+        if let (Some(rect), Some(histogram)) = (layout.histogram(), model.histogram()) {
+            paint_histogram(histogram, rect, damage, sink);
         }
         let scale = layout.surface.scale;
         let rise = ((ROW - CELL_HEIGHT) / 2 * scale.value()) as i64;

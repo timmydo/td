@@ -27,6 +27,7 @@ pub mod color;
 pub mod deblock;
 pub mod develop;
 pub mod exif;
+pub mod histogram;
 pub mod image;
 pub mod jpeg;
 pub mod library;

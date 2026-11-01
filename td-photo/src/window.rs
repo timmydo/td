@@ -196,6 +196,15 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
                 .map_err(|e| format!("--compare: {e}"))?;
         }
     }
+    // The developed preview, in develop or the single view, made here on
+    // the calling thread before the scene is painted, so the pane paints
+    // its histogram as the window does.
+    let shown = roll.as_ref().and_then(|roll| developed(&session, roll));
+    session.ui.set_histogram(
+        shown
+            .as_ref()
+            .and_then(|(_, image)| td_photo::histogram::Histogram::of(image)),
+    );
     let font = td_ui::font::pinned()?;
     let surface = session.ui.surface();
     let stride = surface.width * 4;
@@ -220,12 +229,11 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
                 ui::blit(&mut pixels, surface, stride, area, r#box, &image).map_err(error)?;
             }
         }
-        // The developed preview, in develop or the single view: the cursor
-        // photo blitted into its box, the same frame the window shows
-        // there, made here on the calling thread. The loop above blitted
-        // the grid's thumbnails in cull and the filmstrip's in develop.
-        if let Some((r#box, image)) = developed(&session, roll) {
-            ui::blit(&mut pixels, surface, stride, area, r#box, &image).map_err(error)?;
+        // The developed preview blitted into its box, the same frame the
+        // window shows there. The loop above blitted the grid's thumbnails
+        // in cull and the filmstrip's in develop.
+        if let Some((r#box, image)) = shown.as_ref() {
+            ui::blit(&mut pixels, surface, stride, area, *r#box, image).map_err(error)?;
         }
         // The badges again, over the thumbnails that covered them, within
         // the area as the blits were: the status band covers a badge that
@@ -540,6 +548,7 @@ enum Done {
     Develop {
         preview: Preview,
         made: Made,
+        histogram: Option<td_photo::histogram::Histogram>,
     },
     Export {
         request: crate::ExportRequest,
@@ -1005,7 +1014,13 @@ fn work(queue: &(Mutex<Queue>, Condvar), done: &Sender<Done>) {
             }
             Task::Develop(preview, start) => {
                 let made = develop_task(&preview, start);
-                Done::Develop { preview, made }
+                // Counted here, off the window's thread.
+                let histogram = made.image().and_then(td_photo::histogram::Histogram::of);
+                Done::Develop {
+                    preview,
+                    made,
+                    histogram,
+                }
             }
             Task::Auto(request, raw) => {
                 let raw = raw.as_ref().and_then(Weak::upgrade);
@@ -1066,6 +1081,20 @@ fn work(queue: &(Mutex<Queue>, Condvar), done: &Sender<Done>) {
             }
         } else if done.send(result).is_err() {
             return;
+        }
+    }
+}
+
+impl Made {
+    /// The image made, if any.
+    fn image(&self) -> Option<&Rgb8> {
+        match self {
+            Made::Decoded { image, .. }
+            | Made::Level1 { image, .. }
+            | Made::Level2 { image, .. }
+            | Made::Level3 { image }
+            | Made::Zoom { image } => Some(image),
+            Made::None => None,
         }
     }
 }
@@ -1620,6 +1649,9 @@ struct Window {
     /// when it could not be made), shown in the develop box until the next
     /// one lands. Let go with the thumbnails when the roll or scale changes.
     developed: Option<(Preview, Option<Rgb8>)>,
+    /// The histogram of the held develop's image and the develop it is
+    /// of, counted by the worker that made it.
+    histogram: Option<(Preview, td_photo::histogram::Histogram)>,
     /// The develop memo: the current photo's cached levels above 0 (so an
     /// exposure, contrast or look edit reruns level 3 alone and a resize reruns
     /// level 2) and the level-0 raw cache (so returning to a photo reruns level
@@ -1712,6 +1744,7 @@ impl Window {
             thumbs: HashMap::new(),
             thumb_bytes: 0,
             developed: None,
+            histogram: None,
             memo: Memo::default(),
             pointer: (0, 0),
             pressed: false,
@@ -2163,12 +2196,31 @@ impl Window {
 
     /// Reports the developed image's fitted rectangle to the model as the
     /// crop drag's canvas, and the cursor photo's extent as the zoom's
-    /// measure: facts, so they do not bump the generation.
+    /// measure: facts, so they do not bump the generation; and the held
+    /// develop's histogram while the box shows it, the cursor photo's in
+    /// the same compare state whatever its edit, zoom or crop (the box
+    /// shows it until the next lands), which the pane paints: handed over
+    /// only when it changed.
     fn report_preview_fit(&mut self) {
         let fit = self.preview_fit();
         self.session.ui.set_preview_fit(fit);
         let extent = self.zoom_extent();
         self.session.ui.set_zoom_extent(extent);
+        let wanted = self.wanted_preview();
+        let held = self
+            .histogram
+            .as_ref()
+            .filter(|(preview, _)| {
+                wanted.as_ref().is_some_and(|wanted| {
+                    preview.roll == wanted.roll
+                        && preview.name == wanted.name
+                        && preview.compare == wanted.compare
+                })
+            })
+            .map(|(_, histogram)| histogram);
+        if self.session.ui.histogram() != held {
+            self.session.ui.set_histogram(held.cloned());
+        }
     }
 
     /// Whether the held develop is the wanted one up to a centre the model
@@ -2295,7 +2347,11 @@ impl Window {
             match item {
                 Done::Thumb { key, image } => thumbs.push((key, image)),
                 // Only the newest develop matters; earlier ones are stale.
-                Done::Develop { preview, made } => developed = Some((preview, made)),
+                Done::Develop {
+                    preview,
+                    made,
+                    histogram,
+                } => developed = Some((preview, made, histogram)),
                 Done::Export { request, result } => self.exported(request, result),
                 Done::Auto { request, result } => self.measured(request, result),
                 Done::Match { request, result } => {
@@ -2319,7 +2375,7 @@ impl Window {
                 }
             }
         }
-        if let Some((preview, made)) = developed {
+        if let Some((preview, made, histogram)) = developed {
             // A develop for a roll no longer held (one from a previous roll
             // completing after a switch) is dropped, not shown or memoized;
             // either way the wants are recomputed, so the current roll's
@@ -2338,6 +2394,13 @@ impl Window {
                 // one to redraw the placeholder over any image a previous
                 // develop left in the box and to settle idle honestly.
                 touched |= wanted.as_ref() == Some(&preview);
+                // Held only beside the image it counts: a stale level the
+                // memo declines leaves the box its placeholder, and no
+                // histogram over it.
+                self.histogram = image
+                    .as_ref()
+                    .and(histogram)
+                    .map(|histogram| (preview.clone(), histogram));
                 self.developed = Some((preview, image));
             }
             self.wanted_at = None;
@@ -2581,6 +2644,7 @@ impl Window {
             self.thumbs.clear();
             self.thumb_bytes = 0;
             self.developed = None;
+            self.histogram = None;
             self.memo.clear();
             self.held = held;
         }
@@ -3472,7 +3536,7 @@ mod tests {
         let mut got = false;
         for _ in 0..2000 {
             for done in pool.collect().unwrap() {
-                if let Done::Develop { preview, made } = done {
+                if let Done::Develop { preview, made, .. } = done {
                     assert_eq!(preview.name, "x.NEF");
                     // The roll is not there, so it could not be made.
                     assert!(matches!(made, Made::None));

@@ -6918,7 +6918,28 @@ fn the_pane_s_contrast_row_slides_and_commits_the_contrast() {
     let row = adjusts[0].expect("a contrast row on 800x600");
     let buttons = layout.history_buttons();
     let top = buttons[0].unwrap().rect().y - 2;
-    assert_eq!(row.label.y, list.rect().y + i64::from(list.rect().height));
+    // The histogram's band is between the list and the rows: a cell in on
+    // each side, a quarter row under the list.
+    let foot = list.rect().y + i64::from(list.rect().height);
+    assert_eq!(
+        layout.histogram(),
+        Some(Rect {
+            x: 8,
+            y: foot + 6,
+            width: 200,
+            height: 90,
+        })
+    );
+    assert_eq!(row.label.y, foot + 96);
+    // At scale 2 the band is twice everything: 400 columns, 180 rows.
+    let mut big = Controller::new(Surface::new(1600, 1200, Scale::new(2).unwrap()).unwrap());
+    big.open("roll", b"/r", photos(3)).unwrap();
+    act(&mut big, "develop", &[]);
+    let layout2 = big.layout();
+    let band2 = layout2.histogram().expect("a band at scale 2");
+    assert_eq!((band2.x, band2.width, band2.height), (16, 400, 180));
+    let list2 = layout2.history().unwrap().rect();
+    assert_eq!(band2.y, list2.y + i64::from(list2.height) + 12);
     assert_eq!(row.label.y + (24 * ui::ADJUSTS.len()) as i64, top);
     assert_eq!(row.label.x, 8);
     assert_eq!(
@@ -7043,8 +7064,11 @@ fn the_pane_s_contrast_row_slides_and_commits_the_contrast() {
 
     // Short surfaces: the rows are laid in order, as many as leave the
     // list a row, the last giving way first; those laid lie wholly
-    // between the list and the buttons.
+    // between the list and the buttons. The histogram's band is laid
+    // only once every row is, and only while the list keeps a row over
+    // it.
     let (mut none, mut some) = (false, false);
+    let (mut banded, mut unbanded) = (false, false);
     for height in (40..=600).step_by(2) {
         let mut c = Controller::new(surface(800, height));
         c.open("roll", b"/r", photos(1)).unwrap();
@@ -7053,9 +7077,25 @@ fn the_pane_s_contrast_row_slides_and_commits_the_contrast() {
         let adjusts = layout.adjusts();
         let laid = adjusts.iter().take_while(|row| row.is_some()).count();
         assert!(adjusts[laid..].iter().all(Option::is_none), "{height}");
+        let band = match layout.histogram() {
+            Some(rect) => {
+                assert_eq!(laid, ui::ADJUSTS.len(), "{height}");
+                assert!(layout.history().is_some(), "{height}");
+                banded = true;
+                assert_eq!(rect.height, 90, "{height}");
+                96
+            }
+            None => {
+                unbanded |= laid == ui::ADJUSTS.len();
+                0
+            }
+        };
         match (layout.history(), adjusts[0]) {
             (Some(list), Some(row)) => {
-                assert_eq!(row.label.y, list.rect().y + i64::from(list.rect().height));
+                assert_eq!(
+                    row.label.y,
+                    list.rect().y + i64::from(list.rect().height) + band
+                );
                 assert!(row.slider.rect().y >= row.label.y, "{height}");
                 let rows = (24 * laid) as i64;
                 let buttons = layout.history_buttons();
@@ -7068,7 +7108,7 @@ fn the_pane_s_contrast_row_slides_and_commits_the_contrast() {
             (None, row) => assert_eq!(row, None, "{height}"),
         }
     }
-    assert!(none && some);
+    assert!(none && some && banded && unbanded);
 }
 
 /// The shadows are nudged a twentieth by `s` and `S` (`shadows-in`,
@@ -7491,8 +7531,9 @@ fn the_history_pane_takes_the_pointer_and_is_in_the_scene_frame() {
     assert_eq!(button(0).x, 8);
     assert_eq!(button(0).width, 64);
     assert_eq!(button(2).x + i64::from(button(2).width), 200);
-    // The labelled rows sit between the list and the buttons.
-    let rows = (ui::ADJUSTS.len() * 24) as i64;
+    // The histogram's band and the labelled rows sit between the list and
+    // the buttons.
+    let rows = ((ui::HISTOGRAM_ROWS + ui::ADJUSTS.len()) * 24) as i64;
     assert_eq!(
         button(0).y,
         list.rect().y + i64::from(list.rect().height) + rows + 2
@@ -10001,4 +10042,102 @@ fn the_lighting_is_nudged_set_and_slid_in_the_pane() {
             value: Some("1.00".to_string()),
         }]
     );
+}
+
+/// The histogram the adapter hands the model: a new one is a new
+/// generation and the same one again none; the pane paints it in its band
+/// over the labelled rows, each channel alone its colour and all three
+/// grey, and nothing there without one.
+#[test]
+fn the_pane_paints_the_shown_frames_histogram() {
+    use td_photo::histogram::Histogram;
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(1)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let band = c.layout().histogram().expect("a band on 800x600");
+    let colours = |c: &Controller| {
+        let frame = driven::paint(&c.scene()).unwrap();
+        let foot = (band.y + i64::from(band.height) - 1) as usize;
+        (0..band.width as usize)
+            .map(|x| {
+                let at = (foot * 800 + band.x as usize + x) * 3;
+                [frame.rgb[at], frame.rgb[at + 1], frame.rgb[at + 2]]
+            })
+            .collect::<Vec<[u8; 3]>>()
+    };
+    // Without a histogram the band is the pane's chrome.
+    let paper = colours(&c);
+    assert!(paper.windows(2).all(|pair| pair[0] == pair[1]), "{paper:?}");
+    // Red at 200, green at 100, blue at 50, and a grey at 150 all three
+    // share; at 120 red three times, green twice and blue once, the
+    // tallest column.
+    let mut pixels = vec![[200u8, 100, 50]; 10];
+    pixels.extend(vec![[150u8, 150, 150]; 10]);
+    pixels.extend(vec![[120u8, 120, 120]; 10]);
+    pixels.extend(vec![[120u8, 120, 0]; 10]);
+    pixels.extend(vec![[120u8, 0, 0]; 10]);
+    let image = td_photo::image::Rgb8 {
+        width: pixels.len(),
+        height: 1,
+        data: pixels.iter().flatten().copied().collect(),
+    };
+    let histogram = Histogram::of(&image).unwrap();
+    let generation = fields(&c)[GENERATION].clone();
+    c.set_histogram(Some(histogram.clone()));
+    assert_ne!(fields(&c)[GENERATION], generation);
+    let generation = fields(&c)[GENERATION].clone();
+    c.set_histogram(Some(histogram));
+    assert_eq!(fields(&c)[GENERATION], generation);
+    let painted = colours(&c);
+    // The column a value's bin lands in, 200 columns over 256 bins.
+    let column = |value: usize| {
+        (0..band.width as usize)
+            .find(|&c| c * 256 / 200 <= value && value < (c + 1) * 256 / 200)
+            .unwrap()
+    };
+    let (red, green, blue, grey) = (
+        [0xd0, 0x48, 0x48],
+        [0x48, 0xb0, 0x48],
+        [0x48, 0x68, 0xd8],
+        [0xa0, 0xa0, 0xa0],
+    );
+    assert_eq!(painted[column(200)], red);
+    assert_eq!(painted[column(100)], green);
+    assert_eq!(painted[column(50)], blue);
+    assert_eq!(painted[column(150)], grey);
+    // The tallest column from the foot up: a third grey, a third yellow,
+    // a third red, then the paper.
+    let frame = driven::paint(&c.scene()).unwrap();
+    let x = band.x as usize + column(120);
+    let at = |up: usize| {
+        let y = (band.y + i64::from(band.height)) as usize - 1 - up;
+        let i = (y * 800 + x) * 3;
+        [frame.rgb[i], frame.rgb[i + 1], frame.rgb[i + 2]]
+    };
+    let third = band.height as usize / 3;
+    assert_eq!(at(0), grey);
+    assert_eq!(at(third - 1), grey);
+    assert_eq!(at(third), [0xc8, 0xc0, 0x48]);
+    assert_eq!(at(2 * third - 1), [0xc8, 0xc0, 0x48]);
+    assert_eq!(at(2 * third), red);
+    assert_eq!(at(3 * third - 1), red);
+    assert_ne!(at(3 * third), red);
+    // Black holds the stacked column's green and blue zeros: cyan.
+    let cyan = [0x48, 0xb8, 0xc8];
+    assert_eq!(painted[0], cyan);
+    // The rest of the band's foot is one ground, the histogram's paper
+    // over the pane's chrome.
+    let ground: std::collections::BTreeSet<[u8; 3]> = painted
+        .iter()
+        .filter(|colour| ![red, green, blue, grey, cyan].contains(*colour))
+        .copied()
+        .collect();
+    assert_eq!(ground.len(), 1, "{ground:?}");
+    assert!(!ground.contains(&paper[0]));
+    c.set_histogram(None);
+    assert_eq!(colours(&c), paper);
+    // A roll opened lets the last one go.
+    c.set_histogram(Some(Histogram::of(&image).unwrap()));
+    c.open("roll", b"/r", photos(1)).unwrap();
+    assert_eq!(c.histogram(), None);
 }

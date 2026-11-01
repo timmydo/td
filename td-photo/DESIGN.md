@@ -2187,9 +2187,15 @@ room) of the cursor's photo in the area right of the history pane
 rest), its status marked `develop`, with the developed preview blitted into that
 box once it is made, and the pane at the area's left: the history list
 (`Layout::history`, a `chrome::List` over the pane's width, less the
-labelled rows and the band its buttons take), the labelled slider rows
-under it (`Layout::adjusts`, in order, as many as fit), and, on the
-band under them,
+histogram, the labelled rows and the band its buttons take), the shown
+frame's histogram under it (`Layout::histogram`, `HISTOGRAM_ROWS` rows a
+cell in on each side and a quarter row under the list, laid only once
+every labelled row is and while the list keeps a row over it; on paper,
+a column a pixel, each channel's height from the foot, the stretch all
+three reach grey, two their mix and one its colour; empty chrome with no
+histogram held), the labelled slider rows under that
+(`Layout::adjusts`, in order, as many as fit), and, on the band under
+them,
 the Toggle, Delete and Undo
 buttons (`Layout::history_buttons`, a `chrome::Buttons` strip on the pane's
 width, wrapping), Toggle and Delete enabled with a selection and Undo with a
@@ -2289,7 +2295,18 @@ box as the crop drag's canvas (`set_preview_fit`, a fact that no more moves the
 generation than the job count does) and the cursor photo's oriented, cropped
 extent at full resolution from the level 1 it holds current for it, the zoom
 ladder's and a pan's measure (`set_zoom_extent`, a fact the same way, `None`
-until a develop of the photo lands), serves the socket and hands the exports
+until a develop of the photo lands), and the histogram of the develop it
+holds while the box shows it, the cursor photo's in the compare state
+the model wants (`set_histogram`, handed over only when it changed,
+`None` while none is held; painted, so a new one is a new generation;
+counted by the pool's worker that made the develop, carried on its
+result, so the window's thread counts nothing). It is of what the box
+shows: the box-sized preview, so a small clipped highlight is averaged
+down and reads short; zoomed, the window in view, moving with a pan; in
+crop-adjust, the uncropped frame; comparing, the camera's JPEG; and a
+develop for a stale edit until the next lands. `--preview` makes its
+develop before it paints and hands its histogram over the same way. It
+then serves the socket and hands the exports
 the session queued this turn to the pool, each with the photo's cached level 0
 when the memo holds it, keyed by the request's own path (so a roll opened in
 the same turn never lends a like-named photo's frame) and held weakly, so the
@@ -2544,6 +2561,15 @@ corrupt samples counted and clamped; every container refusal (cycles,
 oversize counts, out-of-file offsets, a missing raw sub-image, an unknown
 compression, a non-Bayer pattern, oversize axes); and the maker-note facts
 of the reference file's header values.
+
+`tests/histogram.rs` pins `histogram`: each channel's counts of an 8-bit
+frame, none for an empty frame or a buffer not its axes' size, and the
+columns the pane paints, each the mean of the bins it spans, scaled so the
+tallest column spanning neither end bin is full height and a pile at
+black or white is held to full height rather than shrinking the rest, at
+fewer columns than bins and at 400 to 1024 (a band at scale 2 and up,
+where several columns lie on each end), the ends scaling themselves when
+nothing lies between them.
 
 `tests/develop.rs` pins the colour math against hand-computed values
 (neutral in, neutral out; the daylight multipliers of the Z 8 matrix; the
@@ -3001,7 +3027,15 @@ alone, the lighting nudged a twentieth by `i` and `I` and set by
 `lighting` (ignored in cull, each key's `Nudge` the action's, a lowering
 past -1.00 no change, a bad spelling `bad-argument`, its value last in
 `state` and `photo`, its row last in the pane and its drag committing
-the lighting alone), the look
+the lighting alone), the histogram's band between the list and the
+labelled rows at 800x600 and laid on a short surface only with every
+row and a list row over it, a histogram handed over a new generation
+and the same one none, and its paint each value's column at the foot
+in its channels' colour (one alone its own, all three grey, black's
+green and blue cyan), the tallest column grey, yellow and red a third
+each from the foot up, the rest of the foot one ground and the band
+without one the pane's chrome; at scale 2 the band twice the size, the
+look
 intensity nudged by `'` and `;` and set by `look-intensity` (ignored
 outside develop and without a look, a bad spelling `bad-argument`, a
 nudge past twice the look no write, a run and a set one step, the value
@@ -3411,7 +3445,9 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    Lighting: an Active D-Lighting-style local tone map, a develop key
    lifting dark neighbourhoods and holding bright ones about an
    edge-aware map of the frame's light, its keys `i`/`I`, action and
-   pane row. Landed.
+   pane row. Landed. (u) The histogram: the shown frame's channels in a
+   band over the pane's labelled rows, so an exposure's shift and a
+   shadow lift's stretch read apart. Landed.
 9. Later: DNG and JPEG rolls, the Nikon High Efficiency codec, a
    better full-resolution demosaic, highlight reconstruction, the
    `.dtstyle` translator, and ratings.
