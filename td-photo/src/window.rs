@@ -302,6 +302,11 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         .sidecar
         .as_ref()
         .map_or_else(crate::look::Tone::default, library::Sidecar::tone);
+    let clarity = photo
+        .sidecar
+        .as_ref()
+        .and_then(|sidecar| sidecar.clarity())
+        .unwrap_or(0);
     let look = photo
         .sidecar
         .as_ref()
@@ -315,6 +320,7 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         exposure,
         contrast,
         tone,
+        clarity,
         look,
         crop,
         session.ui.zoom(),
@@ -358,6 +364,8 @@ struct Preview {
     exposure: i32,
     contrast: i32,
     tone: crate::look::Tone,
+    /// Hundredths of clarity.
+    clarity: i32,
     look: Option<String>,
     /// Hundredths of the look applied.
     look_intensity: i32,
@@ -989,6 +997,8 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
         threads,
         look: look.as_ref(),
         look_intensity: crate::intensity_share(preview.look_intensity),
+        clarity: preview.clarity as f32 / 100.0,
+        clarity_base: None,
     };
     // Level 2 to the shown frame, at this box, exposure, contrast and look.
     let frame = |level2: &develop::Level2, meta: &crate::Meta| {
@@ -999,8 +1009,16 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
     // frame.
     let zoomed = |level1: &develop::Level1, raw: Option<&crate::RawFrame>, meta: &crate::Meta| {
         let zoom = preview.zoom().ok_or_else(|| "no zoom".to_string())?;
-        let level2 = crate::zoom_level2(level1, raw, meta, crop, zoom, threads)?;
-        frame(&level2, meta)
+        crate::zoom_frame(
+            level1,
+            raw,
+            meta,
+            crop,
+            zoom,
+            preview.box_w,
+            preview.box_h,
+            &params,
+        )
     };
     // Level 1 to its fit level 2 and the frame -- the zoomed one when the
     // preview zooms, the fit level 2 kept either way -- shared by the
@@ -2375,6 +2393,11 @@ impl Window {
                 .sidecar
                 .as_ref()
                 .map_or_else(crate::look::Tone::default, library::Sidecar::tone),
+            clarity: photo
+                .sidecar
+                .as_ref()
+                .and_then(|sidecar| sidecar.clarity())
+                .unwrap_or(0),
             look,
             look_intensity,
             zoom: ui.zoom(),
@@ -2777,6 +2800,7 @@ mod tests {
             exposure: 0,
             contrast: 0,
             tone: crate::look::Tone::default(),
+            clarity: 0,
             look: None,
             look_intensity: 100,
             zoom: None,
@@ -2872,6 +2896,7 @@ mod tests {
             exposure: 0,
             contrast: 0,
             tone: crate::look::Tone::default(),
+            clarity: 0,
             crop: None,
             look: None,
             look_intensity: 100,
@@ -3318,6 +3343,13 @@ mod tests {
         };
         assert_ne!(a_tone, a);
         assert_eq!(memo.plan(&a_tone).stage(), Stage::Level3);
+        // So is the clarity's.
+        let a_clear = Preview {
+            clarity: 30,
+            ..a.clone()
+        };
+        assert_ne!(a_clear, a);
+        assert_eq!(memo.plan(&a_clear).stage(), Stage::Level3);
         // So is a look intensity edit alone.
         let a_share = Preview {
             look_intensity: 40,
@@ -3551,6 +3583,7 @@ mod tests {
             exposure: 0,
             contrast: 0,
             tone: crate::look::Tone::default(),
+            clarity: 0,
             crop: None,
             look: None,
             look_intensity: 100,

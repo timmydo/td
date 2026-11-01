@@ -695,6 +695,8 @@ fn the_contrast_is_a_tone_about_grey_before_the_look() {
                 threads: 2,
                 look,
                 look_intensity: 1.0,
+                clarity: 0.0,
+                clarity_base: None,
             },
         )
         .unwrap()
@@ -756,6 +758,8 @@ fn the_pipeline_applies_the_look_after_the_matrix() {
                 threads: 2,
                 look,
                 look_intensity: 1.0,
+                clarity: 0.0,
+                clarity_base: None,
             },
         )
         .unwrap()
@@ -809,6 +813,8 @@ fn the_look_intensity_takes_a_share_of_the_look() {
                 threads: 2,
                 look,
                 look_intensity,
+                clarity: 0.0,
+                clarity_base: None,
             },
         )
         .unwrap()
@@ -998,6 +1004,8 @@ fn the_photo_s_adjustments_are_one_look() {
                 threads: 2,
                 look: None,
                 look_intensity: 1.0,
+                clarity: 0.0,
+                clarity_base: None,
             },
         )
         .unwrap()

@@ -46,26 +46,28 @@ const HELP: &str = concat!(
     "  preview and prints their statistics and hashes.\n",
     "td-photo develop FILE OUT.ppm [--long-edge N] [--exposure STOPS]\n",
     "                 [--contrast C] [--highlights A] [--shadows A]\n",
-    "                 [--whites A] [--blacks A] [--look STEM]\n",
-    "                 [--look-intensity I] [--crop \"X Y W H\"]\n",
+    "                 [--whites A] [--blacks A] [--clarity A]\n",
+    "                 [--look STEM] [--look-intensity I]\n",
+    "                 [--crop \"X Y W H\"]\n",
     "  Develops the raw to 8-bit sRGB at most N pixels on the long side\n",
     "  (default 1600) with an exposure offset in stops (default 0), the\n",
     "  contrast C (-1.00 to 1.00, the tone's steepness about grey 2^C;\n",
     "  default 0), the tonal regions' amounts A (-1.00 to 1.00 each,\n",
     "  default 0: the highlights and shadows lowered or raised, the white\n",
-    "  and black ends moved), the look STEM (see looks; default none) at the\n",
-    "  intensity I (0.00 to 2.00, the share of the look; default 1.00)\n",
-    "  and the crop\n",
-    "  \"X Y W H\", four fractions of the oriented frame as the sidecar\n",
-    "  spells it (default the whole frame), written through a fresh\n",
+    "  and black ends moved), the clarity A (-1.00 to 1.00, local contrast\n",
+    "  raised or smoothed; default 0), the look STEM (see looks; default\n",
+    "  none) at the intensity I (0.00 to 2.00, the share of the look;\n",
+    "  default 1.00) and the crop \"X Y W H\", four fractions of the\n",
+    "  oriented frame as the sidecar spells it (default the whole frame),\n",
+    "  written through a fresh\n",
     "  OUT.ppm.tmp and linked into place. OUT.ppm must not exist: td-photo\n",
     "  never overwrites a file.\n",
     "td-photo export FILE [--format jpeg|avif] [--quality N]\n",
     "                 [--long-edge N|full]\n",
     "  Renders FILE's raw at full resolution (a bilinear demosaic, in row\n",
-    "  bands) with its sidecar's exposure, contrast, tonal regions, crop,\n",
-    "  look and look intensity, shrinks\n",
-    "  it to N pixels on the long side when --long-edge asks (default full,\n",
+    "  bands) with its sidecar's exposure, contrast, tonal regions,\n",
+    "  clarity, crop, look and look intensity, shrinks it to N pixels on\n",
+    "  the long side when --long-edge asks (default full,\n",
     "  never enlarged), and writes it as a JPEG (4:4:4; the default) or an\n",
     "  AVIF (8-bit 4:2:0) at --quality 1 to 100 (default 92) into exported/\n",
     "  beside FILE: STEM.jpg, or STEM-2.jpg, STEM-3.jpg ... when that name\n",
@@ -112,8 +114,9 @@ const HELP: &str = concat!(
     "  alone, and the run fails after the rest. SRC is never written.\n",
     "td-photo list ROLL [--picks | --rejects | --unflagged]\n",
     "  One line per original in ROLL: name, flag, exposure, contrast,\n",
-    "  crop, look, look intensity, highlights, shadows, whites, blacks and\n",
-    "  the sidecar's state (none, ok, or error and why), tab-separated.\n",
+    "  crop, look, look intensity, highlights, shadows, whites, blacks,\n",
+    "  clarity and the sidecar's state (none, ok, or error and why),\n",
+    "  tab-separated.\n",
     "td-photo flag FILE pick | reject | clear\n",
     "  Sets or clears the cull flag in FILE's sidecar.\n",
     "td-photo delete-rejected ROLL\n",
@@ -127,7 +130,8 @@ const HELP: &str = concat!(
     "  Prints FILE's sidecar, or sets exposure STOPS (-5.00 to 5.00),\n",
     "  contrast C (-1.00 to 1.00), crop X Y W H (fractions to four\n",
     "  decimals), look STEM, look-intensity I (0.00 to 2.00), highlights,\n",
-    "  shadows, whites or blacks A (-1.00 to 1.00) or flag pick|reject;\n",
+    "  shadows, whites, blacks or clarity A (-1.00 to 1.00) or flag\n",
+    "  pick|reject;\n",
     "  a VALUE of - clears the key. A develop key set is a step of the\n",
     "  sidecar's history (step-N lines, the keys their summary); auto\n",
     "  chooses exposure and contrast from the photo's tones over its crop\n",
@@ -559,6 +563,7 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
             "--shadows",
             "--whites",
             "--blacks",
+            "--clarity",
             "--look",
             "--look-intensity",
             "--crop",
@@ -599,6 +604,11 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
         whites: tone_flag("--whites", Key::Whites)?,
         blacks: tone_flag("--blacks", Key::Blacks)?,
     };
+    let clarity = match option(rest, "--clarity")? {
+        Some(text) => library::clarity(&text)
+            .map_err(|_| format!("--clarity {text:?} is not D.DD in -1.00..=1.00"))?,
+        None => 0,
+    };
     let look_intensity = match option(rest, "--look-intensity")? {
         Some(text) => library::look_intensity(&text)
             .map_err(|_| format!("--look-intensity {text:?} is not D.DD in 0.00..=2.00"))?,
@@ -629,6 +639,8 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
         threads,
         look: look.as_ref(),
         look_intensity: intensity_share(look_intensity),
+        clarity: clarity as f32 / 100.0,
+        clarity_base: None,
     };
     let (image, info) = develop_raw(path, crop, long_edge, &params)?;
     write_atomically(out, &image)?;
@@ -847,16 +859,52 @@ pub(crate) fn zoom_level2(
     crop: Option<[f32; 4]>,
     zoom: develop::Zoom,
     threads: usize,
-) -> Result<develop::Level2, String> {
-    let view = develop::viewport(level1.width, level1.height, crop, meta.orientation, zoom)
-        .map_err(|e| e.to_string())?;
+) -> Result<(develop::Level2, [f32; 4]), String> {
+    let (view, frame) =
+        develop::viewport_framed(level1.width, level1.height, crop, meta.orientation, zoom)
+            .map_err(|e| e.to_string())?;
     if zoom.percent <= develop::HALF_ZOOM {
         return develop::zoom_level2(level1, view, meta.orientation, threads)
+            .map(|level2| (level2, frame))
             .map_err(|e| e.to_string());
     }
     let raw = raw.ok_or_else(|| "a zoom past half needs the frame".to_string())?;
     develop::zoom_level2_full(&raw.source(), view, meta.orientation, threads)
+        .map(|level2| (level2, frame))
         .map_err(|e| e.to_string())
+}
+
+/// A zoomed frame: the zoomed level 2 (`zoom_level2`) to the frame at
+/// `params`, its clarity, when it has one, reading the whole frame's map
+/// (`develop::clarity_base`, from level 1) at the window's place, so a
+/// zoom shows the clarity the fit does. What the window and `--preview`
+/// both run for a zoomed box.
+// The zoomed develop's inputs, as the window's preview key names them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn zoom_frame(
+    level1: &develop::Level1,
+    raw: Option<&RawFrame>,
+    meta: &Meta,
+    crop: Option<[f32; 4]>,
+    zoom: develop::Zoom,
+    box_w: usize,
+    box_h: usize,
+    params: &Params<'_>,
+) -> Result<Rgb8, String> {
+    let (level2, frame) = zoom_level2(level1, raw, meta, crop, zoom, params.threads)?;
+    let map = if params.clarity != 0.0 {
+        Some(
+            develop::clarity_base(level1, crop, meta.orientation, meta.wb, &meta.color, params)
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let params = Params {
+        clarity_base: map.as_ref().map(|map| develop::ClarityBase { map, frame }),
+        ..*params
+    };
+    level2_frame(&level2, meta, box_w, box_h, &params)
 }
 
 /// The oriented, cropped image's extent at full resolution for a level 1:
@@ -933,6 +981,7 @@ fn develop_preview(
     exposure: i32,
     contrast: i32,
     tone: look::Tone,
+    clarity: i32,
     look: Option<(&str, i32)>,
     crop: Option<library::Crop>,
     zoom: Option<(u32, (u32, u32))>,
@@ -957,6 +1006,8 @@ fn develop_preview(
         threads,
         look: look.as_ref(),
         look_intensity: intensity_share(intensity),
+        clarity: clarity as f32 / 100.0,
+        clarity_base: None,
     };
     let crop = crop.map(crop_fractions);
     let made = match zoom {
@@ -971,8 +1022,16 @@ fn develop_preview(
                     box_w,
                     box_h,
                 };
-                let level2 = zoom_level2(&level1, Some(&raw), &raw.meta, crop, zoom, threads)?;
-                level2_frame(&level2, &raw.meta, box_w, box_h, &params)
+                zoom_frame(
+                    &level1,
+                    Some(&raw),
+                    &raw.meta,
+                    crop,
+                    zoom,
+                    box_w,
+                    box_h,
+                    &params,
+                )
             })
             .map_err(|e| format!("{}: {e}", path.display())),
         None => develop_raw(&path, crop, long_edge, &params).and_then(|(image, _)| {
@@ -999,7 +1058,7 @@ const EXPORT_BAND_ROWS: usize = 64;
 const MAX_EXPORT_NAMES: u32 = 1000;
 
 /// One export as asked for: the original and its sidecar's exposure, contrast,
-/// tonal regions, crop and look with its intensity as the file held them when the export was asked for, and the
+/// tonal regions, clarity, crop and look with its intensity as the file held them when the export was asked for, and the
 /// settings it is written with, so the verb, the replay and the window's pool
 /// job develop the same thing. The look is a stem here and resolved where the
 /// export runs.
@@ -1009,6 +1068,8 @@ pub(crate) struct ExportRequest {
     pub(crate) exposure: i32,
     pub(crate) contrast: i32,
     pub(crate) tone: look::Tone,
+    /// Hundredths of clarity.
+    pub(crate) clarity: i32,
     pub(crate) crop: Option<library::Crop>,
     pub(crate) look: Option<String>,
     /// Hundredths of the look applied.
@@ -1129,6 +1190,8 @@ pub(crate) fn auto_measure(
         threads,
         look: None,
         look_intensity: 1.0,
+        clarity: 0.0,
+        clarity_base: None,
     };
     let image = develop::render(
         &level1,
@@ -1238,6 +1301,7 @@ pub(crate) fn export_request(path: &Path, settings: Settings) -> Result<ExportRe
         exposure: sidecar.exposure().unwrap_or(0),
         contrast: sidecar.contrast().unwrap_or(0),
         tone: sidecar.tone(),
+        clarity: sidecar.clarity().unwrap_or(0),
         crop: sidecar.crop(),
         look: sidecar.look().map(str::to_string),
         look_intensity: sidecar.look_intensity(),
@@ -1394,6 +1458,41 @@ pub(crate) fn export_file(
     } else {
         None
     };
+    let transfer = Transfer::srgb();
+    let params = Params {
+        exposure: stops,
+        contrast: contrast.as_ref(),
+        threads,
+        look: look.as_ref(),
+        look_intensity: intensity_share(request.look_intensity),
+        clarity: request.clarity as f32 / 100.0,
+        clarity_base: None,
+    };
+    // Each band reads the whole frame's clarity map at its rows
+    // (`develop::export_band`); the map is made from level 1 first.
+    let map = if request.clarity != 0 {
+        let level1 = raw_level1(frame, threads)?;
+        Some(
+            develop::clarity_base(
+                &level1,
+                crop,
+                meta.orientation,
+                meta.wb,
+                &meta.color,
+                &params,
+            )
+            .map_err(|e| format!("{}: {e}", path.display()))?,
+        )
+    } else {
+        None
+    };
+    let params = Params {
+        clarity_base: map.as_ref().map(|map| develop::ClarityBase {
+            map,
+            frame: [0.0, 0.0, 1.0, 1.0],
+        }),
+        ..params
+    };
     // The folder is made once there is something to put in it, so a raw
     // that cannot be developed or shrunk leaves the roll as it was.
     let dir = own_folder(&roll, library::EXPORTED)?;
@@ -1404,14 +1503,6 @@ pub(crate) fn export_file(
         .create_new(true)
         .open(&temporary)
         .map_err(|e| format!("{}: {e}", temporary.display()))?;
-    let transfer = Transfer::srgb();
-    let params = Params {
-        exposure: stops,
-        contrast: contrast.as_ref(),
-        threads,
-        look: look.as_ref(),
-        look_intensity: intensity_share(request.look_intensity),
-    };
     let mut write = |file: fs::File| -> Result<(), String> {
         let mut writer = BufWriter::new(file);
         let mut encoder = Output::open(request.settings, out_w, out_h, threads)?;
@@ -2719,7 +2810,7 @@ fn edit(path: &Path, rest: &[OsString]) -> Result<(), String> {
     while let Some((name, tail)) = words.split_first() {
         let key = Key::parse(name).ok_or_else(|| {
             format!(
-                "{name}: not a sidecar key (flag, exposure, contrast, crop, look, look-intensity, highlights, shadows, whites, blacks)"
+                "{name}: not a sidecar key (flag, exposure, contrast, crop, look, look-intensity, highlights, shadows, whites, blacks, clarity)"
             )
         })?;
         let take = match key {
@@ -2768,14 +2859,15 @@ fn list(roll: &Path, rest: &[OsString]) -> Result<(), String> {
         let tone: Vec<String> = Key::TONE.iter().map(|&key| column(key)).collect();
         writeln!(
             out,
-            "{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{status}",
+            "{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{status}",
             column(Key::Flag),
             column(Key::Exposure),
             column(Key::Contrast),
             column(Key::Crop),
             column(Key::Look),
             column(Key::LookIntensity),
-            tone.join("\t")
+            tone.join("\t"),
+            column(Key::Clarity)
         )
         .map_err(|e| e.to_string())?;
     }

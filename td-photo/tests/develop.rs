@@ -16,9 +16,10 @@ use td_photo::color::{
     self, apply, camera_color, invert, multiply, srgb_encode, Transfer, MIDDLE_GREY,
 };
 use td_photo::develop::{
-    self, bilinear, export_band, export_geometry, extent, fit, fit_zoom, level2, level3, orient,
-    resample, resample_u16, superpixel, viewport, zoom_level2, zoom_level2_full, Export, Level1,
-    Level2, Params, Region, Source, Viewport, Zoom, CENTRE_UNIT, HALF_ZOOM, ZOOM_STEPS,
+    self, bilinear, clarity_base, export_band, export_geometry, extent, fit, fit_zoom, level2,
+    level3, orient, resample, resample_u16, superpixel, viewport, viewport_framed, zoom_level2,
+    zoom_level2_full, ClarityBase, ClarityMap, Export, Level1, Level2, Params, Region, Source,
+    Viewport, Zoom, CENTRE_UNIT, HALF_ZOOM, ZOOM_STEPS,
 };
 use td_photo::image::Rgb8;
 use td_photo::look::Look;
@@ -403,6 +404,8 @@ fn render_develops_neutral_patches_to_expected_values() {
             threads: 2,
             look: None,
             look_intensity: 1.0,
+            clarity: 0.0,
+            clarity_base: None,
         },
     )
     .unwrap();
@@ -434,6 +437,8 @@ fn render_develops_neutral_patches_to_expected_values() {
             threads: 1,
             look: None,
             look_intensity: 1.0,
+            clarity: 0.0,
+            clarity_base: None,
         },
     )
     .unwrap();
@@ -457,6 +462,8 @@ fn render_develops_neutral_patches_to_expected_values() {
             threads: 1,
             look: None,
             look_intensity: 1.0,
+            clarity: 0.0,
+            clarity_base: None,
         },
     )
     .unwrap();
@@ -519,6 +526,8 @@ fn the_levels_split_composes_to_render() {
                     threads: 3,
                     look: look_opt,
                     look_intensity: 1.0,
+                    clarity: 0.0,
+                    clarity_base: None,
                 };
                 let new = develop::render(
                     &level1,
@@ -566,6 +575,8 @@ fn the_levels_split_composes_to_render() {
         threads: 1,
         look: None,
         look_intensity: 1.0,
+        clarity: 0.0,
+        clarity_base: None,
     };
     assert_eq!(
         level3(
@@ -610,6 +621,8 @@ fn a_crop_selects_the_oriented_region_for_every_orientation() {
         threads: 3,
         look: None,
         look_intensity: 1.0,
+        clarity: 0.0,
+        clarity_base: None,
     };
     // A long edge past the frame, so fit never shrinks and the compare is
     // exact; the same fractions land on pixel boundaries at either orientation.
@@ -680,6 +693,8 @@ fn a_degenerate_or_edge_crop_is_refused_not_panicked() {
         threads: 1,
         look: None,
         look_intensity: 1.0,
+        clarity: 0.0,
+        clarity_base: None,
     };
     let refused = |crop: [f32; 4], orientation: u16| {
         develop::render(
@@ -762,6 +777,8 @@ fn render_reduces_orients_and_refuses_bad_buffers() {
         threads: 3,
         look: None,
         look_intensity: 1.0,
+        clarity: 0.0,
+        clarity_base: None,
     };
     let small = develop::render(
         &level1,
@@ -951,6 +968,8 @@ fn resampler_and_demosaic_refuse_oversize_and_overflowing_axes() {
         threads: 1,
         look: None,
         look_intensity: 1.0,
+        clarity: 0.0,
+        clarity_base: None,
     };
     for (width, height) in [(usize::MAX, 1), (1, usize::MAX), (16385, 1), (0, 4)] {
         let bad = Level1 {
@@ -1008,6 +1027,8 @@ fn work_is_the_same_on_one_thread_and_many() {
             threads,
             look: None,
             look_intensity: 1.0,
+            clarity: 0.0,
+            clarity_base: None,
         };
         develop::render(&one, None, 17, 8, wb, &color, &transfer, &params).unwrap()
     };
@@ -1321,6 +1342,8 @@ fn export_bands_concatenate_to_the_whole_at_every_orientation() {
         threads: 3,
         look: None,
         look_intensity: 1.0,
+        clarity: 0.0,
+        clarity_base: None,
     };
     let whole = |crop: Option<[f32; 4]>, orientation: u16| -> Rgb8 {
         let export = export_geometry(&source, crop, orientation).unwrap();
@@ -1721,4 +1744,229 @@ fn orient_f32(rgb: &[f32], w: usize, h: usize, orientation: u16) -> (Vec<f32>, u
         out.extend_from_slice(&rgb[from * 3..from * 3 + 3]);
     }
     (out, turned.width, turned.height)
+}
+
+// ----------------------------------------------------------------- clarity
+
+/// A frame of midtones with a fine texture over a broad ramp, neutral
+/// under the daylight balance: what clarity raises or smooths.
+fn textured(w: usize, h: usize, wb: [f32; 3]) -> Level1 {
+    let mut pixels = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let texture = if (x / 2 + y / 2) % 2 == 0 { 1.25 } else { 0.8 };
+            let v = 0.12 * texture * (1.0 + x as f32 / w as f32);
+            pixels.push([v / wb[0], v / wb[1], v / wb[2]]);
+        }
+    }
+    level1_of(&pixels, w, h)
+}
+
+fn clarity_params(clarity: f32) -> Params<'static> {
+    Params {
+        exposure: 0.0,
+        contrast: None,
+        threads: 3,
+        look: None,
+        look_intensity: 1.0,
+        clarity,
+        clarity_base: None,
+    }
+}
+
+/// The mean and the mean absolute step between horizontal neighbours of
+/// an 8-bit image's green: its level and its local contrast.
+fn level_and_texture(image: &Rgb8) -> (f32, f32) {
+    let green: Vec<f32> = image.data.chunks(3).map(|p| f32::from(p[1])).collect();
+    let mean = green.iter().sum::<f32>() / green.len() as f32;
+    let mut steps = 0.0;
+    let mut count = 0;
+    for row in green.chunks(image.width) {
+        for pair in row.windows(2) {
+            steps += (pair[1] - pair[0]).abs();
+            count += 1;
+        }
+    }
+    (mean, steps / count as f32)
+}
+
+#[test]
+fn clarity_raises_and_smooths_local_contrast_about_the_blurred_frame() {
+    let color = camera_color(&z8().xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let wb = color.daylight;
+    let level1 = textured(64, 48, wb);
+    let whole = level2(&level1, None, 64, 1, 3).unwrap();
+    let render = |clarity: f32| level3(&whole, wb, &color, &transfer, &clarity_params(clarity));
+    let plain = render(0.0).unwrap();
+    // None, or NaN, is the plain frame.
+    assert_eq!(render(f32::NAN).unwrap(), plain);
+    let (level, texture) = level_and_texture(&plain);
+    let (up_level, up) = level_and_texture(&render(1.0).unwrap());
+    let (down_level, down) = level_and_texture(&render(-1.0).unwrap());
+    assert!(up > texture * 1.2, "{up} {texture}");
+    assert!(down < texture * 0.8, "{down} {texture}");
+    // About the blur: the frame's level is held.
+    assert!(close(up_level, level, 3.0), "{up_level} {level}");
+    assert!(close(down_level, level, 3.0), "{down_level} {level}");
+    // Amounts past one are held to it.
+    assert_eq!(render(3.0).unwrap(), render(1.0).unwrap());
+    // A map that is not finite leaves every pixel as it was.
+    for bad in [f32::NAN, f32::INFINITY] {
+        let map = ClarityMap {
+            width: 2,
+            height: 2,
+            p: vec![bad; 4],
+        };
+        let based = Params {
+            clarity_base: Some(ClarityBase {
+                map: &map,
+                frame: [0.0, 0.0, 1.0, 1.0],
+            }),
+            ..clarity_params(1.0)
+        };
+        assert_eq!(
+            level3(&whole, wb, &color, &transfer, &based).unwrap(),
+            plain
+        );
+    }
+    // A flat frame has no local contrast to move.
+    let flat = level1_of(
+        &vec![[0.2 / wb[0], 0.2 / wb[1], 0.2 / wb[2]]; 40 * 30],
+        40,
+        30,
+    );
+    let flat = level2(&flat, None, 40, 1, 3).unwrap();
+    let flat_plain = level3(&flat, wb, &color, &transfer, &clarity_params(0.0)).unwrap();
+    for clarity in [-1.0, 1.0] {
+        let moved = level3(&flat, wb, &color, &transfer, &clarity_params(clarity)).unwrap();
+        assert!(moved
+            .data
+            .iter()
+            .zip(&flat_plain.data)
+            .all(|(a, b)| a.abs_diff(*b) <= 1));
+    }
+}
+
+#[test]
+fn a_zoom_and_an_export_band_read_the_whole_frames_clarity() {
+    let color = camera_color(&z8().xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let wb = color.daylight;
+    let (w, h) = (48usize, 36usize);
+    let level1 = textured(w, h, wb);
+    // At half zoom the window is level 1 as it is, so with the whole
+    // frame's map it must develop to that window of the whole frame
+    // developed at its own size, which makes its own map from the same
+    // pixels (both under `CLARITY_EDGE`).
+    let params = clarity_params(0.8);
+    for (crop, orientation) in [1u16, 3, 6, 8]
+        .into_iter()
+        .flat_map(|o| [(None, o), (Some([0.25f32, 0.125, 0.5, 0.75]), o)])
+    {
+        let whole = level2(&level1, crop, 100, orientation, 2).unwrap();
+        let fit = level3(&whole, wb, &color, &transfer, &params).unwrap();
+        let map = clarity_base(&level1, crop, orientation, wb, &color, &params).unwrap();
+        let (bw, bh) = (10usize, 8usize);
+        let centre = (CENTRE_UNIT / 3, CENTRE_UNIT * 2 / 3);
+        let (view, frame) =
+            viewport_framed(w, h, crop, orientation, zoom(HALF_ZOOM, centre, bw, bh)).unwrap();
+        assert_eq!(
+            viewport(w, h, crop, orientation, zoom(HALF_ZOOM, centre, bw, bh)).unwrap(),
+            view
+        );
+        let zoomed = zoom_level2(&level1, view, orientation, 2).unwrap();
+        let based = Params {
+            clarity_base: Some(ClarityBase { map: &map, frame }),
+            ..params
+        };
+        let shown = level3(&zoomed, wb, &color, &transfer, &based).unwrap();
+        let ox = (frame[0] * whole.width as f32).round() as usize;
+        let oy = (frame[1] * whole.height as f32).round() as usize;
+        assert_eq!((shown.width, shown.height), (bw, bh));
+        for y in 0..bh {
+            for x in 0..bw {
+                let (a, b) = (
+                    shown.pixel(x, y).unwrap(),
+                    fit.pixel(ox + x, oy + y).unwrap(),
+                );
+                assert!(
+                    a.iter().zip(&b).all(|(a, b)| a.abs_diff(*b) <= 1),
+                    "{crop:?} {orientation} {x} {y} {a:?} {b:?}"
+                );
+            }
+        }
+        // Without the base the zoom would blur its own window instead.
+        let alone = level3(&zoomed, wb, &color, &transfer, &params).unwrap();
+        assert_ne!(alone, shown);
+    }
+
+    // An export band reads the map at its rows: the bands concatenate to
+    // the whole in one band. A map that differs down the frame shows a
+    // band reading the wrong rows.
+    let (sw, sh) = (14usize, 10usize);
+    let samples: Vec<u16> = (0..sw * sh)
+        .map(|i| 1100 + 300 * ((i % sw / 2 + i / sw / 2) % 2) as u16)
+        .collect();
+    let decoded = frame(sw, sh, samples);
+    let source = Source {
+        decoded: &decoded,
+        cfa: Cfa::RGGB,
+        crop: Crop {
+            left: 1,
+            top: 1,
+            width: 12,
+            height: 8,
+        },
+        black: 1008,
+        white: 15892,
+    };
+    let export = export_geometry(&source, None, 1).unwrap();
+    let ramp = ClarityMap {
+        width: 4,
+        height: 4,
+        p: (0..16).map(|i| 0.1 * (i / 4) as f32).collect(),
+    };
+    let params = Params {
+        exposure: 2.5,
+        ..clarity_params(1.0)
+    };
+    let band = |first: usize, rows: usize, params: &Params<'_>| {
+        export_band(
+            &source,
+            &export,
+            first,
+            rows,
+            color.daylight,
+            &color,
+            &transfer,
+            params,
+        )
+    };
+    // Clarity on part of the frame needs the whole frame's map.
+    assert_eq!(
+        band(0, export.height, &params).unwrap_err(),
+        develop::Error::Clarity
+    );
+    assert!(band(0, export.height, &clarity_params(0.0)).is_ok());
+    let based = Params {
+        clarity_base: Some(ClarityBase {
+            map: &ramp,
+            frame: [0.0, 0.0, 1.0, 1.0],
+        }),
+        ..params
+    };
+    let one = band(0, export.height, &based).unwrap();
+    for size in [1usize, 2, 3] {
+        let mut data = Vec::new();
+        let mut first = 0;
+        while first < export.height {
+            let rows = size.min(export.height - first);
+            data.extend(band(first, rows, &based).unwrap().data);
+            first += rows;
+        }
+        assert_eq!(data, one.data, "{size}");
+    }
+    let plain = band(0, export.height, &clarity_params(0.0)).unwrap();
+    assert_ne!(one.data, plain.data);
 }

@@ -1586,6 +1586,25 @@ fn the_command_line_probes_and_develops_without_overwriting() {
         assert!(ok, "{stderr}");
         std::fs::read(&out).unwrap()
     };
+    // Clarity blurs a share of the frame, under a pixel at 16: a larger
+    // edge shows it.
+    let clear = |name: &str, amount: &str| {
+        let out = dir.join(name);
+        let (ok, _, stderr) = run(&[
+            OsStr::new("develop"),
+            file.as_os_str(),
+            out.as_os_str(),
+            OsStr::new("--long-edge"),
+            OsStr::new("96"),
+            OsStr::new("--clarity"),
+            OsStr::new(amount),
+        ]);
+        assert!(ok, "{stderr}");
+        std::fs::read(&out).unwrap()
+    };
+    let unclear = clear("clarity-0.ppm", "0.00");
+    assert_ne!(clear("clarity-1.ppm", "1.00"), unclear);
+    assert_ne!(clear("clarity-m.ppm", "-1.00"), unclear);
     for flag in ["--highlights", "--shadows", "--whites", "--blacks"] {
         let stem = flag.trim_start_matches('-');
         assert_eq!(develop_with(&format!("{stem}-0.ppm"), flag, "0.00"), plain);
@@ -1705,6 +1724,18 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     assert!(!ok);
     assert!(
         stderr.contains("--shadows \"1.50\" is not D.DD in -1.00..=1.00"),
+        "{stderr}"
+    );
+    let (ok, _, stderr) = run(&[
+        OsStr::new("develop"),
+        file.as_os_str(),
+        x.as_os_str(),
+        OsStr::new("--clarity"),
+        OsStr::new("-1.50"),
+    ]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("--clarity \"-1.50\" is not D.DD in -1.00..=1.00"),
         "{stderr}"
     );
     let (ok, _, stderr) = run(&[
@@ -1896,6 +1927,8 @@ fn the_command_line_exports_into_the_rolls_folder() {
             threads: 2,
             look: None,
             look_intensity: 1.0,
+            clarity: 0.0,
+            clarity_base: None,
         },
     )
     .unwrap();
@@ -1996,6 +2029,17 @@ fn the_command_line_exports_into_the_rolls_folder() {
         mean(&lifted.data),
         mean(&decoded.data)
     );
+    // Clarity reaches the export, whose bands read the frame's map.
+    std::fs::write(&sidecar, "td-photo edit 1\nclarity 1.00\n").unwrap();
+    let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("DSC_0001-8.jpg"), "{stdout}");
+    let clearer = td_jpeg::decode(
+        &std::fs::read(exported.join("DSC_0001-8.jpg")).unwrap(),
+        td_jpeg::Scale::Full,
+    )
+    .unwrap();
+    assert_ne!(clearer.data, decoded.data);
     std::fs::write(
         &sidecar,
         "td-photo edit 1\ncrop 0.2000 0.3000 0.5000 0.4000\n",

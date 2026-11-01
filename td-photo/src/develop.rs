@@ -11,7 +11,7 @@
 use std::fmt;
 use std::sync::Mutex;
 
-use crate::color::{apply, CameraColor, Matrix, Transfer};
+use crate::color::{apply, CameraColor, Matrix, Transfer, LUMA};
 use crate::image::{Rgb8, MAX_AXIS, MAX_IMAGE_PIXELS};
 use crate::look::Look;
 use crate::nef::{Cfa, Channel, Crop, Decoded, MAX_RAW_SAMPLES};
@@ -33,6 +33,9 @@ pub enum Error {
     Size,
     /// White is not above black.
     Levels,
+    /// A part of the frame asked for clarity without the whole frame's
+    /// base map.
+    Clarity,
 }
 
 impl fmt::Display for Error {
@@ -41,6 +44,7 @@ impl fmt::Display for Error {
             Self::Crop => "crop lies outside the frame",
             Self::Size => "image buffer does not match its axes or exceeds the ceiling",
             Self::Levels => "white level is not above black",
+            Self::Clarity => "clarity needs the whole frame's base map",
         })
     }
 }
@@ -472,7 +476,25 @@ pub fn export_band(
     if (width, height) != (export.width, rows) {
         return Err(Error::Size);
     }
-    level3(&Level2 { width, height, rgb }, wb, color, transfer, params)
+    // The band is rows of the whole export: its clarity reads the whole
+    // frame's map at the band's share of it, never a map of its own.
+    let params = match params.clarity_base {
+        Some(base) => Params {
+            clarity_base: Some(ClarityBase {
+                frame: [
+                    0.0,
+                    first as f32 / export.height as f32,
+                    1.0,
+                    rows as f32 / export.height as f32,
+                ],
+                ..base
+            }),
+            ..*params
+        },
+        None if clarity_amount(params.clarity) != 0.0 => return Err(Error::Clarity),
+        None => *params,
+    };
+    level3(&Level2 { width, height, rgb }, wb, color, transfer, &params)
 }
 
 /// One destination index's source contributions along one axis.
@@ -652,6 +674,209 @@ pub struct Params<'a> {
     /// from the one the look was given to the one it made, past it beyond
     /// 1. 1 is the whole look; a value outside is held to that range.
     pub look_intensity: f32,
+    /// The photo's clarity, `-1..=1`: local contrast about the blurred
+    /// luminance (`clarity_map`), raised above zero and smoothed below;
+    /// held to the range, NaN none.
+    pub clarity: f32,
+    /// The whole frame's clarity map and the part of the frame the level
+    /// 2 covers, for a level 2 that is not the whole frame (a zoom, an
+    /// export band); without it level 3 makes the map from its own level
+    /// 2, the whole frame.
+    pub clarity_base: Option<ClarityBase<'a>>,
+}
+
+/// Clarity's base map's long edge: the whole cropped frame resampled to
+/// it, so the map is the same for every render of the frame.
+pub const CLARITY_EDGE: usize = 320;
+/// The base's blur, a share of the map's long edge (about 5 px).
+const CLARITY_SIGMA: f32 = 0.015;
+
+/// The blurred perceptual luminance (`sqrt` of linear luminance, at the
+/// photo's exposure, contrast and tonal regions) of the whole cropped,
+/// oriented frame at `CLARITY_EDGE`: what clarity measures each pixel's
+/// local contrast against.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClarityMap {
+    pub width: usize,
+    pub height: usize,
+    pub p: Vec<f32>,
+}
+
+/// A clarity map and the part of the frame a level 2 covers, `x y w h`
+/// fractions of the oriented, cropped frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClarityBase<'a> {
+    pub map: &'a ClarityMap,
+    pub frame: [f32; 4],
+}
+
+/// The clarity amount as the pipeline applies it: held to `-1..=1`, NaN
+/// none.
+fn clarity_amount(clarity: f32) -> f32 {
+    if clarity.is_nan() {
+        0.0
+    } else {
+        clarity.clamp(-1.0, 1.0)
+    }
+}
+
+/// The camera matrix with the exposure folded in.
+fn exposed(color: &CameraColor, exposure: f32) -> Matrix {
+    let gain = 2.0f32.powf(exposure);
+    let mut matrix: Matrix = color.rgb_cam;
+    for row in matrix.iter_mut() {
+        for cell in row.iter_mut() {
+            *cell *= gain;
+        }
+    }
+    matrix
+}
+
+fn luma(rgb: [f32; 3]) -> f32 {
+    LUMA[0] * rgb[0] + LUMA[1] * rgb[1] + LUMA[2] * rgb[2]
+}
+
+/// The clarity map of `whole`, a level 2 of the whole cropped frame at
+/// any size: resampled to fit `CLARITY_EDGE` (never enlarged), each pixel
+/// through the pipeline to the photo's adjustments (`params.contrast`)
+/// and its perceptual luminance taken, then a separable Gaussian blur of
+/// `CLARITY_SIGMA` of the long edge, edges held.
+pub fn clarity_map(
+    whole: &Level2,
+    wb: [f32; 3],
+    color: &CameraColor,
+    params: &Params<'_>,
+) -> Result<ClarityMap, Error> {
+    let (w, h) = (whole.width, whole.height);
+    if !pixels_ok(w, h) || whole.rgb.len() != w * h * 3 {
+        return Err(Error::Size);
+    }
+    let (mw, mh) = fit(w, h, CLARITY_EDGE);
+    let small = if (mw, mh) == (w, h) {
+        whole.rgb.clone()
+    } else {
+        resample(&whole.rgb, w, h, mw, mh, params.threads)?
+    };
+    let matrix = exposed(color, params.exposure);
+    let p: Vec<f32> = small
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|&[r, g, b]| {
+            let cam = [
+                (r * wb[0]).min(1.0),
+                (g * wb[1]).min(1.0),
+                (b * wb[2]).min(1.0),
+            ];
+            let rgb = apply(&matrix, cam);
+            let rgb = match params.contrast {
+                Some(adjust) => adjust.apply(rgb),
+                None => rgb,
+            };
+            luma(rgb).max(0.0).sqrt()
+        })
+        .collect();
+    let sigma = CLARITY_SIGMA * mw.max(mh) as f32;
+    let radius = (3.0 * sigma).ceil() as usize;
+    let kernel: Vec<f32> = (0..=2 * radius)
+        .map(|i| {
+            let d = i as f32 - radius as f32;
+            (-d * d / (2.0 * sigma * sigma)).exp()
+        })
+        .collect();
+    let total: f32 = kernel.iter().sum();
+    let kernel: Vec<f32> = kernel.iter().map(|k| k / total).collect();
+    // Edge-held taps: an index past either end reads the end.
+    let blur = |src: &[f32], len: usize, at: &dyn Fn(usize) -> usize| -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                kernel
+                    .iter()
+                    .enumerate()
+                    .map(|(k, weight)| {
+                        let j = (i + k).saturating_sub(radius).min(len.saturating_sub(1));
+                        weight * src.get(at(j)).copied().unwrap_or(0.0)
+                    })
+                    .sum()
+            })
+            .collect()
+    };
+    let mut across = Vec::with_capacity(mw * mh);
+    for y in 0..mh {
+        let row = p.get(y * mw..(y + 1) * mw).ok_or(Error::Size)?;
+        across.extend(blur(row, mw, &|j| j));
+    }
+    let mut out = vec![0.0; mw * mh];
+    for x in 0..mw {
+        let column = blur(&across, mh, &|j| j * mw + x);
+        for (y, v) in column.into_iter().enumerate() {
+            if let Some(slot) = out.get_mut(y * mw + x) {
+                *slot = v;
+            }
+        }
+    }
+    Ok(ClarityMap {
+        width: mw,
+        height: mh,
+        p: out,
+    })
+}
+
+/// The clarity map of the whole cropped frame from level 1: its level 2
+/// at `CLARITY_EDGE`, then `clarity_map`. For a render that is part of
+/// the frame (a zoom, an export).
+pub fn clarity_base(
+    level1: &Level1,
+    crop: Option<[f32; 4]>,
+    orientation: u16,
+    wb: [f32; 3],
+    color: &CameraColor,
+    params: &Params<'_>,
+) -> Result<ClarityMap, Error> {
+    let whole = level2(level1, crop, CLARITY_EDGE, orientation, params.threads)?;
+    clarity_map(&whole, wb, color, params)
+}
+
+impl ClarityMap {
+    /// The map at `x y`, fractions of the frame, bilinear between its
+    /// pixel centres and held at its edges.
+    fn at(&self, x: f32, y: f32) -> Option<f32> {
+        let axis = |f: f32, n: usize| {
+            let v = (f * n as f32 - 0.5).clamp(0.0, n.saturating_sub(1) as f32);
+            let i = v.floor() as usize;
+            (i, (i + 1).min(n.saturating_sub(1)), v - i as f32)
+        };
+        let (x0, x1, tx) = axis(x, self.width);
+        let (y0, y1, ty) = axis(y, self.height);
+        let at = |x: usize, y: usize| self.p.get(y * self.width + x).copied();
+        let top = at(x0, y0)? + (at(x1, y0)? - at(x0, y0)?) * tx;
+        let bottom = at(x0, y1)? + (at(x1, y1)? - at(x0, y1)?) * tx;
+        Some(top + (bottom - top) * ty)
+    }
+}
+
+/// Clarity's gain on the softened local difference.
+const CLARITY_GAIN: f32 = 1.0;
+
+/// One pixel's clarity: its perceptual luminance `p` moved by `amount` of
+/// its difference from the base, softened (`d / (1 + 2|d|)`, so an edge's
+/// large step is moved less than texture's small ones, which keeps halos
+/// down) and weighted to the midtones (`4 p (1 - p)`, nothing at black,
+/// white or past it); the colour scaled to the new luminance, keeping its
+/// hue. `amount` -1 at the midtones moves a pixel `1 / (1 + 2|d|)` of
+/// the way to its base. A base that is not finite leaves the pixel.
+fn clarity_pixel(rgb: [f32; 3], amount: f32, base: f32) -> [f32; 3] {
+    let y = luma(rgb);
+    if y.is_nan() || y <= 1e-6 || !base.is_finite() {
+        return rgb;
+    }
+    let p = y.sqrt();
+    let weight = if p < 1.0 { 4.0 * p * (1.0 - p) } else { 0.0 };
+    let d = p - base;
+    let d = d / (1.0 + 2.0 * d.abs());
+    let moved = (p + amount * CLARITY_GAIN * weight * d).max(0.0);
+    let k = (moved / p) * (moved / p);
+    rgb.map(|v| v * k)
 }
 
 /// The axes that fit `long_edge` without enlarging, keeping aspect.
@@ -867,6 +1092,19 @@ pub fn viewport(
     orientation: u16,
     zoom: Zoom,
 ) -> Result<Viewport, Error> {
+    viewport_framed(w1, h1, crop, orientation, zoom).map(|(view, _)| view)
+}
+
+/// `viewport`, with the window's place in the oriented, cropped frame as
+/// `x y w h` fractions of it: where a zoomed level 2 reads the frame's
+/// clarity map (`ClarityBase`).
+pub fn viewport_framed(
+    w1: usize,
+    h1: usize,
+    crop: Option<[f32; 4]>,
+    orientation: u16,
+    zoom: Zoom,
+) -> Result<(Viewport, [f32; 4]), Error> {
     let Zoom {
         percent: zoom,
         centre,
@@ -917,14 +1155,23 @@ pub fn viewport(
     } else {
         (box_w, box_h)
     };
-    Ok(Viewport {
-        x0: cx0 + x0,
-        y0: cy0 + y0,
-        width,
-        height,
-        target: (scale(width).min(box_x), scale(height).min(box_y)),
-        zoom,
-    })
+    let share = |part: usize, whole: usize| part as f32 / whole.max(1) as f32;
+    Ok((
+        Viewport {
+            x0: cx0 + x0,
+            y0: cy0 + y0,
+            width,
+            height,
+            target: (scale(width).min(box_x), scale(height).min(box_y)),
+            zoom,
+        },
+        [
+            share(vx0, ocw),
+            share(vy0, och),
+            share(vw, ocw),
+            share(vh, och),
+        ],
+    ))
 }
 
 /// Level 1 to a zoomed level 2: the viewport's window of the level
@@ -1035,13 +1282,21 @@ pub fn level3(
     if !pixels_ok(dw, dh) || level2.rgb.len() != dw * dh * 3 {
         return Err(Error::Size);
     }
-    let gain = 2.0f32.powf(params.exposure);
-    let mut matrix: Matrix = color.rgb_cam;
-    for row in matrix.iter_mut() {
-        for cell in row.iter_mut() {
-            *cell *= gain;
+    let matrix = exposed(color, params.exposure);
+    let amount = clarity_amount(params.clarity);
+    // Without a base this level 2 is the whole frame: its own map.
+    let own;
+    let clarity = match (amount != 0.0, params.clarity_base) {
+        (false, _) => None,
+        (true, Some(base)) => Some(base),
+        (true, None) => {
+            own = clarity_map(level2, wb, color, params)?;
+            Some(ClarityBase {
+                map: &own,
+                frame: [0.0, 0.0, 1.0, 1.0],
+            })
         }
-    }
+    };
     let mut out = vec![0u8; dw * dh * 3];
     let threads = thread_count(params.threads, dh);
     let band = band_rows(dh, threads);
@@ -1062,11 +1317,12 @@ pub fn level3(
         let Some(input) = small_ref.get(start..start + chunk.len()) else {
             return;
         };
-        for (out_px, &[r, g, b]) in chunk
+        for (i, (out_px, &[r, g, b])) in chunk
             .as_chunks_mut::<3>()
             .0
             .iter_mut()
             .zip(input.as_chunks::<3>().0.iter())
+            .enumerate()
         {
             let cam = [
                 (r * wb[0]).min(1.0),
@@ -1076,6 +1332,19 @@ pub fn level3(
             let rgb = apply(matrix_ref, cam);
             let rgb = match contrast {
                 Some(contrast) => contrast.apply(rgb),
+                None => rgb,
+            };
+            let rgb = match clarity {
+                Some(ClarityBase { map, frame }) => {
+                    let pixel = start / 3 + i;
+                    let (x, y) = ((pixel % dw) as f32, (pixel / dw) as f32);
+                    let fx = frame[0] + (x + 0.5) / dw as f32 * frame[2];
+                    let fy = frame[1] + (y + 0.5) / dh as f32 * frame[3];
+                    match map.at(fx, fy) {
+                        Some(base) => clarity_pixel(rgb, amount, base),
+                        None => rgb,
+                    }
+                }
                 None => rgb,
             };
             let rgb = match look {

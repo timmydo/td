@@ -182,6 +182,18 @@ fn preview_develop_reflects_the_sidecar() {
         box_pixels(&lifted, 800, r#box),
         "the shadows did not reach the developed pixels"
     );
+    // And clarity.
+    std::fs::write(
+        roll.join("DSC_0001.NEF.edit"),
+        "td-photo edit 1\nexposure 1.50\nclarity 1.00\n",
+    )
+    .unwrap();
+    let clearer = preview_develop(&dir, 800, 600, &roll, 0);
+    assert_ne!(
+        box_pixels(&brighter, 800, r#box),
+        box_pixels(&clearer, 800, r#box),
+        "the clarity did not reach the developed pixels"
+    );
     // And a look's intensity: half the mono look is neither the colour nor
     // the whole look's grey.
     let with_look = |intensity: &str| {

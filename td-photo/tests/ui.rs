@@ -369,6 +369,7 @@ fn the_action_table_is_closed_aligned_and_reachable() {
                         "shadows",
                         "whites",
                         "blacks",
+                        "clarity",
                         "look-intensity",
                         "quality",
                         "long-edge",
@@ -427,7 +428,7 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!((layout.columns, layout.rows), (4, 3));
     assert_eq!(
         c.state(),
-        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit\t92\tfull\tjpeg\t-\t-\t-\t-\t-\t-"
+        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit\t92\tfull\tjpeg\t-\t-\t-\t-\t-\t-\t-"
     );
     for name in ["next", "pick", "view", "first"] {
         assert_eq!(
@@ -488,12 +489,12 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!(c.action("select", &[]).unwrap_err().code(), "protocol");
     assert_eq!(
         c.photo(0).unwrap(),
-        format!("{}\t-\t-\t-\t-\tnone\t-\t-\t-\t-\t-\t-\t-", name(0))
+        format!("{}\t-\t-\t-\t-\tnone\t-\t-\t-\t-\t-\t-\t-\t-", name(0))
     );
     assert_eq!(
         c.photo(3).unwrap(),
         format!(
-            "{}\t-\t-\t-\t-\terror\t{}\t-\t-\t-\t-\t-\t-",
+            "{}\t-\t-\t-\t-\terror\t{}\t-\t-\t-\t-\t-\t-\t-",
             name(3),
             hex(b"malformed exposure value")
         )
@@ -1130,7 +1131,7 @@ fn contrast_is_nudged_and_set_in_develop_mode() {
         .map(ui::step_label)
         .collect();
     assert_eq!(labels, ["contrast -0.40"]);
-    assert!(c.photo(0).unwrap().ends_with("\t-0.40\t-\t-\t-\t-\t-"));
+    assert!(c.photo(0).unwrap().ends_with("\t-0.40\t-\t-\t-\t-\t-\t-"));
 }
 
 /// The look intensity: `'` and `;` nudge it a tenth and `look-intensity`
@@ -1197,7 +1198,7 @@ fn look_intensity_is_nudged_and_set_with_a_look() {
     );
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     assert_eq!(fields(&c)[LOOK_INTENSITY], "0.35");
-    assert!(c.photo(0).unwrap().ends_with("\t0.35\t-\t-\t-\t-"));
+    assert!(c.photo(0).unwrap().ends_with("\t0.35\t-\t-\t-\t-\t-"));
     let labels: Vec<String> = c
         .photos()
         .first()
@@ -1462,11 +1463,12 @@ fn auto_picks_asks_for_every_picks_measure() {
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     let values = |index: usize| {
         let photo = c.photo(index).unwrap();
-        // Contrast, before the look intensity and the four tonal regions.
+        // Contrast, before the look intensity, the four tonal regions and
+        // the clarity.
         photo
             .split('\t')
             .rev()
-            .nth(5)
+            .nth(6)
             .unwrap_or_default()
             .to_string()
     };
@@ -2012,10 +2014,11 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "-",
             "-",
+            "-",
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "70"]);
+    assert_eq!(&reply(2)[..2], ["ok", "71"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(
         reply(4),
@@ -2027,6 +2030,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "-",
             "ok",
+            "-",
             "-",
             "-",
             "-",
@@ -2047,6 +2051,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "error",
             &hex(b"malformed exposure value"),
+            "-",
             "-",
             "-",
             "-",
@@ -2152,6 +2157,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "error",
             &hex(b"malformed exposure value"),
+            "-",
             "-",
             "-",
             "-",
@@ -5203,13 +5209,13 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     ]);
     assert_eq!(
         &a[0][21..],
-        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-"]
+        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(&a[1][1..], ["ok", "changed"]);
     assert_eq!(&a[2][1..], ["ok", "changed"]);
     assert_eq!(
         &a[3][21..],
-        ["80", "32", "jpeg", "-", "-", "-", "-", "-", "-"]
+        ["80", "32", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
@@ -5284,12 +5290,12 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     assert!(ok, "{err}");
     assert_eq!(
         &replies[0][21..],
-        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-"],
+        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"],
         "the empty configuration"
     );
     assert_eq!(
         &replies_env[0][21..],
-        ["80", "32", "jpeg", "-", "-", "-", "-", "-", "-"]
+        ["80", "32", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
     );
     fs::write(&file, "td-photo export 1\nquality 80\nsharpen 3\n").unwrap();
     let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
@@ -5299,7 +5305,7 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     ]);
     assert_eq!(
         &replies[0][21..],
-        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-"]
+        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(&replies[1][1..], ["ok", "changed"]);
     let (ok, _, err) = session.finish();
@@ -5322,14 +5328,14 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     ]);
     assert_eq!(
         &replies[0][21..],
-        ["92", "full", "avif", "-", "-", "-", "-", "-", "-"]
+        ["92", "full", "avif", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(&replies[1][1..], ["ok", "changed"]);
     assert_eq!(&replies[2][1..], ["ok", "ignored"]);
     assert_eq!(&replies[3][1..3], ["error", "bad-argument"]);
     assert_eq!(
         &replies[4][21..],
-        ["10", "full", "avif", "-", "-", "-", "-", "-", "-"]
+        ["10", "full", "avif", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
@@ -5342,7 +5348,7 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     assert_eq!(&replies[0][1..], ["ok", "changed"]);
     assert_eq!(
         &replies[1][21..],
-        ["10", "full", "jpeg", "-", "-", "-", "-", "-", "-"]
+        ["10", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
     );
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
@@ -5363,12 +5369,12 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     ]);
     assert_eq!(
         &replies[0][21..],
-        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-"]
+        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
     );
     assert_eq!(replies[1][1..3], ["error", "refused"]);
     assert_eq!(
         &replies[2][21..],
-        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-"]
+        ["92", "full", "jpeg", "-", "-", "-", "-", "-", "-", "-"]
     );
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
@@ -6636,17 +6642,27 @@ fn the_tonal_regions_are_set_and_slid_in_the_pane() {
         }
     }
     let state = c.state();
-    let tail: Vec<&str> = state.split('\t').rev().take(4).collect();
+    let tail: Vec<&str> = state.split('\t').rev().skip(1).take(4).collect();
     assert_eq!(tail, ["-0.05", "0.10", "0.70", "-0.40"]);
-    assert!(c.photo(0).unwrap().ends_with("\t-0.40\t0.70\t0.10\t-0.05"));
+    assert!(c
+        .photo(0)
+        .unwrap()
+        .ends_with("\t-0.40\t0.70\t0.10\t-0.05\t-"));
 
     let names: Vec<&str> = ui::ADJUSTS.iter().map(|(name, _)| *name).collect();
     assert_eq!(
         names,
-        ["Contrast", "Highlights", "Shadows", "Whites", "Blacks"]
+        [
+            "Contrast",
+            "Highlights",
+            "Shadows",
+            "Whites",
+            "Blacks",
+            "Clarity"
+        ]
     );
     let adjusts = c.layout().adjusts();
-    assert_eq!(adjusts.len(), 5);
+    assert_eq!(adjusts.len(), 6);
     for (row, adjust) in adjusts.iter().enumerate() {
         let adjust = adjust.expect("every row on 800x600");
         // A cell a character: the longest label, "Highlights -1.00", fits.
@@ -6690,6 +6706,50 @@ fn the_tonal_regions_are_set_and_slid_in_the_pane() {
             key: Key::Highlights,
             value: Some("-1.00".to_string()),
         }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+
+    // Clarity: its action, its field last, its row; a drag on it commits
+    // the clarity alone.
+    let (_, effects) = c.action("clarity", &["0.30"]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Clarity,
+            value: Some("0.30".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    for bad in ["1.01", "0.5", "x"] {
+        assert_eq!(
+            c.action("clarity", &[bad]).unwrap_err().code(),
+            "bad-argument"
+        );
+    }
+    assert!(c.state().ends_with("\t0.30"));
+    assert!(c.photo(0).unwrap().ends_with("\t-0.05\t0.30"));
+    assert_eq!(c.adjust_label(5), "Clarity 0.30");
+    let (x, y) = knob(&c, 5, ui::ADJUST_STEPS);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_eq!(c.adjust_label(5), "Clarity 1.00");
+    assert_eq!(c.adjust_label(1), "Highlights -1.00");
+    let (_, effects) = release(&mut c, x, y);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Clarity,
+            value: Some("1.00".to_string()),
+        }]
+    );
+    let mut cull = Controller::new(surface(800, 600));
+    cull.open("roll", b"/r", photos(1)).unwrap();
+    assert_eq!(
+        cull.action("clarity", &["0.10"]).unwrap().0,
+        Outcome::Ignored
     );
 }
 

@@ -23,6 +23,9 @@ pub const MAX_CONTRAST: i32 = 100;
 /// A tonal region's amount (highlights, shadows, whites, blacks) in
 /// hundredths, at most this magnitude either way (`look::tone_curve`).
 pub const MAX_TONE: i32 = 100;
+/// Clarity in hundredths, at most this magnitude either way
+/// (`develop::Params::clarity`).
+pub const MAX_CLARITY: i32 = 100;
 /// The look's intensity in hundredths, from none (0) through the whole
 /// look (`DEFAULT_LOOK_INTENSITY`) to twice it (this): the developed pixel
 /// is the one before the look moved this share of the way to the look's,
@@ -106,6 +109,7 @@ pub enum Key {
     Shadows,
     Whites,
     Blacks,
+    Clarity,
 }
 
 impl Key {
@@ -120,6 +124,7 @@ impl Key {
         Key::Shadows,
         Key::Whites,
         Key::Blacks,
+        Key::Clarity,
     ];
 
     /// The tonal regions' keys, in `look::Tone`'s order.
@@ -137,6 +142,7 @@ impl Key {
             Self::Shadows => "shadows",
             Self::Whites => "whites",
             Self::Blacks => "blacks",
+            Self::Clarity => "clarity",
         }
     }
 
@@ -379,6 +385,12 @@ pub fn tone(key: Key, text: &str) -> Result<i32, Error> {
     hundredths(text, MAX_TONE).ok_or(Error::Value(key))
 }
 
+/// Clarity from `-D.DD` or `D.DD`, in hundredths within `MAX_CLARITY`,
+/// spelled as contrast is.
+pub fn clarity(text: &str) -> Result<i32, Error> {
+    hundredths(text, MAX_CLARITY).ok_or(Error::Value(Key::Clarity))
+}
+
 /// A tonal region's amount as the sidecar writes it.
 pub fn tone_text(hundredths: i32) -> String {
     signed_text(hundredths)
@@ -474,6 +486,7 @@ fn check(key: Key, value: &str) -> Result<(), Error> {
         Key::Look => valid_look(value),
         Key::LookIntensity => look_intensity(value).is_ok(),
         Key::Highlights | Key::Shadows | Key::Whites | Key::Blacks => tone(key, value).is_ok(),
+        Key::Clarity => clarity(value).is_ok(),
     };
     if ok {
         Ok(())
@@ -686,6 +699,11 @@ impl Sidecar {
             .contains(&key)
             .then(|| self.get(key).and_then(|value| tone(key, value).ok()))
             .flatten()
+    }
+
+    /// Hundredths of clarity.
+    pub fn clarity(&self) -> Option<i32> {
+        self.get(Key::Clarity).and_then(|value| clarity(value).ok())
     }
 
     /// The tonal regions, each zero when absent.
