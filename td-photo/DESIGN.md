@@ -1215,7 +1215,15 @@ The Nikon layout over the container:
 - Exposure facts from the Exif IFD: `ExposureTime`, `FNumber`,
   `ISOSpeedRatings`, `FocalLength`, `DateTimeOriginal`, `LensModel`, and
   `Orientation` from IFD0 (1, 3, 6 and 8 are honoured; any other value is
-  treated as 1 and reported).
+  treated as 1 and reported). For the export's Exif (`exif`, below)
+  also `OffsetTimeOriginal`, `SubSecTimeOriginal` (which orders a
+  burst), `LensMake`, `FocalLengthIn35mmFilm`,
+  `ExposureBiasValue` (SRATIONAL), `ExposureProgram`, `MeteringMode` and
+  `Flash`, and IFD0's `Artist` and `Copyright` (a blank one none). An
+  `ISOSpeedRatings` of 65535 (or none) takes `ISOSpeed`, else
+  `RecommendedExposureIndex`, where a fast speed is, and keeps which
+  (`iso_tag`). These are `nef::Facts`, which the decoded frame carries,
+  so the window's cached frames export with them too.
 
 ### Nikon Huffman codec
 
@@ -1744,6 +1752,42 @@ bytes, the profile brand to the level and the extent to the data;
 `tests/av1.rs` reads the extent back and decodes it with
 dav1d; ffmpeg 6.1's demuxer read the samples' size, range and colour as
 written and its libdav1d and libaom decoders agreed on them out of band.
+
+The AVIF carries the photo's Exif as a second item (HEIF's annex A):
+`infe` of type `Exif` as item 2, its extent in `iloc` after the
+picture's in `mdat` (four zero bytes, the TIFF header's offset in what
+follows, then the TIFF), and `iref` with `cdsc` from it to item 1, so
+a reader shows it as the picture's; it has no properties. The TIFF is
+`exif::tiff`'s, written fresh rather than copied from the raw: the
+raw's Exif IFD holds the maker note, whose offsets point into the raw
+file, and its orientation is the sensor's, where the export's pixels
+are already turned. Big-endian, IFD0 (`Make`, `Model`, `Orientation`
+1, `XResolution` and `YResolution` 72 and `ResolutionUnit` inches,
+`Software` `td-photo`, `YCbCrPositioning` centred, `Artist`,
+`Copyright`, the Exif IFD's offset) then the Exif IFD (`ExposureTime`,
+`FNumber`, `ExposureProgram`, `ISOSpeedRatings`, `ExifVersion` 0232,
+`DateTimeOriginal`, `OffsetTimeOriginal`, `ComponentsConfiguration`,
+`ExposureBiasValue`, `MeteringMode`, `Flash`, `FocalLength`,
+`SubSecTimeOriginal`, `FlashpixVersion` 0100, `ColorSpace` sRGB, `PixelXDimension` and
+`PixelYDimension` the export's size after crop, turn and shrink,
+`FocalLengthIn35mmFilm`, `LensMake`, `LensModel`), each in tag order,
+then the values longer than four bytes, IFD0's then the Exif IFD's,
+in entry order, each on an even offset. Exif 2.32's mandatory tags are
+written with its fixed values beside the facts. IFD0's
+`DateTime` (the file's change) and `DateTimeDigitized` are not written:
+the export has no clock to read, and readers key on the original.
+Text is 7-bit ASCII as TIFF types it, so an artist written in UTF-8
+on the raw is left out rather than written in a type that says
+otherwise. Only what the raw had is written: no
+GPS and no serial numbers, which the raw may hold and an export
+shared need not; a text the ASCII type cannot hold (past
+`exif::MAX_TEXT` bytes or not printable 7-bit) is left out, as is a
+zero denominator or a code past a SHORT. An ISO past a SHORT is
+written as 65535 with the speed in the tag the raw had it in and
+`SensitivityType` naming that tag (3 for `ISOSpeed`, 2 for
+`RecommendedExposureIndex`), as Exif says; a raw's 65535 with neither
+is written alone, no type claimed. The JPEG export carries no Exif yet
+(an APP1 segment, roadmap 9).
 
 ## Looks
 
@@ -2465,14 +2509,22 @@ and hold the trellis's prices to what the coder counts for random blocks
 of every size and its levels to the quantizer's or one below with an end
 of block that matches them; `cdef`'s pin the direction search on each
 direction's lines, stripes and a flat block and the tap constraint and
-strength adjustment by value; `avif`'s hold every box to its bytes.
+strength adjustment by value; `avif`'s hold every box to its bytes,
+with Exif and without; `exif`'s read the TIFF back with the crate's
+own reader (every fact at its tag, in tag order, values on even
+offsets), leave out what the facts lack or the types cannot hold (a
+fast ISO as 65535 and its speed in the tag it came from, a bare
+65535 alone), and hold the least TIFF with a lens to bytes laid out
+by hand, both IFDs' long values placed.
 
 `tests/nef.rs`'s third command case runs `export` with `--long-edge`,
 `--quality` and `--format` over a temporary roll (the export shrunk with
 its ratio kept, an edge past the source and `full` the source's own size,
 a lower quality fewer bytes at the same size and the shrunk frame's mean
 the full one's within the codings' error, an AVIF named by its format
-with the shrunk size in its `ispe` and, with a `dav1d` on `PATH`, its
+with the shrunk size in its `ispe`, its Exif item found by `iloc` and
+read back as the raw's camera, lens and exposure at the shrunk size,
+upright, and, with a `dav1d` on `PATH`, its
 luma the JPEG export's within the codings' error (the gate holds the
 streams by hash in `tests/av1.rs`), a lower quality fewer bytes, each
 bad setting refused by name before anything is written) and
@@ -3038,7 +3090,8 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    (`transform`, `cdf`, `av1`), held to dav1d. Landed. The HEIF
    container (`avif`), the export settings' `format` and `--format` on
    the export verbs. Landed. The view's format row, its buttons and the
-   `format` action. Landed.
+   `format` action. Landed. The raw's camera, lens and exposure as the
+   AVIF's Exif item (`exif`). Landed.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
    Landed.
@@ -3081,6 +3134,6 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    `default-look`, the look a sidecar without one develops with, and
    `look none`. Landed. (n) Comparing with the camera: `\` shows the
    raw's embedded JPEG in the develop box. Landed.
-9. Later: DNG and JPEG rolls, the Nikon High
-   Efficiency codec, a better full-resolution demosaic, highlight
+9. Later: the JPEG export's Exif (APP1), DNG and JPEG rolls, the Nikon
+   High Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.

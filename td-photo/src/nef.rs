@@ -198,15 +198,45 @@ pub struct Preview {
     pub len: usize,
 }
 
-/// The Exif facts shown beside a photo; each optional.
+/// The Exif facts shown beside a photo and carried into an AVIF
+/// export (`exif`); each optional.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Exposure {
     pub time: Option<(u32, u32)>,
     pub aperture: Option<(u32, u32)>,
     pub iso: Option<u32>,
+    /// The tag `iso` was read from when `ISOSpeedRatings` held no speed
+    /// (65535, or none): `ISOSpeed` or `RecommendedExposureIndex`, which
+    /// Exif's `SensitivityType` tells apart, so an export names it as the
+    /// camera did.
+    pub iso_tag: Option<u16>,
     pub focal_length: Option<(u32, u32)>,
     pub taken: Option<String>,
     pub lens: Option<String>,
+    /// `OffsetTimeOriginal`, the taken time's zone as `+HH:MM`.
+    pub offset: Option<String>,
+    /// `SubSecTimeOriginal`, the taken time's fraction of a second as
+    /// digits, which orders a burst's frames.
+    pub subsec: Option<String>,
+    pub lens_make: Option<String>,
+    pub focal_length_35mm: Option<u32>,
+    /// Exposure compensation in stops, signed.
+    pub bias: Option<(i32, i32)>,
+    /// Exif's codes, as the camera wrote them.
+    pub program: Option<u32>,
+    pub metering: Option<u32>,
+    pub flash: Option<u32>,
+}
+
+/// What an export says of the photo it was made from: the body, who
+/// the camera says took it, and the exposure (`exif::tiff`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Facts {
+    pub make: String,
+    pub model: String,
+    pub artist: Option<String>,
+    pub copyright: Option<String>,
+    pub exposure: Exposure,
 }
 
 /// What the Nikon maker note supplies; each optional.
@@ -241,6 +271,10 @@ pub struct Nef {
     pub endian: Endian,
     pub make: String,
     pub model: String,
+    /// IFD0's `Artist` and `Copyright`, as the camera's settings wrote
+    /// them; absent when blank.
+    pub artist: Option<String>,
+    pub copyright: Option<String>,
     /// TIFF orientation; 1, 3, 6 and 8 are honoured downstream.
     pub orientation: u16,
     pub raw: Raw,
@@ -250,6 +284,17 @@ pub struct Nef {
 }
 
 impl Nef {
+    /// What an export carries of the photo (`exif`).
+    pub fn facts(&self) -> Facts {
+        Facts {
+            make: self.make.clone(),
+            model: self.model.clone(),
+            artist: self.artist.clone(),
+            copyright: self.copyright.clone(),
+            exposure: self.exposure.clone(),
+        }
+    }
+
     /// The sensor crop the maker note names, or the full frame, held to
     /// the frame either way.
     pub fn crop(&self) -> Crop {
@@ -274,6 +319,9 @@ pub fn parse(data: &[u8]) -> Result<Nef, Error> {
     let ifd0 = chain.first().ok_or(Error::NoRawImage)?;
     let make = ascii(&reader, ifd0, tag::MAKE);
     let model = ascii(&reader, ifd0, tag::MODEL);
+    let present = |tag: u16| Some(ascii(&reader, ifd0, tag)).filter(|text| !text.is_empty());
+    let artist = present(tag::ARTIST);
+    let copyright = present(tag::COPYRIGHT);
     let orientation = ifd0
         .find(tag::ORIENTATION)
         .and_then(|e| reader.integer(e, 0).ok())
@@ -318,6 +366,8 @@ pub fn parse(data: &[u8]) -> Result<Nef, Error> {
         endian: reader.endian(),
         make,
         model,
+        artist,
+        copyright,
         orientation,
         raw,
         previews,
@@ -424,10 +474,37 @@ fn check_axes(width: usize, height: usize) -> Result<(), Error> {
 
 fn read_exposure(reader: &Reader<'_>, exif: &Ifd) -> Exposure {
     let rational = |tag: u16| exif.find(tag).and_then(|e| reader.rational(e, 0).ok());
+    let integer = |tag: u16| exif.find(tag).and_then(|e| reader.integer(e, 0).ok());
+    // Past a SHORT the camera writes 65535 and the speed itself in
+    // `ISOSpeed` or `RecommendedExposureIndex`, whichever its type is.
+    let (iso, iso_tag) = match integer(tag::ISO) {
+        Some(65535) | None => [tag::ISO_SPEED, tag::RECOMMENDED_EXPOSURE_INDEX]
+            .into_iter()
+            .find_map(|t| integer(t).map(|v| (Some(v), Some(t))))
+            .unwrap_or((integer(tag::ISO), None)),
+        iso => (iso, None),
+    };
+    let text = |tag: u16| {
+        exif.find(tag)
+            .and_then(|e| reader.ascii(e).ok())
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
     Exposure {
+        offset: text(tag::OFFSET_TIME_ORIGINAL),
+        subsec: text(tag::SUB_SEC_TIME_ORIGINAL),
+        lens_make: text(tag::LENS_MAKE),
+        focal_length_35mm: integer(tag::FOCAL_LENGTH_35MM),
+        bias: exif
+            .find(tag::EXPOSURE_BIAS)
+            .and_then(|e| reader.srational(e, 0).ok()),
+        program: integer(tag::EXPOSURE_PROGRAM),
+        metering: integer(tag::METERING_MODE),
+        flash: integer(tag::FLASH),
         time: rational(tag::EXPOSURE_TIME),
         aperture: rational(tag::F_NUMBER),
-        iso: exif.find(tag::ISO).and_then(|e| reader.integer(e, 0).ok()),
+        iso,
+        iso_tag,
         focal_length: rational(tag::FOCAL_LENGTH),
         taken: exif
             .find(tag::DATE_TIME_ORIGINAL)

@@ -26,6 +26,7 @@ enum Value {
     Short(Vec<u16>),
     Long(Vec<u32>),
     Rational(Vec<(u32, u32)>),
+    SRational(Vec<(i32, i32)>),
     Ascii(String),
     Byte(Vec<u8>),
     Undefined(Vec<u8>),
@@ -71,6 +72,13 @@ fn encode_value(value: &Value, big: bool) -> (u16, u32, Vec<u8>) {
             v.len() as u32,
             v.iter()
                 .flat_map(|(n, d)| [u32_bytes(*n, big), u32_bytes(*d, big)].concat())
+                .collect(),
+        ),
+        Value::SRational(v) => (
+            kind::SRATIONAL,
+            v.len() as u32,
+            v.iter()
+                .flat_map(|(n, d)| [u32_bytes(*n as u32, big), u32_bytes(*d as u32, big)].concat())
                 .collect(),
         ),
         Value::Ascii(s) => {
@@ -343,6 +351,10 @@ struct Synth {
     /// wants a decodable one.
     preview_bytes: Vec<u8>,
     exif: bool,
+    /// A speed past a SHORT: `ISOSpeedRatings` 65535 and this speed in
+    /// this tag (`ISOSpeed` or `RecommendedExposureIndex`) with its
+    /// `SensitivityType`, as a body writes it.
+    fast: Option<(u16, u32)>,
 }
 
 /// The Z 8's lossless 14-bit table: version `0x46 0x30`, four predictors
@@ -380,6 +392,7 @@ impl Synth {
             previews: true,
             preview_bytes: vec![0xff, 0xd8, 0xff, 0xd9],
             exif: true,
+            fast: None,
         }
     }
 
@@ -408,10 +421,13 @@ impl Synth {
         inner.set_first(note_ifd);
         let mut note = b"Nikon\0\x02\x11\0\0".to_vec();
         note.extend_from_slice(&inner.finish());
-        let exif = b.ifd(&[
+        let mut exif_entries = vec![
             (tag::EXPOSURE_TIME, Value::Rational(vec![(10, 20000)])),
             (tag::F_NUMBER, Value::Rational(vec![(560, 100)])),
-            (tag::ISO, Value::Short(vec![2800])),
+            (
+                tag::ISO,
+                Value::Short(vec![if self.fast.is_some() { 65535 } else { 2800 }]),
+            ),
             (
                 tag::DATE_TIME_ORIGINAL,
                 Value::Ascii("2026:09:12 17:18:09".to_string()),
@@ -422,7 +438,24 @@ impl Synth {
                 tag::LENS_MODEL,
                 Value::Ascii("NIKKOR Z 180-600mm f/5.6-6.3 VR".to_string()),
             ),
-        ]);
+            (tag::EXPOSURE_PROGRAM, Value::Short(vec![3])),
+            (
+                tag::OFFSET_TIME_ORIGINAL,
+                Value::Ascii("-07:00".to_string()),
+            ),
+            (tag::EXPOSURE_BIAS, Value::SRational(vec![(-2, 3)])),
+            (tag::METERING_MODE, Value::Short(vec![5])),
+            (tag::FLASH, Value::Short(vec![16])),
+            (tag::FOCAL_LENGTH_35MM, Value::Short(vec![600])),
+            (tag::LENS_MAKE, Value::Ascii("Nikon".to_string())),
+            (tag::SUB_SEC_TIME_ORIGINAL, Value::Ascii("45".to_string())),
+        ];
+        if let Some((speed_tag, speed)) = self.fast {
+            let kind = if speed_tag == tag::ISO_SPEED { 3 } else { 2 };
+            exif_entries.push((tag::SENSITIVITY_TYPE, Value::Short(vec![kind])));
+            exif_entries.push((speed_tag, Value::Long(vec![speed])));
+        }
+        let exif = b.ifd(&exif_entries);
         let strip_offsets: Vec<u32> = (0..self.strip_count as u32)
             .map(|i| strip + i * 4 + self.strip_shift)
             .collect();
@@ -457,6 +490,9 @@ impl Synth {
             (tag::MAKE, Value::Ascii(self.make.to_string())),
             (tag::MODEL, Value::Ascii(self.model.to_string())),
             (tag::ORIENTATION, Value::Short(vec![self.orientation])),
+            (tag::ARTIST, Value::Ascii("A. Photographer".to_string())),
+            // Blank, as a body with no copyright set writes it: none.
+            (tag::COPYRIGHT, Value::Ascii("    ".to_string())),
             (tag::SUB_IFDS, Value::Long(vec![small, raw])),
         ];
         if self.previews {
@@ -827,6 +863,28 @@ fn parse_reads_the_synthetic_layout_and_decode_recovers_the_frame() {
         nef.exposure.lens.as_deref(),
         Some("NIKKOR Z 180-600mm f/5.6-6.3 VR")
     );
+    assert_eq!(nef.exposure.lens_make.as_deref(), Some("Nikon"));
+    assert_eq!(nef.exposure.offset.as_deref(), Some("-07:00"));
+    assert_eq!(nef.exposure.subsec.as_deref(), Some("45"));
+    assert_eq!(nef.exposure.bias, Some((-2, 3)));
+    assert_eq!(nef.exposure.program, Some(3));
+    assert_eq!(nef.exposure.metering, Some(5));
+    assert_eq!(nef.exposure.flash, Some(16));
+    assert_eq!(nef.exposure.focal_length_35mm, Some(600));
+    assert_eq!(nef.artist.as_deref(), Some("A. Photographer"));
+    assert_eq!(nef.copyright, None);
+    assert_eq!(nef.exposure.iso_tag, None);
+    // A speed past a SHORT is read from the tag the body put it in, and
+    // that tag kept.
+    for speed_tag in [tag::ISO_SPEED, tag::RECOMMENDED_EXPOSURE_INDEX] {
+        let mut fast = Synth::lossless(w, h, &samples);
+        fast.fast = Some((speed_tag, 102_400));
+        let exposure = nef::parse(&fast.build()).unwrap().exposure;
+        assert_eq!(
+            (exposure.iso, exposure.iso_tag),
+            (Some(102_400), Some(speed_tag))
+        );
+    }
     let decoded = nef::decode(&nef, &file).unwrap();
     assert_eq!(decoded.samples, samples);
     assert_eq!(decoded.corrupt, 0);
@@ -1413,6 +1471,57 @@ fn scratch(name: &str) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// The AVIF's Exif item, found by `iloc` as a reader finds it, read with
+/// the crate's TIFF reader: the raw's camera, lens and exposure, the
+/// export's size, and upright.
+fn exif_carried(avif: &[u8], (width, height): (u32, u32)) {
+    let at = avif.windows(4).position(|w| w == b"iinf").unwrap();
+    assert_eq!(&avif[at + 8..at + 10], &[0, 2], "two items");
+    assert!(avif.windows(8).any(|w| w == b"\0\x02\0\0Exif"));
+    assert!(avif.windows(10).any(|w| w == b"cdsc\0\x02\0\x01\0\x01"));
+    let at = avif.windows(4).position(|w| w == b"iloc").unwrap() + 4;
+    // version and flags, sizes, count, then the picture's 14 bytes.
+    let item = &avif[at + 22..at + 36];
+    assert_eq!(&item[..2], &[0, 2]);
+    let offset = u32::from_be_bytes(item[6..10].try_into().unwrap()) as usize;
+    let length = u32::from_be_bytes(item[10..14].try_into().unwrap()) as usize;
+    let payload = &avif[offset..offset + length];
+    assert_eq!(&payload[..4], &[0, 0, 0, 0]);
+    let data = &payload[4..];
+    let (reader, first) = tiff::Reader::new(data, 0).unwrap();
+    let ifd0 = reader.ifd(first).unwrap();
+    let text = |ifd: &tiff::Ifd, t: u16| reader.ascii(ifd.find(t).unwrap()).unwrap().to_string();
+    let int = |ifd: &tiff::Ifd, t: u16| reader.integer(ifd.find(t).unwrap(), 0).unwrap();
+    assert_eq!(text(&ifd0, tag::MAKE), "NIKON CORPORATION");
+    assert_eq!(text(&ifd0, tag::MODEL), "NIKON Z 8");
+    assert_eq!(text(&ifd0, tag::ARTIST), "A. Photographer");
+    assert!(ifd0.find(tag::COPYRIGHT).is_none());
+    assert_eq!(int(&ifd0, tag::ORIENTATION), 1);
+    let exif = reader.ifd(int(&ifd0, tag::EXIF_IFD)).unwrap();
+    assert_eq!(
+        text(&exif, tag::LENS_MODEL),
+        "NIKKOR Z 180-600mm f/5.6-6.3 VR"
+    );
+    assert_eq!(text(&exif, tag::LENS_MAKE), "Nikon");
+    assert_eq!(text(&exif, tag::DATE_TIME_ORIGINAL), "2026:09:12 17:18:09");
+    assert_eq!(text(&exif, tag::OFFSET_TIME_ORIGINAL), "-07:00");
+    assert_eq!(text(&exif, tag::SUB_SEC_TIME_ORIGINAL), "45");
+    let rational = |t: u16| reader.rational(exif.find(t).unwrap(), 0).unwrap();
+    assert_eq!(rational(tag::EXPOSURE_TIME), (10, 20000));
+    assert_eq!(rational(tag::F_NUMBER), (560, 100));
+    assert_eq!(rational(tag::FOCAL_LENGTH), (1800, 10));
+    assert_eq!(
+        reader
+            .srational(exif.find(tag::EXPOSURE_BIAS).unwrap(), 0)
+            .unwrap(),
+        (-2, 3)
+    );
+    assert_eq!(int(&exif, tag::ISO), 2800);
+    assert_eq!(int(&exif, tag::FOCAL_LENGTH_35MM), 600);
+    assert_eq!(int(&exif, tag::PIXEL_X_DIMENSION), width);
+    assert_eq!(int(&exif, tag::PIXEL_Y_DIMENSION), height);
 }
 
 fn run(args: &[&std::ffi::OsStr]) -> (bool, String, String) {
@@ -2105,6 +2214,16 @@ fn the_command_line_exports_into_the_rolls_folder() {
     let (ok, stdout, stderr) = run(&[OsStr::new("export"), turned.as_os_str()]);
     assert!(ok, "{stderr}");
     assert!(stdout.contains("-> 28x60 into"), "{stdout}");
+    // Its AVIF's Exif says the turned size, upright.
+    let (ok, _, stderr) = run(&[
+        OsStr::new("export"),
+        turned.as_os_str(),
+        OsStr::new("--format"),
+        OsStr::new("avif"),
+    ]);
+    assert!(ok, "{stderr}");
+    let avif = std::fs::read(other.join("exported/DSC_0002.avif")).unwrap();
+    exif_carried(&avif, (28, 60));
     let blocked = dir.join("blocked");
     std::fs::create_dir(&blocked).unwrap();
     std::fs::write(blocked.join("exported"), b"a file").unwrap();
@@ -2545,6 +2664,7 @@ fn the_command_line_exports_at_a_quality_and_a_long_edge_and_every_pick() {
     assert!(avif.starts_with(b"\0\0\0\x20ftypavif"), "{:?}", &avif[..16]);
     let at = avif.windows(4).position(|w| w == b"ispe").unwrap();
     assert_eq!(&avif[at + 8..at + 16], &[0, 0, 0, 30, 0, 0, 0, 14]);
+    exif_carried(&avif, (30, 14));
     let luma = |rgb: &[u8]| -> Vec<u8> {
         rgb.as_chunks::<3>()
             .0

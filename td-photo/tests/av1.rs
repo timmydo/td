@@ -771,7 +771,7 @@ fn the_container_carries_the_stream_where_it_says() {
     let (width, height, quality) = (300, 200, 60);
     let (obus, reconstruction) = encode(width, height, quality, 2);
     let geometry = Geometry::new(width, height).unwrap();
-    let data = avif::file(&geometry, &obus);
+    let data = avif::file(&geometry, &obus, None);
     assert!(data.starts_with(b"\0\0\0\x20ftypavif"), "{:?}", &data[..16]);
     let at = data.windows(4).position(|w| w == b"iloc").unwrap();
     let offset = u32::from_be_bytes(data[at + 18..at + 22].try_into().unwrap()) as usize;

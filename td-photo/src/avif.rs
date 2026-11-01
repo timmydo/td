@@ -1,12 +1,15 @@
 //! The AVIF container for the export: one AV1 still picture as a HEIF
 //! image item (ISO/IEC 23008-12 with the AV1 ISOBMFF and AVIF
 //! bindings), the least file the format asks for and every reader
-//! expects. `av1` makes the picture; this wraps its OBUs.
+//! expects, and the photo's Exif (`exif`) as a metadata item describing
+//! it. `av1` makes the picture; this wraps its OBUs.
 
 use crate::av1::{self, Geometry};
 
-/// The one item's identifier.
+/// The picture item's identifier.
 const ITEM: u16 = 1;
+/// The Exif item's identifier.
+const EXIF_ITEM: u16 = 2;
 /// The last `seq_level_idx` the AVIF Baseline profile (`MA1B`: the
 /// main profile at level 5.1 or under) admits. The Advanced profile
 /// names the high profile, which this stream is not, so past Baseline
@@ -58,14 +61,18 @@ impl Boxes {
 }
 
 /// The file: `ftyp` (the `avif` brand, `mif1` and `miaf`, and the AVIF
-/// profile the level admits, if one), `meta` describing the one `av01`
+/// profile the level admits, if one), `meta` describing the `av01`
 /// item (its size, its three 8-bit channels, the AV1 configuration and
-/// the colour, all as `av1` codes them), then `mdat` holding `obus`,
-/// the sequence header and frame OBUs `av1::Encoder::finish` gives.
-/// Sizes and offsets are four bytes: a frame is at most `av1::MAX_AXIS`
-/// square, whose stream is well under them.
-pub fn file(geometry: &Geometry, obus: &[u8]) -> Vec<u8> {
-    let mut out = Boxes(Vec::with_capacity(obus.len() + 512));
+/// the colour, all as `av1` codes them) and, with `exif`, an `Exif`
+/// item that describes it (`iref` `cdsc`, HEIF's annex A), then `mdat`
+/// holding `obus`, the sequence header and frame OBUs
+/// `av1::Encoder::finish` gives, and after them the Exif item's data:
+/// a four-byte zero (the TIFF header's offset in what follows) and the
+/// TIFF `exif::tiff` writes. Sizes and offsets are four bytes: a frame
+/// is at most `av1::MAX_AXIS` square, whose stream is well under them.
+pub fn file(geometry: &Geometry, obus: &[u8], exif: Option<&[u8]>) -> Vec<u8> {
+    let exif_len = exif.map(|tiff| 4 + tiff.len());
+    let mut out = Boxes(Vec::with_capacity(obus.len() + exif_len.unwrap_or(0) + 512));
     out.boxed(b"ftyp", |b| {
         b.bytes(b"avif");
         b.u32(0);
@@ -81,19 +88,32 @@ pub fn file(geometry: &Geometry, obus: &[u8]) -> Vec<u8> {
     // bytes either way), so a first write measures the layout and the
     // second carries the offset.
     let meta_at = out.0.len();
-    meta(&mut out, geometry, 0, obus.len());
+    meta(&mut out, geometry, 0, obus.len(), exif_len);
     let data_at = out.0.len() + MDAT_HEADER;
     out.0.truncate(meta_at);
-    meta(&mut out, geometry, data_at, obus.len());
-    out.boxed(b"mdat", |b| b.bytes(obus));
+    meta(&mut out, geometry, data_at, obus.len(), exif_len);
+    out.boxed(b"mdat", |b| {
+        b.bytes(obus);
+        if let Some(tiff) = exif {
+            b.u32(0);
+            b.bytes(tiff);
+        }
+    });
     out.0
 }
 
-fn meta(out: &mut Boxes, geometry: &Geometry, offset: usize, length: usize) {
-    let (offset, length) = (
-        u32::try_from(offset).unwrap_or(u32::MAX),
-        u32::try_from(length).unwrap_or(u32::MAX),
-    );
+fn meta(
+    out: &mut Boxes,
+    geometry: &Geometry,
+    offset: usize,
+    length: usize,
+    exif_len: Option<usize>,
+) {
+    let four = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+    // The Exif data follows the picture's in the mdat.
+    let exif = exif_len.map(|len| (four(offset.saturating_add(length)), four(len)));
+    let (offset, length) = (four(offset), four(length));
+    let items: u16 = if exif.is_some() { 2 } else { 1 };
     let (width, height) = (
         u32::try_from(geometry.width()).unwrap_or(u32::MAX),
         u32::try_from(geometry.height()).unwrap_or(u32::MAX),
@@ -109,26 +129,51 @@ fn meta(out: &mut Boxes, geometry: &Geometry, offset: usize, length: usize) {
         });
         b.full(b"pitm", 0, |b| b.u16(ITEM));
         b.full(b"iloc", 0, |b| {
-            // offset_size 4 and length_size 4, base_offset_size 0; one
+            // offset_size 4 and length_size 4, base_offset_size 0; each
             // item in the file itself, one extent.
             b.u8(0x44);
             b.u8(0);
-            b.u16(1);
+            b.u16(items);
             b.u16(ITEM);
             b.u16(0);
             b.u16(1);
             b.u32(offset);
             b.u32(length);
+            if let Some((offset, length)) = exif {
+                b.u16(EXIF_ITEM);
+                b.u16(0);
+                b.u16(1);
+                b.u32(offset);
+                b.u32(length);
+            }
         });
         b.full(b"iinf", 0, |b| {
-            b.u16(1);
+            b.u16(items);
             b.full(b"infe", 2, |b| {
                 b.u16(ITEM);
                 b.u16(0);
                 b.bytes(b"av01");
                 b.u8(0);
             });
+            if exif.is_some() {
+                b.full(b"infe", 2, |b| {
+                    b.u16(EXIF_ITEM);
+                    b.u16(0);
+                    b.bytes(b"Exif");
+                    b.u8(0);
+                });
+            }
         });
+        if exif.is_some() {
+            // The Exif item describes the picture.
+            b.full(b"iref", 0, |b| {
+                b.boxed(b"cdsc", |b| {
+                    b.u16(EXIF_ITEM);
+                    b.u16(1);
+                    b.u16(ITEM);
+                });
+            });
+        }
         b.boxed(b"iprp", |b| {
             b.boxed(b"ipco", |b| {
                 b.full(b"ispe", 0, |b| {
@@ -183,7 +228,7 @@ mod tests {
     fn the_file_is_the_documented_boxes_around_the_obus() {
         let geometry = Geometry::new(300, 70).unwrap();
         let obus = b"OBUS!".to_vec();
-        let data = file(&geometry, &obus);
+        let data = file(&geometry, &obus, None);
         let top = boxes(&data);
         assert_eq!(
             top.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
@@ -233,19 +278,63 @@ mod tests {
         assert_eq!(iprp[1].1, &[0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 4, 1, 2, 0x83, 4]);
     }
 
+    /// With Exif: a second item of type `Exif`, located after the OBUs in
+    /// the mdat as a zero offset and the TIFF, and a `cdsc` reference
+    /// from it to the picture; the picture's boxes as without it.
+    #[test]
+    fn the_exif_is_an_item_describing_the_picture() {
+        let geometry = Geometry::new(300, 70).unwrap();
+        let obus = b"OBUS!".to_vec();
+        let tiff = b"MM\0\x2a\0\0\0\x08TIFF".to_vec();
+        let data = file(&geometry, &obus, Some(&tiff));
+        let top = boxes(&data);
+        let meta = top[1].1;
+        let inner = boxes(&meta[4..]);
+        assert_eq!(
+            inner.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            [b"hdlr", b"pitm", b"iloc", b"iinf", b"iref", b"iprp"]
+        );
+        let iloc = inner[2].1;
+        assert_eq!(&iloc[..8], &[0, 0, 0, 0, 0x44, 0, 0, 2]);
+        let extent = |at: usize| {
+            let item = u16::from_be_bytes(iloc[at..at + 2].try_into().unwrap());
+            let offset = u32::from_be_bytes(iloc[at + 6..at + 10].try_into().unwrap()) as usize;
+            let length = u32::from_be_bytes(iloc[at + 10..at + 14].try_into().unwrap()) as usize;
+            (item, &data[offset..offset + length])
+        };
+        assert_eq!(extent(8), (1, &obus[..]));
+        let mut payload = vec![0, 0, 0, 0];
+        payload.extend_from_slice(&tiff);
+        assert_eq!(extent(22), (2, &payload[..]));
+        assert_eq!(iloc.len(), 36);
+        let iinf = inner[3].1;
+        assert_eq!(&iinf[..6], &[0, 0, 0, 0, 0, 2]);
+        let infes = boxes(&iinf[6..]);
+        assert_eq!(infes[1].1, b"\x02\0\0\0\0\x02\0\0Exif\0");
+        assert_eq!(inner[4].1, b"\0\0\0\0\0\0\0\x0ecdsc\0\x02\0\x01\0\x01");
+        // The picture's properties are as without Exif, the Exif item
+        // has none, and the mdat ends with the Exif data.
+        assert_eq!(
+            boxes(inner[5].1),
+            boxes(boxes(&boxes(&file(&geometry, &obus, None))[1].1[4..])[4].1)
+        );
+        assert!(data.ends_with(&payload));
+        assert_eq!(top[2].1.len(), obus.len() + payload.len());
+    }
+
     #[test]
     fn the_level_and_size_follow_the_geometry() {
         // Level 6.0 is past the Baseline profile, as is level 31: no
         // profile brand then.
         let geometry = Geometry::new(6000, 4000).unwrap();
-        let data = file(&geometry, &[]);
+        let data = file(&geometry, &[], None);
         assert_eq!(&data[..28], b"\0\0\0\x1cftypavif\0\0\0\0avifmif1miaf");
         assert_eq!(
-            &file(&Geometry::new(16384, 16384).unwrap(), &[])[..28],
+            &file(&Geometry::new(16384, 16384).unwrap(), &[], None)[..28],
             b"\0\0\0\x1cftypavif\0\0\0\0avifmif1miaf"
         );
         assert_eq!(
-            &file(&Geometry::new(3840, 2160).unwrap(), &[])[..32],
+            &file(&Geometry::new(3840, 2160).unwrap(), &[], None)[..32],
             b"\0\0\0\x20ftypavif\0\0\0\0avifmif1miafMA1B"
         );
         let at = data.windows(4).position(|w| w == b"av1C").unwrap();

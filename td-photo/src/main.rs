@@ -34,7 +34,7 @@ use td_photo::look::{self, Look};
 use td_photo::nef::{self, Nef};
 use td_photo::settings::{self, Format, Settings};
 use td_photo::ui::{self, Effect, Photo};
-use td_photo::{av1, avif, camera, jpeg, matching, tiff};
+use td_photo::{av1, avif, camera, exif, jpeg, matching, tiff};
 
 mod window;
 
@@ -72,8 +72,10 @@ const HELP: &str = concat!(
     "  AVIF (8-bit 4:2:0) at --quality 1 to 100 (default 92) into exported/\n",
     "  beside FILE: STEM.jpg, or STEM-2.jpg, STEM-3.jpg ... when that name\n",
     "  is taken (STEM.avif likewise), through a fresh STEM.jpg.tmp or\n",
-    "  STEM.avif.tmp linked into place. Never overwrites, and a sidecar the\n",
-    "  reader refuses refuses the export rather than dropping its edits.\n",
+    "  STEM.avif.tmp linked into place. The AVIF carries the raw's camera,\n",
+    "  lens, exposure and date as Exif (no GPS, no serial numbers); the\n",
+    "  JPEG carries none yet. Never overwrites, and a sidecar the reader\n",
+    "  refuses refuses the export rather than dropping its edits.\n",
     "td-photo export-picks ROLL [--format jpeg|avif] [--quality N]\n",
     "                 [--long-edge N|full]\n",
     "  Exports every pick in ROLL (flag pick in its sidecar) as export\n",
@@ -735,6 +737,8 @@ pub(crate) struct RawFrame {
     black: u16,
     white: u16,
     meta: Meta,
+    /// The camera, lens and exposure an AVIF export carries (`exif`).
+    facts: nef::Facts,
 }
 
 impl RawFrame {
@@ -781,6 +785,7 @@ impl RawFrame {
             },
             black: 0,
             white: 1,
+            facts: nef::Facts::default(),
             meta: Meta {
                 orientation: 1,
                 wb: [1.0, 1.0, 1.0],
@@ -828,6 +833,7 @@ pub(crate) fn decode_raw(path: &Path) -> Result<(RawFrame, DevelopInfo), String>
         crop: nef.crop(),
         black,
         white: camera.white,
+        facts: nef.facts(),
         meta: Meta {
             orientation: nef.orientation,
             wb,
@@ -1417,13 +1423,14 @@ impl Output {
         }
     }
 
-    fn finish(self) -> Result<Vec<u8>, String> {
+    /// The stream's last bytes; an AVIF carries `exif` as its Exif item.
+    fn finish(self, exif: &[u8]) -> Result<Vec<u8>, String> {
         match self {
             Output::Jpeg(encoder, bands) => encoder.finish(&bands).map_err(|e| e.to_string()),
             Output::Avif(encoder) => {
                 let geometry = encoder.geometry().clone();
                 let obus = encoder.finish().map_err(|e| e.to_string())?;
-                Ok(avif::file(&geometry, &obus))
+                Ok(avif::file(&geometry, &obus, Some(exif)))
             }
         }
     }
@@ -1571,7 +1578,12 @@ pub(crate) fn export_file(
         if shrink.as_ref().is_some_and(|shrink| shrink.done() != out_h) {
             return Err("the shrink gave back too few rows".to_string());
         }
-        let tail = encoder.finish()?;
+        // Only the AVIF carries Exif (the JPEG export has no APP1 yet).
+        let exif = match request.settings.format {
+            Format::Avif => exif::tiff(&frame.facts, out_w, out_h),
+            Format::Jpeg => Vec::new(),
+        };
+        let tail = encoder.finish(&exif)?;
         writer.write_all(&tail).map_err(|e| e.to_string())?;
         writer
             .into_inner()

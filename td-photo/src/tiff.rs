@@ -68,10 +68,12 @@ pub mod kind {
     pub const LONG: u16 = 4;
     pub const RATIONAL: u16 = 5;
     pub const UNDEFINED: u16 = 7;
+    pub const SRATIONAL: u16 = 10;
     pub const IFD: u16 = 13;
 }
 
-/// The tags this crate reads, by their TIFF, Exif and Nikon names.
+/// The tags this crate reads and the export's Exif writes, by their
+/// TIFF, Exif and Nikon names.
 pub mod tag {
     pub const NEW_SUBFILE_TYPE: u16 = 254;
     pub const IMAGE_WIDTH: u16 = 256;
@@ -83,21 +85,45 @@ pub mod tag {
     pub const MODEL: u16 = 272;
     pub const STRIP_OFFSETS: u16 = 273;
     pub const ORIENTATION: u16 = 274;
+    pub const X_RESOLUTION: u16 = 282;
+    pub const Y_RESOLUTION: u16 = 283;
+    pub const RESOLUTION_UNIT: u16 = 296;
+    pub const SOFTWARE: u16 = 305;
+    pub const ARTIST: u16 = 315;
     pub const SAMPLES_PER_PIXEL: u16 = 277;
     pub const ROWS_PER_STRIP: u16 = 278;
     pub const STRIP_BYTE_COUNTS: u16 = 279;
     pub const SUB_IFDS: u16 = 330;
     pub const JPEG_OFFSET: u16 = 513;
     pub const JPEG_LENGTH: u16 = 514;
+    pub const YCBCR_POSITIONING: u16 = 531;
     pub const CFA_REPEAT_DIM: u16 = 33421;
     pub const CFA_PATTERN: u16 = 33422;
+    pub const COPYRIGHT: u16 = 33432;
     pub const EXPOSURE_TIME: u16 = 33434;
     pub const F_NUMBER: u16 = 33437;
     pub const EXIF_IFD: u16 = 34665;
+    pub const EXPOSURE_PROGRAM: u16 = 34850;
     pub const ISO: u16 = 34855;
+    pub const SENSITIVITY_TYPE: u16 = 34864;
+    pub const RECOMMENDED_EXPOSURE_INDEX: u16 = 34866;
+    pub const ISO_SPEED: u16 = 34867;
+    pub const EXIF_VERSION: u16 = 36864;
     pub const DATE_TIME_ORIGINAL: u16 = 36867;
+    pub const OFFSET_TIME_ORIGINAL: u16 = 36881;
+    pub const COMPONENTS_CONFIGURATION: u16 = 37121;
+    pub const EXPOSURE_BIAS: u16 = 37380;
+    pub const METERING_MODE: u16 = 37383;
+    pub const FLASH: u16 = 37385;
     pub const FOCAL_LENGTH: u16 = 37386;
+    pub const SUB_SEC_TIME_ORIGINAL: u16 = 37521;
     pub const MAKER_NOTE: u16 = 37500;
+    pub const FLASHPIX_VERSION: u16 = 40960;
+    pub const COLOR_SPACE: u16 = 40961;
+    pub const PIXEL_X_DIMENSION: u16 = 40962;
+    pub const PIXEL_Y_DIMENSION: u16 = 40963;
+    pub const FOCAL_LENGTH_35MM: u16 = 41989;
+    pub const LENS_MAKE: u16 = 42035;
     pub const LENS_MODEL: u16 = 42036;
     pub const NIKON_WB_RB_LEVELS: u16 = 0x000c;
     pub const NIKON_BLACK_LEVEL: u16 = 0x003d;
@@ -364,6 +390,24 @@ impl<'a> Reader<'a> {
             .checked_add(index.checked_mul(8).ok_or(Error::Overflow)?)
             .ok_or(Error::Overflow)?;
         Ok((self.u32_at(at)?, self.u32_at(at + 4)?))
+    }
+
+    /// The `index`th element of an SRATIONAL field.
+    pub fn srational(&self, entry: &Entry, index: usize) -> Result<(i32, i32), Error> {
+        if entry.kind != kind::SRATIONAL {
+            return Err(Error::Kind {
+                tag: entry.tag,
+                kind: entry.kind,
+            });
+        }
+        let (n, d) = self.rational(
+            &Entry {
+                kind: kind::RATIONAL,
+                ..*entry
+            },
+            index,
+        )?;
+        Ok((n as i32, d as i32))
     }
 
     /// An ASCII field up to its first NUL, trimmed of surrounding blanks.
