@@ -1473,10 +1473,34 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
+/// The JPEG's Exif: the APP1 segment after the JFIF APP0, found by
+/// walking the segments as a reader does, its TIFF read as
+/// `exif_carried` reads the AVIF's.
+fn jpeg_exif_carried(jpeg: &[u8], size: (u32, u32)) {
+    assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+    let mut at = 2;
+    let mut markers = Vec::new();
+    let mut tiff = None;
+    while jpeg[at + 1] != 0xda {
+        assert_eq!(jpeg[at], 0xff);
+        let marker = jpeg[at + 1];
+        let len = usize::from(u16::from_be_bytes([jpeg[at + 2], jpeg[at + 3]]));
+        let payload = &jpeg[at + 4..at + 2 + len];
+        if marker == 0xe1 {
+            assert_eq!(&payload[..6], b"Exif\0\0");
+            tiff = Some(&payload[6..]);
+        }
+        markers.push(marker);
+        at += 2 + len;
+    }
+    assert_eq!(&markers[..2], &[0xe0, 0xe1], "APP1 after the JFIF APP0");
+    exif_facts(tiff.unwrap(), size);
+}
+
 /// The AVIF's Exif item, found by `iloc` as a reader finds it, read with
 /// the crate's TIFF reader: the raw's camera, lens and exposure, the
 /// export's size, and upright.
-fn exif_carried(avif: &[u8], (width, height): (u32, u32)) {
+fn exif_carried(avif: &[u8], size: (u32, u32)) {
     let at = avif.windows(4).position(|w| w == b"iinf").unwrap();
     assert_eq!(&avif[at + 8..at + 10], &[0, 2], "two items");
     assert!(avif.windows(8).any(|w| w == b"\0\x02\0\0Exif"));
@@ -1489,7 +1513,12 @@ fn exif_carried(avif: &[u8], (width, height): (u32, u32)) {
     let length = u32::from_be_bytes(item[10..14].try_into().unwrap()) as usize;
     let payload = &avif[offset..offset + length];
     assert_eq!(&payload[..4], &[0, 0, 0, 0]);
-    let data = &payload[4..];
+    exif_facts(&payload[4..], size);
+}
+
+/// An export's Exif TIFF read with the crate's TIFF reader: the raw's
+/// camera, lens and exposure, the export's size, and upright.
+fn exif_facts(data: &[u8], (width, height): (u32, u32)) {
     let (reader, first) = tiff::Reader::new(data, 0).unwrap();
     let ifd0 = reader.ifd(first).unwrap();
     let text = |ifd: &tiff::Ifd, t: u16| reader.ascii(ifd.find(t).unwrap()).unwrap().to_string();
@@ -2214,7 +2243,9 @@ fn the_command_line_exports_into_the_rolls_folder() {
     let (ok, stdout, stderr) = run(&[OsStr::new("export"), turned.as_os_str()]);
     assert!(ok, "{stderr}");
     assert!(stdout.contains("-> 28x60 into"), "{stdout}");
-    // Its AVIF's Exif says the turned size, upright.
+    // Its JPEG's and its AVIF's Exif say the turned size, upright.
+    let jpeg = std::fs::read(other.join("exported/DSC_0002.jpg")).unwrap();
+    jpeg_exif_carried(&jpeg, (28, 60));
     let (ok, _, stderr) = run(&[
         OsStr::new("export"),
         turned.as_os_str(),

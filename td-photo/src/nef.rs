@@ -198,8 +198,8 @@ pub struct Preview {
     pub len: usize,
 }
 
-/// The Exif facts shown beside a photo and carried into an AVIF
-/// export (`exif`); each optional.
+/// The Exif facts shown beside a photo and carried into an export
+/// (`exif`); each optional.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Exposure {
     pub time: Option<(u32, u32)>,

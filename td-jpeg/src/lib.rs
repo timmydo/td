@@ -22,6 +22,7 @@ use std::fmt;
 
 /// The longest axis any RGB buffer here may have.
 pub const MAX_AXIS: usize = 16384;
+
 /// The most pixels one image buffer holds: 64 Mi, so the largest `f32`
 /// RGB buffer the pipeline makes (12 bytes a pixel) is 768 MiB, under the
 /// allocation limit of a 32-bit target.
@@ -1167,6 +1168,9 @@ pub enum EncodeError {
     Rows,
     /// A quantisation table missing from the encoder's own set.
     Table,
+    /// Exif that is empty or past what one APP1 segment holds
+    /// (`MAX_EXIF`).
+    Exif { len: usize },
 }
 
 impl fmt::Display for EncodeError {
@@ -1177,6 +1181,12 @@ impl fmt::Display for EncodeError {
             }
             Self::Rows => f.write_str("JPEG encoder given rows that are not its width or height"),
             Self::Table => f.write_str("JPEG encoder table missing"),
+            Self::Exif { len } => {
+                write!(
+                    f,
+                    "JPEG encoder given {len} bytes of Exif, none or past one APP1 segment"
+                )
+            }
         }
     }
 }
@@ -1317,6 +1327,12 @@ impl Runner for InOrder {
     }
 }
 
+/// The Exif APP1 segment's identifier, before its TIFF.
+const EXIF_ID: &[u8; 6] = b"Exif\0\0";
+/// The most Exif `Encoder::with_exif` carries: one segment's 65533
+/// payload bytes less the identifier.
+pub const MAX_EXIF: usize = 65533 - EXIF_ID.len();
+
 /// A baseline encoder the caller feeds interleaved 8-bit RGB rows, in any
 /// number at a time, and drains bytes from as they are made, so a frame
 /// of any size is coded a band at a time: JFIF, YCbCr 4:4:4, the standard
@@ -1354,6 +1370,31 @@ impl Encoder {
     /// `quant_table`): the headers are written into the pending bytes at
     /// once. Axes are `1..=MAX_AXIS`.
     pub fn new(width: usize, height: usize, quality: u8) -> Result<Self, EncodeError> {
+        Self::start(width, height, quality, None)
+    }
+
+    /// As `new`, the stream carrying `tiff` (an Exif TIFF, header and
+    /// IFDs) as an Exif APP1 segment after the JFIF APP0, as libjpeg's
+    /// writers place it. 1 to `MAX_EXIF` bytes, what one segment holds: an
+    /// identifier with nothing after it is corrupt Exif to some readers.
+    pub fn with_exif(
+        width: usize,
+        height: usize,
+        quality: u8,
+        tiff: &[u8],
+    ) -> Result<Self, EncodeError> {
+        if tiff.is_empty() || tiff.len() > MAX_EXIF {
+            return Err(EncodeError::Exif { len: tiff.len() });
+        }
+        Self::start(width, height, quality, Some(tiff))
+    }
+
+    fn start(
+        width: usize,
+        height: usize,
+        quality: u8,
+        exif: Option<&[u8]>,
+    ) -> Result<Self, EncodeError> {
         if width == 0 || height == 0 || width > MAX_AXIS || height > MAX_AXIS {
             return Err(EncodeError::Axis { width, height });
         }
@@ -1388,7 +1429,7 @@ impl Encoder {
             bytes: Vec::new(),
             coefficients: Vec::new(),
         };
-        encoder.headers();
+        encoder.headers(exif);
         Ok(encoder)
     }
 
@@ -1399,11 +1440,18 @@ impl Encoder {
         self.bytes.extend_from_slice(payload);
     }
 
-    /// SOI, the JFIF APP0, both quantisers, SOF0, the four Huffman tables
-    /// and SOS; the scan follows.
-    fn headers(&mut self) {
+    /// SOI, the JFIF APP0, the Exif APP1 when there is one, both
+    /// quantisers, SOF0, the four Huffman tables and SOS; the scan
+    /// follows.
+    fn headers(&mut self, exif: Option<&[u8]>) {
         self.bytes.extend_from_slice(&[0xff, 0xd8]);
         self.segment(0xe0, b"JFIF\0\x01\x01\x00\x00\x01\x00\x01\x00\x00");
+        if let Some(tiff) = exif {
+            let mut app1 = Vec::with_capacity(EXIF_ID.len() + tiff.len());
+            app1.extend_from_slice(EXIF_ID);
+            app1.extend_from_slice(tiff);
+            self.segment(0xe1, &app1);
+        }
         let mut dqt = Vec::with_capacity(130);
         for (id, table) in self.quant.iter().enumerate() {
             dqt.push(id as u8);

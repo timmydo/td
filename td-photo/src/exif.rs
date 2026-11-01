@@ -1,6 +1,7 @@
-//! The Exif an AVIF export carries: the raw's camera, lens and exposure
+//! The Exif an export carries: the raw's camera, lens and exposure
 //! (`nef::Facts`) written as a fresh big-endian TIFF, IFD0 and an Exif
-//! IFD, for the container's `Exif` item (`avif::file`). The raw's own
+//! IFD, for an AVIF's `Exif` item (`avif::file`) or a JPEG's APP1
+//! (`td_jpeg::Encoder::with_exif`). The raw's own
 //! Exif is not copied: its maker note's offsets point into the raw
 //! file, and its orientation describes the sensor's frame, where the
 //! export's pixels are already turned upright, so `Orientation` is 1.

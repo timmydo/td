@@ -1786,8 +1786,9 @@ zero denominator or a code past a SHORT. An ISO past a SHORT is
 written as 65535 with the speed in the tag the raw had it in and
 `SensitivityType` naming that tag (3 for `ISOSpeed`, 2 for
 `RecommendedExposureIndex`), as Exif says; a raw's 65535 with neither
-is written alone, no type claimed. The JPEG export carries no Exif yet
-(an APP1 segment, roadmap 9).
+is written alone, no type claimed. The JPEG export carries the same
+TIFF as an Exif APP1 segment right after its JFIF APP0
+(`td_jpeg::Encoder::with_exif`), as libjpeg's writers place it.
 
 ## Looks
 
@@ -2524,7 +2525,9 @@ a lower quality fewer bytes at the same size and the shrunk frame's mean
 the full one's within the codings' error, an AVIF named by its format
 with the shrunk size in its `ispe`, its Exif item found by `iloc` and
 read back as the raw's camera, lens and exposure at the shrunk size,
-upright, and, with a `dav1d` on `PATH`, its
+upright (and a raw turned 6 exporting JPEG and AVIF whose Exif, the
+JPEG's found by walking its segments to the APP1 after the APP0, says
+its turned size), and, with a `dav1d` on `PATH`, its
 luma the JPEG export's within the codings' error (the gate holds the
 streams by hash in `tests/av1.rs`), a lower quality fewer bytes, each
 bad setting refused by name before anything is written) and
@@ -3091,7 +3094,8 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    container (`avif`), the export settings' `format` and `--format` on
    the export verbs. Landed. The view's format row, its buttons and the
    `format` action. Landed. The raw's camera, lens and exposure as the
-   AVIF's Exif item (`exif`). Landed.
+   AVIF's Exif item (`exif`). Landed. The same as the JPEG's APP1.
+   Landed.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
    Landed.
@@ -3134,6 +3138,6 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    `default-look`, the look a sidecar without one develops with, and
    `look none`. Landed. (n) Comparing with the camera: `\` shows the
    raw's embedded JPEG in the develop box. Landed.
-9. Later: the JPEG export's Exif (APP1), DNG and JPEG rolls, the Nikon
-   High Efficiency codec, a better full-resolution demosaic, highlight
-   reconstruction, the `.dtstyle` translator, and ratings.
+9. Later: DNG and JPEG rolls, the Nikon High Efficiency codec, a
+   better full-resolution demosaic, highlight reconstruction, the
+   `.dtstyle` translator, and ratings.

@@ -11,7 +11,9 @@
 
 use std::sync::Mutex;
 
-use td_jpeg::{decode, header, EncodeError, Encoder, InOrder, Rgb8, Runner, Scale, MAX_AXIS};
+use td_jpeg::{
+    decode, header, EncodeError, Encoder, InOrder, Rgb8, Runner, Scale, MAX_AXIS, MAX_EXIF,
+};
 
 /// The quality the round trips are held at, td-photo's export's.
 const QUALITY: u8 = 92;
@@ -164,6 +166,48 @@ fn the_encoder_streams_bands_identically_on_any_thread_count() {
         bytes.extend(encoder.finish(&pool).unwrap());
         assert_eq!(bytes, whole, "rows {rows} threads {threads}");
     }
+}
+
+/// With Exif: an APP1 of `Exif\0\0` and the TIFF right after the JFIF
+/// APP0, the rest of the stream as without it, so the pixels are the
+/// same; no Exif or Exif past one segment refused by name, as much as
+/// one holds taken.
+#[test]
+fn the_encoder_carries_exif_after_the_jfif_segment() {
+    let image = ramp(9, 5);
+    let plain = encode(&image, QUALITY, 1);
+    let tiff = b"MM\0\x2a\0\0\0\x08 an Exif TIFF".to_vec();
+    let mut encoder = Encoder::with_exif(9, 5, QUALITY, &tiff).unwrap();
+    encoder.encode_rows(&image.data, &InOrder).unwrap();
+    let with = encoder.finish(&InOrder).unwrap();
+    // SOI and the 18-byte APP0, then the APP1, then the plain stream.
+    let app1_len = 2 + 6 + tiff.len();
+    assert_eq!(&with[..20], &plain[..20]);
+    assert_eq!(&with[20..22], &[0xff, 0xe1]);
+    assert_eq!(
+        usize::from(u16::from_be_bytes([with[22], with[23]])),
+        app1_len
+    );
+    assert_eq!(&with[24..30], b"Exif\0\0");
+    assert_eq!(&with[30..30 + tiff.len()], &tiff[..]);
+    assert_eq!(&with[22 + app1_len..], &plain[20..]);
+    assert_eq!(
+        decode(&with, Scale::Full).unwrap().data,
+        decode(&plain, Scale::Full).unwrap().data
+    );
+    assert_eq!(
+        Encoder::with_exif(8, 8, QUALITY, &vec![0; MAX_EXIF + 1])
+            .err()
+            .unwrap(),
+        EncodeError::Exif { len: MAX_EXIF + 1 }
+    );
+    assert_eq!(
+        Encoder::with_exif(8, 8, QUALITY, &[]).err().unwrap(),
+        EncodeError::Exif { len: 0 }
+    );
+    let mut most = Encoder::with_exif(8, 8, QUALITY, &vec![0; MAX_EXIF]).unwrap();
+    let head = most.take();
+    assert_eq!(u16::from_be_bytes([head[22], head[23]]), u16::MAX);
 }
 
 #[test]

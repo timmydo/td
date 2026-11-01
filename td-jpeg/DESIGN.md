@@ -22,9 +22,11 @@ environment or a clock, or starts a thread.
   and `pixel`.
 - `Error`, each refusal by name.
 - The bounds: `MAX_AXIS` (16384), `MAX_IMAGE_PIXELS` (64 Mi),
-  `MAX_PREVIEW_SAMPLES` (128 Mi) and `MAX_TABLE_DEFINITIONS` (32).
-- `Encoder` (`new(width, height, quality)`, `encode_rows(rows, runner)`,
-  `take`, `finish(runner)`) and `EncodeError`, each refusal by name.
+  `MAX_PREVIEW_SAMPLES` (128 Mi), `MAX_TABLE_DEFINITIONS` (32) and the
+  encoder's `MAX_EXIF` (65527).
+- `Encoder` (`new(width, height, quality)`, `with_exif(width,
+  height, quality, tiff)`, `encode_rows(rows, runner)`, `take`,
+  `finish(runner)`), `MAX_EXIF` and `EncodeError`, each refusal by name.
 - `Runner`, what runs the encoder's independent pieces, and `InOrder`,
   which runs them in turn on the caller's thread.
 
@@ -79,7 +81,13 @@ bottom pad by replicating the last column and row), the T.81 Annex K
 quantisation tables scaled at the caller's quality the way every encoder
 since IJG scales them (`5000 / q` below 50, `200 - 2q` from 50 up,
 entries held to 1..=255) and the Annex K.3 Huffman tables, written into
-the stream, no restart intervals. The colour transform is the JFIF one
+the stream, no restart intervals. `with_exif` adds an Exif APP1
+(`Exif\0\0` then the caller's TIFF, which the encoder does not read)
+right after the JFIF APP0, as libjpeg's writers place it, 1 to
+`MAX_EXIF` bytes so the segment's length fits its sixteen bits and
+the segment is never a bare identifier, which some readers call
+corrupt; the
+rest of the stream is as without it. The colour transform is the JFIF one
 the decoder inverts; the forward transform is the decoder's basis
 transposed, in `f32`, rows then columns; coefficients are held to the
 categories the tables carry (the DC to -1024..=1023, each AC to
@@ -126,7 +134,11 @@ smooth frame a small fraction of its raw bytes, the stream fed in bands
 of any size and run on one thread or a pool of up to sixteen equal to
 the stream fed whole in order, each refusal by name (an axis of zero or
 past `MAX_AXIS`, rows not the width, rows past the height, a finish
-short of it), and the segments before the scan by their bytes. Its unit
+short of it, no Exif or Exif past `MAX_EXIF`), the segments before
+the scan by
+their bytes, and with Exif the APP1 (`Exif\0\0` and the TIFF) right
+after the APP0, the rest of the stream and its pixels as without it,
+and `MAX_EXIF` filling one segment. Its unit
 tests pin the standard tables complete and prefix-free, the quality
 scaling at its ends, the clamp, and the magnitude coding.
 

@@ -72,10 +72,10 @@ const HELP: &str = concat!(
     "  AVIF (8-bit 4:2:0) at --quality 1 to 100 (default 92) into exported/\n",
     "  beside FILE: STEM.jpg, or STEM-2.jpg, STEM-3.jpg ... when that name\n",
     "  is taken (STEM.avif likewise), through a fresh STEM.jpg.tmp or\n",
-    "  STEM.avif.tmp linked into place. The AVIF carries the raw's camera,\n",
-    "  lens, exposure and date as Exif (no GPS, no serial numbers); the\n",
-    "  JPEG carries none yet. Never overwrites, and a sidecar the reader\n",
-    "  refuses refuses the export rather than dropping its edits.\n",
+    "  STEM.avif.tmp linked into place. Either carries the raw's camera,\n",
+    "  lens, exposure and date as Exif (no GPS, no serial numbers). Never\n",
+    "  overwrites, and a sidecar the reader refuses refuses the export\n",
+    "  rather than dropping its edits.\n",
     "td-photo export-picks ROLL [--format jpeg|avif] [--quality N]\n",
     "                 [--long-edge N|full]\n",
     "  Exports every pick in ROLL (flag pick in its sidecar) as export\n",
@@ -737,7 +737,7 @@ pub(crate) struct RawFrame {
     black: u16,
     white: u16,
     meta: Meta,
-    /// The camera, lens and exposure an AVIF export carries (`exif`).
+    /// The camera, lens and exposure an export carries (`exif`).
     facts: nef::Facts,
 }
 
@@ -1386,16 +1386,19 @@ enum Output {
 }
 
 impl Output {
+    /// The encoder for `settings`' format; a JPEG carries `exif` as its
+    /// APP1 from here, an AVIF takes it at `finish`.
     fn open(
         settings: Settings,
         width: usize,
         height: usize,
         threads: usize,
+        exif: &[u8],
     ) -> Result<Output, String> {
         Ok(match settings.format {
             Format::Jpeg => Output::Jpeg(
                 Box::new(
-                    td_jpeg::Encoder::new(width, height, settings.quality)
+                    td_jpeg::Encoder::with_exif(width, height, settings.quality, exif)
                         .map_err(|e| e.to_string())?,
                 ),
                 jpeg::Bands(threads),
@@ -1545,9 +1548,11 @@ pub(crate) fn export_file(
         .create_new(true)
         .open(&temporary)
         .map_err(|e| format!("{}: {e}", temporary.display()))?;
+    // Both formats carry the raw's camera, lens and exposure.
+    let exif = exif::tiff(&frame.facts, out_w, out_h);
     let mut write = |file: fs::File| -> Result<(), String> {
         let mut writer = BufWriter::new(file);
-        let mut encoder = Output::open(request.settings, out_w, out_h, threads)?;
+        let mut encoder = Output::open(request.settings, out_w, out_h, threads, &exif)?;
         let mut first = 0;
         while first < geometry.height {
             let band = develop::export_band(
@@ -1578,11 +1583,6 @@ pub(crate) fn export_file(
         if shrink.as_ref().is_some_and(|shrink| shrink.done() != out_h) {
             return Err("the shrink gave back too few rows".to_string());
         }
-        // Only the AVIF carries Exif (the JPEG export has no APP1 yet).
-        let exif = match request.settings.format {
-            Format::Avif => exif::tiff(&frame.facts, out_w, out_h),
-            Format::Jpeg => Vec::new(),
-        };
         let tail = encoder.finish(&exif)?;
         writer.write_all(&tail).map_err(|e| e.to_string())?;
         writer

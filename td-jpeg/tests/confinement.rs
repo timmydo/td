@@ -93,6 +93,7 @@ fn the_bounds_are_the_ones_the_design_names() {
     assert_eq!(td_jpeg::MAX_IMAGE_PIXELS, 64 << 20);
     assert_eq!(td_jpeg::MAX_PREVIEW_SAMPLES, 128 << 20);
     assert_eq!(td_jpeg::MAX_TABLE_DEFINITIONS, 32);
+    assert_eq!(td_jpeg::MAX_EXIF, 65527);
 }
 
 #[test]
