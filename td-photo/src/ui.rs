@@ -2976,7 +2976,8 @@ impl Controller {
     /// changes the model here and nowhere else, so a photo that is what the
     /// model already holds (a write the file refused) is no change and
     /// leaves the generation; one that differs takes the filter, which may
-    /// hide it and move the cursor on. The budget holds here as at open: a
+    /// hide it and move the cursor back to the previous shown photo
+    /// (`keep_cursor_shown`). The budget holds here as at open: a
     /// sidecar that would take the roll past it is not held, and the photo
     /// is shown as refused for `OVER_BUDGET`. Whether the model changed.
     pub fn settle(&mut self, index: usize, photo: Photo) -> bool {
@@ -6080,12 +6081,17 @@ impl Controller {
     }
 
     /// The cursor stays where it is when the filter still shows it, else
-    /// goes to the first shown photo, else nowhere, and the single and
-    /// develop views end with it, since each is a view of the cursor's
-    /// photo.
+    /// goes to the nearest shown photo before it in the roll (the first
+    /// shown when none is before, or when it was nowhere), else nowhere,
+    /// and the single and develop views end with it, since each is a view
+    /// of the cursor's photo.
     fn keep_cursor_shown(&mut self) {
         if self.position().is_none() {
-            self.cursor = self.shown.first().copied();
+            // How many shown photos come before the cursor's in the roll.
+            let before = self.cursor.map_or(0, |index| {
+                self.shown.partition_point(|&shown| shown < index)
+            });
+            self.cursor = self.shown.get(before.saturating_sub(1)).copied();
             // The cursor left the photo the drag, crop-adjust, aspect lock and
             // look palette were for; end them.
             self.drag = None;

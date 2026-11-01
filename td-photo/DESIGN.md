@@ -229,7 +229,9 @@ window, all speaking the toolkit's one vocabulary.
   control socket are four adapters over that one dispatcher, and nothing
   reaches the model around it. The cursor is
   always among the shown or nowhere: a filter or a flag that hides it moves it
-  to the first shown photo, and the single view ends when there is none, as
+  to the nearest shown photo before it in the roll (the first shown when none
+  is before), so unflagging a pick under the picks filter steps back to the
+  previous pick, and the single view ends when there is none, as
   develop mode does, both falling back to the cull grid. The
   controller reads no file, clock or descriptor; `main`'s `Session` is the
   adapter that reads rolls and writes sidecars for it, and implements td-ui's
@@ -2781,8 +2783,9 @@ change asks
 for, the model unchanged until they are settled and its sidecar text after, the
 flag the file already holds ignored, an unknown line kept, a refused sidecar
 never rewritten, a flag that hides the photo under a filter and ends the single
-view, a settle that brings nothing new leaving the generation and one that
-differs moving it, the sidecar budget at open and at settle, and delete rejected
+view, a flag or filter that hides the cursor's photo stepping back to the
+previous shown photo with develop kept on it, a settle that brings nothing new
+leaving the generation and one that differs moving it, the sidecar budget at open and at settle, and delete rejected
 asked for by verb and by `Delete` whenever a roll is open and moving nothing
 itself, ignored in develop mode, and `remove` taking the moved photos out with
 the cursor keeping its photo or its position, clamped to the end, the single

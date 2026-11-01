@@ -501,8 +501,9 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     );
     assert_eq!(c.photo(10).unwrap_err(), ui::Error::NoPhoto);
 
-    // Filters: the cursor stays when still shown, else goes to the first
-    // shown; the refused sidecar counts as unflagged.
+    // Filters: the cursor stays when still shown, else goes to the nearest
+    // shown before it (the first shown when none is); the refused sidecar
+    // counts as unflagged.
     assert_eq!(act(&mut c, "picks", &[]), Outcome::Changed);
     assert_eq!(
         &fields(&c)[SHOWN..=NAME],
@@ -1854,6 +1855,42 @@ fn losing_the_cursor_drops_develop_back_to_the_cull_grid() {
     // With no roll at all, entering is a no-roll fault.
     let mut empty = Controller::new(surface(800, 600));
     assert_eq!(empty.action("develop", &[]).unwrap_err(), ui::Error::NoRoll);
+}
+
+/// A flag or a filter that hides the cursor's photo moves it to the
+/// nearest shown photo before it in the roll, the first shown when none is
+/// before: `u` on a pick under the picks filter steps back to the
+/// previous pick and develop stays on it.
+#[test]
+fn hiding_the_cursors_photo_moves_it_back_to_the_previous_shown() {
+    let mut c = Controller::new(surface(800, 600));
+    let roll: Vec<Photo> = (0..7)
+        .map(|i| Photo {
+            name: format!("DSC_{i:04}.NEF"),
+            sidecar: (i % 2 == 0).then(|| edits("td-photo edit 1\nflag pick\n")),
+            error: None,
+        })
+        .collect();
+    c.open("roll", b"/r", roll).unwrap();
+    // Under all, on the unflagged photo 5, the picks filter keeps the
+    // pick before it, 4, not the first.
+    assert_eq!(act(&mut c, "select", &["5"]), Outcome::Changed);
+    assert_eq!(act(&mut c, "picks", &[]), Outcome::Changed);
+    assert_eq!(c.shown(), [0, 2, 4, 6]);
+    assert_eq!(c.cursor(), Some(4));
+    // Developing pick 4, `u` unflags it: the previous pick, 2, in develop.
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(carry_key(&mut c, "u"), Outcome::Changed);
+    assert_eq!(c.shown(), [0, 2, 6]);
+    assert_eq!(c.cursor(), Some(2));
+    assert_eq!(c.mode(), ui::Mode::Develop);
+    assert_eq!(fields(&c)[NAME], name(2));
+    // With none before, the first shown: unflagging 0 goes on to 2.
+    assert_eq!(key(&mut c, "Home"), Outcome::Changed);
+    assert_eq!(c.cursor(), Some(0));
+    assert_eq!(carry_key(&mut c, "u"), Outcome::Changed);
+    assert_eq!((c.shown(), c.cursor()), (&[2usize, 6][..], Some(2)));
+    assert_eq!(c.mode(), ui::Mode::Develop);
 }
 
 #[test]
