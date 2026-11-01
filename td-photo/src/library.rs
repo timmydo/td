@@ -491,6 +491,12 @@ pub fn valid_look(stem: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
+/// A metered spot's place on one axis, `D.DDDD` within `0..=1` as a
+/// crop's edges are written, in `CROP_UNIT`s.
+pub fn spot_fraction(text: &str) -> Option<u32> {
+    fraction(text, 4).filter(|value| *value <= CROP_UNIT)
+}
+
 /// `D.F...`: one integer digit and exactly `decimals` fraction digits, as
 /// an integer in units of `10^-decimals`.
 fn fraction(text: &str, decimals: u32) -> Option<u32> {

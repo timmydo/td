@@ -1,7 +1,8 @@
-//! The auto rule, `td_photo::auto::choose`, over grey frames whose
-//! luminance is each pixel's decoded value.
+//! The auto rule, `td_photo::auto::choose`, and its spot meter,
+//! `choose_spot`, over grey frames whose luminance is each pixel's decoded
+//! value.
 
-use td_photo::auto::{choose, Auto};
+use td_photo::auto::{choose, choose_spot, Auto};
 use td_photo::color::srgb_encode;
 use td_photo::image::Rgb8;
 use td_photo::look::contrast_curve;
@@ -136,4 +137,79 @@ fn the_contrast_spreads_the_tones_to_the_target() {
             );
         }
     }
+}
+
+/// A 100 by 100 frame at linear `sky` with a 10 by 10 square at `face`
+/// whose top left is `x y`.
+fn backlit(sky: f64, face: f64, x: usize, y: usize) -> Rgb8 {
+    let (sky, face) = (byte(sky), byte(face));
+    let data = (0..100 * 100)
+        .flat_map(|i| {
+            let (px, py) = (i % 100, i / 100);
+            let inside = (x..x + 10).contains(&px) && (y..y + 10).contains(&py);
+            [if inside { face } else { sky }; 3]
+        })
+        .collect();
+    Rgb8 {
+        width: 100,
+        height: 100,
+        data,
+    }
+}
+
+/// A spot is exposed for itself alone: a dark face against a bright sky
+/// is lifted to the spot key (0.28) where the whole frame's auto would
+/// darken it, the sky metered is darkened to it, and the range holds
+/// black and white.
+#[test]
+fn a_spot_is_exposed_to_the_key_whatever_surrounds_it() {
+    let frame = backlit(0.6, 0.035, 20, 60);
+    let unit = 10_000;
+    let stops = |y: f64| ((0.28f64 / y).log2() * 100.0).round() as i32;
+    let face = choose_spot(&frame, 2_500, 6_500, unit).unwrap();
+    assert!(
+        (face.exposure - stops(linear(byte(0.035)))).abs() <= 1,
+        "{face:?}"
+    );
+    assert!(choose(&frame).unwrap().exposure < 0);
+    let sky = choose_spot(&frame, 7_500, 2_500, unit).unwrap();
+    assert!(
+        (sky.exposure - stops(linear(byte(0.6)))).abs() <= 1,
+        "{sky:?}"
+    );
+    // The contrast is auto's rule over the whole frame, in its range.
+    assert!((40..=90).contains(&face.contrast), "{face:?}");
+    let black = choose_spot(&backlit(0.6, 0.0, 45, 45), 5_000, 5_000, unit).unwrap();
+    assert_eq!(black.exposure, 400);
+    let corner = choose_spot(&frame, 0, 0, unit).unwrap();
+    assert_eq!(corner.exposure, stops(linear(byte(0.6))));
+    // At the far corner the square is moved inside the frame, not cut:
+    // a dark frame with a bright 4 by 4 corner meters dark there, where a
+    // square cut to that corner would be all bright.
+    let corner = choose_spot(&backlit(0.035, 0.6, 96, 96), unit, unit, unit).unwrap();
+    assert!(
+        (corner.exposure - stops(linear(byte(0.035)))).abs() <= 1,
+        "{corner:?}"
+    );
+}
+
+/// Past the frame, or with nothing to meter, there is no choice.
+#[test]
+fn a_spot_outside_the_frame_is_no_choice() {
+    let frame = backlit(0.6, 0.035, 20, 60);
+    assert_eq!(choose_spot(&frame, 10_001, 0, 10_000), None);
+    assert_eq!(choose_spot(&frame, 0, 10_001, 10_000), None);
+    assert_eq!(choose_spot(&frame, 0, 0, 0), None);
+    let empty = Rgb8 {
+        width: 0,
+        height: 0,
+        data: Vec::new(),
+    };
+    assert_eq!(choose_spot(&empty, 0, 0, 10_000), None);
+    let short = Rgb8 {
+        width: 2,
+        height: 2,
+        data: vec![0; 9],
+    };
+    assert_eq!(choose_spot(&short, 0, 0, 10_000), None);
 }

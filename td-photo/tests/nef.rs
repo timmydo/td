@@ -1925,7 +1925,8 @@ fn the_command_line_probes_and_develops_without_overwriting() {
 /// `edit FILE auto` measures the photo developed at 0 EV with no
 /// contrast or look over its crop, as `develop` renders it at the measure's
 /// long edge, writes what `auto::choose` gives it as one step, takes that
-/// step up when run again, and is undone as one.
+/// step up when run again, and is undone as one; `edit FILE spot X Y`
+/// writes what `auto::choose_spot` gives the same frame at that spot.
 #[test]
 fn the_edit_verb_chooses_exposure_and_contrast_from_the_tones() {
     use std::ffi::OsStr;
@@ -1938,8 +1939,8 @@ fn the_edit_verb_chooses_exposure_and_contrast_from_the_tones() {
     )
     .unwrap();
     let sidecar = dir.join("DSC_0001.NEF.edit");
-    // The measure's frame, rendered by the verb and chosen from here.
-    let expected = |name: &str, crop: Option<&str>| {
+    // The measure's frame, rendered by the verb.
+    let rendered = |name: &str, crop: Option<&str>| {
         let out = dir.join(name);
         let edge = td_photo::auto::EDGE.to_string();
         let mut args = vec![
@@ -1955,9 +1956,10 @@ fn the_edit_verb_chooses_exposure_and_contrast_from_the_tones() {
         let (ok, _, stderr) = run(&args);
         assert!(ok, "{stderr}");
         let ppm = std::fs::read(&out).unwrap();
-        let image = td_photo::image::read_ppm(&ppm).unwrap();
-        td_photo::auto::choose(&image).unwrap()
+        td_photo::image::read_ppm(&ppm).unwrap()
     };
+    let expected =
+        |name: &str, crop: Option<&str>| td_photo::auto::choose(&rendered(name, crop)).unwrap();
     let edit = |words: &[&str]| {
         let mut args = vec![OsStr::new("edit"), file.as_os_str()];
         args.extend(words.iter().map(OsStr::new));
@@ -1999,6 +2001,43 @@ fn the_edit_verb_chooses_exposure_and_contrast_from_the_tones() {
         text,
         "td-photo edit 1\nexposure 0.33\nstep-1 on exposure 0.33\n"
     );
+    // A spot: the same frame, metered there alone.
+    let spot =
+        td_photo::auto::choose_spot(&rendered("spot.ppm", None), 2_500, 7_500, 10_000).unwrap();
+    assert_ne!(spot, whole);
+    edit(&["spot", "0.2500", "0.7500"]);
+    let text = std::fs::read_to_string(&sidecar).unwrap();
+    let step = format!(
+        "step-2 on auto {}\n",
+        td_photo::library::auto_text(spot.exposure, spot.contrast)
+    );
+    assert!(text.ends_with(&step), "{text}");
+    // A place past the frame, or not D.DDDD, is refused, the file kept.
+    for bad in [
+        ["1.0001", "0.5000"],
+        ["0.5", "0.5000"],
+        ["0.5000", "-0.5000"],
+    ] {
+        let mut args = vec![OsStr::new("edit"), file.as_os_str(), OsStr::new("spot")];
+        args.extend(bad.iter().map(OsStr::new));
+        let (ok, _, stderr) = run(&args);
+        assert!(!ok, "{bad:?}");
+        assert!(stderr.contains("spot"), "{stderr}");
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), text);
+    }
+    // A spot needs both places: one, or three, is refused as the spot's.
+    for words in [
+        &["spot", "0.5000"][..],
+        &["spot", "0.5000", "0.5000", "0.5000"],
+    ] {
+        let mut args = vec![OsStr::new("edit"), file.as_os_str()];
+        args.extend(words.iter().map(OsStr::new));
+        let (ok, _, stderr) = run(&args);
+        assert!(!ok, "{words:?}");
+        assert!(stderr.contains("spot takes X Y"), "{stderr}");
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), text);
+    }
+    edit(&["undo"]);
     // A sidecar the reader refuses refuses the measure, the file kept.
     std::fs::write(&sidecar, "td-photo edit 1\nflag maybe\n").unwrap();
     let (ok, _, _) = run(&[OsStr::new("edit"), file.as_os_str(), OsStr::new("auto")]);

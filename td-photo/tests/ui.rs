@@ -272,7 +272,7 @@ fn the_key_list_groups_the_table_by_mode_under_the_chooser_while_it_is_open() {
             ("Cull", 9),
             ("Modes", 3),
             ("Moving around", 8),
-            ("Develop", 16),
+            ("Develop", 17),
             ("History", 5),
             ("Looks", 13),
             ("Zoom", 4),
@@ -370,6 +370,7 @@ fn the_action_table_is_closed_aligned_and_reachable() {
                         "whites",
                         "blacks",
                         "clarity",
+                        "spot-auto",
                         "look-intensity",
                         "quality",
                         "long-edge",
@@ -695,6 +696,9 @@ fn a_session_walks_the_grid_and_reports_its_state() {
 /// What `apply` takes an auto measure to choose: exposure and contrast
 /// hundredths.
 const AUTO_STAND_IN: (i32, i32) = (112, 60);
+/// What `apply` takes a spot measure to choose, other than auto's so a
+/// test tells them apart.
+const SPOT_STAND_IN: (i32, i32) = (245, 40);
 
 /// The binary's adapter over the in-process model, for the tests that
 /// carry effects by hand: each effect mutates the photo's sidecar as it
@@ -703,7 +707,8 @@ const AUTO_STAND_IN: (i32, i32) = (112, 60);
 /// as it was writes nothing and is `Ignored` unless the settle itself
 /// brought a change; anything else is `Changed`. A nudge's delta and
 /// clamp are `Sidecar::nudge`'s, as they are in the binary; an auto
-/// measure, the binary's, is `AUTO_STAND_IN` here.
+/// measure, the binary's, is `AUTO_STAND_IN` here (`SPOT_STAND_IN` for a
+/// spot's).
 fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
     let mut outcome = Outcome::Changed;
     for effect in effects {
@@ -712,6 +717,7 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
             | Effect::Edit { index, name, .. }
             | Effect::Nudge { index, name, .. }
             | Effect::Auto { index, name }
+            | Effect::SpotAuto { index, name, .. }
             | Effect::Reset { index, name }
             | Effect::Undo { index, name }
             | Effect::StepToggle { index, name, .. }
@@ -820,6 +826,7 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
             Effect::Edit { key, value, .. } => sidecar.set(*key, value.as_deref()).unwrap(),
             Effect::Nudge { key, delta, .. } => sidecar.nudge(*key, *delta).unwrap(),
             Effect::Auto { .. } => sidecar.auto(AUTO_STAND_IN.0, AUTO_STAND_IN.1).unwrap(),
+            Effect::SpotAuto { .. } => sidecar.auto(SPOT_STAND_IN.0, SPOT_STAND_IN.1).unwrap(),
             Effect::Reset { .. } => sidecar.reset(),
             Effect::Undo { .. } => {
                 sidecar.undo();
@@ -1654,6 +1661,124 @@ fn auto_is_measured_at_the_adapter_in_develop_mode() {
     assert_eq!(fields(&c)[CONTRAST], "-");
 }
 
+/// `spot-auto X Y` asks the adapter to meter the cursor photo on that
+/// spot, in develop mode only, its fractions `D.DDDD` within `0..=1`; a
+/// Control press on the fitted develop asks the same for the spot under
+/// it, and is inert off the photo, zoomed, comparing or adjusting the
+/// crop, where no crop drag starts either.
+#[test]
+fn a_spot_is_metered_by_its_action_and_a_control_press() {
+    use td_ui::keyboard::Held;
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert_eq!(
+        act(&mut c, "spot-auto", &["0.2500", "0.6500"]),
+        Outcome::Ignored
+    );
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    for bad in [
+        ["0.25", "0.5000"],
+        ["1.0001", "0.5000"],
+        ["0.5000", "-0.5000"],
+    ] {
+        assert_eq!(
+            c.action("spot-auto", &bad).unwrap_err(),
+            ui::Error::BadArgument,
+            "{bad:?}"
+        );
+    }
+    let (outcome, effects) = c.action("spot-auto", &["0.2500", "0.6500"]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::SpotAuto {
+            index: 0,
+            name: file(0),
+            x: 2_500,
+            y: 6_500,
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "2.45");
+    assert_eq!(fields(&c)[CONTRAST], "0.40");
+    // The press: its place in the fit the window reports.
+    let fit = Rect {
+        x: 300,
+        y: 100,
+        width: 400,
+        height: 300,
+    };
+    c.set_preview_fit(Some(fit));
+    let control = Held {
+        control: true,
+        ..Held::default()
+    };
+    let at = |c: &mut Controller, x: u32, y: u32| {
+        c.input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x,
+            y,
+        })
+        .unwrap()
+    };
+    assert_eq!(c.input(Input::Held(control)).unwrap().0, Outcome::Ignored);
+    let (outcome, effects) = at(&mut c, 400, 295);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::SpotAuto {
+            index: 0,
+            name: file(0),
+            x: 2_513,
+            y: 6_517,
+        }]
+    );
+    assert_eq!(c.crop_drag(), None);
+    assert_eq!(release(&mut c, 400, 295), (Outcome::Ignored, Vec::new()));
+    // The fit's last pixel is within the frame; past it, or before its
+    // first, is off the photo, and nothing.
+    let (_, effects) = at(&mut c, 699, 399);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::SpotAuto {
+                x: 9_988,
+                y: 9_983,
+                ..
+            }]
+        ),
+        "{effects:?}"
+    );
+    for (x, y) in [(299, 200), (700, 200), (400, 99), (400, 400)] {
+        assert_eq!(at(&mut c, x, y), (Outcome::Ignored, Vec::new()), "{x} {y}");
+    }
+    // Zoomed, comparing or adjusting the crop, the box is not the frame
+    // the measure develops.
+    assert_eq!(act(&mut c, "zoom-100", &[]), Outcome::Changed);
+    assert_eq!(at(&mut c, 400, 295), (Outcome::Ignored, Vec::new()));
+    assert_eq!(act(&mut c, "zoom-fit", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "compare", &[]), Outcome::Changed);
+    assert_eq!(at(&mut c, 400, 295), (Outcome::Ignored, Vec::new()));
+    assert_eq!(act(&mut c, "compare", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert_eq!(at(&mut c, 400, 295), (Outcome::Ignored, Vec::new()));
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    // Released, or the focus gone, a press is a crop drag's again.
+    for gone in [Input::Held(Held::default()), Input::Focus(false)] {
+        assert_eq!(c.input(Input::Held(control)).unwrap().0, Outcome::Ignored);
+        c.input(gone).unwrap();
+        let (_, effects) = at(&mut c, 400, 295);
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(drag_to(&mut c, 500, 350), Outcome::Changed);
+        assert!(c.crop_drag().is_some());
+        let (_, effects) = release(&mut c, 500, 350);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Edit { key: Key::Crop, .. }]),
+            "{effects:?}"
+        );
+    }
+}
+
 /// `auto-picks` and `A` ask the adapter for every pick's measure in any
 /// mode with a roll open; the picks with neither key take the step, the
 /// others are kept.
@@ -2320,7 +2445,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "78"]);
+    assert_eq!(&reply(2)[..2], ["ok", "79"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(
         reply(4),
@@ -5210,26 +5335,27 @@ fn the_binary_deletes_the_rejects_over_the_replay() {
 }
 
 /// The replay measures an auto over the sidecar's crop on the request and
-/// writes its step, the one `edit FILE auto` writes for the same file; a
-/// frame that cannot be decoded, or a sidecar the reader refuses, is
-/// `refused` with nothing written.
+/// writes its step, the one `edit FILE auto` writes for the same file, and
+/// a spot's as `edit FILE spot X Y` does; a frame that cannot be decoded,
+/// or a sidecar the reader refuses, is `refused` with nothing written.
 #[test]
 fn the_binary_writes_auto_over_the_replay() {
     let temp = Temp::new("auto");
     let roll = temp.0.join("roll");
     let apart = temp.0.join("apart");
     let whole = temp.0.join("whole");
-    for dir in [&roll, &apart, &whole] {
+    let spotted = temp.0.join("spotted");
+    for dir in [&roll, &apart, &whole, &spotted] {
         fs::create_dir_all(dir).unwrap();
     }
     let (w, h) = (64usize, 48usize);
     let samples: Vec<u16> = (0..w * h).map(|i| 1008 + (i as u16 % 4000)).collect();
     let nef = synth_nef::uncompressed_nef(w, h, &samples);
     let cropped = "td-photo edit 1\ncrop 0.5000 0.0000 0.5000 1.0000\n";
-    for dir in [&roll, &apart, &whole] {
+    for dir in [&roll, &apart, &whole, &spotted] {
         fs::write(dir.join("DSC_0001.NEF"), &nef).unwrap();
     }
-    for dir in [&roll, &apart] {
+    for dir in [&roll, &apart, &spotted] {
         fs::write(dir.join("DSC_0001.NEF.edit"), cropped).unwrap();
     }
     fs::write(roll.join("DSC_0002.NEF"), b"not really a nef").unwrap();
@@ -5256,6 +5382,25 @@ fn the_binary_writes_auto_over_the_replay() {
     // The crop is what is measured: the whole frame chooses otherwise.
     let (_, whole_step) = auto_step(&whole);
     assert_ne!(whole_step.split_once(" auto "), step.split_once(" auto "));
+    // A spot after the auto takes up its step, as a second auto would.
+    auto_step(&spotted);
+    let spot = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+        .arg("edit")
+        .arg(spotted.join("DSC_0001.NEF"))
+        .args(["spot", "0.2500", "0.7500"])
+        .output()
+        .unwrap();
+    assert!(spot.status.success());
+    let spotted_text = fs::read_to_string(spotted.join("DSC_0001.NEF.edit")).unwrap();
+    assert_ne!(spotted_text, expected);
+    assert!(
+        spotted_text
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("step-2 on auto "),
+        "{spotted_text}"
+    );
 
     let mut session = Replay::start(&[roll.to_str().unwrap()]);
     let a = session.send(&[
@@ -5277,6 +5422,15 @@ fn the_binary_writes_auto_over_the_replay() {
     assert_eq!(
         fs::read_to_string(roll.join("DSC_0003.NEF.edit")).unwrap(),
         "td-photo edit 1\nflag maybe\n"
+    );
+    let b = session.send(&[
+        request(7, &["action", "first"]),
+        request(8, &["action", "spot-auto", "0.2500", "0.7500"]),
+    ]);
+    assert_eq!(&b[1][1..], ["ok", "changed"]);
+    assert_eq!(
+        fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
+        spotted_text
     );
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");

@@ -209,6 +209,15 @@ pub enum Effect {
     /// window hands the measure to its pool and writes the step on the
     /// file as it is when the measure lands.
     Auto { index: usize, name: String },
+    /// `Auto` metered on a spot, `x y` in `library::CROP_UNIT`s of the
+    /// oriented, cropped photo: the exposure from the spot alone
+    /// (`auto::choose_spot`), the same one step.
+    SpotAuto {
+        index: usize,
+        name: String,
+        x: u32,
+        y: u32,
+    },
     /// Choose the exposure and contrast of every pick of the roll, as the
     /// files flag them then, whose sidecar sets neither yet, each as
     /// `Auto` does, in the roll's order: the replay runs them in turn, the
@@ -337,6 +346,7 @@ pub enum Action {
     Clarity,
     Compare,
     Auto,
+    SpotAuto,
     AutoPicks,
     /// The Nth (from 1) of the available looks, `C-1`..`C-9`.
     LookAt(u8),
@@ -412,6 +422,7 @@ impl Action {
         Action::Clarity,
         Action::Compare,
         Action::Auto,
+        Action::SpotAuto,
         Action::AutoPicks,
         Action::LookAt(1),
         Action::LookAt(2),
@@ -494,6 +505,7 @@ impl Action {
             Self::Clarity => "clarity",
             Self::Compare => "compare",
             Self::Auto => "auto",
+            Self::SpotAuto => "spot-auto",
             Self::AutoPicks => "auto-picks",
             Self::LookAt(1) => "look-1",
             Self::LookAt(2) => "look-2",
@@ -593,6 +605,7 @@ impl Action {
             | Self::Clarity
             | Self::Compare
             | Self::Auto
+            | Self::SpotAuto
             | Self::AutoPicks => Group::Develop,
             Self::Reset | Self::Undo | Self::StepToggle | Self::StepDelete => Group::History,
             Self::LookAt(_)
@@ -670,6 +683,10 @@ impl Group {
     /// there is another action's help line.
     pub fn prose(self) -> &'static [(&'static str, &'static str)] {
         match self {
+            Self::Develop => &[(
+                "",
+                "Control and a click on the photo meter that spot, a face say, as spot-auto does (not zoomed).",
+            )],
             Self::History => &[("", "Down and Up choose the step in develop.")],
             _ => &[],
         }
@@ -980,6 +997,12 @@ pub const BINDINGS: &[Binding] = &[
         chord: Some("a"),
         arguments: "",
         help: "Choose the exposure and contrast from the photo's tones, one step (develop mode).",
+    },
+    Binding {
+        name: "spot-auto",
+        chord: None,
+        arguments: "X Y",
+        help: "Auto metered on a spot: the exposure that puts the spot at X Y (fractions of the photo as shown, D.DDDD) a little over middle grey, as a face wants, and the contrast auto gives the photo at it, one step (develop mode).",
     },
     Binding {
         name: "auto-picks",
@@ -2200,6 +2223,10 @@ pub struct Controller {
     /// the frame witnesses, so a change bumps the generation; absent from
     /// `state`.
     hints: bool,
+    /// Whether Control is held (`Input::Held`), so a press on the fitted
+    /// develop meters a spot (`spot_press`) instead of starting a crop.
+    /// Not painted and absent from `state`, so it moves no generation.
+    control: bool,
     /// The develop box's zoom: `None` fits the whole image, `Some(percent)`
     /// shows it at that percent of full resolution around `centre`. Kept
     /// across photos, dropped on leaving develop and on entering
@@ -2783,6 +2810,7 @@ impl Controller {
             history_first: 0,
             slider: None,
             hints: false,
+            control: false,
             zoom: None,
             centre: (CENTRE_UNIT / 2, CENTRE_UNIT / 2),
             pan: None,
@@ -3958,8 +3986,15 @@ impl Controller {
             // Alt held shows the chords under the buttons; a modifier the
             // keyboard stops reporting (the focus left, or the window
             // says so for a new map) hides them.
-            Input::Held(held) => Ok((self.show_hints(held.alt), Vec::new())),
-            Input::Focus(false) => Ok((self.show_hints(false), Vec::new())),
+            // Control held makes a press on the develop a spot meter's.
+            Input::Held(held) => {
+                self.control = held.control;
+                Ok((self.show_hints(held.alt), Vec::new()))
+            }
+            Input::Focus(false) => {
+                self.control = false;
+                Ok((self.show_hints(false), Vec::new()))
+            }
             Input::Focus(true) | Input::Tick(_) => Ok((Outcome::Ignored, Vec::new())),
         }
     }
@@ -4189,6 +4224,7 @@ impl Controller {
             (Action::ClarityOut, []) => return self.nudge(Key::Clarity, -CLARITY_STEP, effects),
             (Action::Clarity, [value]) => return self.set_clarity(value, effects),
             (Action::Auto, []) => return self.auto(effects),
+            (Action::SpotAuto, [x, y]) => return self.spot_auto(x, y, effects),
             (Action::AutoPicks, []) => return self.auto_picks(effects),
             (Action::Look, [stem]) => return self.set_look(stem, effects),
             (Action::Crop, [x, y, w, h]) => return self.set_crop(x, y, w, h, effects),
@@ -5242,6 +5278,54 @@ impl Controller {
         self.develop_effect(index, |index, name| Effect::Auto { index, name }, effects)
     }
 
+    /// Auto metered on the spot `x y`, `D.DDDD` fractions of the photo as
+    /// shown (the oriented, cropped frame), else `BadArgument`; `Ignored`
+    /// outside develop.
+    fn spot_auto(
+        &mut self,
+        x: &str,
+        y: &str,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        let (Some(x), Some(y)) = (library::spot_fraction(x), library::spot_fraction(y)) else {
+            return Err(Error::BadArgument);
+        };
+        self.develop_effect(
+            index,
+            |index, name| Effect::SpotAuto { index, name, x, y },
+            effects,
+        )
+    }
+
+    /// A Control press on the fitted develop: the spot under it metered
+    /// (`spot_auto`), its place the press's within the image's fitted
+    /// rectangle, which the window reports; off the image, or before the
+    /// window has reported where it is, nothing.
+    fn spot_press(&mut self, x: i64, y: i64) -> Result<(Outcome, Vec<Effect>), Error> {
+        let (Some(index), Some(fit)) = (self.develop_photo()?, self.preview_fit) else {
+            return Ok((Outcome::Ignored, Vec::new()));
+        };
+        if !fit.contains(x, y) {
+            return Ok((Outcome::Ignored, Vec::new()));
+        }
+        // The pressed pixel's centre, `(offset + 1/2) / length`, rounded.
+        let unit = i64::from(library::CROP_UNIT);
+        let share = |offset: i64, length: u32| {
+            let length = i64::from(length.max(1));
+            let centre = ((2 * offset + 1) * unit + length) / (2 * length);
+            u32::try_from(centre.clamp(0, unit)).unwrap_or(0)
+        };
+        let (x, y) = (share(x - fit.x, fit.width), share(y - fit.y, fit.height));
+        self.develop_effect(
+            index,
+            |index, name| Effect::SpotAuto { index, name, x, y },
+            Vec::new(),
+        )
+    }
+
     /// Sets the look to the `n`th (from 1) of the available looks, the
     /// look strip's order; `Ignored` when there is no such look.
     fn look_at(&mut self, n: usize, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
@@ -5301,6 +5385,15 @@ impl Controller {
         x: i64,
         y: i64,
     ) -> Result<(Outcome, Vec<Effect>), Error> {
+        if self.control && phase == PointerPhase::Press {
+            // Control meters the spot pressed, on the fitted develop
+            // alone: a zoom, the camera's JPEG and the uncropped canvas
+            // are not the frame the measure develops.
+            if self.comparing || self.zoom.is_some() || self.adjusting {
+                return Ok((Outcome::Ignored, Vec::new()));
+            }
+            return self.spot_press(x, y);
+        }
         if self.comparing {
             // The camera's JPEG is uncropped and need not be the develop's
             // size: no crop maps onto it, and there is no zoom to pan.

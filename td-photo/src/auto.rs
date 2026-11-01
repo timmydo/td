@@ -32,6 +32,17 @@ const SPREAD: f64 = 0.60;
 const CONTRAST: (i32, i32) = (40, 90);
 /// The long edge the measure is developed at.
 pub const EDGE: usize = 600;
+/// A metered spot's side, a share of the measure's long edge: a square
+/// about the point that holds a face's middle in a half-length portrait.
+pub const SPOT: f64 = 0.06;
+/// The linear luminance a metered spot's median is put at: middle grey
+/// (0.18) and about two thirds of a stop, a light meter's allowance for
+/// skin.
+const SPOT_KEY: f64 = 0.28;
+/// A metered exposure's range, hundredths of a stop: wider than auto's,
+/// since a backlit face may want three stops the frame's key would not
+/// give it.
+const SPOT_EXPOSURE: (i32, i32) = (-300, 400);
 
 /// What auto chooses, in the sidecar's hundredths.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,28 +75,79 @@ fn percentile(values: &mut [f64], p: f64) -> Option<f64> {
     Some(*value)
 }
 
+/// Each pixel's linear luminance, row by row: `LUMA` over the sRGB
+/// decode.
+fn luminances(frame: &Rgb8) -> Vec<f64> {
+    let table = linear_table();
+    let linear = |v: u8| table.get(usize::from(v)).copied().unwrap_or(1.0);
+    frame
+        .data
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|pixel| {
+            let [r, g, b] = pixel.map(linear);
+            f64::from(LUMA[0]) * r + f64::from(LUMA[1]) * g + f64::from(LUMA[2]) * b
+        })
+        .collect()
+}
+
 /// The settings for `frame`, the photo developed at 0 EV with no contrast
 /// or look over its crop; `None` for an empty frame.
 pub fn choose(frame: &Rgb8) -> Option<Auto> {
-    let table = linear_table();
-    let mut luminance = Vec::with_capacity(frame.width.saturating_mul(frame.height));
-    let mut log_sum = 0.0;
-    let linear = |v: u8| table.get(usize::from(v)).copied().unwrap_or(1.0);
-    for pixel in frame.data.as_chunks::<3>().0 {
-        let [r, g, b] = pixel.map(linear);
-        let y = f64::from(LUMA[0]) * r + f64::from(LUMA[1]) * g + f64::from(LUMA[2]) * b;
-        log_sum += y.max(FLOOR).log2();
-        luminance.push(y);
-    }
+    let mut luminance = luminances(frame);
     if luminance.is_empty() {
         return None;
     }
+    let log_sum: f64 = luminance.iter().map(|y| y.max(FLOOR).log2()).sum();
     let key = log_sum / luminance.len() as f64;
-    let low = percentile(&mut luminance, 0.1)?;
-    let high = percentile(&mut luminance, 0.9)?;
     let highlight = percentile(&mut luminance, HIGHLIGHT)?;
     let stops = (BASE + ADAPT * (KEY.log2() - key)).min((HEADROOM / highlight.max(FLOOR)).log2());
     let exposure = ((stops * 100.0).round() as i32).clamp(EXPOSURE.0, EXPOSURE.1);
+    contrast_for(&mut luminance, exposure)
+}
+
+/// The settings for `frame` metered on a spot: the exposure that puts the
+/// median luminance of a square `SPOT` of the long edge about `x y`
+/// (`unit`ths of the frame's width and height) at `SPOT_KEY`, within
+/// `SPOT_EXPOSURE`, and the contrast `choose` would give the frame at that
+/// exposure. Nothing of the frame outside the spot moves the exposure, so
+/// a face against a bright sky is exposed for the face. `None` for an
+/// empty frame or a point outside it.
+pub fn choose_spot(frame: &Rgb8, x: u32, y: u32, unit: u32) -> Option<Auto> {
+    let (w, h) = (frame.width, frame.height);
+    if w == 0 || h == 0 || unit == 0 || x > unit || y > unit {
+        return None;
+    }
+    let mut luminance = luminances(frame);
+    if luminance.len() != w.checked_mul(h)? {
+        return None;
+    }
+    let side = ((SPOT * w.max(h) as f64).round() as usize).max(1);
+    let centre = |f: u32, n: usize| {
+        ((u64::from(f) * n as u64 / u64::from(unit)) as usize).min(n.saturating_sub(1))
+    };
+    let (cx, cy) = (centre(x, w), centre(y, h));
+    // The square about the point, moved inside the frame at its edges.
+    let span = |c: usize, n: usize| {
+        let start = c.saturating_sub(side / 2).min(n.saturating_sub(side));
+        start..(start + side).min(n)
+    };
+    let mut spot: Vec<f64> = span(cy, h)
+        .flat_map(|row| span(cx, w).map(move |column| row * w + column))
+        .filter_map(|index| luminance.get(index).copied())
+        .collect();
+    let median = percentile(&mut spot, 0.5)?;
+    let stops = (SPOT_KEY / median.max(FLOOR)).log2();
+    let exposure = ((stops * 100.0).round() as i32).clamp(SPOT_EXPOSURE.0, SPOT_EXPOSURE.1);
+    contrast_for(&mut luminance, exposure)
+}
+
+/// `exposure` with the contrast that spreads `luminance`'s tenth and
+/// ninetieth percentiles closest to `SPREAD` apart after it.
+fn contrast_for(luminance: &mut [f64], exposure: i32) -> Option<Auto> {
+    let low = percentile(luminance, 0.1)?;
+    let high = percentile(luminance, 0.9)?;
     let gain = 2f64.powf(f64::from(exposure) / 100.0);
     let encode = |x: f64| f64::from(srgb_encode(x as f32));
     // The spread each contrast gives, the first closest to `SPREAD` taken:

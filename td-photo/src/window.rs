@@ -1866,7 +1866,12 @@ impl Window {
                 self.input(Input::Held(Held::default()));
             }
             KeyboardEvent::Refused(why) => note(&why),
-            KeyboardEvent::Ready => {}
+            // The roles held as the keyboard became ready (Control or Alt
+            // already down as the focus came) are the baseline later
+            // changes are reported against: the model takes them now.
+            KeyboardEvent::Ready => {
+                self.input(Input::Held(self.client.input().held()));
+            }
         }
     }
 
@@ -3096,6 +3101,7 @@ mod tests {
             crop: None,
             steps: Vec::new(),
             batch: false,
+            spot: None,
         }
     }
 

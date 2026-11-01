@@ -203,7 +203,7 @@ window, all speaking the toolkit's one vocabulary.
   `shadows-out`), the clarity's (`clarity-in`, `clarity-out`), the
   tonal regions' absolute
   `highlights`, `shadows`, `whites` and `blacks`, the absolute
-  `clarity`, `auto` and
+  `clarity`, `auto`, its spot meter `spot-auto` and
   `auto-picks`, look and the
   look shortcuts `look-1`..`look-9`, the look intensity's nudges
   (`look-intensity-in`, `look-intensity-out`) and absolute
@@ -483,6 +483,28 @@ window, all speaking the toolkit's one vocabulary.
   open is written on its file alone, as the verbs write, its failure on
   stderr alone. `edit FILE auto` reads the file again after measuring and
   fails, writing nothing, when its history moved to other values.
+  `spot-auto X Y` asks for a `SpotAuto` effect, `Auto` metered on a spot
+  (Auto): X and Y are `D.DDDD` fractions of the photo as shown, the
+  oriented, cropped frame, in `0..=1` (`library::spot_fraction`), else
+  bad-argument; the adapter measures and writes as for `auto`, the
+  request carrying the spot (`AutoRequest::spot`), and `edit FILE spot X
+  Y` is its verb (`spot` with other than two places refused by name).
+  It has no chord: with Control held (`Input::Held`; the controller's
+  `control`, unpainted and not in `state`, cleared as the focus leaves)
+  a press on the fitted develop meters the spot under it, its fractions
+  the pressed pixel's centre in the fit the window reports
+  (`preview_fit`), rounded; off the image, before a fit is reported,
+  zoomed, comparing or in crop-adjust, where the box is not the frame
+  the measure develops, the press is inert and starts no drag, and with
+  the look palette open the palette owns the box as for any press. The
+  Develop section's prose row names the gesture. A spot's measure
+  landing on a history an auto step written since it was asked moved
+  alone (one added after the history it read, or that history's last
+  auto step taken up) takes that step up in turn (`unmoved`), so
+  pointing again before the first spot lands keeps the last spot
+  pointed at: the pool measures in the order asked. Any other edit made
+  meanwhile still supersedes it, and auto's own measures, the picks'
+  included, keep the rule above.
   `auto-picks` (`A`) asks, as `export-picks` does, in any mode with a roll,
   for an `AutoPicks` effect: the adapter reads the roll's picks as their
   sidecars flag them (`read_picks`), keeps each whose sidecar sets exposure
@@ -859,7 +881,8 @@ window, all speaking the toolkit's one vocabulary.
   `d` into develop, `E` into the export view, 3), Cull (the flags, the
   filters, the single view, `delete-rejected`, 9), Develop (the
   exposure, contrast, crop, look palette, shadows, clarity, compare and
-  Auto keys, `auto-picks`, 16), History (`reset`, `undo` and the step keys,
+  Auto keys, `auto-picks`, then a prose row: Control and a click meter
+  a spot, 17), History (`reset`, `undo` and the step keys,
   then a prose row: `Down` and `Up` choose the step in develop, 5),
   Looks (`C-1`..`C-9`, then `'` and `;` for the intensity, then `D` for
   the default look and `M` for a camera match, 13), Zoom (4), Export
@@ -1465,6 +1488,20 @@ pixel is `LUMA` over the sRGB decode of the frame. `auto::choose` then takes:
 - the contrast: of 0.40..=0.90, the first whose curve
   (`look::contrast_curve`), after that exposure, puts the sRGB-encoded tenth
   and ninetieth percentiles of the luminance closest to 0.60 apart.
+
+`auto::choose_spot` meters a spot instead (`spot-auto`, a Control press
+on the develop, `edit FILE spot X Y`), over the same frame: the exposure
+puts the median luminance of a square `auto::SPOT` (6%) of the long edge
+about the point, moved inside the frame at its edges, at 0.28, middle
+grey and two thirds of
+a stop, a light meter's allowance for skin; within -3.00..=4.00, wider
+than auto's since a backlit face may want three stops the frame's key
+would not give it; and rounded to hundredths. Nothing outside the spot
+moves the exposure, so a face against a bright sky is exposed for the
+face and the sky is let go; the contrast is auto's rule over the whole
+frame at that exposure. The step is auto's, `auto E C`, so a spot after
+an auto takes up its step and one undo takes it back. The point is the
+user's: no face is detected.
 
 The constants are fitted on a 140-frame Z 8 roll against the owner's
 darktable exports of 33 of its frames and hand exposures of 7. Matching
@@ -2169,7 +2206,10 @@ why no endpoint could be made, and points at `--help`. The adapter: `event`
 maps the compositor's
 configure to a resize, a key to its chord (a held move or page repeats through
 the toolkit's repeat; a flag, a filter, a view or quit fires once), a
-modifier change with no key under it to `Input::Held` (the hints), a left
+modifier change with no key under it to `Input::Held` (the hints and the
+spot meter's Control), the roles held as the keyboard becomes ready
+(`KeyboardEvent::Ready`, a modifier already down as the focus came) to
+`Input::Held` too, a left
 button's press, motion and release to the pointer path (the crop drag reads
 the motion and release, not the press alone) and the wheel's frames to
 `scroll` (in develop, the zoom's step), and `end_turn` takes the
@@ -2551,10 +2591,21 @@ black and white at the exposure's ends, a dark frame around a white part held a
 stop past white at the 99.5th percentile and a smaller part not binding, the
 luminance weighing a red and a green frame by `LUMA`, and a narrow, a middle and
 a wide frame given the most, a middling and the least contrast, each the one in
-range whose spread is nearest the target. `tests/nef.rs`'s `edit FILE auto` case
-holds the step to the rule over `develop`'s frame at the measure's edge, whole
-and cropped, the same choice again no step, undone step by step, and a sidecar
-the reader refuses refusing the measure with the file kept.
+range whose spread is nearest the target; and the spot meter: a dark square
+in a bright frame lifted to the spot key where the frame's auto darkens it,
+the bright part metered darkened to it, a black spot at the range's top, the
+far corner's square moved inside the frame (a dark frame with a bright
+corner metered dark there), and a point past the frame, a zero unit,
+an empty frame or a short buffer no choice. `tests/nef.rs`'s `edit FILE auto`
+case holds the step to the rule over `develop`'s frame at the measure's edge,
+whole and cropped, the same choice again no step, undone step by step, `edit
+FILE spot X Y` writing what `choose_spot` gives that frame and refusing a
+place past it or not `D.DDDD`, and one or three places, with the file kept,
+and a sidecar the reader refuses refusing the measure with the file kept.
+main.rs holds the spot's landing (`unmoved`): two spots asked over one
+history and landing in order keep the second as one step, an exposure set
+meanwhile supersedes, an auto step turned off is not taken up, and auto's
+own measure keeps a history an auto step moved.
 
 `tests/jpeg.rs` pins the thumbnail rule by value over td-jpeg's Z 8
 thumbnail fixture, the PPM format, and the export's pool: td-jpeg's
@@ -2877,9 +2928,15 @@ laid in order on short surfaces, some heights laying only some, the
 last giving way first while the list keeps a row,
 `auto` and `a` asking the adapter
 for the cursor photo's measure (ignored outside develop, one step labelled
-`auto E C`, the same values no step, one undo taking both), the replay
+`auto E C`, the same values no step, one undo taking both), `spot-auto` and
+a Control press asking for the spot's (ignored outside develop, a place not
+`D.DDDD` in range bad-argument, the press's place in the fit, its last
+pixel within the frame, a press off it, zoomed, comparing or in
+crop-adjust inert, and a press with Control released or the focus gone a
+crop drag again), the replay
 writing the step `edit FILE auto` writes over the sidecar's crop (the whole
-frame choosing otherwise) and refusing a frame it cannot decode and a refused
+frame choosing otherwise) and the one `edit FILE spot X Y` writes after it
+for `spot-auto`, and refusing a frame it cannot decode and a refused
 sidecar over a decodable one with nothing written, `auto-picks` and `A`
 asking for every pick's measure in any mode with a roll (the picks with
 neither key taking the step, the others kept), the picks' auto over the
@@ -3253,7 +3310,9 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    camera match from the window: `M` (`match-look`) fits the open roll
    on the pool into the next free `camera-match` stem. Landed. (r) The
    clarity's keys: `k` and `K` nudge the clarity a twentieth
-   (`clarity-in`, `clarity-out`). Landed.
+   (`clarity-in`, `clarity-out`). Landed. (s) The spot meter:
+   `spot-auto X Y`, a Control press on the develop and `edit FILE spot
+   X Y` expose for a face or any spot the user points at. Landed.
 9. Later: DNG and JPEG rolls, the Nikon High Efficiency codec, a
    better full-resolution demosaic, highlight reconstruction, the
    `.dtstyle` translator, and ratings.

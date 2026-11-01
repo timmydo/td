@@ -29,7 +29,7 @@ use td_photo::auto::{self, Auto};
 use td_photo::color::{camera_color, CameraColor, Transfer};
 use td_photo::develop::{self, Params, MAX_THREADS};
 use td_photo::image::{self, read_ppm, write_ppm, Rgb8};
-use td_photo::library::{self, Filter, Flag, Key, Sidecar};
+use td_photo::library::{self, Filter, Flag, Key, Sidecar, Step, StepKey};
 use td_photo::look::{self, Look};
 use td_photo::nef::{self, Nef};
 use td_photo::settings::{self, Format, Settings};
@@ -150,7 +150,7 @@ const HELP: &str = concat!(
     "  when only the sidecar's move failed; the run fails after the rest\n",
     "  when any was kept or split. Each file is linked into rejected/ before\n",
     "  its old name is dropped, so no name is replaced and no file is lost.\n",
-    "td-photo edit FILE [KEY VALUE ... | auto | reset | undo]\n",
+    "td-photo edit FILE [KEY VALUE ... | auto | spot X Y | reset | undo]\n",
     "  Prints FILE's sidecar, or sets exposure STOPS (-5.00 to 5.00),\n",
     "  contrast C (-1.00 to 1.00), crop X Y W H (fractions to four\n",
     "  decimals), look STEM, look-intensity I (0.00 to 2.00), highlights,\n",
@@ -159,8 +159,10 @@ const HELP: &str = concat!(
     "  a VALUE of - clears the key. A develop key set is a step of the\n",
     "  sidecar's history (step-N lines, the keys their summary); auto\n",
     "  chooses exposure and contrast from the photo's tones over its crop\n",
-    "  as one step, undo takes the last step back and reset clears all\n",
-    "  but the flag. The sidecar\n",
+    "  as one step, spot X Y does so metered on the spot at the fractions\n",
+    "  X Y of the photo as shown (D.DDDD), its exposure putting that spot\n",
+    "  a little over middle grey as a face wants, undo takes the last step\n",
+    "  back and reset clears all but the flag. The sidecar\n",
     "  is written through NAME.edit.tmp and renamed into place, the one\n",
     "  file td-photo replaces, since it is its own.\n",
     "td-photo [open [ROLL] [--control-socket PATH]]\n",
@@ -1132,6 +1134,10 @@ pub(crate) struct AutoRequest {
     /// One of the picks' batch, counted in the batch's note as it lands,
     /// rather than a measure of its own.
     pub(crate) batch: bool,
+    /// The spot metered, `x y` in `library::CROP_UNIT`s of the oriented,
+    /// cropped frame (`auto::choose_spot`); `None` meters the whole frame
+    /// (`auto::choose`).
+    pub(crate) spot: Option<(u32, u32)>,
 }
 
 /// The auto measure `path` asks for, from its sidecar as the file holds
@@ -1145,6 +1151,7 @@ pub(crate) fn auto_request(path: &Path) -> Result<AutoRequest, String> {
         crop: sidecar.crop(),
         steps: sidecar.steps().to_vec(),
         batch: false,
+        spot: None,
     })
 }
 
@@ -1162,6 +1169,7 @@ pub(crate) fn auto_pick_request(path: &Path) -> Result<Option<AutoRequest>, Stri
         crop: sidecar.crop(),
         steps: sidecar.steps().to_vec(),
         batch: true,
+        spot: None,
     }))
 }
 
@@ -1172,7 +1180,7 @@ pub(crate) fn auto_pick_request(path: &Path) -> Result<Option<AutoRequest>, Stri
 fn write_auto_file(request: &AutoRequest, chosen: Auto) -> Result<Landing, String> {
     let path = &request.path;
     let mut sidecar = read_sidecar(path)?;
-    if sidecar.steps() != request.steps.as_slice() {
+    if !unmoved(sidecar.steps(), request) {
         return Ok(moved(&sidecar, chosen));
     }
     sidecar
@@ -1180,6 +1188,31 @@ fn write_auto_file(request: &AutoRequest, chosen: Auto) -> Result<Landing, Strin
         .map_err(|e| format!("{}: {e}", path.display()))?;
     write_sidecar(path, &sidecar)?;
     Ok(Landing::Written)
+}
+
+/// Whether `request`'s measure may still be written on the history
+/// `now`: the history it read, or, for a spot, one an auto step written
+/// since moved alone (one added after it, or its last auto step taken
+/// up), which the spot, asked for later, takes up in turn. So the last of
+/// several spots pointed at before the first landed is the one kept, as
+/// the pool measures in the order asked; auto's own measures, the picks'
+/// included, keep a history moved by any step.
+fn unmoved(now: &[Step], request: &AutoRequest) -> bool {
+    let asked = request.steps.as_slice();
+    let auto = |step: Option<&Step>| step.is_some_and(|step| step.on && step.key == StepKey::Auto);
+    if now == asked {
+        return true;
+    }
+    if request.spot.is_none() {
+        return false;
+    }
+    match (now.split_last(), asked.split_last()) {
+        (Some((last, before)), _) if before == asked => auto(Some(last)),
+        (Some((last, before)), Some((was, kept))) if before == kept => {
+            auto(Some(last)) && auto(Some(was))
+        }
+        _ => false,
+    }
 }
 
 /// What came of a measure whose photo's history moved since it was asked
@@ -1208,8 +1241,8 @@ fn auto_written(request: &AutoRequest, landing: Landing) -> Result<(), String> {
 /// Measures `request`: the photo developed at 0 EV with no contrast or
 /// look over its crop, `auto::EDGE` on the long side, from `raw` when the
 /// caller holds the frame, and the exposure and contrast `auto::choose`
-/// gives it, with the frame it decoded when the caller held none (for the
-/// window's raw cache).
+/// gives it, or `auto::choose_spot` for a metered spot, with the frame it
+/// decoded when the caller held none (for the window's raw cache).
 pub(crate) fn auto_measure(
     request: &AutoRequest,
     raw: Option<&RawFrame>,
@@ -1243,8 +1276,11 @@ pub(crate) fn auto_measure(
         &params,
     )
     .map_err(|e| format!("{}: {e}", request.path.display()))?;
-    let chosen = auto::choose(&image)
-        .ok_or_else(|| format!("{}: nothing to measure", request.path.display()))?;
+    let chosen = match request.spot {
+        Some((x, y)) => auto::choose_spot(&image, x, y, library::CROP_UNIT),
+        None => auto::choose(&image),
+    }
+    .ok_or_else(|| format!("{}: nothing to measure", request.path.display()))?;
     Ok((chosen, decoded))
 }
 
@@ -3171,12 +3207,27 @@ fn edit(path: &Path, rest: &[OsString]) -> Result<(), String> {
         sidecar.undo();
         return write_sidecar(path, &sidecar);
     }
-    if words == ["auto"] {
+    let spot = match words.as_slice() {
+        [word] if *word == "auto" => Some(None),
+        [word, x, y] if *word == "spot" => Some(Some(
+            library::spot_fraction(x)
+                .zip(library::spot_fraction(y))
+                .ok_or_else(|| {
+                    format!("spot {x} {y}: not two fractions D.DDDD in 0.0000..=1.0000")
+                })?,
+        )),
+        [word, ..] if *word == "spot" => {
+            return Err("spot takes X Y, two fractions D.DDDD".to_string());
+        }
+        _ => None,
+    };
+    if let Some(spot) = spot {
         let request = AutoRequest {
             path: path.to_path_buf(),
             crop: sidecar.crop(),
             steps: sidecar.steps().to_vec(),
             batch: false,
+            spot,
         };
         let (chosen, _) = auto_measure(&request, None, threads())?;
         // Read again: the measure takes a decode, and the window may have
@@ -3733,7 +3784,10 @@ impl Session {
                     key,
                     delta,
                 } => outcome = self.edit(index, name, |sidecar| sidecar.nudge(key, delta))?,
-                Effect::Auto { index, name } => outcome = self.auto(index, name)?,
+                Effect::Auto { index, name } => outcome = self.auto(index, name, None)?,
+                Effect::SpotAuto { index, name, x, y } => {
+                    outcome = self.auto(index, name, Some((x, y)))?
+                }
                 Effect::AutoPicks => outcome = self.auto_picks()?,
                 Effect::Reset { index, name } => {
                     outcome = self.edit(index, name, |sidecar| {
@@ -3823,11 +3877,16 @@ impl Session {
     /// queued for the window's pool, `changed` as it is queued, the step
     /// written as it lands (`auto_landed`). A measure that fails is
     /// `refused` with its reason on stderr.
-    fn auto(&mut self, index: usize, name: String) -> Result<Outcome, ui::Error> {
+    fn auto(
+        &mut self,
+        index: usize,
+        name: String,
+        spot: Option<(u32, u32)>,
+    ) -> Result<Outcome, ui::Error> {
         let roll = self.ui.roll().ok_or(ui::Error::NoRoll)?;
         let original = PathBuf::from(OsStr::from_bytes(roll)).join(&name);
         let request = match auto_request(&original) {
-            Ok(request) => request,
+            Ok(request) => AutoRequest { spot, ..request },
             Err(why) => {
                 note(&why);
                 return Err(ui::Error::Refused);
@@ -3998,7 +4057,7 @@ impl Session {
     ) -> Result<(Outcome, Landing), ui::Error> {
         let mut landing = Landing::Written;
         let outcome = self.edit(index, name, |sidecar| {
-            if sidecar.steps() != request.steps.as_slice() {
+            if !unmoved(sidecar.steps(), request) {
                 landing = moved(sidecar, chosen);
                 return Ok(());
             }
@@ -4494,6 +4553,69 @@ fn help_actions() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spots pointed at one after another, each asked for before the
+    /// last landed: each later one takes up the auto step the earlier
+    /// wrote, so the last pointed at is kept as one step; an edit of
+    /// another key made meanwhile still supersedes, and an auto step
+    /// turned off is not taken up.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn the_last_spot_asked_for_takes_up_an_auto_step_written_meanwhile() {
+        let temp = td_fs::TempDir::new("td-photo-spot-landed").unwrap();
+        let path = temp.path().join("DSC_0001.NEF");
+        let sidecar_text = || fs::read_to_string(temp.path().join("DSC_0001.NEF.edit")).unwrap();
+        let request = |spot| AutoRequest {
+            path: path.clone(),
+            crop: None,
+            steps: read_sidecar(&path).unwrap().steps().to_vec(),
+            batch: false,
+            spot: Some(spot),
+        };
+        let (cheek, forehead) = (request((4_000, 5_000)), request((4_000, 3_000)));
+        let chosen = |exposure, contrast| Auto { exposure, contrast };
+        assert_eq!(
+            write_auto_file(&cheek, chosen(200, 50)).unwrap(),
+            Landing::Written
+        );
+        assert_eq!(
+            write_auto_file(&forehead, chosen(300, 40)).unwrap(),
+            Landing::Written
+        );
+        assert_eq!(
+            sidecar_text(),
+            "td-photo edit 1\nexposure 3.00\ncontrast 0.40\nstep-1 on auto 3.00 0.40\n"
+        );
+        // Asked for, then an exposure set before it landed: superseded.
+        let late = request((5_000, 5_000));
+        let mut sidecar = read_sidecar(&path).unwrap();
+        sidecar.set(Key::Exposure, Some("1.00")).unwrap();
+        write_sidecar(&path, &sidecar).unwrap();
+        let before = sidecar_text();
+        assert_eq!(
+            write_auto_file(&late, chosen(250, 45)).unwrap(),
+            Landing::Superseded
+        );
+        assert_eq!(sidecar_text(), before);
+        // An auto step written meanwhile and turned off is not taken up.
+        let asked = request((5_000, 5_000));
+        let mut sidecar = read_sidecar(&path).unwrap();
+        sidecar.auto(120, 60).unwrap();
+        let last = sidecar.steps().len() - 1;
+        sidecar.toggle_step(last);
+        write_sidecar(&path, &sidecar).unwrap();
+        assert!(!unmoved(sidecar.steps(), &asked));
+        assert!(unmoved(&asked.steps, &asked));
+        // Auto's own measure keeps a history an auto step moved.
+        let mut sidecar = read_sidecar(&path).unwrap();
+        sidecar.toggle_step(last);
+        assert!(unmoved(sidecar.steps(), &asked));
+        let plain = AutoRequest {
+            spot: None,
+            ..asked.clone()
+        };
+        assert!(!unmoved(sidecar.steps(), &plain));
+    }
 
     /// The batch's note names the pick being written while any is
     /// outstanding, then counts what landed and what failed.
