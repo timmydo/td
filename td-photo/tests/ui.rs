@@ -1147,7 +1147,7 @@ fn look_intensity_is_nudged_and_set_with_a_look() {
     }
     assert_eq!(act(&mut c, "look-intensity", &["0.50"]), Outcome::Ignored);
     assert_eq!(
-        c.action("look-intensity", &["1.50"]).unwrap_err(),
+        c.action("look-intensity", &["2.50"]).unwrap_err(),
         ui::Error::BadArgument
     );
     let (_, effects) = c.action("look", &["mono"]).unwrap();
@@ -1173,7 +1173,12 @@ fn look_intensity_is_nudged_and_set_with_a_look() {
     );
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     assert_eq!(fields(&c)[LOOK_INTENSITY], "1.00");
-    // The whole look nudged up is no change, and no write.
+    // Past the whole to twice it, then no change, and no write.
+    for _ in 0..10 {
+        let (_, effects) = c.input(Input::Key { chord: "'" }).unwrap();
+        assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    }
+    assert_eq!(fields(&c)[LOOK_INTENSITY], "2.00");
     let (_, effects) = c.input(Input::Key { chord: "'" }).unwrap();
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Ignored);
     let (_, effects) = c.action("look-intensity", &["0.35"]).unwrap();
@@ -1199,7 +1204,7 @@ fn look_intensity_is_nudged_and_set_with_a_look() {
         .map(ui::step_label)
         .collect();
     assert_eq!(labels, ["look mono", "look-intensity 0.35"]);
-    for bad in ["1.01", "-0.10", "0.5", "x", "-"] {
+    for bad in ["2.01", "-0.10", "0.5", "x", "-"] {
         assert_eq!(
             c.action("look-intensity", &[bad]).unwrap_err(),
             ui::Error::BadArgument,
@@ -1248,7 +1253,11 @@ fn the_look_intensity_slider_commits_on_release() {
     assert_eq!(ui::intensity_step(37), 7);
     assert_eq!(ui::intensity_step(38), 8);
     assert_eq!(ui::intensity_at(7), 35);
-    assert_eq!(ui::intensity_at(40), 100);
+    assert_eq!(ui::intensity_step(200), 40);
+    assert_eq!(ui::intensity_step(300), 40);
+    assert_eq!(ui::intensity_at(40), 200);
+    assert_eq!(ui::intensity_at(60), 200);
+    // The whole look, absent the key, in the middle of the travel.
     assert_eq!(c.intensity_value(), 20);
     assert!(!c.intensity_enabled());
     // Without a look the slider is inert.

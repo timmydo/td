@@ -632,6 +632,10 @@ pub fn resample_u16(
     resample_core(src, sw, sh, dw, dh, threads, |v| f32::from(v) / 65535.0)
 }
 
+/// The most of a look the pipeline applies: twice the whole, each change
+/// the look makes doubled.
+pub const MAX_LOOK_SHARE: f32 = 2.0;
+
 /// What the pipeline takes beyond the camera's facts.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params<'a> {
@@ -643,9 +647,9 @@ pub struct Params<'a> {
     pub threads: usize,
     /// Applied after the matrix and before the transfer, when given.
     pub look: Option<&'a Look>,
-    /// The share of the look applied, `0..=1`: each pixel moves this far
-    /// from the one the look was given to the one it made. 1 is the whole
-    /// look; a value outside is held to that range.
+    /// The share of the look applied, `0..=2`: each pixel moves this far
+    /// from the one the look was given to the one it made, past it beyond
+    /// 1. 1 is the whole look; a value outside is held to that range.
     pub look_intensity: f32,
 }
 
@@ -1047,7 +1051,7 @@ pub fn level3(
     let intensity = if params.look_intensity.is_nan() {
         1.0
     } else {
-        params.look_intensity.clamp(0.0, 1.0)
+        params.look_intensity.clamp(0.0, MAX_LOOK_SHARE)
     };
     // No share of it is no look, and skips its cost.
     let look = look.filter(|_| intensity > 0.0);
@@ -1074,7 +1078,7 @@ pub fn level3(
                 None => rgb,
             };
             let rgb = match look {
-                Some(look) if intensity < 1.0 => {
+                Some(look) if intensity != 1.0 => {
                     let ([r, g, b], [lr, lg, lb]) = (rgb, look.apply(rgb));
                     [
                         r + intensity * (lr - r),

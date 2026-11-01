@@ -816,10 +816,10 @@ fn the_look_intensity_takes_a_share_of_the_look() {
     let plain = render(None, 1.0);
     let whole = render(Some(&mono), 1.0);
     // None of the look is no look; all of it is the look; a value past
-    // either end, or NaN, is held to the range, NaN to the whole.
+    // either end of 0..=2, or NaN, is held to the range, NaN to the whole.
     assert_eq!(render(Some(&mono), 0.0), plain);
     assert_eq!(render(Some(&mono), -0.5), plain);
-    assert_eq!(render(Some(&mono), 1.5), whole);
+    assert_eq!(render(Some(&mono), 2.5), render(Some(&mono), 2.0));
     assert_eq!(render(Some(&mono), f32::NAN), whole);
     // Without a look the intensity moves nothing.
     assert_eq!(render(None, 0.3), plain);
@@ -836,6 +836,21 @@ fn the_look_intensity_takes_a_share_of_the_look() {
     }
     assert!(h[0] > h[1], "{h:?}");
     assert_eq!(half.pixel(1, 0), plain.pixel(1, 0));
+    // Past the whole the look's change goes further the same way: each
+    // channel of the red beyond the whole look's, away from the plain one
+    // (a mono mix past its grey turns the red toward its complement), and
+    // grey still where it is.
+    let more = render(Some(&mono), 1.5);
+    let m = more.pixel(1, 1).unwrap();
+    for ((p, w), m) in p.iter().zip(w).zip(m) {
+        if w > *p {
+            assert!(m >= w, "{p} {w} {m}");
+        } else {
+            assert!(m <= w, "{p} {w} {m}");
+        }
+    }
+    assert!(m[0] < m[1], "{m:?}");
+    assert_eq!(more.pixel(1, 0), plain.pixel(1, 0));
 }
 
 // ------------------------------------------------------------ the binary

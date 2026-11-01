@@ -763,17 +763,20 @@ fn contrast_is_a_develop_key_nudged_within_its_range() {
     assert_eq!(sidecar.text(), "td-photo edit 1\n");
 }
 
-/// The look's intensity is a develop key of hundredths in 0.00..=1.00,
-/// the whole look when absent; a nudge clamps to that range, and one that
-/// clamps to the value in force (the absent key's whole look among them)
-/// is no step; reset clears it with the others.
+/// The look's intensity is a develop key of hundredths in 0.00..=2.00,
+/// the whole look (1.00) when absent; a nudge clamps to that range, and
+/// one that clamps to the value in force is no step, as is the whole set
+/// on the absent key; reset clears it with the others.
 #[test]
-fn look_intensity_is_a_develop_key_held_to_the_whole_look() {
+fn look_intensity_is_a_develop_key_held_to_twice_the_look() {
     assert_eq!(library::look_intensity("0.00"), Ok(0));
     assert_eq!(library::look_intensity("1.00"), Ok(100));
+    assert_eq!(library::look_intensity("1.50"), Ok(150));
+    assert_eq!(library::look_intensity("2.00"), Ok(200));
     assert_eq!(library::look_intensity("0.35"), Ok(35));
     assert_eq!(library::look_intensity_text(5), "0.05");
-    for bad in ["1.01", "-0.10", "-0.00", "0.5", "+0.10", "2.00", "x"] {
+    assert_eq!(library::look_intensity_text(250), "2.00");
+    for bad in ["2.01", "-0.10", "-0.00", "0.5", "+0.10", "3.00", "x"] {
         assert_eq!(
             library::look_intensity(bad),
             Err(Error::Value(Key::LookIntensity)),
@@ -783,15 +786,21 @@ fn look_intensity_is_a_develop_key_held_to_the_whole_look() {
     assert_eq!(Key::parse("look-intensity"), Some(Key::LookIntensity));
     assert!(Key::LookIntensity.develops());
     let mut sidecar = Sidecar::default();
-    assert_eq!(sidecar.look_intensity(), library::MAX_LOOK_INTENSITY);
-    // Up from the whole look: no change, no step.
-    sidecar.nudge(Key::LookIntensity, 10).unwrap();
-    assert_eq!(sidecar.text(), "td-photo edit 1\n");
-    // ... and so is setting the whole on the absent key.
+    assert_eq!(sidecar.look_intensity(), library::DEFAULT_LOOK_INTENSITY);
+    // The whole set on the absent key: no change, no step.
     sidecar.set(Key::LookIntensity, Some("1.00")).unwrap();
     assert_eq!(sidecar.text(), "td-photo edit 1\n");
     sidecar.set(Key::Look, Some("mono")).unwrap();
+    // Up past the whole to twice it, and no further: the clamp to the
+    // value in force writes nothing.
     for _ in 0..12 {
+        sidecar.nudge(Key::LookIntensity, 10).unwrap();
+    }
+    assert_eq!(sidecar.look_intensity(), library::MAX_LOOK_INTENSITY);
+    let at_most = sidecar.text();
+    sidecar.nudge(Key::LookIntensity, 10).unwrap();
+    assert_eq!(sidecar.text(), at_most);
+    for _ in 0..22 {
         sidecar.nudge(Key::LookIntensity, -10).unwrap();
     }
     assert_eq!(sidecar.look_intensity(), 0);
@@ -803,14 +812,14 @@ fn look_intensity_is_a_develop_key_held_to_the_whole_look() {
     );
     let reread = Sidecar::parse(sidecar.text().as_bytes()).unwrap();
     assert_eq!(reread.look_intensity(), 25);
-    assert!(Sidecar::parse(b"td-photo edit 1\nlook-intensity 1.50\n").is_err());
+    assert!(Sidecar::parse(b"td-photo edit 1\nlook-intensity 2.50\n").is_err());
     assert!(Sidecar::parse(b"td-photo edit 1\nstep-1 on look-intensity -0.10\n").is_err());
     // Turning its step off falls back to the whole look.
     assert!(sidecar.toggle_step(1));
-    assert_eq!(sidecar.look_intensity(), library::MAX_LOOK_INTENSITY);
+    assert_eq!(sidecar.look_intensity(), library::DEFAULT_LOOK_INTENSITY);
     assert!(sidecar.toggle_step(1));
     sidecar.reset();
-    assert_eq!(sidecar.look_intensity(), library::MAX_LOOK_INTENSITY);
+    assert_eq!(sidecar.look_intensity(), library::DEFAULT_LOOK_INTENSITY);
     assert_eq!(sidecar.text(), "td-photo edit 1\n");
 }
 
@@ -827,7 +836,12 @@ fn look_intensity_goes_through_edit_and_list() {
         td_photo(&["list", roll_s]).1,
         "DSC_0001.NEF\t-\t-\t-\t-\tmono\t0.60\tok\n"
     );
-    let (ok, _, err) = td_photo(&["edit", photo_s, "look-intensity", "1.50"]);
+    assert!(td_photo(&["edit", photo_s, "look-intensity", "1.80"]).0);
+    assert_eq!(
+        td_photo(&["list", roll_s]).1,
+        "DSC_0001.NEF\t-\t-\t-\t-\tmono\t1.80\tok\n"
+    );
+    let (ok, _, err) = td_photo(&["edit", photo_s, "look-intensity", "2.50"]);
     assert!(!ok);
     assert!(err.contains("malformed look-intensity value"), "{err}");
     assert!(td_photo(&["edit", photo_s, "look-intensity", "-"]).0);

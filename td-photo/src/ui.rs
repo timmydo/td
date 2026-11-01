@@ -920,7 +920,7 @@ pub const BINDINGS: &[Binding] = &[
         name: "look-intensity-in",
         chord: Some("'"),
         arguments: "",
-        help: "Apply a tenth more of the look, up to the whole (develop mode, with a look).",
+        help: "Apply a tenth more of the look, up to twice the whole (develop mode, with a look).",
     },
     Binding {
         name: "look-intensity-out",
@@ -932,7 +932,7 @@ pub const BINDINGS: &[Binding] = &[
         name: "look-intensity",
         chord: None,
         arguments: "VALUE",
-        help: "Set the share of the look applied to VALUE, two decimals in 0.00..1.00 (develop mode, with a look); the look band's slider commits one on release.",
+        help: "Set the share of the look applied to VALUE, two decimals in 0.00..2.00, 1.00 the whole look (develop mode, with a look); the look band's slider commits one on release.",
     },
     Binding {
         name: "zoom-fit",
@@ -1209,9 +1209,10 @@ pub fn exposure_at(value: usize) -> i32 {
 }
 
 /// The look intensity slider's steps: a twentieth of the look each, so
-/// value 0 is none of the look and 20 all of it, few enough to fit after
-/// the looks on their last row where a hundred would not.
-pub const INTENSITY_STEPS: usize = 20;
+/// value 0 is none of the look, 20 the whole and 40 twice it, few enough
+/// to fit after the looks on their last row where a step a hundredth
+/// would not.
+pub const INTENSITY_STEPS: usize = 40;
 const _: () = assert!(library::MAX_LOOK_INTENSITY == 5 * INTENSITY_STEPS as i32);
 
 /// The intensity slider's value for a look intensity in hundredths.
@@ -4407,7 +4408,7 @@ impl Controller {
         self.photos
             .get(index)
             .and_then(|photo| photo.sidecar.as_ref())
-            .map_or(library::MAX_LOOK_INTENSITY, Sidecar::look_intensity)
+            .map_or(library::DEFAULT_LOOK_INTENSITY, Sidecar::look_intensity)
     }
 
     /// A develop slider's value for photo `index` as its sidecar holds it.
@@ -4587,9 +4588,11 @@ impl Controller {
     pub fn intensity_value(&self) -> usize {
         match self.slider {
             Some((Dial::Intensity, value)) => value,
-            _ => self.cursor.map_or(INTENSITY_STEPS, |index| {
-                self.dial_value(Dial::Intensity, index)
-            }),
+            _ => self
+                .cursor
+                .map_or(intensity_step(library::DEFAULT_LOOK_INTENSITY), |index| {
+                    self.dial_value(Dial::Intensity, index)
+                }),
         }
     }
 
@@ -4670,7 +4673,7 @@ impl Controller {
     }
 
     /// Sets the cursor photo's look intensity to `value`, `D.DD` within
-    /// `0.00..=1.00`, else `BadArgument`; `Ignored` without a look, which
+    /// `0.00..=2.00`, else `BadArgument`; `Ignored` without a look, which
     /// it would take no share of.
     fn set_look_intensity(
         &mut self,

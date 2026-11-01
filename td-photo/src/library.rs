@@ -20,10 +20,13 @@ pub const MAX_EXPOSURE: i32 = 500;
 /// Contrast in hundredths, at most this magnitude either way: the tone
 /// curve's steepness about middle grey is `2^(contrast / 100)`.
 pub const MAX_CONTRAST: i32 = 100;
-/// The look's intensity in hundredths, from none (0) to the whole look
-/// (this, the value an absent key holds): the developed pixel is the one
-/// before the look moved this share of the way to the look's.
-pub const MAX_LOOK_INTENSITY: i32 = 100;
+/// The look's intensity in hundredths, from none (0) through the whole
+/// look (`DEFAULT_LOOK_INTENSITY`) to twice it (this): the developed pixel
+/// is the one before the look moved this share of the way to the look's,
+/// past it beyond the whole.
+pub const MAX_LOOK_INTENSITY: i32 = 200;
+/// The whole look, the intensity an absent key holds.
+pub const DEFAULT_LOOK_INTENSITY: i32 = 100;
 /// Crop fractions are ten-thousandths of the oriented image.
 pub const CROP_UNIT: u32 = 10_000;
 /// A crop edge is at least this long (0.05 of the image).
@@ -655,12 +658,12 @@ impl Sidecar {
         self.get(Key::Look)
     }
 
-    /// Hundredths of the look applied, `MAX_LOOK_INTENSITY` (the whole
-    /// look) when the key is absent.
+    /// Hundredths of the look applied, `DEFAULT_LOOK_INTENSITY` (the
+    /// whole look) when the key is absent.
     pub fn look_intensity(&self) -> i32 {
         self.get(Key::LookIntensity)
             .and_then(|value| look_intensity(value).ok())
-            .unwrap_or(MAX_LOOK_INTENSITY)
+            .unwrap_or(DEFAULT_LOOK_INTENSITY)
     }
 
     /// The value a known key has, as written.
@@ -700,7 +703,7 @@ impl Sidecar {
         // An absent intensity is the whole look already.
         if key == Key::LookIntensity
             && self.get(key).is_none()
-            && value.and_then(|text| look_intensity(text).ok()) == Some(MAX_LOOK_INTENSITY)
+            && value.and_then(|text| look_intensity(text).ok()) == Some(DEFAULT_LOOK_INTENSITY)
         {
             return Ok(());
         }
@@ -752,8 +755,7 @@ impl Sidecar {
             _ => return Err(Error::Value(key)),
         };
         let next = current.saturating_add(delta).clamp(range.0, range.1);
-        // A clamp to the value in force is no step, even where it is the
-        // absent key's (a whole look nudged up).
+        // A clamp to the value in force is no step.
         if next == current {
             return Ok(());
         }

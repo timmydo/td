@@ -120,7 +120,8 @@ modes are the photographer's order of work.
    contrast by a tenth, `a` chooses both from the photo's tones (Auto) and
    `A` (in any mode) does so for every pick that has neither yet, in the
    background (`td-photo auto-picks ROLL` headless), `'`/`;` take a tenth
-   more or less of the look (its intensity, from none to the whole), `0`
+   more or less of the look (its intensity, from none through the whole
+   to twice it), `0`
    resets to camera defaults, and the crop and the
    look are set by the `crop` and `look` actions, taking the box's four
    fractions or a look's stem, and the crop
@@ -262,8 +263,8 @@ window, all speaking the toolkit's one vocabulary.
   `Nudge` the adapter adds to the file's value as it stands
   (concurrency-correct as a flag is, not the model's copy) and clamps to
   `MAX_EXPOSURE`, `MAX_CONTRAST` or `0..=MAX_LOOK_INTENSITY`
-  (`Sidecar::nudge`), so a step that clamps to no change (a whole look
-  nudged up, the absent key's value) writes nothing and is `ignored`, unless a file changed meanwhile
+  (`Sidecar::nudge`), so a step that clamps to no change (twice the look
+  nudged up, none nudged down) writes nothing and is `ignored`, unless a file changed meanwhile
   makes the settle a change, as it does for a flag; `look` and `crop` are
   absolute values the adapter sets,
   their grammar judged in the dispatch so a stem that is not a look or a box
@@ -322,11 +323,12 @@ window, all speaking the toolkit's one vocabulary.
   under it) with `NO_LOOK` (None) then a button per available look, in
   the order the session reported them, a strip wrapping the same way, and
   after it the look intensity slider (`Layout::look_slider`,
-  `INTENSITY_STEPS` (20) steps of a twentieth, `ui::intensity_step`
+  `INTENSITY_STEPS` (40) steps of a twentieth from none to twice the
+  look, the whole in the middle, `ui::intensity_step`
   placing the sidecar's intensity on it to the nearest step and
   `ui::intensity_at` reading a step back: few enough to fit after the
-  built-in looks on their last row at the default window, where a
-  hundred would not) from the last look
+  built-in looks on their last row at the default window, where a step
+  a hundredth would not) from the last look
   button to a cell short of the region's right on that row when the
   travel gives every step its own column, else on a row of its own across
   the region, and none when the session has no look to list or the
@@ -847,10 +849,16 @@ The library is folders of originals; there is no database.
   and `h` at least 0.05; `look` is a look's file stem, 1 to 64 bytes of ASCII
   letters, digits, `-`, `_` and `.`, not starting with `.` and not the bare
   `-`, the clear wherever a look is set; `look-intensity` is the share of the
-  look applied, `D.DD` in 0.00..=1.00 with no sign, absent the whole look
-  (1.00), kept whether or not a look is set and through a change of look,
-  and moving nothing without one (Pipeline); setting 1.00 while it is
-  absent is no step, as a value the key already holds is not. Builds
+  look applied, `D.DD` in 0.00..=2.00 with no sign (`MAX_LOOK_INTENSITY`),
+  absent the whole look (1.00, `DEFAULT_LOOK_INTENSITY`), past it each
+  change the look makes carried further (Pipeline), kept whether or not
+  a look is set and through a change of look, and moving nothing without
+  one (Pipeline); setting 1.00 while it is absent is no step, as a value
+  the key already holds is not. A build whose range stopped at 1.00
+  refuses a value past it as it refuses any known key's bad value, the
+  whole sidecar with it, so a deployment rolled back to one shows such a
+  photo at camera defaults with the error until the newer build returns
+  or the value is brought back within 1.00 by hand. Builds
   before it keep its step as a later version's (below) and write it
   back, but their `reset`, or an undo or delete of theirs that empties
   the history, keeps its summary line as an unknown line, which this
@@ -1215,8 +1223,11 @@ In order, per pixel, all linear `f32` until the last step:
    (`Look::contrast`); then the look, when one is applied, otherwise
    nothing, at the photo's look intensity `t`: each channel moved `t` of
    the way from the value the look was given to the one it made, `x + t
-   (look(x) - x)` (`Params::look_intensity`, held to `0..=1`, NaN the
-   whole), so 0 is no look and skips it and 1 is the look as it is;
+   (look(x) - x)` (`Params::look_intensity`, held to `0..=2`,
+   `MAX_LOOK_SHARE`, NaN the whole), so 0 is no look and skips it, 1 is
+   the look as it is, and past 1 the look's change goes further the same
+   way (a monochrome mix past its grey turns a colour toward its
+   complement; the clip at step 6 holds the result);
 6. clip to `0..=1` and the sRGB transfer to 8 bits.
 
 Steps 3 and 4 fold into one 3x3 matrix; step 5 is the contrast's tone, a
@@ -1225,7 +1236,7 @@ look's operations in file order, each a 3x3 matrix, a curve as a table over a
 log-spaced domain or a luminance mix (Looks, below); step 6 is the table. The
 cost per pixel without a contrast or a look is twelve multiplies (three for the
 white balance, nine for the matrix), a clip, three table loads and a few adds;
-the contrast adds six loads and a few multiplies, a look short of its whole
+the contrast adds six loads and a few multiplies, a look at other than its whole
 intensity three multiplies and six adds, and a look nine multiplies
 per matrix, six loads and a few multiplies per tone or three-channel curve, and
 a few multiplies (one division for a luminance curve) per mix or luminance
@@ -2106,9 +2117,11 @@ power of two, none at zero, steepening or flattening about grey per channel,
 and applied before the look as a look that begins with that tone would, a
 channel outside `0..=1` passed as it is so the least contrast under `mono`
 moves a colour past white by little; the look intensity at none the
-plain frame, at the whole the look, past either end held and NaN the
-whole, nothing without a look, and at a half each channel of a colour
-between the two with grey held; and
+plain frame, at the whole the look, past either end of 0..=2 held and
+NaN the whole, nothing without a look, at a half each channel of a
+colour between the two with grey held, and at one and a half each
+channel past the whole look's away from the plain one with grey held;
+and
 runs the built binary: `looks` over a
 user directory with a shadowing, a nameless, a refused, a linked and a stray
 file, a stem with a tab, a folder and a link to nothing at a built-in's stem,
@@ -2117,8 +2130,8 @@ bad stem, an unknown one, an unparseable user file and a link to nothing before
 reading anything. `tests/nef.rs`'s command case develops its synthetic frame
 with `--look mono` to a grey image, with `--contrast 0.00` to the plain frame
 and `0.80` to another, with `--look mono --look-intensity` 0.00 to the plain
-frame, 1.00 to the grey one and 0.50 to neither, and refuses `--contrast
-1.50` and `--look-intensity 1.50`, and
+frame, 1.00 to the grey one and 0.50 and 1.50 to neither, and refuses
+`--contrast 1.50` and `--look-intensity 2.50`, and
 `tests/control_process.rs`'s `--preview --develop` case holds a sidecar's
 contrast and look intensity to the develop box's pixels.
 
@@ -2230,8 +2243,9 @@ landing on its files and counted on after the second opened.
 `tests/library.rs` holds the sidecar grammar to its refusals by name and to
 in-place rewriting around an unknown line, the canonical value spellings,
 contrast's range and its nudges and exposure's clamped as one step a run,
-the look intensity's grammar, its absent whole look, its nudges clamped to
-0..=1 with one to the value in force no step, a step of it turned off
+the look intensity's grammar to 2.00, its absent whole look, the whole
+set on it no step, its nudges clamped to 0..=2 with one to the value in
+force no step, a step of it turned off
 falling back to the whole and reset clearing it, a
 later version's step kept in place and written back, taken by undo, toggle
 and delete, beside a flag step and a known key's bad value refused, an auto
@@ -2371,7 +2385,7 @@ outside develop, a bad spelling `bad-argument`, a run of nudges one step,
 the value before the intensity in `state` and `photo`), the look
 intensity nudged by `'` and `;` and set by `look-intensity` (ignored
 outside develop and without a look, a bad spelling `bad-argument`, a
-nudge past the whole look no write, a run and a set one step, the value
+nudge past twice the look no write, a run and a set one step, the value
 last in `state` and `photo`), its slider in the look band after the
 looks and none without one to list, on its own row at some widths and
 giving way to the filmstrip at some height, after the built-in looks on

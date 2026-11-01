@@ -182,6 +182,12 @@ fn preview_develop_reflects_the_sidecar() {
     };
     let whole = with_look("");
     let half = with_look("look-intensity 0.50\n");
+    let more = with_look("look-intensity 1.50\n");
+    assert_ne!(
+        box_pixels(&more, 800, r#box),
+        box_pixels(&whole, 800, r#box),
+        "an intensity past the whole did not reach the developed pixels"
+    );
     for other in [&brighter, &whole] {
         assert_ne!(
             box_pixels(other, 800, r#box),

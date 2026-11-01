@@ -51,7 +51,7 @@ const HELP: &str = concat!(
     "  (default 1600) with an exposure offset in stops (default 0), the\n",
     "  contrast C (-1.00 to 1.00, the tone's steepness about grey 2^C;\n",
     "  default 0), the look STEM (see looks; default none) at the\n",
-    "  intensity I (0.00 to 1.00, the share of the look; default 1.00)\n",
+    "  intensity I (0.00 to 2.00, the share of the look; default 1.00)\n",
     "  and the crop\n",
     "  \"X Y W H\", four fractions of the oriented frame as the sidecar\n",
     "  spells it (default the whole frame), written through a fresh\n",
@@ -123,7 +123,7 @@ const HELP: &str = concat!(
     "td-photo edit FILE [KEY VALUE ... | auto | reset | undo]\n",
     "  Prints FILE's sidecar, or sets exposure STOPS (-5.00 to 5.00),\n",
     "  contrast C (-1.00 to 1.00), crop X Y W H (fractions to four\n",
-    "  decimals), look STEM, look-intensity I (0.00 to 1.00) or flag\n",
+    "  decimals), look STEM, look-intensity I (0.00 to 2.00) or flag\n",
     "  pick|reject;\n",
     "  a VALUE of - clears the key. A develop key set is a step of the\n",
     "  sidecar's history (step-N lines, the keys their summary); auto\n",
@@ -525,8 +525,14 @@ fn probe(path: &Path, rest: &[OsString]) -> Result<(), String> {
 }
 
 /// The look's intensity, hundredths, as the share the pipeline takes.
+// The sidecar's most, read as a share, is the most the pipeline applies.
+const _: () = assert!(
+    develop::MAX_LOOK_SHARE
+        == (library::MAX_LOOK_INTENSITY / library::DEFAULT_LOOK_INTENSITY) as f32
+);
+
 pub(crate) fn intensity_share(hundredths: i32) -> f32 {
-    hundredths.clamp(0, library::MAX_LOOK_INTENSITY) as f32 / library::MAX_LOOK_INTENSITY as f32
+    hundredths.clamp(0, library::MAX_LOOK_INTENSITY) as f32 / library::DEFAULT_LOOK_INTENSITY as f32
 }
 
 /// FNV-1a-64 over bytes, the hash the fixture README records.
@@ -575,8 +581,8 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
     };
     let look_intensity = match option(rest, "--look-intensity")? {
         Some(text) => library::look_intensity(&text)
-            .map_err(|_| format!("--look-intensity {text:?} is not D.DD in 0.00..=1.00"))?,
-        None => library::MAX_LOOK_INTENSITY,
+            .map_err(|_| format!("--look-intensity {text:?} is not D.DD in 0.00..=2.00"))?,
+        None => library::DEFAULT_LOOK_INTENSITY,
     };
     // The look, like a bad option, is refused before the camera file is
     // read; a user look that does not parse is an error, not the built-in.
@@ -920,7 +926,7 @@ fn develop_preview(
                 return None;
             }
         },
-        None => (None, library::MAX_LOOK_INTENSITY),
+        None => (None, library::DEFAULT_LOOK_INTENSITY),
     };
     let long_edge = box_w.max(box_h);
     let contrast = Look::contrast(contrast);

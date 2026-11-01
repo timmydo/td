@@ -2340,7 +2340,7 @@ impl Window {
         // Without a look its intensity moves no pixel.
         let look_intensity = match (&look, &photo.sidecar) {
             (Some(_), Some(sidecar)) => sidecar.look_intensity(),
-            _ => library::MAX_LOOK_INTENSITY,
+            _ => library::DEFAULT_LOOK_INTENSITY,
         };
         Some(Preview {
             roll: PathBuf::from(OsStr::from_bytes(roll)),

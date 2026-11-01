@@ -1593,6 +1593,10 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     let half = share_of_mono("share-half.ppm", "0.50");
     assert_ne!(half, plain);
     assert_ne!(half, ppm);
+    let more = share_of_mono("share-more.ppm", "1.50");
+    assert_ne!(more, ppm);
+    assert_ne!(more, plain);
+    assert_ne!(more, half);
     // A crop develops a sub-region: fewer pixels on each axis than the whole
     // frame at the same long edge, so the crop is applied (5(e)). The exact
     // oriented-region mapping is pinned in tests/develop.rs.
@@ -1666,10 +1670,10 @@ fn the_command_line_probes_and_develops_without_overwriting() {
         file.as_os_str(),
         x.as_os_str(),
         OsStr::new("--look-intensity"),
-        OsStr::new("1.50"),
+        OsStr::new("2.50"),
     ]);
     assert!(!ok);
-    assert!(stderr.contains("D.DD in 0.00..=1.00"), "{stderr}");
+    assert!(stderr.contains("D.DD in 0.00..=2.00"), "{stderr}");
     let (ok, _, stderr) = run(&[
         OsStr::new("develop"),
         file.as_os_str(),
