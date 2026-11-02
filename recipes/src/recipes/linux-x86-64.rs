@@ -502,6 +502,65 @@ pub fn recipe() -> Recipe {
     //    Unasked: WLAN defaults in every vendor's menu (none of their
     //    drivers), and QRTR adds the AF_QIPCRTR socket family.
     //
+    //    Ryzen desktop (AM4 Ryzen 7 5700G on a 500-series board): its wired
+    //    NIC is the Intel I225-V, driven by IGC under the already pinned
+    //    NET_VENDOR_INTEL. IGC depends on PTP_1588_CLOCK_OPTIONAL, which
+    //    follows the built-in PTP clock, and on ETHTOOL_NETLINK, prompted but
+    //    invisible at allnoconfig (NET is off), so it is written with IGC.
+    //    The rest of the machine is the T14s's set: amd-pstate, the AMD
+    //    IOMMU, xHCI, NVMe, AHCI and the HDA controller, whose ALC1220 is
+    //    bound by the Realtek ALC882 family. CPU_SUP_AMD, SND_HDA_CODEC_ALC882
+    //    and SND_HDA_CODEC_HDMI_ATI prompt only under EXPERT, so they are
+    //    guarded, not written. Its Cezanne GPU matches amdgpu, whose graphics
+    //    and SDMA blocks request their firmware in early init, before amdgpu
+    //    takes the display from the GOP framebuffer: without Cezanne's files
+    //    among those EXTRA_FIRMWARE names the probe fails and simpledrm keeps
+    //    it, and the DisplayPort audio the AMD HDMI codec would carry waits
+    //    on amdgpu for its audio endpoint.
+    //
+    //    CLOCK (td-time/DESIGN.md): td-time writes the RTC through
+    //    /dev/rtc0 (RTC_INTF_DEV). On x86 the boot clock is read from the
+    //    CMOS clock whatever RTC_HCTOSYS says; RTC_HCTOSYS is the RTC
+    //    class's own seeding at boot and resume. Both are prompted but
+    //    invisible at allnoconfig (RTC_CLASS is off there), so they are
+    //    written beside the pinned RTC_CLASS.
+    //
+    //    KVM HOST: VIRTUALIZATION is the prompted menu allnoconfig forces
+    //    off; KVM with KVM_AMD and KVM_INTEL builds /dev/kvm, so a td
+    //    machine can host QEMU guests at native speed. The node is a
+    //    root-only devtmpfs node and stays so: until a device policy hands
+    //    it to a session, only root services can create VMs, and td's
+    //    integration oracles (DEVELOPMENT.md) still cannot run as the
+    //    session account. By default (kvm.enable_virt_at_load) the vendor
+    //    modules enable VMX or SVM on every CPU when they load, so a
+    //    built-in KVM does that at boot even if no VM is created. CPU_MITIGATIONS (below) is on, and
+    //    VMSCAPE, which protects the VMM's userspace from its guests,
+    //    is guarded with the other mitigations. KVM_X86 has no prompt and is
+    //    guarded.
+    //    Unasked: KVM_X86 selects the generic KVM core (EVENTFD, MMU and
+    //    preempt notifiers, VHOST_TASK, KVM_VFIO with no VFIO driver,
+    //    USER_RETURN_NOTIFIER), SCHED_INFO (/proc/PID/schedstat),
+    //    GUEST_PERF_EVENTS, PERF_GUEST_MEDIATED_PMU and KVM_GUEST_MEMFD
+    //    (with XARRAY_MULTI), and PERF_EVENTS, already on; KVM_COMPAT
+    //    follows IA32_EMULATION; KVM_IOAPIC, KVM_SMM and KVM_HYPERV default
+    //    on; KVM_INTEL selects X86_FRED, used only on CPUs that implement
+    //    FRED; KVM_AMD_SEV stays off without the PSP crypto driver.
+    //
+    //    REMOVABLE AND FOREIGN FILESYSTEMS: ext4 for disks other systems
+    //    format, VFAT for USB sticks, cameras and EFI system partitions, and
+    //    exFAT, which SDXC cards and large sticks carry. FAT reads 8.3 names
+    //    through its default codepage 437 and long names through its default
+    //    iocharset, iso8859-1, and refuses a mount if either is missing, so
+    //    both are built in; FAT_DEFAULT_UTF8 makes long names UTF-8, which
+    //    exFAT's utf8 default already is, and NLS_UTF8 serves an explicit
+    //    iocharset=utf8. NLS is their prompted parent, already selected by
+    //    ACPI, USB, FAT and exFAT among others. EXT4_USE_FOR_EXT2 (prompted,
+    //    invisible at allnoconfig) mounts ext2 and ext3 through ext4. None of
+    //    these filesystems allows an unprivileged user-namespace mount.
+    //    Unasked: EXT4_FS selects JBD2, CRC16, CRC32, FS_IOMAP and
+    //    BUFFER_HEAD; VFAT_FS selects FAT_FS; FAT selects LEGACY_DIRECT_IO
+    //    and exFAT FS_IOMAP.
+    //
     //    CLOUD GUESTS (td-svc/DESIGN.md §10, "Cloud images"): the drivers a
     //    server image needs to find its disk and network on Azure, EC2 Nitro
     //    and GCE. Azure's synthetic devices are on VMBus: storvsc presents the
@@ -582,8 +641,8 @@ pub fn recipe() -> Recipe {
     //    RETBleed, Spectre v1/v2 and SSB. Each is invisible at allnoconfig
     //    (its menu is off), so they are guarded, not written; the kernel
     //    enables only those the running CPU needs. SLS is left at
-    //    upstream's default, off. VMSCAPE depends on KVM, which this
-    //    kernel does not build. Those that need CPU microcode (IBPB, IBRS, STIBP, VERW
+    //    upstream's default, off. VMSCAPE, which depends on KVM, is
+    //    guarded with the rest. Those that need CPU microcode (IBPB, IBRS, STIBP, VERW
     //    buffer clearing, SRBDS, GDS, SRSO's IBPB forms) take effect only
     //    where platform firmware supplied it: td loads no microcode
     //    (AGENTS.md "Device firmware").
@@ -846,6 +905,23 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_EXTRA_FIRMWARE[ =]/d; \
                   /^#? *CONFIG_EXTRA_FIRMWARE_DIR[ =]/d; \
                   /^#? *CONFIG_CPU_MITIGATIONS[ =]/d; \
+                  /^#? *CONFIG_IGC[ =]/d; \
+                  /^#? *CONFIG_ETHTOOL_NETLINK[ =]/d; \
+                  /^#? *CONFIG_RTC_INTF_DEV[ =]/d; \
+                  /^#? *CONFIG_RTC_HCTOSYS[ =]/d; \
+                  /^#? *CONFIG_VIRTUALIZATION[ =]/d; \
+                  /^#? *CONFIG_KVM[ =]/d; \
+                  /^#? *CONFIG_KVM_AMD[ =]/d; \
+                  /^#? *CONFIG_KVM_INTEL[ =]/d; \
+                  /^#? *CONFIG_EXT4_FS[ =]/d; \
+                  /^#? *CONFIG_EXT4_USE_FOR_EXT2[ =]/d; \
+                  /^#? *CONFIG_VFAT_FS[ =]/d; \
+                  /^#? *CONFIG_FAT_DEFAULT_UTF8[ =]/d; \
+                  /^#? *CONFIG_EXFAT_FS[ =]/d; \
+                  /^#? *CONFIG_NLS[ =]/d; \
+                  /^#? *CONFIG_NLS_CODEPAGE_437[ =]/d; \
+                  /^#? *CONFIG_NLS_ISO8859_1[ =]/d; \
+                  /^#? *CONFIG_NLS_UTF8[ =]/d; \
                   /^#? *CONFIG_SND_ALOOP[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
@@ -1089,6 +1165,23 @@ pub fn recipe() -> Recipe {
                    'CONFIG_ATH11K=y' \
                    'CONFIG_ATH11K_PCI=y' \
                    'CONFIG_CPU_MITIGATIONS=y' \
+                   'CONFIG_IGC=y' \
+                   'CONFIG_ETHTOOL_NETLINK=y' \
+                   'CONFIG_RTC_INTF_DEV=y' \
+                   'CONFIG_RTC_HCTOSYS=y' \
+                   'CONFIG_VIRTUALIZATION=y' \
+                   'CONFIG_KVM=y' \
+                   'CONFIG_KVM_AMD=y' \
+                   'CONFIG_KVM_INTEL=y' \
+                   'CONFIG_EXT4_FS=y' \
+                   'CONFIG_EXT4_USE_FOR_EXT2=y' \
+                   'CONFIG_VFAT_FS=y' \
+                   'CONFIG_FAT_DEFAULT_UTF8=y' \
+                   'CONFIG_EXFAT_FS=y' \
+                   'CONFIG_NLS=y' \
+                   'CONFIG_NLS_CODEPAGE_437=y' \
+                   'CONFIG_NLS_ISO8859_1=y' \
+                   'CONFIG_NLS_UTF8=y' \
                    'CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' \
                    'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' >> .config"
                     .replace(
@@ -1354,7 +1447,34 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_DMIID=y' .config || { echo 'DMIID off — /sys/class/dmi/id is missing, so a server cannot tell which cloud it runs on' >&2; exit 1; }; \
                  grep -q '^CONFIG_HYPERV_TIMER=y' .config || { echo 'HYPERV_TIMER off — an Azure VM has no Hyper-V clocksource. It is unprompted (def_bool HYPERV && X86), so something took HYPERV away' >&2; exit 1; }; \
                  grep -q '^CONFIG_CPU_MITIGATIONS=y' .config || { echo 'CPU_MITIGATIONS off — every CPU vulnerability mitigation is compiled out and mitigations= cannot restore one' >&2; exit 1; }; \
-                 for m in PAGE_TABLE_ISOLATION RETPOLINE RETHUNK UNRET_ENTRY CALL_DEPTH_TRACKING IBPB_ENTRY IBRS_ENTRY SRSO GDS RFDS SPECTRE_BHI MDS TAA MMIO_STALE_DATA L1TF RETBLEED SPECTRE_V1 SPECTRE_V2 SRBDS SSB ITS TSA; do grep -q \"^CONFIG_MITIGATION_$m=y\" .config || { echo \"MITIGATION_$m off or absent — its upstream default did not survive resolution, or this kernel renamed it\" >&2; exit 1; }; done; \
+                 grep -q '^CONFIG_RTC_INTF_DEV=y' .config || { echo 'RTC_INTF_DEV off — /dev/rtc0 is missing, so td-time cannot persist a correction to the RTC' >&2; exit 1; }; \
+                 grep -q '^CONFIG_RTC_HCTOSYS=y' .config || { echo 'RTC_HCTOSYS off — the RTC class does not re-seed the system clock at boot or resume' >&2; exit 1; }; \
+                 grep -q '^CONFIG_IGC=y' .config || { echo 'IGC off — the Intel I225/I226 wired NIC of the Ryzen desktop has no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ETHTOOL_NETLINK=y' .config || { echo 'ETHTOOL_NETLINK off — IGC depends on it' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CPU_SUP_AMD=y' .config || { echo 'CPU_SUP_AMD off — AMD processors lose their detection and quirks, and KVM_AMD cannot be built' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CPU_SUP_INTEL=y' .config || { echo 'CPU_SUP_INTEL off — Intel processors lose their detection, quirks and mitigations' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_HDA_CODEC_ALC882=y' .config || { echo 'SND_HDA_CODEC_ALC882 off — the desktop ALC1220 has no Realtek fixups' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_HDA_CODEC_HDMI_ATI=y' .config || { echo 'SND_HDA_CODEC_HDMI_ATI off — AMD HDMI and DisplayPort audio has no codec driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_VIRTUALIZATION=y' .config || { echo 'VIRTUALIZATION off — the KVM menu stays hidden' >&2; exit 1; }; \
+                 grep -q '^CONFIG_KVM=y' .config || { echo 'KVM off — /dev/kvm is missing, so QEMU guests run only under emulation' >&2; exit 1; }; \
+                 grep -q '^CONFIG_KVM_X86=y' .config || { echo 'KVM_X86 off — no vendor KVM module survived resolution' >&2; exit 1; }; \
+                 grep -q '^CONFIG_KVM_AMD=y' .config || { echo 'KVM_AMD off — AMD-V hosts cannot run KVM guests' >&2; exit 1; }; \
+                 grep -q '^CONFIG_KVM_INTEL=y' .config || { echo 'KVM_INTEL off — VT-x hosts cannot run KVM guests' >&2; exit 1; }; \
+                 grep -q '^CONFIG_EXT4_FS=y' .config || { echo 'EXT4_FS off — ext4 disks formatted by other systems cannot be mounted' >&2; exit 1; }; \
+                 grep -q '^CONFIG_JBD2=y' .config || { echo 'JBD2 off — ext4 has no journal layer' >&2; exit 1; }; \
+                 grep -q '^CONFIG_EXT4_USE_FOR_EXT2=y' .config || { echo 'EXT4_USE_FOR_EXT2 off — ext2 and ext3 volumes do not mount through ext4' >&2; exit 1; }; \
+                 grep -q '^CONFIG_FAT_FS=y' .config || { echo 'FAT_FS off — VFAT has no FAT core' >&2; exit 1; }; \
+                 grep -q '^CONFIG_VFAT_FS=y' .config || { echo 'VFAT_FS off — USB sticks and SD cards formatted FAT cannot be mounted' >&2; exit 1; }; \
+                 grep -q '^CONFIG_FAT_DEFAULT_UTF8=y' .config || { echo 'FAT_DEFAULT_UTF8 off — FAT long names are not UTF-8 by default' >&2; exit 1; }; \
+                 grep -qx 'CONFIG_FAT_DEFAULT_CODEPAGE=437' .config || { echo 'FAT_DEFAULT_CODEPAGE is not 437 — the built-in codepage would not be the one FAT mounts with' >&2; exit 1; }; \
+                 grep -qx 'CONFIG_FAT_DEFAULT_IOCHARSET=\"iso8859-1\"' .config || { echo 'FAT_DEFAULT_IOCHARSET is not iso8859-1 — the built-in iocharset would not be the one FAT mounts with' >&2; exit 1; }; \
+                 grep -q '^CONFIG_EXFAT_FS=y' .config || { echo 'EXFAT_FS off — SDXC cards and large sticks formatted exFAT cannot be mounted' >&2; exit 1; }; \
+                 grep -qx 'CONFIG_EXFAT_DEFAULT_IOCHARSET=\"utf8\"' .config || { echo 'EXFAT_DEFAULT_IOCHARSET is not utf8 — exFAT names would need an NLS table' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NLS=y' .config || { echo 'NLS off — FAT and exFAT have no character sets' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NLS_CODEPAGE_437=y' .config || { echo 'NLS_CODEPAGE_437 off — FAT refuses to mount without its default codepage' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NLS_ISO8859_1=y' .config || { echo 'NLS_ISO8859_1 off — VFAT refuses to mount without its default iocharset' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NLS_UTF8=y' .config || { echo 'NLS_UTF8 off — a mount asking iocharset=utf8 fails' >&2; exit 1; }; \
+                 for m in PAGE_TABLE_ISOLATION RETPOLINE RETHUNK UNRET_ENTRY CALL_DEPTH_TRACKING IBPB_ENTRY IBRS_ENTRY SRSO GDS RFDS SPECTRE_BHI MDS TAA MMIO_STALE_DATA L1TF RETBLEED SPECTRE_V1 SPECTRE_V2 SRBDS SSB ITS TSA VMSCAPE; do grep -q \"^CONFIG_MITIGATION_$m=y\" .config || { echo \"MITIGATION_$m off or absent — its upstream default did not survive resolution, or this kernel renamed it\" >&2; exit 1; }; done; \
                  if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::shared::efi_default_cmdline())),
             ],
         )
@@ -1723,6 +1843,93 @@ mod tests {
         }
     }
 
+    /// The Ryzen desktop's I225-V NIC, the RTC interfaces td-time uses, a
+    /// KVM host for QEMU guests, and the filesystems removable and foreign
+    /// disks carry, each with the character sets its default mount options
+    /// load.
+    #[test]
+    fn desktop_nic_clock_kvm_host_and_removable_filesystems_are_builtin() {
+        let steps = recipe().steps.unwrap_or_default();
+        let runs = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let text = runs.join("\n");
+        let config = runs
+            .iter()
+            .find(|run| run.contains("sed -i -r"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(config.contains("'CONFIG_IGC=y'"), "the config step");
+        for symbol in [
+            "IGC",
+            "ETHTOOL_NETLINK",
+            "RTC_INTF_DEV",
+            "RTC_HCTOSYS",
+            "VIRTUALIZATION",
+            "KVM",
+            "KVM_AMD",
+            "KVM_INTEL",
+            "EXT4_FS",
+            "EXT4_USE_FOR_EXT2",
+            "VFAT_FS",
+            "FAT_DEFAULT_UTF8",
+            "EXFAT_FS",
+            "NLS",
+            "NLS_CODEPAGE_437",
+            "NLS_ISO8859_1",
+            "NLS_UTF8",
+        ] {
+            let pin = format!("'CONFIG_{symbol}=y'");
+            let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
+            assert_eq!(text.matches(&stale).count(), 1, "{symbol}");
+            assert_eq!(text.matches(&pin).count(), 1, "{symbol}");
+            assert_eq!(
+                text.matches(&format!("grep -q '^CONFIG_{symbol}=y' .config"))
+                    .count(),
+                1,
+                "{symbol}"
+            );
+        }
+        // Unprompted, selected, or prompting only under EXPERT: guarded only.
+        for symbol in [
+            "CPU_SUP_AMD",
+            "CPU_SUP_INTEL",
+            "SND_HDA_CODEC_ALC882",
+            "SND_HDA_CODEC_HDMI_ATI",
+            "KVM_X86",
+            "JBD2",
+            "FAT_FS",
+        ] {
+            assert!(
+                !text.contains(&format!("CONFIG_{symbol}[ =]/d")),
+                "{symbol}"
+            );
+            assert!(!text.contains(&format!("'CONFIG_{symbol}=y'")), "{symbol}");
+            assert!(
+                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
+                "{symbol}"
+            );
+        }
+        // The defaults the built-in tables serve are checked, not written.
+        for line in [
+            "CONFIG_FAT_DEFAULT_CODEPAGE=437",
+            "CONFIG_FAT_DEFAULT_IOCHARSET=\"iso8859-1\"",
+            "CONFIG_EXFAT_DEFAULT_IOCHARSET=\"utf8\"",
+        ] {
+            assert!(!config.contains(&format!("'{line}'")), "{line}");
+            assert!(
+                text.contains(&format!("grep -qx '{line}' .config")),
+                "{line}"
+            );
+        }
+        // Modules stay off: every driver above is built in.
+        assert!(config.contains("'# CONFIG_MODULES is not set'"));
+    }
+
     /// CPU_MITIGATIONS is the prompted parent allnoconfig turns off; with it
     /// pinned, every mitigation keeps its upstream default and is checked
     /// after resolution rather than written.
@@ -1774,6 +1981,7 @@ mod tests {
             "SSB",
             "ITS",
             "TSA",
+            "VMSCAPE",
         ] {
             assert!(looped.contains(&name), "{name}");
         }

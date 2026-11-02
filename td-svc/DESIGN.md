@@ -1824,7 +1824,8 @@ unit opens the device, checks its primary volume descriptor, mounts
 that descriptor's device read-only, `nodev`, `nosuid` and `noexec` at
 `/run/td-metadata-seed`, reads `meta-data` and `user-data` and
 unmounts it. The file names are Rock Ridge's: a Joliet-only or vfat
-seed is not read, since the kernel builds neither. Two seeds are
+seed is not read, since the unit admits only an ISO 9660 primary
+volume descriptor and the kernel builds no Joliet. Two seeds are
 refused rather than chosen between. The scan runs once and does not
 wait: a seed whose device appears later, as a USB stick's can, is
 missed.

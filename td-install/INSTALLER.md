@@ -70,6 +70,17 @@ by the card's PCI subsystem ID from `board-2.bin`, which holds Lenovo's
 fetch board data" and brings up no interface. This has not yet been
 tried on the hardware.
 
+A Ryzen 7 5700G desktop on an AMD 500-series board is a third target on
+the same terms. It shares the T14s's AMD platform set; beside it, its
+Intel I225-V wired port is driven by igc and its ALC1220 by the Realtek
+ALC882 family. Its Cezanne Radeon matches AMDGPU but carries no reviewed
+firmware here, so the probe stops in early init and simpledrm keeps the
+GOP framebuffer; its DisplayPort audio, which the AMD HDMI codec would
+carry, waits on AMDGPU for its audio endpoint. The same kernel can
+host KVM guests and mount ext4, FAT and exFAT; nothing in td hands
+`/dev/kvm` to a session or mounts such a filesystem yet. None of this has
+been tried on the machine.
+
 Legacy BIOS, resizing, dual boot and RAID are outside v1. Preserving an
 existing td installation is limited to the explicit reinstall mode below.
 For a new installation, one selected whole disk is reformatted, not
