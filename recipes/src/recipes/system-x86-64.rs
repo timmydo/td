@@ -2104,26 +2104,27 @@ fn build_desktop_td_svc_conf() -> String {
          # jail, and the unit is ready once the compositor's layout report\n\
          # names its toplevel by the app id the client sets, anchored at the\n\
          # record's every field so a title cannot forge one; a client that\n\
-         # could not open its window is a unit that never becomes ready, as\n\
-         # one that could not open its pty was. Mail opens its window before\n\
-         # the account connects, so the minutes discovery can take do not\n\
-         # count against the wait. restart=never: a client that exits is\n\
-         # restarted by the operator (a reboot today; a user-level relaunch is\n\
-         # APPLICATIONS.md §W.7), not by a loop that would hide a broken\n\
-         # configuration behind a flickering window, and a broker that failed\n\
-         # is a session they are skipped in rather than launched into. The\n\
-         # compositor tiles a new window into the active workspace, so the\n\
-         # control channel makes workspace {application_workspace} active before\n\
-         # either starts and returns to the first once both are decided: the\n\
-         # first stays the shell's and Firefox's, whose tiles the physical-input\n\
-         # oracle binds, and Firefox maps only after the return. The switch is\n\
-         # an ordering, not a requirement: a channel that failed loses the\n\
-         # placement, not the applications, and the placement evidence below\n\
-         # says so.\n\
+         # could not open its window is a unit that never becomes ready. Mail\n\
+         # opens its window before the account connects, so the minutes\n\
+         # discovery can take do not count against the wait. Like Firefox they\n\
+         # start at boot only where the oracles ask ({applications_on_demand}\n\
+         # is absent): an ordinary session runs `mail` or `news` from the\n\
+         # terminal, where td-jail admits the session's own uid and its\n\
+         # diagnostics reach the shell (APPLICATIONS.md §W.7). restart=never:\n\
+         # a client that exits is not restarted by a loop that would hide a\n\
+         # broken configuration behind a flickering window. The compositor\n\
+         # tiles a new window into the active workspace, so on an oracle's\n\
+         # boot the control channel makes workspace {application_workspace}\n\
+         # active before either starts and returns to the first once both are\n\
+         # decided: the first stays the shell's and Firefox's, whose tiles the\n\
+         # physical-input oracle binds, and Firefox maps only after the return.\n\
+         # The switch is an ordering, not a requirement: a channel that failed\n\
+         # loses the placement, not the applications, and the placement\n\
+         # evidence below says so.\n\
          [applications-workspace]\n\
          type=oneshot\n\
          cgroup=session\n\
-         unless-exists={live_medium}\n\
+         unless-exists={applications_on_demand}\n\
          exec=/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace {application_workspace}\n\
          after=terminal\n\
          requires=wayland\n\
@@ -2134,7 +2135,7 @@ fn build_desktop_td_svc_conf() -> String {
          [mail]\n\
          type=daemon\n\
          cgroup=session\n\
-         unless-exists={live_medium}\n\
+         unless-exists={applications_on_demand}\n\
          exec=/bin/td-authd application-start {ui_uid} {mail_name} direct --\n\
          after=busd,portal,fetchd,applications-workspace,firefox-tls-setup\n\
          requires=wayland,busd,fetchd,td-firstboot\n\
@@ -2167,7 +2168,7 @@ fn build_desktop_td_svc_conf() -> String {
          [news]\n\
          type=daemon\n\
          cgroup=session\n\
-         unless-exists={live_medium}\n\
+         unless-exists={applications_on_demand}\n\
          exec=/bin/td-authd application-start {ui_uid} {news_name} direct --\n\
          after=busd,fetchd,applications-workspace\n\
          requires=wayland,busd,fetchd,td-firstboot\n\
@@ -2189,7 +2190,7 @@ fn build_desktop_td_svc_conf() -> String {
          [shell-workspace]\n\
          type=oneshot\n\
          cgroup=session\n\
-         unless-exists={live_medium}\n\
+         unless-exists={applications_on_demand}\n\
          exec=/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace 1\n\
          after=mail,news\n\
          requires=wayland\n\
@@ -4295,6 +4296,39 @@ fn application_names(sys: &SystemDef) -> Vec<&'static str> {
         .collect()
 }
 
+/// td's own source-built mail and news clients run as the login user, not
+/// a service account (APPLICATIONS.md §D); every other application has
+/// its reserved external UID.
+fn launch_uid(application: &ShippedApplication) -> u32 {
+    if matches!(application.name, TD_MAIL_NAME | TD_NEWS_NAME) {
+        UI_UID
+    } else {
+        application.external_uid
+    }
+}
+
+/// The applications with a `/bin/NAME` link to td-jail: those the
+/// deployment runs as the login user, whose shell is then the account
+/// td-jail requires, so the session starts them from its terminal
+/// (APPLICATIONS.md §A.0). A service-account application gets none; a
+/// shell could only reach td-jail's refusal.
+fn application_bin_links(sys: &SystemDef) -> Vec<&'static str> {
+    sys.applications
+        .iter()
+        .filter(|application| launch_uid(application) == UI_UID)
+        .map(|application| application.name)
+        .collect()
+}
+
+/// The applications that must have no `/bin` entry at all.
+fn unlinked_application_names(sys: &SystemDef) -> Vec<&'static str> {
+    let links = application_bin_links(sys);
+    application_names(sys)
+        .into_iter()
+        .filter(|name| !links.contains(name))
+        .collect()
+}
+
 fn application_payload_inputs(sys: &SystemDef) -> Vec<&'static str> {
     let mut inputs: Vec<&str> = sys
         .applications
@@ -4506,11 +4540,7 @@ fn build_bus_application_policy(sys: &SystemDef) -> Result<String, String> {
             .map(|(name, _)| name.to_string())
             .collect();
         rules.push(bus_application_policy::Rule {
-            uid: if matches!(application.name, TD_MAIL_NAME | TD_NEWS_NAME) {
-                UI_UID
-            } else {
-                application.external_uid
-            },
+            uid: launch_uid(application),
             application: application.name.into(),
             owned,
         });
@@ -5289,10 +5319,16 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
-    // No application has a /bin name: td-authd's supervised launch execs
-    // /bin/td-jail with the application's name as argv[0], and a name a
-    // shell could run would only reach td-jail's refusal (APPLICATIONS.md
-    // §A.0).
+    // td-authd's supervised launch execs /bin/td-jail with the application's
+    // name as argv[0]; only an application the login user runs has a /bin
+    // name, since for any other a shell would only reach td-jail's refusal
+    // (APPLICATIONS.md §A.0).
+    for name in application_bin_links(sys) {
+        steps.push(Step::Symlink {
+            target: "/bin/td-jail".into(),
+            link: format!("{{root}}/real-root/bin/{name}"),
+        });
+    }
     // /init is PID 1 on the real root, and it is td-init. switch_root execs it under the
     // OPERAND's name (`/init`), so argv[0]'s basename is `init` and the multicall dispatches
     // to the init applet exactly as a /bin/<applet> symlink would — the symlink's TARGET
@@ -5802,7 +5838,10 @@ fn shape_check(sys: &SystemDef) -> String {
      @DESKTOP{@\
      [ \"$(readlink \"$root/bin/td-portal\" 2>/dev/null)\" = \"{in:td-portal}/bin/td-portal\" ] || { echo 'root tree: /bin/td-portal is not a symlink to the staged Settings portal' >&2; exit 1; }; \
      tdportal=\"{root}/real-root{in:td-portal}/bin/td-portal\"; { [ -f \"$tdportal\" ] && [ -x \"$tdportal\" ]; } || { echo 'root tree: td-portal is not packed/executable at real-root{in:td-portal}/bin/td-portal - the portal supervisor, child, and live probe would all fail' >&2; exit 1; }; \
-     for a in @APPLICATIONS@; do \
+     for a in @APPLICATION_LINKS@; do \
+         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ] || { echo \"root tree: /bin/$a is not an application launcher pointing to /bin/td-jail - another packed /bin provider replaced it\" >&2; exit 1; }; \
+     done; \
+     for a in @UNLINKED_APPLICATIONS@; do \
          if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then echo \"root tree: /bin/$a is packed, but td-authd starts $a by argv[0] and a shell launch would only be refused\" >&2; exit 1; fi; \
      done; \
      @}DESKTOP@\
@@ -5911,7 +5950,11 @@ fn shape_check(sys: &SystemDef) -> String {
         .replace("@TD_SH_APPLETS@", &TD_SH_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
         .replace("@TD_LOGIN_APPLETS@", &TD_LOGIN_APPLETS.join(" "))
-        .replace("@APPLICATIONS@", &application_names(sys).join(" "))
+        .replace("@APPLICATION_LINKS@", &application_bin_links(sys).join(" "))
+        .replace(
+            "@UNLINKED_APPLICATIONS@",
+            &unlinked_application_names(sys).join(" "),
+        )
         .replace("@TD_SVC_UNITS@", &td_svc_units(sys).join(" "))
         .replace("@TD_SVC_CONF@", TD_SVC_CONF)
         .replace("@TERMINFO_ENTRY@", TERMINFO_ENTRY)
@@ -8892,7 +8935,8 @@ mod tests {
 
     /// A live session opens the wizard alone (td-install/INSTALLER.md "Live
     /// startup"): exactly the stock session's window units and their
-    /// evidence name the live medium in unless-exists=, which td-svc settles
+    /// evidence name the live medium, or for the applications the on-demand
+    /// path a live boot also has, in unless-exists=, which td-svc settles
     /// ready unstarted, so what requires the terminal still runs. The path
     /// is where the live initramfs moves the medium and td-authd serves it.
     #[test]
@@ -8913,7 +8957,13 @@ mod tests {
                         if path.as_str() == APPLICATIONS_ON_DEMAND
                             && matches!(
                                 name.as_str(),
-                                "firefox" | "firefox-fetch" | "software-evidence"
+                                "firefox"
+                                    | "firefox-fetch"
+                                    | "software-evidence"
+                                    | "applications-workspace"
+                                    | "mail"
+                                    | "news"
+                                    | "shell-workspace"
                             ) =>
                     {
                         Some(name)
@@ -10619,22 +10669,29 @@ mod tests {
                     && registry == "{root}/real-root/etc/td-applications.tsv"
                     && launcher == "{root}/real-root/etc/td-launcher.tsv"
         )));
-        // No /bin name: the supervised launch selects it by argv[0].
+        // A service-account application has no /bin name: the supervised
+        // launch selects it by argv[0].
         assert!(!steps.iter().any(|step| matches!(
             step,
             Step::Symlink { target, link }
                 if target == "/bin/td-jail"
                     || link == "{root}/real-root/bin/fixture"
         )));
-        assert!(
-            !real_root_steps(&SYSTEM)
-                .unwrap()
-                .iter()
-                .any(|step| matches!(
-                    step,
-                    Step::Symlink { target, .. } if target == "/bin/td-jail"
-                )),
-            "no shipped application has a /bin name"
+        let shipped_links: Vec<_> = real_root_steps(&SYSTEM)
+            .unwrap()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Symlink { target, link } if target == "/bin/td-jail" => Some(link),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shipped_links,
+            vec![
+                format!("{{root}}/real-root/bin/{TD_MAIL_NAME}"),
+                format!("{{root}}/real-root/bin/{TD_NEWS_NAME}"),
+            ],
+            "only the applications the login user runs have a /bin name"
         );
 
         assert_eq!(SYSTEM.applications.len(), 3);
@@ -11303,9 +11360,17 @@ mod tests {
         };
         assert_eq!(application_name_collisions(&fixture), vec!["rg", "td-netd"]);
         let shape = shape_check(&SYSTEM);
-        assert!(!shape.contains("= /bin/td-jail ]"));
+        assert_eq!(
+            application_bin_links(&SYSTEM),
+            vec![TD_MAIL_NAME, TD_NEWS_NAME]
+        );
+        assert_eq!(unlinked_application_names(&SYSTEM), vec![FIREFOX_NAME]);
         assert!(shape.contains(&format!(
-            "for a in {FIREFOX_NAME} {TD_MAIL_NAME} {TD_NEWS_NAME}; do \
+            "for a in {TD_MAIL_NAME} {TD_NEWS_NAME}; do \
+             [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ]"
+        )));
+        assert!(shape.contains(&format!(
+            "for a in {FIREFOX_NAME}; do \
              if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then"
         )));
     }
@@ -12598,6 +12663,30 @@ mod tests {
             Some(APPLICATIONS_ON_DEMAND)
         );
         assert!(unit_after("firefox").contains(&"firefox-fetch".to_string()));
+        // Mail and news, and the workspace switches around them, run at
+        // boot only on an oracle's: an ordinary session starts each from
+        // the terminal. Their evidence keeps the live gate and exits 0
+        // without the autotest token, so a skipped window settles it.
+        for unit in ["applications-workspace", "mail", "news", "shell-workspace"] {
+            assert_eq!(
+                unit_key(unit, "unless-exists").as_deref(),
+                Some(APPLICATIONS_ON_DEMAND),
+                "{unit}"
+            );
+        }
+        for unit in ["mail-evidence", "news-evidence", "placement-evidence"] {
+            assert_eq!(
+                unit_key(unit, "unless-exists").as_deref(),
+                Some(LIVE_MEDIUM),
+                "{unit}"
+            );
+            assert!(
+                unit_key(unit, "exec").is_some_and(|exec| exec.contains(&format!(
+                    "*\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac;"
+                ))),
+                "{unit}"
+            );
+        }
         // td-software's request path runs after the install and before
         // Firefox, under the autotest token alone, as the human through the
         // control socket, and prints its marker only on root's report of

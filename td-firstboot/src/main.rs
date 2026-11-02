@@ -153,10 +153,10 @@ const APPLICATION_CONFIGS: &[ApplicationConfig] = &[
 
 /// td-mail starts offline from this and says so; the operator replaces the two
 /// placeholders, binds a td-pass entry, and the client reads them when it next
-/// starts. The comments name no way to start it: a user-level relaunch of an
-/// application window is deferred (APPLICATIONS.md §W.7), and the
+/// starts, which is when the session runs `mail` from its terminal
+/// (APPLICATIONS.md §W.7). The comments name no way to start it: the
 /// administrative escape hatch is not a flow a shipped file may depend on
-/// (AGENTS.md).
+/// (AGENTS.md), and the file outlives any one way of starting the client.
 const MAIL_CONFIG: &str = "\
 # td-mail. Provisioned on first boot; edit freely, it is never rewritten.
 # Paths are as the application sees them inside its jail. The client reads
@@ -170,8 +170,8 @@ secret = \"td-pass\"
 
 /// td-news needs at least one feed to start. These two public feeds are
 /// shipped so the first window shows something rather than an error; it fetches them
-/// on its first start, which is the one outbound request the image makes on a
-/// user's behalf without being asked, and the comment says how to stop it.
+/// when the session first runs `news`, never at boot outside an oracle's, and
+/// the comment says how to stop it.
 const NEWS_CONFIG: &str = "\
 # td-news. Provisioned on first boot; edit freely, it is never rewritten.
 # The client reads this file when it starts. The feeds below are public

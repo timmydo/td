@@ -502,13 +502,13 @@ active (increment 7), with the parts named at the top remaining.
 The system image carries td-setup, and a live boot (`td.live=1`, which only
 the live selector's handoff sets; td-install/MEDIA.md "Live boot") opens it
 and nothing else: the live session is for installing td. Every stock session
-unit that opens a window (the shell's terminal, mail and news), places those
-windows, or proves them in the autotest evidence names the live medium's
-mount, `/run/td-media`, in td-svc's `unless-exists=` (td-svc/DESIGN.md §3),
-so each settles ready without running and what requires it, such as boot
-health after the terminal, still runs. Firefox names
-`/run/td-applications-on-demand` instead, which a live boot also has
-(APPLICATIONS.md §W.9). The session's
+unit that opens a window (the shell's terminal) or proves the windows in
+the autotest evidence names the live medium's mount, `/run/td-media`, in
+td-svc's `unless-exists=` (td-svc/DESIGN.md §3), so each settles ready
+without running and what requires it, such as boot health after the
+terminal, still runs. Firefox, mail and news, and the workspace switches
+that place them, name `/run/td-applications-on-demand` instead, which a
+live boot also has (APPLICATIONS.md §W.7, §W.9). The session's
 services, the secure attention path and td-authd's authority run as on an
 installed boot. The `[setup]` td-svc unit starts the wizard once the
 compositor serves (under the autotest token, also once TLS setup's console
@@ -519,7 +519,8 @@ cgroup, unjailed and without disk authority, on the compositor's socket by
 `WAYLAND_DISPLAY`. The compositor admits that identity as a display client
 only, never as the human. The wizard maps alone on the first workspace,
 where the session begins, with the whole output and the keyboard. A person
-can still open a terminal or the launcher's programs; such a window maps
+can still open a terminal or the launcher's programs, and from that
+terminal `mail` or `news` (APPLICATIONS.md §W.7); such a window maps
 beside the wizard and takes the keyboard as any newly mapped window does.
 The unit is ready when the compositor's layout report names a window with
 td-setup's app id; it is never restarted, so a wizard that exits is not

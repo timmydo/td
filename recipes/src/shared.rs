@@ -45,9 +45,9 @@ pub const TD_JAIL_FIXTURE_PICTURES_TARGET: &str = "/home/td/Pictures";
 pub const TD_JAIL_FIXTURE_GRANT_FILE: &str = "/var/td-jail-fixture-file";
 pub const TD_JAIL_FIXTURE_GRANT_ROOT: &str = "/mnt/td-jail-fixture-pictures";
 pub const TD_JAIL_FIXTURE_SEARCH_TERMS: &[&str] = &["jail", "fixture", "sandbox", "wayland"];
-// The two terminal applications: td-owned static programs on the empty
-// runtime, each a `/bin` launcher that td-term runs as its `--command` in
-// a window of its own at boot. `mail` is td-mail, `news` is td-news; the
+// The two source-built window applications: td-owned static programs on
+// the empty runtime, each a `/bin` launcher the session runs from its
+// terminal (at boot only on an oracle's). `mail` is td-mail, `news` is td-news; the
 // launcher keys are the words a person types, the entries are the
 // programs' names.
 pub const TD_MAIL_NAME: &str = "mail";

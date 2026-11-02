@@ -1236,7 +1236,10 @@ Authenticated firmware entry and update authorization remain unimplemented.
 The creation boot requires firstboot's file-backed mail placeholder and
 portal-mode configuration without an application password file. E enrolls
 primary and recovery devices, U unlocks, and the public one-operation writer
-queues mail/main for W and a fresh assertion. Restarting the stock mail unit
+queues mail/main for W and a fresh assertion. The stock session starts mail
+and news at boot only on an autotest boot, which this is not, so the
+fixture's image restores their boot start (and the workspace switches
+around them) to the live-only gate. Restarting the stock mail unit
 must produce fresh portal receipt acknowledgements from its jailed helper;
 the store's exact credential bytes are checked separately. Restarting the
 stock compositor/authority pair must relock and make a fresh mail launch

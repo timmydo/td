@@ -417,19 +417,31 @@ validated name to the exact content-addressed package path; `td-init`,
 `td-util`, `td-login` and `td-sh` are all multicalls keyed on `argv[0]`;
 this is a fifth.
 
-**An application runs only as its own account, so the image gives it no
-`/bin` name.** td-authd starts it after dropping to the UID the deployment
-assigned it (`application-start`, td-authd/DESIGN.md), which is the identity
-its private home, account cache, cgroup and bus registration belong to. A
-shell has none of them, so before any session, cgroup or cache exists
-td-jail refuses a by-name launch whose effective UID is not the one the
-immutable bus policy (`/etc/td-bus-applications.tsv`) assigns that name, in
-one line: `td-jail: firefox runs only as its own application account, not
-uid 1000; td starts it from the desktop, not from a shell`. Stage 1 checks
-the same rule again as it resolves the launch and as it selects the
-session's display. A `/bin/firefox` would only reach that refusal, so the
-image ships no `/bin` name for any application; their units, and for
-Firefox the compositor's card, start them through td-authd.
+**An application runs only as its own account, so only one the login
+user runs has a `/bin` name.** td-authd starts a supervised application
+after dropping to the UID the deployment assigned it (`application-start`,
+td-authd/DESIGN.md), which is the identity its private home, account
+cache, cgroup and bus registration belong to. Before any session, cgroup
+or cache exists td-jail refuses a by-name launch whose effective UID is
+not the one the immutable bus policy (`/etc/td-bus-applications.tsv`)
+assigns that name, in one line: `td-jail: firefox runs only as its own
+application account, not uid 1000; td starts it from the desktop, not
+from a shell`. Stage 1 checks the same rule again as it resolves the
+launch and as it selects the session's display. A `/bin/firefox` would
+only reach that refusal, so a service-account application has no `/bin`
+name; its unit, and for Firefox the compositor's card, start it through
+td-authd. The personal applications, `mail` and `news` (§L), are
+assigned the login user's own UID, so the session's shell is already
+their account: `/bin/mail` and `/bin/news` link to td-jail, and running
+either from the terminal takes the same td-jail admission, home,
+`td-user-1000` instance cgroup and broker registration as the
+supervised start (§W.7). It does not take td-authd's part: no
+`td-firstboot check-launch-application`, no check of the caller's
+capabilities or session cgroup, and the shell's working directory
+rather than `/`. None of that is authority the shell lacked, since any
+login-user process could already exec td-jail under either name. The
+image check requires those two links and refuses a `/bin` entry for
+every other application.
 
 **`argv[0]` selects, it does not authenticate.** A caller controls
 `argv[0]`, but a name the immutable policy does not assign to the caller's
@@ -450,11 +462,11 @@ here did not come from there.
 **Application names are a seventh applet farm and are registered as
 one.** `bin_farms()` enumerates the six closed farms plus this open one,
 and `applet_farms_are_disjoint_and_boot_names_stay_static` exists because
-a name in two farms packs two conflicting symlinks for one applet. No
-application is linked, and the image check refuses a `/bin` entry for
-any of them; the whole roster stays in the farm, so an applet can
-neither take an application's name nor collide with one that regains a
-link. Application names are a new, open-ended, recipe-authored class in
+a name in two farms packs two conflicting symlinks for one applet. Only
+the personal applications are linked, and the image check refuses a
+`/bin` entry for the others; the whole roster stays in the farm, so an
+applet can neither take an application's name nor collide with one that
+gains a link. Application names are a new, open-ended, recipe-authored class in
 the same directory — authored by whoever packages an application — so
 the guard covers them whether or not they are linked, or it goes stale
 for exactly the class of name a non-td author picks. "A collision is a
@@ -882,8 +894,10 @@ Each table admits at most 256 applications and 1 MiB. Keeping the path out of
 the presentation table gives each reader only its own input and closes the
 previous design gap where a three-column row gave `td-jail` no way to locate a
 content-addressed package. The image now selects Firefox into both tables.
-Every launch is td-authd's supervised start, which execs td-jail under the
-application's name (§A.0); there is no direct `/bin/<name>` route. The
+A service-account application's every launch is td-authd's supervised
+start, which execs td-jail under the application's name (§A.0); only the
+personal `mail` and `news` also have a `/bin/<name>` route, from the
+login user's own shell. The
 compositor's card is table-driven (td-compositor/DESIGN.md, the launcher): it
 reads `/etc/td-launcher.tsv` once at startup, shows each application root's
 installed set says is installed (td-authd/DESIGN.md, request `23`), activates
@@ -7784,10 +7798,10 @@ Each row is one landing or a small family, leaving the tree green.
 | 28 | **Firefox proof closure — LANDED**; §H's every-boot kill-reaps leg now creates a dedicated application cgroup through the production detached watcher, proves stage 2 and its descendant occupy it before killing only stage 1, and accepts only after PID-namespace teardown empties the leaf and the watcher removes it. The previously deferred real target-kernel `mount(2)` refusal is supplied by the landed 17-call outer-filter audit. `AGENTS.md` names the source graph, host control plane, and marked foreign payload as three distinct trust zones. The complete shipped source and confinement regressions were reconciled against application-path `UNSAFE.md` surfaces #9 (`td-jail`), #10 (`td-busd`), #12 (`td-portal`), and #13 (`td-audio`); their syscall, operation, flag, ancillary-data, pointer-provenance, and scoped-allow rosters remain exact and require no roster amendment | **Firefox portals, isolation, soak and sound are all proved without manual testing** |
 | 29 | **native clock in local time — LANDED**: the bar snapshots rung 12k's saved name and source-built TZif v2/v3 data, including future DST recurrence. Absence stays UTC; invalid or unsupported data displays `CLOCK ?`. `td-compositor/DESIGN.md` owns bounds, session lifetime and tests | the bar shows local civil time with the actual UTC offset |
 | 30 | **fresh-terminal grant — LANDED** in the jail; `devices=tty` parses and is honoured. Stage 1 requires one pseudo-terminal slave on its own stdio, issues a single non-stealing `TIOCSCTTY` from the session the bootstrap proved, and reads the terminal back from procfs before any registration, namespace or cgroup; stage 2 re-proves the same device on its stdout before mounting, binds `/dev/tty`, and gives the entry three clones; `TERM` forwards under a closed grammar beside `TERMINFO`, with the one matching description bound; td-term `--command` is the producer of such terminals. Unit tests and confinement pins cover the grammar, the wire format, the procfs decoding, the devpts identity and the order; rung 31's boot oracle proves the acquisition end to end | a terminal application runs in the jail with a terminal of its own, and never the operator's |
-| 31 | **terminal applications — LANDED**: `mail` (td-mail) and `news` (td-news) are source-built static packages on the data-only `static-runtime`, `/bin/mail` and `/bin/news` launchers (since dropped: td-authd starts each by name, §A.0), and two td-svc units that ran each as td-term's `--command` (until rung 36 moved both into td-ui windows) in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it |
+| 31 | **terminal applications — LANDED**: `mail` (td-mail) and `news` (td-news) are source-built static packages on the data-only `static-runtime`, `/bin/mail` and `/bin/news` launchers (since dropped: td-authd starts each by name, §A.0; restored once both ran as the login user, §W.7), and two td-svc units (since run at boot only on an oracle's, §W.7) that ran each as td-term's `--command` (until rung 36 moved both into td-ui windows) in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it (since only on an oracle's boot; the session starts them, §W.7) |
 | 32 | **a second bus-holding application's peer attribution — LANDED** in the broker, in two halves. A jailed or unproved caller is told no host pid, about itself or the broker: `GetConnectionUnixProcessID` answers `UnixProcessIdUnknown` and `GetConnectionCredentials` carries the uid without `ProcessID`, and only a caller the lineage walk proved unconfined gets one. Queued descriptors are charged to the admission key HOLDING them beside the bus's ceiling, in two counts per key with a quarter of it each: the sender's freight count until every recipient is charged, each recipient's queued count once a frame is queued to it, apart so a stall on one of a key's connections does not refuse its siblings. A recipient key at its queued share costs the sender a `LimitsExceeded` reply and nobody a connection; a sender key at its freight share is refused; only the ceiling, which one key's two counts cannot reach, relieves a holder. Both halves have tests that drive them through the broker. The roster tripwire stays at one bus-holding application until the entry that lifts it brings the first two-application boot oracle | a second bus-holding application shares the broker without reading a host pid through it, and without starving the first of descriptors |
 | 33 | **Claude Code — shipped, then removed.** It was the fourth shipped application and the first foreign-payload terminal program, UID 65539, on Firefox's runtime under the `devices=tty` grant, with its own boot oracle; it has left td by the user's decision, with its recipe, release stream, shell launch and oracle. Its oracle's findings stay: the jail keys the `/usr` aliases on the runtime rather than on Firefox's package library path; the boot emulates `Nehalem` because `qemu64` lacks the x86-64-v2 baseline a modern payload assumes; and the jail's post-exit read of an already-reaped cgroup leaf is `None`, not a failed launch. An install enrolled while it shipped keeps its 65539 reservation (§W.9, "Removed: Claude Code") | no shipped application holds the `devices=tty` grant; the grant and its stage-1 acquisition remain, unit-tested, for the next terminal application |
-| 34 | **the admitted caller's working directory**: stage 1 maps its own directory through a declared filesystem grant and passes the bounded canonical result to stage 2, which starts there or falls back to `/` if it cannot enter it. The private-UID cutover makes the stock root authority the supported launcher; it starts from `/` and does not forward an operator's working directory. Direct human-UID application launch is refused. A later typed launch request must carry an admitted working directory to restore that operator flow. The jail's existing grant mapping and argv/refusal tests remain applicable to admitted callers | an admitted caller's directory is retained only inside its declared grant; stock launches currently start at `/` |
+| 34 | **the admitted caller's working directory**: stage 1 maps its own directory through a declared filesystem grant and passes the bounded canonical result to stage 2, which starts there or falls back to `/` if it cannot enter it. The private-UID cutover makes the stock root authority the supported launcher; it starts from `/` and does not forward an operator's working directory. Direct human-UID application launch is refused (since admitted for the personal `mail` and `news`, whose shell launch keeps the shell's directory where a grant maps it, §W.7). A later typed launch request must carry an admitted working directory to restore that operator flow. The jail's existing grant mapping and argv/refusal tests remain applicable to admitted callers | an admitted caller's directory is retained only inside its declared grant; stock launches currently start at `/` |
 | 35 | **news in a td-ui window — LANDED** (§W.8, "Reworked"): td-ui gains the cell screen, a grid of styled cells presented as a plain toplevel that polls the program's handler each turn, and td-news's views draw on it whole; its terminal layer and UNSAFE.md §18 surface are gone, the crate forbids `unsafe`, the recipe is a static PIE Cargo build over the toolkit, the `news` package drops `devices=tty`, and the `[news]` unit launches it direct and is ready when the compositor's layout names its toplevel. Mail follows in its own increment. Reworked again (§W.8, "Reworked again"): for news the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted (`td-ui/DESIGN.md`, increment 13), and the recipe stages `td-editor` beside `td-ui` | one of the two source-built applications no longer needs a terminal, a pty grant or td-term to exist |
 | 36 | **mail in a td-ui window — LANDED** (§W.8, "Reworked"): td-mail's views keep their cursor-and-attribute writer over the window's cell screen, so they move untouched; its terminal layer and UNSAFE.md §17 are gone and the crate forbids `unsafe`; the recipe is a static PIE Cargo build over the toolkit, the `mail` package drops `devices=tty`, and the `[mail]` unit launches it direct with the anchored layout probe. The direct-rustc local-source ladder keeps one user, td-install-qemu-test. Reworked again (§W.8, "Reworked again"): for mail too the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted, and the recipe stages `td-editor` beside `td-ui`; composing is in an editable pane in the same window (§W.8, "Composing in place"), so the package ships no editor | neither source-built application needs a terminal, a pty grant or td-term to exist; no shipped application holds the terminal grant, and §W.7's relaunch is a window request |
 
@@ -8569,7 +8583,11 @@ and this table, then uses td-login's checked credential drop. Personal
 applications use `exec-primary` and `/td-user-1000/session`; foreign
 applications use `exec-service-as` and their application session cgroup.
 No caller may choose an executable or UID through that operation. There
-is no public launch listener.
+is no public launch listener. A personal application also starts from
+the login user's own shell, as `/bin/mail` or `/bin/news` (§A.0, §W.7):
+that path has no root step, so td-jail's check of this table is its
+whole admission and the reservation check is not run; it reaches only
+the account the shell already is.
 
 The jail maps each external UID to 1000 inside its private namespace.
 The broker checks AUTH EXTERNAL against that kernel mapping and permits
@@ -10432,30 +10450,49 @@ there as read-only copies.
 
 ### W.7 Relaunching a shipped application without root
 
-**Diagnosis.** `mail` and `news` are started once at boot by td-svc
-units with `restart=never`, so a client that exits stays gone until the
-operator starts it again. Today the one way to do that is a reboot:
-`td-svc restart` needs a root shell, and since §L.1's L7 no session has
-one, because root has no login. Both programs now draw in td-ui windows
-of their own (§W.8, "Reworked"), so the pty the terminal grant insisted
-on is no longer in the way; what is missing is a user-level request
-that starts the program in a fresh window. No shipped application is a
-terminal case now.
+**Diagnosis.** `mail` and `news` were started once at boot by td-svc
+units with `restart=never`, so a client that exited stayed gone until
+a reboot: `td-svc restart` needs a root shell, and since §L.1's L7 no
+session has one. The supervised start also discards the client's
+output (td-authd/DESIGN.md), so a window that never appeared said
+nothing about why.
 
-**Plan.** (1) The compositor's launcher already builds `td-term run`
-for a new terminal window on a key chord; it gains a request that
-starts a shipped application through td-authd's `application-start`,
-`direct`, the only presentation, so a chord
-opens a fresh `mail` or `news` window, and the running td-svc window is
-not involved. The launcher, not the shell, chooses the program, so the
-set of programs a chord can start is the launcher table's and nothing
-the user typed. (2) The same request is exposed through the compositor
-control socket the `[applications-workspace]` and `[shell-workspace]`
-units already drive, so a later settings surface can offer "open mail"
-without a key chord. (3) Until (1) lands, the provisioned configuration
-files name no restart path at all, and the two units keep
-`restart=never`: a client that exits because its configuration is wrong
-must not be restarted into the same failure behind a flickering window.
+**Landed: the session starts them.** Both now run as the login user
+(§L), so the terminal's shell is already their account, and the image
+links `/bin/mail` and `/bin/news` to td-jail (§A.0). Typing `mail` or
+`news` opens a fresh window in the active workspace through the same
+td-jail admission, home, cgroup and broker registration as the
+supervised start, with no root request (§A.0 names what it skips).
+td-jail's own refusals reach the shell's stderr, and a client that
+exits unsuccessfully is reported there as `application jail exited
+unsuccessfully` with its status, the command exiting 1; the client's
+standard input, output and error are the null device, so td-mail and
+td-news say why they stopped in their logs,
+`~/.td/app/mail/state/td-mail/td-mail.log` and
+`~/.td/app/news/cache/td-news/news.log`. The command holds its terminal
+until the window closes, and the window lives only as long as the
+command: td-sh has no job control, so even `mail &` stays in the
+shell's process group, and ending the command or closing its terminal
+takes the jail down (its stage 1 dies with its parent). A live
+session's terminal can start them too, as it can the launcher's
+programs: nothing starts them there unasked, but td-authd's live
+refusal does not cover this path. An ordinary boot no
+longer opens either window: the `[mail]` and `[news]` units, and the
+workspace switches around them, name `/run/td-applications-on-demand`
+as Firefox does (§W.9), so they run at boot only on an oracle's, whose
+evidence they remain. The units keep `restart=never`, and nothing
+relaunches a client that exits on a bad configuration. The provisioned
+configuration files still name no start path.
+
+**Open.** No oracle starts either client from a shell: the boot
+evidence still runs them through td-authd, so the `/bin` route is
+proved by unit tests and the code it shares, not in a guest. A window
+that outlives its terminal needs a detached start, which the terminal
+route does not give. A service-account application still has no
+user-level relaunch: a launcher request that starts one through
+td-authd's `application-start`, chosen from the launcher table rather
+than typed, and the same request on the compositor control socket,
+remain the plan for those.
 
 ### W.8 td-mail and td-news: the two applications as td code
 

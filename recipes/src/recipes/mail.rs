@@ -1,6 +1,7 @@
 //! The `mail` application: td-mail, td's JMAP mail client, as a static
-//! package on the data-only static runtime. It opens a td-ui window of its own at
-//! boot (`system-x86-64`'s `[mail]` unit) and reads
+//! package on the data-only static runtime. It opens a td-ui window of its own
+//! when the session runs `/bin/mail` (at boot only on an oracle's, through
+//! `system-x86-64`'s `[mail]` unit) and reads
 //! `$XDG_CONFIG_HOME/td-mail/config.toml`, which
 //! td-firstboot provisions once in the login user's own configuration directory. Saved
 //! attachments land in the `xdg-download` grant, the directory Firefox shares.

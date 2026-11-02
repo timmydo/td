@@ -325,7 +325,8 @@ table uses it for a live boot, whose initramfs alone mounts the install
 medium at `/run/td-media`: the stock session's window units name that path,
 so the live session opens only the installer (td-install/INSTALLER.md "Live
 startup") while boot health, which requires the terminal, still runs.
-Firefox and the oracles' install and request-path evidence name
+Firefox, mail and news with the workspace switches around them, and the
+oracles' install and request-path evidence name
 `/run/td-applications-on-demand` instead, which the init creates on every
 boot without the autotest token and on every live one, so they run at boot
 only on an oracle's (APPLICATIONS.md §W.9).
@@ -424,15 +425,15 @@ Settings reply and its pre-subscribed Background denial; ordinary startup
 ordering alone does not establish either result.
 
 Application units require successful firstboot and invoke the root typed
-launcher, with `cgroup=session` because the leader moves into its own
-`td-app-UID/session` leaf. Firefox also requires `firefox-files`. Mail
-requires `mail-files`, and mail and news require their separate
-application-UID fetch services. The root grant oneshots finish before
-their applications start. Mail's preparation follows Firefox's settled
-preparation so the shared Downloads source has one initializer at a
-time. It does not require Firefox preparation to succeed. Shutdown
-releases both views after services stop and before releasing the portal
-view and `/var`.
+launcher, with `cgroup=session` because the leader moves into its
+application's session leaf (`td-app-UID/session`, or the human's
+`td-user-1000/session` for the personal mail and news). Like Firefox's,
+the mail and news units run at boot only on an oracle's (§3's
+`unless-exists=`); an ordinary session starts those two from its own
+shell (APPLICATIONS.md §W.7). Firefox also requires `firefox-files`,
+whose root grant oneshot finishes before it starts; mail and news
+require the human's `fetchd`. Shutdown releases Firefox's view after
+services stop and before releasing the portal view and `/var`.
 
 Application audio uses both edges deliberately. `audio requires=seat`
 because its private identity and runtime directory do not exist before seat

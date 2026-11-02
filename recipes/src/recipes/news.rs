@@ -1,6 +1,7 @@
 //! The `news` application: td-news, td's feed reader, as a static package
-//! on the data-only static runtime. It opens a td-ui window of its own at
-//! boot (`system-x86-64`'s `[news]` unit) and reads
+//! on the data-only static runtime. It opens a td-ui window of its own when
+//! the session runs `/bin/news` (at boot only on an oracle's, through
+//! `system-x86-64`'s `[news]` unit) and reads
 //! `$XDG_CONFIG_HOME/td-news/config.toml`, which
 //! td-firstboot provisions once under the login user's jail state.
 use crate::application::ApplicationDeclaration;
