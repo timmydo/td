@@ -603,3 +603,41 @@ fn late_results_cannot_renew_the_original_transport_finishing_cap() {
         }
     });
 }
+
+#[test]
+fn refusal_observation_is_once_per_reply_even_when_transport_stalls() {
+    fixture(|routes, plan, timer| {
+        let mut n = network(routes, plan, timer);
+        let mut w = Wire::default();
+        // Retire the banner before feeding a refused command.
+        for _ in 0..4 {
+            let _ = n.advance(&mut w, timer).unwrap();
+        }
+        w.input.extend(b"BOGUS secret-payload\r\n");
+        for _ in 0..4 {
+            let _ = n.advance(&mut w, timer).unwrap();
+            if matches!(n.session().pending(), Pending::Reply { .. }) {
+                break;
+            }
+        }
+        let refusal = n.take_rejection().unwrap();
+        assert_eq!(refusal.status(), 500);
+        assert_eq!(refusal.reason(), "command_refused");
+        assert_eq!(n.take_rejection(), None);
+        w.write_max = Some(0);
+        assert_eq!(n.advance(&mut w, timer), Ok(Progress::Pending));
+        assert_eq!(n.take_rejection(), None);
+        w.write_max = None;
+        for _ in 0..4 {
+            let _ = n.advance(&mut w, timer).unwrap();
+        }
+        w.input.extend(b"BOGUS another-secret\r\n");
+        for _ in 0..4 {
+            let _ = n.advance(&mut w, timer).unwrap();
+            if matches!(n.session().pending(), Pending::Reply { .. }) {
+                break;
+            }
+        }
+        assert_eq!(n.take_rejection(), Some(refusal));
+    });
+}

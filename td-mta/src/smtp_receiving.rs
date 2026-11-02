@@ -599,7 +599,19 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                 slot.phase = Phase::Retire;
                             } else {
                                 let turn = (|| {
+                                    let peer = slot.peer;
                                     let connection = slot.connection()?;
+                                    if let Some(reply) = connection.network_mut()?.take_rejection()
+                                    {
+                                        control.log(
+                                            crate::observability::Kind::SmtpRejected {
+                                                reply,
+                                                peer,
+                                            },
+                                            None,
+                                            None,
+                                        );
+                                    }
                                     if stopping.is_some() {
                                         let _ = connection
                                             .network_mut()?
@@ -611,6 +623,16 @@ impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
                                     Ok(Progress::Pending) => break,
                                     Ok(Progress::Advanced) => progress = true,
                                     Ok(Progress::Closed) | Err(_) => {
+                                        if slot.data_timing.is_some() {
+                                            control.log(
+                                                crate::observability::Kind::SmtpDataInterrupted {
+                                                    peer: slot.peer,
+                                                    error: turn.err(),
+                                                },
+                                                None,
+                                                None,
+                                            );
+                                        }
                                         slot.phase = Phase::Retire;
                                         progress = true;
                                     }

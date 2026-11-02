@@ -39,6 +39,53 @@ pub struct Envelope {
     pub declared_bytes: Option<u64>,
 }
 
+/// Classification of our own fixed SMTP replies, never peer text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Rejection {
+    status: u16,
+    reason: &'static str,
+}
+impl Rejection {
+    pub fn status(self) -> u16 {
+        self.status
+    }
+    pub fn reason(self) -> &'static str {
+        self.reason
+    }
+    pub(crate) fn from_reply(bytes: &[u8]) -> Option<Self> {
+        let status = match bytes.get(..3)? {
+            b"421" => 421,
+            b"451" => 451,
+            b"452" => 452,
+            b"500" => 500,
+            b"501" => 501,
+            b"502" => 502,
+            b"503" => 503,
+            b"550" => 550,
+            b"552" => 552,
+            b"554" => 554,
+            b"555" => 555,
+            _ => return None,
+        };
+        let reason = match bytes {
+            b"554 5.6.0 Message line too long\r\n" => "data_line_too_long",
+            b"554 5.6.0 Invalid message framing\r\n" => "invalid_data_framing",
+            b"554 5.6.0 8-bit data requires BODY=8BITMIME\r\n" => "undeclared_8bit_data",
+            b"552 5.3.4 Message headers too large\r\n" => "headers_too_large",
+            b"552 5.3.4 Message too large\r\n" => "message_too_large",
+            b"550 5.1.1 Unknown local recipient\r\n" => "unknown_recipient",
+            b"451 4.3.0 Delivery temporarily unavailable\r\n" => "delivery_unavailable",
+            b"451 4.3.0 Routing unavailable\r\n" => "routing_unavailable",
+            b"421 4.3.2 Service unavailable\r\n" => "service_unavailable",
+            b"421 4.3.2 Transaction limit reached\r\n" => "transaction_limit",
+            b"452 4.5.3 Too many recipients\r\n" => "recipient_limit",
+            b"554 5.5.0 Buffered plaintext at STARTTLS\r\n" => "starttls_buffered_plaintext",
+            _ => "command_refused",
+        };
+        Some(Self { status, reason })
+    }
+}
+
 pub struct Recipient {
     pub account: AccountId,
     pub address: String,
@@ -240,7 +287,12 @@ impl<'a> Session<'a> {
                     && (byte == 0
                         || (!self.envelope.as_ref().is_some_and(|e| e.eight_bit) && byte >= 128)))
             {
-                let reply = if data {
+                let reply = if data
+                    && byte >= 128
+                    && !self.envelope.as_ref().is_some_and(|e| e.eight_bit)
+                {
+                    "554 5.6.0 8-bit data requires BODY=8BITMIME\r\n"
+                } else if data {
                     "554 5.6.0 Invalid message framing\r\n"
                 } else {
                     "501 5.5.2 Invalid command framing\r\n"

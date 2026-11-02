@@ -356,7 +356,26 @@ ID when the notice producer has not returned one).
 Connection/request correlation is not yet emitted by these producers; the
 broader protocol/TLS/outcome event vocabulary above remains available to future
 instrumentation. No peer SMTP text, email addresses, credentials, subjects or
-message bodies enter these default records.
+message bodies enter these default records. SMTP refusal diagnostics additionally
+record the numeric socket peer IP, for correlation with a sender's delivery
+report. Treat that field as private operational metadata; it is not sender
+identity and never selects a logging rate bucket.
+
+`smtp_rejected` reports a locally queued 4xx/5xx reply once per reply,
+including `smtp_status`, a fixed `reason`, `peer_ip` and `reply_queued:true`.
+It does not prove that the peer received the reply. DATA reasons distinguish
+line length, framing, undeclared 8-bit data, header/message size and storage
+unavailability; other command syntax refusals have `command_refused`.
+`smtp_data_interrupted` records network-reported closure/error during admitted
+DATA with a numeric
+peer and fixed error class; `error:none` means the transport owner closed
+without returning an error, not successful delivery. A refused DATA exchange
+can emit both records. No final SMTP status is invented for an interruption or
+uncertain COMMIT. Transport closure before DATA admission, forced shutdown retirement and
+worker failures that bypass network progress are outside this event.
+Both event kinds use separate fixed one-per-minute producer buckets and the
+existing bounded queue/database retention. Suppression counts remain visible;
+these sampled events are not a complete per-message delivery ledger.
 
 The writer remains alive through the normal service-worker drain, then performs
 one bounded final batch and counts the discarded remainder. Logging failures do

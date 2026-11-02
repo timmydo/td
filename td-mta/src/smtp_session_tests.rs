@@ -615,3 +615,30 @@ fn multi_account_envelope_requires_complete_commit_set() {
     assert_eq!(Commits::new([receipt(), receipt()]), Err(Error::Invalid));
     assert_eq!(Commits::new([]), Err(Error::Invalid));
 }
+
+#[test]
+fn data_refusals_have_content_free_diagnostics() {
+    fixture(|routes| {
+        for (input, reason) in [
+            (b"private\n".to_vec(), "invalid_data_framing"),
+            (b"private\0\r\n".to_vec(), "invalid_data_framing"),
+            (b"private\xff\r\n".to_vec(), "undeclared_8bit_data"),
+            (vec![b'x'; 1002], "data_line_too_long"),
+        ] {
+            let mut s = session(routes);
+            begin(&mut s, "");
+            s.feed(&input).unwrap();
+            let Pending::Reply { bytes, close } = s.pending() else {
+                panic!("missing refusal")
+            };
+            assert!(close);
+            let refusal = Rejection::from_reply(bytes).unwrap();
+            assert_eq!(refusal.status(), 554);
+            assert_eq!(refusal.reason(), reason);
+        }
+        assert_eq!(
+            Rejection::from_reply(b"250 2.0.0 Message accepted\r\n"),
+            None
+        );
+    });
+}

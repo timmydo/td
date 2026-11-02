@@ -48,6 +48,7 @@ pub struct Network<'a> {
     start: usize,
     end: usize,
     written: usize,
+    refusal_reported: bool,
     work: Option<Work>,
     reply_grace: Option<Deadline>,
     session_deadline: Deadline,
@@ -76,6 +77,7 @@ impl<'a> Network<'a> {
             start: 0,
             end: 0,
             written: 0,
+            refusal_reported: false,
             work: None,
             reply_grace: None,
             session_deadline,
@@ -91,6 +93,19 @@ impl<'a> Network<'a> {
 
     pub fn session(&self) -> &Session<'a> {
         &self.session
+    }
+
+    /// Reports a queued refusal once, without claiming that the peer received it.
+    pub fn take_rejection(&mut self) -> Option<crate::smtp_session::Rejection> {
+        if self.refusal_reported {
+            return None;
+        }
+        let Pending::Reply { bytes, .. } = self.session.pending() else {
+            return None;
+        };
+        let rejection = crate::smtp_session::Rejection::from_reply(bytes)?;
+        self.refusal_reported = true;
+        Some(rejection)
     }
 
     pub fn data_ready(
@@ -354,6 +369,7 @@ impl<'a> Network<'a> {
                 } else if transport.flush()? == FlushProgress::Complete {
                     self.session.reply_sent()?;
                     self.written = 0;
+                    self.refusal_reported = false;
                     let grace = self.reply_grace.take();
                     if close {
                         self.start = 0;

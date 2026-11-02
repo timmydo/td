@@ -2982,3 +2982,9 @@ generation in the existing 30-second certificate watcher. A definite change
 requests the same bounded drain and reload as a managed certificate change;
 a failed observation does not claim a change. This includes idle read-only
 replicas, so certificate activation does not depend on client traffic.
+
+SMTP receiving emits bounded refusal observations through the existing
+nonblocking application-log producer. OBSERVABILITY.md owns their numeric
+peer attribution, fixed reason/status vocabulary, sampling and queued-versus-
+delivered distinction. No protocol acceptance, retry or durable publication
+rule is relaxed by diagnostic collection.

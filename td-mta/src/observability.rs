@@ -210,6 +210,14 @@ fn notice_error(error: crate::postgres_failure_notice::Error) -> &'static str {
 /// No free-form strings, addresses, credentials or message fields are accepted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
+    SmtpDataInterrupted {
+        peer: std::net::IpAddr,
+        error: Option<crate::ports::Error>,
+    },
+    SmtpRejected {
+        reply: crate::smtp_session::Rejection,
+        peer: std::net::IpAddr,
+    },
     RelayPollDeferred,
     Performance {
         phase: crate::performance::Phase,
@@ -272,6 +280,8 @@ pub enum Kind {
 impl Kind {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::SmtpDataInterrupted { .. } => "smtp_data_interrupted",
+            Self::SmtpRejected { .. } => "smtp_rejected",
             Self::RelayPollDeferred => "relay_poll_deferred",
             Self::Performance { .. } => "performance",
             Self::DeliveryNoticeDeferred { .. } => "delivery_notice_deferred",
@@ -299,7 +309,9 @@ impl Kind {
     }
     pub const fn severity(self) -> Severity {
         match self {
-            Self::DeliveryNoticeDeferred { .. }
+            Self::SmtpDataInterrupted { .. }
+            | Self::SmtpRejected { .. }
+            | Self::DeliveryNoticeDeferred { .. }
             | Self::RelayConnectionFailed { .. }
             | Self::RelayStepFailed { .. }
             | Self::AdmissionRefused { .. }
@@ -331,6 +343,9 @@ impl Kind {
     }
     fn action(self) -> Option<&'static str> {
         match self {
+            Self::SmtpRejected { .. } | Self::SmtpDataInterrupted { .. } => {
+                Some("inspect_smtp_rejections")
+            }
             Self::DeliveryNoticeDeferred { .. }
             | Self::RelayConnectionFailed { .. }
             | Self::RelayStepFailed { .. } => Some("inspect_relay"),
@@ -390,6 +405,8 @@ impl fmt::Display for EventJson<'_> {
             e.kind.severity().code()
         )?;
         match e.kind {
+            Kind::SmtpDataInterrupted { peer, error } => write!(f, ",\"peer_ip\":\"{}\",\"error\":\"{}\"", peer, error.map_or("none", |error| connect_error(Some(error))))?,
+            Kind::SmtpRejected { reply, peer } => write!(f, ",\"smtp_status\":{},\"reason\":\"{}\",\"peer_ip\":\"{}\",\"reply_queued\":true", reply.status(), reply.reason(), peer)?,
             Kind::RelayPollDeferred => f.write_str(",\"reason\":\"storage_busy\"")?,
             Kind::Performance { phase, sample } => write!(f,
                 ",\"phase\":\"{}\",\"calls\":{},\"failures\":{},\"busy\":{},\"unavailable\":{},\"total_us\":{},\"max_us\":{},\"lost\":{}",
@@ -609,8 +626,20 @@ mod tests {
             submission: Some(SubmissionId::from_bytes([255; 16])),
         }
     }
+    #[allow(clippy::unwrap_used)]
     fn kinds() -> Vec<Kind> {
         let mut result = vec![
+            Kind::SmtpRejected {
+                reply: crate::smtp_session::Rejection::from_reply(
+                    b"554 5.6.0 Message line too long\r\n",
+                )
+                .unwrap(),
+                peer: std::net::IpAddr::V6(std::net::Ipv6Addr::from([u16::MAX; 8])),
+            },
+            Kind::SmtpDataInterrupted {
+                peer: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                error: None,
+            },
             Kind::BootStarted,
             Kind::ConfigActivated,
             Kind::ConnectionClosed,
@@ -704,6 +733,31 @@ mod tests {
         }
         result
     }
+    #[test]
+    fn smtp_diagnostics_encode_closure_without_implying_publication() -> Result<(), bounded::Error>
+    {
+        for (error, expected) in [
+            (None, "none"),
+            (Some(crate::ports::Error::Deadline), "deadline"),
+        ] {
+            let mut bytes = [0; 1024];
+            let mut out = TextBuffer::new(&mut bytes);
+            Event {
+                context: context(),
+                kind: Kind::SmtpDataInterrupted {
+                    peer: std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                    error,
+                },
+            }
+            .encode(&mut out)?;
+            let text = out.as_str()?;
+            assert!(text.contains(&format!("\"error\":\"{expected}\"")));
+            assert!(text.contains("\"peer_ip\":\"::1\""));
+            assert!(!text.contains("publication"));
+        }
+        Ok(())
+    }
+
     #[test]
     fn literal_event_schema_and_unknown_time_are_stable() -> Result<(), bounded::Error> {
         let mut bytes = [0; MAX_EVENT_BYTES];
@@ -841,6 +895,14 @@ mod tests {
     // Independent v1 contract oracle; a new variant requires an explicit policy.
     fn policy(kind: Kind) -> (&'static str, &'static str, &'static str) {
         match kind {
+            Kind::SmtpRejected { .. } => {
+                ("smtp_rejected", "warning", "[\"inspect_smtp_rejections\"]")
+            }
+            Kind::SmtpDataInterrupted { .. } => (
+                "smtp_data_interrupted",
+                "warning",
+                "[\"inspect_smtp_rejections\"]",
+            ),
             Kind::RelayPollDeferred => ("relay_poll_deferred", "info", "[]"),
             Kind::Performance { .. } => ("performance", "info", "[]"),
             Kind::DeliveryNoticeDeferred { .. } => {
