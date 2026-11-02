@@ -31,7 +31,8 @@ needs them:
 - For shared JPEG decoding or encoding, read `td-jpeg/DESIGN.md`.
 - For shared PNG decoding or encoding, read `td-png/DESIGN.md`.
 - For making or checking Btrfs volumes (`mkfs.btrfs`), read
-  `td-btrfs/DESIGN.md`.
+  `td-btrfs/DESIGN.md`; for mounting extra data volumes, read
+  `td-disks/DESIGN.md`.
 - For the Rust link driver td's Rust recipes link through, read
   `td-link/DESIGN.md`.
 - For disk encryption or session unlock, read `td-install/ENCRYPTION.md`;

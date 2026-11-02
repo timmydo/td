@@ -147,9 +147,15 @@ fn the_production_source_and_raw_boundary_are_closed() {
     let time_setting = include_str!("../../td-time/src/request.rs");
     assert_eq!(time_setting.matches("unsafe").count(), 0);
     assert!(time_setting.contains("#[path = \"../../td-civil/src/tzif.rs\"]"));
+    // The volume codec is std-only and declares no further shared source.
+    let volume_setting = include_str!("../../td-disks/src/setting.rs");
+    assert_eq!(volume_setting.matches("unsafe").count(), 0);
+    assert!(!volume_setting.contains("#[path"));
+    assert!(!volume_setting.contains("std::process"));
+    assert!(!volume_setting.contains("std::fs"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xaab473803ba3e97e,
+        0xf7254be5c0db5c64,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -593,7 +599,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // write refusing until one succeeds; the table for the owner before
     // the queue; and at commit, the confirmation consumed, the backoff
     // cleared, the saved name read again and written through
-    // td-firstboot's shared source. Only time and initial admin-key enrollment start their fixed helpers.
+    // td-firstboot's shared source. Only time, volume and initial admin-key
+    // enrollment start their fixed helpers.
     let rename = include_str!("../src/set_hostname.rs")
         .split("#[cfg(test)]")
         .next()
@@ -637,10 +644,13 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(rename.matches("self.unwritten = None;").count(), 1);
     // A failed write is sticky: `1f` answers 02 while one stands.
     assert!(rename.contains("            _ => vec![0x9f, 2, 0],"));
-    assert_eq!(rename.matches("Command::new(").count(), 2);
+    assert_eq!(rename.matches("Command::new(").count(), 3);
     assert!(rename.contains("Command::new(\"/bin/td-admin\")"));
     assert!(rename.contains("command.args([\"accept-key\", blob]);"));
     assert!(rename.contains("Command::new(\"/bin/td-time\")"));
+    assert!(rename.contains(
+        "            let mut command = Command::new(\"/bin/td-disks\");\n            command.arg(\"apply\").args(change.words());"
+    ));
     for forbidden in [
         ".spawn(",
         "send_descriptor(",
@@ -1349,7 +1359,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 const CACHE_FINGERPRINT: u64 = 0xca9ca5668a3cec8c;
 const SOFTWARE_FINGERPRINT: u64 = 0xedb33f4ba9468adf;
 const LAUNCH_FINGERPRINT: u64 = 0x917d816a91d3a16e;
-const MAIN_FINGERPRINT: u64 = 0x9eb9343b76372c21;
+const MAIN_FINGERPRINT: u64 = 0x8f723a974f31a2be;
 const SESSION_FINGERPRINT: u64 = 0xbc41e16634b78938;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
@@ -1359,8 +1369,8 @@ const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
 const INSTALLATION_FINGERPRINT: u64 = 0xabb4e7cd418585ae;
 const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0xb0d5ccf021f64f9d;
 const ROLLBACK_FINGERPRINT: u64 = 0xf96a32041165e345;
-const ELEVATION_FINGERPRINT: u64 = 0xf4a31827aee8856a;
-const SET_HOSTNAME_FINGERPRINT: u64 = 0xf9f5a1c2a92bcfda;
+const ELEVATION_FINGERPRINT: u64 = 0xed15ae917aaaa734;
+const SET_HOSTNAME_FINGERPRINT: u64 = 0x93106fbc28219f20;
 const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const REVOCATION_FINGERPRINT: u64 = 0xae6413da1bcf5b12;

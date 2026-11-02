@@ -7,6 +7,8 @@ use std::time::Duration;
 use super::hostname::Hostname;
 #[path = "../../td-time/src/request.rs"]
 pub mod time_setting;
+#[path = "../../td-disks/src/setting.rs"]
+pub mod volume_setting;
 
 /// One canonical Ed25519 SSH blob. Cryptographic-format admission is also
 /// checked by the installed ssh-keygen before the root key file is published.
@@ -1116,6 +1118,11 @@ pub enum Operation {
         requester: u32,
         setting: String,
     },
+    /// Tag 42: one extra-volume change (td-disks/DESIGN.md).
+    ManageVolumes {
+        requester: u32,
+        setting: String,
+    },
     EnrollAdminKey {
         requester: u32,
         blob: String,
@@ -1719,6 +1726,11 @@ impl Request {
             {
                 return Err("invalid consent time change".into());
             }
+            Operation::ManageVolumes { requester, setting }
+                if *requester != owner || volume_setting::Change::decode(setting).is_err() =>
+            {
+                return Err("invalid consent volume change".into());
+            }
             Operation::SetHostname {
                 requester,
                 old,
@@ -1919,6 +1931,7 @@ impl Request {
             | Operation::DeployRollback { .. }
             | Operation::SetHostname { .. }
             | Operation::ManageTime { .. }
+            | Operation::ManageVolumes { .. }
             | Operation::EnrollAdminKey { .. }
             | Operation::SelectorUpdate { .. }
             | Operation::UpgradeCancel => true,
@@ -2488,6 +2501,11 @@ impl Request {
                 bytes.extend_from_slice(&requester.to_be_bytes());
                 put_text(&mut bytes, setting);
             }
+            Operation::ManageVolumes { requester, setting } => {
+                bytes.push(42);
+                bytes.extend_from_slice(&requester.to_be_bytes());
+                put_text(&mut bytes, setting);
+            }
             Operation::SetHostname {
                 requester,
                 old,
@@ -2756,6 +2774,10 @@ impl Request {
                     .map_err(|_| "notebook token digest")?,
             }),
             39 => Operation::ManageTime {
+                requester: input.number()?,
+                setting: input.text()?,
+            },
+            42 => Operation::ManageVolumes {
                 requester: input.number()?,
                 setting: input.text()?,
             },
@@ -3064,6 +3086,15 @@ impl Request {
                 lines.push(format!("REQUEST: {setting}"));
                 lines.push("CLOCK AND HARDWARE CLOCK USE UTC".into());
                 lines.push("AUTOMATIC SYNC CAN ADJUST MANUAL TIME".into());
+                approval_lines(&mut lines);
+            }
+            Operation::ManageVolumes { requester, setting } => {
+                lines.push("CHANGE EXTRA VOLUMES".into());
+                lines.push(format!("REQUESTER UID {requester}"));
+                match volume_setting::Change::decode(setting) {
+                    Ok(change) => lines.extend(change.describe()),
+                    Err(_) => lines.push("INVALID VOLUME CHANGE".into()),
+                }
                 approval_lines(&mut lines);
             }
             Operation::SetHostname {

@@ -1458,6 +1458,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "hostname",
     "td-firstboot",
     "time",
+    "volumes",
     "sandbox-default",
     "release-source",
     "rootcheck",
@@ -1832,6 +1833,15 @@ fn build_desktop_td_svc_conf() -> String {
          requires=td-firstboot\n\
          restart=on-failure\n\
          log=/var/log/svc/time.log\n\
+         \n\
+         # Extra volumes (td-disks/DESIGN.md): never waits for a disk, and\n\
+         # nothing requires it, so an absent volume costs the boot nothing.\n\
+         [volumes]\n\
+         type=oneshot\n\
+         exec=/bin/td-disks mount-all\n\
+         after=td-firstboot\n\
+         timeout=120\n\
+         log=/var/log/svc/volumes.log\n\
          \n\
          [sandbox-default]\n\
          type=oneshot\n\
@@ -4508,7 +4518,7 @@ fn build_firefox_tls_ready() -> String {
 /// consults it before any prompt, for `deploy-rollback` from L3.
 fn build_elevation_table() -> String {
     format!(
-        "td-elevation-v1\n{UI_UID}\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\n"
+        "td-elevation-v1\n{UI_UID}\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\tmanage-volumes\n"
     )
 }
 
@@ -4968,6 +4978,14 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         steps.push(Step::Symlink {
             target: "{in:td-time}/bin/td-time".into(),
             link: "{root}/real-root/bin/td-time".into(),
+        });
+        steps.push(Step::CopyTree {
+            from: "{in:td-disks}".into(),
+            dest: "{root}/real-root{in:td-disks}".into(),
+        });
+        steps.push(Step::Symlink {
+            target: "{in:td-disks}/bin/td-disks".into(),
+            link: "{root}/real-root/bin/td-disks".into(),
         });
         steps.push(Step::CopyTree {
             from: "{in:td-taskmgr}".into(),
@@ -6182,6 +6200,7 @@ const DESKTOP_INPUTS: &[&str] = &[
     "td-authd",
     "td-taskmgr",
     "td-time",
+    "td-disks",
     "td-review",
     "td-agent",
     "td-sandbox",
@@ -6498,6 +6517,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "td-profiler",
                 "td-taskmgr",
                 "td-time",
+                "td-disks",
                 "td-review",
                 "td-agent",
                 "td-sandbox",
@@ -9729,7 +9749,7 @@ mod tests {
         assert_eq!(ELEVATION_TABLE, "/etc/td-elevation.tsv");
         assert_eq!(
             build_elevation_table(),
-            "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\n"
+            "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\tmanage-volumes\n"
         );
         assert!(etc_files(&SYSTEM)
             .unwrap()
@@ -17057,6 +17077,7 @@ mod server_tests {
             "td-term",
             "td-taskmgr",
             "td-time",
+            "td-disks",
             "td-review",
             "td-agent",
             "td-sandbox",

@@ -26,6 +26,7 @@ pub(crate) enum Operation {
     ManageTime,
     EnrollAdminKey,
     DeployPublish,
+    ManageVolumes,
 }
 
 impl Operation {
@@ -35,6 +36,7 @@ impl Operation {
         Self::DeployPublish,
         Self::ManageTime,
         Self::EnrollAdminKey,
+        Self::ManageVolumes,
     ];
 
     fn name(self) -> &'static str {
@@ -44,6 +46,7 @@ impl Operation {
             Self::ManageTime => "manage-time",
             Self::EnrollAdminKey => "enroll-admin-key",
             Self::DeployPublish => "deploy-publish",
+            Self::ManageVolumes => "manage-volumes",
         }
     }
 

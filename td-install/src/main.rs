@@ -8369,6 +8369,11 @@ mod tests {
             [].as_slice(),
         ),
         (
+            "setting.rs",
+            include_str!("../../td-disks/src/setting.rs"),
+            [].as_slice(),
+        ),
+        (
             "frames.rs",
             include_str!("../../td-secret/src/frames.rs"),
             [].as_slice(),
@@ -8469,6 +8474,7 @@ mod tests {
                         matches!(
                             (label, path),
                             ("consent.rs", "../../td-time/src/request.rs")
+                                | ("consent.rs", "../../td-disks/src/setting.rs")
                                 | ("request.rs", "../../td-civil/src/tzif.rs")
                         ),
                         "unreviewed nested source path: {label}: {path}"

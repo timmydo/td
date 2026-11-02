@@ -433,6 +433,7 @@ impl Elevation {
             Operation::DeployRollback { .. } => Some(Self::Rollback),
             Operation::SetHostname { .. }
             | Operation::ManageTime { .. }
+            | Operation::ManageVolumes { .. }
             | Operation::EnrollAdminKey { .. } => Some(Self::Hostname),
             _ => None,
         }
@@ -2228,6 +2229,11 @@ impl Client {
                             Operation::ManageTime { .. }
                         ) {
                             crate::attention::Notice::TimeSaved
+                        } else if matches!(
+                            pending.request.operation(),
+                            Operation::ManageVolumes { .. }
+                        ) {
+                            crate::attention::Notice::VolumeSaved
                         } else {
                             crate::attention::Notice::HostnameSaved
                         }

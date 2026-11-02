@@ -660,3 +660,90 @@ fn time_settings_have_a_distinct_principal_and_refuse_malformed_values() {
     let table = Table::parse("td-elevation-v1\n1000\tset-hostname\n").unwrap();
     assert!(!table.grants(1000, elevation::Operation::ManageTime));
 }
+
+#[test]
+fn volume_changes_bind_exact_values_and_cancellation_never_starts_the_helper() {
+    for setting in [
+        "add backup 3f1c2a4e-9b7d-4c21-8e55-0d6a7b8c9e10 btrfs data",
+        "add old-root 0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9 ext4 exec",
+        // The longest change: a 16-byte name, a 75-byte frame payload.
+        "add abcdefghijklmnop 0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9 btrfs data",
+        "remove backup",
+    ] {
+        let fixture = Fixture::new("td");
+        let (mut intake, _client) = queued(&fixture, &format!("volume {setting}"));
+        let ready = intake.select().unwrap();
+        assert_eq!(ready.operation(), elevation::Operation::ManageVolumes);
+        let mut change = intake.describe(fixture.uid(), ready).unwrap();
+        let request = change.request().clone();
+        assert!(request.awaits_approval());
+        assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+        assert_eq!(
+            request.operation(),
+            &Operation::ManageVolumes {
+                requester: fixture.uid(),
+                setting: setting.into()
+            }
+        );
+        let lines = request.lines();
+        assert!(lines.iter().any(|line| line == "CHANGE EXTRA VOLUMES"));
+        assert!(lines.iter().any(|line| line.starts_with("VOLUME: ")));
+        assert!(change.commit(&request).is_err());
+        assert!(change.helper.is_none());
+        change.presented(&request).unwrap();
+        let wrong = Request::new(
+            *request.nonce(),
+            fixture.uid(),
+            Operation::ManageVolumes {
+                requester: fixture.uid(),
+                setting: "remove other".into(),
+            },
+        )
+        .unwrap();
+        assert!(change.commit(&wrong).is_err());
+        assert!(change.helper.is_none());
+        change.cancel().unwrap();
+        assert!(change.commit(&request).is_err());
+        assert!(matches!(change.poll().unwrap(), Event::Failed(_)));
+        assert!(change.helper.is_none());
+        assert_eq!(fixture.saved(), b"td\n");
+    }
+}
+
+#[test]
+fn volume_changes_have_a_distinct_principal_and_refuse_malformed_values() {
+    assert_eq!(
+        Setting::parse("volume remove backup").unwrap().operation(),
+        elevation::Operation::ManageVolumes
+    );
+    for text in [
+        "volume add ../etc 3f1c2a4e-9b7d-4c21-8e55-0d6a7b8c9e10 btrfs data",
+        "volume add backup 3f1c2a4e-9b7d-4c21-8e55-0d6a7b8c9e10 vfat data",
+        "volume add backup 3f1c2a4e-9b7d-4c21-8e55-0d6a7b8c9e10 btrfs suid",
+        "volume remove backup\n",
+        "volume remove",
+    ] {
+        assert!(Setting::parse(text).is_err(), "{text:?}");
+    }
+    let table = Table::parse("td-elevation-v1\n1000\tmanage-time\n").unwrap();
+    assert!(!table.grants(1000, elevation::Operation::ManageVolumes));
+    // A request naming another owner or a malformed change never forms.
+    assert!(Request::new(
+        [1; 32],
+        1000,
+        Operation::ManageVolumes {
+            requester: 1001,
+            setting: "remove backup".into(),
+        },
+    )
+    .is_err());
+    assert!(Request::new(
+        [1; 32],
+        1000,
+        Operation::ManageVolumes {
+            requester: 1000,
+            setting: "remove Backup".into(),
+        },
+    )
+    .is_err());
+}

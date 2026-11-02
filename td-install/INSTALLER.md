@@ -77,9 +77,10 @@ ALC882 family. Its Cezanne Radeon is driven by AMDGPU and DC with the
 ten reviewed linux-firmware files amdgpu requests for it embedded in the
 kernel beside Phoenix's (AGENTS.md, "Device firmware"); its DisplayPort
 audio is the AMD HDMI codec on AMDGPU's audio endpoint. The same kernel can
-host KVM guests and mount ext4, FAT and exFAT; nothing in td hands
-`/dev/kvm` to a session or mounts such a filesystem yet. None of this has
-been tried on the machine.
+host KVM guests and mount ext4, FAT and exFAT. Nothing in td hands
+`/dev/kvm` to a session yet; the owner's consented extra Btrfs and ext4
+volumes mount at boot (td-disks/DESIGN.md), and removable FAT and exFAT
+media do not mount yet. None of this has been tried on the machine.
 
 Legacy BIOS, resizing, dual boot and RAID are outside v1. Preserving an
 existing td installation is limited to the explicit reinstall mode below.

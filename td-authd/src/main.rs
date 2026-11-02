@@ -99,9 +99,17 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd application-start OWNER APP direct -- ARG... | \
      td-authd application-exec UID OWNER APP direct -- ARG... | \
      td-authd application-cache OWNER APP install|update|remove|delete-data|status | \
-     td-authd request-update SOURCE DEPLOYMENT-ID | td-authd request-hostname NAME";
+     td-authd request-update SOURCE DEPLOYMENT-ID | td-authd request-hostname NAME | \
+     td-authd time ACTION VALUE | td-authd volume add|remove ...";
 
 fn run(arguments: &[String]) -> Result<(), String> {
+    if let [verb, words @ ..] = arguments {
+        if verb == "volume" {
+            let words: Vec<&str> = words.iter().map(String::as_str).collect();
+            let change = consent::volume_setting::Change::parse(&words)?;
+            return set_hostname::request(&format!("volume {}", change.encode()));
+        }
+    }
     if let [verb, action, value] = arguments {
         if verb == "time" {
             let change = consent::time_setting::Change::parse(action, value)?;

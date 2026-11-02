@@ -163,6 +163,10 @@ const STAGED_FILES: &[(&str, &str)] = &[
         include_str!("../../../td-civil/src/tzif.rs"),
     ),
     (
+        "td-disks/src/setting.rs",
+        include_str!("../../../td-disks/src/setting.rs"),
+    ),
+    (
         "td-authd/src/consent.rs",
         include_str!("../../../td-authd/src/consent.rs"),
     ),
@@ -239,6 +243,7 @@ pub fn recipe() -> Recipe {
         "{src}/td-authd/src",
         "{src}/td-time/src",
         "{src}/td-civil/src",
+        "{src}/td-disks/src",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),

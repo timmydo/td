@@ -510,6 +510,7 @@ mod tests {
                 "fd",
                 "ripgrep",
                 "td-agent",
+                "td-disks",
                 "td-dua",
                 "td-editor",
                 "td-mail",
@@ -638,9 +639,11 @@ mod tests {
                 "net",
                 "td-agent",
                 "td-authd",
+                "td-btrfs",
                 "td-busd",
                 "td-civil",
                 "td-compositor",
+                "td-disks",
                 "td-dua",
                 "td-editor",
                 "td-encoding",
@@ -677,7 +680,7 @@ mod tests {
                 "td-toml",
                 "td-tpm",
                 "td-ui",
-                "td-util"
+                "td-util",
             ]
         );
         lone.sort_unstable();

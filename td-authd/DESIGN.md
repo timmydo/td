@@ -3656,6 +3656,36 @@ separate in `td-time status`; `td-time/DESIGN.md` owns persistence and sync.
 The static image table grants the primary owner `manage-time` after its
 three existing operations. The public client is `td-authd time ACTION VALUE`.
 
+## Extra volumes through the protected settings intake
+
+A `volume ` prefix on the same intake selects the bounded canonical
+codec in `td-disks/src/setting.rs`: `add NAME UUID btrfs|ext4
+data|exec` or `remove NAME`, a name of 1–16 bytes of `[a-z0-9-]` and a
+lowercase non-nil UUID, so the longest request fits the 79-byte payload.
+Admission and selection require the distinct `manage-volumes` grant for
+the owner and the requester, as `manage-time` does; there is no saved
+value to compare, and H reviews it beside hostname and time changes.
+
+Tag 42 carries a requester u32 equal to the owner and one length-prefixed
+canonical change. Its description shows the name and UUID as argument
+rows and states the filesystem kind, that the volume mounts under `/mnt`
+at every boot (or no longer does), whether programs on it may run, that
+setuid bits and device nodes are ignored, that files keep their on-disk
+owners and that any disk carrying the UUID mounts; a remove states that
+a busy volume is refused. Commitment is consumed first, clears the
+common backoff, and starts only `/bin/td-disks apply add|remove ...` with the change's
+own words, under the same cleared environment and bounded stdout as the
+time helper but a sixty-second Inspection deadline, since mounting a
+large multi-device filesystem can outlast ten. A failed or timed-out
+helper never retries; `td-disks/DESIGN.md` owns the table, the recheck
+against attached devices, the mount and what a timeout leaves. The
+attention screen's lifetime still runs from selection, so a review that
+took most of it can end before the helper does: the change completes,
+but its completion notice may not be shown, and `td-disks status` says
+what happened. The static image table grants
+the primary owner `manage-volumes` last. The public client is `td-authd
+volume add|remove ...`, which `td-disks add` and `remove` run.
+
 Power helper failures report launch errors, monotonic deadline expiry, or
 helper failure/disconnection on the authority's diagnostic stream. Wall-clock
 correction does not alter that two-second Instant deadline. A timeout leaves

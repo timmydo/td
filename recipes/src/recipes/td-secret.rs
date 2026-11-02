@@ -220,6 +220,14 @@ pub fn recipe() -> Recipe {
             content: include_str!("../../../td-time/src/request.rs").into(),
             exec: false,
         },
+        Step::MkDir {
+            path: "{src}/td-disks/src".into(),
+        },
+        Step::WriteFile {
+            path: "{src}/td-disks/src/setting.rs".into(),
+            content: include_str!("../../../td-disks/src/setting.rs").into(),
+            exec: false,
+        },
     ];
     for directory in [
         "{src}/td-secret/src",

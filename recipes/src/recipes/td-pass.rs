@@ -35,6 +35,7 @@ pub fn recipe() -> Recipe {
             "td-fs",
             "td-civil",
             "td-time",
+            "td-disks",
         ])
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
@@ -69,7 +70,8 @@ mod tests {
                     "td-test-compositor",
                     "td-fs",
                     "td-civil",
-                    "td-time"
+                    "td-time",
+                    "td-disks"
                 ]
                 .map(String::from)
                 .to_vec()

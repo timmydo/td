@@ -5,6 +5,7 @@
 
 use crate::backoff::{self, Backoff, Entry, Refused, Row, BACKING_OFF, REFUSED};
 use crate::consent::time_setting;
+use crate::consent::volume_setting;
 use crate::consent::{Operation, Request};
 use crate::deployment::{bind_intake, unlink_intake};
 use crate::elevation::{self, Table};
@@ -32,6 +33,8 @@ impl Setting {
             }
         } else if let Some(value) = text.strip_prefix("time ") {
             time_setting::Change::decode(value)?;
+        } else if let Some(value) = text.strip_prefix("volume ") {
+            volume_setting::Change::decode(value)?;
         } else {
             Hostname::parse(text)?;
         }
@@ -45,6 +48,8 @@ impl Setting {
             elevation::Operation::EnrollAdminKey
         } else if self.0.starts_with("time ") {
             elevation::Operation::ManageTime
+        } else if self.0.starts_with("volume ") {
+            elevation::Operation::ManageVolumes
         } else {
             elevation::Operation::SetHostname
         }
@@ -60,6 +65,8 @@ const ADMITTED: u8 = 2;
 const SAVED: &str = "/var/lib/td/hostname";
 /// How long presentation and commit may take after selection.
 const CONSENT: Duration = Duration::from_secs(120);
+/// How long `td-disks apply` may take to mount or unmount one volume.
+const VOLUME_APPLY: Duration = Duration::from_secs(60);
 
 fn error(why: impl std::fmt::Display) -> io::Error {
     io::Error::other(why.to_string())
@@ -643,6 +650,11 @@ impl Change {
                     requester: ready.requester,
                     setting: setting.into(),
                 }
+            } else if let Some(setting) = ready.name.name().strip_prefix("volume ") {
+                Operation::ManageVolumes {
+                    requester: ready.requester,
+                    setting: setting.into(),
+                }
             } else {
                 Operation::SetHostname {
                     requester: ready.requester,
@@ -716,6 +728,18 @@ impl Change {
             let mut command = Command::new("/bin/td-time");
             command.args(["apply", change.action(), &change.value()?]);
             self.helper = Some(Inspection::printing(command, 511, Duration::from_secs(10))?);
+            self.result = None;
+            return Ok(());
+        }
+        if let Operation::ManageVolumes { setting, .. } = self.request.operation() {
+            let change = volume_setting::Change::decode(setting)?;
+            self.committed = true;
+            self.result = Some(false);
+            self.backoff.approved()?;
+            let mut command = Command::new("/bin/td-disks");
+            command.arg("apply").args(change.words());
+            // Mounting a large or multi-device filesystem can take a while.
+            self.helper = Some(Inspection::printing(command, 511, VOLUME_APPLY)?);
             self.result = None;
             return Ok(());
         }

@@ -8449,6 +8449,7 @@ mod tests {
                 "td-btrfs",
                 "td-busd",
                 "td-compositor",
+                "td-disks",
                 "td-dua",
                 "td-editor",
                 "td-firstboot",

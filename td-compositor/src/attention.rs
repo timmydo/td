@@ -34,6 +34,7 @@ pub(crate) enum Notice {
     /// Root's success for `set-hostname`.
     HostnameSaved,
     TimeSaved,
+    VolumeSaved,
     AdminKeySaved,
     /// A committed device-bound disk installation, before its recovery key:
     /// the screen then closes by itself (secret_client).
@@ -688,6 +689,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::NoHostname => "NO HOSTNAME OR TIME CHANGE IS READY",
         Notice::HostnameSaved => "HOSTNAME SAVED",
         Notice::TimeSaved => "TIME SETTINGS SAVED",
+        Notice::VolumeSaved => "VOLUME CHANGE APPLIED",
         Notice::AdminKeySaved => "REMOTE ADMIN KEY ENROLLED",
         Notice::Returning => RETURNING_NOTICE,
         Notice::Stored => "CREDENTIAL STORED",
@@ -967,6 +969,12 @@ mod tests {
             Operation::Install {
                 deployment: "c".repeat(64),
                 requester: 65533,
+            },
+            // The longest extra-volume change: a 16-byte name, exec.
+            Operation::ManageVolumes {
+                requester: 65533,
+                setting: "add abcdefghijklmnop 3f1c2a4e-9b7d-4c21-8e55-0d6a7b8c9e10 btrfs exec"
+                    .into(),
             },
         ]
         .map(|operation| Request::new([1; 32], 65533, operation).unwrap());
@@ -1364,6 +1372,7 @@ mod tests {
         Notice::NoHostname,
         Notice::HostnameSaved,
         Notice::TimeSaved,
+        Notice::VolumeSaved,
         Notice::AdminKeySaved,
         Notice::Returning,
         Notice::Enrolled,
