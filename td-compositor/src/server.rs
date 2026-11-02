@@ -11097,7 +11097,10 @@ mod tests {
                 client: 77,
                 object: 7,
             }),
-            Some((592, 332))
+            Some((
+                640 - 2 * crate::scene::GAP,
+                400 - 2 * crate::scene::GAP - crate::scene::TITLE_HEIGHT
+            ))
         );
 
         runtime
@@ -11111,13 +11114,25 @@ mod tests {
                 Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
             )
             .unwrap();
-        connected.wait_for((284, 332), false, false).unwrap();
+        connected
+            .wait_for(
+                (
+                    (640 - 3 * crate::scene::GAP) / 2,
+                    400 - 2 * crate::scene::GAP - crate::scene::TITLE_HEIGHT,
+                ),
+                false,
+                false,
+            )
+            .unwrap();
         assert_eq!(
             runtime.lock().unwrap().surface_size(SurfaceKey {
                 client: 77,
                 object: 7,
             }),
-            Some((284, 332))
+            Some((
+                (640 - 3 * crate::scene::GAP) / 2,
+                400 - 2 * crate::scene::GAP - crate::scene::TITLE_HEIGHT
+            ))
         );
 
         runtime
@@ -11125,7 +11140,16 @@ mod tests {
             .unwrap()
             .command(Command::Focus(Direction::Left))
             .unwrap();
-        connected.wait_for((284, 332), true, false).unwrap();
+        connected
+            .wait_for(
+                (
+                    (640 - 3 * crate::scene::GAP) / 2,
+                    400 - 2 * crate::scene::GAP - crate::scene::TITLE_HEIGHT,
+                ),
+                true,
+                false,
+            )
+            .unwrap();
         runtime
             .lock()
             .unwrap()
@@ -15561,10 +15585,15 @@ mod tests {
             )
         });
 
+        // One tile filling the 120x80 tiling area less its gaps and band.
+        let tile = (
+            i32::try_from(120 - 2 * crate::scene::GAP).unwrap(),
+            i32::try_from(80 - 2 * crate::scene::GAP - crate::scene::TITLE_HEIGHT).unwrap(),
+        );
         let mut received = Vec::new();
         let (primed_size, primed_serial, primed_activated) =
             receive_configure(&mut peer, &mut received, 9, 10);
-        assert_eq!(primed_size, (72, 12));
+        assert_eq!(primed_size, tile);
         assert!(primed_activated);
         {
             let mut tracker = tracker.lock().unwrap();
@@ -15593,7 +15622,7 @@ mod tests {
             .dispatch(request(9, 4, ack).unwrap(), &mut VecDeque::new())
             .unwrap();
         let (size, serial, activated) = receive_configure(&mut peer, &mut received, 9, 10);
-        assert_eq!(size, (72, 12));
+        assert_eq!(size, tile);
         assert!(activated);
         assert_ne!(serial, 0);
 

@@ -426,9 +426,10 @@ const PORTAL_CLIENT_Y: usize =
     PORTAL_BAR_HEIGHT + (PORTAL_USABLE_HEIGHT - PORTAL_FRAME_HEIGHT) / 2 + PORTAL_TITLE_HEIGHT;
 const PORTAL_CLIENT_WIDTH: usize = PORTAL_FRAME_WIDTH;
 const PORTAL_CLIENT_HEIGHT: usize = PORTAL_FRAME_HEIGHT - PORTAL_TITLE_HEIGHT;
-/// Where the pointer waits while the chooser is captured: the 24-pixel gap
-/// below the tiles, between the two, outside the chooser and any window.
-const PORTAL_POINTER_PARK: (u32, u32) = (640, 790);
+/// Where the pointer waits while the chooser is captured: the output's last
+/// row, inside the gap below the tiles, at the first column of the divider
+/// between the two, outside the chooser and any window.
+const PORTAL_POINTER_PARK: (u32, u32) = (TILE_GAP + TERMINAL_TILE_WIDTH, QMP_OUTPUT_HEIGHT - 1);
 // The file chooser renders on td-ui's light palette (increment 7c): a chrome
 // ground, the filter field on paper, and the selected list row highlighted.
 // These are `td_ui::raster::{CHROME, PAPER}` and `td_ui::chrome::SELECTED_ROW`
@@ -440,12 +441,18 @@ const PORTAL_SELECTED_RGB: [u8; 3] = [0xc9, 0xc1, 0xb2];
 const MAX_SCREENSHOT_HEADER_BYTES: usize = 4096;
 const MAX_SCREENSHOT_BYTES: usize =
     QMP_OUTPUT_WIDTH as usize * QMP_OUTPUT_HEIGHT as usize * 3 + MAX_SCREENSHOT_HEADER_BYTES;
-const TERMINAL_CONTENT_X: u32 = 24;
-const TERMINAL_CONTENT_Y: u32 = 68;
+// td-compositor's tile gap, which its outer inset and the divider between
+// two tiles both are. The terminal is the left of two tiles on the first
+// workspace, and a split's remainder pixel goes to its first child.
+const TILE_GAP: u32 = 2;
+const TERMINAL_TILE_WIDTH: u32 = (QMP_OUTPUT_WIDTH - 3 * TILE_GAP).div_ceil(2);
+const TERMINAL_CONTENT_X: u32 = TILE_GAP;
+const TERMINAL_CONTENT_Y: u32 = PORTAL_BAR_HEIGHT as u32 + TILE_GAP + PORTAL_TITLE_HEIGHT as u32;
+const TERMINAL_CONTENT_HEIGHT: u32 = QMP_OUTPUT_HEIGHT - TERMINAL_CONTENT_Y - TILE_GAP;
 const TERMINAL_CELL_WIDTH: u32 = 8;
 const TERMINAL_CELL_HEIGHT: u32 = 16;
-const TERMINAL_ROWS: u16 = 44;
-const TERMINAL_COLUMNS: u16 = 75;
+const TERMINAL_ROWS: u16 = (TERMINAL_CONTENT_HEIGHT / TERMINAL_CELL_HEIGHT) as u16;
+const TERMINAL_COLUMNS: u16 = (TERMINAL_TILE_WIDTH / TERMINAL_CELL_WIDTH) as u16;
 const TERMINAL_CLIPBOARD_TEXT: &[u8; 7] = b"Welcome";
 const TERMINAL_CLIPBOARD_CELLS: u16 = TERMINAL_CLIPBOARD_TEXT.len() as u16;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
@@ -10011,7 +10018,7 @@ mod tests {
         assert!(commands
             .get(17)
             .unwrap()
-            .contains("\"axis\":\"x\",\"value\":1536"));
+            .contains("\"axis\":\"x\",\"value\":973"));
         assert!(commands
             .get(18)
             .unwrap()
@@ -10019,7 +10026,7 @@ mod tests {
         assert!(commands
             .get(19)
             .unwrap()
-            .contains("\"axis\":\"x\",\"value\":2765"));
+            .contains("\"axis\":\"x\",\"value\":2202"));
         assert!(commands
             .get(20)
             .unwrap()
@@ -10063,11 +10070,11 @@ mod tests {
         assert!(commands
             .get(35)
             .unwrap()
-            .contains("\"axis\":\"x\",\"value\":16384"));
+            .contains("\"axis\":\"x\",\"value\":16359"));
         assert!(commands
             .get(35)
             .unwrap()
-            .contains("\"axis\":\"y\",\"value\":32359"));
+            .contains("\"axis\":\"y\",\"value\":32728"));
         assert_eq!(
             commands.get(36).map(String::as_str),
             Some(concat!(
@@ -10121,10 +10128,17 @@ mod tests {
     fn clipboard_coordinates_bind_the_fixed_first_workspace() {
         assert_eq!(
             terminal_clipboard_coordinates(TerminalClipboardTarget { row: 0, column: 4 }).unwrap(),
-            (1_536, 2_765, 3_113)
+            (973, 2_202, 2_212)
         );
+        // 1280x800 less the 24-row bar: two 637-pixel tiles whose clients
+        // start at (2, 46) and are 752 rows tall, which td-term's grid
+        // divides into 47 rows of 79 columns.
+        assert_eq!((TERMINAL_CONTENT_X, TERMINAL_CONTENT_Y), (2, 46));
+        assert_eq!((TERMINAL_ROWS, TERMINAL_COLUMNS), (47, 79));
+        assert_eq!(PORTAL_POINTER_PARK, (639, 799));
         let scene = include_str!("../../../../../td-compositor/src/scene.rs");
-        assert!(scene.contains("pub(crate) const GAP: usize = 24;"));
+        assert!(scene.contains(&format!("const BORDER: usize = {TILE_GAP};")));
+        assert!(scene.contains("pub(crate) const GAP: usize = BORDER;"));
         assert!(scene.contains(&format!(
             "pub(crate) const TITLE_HEIGHT: usize = {PORTAL_TITLE_HEIGHT};"
         )));
@@ -12254,27 +12268,27 @@ mod tests {
 
         latch_console_evidence(
             &mut evidence,
-            b"\nTD-TERM-CLIPBOARD-TARGET-READY rows=44 columns=75 row=0 column=4 bytes=8\n",
+            b"\nTD-TERM-CLIPBOARD-TARGET-READY rows=47 columns=79 row=0 column=4 bytes=8\n",
             b"target",
         );
         assert_eq!(evidence.td_term_clipboard_target, None);
         latch_console_evidence(
             &mut evidence,
-            b"noiseTD-TERM-CLIPBOARD-TARGET-READY rows=44 columns=75 row=0 column=4 bytes=7\n",
+            b"noiseTD-TERM-CLIPBOARD-TARGET-READY rows=47 columns=79 row=0 column=4 bytes=7\n",
             b"target",
         );
         assert_eq!(evidence.td_term_clipboard_target, None);
         let mut overlap = ConsoleEvidence::default();
         latch_console_evidence_from(
             &mut overlap,
-            b"TD-TERM-CLIPBOARD-TARGET-READY rows=44 columns=75 row=0 column=4 bytes=7\n",
+            b"TD-TERM-CLIPBOARD-TARGET-READY rows=47 columns=79 row=0 column=4 bytes=7\n",
             b"target",
             false,
         );
         assert_eq!(overlap.td_term_clipboard_target, None);
         latch_console_evidence_from(
             &mut overlap,
-            b"\nTD-TERM-CLIPBOARD-TARGET-READY rows=44 columns=75 row=0 column=4 bytes=7\n",
+            b"\nTD-TERM-CLIPBOARD-TARGET-READY rows=47 columns=79 row=0 column=4 bytes=7\n",
             b"target",
             false,
         );
@@ -12284,7 +12298,7 @@ mod tests {
         );
         latch_console_evidence(
             &mut evidence,
-            b"TD-TERM-CLIPBOARD-TARGET-READY rows=44 columns=75 row=0 column=4 bytes=7\r\n",
+            b"TD-TERM-CLIPBOARD-TARGET-READY rows=47 columns=79 row=0 column=4 bytes=7\r\n",
             b"target",
         );
         assert_eq!(

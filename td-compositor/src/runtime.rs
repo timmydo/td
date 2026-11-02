@@ -12524,7 +12524,7 @@ mod tests {
         // would move focus and be caught.
         goto(&mut runtime, one.rect.x + 2, 2);
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
-        let gap = one.rect.x + one.rect.width + 2;
+        let gap = one.rect.x + one.rect.width + crate::scene::GAP / 2;
         assert!(gap < two.rect.x, "{gap} is not between the two tiles");
         goto(&mut runtime, gap, one.rect.y + 2);
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
@@ -12605,10 +12605,11 @@ mod tests {
         assert_eq!(runtime.keyboard_snapshot().focus, Some(menu));
 
         // Onto the tile and clear of the menu, with no button: the motion is
-        // what the press below must not be confused with.
+        // what the press below must not be confused with. Across the middle
+        // of the 100-pixel buffer rather than of the tile, which is wider.
         let half = |value: usize| i32::try_from(value / 2).unwrap_or(0);
         let (at_x, at_y) = (
-            i32::try_from(rect.x).unwrap() + half(rect.width),
+            i32::try_from(rect.x).unwrap() + half(rect.width.min(100)),
             i32::try_from(rect.y).unwrap() + half(rect.height),
         );
         runtime
@@ -16489,11 +16490,12 @@ mod tests {
         runtime.commit(application, surface([1, 2, 3, 0])).unwrap();
         runtime.commit(dialog, surface([4, 5, 6, 0])).unwrap();
         let rect = runtime.layout_snapshot().get(&application).unwrap().rect;
+        // The parent's centre, which the dialog centred over it will cover.
         runtime
             .pointer_frame(
                 1,
-                i32::try_from(rect.x.saturating_add(2)).unwrap(),
-                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                i32::try_from(rect.x.saturating_add(rect.width / 2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(rect.height / 2)).unwrap(),
                 &[],
                 PointerScroll::default(),
             )

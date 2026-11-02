@@ -14,8 +14,11 @@ use std::sync::Arc;
 // The buffer owns the format vocabulary; the scene re-exports it so the
 // renderer and the protocol keep spelling it the one way.
 pub use crate::buffer::{SHM_ARGB8888, SHM_XRGB8888};
-pub(crate) const GAP: usize = 24;
-const BORDER: usize = 4;
+/// Sway's default: a thin frame and no dead space. The border is drawn
+/// OUTSIDE its tile, into the gap, so a gap of exactly one border fills the
+/// output's edge with frame and lets two neighbours share one divider.
+const BORDER: usize = 2;
+pub(crate) const GAP: usize = BORDER;
 /// One line of 2x glyphs with a little air, as the status bar is sized. The
 /// tile keeps this band and the client gets what is left, so the number is
 /// layout rather than decoration.
@@ -532,7 +535,7 @@ pub(crate) fn band_buttons(band: Rect) -> Option<[Rect; BUTTONS.len()]> {
 /// measured. Every band there sits in the run at the container's top while the
 /// content is below all of them, so the run's LAST band abuts the content
 /// exactly as an ordinary band does and adjacency cannot tell the two apart.
-/// Joining it would put that leaf's border four pixels ABOVE its own band —
+/// Joining it would put that leaf's border one border ABOVE its own band —
 /// over the band of the leaf before it — and only when the last of a stack is
 /// shown, so a stack's frame is the client area alone whichever leaf that is.
 /// The band is then its own strip, which is how a stack reads: one title per
@@ -3600,7 +3603,7 @@ impl Scene {
         let modal = self.portal_modal();
         // EVERY band before ANY border, rather than the two per placement.
         // They are separate rectangles that overlap in a stack — the shown
-        // leaf's border rides four pixels up into the run's last band — so
+        // leaf's border rides one border up into the run's last band — so
         // interleaving them lets a band drawn later erase a border drawn
         // earlier, and only when the shown leaf is not the last of its run.
         // Same argument one pass down as decoration before client pixels.
@@ -3615,7 +3618,11 @@ impl Scene {
             // sibling draws nothing else, and its band says it is there.
             self.draw_title(frame, width, height, stride, placement);
         }
-        for placement in &placements {
+        // Unfocused frames first: neighbours share the divider between them,
+        // and the focused colour has to win it on every side.
+        let unfocused = placements.iter().filter(|placement| !placement.focused);
+        let focused = placements.iter().filter(|placement| placement.focused);
+        for placement in unfocused.chain(focused) {
             if modal == Some(placement.key) {
                 continue;
             }
@@ -5018,14 +5025,14 @@ mod tests {
             )
             .unwrap();
         below(&mut scene, 4);
-        // The last is a tile SHORTER than a band: 60 tiling rows less the two
-        // GAP insets is 12, so that arrangement is all band and no client and
-        // the partition below has to hold there too.
+        // The last is a tile SHORTER than a band: the two GAP insets and 12
+        // rows, so that arrangement is all band and no client and the
+        // partition below has to hold there too.
         for (width, height) in [
             (320, least_output_height(8)),
             (640, 400),
             (1920, 1080),
-            (200, BAR_HEIGHT + 60),
+            (200, BAR_HEIGHT + 2 * GAP + 12),
         ] {
             // The tile the split ACTUALLY produced, asked for independently:
             // band 0 leaves it uncarved. Deriving it from the band plus the
@@ -5556,7 +5563,7 @@ mod tests {
             // The frame a BORDER wraps is the client area ALONE in a stack.
             // The run's last band abuts the content exactly as an ordinary
             // band does, so joining it — which adjacency alone cannot refuse
-            // — would draw that leaf's border four pixels above its own band,
+            // — would draw that leaf's border one border above its own band,
             // inside the band before it, and only when the last of the stack
             // is shown.
             let content = placements.first().unwrap().rect;
@@ -5573,8 +5580,8 @@ mod tests {
                 0,
                 "a border reached above the run's last band"
             );
-            // The shown leaf's own top border SURVIVES the run. It rides four
-            // pixels up into the last band, so a pass that drew each band
+            // The shown leaf's own top border SURVIVES the run. It rides one
+            // border up into the last band, so a pass that drew each band
             // beside its border would erase it with a band belonging to a
             // later placement — every time the shown leaf is not the last.
             assert_eq!(
@@ -6229,9 +6236,9 @@ mod tests {
 
     #[test]
     fn a_fullscreen_tile_stops_at_the_bar_rather_than_covering_them() {
-        // This is where the reservation is load-bearing and the tiled case is
-        // not: a tiled placement is already inset by GAP, which happens to
-        // equal BAR_HEIGHT, so removing the offset leaves it looking right.
+        // Fullscreen is where a dropped bar reservation reaches row 0: a
+        // tiled placement is inset by GAP, so without the offset it would
+        // start GAP rows down, over the bar but not at its top edge.
         // Fullscreen has no gap at all — it is the full area or nothing — so
         // it is the only arrangement whose pixels reach row 0 without it.
         let mut scene = Scene::new();
@@ -6352,17 +6359,45 @@ mod tests {
         let mut frame = vec![0; stride * height];
         scene.render(&mut frame, width, height, stride);
 
+        // Two tiles side by side: the output's edge and the divider between
+        // them are each one GAP, and each is exactly one border wide.
+        let left = 24usize;
+        let right = 72usize;
+        // The divider is the gap's first column after the left tile, asked
+        // of the layout rather than computed: a split's remainder pixel goes
+        // to its first child.
+        let first = scene
+            .tiled_placements(width, height)
+            .into_iter()
+            .map(|placement| placement.rect)
+            .min_by_key(|rect| rect.x)
+            .unwrap();
+        let divider = first.x + first.width;
         // A tile's top rows are its title band now, and the client's own
         // pixels start below it. Both are asserted, so a band that stopped
         // being drawn and a client that stopped being pushed down are two
         // different failures rather than one.
-        assert_eq!(tiled(&frame, stride, 24, 24), TITLE_UNFOCUSED);
-        assert_eq!(tiled(&frame, stride, 72, 24), TITLE_FOCUSED);
-        assert_eq!(tiled(&frame, stride, 24, 24 + TITLE_HEIGHT), [1, 2, 3, 0]);
-        assert_eq!(tiled(&frame, stride, 72, 24 + TITLE_HEIGHT), [4, 5, 6, 0]);
-        assert_eq!(tiled(&frame, stride, 60, 30), [0x30, 0x25, 0x20, 0]);
-        assert_eq!(tiled(&frame, stride, 68, 30), [0xc0, 0x70, 0xf0, 0]);
-        assert_eq!(tiled(&frame, stride, 20, 30), [0x70, 0x70, 0x70, 0]);
+        assert_eq!(tiled(&frame, stride, left, GAP), TITLE_UNFOCUSED);
+        assert_eq!(tiled(&frame, stride, right, GAP), TITLE_FOCUSED);
+        assert_eq!(
+            tiled(&frame, stride, left, GAP + TITLE_HEIGHT),
+            [1, 2, 3, 0]
+        );
+        assert_eq!(
+            tiled(&frame, stride, right, GAP + TITLE_HEIGHT),
+            [4, 5, 6, 0]
+        );
+        assert_eq!(tiled(&frame, stride, 0, 30), [0x70, 0x70, 0x70, 0]);
+        assert_eq!(tiled(&frame, stride, width - 1, 30), [0xc0, 0x70, 0xf0, 0]);
+        assert_eq!(tiled(&frame, stride, divider, 30), [0xc0, 0x70, 0xf0, 0]);
+        // No dead space: every tiled pixel is frame, band or client.
+        let area = Rect {
+            x: 0,
+            y: BAR_HEIGHT,
+            width,
+            height: height - BAR_HEIGHT,
+        };
+        assert_eq!(count_color(&frame, stride, area, BACKGROUND), 0);
         // The bar owns its own rows and the tiles start below them. Sampled
         // at the launcher button's right edge, past its mark and the cursor.
         assert_eq!(pixel(&frame, stride, 23, 0), [0x18, 0x14, 0x20, 0]);
@@ -6373,12 +6408,15 @@ mod tests {
 
         scene.command(Command::Focus(crate::layout::Direction::Left));
         scene.render(&mut frame, width, height, stride);
-        assert_eq!(tiled(&frame, stride, 20, 30), [0xc0, 0x70, 0xf0, 0]);
-        assert_eq!(tiled(&frame, stride, 68, 30), [0x70, 0x70, 0x70, 0]);
+        assert_eq!(tiled(&frame, stride, 0, 30), [0xc0, 0x70, 0xf0, 0]);
+        assert_eq!(tiled(&frame, stride, width - 1, 30), [0x70, 0x70, 0x70, 0]);
+        // The shared divider follows focus to whichever side holds it, so
+        // the unfocused neighbour's frame cannot be painted over it.
+        assert_eq!(tiled(&frame, stride, divider, 30), [0xc0, 0x70, 0xf0, 0]);
         // The band follows focus with the border, and the two are separate
         // colours: a band that took the border's would say nothing new.
-        assert_eq!(tiled(&frame, stride, 24, 24), TITLE_FOCUSED);
-        assert_eq!(tiled(&frame, stride, 72, 24), TITLE_UNFOCUSED);
+        assert_eq!(tiled(&frame, stride, left, GAP), TITLE_FOCUSED);
+        assert_eq!(tiled(&frame, stride, right, GAP), TITLE_UNFOCUSED);
     }
 
     const BACKGROUND: [u8; 4] = [0x30, 0x25, 0x20, 0];

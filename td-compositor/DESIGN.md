@@ -3045,7 +3045,14 @@ client forgets that assignment. A new mapping exits fullscreen so focus never
 points behind a fullscreen tile.
 
 Geometry uses a fixed outer and inner gap and divides remainders from the
-first child onward. Undersized splits reserve a pixel for as many children as
+first child onward. The gap is exactly one border wide, 2 pixels, as sway's
+default frame is: a border is drawn OUTSIDE its tile and into the gap, so
+around split tiles the output's edge is all frame and two neighbours share
+one divider rather than being separated by dead space. A grouped container
+is the exception: its frame wraps the client area alone (below), so the gap
+beside and above its run of bands stays background. The border pass paints
+unfocused frames before the focused one, so the focused colour takes every
+divider it shares. Undersized splits reserve a pixel for as many children as
 the axis can show before budgeting gaps, and zero-area tiles draw neither
 decoration nor client pixels. Borders are composed before all client buffers
 so overlapping decorations cannot overwrite a neighboring client. These
@@ -3168,7 +3175,7 @@ together, since one around the client area alone would leave a window's own
 title bar outside its own frame. A STACKED leaf is the exception and the
 placement SAYS which it is rather than being measured: the run's last band
 abuts the content exactly as an ordinary band does, so adjacency cannot tell
-the two apart, and joining it would draw that leaf's border four pixels above
+the two apart, and joining it would draw that leaf's border one border above
 its own band — over the band before it — and only when the last of a stack is
 shown. A stack's frame is therefore the client area alone. A leaf its
 WORKSPACE presents is NOT that exception, whichever of the three the workspace
@@ -3678,10 +3685,10 @@ names them, and a third state on `Presentation::Split` would exist only to
 remember something two other chords already say.
 
 Bands in a run are NOT separated by a border, and adjacent unfocused ones
-therefore read as one block distinguished only by their titles. That is a
-limitation rather than a decision deferred: the border is 4 pixels against a
-20-pixel band whose text already occupies rows 3 to 16, so a border per band
-would draw over the name it was meant to delimit.
+therefore read as one block distinguished only by their titles. That was
+decided when the border was 4 pixels and would have drawn over a band's text,
+which occupies rows 3 to 16 of its 20; at 2 pixels a border per band would
+clear the text, so separating them is now possible and simply not done.
 
 Where this diverges from i3 is WHAT is presented: i3 groups a container's
 CHILDREN, so a nested split shows as one title, and td groups its LEAVES, so
@@ -3703,7 +3710,7 @@ not ask: a band is drawn whether or not its client is.
 
 Bands are drawn in a pass of their own, before any border rather than beside
 each one. The two are separate rectangles that OVERLAP in a group — the shown
-leaf's border rides four pixels up into the run's last band — so interleaving
+leaf's border rides one border up into the run's last band — so interleaving
 them lets a band belonging to a later placement erase a border already drawn,
 and only when the shown leaf is not the last of its run. That is the same
 argument one level down from decoration preceding client pixels.
