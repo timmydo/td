@@ -866,7 +866,7 @@ fn the_look_intensity_takes_a_share_of_the_look() {
 }
 
 /// The tonal regions' curve: the identity at all zero; rising at every
-/// extreme mix of the four, so no tone reverses; the shadows lifting or
+/// mix of the four at whole and half amounts, so no tone reverses; the shadows lifting or
 /// deepening the dark tones with black and white held, the highlights
 /// the bright ones, and the whites and blacks moving their ends.
 #[test]
@@ -883,7 +883,7 @@ fn the_tonal_regions_curve_rises_and_moves_its_region() {
     for &y in &grid {
         assert!((none(y) - y).abs() < 1e-12, "{y}");
     }
-    let amounts = [-100, 0, 100];
+    let amounts = [-100, -50, 0, 50, 100];
     for h in amounts {
         for s in amounts {
             for w in amounts {
@@ -901,16 +901,32 @@ fn the_tonal_regions_curve_rises_and_moves_its_region() {
         }
     }
     let stops = |f: &dyn Fn(f64) -> f64, y: f64| (f(y) / y).log2();
-    // Shadows: a deep shadow at least a stop up at +1.00 and down at
-    // -1.00; black and white held; a bright tone barely moved.
+    // Shadows: a deep shadow (Y 0.02, three stops under grey) more than
+    // 1.3 stops up at +1.00 and down at -1.00; black and white held; and
+    // no exposure, which moves every tone alike: grey moved under a fifth
+    // of the deep shadow's move, a bright tone barely, and the darkest
+    // tones less than the deep shadow.
     let lift = tone_curve(tone(0, 100, 0, 0));
     let deepen = tone_curve(tone(0, -100, 0, 0));
-    assert!(stops(&lift, 0.02) > 1.0, "{}", stops(&lift, 0.02));
-    assert!(stops(&deepen, 0.02) < -1.0, "{}", stops(&deepen, 0.02));
+    assert!(stops(&lift, 0.02) > 1.4, "{}", stops(&lift, 0.02));
+    assert!(stops(&deepen, 0.02) < -1.3, "{}", stops(&deepen, 0.02));
     for f in [&lift, &deepen] {
+        let deep = stops(f, 0.02).abs();
         assert_eq!(f(0.0), 0.0);
         assert!((f(1.0) - 1.0).abs() < 1e-12);
-        assert!(stops(f, 0.8).abs() < 0.15, "{}", stops(f, 0.8));
+        assert!(stops(f, 0.18).abs() < deep / 5.0, "{}", stops(f, 0.18));
+        assert!(stops(f, 0.5).abs() < 0.01, "{}", stops(f, 0.5));
+        let black = stops(f, 0.001).abs();
+        assert!(black < deep * 0.75, "{black} {deep}");
+        // Its slope in `p` at least a half: the lower midtones it falls
+        // off through keep their contrast.
+        for pair in grid.windows(2) {
+            let (Some(&y0), Some(&y1)) = (pair.first(), pair.last()) else {
+                continue;
+            };
+            let slope = (f(y1).sqrt() - f(y0).sqrt()) / (y1.sqrt() - y0.sqrt());
+            assert!(slope >= 0.5, "{slope} at {y0}");
+        }
     }
     // Half the amount, part of the way.
     let half = tone_curve(tone(0, 50, 0, 0));

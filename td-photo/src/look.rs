@@ -167,11 +167,12 @@ pub struct Tone {
 }
 
 /// The shadows' bump at +1.00 and at -1.00, and the highlights' at -1.00
-/// and at +1.00, over `p (1 - p)^2` and `p^3 (1 - p)`: each within what
-/// keeps the map rising (slope at least 0.2), the lift and the recovery
-/// the larger.
-const SHADOWS_LIFT: f64 = 1.5;
-const SHADOWS_DEEPEN: f64 = 0.8;
+/// and at +1.00, over `p^2 (1 - p)^8` and `p^3 (1 - p)`: each within what
+/// keeps the map rising (slope at least 0.2; the shadows' at least a
+/// half, so the lower midtones they fall off through keep their contrast),
+/// the lift and the recovery the larger.
+const SHADOWS_LIFT: f64 = 16.0;
+const SHADOWS_DEEPEN: f64 = 9.0;
 const HIGHLIGHTS_RECOVER: f64 = 2.0;
 const HIGHLIGHTS_LIFT: f64 = 0.8;
 /// The whites' and blacks' move of their end at 1.00, over `p^3` and
@@ -180,8 +181,10 @@ const ENDS: f64 = 0.25;
 
 /// The tonal regions' curve over linear luminance in `0..=1`, the one
 /// `Look::adjust` tabulates: in `p = sqrt(Y)`, roughly perceptual, the
-/// shadows' bump `p (1 - p)^2` (peaking a third of the way up), the
-/// highlights' `p^3 (1 - p)` (three quarters, falling away fast enough
+/// shadows' bump `p^2 (1 - p)^8` (its lift in stops largest near Y 0.012,
+/// four stops under grey, fading toward black and toward grey, so it is
+/// no exposure: +1.00 lifts Y 0.02 a stop and a half, grey a quarter of
+/// one), the highlights' `p^3 (1 - p)` (three quarters, falling away fast enough
 /// below that a deep shadow barely moves), then the whites' `p^3` and the
 /// blacks' `(1 - p)^3`, each scaled by its amount, then squared back,
 /// below zero black. Each map rises at every amount within 1.00, so the
@@ -205,7 +208,7 @@ pub fn tone_curve(tone: Tone) -> impl Fn(f64) -> f64 {
         };
     move |y: f64| {
         let p = y.max(0.0).sqrt();
-        let p = p + shadows * p * (1.0 - p) * (1.0 - p);
+        let p = p + shadows * p * p * (1.0 - p).powi(8);
         let p = p + highlights * p * p * p * (1.0 - p);
         let p = p + whites * ENDS * p * p * p;
         let q = 1.0 - p;

@@ -1458,8 +1458,14 @@ In order, per pixel, all linear `f32` until the last step:
    (`Look::contrast`); then the photo's tonal regions, when any is not
    zero (`look::tone_curve`, `Op::Tone`, the two together
    `Look::adjust`): one rising curve over luminance, in `p = sqrt(Y)`
-   the shadows' bump `p (1 - p)^2` (peak a third of the way up; +1.00
-   lifts a deep shadow at Y 0.02 more than a stop, -1.00 deepens it),
+   the shadows' bump `p^2 (1 - p)^8` (a fifth of the way up in `p`, Y
+   0.04, its lift in stops largest near Y 0.012, four stops under grey,
+   fading toward black and toward grey so that it is no exposure: +1.00
+   lifts a deep shadow at Y 0.02 a stop and a half, grey under a quarter
+   of a stop, Y 0.001 about a stop and a bright tone at Y 0.5 not at
+   all; -1.00 deepens them a little less, Y 0.02 by 1.36 stops and grey
+   by 0.14; its map's slope in `p` at least a half, so the lower
+   midtones it falls off through keep their contrast),
    the highlights' `p^3 (1 - p)` (three quarters; -1.00 recovers a
    bright tone at Y 0.5 by about a stop, a deep shadow moved under a
    tenth of one), then the whites' `p^3` and the blacks' `(1 - p)^3`
@@ -2625,9 +2631,12 @@ refused (`Error::Lighting`), and with a map darkening down the frame
 the bands of every size joining to the whole.
 
 `tests/look.rs` holds the tonal regions' curve to the identity at zero,
-rising at every extreme mix of the four, the shadows lifting and
-deepening a deep shadow more than a stop with black, white and a bright
-tone held, the highlights recovering and raising a bright tone with a
+rising at every mix of the four at -1.00, -0.50, 0, 0.50 and 1.00, the
+shadows lifting and deepening a deep shadow (Y 0.02) more than 1.3
+stops with black and white held, grey moved under a fifth of the deep
+shadow's move, a bright tone (Y 0.5) under a hundredth of a stop and
+the darkest tones (Y 0.001) under three quarters of the deep shadow's
+move, the highlights recovering and raising a bright tone with a
 deep shadow held, the whites and blacks moving their ends by a quarter
 of the perceptual range, and amounts past 1.00 held; the adjustments as
 one look (none at zero, an operation each) keeping a neutral neutral
