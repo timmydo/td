@@ -570,6 +570,30 @@ pub fn recipe() -> Recipe {
     //    parent pin is needed. A `default` flip is absorbed by the pin; only a
     //    `select` that defeats it reaches the guard, which names the symbol here
     //    rather than letting it surface as a broken applet in the boot oracle.
+    //
+    //    CPU VULNERABILITY MITIGATIONS: x86 prompts for CPU_MITIGATIONS as a
+    //    menuconfig (ARCH_CONFIGURES_CPU_MITIGATIONS), so allnoconfig answers
+    //    it `n` despite its `default y`, and with it off every mitigation is
+    //    compiled out and the `mitigations=` parameter cannot restore one.
+    //    It is pinned on, and each mitigation under it keeps its upstream
+    //    default: page-table isolation, retpoline and return thunks, the
+    //    AMD UNRET/IBPB/SRSO/TSA and Intel IBRS/call-depth/BHI/MDS/TAA/
+    //    MMIO/L1TF/GDS/RFDS/SRBDS/ITS entry, exit and boot-time work,
+    //    RETBleed, Spectre v1/v2 and SSB. Each is invisible at allnoconfig
+    //    (its menu is off), so they are guarded, not written; the kernel
+    //    enables only those the running CPU needs. SLS is left at
+    //    upstream's default, off. VMSCAPE depends on KVM, which this
+    //    kernel does not build. Those that need CPU microcode (IBPB, IBRS, STIBP, VERW
+    //    buffer clearing, SRBDS, GDS, SRSO's IBPB forms) take effect only
+    //    where platform firmware supplied it: td loads no microcode
+    //    (AGENTS.md "Device firmware").
+    //    Unasked: RETPOLINE selects OBJTOOL, already built for x86_64;
+    //    CALL_DEPTH_TRACKING selects CALL_THUNKS, whose call padding brings
+    //    16-byte function alignment, and HAVE_DYNAMIC_FTRACE_NO_PATCHABLE,
+    //    inert with FTRACE off; ITS selects EXECMEM for its thunk pages;
+    //    x86 then selects ARCH_HAS_CPU_ATTACK_VECTORS, the attack-vector
+    //    controls of `mitigations=`; ADDRESS_MASKING (LAM, unpinned)
+    //    becomes unavailable.
     steps.push(
         Step::run(
             "{src}",
@@ -821,6 +845,7 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_ATH11K_PCI[ =]/d; \
                   /^#? *CONFIG_EXTRA_FIRMWARE[ =]/d; \
                   /^#? *CONFIG_EXTRA_FIRMWARE_DIR[ =]/d; \
+                  /^#? *CONFIG_CPU_MITIGATIONS[ =]/d; \
                   /^#? *CONFIG_SND_ALOOP[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
@@ -1063,6 +1088,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_WLAN_VENDOR_ATH=y' \
                    'CONFIG_ATH11K=y' \
                    'CONFIG_ATH11K_PCI=y' \
+                   'CONFIG_CPU_MITIGATIONS=y' \
                    'CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' \
                    'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' >> .config"
                     .replace(
@@ -1327,6 +1353,8 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_DMI=y' .config || { echo 'DMI off — the firmware tables that name a cloud are not scanned' >&2; exit 1; }; \
                  grep -q '^CONFIG_DMIID=y' .config || { echo 'DMIID off — /sys/class/dmi/id is missing, so a server cannot tell which cloud it runs on' >&2; exit 1; }; \
                  grep -q '^CONFIG_HYPERV_TIMER=y' .config || { echo 'HYPERV_TIMER off — an Azure VM has no Hyper-V clocksource. It is unprompted (def_bool HYPERV && X86), so something took HYPERV away' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CPU_MITIGATIONS=y' .config || { echo 'CPU_MITIGATIONS off — every CPU vulnerability mitigation is compiled out and mitigations= cannot restore one' >&2; exit 1; }; \
+                 for m in PAGE_TABLE_ISOLATION RETPOLINE RETHUNK UNRET_ENTRY CALL_DEPTH_TRACKING IBPB_ENTRY IBRS_ENTRY SRSO GDS RFDS SPECTRE_BHI MDS TAA MMIO_STALE_DATA L1TF RETBLEED SPECTRE_V1 SPECTRE_V2 SRBDS SSB ITS TSA; do grep -q \"^CONFIG_MITIGATION_$m=y\" .config || { echo \"MITIGATION_$m off or absent — its upstream default did not survive resolution, or this kernel renamed it\" >&2; exit 1; }; done; \
                  if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::shared::efi_default_cmdline())),
             ],
         )
@@ -1693,6 +1721,65 @@ mod tests {
                 "{symbol}"
             );
         }
+    }
+
+    /// CPU_MITIGATIONS is the prompted parent allnoconfig turns off; with it
+    /// pinned, every mitigation keeps its upstream default and is checked
+    /// after resolution rather than written.
+    #[test]
+    fn cpu_vulnerability_mitigations_are_compiled_in() {
+        let text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            text.matches("/^#? *CONFIG_CPU_MITIGATIONS[ =]/d;").count(),
+            1
+        );
+        assert_eq!(text.matches("'CONFIG_CPU_MITIGATIONS=y'").count(), 1);
+        assert!(text.contains("grep -q '^CONFIG_CPU_MITIGATIONS=y' .config"));
+        let looped = text
+            .split("for m in ")
+            .nth(1)
+            .and_then(|rest| rest.split("; do").next())
+            .unwrap_or_default()
+            .split(' ')
+            .collect::<Vec<_>>();
+        for name in [
+            "PAGE_TABLE_ISOLATION",
+            "RETPOLINE",
+            "RETHUNK",
+            "UNRET_ENTRY",
+            "CALL_DEPTH_TRACKING",
+            "IBPB_ENTRY",
+            "IBRS_ENTRY",
+            "SRSO",
+            "GDS",
+            "RFDS",
+            "SPECTRE_BHI",
+            "MDS",
+            "TAA",
+            "MMIO_STALE_DATA",
+            "L1TF",
+            "RETBLEED",
+            "SPECTRE_V1",
+            "SPECTRE_V2",
+            "SRBDS",
+            "SSB",
+            "ITS",
+            "TSA",
+        ] {
+            assert!(looped.contains(&name), "{name}");
+        }
+        assert!(text.contains("grep -q \"^CONFIG_MITIGATION_$m=y\" .config"));
+        assert!(!text.contains("'CONFIG_MITIGATION_"));
+        assert!(!text.contains("CONFIG_MITIGATION_SLS"));
     }
 
     /// The T14s's Wi-Fi: ath11k built in, with linux-firmware's files
