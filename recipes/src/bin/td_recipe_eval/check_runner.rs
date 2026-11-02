@@ -8504,6 +8504,16 @@ mod tests {
                 "linux-firmware-amdgpu-gc-11-0-1-mes1-source",
                 "linux-firmware-amdgpu-gc-11-0-1-pfp-source",
                 "linux-firmware-amdgpu-gc-11-0-1-rlc-source",
+                "linux-firmware-amdgpu-green-sardine-asd-source",
+                "linux-firmware-amdgpu-green-sardine-ce-source",
+                "linux-firmware-amdgpu-green-sardine-dmcub-source",
+                "linux-firmware-amdgpu-green-sardine-me-source",
+                "linux-firmware-amdgpu-green-sardine-mec-source",
+                "linux-firmware-amdgpu-green-sardine-pfp-source",
+                "linux-firmware-amdgpu-green-sardine-rlc-source",
+                "linux-firmware-amdgpu-green-sardine-sdma-source",
+                "linux-firmware-amdgpu-green-sardine-ta-source",
+                "linux-firmware-amdgpu-green-sardine-vcn-source",
                 "linux-firmware-amdgpu-psp-13-0-4-ta-source",
                 "linux-firmware-amdgpu-psp-13-0-4-toc-source",
                 "linux-firmware-amdgpu-sdma-6-0-1-source",
@@ -8524,6 +8534,16 @@ mod tests {
              device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-gc-11-0-1-mes1-source\n\
              device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-gc-11-0-1-pfp-source\n\
              device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-gc-11-0-1-rlc-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-green-sardine-asd-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-green-sardine-ce-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-green-sardine-dmcub-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-green-sardine-me-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-green-sardine-mec-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-green-sardine-pfp-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-green-sardine-rlc-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-green-sardine-sdma-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-green-sardine-ta-source\n\
+             device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-green-sardine-vcn-source\n\
              device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-psp-13-0-4-ta-source\n\
              device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-psp-13-0-4-toc-source\n\
              device-firmware\tlinux-firmware\tlinux-firmware-amdgpu-sdma-6-0-1-source\n\

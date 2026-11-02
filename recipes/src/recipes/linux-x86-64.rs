@@ -10,7 +10,7 @@ const FIRMWARE_DIR: &str = "td-firmware";
 /// The build root's cp, which may write into the build tree.
 const CP: &str = "/usr/bin/cp";
 
-/// Phoenix GPU and WCN6855 files requested at probe (AGENTS.md
+/// Phoenix and Cezanne GPU and WCN6855 files requested at probe (AGENTS.md
 /// "Device firmware"), each by its pin and the name the driver asks for.
 pub const FIRMWARE: &[(&str, &str)] = &[
     (
@@ -60,6 +60,46 @@ pub const FIRMWARE: &[(&str, &str)] = &[
     (
         "linux-firmware-amdgpu-vcn-4-0-2-source",
         "amdgpu/vcn_4_0_2.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-green-sardine-asd-source",
+        "amdgpu/green_sardine_asd.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-green-sardine-ce-source",
+        "amdgpu/green_sardine_ce.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-green-sardine-dmcub-source",
+        "amdgpu/green_sardine_dmcub.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-green-sardine-me-source",
+        "amdgpu/green_sardine_me.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-green-sardine-mec-source",
+        "amdgpu/green_sardine_mec.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-green-sardine-pfp-source",
+        "amdgpu/green_sardine_pfp.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-green-sardine-rlc-source",
+        "amdgpu/green_sardine_rlc.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-green-sardine-sdma-source",
+        "amdgpu/green_sardine_sdma.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-green-sardine-ta-source",
+        "amdgpu/green_sardine_ta.bin",
+    ),
+    (
+        "linux-firmware-amdgpu-green-sardine-vcn-source",
+        "amdgpu/green_sardine_vcn.bin",
     ),
     (
         "linux-firmware-ath11k-wcn6855-amss-source",
@@ -511,12 +551,17 @@ pub fn recipe() -> Recipe {
     //    IOMMU, xHCI, NVMe, AHCI and the HDA controller, whose ALC1220 is
     //    bound by the Realtek ALC882 family. CPU_SUP_AMD, SND_HDA_CODEC_ALC882
     //    and SND_HDA_CODEC_HDMI_ATI prompt only under EXPERT, so they are
-    //    guarded, not written. Its Cezanne GPU matches amdgpu, whose graphics
-    //    and SDMA blocks request their firmware in early init, before amdgpu
-    //    takes the display from the GOP framebuffer: without Cezanne's files
-    //    among those EXTRA_FIRMWARE names the probe fails and simpledrm keeps
-    //    it, and the DisplayPort audio the AMD HDMI codec would carry waits
-    //    on amdgpu for its audio endpoint.
+    //    guarded, not written. Its Cezanne GPU (Renoir family, which
+    //    amdgpu names green_sardine) is driven by AMDGPU and DC with the
+    //    ten files amdgpu requests for it embedded beside Phoenix's: PSP
+    //    ASD and TA, the gfx CE/PFP/ME/MEC/RLC microcode, SDMA, VCN and the
+    //    DCN 2.1 DMCUB. MODULE_FIRMWARE also declares green_sardine_mec2,
+    //    but gfx v9 skips that request on GC 9.3.0 and reuses MEC, and
+    //    Renoir loads no gpu_info file. Every one of these blocks requests
+    //    its file in early init, before amdgpu takes the display from the
+    //    GOP framebuffer, so a missing file leaves simpledrm driving it
+    //    rather than a dark panel.
+    //    DisplayPort audio follows amdgpu's audio endpoint.
     //
     //    CLOCK (td-time/DESIGN.md): td-time writes the RTC through
     //    /dev/rtc0 (RTC_INTF_DEV). On x86 the boot clock is read from the
@@ -1182,7 +1227,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_NLS_CODEPAGE_437=y' \
                    'CONFIG_NLS_ISO8859_1=y' \
                    'CONFIG_NLS_UTF8=y' \
-                   'CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' \
+                   'CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin amdgpu/green_sardine_asd.bin amdgpu/green_sardine_ce.bin amdgpu/green_sardine_dmcub.bin amdgpu/green_sardine_me.bin amdgpu/green_sardine_mec.bin amdgpu/green_sardine_pfp.bin amdgpu/green_sardine_rlc.bin amdgpu/green_sardine_sdma.bin amdgpu/green_sardine_ta.bin amdgpu/green_sardine_vcn.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' \
                    'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' >> .config"
                     .replace(
                         "@EFI_CMDLINE@",
@@ -1425,7 +1470,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_QRTR=y' .config || { echo 'QRTR off — ath11k talks QMI to the WCN6855 over QRTR' >&2; exit 1; }; \
                  grep -q '^CONFIG_QRTR_MHI=y' .config || { echo 'QRTR_MHI off — QRTR has no transport to the WCN6855' >&2; exit 1; }; \
                  grep -q '^CONFIG_QCOM_QMI_HELPERS=y' .config || { echo 'QCOM_QMI_HELPERS off — ath11k has no QMI client' >&2; exit 1; }; \
-                 grep -qx 'CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' .config || { echo 'EXTRA_FIRMWARE is not the Phoenix and WCN6855 set — ath11k probes before any root and finds no firmware' >&2; exit 1; }; \
+                 grep -qx 'CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin amdgpu/green_sardine_asd.bin amdgpu/green_sardine_ce.bin amdgpu/green_sardine_dmcub.bin amdgpu/green_sardine_me.bin amdgpu/green_sardine_mec.bin amdgpu/green_sardine_pfp.bin amdgpu/green_sardine_rlc.bin amdgpu/green_sardine_sdma.bin amdgpu/green_sardine_ta.bin amdgpu/green_sardine_vcn.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' .config || { echo 'EXTRA_FIRMWARE is not the Phoenix, Cezanne and WCN6855 set — amdgpu and ath11k probe before any root is mounted, with no firmware to load' >&2; exit 1; }; \
                  grep -qx 'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' .config || { echo 'EXTRA_FIRMWARE_DIR is not the build-tree firmware directory' >&2; exit 1; }; \
                  if grep -q '^CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y' .config; then echo 'CFG80211_REQUIRE_SIGNED_REGDB on — it selects the trusted keyring and its openssl-linked certs/ tool' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_SYSTEM_TRUSTED_KEYRING=y' .config; then echo 'SYSTEM_TRUSTED_KEYRING on — a select overrode its pin, and certs/ would need openssl' >&2; exit 1; fi; \

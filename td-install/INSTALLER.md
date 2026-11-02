@@ -73,10 +73,10 @@ tried on the hardware.
 A Ryzen 7 5700G desktop on an AMD 500-series board is a third target on
 the same terms. It shares the T14s's AMD platform set; beside it, its
 Intel I225-V wired port is driven by igc and its ALC1220 by the Realtek
-ALC882 family. Its Cezanne Radeon matches AMDGPU but carries no reviewed
-firmware here, so the probe stops in early init and simpledrm keeps the
-GOP framebuffer; its DisplayPort audio, which the AMD HDMI codec would
-carry, waits on AMDGPU for its audio endpoint. The same kernel can
+ALC882 family. Its Cezanne Radeon is driven by AMDGPU and DC with the
+ten reviewed linux-firmware files amdgpu requests for it embedded in the
+kernel beside Phoenix's (AGENTS.md, "Device firmware"); its DisplayPort
+audio is the AMD HDMI codec on AMDGPU's audio endpoint. The same kernel can
 host KVM guests and mount ext4, FAT and exFAT; nothing in td hands
 `/dev/kvm` to a session or mounts such a filesystem yet. None of this has
 been tried on the machine.

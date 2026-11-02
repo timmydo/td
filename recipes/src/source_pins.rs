@@ -226,6 +226,86 @@ const PINS: &[PinDef] = &[
         file: "linux-firmware-20261019-amdgpu-gc_11_0_1_rlc.bin",
     },
     PinDef {
+        key: "linux-firmware-amdgpu-green-sardine-asd-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/green_sardine_asd.bin",
+        sha256: "ebe32baa51bc1fa04dc4df6d7e1f90a3ebb6b0e8931aeb40fc838e0ba2e2c192",
+        file: "linux-firmware-20261019-amdgpu-green_sardine_asd.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-green-sardine-ce-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/green_sardine_ce.bin",
+        sha256: "3bba10cff48ec51eb63e78078456596258c9fea2e8b38d91d02be66c0aca70fd",
+        file: "linux-firmware-20261019-amdgpu-green_sardine_ce.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-green-sardine-dmcub-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/green_sardine_dmcub.bin",
+        sha256: "1c9d74c58dd14dacd6d4a330dcf9820b2263d6a7d39fa54c826636a797b4b6a8",
+        file: "linux-firmware-20261019-amdgpu-green_sardine_dmcub.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-green-sardine-me-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/green_sardine_me.bin",
+        sha256: "671af908c8d631e659895d62db2e6bffc1d2c87d6db4c08246be0216f468fb9c",
+        file: "linux-firmware-20261019-amdgpu-green_sardine_me.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-green-sardine-mec-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/green_sardine_mec.bin",
+        sha256: "0e4c6712f75af494c3fd70386bc07739cab3aafd77c4fe8efb46c0bc1ae4eba6",
+        file: "linux-firmware-20261019-amdgpu-green_sardine_mec.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-green-sardine-pfp-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/green_sardine_pfp.bin",
+        sha256: "94e1474b3c8d422e35661d2d584297d891464c173ebf4ad45536277bdf7bdcdc",
+        file: "linux-firmware-20261019-amdgpu-green_sardine_pfp.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-green-sardine-rlc-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/green_sardine_rlc.bin",
+        sha256: "66f4397c2e9d19af245f9da290c8678eb1a51cc815fa7864a9383c2cd0db319d",
+        file: "linux-firmware-20261019-amdgpu-green_sardine_rlc.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-green-sardine-sdma-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/green_sardine_sdma.bin",
+        sha256: "cba8658ea950a99115ca46ee88c9622240632a0ca1731abbcd18b6d9be9e09de",
+        file: "linux-firmware-20261019-amdgpu-green_sardine_sdma.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-green-sardine-ta-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/green_sardine_ta.bin",
+        sha256: "53ad33b376b85b90f858c8cc3b4bc6c709135b4bd37340ed69b1f00fecd6626b",
+        file: "linux-firmware-20261019-amdgpu-green_sardine_ta.bin",
+    },
+    PinDef {
+        key: "linux-firmware-amdgpu-green-sardine-vcn-source",
+        aliases: &[],
+        version: "20261019",
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amdgpu/green_sardine_vcn.bin",
+        sha256: "5b32a9f1ee1176babe56910fa1fa52df938b60665febbeab1ce0ee38cb4d5c98",
+        file: "linux-firmware-20261019-amdgpu-green_sardine_vcn.bin",
+    },
+    PinDef {
         key: "linux-firmware-amdgpu-psp-13-0-4-ta-source",
         aliases: &[],
         version: "20261019",
@@ -449,6 +529,16 @@ pub const DEVICE_FIRMWARE: &[&str] = &[
     "linux-firmware-amdgpu-gc-11-0-1-mec-source",
     "linux-firmware-amdgpu-gc-11-0-1-pfp-source",
     "linux-firmware-amdgpu-gc-11-0-1-rlc-source",
+    "linux-firmware-amdgpu-green-sardine-asd-source",
+    "linux-firmware-amdgpu-green-sardine-ce-source",
+    "linux-firmware-amdgpu-green-sardine-dmcub-source",
+    "linux-firmware-amdgpu-green-sardine-me-source",
+    "linux-firmware-amdgpu-green-sardine-mec-source",
+    "linux-firmware-amdgpu-green-sardine-pfp-source",
+    "linux-firmware-amdgpu-green-sardine-rlc-source",
+    "linux-firmware-amdgpu-green-sardine-sdma-source",
+    "linux-firmware-amdgpu-green-sardine-ta-source",
+    "linux-firmware-amdgpu-green-sardine-vcn-source",
     "linux-firmware-amdgpu-psp-13-0-4-ta-source",
     "linux-firmware-amdgpu-psp-13-0-4-toc-source",
     "linux-firmware-amdgpu-sdma-6-0-1-source",
@@ -571,7 +661,7 @@ mod tests {
 
     #[test]
     fn catalog_carries_all_legacy_source_locks() {
-        assert_eq!(all().len(), 45);
+        assert_eq!(all().len(), 55);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

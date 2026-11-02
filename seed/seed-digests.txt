@@ -24,6 +24,16 @@ linux-firmware-amdgpu-gc-11-0-1-mes-2-source r1vmvns7psd1isljad4w1zqy40i1x8b0-li
 linux-firmware-amdgpu-gc-11-0-1-mes1-source 74z0vvi37531pk86kqd2mm04ac3hx0rq-linux-firmware-amdgpu-gc-11-0-1-mes1-source
 linux-firmware-amdgpu-gc-11-0-1-pfp-source al2cd7zkfy2qwqn7484b1pf9wbcw3cn1-linux-firmware-amdgpu-gc-11-0-1-pfp-source
 linux-firmware-amdgpu-gc-11-0-1-rlc-source ssphrrcwj2dg2yz0kv57mzbf7mk8w1xq-linux-firmware-amdgpu-gc-11-0-1-rlc-source
+linux-firmware-amdgpu-green-sardine-asd-source md2hvaj91gp2s5gaq513dmx0zyhcc5sf-linux-firmware-amdgpu-green-sardine-asd-source
+linux-firmware-amdgpu-green-sardine-ce-source q3nnrlwhrfqcn5jd49cpgm96mdjrmzlf-linux-firmware-amdgpu-green-sardine-ce-source
+linux-firmware-amdgpu-green-sardine-dmcub-source r7ifyg5cmrykvjfh13m6dfvlbr6hh0sz-linux-firmware-amdgpu-green-sardine-dmcub-source
+linux-firmware-amdgpu-green-sardine-me-source 9rrz8573ks23mqz19qlssn32qh9b028b-linux-firmware-amdgpu-green-sardine-me-source
+linux-firmware-amdgpu-green-sardine-mec-source 5ys0d6l28j4abz8j164cdpx1vw86mfzg-linux-firmware-amdgpu-green-sardine-mec-source
+linux-firmware-amdgpu-green-sardine-pfp-source mirrb4fby73irn0316cd8aqkvp38q9zd-linux-firmware-amdgpu-green-sardine-pfp-source
+linux-firmware-amdgpu-green-sardine-rlc-source ab43cijv8a4zp727c6458a1kzvr02vr1-linux-firmware-amdgpu-green-sardine-rlc-source
+linux-firmware-amdgpu-green-sardine-sdma-source 7xdpqlg5xjdcsfpvyfklhmn6s3mabk0z-linux-firmware-amdgpu-green-sardine-sdma-source
+linux-firmware-amdgpu-green-sardine-ta-source an3hzjamiwwba16r3x7sj9qcv7xxncvf-linux-firmware-amdgpu-green-sardine-ta-source
+linux-firmware-amdgpu-green-sardine-vcn-source zqzw848vdz994xbb26z3hk7g2m46fc0q-linux-firmware-amdgpu-green-sardine-vcn-source
 linux-firmware-amdgpu-license-source lkw7lv56wra9vmx0h5zikfnryzsjxndy-linux-firmware-amdgpu-license-source
 linux-firmware-amdgpu-psp-13-0-4-ta-source 5xy2rj06zshvj3f2b4hsqnnhw6m6xzql-linux-firmware-amdgpu-psp-13-0-4-ta-source
 linux-firmware-amdgpu-psp-13-0-4-toc-source bdxjh6jca30si1lf0n6lxh709sxli9py-linux-firmware-amdgpu-psp-13-0-4-toc-source
