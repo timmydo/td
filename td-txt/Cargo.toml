@@ -5,6 +5,9 @@ edition = "2021"
 description = "td's target-built text userland (busybox grep/sed replacement): multicall + conformance harness"
 license = "MIT"
 
+[package.metadata.td-gate]
+clippy-all-targets = true
+
 # The SHIPPED multicall is the `td-txt` bin (src/main.rs), compiled directly by
 # rustc from recipes/src/recipes/td-txt.rs (never `cargo build`) into a static
 # ET_EXEC. It dispatches on argv[0]'s basename like busybox, so /bin/grep and
