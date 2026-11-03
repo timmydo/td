@@ -212,6 +212,7 @@ xfail array-basic.test.sh::Empty array with :-
 xfail array-basic.test.sh::empty array
 xfail array-compat.test.sh::++ on a whole array increments the first element (disallowed with strict_array)
 xfail array-compat.test.sh::Apply vectorized operations on ${a[*]}
+xfail array-compat.test.sh::Array Decay with IFS
 xfail array-compat.test.sh::Assign to array index without initialization
 xfail array-compat.test.sh::User arrays decay
 xfail array-compat.test.sh::a[40] grows array
@@ -1026,9 +1027,6 @@ xfail tilde.test.sh::tilde expansion an assignment keyword
 xfail tilde.test.sh::x=${undef-~:~}
 xfail tilde.test.sh::~ expansion in readonly assignment
 xfail toysh-posix.test.sh::IFS
-xfail toysh-posix.test.sh::IFS - http://landley.net/notes.html#15-02-2020 (TODO: osh)
-xfail toysh-posix.test.sh::IFS 2 - copied into spec/word-split
-xfail toysh-posix.test.sh::IFS 4
 xfail toysh-posix.test.sh::no shebang
 xfail toysh.test.sh::Brace Expansion
 xfail toysh.test.sh::char class / extglob
@@ -1147,13 +1145,8 @@ xfail whitespace.test.sh::Parsing shell words \r \v
 xfail whitespace.test.sh::\r at end of line is not special
 xfail whitespace.test.sh::\r in arith expression is allowed by some shells, but not most!
 xfail whitespace.test.sh::whitespace in string to integer conversion
-xfail word-split.test.sh::""$A"" - empty string on both sides - derived from spec/toysh-posix #15
-xfail word-split.test.sh::IFS and joining arrays by assignments
 xfail word-split.test.sh::IFS empty doesn't do splitting
 xfail word-split.test.sh::IFS unset behaves like $' \t\n'
-xfail word-split.test.sh::IFS=x and '' and $@ (#2)
-xfail word-split.test.sh::IFS=x and '' and $@ (#3)
-xfail word-split.test.sh::IFS=x and '' and $@ - same bug as spec/toysh-posix case #12
 xfail word-split.test.sh::Unicode in IFS
 xfail xtrace.test.sh::PS4 with runtime error
 xfail xtrace.test.sh::PS4 with unterminated $(

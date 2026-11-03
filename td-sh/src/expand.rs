@@ -39,13 +39,82 @@ impl QChar {
     }
 }
 
-/// A field under construction. `had_quotes` records that some quoted segment
-/// contributed, so an empty result is still a field: `""` is one empty
-/// argument, while an unquoted empty `$x` is none at all.
+/// A field under construction. `cuts` records, as indices into `chars` and
+/// in the order they happened, two things splitting has to see that are not
+/// characters.
+///
+/// A `Quote` is where a quoted segment began, so an empty result is still a
+/// field: `""` is one empty argument, while an unquoted empty `$x` is none at
+/// all. A position rather than a flag because splitting needs to know which
+/// PIECE the quotes fell in: `""$A""` keeps an empty field at each end, where
+/// `$A` keeps none.
+///
+/// A `Break` is the boundary between two positional parameters of an
+/// unquoted `$@` or `$*` that will be split. Splitting reads one as IFS
+/// WHITESPACE whatever IFS holds: ash joins those parameters on a NUL, which
+/// its splitter matches as whitespace, so a boundary absorbs the IFS
+/// whitespace beside it and one non-whitespace IFS character after it, and an
+/// empty parameter between two is no field.
+///
+/// An `End` is where an UNQUOTED expansion's characters stopped. ash splits
+/// each expansion as a region of its own, and the one rule that does not
+/// reach across a region's end is the non-whitespace separator that IFS
+/// whitespace before it absorbs: `L='a '; R=':b'; IFS=' :'; $L$R` is `a`, an
+/// empty field, `b`, where `x='a :b'; $x` is `a`, `b`. Everything else reads
+/// straight through an `End`.
+///
+/// One list rather than two because a quote and a break can fall at the same
+/// index, and which came first decides the answer: `""$@` over `("", b)` is
+/// an empty field then `b`, `$@""` over `(a, "")` is `a` then an empty field.
 #[derive(Default)]
 struct Field {
     chars: Vec<QChar>,
-    had_quotes: bool,
+    cuts: Vec<(usize, Cut)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    Quote,
+    Break,
+    End,
+}
+
+impl Field {
+    /// A fresh field, already marked when what opens it is quoted.
+    fn opened(quoted: bool) -> Field {
+        Field {
+            chars: Vec::new(),
+            cuts: if quoted {
+                vec![(0, Cut::Quote)]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// Record that a quoted segment starts here.
+    fn quote(&mut self) {
+        self.cuts.push((self.chars.len(), Cut::Quote));
+    }
+
+    /// Record a parameter boundary here.
+    fn brk(&mut self) {
+        self.cuts.push((self.chars.len(), Cut::Break));
+    }
+
+    /// Record that an unquoted expansion ended here.
+    fn end(&mut self) {
+        self.cuts.push((self.chars.len(), Cut::End));
+    }
+
+    /// Append another field's characters, keeping its cuts at their offsets
+    /// in this one.
+    fn append(&mut self, other: &Field, quoted: bool) {
+        let base = self.chars.len();
+        self.cuts
+            .extend(other.cuts.iter().map(|&(at, cut)| (base + at, cut)));
+        push_chars(&mut self.chars, &other.chars, quoted);
+    }
 }
 
 /// Full expansion of one word in an argument position: splitting and pathname
@@ -215,17 +284,32 @@ pub fn expand_pattern(sh: &mut Shell, w: &Word) -> R<Vec<QChar>> {
 }
 
 /// Expand and flatten to a single run of characters, joining the fields that a
-/// `$@` may have produced with a space.
+/// `$@` may have produced on IFS's first character.
 fn expand_chars(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> R<Vec<QChar>> {
     let fields = expand_raw(sh, w, force_quoted, splitting)?;
+    // The fields a `$@` made are rejoined on IFS's first character, as `$*`'s
+    // are, and on nothing when IFS is empty: ash's `s="$@"` at `IFS=:` is
+    // `x:y z` (`word-split::IFS and joining arrays by assignments`), where
+    // bash would use a space. That reaches `[[ "$@" == ... ]]` too, which ash
+    // does not have and bash joins on a space. Asked only when there is
+    // something to join, which spares the lookup for the common one field.
+    //
+    // Only a NON-splitting expansion reaches here, so no field carries a
+    // `Break`, which this would otherwise close up on nothing.
+    let sep = match fields.len() {
+        0 | 1 => None,
+        _ => ifs_value(sh).chars().next(),
+    };
     let mut out: Vec<QChar> = Vec::new();
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
-            out.push(QChar {
-                c: ' ',
-                quoted: true,
-                expanded: false,
-            });
+            if let Some(c) = sep {
+                out.push(QChar {
+                    c,
+                    quoted: true,
+                    expanded: false,
+                });
+            }
         }
         out.extend(f.chars.iter().copied());
     }
@@ -263,7 +347,7 @@ fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> 
                 }
             }
             Seg::Quoted(s) => {
-                cur.had_quotes = true;
+                cur.quote();
                 for c in s.chars() {
                     cur.chars.push(QChar {
                         c,
@@ -280,10 +364,13 @@ fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> 
             } => {
                 let q = *quoted || force_quoted;
                 if q {
-                    cur.had_quotes = true;
+                    cur.quote();
                 }
                 let out = command_subst(sh, code, *line, *backtick)?;
                 push_expanded(&mut cur.chars, &out, q);
+                if !q {
+                    cur.end();
+                }
             }
             // The path is `expanded`, like a command substitution's bytes and
             // unlike a literal, so it is field-split and globbed rather than
@@ -298,21 +385,32 @@ fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> 
             // found it unreachable.
             Seg::ProcSub { code, write, line } => {
                 if force_quoted {
-                    cur.had_quotes = true;
+                    cur.quote();
                 }
                 let path = crate::process::open_procsub(sh, code, *write, *line)?;
                 push_expanded(&mut cur.chars, &path, force_quoted);
+                if !force_quoted {
+                    cur.end();
+                }
             }
             Seg::Arith { expr, quoted } => {
                 let q = *quoted || force_quoted;
                 if q {
-                    cur.had_quotes = true;
+                    cur.quote();
                 }
                 let text = QChar::text(&expand_chars(sh, expr, false, false)?);
                 let value = arith::eval(sh, &text)?;
                 push_expanded(&mut cur.chars, &value.to_string(), q);
+                if !q {
+                    cur.end();
+                }
             }
-            Seg::Param(p) => expand_param(sh, p, force_quoted, splitting, &mut done, &mut cur)?,
+            Seg::Param(p) => {
+                expand_param(sh, p, force_quoted, splitting, &mut done, &mut cur)?;
+                if !(p.quoted || force_quoted) {
+                    cur.end();
+                }
+            }
             // Raised from HERE rather than from the parser: ash reports it while
             // expanding, so a word in a branch never taken never reports.
             Seg::BadSub(text) => return Err(sh.fatal(&format!("bad substitution: `{text}`"), 2)),
@@ -429,32 +527,39 @@ fn expand_param(
     // deliberately does not mark the field as quoted, so a lone `"$@"` expands
     // to zero arguments rather than one empty one.
     //
-    // An UNQUOTED `$*` joins the parameters and lets splitting take them apart
-    // again, which is indistinguishable from this path until IFS is EMPTY:
-    // then nothing splits the join back up, and `set -- "1 2" "3  4"; IFS=`
-    // has to pass two arguments rather than one. Quoted, `"$*"` still joins --
-    // and so does a `$*` in a context that takes ONE word (`v=$*`, `case $*`,
-    // a redirect target), where there is no splitting to undo the join and
-    // several fields would be rejoined on a space that is not the separator.
-    let star_unsplit = p.name == "*" && !quoted && splitting && ifs_value(sh).is_empty();
-    if p.op.is_none() && (p.name == "@" || star_unsplit) {
+    // A plain UNQUOTED `$@` or `$*` that will be split is one run with a
+    // BREAK between parameters, which splitting reads as IFS whitespace
+    // whatever IFS holds -- ash's NUL join, see `Field`. Not a join on IFS's
+    // first character, which leaves bash's null field for an empty parameter
+    // (`one '' two` at `IFS=x`, where ash has `one two`), and not one field
+    // per parameter either, which keeps a null one where a parameter starts
+    // with a non-whitespace separator (`a ":b"` at `IFS=:` is `a b` in ash).
+    // Under an empty IFS only the breaks split. Quoted, `"$*"` still joins
+    // -- and so does a `$*` in a context that takes ONE word (`v=$*`, `case
+    // $*`, a redirect target), where there is no splitting to count
+    // boundaries with.
+    let unquoted_split = !quoted && splitting && (p.name == "@" || p.name == "*");
+    if p.op.is_none() && unquoted_split {
+        for (i, v) in sh.params.clone().iter().enumerate() {
+            if i > 0 {
+                cur.brk();
+            }
+            push_expanded(&mut cur.chars, v, false);
+        }
+        return Ok(());
+    }
+    if p.op.is_none() && p.name == "@" {
         let params = sh.params.clone();
         // Each positional becomes its own field; when quoted, every one is a
         // field even if empty (so `"$@"` over ("", "b") yields two args). But a
         // quoted `$@` over ZERO params must NOT mark the field as quoted, so a
         // lone `"$@"` expands to no words rather than one empty word (POSIX).
         if quoted && !params.is_empty() {
-            cur.had_quotes = true;
+            cur.quote();
         }
         for (i, v) in params.iter().enumerate() {
             if i > 0 {
-                done.push(std::mem::replace(
-                    cur,
-                    Field {
-                        chars: Vec::new(),
-                        had_quotes: quoted,
-                    },
-                ));
+                done.push(std::mem::replace(cur, Field::opened(quoted)));
             }
             push_expanded(&mut cur.chars, v, quoted);
         }
@@ -482,11 +587,11 @@ fn expand_param(
                 // not: `set -- "${*:9}"` passes one empty argument and
                 // `set -- "${@:9}"` passes none.
                 if quoted {
-                    cur.had_quotes = true;
+                    cur.quote();
                 }
-                // Joined on IFS's first character. A plain unquoted `$*`
-                // stops joining when IFS is empty; a slice does not, because
-                // it is the QUOTED form that reaches here as one field.
+                // Joined on IFS's first character. A plain unquoted `$*` is
+                // broken at its parameters instead (above); a slice is not,
+                // and is split from this join as bash splits it.
                 let sep = ifs_value(sh)
                     .chars()
                     .next()
@@ -499,17 +604,11 @@ fn expand_param(
             // quoted, or `set -- "${@:9}"` would pass one empty argument where
             // it should pass none.
             if quoted && !picked.is_empty() {
-                cur.had_quotes = true;
+                cur.quote();
             }
             for (i, v) in picked.iter().enumerate() {
                 if i > 0 {
-                    done.push(std::mem::replace(
-                        cur,
-                        Field {
-                            chars: Vec::new(),
-                            had_quotes: quoted,
-                        },
-                    ));
+                    done.push(std::mem::replace(cur, Field::opened(quoted)));
                 }
                 push_expanded(&mut cur.chars, v, quoted);
             }
@@ -520,7 +619,7 @@ fn expand_param(
         // empty slice yields none. `"${v:2:0}"` is one argument and `"${@:9}"`
         // is zero, both measured.
         if quoted {
-            cur.had_quotes = true;
+            cur.quote();
         }
         nounset_check(sh, &p.name)?;
         let value = lookup(sh, &p.name).unwrap_or_default();
@@ -531,7 +630,7 @@ fn expand_param(
     }
 
     if quoted {
-        cur.had_quotes = true;
+        cur.quote();
     }
 
     if matches!(p.op, Some(ParamOp::Length)) {
@@ -664,17 +763,11 @@ fn push_word(
     }
     let mut fields = expand_raw(sh, word, quoted, splitting)?.into_iter();
     if let Some(first) = fields.next() {
-        if first.had_quotes {
-            cur.had_quotes = true;
-        }
-        push_chars(&mut cur.chars, &first.chars, quoted);
+        cur.append(&first, quoted);
     }
     for field in fields {
-        let mut next = Field {
-            chars: Vec::new(),
-            had_quotes: field.had_quotes || quoted,
-        };
-        push_chars(&mut next.chars, &field.chars, quoted);
+        let mut next = Field::opened(quoted);
+        next.append(&field, quoted);
         done.push(std::mem::replace(cur, next));
     }
     Ok(())
@@ -834,55 +927,92 @@ pub fn ifs_value(sh: &Shell) -> String {
 
 /// IFS field splitting, applied only to characters that came out of an
 /// expansion unquoted.
+///
+/// A quote mark takes part as a character that is never a separator and
+/// adds nothing to the piece: it stops a run of IFS whitespace from being
+/// skipped and makes the piece it lands in a field even when empty. That is
+/// what keeps `""$A""` at `A='  abc  def  '` four fields wide in ash -- an
+/// empty one, `abc`, `def`, an empty one -- while `$A` alone is two, and it is
+/// the only rule here: a quoted empty word is one empty field because its
+/// mark is a piece of its own. A parameter break is IFS whitespace, under an
+/// empty IFS as under any other.
 fn split_fields(sh: &Shell, fields: Vec<Field>) -> Vec<Vec<QChar>> {
     let ifs = ifs_value(sh);
     let mut out: Vec<Vec<QChar>> = Vec::new();
     for field in fields {
-        if ifs.is_empty() {
-            if !field.chars.is_empty() || field.had_quotes {
-                out.push(field.chars);
-            }
-            continue;
-        }
-        let is_delim = |q: &QChar| q.expanded && !q.quoted && ifs.contains(q.c);
-        let chars = &field.chars;
+        let is_sep = |q: &QChar| q.expanded && !q.quoted && ifs.contains(q.c);
+        let is_delim = |t: &Tok| match t {
+            Tok::Char(q) => is_sep(q),
+            Tok::Cut(Cut::Break) => true,
+            Tok::Cut(Cut::Quote | Cut::End) => false,
+        };
+        let is_ws = |t: &Tok| match t {
+            Tok::Char(q) => is_sep(q) && is_ifs_ws(q.c),
+            Tok::Cut(Cut::Break) => true,
+            Tok::Cut(Cut::Quote | Cut::End) => false,
+        };
+        let is_end = |t: &Tok| matches!(t, Tok::Cut(Cut::End));
+        let toks = tokens(field);
         let mut i = 0usize;
-        let before = out.len();
         // Leading IFS whitespace never makes an empty first field.
-        while chars.get(i).is_some_and(|q| is_delim(q) && is_ifs_ws(q.c)) {
+        while toks.get(i).is_some_and(|t| is_ws(t) || is_end(t)) {
             i += 1;
         }
-        while i < chars.len() {
+        while i < toks.len() {
             let mut piece = Vec::new();
-            while let Some(q) = chars.get(i) {
-                if is_delim(q) {
+            while let Some(t) = toks.get(i) {
+                if is_delim(t) {
                     break;
                 }
-                piece.push(*q);
+                if let Tok::Char(q) = t {
+                    piece.push(*q);
+                }
                 i += 1;
             }
             out.push(piece);
-            if i >= chars.len() {
+            if i >= toks.len() {
                 break;
             }
-            while chars.get(i).is_some_and(|q| is_delim(q) && is_ifs_ws(q.c)) {
+            // Whitespace, and whether a region ended anywhere in it.
+            let mut crossed = false;
+            while let Some(t) = toks.get(i).filter(|t| is_ws(t) || is_end(t)) {
+                crossed |= is_end(t);
                 i += 1;
             }
-            // At most one non-whitespace separator delimits a field.
-            if chars.get(i).is_some_and(|q| is_delim(q) && !is_ifs_ws(q.c)) {
+            // At most one non-whitespace separator delimits a field, and the
+            // whitespace that ended a field absorbs one only within its own
+            // region: in the next, leading whitespace is merely skipped, so
+            // `L='a  '; R='  :b'` is `a`, an empty field, `b`.
+            if !crossed && toks.get(i).is_some_and(|t| is_delim(t) && !is_ws(t)) {
                 i += 1;
-                while chars.get(i).is_some_and(|q| is_delim(q) && is_ifs_ws(q.c)) {
+                while toks.get(i).is_some_and(|t| is_ws(t) || is_end(t)) {
                     i += 1;
                 }
             }
         }
-        // An expansion that produced nothing is not an argument, unless quotes
-        // asked for an empty one.
-        if out.len() == before && field.had_quotes {
-            out.push(Vec::new());
-        }
     }
     out
+}
+
+/// One step of a field as splitting reads it.
+enum Tok {
+    Char(QChar),
+    Cut(Cut),
+}
+
+/// A field's characters with its cuts interleaved, each before the character
+/// it was recorded at and in the order it was recorded.
+fn tokens(field: Field) -> Vec<Tok> {
+    let mut cuts = field.cuts.into_iter().peekable();
+    let mut toks = Vec::with_capacity(field.chars.len() + cuts.len());
+    for (at, q) in field.chars.into_iter().enumerate() {
+        while let Some((_, cut)) = cuts.next_if(|(m, _)| *m <= at) {
+            toks.push(Tok::Cut(cut));
+        }
+        toks.push(Tok::Char(q));
+    }
+    toks.extend(cuts.map(|(_, cut)| Tok::Cut(cut)));
+    toks
 }
 
 /// Pathname expansion. With no match (or `set -f`) the field is used as written,
@@ -1429,10 +1559,9 @@ mod tests {
         assert_eq!(fields(&mut q, "${@:1:1}"), vec!["x", "y"]);
     }
 
-    /// An unquoted `$*` joins on IFS and lets splitting take the join apart,
-    /// which is indistinguishable from one-field-per-parameter until IFS is
-    /// EMPTY: then nothing splits it back up. `word-split::$* with empty IFS`
-    /// grades it, and `$@` -- which never joined -- is the shape to match.
+    /// An unquoted `$*` that splits never joins: it breaks at each parameter,
+    /// and under an EMPTY IFS only those breaks split, so a parameter's own
+    /// spaces survive. `word-split::$* with empty IFS` grades it.
     #[test]
     fn an_unquoted_star_does_not_join_when_ifs_is_empty() {
         let mut sh = Shell::new_for_test();
@@ -1588,22 +1717,103 @@ mod tests {
             expand_single(&mut sh, &word("-$*-")).ok(),
             Some("-ab-".into())
         );
-        // `$@` has always been rejoined on a space here, and still is.
+        // `$@` is rejoined the same way, as ash's is: on nothing here, on
+        // IFS's first character when there is one, on a space when unset.
+        assert_eq!(expand_single(&mut sh, &word("$@")).ok(), Some("ab".into()));
+        assert_eq!(
+            expand_single(&mut sh, &word("\"$@\"")).ok(),
+            Some("ab".into())
+        );
+        let _ = sh.set_var("IFS", ":x");
+        assert_eq!(expand_single(&mut sh, &word("$@")).ok(), Some("a:b".into()));
+        sh.unset_var("IFS");
         assert_eq!(expand_single(&mut sh, &word("$@")).ok(), Some("a b".into()));
     }
 
-    /// The only thing that can tell join-then-split from one field per
-    /// parameter under a NON-empty IFS is an empty parameter -- and there this
-    /// shell answers as bash does while the ash golden drops it
-    /// (`word-split::IFS=x and '' and $@`, still an xfail). Recorded rather
-    /// than endorsed: it is pre-existing, untouched here, and asserted so that
-    /// changing it has to be deliberate.
+    /// A plain unquoted `$@` or `$*` that splits breaks at each parameter,
+    /// and the break is IFS WHITESPACE whatever IFS holds -- ash's NUL join.
+    /// So an EMPTY parameter is no field at all (`word-split::IFS=x and ''
+    /// and $@`), where bash's join-then-split leaves a null one, and a
+    /// parameter that starts with a non-whitespace separator loses it to the
+    /// break, where one field per parameter would keep a null field. Every
+    /// answer below was measured on busybox 1.37.0's ash.
     #[test]
-    fn an_empty_parameter_under_a_non_empty_ifs_is_a_known_divergence() {
+    fn an_unquoted_star_breaks_at_parameters_as_whitespace() {
         let mut sh = Shell::new_for_test();
-        sh.params = vec!["".into(), "a".into()];
-        let _ = sh.set_var("IFS", ":");
-        assert_eq!(fields(&mut sh, "$*"), vec!["", "a"]);
+        let mut at = |params: &[&str], ifs: &str, src: &str| {
+            sh.params = params.iter().map(|p| p.to_string()).collect();
+            let _ = sh.set_var("IFS", ifs);
+            fields(&mut sh, src)
+        };
+        assert_eq!(at(&["", "a"], ":", "$*"), vec!["a"]);
+        assert_eq!(at(&["", "a"], ":", "$@"), vec!["a"]);
+        assert_eq!(at(&["one", "", "two"], "zx", "$*"), vec!["one", "two"]);
+        // A parameter's own separators still split it, and a trailing one
+        // still makes no empty field: `a:` is `a`, not `a` and nothing.
+        assert_eq!(at(&["a:", "b::c"], ":", "$*"), vec!["a", "b", "", "c"]);
+        // A separator just after a break is absorbed by it.
+        assert_eq!(at(&["a", ":b"], ":", "$*"), vec!["a", "b"]);
+        assert_eq!(at(&["a", ":"], ":", "$*"), vec!["a"]);
+        assert_eq!(at(&["a", ":", "b"], ":", "$*"), vec!["a", "b"]);
+        assert_eq!(at(&["a", "", ":b"], ":", "$@"), vec!["a", "b"]);
+        assert_eq!(at(&["a ", ": b"], " :", "$*"), vec!["a", "b"]);
+        // Under an empty IFS only the breaks split.
+        assert_eq!(at(&["1 2", "", "3"], "", "=$*="), vec!["=1 2", "3="]);
+        // A quote at the same index as a break keeps the order it came in.
+        assert_eq!(at(&["", "b"], ":", "\"\"$@"), vec!["", "b"]);
+        assert_eq!(at(&["a", ""], ":", "$@\"\""), vec!["a", ""]);
+        // Quoted, the join is one field with the empty parameter inside it.
+        assert_eq!(at(&["", "a"], ":", "\"$*\""), vec![":a"]);
+    }
+
+    /// The whitespace that ends a field absorbs one following non-whitespace
+    /// separator only inside the expansion it came from; across into the
+    /// next, the separator makes an empty field. Measured on ash.
+    #[test]
+    fn a_separator_is_absorbed_only_within_its_own_expansion() {
+        let mut sh = sh_with(&[("IFS", " :"), ("L", "a "), ("R", ":b"), ("X", "a :b")]);
+        assert_eq!(fields(&mut sh, "$X"), vec!["a", "b"]);
+        assert_eq!(fields(&mut sh, "$L$R"), vec!["a", "", "b"]);
+        let mut sh = sh_with(&[("IFS", " :"), ("L", "a  "), ("R", "  :b")]);
+        assert_eq!(fields(&mut sh, "$L$R"), vec!["a", "", "b"]);
+        // A trailing empty parameter's break is whitespace that cannot reach
+        // into the next expansion either.
+        let mut sh = sh_with(&[("IFS", ":"), ("x", ":b")]);
+        sh.params = vec!["a".into(), "".into()];
+        assert_eq!(fields(&mut sh, "$*$x"), vec!["a", "", "b"]);
+        // A separator that is itself the delimiter is unaffected.
+        let mut sh = sh_with(&[("IFS", ":"), ("L", "a"), ("R", ":b")]);
+        assert_eq!(fields(&mut sh, "$L$R"), vec!["a", "b"]);
+    }
+
+    /// KNOWN DIVERGENCE, pinned so changing it is deliberate: ash never lets
+    /// whitespace absorb a separator in the expansion right after a quoted
+    /// `"$@"` with parameters (its `nulonly` region leaves `ifsspc` unset), so
+    /// `set -- a b; IFS=': '; y='  :c'; f "$@"$y` is `a`, `b`, an empty
+    /// field, `c` there. This shell absorbs it. No corpus case reaches it.
+    #[test]
+    fn whitespace_after_a_quoted_at_still_absorbs_here() {
+        let mut sh = sh_with(&[("IFS", ": "), ("y", "  :c")]);
+        sh.params = vec!["a".into(), "b".into()];
+        assert_eq!(fields(&mut sh, "\"$@\"$y"), vec!["a", "b", "c"]);
+    }
+
+    /// An empty quoted string is part of the PIECE it lands in, so a field
+    /// that holds nothing else survives splitting: ash keeps an empty field at
+    /// each end of `""$A""` and between `$A""$B`, and keeps none for `$A`.
+    #[test]
+    fn an_empty_quote_keeps_the_piece_it_lands_in() {
+        let mut sh = sh_with(&[("A", "  abc  def  "), ("L", "a  "), ("R", "  b")]);
+        assert_eq!(fields(&mut sh, "$A"), vec!["abc", "def"]);
+        assert_eq!(fields(&mut sh, "\"\"$A\"\""), vec!["", "abc", "def", ""]);
+        assert_eq!(fields(&mut sh, "''$A"), vec!["", "abc", "def"]);
+        assert_eq!(fields(&mut sh, "$A''"), vec!["abc", "def", ""]);
+        assert_eq!(fields(&mut sh, "x\"\"$A"), vec!["x", "abc", "def"]);
+        assert_eq!(fields(&mut sh, "$L\"\"$R"), vec!["a", "", "b"]);
+        assert_eq!(fields(&mut sh, "$L\"$unset\"$R"), vec!["a", "", "b"]);
+        assert_eq!(fields(&mut sh, "$L$R"), vec!["a", "b"]);
+        // The mark travels with an operator's word, at its own offset.
+        assert_eq!(fields(&mut sh, "$L${unset-\"\"}$R"), vec!["a", "", "b"]);
     }
 
     /// Every operator over `$@` acts on the JOIN rather than on each positional
