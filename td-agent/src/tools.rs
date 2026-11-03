@@ -678,7 +678,7 @@ pub(crate) fn definition(tool: Tool) -> Json {
                         one_of("Which sub-agent: general, with the workspace's tools, or explore, reading and searching alone; general when left out.", SubAgent::WORDS),
                     ),
                     ("model", property("string", "Full model id exactly as listed by the provider, including its namespace: for example openai/gpt-6.1-sol, not gpt-6.1-sol, or anthropic/claude-opus-5.5. Overrides the conversation or configured explore model for this call only. Select the required reviewer explicitly for code reviews.")),
-                    ("effort", one_of("Reasoning effort for this sub-agent only; the conversation's when omitted. An explicit effort is refused if the selected model takes no reasoning.", &crate::config::EFFORTS)),
+                    ("effort", one_of("Reasoning effort for this sub-agent only; the conversation's when omitted. An explicit effort is refused if the selected model takes no reasoning.", crate::config::EFFORTS)),
                     ("routing", one_of("Routing for this sub-agent only; overrides inherited or configured explore routing. balanced clears any inherited routing override.", crate::config::ROUTINGS)),
                 ],
                 &["prompt"],

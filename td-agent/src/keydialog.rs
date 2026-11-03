@@ -29,7 +29,7 @@ use td_ui::CELL_WIDTH;
 use crate::key::{self, Secret};
 
 const TITLE: &str = "Set OpenRouter key";
-const BUTTONS: [&str; 2] = ["Cancel", "Save"];
+const BUTTONS: &[&str] = &["Cancel", "Save"];
 /// The most rows the explanation takes.
 const MAX_LINES: usize = 6;
 /// The rows a refusal or a warning takes, wrapped.
@@ -303,7 +303,7 @@ impl KeyDialog {
                 x + s,
                 y + s + (2 + lines + message_rows) * row,
                 inside,
-                &BUTTONS,
+                BUTTONS,
             ),
         })
     }

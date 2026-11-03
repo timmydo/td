@@ -37,8 +37,8 @@ pub const KEYS: &[&str] = &[
 ];
 pub const LOCKED: &[&str] = &["Unlock", "Create", "Restore", td_ui::keys::BUTTON, QUIT];
 pub const IMPORT: &[&str] = &["Restore", "Cancel", td_ui::keys::BUTTON, QUIT];
-pub const PRESENT: [&str; 2] = ["Continue", "Cancel"];
-pub const PIN: [&str; 2] = ["OK", "Cancel"];
+pub const PRESENT: &[&str] = &["Continue", "Cancel"];
+pub const PIN: &[&str] = &["OK", "Cancel"];
 
 /// The notebook's panes; a region the surface is too small for is `None`
 /// and is neither painted nor hit.
@@ -253,7 +253,7 @@ pub fn prompt(surface: Surface, pin: bool, title_rows: usize, line_rows: usize) 
             x + s,
             top + (rows - 1) * row,
             inside.max(0) as u32,
-            if pin { &PIN } else { &PRESENT },
+            if pin { PIN } else { PRESENT },
         ),
     }
 }

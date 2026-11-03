@@ -1387,7 +1387,7 @@ fn limit(value: &Value<'_>, key: u64, default: usize, ceiling: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    const LABELS: [&str; 4] = ["p1-legacy", "p1-scoped", "p2-legacy", "p2-scoped"];
+    const LABELS: &[&str] = &["p1-legacy", "p1-scoped", "p2-legacy", "p2-scoped"];
     fn fixture(label: &str, key: &str) -> Vec<u8> {
         let line = include_str!("../tests/pin_vectors.txt")
             .lines()
@@ -1488,7 +1488,7 @@ mod tests {
 
     #[test]
     fn valid_signatures_do_not_override_uv_presence_rp_or_extension_policy() {
-        for label in LABELS {
+        for &label in LABELS {
             let challenge = fixture(label, "challenge").try_into().unwrap();
             for (name, reason) in [
                 ("no_uv", "portable assertion requires UV"),

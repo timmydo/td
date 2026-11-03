@@ -23,7 +23,7 @@ pub const DEFAULT_TITLE_MODEL: &str = "anthropic/claude-haiku-4.5";
 pub const DEFAULT_JEV_MODEL: &str = "typesafe/jev-1.13";
 pub const DEFAULT_CLASSIFIER_MODEL: &str = "openai/gpt-oss-safeguard-20b";
 /// OpenRouter's reasoning efforts, `reasoning.effort`.
-pub const EFFORTS: [&str; 6] = ["none", "minimal", "low", "medium", "high", "xhigh"];
+pub const EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
 const DEFAULT_EFFORT: &str = "medium";
 /// OpenRouter's routing modes a conversation or review may ask for
 /// (DESIGN.md §5, Routing): balanced is its default; cheapest, fastest

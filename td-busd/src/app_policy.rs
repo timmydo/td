@@ -235,7 +235,7 @@ pub(crate) fn application_name(name: &str) -> bool {
 }
 
 /// The reserved names and namespace roots no grant may reach.
-const RESERVED_ROOTS: [&str; 3] = [
+const RESERVED_ROOTS: &[&str] = &[
     "org.freedesktop.DBus",
     "org.freedesktop.portal",
     "org.freedesktop.impl.portal",

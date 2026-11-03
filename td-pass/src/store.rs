@@ -18,7 +18,7 @@ use crate::plain::{self, Text};
 use crate::protocol::{MAX_BODY, MAX_ENTRIES, MAX_TITLE};
 
 /// The folders `pass` keeps beside its entries, never walked.
-const PRUNED: [&str; 2] = [".git", ".extensions"];
+const PRUNED: &[&str] = &[".git", ".extensions"];
 
 /// The deepest folder walked below the store.
 const DEPTH: usize = 32;

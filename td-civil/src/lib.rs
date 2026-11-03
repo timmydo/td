@@ -351,7 +351,7 @@ fn strip_comments(s: &str) -> String {
 }
 
 fn is_day_name(tok: &str) -> bool {
-    const DAYS: [&str; 14] = [
+    const DAYS: &[&str] = &[
         "mon",
         "tue",
         "wed",

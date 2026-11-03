@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 /// The filesystem types whose files live only in memory.
-const MEMORY: [&str; 2] = ["tmpfs", "ramfs"];
+const MEMORY: &[&str] = &["tmpfs", "ramfs"];
 
 /// Whether `path`, an absolute path without links, lies on a
 /// memory-backed filesystem by `mountinfo` (`/proc/self/mountinfo`). The
