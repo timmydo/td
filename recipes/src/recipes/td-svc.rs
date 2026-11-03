@@ -10,8 +10,8 @@ use crate::types::{Recipe, Step};
 // `recipes/src/recipes/*.rs` catalog glob, so it is not itself a recipe module.
 //
 // SCOPE: service supervision moved OFF PID 1 — dependency ordering, restart
-// backoff, readiness probing, an ordered shutdown, Ctrl-Alt-Del, and (in a
-// later landing) log capture. `td-svc/DESIGN.md` is the normative specification.
+// backoff, readiness probing, an ordered shutdown, Ctrl-Alt-Del, and log
+// capture. `td-svc/DESIGN.md` is the normative specification.
 //
 // td-svc is the FIFTH target-side unsafe exception, and only just: one scoped
 // `#[allow]` on a `syscall2` body carrying `kill(2)`, and nothing else. It
