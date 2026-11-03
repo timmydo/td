@@ -14,8 +14,6 @@
 //! names in sets (dedup, last-wins); we keep file order with duplicates —
 //! identical for real drvs, which are emitted from those sorted structures.
 
-#![allow(clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-
 /// One (name,path,hashAlgo,hash) output entry, in file order.
 #[derive(Debug)]
 pub struct Output {
@@ -72,7 +70,11 @@ impl<'a> Parser<'a> {
     }
 
     fn expect(&mut self, lit: &str) -> Result<(), ParseError> {
-        if self.input[self.pos..].starts_with(lit.as_bytes()) {
+        if self
+            .input
+            .get(self.pos..)
+            .is_some_and(|rest| rest.starts_with(lit.as_bytes()))
+        {
             self.pos += lit.len();
             Ok(())
         } else {

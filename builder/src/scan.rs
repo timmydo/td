@@ -16,8 +16,6 @@
 //! match on one would surface as a references mismatch in the differential,
 //! red and diagnosable, never silently dropped.
 
-#![allow(clippy::unwrap_used, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
@@ -95,19 +93,13 @@ impl Scanner {
     /// The daemon's `search`: backwards base32 check with skip-ahead.
     fn search(&mut self, s: &[u8]) {
         let mut i = 0;
-        while i + REF_LEN <= s.len() {
-            let mut skip = None;
-            for j in (0..REF_LEN).rev() {
-                if !is_base32(s[i + j]) {
-                    skip = Some(j + 1);
-                    break;
-                }
-            }
-            if let Some(n) = skip {
-                i += n;
+        while let Some(window) = s.get(i..).and_then(<[u8]>::first_chunk::<REF_LEN>) {
+            // The last non-base32 byte: no window starting at or before it
+            // can match, so skip past it.
+            if let Some(j) = window.iter().rposition(|&c| !is_base32(c)) {
+                i += j + 1;
                 continue;
             }
-            let window: &[u8; REF_LEN] = s[i..i + REF_LEN].try_into().unwrap();
             if self.candidates.contains_key(window) {
                 self.seen.insert(*window);
             }
@@ -147,15 +139,15 @@ impl Write for Scanner {
         // chunk itself — the daemon's exact coverage; double-hits are idempotent.
         let head_len = buf.len().min(REF_LEN);
         let mut seam = self.tail.clone();
-        seam.extend_from_slice(&buf[..head_len]);
+        seam.extend_from_slice(buf.get(..head_len).unwrap_or_default());
         self.search(&seam);
         self.search(buf);
         // New tail: last (REF_LEN - head_len) bytes of the old tail, then the
         // last head_len bytes of the chunk — RefScanSink's exact arithmetic.
         let keep = REF_LEN - head_len;
         let start = self.tail.len().saturating_sub(keep);
-        let mut tail = self.tail[start..].to_vec();
-        tail.extend_from_slice(&buf[buf.len() - head_len..]);
+        let mut tail = self.tail.get(start..).unwrap_or_default().to_vec();
+        tail.extend_from_slice(buf.get(buf.len() - head_len..).unwrap_or_default());
         self.tail = tail;
         Ok(buf.len())
     }

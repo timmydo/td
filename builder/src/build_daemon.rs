@@ -23,12 +23,10 @@
 //!            | "SHUTDOWN\n"             clean stop
 //!   response = "OK <payload>\n" | "ERR <msg>\n"
 
-#![allow(clippy::unwrap_used)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 
 /// The daemon's runtime dir (sockets, pid files, lineage records):
@@ -69,9 +67,11 @@ impl Semaphore {
         })
     }
     fn acquire(self: &Arc<Self>) -> Permit {
-        let mut n = self.count.lock().unwrap();
+        // The lock guards a bare count no holder can panic over, so a
+        // poisoned lock still holds a valid count.
+        let mut n = self.count.lock().unwrap_or_else(PoisonError::into_inner);
         while *n == 0 {
-            n = self.cv.wait(n).unwrap();
+            n = self.cv.wait(n).unwrap_or_else(PoisonError::into_inner);
         }
         *n -= 1;
         Permit(self.clone())
@@ -82,7 +82,7 @@ impl Semaphore {
 struct Permit(Arc<Semaphore>);
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut n = self.0.count.lock().unwrap();
+        let mut n = self.0.count.lock().unwrap_or_else(PoisonError::into_inner);
         *n += 1;
         self.0.cv.notify_one();
     }
