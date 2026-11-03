@@ -3435,30 +3435,118 @@ fn cargo_group_key(cmd: &str) -> Option<String> {
 /// set one, the CPUs otherwise, split as `cargo_group_plan` says; the test
 /// harnesses still take every thread, and the kernel shares them.
 ///
-/// A command that passed before on the same content, under the same
-/// td-builder and host toolchain, is not run again (`preflight_key`): a
-/// `ready` stopped to amend a message keeps the suites it had finished.
-/// Each command is forgotten under every key before it runs and recorded
-/// only when it passes, as the gates are (`verdict_journal`), and
-/// TD_CHECK_FULL runs every one.
+/// A command that passed before, on this host's toolchain and td-builder,
+/// on content that differs from this content only in paths that do not
+/// select it, is not run again (`shared_preflight_passes`): a `ready`
+/// stopped to amend a message keeps the suites it had finished, and a
+/// worktree keeps every leg a worktree on the host passed over the files
+/// that leg reads. Before a command runs its tree is marked failed for it,
+/// and again if it reds, so no earlier pass answers for that content; a
+/// pass is recorded only on unchanged content, and TD_CHECK_FULL runs every
+/// one.
 fn run_cargo_groups(root: &Path, cmds: &[String]) -> i32 {
-    run_cargo_groups_with(root, cmds, std::env::var_os("TD_CHECK_FULL").is_none())
+    run_cargo_groups_with(
+        root,
+        cmds,
+        std::env::var_os("TD_CHECK_FULL").is_none(),
+        preflight_verdicts_dir().as_deref(),
+    )
 }
 
-/// `run_cargo_groups`, with whether a journaled pass may answer a command
-/// given rather than read from the environment.
-fn run_cargo_groups_with(root: &Path, cmds: &[String], reuse: bool) -> i32 {
+/// The host-wide preflight pass journal: `$HOME/.td/preflight-verdicts-v1`.
+/// Outside `~/.td/build-daemon` deliberately, since that is bound read-write
+/// into every build sandbox and a recipe step must not be able to write a
+/// pass. None without a HOME, and then nothing is shared.
+fn preflight_verdicts_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| Path::new(&home).join(".td/preflight-verdicts-v1"))
+}
+
+/// Bytes a host-wide journal file is trimmed to once it holds twice this:
+/// some twenty thousand verdicts, a hundred-odd full runs, so an old
+/// branch's proofs age out.
+const SHARED_PREFLIGHT_BYTES: u64 = 4 << 20;
+
+/// Recorded trees a run compares with its own, newest first: each costs a
+/// `git diff`.
+const SHARED_PREFLIGHT_CANDIDATES: usize = 64;
+
+/// Of those, how many of the nearest the selection weighs.
+const SHARED_PREFLIGHT_TREES: usize = 8;
+
+const PREFLIGHT_PASS: &str = "pass";
+const PREFLIGHT_FAIL: &str = "fail";
+
+/// A journal line: `TREE\tVERDICT\tCOMMAND`.
+fn preflight_line(tree: &str, verdict: &str, cmd: &str) -> String {
+    format!("{tree}\t{verdict}\t{cmd}")
+}
+
+/// A git object name, SHA-1 or SHA-256, as `write-tree` prints it: what a
+/// journal line may hand to git as a tree.
+fn git_object_name(name: &str) -> bool {
+    matches!(name.len(), 40 | 64)
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// `run_cargo_groups`, with whether a journaled pass may answer a command,
+/// and where the host-wide journal is, given rather than read from the
+/// environment.
+fn run_cargo_groups_with(root: &Path, cmds: &[String], reuse: bool, shared: Option<&Path>) -> i32 {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, PoisonError};
-    let journal =
-        crate::verdict_journal::Journal::new(root.join(".td-build-cache/preflight-verdicts"));
-    // Held to the end of the run; without it nothing is reused or recorded.
-    let held = journal.hold_run();
-    let host = held.as_ref().and_then(|_| preflight_host(root));
-    let key = host.as_deref().and_then(|h| preflight_key(root, h));
-    let passed = match &key {
-        Some(k) if reuse => journal.read(k),
-        _ => std::collections::HashSet::new(),
+    // Held to the end of the run, in this worktree only, so a second run
+    // here waits; without it nothing is reused or recorded.
+    let local = root.join(".td-build-cache/preflight-verdicts");
+    let held = crate::verdict_journal::Journal::new(local.clone()).hold_run();
+    if held.is_some() {
+        sweep_preflight_leftovers(root, &local);
+    }
+    let journal = shared.map(|dir| crate::verdict_journal::Journal::new(dir.to_path_buf()));
+    // The content this run starts on, as a git tree any worktree of the
+    // repository can diff against, and the host it runs on.
+    let tree = held
+        .as_ref()
+        .and(journal.as_ref())
+        .and_then(|_| content_tree(root));
+    let host = tree.as_ref().and_then(|_| preflight_host(root));
+    let key = host.as_deref().map(|h| {
+        let mut d = crate::sha256::Sha256::new();
+        d.update(h);
+        crate::sha256::to_base16(&d.finalize())
+    });
+    let canon = canonical_preflight();
+    // Each measured tree's paths, kept for the selection that weighs it.
+    let deltas = std::cell::RefCell::new(std::collections::HashMap::new());
+    let vouchers = match (&journal, &key, &tree) {
+        (Some(journal), Some(key), Some(tree)) => {
+            let wanted: Vec<String> = cmds.iter().map(|c| canon(c)).collect();
+            shared_preflight_passes(
+                &journal.read_lines(key),
+                tree,
+                &wanted,
+                |from| {
+                    let changed = tree_delta(root, from, tree)?;
+                    let distance = changed.len();
+                    deltas.borrow_mut().insert(from.to_string(), changed);
+                    Some(distance)
+                },
+                |from| {
+                    let changed = deltas.borrow_mut().remove(from)?;
+                    cleared_preflights(root, &changed, &canon)
+                },
+            )
+        }
+        _ => std::collections::HashMap::new(),
+    };
+    // Appends verdicts for this run's tree; nothing without a journal.
+    let mark = |lines: &[String]| {
+        if let (Some(journal), Some(key)) = (&journal, &key) {
+            journal.record_bounded(key, lines, Some(SHARED_PREFLIGHT_BYTES));
+        }
     };
     let reused = AtomicUsize::new(0);
     let mut groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
@@ -3495,21 +3583,35 @@ fn run_cargo_groups_with(root: &Path, cmds: &[String], reuse: bool) -> i32 {
     std::thread::scope(|scope| {
         for _ in 0..width {
             let (next, codes, pen, groups, jobs) = (&next, &codes, &pen, &groups, &jobs);
-            let (journal, key, host, passed, reused) = (&journal, &key, &host, &passed, &reused);
+            let (host, tree, vouchers, reused, canon, mark) =
+                (&host, &tree, &vouchers, &reused, &canon, &mark);
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some((_, list)) = groups.get(i) else {
                     return;
                 };
                 let mut code = 0;
+                let mut passed: Vec<String> = Vec::new();
                 for cmd in list {
-                    if passed.contains(cmd) {
-                        let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
-                        println!("================ {cmd}: REUSED (passed on this content) ================");
-                        reused.fetch_add(1, Ordering::Relaxed);
-                        continue;
+                    let line = canon(cmd);
+                    if reuse {
+                        if let Some(from) = vouchers.get(&line).and_then(|v| v.first()) {
+                            let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
+                            println!(
+                                "================ {cmd}: REUSED (passed on tree {from}, \
+                                 which differs here in nothing it reads) ================"
+                            );
+                            reused.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                     }
-                    journal.forget(cmd);
+                    // Owed here until it passes: a run that reds or is
+                    // stopped leaves this content answered by no pass.
+                    let failed = tree
+                        .as_deref()
+                        .map(|t| vec![preflight_line(t, PREFLIGHT_FAIL, &line)])
+                        .unwrap_or_default();
+                    mark(&failed);
                     {
                         let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
                         println!("affected-checks: running: {cmd}");
@@ -3540,16 +3642,33 @@ fn run_cargo_groups_with(root: &Path, cmds: &[String], reuse: bool) -> i32 {
                         let _ = out.flush();
                     }
                     if got != 0 {
+                        // Again: a pass another worktree recorded on this
+                        // content while this ran does not outweigh the red.
+                        // And on each tree whose pass would have answered
+                        // here (a forced run's, or a run on a host change
+                        // the key misses): those passes are in doubt too,
+                        // and a later edit here could reach them again.
+                        let vouching = vouchers.get(&line).map(Vec::as_slice);
+                        mark(&red_lines(
+                            tree.as_deref(),
+                            vouching.unwrap_or_default(),
+                            &line,
+                        ));
                         code = got;
                         break;
                     }
                     // Only if the content is still what the run started on:
                     // a pass over an edit made meanwhile proves neither.
-                    if let (Some(k), Some(h)) = (key, host) {
-                        if preflight_key(root, h).as_ref() == Some(k) {
-                            journal.record(k, cmd);
+                    if let Some(t) = tree {
+                        if content_tree(root).as_ref() == Some(t) {
+                            passed.push(preflight_line(t, PREFLIGHT_PASS, &line));
                         }
                     }
+                }
+                // The host once per group rather than per command: its
+                // probes are the expensive part of the recheck.
+                if !passed.is_empty() && host.is_some() && preflight_host(root) == *host {
+                    mark(&passed);
                 }
                 if let Some(cell) = codes.get(i) {
                     *cell.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
@@ -3560,8 +3679,8 @@ fn run_cargo_groups_with(root: &Path, cmds: &[String], reuse: bool) -> i32 {
     let reused = reused.load(Ordering::Relaxed);
     if reused > 0 {
         println!(
-            "affected-checks: {reused} of {} cargo command(s) reused from passes on this content \
-             (TD_CHECK_FULL=1 runs them again)",
+            "affected-checks: {reused} of {} cargo command(s) reused from passes on this host \
+             over the same inputs (TD_CHECK_FULL=1 runs them again)",
             cmds.len()
         );
     }
@@ -3577,16 +3696,302 @@ fn run_cargo_groups_with(root: &Path, cmds: &[String], reuse: bool) -> i32 {
     0
 }
 
-/// The key the cargo preflights journal their passes under: the gates'
-/// content key (`check_loop::tree_key`) over this td-builder, which runs
-/// the format check, and `host`. None when the content cannot be keyed.
-fn preflight_key(root: &Path, host: &[u8]) -> Option<String> {
-    let me = std::env::current_exe().ok()?;
-    let tree = crate::check_loop::tree_key(root, &me)?;
+/// What a red of `line` on `tree` records: `fail` there, and on every tree
+/// whose pass vouched for it there. Nothing without a tree.
+fn red_lines(tree: Option<&str>, vouching: &[String], line: &str) -> Vec<String> {
+    let Some(tree) = tree else {
+        return Vec::new();
+    };
+    std::iter::once(tree)
+        .chain(vouching.iter().map(String::as_str))
+        .map(|from| preflight_line(from, PREFLIGHT_FAIL, line))
+        .collect()
+}
+
+/// Under the worktree's run hold: the private indexes a killed run left
+/// beside the real one (`content_tree`), and the per-worktree journal's
+/// retired key files, which the host-wide journal replaced.
+fn sweep_preflight_leftovers(root: &Path, local: &Path) {
+    if let Some(dir) = git_index_path(root).as_deref().and_then(Path::parent) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PREFLIGHT_INDEX)
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(local) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// A preflight command as the shared journal spells it: this binary's quoted
+/// path, which the format and crate-driver commands start with and which
+/// names the worktree, becomes `td-builder`. Which td-builder it was is in
+/// the host key (`preflight_host`).
+fn canonical_preflight() -> impl Fn(&str) -> String {
+    let me = std::env::current_exe()
+        .ok()
+        .and_then(|exe| shell_quote(&exe));
+    move |cmd: &str| match &me {
+        Some(me) => cmd.replace(me.as_str(), "td-builder"),
+        None => cmd.to_string(),
+    }
+}
+
+/// The prefix of `content_tree`'s private index files.
+const PREFLIGHT_INDEX: &str = "td-preflight-index-";
+
+/// `git` in the worktree at `root`, with the caller's repository variables
+/// cleared and an `index` of its own if given; stdout when it succeeds.
+fn preflight_git(root: &Path, args: &[&str], index: Option<&Path>) -> Option<Vec<u8>> {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(index) = index {
+        cmd.env("GIT_INDEX_FILE", index);
+    }
+    crate::host_bin::arm_check_child(&mut cmd);
+    let out = cmd.output().ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// The worktree's own index file, which a linked worktree keeps in its
+/// private git directory.
+fn git_index_path(root: &Path) -> Option<PathBuf> {
+    let real = preflight_git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        None,
+    )?;
+    Some(PathBuf::from(String::from_utf8(real).ok()?.trim_end()))
+}
+
+/// The worktree's content as a git tree: its index with every tracked and
+/// untracked, unignored file as it is now added over it, written through a
+/// private copy beside the real index so neither it nor HEAD moves. Every
+/// worktree of the repository shares the objects, so another can diff
+/// against it. None where git cannot say, and then nothing is shared.
+fn content_tree(root: &Path) -> Option<String> {
+    static INDEXES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let real = git_index_path(root)?;
+    let index = real.parent()?.join(format!(
+        "{PREFLIGHT_INDEX}{}-{}",
+        std::process::id(),
+        INDEXES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // A copy keeps the real index's stat cache, so only changed files are
+    // hashed; without one the add hashes the whole tree.
+    let _ = std::fs::copy(&real, &index);
+    let tree = preflight_git(root, &["add", "--all", "--", "."], Some(&index))
+        .and_then(|_| preflight_git(root, &["write-tree"], Some(&index)));
+    let _ = std::fs::remove_file(&index);
+    let _ = std::fs::remove_file(index.with_extension("lock"));
+    let tree = String::from_utf8(tree?).ok()?;
+    let tree = tree.trim_end();
+    git_object_name(tree).then(|| tree.to_string())
+}
+
+/// The paths that differ between trees `from` and `to`, renames as their
+/// two halves. None when git cannot compare them, either is not an object
+/// name, or any path maps to nothing (`mapped_paths`): documentation is
+/// such a path, and tests read it (td-login its threat model, the builder
+/// AGENTS.md), so a tree that differs in one vouches for no command.
+fn tree_delta(root: &Path, from: &str, to: &str) -> Option<Vec<String>> {
+    if !git_object_name(from) || !git_object_name(to) {
+        return None;
+    }
+    let out = preflight_git(
+        root,
+        &["diff", "--name-only", "--no-renames", "-z", from, to, "--"],
+        None,
+    )?;
+    let changed = out
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8(p.to_vec()).ok())
+        .collect::<Option<Vec<String>>>()?;
+    let roster = discover_gate_crates(root).ok()?;
+    (!changed.is_empty() && mapped_paths(root, &roster, &changed).len() == changed.len())
+        .then_some(changed)
+}
+
+/// The cargo commands, as `canon` spells them, a diff over `changed` does
+/// not select: every command this tree's preflight knows
+/// (`cargo_test_cmds_all`) but those `cargo_test_cmds` selects. A command
+/// it does not know is never cleared. None when the selection fails, which
+/// clears nothing.
+fn cleared_preflights(
+    root: &Path,
+    changed: &[String],
+    canon: &impl Fn(&str) -> String,
+) -> Option<std::collections::HashSet<String>> {
+    let known = cargo_test_cmds_all(root).ok()?;
+    let owed: std::collections::HashSet<String> = cargo_test_cmds(root, changed)
+        .ok()?
+        .iter()
+        .map(|c| canon(c))
+        .collect();
+    Some(
+        known
+            .iter()
+            .map(|c| canon(c))
+            .filter(|c| !owed.contains(c))
+            .collect(),
+    )
+}
+
+/// For each of `wanted`, the recorded trees whose pass of it vouches for
+/// `tree`, nearest first. `lines` are `preflight_line`s, oldest first; a
+/// tree's newest line for a command is its verdict there, and a line that
+/// is not one, or whose tree is not an object name, is skipped. A command
+/// whose verdict on `tree` is `fail` has no voucher at all: it last ran on
+/// this content and did not pass, so no pass anywhere answers for it.
+/// Otherwise a pass on `tree` vouches; of the other trees with a wanted
+/// pass, the newest `SHARED_PREFLIGHT_CANDIDATES` are measured by
+/// `distance` (None: they cannot vouch), and the nearest
+/// `SHARED_PREFLIGHT_TREES` vouch for the commands `cleared` names.
+fn shared_preflight_passes(
+    lines: &[String],
+    tree: &str,
+    wanted: &[String],
+    mut distance: impl FnMut(&str) -> Option<usize>,
+    mut cleared: impl FnMut(&str) -> Option<std::collections::HashSet<String>>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    use std::collections::{HashMap, HashSet};
+    let wanted: HashSet<&str> = wanted.iter().map(String::as_str).collect();
+    let mut verdicts: HashMap<(&str, &str), bool> = HashMap::new();
+    // Trees with a standing pass, newest first, and what passed on each.
+    let mut trees: Vec<&str> = Vec::new();
+    let mut passes: HashMap<&str, Vec<&str>> = HashMap::new();
+    for line in lines.iter().rev() {
+        let mut fields = line.splitn(3, '\t');
+        let (Some(from), Some(verdict), Some(cmd)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let pass = match verdict {
+            PREFLIGHT_PASS => true,
+            PREFLIGHT_FAIL => false,
+            _ => continue,
+        };
+        if !wanted.contains(cmd) || !git_object_name(from) || verdicts.contains_key(&(from, cmd)) {
+            continue;
+        }
+        verdicts.insert((from, cmd), pass);
+        if pass {
+            let on = passes.entry(from).or_default();
+            if on.is_empty() {
+                trees.push(from);
+            }
+            on.push(cmd);
+        }
+    }
+    let mut vouchers: HashMap<String, Vec<String>> = HashMap::new();
+    let mut vouch = |from: &str, cmd: &str| {
+        if verdicts.get(&(tree, cmd)) != Some(&false) {
+            vouchers
+                .entry(cmd.to_string())
+                .or_default()
+                .push(from.to_string());
+        }
+    };
+    for cmd in passes.get(tree).into_iter().flatten() {
+        vouch(tree, cmd);
+    }
+    let mut near: Vec<(usize, &str)> = trees
+        .iter()
+        .filter(|from| **from != tree)
+        .take(SHARED_PREFLIGHT_CANDIDATES)
+        .filter_map(|from| Some((distance(from)?, *from)))
+        .collect();
+    // Stable: among equals, the newer first.
+    near.sort_by_key(|(d, _)| *d);
+    for (_, from) in near.into_iter().take(SHARED_PREFLIGHT_TREES) {
+        let Some(carried) = cleared(from) else {
+            continue;
+        };
+        for cmd in passes.get(from).into_iter().flatten() {
+            if carried.contains(*cmd) {
+                vouch(from, cmd);
+            }
+        }
+    }
+    vouchers
+}
+
+/// The digest of what an executable runs: an ELF64's header and program
+/// headers, and the bytes of its loadable segments, but none of its symbol
+/// table. Two worktrees' builds of the same td-builder differ only there,
+/// in local symbol names LLVM derives from the absolute `#[path]` of the
+/// gate registry, so a whole-file digest would share nothing between them.
+/// Anything not such an ELF, or one these headers do not describe, is
+/// hashed whole. None when the file cannot be read.
+fn loaded_digest(path: &Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    if let Some(digest) = elf_loaded_digest(bytes.clone()) {
+        return Some(digest);
+    }
     let mut h = crate::sha256::Sha256::new();
-    h.update(tree.as_bytes());
-    h.update(host);
-    Some(crate::sha256::to_base16(&h.finalize()))
+    h.update(b"file");
+    h.update(&bytes);
+    Some(h.finalize().to_vec())
+}
+
+fn elf_loaded_digest(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
+    // Little-endian fields of `N` bytes read from a slice, so every offset
+    // below is a small constant into a bounds-checked slice.
+    fn read<const N: usize>(slice: &[u8], at: usize) -> Option<u64> {
+        let field: [u8; N] = slice.get(at..at.checked_add(N)?)?.try_into().ok()?;
+        let mut wide = [0u8; 8];
+        wide.get_mut(..N)?.copy_from_slice(&field);
+        Some(u64::from_le_bytes(wide))
+    }
+    // ELF, 64-bit, little-endian.
+    if bytes.get(..6) != Some(b"\x7fELF\x02\x01") {
+        return None;
+    }
+    // The section-table fields (e_shoff, e_shentsize, e_shnum, e_shstrndx)
+    // are not read by the loader, and e_shoff moves with the symbol names.
+    bytes.get_mut(0x28..0x30)?.fill(0);
+    bytes.get_mut(0x3a..0x40)?.fill(0);
+    let phoff = usize::try_from(read::<8>(&bytes, 0x20)?).ok()?;
+    let entsize = usize::try_from(read::<2>(&bytes, 0x36)?).ok()?;
+    let count = usize::try_from(read::<2>(&bytes, 0x38)?).ok()?;
+    if entsize < 56 {
+        return None;
+    }
+    let table = bytes.get(phoff..phoff.checked_add(entsize.checked_mul(count)?)?)?;
+    let mut h = crate::sha256::Sha256::new();
+    h.update(b"elf-load");
+    h.update(bytes.get(..0x40)?);
+    h.update(table);
+    for entry in table.chunks(entsize) {
+        // PT_LOAD: what the loader maps.
+        if read::<4>(entry, 0)? != 1 {
+            continue;
+        }
+        let start = usize::try_from(read::<8>(entry, 8)?).ok()?;
+        let end = start.checked_add(usize::try_from(read::<8>(entry, 32)?).ok()?)?;
+        h.update(bytes.get(start..end)?);
+    }
+    Some(h.finalize().to_vec())
 }
 
 /// Host tools a preflight takes from PATH: PostgreSQL's `initdb`, which the
@@ -3608,8 +4013,24 @@ fn preflight_host(root: &Path) -> Option<Vec<u8>> {
     // including the per-target runner and linker, and `RUST*`), but the
     // ones that set only parallelism or output, which `ready` varies per
     // run; and td's own toolchain and memory-cap variables.
+    // Nor what `cargo run` sets for the td-builder it starts, which names
+    // the worktree (CARGO_MANIFEST_DIR) and configures nothing.
     let volatile = |name: &str| {
-        matches!(name, "CARGO_BUILD_JOBS" | "CARGO_MAKEFLAGS") || name.starts_with("CARGO_TERM_")
+        matches!(
+            name,
+            "CARGO_BUILD_JOBS"
+                | "CARGO_MAKEFLAGS"
+                | "CARGO"
+                | "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_MANIFEST_LINKS"
+                | "CARGO_CRATE_NAME"
+                | "CARGO_BIN_NAME"
+                | "CARGO_PRIMARY_PACKAGE"
+                | "CARGO_RUSTC_CURRENT_DIR"
+        ) || name.starts_with("CARGO_TERM_")
+            || name.starts_with("CARGO_PKG_")
+            || name.starts_with("CARGO_BIN_EXE_")
     };
     let mut vars: Vec<(String, std::ffi::OsString)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v)))
@@ -3641,19 +4062,29 @@ fn preflight_host(root: &Path) -> Option<Vec<u8>> {
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cargo")));
+    // The repository's own config is in the tree. Only configs that exist
+    // enter, by where they are and what they say, so two worktrees with none
+    // above them agree although their ancestors differ.
     let configs = root
         .ancestors()
+        .skip(1)
         .map(|dir| dir.join(".cargo"))
         .chain(cargo_home);
     for dir in configs {
         for name in ["config.toml", "config"] {
             let path = dir.join(name);
-            let bytes = std::fs::read(&path).ok();
-            field(&path.display().to_string(), bytes.as_deref());
+            if let Ok(bytes) = std::fs::read(&path) {
+                field(&path.display().to_string(), Some(&bytes));
+            }
         }
     }
-    let runner = crate::check_loop::file_digest(&root.join("target/release/td-builder"));
+    let runner = loaded_digest(&root.join("target/release/td-builder"));
     field("runner", runner.as_deref());
+    // This td-builder runs the format check and the crate drivers.
+    let me = std::env::current_exe()
+        .ok()
+        .and_then(|exe| loaded_digest(&exe));
+    field("td-builder", me.as_deref());
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let probe = |program: &str, args: &[&str]| -> Option<Vec<u8>> {
         let out = Command::new(program)
@@ -5164,18 +5595,7 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
     let all = cargo_test_cmds_all(root)?;
     let roster = discover_gate_crates(root)?;
     // A documentation-only path must not broaden a mixed code diff either.
-    let routing_roster = Ok(roster.clone());
-    let active: Vec<String> = changed
-        .iter()
-        .filter(|path| {
-            let mut selection = Selection::default();
-            map_path(root, &routing_roster, path, &mut selection);
-            !selection.preflights.is_empty()
-                || !selection.targets.is_empty()
-                || !selection.notes.is_empty()
-        })
-        .cloned()
-        .collect();
+    let active = mapped_paths(root, &roster, changed);
     let changed = active.as_slice();
     let Some(mut selected) = changed_roster_crates(&roster, changed) else {
         return Ok(all);
@@ -5230,6 +5650,23 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
         true => Ok(narrowed),
         false => Ok(all),
     }
+}
+
+/// The paths of `changed` that select anything at all: a path that maps to
+/// no preflight, target or note (documentation) owes no cargo command.
+fn mapped_paths(root: &Path, roster: &[GateCrate], changed: &[String]) -> Vec<String> {
+    let routing_roster = Ok(roster.to_vec());
+    changed
+        .iter()
+        .filter(|path| {
+            let mut selection = Selection::default();
+            map_path(root, &routing_roster, path, &mut selection);
+            !selection.preflights.is_empty()
+                || !selection.targets.is_empty()
+                || !selection.notes.is_empty()
+        })
+        .cloned()
+        .collect()
 }
 
 /// The builder files that decide how a roster crate's legs are built or
@@ -8864,8 +9301,8 @@ mod tests {
         // line whenever a query is added or removed — the same cost every
         // other pinned count in this tree has, and the same reason.
         assert_eq!(
-            checked, 5,
-            "{checked} shipped --name-only queries were read, not 5 — a query \
+            checked, 6,
+            "{checked} shipped --name-only queries were read, not 6 — a query \
              that stopped being read looks exactly like one that was deleted"
         );
         // …and main.rs specifically, which the old split reduced to 30 lines.
@@ -10477,6 +10914,7 @@ mod tests {
         // The repo is the content; the counters live beside it, so running
         // a command does not itself change the key.
         let (repo, out) = (base.join("repo"), base.join("out"));
+        let shared = base.join("verdicts");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&out).unwrap();
         let git = |args: &[&str]| {
@@ -10516,23 +10954,23 @@ mod tests {
                 .unwrap_or(0)
         };
         let counts = || (runs("one"), runs("two"));
-        assert_eq!(run_cargo_groups_with(&repo, &cmds, true), 0);
+        assert_eq!(run_cargo_groups_with(&repo, &cmds, true, Some(&shared)), 0);
         assert_eq!(counts(), (1, 1));
-        assert_eq!(run_cargo_groups_with(&repo, &cmds, true), 0);
+        assert_eq!(run_cargo_groups_with(&repo, &cmds, true, Some(&shared)), 0);
         assert_eq!(counts(), (1, 1), "both reused on the same content");
         git(&["commit", "--amend", "-qm", "a new message"]);
-        assert_eq!(run_cargo_groups_with(&repo, &cmds, true), 0);
+        assert_eq!(run_cargo_groups_with(&repo, &cmds, true, Some(&shared)), 0);
         assert_eq!(counts(), (1, 1), "a message-only amend keeps the key");
         // A forced run that reds leaves no pass for the next one to reuse.
         std::fs::write(out.join("broken"), "").unwrap();
-        assert_ne!(run_cargo_groups_with(&repo, &cmds, false), 0);
+        assert_ne!(run_cargo_groups_with(&repo, &cmds, false, Some(&shared)), 0);
         assert_eq!(counts(), (2, 2));
-        assert_ne!(run_cargo_groups_with(&repo, &cmds, true), 0);
+        assert_ne!(run_cargo_groups_with(&repo, &cmds, true, Some(&shared)), 0);
         assert_eq!(counts(), (2, 3), "the red one reruns, the other is reused");
         // An edit is new content: everything runs.
         std::fs::remove_file(out.join("broken")).unwrap();
         std::fs::write(repo.join("code.rs"), "fn main() { () }\n").unwrap();
-        assert_eq!(run_cargo_groups_with(&repo, &cmds, true), 0);
+        assert_eq!(run_cargo_groups_with(&repo, &cmds, true, Some(&shared)), 0);
         assert_eq!(counts(), (3, 4));
         // A command that edits the content as it runs proves nothing about
         // the content the run started on: its pass is not recorded, so with
@@ -10542,10 +10980,305 @@ mod tests {
             format!("echo run >> {o}/one"),
             format!("echo run >> {o}/three; echo '// edited' >> {r}/code.rs"),
         ];
-        assert_eq!(run_cargo_groups_with(&repo, &editing, true), 0);
+        assert_eq!(
+            run_cargo_groups_with(&repo, &editing, true, Some(&shared)),
+            0
+        );
         std::fs::write(repo.join("code.rs"), "fn main() { () }\n").unwrap();
-        assert_eq!(run_cargo_groups_with(&repo, &editing, true), 0);
+        assert_eq!(
+            run_cargo_groups_with(&repo, &editing, true, Some(&shared)),
+            0
+        );
         assert_eq!((runs("one"), runs("three")), (3, 2));
+        // Another worktree of the repository, at another path, with the same
+        // content reuses what this one passed: the journal is the host's.
+        git(&["add", "."]);
+        git(&["commit", "-qm", "edit"]);
+        assert_eq!(run_cargo_groups_with(&repo, &cmds, true, Some(&shared)), 0);
+        let before = counts();
+        let other = base.join("other");
+        git(&["worktree", "add", "-q", "--detach", other.to_str().unwrap()]);
+        assert_eq!(run_cargo_groups_with(&other, &cmds, true, Some(&shared)), 0);
+        assert_eq!(counts(), before, "the other worktree reuses both");
+        // Commands no selection knows, as these stand-ins, carry only on the
+        // identical tree: an edit there runs them again.
+        std::fs::write(other.join("code.rs"), "fn main() { (); }\n").unwrap();
+        assert_eq!(run_cargo_groups_with(&other, &cmds, true, Some(&shared)), 0);
+        assert_eq!(counts(), (before.0 + 1, before.1 + 1));
+    }
+
+    /// Which recorded passes vouch for a tree: one on the tree itself, any
+    /// command; one on another tree, only the commands cleared for it, the
+    /// nearest trees weighed first; a tree that cannot be compared, none;
+    /// and a red on this tree outweighs every pass, here or anywhere.
+    #[test]
+    fn a_shared_pass_vouches_only_where_its_tree_differs_in_nothing_the_command_reads() {
+        use std::collections::HashSet;
+        let t = |n: usize| format!("{n:040x}");
+        let (now, t1, t2, old, broken) = (t(0), t(1), t(2), t(3), t(5));
+        let line = |tree: &str, verdict: &str, cmd: &str| preflight_line(tree, verdict, cmd);
+        let lines = vec![
+            line(&old, PREFLIGHT_PASS, "ws"),
+            line(&t1, PREFLIGHT_PASS, "ws"),
+            line(&t1, PREFLIGHT_PASS, "jail"),
+            line(&t2, PREFLIGHT_PASS, "ws"),
+            line(&t2, PREFLIGHT_PASS, "jail"),
+            line(&broken, PREFLIGHT_PASS, "ws"),
+            line(&now, PREFLIGHT_PASS, "fmt"),
+            line(&t1, PREFLIGHT_PASS, "other-command"),
+            // Not lines: no verdict, an unknown one, a tree git would read
+            // as an option.
+            format!("{}\tws", t(6)),
+            line(&t(7), "maybe", "ws"),
+            line("--output=x", PREFLIGHT_PASS, "ws"),
+        ];
+        let wanted = ["ws", "jail", "fmt"].map(String::from);
+        let distance = |from: &str| match from {
+            f if f == t1 => Some(3),
+            f if f == t2 => Some(1),
+            f if f == old => Some(2),
+            _ => None,
+        };
+        let cleared_for = |from: &str| -> Option<HashSet<String>> {
+            match from {
+                // The change from t1 selects ws, not jail.
+                f if f == t1 => Some(["jail", "fmt"].map(String::from).into()),
+                // From t2 it selects everything.
+                f if f == t2 => Some(HashSet::new()),
+                f if f == old => Some(["ws"].map(String::from).into()),
+                _ => None,
+            }
+        };
+        let (mut measured, mut asked) = (Vec::new(), Vec::new());
+        let vouchers = shared_preflight_passes(
+            &lines,
+            &now,
+            &wanted,
+            |from| {
+                measured.push(from.to_string());
+                distance(from)
+            },
+            |from| {
+                asked.push(from.to_string());
+                cleared_for(from)
+            },
+        );
+        assert_eq!(vouchers.get("fmt"), Some(&vec![now.clone()]));
+        assert_eq!(vouchers.get("jail"), Some(&vec![t1.clone()]));
+        assert_eq!(vouchers.get("ws"), Some(&vec![old.clone()]));
+        assert!(!vouchers.contains_key("other-command"));
+        // Measured newest first, the identical tree never; weighed nearest
+        // first, and one that cannot be compared not at all.
+        assert_eq!(
+            measured,
+            [broken.clone(), t2.clone(), t1.clone(), old.clone()]
+        );
+        assert_eq!(asked, [t2.clone(), old.clone(), t1.clone()]);
+
+        // A red here outweighs a pass here and every other tree's, until it
+        // passes here again; a red after a concurrent pass still does.
+        let carried =
+            |_: &str| -> Option<HashSet<String>> { Some(["ws"].map(String::from).into()) };
+        let near = |_: &str| Some(1);
+        let ws = |lines: &[String]| {
+            shared_preflight_passes(lines, &now, &wanted, near, carried)
+                .remove("ws")
+                .unwrap_or_default()
+        };
+        let mut history = vec![
+            line(&t1, PREFLIGHT_PASS, "ws"),
+            line(&now, PREFLIGHT_PASS, "ws"),
+            line(&now, PREFLIGHT_FAIL, "ws"),
+        ];
+        assert!(ws(&history).is_empty(), "a red here: no voucher");
+        history.push(line(&now, PREFLIGHT_PASS, "ws"));
+        assert_eq!(ws(&history), [now.clone(), t1.clone()]);
+        history.push(line(&now, PREFLIGHT_FAIL, "ws"));
+        assert!(ws(&history).is_empty(), "a red after a concurrent pass");
+        // Another tree's own red withdraws its pass.
+        let withdrawn = [
+            line(&t1, PREFLIGHT_PASS, "ws"),
+            line(&t1, PREFLIGHT_FAIL, "ws"),
+        ];
+        assert!(ws(&withdrawn).is_empty());
+        // A red here withdraws the passes that vouched here, so an edit
+        // that does not select the command cannot reach them again.
+        let red = red_lines(Some(&now), &[t1.clone()], "ws");
+        assert_eq!(
+            red,
+            [
+                line(&now, PREFLIGHT_FAIL, "ws"),
+                line(&t1, PREFLIGHT_FAIL, "ws")
+            ]
+        );
+        let mut after = vec![line(&t1, PREFLIGHT_PASS, "ws")];
+        after.extend(red);
+        let edited = shared_preflight_passes(&after, &t(9), &wanted, near, carried);
+        assert!(!edited.contains_key("ws"), "{edited:?}");
+        assert!(red_lines(None, &[t1.clone()], "ws").is_empty());
+
+        // Only the newest candidates are measured, and of those only the
+        // nearest weighed, nearest first.
+        let count = SHARED_PREFLIGHT_CANDIDATES + 2;
+        let many: Vec<String> = (1..=count)
+            .map(|n| line(&t(n), PREFLIGHT_PASS, "ws"))
+            .collect();
+        let (mut measured, mut weighed) = (0, Vec::new());
+        let vouchers = shared_preflight_passes(
+            &many,
+            &now,
+            &wanted,
+            |from| {
+                measured += 1;
+                (1..=count).find(|n| t(*n) == from)
+            },
+            |from| {
+                weighed.push(from.to_string());
+                Some(["ws"].map(String::from).into())
+            },
+        );
+        assert_eq!(measured, SHARED_PREFLIGHT_CANDIDATES);
+        let nearest: Vec<String> = (count - SHARED_PREFLIGHT_CANDIDATES + 1..)
+            .take(SHARED_PREFLIGHT_TREES)
+            .map(t)
+            .collect();
+        assert_eq!(weighed, nearest);
+        assert_eq!(vouchers.get("ws"), Some(&nearest));
+    }
+
+    /// Between two real trees of this repository: a difference in a test's
+    /// documentation vouches for nothing, a crate's own source clears every
+    /// command but that crate's and its readers', the commands are spelled
+    /// without this binary's path, and a name git would read as an option is
+    /// never asked.
+    #[test]
+    fn a_tree_delta_clears_what_the_narrowing_leaves_and_no_documentation() {
+        let root = repo_root();
+        let Some(base) = preflight_git(&root, &["rev-parse", "HEAD^{tree}"], None)
+            .and_then(|out| String::from_utf8(out).ok())
+            .map(|tree| tree.trim_end().to_string())
+            .filter(|tree| git_object_name(tree))
+        else {
+            eprintln!("SKIP: no git checkout (the in-sandbox gate)");
+            return;
+        };
+        let scratch = crate::test_temp::TempDir::new("td-preflight-delta").unwrap();
+        let index = scratch.join("index");
+        // `base` with `path` holding new bytes, written through a private
+        // index into the repository's objects, as `content_tree` writes.
+        let with = |path: &str, bytes: &[u8]| -> String {
+            let blob_file = scratch.join("blob");
+            std::fs::write(&blob_file, bytes).unwrap();
+            let blob = preflight_git(
+                &root,
+                &["hash-object", "-w", "--", blob_file.to_str().unwrap()],
+                None,
+            )
+            .unwrap();
+            let blob = String::from_utf8(blob).unwrap();
+            preflight_git(&root, &["read-tree", &base], Some(&index)).unwrap();
+            let entry = format!("100644,{},{path}", blob.trim_end());
+            preflight_git(
+                &root,
+                &["update-index", "--add", "--cacheinfo", &entry],
+                Some(&index),
+            )
+            .unwrap();
+            let tree = preflight_git(&root, &["write-tree"], Some(&index)).unwrap();
+            String::from_utf8(tree).unwrap().trim_end().to_string()
+        };
+        let doc = with("td-login/THREAT-MODEL.md", b"a changed threat model\n");
+        assert_eq!(tree_delta(&root, &base, &doc), None);
+        assert_eq!(tree_delta(&root, &doc, &base), None);
+
+        let probe = "td-login/src/td_preflight_probe.rs";
+        let code = with(probe, b"// probe\n");
+        assert_eq!(
+            tree_delta(&root, &base, &code),
+            Some(vec![probe.to_string()])
+        );
+        let canon = canonical_preflight();
+        let cleared = cleared_preflights(&root, &[probe.to_string()], &canon).unwrap();
+        let known: std::collections::HashSet<String> = cargo_test_cmds_all(&root)
+            .unwrap()
+            .iter()
+            .map(|c| canon(c))
+            .collect();
+        assert!(cleared.is_subset(&known));
+        assert!(cleared
+            .iter()
+            .all(|c| cmd_manifest_crate(c) != Some("td-login")));
+        assert!(cleared
+            .iter()
+            .any(|c| cmd_manifest_crate(c) == Some("td-png")));
+        assert!(
+            !cleared.iter().any(|c| is_format_check(c)),
+            "the format check reads every source"
+        );
+        let me = std::env::current_exe()
+            .ok()
+            .and_then(|exe| shell_quote(&exe))
+            .unwrap();
+        assert!(known.iter().all(|c| !c.contains(&me)), "{me} in a command");
+
+        // A path the rule does not recognise owes everything.
+        let stray = with("td-preflight-probe.txt", b"stray\n");
+        let stray = tree_delta(&root, &base, &stray)
+            .and_then(|changed| cleared_preflights(&root, &changed, &canon));
+        assert!(stray.is_none_or(|cleared| cleared.is_empty()));
+        assert_eq!(tree_delta(&root, "--output=x", &base), None);
+    }
+
+    /// The host key's td-builder digest reads what the loader maps: a byte
+    /// past the segments (the section headers, beside the symbol table)
+    /// does not change it, the entry point does, and a file that is not an
+    /// ELF is hashed whole.
+    #[test]
+    fn a_builder_digest_reads_what_runs_and_not_its_symbol_names() {
+        let me = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let dir = crate::test_temp::TempDir::new("td-loaded-digest").unwrap();
+        let digest = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            loaded_digest(&path).unwrap()
+        };
+        let base = digest("base", &me);
+        let mut tail = me.clone();
+        *tail.last_mut().unwrap() ^= 0xff;
+        assert_eq!(digest("tail", &tail), base, "nothing loaded changed");
+        // Where the section table starts, which moves with the symbol names.
+        let mut shoff = me.clone();
+        shoff[0x28] ^= 0x08;
+        assert_eq!(digest("shoff", &shoff), base);
+        let mut entry = me.clone();
+        entry[0x18] ^= 0x01;
+        assert_ne!(digest("entry", &entry), base);
+        // A byte in the middle of the executable segment: code.
+        let field = |at: usize, n: usize| {
+            let mut wide = [0u8; 8];
+            wide[..n].copy_from_slice(&me[at..at + n]);
+            u64::from_le_bytes(wide) as usize
+        };
+        let (phoff, entsize, count) = (field(0x20, 8), field(0x36, 2), field(0x38, 2));
+        let code = (0..count)
+            .map(|n| phoff + n * entsize)
+            .find(|at| field(*at, 4) == 1 && field(at + 4, 4) & 1 == 1)
+            .map(|at| field(at + 8, 8) + field(at + 32, 8) / 2)
+            .expect("an executable PT_LOAD");
+        assert!(code > 0x1000, "away from the headers");
+        let mut text = me.clone();
+        text[code] ^= 0x01;
+        assert_ne!(digest("code", &text), base);
+        // A header these fields cannot follow is hashed whole, not as absent.
+        let (mut cut, mut other_cut) = (me[..0x30].to_vec(), me[..0x30].to_vec());
+        other_cut[0x2f] ^= 0x01;
+        assert_ne!(digest("cut", &cut), digest("other-cut", &other_cut));
+        cut[0x28] ^= 0x01;
+        assert_ne!(digest("cut-shoff", &cut), digest("other-cut", &other_cut));
+        let text = b"not an elf".to_vec();
+        let mut other = text.clone();
+        other[0] = b'N';
+        assert_ne!(digest("text", &text), digest("other", &other));
     }
 
     /// The cargo groups: one per manifest in table order, run to their end,
@@ -10585,7 +11318,7 @@ mod tests {
             "echo a-clippy --manifest-path a/Cargo.toml; touch a-clippy-ran".to_string(),
             "echo b-clippy --manifest-path b/Cargo.toml; touch b-clippy-ran; exit 5".to_string(),
         ];
-        let code = run_cargo_groups_with(&root, &cmds, false);
+        let code = run_cargo_groups_with(&root, &cmds, false, None);
         // a's failure comes first in table order, so it is the verdict even
         // though b failed too...
         assert_eq!(code, 3);
@@ -10598,8 +11331,11 @@ mod tests {
             !root.join("a-clippy-ran").is_file(),
             "a group stops at its first failure"
         );
-        assert_eq!(run_cargo_groups(&root, &["true".to_string()]), 0);
-        assert_eq!(run_cargo_groups(&root, &[]), 0);
+        assert_eq!(
+            run_cargo_groups_with(&root, &["true".to_string()], true, None),
+            0
+        );
+        assert_eq!(run_cargo_groups_with(&root, &[], true, None), 0);
         let (got, out) = run_shell_captured(&root, "echo one; echo two >&2; echo three", "1");
         assert_eq!(got, 0);
         assert_eq!(String::from_utf8_lossy(&out), "one\ntwo\nthree\n");

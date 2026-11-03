@@ -120,23 +120,55 @@ reads history or a message, so a run stopped to amend a commit message
 and started again runs only the gates it had not passed. A gate that
 runs first drops its pass under every key, so a rerun that fails or is
 stopped leaves nothing to resume, and a pass with unprovisioned checks
-inside it is not journaled. The cargo preflights (each crate's tests and
-clippy, the workspace's, the format check) keep the same journal per
-command in `.td-build-cache/preflight-verdicts/`, and say which they
-reused. Their key adds what picks and configures the toolchain: the
-`rustc` cargo would run, `cargo`, `clippy`, `rustfmt` and `cc` versions,
-every `CARGO_*` and `RUST*` variable but those that set only
-parallelism or output, `TD_RUST_HOME`, `TD_CC_HOME` and the memory cap,
-every cargo config cargo merges from above the repository or in
-`CARGO_HOME`, the test runner's bytes, and which `initdb` (the native
-mail leg's PostgreSQL) and `dav1d` (td-photo's decode oracles) are first
-on `PATH` with what their `--version` prints, or that there is none; a
-pass is recorded only if
-the content is unchanged when it finishes. A run holds its journal
-throughout, so a second run in the worktree waits. A gate does not
-recheck the content, so do not edit a worktree under a running `ready`.
-The journals do not see the rest of the host; `TD_CHECK_FULL` runs every
-gate and preflight, forgetting each pass as it goes.
+inside it is not journaled.
+
+The cargo preflights (each crate's tests and clippy, the workspace's, the
+format check) share one journal per host, `~/.td/preflight-verdicts-v1`,
+and say which they reused. Each command's verdict is recorded against
+the worktree's content as a git tree (the worktree's index with every
+tracked and unignored untracked file as it is added over it, written
+through a private copy beside the real index), so any worktree of the
+repository can diff against it: `fail` before the command runs, and
+again if it reds, then also on each tree whose pass vouched for it here;
+`pass`, as its group finishes, once it passed on content unchanged since
+the run began. A command whose newest verdict on this tree is `fail`
+runs, and no pass on any tree answers for it. Trimming ages verdicts out
+oldest first, a `fail` with the rest. Otherwise it is not run again when it
+passed on this host on this tree, or on a tree that differs from this
+one only in paths that map to a check and whose `cargo_test_cmds`
+narrowing leaves it out. A difference in a path no rule maps, such as
+documentation, clears nothing, since tests read documentation (td-login
+its threat model, the builder AGENTS.md); so does any path the narrowing
+does not recognise, and a command it does not know carries only on the
+identical tree. Of the newest 64 trees with a standing pass, the eight
+nearest are weighed. A host file is trimmed to its newest 4 MiB once it
+holds twice that. The key adds what picks and configures the toolchain:
+the `rustc` cargo would run, `cargo`, `clippy`, `rustfmt` and `cc`
+versions, every `CARGO_*` and `RUST*` variable but those that set only
+parallelism or output and those `cargo run` sets for the td-builder it
+starts, `TD_RUST_HOME`, `TD_CC_HOME` and the memory cap, every cargo
+config that exists above the repository or in `CARGO_HOME`, the test
+runner's and this td-builder's loaded segments, and which `initdb` (the
+native mail leg's PostgreSQL) and `dav1d` (td-photo's decode oracles) are
+first on `PATH` with what their `--version` prints, or that there is
+none. Two worktrees' builds of the same sources differ only in local
+symbol names, which the loader never reads, so they share passes;
+builders built from different sources do not.
+Commands are journaled with this td-builder's path spelled `td-builder`.
+
+The journal lives outside `~/.td/build-daemon`, which build sandboxes bind
+writable; without a HOME nothing is shared. Cargo tests run unsandboxed
+as the user, so any branch's test code could write a pass every worktree
+on the host then reuses, where before it could write only its own
+worktree's; the journal is the user's, like the rest of `~/.td`.
+
+A run holds a lock in `.td-build-cache/preflight-verdicts/` throughout,
+so a second run in the worktree waits; runs in other worktrees do not,
+and a red recorded after a concurrent pass still outweighs it. A gate
+does not recheck the content, so do not edit a worktree under a running
+`ready`. The journals do not see the rest of the host; `TD_CHECK_FULL`
+runs every gate and preflight, forgetting each gate's pass and marking
+each preflight `fail` on this content before it runs.
 
 The recipe-checks gate answers a check from its verdict memo when that check
 passed on this host before and nothing it reads has changed since: the
@@ -252,8 +284,9 @@ TD_CHECK_FULL=1 td-builder ready
 
 The variable set to any value, the way `td-builder check --resume` reads it
 to rerun gates it has a passing record for; it also runs the checks a
-branch run would defer to main. A forced rerun forgets the
-recorded pass before it runs, so a failure leaves nothing to answer from.
+branch run would defer to main. A forced rerun forgets the gate's
+recorded pass, or marks the preflight failed on this content, before it
+runs, so a failure leaves nothing to answer from.
 `td-recipe-eval clear-store` drops the memos with the rest of the ladder work
 dir.
 

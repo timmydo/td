@@ -1,15 +1,20 @@
 //! The pass journals `--resume` reads: a directory holding one file per
-//! content key, each a line per gate or preflight command that passed on
-//! that content. Host-only (engine_set.rs): `gate-run` and `affected-checks`
-//! keep them, and no build reads them.
+//! key, each a line per gate or preflight command that passed under it.
+//! The gates' is the worktree's, keyed by content; the cargo preflights'
+//! is the host's, keyed by toolchain, each line naming the tree it passed
+//! on (affected.rs, `shared_preflight_passes`). Host-only (engine_set.rs):
+//! `gate-run` and `affected-checks` keep them, and no build reads them.
 //!
-//! A line is a proof only until it is asked again: whatever runs is first
-//! forgotten under every key, so a rerun that fails or is stopped leaves
-//! nothing to resume. Losing another key's line costs a rerun, never a
-//! wrong skip. Every access holds a lock, within the process for parallel
-//! gates and across processes for two runs in one worktree, since a forget
-//! is a read, filter and rename that a concurrent one could undo; a run
-//! holds a second lock for its whole cycle (`hold_run`).
+//! For the gates a line is a proof only until it is asked again: whatever
+//! runs is first forgotten under every key, so a rerun that fails or is
+//! stopped leaves nothing to resume. The preflights instead append a
+//! `fail` line for their tree before a command runs and again if it reds,
+//! which no earlier pass outweighs (`shared_preflight_passes`). Losing a
+//! line costs a rerun, never a wrong skip. Every access holds a lock,
+//! within the process for parallel gates and across processes, since a
+//! forget or a trim is a read, filter and rename that a concurrent one
+//! could undo; a run holds a second lock, in its worktree, for its whole
+//! cycle (`hold_run`).
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -94,25 +99,94 @@ impl Journal {
         })
     }
 
+    /// What passed under `key`, oldest first, as recorded.
+    pub(crate) fn read_lines(&self, key: &str) -> Vec<String> {
+        self.locked(|held| {
+            if !held {
+                return Vec::new();
+            }
+            std::fs::read_to_string(self.path(key))
+                .map(|t| t.lines().map(str::to_string).collect())
+                .unwrap_or_default()
+        })
+    }
+
     /// Record that `line` passed under `key` (best-effort: journaling never
     /// changes a verdict). A line that is empty or spans lines is not
     /// recorded, since it would read back as something else.
     pub(crate) fn record(&self, key: &str, line: &str) {
-        if line.is_empty() || line.contains('\n') {
+        self.record_bounded(key, &[line.to_string()], None);
+    }
+
+    /// Append `lines` under `key` in one hold, and once the file is over
+    /// twice `keep` bytes rewrite it to the newest lines within `keep`, so a
+    /// journal every worktree appends to stays small without a read per
+    /// append. Trimming drops only the oldest lines. Lines that are empty or
+    /// span lines are skipped, as in `record`.
+    pub(crate) fn record_bounded(&self, key: &str, lines: &[String], keep: Option<u64>) {
+        let text: String = lines
+            .iter()
+            .filter(|line| !line.is_empty() && !line.contains('\n'))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        if text.is_empty() {
             return;
         }
         self.locked(|held| {
             if !held {
                 return;
             }
-            if let Ok(mut f) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(self.path(key))
+            let path = self.path(key);
+            let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) else {
+                return;
+            };
+            let _ = f.write_all(text.as_bytes());
+            let Some(keep) = keep else {
+                return;
+            };
+            if f.metadata()
+                .map_or(true, |m| m.len() <= keep.saturating_mul(2))
             {
-                let _ = writeln!(f, "{line}");
+                return;
+            }
+            drop(f);
+            self.sweep_temporaries();
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            let mut size = 0u64;
+            let mut newest: Vec<&str> = text
+                .lines()
+                .rev()
+                .take_while(|line| {
+                    size = size.saturating_add(line.len() as u64 + 1);
+                    size <= keep
+                })
+                .collect();
+            newest.reverse();
+            let kept: String = newest.iter().map(|l| format!("{l}\n")).collect();
+            let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+            let written = File::create(&tmp)
+                .and_then(|mut f| f.write_all(kept.as_bytes()))
+                .and_then(|()| std::fs::rename(&tmp, &path));
+            if written.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::remove_file(&path);
             }
         });
+    }
+
+    /// Remove the rewrite temporaries a killed process left. Only under the
+    /// file lock, which every rewrite holds while its temporary exists.
+    fn sweep_temporaries(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".tmp") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// Remove `line` under every key, before it runs. A journal that cannot
@@ -209,6 +283,31 @@ mod tests {
         assert!(!d.join("k1").exists(), "held the line: removed");
         assert!(d.join("k2").exists(), "did not: kept");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A bounded journal reads back in order and keeps only its newest
+    /// lines once it holds twice the bound, sweeping what a killed rewrite
+    /// left as it trims.
+    #[test]
+    fn a_bounded_record_keeps_the_newest_lines_in_order() {
+        let d = dir("bounded");
+        let j = Journal::new(d.to_path_buf());
+        // Each line is 7 bytes: a bound of 14 keeps two.
+        std::fs::create_dir_all(d.path()).unwrap();
+        std::fs::write(d.join("k.99999.tmp"), "left by a killed rewrite").unwrap();
+        for n in 0..4 {
+            j.record_bounded("k", &[format!("line {n}")], Some(14));
+        }
+        assert_eq!(j.read_lines("k").len(), 4, "not trimmed at twice the bound");
+        j.record_bounded("k", &["line 4".to_string(), String::new()], Some(14));
+        assert_eq!(j.read_lines("k"), ["line 3", "line 4"]);
+        j.record("k", "line 5");
+        assert_eq!(j.read_lines("k"), ["line 3", "line 4", "line 5"]);
+        let names: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
     }
 
     /// A second run's hold waits for the first's to drop.
