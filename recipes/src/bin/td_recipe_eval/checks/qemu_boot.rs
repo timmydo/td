@@ -3245,13 +3245,13 @@ fn valid_manifest_digest(digest: &str) -> bool {
 /// Hashing again at consumption catches stale, truncated, or tampered staging
 /// before qemu sees any artifact.
 pub(crate) fn verify_deployment(deployment: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
-    const CANONICAL_NAMES: [&str; 3] = ["bzImage", "initramfs.cpio", "root.erofs"];
+    const CANONICAL_NAMES: &[&str] = &["bzImage", "initramfs.cpio", "root.erofs"];
     let manifest_path = deployment.join("manifest");
-    let digests = parse_host_manifest(&manifest_path, "deployment", &CANONICAL_NAMES)?;
+    let digests = parse_host_manifest(&manifest_path, "deployment", CANONICAL_NAMES)?;
     let mut paths = Vec::with_capacity(CANONICAL_NAMES.len());
     // Positional pairing is safe only because parse_host_manifest has already
     // required each label at this exact canonical position.
-    for (name, digest) in CANONICAL_NAMES.into_iter().zip(digests) {
+    for (&name, digest) in CANONICAL_NAMES.iter().zip(digests) {
         let path = deployment.join(name);
         if !path.is_file() {
             return Err(format!(
@@ -7671,8 +7671,9 @@ fn latch_setup_shown(
 /// this QEMU reports them.
 fn drive_writes(response: &str, drive: &str) -> Result<u64, String> {
     const DEVICE: &str = "\"device\": \"";
-    const CHANGES: [&str; 3] = [
-        "\"wr_operations\": ",
+    const WRITES: &str = "\"wr_operations\": ";
+    const CHANGES: &[&str] = &[
+        WRITES,
         "\"unmap_operations\": ",
         "\"zone_append_operations\": ",
     ];
@@ -7688,7 +7689,7 @@ fn drive_writes(response: &str, drive: &str) -> Result<u64, String> {
         .get(start.saturating_add(key.len())..)
         .unwrap_or_default();
     let entry = entry.split(DEVICE).next().unwrap_or_default();
-    if !entry.contains(CHANGES[0]) {
+    if !entry.contains(WRITES) {
         return Err(format!("QMP block statistics for {drive} count no writes"));
     }
     let mut writes = 0u64;
