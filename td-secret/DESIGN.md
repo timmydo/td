@@ -372,8 +372,8 @@ a fictitious direct pin. Besides EHCI, built in for the ThinkPad T430s's
 USB 2.0 port, the profile adds no legacy USB host controller drivers.
 Raw token nodes stay root-only and never enter an application jail or the
 compositor's input-device delegation. Separate USB keyboard/pointer
-interfaces do enter the compositor's startup evdev
-roster; its trusted-device boundary is specified in
+interfaces do enter the compositor's seat-assigned evdev roster, at
+startup and through hotplug; its trusted-device boundary is specified in
 `td-compositor/DESIGN.md` under Physical secure attention.
 
 A root Session starts `/proc/self/exe hid-worker`, retaining the

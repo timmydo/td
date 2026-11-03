@@ -1403,15 +1403,17 @@ both forms, changed them on its own account.
 QEMU proves protocol composition, td's state machine, the refusal paths,
 the trusted input and display path, relock on crash and resume, console
 and SSH revocation and publication. It does not prove a USB controller,
-YubiKey firmware interoperability (PIN protocol, credential-ID length, list
-limit, silent assertion, UV-protected hmac-secret), real touch timing
-within the deadlines, a real retry counter, a real lid switch, real
-laptop suspend or a real OTP interface. Before the tier is described as
-usable, record a ThinkPad T430s with two YubiKeys (model and firmware),
-exercised on both its xHCI and EHCI ports, including a lid close, a
-suspend and resume, and a touch of the OTP interface while the attention
-screen is open. No test enrolls, resets or changes the PIN of an
-operator's device.
+YubiKey firmware interoperability (PIN protocol, credential-ID length,
+list limit, silent assertion, UV-protected hmac-secret), real touch
+timing within the deadlines, a real retry counter, a real lid switch,
+real laptop suspend or a real OTP interface. Before the tier is
+described as usable, record a ThinkPad T430s with two YubiKeys (model
+and firmware), exercised on both its xHCI and EHCI ports, including a
+lid close, a suspend and resume, a touch of the OTP interface while the
+attention screen is open, and a suspend and resume that re-enumerates a
+composite key, whose OTP keyboard must come back excluded from secure
+attention (td-compositor/DESIGN.md, "Input hotplug"). No test enrolls,
+resets or changes the PIN of an operator's device.
 
 ## Increments
 

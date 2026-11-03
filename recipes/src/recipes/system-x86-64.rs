@@ -1466,6 +1466,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "profiler",
     "profiler-evidence",
     "seat",
+    "seat-watch",
     "vm-power",
     "vm-guest",
     "audio",
@@ -1915,6 +1916,16 @@ fn build_desktop_td_svc_conf() -> String {
          exec=/bin/td-seatd assign --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid}\n\
          after=rootcheck\n\
          timeout={seat}\n\
+         \n\
+         # Each evdev node that appears later gets the same assignment\n\
+         # (td-compositor/DESIGN.md, \"Input hotplug\").\n\
+         [seat-watch]\n\
+         type=daemon\n\
+         exec=/bin/td-seatd watch --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid}\n\
+         after=seat\n\
+         requires=seat\n\
+         restart=always\n\
+         log=/var/log/svc/td-seat-watch.log\n\
          \n\
          [vm-power]\n\
          type=daemon\n\
@@ -9307,6 +9318,7 @@ mod tests {
             ("td-firstboot", vec!["hostname"]),
             ("rootcheck", vec!["td-firstboot"]),
             ("seat", vec!["rootcheck"]),
+            ("seat-watch", vec!["seat"]),
             ("vm-guest", vec!["seat", "netup"]),
             ("vm-power", vec!["seat"]),
             ("audio", vec!["seat"]),
@@ -10296,6 +10308,22 @@ mod tests {
                  --compositor-uid {COMPOSITOR_RESERVED_UID} --audio-uid {AUDIO_UID} --audio-gid {AUDIO_GID}"
             )),
             "the seat service must create all three compiled runtime identities"
+        );
+        // The watcher takes the oneshot's exact account arguments, and runs
+        // for the whole boot.
+        assert_eq!(
+            unit_key("seat-watch", "exec"),
+            Some(format!(
+                "/bin/td-seatd watch --uid {UI_UID} --gid {UI_GID} \
+                 --compositor-uid {COMPOSITOR_RESERVED_UID} --audio-uid {AUDIO_UID} --audio-gid {AUDIO_GID}"
+            ))
+        );
+        assert_eq!(unit_key("seat-watch", "type").as_deref(), Some("daemon"));
+        assert_eq!(unit_key("seat-watch", "requires").as_deref(), Some("seat"));
+        assert_eq!(unit_key("seat-watch", "restart").as_deref(), Some("always"));
+        assert_eq!(
+            unit_key("seat-watch", "log").as_deref(),
+            Some("/var/log/svc/td-seat-watch.log")
         );
         assert_eq!(
             unit_key("td-firstboot", "exec"),

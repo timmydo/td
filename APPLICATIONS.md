@@ -658,13 +658,13 @@ changes program output between boots. That is why the units above pass
 every path as an explicit argument, and adding a variable is a
 unit-level key rather than a flag on `exec-as`.
 
-**No setuid helper and no new root daemon of its own.** One dependency is
-not this design's: `td-authd` (§L.1), for elevation and the
-identity transition per-app UIDs use. Root on this image is ordinary
-rather than exceptional — `build_td_svc_conf` already runs seven root
-oneshots and two root daemons — so the claim worth making is the narrow
-one: **nothing here is more privileged than its caller**, no setuid
-binary exists, and the runtime path is unprivileged end to end.
+**No setuid helper and no new root daemon of its own.** One dependency
+is not this design's: `td-authd` (§L.1), for elevation and the identity
+transition per-app UIDs use. Root on this image is ordinary rather than
+exceptional — `build_td_svc_conf` already runs several root oneshots and
+root daemons — so the claim worth making is the narrow one: **nothing
+here is more privileged than its caller**, no setuid binary exists, and
+the runtime path is unprivileged end to end.
 
 ### Process tree
 
@@ -8543,7 +8543,7 @@ middle.
 | component | uid | why |
 |---|---|---|
 | `td-svc` | root | the supervisor |
-| `td-seatd` | root, oneshot | assigns `/dev/fb0`, `/dev/dri/card0` when present, and `/dev/input/*`; makes human `/run/user/1000`, compositor `/run/td-compositor/1000`, and audio `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
+| `td-seatd` | root, oneshot, and the `[seat-watch]` daemon (`td-seatd watch`) | assigns `/dev/fb0`, `/dev/dri/card0` when present, and `/dev/input/event*`, at boot and, through `watch`, each event node that appears later; makes human `/run/user/1000`, compositor `/run/td-compositor/1000`, and audio `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
 | `td-compositor` | 993 (`tdc1000`) | owns display/input devices and the private root authority endpoint |
 | `td-busd` | 992 (`tdb1000`) | protected runtime and explicit kernel-UID admission |
 | `td-portal` | 991 (`tdp1000`) | owns the credential store and reads a fixed read-only Downloads view |
@@ -8790,11 +8790,14 @@ This enables ordinary terminal launches, with no consent path.
 
 1. **Device access belongs to the compositor.** `td-seatd` assigns mode-0600
    `/dev/fb0`, `/dev/dri/card0` when the machine has one, and
-   `/dev/input/event*` to UID/GID 993. The human identity has
-   no supplementary membership in the compositor group. A required boot probe
-   runs as UID 1000, verifies the assigned metadata, and requires `EACCES` when
-   opening each node. Missing devices or an unexpectedly successful open
-   fail the probe and deployment health. The boot oracle separately requires
+   `/dev/input/event*` to UID/GID 993, and its `watch` daemon gives each
+   event node that appears later the same assignment
+   (td-compositor/DESIGN.md, "Input hotplug"); a late node is root-owned
+   until then. The human identity has no supplementary membership in the
+   compositor group. A required boot probe runs as UID 1000, verifies the
+   assigned metadata, and requires `EACCES` when opening each node. Missing
+   devices or an unexpectedly successful open fail the probe and deployment
+   health. The boot oracle separately requires
    `TD-COMPOSITOR-DEVICES-PRIVATE`. Deployment reboot discards pre-cutover
    open descriptors. This requires no `EVIOCGRAB`; processes at the
    compositor's own UID are inside the same trust boundary.
@@ -8977,11 +8980,11 @@ production performs (L3 to L5 below).
 The kernel now carries USB PCI xHCI, generic HID,
 USB HID and hidraw. The root-only worker implements the narrow CTAP HID
 transport described in `td-secret/DESIGN.md`; it does not grant consent.
-USB keyboard interfaces follow the compositor's seat-assigned startup
-roster, including the separate OTP interface of a composite token, which
-secure attention never selects or confirms with (`td-compositor/DESIGN.md`,
-"Physical secure attention"). Physical input hardware remains trusted;
-keyboard events never prove a FIDO assertion.
+USB keyboard interfaces follow the compositor's seat-assigned roster, at
+startup and through hotplug, including the separate OTP interface of a
+composite token, which secure attention never selects or confirms with
+(`td-compositor/DESIGN.md`, "Physical secure attention"). Physical input
+hardware remains trusted; keyboard events never prove a FIDO assertion.
 
 #### The v1 operations
 

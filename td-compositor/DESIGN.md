@@ -16,28 +16,28 @@ Linux devtmpfs + sysfs + fbdev + evdev
   -> td-ui-demo and later wl_shm Wayland clients
 ```
 
-`td-seatd` is a root oneshot for one permanently configured local seat.
-It creates the private human runtime `/run/user/1000` and the compositor's
-`/run/td-compositor/1000` below root-owned parents. It validates the
-framebuffer, the DRM card `/dev/dri/card0` and the evdev nodes as character
-devices, assigns them to compositor UID/GID 993 with mode 0600, and verifies
-the result. The human cannot open those devices. The card is optional: a
-framebuffer with no card boots with `card=none` on the ready line. The
-kernel builds in simpledrm (td-install/ENCRYPTION.md "Keyboard
-console"), so a UEFI GOP display is itself a card, simpledrm's `card0`,
-and a machine has none only when its display has neither a UEFI GOP
-framebuffer simple-framebuffer can describe nor a td driver, or when it
-has no display at all. A card that appears after assignment
-is not taken as assigned: the compositor cannot open it until the next
-assignment.
-The render node is not the display, and seatd leaves it alone.
-It also assigns only playback PCM nodes to the dedicated audio account and
-creates `/run/td-audio`; `APPLICATIONS.md` §K.5 owns that boundary.
-There is no multi-user arbitration, hotplug, VT switching or
-live seat reassignment. Deployment reboot discards earlier open descriptors.
-"Input hotplug (target)", under "Physical secure attention", specifies
-evdev hotplug and records the repository owner's decisions on it; it is
-not implemented yet.
+`td-seatd` is a root oneshot for one permanently configured local seat, and
+in its `watch` mode the root daemon `[seat-watch]`, which gives each evdev
+node that appears later the same assignment. It creates the private human
+runtime `/run/user/1000` and the compositor's `/run/td-compositor/1000`
+below root-owned parents. It validates the framebuffer, the DRM card
+`/dev/dri/card0` and the evdev nodes as character devices, the evdev nodes
+of input major 13, assigns them to compositor UID/GID 993 with mode 0600,
+and verifies the result. The human cannot open those devices. The card is
+optional: a framebuffer with no card boots with `card=none` on the ready
+line. The kernel builds in simpledrm (td-install/ENCRYPTION.md "Keyboard
+console"), so a UEFI GOP display is itself a card, simpledrm's `card0`, and
+a machine has none only when its display has neither a UEFI GOP framebuffer
+simple-framebuffer can describe nor a td driver, or when it has no display
+at all. A card that appears after assignment is not taken as assigned: the
+compositor cannot open it until the next assignment. The render node is not
+the display, and seatd leaves it alone. It also assigns only playback PCM
+nodes to the dedicated audio account and creates `/run/td-audio`;
+`APPLICATIONS.md` §K.5 owns that boundary. There is no multi-user
+arbitration, VT switching or live seat reassignment, and no hotplug but
+evdev's. Deployment reboot discards earlier open descriptors. "Input hotplug
+(target)", under "Physical secure attention", specifies evdev hotplug and
+records the repository owner's decisions on it.
 
 Assignment uses safe std path ownership and permission operations, with a
 check/use window between rejecting a symlink and changing the node. The fixed
@@ -6023,8 +6023,10 @@ attached input hardware and root's device provisioning; it provides no
 defense against a malicious keyboard or USB peripheral that presents as one.
 Token presence is never inferred from keyboard events.
 
-Seat assignment is a boot oneshot, so late USB nodes can remain root-owned
-and inaccessible to UID 993. Compositor startup skips permission-denied,
+Seat assignment runs at boot and, through `td-seatd watch`, for each event
+node that appears later ("Input hotplug (target)"); until the watcher
+assigns it, about one poll period, a late node is root-owned and
+inaccessible to UID 993. Compositor startup skips permission-denied,
 missing, or removed-device nodes with one diagnostic per node. Other open
 errors fail startup, and an empty accessible roster, counting the nodes it
 leaves to the poll, still fails; it never changes permissions or admits an
@@ -6036,16 +6038,12 @@ the seat's sets and its entry the roster; an end other than its device's
 loss (end of file or `ENODEV`, which is not reported as an error), and a
 loss whose release then fails, also retires the inode, for the poll "Input
 hotplug (target)" specifies; a lost node is gone, so retiring it costs
-nothing. A restart alone does not assign a new device: it needs trusted seat
-assignment as well. The running compositor polls `/dev/input` for late nodes
-("Input hotplug (target)"), but no root service assigns one yet, so on an
-image it admits only what startup left to it: a USB device still probing, or
-a node startup could not open. The nonempty roster check does not prove that
-a usable keyboard remains or that the attention chord is reachable; removing
-the assigned keyboard can deny that input path. Startup input counts are not
-an authentication-readiness claim. "Input hotplug (target)" below specifies
-the replacement for this fixed roster; until it lands, this paragraph is
-what ships.
+nothing. The running compositor's hotplug poll admits each node root has
+assigned that no reader holds, so a keyboard or pointer attached later, a
+replacement included, is usable without a restart. The nonempty roster check
+does not prove that a usable keyboard remains or that the attention chord is
+reachable; removing the last keyboard denies that input path until another
+is attached. Startup input counts are not an authentication-readiness claim.
 
 Only the root-paired stock compositor profile reserves Ctrl+Alt+Esc. The
 Escape press opens an opaque, built-in screen with no pending authorization
@@ -6147,8 +6145,9 @@ passed ("Probe completeness" under "Input hotplug (target)"), and one whose
 FIDO function is not a HID interface of the same USB device. UHID devices
 have no USB parent, so no guest can show the exclusion; host tests over
 hand-built sysfs trees are its present evidence, and the hardware record
-TOKEN-LOGIN.md's "Evidence" requires, not yet made, is still owed. The fixed
-startup roster means a key inserted later adds no keyboard at all.
+TOKEN-LOGIN.md's "Evidence" requires, not yet made, is still owed. A key
+inserted later is classified as one present at startup is, once its USB
+device reads complete or the 5 s bound has passed ("Probe completeness").
 
 The device dispatcher treats a secret selection as work even when that
 key produces no ordinary key, modifier or pointer delivery. Its device-event
@@ -6287,22 +6286,20 @@ committed device-bound disk installation's after its notice ("Physical
 installation confirmation"), which one shared seat path
 (`Seat::close_itself`) makes, and a lid or resume lock's. If the
 installation's drain fails, the screen stays open as it was, and Escape
-still closes it. Unplugging the device drains its bookkeeping. The current
-fixed device roster requires compositor restart to add a replacement.
-Direct-profile readers retain their per-device partial-report fast path;
-they never claim secure attention or use the trusted timestamp cutoff.
+still closes it. Unplugging the device drains its bookkeeping, and the
+hotplug poll admits a replacement without a restart. Direct-profile readers
+retain their per-device partial-report fast path; they never claim secure
+attention or use the trusted timestamp cutoff.
 
 ### Input hotplug (target)
 
-Increments 1 and 2 below have landed; root's late assignment and the
-oracle are not implemented yet. This subsection specifies how keyboards
-and pointers attached after boot become usable and how their removal is
-handled. The repository owner decided the two questions it raised
-("Decisions" at its end): a late keyboard has parity with a boot-time
-one, and root assigns late nodes through a new `[seat-watch]` unit. The
-increments below implement it in order, and the rest changes nothing
-above until it lands. Until then the fixed startup roster above is what
-ships, and a node that appears after the boot oneshot stays root-owned.
+Increments 1 to 3 below have landed; the qemu oracle is not implemented
+yet. This subsection specifies how keyboards and pointers attached after
+boot become usable and how their removal is handled. The repository
+owner decided the two questions it raised ("Decisions" at its end): a
+late keyboard has parity with a boot-time one, and root assigns late
+nodes through a new `[seat-watch]` unit. The increments below implement
+it in order.
 
 **What changes and what does not.** Assignment stays root's decision: a
 node is usable only once root has made it the compositor's, and the
@@ -6363,11 +6360,16 @@ the compositor. Removal needs nothing from root: devtmpfs deletes the
 node, and a node recreated under the same name is root:root mode 0600
 until assigned. A node that fails assignment is reported once per inode
 and retried each tick without another report; the reported set is
-pruned each tick to inodes still present. A failed directory read is
-reported once per transition and retried. Neither ends the daemon; an
-argument error exits nonzero before the loop. Boot evidence keeps its
-snapshot meaning: `probe` and `probe-access` check the nodes present when
-they run, and a node mid-assignment is refused to the human either way.
+pruned, after each complete listing, to inodes still present. A node
+that is gone, or already assigned, when its assignment fails is no
+failure. A successful assignment is reported once per inode, the
+root-side record of a late node's ownership. A failed directory read and
+an overflow are each reported when the listing first turns to it, and
+retried. Neither ends the daemon; an argument error exits nonzero before
+the loop. Boot evidence keeps its snapshot meaning: `probe` and
+`probe-access` check the nodes present when they run, `probe` with the
+same major check, and a node mid-assignment is refused to the human
+either way.
 
 Polling is chosen over the alternatives, as td-disks' media watcher
 chose it. A `NETLINK_KOBJECT_UEVENT` listener (td-profiler's
@@ -6604,6 +6606,8 @@ every assigned node at startup.
    its fixed roster", "The fixed startup roster means a key inserted
    later adds no keyboard at all" and "requires compositor restart to
    add a replacement"; and item 6's "Since the roster is fixed".
+   Landed, with those rewritten ("keeps its fixed roster" went with the
+   poll).
 4. The qemu oracle.
 
 **Decisions.** Two questions here were the repository owner's, not an
@@ -7813,24 +7817,25 @@ excluded from every selection, confirmation and field below.
 6. **Lid switch (4).** Implemented (C10). When the connect-time `1a`
    state is enrolled or unavailable, the startup roster admits the ACPI
    lid switch's evdev node, a switch-only device reporting `SW_LID`; on
-   an unenrolled account, with no answer and in the direct profile it
-   is not admitted. Its close event locks while the last `1a` state is
-   enrolled or unavailable; nothing else is read from it.
-   Since the roster is fixed, a generation that starts unenrolled reads
-   no lid until the next generation. The node is classified from sysfs,
-   as a touchpad is, with no new ioctl: its `capabilities/ev` declares
-   `EV_SW` and no type but `EV_SYN` beside it, and its `capabilities/sw`
-   declares `SW_LID`; anything unreadable is no lid. A node reporting
-   `SW_LID` beside keys or axes is therefore no lid switch and is read
-   as before, its `SW_LID` ignored. A lid switch never reaches the
-   ordinary readers: admitted, its own reader acts on a close
-   (`SW_LID` 1) and on nothing else; not admitted, it is not opened,
-   but for a node that reads as one only after the hotplug poll opened
-   it, which is closed at once ("Input hotplug (target)" step 2). A lid
-   switch that cannot be opened is reported and left out. A
-   close lost to a dropped batch is not recovered (the switch state is
-   not re-queried, which would be a new ioctl); resume detection still
-   sees the suspend it would have preceded.
+   an unenrolled account, with no answer and in the direct profile it is
+   not admitted. Its close event locks while the last `1a` state is
+   enrolled or unavailable; nothing else is read from it. Since
+   admission is decided at connect, a generation that starts unenrolled
+   reads no lid, a late one included, until the next generation. The
+   node is classified from sysfs, as a touchpad is, with no new ioctl:
+   its `capabilities/ev` declares `EV_SW` and no type but `EV_SYN`
+   beside it, and its `capabilities/sw` declares `SW_LID`; anything
+   unreadable is no lid. A node reporting `SW_LID` beside keys or axes
+   is therefore no lid switch and is read as before, its `SW_LID`
+   ignored. A lid switch never reaches the ordinary readers: admitted,
+   its own reader acts on a close (`SW_LID` 1) and on nothing else; not
+   admitted, it is not opened, but for a node that reads as one only
+   after the hotplug poll opened it, which is closed at once ("Input
+   hotplug (target)" step 2). A lid switch that cannot be opened is
+   reported and left out. A close lost to a dropped batch is not
+   recovered (the switch state is not re-queried, which would be a new
+   ioctl); resume detection still sees the suspend it would have
+   preceded.
 7. **Resume (4).** The kernel does not repeat an unchanged switch state, so
    a lid close cannot be relied on to precede every suspend. The compositor
    detects resume itself, sampling only while the last `1a` state is
