@@ -19,15 +19,7 @@
 //! big-endian; lengths are SQLite varints (big-endian base-128, high bit =
 //! continue, up to 9 bytes).
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(clippy::expect_used, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 const PAGE_SIZE: usize = 4096;
 const HEADER_LEN: usize = 100;

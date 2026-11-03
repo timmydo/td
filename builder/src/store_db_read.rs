@@ -16,15 +16,7 @@
 //! big-endian; lengths are SQLite varints (big-endian base-128, high bit =
 //! continue, up to 9 bytes — the 9th byte contributes a full 8 bits).
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 use std::collections::{HashMap, HashSet};
 

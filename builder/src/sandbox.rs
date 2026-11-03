@@ -31,15 +31,7 @@
 //!     set and override order (the TMPDIR group wins over drv env). The trusted
 //!     mesboot runner receives the hashed TD_STEPS data path through TD_STEPS_FILE.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 #![allow(unsafe_code)] // confined raw-syscall / low-level layer (UNSAFE.md)
 
 use std::collections::BTreeSet;

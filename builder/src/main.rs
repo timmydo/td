@@ -103,15 +103,6 @@ fn nar_hash_path(path: &Path) -> Result<String, std::io::Error> {
     sandbox::nar_hash_of(path)
 }
 
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn nar_hash(path: &str) -> Result<String, std::io::Error> {
     nar_hash_path(Path::new(path))
 }
@@ -123,15 +114,6 @@ struct HashSizeWriter {
     size: u64,
 }
 
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 impl std::io::Write for HashSizeWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.hasher.update(buf);
@@ -144,15 +126,6 @@ impl std::io::Write for HashSizeWriter {
 }
 
 /// The (NAR hash, NAR size) of a path — one serialization pass.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn nar_hash_size_path(path: &Path) -> Result<(String, u64), std::io::Error> {
     let mut w = HashSizeWriter {
         hasher: sha256::Sha256::new(),
@@ -555,15 +528,6 @@ struct SubstMember {
 }
 
 /// The basename (`<hash>-name`) of a store path.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn store_basename(p: &str) -> &str {
     p.rsplit('/').next().unwrap_or(p)
 }
@@ -571,15 +535,6 @@ fn store_basename(p: &str) -> &str {
 /// Render a td-native narinfo (minimal, line-oriented). References are recorded as
 /// basenames so the record is store-location independent; the consumer rebases them onto
 /// its own store dir. The signature line (`Sig:`) is appended later by the signer.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn narinfo_text(
     store_path: &str,
     narhash: &str,
@@ -595,15 +550,6 @@ fn narinfo_text(
 
 /// Write a serve-able substitute directory for MEMBERS into OUTDIR. Returns the basenames
 /// written. Each member yields `OUTDIR/<basename>.narinfo` + `OUTDIR/nar/<narhash>.nar`.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn subst_export(outdir: &Path, members: &[SubstMember]) -> std::io::Result<Vec<String>> {
     let nardir = outdir.join("nar");
     std::fs::create_dir_all(&nardir)?;
@@ -636,15 +582,6 @@ fn subst_export(outdir: &Path, members: &[SubstMember]) -> std::io::Result<Vec<S
 /// narinfo still lists each path's refs as basenames either way, so a consumer can scan-verify
 /// the restored bytes. (td-builder's OWN substitute-consumer hook was deleted, re #469; the
 /// format's consumer half is proven by the `restore_substitute` round-trip test.)
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn subst_export_members(
     db: &store_db_read::Db,
     store_dir: &str,
@@ -714,15 +651,6 @@ fn harness_subst_export(outdir: &Path, harness_dir: &Path) -> Result<Vec<String>
 }
 
 /// The `path` column (index 1) of a read `ValidPaths` row, or "" if absent.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn path_at(cols: &[store_db_read::Value]) -> &str {
     match cols.get(1) {
         Some(store_db_read::Value::Text(p)) => p,
@@ -738,15 +666,6 @@ fn path_at(cols: &[store_db_read::Value]) -> &str {
 /// reproduced (dirs are left writable so the scratch copy can be cleaned up);
 /// regular files get the canonical `0555`/`0444` by their source exec bit, which
 /// is the one perm NAR encodes. Mirrors `(guix serialization) write-file`.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn copy_canonical(src: &Path, dst: &Path) -> Result<(), String> {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let md = std::fs::symlink_metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
@@ -1344,15 +1263,7 @@ struct OutputReg {
 /// references resolve to another output's id or to a scaffolding `ValidPaths` row
 /// (path only) — the same shape `store-add-referenced` writes. registrationTime is
 /// a fixed sentinel (excluded from the daemon differential, as in `store-register`).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(clippy::expect_used, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
     use std::collections::BTreeMap;
     use store_db::{Table, Value};
@@ -1453,15 +1364,7 @@ fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
 /// Scope is the GC/closure authority — `ValidPaths` + `Refs`; a persistent commit DB
 /// does not carry `DerivationOutputs` (as `store-gc-sweep`'s swept DB does not: the
 /// drv→output mapping is rebuilt by registration, not by accumulation).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn merge_regs(existing: Option<&[u8]>, new_regs: &[OutputReg]) -> Result<Vec<u8>, String> {
     use std::collections::{BTreeMap, BTreeSet};
     use store_db::{Table, Value as WV};
@@ -1587,15 +1490,6 @@ fn merge_regs(existing: Option<&[u8]>, new_regs: &[OutputReg]) -> Result<Vec<u8>
 /// Read-modify-write `merge_regs` against an on-disk persistent DB: load DEST-DB if
 /// it exists (a missing file = the first commit), union the NEW outputs in, write it
 /// back. The store dir's bytes are interned by the caller (`store-commit`).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn merge_output_db(dest_db: &Path, new_regs: &[OutputReg]) -> Result<(), String> {
     let existing = match std::fs::read(dest_db) {
         Ok(b) => Some(b),
@@ -2330,15 +2224,7 @@ fn store_add_builder(
 /// shape. Returns the per-output registration facts (for `realize` to write a td
 /// store-db). Shared by `build` (CLOSURE handed in as a file) and `realize`
 /// (CLOSURE computed by td itself from the store DB's Refs graph).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(clippy::expect_used)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_and_register(
     drv_path: &str,
     closure: &[String],
@@ -2409,15 +2295,6 @@ fn build_and_register(
 /// separated. Written by `build_and_register` after a real build and by a
 /// persistent-store read-back (so a fresh scratch that reused a prior build's output
 /// still carries the same registration a real build would have).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn registration_text(regs: &[OutputReg]) -> String {
     let mut record = String::new();
     for r in regs {
@@ -2436,15 +2313,6 @@ fn registration_text(regs: &[OutputReg]) -> String {
 /// PERSISTENT store and MERGE its registration into the accumulating DB — the build-into
 /// half of an incremental store. Idempotent (a content path already present is a no-op).
 /// Shared by the `store-commit` subcommand and build-recipe's persistent-store build-into.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn commit_scratch_to_store(
     scratch: &Path,
     store_dir: &str,
@@ -2750,15 +2618,6 @@ fn persist_index(persist_db: &Path) -> Result<Option<std::sync::Arc<PersistIndex
 /// td.db from them), so the build is SKIPPED. Any missing/identity-mismatched leg ⇒ None
 /// (rebuild), and any tree staged so far is unwound. The daemon's valid-path skip, sourced
 /// across process boundaries from an on-disk store.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn persistent_realization(
     parsed: &drv::Derivation,
     persist_store: &str,
@@ -2864,15 +2723,6 @@ fn persistent_realization(
 /// writes — one block per output, a `path ` line opening each. Order is preserved.
 /// Shared by `cached_realization` (the build cache) and `store-commit` (interning a
 /// finished build into the persistent store), so both read the registration the same way.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn parse_registration_blocks(text: &str) -> Vec<OutputReg> {
     let mut recs: Vec<OutputReg> = Vec::new();
     let mut cur: Option<OutputReg> = None;
@@ -3292,15 +3142,6 @@ fn authenticate_recipe_output_db(dbp: &str) -> Result<(), String> {
 /// reuse decision is bound to the same typed authority a fresh build would
 /// stage from; the reproducibility `check` force-rebuilds, so reuse here never
 /// weakens the repro proof.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn cached_realization(
     parsed: &drv::Derivation,
     scratch: &Path,
@@ -3374,15 +3215,6 @@ fn narinfo_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 /// inputs): it survives as the consumer half of the subst-export FORMAT proof,
 /// exercised by `restore_substitute_round_trips_and_rejects_corruption`.
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn restore_substitute(
     narinfo: &str,
     narfile: &Path,
@@ -3878,15 +3710,6 @@ fn daemon_check_one(
 /// skipped (a caller may pass an optional td-store dir). This is the hoisted candidate set a
 /// `scan::Scanner` matches against (store-closure-scan / #260): building it ONCE and
 /// `reset()`-ing between paths keeps a whole-live-store walk O(bytes), not O(candidates).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn scan_candidate_index(
     store_dirs: &[String],
     canonical_prefix: &str,
@@ -3977,15 +3800,6 @@ fn recanonicalize_candidates(
 /// reference (the only unsafe direction is under-staging). SCANNER carries the candidate
 /// index built ONCE; it is `reset()` between paths, so this is O(bytes scanned), not
 /// O(candidates × paths). Returns the reachable canonical paths (ROOTS included).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn scan_closure_hybrid(
     scanner: &mut scan::Scanner,
     on_disk: &std::collections::HashMap<String, String>,
@@ -4206,15 +4020,6 @@ fn resolve_link_closure(
 /// map, for `scan_closure_hybrid`. These DBs are td's OWN registration (never `/var/guix`);
 /// they carry a td-built dep whose bytes live outside the content-scanned seed dirs, so
 /// its refs are read from the DB it wrote.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn merge_extra_refs(
     extra_dbs: &[(String, sandbox::InputOrigin)],
 ) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
@@ -4553,15 +4358,6 @@ struct InputClosure {
 /// (which scope the reuse digest to it BEFORE the cache read). Reads only INPUT
 /// trees/dbs — all materialized before this step's build — so read and write see
 /// the same bytes and derive the same closure.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn stage_input_closure(
     parsed: &drv::Derivation,
     seed_store_dirs: &[String],
@@ -4839,15 +4635,6 @@ fn stage_input_closure(
 /// live `store::store_dir()` when scanning the active store itself; per-entry truth
 /// (a td-built copy inside a foreign-prefix seed dir, or vice versa) is restored from the drv roots +
 /// td-owned DBs by `recanonicalize_candidates` (#292).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn realize_drv(
     drv_path: &str,
     seed_store_dirs: &[String],
@@ -5020,15 +4807,6 @@ fn realize_drv(
 /// The td-builder store path of the RUNNING binary (…/td-builder-<v>), stripped of
 /// the trailing `/bin/td-builder` — so a recipe built by td references the very
 /// builder that built it, with no Guile resolution.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn self_store_path() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let s = exe.to_string_lossy();
@@ -5097,15 +4875,6 @@ fn timed(label: impl Into<String>) -> Timed {
 /// STORE_DBS (the closure's store-db set) and TD_STORE (td's own store dir for td-BUILT
 /// deps) thread straight through to realize_drv — build-plan passes the multi-db set +
 /// td-store so a downstream step consumes an upstream step's td-built output.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_recipe(
     recipe_json: &str,
     lock_file: &str,
@@ -5389,15 +5158,6 @@ fn build_recipe(
 /// Only the toolchain input is swapped; every other build input + the order are untouched. Returns
 /// true iff at least one input was substituted (callers no-op silently when none — see the override
 /// site). A multi-match dedup is the caller's (`inputs.dedup()` after sort).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn substitute_gcc_toolchain(inputs: &mut [String], tc: &str) -> bool {
     let mut swapped = false;
     for p in inputs.iter_mut() {
@@ -6032,15 +5792,7 @@ fn push_drv_env_line(spec: &mut String, name: &str, value: &str) -> Result<(), S
 /// (assemble-only, so a SEPARATE process — the build daemon — realizes the td-assembled
 /// drv). Splitting assembly from realization is what lets td's own daemon, not a `guix
 /// repl`-emitted drv, be the build's input (own-builder-daemon §5).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(clippy::unreachable)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn assemble_recipe_drv(
     recipe_json: &str,
     lock_file: &str,
@@ -7234,15 +6986,6 @@ fn names_in_channel(alist: &json::Json, key: &str) -> Result<Vec<String>, String
         .collect()
 }
 
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_recipe_json(recipe_dir: &str, name: &str) -> Result<json::Json, String> {
     let p = format!("{recipe_dir}/{name}.json");
     let text = std::fs::read_to_string(&p).map_err(|e| format!("read recipe {p}: {e}"))?;
@@ -7363,30 +7106,12 @@ fn foreign_source_of(name: &str, alist: &json::Json) -> Result<bool, String> {
 /// An input is OWNED (td reconstructs it) iff its recipe JSON exists in RECIPE-DIR;
 /// otherwise it is an external seed/tool (the toolchain, retired last) resolved
 /// through the --auto MAP instead (#429 — no per-rung hand-written base lock).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_is_owned(recipe_dir: &str, name: &str) -> bool {
     Path::new(&format!("{recipe_dir}/{name}.json")).exists()
 }
 
 /// Post-order DFS over the OWNED-input subgraph: appends each recipe AFTER its owned
 /// deps → a topo order (deps first). Cycles error.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn auto_topo(
     recipe_dir: &str,
     name: &str,
@@ -8133,15 +7858,6 @@ fn auto_synthesize_lock(
 /// for anything that names no local-source-roster key; a plan that DOES need
 /// one then reds at per-entry provenance (`auto_seed_provenance`) or
 /// manifest assembly, naming the key, never silently succeeding.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 #[allow(clippy::too_many_arguments)] // seed_db (#468) + persist (#474 cache) + local_seed_db (#469 blocker fix) all thread through this arm
 fn build_plan_auto(
     target: &str,
@@ -8221,15 +7937,6 @@ fn build_plan_auto(
 /// with a non-zero exit on an unknown stem, which we surface as the loud "no td
 /// recipe for PKG" error — td shell resolves PKG to a td recipe or fails; it never
 /// falls back to guix.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn emit_recipe_json(pkg: &str) -> Result<String, String> {
     let eval = std::env::var("TD_RECIPE_EVAL").map_err(|_| {
         "TD_RECIPE_EVAL must point at td's td-recipe-eval binary (the Rust recipe catalog evaluator)"
@@ -8334,15 +8041,7 @@ impl NativeToolchain {
 /// Usage: shell PKG... [-- CMD ARGS...]
 ///   PKG...      td package names (a recipe must exist; no guix fallback)
 ///   -- CMD...   the command to run in the composed env; omitted → interactive $SHELL
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
     // Everything before the first `--` is a package name; after it, the command.
     let sep = rest.iter().position(|a| a == "--");
@@ -8503,15 +8202,6 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
 /// (`store-add-recursive`) — no `guix repl`, no guix-daemon. Returns the
 /// content-addressed `source` store path td computed from the path's recursive
 /// NAR sha256 and restored under `store_dir` (+ `db`).
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn run_store_add(
     self_exe: &str,
     name: &str,
@@ -8547,15 +8237,6 @@ fn run_store_add(
 /// crates ride the separately interned vendor tree and the build platform is
 /// appended from authenticated recipe outputs below; no retired package lock or
 /// host-tool line is carried forward.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn source_lock_body(sourcekey: &str, src_canonical: &str) -> String {
     format!("{sourcekey} {src_canonical} source\n")
 }
@@ -8749,15 +8430,6 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
 /// Returns `Ok(None)` when no warmed closure exists for PKG
 /// (`TD_SHELL_VENDOR_ROOT` unset, or no registry vendor directory); the caller
 /// fails closed because the legacy shell fallback was retired with the corpus.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn provision_rust_inputs(
     pkg: &str,
     recipe_json: &str,
@@ -8893,15 +8565,6 @@ fn provision_rust_inputs(
 /// — so the profile resolves inside a store-ns own-root where `prefix` (e.g. `/td/store`) is
 /// the bound store but the physical scratch dir is absent. `None` keeps the thin-view behavior
 /// (link straight at PKG-OUT as given). Enumeration always reads the physical PKG-OUT dir.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_profile(
     profile_dir: &str,
     pkgs: &[String],
@@ -8973,15 +8636,6 @@ fn build_profile(
 /// from the raw env value so the policy is unit-testable without touching real
 /// process state. Clamped to the kernel's -20..=19 range; a missing/garbage value
 /// falls back to the default.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn parse_build_nice(raw: Option<String>) -> i32 {
     raw.and_then(|v| v.trim().parse::<i32>().ok())
         .unwrap_or(10)
@@ -8994,30 +8648,12 @@ fn parse_build_nice(raw: Option<String>) -> i32 {
 /// increase-only: the kernel rejects an unprivileged DEcrease with EPERM, which
 /// just means we were already at least this nice, so we ignore the result. Purely
 /// a scheduling knob — build OUTPUT (and thus reproducibility) is unaffected.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn nice_self_for_builds() {
     let _ = sys::set_self_priority(parse_build_nice(std::env::var("TD_BUILD_NICE").ok()));
 }
 
 /// Parse an `oci-image`/`oci-image-closure` CONFIG-JSON ({"repoTag","env","entrypoint",
 /// "cmd"}, all optional; repoTag defaults to td:latest) into an `oci::ImageConfig`.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn image_config_from_json(cj: &json::Json) -> oci::ImageConfig {
     let strs = |key: &str| -> Vec<String> {
         cj.get(key)
@@ -9092,15 +8728,7 @@ struct HostSandboxArgs {
 
 /// Parse the full `td-builder host-sandbox …` argv (args[0]=prog, args[1]=subcommand,
 /// flags…, `--`, CMD, CMD-ARGS…). Returns the parsed form or a user-facing message.
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn parse_host_sandbox_args(args: &[String]) -> Result<HostSandboxArgs, String> {
     let mut i = 2usize;
     let mut expose_cwd = false;
@@ -9289,15 +8917,7 @@ fn parse_recipe_output_options(args: &[String]) -> Result<RecipeOutputOptions, S
     })
 }
 
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#[allow(clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let applet = Path::new(args.first().map_or("", String::as_str))

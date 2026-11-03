@@ -26,16 +26,6 @@
 //! AArch64. Application launch checks remain explicitly x86-64. Other classes
 //! and endiannesses are rejected.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
