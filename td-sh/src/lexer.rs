@@ -430,24 +430,17 @@ fn push_utf8(bytes: &mut Vec<u8>, c: char) {
 /// `$'\xc3\xa9'` into `Ã©`.
 fn decode_ansi_c(body: &[char]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(body.len());
-    // A NUL ends the STRING, not the walk: the rest is still consumed so the
-    // escapes in it cannot be mistaken for anything else.
-    let mut done = false;
     let mut i = 0;
     while let Some(&c) = body.get(i) {
         i += 1;
         if c != '\\' {
-            if !done {
-                push_utf8(&mut bytes, c);
-            }
+            push_utf8(&mut bytes, c);
             continue;
         }
         // A trailing backslash cannot occur -- the scan pairs it with the
         // character it escapes -- but it is a literal if it ever does.
         let Some(&esc) = body.get(i) else {
-            if !done {
-                push_utf8(&mut bytes, c);
-            }
+            push_utf8(&mut bytes, c);
             break;
         };
         i += 1;
@@ -467,9 +460,7 @@ fn decode_ansi_c(body: &[char]) -> Vec<u8> {
             _ => None,
         };
         if let Some(ch) = simple {
-            if !done {
-                push_utf8(&mut bytes, ch);
-            }
+            push_utf8(&mut bytes, ch);
             continue;
         }
         // `\cX` is a control character: the operand masked to five bits, which
@@ -480,10 +471,8 @@ fn decode_ansi_c(body: &[char]) -> Vec<u8> {
         if esc == 'c' {
             let Some(&ch) = body.get(i) else {
                 // No operand at all: bash leaves `\c` as those two characters.
-                if !done {
-                    push_utf8(&mut bytes, '\\');
-                    push_utf8(&mut bytes, 'c');
-                }
+                push_utf8(&mut bytes, '\\');
+                push_utf8(&mut bytes, 'c');
                 continue;
             };
             i += 1;
@@ -499,9 +488,8 @@ fn decode_ansi_c(body: &[char]) -> Vec<u8> {
             if let Some((&first, rest)) = ch.encode_utf8(&mut [0u8; 4]).as_bytes().split_first() {
                 // Ctrl-? is DEL by convention rather than the mask's 0x1f.
                 let ctl = if ch == '?' { 0x7f } else { first & 0x1f };
-                if ctl == 0 {
-                    done = true;
-                } else if !done {
+                // A NUL is dropped, as every other spelling of one is below.
+                if ctl != 0 {
                     bytes.push(ctl);
                     bytes.extend_from_slice(rest);
                 }
@@ -514,7 +502,7 @@ fn decode_ansi_c(body: &[char]) -> Vec<u8> {
             // `\x{...}` is bash's ksh93-compatible brace form and takes any
             // number of digits, closing brace optional. It is a BYTE like the
             // bare form -- `\x{263a}` is masked to 0x3a, not a code point -- and
-            // `\x{}` names zero, which truncates. There is no such form for
+            // `\x{}` names zero, which is dropped. There is no such form for
             // `\u`/`\U`, where `$'\u{41}'` stays literal.
             'x' if body.get(i) == Some(&'{') => {
                 i += 1;
@@ -548,37 +536,35 @@ fn decode_ansi_c(body: &[char]) -> Vec<u8> {
         match decoded {
             Some(Esc::Byte(n)) => {
                 // Three octal digits can name 0x1ff, which is not a byte; bash
-                // keeps the low eight bits, so `$'\400'` is a NUL and
-                // truncates. Mask BEFORE that test, or it does not.
+                // keeps the low eight bits, so `$'\400'` is a NUL. Mask BEFORE
+                // the NUL test, or it is not one.
+                //
+                // A NUL is DROPPED and the string goes on, as ash's does:
+                // `$'foo\0bar'` is `foobar` there (`nul-bytes::NUL bytes with
+                // test -f`, ash's own block), where bash truncates to `foo`.
                 let b = (n & 0xff) as u8;
-                if b == 0 {
-                    done = true;
-                } else if !done {
+                if b != 0 {
                     bytes.push(b);
                 }
             }
             // A `\u` names a code point. One that is not a scalar value -- a
             // surrogate, or past U+10FFFF -- has no representation here and
             // takes the same replacement an undecodable byte does.
-            Some(Esc::Point(0)) => done = true,
+            Some(Esc::Point(0)) => {}
             // Above 0x7fffffff bash emits NOTHING rather than any encoding of
             // it, so a replacement character here would be a character bash
             // does not produce at all.
             Some(Esc::Point(n)) if n > 0x7fff_ffff => {}
             Some(Esc::Point(n)) => {
-                if !done {
-                    push_utf8(
-                        &mut bytes,
-                        char::from_u32(n).unwrap_or(char::REPLACEMENT_CHARACTER),
-                    );
-                }
+                push_utf8(
+                    &mut bytes,
+                    char::from_u32(n).unwrap_or(char::REPLACEMENT_CHARACTER),
+                );
             }
             None => {
                 // An unclaimed escape keeps BOTH characters.
-                if !done {
-                    push_utf8(&mut bytes, '\\');
-                    push_utf8(&mut bytes, esc);
-                }
+                push_utf8(&mut bytes, '\\');
+                push_utf8(&mut bytes, esc);
             }
         }
     }
@@ -1761,7 +1747,7 @@ impl Lexer {
             }
         }
         // Even an empty body is a real (empty) field, exactly as `''` is: `set
-        // -- a $'' b` passes THREE arguments, and a `$'\0'` that truncated to
+        // -- a $'' b` passes THREE arguments, and a `$'\0'` that dropped to
         // nothing is the same case.
         buf.open_quoted();
         for ch in String::from_utf8_lossy(&decode_ansi_c(&body)).chars() {
@@ -3214,9 +3200,9 @@ mod tests {
         // Masked to a byte: 0x263a becomes 0x3a, NOT the code point.
         assert_eq!(ansi_c(r"\x{263a}")?, ":");
         assert_eq!(ansi_c(r"\x{1ff}")?, "\u{fffd}");
-        // No digits names zero, which truncates as any other NUL does.
+        // No digits names zero, which is dropped as any other NUL is.
         assert_eq!(ansi_c(r"\x{}")?, "");
-        assert_eq!(ansi_c(r"\x{0}b")?, "");
+        assert_eq!(ansi_c(r"\x{0}b")?, "b");
         // `\u`/`\U` have NO brace form -- both stay literal in bash.
         assert_eq!(ansi_c(r"\u{41}")?, "\\u{41}");
         assert_eq!(ansi_c(r"\U{41}")?, "\\U{41}");
@@ -3274,10 +3260,10 @@ mod tests {
         assert_eq!(ansi_c(r"\c\\x")?, "\u{1c}x");
         // Ctrl-? is DEL by convention rather than the mask's 0x1f.
         assert_eq!(ansi_c(r"\c?")?, "\u{7f}");
-        // An operand that masks to NUL truncates like any other NUL.
-        assert_eq!(ansi_c(r"\c@x")?, "");
-        assert_eq!(ansi_c(r"a\c@b")?, "a");
-        assert_eq!(ansi_c(r"\c x")?, "");
+        // An operand that masks to NUL is dropped like any other NUL.
+        assert_eq!(ansi_c(r"\c@x")?, "x");
+        assert_eq!(ansi_c(r"a\c@b")?, "ab");
+        assert_eq!(ansi_c(r"\c x")?, "x");
         // Only the FIRST byte is masked, so a multi-byte operand keeps its
         // tail: bash gives 0x03 then a stray 0xa9, which is not valid UTF-8 and
         // so takes the replacement the byte escapes above do.
@@ -3285,19 +3271,21 @@ mod tests {
         Ok(())
     }
 
-    /// A NUL cannot travel in an argument and bash TRUNCATES there. The rest of
-    /// the body is still LEXED, or a later `\'` would be read as the closing
-    /// quote and the construct would end in the wrong place.
+    /// A NUL cannot travel in an argument, and ash DROPS it and goes on where
+    /// bash truncates: `$'foo\0bar'` is `foobar` (`nul-bytes::NUL bytes with
+    /// test -f`, ash's own block). Every escape after it is still evaluated,
+    /// and a later `\'` is still an escape rather than the closing quote.
     #[test]
-    fn ansi_c_truncates_at_a_nul_but_keeps_lexing() -> Syn<()> {
-        assert_eq!(ansi_c(r"a\0b")?, "a");
+    fn ansi_c_drops_a_nul_and_goes_on() -> Syn<()> {
+        assert_eq!(ansi_c(r"a\0b")?, "ab");
         assert_eq!(ansi_c(r"\0")?, "");
-        assert_eq!(ansi_c(r"\x00b")?, "");
+        assert_eq!(ansi_c(r"\x00b")?, "b");
+        assert_eq!(ansi_c(r"a\u0000\tb")?, "a\tb");
         // `\400` masks to 0x00, so the mask has to come BEFORE the NUL test.
-        assert_eq!(ansi_c(r"\400x")?, "");
+        assert_eq!(ansi_c(r"\400x")?, "x");
         // The escaped quote is an escape, not the closer: one word, and the
         // `c` after it belongs to this construct rather than to the next word.
-        assert_eq!(ansi_c(r"a\0b\'c")?, "a");
+        assert_eq!(ansi_c(r"a\0b\'c")?, "ab'c");
         assert_eq!(words(r"echo $'a\0b\'c' second")?.len(), 3);
         Ok(())
     }
@@ -3364,7 +3352,7 @@ mod tests {
             // The property is only that it returns: no panic, no overflow in a
             // debug build, and no walk that fails to advance.
             let out = decode_ansi_c(&body);
-            // A NUL never reaches the result -- it truncates instead.
+            // A NUL never reaches the result -- it is dropped instead.
             assert!(!out.contains(&0), "NUL in output for {body:?}");
             // And the same text through the WHOLE lexer, which is where the
             // body-finding phase meets the escapes: a syntax error is a fine

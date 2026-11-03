@@ -3624,6 +3624,7 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
         Ok(mut f) => {
             let mut t = String::new();
             let _ = std::io::Read::read_to_string(&mut f, &mut t);
+            exec::drop_nuls(&mut t);
             t
         }
         // ash quotes the name here and nowhere else (`can't open '%s'`,

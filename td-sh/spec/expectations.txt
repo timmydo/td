@@ -465,7 +465,6 @@ xfail brace-expansion.test.sh::triple expansion
 xfail brace-expansion.test.sh::triple nested brace expansion
 xfail brace-expansion.test.sh::} in expansion
 xfail bugs.test.sh::#2640 Hanging when reading from character devices
-xfail bugs.test.sh::file with NUL byte
 xfail bugs.test.sh::other builtins fail on writing to full disk
 xfail builtin-bash.test.sh::bad help topic
 xfail builtin-bash.test.sh::help
@@ -913,12 +912,6 @@ xfail nix-idioms.test.sh::var ref to array 'preHooks[@]'
 xfail nocasematch-match.test.sh::[[ equality matching
 xfail nocasematch-match.test.sh::[[ regex matching
 xfail nocasematch-match.test.sh::case matching
-xfail nul-bytes.test.sh::Compare \x00 byte versus \x01 byte - command sub
-xfail nul-bytes.test.sh::Issue 2269 - Do NUL bytes match ? in ${a#?}
-xfail nul-bytes.test.sh::Issue 2269 Reduction
-xfail nul-bytes.test.sh::NUL bytes and IFS splitting
-xfail nul-bytes.test.sh::NUL bytes with test -f
-xfail nul-bytes.test.sh::Strip ops # ## % %% with NUL bytes
 xfail osh-bugs.test.sh::YSH $[expr_sub] in OSH should not do dynamic globbing
 xfail osh-bugs.test.sh::var x = $(echo bad; false) in OSH
 xfail osh-bugs.test.sh::var x = $(echo one; false; echo two) in OSH

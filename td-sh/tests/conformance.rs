@@ -4993,3 +4993,30 @@ fn an_interactive_shell_asks_for_the_rest_of_an_open_construct(
     }
     Ok(())
 }
+
+/// A NUL in SOURCE is dropped on every path the shell reads source by, as
+/// ash drops it: a script operand, a seekable stdin, a pipe read a byte at a
+/// time, and `.`. Only the first is reached by the corpus
+/// (`bugs::file with NUL byte`), so the others are pinned here, through the
+/// real binary because two of them are `main`'s.
+#[test]
+fn a_nul_in_source_is_dropped_on_every_reading_path() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let spec = "#### nul in source\n\
+                printf 'echo one \\000 echo two\\n' > f\n\
+                $SH f\n\
+                $SH < f\n\
+                cat f | $SH\n\
+                . ./f\n\
+                ## STDOUT:\n\
+                one echo two\n\
+                one echo two\n\
+                one echo two\n\
+                one echo two\n\
+                ## END\n";
+    let cases = parse_spec(spec)?;
+    let case = cases.first().ok_or("no case parsed")?;
+    let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
+    assert!(outcome.passed, "{:?}", outcome.detail);
+    Ok(())
+}

@@ -269,6 +269,7 @@ fn run(args: &[String]) -> Result<i32, String> {
             let mut src = String::new();
             file.read_to_string(&mut src)
                 .map_err(|e| format!("{path}: {}", exec::strerror(&e)))?;
+            exec::drop_nuls(&mut src);
             // ash.c:14630 sets `commandname = arg0` for a script named on the
             // command line and nowhere else, which is why a script reports the
             // line of a failure and `-c` does not. Equal to `$0`, so the
@@ -331,7 +332,8 @@ fn read_profiles(sh: &mut Shell) -> Option<i32> {
 /// ends, where a program-shaped run would swallow the first and fire the second
 /// immediately.
 fn read_profile(sh: &mut Shell, path: &str) -> Option<i32> {
-    let src = std::fs::read_to_string(path).ok()?;
+    let mut src = std::fs::read_to_string(path).ok()?;
+    exec::drop_nuls(&mut src);
     // A profile is read from a real file, which is ash's `pf_fd > 0`: an
     // INTERACTIVE login still reports the line of a failure inside one, where
     // the same failure typed at its prompt reports none.

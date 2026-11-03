@@ -1784,7 +1784,10 @@ pub fn read_script_line() -> ScriptLine {
         return ScriptLine::Eof;
     }
     match String::from_utf8(bytes) {
-        Ok(line) => ScriptLine::Line(line),
+        Ok(mut line) => {
+            crate::exec::drop_nuls(&mut line);
+            ScriptLine::Line(line)
+        }
         // The message `read_to_string` gave for the same input, which is what
         // this path reported before it read a line at a time.
         Err(_) => ScriptLine::Failed("stream did not contain valid UTF-8".to_string()),

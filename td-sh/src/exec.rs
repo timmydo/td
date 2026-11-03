@@ -2256,10 +2256,24 @@ pub fn command_subst(sh: &mut Shell, code: &str, line: u32, backtick: bool) -> R
     // Counted so an assignment-only command can adopt the last substitution's $?.
     sh.cmdsubst_count = sh.cmdsubst_count.wrapping_add(1);
     let mut out = process::capture_stdout(sh, code, line, backtick)?;
+    // Before the newlines, so a NUL after the last one does not shield it
+    // from the strip: `$(printf 'a\n\0')` is `a`.
+    drop_nuls(&mut out);
     while out.ends_with('\n') {
         out.pop();
     }
     Ok(out)
+}
+
+/// Remove every NUL from text the shell takes in, as a value or as source. A
+/// value cannot hold one in ash, which discards them where it reads them --
+/// a command substitution's output, a script, a sourced file, stdin -- and
+/// the characters either side close up: `$(printf '.\0.')` is `..`, and a
+/// script line `echo one <NUL> echo two` prints `one echo two`.
+pub fn drop_nuls(text: &mut String) {
+    if text.contains('\0') {
+        text.retain(|c| c != '\0');
+    }
 }
 
 /// The word after a here-document body has been assembled into a `Word`; expand
@@ -2372,6 +2386,29 @@ pub fn note_epipe(sh: &Shell, r: std::io::Result<()>) -> std::io::Result<()> {
 mod tests {
     fn run(src: &str) -> (i32, String, String) {
         crate::process::run_capturing(src)
+    }
+
+    /// A command substitution's NULs are dropped, as ash drops them, and
+    /// BEFORE the trailing newlines are: a NUL after the last one does not
+    /// keep it. `nul-bytes::Compare \x00 byte versus \x01 byte` grades the
+    /// first two lines.
+    #[test]
+    fn a_substitution_drops_its_nul_bytes() {
+        let (_, out, _) = run("s=$(printf '.\\000.'); echo ${#s}\n\
+             s=$(printf '\\000'); echo ${#s}\n\
+             s=$(printf 'a\\n\\000'); echo \"[$s]\"\n\
+             s=`printf 'b\\000c'`; echo \"[$s]\"");
+        assert_eq!(out, "2\n0\n[a]\n[bc]\n");
+    }
+
+    #[test]
+    fn drop_nuls_closes_up_the_text() {
+        let mut s = String::from("\0one \0\0two\0");
+        super::drop_nuls(&mut s);
+        assert_eq!(s, "one two");
+        let mut s = String::from("plain");
+        super::drop_nuls(&mut s);
+        assert_eq!(s, "plain");
     }
 
     /// A `/` name is DEFINED and never looked up, which is not the same as
