@@ -95,6 +95,7 @@ fn cli_mode_reads_json_commands_and_returns_json_lines() {
     assert_eq!(responses[5]["quit"], Json::Bool(true));
 }
 
+#[allow(clippy::expect_used, reason = "a seeding failure fails the test")]
 fn seed_cache(path: &std::path::Path) {
     // Scoped: the store takes an exclusive lock on its log, so it must be
     // closed before the binary under test opens the same file.

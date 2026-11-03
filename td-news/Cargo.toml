@@ -5,6 +5,9 @@ edition = "2021"
 description = "Timmy's News: an RSS and Atom reader in a td-ui window, td's news application"
 license = "MIT"
 
+[package.metadata.td-gate]
+clippy-all-targets = true
+
 [[bin]]
 name = "td-news"
 path = "src/main.rs"
