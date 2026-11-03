@@ -4550,8 +4550,12 @@ fn build_elevation_table() -> String {
 
 fn build_principals(sys: &SystemDef) -> String {
     let mut text = format!(
-        "td-principals-v1\nsession\t{UI_UID}\t{COMPOSITOR_RESERVED_UID}\t{BROKER_RESERVED_UID}\t{PORTAL_RESERVED_UID}\nnotebook\t{UI_UID}\t{NOTEBOOK_RESERVED_UID}\n"
+        "td-principals-v1\nsession\t{UI_UID}\t{COMPOSITOR_RESERVED_UID}\t{BROKER_RESERVED_UID}\t{PORTAL_RESERVED_UID}\n"
     );
+    // An active notebook needs its account, which only the desktop ships.
+    if sys.desktop() {
+        text.push_str(&format!("notebook\t{UI_UID}\t{NOTEBOOK_RESERVED_UID}\n"));
+    }
     let mut applications: Vec<&ShippedApplication> = sys.applications.iter().collect();
     applications.sort_by_key(|application| application.name);
     for application in applications {
@@ -17238,9 +17242,27 @@ mod server_tests {
             PORTAL_USER,
             AUDIO_USER,
             INSTALLER_USER,
+            NOTEBOOK_USER,
         ] {
             assert!(!passwd.contains(&format!("{user}:")), "{user}");
         }
+        // The image build's `td-firstboot check-principals`: the table must
+        // verify against the server's own accounts, so it carries no
+        // notebook row for an account the server does not ship.
+        let registry = principal_schema::Registry::parse(&build_principals(&SERVER)).unwrap();
+        registry
+            .verify_accounts(
+                &build_passwd(&SERVER),
+                &build_group(&SERVER),
+                &build_shadow(&SERVER),
+            )
+            .unwrap();
+        assert_eq!(registry.notebooks().count(), 0);
+        let desktop = principal_schema::Registry::parse(&build_principals(&SYSTEM)).unwrap();
+        assert_eq!(
+            desktop.notebooks().collect::<Vec<_>>(),
+            [(UI_UID, NOTEBOOK_RESERVED_UID)]
+        );
         let primary = SERVER
             .users
             .iter()

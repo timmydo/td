@@ -1652,10 +1652,13 @@ The system recipe generates the table for one of two profiles. The
 desktop (`system-x86-64`) is everything above. The server
 (`server-x86-64`) runs the same supervisor, inittab and boot path. Its
 accounts are the desktop's root, primary (UID 1000), profiler and
-OpenSSH privilege-separation accounts, without the compositor, broker,
-portal, audio or installer accounts. Its principal table still
+OpenSSH privilege-separation accounts, without the td-admin,
+td-admin-build, compositor, broker, portal, audio, installer or notebook
+accounts. Its principal table still
 reserves the primary session's identities, which the account preflight
-requires; no account holds them. Its table is the desktop's units
+requires; no account holds them. It has no notebook row: the preflight
+requires an active notebook's account (APPLICATIONS.md, the personal
+notebook), and the server ships none. Its table is the desktop's units
 restricted to what a headless machine needs: hostname, td-firstboot,
 rootcheck, the profiler and its evidence, netup, network, sshd and
 bootsuccess, plus the server's own metadata, cloud-metadata and
