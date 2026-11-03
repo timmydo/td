@@ -3260,13 +3260,22 @@ pub struct MappedRegion {
         // paired profile.
         assert_eq!(occurrences(input, "read_lid("), 1);
         let lids = input
-            .split_once("    for (path, mut file) in lids {\n")
+            .split_once("    for (path, mut file, device) in lids {\n")
             .unwrap()
             .1;
         assert!(lids.contains(
             "                let read = read_lid(&path, &mut file, target.as_ref(), bindings.as_ref());\n"
         ));
         assert!(input.contains("    let lids = open_lids(lids);\n"));
+        // Each reader, a lid's included, is retired once it returns, by its
+        // device's loss only when it ended Ok.
+        assert_eq!(
+            occurrences(
+                input,
+                "retire_reader(bindings.as_ref(), roster.as_ref(), device, read.is_ok());"
+            ),
+            2
+        );
         assert!(input.contains(
             "    let lid = lid_admitted(attention_enabled, connected.as_ref());\n    \
              let (paths, lids) = admit_lids(event_paths(input_dir)?, Path::new(SYSFS_INPUT), lid);\n"

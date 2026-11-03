@@ -6026,14 +6026,21 @@ and inaccessible to UID 993. Compositor startup skips permission-denied,
 missing, or removed-device nodes with one diagnostic per node. Other open
 errors fail startup, and an empty accessible roster still fails; it never
 changes permissions or admits an inaccessible device. All admitted handles
-are opened before any reader starts. A restart alone does not assign a new
-device: it needs trusted seat assignment as well. The running compositor
-keeps its fixed roster and has no input hotplug service. The nonempty roster
-check does not prove that a usable keyboard remains or that the attention
-chord is reachable; removing the assigned keyboard can deny that input
-path. Startup input counts are not an authentication-readiness claim.
-"Input hotplug (target)" below specifies the replacement for this fixed
-roster; until it lands, this paragraph is what ships.
+are opened before any reader starts. Each reader, a lid switch's included,
+has a roster entry naming its descriptor's inode and a device id unique for
+the generation, which no later device is given. A reader that ends performs
+its release, then its id leaves the seat's sets and its entry the roster; an
+end other than its device's loss (end of file or `ENODEV`, which is not
+reported as an error), and a loss whose release then fails, also retires the
+inode, for the poll "Input hotplug (target)" specifies; a lost node is gone,
+so retiring it costs nothing. A restart alone does not assign a new device:
+it needs trusted seat assignment as well. The running compositor keeps its
+fixed roster and has no input hotplug service. The nonempty roster check
+does not prove that a usable keyboard remains or that the attention chord is
+reachable; removing the assigned keyboard can deny that input path. Startup
+input counts are not an authentication-readiness claim. "Input hotplug
+(target)" below specifies the replacement for this fixed roster; until it
+lands, this paragraph is what ships.
 
 Only the root-paired stock compositor profile reserves Ctrl+Alt+Esc. The
 Escape press opens an opaque, built-in screen with no pending authorization
@@ -6282,14 +6289,15 @@ they never claim secure attention or use the trusted timestamp cutoff.
 
 ### Input hotplug (target)
 
-Not implemented yet. This subsection specifies how keyboards and
-pointers attached after boot become usable and how their removal is
-handled. The repository owner decided the two questions it raised
-("Decisions" at its end): a late keyboard has parity with a boot-time
-one, and root assigns late nodes through a new `[seat-watch]` unit. The
-increments below implement it in order, and it changes nothing above
-until they land. Until then the fixed startup roster above is what
-ships, and a node that appears after the boot oneshot stays root-owned.
+Increment 1 below has landed; the rest is not implemented yet. This
+subsection specifies how keyboards and pointers attached after boot
+become usable and how their removal is handled. The repository owner
+decided the two questions it raised ("Decisions" at its end): a late
+keyboard has parity with a boot-time one, and root assigns late nodes
+through a new `[seat-watch]` unit. The increments below implement it in
+order, and the rest changes nothing above until it lands. Until then the
+fixed startup roster above is what ships, and a node that appears after
+the boot oneshot stays root-owned.
 
 **What changes and what does not.** Assignment stays root's decision: a
 node is usable only once root has made it the compositor's, and the
@@ -6558,7 +6566,10 @@ single late node, because once root does, a generation restart admits
 every assigned node at startup.
 
 1. The compositor's shared roster with unique ids and reader retirement,
-   no behaviour change.
+   one diagnostic change. Landed: the fixed-roster paragraph above
+   describes it, and the change is that an unplug's `ENODEV` no longer
+   prints a read error. The roster entry's node name is added with the
+   poll, its first reader.
 2. The hotplug poll, probe completeness at startup and late, the
    in-lifetime rule, Q1's parity and the announcement, with
    the `UNSAFE.md` §6 sentence. On an image it is inert, since nothing

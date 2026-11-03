@@ -16,7 +16,7 @@ use crate::sys;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
@@ -1280,6 +1280,17 @@ impl KeyBindings {
     fn remove_pointer_device(&mut self, device: usize) {
         self.pointer_pressed.retain(|(owner, _)| *owner != device);
     }
+
+    /// A reader ended after its release: its id leaves every set, though
+    /// no later device is ever given it.
+    fn forget_device(&mut self, device: usize) {
+        self.attention_excluded.remove(&device);
+        self.pressed.retain(|(owner, _)| *owner != device);
+        self.consumed.retain(|(owner, _)| *owner != device);
+        self.forwarded.retain(|(owner, _)| *owner != device);
+        self.pointer_pending.remove(&device);
+        self.remove_pointer_device(device);
+    }
 }
 
 impl Event {
@@ -2192,6 +2203,7 @@ fn read_lid<T: InputTarget>(
             Ok(0) => return Ok(()),
             Ok(count) => count,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if device_lost(&error) => return Ok(()),
             Err(error) => return Err(format!("read input {}: {error}", path.display())),
         };
         filled = filled.saturating_add(read);
@@ -3324,6 +3336,101 @@ fn parse(bytes: &[u8]) -> Result<Event, String> {
     })
 }
 
+/// A read or an ioctl on an evdev device that is gone (`evdev_read`'s
+/// answer once `evdev_disconnect` has marked it dead).
+const ENODEV: i32 = 19;
+
+/// Whether an evdev read's error is its device's loss, which ends a reader
+/// as end of file does.
+fn device_lost(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(ENODEV)
+}
+
+/// The live readers of one generation (td-compositor/DESIGN.md, "Input
+/// hotplug"), lid readers included: each one's descriptor's inode and its
+/// device id. Ids are never reused within the generation, so bookkeeping
+/// keyed by a retired id never names a later device. A reader that ends by
+/// its device's loss frees its entry; any other end also retires its
+/// inode, in the same hold of this lock, so that node is not opened again
+/// until it is recreated. Never held with the bindings lock.
+#[derive(Default)]
+struct Roster {
+    entries: Vec<RosterEntry>,
+    retired: BTreeSet<u64>,
+    next_device: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RosterEntry {
+    inode: u64,
+    device: usize,
+}
+
+impl Roster {
+    /// Records a live reader of `inode`, answering its new device id.
+    fn admit(&mut self, inode: u64) -> Result<usize, String> {
+        let device = self.next_device;
+        self.next_device = device.checked_add(1).ok_or("input device ids exhausted")?;
+        self.entries.push(RosterEntry { inode, device });
+        Ok(device)
+    }
+
+    /// `device`'s reader ended, by its device's loss when `lost`.
+    fn end(&mut self, device: usize, lost: bool) {
+        let Some(at) = self.entries.iter().position(|entry| entry.device == device) else {
+            return;
+        };
+        let entry = self.entries.remove(at);
+        if !lost {
+            self.retired.insert(entry.inode);
+        }
+    }
+}
+
+/// What a reader's thread does once its reader returns: its id leaves the
+/// bindings' sets, then its entry leaves the roster, never under both
+/// locks. A reader that returned `Ok` ended by its device's loss; one
+/// whose release failed after that loss is retired too, which costs
+/// nothing, since the loss also removed the node.
+fn retire_reader(bindings: &Mutex<KeyBindings>, roster: &Mutex<Roster>, device: usize, lost: bool) {
+    match bindings.lock() {
+        Ok(mut bindings) => bindings.forget_device(device),
+        Err(_) => say_line("td-compositor: input bindings lock poisoned"),
+    }
+    match roster.lock() {
+        Ok(mut roster) => roster.end(device, lost),
+        Err(_) => say_line("td-compositor: input roster lock poisoned"),
+    }
+}
+
+/// Opened nodes with their descriptors' inodes, and then with their ids.
+type Opened<T> = Vec<(PathBuf, (T, u64))>;
+type Admitted<T> = Vec<(PathBuf, T, usize)>;
+
+/// Gives startup's opened readers their roster entries: the ordinary ones
+/// first, in roster order, then the lid switches.
+fn admit_startup<T>(
+    roster: &mut Roster,
+    devices: Opened<T>,
+    lids: Opened<T>,
+) -> Result<(Admitted<T>, Admitted<T>), String> {
+    let mut admit = |(path, (file, inode))| roster.admit(inode).map(|id| (path, file, id));
+    Ok((
+        devices
+            .into_iter()
+            .map(&mut admit)
+            .collect::<Result<_, _>>()?,
+        lids.into_iter().map(&mut admit).collect::<Result<_, _>>()?,
+    ))
+}
+
+/// Opens an input node, with its descriptor's inode.
+fn open_node(path: &Path) -> std::io::Result<(File, u64)> {
+    let file = File::open(path)?;
+    let inode = file.metadata()?.ino();
+    Ok((file, inode))
+}
+
 fn event_name(name: &str) -> bool {
     name.strip_prefix("event")
         .is_some_and(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
@@ -3361,7 +3468,7 @@ fn open_event_devices<T>(
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-                ) || error.raw_os_error() == Some(19) =>
+                ) || device_lost(&error) =>
             {
                 eprintln!(
                     "td-compositor: skipping unavailable input {}: {error}",
@@ -4012,6 +4119,7 @@ fn read_device<T: InputTarget>(
             Ok(0) => break Ok(()),
             Ok(count) => count,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if device_lost(&error) => break Ok(()),
             Err(error) => break Err(format!("read input {}: {error}", path.display())),
         };
         filled = filled.saturating_add(read);
@@ -4103,18 +4211,18 @@ fn absolute_axes(device: &File) -> Option<AbsoluteAxes> {
     AbsoluteAxes::declared(x, y)
 }
 
-/// The roster indices secure attention never selects or confirms with, each
+/// The device ids secure attention never selects or confirms with, each
 /// named once.
-fn attention_exclusions<T>(sysfs: &Path, devices: &[(PathBuf, T)]) -> BTreeSet<usize> {
+fn attention_exclusions<T>(sysfs: &Path, devices: &[(PathBuf, T, usize)]) -> BTreeSet<usize> {
     let mut excluded = BTreeSet::new();
-    for (device, (path, _)) in devices.iter().enumerate() {
+    for (path, _, device) in devices {
         if security_key_keyboard(sysfs, path) {
             eprintln!(
                 "td-compositor: {} shares a USB device with a FIDO interface; \
                  secure attention never selects or confirms with it",
                 path.display()
             );
-            excluded.insert(device);
+            excluded.insert(*device);
         }
     }
     excluded
@@ -4135,9 +4243,17 @@ pub fn start(
     };
     let lid = lid_admitted(attention_enabled, connected.as_ref());
     let (paths, lids) = admit_lids(event_paths(input_dir)?, Path::new(SYSFS_INPUT), lid);
-    let devices = open_event_devices(paths, |path| File::open(path))?;
+    let devices = open_event_devices(paths, open_node)?;
     let lids = open_lids(lids);
     let count = devices.len().saturating_add(lids.len());
+    let roster = Arc::new(Mutex::new(Roster::default()));
+    let (devices, lids) = admit_startup(
+        &mut *roster
+            .lock()
+            .map_err(|_| "input roster lock poisoned".to_string())?,
+        devices,
+        lids,
+    )?;
     // Decided once against the fixed roster, as admission is.
     let attention_excluded = if attention_enabled {
         attention_exclusions(Path::new(SYSFS_INPUT), &devices)
@@ -4177,7 +4293,7 @@ pub fn start(
             },
         })
     });
-    for (device, (path, mut file)) in devices.into_iter().enumerate() {
+    for (path, mut file, device) in devices {
         if attention_enabled {
             sys::input_monotonic_clock(&file)?;
         }
@@ -4214,6 +4330,7 @@ pub fn start(
         let label = path.display().to_string();
         let target = Arc::clone(&target);
         let bindings = Arc::clone(&bindings);
+        let roster = Arc::clone(&roster);
         thread::Builder::new()
             .name(format!(
                 "input-{}",
@@ -4223,7 +4340,7 @@ pub fn start(
             ))
             .spawn(move || {
                 let mut resync = move || resync_handle.as_ref().and_then(absolute_axes);
-                if let Err(error) = read_device(
+                let read = read_device(
                     &path,
                     &mut file,
                     device,
@@ -4231,23 +4348,27 @@ pub fn start(
                     bindings.as_ref(),
                     absolute,
                     &mut resync,
-                ) {
+                );
+                if let Err(error) = &read {
                     eprintln!("td-compositor: {error}");
                 }
+                retire_reader(bindings.as_ref(), roster.as_ref(), device, read.is_ok());
             })
             .map_err(|e| format!("spawn input reader for {label}: {e}"))?;
     }
-    for (path, mut file) in lids {
+    for (path, mut file, device) in lids {
         let label = path.display().to_string();
         let target = Arc::clone(&target);
         let bindings = Arc::clone(&bindings);
+        let roster = Arc::clone(&roster);
         thread::Builder::new()
             .name("input-lid".into())
             .spawn(move || {
                 let read = read_lid(&path, &mut file, target.as_ref(), bindings.as_ref());
-                if let Err(error) = read {
+                if let Err(error) = &read {
                     let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
                 }
+                retire_reader(bindings.as_ref(), roster.as_ref(), device, read.is_ok());
             })
             .map_err(|e| format!("spawn lid reader for {label}: {e}"))?;
     }
@@ -4263,10 +4384,10 @@ pub fn start(
 /// Opens the admitted lid switches. One that cannot be opened is reported
 /// and left out, as an unavailable input is: resume detection still sees
 /// the suspend a close would have preceded.
-fn open_lids(paths: Vec<PathBuf>) -> Vec<(PathBuf, File)> {
+fn open_lids(paths: Vec<PathBuf>) -> Vec<(PathBuf, (File, u64))> {
     let mut lids = Vec::with_capacity(paths.len());
     for path in paths {
-        match File::open(&path) {
+        match open_node(&path) {
             Ok(file) => {
                 let _ = writeln!(
                     std::io::stderr().lock(),
@@ -4299,6 +4420,136 @@ mod tests {
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn roster_ids_are_never_reused_and_only_a_failed_reader_retires() {
+        let mut roster = Roster::default();
+        let (devices, lids) = admit_startup(
+            &mut roster,
+            vec![
+                (PathBuf::from("/dev/input/event0"), ((), 40)),
+                (PathBuf::from("/dev/input/event2"), ((), 42)),
+            ],
+            vec![(PathBuf::from("/dev/input/event1"), ((), 41))],
+        )
+        .unwrap();
+        // Startup's ordinary readers take the first ids in roster order, as
+        // their indices did, and the lid switches the next.
+        assert_eq!(
+            devices.iter().map(|(_, _, id)| *id).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(lids, [(PathBuf::from("/dev/input/event1"), (), 2)]);
+        assert_eq!(roster.entries.len(), 3);
+        // A lost device frees its entry and retires nothing.
+        roster.end(0, true);
+        assert!(roster.retired.is_empty());
+        // Any other end retires the inode its descriptor named.
+        roster.end(2, false);
+        assert_eq!(roster.retired, BTreeSet::from([41]));
+        assert_eq!(
+            roster.entries,
+            [RosterEntry {
+                inode: 42,
+                device: 1
+            }]
+        );
+        // An id once given is never given again, and an unknown end is a
+        // no-op.
+        assert_eq!(roster.admit(40).unwrap(), 3);
+        roster.end(0, false);
+        assert_eq!(roster.retired, BTreeSet::from([41]));
+        roster.next_device = usize::MAX;
+        assert!(roster.admit(43).is_err());
+        assert_eq!(roster.entries.len(), 2);
+    }
+
+    #[test]
+    fn a_retired_reader_leaves_every_set_then_the_roster() {
+        let bindings = Mutex::new(KeyBindings {
+            attention_excluded: BTreeSet::from([4, 5]),
+            pressed: BTreeSet::from([(4, KEY_A), (5, KEY_A)]),
+            consumed: BTreeSet::from([(4, KEY_B)]),
+            forwarded: BTreeSet::from([(4, KEY_C), (5, KEY_C)]),
+            pointer_pending: BTreeSet::from([4]),
+            pointer_pressed: BTreeSet::from([(4, BTN_LEFT)]),
+            ..KeyBindings::default()
+        });
+        let roster = Mutex::new(Roster::default());
+        // Ids 0 to 5, id 4 the reader of inode 10.
+        for inode in 6..12 {
+            roster.lock().unwrap().admit(inode).unwrap();
+        }
+        retire_reader(&bindings, &roster, 4, false);
+        let held = bindings.lock().unwrap();
+        assert_eq!(held.attention_excluded, BTreeSet::from([5]));
+        assert_eq!(held.pressed, BTreeSet::from([(5, KEY_A)]));
+        assert!(held.consumed.is_empty());
+        assert_eq!(held.forwarded, BTreeSet::from([(5, KEY_C)]));
+        assert!(held.pointer_pending.is_empty());
+        assert!(held.pointer_pressed.is_empty());
+        drop(held);
+        {
+            let roster = roster.lock().unwrap();
+            assert_eq!(roster.retired, BTreeSet::from([10]));
+            assert_eq!(roster.entries.len(), 5);
+            assert!(roster.entries.iter().all(|entry| entry.device != 4));
+        }
+        // A lost device's reader leaves its sets and entry and retires
+        // nothing.
+        retire_reader(&bindings, &roster, 5, true);
+        assert!(bindings.lock().unwrap().attention_excluded.is_empty());
+        assert!(bindings.lock().unwrap().pressed.is_empty());
+        let roster = roster.lock().unwrap();
+        assert_eq!(roster.retired, BTreeSet::from([10]));
+        assert_eq!(roster.entries.len(), 4);
+    }
+
+    #[test]
+    fn a_reader_ends_lost_on_end_of_file_or_enodev_and_failed_otherwise() {
+        let seat = LockedSeat::open(&[]);
+        let read = |mut reader: &mut dyn Read| {
+            read_device(
+                Path::new("event-end"),
+                &mut reader,
+                0,
+                seat.target.as_ref(),
+                seat.bindings.as_ref(),
+                None,
+                &mut || None,
+            )
+        };
+        assert_eq!(read(&mut std::io::empty()), Ok(()));
+        assert_eq!(read(&mut Failing(ENODEV)), Ok(()));
+        assert!(read(&mut Failing(5)).is_err());
+        let lid = |code| {
+            read_lid(
+                Path::new("event-lid"),
+                &mut Failing(code),
+                seat.target.as_ref(),
+                seat.bindings.as_ref(),
+            )
+        };
+        assert_eq!(lid(ENODEV), Ok(()));
+        assert!(lid(5).is_err());
+        assert_eq!(
+            read_lid(
+                Path::new("event-lid"),
+                &mut std::io::empty(),
+                seat.target.as_ref(),
+                seat.bindings.as_ref(),
+            ),
+            Ok(())
+        );
+    }
+
+    struct Failing(i32);
+
+    impl Read for Failing {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(self.0))
         }
     }
 
@@ -5902,13 +6153,14 @@ mod tests {
         security_key(&tree, "1-8", "event11", &[]);
         assert!(tree.excluded("event10"));
         assert!(!tree.excluded("event11"));
-        let roster: Vec<(PathBuf, ())> = ["event5", "event6", "event9"]
+        let roster: Vec<(PathBuf, (), usize)> = ["event5", "event6", "event9"]
             .iter()
-            .map(|event| (Path::new("/dev/input").join(event), ()))
+            .zip([3, 4, 7])
+            .map(|(event, id)| (Path::new("/dev/input").join(event), (), id))
             .collect();
         assert_eq!(
             attention_exclusions(&tree.class(), &roster),
-            BTreeSet::from([0, 2])
+            BTreeSet::from([3, 7])
         );
     }
 
@@ -15041,7 +15293,8 @@ mod tests {
             None,
             &mut || None,
         );
-        assert!(lost.is_err());
+        // `ENODEV` is the device's loss, an end as end of file is.
+        assert_eq!(lost, Ok(()));
         let seen = delivered(&events);
         let press = |kind: &str, code: u16| {
             seen.iter()
