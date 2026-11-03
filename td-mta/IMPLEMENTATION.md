@@ -2467,11 +2467,12 @@ Offline commands hold the mail store lock. M13c activates the mailbox-access
 profile with bounded HTTPS/TLS workers, configured-origin Basic authentication,
 current revocation checks, fixed attempt limits, deadlines and live device
 control commands. Socket and process fixtures cover the activated transport.
-It returns only refusals (authenticated discovery is 503); JMAP is not yet
-advertised. Next: authenticated discovery/Core dispatch.
-Mail listing/retrieval/download integration and a real td-mail fixture
-follow in M14. DESIGN section 10 owns the initial framing restrictions
-and the enclosing driver's outstanding admission obligations.
+At M13c it returned only refusals (authenticated discovery was 503) and
+advertised no JMAP. Authenticated discovery and Core dispatch followed;
+the mailbox-access profile now advertises Core and the td-mail Mail
+profile (CONFORMANCE.md). Mail listing/retrieval/download integration and
+the real td-mail fixture are M14's. DESIGN section 10 owns the initial
+framing restrictions and the enclosing driver's outstanding admission obligations.
 
 M13d adds the inert `jmap_request` boundary with shared 16-byte token storage with
 in-place string decoding and no parser allocation. It validates the entire
@@ -2928,8 +2929,10 @@ real td-mail integration evidence and tested migration/restore procedure.
 
 ### Foreground direct receiving activation
 
-`serve --smtp-only --config PATH` now composes protected configuration,
-provisioned roots, initialized account/Inbox, cold quota reconciliation,
+This records the file-configured receiver. Its `serve --smtp-only --config
+PATH` form is removed; the PostgreSQL service in CONFIG.md ("Foreground
+PostgreSQL service") replaced it. That form composed protected
+configuration, provisioned roots, initialized account/Inbox, cold quota reconciliation,
 disposable ingress recovery, direct IPv4 bindings and the fixed receiving
 workers. CONFIG.md owns command scope, readiness and termination-signal behavior;
 STORAGE.md owns the selected data/ingress layout. The child-process fixture
@@ -2942,9 +2945,13 @@ The status command now offers --require-ready for supervisor probes, with
 exit zero only for the ready lifecycle and unchanged JSON. Next operational
 work is end-to-end supervisor qualification;
 DEPLOYMENT.md supplies systemd and high-port td-svc examples with their
-current readiness, orderly-stop and forced-termination limits. HTTPS/JMAP, gateway, reload,
-ACME, outgoing delivery
-and file logging remain unimplemented activation paths.
+current readiness, orderly-stop and forced-termination limits. The
+PostgreSQL service has since activated HTTPS/JMAP, relay delivery,
+database service logging (OBSERVABILITY.md) and ACME through the separate
+`td-mta acme` worker; serving drains and reloads when its managed
+certificate generation changes (ACME.md). It still refuses a gateway SMTP
+listener at startup, and other configuration changes still require a
+process restart (CONFIG.md).
 
 Prepared Core Session metadata now covers configured-origin URL templates,
 the single account and username, resource-limit projection and a deterministic

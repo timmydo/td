@@ -89,8 +89,10 @@ open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
 Native query/edit/file/dialog and decoded key/pointer/wheel control are explicit.
 Ordinary foreground invocation is implemented for experimental local
-`$EDITOR` use. GPU rendering, crash recovery and td-mail/jail integration
-remain unimplemented; keep backups of important files.
+`$EDITOR` use. GPU rendering and crash recovery remain unimplemented; keep
+backups of important files. td-mail does not run td-editor as `$EDITOR`: it
+composes in td-editor's document view embedded in its own window, and the
+`mail` package ships no editor.
 
 The optional `test-file-barrier` feature is a separate test editor, never a
 normal runtime option. The native gate builds it in an isolated directory
@@ -417,9 +419,8 @@ For a caller that passes filenames as literal arguments and waits for its
 child, set `$EDITOR` to the executable's absolute path. No wrapper or mode
 flag is needed. The process stays in the foreground until its window closes;
 it does not consume inherited stdin. Exit 0 includes explicit discard, not
-only saving. This does not complete td-mail composition: its current caller
-uses shell command construction and retains drafts but cannot submit mail.
-See DESIGN.md before attempting that integration.
+only saving. td-mail no longer launches an editor; this contract is for
+callers outside this tree. See DESIGN.md for its details.
 
 Try the actual window from a terminal in your Linux x86-64 Wayland session:
 
@@ -843,6 +844,7 @@ lists its driver, runtime-policy and DMA-BUF prerequisites. Direct GPU
 rendering for the dependency-free editor also needs a source-built graphics
 implementation; the software reference backend does not complete that goal.
 
-td-mail retains drafts and attachments in its persistent state directory
-after editor exit. Explicitly delete them when no longer needed. It still
-has no mail submission path; the design describes the remaining integration.
+td-mail retains drafts and attachments in its persistent state directory,
+and moves a sent draft to the sent directory beside it
+([td-mail/README.md](../td-mail/README.md)). Explicitly delete them when no
+longer needed.

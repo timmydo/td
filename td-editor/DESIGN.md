@@ -1338,8 +1338,9 @@ files. Duplicate paths/inodes select the existing tab without refreshing its
 baseline or replacing edits. With no paths, New creates one clean Untitled
 tab. Missing paths create empty dirty tabs without creating a disk file.
 Ordinary no-option/filename invocation uses this same experimental window;
-GPU integration remains a separate milestone, and of the td-mail jail
-integration only the in-jail acceptance test does.
+GPU integration remains a separate milestone. The in-jail td-mail
+acceptance test is moot: td-mail composes in the embedded document view
+and its package ships no editor (APPLICATIONS.md §W.5).
 
 The file window reuses the preview's transport, input dispatcher and
 bitmap renderer, with the window's theme and medium weight. It requires a
@@ -3134,8 +3135,7 @@ pathname as a quoted positional argument, a background thread reaping
 the child. td-mail no longer launches an editor: it composes in the
 embedded document view (see "Embedding the document view"), and its
 `editor` key is accepted and ignored. The contract stands for callers
-outside this tree. Local retention is td-mail's; a complete
-mail-composition workflow still needs submission.
+outside this tree. Local retention and submission are td-mail's.
 
 `src/compose.rs` creates mode-0600 `.eml` files inside a mode-0700 directory,
 using `$XDG_STATE_HOME/td-mail/drafts`, then `$HOME/.local/state/td-mail/drafts`.

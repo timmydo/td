@@ -6069,7 +6069,7 @@ credential write queued through `td-secret set`; I selects a queued system
 installation, K opens the key-management screen ("Login-key
 operations" below), and L locks the session ("Session lock and
 login-key entry" below, item 5); ENCRYPTION.md increment 8e adds S, the
-storage screen ("Storage operations" below), fixed but not yet
+storage screen ("Storage operations" below), which is
 implemented. Only one operation is selected per successfully
 opened and closed attention lifetime. Held keys, repeats and a second
 device pressing an already-held logical key cannot select an operation; a key held only by
