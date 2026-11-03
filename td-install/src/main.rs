@@ -8127,7 +8127,7 @@ mod tests {
     /// `#[warn(clippy::disallowed_methods)]` turns the deny into a warning and
     /// the preflight passes no `-D warnings` — review found it, an eighth
     /// spelling after the seven the scan was built for.
-    const LOWERS: [&str; 3] = ["allow(", "expect(", "warn("];
+    const LOWERS: &[&str] = &["allow(", "expect(", "warn("];
 
     /// The four spellings that can reach THIS lint: itself, the group it is
     /// in, the group that holds every clippy lint, and rustc's group that
@@ -8147,7 +8147,7 @@ mod tests {
     /// `#[allow(renamed_and_removed_lints, …)]`, leaving no diagnostic at
     /// all. So an alias reaches this lint today, and the residual risk is
     /// not only the clippy release that moves it into another group.
-    const REACHES: [&str; 4] = [
+    const REACHES: &[&str] = &[
         concat!("clippy::disallowed", "_method"),
         "clippy::style",
         "clippy::all",
@@ -8272,11 +8272,11 @@ mod tests {
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
     const COMPILED_FILES: &[Compiled] = &[
-        ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
+        ("main.rs", include_str!("main.rs"), MAIN_CHOKE),
         (
             "real_file.rs",
             include_str!("../../td-fs/src/real_file.rs"),
-            TD_FS_CHOKE.as_slice(),
+            TD_FS_CHOKE,
         ),
         (
             "gpt.rs",
@@ -8306,7 +8306,7 @@ mod tests {
         (
             "sha256.rs",
             include_str!("../../engine/src/sha256.rs"),
-            SHA256_CHOKE.as_slice(),
+            SHA256_CHOKE,
         ),
         (
             "protocol.rs",
@@ -8610,16 +8610,16 @@ mod tests {
     }
 
     /// `main.rs`'s one choke point, as the line under its allow reads.
-    const MAIN_CHOKE: [&str; 1] = ["mod paths {"];
+    const MAIN_CHOKE: &[&str] = &["mod paths {"];
 
     /// The engine hash's one, a path helper this crate compiles and never
     /// calls; it names its path like every other choke wrapper.
-    const SHA256_CHOKE: [&str; 1] = ["pub fn sha256_file(p: &Path) -> std::io::Result<String> {"];
+    const SHA256_CHOKE: &[&str] = &["pub fn sha256_file(p: &Path) -> std::io::Result<String> {"];
 
     /// td-fs's two, which are functions rather than a module: td-boot
     /// compiles that file too and has no `clippy.toml`, so the allow there is
     /// inert for it and load-bearing here.
-    const TD_FS_CHOKE: [&str; 2] = [
+    const TD_FS_CHOKE: &[&str] = &[
         "pub fn open_real_file(path: &Path, label: &str) -> io::Result<(File, Metadata)> {",
         "fn open_checked(path: &Path, expected: &Metadata, label: &str) -> io::Result<(File, Metadata)> {",
     ];
@@ -8864,10 +8864,10 @@ mod tests {
     /// `implementation` and `pub` of `public`; and a head rather than a line,
     /// since a declaration may be written across as many as it likes.
     fn declarations(plain: &str) -> Vec<(&'static str, &str)> {
-        const KEYWORDS: [&str; 5] = ["impl", "trait", "mod", "macro_rules!", "pub"];
+        const KEYWORDS: &[&str] = &["impl", "trait", "mod", "macro_rules!", "pub"];
         let ident = |c: char| c.is_alphanumeric() || c == '_';
         let mut out = Vec::new();
-        for keyword in KEYWORDS {
+        for &keyword in KEYWORDS {
             let mut from = 0usize;
             while let Some(at) = plain.get(from..).and_then(|rest| index_of(rest, keyword)) {
                 let start = from.saturating_add(at);
@@ -8912,7 +8912,7 @@ mod tests {
     /// A `use` is not among the keywords that reach this, because `pub use`
     /// is already refused as a non-`pub fn` export and a private one
     /// re-exports nothing.
-    const PINNED_ITEMS: [&str; 3] = [
+    const PINNED_ITEMS: &[&str] = &[
         "mod paths {",
         "trait NamePath<T> {",
         "impl<T> NamePath<T> for io::Result<T> {",
@@ -8927,7 +8927,7 @@ mod tests {
     /// `builder` NEUTRALISES the same literals instead, because it reads whole
     /// files and cannot refuse one; these short wrappers can afford the
     /// refusal, and refusing is the smaller thing to be right about.
-    const REFUSED_CHARS: [&str; 4] = ["'\u{22}'", "'\\\u{22}'", "'{'", "'}'"];
+    const REFUSED_CHARS: &[&str] = &["'\u{22}'", "'\\\u{22}'", "'{'", "'}'"];
 
     /// `unstringed`'S TOGGLE IS ONLY RIGHT IF THE REGION IS PLAIN, AND THE
     /// REGION IS ONLY THE ITEM IF NOTHING CUT IT SHORT.
@@ -12228,7 +12228,7 @@ mod tests {
     /// change a byte of it, such as setting a flag at a literal offset.
     #[test]
     fn the_raw_entry_point_is_pinned_whole() {
-        const WRAPPERS: [&str; 2] = [
+        const WRAPPERS: &[&str] = &[
             concat!(
                 "pubfnfree_loop(control:&File)->io::Result<usize>{",
                 "constLOOP_CTL_GET_FREE:usize=0x4c82;check(sys",
