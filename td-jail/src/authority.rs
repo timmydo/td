@@ -2007,9 +2007,9 @@ impl GrantBoundary {
                 Err(error) => return Err(error),
             }
         }
-        let reserved_mounts = mount_identities_for_roots(mountinfo, &reserved)?;
-        let home_mounts = mount_identities_for_roots(mountinfo, &home_roots)?;
         let allowed_home_mount = mount_identity_for_path(mountinfo, &state.real_home)?;
+        let reserved_mounts = grant_reserved_mounts(mountinfo, &reserved, &allowed_home_mount)?;
+        let home_mounts = mount_identities_for_roots(mountinfo, &home_roots)?;
         let allowed_home_mounts = mount_tree_identities(mountinfo, &state.real_home)?;
         let other_home_mounts =
             mount_identities_outside_allowed_home(mountinfo, &home_roots, &state.real_home)?;
@@ -2050,9 +2050,10 @@ impl GrantBoundary {
             bus_socket.to_path_buf(),
             canonical_candidate(fetch_runtime)?,
         ];
+        let allowed_home_mount = mount_identity_for_path(mountinfo, &state.real_home)?;
         Ok(Self {
-            reserved_mounts: mount_identities_for_roots(mountinfo, &reserved)?,
-            allowed_home_mount: mount_identity_for_path(mountinfo, &state.real_home)?,
+            reserved_mounts: grant_reserved_mounts(mountinfo, &reserved, &allowed_home_mount)?,
+            allowed_home_mount,
             allowed_home_mounts: mount_tree_identities(mountinfo, &state.real_home)?,
             reserved,
             home_roots: Vec::new(),
@@ -2283,6 +2284,38 @@ pub(crate) fn mount_identities_outside_allowed_home(
             identities.insert(mount_identity_for_path(mountinfo, &mountpoint)?);
         }
     }
+    Ok(identities)
+}
+
+/// The identities a grant may not alias: every mount below the reserved
+/// roots, except one showing a directory strictly below the allowed home
+/// that no reserved root's own identity overlaps. Such a mount is that
+/// home's data seen from a reserved tree, as root's projection of the
+/// human's `Downloads` into Firefox's home is, and reserves nothing a
+/// grant of the home child itself could not reach. What keeps the home's
+/// reserved state (`~/.td`) refused however it is mounted is that each
+/// reserved root's own identity always overlaps itself and so is never
+/// dropped; keeping a view of such a root's ancestor as well is only
+/// conservative.
+fn grant_reserved_mounts(
+    mountinfo: &str,
+    reserved: &[PathBuf],
+    home: &MountIdentity,
+) -> io::Result<BTreeSet<MountIdentity>> {
+    let anchors = reserved
+        .iter()
+        .map(|root| mount_identity_for_path(mountinfo, root))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut identities = mount_identities_for_roots(mountinfo, reserved)?;
+    identities.retain(|identity| {
+        let below_home = identity.device == home.device
+            && identity.root != home.root
+            && path_is_same_or_child(&identity.root, &home.root);
+        !below_home
+            || anchors
+                .iter()
+                .any(|anchor| mount_identities_overlap(identity, anchor))
+    });
     Ok(identities)
 }
 
@@ -3757,6 +3790,106 @@ mod tests {
             } else {
                 assert!(admitted.is_err());
             }
+        }
+    }
+
+    /// A personal application's grant of the human's `Downloads` is not
+    /// refused because root also projects that directory into Firefox's
+    /// home below the reserved `/var/lib/td`; the table is a stock boot's.
+    #[test]
+    fn a_projection_of_the_home_into_a_reserved_tree_does_not_reserve_it() {
+        let stock = "\
+23 24 0:19 / /run/td-volume ro,nosuid,nodev,noexec,relatime - btrfs none rw\n\
+22 2 7:0 / / ro,relatime - erofs /dev/loop0 ro\n\
+25 22 0:19 /@var /var rw,nosuid,nodev,relatime - btrfs none rw\n\
+24 22 0:22 / /run rw,relatime - tmpfs tmpfs rw,mode=755\n\
+21 22 0:18 / /tmp rw,relatime - tmpfs tmpfs rw\n\
+20 25 0:19 /@var/home/timmy/Downloads /var/home/timmy/Downloads rw,nosuid,nodev,relatime - btrfs none rw\n\
+33 25 0:19 /@var/home/timmy/Downloads /var/td-portal-files/1000/Downloads ro,nosuid,nodev,noexec,relatime,idmapped - btrfs none rw\n\
+34 25 0:19 /@var/lib/td/applications/65536/Opened /var/td-portal-files/1000/Opened rw,nosuid,nodev,noexec,relatime,idmapped - btrfs none rw\n\
+35 25 0:19 /@var/home/timmy/Downloads /var/lib/td/applications/65536/Downloads rw,nosuid,nodev,noexec,relatime,idmapped - btrfs none rw\n";
+        let home = Path::new("/var/home/timmy");
+        let reserved = [
+            home.join(".td/app"),
+            home.join(".td"),
+            home.join(".local/share/flatpak"),
+            PathBuf::from("/run"),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/var/lib/td"),
+        ];
+        let home_roots = [PathBuf::from("/var/home")];
+        let source = home.join("Downloads");
+        let admit = |mounts: &str| {
+            let allowed = mount_identity_for_path(mounts, home).unwrap();
+            let reserved_mounts = grant_reserved_mounts(mounts, &reserved, &allowed).unwrap();
+            require_grant_mount_identities(
+                &source,
+                &mount_tree_identities(mounts, &source).unwrap(),
+                &reserved_mounts,
+                &allowed,
+                &mount_identities_for_roots(mounts, &home_roots).unwrap(),
+                &mount_tree_identities(mounts, home).unwrap(),
+                &mount_identities_outside_allowed_home(mounts, &home_roots, home).unwrap(),
+            )
+        };
+        admit(stock).unwrap();
+        // Every reserved mount but the projection stays reserved, and the
+        // unfiltered set refuses the grant as the stock boot did.
+        let allowed = mount_identity_for_path(stock, home).unwrap();
+        let mut unfiltered = mount_identities_for_roots(stock, &reserved).unwrap();
+        let projection = MountIdentity {
+            device: "0:19".into(),
+            root: "/@var/home/timmy/Downloads".into(),
+        };
+        let error = require_grant_mount_identities(
+            &source,
+            &BTreeSet::from([projection.clone()]),
+            &unfiltered,
+            &allowed,
+            &mount_identities_for_roots(stock, &home_roots).unwrap(),
+            &mount_tree_identities(stock, home).unwrap(),
+            &mount_identities_outside_allowed_home(stock, &home_roots, home).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.ends_with("aliases a reserved mount identity 0:19:/@var/home/timmy/Downloads")
+        );
+        assert!(unfiltered.remove(&projection));
+        assert_eq!(
+            grant_reserved_mounts(stock, &reserved, &allowed).unwrap(),
+            unfiltered
+        );
+        // A reserved tree's view of the home's own reserved state or an
+        // ancestor of it (`.local` above the flatpak root), of the home
+        // itself or of anything outside it stays reserved, and a grant
+        // carrying such a mount below it is refused.
+        for shown in [
+            "/@var/home/timmy/.td",
+            "/@var/home/timmy/.td/app/mail",
+            "/@var/home/timmy/.local",
+            "/@var/home/timmy",
+            "/@var",
+            "/",
+        ] {
+            let aliased = format!(
+                "{stock}36 25 0:19 {shown} /var/lib/td/applications/65537/alias rw,nosuid,nodev - btrfs none rw\n\
+                 37 20 0:19 {shown} /var/home/timmy/Downloads/alias rw,nosuid,nodev - btrfs none rw\n"
+            );
+            let view = mount_identity_for_path(
+                &aliased,
+                Path::new("/var/lib/td/applications/65537/alias"),
+            )
+            .unwrap();
+            assert_eq!(view.root, Path::new(shown));
+            assert!(grant_reserved_mounts(&aliased, &reserved, &allowed)
+                .unwrap()
+                .contains(&view));
+            let error = admit(&aliased).unwrap_err().to_string();
+            assert!(
+                error.contains("aliases a reserved mount"),
+                "{shown}: {error}"
+            );
         }
     }
 

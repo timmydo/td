@@ -3289,7 +3289,18 @@ identity with every visible mount below the reserved trees and mounted home
 trees. An alias physically below the launching user's exact real-home root
 remains admissible. A reserved identity that strictly contains that exact
 home does not by itself reject a source physically below the home: the source
-does not carry its reserved siblings. Specific state identities and a nested
+does not carry its reserved siblings. Conversely, a mount below a reserved
+tree that shows a directory strictly below that exact home, and overlaps
+no reserved root's own identity, reserves nothing: it is the home's data
+seen from elsewhere, as root's projection of the human's `Downloads` into
+Firefox's home under `/var/lib/td` is, so a personal application's grant
+of `~/Downloads` is not refused for it. Such a view of the home itself,
+of anything outside it, or of anything overlapping the mount identity of
+a reserved root inside the home (`~/.td`, which td creates as a plain
+directory, or an ancestor of one) stays reserved. Where the home's
+identity is itself a filesystem root, every mount of that filesystem
+below a reserved tree that overlaps no reserved root is the home's in
+this sense. Specific state identities and a nested
 alias of the backing filesystem remain refused. This exception is
 intentionally home-specific. A non-home grant on that backing filesystem, or
 a home whose mount identity is itself the filesystem root, may be refused
