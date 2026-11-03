@@ -23,9 +23,9 @@ path = "src/bin/td-recipe-eval.rs"
 td-engine = { path = "../engine" }
 
 # Rust coding rules (AGENTS.md → "Rust code"): deny the panic/indexing/unsafe
-# surface for NEW code. Existing files carry a per-file `#![allow(...)]`
-# grandfather header (remove it when the file is cleaned). The cargo-test gate's clippy leg
-# runs `cargo clippy` over this crate offline; a denied lint reds the gate.
+# surface. No file in this crate carries a grandfathered allowance; do not add
+# one. The cargo-test gate's clippy leg runs `cargo clippy` over this crate
+# offline; a denied lint reds the gate.
 [lints.rust]
 # This crate has no unsafe and must stay that way — forbid (cannot be re-enabled
 # by an inner #![allow]).

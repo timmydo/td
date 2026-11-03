@@ -143,15 +143,6 @@ mod test_fonts;
 // unchanged.
 use td_engine::sha256;
 
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn die(msg: &str) -> ! {
     eprintln!("td-recipe-eval: {msg}");
     exit(2);
@@ -183,15 +174,6 @@ fn die_runner(msg: &str) -> ! {
     exit(2);
 }
 
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn lookup_or_die(stem: &str) -> td_recipe::types::Recipe {
     match catalog::lookup(stem) {
         Some(r) => r,
@@ -270,15 +252,6 @@ fn check_index(arg: Option<&String>) -> Option<usize> {
     Some(n)
 }
 
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {

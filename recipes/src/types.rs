@@ -9,16 +9,6 @@
 //! lowering bridge is unchanged (camelCase keys; an optional field is emitted iff
 //! it is present, matching boa's "keys present in the object literal").
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-
 use crate::application::ApplicationDeclaration;
 use crate::json::Json;
 use td_engine::launcher::LauncherDeclaration;
