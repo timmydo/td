@@ -295,8 +295,19 @@ fn unasked(events: &[Event], to: &str) -> usize {
         .count()
 }
 
+/// Why an unconfined workspace's call is the person's (DESIGN.md §8,
+/// Unconfined workspaces), as its card says.
+const UNCONFINED_WHY: &str = "this workspace is unconfined, and this call runs outside any jail with everything you have: a command, or a file tool reaching outside the workspace";
+
+/// Why an unconfined workspace's call judged contained does not run: a
+/// path it names resolves outside the workspace since (DESIGN.md §8).
+const MOVED_OUT: &str = "not run: a path this call names no longer resolves inside the workspace, as it did when it was judged; nothing was changed";
+
 /// Why a call that acts runs in `auto` mode, as its approval says.
 const AUTO: &str = "the workspace is in auto mode, where a call inside the jail runs";
+/// And in an unconfined workspace, where it keeps to the workspace (§8).
+const AUTO_CONTAINED: &str =
+    "the workspace is in auto mode, where a call that keeps to an unconfined workspace runs";
 
 /// Why a call a card waited on runs with no answer, its rules having
 /// changed so that none asks.
@@ -316,6 +327,10 @@ enum Judged<'a> {
         command: Option<&'a str>,
         acts: bool,
         repeated: bool,
+        /// An unconfined workspace's call that does not keep to its
+        /// roots (DESIGN.md §8, Unconfined workspaces): the person's in
+        /// either mode, no allow releasing it.
+        unconfined: bool,
     },
     Cross {
         op: crate::rules::Crossed,
@@ -383,6 +398,8 @@ const CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// What a call is answered with when its tool host says nothing by the
 /// call's deadline: the jail is torn down instead.
 const CALL_UNANSWERED: &str = "the tool host did not end this call by its deadline, so its jail was torn down; whatever the call did before then stays";
+/// And for an unconfined workspace's, whose host is ended instead (§8).
+const CALL_UNANSWERED_UNJAILED: &str = "the tool host did not end this call by its deadline, so it was ended; whatever the call did, or started, before then stays";
 
 /// What the log keeps of a call beside the result the model is shown
 /// (`Kind::ToolResult`).
@@ -412,6 +429,7 @@ pub fn run(
     id: &Id,
     create: Option<Role>,
     workspace: Option<Workspace>,
+    unconfined: bool,
 ) -> Result<(), String> {
     // The socketpair is standard input and output: one socket, taken as
     // a stream by duplicating the descriptor, which needs no `unsafe`.
@@ -425,6 +443,7 @@ pub fn run(
         id,
         create,
         workspace,
+        unconfined,
         crate::skills::dir(),
     )
 }
@@ -609,7 +628,7 @@ pub fn serve(
     id: &Id,
     create: Option<Role>,
 ) -> Result<(), String> {
-    serve_in(stream, state, id, create, None, None)
+    serve_in(stream, state, id, create, None, false, None)
 }
 
 /// `serve`, creating the conversation in `workspace`; a workspace is
@@ -621,12 +640,19 @@ pub fn serve_in(
     id: &Id,
     create: Option<Role>,
     workspace: Option<Workspace>,
+    unconfined: bool,
     skills: Option<PathBuf>,
 ) -> Result<(), String> {
-    let (conversation, load) = match (create, workspace) {
-        (Some(role), workspace) => Conversation::create(state, id, role, workspace, LOCK_WAIT)?,
-        (None, None) => Conversation::open(state, id, None, LOCK_WAIT)?,
-        (None, Some(_)) => return Err("a workspace is given only to a new conversation".into()),
+    let (conversation, load) = match (create, workspace, unconfined) {
+        (Some(role), Some(workspace), true) => {
+            Conversation::create_unconfined(state, id, role, workspace, LOCK_WAIT)?
+        }
+        (_, None, true) => return Err("only a workspace is made unconfined".into()),
+        (Some(role), workspace, false) => {
+            Conversation::create(state, id, role, workspace, LOCK_WAIT)?
+        }
+        (None, None, false) => Conversation::open(state, id, None, LOCK_WAIT)?,
+        (None, Some(_), _) => return Err("a workspace is given only to a new conversation".into()),
     };
     if conversation.meta().workspace.is_some() {
         if let Err(e) = crate::workspace::clear_specs(state, id) {
@@ -4024,6 +4050,7 @@ impl Session {
                 Err(why) => eprintln!("td-agent: directory grant not mounted: {why}"),
             }
         }
+        self.bench.set_unconfined(meta.unconfined);
         let policy = self
             .bench
             .prepare(workspace, &state, &meta.id, &shared, &meta.prepared)
@@ -4051,6 +4078,7 @@ impl Session {
             allowlist: &client.network_allowlist,
             system: client.system_for(workspace) && !self.system_revoked,
             host_commands: client.host_commands,
+            unconfined: meta.unconfined,
         };
         Ok(made(meta.created, Some(&place)))
     }
@@ -4110,7 +4138,7 @@ impl Session {
                 }
                 // Logged once the decision holds.
                 Ruling::Run(Some(why)) => allowed = Some(("rule", why)),
-                Ruling::Auto => allowed = Some(("mode", AUTO.into())),
+                Ruling::Auto => allowed = Some(("mode", self.auto_reason().into())),
                 Ruling::Run(None) | Ruling::Deny(_) => {}
             }
             // An interrupt that came with the decision, or before it: nothing
@@ -4180,11 +4208,15 @@ impl Session {
             }
             _ => None,
         };
+        // Outside any jail, a call that does not keep to the workspace's
+        // roots is judged as one that acts, and is the person's (§8).
+        let unconfined = self.bench.unconfined() && !self.bench.contained(&call);
         let judged = Judged::Host {
             name,
             command,
-            acts,
+            acts: acts || unconfined,
             repeated,
+            unconfined,
         };
         // The policy it was judged by: a background call's check below
         // can take a newer one.
@@ -4247,9 +4279,15 @@ impl Session {
         )? {
             return failed(why);
         }
+        // Judged contained before its card, it must still be: a link the
+        // human's wait gave time to move is not followed out (§8).
+        if self.bench.unconfined() && !unconfined && !self.bench.contained(&call) {
+            return failed(MOVED_OUT.into());
+        }
         let call = self.bench.with_digest(call);
         let mut client = match self.bench.take(&call, started) {
             Ok(client) => client,
+            Err(why) if self.bench.unconfined() => return failed(format!("the tool host: {why}")),
             Err(why) => return failed(format!("the jail: {why}")),
         };
         let id = match client.call(call.clone()) {
@@ -4264,7 +4302,8 @@ impl Session {
             ));
         }
         // What runs in the jail may stop or replace the tool host, so the
-        // call's time is kept here too, past which its jail is torn down.
+        // call's time is kept here too, past which its jail is torn down,
+        // or an unjailed host ended.
         let mut deadline = Instant::now() + crate::bench::limit(&call);
         let mut cancelled = false;
         loop {
@@ -4281,7 +4320,11 @@ impl Session {
             }
             if Instant::now() >= deadline {
                 drop(client);
-                return failed(CALL_UNANSWERED.into());
+                return failed(if self.bench.unconfined() {
+                    CALL_UNANSWERED_UNJAILED.into()
+                } else {
+                    CALL_UNANSWERED.into()
+                });
             }
             match client.next_reply(HOST_POLL) {
                 // A link's frame goes to its links, never here.
@@ -5398,7 +5441,7 @@ impl Session {
                         Some(Ruling::Auto)
                             if matches!(judged, Some(Judged::Host { .. } | Judged::Mcp { .. })) =>
                         {
-                            break Some(Err(Ok(("mode", AUTO.into()))))
+                            break Some(Err(Ok(("mode", self.auto_reason().into()))))
                         }
                         Some(Ruling::Auto) => {}
                         Some(Ruling::Card(_)) | None => {}
@@ -5469,13 +5512,14 @@ impl Session {
     /// no allow for it, or a repeated one puts it on a card; else it
     /// runs.
     fn ruling(&self, judged: &Judged<'_>) -> Ruling {
-        let (name, command, acts, repeated) = match *judged {
+        let (name, command, acts, repeated, unconfined) = match *judged {
             Judged::Host {
                 name,
                 command,
                 acts,
                 repeated,
-            } => (name, command, acts, repeated),
+                unconfined,
+            } => (name, command, acts, repeated, unconfined),
             // As a `shell` call is: a call of a program in the jail
             // (DESIGN.md §12, Approval).
             Judged::Mcp {
@@ -5561,7 +5605,13 @@ impl Session {
         let (rules, unread) = self.rules();
         match crate::rules::judge(&rules, &unread, name, command, acts) {
             crate::rules::Verdict::Deny(why) => Ruling::Deny(tools::visible(&why)),
+            crate::rules::Verdict::Ask(why) if unconfined => Ruling::Card(Some(format!(
+                "{UNCONFINED_WHY}; and {}",
+                tools::visible(&why)
+            ))),
             crate::rules::Verdict::Ask(why) => Ruling::Card(Some(tools::visible(&why))),
+            // Outside any jail, neither an allow nor the mode releases it.
+            _ if unconfined => Ruling::Card(Some(UNCONFINED_WHY.into())),
             _ if repeated => Ruling::Card(None),
             crate::rules::Verdict::Allow(why) => Ruling::Run(acts.then(|| tools::visible(&why))),
             // The table: in `auto` mode a call inside the jail runs.
@@ -5572,6 +5622,15 @@ impl Session {
             }
             crate::rules::Verdict::Table if acts => Ruling::Card(None),
             crate::rules::Verdict::Table => Ruling::Run(None),
+        }
+    }
+
+    /// Why a call `auto` mode runs does, as its approval says.
+    fn auto_reason(&self) -> &'static str {
+        if self.bench.unconfined() {
+            AUTO_CONTAINED
+        } else {
+            AUTO
         }
     }
 
@@ -5590,6 +5649,7 @@ impl Session {
             command,
             acts: true,
             repeated: false,
+            unconfined: false,
         };
         if let Ruling::Deny(why) = self.ruling(&judged) {
             return Ok(Err(ruled(&why)));
@@ -5703,6 +5763,12 @@ impl Session {
         let Some(workspace) = &meta.workspace else {
             return Ok(Err("no workspace".into()));
         };
+        if meta.unconfined {
+            return Ok(Err(
+                "this workspace is unconfined: its tools already reach every directory, so nothing is granted"
+                    .into(),
+            ));
+        }
         let Some((_, client)) = &self.setup else {
             return Ok(Err("workspace is not configured".into()));
         };

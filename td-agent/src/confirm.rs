@@ -45,6 +45,9 @@ pub enum Purpose {
     Remove(Id),
     /// How this conversation's turn `turn` resumes cold (DESIGN.md §14).
     Resume { conversation: Id, turn: u64 },
+    /// Making an unconfined workspace (DESIGN.md §8): a scratch one, or
+    /// in this folder.
+    Unconfine(Option<std::path::PathBuf>),
 }
 
 impl Purpose {
@@ -54,7 +57,7 @@ impl Purpose {
         match self {
             Self::Approve { conversation, call } => Some((conversation, *call)),
             Self::Resume { conversation, turn } => Some((conversation, *turn)),
-            Self::Delete(_) | Self::Admit { .. } | Self::Remove(_) => None,
+            Self::Delete(_) | Self::Admit { .. } | Self::Remove(_) | Self::Unconfine(_) => None,
         }
     }
 }
@@ -97,6 +100,9 @@ pub const REMOVE_TITLE: &str = "Delete and lose work";
 pub const REMOVE: &str = "Delete anyway";
 pub const ARCHIVE_TITLE: &str = "Archive and lose work";
 pub const ARCHIVE: &str = "Archive anyway";
+/// The unconfined workspace card's title and its action's label.
+pub const UNCONFINE_TITLE: &str = "Run without the jail";
+pub const UNCONFINE: &str = "Run without the jail";
 
 /// The open question: what it is for and the dialog.
 pub struct Confirm {
@@ -195,7 +201,8 @@ fn place(surface: Surface, body: Rect, purpose: &Purpose) -> Rect {
         Purpose::Approve { .. }
         | Purpose::Admit { .. }
         | Purpose::Remove(_)
-        | Purpose::Resume { .. } => (100, 24),
+        | Purpose::Resume { .. }
+        | Purpose::Unconfine(_) => (100, 24),
     };
     let scale = surface.scale.value();
     let pixels = |logical: usize| u32::try_from(logical.saturating_mul(scale)).unwrap_or(u32::MAX);
@@ -233,6 +240,39 @@ impl Confirm {
         let purpose = Purpose::Delete(id);
         let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
             .map_err(|e| format!("the deletion question: {e}"))?;
+        Ok(Self {
+            purpose,
+            dialog,
+            revision,
+        })
+    }
+
+    /// Asks whether a new conversation's tools are to run outside any
+    /// jail, in a scratch directory or in `folder` (DESIGN.md §8).
+    pub fn unconfine(
+        surface: Surface,
+        body: Rect,
+        folder: Option<std::path::PathBuf>,
+        revision: u64,
+    ) -> Result<Self, String> {
+        let place_line = match &folder {
+            None => "A new conversation in a scratch directory td-agent makes, whose tools run outside any jail.".to_string(),
+            Some(folder) => format!(
+                "A new conversation in {}, whose tools run outside any jail.",
+                crate::tools::visible(&folder.display().to_string())
+            ),
+        };
+        let details: Vec<&str> = vec![
+            &place_line,
+            "Its commands and file tools run as you, with everything you have: your whole home, your keys and credentials, td-agent's own key, state and sockets, your SSH agent and every host service. A command could answer its own cards through td-agent's control socket.",
+            "Every command, and every file tool that reaches outside the workspace, asks you on a card in either mode; no \u{201c}always allow\u{201d} releases one. Stopping a command cannot guarantee that what it started stops.",
+            "Choose this only for a model and a task you would trust with your account.",
+        ];
+        let model = Model::new(UNCONFINE_TITLE, UNCONFINE, &details, Act::Confirm, revision)
+            .map_err(|e| format!("the unconfined workspace question: {e}"))?;
+        let purpose = Purpose::Unconfine(folder);
+        let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
+            .map_err(|e| format!("the unconfined workspace question: {e}"))?;
         Ok(Self {
             purpose,
             dialog,
@@ -412,6 +452,7 @@ impl Confirm {
                 Purpose::Admit { .. } => "admit",
                 Purpose::Remove(_) => "remove",
                 Purpose::Resume { .. } => "compact first",
+                Purpose::Unconfine(_) => "run without the jail",
             },
         }
     }

@@ -618,6 +618,13 @@ impl Workspace {
     }
 }
 
+/// Whether `workspace` may run its tools outside any jail (DESIGN.md §8,
+/// Unconfined workspaces): an Empty or a Directory… one; a template's
+/// and a repository workspace are always jailed.
+pub fn may_be_unconfined(workspace: &Workspace) -> bool {
+    matches!(workspace, Workspace::Scratch | Workspace::Directory(_))
+}
+
 /// A shared directory (DESIGN.md §8): bound into every workspace,
 /// read-only unless the human made it writable.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -702,12 +709,9 @@ const EXECUTED: &[&str] = &[".cargo/bin", ".local/bin", "bin"];
 
 impl Places {
     /// From the environment, with td-agent's state at `state`, the
-    /// configured `root`, and the jail's `programs`.
-    pub fn from_env(
-        state: &Path,
-        root: &Path,
-        programs: &crate::jail::Programs,
-    ) -> Result<Self, String> {
+    /// configured `root`, and the `programs` td-agent runs: the jail's,
+    /// or without it td-agent and the td-txt it has.
+    pub fn from_env(state: &Path, root: &Path, programs: &[&Path]) -> Result<Self, String> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|home| home.is_absolute())
@@ -746,10 +750,7 @@ impl Places {
             root: resolved(root),
             config_homes: both(".config", "XDG_CONFIG_HOME"),
             data_homes: both(".local/share", "XDG_DATA_HOME"),
-            programs: [&programs.jail, &programs.agent, &programs.txt]
-                .into_iter()
-                .map(|program| resolved(program))
-                .collect(),
+            programs: programs.iter().map(|program| resolved(program)).collect(),
             path: std::env::var_os("PATH")
                 .map(|path| {
                     std::env::split_paths(&path)

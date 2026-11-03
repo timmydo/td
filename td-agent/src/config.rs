@@ -1059,6 +1059,7 @@ const KEYS: &[(&str, Use)] = &[
     ("fetch_concurrency", Use::Later(11)),
     ("max_background", Use::Read),
     ("host_commands", Use::Read),
+    ("unconfined_without_jail", Use::Read),
     ("background_output_bytes", Use::Read),
     ("auto_compact", Use::Read),
     ("compact_at", Use::Read),
@@ -1111,6 +1112,10 @@ pub struct Config {
     /// `fetch_interval` in seconds as the file gives it; none is
     /// `DEFAULT_FETCH_INTERVAL`.
     pub fetch_interval: Option<u64>,
+    /// `unconfined_without_jail`: when td-jail cannot run, Empty and
+    /// Directory… workspaces are made unconfined rather than none at all
+    /// (DESIGN.md §8, Unconfined workspaces); false by default.
+    pub unconfined_without_jail: bool,
 }
 
 /// The most background processes a conversation runs at once
@@ -1405,6 +1410,9 @@ pub const MAX_TEMPLATES: usize = 64;
 pub const EMPTY: &str = "Empty";
 pub const DIRECTORY: &str = "Directory\u{2026}";
 pub const NEW_TEMPLATE: &str = "New template\u{2026}";
+/// The chooser's unconfined built-ins (DESIGN.md §8).
+pub const EMPTY_UNCONFINED: &str = "Empty, unconfined";
+pub const DIRECTORY_UNCONFINED: &str = "Directory\u{2026}, unconfined";
 
 /// A template's name: visible, at most `MAX_TEMPLATE_NAME` bytes, and
 /// neither built-in's, ASCII case aside.
@@ -1418,16 +1426,19 @@ pub fn template_name(name: &str) -> Result<String, String> {
         ));
     }
     let lower = name.to_ascii_lowercase();
-    let reserved = [
+    const RESERVED: &[&str] = &[
         "empty",
         "directory\u{2026}",
         "directory...",
         "new template\u{2026}",
         "new template...",
+        "empty, unconfined",
+        "directory\u{2026}, unconfined",
+        "directory..., unconfined",
     ];
-    if reserved.contains(&lower.as_str()) {
+    if RESERVED.contains(&lower.as_str()) {
         return Err(format!(
-            "no template may be named {name:?}: the chooser lists {EMPTY}, {DIRECTORY} and {NEW_TEMPLATE} itself"
+            "no template may be named {name:?}: the chooser lists {EMPTY}, {DIRECTORY}, {EMPTY_UNCONFINED}, {DIRECTORY_UNCONFINED} and {NEW_TEMPLATE} itself"
         ));
     }
     Ok(name.to_string())
@@ -2195,6 +2206,12 @@ pub fn parse(text: &str) -> Result<Config, String> {
             _ => return Err(cold_resume_refused(value)),
         };
     }
+    if let Some(value) = table.get("unconfined_without_jail") {
+        config.unconfined_without_jail = match value {
+            Toml::Bool(value) => *value,
+            _ => return Err("`unconfined_without_jail` must be a boolean".into()),
+        };
+    }
     if let Some(value) = table.get("host_commands") {
         config.client.host_commands = match value {
             Toml::Bool(value) => *value,
@@ -2251,6 +2268,7 @@ mod tests {
     fn an_empty_or_missing_configuration_is_every_default() {
         assert_eq!(parse("").unwrap(), Config::default());
         assert_eq!(Config::default().mode, Mode::Auto);
+        assert!(!Config::default().unconfined_without_jail);
         let client = Config::default().client;
         assert_eq!(client.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(client.reasoning_effort, "medium");
@@ -2275,6 +2293,14 @@ mod tests {
     fn the_mode_is_read_and_checked() {
         assert_eq!(parse("mode = \"ask\"").unwrap().mode, Mode::Ask);
         assert_eq!(parse("mode = \"auto\"").unwrap().mode, Mode::Auto);
+        assert!(
+            parse("unconfined_without_jail = true")
+                .unwrap()
+                .unconfined_without_jail
+        );
+        assert!(parse("unconfined_without_jail = \"yes\"")
+            .unwrap_err()
+            .contains("must be a boolean"));
         let e = parse("mode = \"yolo\"").unwrap_err();
         assert!(e.contains("`mode`"), "{e}");
         assert!(parse("mode = 1").unwrap_err().contains("mode"));
@@ -3729,7 +3755,12 @@ mod tests {
         assert!(parse(&many).unwrap_err().contains("at most"));
         assert!(template_name(&"x".repeat(MAX_TEMPLATE_NAME)).is_ok());
         assert!(template_name(&"x".repeat(MAX_TEMPLATE_NAME + 1)).is_err());
-        for reserved in ["New template\u{2026}", "new template..."] {
+        for reserved in [
+            "New template\u{2026}",
+            "new template...",
+            "Empty, unconfined",
+            "directory..., unconfined",
+        ] {
             assert!(template_name(reserved)
                 .unwrap_err()
                 .contains("New template"));

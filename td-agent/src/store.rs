@@ -876,6 +876,11 @@ pub struct Meta {
     /// What it works in (DESIGN.md §7), fixed when it is created; null
     /// for a conversation with none.
     pub workspace: Option<Workspace>,
+    /// Its tools run outside any jail (DESIGN.md §8, Unconfined
+    /// workspaces): the human's choice at its creation, fixed then; only
+    /// an Empty or a Directory… workspace is. Absent and false in a meta
+    /// written before.
+    pub unconfined: bool,
     /// The human archived it (DESIGN.md §7): the window starts no
     /// process for it and routes no message to it until unarchived. Only
     /// the window writes it; absent and false in a meta written before.
@@ -932,6 +937,7 @@ impl Meta {
             ("routing".into(), or_null(&self.routing)),
             ("archived".into(), Json::Bool(self.archived)),
             ("removed".into(), Json::Bool(self.removed)),
+            ("unconfined".into(), Json::Bool(self.unconfined)),
             (
                 "directory_exposures".into(),
                 Json::Arr(
@@ -1025,6 +1031,25 @@ impl Meta {
             removed: match value.get("removed") {
                 None => false,
                 Some(removed) => removed.as_bool().ok_or("meta's removed is not a boolean")?,
+            },
+            unconfined: match value.get("unconfined") {
+                None => false,
+                Some(unconfined) => {
+                    let unconfined = unconfined
+                        .as_bool()
+                        .ok_or("meta's unconfined is not a boolean")?;
+                    let may = value
+                        .get("workspace")
+                        .and_then(|workspace| Workspace::from_json(workspace).ok())
+                        .is_some_and(|workspace| crate::workspace::may_be_unconfined(&workspace));
+                    if unconfined && !may {
+                        return Err(
+                            "meta is unconfined, but only an Empty or a Directory\u{2026} workspace may be"
+                                .into(),
+                        );
+                    }
+                    unconfined
+                }
             },
             tracked: match value.get("tracked") {
                 None => Vec::new(),
@@ -2492,7 +2517,7 @@ impl Conversation {
         create: Option<Role>,
         wait: Duration,
     ) -> Result<(Self, Load), String> {
-        Self::open_as(state, id, create.map(|role| (role, None)), wait)
+        Self::open_as(state, id, create.map(|role| (role, None, false)), wait)
     }
 
     /// Creates conversation `id` as `role`, working in `workspace`, and
@@ -2504,13 +2529,32 @@ impl Conversation {
         workspace: Option<Workspace>,
         wait: Duration,
     ) -> Result<(Self, Load), String> {
-        Self::open_as(state, id, Some((role, workspace)), wait)
+        Self::open_as(state, id, Some((role, workspace, false)), wait)
+    }
+
+    /// `create`, its tools run outside any jail (DESIGN.md §8,
+    /// Unconfined workspaces): only an Empty or a Directory… workspace
+    /// may be.
+    pub fn create_unconfined(
+        state: &StateDir,
+        id: &Id,
+        role: Role,
+        workspace: Workspace,
+        wait: Duration,
+    ) -> Result<(Self, Load), String> {
+        if !crate::workspace::may_be_unconfined(&workspace) {
+            return Err(format!(
+                "a {} workspace is always jailed; only Empty and Directory\u{2026} may be unconfined",
+                workspace.label()
+            ));
+        }
+        Self::open_as(state, id, Some((role, Some(workspace), true)), wait)
     }
 
     fn open_as(
         state: &StateDir,
         id: &Id,
-        create: Option<(Role, Option<Workspace>)>,
+        create: Option<(Role, Option<Workspace>, bool)>,
         wait: Duration,
     ) -> Result<(Self, Load), String> {
         let dir = state.conversation(id);
@@ -2522,9 +2566,10 @@ impl Conversation {
         }
         let lock = lock_conversation(&dir, wait)?;
         let meta = match create {
-            Some((role, workspace)) => {
+            Some((role, workspace, unconfined)) => {
                 let meta = Meta {
                     routing: None,
+                    unconfined,
                     id: id.clone(),
                     role,
                     title: role.first_title().to_string(),
@@ -3368,6 +3413,67 @@ pub mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!cut.exists());
+    }
+
+    /// An unconfined workspace is fixed in the meta at creation, an Empty
+    /// or a Directory… one alone; a meta written before reads as jailed.
+    #[test]
+    fn an_unconfined_workspace_is_recorded_and_only_scratch_or_directory() {
+        let scratch = Scratch::new("unconfined");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let workspace = Workspace::Directory("/home/u/notes".into());
+        let (conversation, _) = Conversation::create_unconfined(
+            &state,
+            &id,
+            Role::Conversation,
+            workspace.clone(),
+            LOCK_WAIT,
+        )
+        .unwrap();
+        assert!(conversation.meta().unconfined);
+        drop(conversation);
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert!(conversation.meta().unconfined);
+        assert_eq!(conversation.meta().workspace, Some(workspace));
+        drop(conversation);
+        let template = Id::random().unwrap();
+        let refused = Conversation::create_unconfined(
+            &state,
+            &template,
+            Role::Conversation,
+            Workspace::Template("notes".into()),
+            LOCK_WAIT,
+        )
+        .err()
+        .unwrap();
+        assert!(refused.contains("always jailed"), "{refused}");
+        assert!(!state.conversation(&template).exists());
+        // A meta with no `unconfined` is a jailed one's.
+        let mut json = Meta::from_json(
+            &td_json::parse(
+                &std::fs::read_to_string(state.conversation(&id).join("meta")).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .to_json();
+        if let Json::Obj(fields) = &mut json {
+            fields.retain(|(name, _)| name != "unconfined");
+        }
+        assert!(!Meta::from_json(&json).unwrap().unconfined);
+        // Nor is a meta read unconfined with any other kind.
+        if let Json::Obj(fields) = &mut json {
+            fields.retain(|(name, _)| name != "workspace");
+            fields.push(("unconfined".into(), Json::Bool(true)));
+            fields.push((
+                "workspace".into(),
+                Workspace::Template("notes".into()).to_json(),
+            ));
+        }
+        assert!(Meta::from_json(&json)
+            .unwrap_err()
+            .contains("only an Empty"));
     }
 
     /// A workspace is fixed in the meta at creation, and a conversation's

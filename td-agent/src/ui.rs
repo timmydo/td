@@ -303,6 +303,8 @@ pub struct Row {
     pub paused: bool,
     /// What it works in; the list groups conversations by workspace.
     pub workspace: Option<Workspace>,
+    /// Its tools run outside any jail (DESIGN.md §8): the list marks it.
+    pub unconfined: bool,
     /// The human archived it: the list hides it unless archived ones
     /// show, and it opens only once unarchived.
     pub archived: bool,
@@ -331,6 +333,11 @@ fn fold_key(item: &Item) -> Item {
 /// How soon a second press is a double press, which starts one
 /// conversation, not two.
 const DOUBLE_PRESS: Duration = Duration::from_millis(400);
+
+/// What the status row says of an unconfined workspace, and what the
+/// list puts after its conversations' titles (DESIGN.md §4, §8).
+pub const UNCONFINED_STATUS: &str = "unconfined: no jail";
+pub const UNCONFINED_MARK: &str = "[no jail]";
 
 /// Monochrome symbols keep the state small without needing emoji fonts.
 fn state_label(state: &str, title: &str) -> String {
@@ -443,10 +450,11 @@ pub enum Request {
     /// Start a new conversation with no workspace, when none can be made.
     New,
     /// Start a new conversation in a scratch workspace: the Empty
-    /// template.
-    NewScratch,
-    /// Start a new conversation in this directory, once admitted.
-    NewIn(PathBuf),
+    /// template; unconfined when it says so (DESIGN.md §8).
+    NewScratch(bool),
+    /// Start a new conversation in this directory, once admitted;
+    /// unconfined when it says so.
+    NewIn(PathBuf, bool),
     /// Start a new conversation from the configured template named.
     NewFrom(String),
     /// Keep the template from the template dialog, in place of the one
@@ -957,6 +965,11 @@ pub struct App {
     /// Why no workspace can be made, when none can: said at once, before
     /// a directory is chosen.
     no_workspaces: Option<String>,
+    /// Why there is no jail, when only unconfined workspaces can be made
+    /// (DESIGN.md §8, `unconfined_without_jail`).
+    jailless: Option<String>,
+    /// The directory chooser is choosing an unconfined workspace's folder.
+    chooser_unconfined: bool,
     /// The open workspace card's conversation and what its trust mark
     /// said when it was read: what its chord asks for.
     card_trust: Option<(Id, crate::card::Trust)>,
@@ -1141,6 +1154,8 @@ impl App {
                 .filter(|home| home.is_absolute())
                 .unwrap_or_else(|| PathBuf::from("/")),
             no_workspaces: None,
+            jailless: None,
+            chooser_unconfined: false,
             confirm: None,
             confirm_revision: 0,
             cards: Vec::new(),
@@ -1281,6 +1296,15 @@ impl App {
         self.notes
             .as_ref()
             .filter(|panel| panel.name() == crate::notes::WORKSPACE_CARD)
+    }
+
+    /// Whether the open conversation's workspace is unconfined
+    /// (DESIGN.md §8).
+    fn unconfined(&self) -> bool {
+        self.active
+            .as_ref()
+            .and_then(|id| self.rows.iter().find(|r| &r.id == id))
+            .is_some_and(|row| row.unconfined)
     }
 
     /// The open conversation's repository workspace, if it has one.
@@ -1441,6 +1465,14 @@ impl App {
         .filter(|(text, _)| !text.is_empty())
         .map(|(text, rank)| part(text.to_string(), rank))
         .collect();
+        // That no jail holds its tools, kept as long as the mode is.
+        if self.unconfined() {
+            parts.push(StatusPart {
+                text: UNCONFINED_STATUS.to_string(),
+                rank: 1,
+                kind: StatusKind::Other,
+            });
+        }
         // The mode and the network policy before the model, and kept
         // after it, as they say what runs unasked.
         parts.push(StatusPart {
@@ -1672,6 +1704,13 @@ impl App {
     /// Why no workspace can be made, or none when they can.
     pub fn set_no_workspaces(&mut self, why: Option<String>) {
         self.no_workspaces = why;
+        self.refresh_list();
+    }
+
+    /// Why there is no jail when only unconfined Empty and Directory…
+    /// workspaces can be made (DESIGN.md §8), or none when the jail runs.
+    pub fn set_jailless(&mut self, why: Option<String>) {
+        self.jailless = why;
         self.refresh_list();
     }
 
@@ -3665,9 +3704,14 @@ impl App {
                     children: under,
                     expanded: open && under,
                 });
+                let label = state_label(self.conversation_state(row), &row.title);
                 labels.insert(
                     conversation,
-                    state_label(self.conversation_state(row), &row.title),
+                    if row.unconfined {
+                        format!("{label} {UNCONFINED_MARK}")
+                    } else {
+                        label
+                    },
                 );
                 items.insert(conversation, item);
                 if !open {
@@ -3853,7 +3897,22 @@ impl App {
                 ));
                 None
             }
-            (None, Group::Empty) => Some(Request::NewScratch),
+            (None, Group::Empty) if self.jailless.is_some() => {
+                self.ask_unconfine(None);
+                None
+            }
+            (None, Group::Directory) if self.jailless.is_some() => {
+                self.open_chooser_for(true);
+                None
+            }
+            (None, Group::Template(_)) if self.jailless.is_some() => {
+                self.note(format!(
+                    "a template's workspace is always jailed, and there is no jail: {}",
+                    self.jailless.clone().unwrap_or_default()
+                ));
+                None
+            }
+            (None, Group::Empty) => Some(Request::NewScratch(false)),
             (None, Group::Directory) => {
                 self.open_chooser();
                 None
@@ -4129,6 +4188,7 @@ impl App {
                     // when there is room (`offer`).
                     confirm::Purpose::Approve { .. } | confirm::Purpose::Resume { .. } => "the window is now too small for the card, which waits until there is room for it: nothing was decided".to_string(),
                     confirm::Purpose::Delete(_) => "the window is now too small for the question, which is closed: nothing was deleted".to_string(),
+                    confirm::Purpose::Unconfine(_) => "the window is now too small for the question, which is closed: no conversation was started".to_string(),
                     // Asked again when there is room (`offer`), which says
                     // nothing more meanwhile.
                     confirm::Purpose::Remove(id) => {
@@ -5517,6 +5577,24 @@ impl App {
             self.requests.push(Request::New);
             return self.touch();
         }
+        let unconfined = [
+            (
+                crate::config::EMPTY_UNCONFINED.to_string(),
+                "scratch, no jail".to_string(),
+            ),
+            (
+                crate::config::DIRECTORY_UNCONFINED.to_string(),
+                "folder, no jail".to_string(),
+            ),
+        ];
+        if let Some(why) = &self.jailless {
+            let note = format!(
+                "there is no jail ({}), so a workspace is unconfined: its tools run with everything you have",
+                crate::tools::visible(why)
+            );
+            let opened = Picker::templates(self.surface, body(self.surface), &unconfined, &note);
+            return self.show_picker(opened, Picking::Template);
+        }
         let mut rows = vec![
             (crate::config::EMPTY.to_string(), "scratch".to_string()),
             (crate::config::DIRECTORY.to_string(), "folder".to_string()),
@@ -5525,6 +5603,7 @@ impl App {
             let meta = if *repos { "repositories" } else { "scratch" };
             (name.clone(), meta.to_string())
         }));
+        rows.extend(unconfined);
         rows.push((
             crate::config::NEW_TEMPLATE.to_string(),
             "make one".to_string(),
@@ -5705,12 +5784,19 @@ impl App {
     /// does: modal over the window's body, on the folder it last chose
     /// from, else the home directory.
     fn open_chooser(&mut self) {
+        self.open_chooser_for(false);
+    }
+
+    /// `open_chooser`, for an unconfined workspace's folder when
+    /// `unconfined` says so (DESIGN.md §8).
+    fn open_chooser_for(&mut self, unconfined: bool) {
         if self.modal() {
             return;
         }
         if let Some(why) = self.no_workspaces.clone() {
             return self.note(why);
         }
+        self.chooser_unconfined = unconfined;
         self.cancel_pointer();
         self.menu.dismiss();
         // Where it last chose from, else the home directory, else the
@@ -5777,8 +5863,19 @@ impl App {
                 if let Some(parent) = folder.parent() {
                     self.chooser_start = parent.to_path_buf();
                 }
-                self.close_chooser();
-                self.requests.push(Request::NewIn(folder));
+                if std::mem::take(&mut self.chooser_unconfined) {
+                    // Straight on to its card, before a waiting one.
+                    self.chooser = None;
+                    self.apply_focus();
+                    self.touch();
+                    self.ask_unconfine(Some(folder));
+                    if self.confirm.is_none() {
+                        self.offer();
+                    }
+                } else {
+                    self.close_chooser();
+                    self.requests.push(Request::NewIn(folder, false));
+                }
             }
         }
     }
@@ -5835,7 +5932,12 @@ impl App {
             crate::picker::Reply::Closed => self.close_picker(),
             crate::picker::Reply::Chosen(name) => {
                 let picking = self.picking;
-                let onward = [crate::config::DIRECTORY, crate::config::NEW_TEMPLATE];
+                let onward = [
+                    crate::config::DIRECTORY,
+                    crate::config::NEW_TEMPLATE,
+                    crate::config::EMPTY_UNCONFINED,
+                    crate::config::DIRECTORY_UNCONFINED,
+                ];
                 if picking == Picking::Edit
                     || (picking == Picking::Template && onward.contains(&name.as_str()))
                 {
@@ -5854,8 +5956,22 @@ impl App {
                     }
                     Picking::Model => self.choose(Some(name), self.wanted().1),
                     Picking::Template if name == crate::config::EMPTY => {
-                        self.requests.push(Request::NewScratch);
+                        self.requests.push(Request::NewScratch(false));
                         self.touch();
+                    }
+                    // Its card first: running without the jail is the
+                    // person's decision, made knowing what it gives.
+                    Picking::Template if name == crate::config::EMPTY_UNCONFINED => {
+                        self.ask_unconfine(None);
+                        if self.confirm.is_none() {
+                            self.offer();
+                        }
+                    }
+                    Picking::Template if name == crate::config::DIRECTORY_UNCONFINED => {
+                        self.open_chooser_for(true);
+                        if self.chooser.is_none() {
+                            self.offer();
+                        }
                     }
                     // Straight on to the folder chooser: a card that waited
                     // behind the picker waits behind the chooser too, rather
@@ -5910,6 +6026,31 @@ impl App {
             return self.note("no conversation is open to delete");
         };
         self.ask_delete(id);
+    }
+
+    /// Asks whether to make an unconfined workspace (DESIGN.md §8), a
+    /// scratch one or in `folder`: its `Run without the jail` starts it.
+    fn ask_unconfine(&mut self, folder: Option<PathBuf>) {
+        if self.modal() {
+            return;
+        }
+        self.cancel_pointer();
+        self.menu.dismiss();
+        self.confirm_revision = self.confirm_revision.wrapping_add(1);
+        match Confirm::unconfine(
+            self.surface,
+            body(self.surface),
+            folder,
+            self.confirm_revision,
+        ) {
+            Ok(confirm) => {
+                self.confirm = Some(confirm);
+                self.card_shown = Some(Instant::now());
+                self.apply_focus();
+                self.touch();
+            }
+            Err(e) => self.note(e),
+        }
     }
 
     /// Asks whether to delete conversation `id`, open or not, as its row
@@ -5996,6 +6137,7 @@ impl App {
                 | confirm::Purpose::Admit { .. }
                 | confirm::Purpose::Remove(_)
                 | confirm::Purpose::Resume { .. }
+                | confirm::Purpose::Unconfine(_)
         ) && self
             .card_shown
             .is_some_and(|shown| shown.elapsed() < self.settle);
@@ -6029,7 +6171,7 @@ impl App {
                     confirm::Purpose::Admit { template, .. } => self.note(format!(
                         "no conversation from template {template:?}: its remotes were not admitted"
                     )),
-                    confirm::Purpose::Delete(_) => {}
+                    confirm::Purpose::Delete(_) | confirm::Purpose::Unconfine(_) => {}
                     confirm::Purpose::Remove(id) => self.answer_removal(id, false),
                     confirm::Purpose::Resume { conversation, turn } => {
                         self.resume(conversation, turn, crate::protocol::Resumed::Stop)
@@ -6044,6 +6186,13 @@ impl App {
             confirm::Reply::Confirmed(confirm::Purpose::Delete(id), _) => {
                 self.close_confirm();
                 self.requests.push(Request::Delete(id));
+            }
+            confirm::Reply::Confirmed(confirm::Purpose::Unconfine(folder), _) => {
+                self.close_confirm();
+                self.requests.push(match folder {
+                    None => Request::NewScratch(true),
+                    Some(folder) => Request::NewIn(folder, true),
+                });
             }
             confirm::Reply::Confirmed(confirm::Purpose::Approve { conversation, call }, act) => {
                 self.decide(conversation, call, Some(act));
@@ -7012,6 +7161,7 @@ pub mod tests {
             state: RowState::Closed,
             paused: false,
             workspace: None,
+            unconfined: false,
             archived: false,
         }
     }
@@ -9888,7 +10038,7 @@ pub mod tests {
         press(&mut app, Group::Template("td".into()));
         assert_eq!(app.take_requests(), [Request::NewFrom("td".into())]);
         press(&mut app, Group::Empty);
-        assert_eq!(app.take_requests(), [Request::NewScratch]);
+        assert_eq!(app.take_requests(), [Request::NewScratch(false)]);
         press(&mut app, Group::Directory);
         assert!(app.chooser().is_some());
         key(&mut app, "Escape");
@@ -11807,6 +11957,133 @@ pub mod tests {
         assert!(app.notice().unwrap().contains("/srv/git/td"));
     }
 
+    /// An unconfined workspace (DESIGN.md §8) starts only from its card,
+    /// which says what it gives; without the jail and with
+    /// `unconfined_without_jail`, the chooser offers it alone, and a
+    /// conversation's row and status say so.
+    #[test]
+    fn an_unconfined_workspace_starts_only_from_its_card() {
+        let mut app = app();
+        app.settle = Duration::ZERO;
+        let choose = |app: &mut App, downs: usize| {
+            key(app, "C-n");
+            for _ in 0..downs {
+                key(app, "Down");
+            }
+            key(app, "Return");
+        };
+        let answer = |app: &mut App, focus: &str| {
+            for _ in 0..8 {
+                if app.confirm().is_some_and(|c| c.focus() == focus) {
+                    break;
+                }
+                key(app, "Tab");
+            }
+            assert_eq!(app.confirm().map(|c| c.focus()), Some(focus));
+            key(app, "Return");
+            assert!(app.confirm().is_none());
+        };
+        // Empty, unconfined: the card, then a scratch workspace unconfined;
+        // its Cancel starts nothing.
+        choose(&mut app, 2);
+        assert!(matches!(
+            app.confirm().map(|c| c.purpose()),
+            Some(confirm::Purpose::Unconfine(None))
+        ));
+        assert!(text(&app).contains("credentials"), "{}", text(&app));
+        assert!(app.take_requests().is_empty());
+        answer(&mut app, "run without the jail");
+        assert_eq!(app.take_requests(), [Request::NewScratch(true)]);
+        choose(&mut app, 2);
+        answer(&mut app, "cancel");
+        assert!(app.take_requests().is_empty());
+        // Directory…, unconfined: the folder chooser, then the card.
+        let owned = td_fs::TempDir::new("ui-unconfined").unwrap();
+        let base = std::fs::canonicalize(owned.path()).unwrap();
+        app.set_chooser_start(base.clone());
+        choose(&mut app, 3);
+        assert_eq!(app.chooser().unwrap().folder(), base);
+        key(&mut app, "C-Return");
+        assert!(app.chooser().is_none());
+        assert!(matches!(
+            app.confirm().map(|c| c.purpose()),
+            Some(confirm::Purpose::Unconfine(Some(folder))) if *folder == base
+        ));
+        answer(&mut app, "run without the jail");
+        assert_eq!(app.take_requests(), [Request::NewIn(base.clone(), true)]);
+        // A card that waited behind the chooser waits behind this one too.
+        app.set_chooser_start(base.clone());
+        choose(&mut app, 3);
+        app.ask(Card {
+            conversation: id(1),
+            call: 4,
+            title: "Run a command".into(),
+            details: vec!["make".into()],
+            always: None,
+            resume: false,
+        });
+        key(&mut app, "C-Return");
+        assert!(matches!(
+            app.confirm().map(|c| c.purpose()),
+            Some(confirm::Purpose::Unconfine(Some(_)))
+        ));
+        // Cancel is focused first; the waiting card follows it.
+        assert_eq!(app.confirm().map(|c| c.focus()), Some("cancel"));
+        key(&mut app, "Return");
+        assert!(matches!(
+            app.confirm().map(|c| c.purpose()),
+            Some(confirm::Purpose::Approve { call: 4, .. })
+        ));
+        answer(&mut app, "cancel");
+        assert!(app
+            .take_requests()
+            .iter()
+            .all(|request| !matches!(request, Request::NewIn(..) | Request::NewScratch(_))));
+        // The plain Directory… after it asks nothing.
+        app.set_chooser_start(base.clone());
+        choose(&mut app, 1);
+        key(&mut app, "C-Return");
+        assert!(app.confirm().is_none());
+        assert_eq!(app.take_requests(), [Request::NewIn(base, false)]);
+        // Without the jail, only the unconfined built-ins are offered.
+        app.set_templates(vec![("notes".into(), false)]);
+        app.set_jailless(Some("no workspace jail".into()));
+        key(&mut app, "C-n");
+        let listed: Vec<String> = app
+            .picker()
+            .unwrap()
+            .listing()
+            .entries()
+            .iter()
+            .map(|entry| entry.name().to_string())
+            .collect();
+        assert_eq!(
+            listed,
+            ["Empty, unconfined", "Directory\u{2026}, unconfined"]
+        );
+        key(&mut app, "Return");
+        answer(&mut app, "run without the jail");
+        assert_eq!(app.take_requests(), [Request::NewScratch(true)]);
+        // Its row and its status say so.
+        app.add_row(Row {
+            id: id(7),
+            title: "loose".into(),
+            activity: 1,
+            state: RowState::Idle,
+            paused: false,
+            workspace: Some(Workspace::Scratch),
+            unconfined: true,
+            archived: false,
+        });
+        app.set_active(id(7));
+        assert!(
+            app.status_line().contains(UNCONFINED_STATUS),
+            "{}",
+            app.status_line()
+        );
+        assert!(text(&app).contains(UNCONFINED_MARK), "{}", text(&app));
+    }
+
     #[test]
     fn a_new_conversation_chooses_its_workspace_template() {
         let mut app = app();
@@ -11837,6 +12114,8 @@ pub mod tests {
                 "Directory\u{2026}",
                 "notes",
                 "td",
+                "Empty, unconfined",
+                "Directory\u{2026}, unconfined",
                 "New template\u{2026}"
             ]
         );
@@ -11852,7 +12131,7 @@ pub mod tests {
         assert!(app.take_requests().is_empty());
         key(&mut app, "Return");
         assert!(app.picker().is_none());
-        assert_eq!(app.take_requests(), [Request::NewScratch]);
+        assert_eq!(app.take_requests(), [Request::NewScratch(false)]);
         for (downs, name) in [(2, "notes"), (3, "td")] {
             app.menu_action(menu::Action::New);
             for _ in 0..downs {
@@ -11889,7 +12168,10 @@ pub mod tests {
         assert_eq!(app.chooser().unwrap().folder(), base.join("notes"));
         key(&mut app, "C-Return");
         assert!(app.chooser().is_none());
-        assert_eq!(app.take_requests(), [Request::NewIn(base.join("notes"))]);
+        assert_eq!(
+            app.take_requests(),
+            [Request::NewIn(base.join("notes"), false)]
+        );
         // It opens next where it last chose from; Escape chooses nothing.
         directory(&mut app);
         assert_eq!(app.chooser().unwrap().folder(), base);

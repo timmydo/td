@@ -30,8 +30,10 @@ checkout, whose launch serves that.\n\
 Keys: Return in the composer sends it (S-Return is a newline, and\n\
 C-Return sends from outside a dialog); C-r asks a failed turn again;\n\
 C-n starts a conversation from a workspace template\n\
-(Empty, Directory... or one configured; td-agent/DESIGN.md §7), or\n\
-with no workspace when its jail is absent; C-PageUp and C-PageDown\n\
+(Empty, Directory..., one configured, or Empty or Directory... unconfined,\n\
+whose tools run outside any jail; td-agent/DESIGN.md §7, §8), or\n\
+with no workspace when its jail is absent (unconfined ones only, with\n\
+unconfined_without_jail); C-PageUp and C-PageDown\n\
 open the one above or below; C-S-m opens the Messages window, which\n\
 keeps td-agent's notes whole and with their times (the status row\n\
 counts the unread); F6 and S-F6 move the focus between the\n\
@@ -63,22 +65,31 @@ td-agent calibrate --help says more.\n";
 /// WORKSPACE]]`: the window starts these; a person does not.
 fn conversation(args: &[String]) -> Result<(), String> {
     let usage = "usage: td-agent conversation ID --state-dir ABSOLUTE-DIR \
-                 [--create ROLE [--workspace scratch|template:NAME|ABSOLUTE-DIR]]";
+                 [--create ROLE [--workspace scratch|template:NAME|ABSOLUTE-DIR [--unconfined]]]";
     let (id, rest) = args.split_first().ok_or(usage)?;
     let id = Id::parse(id).ok_or_else(|| format!("{id:?} is not a conversation id"))?;
     let role = |role: &str| Role::parse(role).ok_or_else(|| format!("{role:?} is not a role"));
-    let (state, create, workspace) = match rest {
-        [flag, dir] if flag == "--state-dir" => (dir, None, None),
+    let (state, create, workspace, unconfined) = match rest {
+        [flag, dir] if flag == "--state-dir" => (dir, None, None, false),
         [flag, dir, create, named] if flag == "--state-dir" && create == "--create" => {
-            (dir, Some(role(named)?), None)
+            (dir, Some(role(named)?), None, false)
         }
-        [flag, dir, create, named, inside, word]
-            if flag == "--state-dir" && create == "--create" && inside == "--workspace" =>
+        [flag, dir, create, named, inside, word, unconfined @ ..]
+            if flag == "--state-dir"
+                && create == "--create"
+                && inside == "--workspace"
+                && matches!(unconfined, [] | [_]) =>
         {
+            let unconfined = match unconfined {
+                [] => false,
+                [word] if word == "--unconfined" => true,
+                _ => return Err(usage.into()),
+            };
             (
                 dir,
                 Some(role(named)?),
                 Some(Workspace::parse_argument(word)?),
+                unconfined,
             )
         }
         _ => return Err(usage.into()),
@@ -87,7 +98,7 @@ fn conversation(args: &[String]) -> Result<(), String> {
     if !state.is_absolute() {
         return Err(format!("{} is not an absolute path", state.display()));
     }
-    td_agent::conversation::run(&StateDir::at(state), &id, create, workspace)
+    td_agent::conversation::run(&StateDir::at(state), &id, create, workspace, unconfined)
 }
 
 fn window(args: &[String]) -> Result<(), String> {

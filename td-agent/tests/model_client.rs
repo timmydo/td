@@ -97,6 +97,19 @@ impl Harness {
         jailed: bool,
         script: Vec<Reply>,
     ) -> Self {
+        Self::new_in_as(tag, role, workspace, jailed, false, script)
+    }
+
+    /// `new_in`, the workspace made unconfined when `unconfined` says so
+    /// (DESIGN.md §8), its tools given `PATH` and a private `HOME`.
+    fn new_in_as(
+        tag: &str,
+        role: Role,
+        workspace: Option<&str>,
+        jailed: bool,
+        unconfined: bool,
+        script: Vec<Reply>,
+    ) -> Self {
         let name = format!(
             "td-agent-model-{tag}-{}-{}",
             std::process::id(),
@@ -123,12 +136,13 @@ impl Harness {
             .unwrap();
         let id = Id::random().unwrap();
         let stderr = root.join("stderr");
-        let (child, window) = spawn(
+        let (child, window) = spawn_as(
             &state,
             &id,
             Some(role),
             workspace,
             jailed,
+            unconfined,
             mock.runtime(),
             &stderr,
         );
@@ -456,6 +470,20 @@ fn spawn(
     runtime: &std::path::Path,
     stderr: &std::path::Path,
 ) -> (Child, UnixStream) {
+    spawn_as(state, id, create, workspace, jailed, false, runtime, stderr)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_as(
+    state: &StateDir,
+    id: &Id,
+    create: Option<Role>,
+    workspace: Option<&str>,
+    jailed: bool,
+    unconfined: bool,
+    runtime: &std::path::Path,
+    stderr: &std::path::Path,
+) -> (Child, UnixStream) {
     let (ours, theirs) = UnixStream::pair().unwrap();
     let mut command = Command::new(PROGRAM);
     command
@@ -470,6 +498,15 @@ fn spawn(
     }
     if let Some(workspace) = workspace {
         command.args(["--workspace", workspace]);
+    }
+    if unconfined {
+        command.arg("--unconfined");
+        let home = runtime.parent().unwrap().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        command.env("HOME", home);
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
     }
     if jailed {
         if let Some(home) = std::env::var_os("HOME") {
@@ -10182,6 +10219,147 @@ fn host_execution_requires_a_human_even_in_auto_and_can_be_refused() {
         std::fs::read_to_string(root.join("proof")).unwrap(),
         "reached\n"
     );
+}
+
+/// An unconfined workspace's tools run outside any jail (DESIGN.md §8,
+/// Unconfined workspaces): a file tool that keeps to the workspace runs
+/// in `auto` mode with no card; a command, or a file tool reaching
+/// outside, asks the person in `auto` mode too, an allow rule
+/// releasing neither, and the command allowed reaches past the
+/// workspace, where no jail would let it.
+#[test]
+fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
+    let owned = td_fs::TempDir::new("unconfined").unwrap();
+    let base = std::fs::canonicalize(owned.path()).unwrap();
+    let work = base.join("work");
+    let outside = base.join("outside");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(work.join("inside.txt"), "inside text").unwrap();
+    std::fs::write(outside.join("secret.txt"), "outside text").unwrap();
+    let read = |path: PathBuf| {
+        access_reply(
+            "read_file",
+            td_json::Json::Obj(vec![("path".into(), path.display().to_string().into())]),
+        )
+    };
+    let proof = outside.join("proof");
+    let command = access_reply(
+        "shell",
+        td_json::Json::Obj(vec![(
+            "command".into(),
+            format!("echo reached > '{}'", proof.display()).into(),
+        )]),
+    );
+    let workspace = work.display().to_string();
+    std::fs::create_dir(work.join("sub")).unwrap();
+    let moved = access_reply(
+        "write_file",
+        td_json::Json::Obj(vec![
+            (
+                "path".into(),
+                work.join("sub/planted").display().to_string().into(),
+            ),
+            ("content".into(), "planted".into()),
+        ]),
+    );
+    let mut h = Harness::new_in_as(
+        "unconfined",
+        Role::Conversation,
+        Some(&workspace),
+        false,
+        true,
+        vec![
+            read(work.join("inside.txt")),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            command,
+            Reply::sse("stream-sonnet.sse"),
+            read(outside.join("secret.txt")),
+            Reply::sse("stream-sonnet.sse"),
+            moved,
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    h.down(&auto_with("[everywhere]\nallow shell echo\n"));
+
+    // Inside the workspace: runs, no card.
+    h.say("Read the file.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(results(&events)
+        .iter()
+        .any(|(_, result, error)| !*error && result.contains("inside text")));
+
+    // A command: the person's, the allow rule and the mode aside.
+    h.say("Run it.");
+    let (call, _, details) = h.until_ask();
+    assert!(
+        details.iter().any(|line| line.contains("unconfined")),
+        "{details:?}"
+    );
+    assert!(!proof.exists());
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(std::fs::read_to_string(&proof).unwrap(), "reached\n");
+
+    // A read outside the workspace: asked, an ask rule's reason after
+    // why it is the person's; refused, nothing read.
+    h.down(&Down::Policy {
+        version: 2,
+        mode: td_agent::config::Mode::Auto,
+        rules: Ok("[everywhere]\nallow shell echo\nask read_file\n".into()),
+    });
+    h.say("Read the other one.");
+    let (call, _, details) = h.until_ask();
+    assert!(
+        details.iter().any(|line| line
+            .find("unconfined")
+            .zip(line.find("; and "))
+            .is_some_and(|(first, then)| first < then)),
+        "{details:?}"
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(results(&events)
+        .iter()
+        .all(|(_, result, _)| !result.contains("outside text")));
+
+    // In `ask` mode a contained write waits on its card; a link moved in
+    // meanwhile does not take it out of the workspace.
+    h.down(&Down::Policy {
+        version: 3,
+        mode: td_agent::config::Mode::Ask,
+        rules: Ok(String::new()),
+    });
+    h.say("Write it.");
+    let (call, _, _) = h.until_ask();
+    std::fs::remove_dir(work.join("sub")).unwrap();
+    std::os::unix::fs::symlink(&outside, work.join("sub")).unwrap();
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(results(&events)
+        .iter()
+        .any(|(_, result, error)| *error && result.contains("no longer resolves")));
+    assert!(!outside.join("planted").exists());
+    let (conversation, _) = h.close();
+    assert!(conversation.meta().unconfined);
 }
 
 #[test]

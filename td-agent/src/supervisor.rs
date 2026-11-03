@@ -421,19 +421,30 @@ impl Supervisor {
     /// its own or the one already running its turn; the conversation open
     /// before is closed, or left running while its turn does.
     pub fn open(&mut self, id: Id, create: Option<Role>) -> Result<Opened, String> {
-        self.open_as(id, create.map(|role| (role, None)))
+        self.open_as(id, create.map(|role| (role, None, false)))
     }
 
     /// Creates conversation `id` as `role`, working in `workspace`, and
     /// opens it, as `open` does.
     pub fn create(&mut self, id: Id, role: Role, workspace: Workspace) -> Result<Opened, String> {
-        self.open_as(id, Some((role, Some(workspace))))
+        self.open_as(id, Some((role, Some(workspace), false)))
+    }
+
+    /// `create`, its tools run outside any jail (DESIGN.md §8,
+    /// Unconfined workspaces).
+    pub fn create_unconfined(
+        &mut self,
+        id: Id,
+        role: Role,
+        workspace: Workspace,
+    ) -> Result<Opened, String> {
+        self.open_as(id, Some((role, Some(workspace), true)))
     }
 
     fn open_as(
         &mut self,
         id: Id,
-        create: Option<(Role, Option<Workspace>)>,
+        create: Option<(Role, Option<Workspace>, bool)>,
     ) -> Result<Opened, String> {
         self.leave();
         if let Some(at) = self.at(&id) {
@@ -516,7 +527,7 @@ impl Supervisor {
     fn spawn(
         &self,
         id: &Id,
-        create: Option<&(Role, Option<Workspace>)>,
+        create: Option<&(Role, Option<Workspace>, bool)>,
     ) -> Result<(Child, UnixStream, Receiver<Incoming>), String> {
         let (ours, theirs) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
         let input = theirs.try_clone().map_err(|e| format!("socketpair: {e}"))?;
@@ -527,10 +538,13 @@ impl Supervisor {
             .arg(id.as_str())
             .arg("--state-dir")
             .arg(&self.state);
-        if let Some((role, workspace)) = create {
+        if let Some((role, workspace, unconfined)) = create {
             command.arg("--create").arg(role.word());
             if let Some(workspace) = workspace {
                 command.arg("--workspace").arg(workspace.argument());
+                if *unconfined {
+                    command.arg("--unconfined");
+                }
             }
         }
         let mut child = command

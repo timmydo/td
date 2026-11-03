@@ -84,6 +84,65 @@ fn the_tool_host_serves_calls_as_a_process() {
     assert_eq!(done(&mut client, id).unwrap().digest, written.digest);
 }
 
+/// An unconfined workspace's host (DESIGN.md §8) runs outside any jail
+/// with only `PATH`, `HOME`, `TMPDIR` and `LANG` of its launcher's
+/// environment, and dropping its client ends the command it was running,
+/// not only the host.
+#[test]
+fn an_unjailed_host_ends_its_command_when_dropped() {
+    let owned = td_fs::TempDir::new("unjailed").unwrap();
+    let dir = std::fs::canonicalize(owned.path()).unwrap();
+    let programs = td_agent::jail::Unjailed {
+        agent: PathBuf::from(PROGRAM),
+        txt: None,
+    };
+    let policy = td_agent::jail::Policy {
+        worktrees: vec![dir.clone()],
+        ..td_agent::jail::Policy::default()
+    };
+    let mut client = td_agent::jail::launch_unjailed(&programs, &policy).unwrap();
+    let pid = dir.join("pid");
+    let env = dir.join("env");
+    let id = client
+        .call(Call::Shell {
+            command: format!(
+                "env > '{}'; echo $$ > '{1}.part'; mv '{1}.part' '{1}'; exec sleep 60",
+                env.display(),
+                pid.display()
+            ),
+            timeout_ms: Some(120_000),
+            workdir: None,
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !pid.exists() {
+        assert!(Instant::now() < deadline, "the command did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let names: Vec<String> = std::fs::read_to_string(&env)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_string()))
+        .collect();
+    for name in &names {
+        assert!(
+            ["PATH", "HOME", "TMPDIR", "LANG", "TERM", "PWD", "SHLVL", "_", "OLDPWD"]
+                .contains(&name.as_str()),
+            "{name} reached the command: {names:?}"
+        );
+    }
+    let running = std::fs::read_to_string(&pid).unwrap();
+    let proc = PathBuf::from(format!("/proc/{}", running.trim()));
+    assert!(proc.exists());
+    let _ = id;
+    drop(client);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while proc.exists() {
+        assert!(Instant::now() < deadline, "its command outlived the host");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Its input closing ends it, and the calls it was running with it.
 #[test]
 fn the_tool_host_ends_with_its_input() {

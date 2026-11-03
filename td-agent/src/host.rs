@@ -976,9 +976,14 @@ pub struct Client {
     unread: Arc<Mutex<std::collections::BTreeMap<u64, u64>>>,
     child: Option<Child>,
     /// A jailed host's spec, removed with it, and the tail of td-jail's
-    /// own diagnostics (crate::jail).
+    /// own diagnostics (crate::jail), or of an unjailed host's own
+    /// standard error.
     spec: Option<PathBuf>,
     diagnostic: Option<Arc<Tail>>,
+    /// An unjailed host's channel, shut when it is dropped, so that it
+    /// cancels its calls and ends them before it is killed (DESIGN.md §8,
+    /// Unconfined workspaces).
+    channel: Option<std::os::unix::net::UnixStream>,
     /// A failure has waited for td-jail's account once; later ones do not.
     waited: bool,
 }
@@ -986,8 +991,10 @@ pub struct Client {
 /// How long a failure waits for td-jail to finish saying why.
 const FAILURE_WAIT: Duration = Duration::from_secs(2);
 /// How long dropping a jailed host waits for its instance to let go of
-/// the channel.
+/// the channel, and an unjailed one for its host to end its calls.
 const DROP_WAIT: Duration = Duration::from_secs(5);
+/// How often a dropped unjailed host is looked at while it ends.
+const UNJAILED_POLL: Duration = Duration::from_millis(10);
 
 impl Client {
     /// Speaks to a tool host over `reader` and `writer`, with no links:
@@ -1057,6 +1064,7 @@ impl Client {
             spec: None,
             diagnostic: None,
             waited: false,
+            channel: None,
         }
     }
 
@@ -1069,7 +1077,22 @@ impl Client {
         self
     }
 
-    /// What td-jail has said so far, when this host is jailed and it said
+    /// `owning`, for an unconfined workspace's tool host (DESIGN.md §8),
+    /// which has no spec: `diagnostic` is its own standard error, and
+    /// `channel` its end of the stream, shut first when it is dropped.
+    pub(crate) fn owning_unjailed(
+        mut self,
+        child: Child,
+        diagnostic: Arc<Tail>,
+        channel: std::os::unix::net::UnixStream,
+    ) -> Self {
+        self.child = Some(child);
+        self.diagnostic = Some(diagnostic);
+        self.channel = Some(channel);
+        self
+    }
+
+    /// What td-jail, or an unjailed host, has said so far, when it said
     /// anything.
     pub fn diagnostic(&self) -> Option<String> {
         self.diagnostic.as_ref()?.text(Duration::ZERO)
@@ -1098,7 +1121,12 @@ impl Client {
             .as_mut()
             .and_then(|child| child.try_wait().ok().flatten());
         if let Some(status) = ended {
-            why.push_str(&format!(" (td-jail {status})"));
+            let who = if self.spec.is_some() {
+                "td-jail"
+            } else {
+                "the tool host"
+            };
+            why.push_str(&format!(" ({who} {status})"));
         }
         why
     }
@@ -1251,6 +1279,18 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
+        // An unjailed host has no instance to take its commands down: told
+        // of the end by its channel, it cancels them itself, and is killed
+        // only if it has not ended within the wait.
+        if let (Some(channel), Some(child)) = (self.channel.as_ref(), self.child.as_mut()) {
+            let _ = channel.shutdown(std::net::Shutdown::Both);
+            let deadline = Instant::now().checked_add(DROP_WAIT);
+            while matches!(child.try_wait(), Ok(None))
+                && deadline.is_some_and(|at| Instant::now() < at)
+            {
+                std::thread::sleep(UNJAILED_POLL);
+            }
+        }
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();

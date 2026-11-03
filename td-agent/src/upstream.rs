@@ -144,6 +144,7 @@ mod tests {
             directory_grants: Vec::new(),
             directory_exposures: Vec::new(),
             removed,
+            unconfined: false,
             tracked: Vec::new(),
         }
     }

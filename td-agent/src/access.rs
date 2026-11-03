@@ -23,7 +23,7 @@ pub fn admitted(state: &StateDir, requested: &[Shared]) -> Result<Vec<Shared>, S
         .ok_or("HOME missing")?;
     let programs = jail::Programs::from_env()?;
     let mut places =
-        workspace::Places::from_env(state.root(), &config.workspace_root(&home), &programs)?;
+        workspace::Places::from_env(state.root(), &config.workspace_root(&home), &programs.all())?;
     let mut remotes = config.remotes;
     for remote in state.load_admitted()? {
         remotes.push(git::Admission::parse(&remote)?);

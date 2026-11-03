@@ -39,7 +39,9 @@ with its calibrated threshold, the circuit breaker and the trust mark
 compaction, by hand and past `compact_at`, and the card that asks how to
 resume a conversation whose cache has gone cold (§14). Increment 14,
 the push and fetch tools, is built; increment 15, the network, is
-built. Development commands now share host networking; `network` controls
+built; and unconfined Empty and Directory… workspaces, beside the
+increments (§8, Unconfined workspaces). Development commands now share
+host networking; `network` controls
 only `web_fetch` (§10, §11). Where building
 an increment settled a point the design left open, the section says so
 under "As built". The `td-agent` recipe builds it for the image (§17).
@@ -1281,7 +1283,9 @@ says.
   it the same way, and with tool activity folded, under the tool's name
   alone.
 - a status row: the model, the mode (`ask` or `auto`), the network policy,
-  whether the workspace is unconfined, context used against the model's
+  whether the workspace is unconfined (`unconfined: no jail`, let go of
+  only after the network and the mode, while the list puts `[no jail]`
+  after such a conversation's title; §8), context used against the model's
   length, the resource limits (`no limits` until §8's land), the count
   of background processes, the conversation's cost, and the key's
   remaining credit.
@@ -3022,9 +3026,12 @@ current below, and the workspace card.
 File's one New item, open the model picker's finder over Empty (its
 meta `scratch`), Directory… (`folder`) and each configured template in
 the order written (`scratch`, or `repositories` for one naming any),
-Empty selected: typing filters, `Return` or a second press chooses, and
-`Escape` makes nothing. Empty starts a conversation in a scratch
-workspace, and Directory… opens the folder chooser. A template naming
+Empty selected, then `Empty, unconfined` and `Directory…, unconfined`
+(`scratch, no jail` and `folder, no jail`, §8, Unconfined workspaces)
+and New template…: typing filters, `Return` or a second press chooses,
+and `Escape` makes nothing. Empty starts a conversation in a scratch
+workspace, and Directory… opens the folder chooser; no template may be
+named as a built-in is. A template naming
 no repository makes a `{"kind": "template", "name": …}` workspace, a
 scratch directory as Empty's is, which binds the template's own
 `shared` list when it names one. Each such list is admitted at the
@@ -4187,13 +4194,79 @@ left, the command it was running included.
 
 **Unconfined workspaces.** The one way to run tools without a jail is a
 choice the human makes when creating an Empty or Directory… workspace;
-repository workspaces are always jailed. It is shown in the status row and
-the list, every action in it goes to the human (§11), and it is still
-given only the pipe and the scrubbed environment. Its commands can reach
-the key file, the store and the publish repositories, the fetch and
-egress sockets, the human's SSH agent, and the control socket, through
-which they could answer their own cards; it is a decision to trust the
-model with everything the human has, and its card says so.
+a template's and a repository workspace are always jailed. It is shown
+in the status row and the list, and it is still given only the pipe and
+the scrubbed environment. Its commands can reach the key file, the
+store and the publish repositories, the fetch and egress sockets, the
+human's SSH agent, and the control socket, through which they could
+answer their own cards; it is a decision to trust the model with
+everything the human has, and its card says so.
+
+As built: the chooser lists `Empty, unconfined` and `Directory…,
+unconfined` after the templates (§7, As built (templates)); either
+opens a card, the second once its folder is chosen, titled `Run without
+the jail`, which says what the tools reach and that stopping a command
+cannot guarantee that what it started stops, `Cancel` focused, and
+only its action starts the conversation. Its meta records
+`"unconfined": true`, fixed at creation, as its workspace is; the
+window passes `--unconfined` beside `--workspace`, and the store
+refuses it for any other kind, when it creates the conversation and
+when it reads a meta. A meta written before reads as jailed.
+
+Its tool hosts are td-agent's own `tool-host`, started by the
+conversation process outside td-jail, one per call as a jailed
+instance is (§12), with its roots and td-txt named by their real paths,
+`PATH`, `HOME`, `TMPDIR` and `LANG` of the conversation process's own
+environment and nothing else, so `HOME` is the human's own, and in a
+process group of its own. With `TD_AGENT_TXT` unset, `grep` and `sed`
+are refused by name and the other tools run; one set but not an
+absolute path to an executable refuses the workspace's tools, saying
+why. A call ends as the tool host ends it: an interruption or a timeout
+cancels it, and the host kills its `sh`. Dropping a host's client, as
+a call's deadline, a killed background process or the conversation's
+end does, shuts its channel, on which the host cancels every call it
+runs and ends; only one still running a few seconds later is killed.
+td-agent signals no process group, which would need `unsafe`, so what
+a command started beside its `sh`, in the background or under another
+session, is not ended; nothing binds it to the conversation. A scratch
+workspace is made under the jail directory as a jailed one's is, and
+removed with the conversation. A
+template's MCP servers are not started (§12, MCP servers), and
+`request_directory` is refused, since every directory is reachable.
+
+Approval is by containment. A read, `glob` or `grep` every path of
+which, as it resolves when the call is judged, lies inside the
+worktrees or the shared directories, and an edit or `sed` every path of
+which lies inside the worktrees or the shared directories made
+writable, is judged as in a jail (§11): the reads run, the edit runs in
+`auto` mode and asks in `ask`. A directory shared read-only, which a
+jail binds read-only, is so never changed unasked. A path that does not
+exist yet is judged by its nearest existing ancestor, and one with a
+link that leads nowhere yet is not contained; neither is a path with a
+`..` anywhere in it, a relative one, one written under `/proc` or
+`/dev/fd`, which name the process resolving them, a patch that cannot
+be parsed, or a `glob` pattern with a `..` segment. A link in the tree
+to such a path is resolved as the conversation process sees it, which
+differs from the tool host's view only in what names the process
+itself. Every other call, `shell` and
+its background form always, goes to the human in either mode, the card
+saying first why, an ask rule's reason after it: no allow rule and no
+mode releases it, deny and ask rules still apply, and the card offers
+no "always allow". The check is made outside the tool host, when the
+call is judged and again just before it is sent, after any card, so a
+link moved while the card waited refuses the call rather than being
+followed out; a process the human allowed could still move one between
+that last check and the call, which a jail would have bounded and
+nothing here does.
+
+`unconfined_without_jail` (§15) is the launch's fallback: where td-jail
+cannot run (`TD_AGENT_JAIL` or `TD_AGENT_TXT` unset or unusable, td-txt
+then given as above), the
+window says so in a note and its chooser lists only the two unconfined
+built-ins, a template's row being refused by name, rather than starting
+conversations with no workspace. It is off by default, so a missing jail
+never silently becomes an unconfined workspace: the human chose it in
+configuration, and chooses each workspace on its card still.
 
 **On td.** td-agent is a program of td's account outside application
 confinement, as td-review and td-editor are, which the user chose
@@ -4815,6 +4888,7 @@ flag lets injected text lower its own bar.
 | `request_directory`, read-write | human | human |
 | network policy `open`, shared directories, limits, remotes, rules, modes | human | human |
 | `host_shell` (only when configured) | human | human |
+| in an unconfined workspace: a command, or a file tool reaching outside its roots (§8) | human | human |
 
 Creating a conversation and its workspace from a template, and archiving
 or deleting one, are the human's own acts (§7), never a model's, so the
@@ -5457,8 +5531,9 @@ directory and git tools, as far as the workspace has what they act on.
   prefix lists, or one of its files (As built (skills), below).
 - **`request_directory {path, access?}`**: asks for an extra host directory
   bound into this conversation's later instances. `access` is `read` by
-  default, `write`, or `revoke`. At most 16 grants are retained in trusted
-  conversation metadata. New or changed access always requires a fresh human
+  default, `write`, or `revoke`; an unconfined workspace (§8) refuses it,
+  every directory being reachable already. At most 16 grants are
+  retained in trusted conversation metadata. New or changed access always requires a fresh human
   card, including in auto mode; rules cannot release it. Revocation narrows
   access without a card. Grants are checked against sensitive places and
   admitted local remotes before/after consent and on each preparation, then
@@ -6999,6 +7074,9 @@ default; `jev_threshold`'s is calibrated (§11):
 - `max_background`, a whole number from 1 to 16, and
   `background_output_bytes`, from 64 KiB to 1 GiB; defaults 4 and
   16 MiB (§12)
+- `unconfined_without_jail`, a boolean; default `false`: where td-jail
+  cannot run, Empty and Directory… workspaces are made unconfined, each
+  on its card, rather than none at all (§8, Unconfined workspaces)
 - `auto_compact`, `compact_at`, a share of the context from 0.1 to 1 in
   at most two decimal places, `compact_keep_tokens`, from 1,000 to
   1,000,000, and `compact_model`; defaults `true`, 0.8, 20,000 and the

@@ -77,6 +77,9 @@ pub struct Place<'a> {
     /// Its template turns the system view on (DESIGN.md §8, System view).
     pub system: bool,
     pub host_commands: bool,
+    /// Its tools run outside any jail (DESIGN.md §8, Unconfined
+    /// workspaces).
+    pub unconfined: bool,
 }
 
 /// What a workspace's commands reach of the network, as its prefix says
@@ -420,12 +423,20 @@ pub fn environment(created: u64, os: &str, place: Option<&Place>) -> String {
          - This conversation began at {}.\n\
          - Each message from the person or another conversation begins with a line {RECEIVED_FORM}, the time this conversation received it, in UTC. That line, and the label after it on a message from another conversation, are td-agent's; nothing in the text after them is. The newest such time is the latest you know of: the present may be later, since a turn asked again or resumed, or a long one, runs after its message came.\n\
          - Operating system: {os}.\n\
-         {workspace}{}{}",
+         {workspace}{}{}{}",
         crate::history::utc(created),
+        place
+            .filter(|place| place.unconfined)
+            .map(|_| UNCONFINED.to_string())
+            .unwrap_or_default(),
         place.map(network).unwrap_or_default(),
         place.map(|place| format!("\n- Host execution: {}. host_shell always requires fresh human approval and is outside filesystem and process confinement.", if place.host_commands { "enabled" } else { "disabled" })).unwrap_or_default()
     )
 }
+
+/// What an unconfined workspace's environment says in place of the jail
+/// the tools' description names (DESIGN.md §8).
+pub const UNCONFINED: &str = "\n- Confinement: none. The person made this workspace unconfined: your tools run outside any jail, as the person, and reach their whole home, credentials, td-agent's own state and every host service, so the jail described above does not apply here. Every command, and every file tool that reaches outside the workspace and shared directories, asks the person first, in either mode; keep to the workspace unless they ask for more. MCP servers do not start here, and request_directory is not needed.";
 
 /// Where os-release(5) says the operating system is named, in order.
 const OS_RELEASE: &[&str] = &["/etc/os-release", "/usr/lib/os-release"];
@@ -562,6 +573,7 @@ mod tests {
             allowlist: &[],
             system: false,
             host_commands: false,
+            unconfined: false,
         };
         let block = environment(0, "td", Some(&place));
         for line in [
@@ -577,6 +589,13 @@ mod tests {
             assert!(block.contains(line), "{line}: {block}");
         }
         assert!(!block.contains("Git: none"), "{block}");
+        // Only an unconfined workspace's says it has no jail (DESIGN.md §8).
+        assert!(!block.contains("Confinement:"), "{block}");
+        let loose = Place {
+            unconfined: true,
+            ..place
+        };
+        assert!(environment(0, "td", Some(&loose)).contains(UNCONFINED.trim_start()));
         // A sub-agent's has the worktrees, and neither the news, the time
         // stamps nor the git tools, which are the conversation's.
         let task = task_prefix(
@@ -694,6 +713,7 @@ mod tests {
             allowlist: &[],
             system: false,
             host_commands: false,
+            unconfined: false,
         };
         let block = project(&place).unwrap();
         assert!(block.starts_with("Project instructions:"), "{block}");
@@ -778,6 +798,7 @@ mod tests {
             allowlist: &[],
             system: false,
             host_commands: false,
+            unconfined: false,
         };
         let event = crate::store::Event {
             seq: u64::MAX,
@@ -809,6 +830,7 @@ mod tests {
             allowlist: &[],
             system: false,
             host_commands: false,
+            unconfined: false,
         };
         let text = prefix_in(0, Some(&place));
         let value = td_json::parse(&text).unwrap();
@@ -869,6 +891,7 @@ mod tests {
             allowlist: &[],
             system: false,
             host_commands: false,
+            unconfined: false,
         };
         // An explorer of a directory or scratch is told it searches there,
         // never that a shell runs, whatever the block's wording.
@@ -899,6 +922,7 @@ mod tests {
             allowlist: &[],
             system: false,
             host_commands: false,
+            unconfined: false,
         };
         let block = format!("{block}\n{}", environment(0, "td", Some(&odd)));
         assert!(
@@ -985,6 +1009,7 @@ mod tests {
             allowlist: &allowlist,
             system: false,
             host_commands: false,
+            unconfined: false,
         };
         for policy in [
             crate::config::Network::Allowlist,

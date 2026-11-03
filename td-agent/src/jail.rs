@@ -11,7 +11,9 @@
 //! checkout and installed: td-jail and td-txt beside td-agent, and td-net's
 //! launch names them in `TD_AGENT_JAIL` and `TD_AGENT_TXT`
 //! (net/src/launch.rs). Without them there is no jail, and tools are
-//! refused by name; there is no unconfined fallback.
+//! refused by name; nothing falls back to running them unconfined, which
+//! only a workspace the human made so does (DESIGN.md §8, Unconfined
+//! workspaces; `launch_unjailed`).
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -44,6 +46,52 @@ pub struct Programs {
     /// This program, the instance's entry.
     pub agent: PathBuf,
     pub txt: PathBuf,
+}
+
+/// The programs an unconfined workspace's tool host needs (DESIGN.md §8,
+/// Unconfined workspaces): this program, its entry, and td-txt when the
+/// launch names it, without which `grep` and `sed` are refused by name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Unjailed {
+    pub agent: PathBuf,
+    pub txt: Option<PathBuf>,
+}
+
+impl Unjailed {
+    /// From the launch's variables: td-txt only when `TD_AGENT_TXT` names
+    /// one, which must then be an absolute path to an executable file.
+    pub fn from_env() -> Result<Self, String> {
+        let agent = std::env::current_exe().map_err(|e| format!("this program's path: {e}"))?;
+        let agent = fs::canonicalize(&agent).map_err(|e| format!("{}: {e}", agent.display()))?;
+        let txt = match std::env::var_os(TXT_VAR).filter(|value| !value.is_empty()) {
+            None => None,
+            Some(txt) => {
+                let txt = PathBuf::from(txt);
+                let resolved = fs::canonicalize(&txt)
+                    .ok()
+                    .filter(|_| txt.is_absolute())
+                    .filter(|path| {
+                        fs::metadata(path).is_ok_and(|meta| {
+                            meta.is_file() && meta.permissions().mode() & 0o111 != 0
+                        })
+                    });
+                Some(resolved.ok_or_else(|| {
+                    format!(
+                        "{TXT_VAR} {} is not an absolute path to an executable file",
+                        txt.display()
+                    )
+                })?)
+            }
+        };
+        Ok(Self { agent, txt })
+    }
+
+    /// The programs it runs.
+    pub fn all(&self) -> Vec<&Path> {
+        std::iter::once(self.agent.as_path())
+            .chain(self.txt.as_deref())
+            .collect()
+    }
 }
 
 /// The host trees td-jail binds into every instance (APPLICATIONS.md §C,
@@ -147,6 +195,11 @@ impl Programs {
         Ok(Self { jail, agent, txt })
     }
 
+    /// The programs td-agent runs, outside the jail or in it.
+    pub fn all(&self) -> [&Path; 3] {
+        [&self.jail, &self.agent, &self.txt]
+    }
+
     fn inside(path: &Path) -> Result<PathBuf, String> {
         path.file_name()
             .map(|name| Path::new(PROGRAM_DIR).join(name))
@@ -188,6 +241,20 @@ impl Policy {
             .iter()
             .chain(&self.checkouts)
             .chain(&self.read)
+            .chain(&self.write)
+            .cloned()
+            .collect()
+    }
+}
+
+impl Policy {
+    /// The directories the tool host may change: the worktrees, the
+    /// checkouts and the shared directories made writable, never one
+    /// shared read-only (DESIGN.md §8, Unconfined workspaces).
+    pub fn writable_roots(&self) -> Vec<PathBuf> {
+        self.worktrees
+            .iter()
+            .chain(&self.checkouts)
             .chain(&self.write)
             .cloned()
             .collect()
@@ -389,6 +456,73 @@ fn start(
         tail.end();
     }
     Ok(Client::linked(reader, ours, linked).owning(child, spec.to_path_buf(), tail))
+}
+
+/// The variables an unconfined workspace's tool host is given from this
+/// process's, as a jailed one's are given by td-jail (DESIGN.md §8): its
+/// commands take them as they are.
+const UNJAILED_ENVIRONMENT: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG"];
+
+/// Starts a tool host for an unconfined workspace (DESIGN.md §8,
+/// Unconfined workspaces): this program as `tool-host`, outside any jail,
+/// its roots and td-txt named as they are, with only `PATH`, `HOME`,
+/// `TMPDIR` and `LANG` of this process's environment, and in a process
+/// group of its own. Dropping the client shuts its channel, which the
+/// host ends on, cancelling its calls and so killing each command's `sh`,
+/// and kills it only if it has not ended within a few seconds; what a
+/// command started beside its `sh` is not ended.
+pub fn launch_unjailed(programs: &Unjailed, policy: &Policy) -> Result<Client, String> {
+    let (ours, theirs) = UnixStream::pair().map_err(|e| format!("the tool host's channel: {e}"))?;
+    let channel = |e: io::Error| format!("the tool host's channel: {e}");
+    let theirs_in = theirs.try_clone().map_err(channel)?;
+    let reader = ours.try_clone().map_err(channel)?;
+    let shut = ours.try_clone().map_err(channel)?;
+    ours.set_write_timeout(Some(crate::egress::PIPE_STEP))
+        .map_err(channel)?;
+    let mut command = Command::new(&programs.agent);
+    command.env_clear().envs(
+        UNJAILED_ENVIRONMENT
+            .iter()
+            .filter_map(|name| Some((*name, std::env::var_os(name)?))),
+    );
+    command.arg("tool-host");
+    if let Some(txt) = &programs.txt {
+        command.arg("--txt").arg(txt);
+    }
+    if let Some(directory) = &policy.directory {
+        command.arg("--directory").arg(directory);
+    }
+    let roots = policy.roots();
+    for root in &roots {
+        command.arg("--root").arg(root);
+    }
+    if let Some(first) = roots.first() {
+        command.current_dir(first);
+    }
+    {
+        use std::os::unix::process::CommandExt;
+        // A terminal's signals for the window are not its.
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::from(OwnedFd::from(theirs_in)))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", programs.agent.display()))?;
+    drop(command);
+    let tail = Arc::new(Tail::default());
+    let reading = child.stderr.take().and_then(|mut stderr| {
+        let kept = Arc::clone(&tail);
+        std::thread::Builder::new()
+            .name("tool-host-stderr".into())
+            .spawn(move || kept.keep(&mut stderr))
+            .ok()
+    });
+    if reading.is_none() {
+        tail.end();
+    }
+    Ok(Client::linked(reader, ours, None).owning_unjailed(child, tail, shut))
 }
 
 /// Runs `task` in a maintenance instance of `policy` (DESIGN.md §9), its

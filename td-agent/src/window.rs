@@ -320,6 +320,9 @@ pub struct Session {
     show_keys: bool,
     /// Where no workspace may be, or why there are no workspaces.
     places: Result<Places, String>,
+    /// Why there is no jail, when `unconfined_without_jail` makes Empty
+    /// and Directory… workspaces unconfined instead (DESIGN.md §8).
+    jailless: Option<String>,
     /// The templates the chooser lists (DESIGN.md §7): the configured
     /// ones, then those made in the window.
     templates: Vec<Template>,
@@ -389,9 +392,9 @@ impl Session {
         for request in self.app.take_requests() {
             match request {
                 Request::Open(id) => self.open(id, None),
-                Request::New => self.start(None),
-                Request::NewScratch => self.start_in(None),
-                Request::NewIn(folder) => self.start_in(Some(folder)),
+                Request::New => self.start(None, false),
+                Request::NewScratch(unconfined) => self.start_in(None, unconfined),
+                Request::NewIn(folder, unconfined) => self.start_in(Some(folder), unconfined),
                 Request::NewFrom(name) => self.start_from(&name),
                 Request::SaveTemplate {
                     template,
@@ -784,11 +787,16 @@ impl Session {
 
     /// A new conversation in a workspace: a scratch one, or `folder`,
     /// admitted first (DESIGN.md §8), its refusal said by name.
-    fn start_in(&mut self, folder: Option<PathBuf>) {
+    fn start_in(&mut self, folder: Option<PathBuf>, unconfined: bool) {
         let places = match &self.places {
             Ok(places) => places,
             Err(why) => return self.app.note(why.clone()),
         };
+        if let (Some(why), false) = (&self.jailless, unconfined) {
+            return self
+                .app
+                .note(format!("no jailed workspace can be made: {why}"));
+        }
         let workspace = match folder {
             None => Workspace::Scratch,
             Some(folder) => {
@@ -812,7 +820,7 @@ impl Session {
                 }
             }
         };
-        self.start(Some(workspace));
+        self.start(Some(workspace), unconfined);
     }
 
     /// A new conversation from the configured template `name`
@@ -824,12 +832,17 @@ impl Session {
             Ok(places) => places.root.clone(),
             Err(why) => return self.app.note(why.clone()),
         };
+        if let Some(why) = &self.jailless {
+            return self.app.note(format!(
+                "a template's workspace is always jailed, and there is no jail: {why}"
+            ));
+        }
         let template = match chosen(&self.templates, name) {
             Ok(template) => template,
             Err(why) => return self.app.note(why),
         };
         if template.repos.is_empty() {
-            return self.start(Some(Workspace::Template(name.to_string())));
+            return self.start(Some(Workspace::Template(name.to_string())), false);
         }
         let shared = self
             .client
@@ -855,7 +868,7 @@ impl Session {
         });
         match made {
             Ok(Ok((id, repositories))) => {
-                self.start_as(id, Some(Workspace::Repositories(repositories)))
+                self.start_as(id, Some(Workspace::Repositories(repositories)), false)
             }
             Ok(Err(unadmitted)) => self.app.ask_admission(name.to_string(), unadmitted),
             Err(why) => self
@@ -1008,15 +1021,16 @@ impl Session {
     }
 
     /// A new conversation, created by its own process and opened.
-    fn start(&mut self, workspace: Option<Workspace>) {
+    fn start(&mut self, workspace: Option<Workspace>, unconfined: bool) {
         match Id::random() {
-            Ok(id) => self.start_as(id, workspace),
+            Ok(id) => self.start_as(id, workspace, unconfined),
             Err(e) => self.app.note(format!("a new conversation: {e}")),
         }
     }
 
     /// `start`, with the conversation's id given.
-    fn start_as(&mut self, id: Id, workspace: Option<Workspace>) {
+    /// `unconfined` runs its tools outside any jail (DESIGN.md §8).
+    fn start_as(&mut self, id: Id, workspace: Option<Workspace>, unconfined: bool) {
         self.app.add_row(Row {
             id: id.clone(),
             title: Role::Conversation.first_title().to_string(),
@@ -1024,6 +1038,7 @@ impl Session {
             state: RowState::Starting,
             paused: false,
             workspace: workspace.clone(),
+            unconfined,
             archived: false,
         });
         self.app.set_active(id.clone());
@@ -1031,7 +1046,12 @@ impl Session {
         match workspace {
             None => self.open(id, Some(Role::Conversation)),
             Some(workspace) => {
-                let created = self.supervisor.create(id, Role::Conversation, workspace);
+                let created = if unconfined {
+                    self.supervisor
+                        .create_unconfined(id, Role::Conversation, workspace)
+                } else {
+                    self.supervisor.create(id, Role::Conversation, workspace)
+                };
                 self.opened(created);
             }
         }
@@ -2593,14 +2613,25 @@ fn default_model(
 }
 
 /// Where no workspace may be (DESIGN.md §8), with the jail's programs:
-/// none without them.
-fn places(config: &Config, state: &StateDir) -> Result<Places, String> {
-    let programs = Programs::from_env()?;
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|home| home.is_absolute())
-        .ok_or("HOME is not an absolute path, so no workspace can be admitted")?;
-    Places::from_env(state.root(), &config.workspace_root(&home), &programs)
+/// none without them, unless `unconfined_without_jail` makes Empty and
+/// Directory… workspaces unconfined instead, when the second is why
+/// there is no jail.
+fn places(config: &Config, state: &StateDir) -> (Result<Places, String>, Option<String>) {
+    let made = |programs: &[&std::path::Path]| {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+            .ok_or("HOME is not an absolute path, so no workspace can be admitted")?;
+        Places::from_env(state.root(), &config.workspace_root(&home), programs)
+    };
+    match Programs::from_env() {
+        Ok(programs) => (made(&programs.all()), None),
+        Err(why) if config.unconfined_without_jail => match crate::jail::Unjailed::from_env() {
+            Ok(unjailed) => (made(&unjailed.all()), Some(why)),
+            Err(also) => (Err(format!("{why}; and unconfined: {also}")), None),
+        },
+        Err(why) => (Err(why), None),
+    }
 }
 
 /// The most a setup frame's client may take of `frame::MAX_FRAME`, the
@@ -2622,6 +2653,7 @@ fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
                 state: RowState::Closed,
                 paused: meta.paused,
                 workspace: meta.workspace,
+                unconfined: meta.unconfined,
                 archived: meta.archived,
             }
         })
@@ -2744,10 +2776,19 @@ pub fn run(
     // Workspaces, and the shared directories each gets, admitted once
     // here; without the jail there are none, and asking says why. No
     // workspace may reach an admitted local repository.
-    let places = places(&config, &state).map(|places| crate::workspace::Places {
+    let (places, jailless) = places(&config, &state);
+    let places = places.map(|places| crate::workspace::Places {
         locals: local_paths(&remotes),
         ..places
     });
+    if let Some(why) = &jailless {
+        let note = format!(
+            "there is no jail, so a new Empty or Directory\u{2026} workspace is unconfined (unconfined_without_jail): {why}"
+        );
+        eprintln!("td-agent: {note}");
+        app.note(note);
+        app.set_jailless(Some(why.clone()));
+    }
     match &places {
         Ok(places) => {
             let (shared, mut notes) = workspace::admit_shared(&config.shared(&places.home), places);
@@ -2876,6 +2917,7 @@ pub fn run(
         keys: key.iter().cloned().collect(),
         show_keys: false,
         places,
+        jailless,
         templates,
         configured: config.templates.clone(),
         saved,
@@ -3587,6 +3629,7 @@ mod tests {
             directory_grants: Vec::new(),
             directory_exposures: Vec::new(),
             removed: false,
+            unconfined: false,
             tracked: Vec::new(),
         };
         let metas = [
@@ -3637,6 +3680,7 @@ mod tests {
             directory_grants: Vec::new(),
             directory_exposures: Vec::new(),
             removed: false,
+            unconfined: false,
             tracked: Vec::new(),
         };
         let e = local_remote(&remote, &places, &reached(&[meta], &client)).unwrap_err();

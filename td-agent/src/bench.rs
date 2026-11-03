@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::host::{Call, Client};
-use crate::jail::{self, Policy, Programs};
+use crate::jail::{self, Policy, Programs, Unjailed};
 use crate::shell;
 use crate::store::{Event, Id, Kind, StateDir};
 use crate::tools::{self, Args};
@@ -24,6 +24,10 @@ use crate::workspace::{self, Shared, Workspace};
 pub struct Bench {
     /// The jail's programs, found once; why there are none otherwise.
     programs: Option<Result<Programs, String>>,
+    /// Whether the workspace is unconfined (DESIGN.md §8), its tool hosts
+    /// started outside any jail with these programs.
+    unconfined: bool,
+    unjailed: Option<Result<Unjailed, String>>,
     /// The policy and specs directory, for the shared directories and
     /// prepared repositories they were worked out with.
     policy: Option<(Vec<Shared>, Vec<PathBuf>, Policy, PathBuf)>,
@@ -36,6 +40,11 @@ pub struct Bench {
     asker: Option<crate::egress::Asker>,
     digests: BTreeMap<String, String>,
 }
+
+/// Why an MCP server does not start in an unconfined workspace (DESIGN.md
+/// §8, §12): a template's server is a standing decision made for a jail.
+pub const UNCONFINED_SERVER: &str =
+    "an MCP server does not start in an unconfined workspace, whose tools run outside any jail";
 
 /// Whether `call` runs in an instance of its own rather than the file
 /// tools' (DESIGN.md §12).
@@ -63,7 +72,11 @@ impl Bench {
         shared: &[Shared],
         prepared: &[PathBuf],
     ) -> Result<&Policy, String> {
-        if self.programs.is_none() {
+        if self.unconfined {
+            if self.unjailed.is_none() {
+                self.unjailed = Some(Unjailed::from_env());
+            }
+        } else if self.programs.is_none() {
             self.programs = Some(Programs::from_env());
         }
         let current = self.policy.as_ref().is_some_and(|(with, ready, _, _)| {
@@ -78,6 +91,52 @@ impl Bench {
             .as_ref()
             .map(|(_, _, policy, _)| policy)
             .ok_or_else(|| "no workspace policy".to_string())
+    }
+
+    /// Makes its tool hosts unconfined, as the conversation's workspace
+    /// was made (DESIGN.md §8), before it is prepared.
+    pub fn set_unconfined(&mut self, unconfined: bool) {
+        self.unconfined = unconfined;
+    }
+
+    /// Whether its tool hosts run outside any jail.
+    pub fn unconfined(&self) -> bool {
+        self.unconfined
+    }
+
+    /// Whether `call` keeps to the workspace's roots (DESIGN.md §8,
+    /// Unconfined workspaces): a file tool every path of which resolves,
+    /// as it is now, inside the worktrees or the shared directories, and
+    /// one that changes files inside the worktrees or the shared
+    /// directories made writable. A command never does, nor does a path
+    /// that cannot be told.
+    pub fn contained(&self, call: &Call) -> bool {
+        let Some((_, _, policy, _)) = &self.policy else {
+            return false;
+        };
+        let canonical = |roots: Vec<PathBuf>| -> Vec<PathBuf> {
+            roots
+                .iter()
+                .filter_map(|root| std::fs::canonicalize(root).ok())
+                .collect()
+        };
+        let roots = canonical(policy.roots());
+        let writable = canonical(policy.writable_roots());
+        let inside = |path: &str| within(Path::new(path), &roots);
+        let changes = |path: &str| within(Path::new(path), &writable);
+        match call {
+            Call::Read { path, .. } => inside(path),
+            Call::Write { path, .. } | Call::Edit { path, .. } => changes(path),
+            Call::Patch { patch, .. } => crate::patch::parse(patch)
+                .is_ok_and(|parsed| parsed.paths().into_iter().all(changes)),
+            Call::Glob { pattern, path } => {
+                !pattern.split('/').any(|segment| segment == "..")
+                    && path.as_deref().is_none_or(inside)
+            }
+            Call::Grep { path, .. } => path.as_deref().is_none_or(inside),
+            Call::Sed { paths, .. } => paths.iter().all(|path| changes(path)),
+            _ => false,
+        }
     }
 
     /// `call` with the digest a write or an edit must match: the one this
@@ -135,6 +194,21 @@ impl Bench {
             if let Some(files) = self.files.take() {
                 return Ok(files);
             }
+        }
+        if self.unconfined {
+            if matches!(call, Call::Serve { .. }) {
+                return Err(UNCONFINED_SERVER.into());
+            }
+            let programs = match &self.unjailed {
+                Some(Ok(programs)) => programs,
+                Some(Err(why)) => return Err(why.clone()),
+                None => return Err("the workspace is not prepared".into()),
+            };
+            let (_, _, policy, _) = self
+                .policy
+                .as_ref()
+                .ok_or("the workspace is not prepared")?;
+            return jail::launch_unjailed(programs, policy);
         }
         let programs = match &self.programs {
             Some(Ok(programs)) => programs,
@@ -299,6 +373,52 @@ impl Bench {
     }
 }
 
+/// Whether `path`, absolute, resolves inside one of `roots`, which are
+/// canonical: its nearest existing ancestor as it resolves, with the
+/// components that do not exist yet after it. A path with a `..`
+/// anywhere, or a link that leads nowhere yet, cannot be told, and is
+/// not; nor is one written under a tree naming the resolving process.
+fn within(path: &Path, roots: &[PathBuf]) -> bool {
+    // What these name is the resolving process's own, which the tool host
+    // is not; and with no `..`, none is reached but as written.
+    if !path.is_absolute() || PROCESS_OWN.iter().any(|own| path.starts_with(own)) {
+        return false;
+    }
+    let mut existing = PathBuf::new();
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return false,
+            std::path::Component::Normal(name) if !rest.is_empty() => rest.push(name),
+            other => {
+                let next = existing.join(other);
+                match std::fs::symlink_metadata(&next) {
+                    Ok(_) => existing = next,
+                    Err(_) => match other {
+                        std::path::Component::Normal(name) => rest.push(name),
+                        _ => return false,
+                    },
+                }
+            }
+        }
+    }
+    let Ok(mut resolved) = std::fs::canonicalize(&existing) else {
+        return false;
+    };
+    resolved.extend(rest);
+    roots.iter().any(|root| resolved.starts_with(root))
+}
+
+/// Trees whose paths name the process that resolves them.
+const PROCESS_OWN: &[&str] = &[
+    "/proc",
+    "/dev/fd",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+];
+
 /// The key a path's digest is kept under: its components, so `/w/./a`
 /// and `/w//a` are `/w/a`; `..` is left for the tool host to judge.
 fn key(path: &str) -> String {
@@ -334,6 +454,136 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::store::Call as Asked;
+
+    /// An unconfined workspace's call keeps to its roots only when every
+    /// path it names resolves inside one (DESIGN.md §8): through a link
+    /// or `..` out of them it does not, nor does a command, ever.
+    #[test]
+    fn an_unconfined_call_is_contained_only_inside_its_roots() {
+        let owned = td_fs::TempDir::new("contained").unwrap();
+        let base = std::fs::canonicalize(owned.path()).unwrap();
+        let work = base.join("work");
+        let outside = base.join("outside");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(work.join("a"), "a").unwrap();
+        std::fs::write(outside.join("s"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.join("s"), work.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("nowhere"), work.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(&outside, work.join("away")).unwrap();
+        let mut bench = Bench::default();
+        let text = |path: &Path| path.display().to_string();
+        let read = |path: &Path| Call::Read {
+            path: text(path),
+            offset: None,
+            limit: None,
+        };
+        let write = |path: &Path| Call::Write {
+            path: text(path),
+            content: "x".into(),
+            expected: None,
+        };
+        // Unprepared, nothing is.
+        assert!(!bench.contained(&read(&work.join("a"))));
+        bench.policy = Some((
+            Vec::new(),
+            Vec::new(),
+            Policy {
+                worktrees: vec![work.clone()],
+                ..Policy::default()
+            },
+            base.join("specs"),
+        ));
+        assert!(bench.contained(&read(&work.join("a"))));
+        assert!(bench.contained(&read(&work.join("./a"))));
+        assert!(bench.contained(&write(&work.join("new/deeper"))));
+        assert!(bench.contained(&read(&work)));
+        assert!(!bench.contained(&read(&outside.join("s"))));
+        assert!(!bench.contained(&read(&work.join("link"))));
+        assert!(!bench.contained(&write(&work.join("dangling"))));
+        assert!(!bench.contained(&write(&work.join("away/new"))));
+        assert!(!bench.contained(&read(&work.join("../outside/s"))));
+        assert!(!bench.contained(&write(&work.join("new/../../outside/x"))));
+        assert!(!bench.contained(&read(Path::new("a"))));
+        assert!(!bench.contained(&read(&base)));
+        assert!(!bench.contained(&read(Path::new("/proc/self/cwd/a"))));
+        assert!(!bench.contained(&read(Path::new("/dev/fd/3"))));
+        assert!(!bench.contained(&read(&work.join("../work/a"))));
+        // A directory shared read-only is read, never changed, unasked.
+        let notes = base.join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        std::fs::write(notes.join("n"), "n").unwrap();
+        if let Some((_, _, policy, _)) = bench.policy.as_mut() {
+            policy.read = vec![notes.clone()];
+        }
+        assert!(bench.contained(&read(&notes.join("n"))));
+        assert!(!bench.contained(&write(&notes.join("n"))));
+        assert!(!bench.contained(&write(&notes.join("new"))));
+        if let Some((_, _, policy, _)) = bench.policy.as_mut() {
+            policy.read = Vec::new();
+            policy.write = vec![notes.clone()];
+        }
+        assert!(bench.contained(&write(&notes.join("n"))));
+        if let Some((_, _, policy, _)) = bench.policy.as_mut() {
+            policy.write = Vec::new();
+        }
+        let glob = |pattern: &str, path: Option<&Path>| Call::Glob {
+            pattern: pattern.into(),
+            path: path.map(text),
+        };
+        assert!(bench.contained(&glob("**/*.rs", None)));
+        assert!(bench.contained(&glob("*", Some(&work))));
+        assert!(!bench.contained(&glob("../*", None)));
+        assert!(!bench.contained(&glob("*", Some(&outside))));
+        let grep = |path: Option<&Path>| Call::Grep {
+            pattern: "x".into(),
+            path: path.map(text),
+            include: None,
+            exclude: None,
+            extended: false,
+            ignore_case: false,
+            context: None,
+        };
+        assert!(bench.contained(&grep(None)));
+        assert!(!bench.contained(&grep(Some(&outside))));
+        let sed = |paths: &[&Path]| Call::Sed {
+            script: "s/a/b/".into(),
+            paths: paths.iter().map(|path| text(path)).collect(),
+            extended: false,
+        };
+        assert!(bench.contained(&sed(&[&work.join("a")])));
+        assert!(!bench.contained(&sed(&[&work.join("a"), &outside.join("s")])));
+        let patch = |text: String| Call::Patch {
+            patch: text,
+            expected: Vec::new(),
+        };
+        let a = text(&work.join("a"));
+        assert!(bench.contained(&patch(format!(
+            "*** Begin Patch\n*** Update File: {a}\n@@\n-a\n+b\n*** End Patch\n"
+        ))));
+        let moved = text(&outside.join("moved"));
+        assert!(!bench.contained(&patch(format!(
+            "*** Begin Patch\n*** Update File: {a}\n*** Move to: {moved}\n@@\n-a\n+b\n*** End Patch\n"
+        ))));
+        assert!(!bench.contained(&patch("not a patch".into())));
+        assert!(!bench.contained(&Call::Shell {
+            command: "true".into(),
+            timeout_ms: None,
+            workdir: None
+        }));
+        // An MCP server does not start outside the jail.
+        bench.set_unconfined(true);
+        bench.unjailed = Some(Ok(Unjailed {
+            agent: "/bin/true".into(),
+            txt: None,
+        }));
+        let serve = Call::Serve {
+            program: "server".into(),
+            args: Vec::new(),
+            workdir: None,
+        };
+        assert_eq!(bench.take(&serve, 1).err().unwrap(), UNCONFINED_SERVER);
+    }
 
     #[test]
     fn web_fetch_settings_do_not_restart_servers() {
