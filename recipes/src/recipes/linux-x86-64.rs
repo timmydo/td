@@ -606,6 +606,31 @@ pub fn recipe() -> Recipe {
     //    BUFFER_HEAD; VFAT_FS selects FAT_FS; FAT selects LEGACY_DIRECT_IO
     //    and exFAT FS_IOMAP.
     //
+    //    DRIVER FAMILIES: td builds no modules, so hardware binds only to a
+    //    built-in driver, and allnoconfig starts with none. Rather than one
+    //    board's chips at a time, the common families a desktop or laptop
+    //    meets are built in whole: Intel IGB and Realtek R8169 (behind
+    //    NET_VENDOR_REALTEK) wired NICs; USB Ethernet behind USB_NET_DRIVERS:
+    //    usbnet with CDC Ethernet, CDC NCM (docks and tethering) and ASIX
+    //    AX88179, and Realtek's RTL8152 family; USB Attached SCSI for USB
+    //    SSDs and enclosures; USB audio behind SND_USB (playback: td-seatd
+    //    hands the audio account playback nodes only); and UDF for Blu-ray
+    //    and UDF media. Only UDF_FS is visible at allnoconfig; the rest sit
+    //    behind NET, USB or SND, and several would follow by default, so the
+    //    pins hold them as the vendor menus' are held. R8169 and RTL8152 ask
+    //    for optional firmware patches, which no pin supplies: the chips run
+    //    their ROM's firmware, as without linux-firmware. Defaults that come
+    //    with them: IGB_HWMON, and usbnet's ASIX AX8817X (AX88772 adapters,
+    //    with PHYLINK and AX88796B_PHY) and RTL8153_ECM. usbnet's
+    //    host-to-host cables (NET1080, the CDC subset) and Zaurus links also
+    //    default on, and are pinned off: a module-free kernel binds any USB
+    //    device to every built-in driver, so a driver nobody uses is surface.
+    //    Selected, so not written: IGB's I2C_ALGOBIT; R8169's FW_LOADER,
+    //    PHYLIB, REALTEK_PHY (and PHY_PACKAGE) and CRC32; RTL8152's MII and
+    //    CRYPTO_LIB_SHA256; AX88179's PHYLIB; UDF's CRC_ITU_T, BUFFER_HEAD
+    //    and LEGACY_DIRECT_IO; USB audio's SND_HWDEP, SND_RAWMIDI and
+    //    BITREVERSE.
+    //
     //    CLOUD GUESTS (td-svc/DESIGN.md §10, "Cloud images"): the drivers a
     //    server image needs to find its disk and network on Azure, EC2 Nitro
     //    and GCE. Azure's synthetic devices are on VMBus: storvsc presents the
@@ -967,6 +992,22 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_NLS_CODEPAGE_437[ =]/d; \
                   /^#? *CONFIG_NLS_ISO8859_1[ =]/d; \
                   /^#? *CONFIG_NLS_UTF8[ =]/d; \
+                  /^#? *CONFIG_IGB[ =]/d; \
+                  /^#? *CONFIG_NET_VENDOR_REALTEK[ =]/d; \
+                  /^#? *CONFIG_R8169[ =]/d; \
+                  /^#? *CONFIG_USB_NET_DRIVERS[ =]/d; \
+                  /^#? *CONFIG_USB_USBNET[ =]/d; \
+                  /^#? *CONFIG_USB_NET_CDCETHER[ =]/d; \
+                  /^#? *CONFIG_USB_NET_CDC_NCM[ =]/d; \
+                  /^#? *CONFIG_USB_RTL8152[ =]/d; \
+                  /^#? *CONFIG_USB_NET_AX88179_178A[ =]/d; \
+                  /^#? *CONFIG_USB_UAS[ =]/d; \
+                  /^#? *CONFIG_SND_USB[ =]/d; \
+                  /^#? *CONFIG_SND_USB_AUDIO[ =]/d; \
+                  /^#? *CONFIG_UDF_FS[ =]/d; \
+                  /^#? *CONFIG_USB_NET_NET1080[ =]/d; \
+                  /^#? *CONFIG_USB_NET_CDC_SUBSET[ =]/d; \
+                  /^#? *CONFIG_USB_NET_ZAURUS[ =]/d; \
                   /^#? *CONFIG_SND_ALOOP[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
@@ -1227,6 +1268,22 @@ pub fn recipe() -> Recipe {
                    'CONFIG_NLS_CODEPAGE_437=y' \
                    'CONFIG_NLS_ISO8859_1=y' \
                    'CONFIG_NLS_UTF8=y' \
+                   'CONFIG_IGB=y' \
+                   'CONFIG_NET_VENDOR_REALTEK=y' \
+                   'CONFIG_R8169=y' \
+                   'CONFIG_USB_NET_DRIVERS=y' \
+                   'CONFIG_USB_USBNET=y' \
+                   'CONFIG_USB_NET_CDCETHER=y' \
+                   'CONFIG_USB_NET_CDC_NCM=y' \
+                   'CONFIG_USB_RTL8152=y' \
+                   'CONFIG_USB_NET_AX88179_178A=y' \
+                   'CONFIG_USB_UAS=y' \
+                   'CONFIG_SND_USB=y' \
+                   'CONFIG_SND_USB_AUDIO=y' \
+                   'CONFIG_UDF_FS=y' \
+                   '# CONFIG_USB_NET_NET1080 is not set' \
+                   '# CONFIG_USB_NET_CDC_SUBSET is not set' \
+                   '# CONFIG_USB_NET_ZAURUS is not set' \
                    'CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin amdgpu/green_sardine_asd.bin amdgpu/green_sardine_ce.bin amdgpu/green_sardine_dmcub.bin amdgpu/green_sardine_me.bin amdgpu/green_sardine_mec.bin amdgpu/green_sardine_pfp.bin amdgpu/green_sardine_rlc.bin amdgpu/green_sardine_sdma.bin amdgpu/green_sardine_ta.bin amdgpu/green_sardine_vcn.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' \
                    'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' >> .config"
                     .replace(
@@ -1519,6 +1576,22 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_NLS_CODEPAGE_437=y' .config || { echo 'NLS_CODEPAGE_437 off — FAT refuses to mount without its default codepage' >&2; exit 1; }; \
                  grep -q '^CONFIG_NLS_ISO8859_1=y' .config || { echo 'NLS_ISO8859_1 off — VFAT refuses to mount without its default iocharset' >&2; exit 1; }; \
                  grep -q '^CONFIG_NLS_UTF8=y' .config || { echo 'NLS_UTF8 off — a mount asking iocharset=utf8 fails' >&2; exit 1; }; \
+                 grep -q '^CONFIG_IGB=y' .config || { echo 'IGB off — the Intel 82575/82576/I210/I211/I350 wired NICs many desktop and server boards carry have no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NET_VENDOR_REALTEK=y' .config || { echo 'NET_VENDOR_REALTEK off — R8169 is hidden behind it' >&2; exit 1; }; \
+                 grep -q '^CONFIG_R8169=y' .config || { echo 'R8169 off — the Realtek 8111/8168/8125 wired NICs most consumer boards carry have no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_NET_DRIVERS=y' .config || { echo 'USB_NET_DRIVERS off — every USB Ethernet driver is hidden behind it' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_USBNET=y' .config || { echo 'USB_USBNET off — the CDC, NCM and AX88179 adapters are drivers on it' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_NET_CDCETHER=y' .config || { echo 'USB_NET_CDCETHER off — class-compliant USB Ethernet adapters and phone tethering have no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_NET_CDC_NCM=y' .config || { echo 'USB_NET_CDC_NCM off — USB-C docks and NCM tethering have no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_RTL8152=y' .config || { echo 'USB_RTL8152 off — Realtek RTL8152/8153/8156 USB and dock Ethernet has no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_NET_AX88179_178A=y' .config || { echo 'USB_NET_AX88179_178A off — ASIX AX88179 USB 3 gigabit adapters have no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_UAS=y' .config || { echo 'USB_UAS off — USB SSDs and enclosures fall back to slow bulk-only transport' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_USB=y' .config || { echo 'SND_USB off — USB audio is hidden behind it' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_USB_AUDIO=y' .config || { echo 'SND_USB_AUDIO off — USB headsets and DACs have no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_UDF_FS=y' .config || { echo 'UDF_FS off — Blu-ray discs, packet-written DVDs and UDF-formatted media cannot be mounted' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_USB_NET_NET1080 is not set' .config || { echo 'USB_NET_NET1080 on — NetChip host-to-host cables are USB drivers nothing asked for' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_USB_NET_CDC_SUBSET is not set' .config || { echo 'USB_NET_CDC_SUBSET on — Belkin and ARM Linux host-to-host links are USB drivers nothing asked for' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_USB_NET_ZAURUS is not set' .config || { echo 'USB_NET_ZAURUS on — Sharp Zaurus links are USB drivers nothing asked for' >&2; exit 1; }; \
                  for m in PAGE_TABLE_ISOLATION RETPOLINE RETHUNK UNRET_ENTRY CALL_DEPTH_TRACKING IBPB_ENTRY IBRS_ENTRY SRSO GDS RFDS SPECTRE_BHI MDS TAA MMIO_STALE_DATA L1TF RETBLEED SPECTRE_V1 SPECTRE_V2 SRBDS SSB ITS TSA VMSCAPE; do grep -q \"^CONFIG_MITIGATION_$m=y\" .config || { echo \"MITIGATION_$m off or absent — its upstream default did not survive resolution, or this kernel renamed it\" >&2; exit 1; }; done; \
                  if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::shared::efi_default_cmdline())),
             ],
@@ -1889,9 +1962,10 @@ mod tests {
     }
 
     /// The Ryzen desktop's I225-V NIC, the RTC interfaces td-time uses, a
-    /// KVM host for QEMU guests, and the filesystems removable and foreign
+    /// KVM host for QEMU guests, the filesystems removable and foreign
     /// disks carry, each with the character sets its default mount options
-    /// load.
+    /// load, and the common wired, USB Ethernet, UAS, USB audio and UDF
+    /// families, with usbnet's unused host-to-host links held off.
     #[test]
     fn desktop_nic_clock_kvm_host_and_removable_filesystems_are_builtin() {
         let steps = recipe().steps.unwrap_or_default();
@@ -1927,6 +2001,19 @@ mod tests {
             "NLS_CODEPAGE_437",
             "NLS_ISO8859_1",
             "NLS_UTF8",
+            "IGB",
+            "NET_VENDOR_REALTEK",
+            "R8169",
+            "USB_NET_DRIVERS",
+            "USB_USBNET",
+            "USB_NET_CDCETHER",
+            "USB_NET_CDC_NCM",
+            "USB_RTL8152",
+            "USB_NET_AX88179_178A",
+            "USB_UAS",
+            "SND_USB",
+            "SND_USB_AUDIO",
+            "UDF_FS",
         ] {
             let pin = format!("'CONFIG_{symbol}=y'");
             let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
@@ -1935,6 +2022,21 @@ mod tests {
             assert_eq!(
                 text.matches(&format!("grep -q '^CONFIG_{symbol}=y' .config"))
                     .count(),
+                1,
+                "{symbol}"
+            );
+        }
+        for symbol in ["USB_NET_NET1080", "USB_NET_CDC_SUBSET", "USB_NET_ZAURUS"] {
+            let off = format!("# CONFIG_{symbol} is not set");
+            assert_eq!(
+                text.matches(&format!("/^#? *CONFIG_{symbol}[ =]/d;"))
+                    .count(),
+                1,
+                "{symbol}"
+            );
+            assert_eq!(text.matches(&format!("'{off}'")).count(), 1, "{symbol}");
+            assert_eq!(
+                text.matches(&format!("grep -q '^{off}' .config")).count(),
                 1,
                 "{symbol}"
             );
