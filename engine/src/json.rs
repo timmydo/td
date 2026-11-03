@@ -13,15 +13,7 @@
 //! exact (no f64 round-trip); recipe and phase JSON today carry only strings,
 //! bools, arrays and objects.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
+#![allow(clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Json {

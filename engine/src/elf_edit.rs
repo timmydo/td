@@ -1,5 +1,4 @@
 //! ELF interpreter and run-path rewriting for the pinned Rust toolchain.
-#![allow(clippy::indexing_slicing)] // relocated existing writer
 use crate::elf::*;
 use std::path::Path;
 const PT_NOTE: u32 = 4;
@@ -132,7 +131,7 @@ pub fn set_interp(path: &Path, new_interp: &str) -> Result<(), String> {
             .get_mut(off..end)
             .ok_or("PT_INTERP string runs past end of file")?;
         for (i, slot) in raw.iter_mut().enumerate() {
-            *slot = if i < nb.len() { nb[i] } else { 0 };
+            *slot = nb.get(i).copied().unwrap_or(0);
         }
     } else {
         // Too long for the slot — GROW. Appending the string and repointing PT_INTERP's file
@@ -260,8 +259,12 @@ pub fn set_rpath(path: &Path, new_rpath: &str) -> Result<(), String> {
     }
     for (off, term) in terms {
         // Write the new string then a NUL, NUL-padding the rest of the old slot in place.
-        for i in 0..=term {
-            b[off + i] = if i < nb.len() { nb[i] } else { 0 };
+        let raw = b
+            .get_mut(off..)
+            .and_then(|r| r.get_mut(..=term))
+            .ok_or("DT_RPATH/DT_RUNPATH string slot runs past end of file")?;
+        for (i, slot) in raw.iter_mut().enumerate() {
+            *slot = nb.get(i).copied().unwrap_or(0);
         }
     }
     std::fs::write(path, &b).map_err(|e| format!("write {}: {e}", path.display()))?;
