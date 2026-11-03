@@ -10094,9 +10094,13 @@ mod tests {
     }
 
     /// A chain deeper than the bound is drawn nowhere rather than walked
-    /// forever. The bound is load-bearing: the server does not yet refuse a
-    /// popup parented on its own descendant, so a cycle is constructible and
-    /// this is what contains it.
+    /// forever. The protocol cannot build the cycle below: DESIGN.md §3's six
+    /// legs pin each popup parent edge to the role object already there when
+    /// it was made, and the server's
+    /// `a_recreated_popup_role_object_cannot_close_a_cycle` drives the
+    /// closest shape. These placements go through `commit_popup` directly,
+    /// below the protocol, because that is the only way to hand the renderer
+    /// one. The bound is defence in depth for an argument spanning two modules.
     #[test]
     fn a_chain_of_menus_past_the_bound_is_drawn_nowhere() {
         let (mut scene, _, width, height, _, key, rect) = popup_output();

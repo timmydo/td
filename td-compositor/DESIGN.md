@@ -2296,6 +2296,20 @@ renderer's depth bound stays. Six rules across two modules is exactly the kind
 of conjunction that has now been corrected three times, and what it costs to be
 wrong is a compositor that never paints again.
 
+The tests split the same way, and should be read that way. At the protocol,
+the server's tests drive the closing requests and see each refused or come to
+nothing: a popup naming its own xdg_surface, a menu's surface taking a
+toplevel, a second popup beside a live one, a menu destroyed under its
+submenu, an edge to a destroyed wl_surface, a commit through a reissued
+xdg_surface id, and the sixth-leg shape, which reverses an edge and leaves no
+loop. No other request moves a popup edge: `xdg_popup.reposition` is version
+3 and td advertises version 1, and the toplevel parent map that `set_parent`,
+xdg-foreign and the portal manager write is a separate graph with its own
+cycle refusal, which no popup walk follows. The scene's cycle test is not
+evidence that a cycle is reachable: it calls `commit_popup` directly, below
+the protocol, because that is the only way to hand the renderer one, and what
+it proves is the bound.
+
 One part is incomplete and three have landed, and each is a landing of its
 own. **Constraint adjustment** is acted on when the parent is visible and has
 a placeable output: flip, slide and resize are applied in protocol order and

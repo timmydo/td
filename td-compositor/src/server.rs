@@ -21349,9 +21349,13 @@ mod tests {
 
     /// A menu may not be destroyed while a submenu hangs off it — the
     /// protocol's `not_the_topmost_popup`, which for a tree is a popup with a
-    /// live child. It does NOT make a cycle unbuildable; a popup's parent is a
-    /// wl_surface id and ids are recycled, which DESIGN.md §3 carries and the
-    /// renderer's depth bound is what contains.
+    /// live child. On its own it does not make a cycle unbuildable; it is the
+    /// leg of DESIGN.md §3's argument that PINS a parent edge, so a menu cannot
+    /// be destroyed and rebuilt hanging off its own submenu. The recycled-id
+    /// roads are closed elsewhere: a wl_surface id, which only a toplevel
+    /// parent can give back while a menu names it, by `orphan_popups_of`
+    /// breaking the edge at `wl_surface.destroy`; an xdg_surface id by
+    /// `SurfaceRole::XdgRetired`.
     ///
     /// The protocol's own wording is "tried to map or destroy a non-topmost
     /// popup", and only the destroy half is here. A naive map check would be
