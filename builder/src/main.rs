@@ -1263,7 +1263,6 @@ struct OutputReg {
 /// references resolve to another output's id or to a scaffolding `ValidPaths` row
 /// (path only) — the same shape `store-add-referenced` writes. registrationTime is
 /// a fixed sentinel (excluded from the daemon differential, as in `store-register`).
-#[allow(clippy::expect_used, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
     use std::collections::BTreeMap;
     use store_db::{Table, Value};
@@ -1286,11 +1285,12 @@ fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
             }
         }
     }
-    let id_of = |p: &str| -> i64 {
-        *out_id
+    let id_of = |p: &str| -> Result<i64, String> {
+        out_id
             .get(p)
             .or_else(|| ext_id.get(p))
-            .expect("reference id assigned above")
+            .copied()
+            .ok_or_else(|| format!("internal: reference {p} was assigned no id"))
     };
     let mut valid: Vec<(i64, Vec<Value>)> = Vec::new();
     for (i, r) in regs.iter().enumerate() {
@@ -1308,7 +1308,7 @@ fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
     }
     for p in &ext_order {
         valid.push((
-            ext_id[p],
+            id_of(p)?,
             vec![
                 Value::Null,
                 Value::Text(p.clone()),
@@ -1323,7 +1323,7 @@ fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
     let mut rid = 1i64;
     for (i, r) in regs.iter().enumerate() {
         for rf in &r.refs {
-            ref_rows.push((rid, vec![Value::Int(i as i64 + 1), Value::Int(id_of(rf))]));
+            ref_rows.push((rid, vec![Value::Int(i as i64 + 1), Value::Int(id_of(rf)?)]));
             rid += 1;
         }
     }
@@ -1364,7 +1364,6 @@ fn write_output_db(regs: &[OutputReg], out_db: &Path) -> Result<(), String> {
 /// Scope is the GC/closure authority — `ValidPaths` + `Refs`; a persistent commit DB
 /// does not carry `DerivationOutputs` (as `store-gc-sweep`'s swept DB does not: the
 /// drv→output mapping is rebuilt by registration, not by accumulation).
-#[allow(clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn merge_regs(existing: Option<&[u8]>, new_regs: &[OutputReg]) -> Result<Vec<u8>, String> {
     use std::collections::{BTreeMap, BTreeSet};
     use store_db::{Table, Value as WV};
@@ -1468,7 +1467,10 @@ fn merge_regs(existing: Option<&[u8]>, new_regs: &[OutputReg]) -> Result<Vec<u8>
             ],
         ));
         for rf in &r.refs {
-            ref_rows.push((rid, vec![WV::Int(myid), WV::Int(id_of[rf.as_str()])]));
+            let target = id_of
+                .get(rf.as_str())
+                .ok_or_else(|| format!("internal: reference {rf} has no row"))?;
+            ref_rows.push((rid, vec![WV::Int(myid), WV::Int(*target)]));
             rid += 1;
         }
     }
@@ -2224,7 +2226,6 @@ fn store_add_builder(
 /// shape. Returns the per-output registration facts (for `realize` to write a td
 /// store-db). Shared by `build` (CLOSURE handed in as a file) and `realize`
 /// (CLOSURE computed by td itself from the store DB's Refs graph).
-#[allow(clippy::expect_used)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn build_and_register(
     drv_path: &str,
     closure: &[String],
@@ -2270,7 +2271,7 @@ fn build_and_register(
             .outputs
             .iter()
             .find(|o| &o.name == name)
-            .expect("output came from this drv")
+            .ok_or_else(|| format!("internal: built output {name} is not in {drv_path}"))?
             .path;
         let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
         nar::write_nar(&mut scanner, host).map_err(|e| e.to_string())?;
@@ -5792,7 +5793,6 @@ fn push_drv_env_line(spec: &mut String, name: &str, value: &str) -> Result<(), S
 /// (assemble-only, so a SEPARATE process — the build daemon — realizes the td-assembled
 /// drv). Splitting assembly from realization is what lets td's own daemon, not a `guix
 /// repl`-emitted drv, be the build's input (own-builder-daemon §5).
-#[allow(clippy::unreachable)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn assemble_recipe_drv(
     recipe_json: &str,
     lock_file: &str,
@@ -6335,7 +6335,11 @@ fn assemble_recipe_drv(
                 }
             }
         }
-        _ => unreachable!("buildSystem already validated"),
+        other => {
+            return Err(format!(
+                "internal: buildSystem `{other}' passed validation unhandled"
+            ))
+        }
     }
     // td assembles the .drv (pure Rust, no guix (derivation …), no daemon).
     let read = |p: &str| std::fs::read(p).map_err(|e| e.to_string());
@@ -8041,12 +8045,16 @@ impl NativeToolchain {
 /// Usage: shell PKG... [-- CMD ARGS...]
 ///   PKG...      td package names (a recipe must exist; no guix fallback)
 ///   -- CMD...   the command to run in the composed env; omitted → interactive $SHELL
-#[allow(clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
     // Everything before the first `--` is a package name; after it, the command.
     let sep = rest.iter().position(|a| a == "--");
     let (pkgs, cmd): (&[String], &[String]) = match sep {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
+        Some(i) => rest.get(..i).zip(rest.get(i + 1..)).ok_or_else(|| {
+            format!(
+                "internal: shell's `--` at {i} is outside its {} arguments",
+                rest.len()
+            )
+        })?,
         None => (rest, &[]),
     };
 
