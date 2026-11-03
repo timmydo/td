@@ -566,8 +566,13 @@ wait, so they do not overwrite one another's generated state. These operations
 replace generated `.td-build-cache/crate-vendor/RECIPE` state, never the user's
 source checkout. The builder's early td-net preparation uses the same
 `warm crate-local` operation and canonical `RECIPE/vendor` layout; it no longer
-writes a separate flat archive cache. Existing host caches need that ordinary
-warm operation before export if they contain only the retired flat layout.
+writes a separate flat archive cache. Existing host caches need that
+ordinary warm operation before export if they contain only the retired flat
+layout. Distinct from that retired per-worktree layout, the `warm crate`,
+`crate-local` and `crate-lock` jobs take and give verified archives through
+the host-wide `~/.td/crates` download cache (DEVELOPMENT.md), which only
+saves the download: each archive it yields is checked against the lock, and
+export reads only the canonical `RECIPE/vendor` set.
 A published cache remains successful if old-backup cleanup fails: the command
 warns and the next preparation retries cleanup. Repeated consume operations
 reverify private archive bytes; a completion marker alone is not integrity

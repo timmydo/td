@@ -488,6 +488,24 @@ fn download_verified_policy(
     )
 }
 
+/// The digest of `dst` when it is a bounded regular file, opened without
+/// following a link or blocking on a FIFO: whatever else sits at a
+/// destination is replaced by the publish, never read through or kept.
+fn existing_regular_sha256(dst: &Path, guard: Option<&ResponseGuard<'_>>) -> io::Result<String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_REGULAR_NOFOLLOW)
+        .open(dst)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_ARTIFACT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "destination is not a bounded regular file",
+        ));
+    }
+    reader_sha256_before(&mut file, MAX_ARTIFACT_BYTES, guard)
+}
+
 /// One locked publication path for downloaded and locally exported artifacts.
 fn acquire_verified(
     dst: &Path,
@@ -537,7 +555,7 @@ fn acquire_verified(
             .map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
     }
     sweep_download_temps(parent);
-    let existing = file_sha256_before(dst, MAX_ARTIFACT_BYTES, guard);
+    let existing = existing_regular_sha256(dst, guard);
     if let Some(guard) = guard {
         guard
             .check()
@@ -1148,7 +1166,8 @@ fn serve_index_before(
 /// index cksum — the td-owned, verifying egress. The cache is NOT trusted blindly: a cache
 /// hit is re-verified against the index cksum on every serve, and a corrupted/stale entry
 /// is discarded and refetched. So the sha256==index-cksum guarantee holds for cached hits,
-/// not just fresh downloads (the integrity the `warm crate`/`warm crate-local` path relies on).
+/// not just fresh downloads (the integrity the `warm crate`/`warm crate-local` path relies on for
+/// what it fetches; what it takes from `crates_dir()` is checked against the lock alone).
 fn serve_crate_before(
     store: &Path,
     cr: &str,
@@ -1157,12 +1176,7 @@ fn serve_crate_before(
 ) -> Result<(File, u64), String> {
     guard.check().map_err(|e| e.to_string())?;
     let idxpath = index_path(cr).ok_or_else(|| format!("bad download crate name {cr:?}"))?;
-    if ver.is_empty()
-        || ver.len() > 128
-        || !ver
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
-    {
+    if !valid_crate_version(ver) {
         return Err(format!("bad download version {ver:?}"));
     }
     let cache = store_path(&store.join("crates"), &format!("{cr}-{ver}.crate"))
@@ -1767,13 +1781,7 @@ fn account_locked_cargo_source(
             "Cargo.lock registry package `{name}-{version}' has no canonical SHA-256 checksum"
         ));
     };
-    if index_path(name).is_none()
-        || version.is_empty()
-        || version.len() > 128
-        || !version
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
-    {
+    if index_path(name).is_none() || !valid_crate_version(version) {
         return Err(format!(
             "Cargo.lock registry package has an unsafe name or version: `{name}-{version}'"
         ));
@@ -1941,12 +1949,32 @@ fn transfer_registry_sources(
 /// afterwards would let a lock edited mid-fetch stamp the NEW digest onto the
 /// set selected by the OLD one — sealing a mismatch as complete (review
 /// finding).
+///
+/// With `shared` (`crates_dir()`), a crate already there whose bytes hash to
+/// the lock's checksum is copied into `store` instead of fetched, and a
+/// fetched one is published there, so a crate is downloaded once per host
+/// rather than once per worktree. A crate taken from there is checked
+/// against the lock alone: it passed the index check when it was fetched,
+/// so only bytes a same-user writer planted under the name could differ,
+/// and those serve only a lock that names exactly them.
 fn fetch_locked_registry(
     lock_path: &Path,
     store: &Path,
+    shared: Option<&Path>,
 ) -> Result<(LockedCargoSources, String), String> {
     let (sources, digest) = read_locked_cargo_sources(lock_path)?;
+    let mut publish = shared;
+    let mut said = false;
     for package in &sources.registry {
+        match shared.map(|shared| reuse_shared_crate(shared, store, package)) {
+            Some(Ok(true)) => continue,
+            // Once: an unreadable cache would say it for every crate.
+            Some(Err(error)) if !said => {
+                eprintln!("td-feed: {error}; fetching it (later shared misses go unsaid)");
+                said = true;
+            }
+            _ => {}
+        }
         let guard = ResponseGuard {
             deadline: Instant::now() + RESPONSE_DEADLINE,
             client: None,
@@ -1960,8 +1988,87 @@ fn fetch_locked_registry(
                 package.name, package.version, package.checksum
             ));
         }
+        if let Some(shared) = publish {
+            if let Err(error) = publish_shared_crate(shared, store, package) {
+                // Once: an unwritable cache would say it for every crate.
+                eprintln!(
+                    "td-feed: {}-{} not shared in {} ({error}); not sharing the rest of this lock",
+                    package.name,
+                    package.version,
+                    shared.display()
+                );
+                publish = None;
+            }
+        }
     }
     Ok((sources, digest))
+}
+
+/// The shared crate download cache: `$HOME/.td/crates`, flat
+/// `NAME-VERSION.crate`, None without a HOME (nothing is shared then). Like
+/// `sources_dir` it is every worktree's with no override; unlike it, no
+/// sandbox binds it. Nothing in it is trusted: a file is used only through
+/// `copy_verified_file`, whose copy must hash to the committed lock's
+/// checksum, and only bytes that passed both the index and the lock check
+/// are put in.
+fn crates_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".td/crates"))
+}
+
+fn valid_crate_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 128
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
+}
+
+/// `NAME-VERSION.crate`, the name the proxy store and the vendor set use.
+fn crate_file_name(name: &str, version: &str) -> Option<String> {
+    index_path(name)?;
+    valid_crate_version(version).then(|| format!("{name}-{version}.crate"))
+}
+
+/// Copy the shared cache's `package` into `store`'s crate cache, where the
+/// vendor set is taken from, through `copy_verified_file`: opened without
+/// following a link, bounded, copied to a private reservation that must
+/// hash to the lock's checksum, then renamed. Ok(false) for a crate the
+/// cache does not hold or cannot name, Err for one it holds but cannot
+/// yield; either way nothing is left behind and the caller fetches it.
+fn reuse_shared_crate(
+    shared: &Path,
+    store: &Path,
+    package: &LockedRegistryPackage,
+) -> Result<bool, String> {
+    let Some(file) = crate_file_name(&package.name, &package.version) else {
+        return Ok(false);
+    };
+    let Some(dst) = store_path(&store.join("crates"), &file) else {
+        return Ok(false);
+    };
+    let src = shared.join(&file);
+    if matches!(std::fs::symlink_metadata(&src), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+        return Ok(false);
+    }
+    copy_verified_file(&src, &dst, &package.checksum, || Ok(()))
+        .map(|()| true)
+        .map_err(|error| format!("shared {} not reused ({error})", src.display()))
+}
+
+/// Publish `store`'s verified `package` into the shared cache through the
+/// same `copy_verified_file`, which reserves its own temporary under the
+/// cache's lock, sweeps ones a killed warm left, and leaves a crate another
+/// worktree already published as it is.
+fn publish_shared_crate(
+    shared: &Path,
+    store: &Path,
+    package: &LockedRegistryPackage,
+) -> Result<(), String> {
+    let file = crate_file_name(&package.name, &package.version).ok_or("unsafe crate name")?;
+    let src = store_path(&store.join("crates"), &file).ok_or("unsafe crate name")?;
+    copy_verified_file(&src, &shared.join(&file), &package.checksum, || Ok(()))
 }
 
 /// The cargo `config.toml` body that routes crates.io through the proxy at `addr` (sparse
@@ -2054,7 +2161,8 @@ fn detach_from_workspace(manifest: &Path) -> Result<(), String> {
 
 /// warm crate CRATE VERSION [DEST] — provision a crates.io package's metadata + its FULL
 /// locked registry closure through td's verifying egress (each `.crate` sha256 must equal
-/// both the Cargo.lock checksum and crates.io sparse-index cksum). Leaves, for the
+/// the Cargo.lock checksum, and a fetched one crates.io's sparse-index cksum too; one the
+/// host's `crates_dir()` already holds is checked against the lock alone). Leaves, for the
 /// offline gate to intern + build via TD_VENDOR_DIR:
 ///   .td-build-cache/crate-vendor/<dest>/src/<crate>-<ver>/  Cargo metadata only
 ///   .td-build-cache/crate-vendor/<dest>/work/<crate>-<ver>.crate  original source
@@ -2139,7 +2247,11 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     //    td's verifying egress.
     let _ = std::fs::remove_dir_all(proxy_store.join("crates"));
     let _ = std::fs::remove_dir_all(proxy_store.join("index"));
-    let (sources, digest) = match fetch_locked_registry(&srcdir.join("Cargo.lock"), &proxy_store) {
+    let (sources, digest) = match fetch_locked_registry(
+        &srcdir.join("Cargo.lock"),
+        &proxy_store,
+        crates_dir().as_deref(),
+    ) {
         Ok(sources) => sources,
         Err(error) => {
             eprintln!(
@@ -2180,7 +2292,7 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     mark_warm_complete(&vendor, n, &digest);
     eprintln!(
         "td-feed warm crate: {krate}-{ver} — source + {n} registry crates provisioned guix-free \
-         (Cargo.lock-pinned, registry sha==index cksum) in {}",
+         (Cargo.lock-pinned: every sha==lock checksum, each fetched one ==index cksum) in {}",
         cv.display()
     );
 }
@@ -2256,7 +2368,8 @@ fn warm_crate_lock(root: &Path, lock: &Path, dest: &str, action: &str) {
         .join(format!("{dest}.work"));
     let _ = std::fs::remove_dir_all(&work);
     let proxy_store = work.join("proxy-store");
-    let (sources, digest) = match fetch_locked_registry(lock, &proxy_store) {
+    let (sources, digest) = match fetch_locked_registry(lock, &proxy_store, crates_dir().as_deref())
+    {
         Ok(sources) => sources,
         Err(error) => {
             eprintln!(
@@ -2290,7 +2403,7 @@ fn warm_crate_lock(root: &Path, lock: &Path, dest: &str, action: &str) {
     mark_warm_complete(&vendor, n, &digest);
     eprintln!(
         "td-feed warm {action}: {dest} — {n} registry crates provisioned guix-free \
-         (lock {}, registry sha==index cksum) in {}",
+         (lock {}: every sha==lock checksum, each fetched one ==index cksum) in {}",
         lock.display(),
         vendor.display()
     );
@@ -3004,11 +3117,39 @@ fn warm_selftest() {
     );
     std::fs::write(&lock, &lock_text)
         .unwrap_or_else(|e| die(format!("warm-selftest: write Cargo.lock: {e}")));
-    let (locked, _) = fetch_locked_registry(&lock, &store)
+    let shared = store.join("shared-crates");
+    let (locked, _) = fetch_locked_registry(&lock, &store, Some(&shared))
         .unwrap_or_else(|e| die(format!("warm-selftest: lock-driven registry fetch: {e}")));
     if locked.registry.len() != 1 {
         die("warm-selftest: lock-driven fetch did not select the registry package".into());
     }
+    // The fetched crate is published to the host's cache, and the next
+    // worktree's fetch is answered from it with the upstream unreachable.
+    if std::fs::read(shared.join("warmcrate-0.1.0.crate"))
+        .ok()
+        .as_deref()
+        != Some(&good[..])
+    {
+        die("warm-selftest: a fetched crate was not published to the shared cache".into());
+    }
+    std::env::set_var("TD_INDEX_BASE", "http://127.0.0.1:9");
+    std::env::set_var("TD_CRATES_BASE", "http://127.0.0.1:9");
+    let fresh = store.join("fresh");
+    fetch_locked_registry(&lock, &fresh, Some(&shared)).unwrap_or_else(|e| {
+        die(format!(
+            "warm-selftest: a shared crate did not answer the next fetch offline: {e}"
+        ))
+    });
+    if std::fs::read(fresh.join("crates/warmcrate-0.1.0.crate"))
+        .ok()
+        .as_deref()
+        != Some(&good[..])
+        || fresh.join("index").exists()
+    {
+        die("warm-selftest: the shared crate was not reused without an index request".into());
+    }
+    std::env::set_var("TD_INDEX_BASE", &ubase);
+    std::env::set_var("TD_CRATES_BASE", &ubase);
     let git_commit = "0123456789abcdef0123456789abcdef01234567";
     std::fs::write(
         &lock,
@@ -3018,7 +3159,7 @@ fn warm_selftest() {
         ),
     )
     .unwrap_or_else(|e| die(format!("warm-selftest: write Cargo.lock: {e}")));
-    if fetch_locked_registry(&lock, &store).is_ok() {
+    if fetch_locked_registry(&lock, &store, None).is_ok() {
         die("warm-selftest: lock-driven fetch accepted a Git package".into());
     }
     let _ = std::fs::remove_dir_all(&store);
@@ -3027,7 +3168,8 @@ fn warm_selftest() {
         "td-feed: warm selftest OK — parse_source_pins (+malformed reject), kernel source filename, \
          cargo_config (sparse source replacement), and the IN-PROCESS cargo-proxy \
          round-trip a verifying source-crate GET over loopback (mock upstream 127.0.0.1:{uport}); a crate whose \
-         bytes mismatch its index cksum is refused; lock-driven warming fetched its registry crate and refused \
+         bytes mismatch its index cksum is refused; lock-driven warming fetched its registry crate, published it \
+         to the shared crate cache and answered the next fetch from it offline, and refused \
          a Git source (the verifying egress and no-Git boundary are load-bearing)"
     );
 }
@@ -3373,8 +3515,159 @@ pub(crate) mod tests {
         real_relative_file, resolve_feed_dir, snapshot_for_serve, snapshot_for_serve_before,
         sweep_download_temps, write_before, FeedDaemonPolicy, ResponseGuard, RESPONSE_DEADLINE,
     };
+    use super::{
+        crate_file_name, fetch_locked_registry, publish_shared_crate, reuse_shared_crate,
+        LockedRegistryPackage,
+    };
     use std::io::Read;
     use std::path::PathBuf;
+
+    fn locked(name: &str, version: &str, bytes: &[u8]) -> LockedRegistryPackage {
+        LockedRegistryPackage {
+            name: name.into(),
+            version: version.into(),
+            checksum: crate::sig::to_hex(&<sha2::Sha256 as sha2::Digest>::digest(bytes)),
+        }
+    }
+
+    /// A crate one worktree fetched is reused by the next from the shared
+    /// cache, with no fetch: no index request is made, and the lock below
+    /// pins bytes no registry serves, so only the cache can answer it.
+    #[test]
+    fn a_shared_crate_answers_the_next_locked_fetch_without_the_network() {
+        let dir = crate::test_temp::TempDir::new("shared-crates").unwrap();
+        let shared = dir.path().join("crates");
+        std::fs::create_dir(&shared).unwrap();
+        let mut lock = String::from("version = 4\n");
+        for (name, bytes) in [
+            ("td-feed-test-alpha", b"alpha bytes".as_slice()),
+            ("td_feed_test_beta", b"beta"),
+        ] {
+            let package = locked(name, "1.0.0", bytes);
+            std::fs::write(shared.join(format!("{name}-1.0.0.crate")), bytes).unwrap();
+            lock.push_str(&format!(
+                "\n[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"{}\"\n",
+                package.checksum
+            ));
+        }
+        let lock_path = dir.path().join("Cargo.lock");
+        std::fs::write(&lock_path, lock).unwrap();
+        let store = dir.path().join("proxy-store");
+        let (sources, _) = fetch_locked_registry(&lock_path, &store, Some(&shared)).unwrap();
+        assert_eq!(sources.registry.len(), 2);
+        assert_eq!(
+            std::fs::read(store.join("crates/td-feed-test-alpha-1.0.0.crate")).unwrap(),
+            b"alpha bytes"
+        );
+        assert_eq!(
+            std::fs::read(store.join("crates/td_feed_test_beta-1.0.0.crate")).unwrap(),
+            b"beta"
+        );
+        assert!(!store.join("index").exists(), "a hit asks no index");
+    }
+
+    /// The shared cache is not trusted: bytes other than the lock's are not
+    /// reused and leave nothing in the store, a link is not followed, and
+    /// an unsafe name is never joined onto either directory.
+    #[test]
+    fn a_shared_crate_is_reused_only_with_the_locked_bytes() {
+        let dir = crate::test_temp::TempDir::new("shared-crates-refused").unwrap();
+        let shared = dir.path().join("crates");
+        let store = dir.path().join("proxy-store");
+        std::fs::create_dir(&shared).unwrap();
+        let package = locked("gamma", "0.1.0", b"the locked bytes");
+        std::fs::write(shared.join("gamma-0.1.0.crate"), b"other bytes").unwrap();
+        assert!(reuse_shared_crate(&shared, &store, &package).is_err());
+        assert!(!store.join("crates/gamma-0.1.0.crate").exists());
+
+        std::fs::remove_file(shared.join("gamma-0.1.0.crate")).unwrap();
+        let elsewhere = dir.path().join("elsewhere.crate");
+        std::fs::write(&elsewhere, b"the locked bytes").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, shared.join("gamma-0.1.0.crate")).unwrap();
+        assert!(reuse_shared_crate(&shared, &store, &package).is_err());
+
+        std::fs::remove_file(shared.join("gamma-0.1.0.crate")).unwrap();
+        std::fs::write(shared.join("gamma-0.1.0.crate"), b"the locked bytes").unwrap();
+        assert_eq!(reuse_shared_crate(&shared, &store, &package), Ok(true));
+
+        for (name, version) in [("../gamma", "0.1.0"), ("gamma", "../0.1.0"), ("", "1")] {
+            assert_eq!(crate_file_name(name, version), None);
+            assert_eq!(
+                reuse_shared_crate(&shared, &store, &locked(name, version, b"the locked bytes")),
+                Ok(false)
+            );
+        }
+    }
+
+    /// What a same-user writer left at a shared name, a link to the right
+    /// bytes or a FIFO, is not read through when a fetched crate is published
+    /// there: the publish replaces it with a regular file.
+    #[test]
+    fn a_publish_replaces_a_link_or_fifo_at_the_shared_name() {
+        let dir = crate::test_temp::TempDir::new("shared-crates-replace").unwrap();
+        let shared = dir.path().join("crates");
+        let store = dir.path().join("proxy-store");
+        std::fs::create_dir_all(store.join("crates")).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let package = locked("epsilon", "1.0.0", b"fetched");
+        std::fs::write(store.join("crates/epsilon-1.0.0.crate"), b"fetched").unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"fetched").unwrap();
+        let name = shared.join("epsilon-1.0.0.crate");
+        std::os::unix::fs::symlink(&elsewhere, &name).unwrap();
+        publish_shared_crate(&shared, &store, &package).unwrap();
+        assert!(std::fs::symlink_metadata(&name).unwrap().is_file());
+        std::fs::remove_file(&name).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&name)
+            .status()
+            .is_ok_and(|status| status.success());
+        if made {
+            publish_shared_crate(&shared, &store, &package).unwrap();
+            assert!(std::fs::symlink_metadata(&name).unwrap().is_file());
+        }
+        assert_eq!(std::fs::read(&name).unwrap(), b"fetched");
+    }
+
+    /// A fetched crate is published whole under its name and only while its
+    /// bytes still match the lock; a stale entry is replaced, and a temporary
+    /// a killed warm left is swept.
+    #[test]
+    fn a_fetched_crate_is_published_whole_and_only_with_the_locked_bytes() {
+        let dir = crate::test_temp::TempDir::new("shared-crates-publish").unwrap();
+        let shared = dir.path().join("crates");
+        let store = dir.path().join("proxy-store");
+        std::fs::create_dir_all(store.join("crates")).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let visible = || {
+            let mut names = std::fs::read_dir(&shared)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name != ".td-feed-download.lock")
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let package = locked("delta", "2.0.0", b"fetched");
+        std::fs::write(store.join("crates/delta-2.0.0.crate"), b"fetched").unwrap();
+        std::fs::write(shared.join("delta-2.0.0.crate"), b"stale").unwrap();
+        std::fs::write(shared.join(".td-feed-download-1-1.tmp"), b"partial").unwrap();
+        publish_shared_crate(&shared, &store, &package).unwrap();
+        // Publishing again leaves the matching entry as it is.
+        publish_shared_crate(&shared, &store, &package).unwrap();
+        assert_eq!(visible(), ["delta-2.0.0.crate"]);
+        assert_eq!(
+            std::fs::read(shared.join("delta-2.0.0.crate")).unwrap(),
+            b"fetched"
+        );
+
+        std::fs::write(store.join("crates/delta-2.0.0.crate"), b"changed").unwrap();
+        std::fs::remove_file(shared.join("delta-2.0.0.crate")).unwrap();
+        assert!(publish_shared_crate(&shared, &store, &package).is_err());
+        assert!(visible().is_empty());
+    }
 
     /// The marker answers for the lock it was published from, and only that one.
     ///

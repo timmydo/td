@@ -332,6 +332,20 @@ it waits, and empties it when the toolchain the packages link changes, so
 it holds one toolchain's builds; two worktrees on different toolchains
 empty it in turn. `gc-store` leaves it and `clear-store` drops it.
 
+Cargo registry archives are downloaded once per host, not once per
+worktree. The vendor warms (`td-feed warm crate`, `crate-local`,
+`crate-lock`) still publish each recipe's closure into the worktree's
+`.td-build-cache/crate-vendor/RECIPE/vendor`, but take each locked
+`NAME-VERSION.crate` from `~/.td/crates` when a copy of it, opened without
+following links, hashes to the lock's checksum, and put there each crate
+they had to fetch once it has passed both the index and the lock check. A
+crate taken from there is checked against the lock alone, since it passed
+the index when it was fetched; a stale, foreign or partial file, a link or
+anything not a regular file is refetched and replaced, never used. Like
+`~/.td/sources`
+it has no override and is not collected (delete it to reclaim the space);
+unlike it, no sandbox binds it. Without a HOME nothing is shared.
+
 Fetched and host-generated seeds are pinned by the seed digest table the
 evaluator compiles in (`seed/seed-digests.txt`); regenerate it after a pin
 change and commit it with the change. The generator compiles the pins in, so
