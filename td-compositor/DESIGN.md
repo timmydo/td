@@ -36,8 +36,8 @@ creates `/run/td-audio`; `APPLICATIONS.md` §K.5 owns that boundary.
 There is no multi-user arbitration, hotplug, VT switching or
 live seat reassignment. Deployment reboot discards earlier open descriptors.
 "Input hotplug (target)", under "Physical secure attention", specifies
-evdev hotplug; it is not implemented and waits on the owner's answer
-recorded there.
+evdev hotplug and records the repository owner's decisions on it; it is
+not implemented yet.
 
 Assignment uses safe std path ownership and permission operations, with a
 check/use window between rejecting a symlink and changing the node. The fixed
@@ -6282,12 +6282,14 @@ they never claim secure attention or use the trusted timestamp cutoff.
 
 ### Input hotplug (target)
 
-Not implemented. This subsection specifies how keyboards and pointers
-attached after boot become usable and how their removal is handled. It
-changes nothing above until an implementation lands, and implementation
-waits on the owner's answer to the open question at its end. Until then
-the fixed startup roster above is what ships, and a node that appears
-after the boot oneshot stays root-owned.
+Not implemented yet. This subsection specifies how keyboards and
+pointers attached after boot become usable and how their removal is
+handled. The repository owner decided the two questions it raised
+("Decisions" at its end): a late keyboard has parity with a boot-time
+one, and root assigns late nodes through a new `[seat-watch]` unit. The
+increments below implement it in order, and it changes nothing above
+until they land. Until then the fixed startup roster above is what
+ships, and a node that appears after the boot oneshot stays root-owned.
 
 **What changes and what does not.** Assignment stays root's decision: a
 node is usable only once root has made it the compositor's, and the
@@ -6363,10 +6365,10 @@ forbids `unsafe`, and a netlink listener still needs a rescan after
 helper needs `CONFIG_UEVENT_HELPER` and forks a root process per uevent.
 Folding assignment into td-disks' `[media]` daemon would give one root
 daemon two unrelated authorities. td-authd could instead take a typed
-request from its paired compositor to assign one named node; the open
-question weighs that. Polling costs each of the two pollers four wakeups
-a second for the whole session, with a directory read and an `lstat`
-per entry, which an idle laptop pays in residency.
+request from its paired compositor to assign one named node, which the
+owner declined (Q2 below). Polling costs each of the two pollers four
+wakeups a second for the whole session, with a directory read and an
+`lstat` per entry, which an idle laptop pays in residency.
 
 **Compositor: the hotplug poll.** Once startup has started its readers,
 one `input-hotplug` thread reads `/dev/input` every 250 ms under the same
@@ -6472,21 +6474,21 @@ today, and reported once. Failing open there keeps startup's residual
 rather than adding one; failing closed would deny secure attention to
 any keyboard whose HID-class interface never gets a HID child (one bound
 by a non-HID driver, such as an Apple trackpad's `bcm5974`, or ignored by
-a HID quirk), which is option (B)'s lockout below. Such a device always
-pays the 5 s wait and its report.
+a HID quirk), which is the lockout option (B) would have had (Q1 below).
+Such a device always pays the 5 s wait and its report.
 
-**Secure attention.** Under the recommended answer below, a late device
-is one secure attention reads, excluded as at startup when it shares a
-USB device with a FIDO interface, with one addition. A device whose
-record (step 4) is made while an attention lifetime is open or draining
-reads, for that lifetime, as an excluded device does: its keys never
-select, never confirm and are not a prompt's first press; its held keys
-neither block another keyboard's fresh press nor count as modifiers;
-its presses and releases are tracked, so the drain waits for them; and
-its Escape cancels. From the next lifetime on it reads as any other
-device. So nothing attached while a prompt is on screen can answer it.
-A device recorded before a lifetime opens reads fully in it, which is
-what lets a keyboard re-enumerated by a resume, or a replacement
+**Secure attention.** Under the owner's answer (Q1, parity), a late
+device is one secure attention reads, excluded as at startup when it
+shares a USB device with a FIDO interface, with one addition. A device
+whose record (step 4) is made while an attention lifetime is open or
+draining reads, for that lifetime, as an excluded device does: its keys
+never select, never confirm and are not a prompt's first press; its held
+keys neither block another keyboard's fresh press nor count as
+modifiers; its presses and releases are tracked, so the drain waits for
+them; and its Escape cancels. From the next lifetime on it reads as any
+other device. So nothing attached while a prompt is on screen can answer
+it. A device recorded before a lifetime opens reads fully in it, which
+is what lets a keyboard re-enumerated by a resume, or a replacement
 keyboard, open the lock surface's unlock.
 
 Device loss keeps its meaning: it clears that device's held state and
@@ -6511,9 +6513,9 @@ but not `KEY_ENTER` a pointer, and a device declaring neither is
 silent. The name is the device's own choice, so it is printed quoted,
 at most 64 bytes, with every byte outside printable ASCII and every
 quote or backslash escaped, and cannot forge a field.
-Under the recommended answer the runtime also shows a short status
-notice, `KEYBOARD ADDED` or `POINTER ADDED`, while the session is
-unlocked and attention is closed. It is advisory: nothing claims the
+Under that answer the runtime also shows a short status notice,
+`KEYBOARD ADDED` or `POINTER ADDED`, while the session is unlocked and
+attention is closed. It is advisory: nothing claims the
 person sees it.
 
 **What is not claimed.** A late device is trusted exactly as a startup
@@ -6551,14 +6553,14 @@ landing adds to TOKEN-LOGIN.md's "Evidence" the hardware record of a
 suspend and resume that re-enumerates a composite key, whose OTP
 keyboard must come back excluded.
 
-**Increments, once answered.** Each compositor change lands before root
-assigns a single late node, because once root does, a generation restart
-admits every assigned node at startup.
+**Increments.** Each compositor change lands before root assigns a
+single late node, because once root does, a generation restart admits
+every assigned node at startup.
 
 1. The compositor's shared roster with unique ids and reader retirement,
    no behaviour change.
 2. The hotplug poll, probe completeness at startup and late, the
-   in-lifetime rule, the owner's answer to Q1 and the announcement, with
+   in-lifetime rule, Q1's parity and the announcement, with
    the `UNSAFE.md` §6 sentence. On an image it is inert, since nothing
    yet assigns a late node, except startup's deferral of an incomplete
    USB device, which makes three sentences false that it rewrites:
@@ -6577,11 +6579,18 @@ admits every assigned node at startup.
    "Decided once against the fixed roster" comment in `input.rs`.
 4. The qemu oracle.
 
-**Open question for the repository owner (blocks implementation).**
-Two decisions here are the owner's, not an implementer's.
+**Decisions.** Two questions here were the repository owner's, not an
+implementer's, and the owner has answered both.
 
-*Q1: may a keyboard attached after boot operate secure attention?* The
-facts the answer rests on:
+*Q1: may a keyboard attached after boot operate secure attention?*
+Answered: yes, option (A), parity. A late keyboard reads in secure
+attention exactly as a boot-time one does, with the security-key
+exclusion; it is announced, and the in-lifetime rule above applies: a
+device recorded while an attention lifetime is open or draining reads,
+for that lifetime, as an excluded device, so Escape cancels and nothing
+it presses selects or confirms. A resumed, replugged or replacement
+keyboard can therefore unlock and approve. The facts the decision
+weighed:
 
 - Much of attention needs only a keyboard. Restart, power off and sleep
   take `R`, `P` or `Z` and a fresh Enter. Rollback, a queued update and
@@ -6600,9 +6609,11 @@ facts the answer rests on:
   session: on the lock surface no menu letter selects, and the chord
   opens only the token-gated unlock ("The lock surface"). They are
   reachable from an unlocked session, and a walk-up attacker at an
-  unlocked session is out of scope by decision
-  (`APPLICATIONS.md` §L.1's threat table). An unenrolled machine is
-  never locked.
+  unlocked session is out of scope by decision (`APPLICATIONS.md` §L.1's
+  threat table). An unenrolled machine is never locked, except that an
+  unenrolled protected machine answers unavailable: outside an admitted
+  boot's first session it locks with no unlock, where nothing selects
+  either.
 - Attaching before boot gives the same parity, but on an enrolled
   machine that route is visible: a forced restart loses work and starts
   locked, needing the owner's key. A hot attach is silent and acts in
@@ -6618,62 +6629,52 @@ facts the answer rests on:
   resume locks first and a USB keyboard can re-enumerate after that, so
   "attached while locked, excluded" is a lockout.
 
-The options:
+What parity accepts: a device attached unseen to an unlocked session
+can, while it stays, do what the built-in keyboard can, including
+approving an update UID 1000 queued; one attached at the lock screen
+gains that once the owner unlocks. The owner accepts both. The profile
+already trusts attached input hardware, and the delta is a silent attach
+while the attacker is at the machine, which the threat table leaves out
+for an unlocked session; a device left at the lock screen that acts on
+its own is the malicious input device TOKEN-LOGIN.md's Scope leaves out.
+The options not taken:
 
-- (A) Parity: a late keyboard reads as a startup one, under the
-  in-lifetime rule, the security-key exclusion and the announcement. A
-  resumed, replugged or replacement keyboard can unlock and approve. A
-  device attached unseen to an unlocked session can, while it stays,
-  do what the built-in keyboard can, including approving an update UID
-  1000 queued. Attached at the lock screen, it gains that once the owner
-  unlocks.
 - (B) Ordinary input only, held across generations: a late keyboard
-  types into the session but reads in attention as an excluded device,
-  so it cannot select, confirm, unlock or enter a PIN. Where the only
-  keyboard is USB, a resume that re-enumerates it, or a replug, leaves
-  the lock surface unanswerable until reboot: a lockout on an enrolled
-  machine. It still types as UID 1000 into an unlocked session.
-- (C) Parity after consent: a late keyboard is ordinary until an
-  already-admitted keyboard approves it on the attention screen, held
-  across generations. It closes the unseen-device case only where
-  another keyboard exists, and is (B)'s lockout where none does.
-- (D) No late keyboards: hotplug admits pointers only. The goal is not
-  met for keyboards.
+  types into the session but reads in attention as an excluded device.
+  Where the only keyboard is USB, a resume that re-enumerates it, or a
+  replug, leaves the lock surface unanswerable until reboot: a lockout
+  on an enrolled machine. It still types as UID 1000 into an unlocked
+  session.
+- (C) Parity after an already-admitted keyboard consents, held across
+  generations: it closes the unseen-device case only where another
+  keyboard exists, and is (B)'s lockout where none does.
+- (D) No late keyboards: hotplug admits pointers only, and the goal is
+  not met for keyboards.
 - (E) Unlock first: a late keyboard may always use the chord's
   token-gated unlock and Escape, and gains the keyboard-only operations
-  once a token unlock completes after its admission; on an unenrolled
-  machine it has parity at once. A restart on an enrolled machine starts
-  locked, so a restart does not launder it. It avoids the lockout, but
-  it withholds the operations only from a device attached to an
-  unlocked session; one attached at the lock screen gains them at the
-  owner's next unlock.
+  once a token unlock completes after its admission, and at once on an
+  unenrolled machine. A restart on an enrolled machine starts locked, so
+  a restart does not launder it. It avoids the lockout, but withholds
+  the operations only from a device attached to an unlocked session,
+  already out of scope; one attached at the lock screen gains them at
+  the owner's next unlock.
 
-Recommended: (A). The profile already trusts attached input hardware,
-and the delta (A) adds is a silent attach while the attacker is at the
-machine, which (E) closes only for an unlocked session already out of
-scope, and which (B) and (C) close only at the cost of a lockout and of
-state held across generations. If the owner wants a hot-attached device
-never to reach a keyboard-only root operation without a token unlock,
-(E) is the cheapest rule that does so without a lockout.
+*Q2: is a new long-running root service acceptable?* Answered: yes,
+option (i), the `[seat-watch]` unit running `td-seatd watch` ("Root"
+above): safe `std`, no new syscall, no sysfs reads and no per-device
+policy, at the cost of a root poller. The options not taken:
 
-*Q2: is a new long-running root service acceptable?* Late assignment
-needs root to act after boot. The options:
-
-- (i) The `[seat-watch]` daemon above. Recommended: safe `std`, no new
-  syscall, no sysfs reads, no per-device policy, at the cost of a root
-  poller.
-- (ii) td-authd, the existing paired root authority, takes a typed
+- (ii) td-authd, the existing paired root authority, taking a typed
   request from the compositor to assign one named `/dev/input/eventN`.
-  No new daemon or root poller: root still decides, applies the same
-  fixed policy and gains nothing from a compromised compositor, which
-  owns every evdev node anyway. But it adds a request to the authority
-  protocol and its review, assigns only while a paired generation is
-  connected, and leaves the direct profile without late nodes.
+  Root would still decide, apply the same fixed policy and gain nothing
+  from a compromised compositor, which owns every evdev node anyway. It
+  needs no new daemon, but adds a request to the authority protocol
+  and its review, assigns only while a paired generation is connected,
+  and leaves the direct profile without late nodes.
 - (iii) A uevent listener, which needs a new unsafe surface.
 - (iv) The kernel's usermode helper, or folding assignment into
   td-disks' root daemon, each weighed under "Root" above.
-- (v) No hotplug.
-
+- (v) No hotplug: the goal is not met.
 
 ### Physical installation confirmation
 
