@@ -707,13 +707,8 @@ xfail command-sub.test.sh::Double Quotes in Command Sub in Double Quotes
 xfail command-sub.test.sh::Here doc with pipeline
 xfail command-sub.test.sh::More levels of double quotes in backticks
 xfail command-sub.test.sh::Nested backticks
-xfail command_.test.sh::$PATH lookup
 xfail command_.test.sh::Command block
-xfail command_.test.sh::File in relative subdirectory and no shebang is executed
-xfail command_.test.sh::File with no shebang is executed
-xfail command_.test.sh::File with relative path and no shebang is executed
 xfail command_.test.sh::Name too long
-xfail command_.test.sh::Non-executable on $PATH
 xfail command_.test.sh::filling $PATH cache, then deleting command
 xfail command_.test.sh::filling $PATH cache, then insert the same command earlier in cache
 xfail command_.test.sh::hash -r doesn't allow additional args
@@ -1020,7 +1015,6 @@ xfail tilde.test.sh::tilde expansion an assignment keyword
 xfail tilde.test.sh::x=${undef-~:~}
 xfail tilde.test.sh::~ expansion in readonly assignment
 xfail toysh-posix.test.sh::IFS
-xfail toysh-posix.test.sh::no shebang
 xfail toysh.test.sh::Brace Expansion
 xfail toysh.test.sh::char class / extglob
 xfail toysh.test.sh::extglob $IFS 1

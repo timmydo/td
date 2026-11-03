@@ -26,6 +26,7 @@
 //! it rather than inheriting it.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -35,7 +36,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::ast::{AndOr, Cmd, List, Redir, RedirKind, Sep, Stage, Word};
-use crate::exec::{self, Shell, Sig, EACCES, EEXIST, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR, R};
+use crate::exec::{
+    self, Shell, Sig, EACCES, EEXIST, ELOOP, ENAMETOOLONG, ENOENT, ENOEXEC, ENOTDIR, R,
+};
 
 /// One entry in the shell's descriptor table. Everything shareable is behind an
 /// `Arc` so a subshell or pipeline stage inherits the same open file (and its
@@ -2104,6 +2107,113 @@ fn failed_exec(sh: &mut Shell, code: i32) -> R<()> {
     Err(Sig::Exit(code))
 }
 
+/// Where Linux names the running binary, for a script without `#!`. That
+/// path, and only it, needs `/proc` mounted; without it the retry fails as
+/// ash's does (busybox's default `CONFIG_BUSYBOX_EXEC_PATH` is the same
+/// file), reporting the script `not found`.
+const SELF_EXE: &str = "/proc/self/exe";
+
+/// A `Command` for `program`, with the exported environment, the cwd and
+/// stdio wired to the descriptor table -- a pipe where `piped` says the
+/// shell bridges that descriptor itself.
+fn external_command(
+    sh: &Shell,
+    program: &OsStr,
+    arg0: &str,
+    args: &[&OsStr],
+    piped: [bool; 3],
+) -> R<Command> {
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = Command::new(program);
+    cmd.arg0(arg0);
+    cmd.args(args);
+    cmd.env_clear();
+    for (k, v) in sh.exported_env() {
+        cmd.env(k, v);
+    }
+    // Names the shell cannot spell still belong to the environment it was handed.
+    for (k, v) in &sh.opaque_env {
+        cmd.env(k, v);
+    }
+    cmd.current_dir(&sh.cwd);
+    let [stdin, stdout, stderr] = piped;
+    cmd.stdin(if stdin {
+        Stdio::piped()
+    } else {
+        stdio_for(sh, 0)?
+    });
+    cmd.stdout(if stdout {
+        Stdio::piped()
+    } else {
+        stdio_for(sh, 1)?
+    });
+    cmd.stderr(if stderr {
+        Stdio::piped()
+    } else {
+        stdio_for(sh, 2)?
+    });
+    Ok(cmd)
+}
+
+/// Whether a file the kernel refused is one to run as a script. Not when
+/// it is plainly BINARY -- a NUL before the first newline of its first 80
+/// bytes, bash's test -- since a foreign-architecture or truncated ELF
+/// would otherwise come back as a UTF-8 complaint from the child shell
+/// rather than the `Exec format error` (126) it is. ash has no such test
+/// and reports the ELF's first line as a command not found.
+///
+/// Never under `cargo test`, where `/proc/self/exe` is the TEST binary and
+/// would take the script's name as a test filter and run the suite again.
+fn runs_as_script(path: &std::path::Path) -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    let mut head = [0u8; 80];
+    let n = File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    let head = head.get(..n).unwrap_or(&[]);
+    let line = head.split(|b| *b == b'\n').next().unwrap_or(head);
+    !line.contains(&0)
+}
+
+/// The name a script without `#!` is handed as its `$0`: the word itself when
+/// it has a slash, else the PATH entry it was found under AS WRITTEN joined to
+/// it -- `d/s` for `PATH=d` and `d//s` for `PATH=d/`, never this shell's
+/// absolute resolution of it, as ash's `padvance` builds it. An empty entry
+/// is the bare name. The child runs in the shell's cwd, so a relative name
+/// finds the same file.
+fn script_name(
+    sh: &Shell,
+    program: &str,
+    path: Option<&str>,
+    resolved: &std::path::Path,
+) -> String {
+    if program.contains('/') {
+        return program.to_owned();
+    }
+    let owned;
+    let path = match path {
+        Some(p) => p,
+        None => {
+            owned = sh.get_var("PATH").unwrap_or_default();
+            &owned
+        }
+    };
+    for dir in path.split(':') {
+        let probe = if dir.is_empty() { "." } else { dir };
+        if sh.resolve(probe).join(program) == resolved {
+            return if dir.is_empty() {
+                program.to_owned()
+            } else {
+                format!("{dir}/{program}")
+            };
+        }
+    }
+    resolved.to_string_lossy().into_owned()
+}
+
 /// Spawn an external program, wiring its stdio to the current descriptor table.
 /// The seed corpus never reaches here (it is builtin-only), but real scripts do.
 ///
@@ -2120,8 +2230,6 @@ pub fn exec_external(
     path: Option<&str>,
     arg0: Option<&str>,
 ) -> R<()> {
-    use std::os::unix::process::CommandExt;
-
     let Some(program) = argv.first() else {
         sh.set_status(0);
         return Ok(());
@@ -2135,21 +2243,6 @@ pub fn exec_external(
             return Ok(());
         }
     };
-
-    let mut cmd = Command::new(&resolved);
-    // argv[0] is the WORD, not the path the search resolved to (ash.c:8354);
-    // `Command`'s default is the program path. `exec -a` overrides the word.
-    cmd.arg0(arg0.unwrap_or(program));
-    cmd.args(argv.iter().skip(1));
-    cmd.env_clear();
-    for (k, v) in sh.exported_env() {
-        cmd.env(k, v);
-    }
-    // Names the shell cannot spell still belong to the environment it was handed.
-    for (k, v) in &sh.opaque_env {
-        cmd.env(k, v);
-    }
-    cmd.current_dir(&sh.cwd);
 
     // A `ReadBuf` on stdin becomes piped input; a `WriteBuf` on stdout/stderr
     // becomes a captured pipe. Everything else maps to a `Stdio` directly.
@@ -2170,23 +2263,40 @@ pub fn exec_external(
         _ => None,
     };
 
-    cmd.stdin(if stdin_bytes.is_some() {
-        Stdio::piped()
-    } else {
-        stdio_for(sh, 0)?
-    });
-    cmd.stdout(if stdout_buf.is_some() {
-        Stdio::piped()
-    } else {
-        stdio_for(sh, 1)?
-    });
-    cmd.stderr(if stderr_buf.is_some() {
-        Stdio::piped()
-    } else {
-        stdio_for(sh, 2)?
-    });
+    let piped = [
+        stdin_bytes.is_some(),
+        stdout_buf.is_some(),
+        stderr_buf.is_some(),
+    ];
+    // argv[0] is the WORD, not the path the search resolved to (ash.c:8354);
+    // `Command`'s default is the program path. `exec -a` overrides the word.
+    let word = arg0.unwrap_or(program);
+    let args: Vec<&OsStr> = argv.iter().skip(1).map(OsStr::new).collect();
+    let mut cmd = external_command(sh, resolved.as_os_str(), word, &args, piped)?;
+    let mut spawned = spawn_uninherited(sh, &mut cmd);
+    // A file the kernel will not execute -- no `#!`, not an ELF -- is a
+    // script for THIS shell, as POSIX asks and ash does: `tryexec`
+    // (ash.c:8267) re-executes its own binary with the script as its first
+    // operand, a fresh shell that sees only what was exported. Its argv[0]
+    // is `ash` there and `sh` here, which only a startup diagnostic shows.
+    // This shell re-executes itself through `/proc/self/exe`, so that it is
+    // this binary even when the path it was started from has since been
+    // replaced. A `--` goes
+    // first, where ash has none, so a script found under an empty PATH
+    // entry and named like an option (`-c`) is still a script.
+    if spawned
+        .as_ref()
+        .is_err_and(|e| e.raw_os_error() == Some(ENOEXEC))
+        && runs_as_script(&resolved)
+    {
+        let name = script_name(sh, program, path, &resolved);
+        let mut script: Vec<&OsStr> = vec![OsStr::new("--"), OsStr::new(&name)];
+        script.extend(args.iter().copied());
+        cmd = external_command(sh, OsStr::new(SELF_EXE), "sh", &script, piped)?;
+        spawned = spawn_uninherited(sh, &mut cmd);
+    }
 
-    let mut child = match spawn_uninherited(sh, &mut cmd) {
+    let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
             let (why, code) = exec_failure(&e);
@@ -2575,6 +2685,29 @@ mod thread_state {
 #[cfg(test)]
 mod tests {
     use super::{exec, OpenKind, EEXIST, ENOENT, ENOTDIR};
+
+    /// The `$0` a script without `#!` gets is the name ash builds, not the
+    /// path this shell resolved: measured on busybox 1.37.0. The re-exec
+    /// itself runs `/proc/self/exe`, which under `cargo test` is the test
+    /// binary, so it is graded by the corpus through the real shell
+    /// (`command_::File with no shebang is executed` and its neighbours).
+    #[test]
+    fn a_script_without_a_shebang_is_named_as_ash_names_it() {
+        let mut sh = exec::Shell::new_for_test();
+        let resolved = sh.resolve("d").join("s");
+        let name = |sh: &exec::Shell, word: &str, path: &str| {
+            super::script_name(sh, word, Some(path), &resolved)
+        };
+        assert_eq!(name(&sh, "./d/s", ""), "./d/s");
+        assert_eq!(name(&sh, "d/s", ""), "d/s");
+        assert_eq!(name(&sh, "s", "x:d"), "d/s");
+        assert_eq!(name(&sh, "s", "d/"), "d//s");
+        let _ = sh.set_var("PATH", "d");
+        assert_eq!(super::script_name(&sh, "s", None, &resolved), "d/s");
+        // An empty entry is the cwd, and names the file bare.
+        let here = sh.resolve(".").join("s");
+        assert_eq!(super::script_name(&sh, "s", Some(":d"), &here), "s");
+    }
 
     /// Captured output as SORTED lines. Two threads writing one capture buffer
     /// have no order between them, so a test about what was written must not

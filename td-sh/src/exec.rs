@@ -2290,6 +2290,7 @@ pub fn redir_target(sh: &mut Shell, r: &Redir) -> R<String> {
 /// The errnos td-sh names itself, the failure being one it DECIDED rather than
 /// one a syscall reported. Linux numbering, as every other constant here is.
 pub const ENOENT: i32 = 2;
+pub const ENOEXEC: i32 = 8;
 pub const EACCES: i32 = 13;
 pub const EEXIST: i32 = 17;
 pub const ENOTDIR: i32 = 20;

@@ -5020,3 +5020,44 @@ fn a_nul_in_source_is_dropped_on_every_reading_path() -> Result<(), Box<dyn std:
     assert!(outcome.passed, "{:?}", outcome.detail);
     Ok(())
 }
+
+/// A script without `#!` is re-executed through the shell itself, and gets
+/// the descriptors the program would have got: a here-document on stdin
+/// (an in-process buffer the shell bridges through a pipe), a captured
+/// stdout, a pipe, and its operands and exit status. The corpus cases it
+/// flips use real descriptors only, so the bridged ones are pinned here,
+/// through the built binary: under `cargo test` `/proc/self/exe` is the test
+/// harness, not the shell.
+#[test]
+fn a_script_without_a_shebang_keeps_its_descriptors() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let spec = "#### no shebang wiring\n\
+                printf 'read l; echo \"$0 $# [$l]\"; exit 3\\n' > ns\n\
+                chmod +x ns\n\
+                x=$(./ns a b <<EOF\n\
+                line\n\
+                EOF\n\
+                )\n\
+                echo \"$? $x\"\n\
+                echo piped | ./ns | cat\n\
+                mkdir d; cat ns > d/s; chmod +x d/s\n\
+                echo path | PATH=\"d:$PATH\" s x\n\
+                printf '\\177ELF\\000\\001\\n' > elf; chmod +x elf\n\
+                ./elf 2>/dev/null; echo \"elf $?\"\n\
+                cat ns > ./-c; chmod +x ./-c\n\
+                echo dash | PATH=\":$PATH\" -c\n\
+                echo \"st $?\"\n\
+                ## STDOUT:\n\
+                3 ./ns 2 [line]\n\
+                ./ns 0 [piped]\n\
+                d/s 1 [path]\n\
+                elf 126\n\
+                -c 0 [dash]\n\
+                st 3\n\
+                ## END\n";
+    let cases = parse_spec(spec)?;
+    let case = cases.first().ok_or("no case parsed")?;
+    let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
+    assert!(outcome.passed, "{:?}", outcome.detail);
+    Ok(())
+}
