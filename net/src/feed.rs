@@ -2690,6 +2690,9 @@ pub(crate) fn export_verified_file(
     })
 }
 
+/// The most `copy_verified_file` copies between deadline checks.
+const COPY_CHUNK_BYTES: u64 = 256 << 20;
+
 fn copy_verified_file(
     source: &Path,
     dst: &Path,
@@ -2719,28 +2722,28 @@ fn copy_verified_file(
             }
             let mut output =
                 File::create(temp).map_err(|e| format!("open {}: {e}", temp.display()))?;
-            let mut buffer = [0u8; 64 * 1024];
+            // copy_file_range: a clone where the filesystem can, which is
+            // copy-on-write, and the private copy is hashed before publish.
+            // Chunked so the deadline still bounds a slow plain copy.
             let mut count = 0u64;
             loop {
                 guard.check().map_err(|e| e.to_string())?;
-                let read = input
-                    .read(&mut buffer)
-                    .map_err(|e| format!("read {}: {e}", source.display()))?;
-                if read == 0 {
-                    break;
-                }
-                count = count
-                    .checked_add(read as u64)
-                    .ok_or("source byte count overflow")?;
+                // Never more than one byte past the ceiling, however the
+                // source grows.
+                let left = MAX_ARTIFACT_BYTES.saturating_add(1).saturating_sub(count);
+                let copied = io::copy(
+                    &mut (&mut input).take(COPY_CHUNK_BYTES.min(left)),
+                    &mut output,
+                )
+                .map_err(|e| format!("copy {} to {}: {e}", source.display(), temp.display()))?;
+                count = count.saturating_add(copied);
                 if count > MAX_ARTIFACT_BYTES {
                     return Err("source exceeds artifact byte ceiling".into());
                 }
-                let bytes = buffer.get(..read).ok_or("invalid source read length")?;
-                output
-                    .write_all(bytes)
-                    .map_err(|e| format!("write {}: {e}", temp.display()))?;
+                if copied < COPY_CHUNK_BYTES {
+                    return Ok(());
+                }
             }
-            Ok(())
         },
         finish,
     )
@@ -3599,6 +3602,40 @@ pub(crate) mod tests {
                 Ok(false)
             );
         }
+    }
+
+    /// A verified copy is its own bytes whether the filesystem cloned it or
+    /// copied it: writing into the source in place afterwards, without
+    /// truncating it, changes neither the shared crate nor a reused one.
+    #[test]
+    fn a_verified_copy_keeps_its_bytes_when_the_source_is_written_in_place() {
+        use std::os::unix::fs::FileExt;
+        let dir = crate::test_temp::TempDir::new("shared-crates-in-place").unwrap();
+        let shared = dir.path().join("crates");
+        let store = dir.path().join("proxy-store");
+        std::fs::create_dir_all(store.join("crates")).unwrap();
+        let bytes: Vec<u8> = (0..300_000u32).map(|n| (n % 251) as u8).collect();
+        let package = locked("zeta", "1.0.0", &bytes);
+        let stored = store.join("crates/zeta-1.0.0.crate");
+        std::fs::write(&stored, &bytes).unwrap();
+        publish_shared_crate(&shared, &store, &package).unwrap();
+        let in_place = |path: &std::path::Path| {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.write_all_at(b"rewritten", 40_000).unwrap();
+        };
+        in_place(&stored);
+        assert_eq!(
+            std::fs::read(shared.join("zeta-1.0.0.crate")).unwrap(),
+            bytes
+        );
+
+        let fresh = dir.path().join("fresh");
+        assert_eq!(reuse_shared_crate(&shared, &fresh, &package), Ok(true));
+        in_place(&shared.join("zeta-1.0.0.crate"));
+        assert_eq!(
+            std::fs::read(fresh.join("crates/zeta-1.0.0.crate")).unwrap(),
+            bytes
+        );
     }
 
     /// What a same-user writer left at a shared name, a link to the right

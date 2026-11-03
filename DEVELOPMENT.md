@@ -374,9 +374,13 @@ following links, hashes to the lock's checksum, and put there each crate
 they had to fetch once it has passed both the index and the lock check. A
 crate taken from there is checked against the lock alone, since it passed
 the index when it was fetched; a stale, foreign or partial file, a link or
-anything not a regular file is refetched and replaced, never used. Like
-`~/.td/sources`
-it has no override and is not collected (delete it to reclaim the space);
+anything not a regular file is refetched and replaced, never used. These
+copies, and the vendor set's from them, use `copy_file_range`, which
+btrfs serves by sharing extents when the worktree and the cache are on
+the same filesystem, so there a worktree's crates take no space beyond
+the cache's; elsewhere it copies. Either way the copy is hashed before
+it is published, and a clone is copy-on-write. Like `~/.td/sources` it
+has no override and is not collected (delete it to reclaim the space);
 unlike it, no sandbox binds it. Without a HOME nothing is shared.
 
 Fetched and host-generated seeds are pinned by the seed digest table the
