@@ -64,7 +64,8 @@ The authority flag selects one complete deployment profile: a root-paired
 service with cross-UID sockets. Direct development mode has private sockets
 and a direct launcher. The two mixed combinations are deliberately absent.
 The root greeting and enrolled-session check precede devices and workers.
-Readiness follows the initial framebuffer paint, opening all input nodes and
+Readiness follows the initial framebuffer paint, opening every input node
+startup admits (a USB device still probing is left to the hotplug poll) and
 binding both Wayland listeners. The optional control socket binds before
 that marker as well, and a failed bind is fatal.
 
@@ -6010,37 +6011,41 @@ initiated automatically on lid close in this increment: it retains its lock
 behavior. Hardware acceptance requires testing the panel, input, Wi-Fi and
 hardware sleep residency on the T14s itself; host tests cannot establish it.
 
-The trusted input boundary includes every evdev device admitted at startup,
-including USB HID keyboards and pointers. USB provenance is not device
-attestation. A composite token's separate OTP keyboard interface is an input
-device and can type into the focused application, though not into secure
-attention ("A security key's own keyboard" below); the FIDO hidraw interface
-is separate, remains root-only, and supplies no keyboard events itself.
-A malicious admitted keyboard can synthesize the attention chord. This
-profile trusts attached input hardware and root's device provisioning; it
-provides no defense against a malicious keyboard or USB peripheral that
-presents as one. Token presence is never inferred from keyboard events.
+The trusted input boundary includes every evdev device admitted, at startup
+or by the hotplug poll ("Input hotplug (target)"), including USB HID
+keyboards and pointers. USB provenance is not device attestation. A
+composite token's separate OTP keyboard interface is an input device and can
+type into the focused application, though not into secure attention ("A
+security key's own keyboard" below); the FIDO hidraw interface is separate,
+remains root-only, and supplies no keyboard events itself. A malicious
+admitted keyboard can synthesize the attention chord. This profile trusts
+attached input hardware and root's device provisioning; it provides no
+defense against a malicious keyboard or USB peripheral that presents as one.
+Token presence is never inferred from keyboard events.
 
 Seat assignment is a boot oneshot, so late USB nodes can remain root-owned
 and inaccessible to UID 993. Compositor startup skips permission-denied,
 missing, or removed-device nodes with one diagnostic per node. Other open
-errors fail startup, and an empty accessible roster still fails; it never
-changes permissions or admits an inaccessible device. All admitted handles
-are opened before any reader starts. Each reader, a lid switch's included,
-has a roster entry naming its descriptor's inode and a device id unique for
-the generation, which no later device is given. A reader that ends performs
-its release, then its id leaves the seat's sets and its entry the roster; an
-end other than its device's loss (end of file or `ENODEV`, which is not
-reported as an error), and a loss whose release then fails, also retires the
-inode, for the poll "Input hotplug (target)" specifies; a lost node is gone,
-so retiring it costs nothing. A restart alone does not assign a new device:
-it needs trusted seat assignment as well. The running compositor keeps its
-fixed roster and has no input hotplug service. The nonempty roster check
-does not prove that a usable keyboard remains or that the attention chord is
-reachable; removing the assigned keyboard can deny that input path. Startup
-input counts are not an authentication-readiness claim. "Input hotplug
-(target)" below specifies the replacement for this fixed roster; until it
-lands, this paragraph is what ships.
+errors fail startup, and an empty accessible roster, counting the nodes it
+leaves to the poll, still fails; it never changes permissions or admits an
+inaccessible device. All admitted handles are opened before any reader
+starts. Each reader, a lid switch's included, has a roster entry naming its
+descriptor's inode and a device id unique for the generation, which no later
+device is given. A reader that ends performs its release, then its id leaves
+the seat's sets and its entry the roster; an end other than its device's
+loss (end of file or `ENODEV`, which is not reported as an error), and a
+loss whose release then fails, also retires the inode, for the poll "Input
+hotplug (target)" specifies; a lost node is gone, so retiring it costs
+nothing. A restart alone does not assign a new device: it needs trusted seat
+assignment as well. The running compositor polls `/dev/input` for late nodes
+("Input hotplug (target)"), but no root service assigns one yet, so on an
+image it admits only what startup left to it: a USB device still probing, or
+a node startup could not open. The nonempty roster check does not prove that
+a usable keyboard remains or that the attention chord is reachable; removing
+the assigned keyboard can deny that input path. Startup input counts are not
+an authentication-readiness claim. "Input hotplug (target)" below specifies
+the replacement for this fixed roster; until it lands, this paragraph is
+what ships.
 
 Only the root-paired stock compositor profile reserves Ctrl+Alt+Esc. The
 Escape press opens an opaque, built-in screen with no pending authorization
@@ -6132,18 +6137,18 @@ whole, and another keyboard must select.
 
 The residual is a trusted-device one. A node whose USB ancestry cannot be
 read, or that has no USB device above it (PS/2, UHID, virtio), is admitted
-as before. A classic Bluetooth keyboard behind a USB adapter resolves to
-the adapter, which has no FIDO interface, so it is admitted too; a BLE
-keyboard (connected through UHID) or one behind a UART or SDIO adapter has
-no USB device above it; a FIDO token reached over Bluetooth is admitted
-either way. So is a key whose descriptor is unreadable, oversized,
-malformed or empty (a HID device whose driver has not probed by compositor
-startup reads as zero bytes), and one whose FIDO function is not a HID
-interface of the same USB device. UHID devices have no USB parent, so no
-guest can show the exclusion; host tests over hand-built sysfs trees are
-its present evidence, and the hardware record TOKEN-LOGIN.md's "Evidence"
-requires, not yet made, is still owed. The fixed startup roster means a key
-inserted later adds no keyboard at all.
+as before. A classic Bluetooth keyboard behind a USB adapter resolves to the
+adapter, which has no FIDO interface, so it is admitted too; a BLE keyboard
+(connected through UHID) or one behind a UART or SDIO adapter has no USB
+device above it; a FIDO token reached over Bluetooth is admitted either way.
+So is a key whose descriptor is unreadable, oversized, malformed or empty
+once its USB device reads complete, or once the 5 s completeness bound has
+passed ("Probe completeness" under "Input hotplug (target)"), and one whose
+FIDO function is not a HID interface of the same USB device. UHID devices
+have no USB parent, so no guest can show the exclusion; host tests over
+hand-built sysfs trees are its present evidence, and the hardware record
+TOKEN-LOGIN.md's "Evidence" requires, not yet made, is still owed. The fixed
+startup roster means a key inserted later adds no keyboard at all.
 
 The device dispatcher treats a secret selection as work even when that
 key produces no ordinary key, modifier or pointer delivery. Its device-event
@@ -6289,15 +6294,15 @@ they never claim secure attention or use the trusted timestamp cutoff.
 
 ### Input hotplug (target)
 
-Increment 1 below has landed; the rest is not implemented yet. This
-subsection specifies how keyboards and pointers attached after boot
-become usable and how their removal is handled. The repository owner
-decided the two questions it raised ("Decisions" at its end): a late
-keyboard has parity with a boot-time one, and root assigns late nodes
-through a new `[seat-watch]` unit. The increments below implement it in
-order, and the rest changes nothing above until it lands. Until then the
-fixed startup roster above is what ships, and a node that appears after
-the boot oneshot stays root-owned.
+Increments 1 and 2 below have landed; root's late assignment and the
+oracle are not implemented yet. This subsection specifies how keyboards
+and pointers attached after boot become usable and how their removal is
+handled. The repository owner decided the two questions it raised
+("Decisions" at its end): a late keyboard has parity with a boot-time
+one, and root assigns late nodes through a new `[seat-watch]` unit. The
+increments below implement it in order, and the rest changes nothing
+above until it lands. Until then the fixed startup roster above is what
+ships, and a node that appears after the boot oneshot stays root-owned.
 
 **What changes and what does not.** Assignment stays root's decision: a
 node is usable only once root has made it the compositor's, and the
@@ -6379,43 +6384,49 @@ wakeups a second for the whole session, with a directory read and an
 `lstat` per entry, which an idle laptop pays in residency.
 
 **Compositor: the hotplug poll.** Once startup has started its readers,
-one `input-hotplug` thread reads `/dev/input` every 250 ms under the same
-2048-entry rule, in both profiles. The roster becomes shared state: each
-live reader, lid readers included, has an entry of its name, its inode
-and a device id. Device ids are unique for the generation and never
-reused, so held-key, pointer, exclusion and lifetime bookkeeping keyed by
-a retired id never names a later device. A reader that ends performs the
-existing release first (`release_device`: keyboard and pointer cleanup,
-then the drain check). If it ended by device loss (end of file or
-`ENODEV`), it then removes its entry and its id from every set, freeing
-the name. Any other end (a parse error, an overrun batch, a failed
-delivery) also removes the entry but retires the inode, under the same hold
-of the roster lock, so the poll cannot reopen the name in between and a
-live device that failed is not reopened every tick; it returns once its
-node is recreated. The retired and remembered sets live under the
-roster lock beside the entries, and every inode recorded is the opened
-descriptor's (`fstat`), not the directory listing's, except a failed
-open's, which is the listing's and is pruned with it. The roster lock
-and the bindings lock are never held together.
+one `input-hotplug` thread reads `/dev/input` every 250 ms under the
+same 2048-entry rule, in both profiles. The roster becomes shared state:
+each live reader, lid readers included, has an entry of its name, its
+inode and a device id. Device ids are unique for the generation and
+never reused, so held-key, pointer, exclusion and lifetime bookkeeping
+keyed by a retired id never names a later device. A reader that ends
+performs the existing release first (`release_device`: keyboard and
+pointer cleanup, then the drain check). If it ended by device loss (end
+of file or `ENODEV`), it then removes its entry and its id from every
+set, freeing the name. Any other end (a parse error, an overrun batch, a
+failed delivery), and a loss whose release then fails, also removes the
+entry but retires the inode, under the same hold of the roster lock, so
+the poll cannot reopen the name in between and a live device that failed
+is not reopened every tick; it returns once its node is recreated. The
+retired and remembered sets live under the roster lock beside the
+entries, and every inode recorded is the opened descriptor's (`fstat`),
+not the directory listing's, except a failed open's, which is the
+listing's and is pruned with it. The roster lock and the bindings lock
+are never held together.
 
 A name with no live entry, whose inode is neither retired nor a
 remembered unadmitted lid switch, is a candidate. Per candidate the
-thread keeps state across ticks and never sleeps on one. Each tick, in
-order:
+thread keeps state across ticks and never sleeps on one. Where startup's
+decision admits no lid, a candidate sysfs reads as a lid switch is
+remembered by its listed inode and never opened, as startup never opens
+one. Each tick, in order:
 
-1. Notes the bindings' cutoff generation, under the bindings lock,
-   then opens it with `File::open`. `EACCES` means root has not assigned
-   it yet: it stays a candidate and is reported once if still refused 5 s
+1. Notes the bindings' cutoff generation, under the bindings lock, then
+   opens it with `File::open`. `EACCES` means root has not assigned it
+   yet: it stays a candidate and is reported once if still refused 5 s
    after first sight. `ENOENT`, `ENODEV` and `ENXIO` (an open racing
-   removal) drop it silently. Any other error is reported once and
-   retires the inode until the node is recreated.
+   removal) drop it silently. `EMFILE`, `ENFILE` and `ENOMEM`, the
+   process short of descriptors or memory, leave it a candidate,
+   reported once. Any other error is reported once and retires the inode
+   until the node is recreated.
 2. Classifies it from sysfs, after the open: lid switch, probe
-   completeness ("Probe completeness" below), the tablet or touchpad
-   kind after `EVIOCGABS`, and in the paired profile the security-key
-   walk, each as startup does. An unadmitted lid switch (startup's
-   `lid_admitted` decision is the late one too) is closed and its inode
-   remembered. A device that reads incomplete is closed and stays a
-   candidate, to the 5 s bound.
+   completeness ("Probe completeness" below) in the paired profile,
+   whose exclusion it protects, the tablet or touchpad kind after
+   `EVIOCGABS`, and in the paired profile the security-key walk, each as
+   startup does. A node that reads as an unadmitted lid switch only now
+   (startup's `lid_admitted` decision is the late one too) is closed and
+   its descriptor's inode remembered. A device that reads incomplete is
+   closed and stays a candidate, to the 5 s bound.
 3. In the paired profile, for every device but a lid switch, selects
    `CLOCK_MONOTONIC` with `EVIOCSCLOCKID`. It comes after step 2 on
    purpose: evdev refuses an ioctl on a disconnected device with
@@ -6440,8 +6451,9 @@ order:
    is left stale, so it discards its first report under the new cutoff
    as every device does. Only then is its reader spawned (`read_lid` for
    an admitted lid switch, `read_device` otherwise), so no event is
-   routed before its record exists. A failed spawn undoes both, closes
-   the handle and retires the inode.
+   routed before its record exists, and its `TD-INPUT-ADDED` is said
+   before it starts. A failed spawn undoes both, says its removal,
+   closes the handle and retires the inode.
 
 A lid switch's classification has no liveness proof, since startup
 selects no clock for it, and none is needed for safety: a reused name
@@ -6514,16 +6526,18 @@ resets the device as it resets every device.
 removal of a keyboard or a pointer is said on standard error as
 `TD-INPUT-ADDED` or `TD-INPUT-REMOVED`, with the node, the device id,
 `kind=keyboard` or `kind=pointer`, `attention=read` or
-`attention=excluded`, and last the sysfs `name`, never a key. Kind is
-read from `capabilities/key` with the lid classifier's plain file read:
-a device declaring `KEY_ENTER` is a keyboard, one declaring `BTN_LEFT`
-but not `KEY_ENTER` a pointer, and a device declaring neither is
-silent. The name is the device's own choice, so it is printed quoted,
-at most 64 bytes, with every byte outside printable ASCII and every
-quote or backslash escaped, and cannot forge a field.
-Under that answer the runtime also shows a short status notice,
-`KEYBOARD ADDED` or `POINTER ADDED`, while the session is unlocked and
-attention is closed. It is advisory: nothing claims the
+`attention=excluded` (the security-key exclusion's verdict, which a
+removal repeats), and last the sysfs `name`, never a key. A startup
+device's removal is said as a late one's is. Kind is read from
+`capabilities/key` with the lid classifier's plain file read: a device
+declaring `KEY_ENTER` is a keyboard, one declaring `BTN_LEFT` but not
+`KEY_ENTER` a pointer, and a device declaring neither is silent. The
+name is the device's own choice, so it is printed quoted, at most 64
+bytes, with every byte outside printable ASCII and every quote or
+backslash escaped, and cannot forge a field. Under that answer the
+runtime also shows a short status notice, `KEYBOARD ADDED` or `POINTER
+ADDED`, while the session is unlocked and attention is closed, on the
+bar as a screenshot's outcome is. It is advisory: nothing claims the
 person sees it.
 
 **What is not claimed.** A late device is trusted exactly as a startup
@@ -6571,13 +6585,16 @@ every assigned node at startup.
    prints a read error. The roster entry's node name is added with the
    poll, its first reader.
 2. The hotplug poll, probe completeness at startup and late, the
-   in-lifetime rule, Q1's parity and the announcement, with
-   the `UNSAFE.md` §6 sentence. On an image it is inert, since nothing
-   yet assigns a late node, except startup's deferral of an incomplete
-   USB device, which makes three sentences false that it rewrites:
-   section 1's "opening all input nodes", the residual's "(a HID device
-   whose driver has not probed by compositor startup reads as zero
-   bytes)", and above, "an empty accessible roster still fails".
+   in-lifetime rule, Q1's parity and the announcement, with the
+   `UNSAFE.md` §6 sentence. On an image it is inert, since nothing yet
+   assigns a late node, except startup's deferral of an incomplete USB
+   device, which makes three sentences false that it rewrites: section
+   1's "opening all input nodes", the residual's "(a HID device whose
+   driver has not probed by compositor startup reads as zero bytes)",
+   and above, "an empty accessible roster still fails". Landed, with
+   those three rewritten, and with them the fixed-roster paragraph's
+   "has no input hotplug service" and the "Decided once against the
+   fixed roster" comment in `input.rs`.
 3. td-seatd's major check, `watch` and the `[seat-watch]` unit, with
    `APPLICATIONS.md` §L.1's td-seatd row and its item 1, the unit-edge
    pins, TOKEN-LOGIN.md's "Evidence" addition, and every current-state
@@ -6585,9 +6602,8 @@ every assigned node at startup.
    "There is no ... hotplug"; above, "late USB nodes can remain
    root-owned", "A restart alone does not assign a new device", "keeps
    its fixed roster", "The fixed startup roster means a key inserted
-   later adds no keyboard at all" and "requires compositor restart to add
-   a replacement"; item 6's "Since the roster is fixed"; and the
-   "Decided once against the fixed roster" comment in `input.rs`.
+   later adds no keyboard at all" and "requires compositor restart to
+   add a replacement"; and item 6's "Since the roster is fixed".
 4. The qemu oracle.
 
 **Decisions.** Two questions here were the repository owner's, not an
@@ -7808,8 +7824,10 @@ excluded from every selection, confirmation and field below.
    `SW_LID` beside keys or axes is therefore no lid switch and is read
    as before, its `SW_LID` ignored. A lid switch never reaches the
    ordinary readers: admitted, its own reader acts on a close
-   (`SW_LID` 1) and on nothing else; not admitted, it is not opened.
-   A lid switch that cannot be opened is reported and left out. A
+   (`SW_LID` 1) and on nothing else; not admitted, it is not opened,
+   but for a node that reads as one only after the hotplug poll opened
+   it, which is closed at once ("Input hotplug (target)" step 2). A lid
+   switch that cannot be opened is reported and left out. A
    close lost to a dropped batch is not recovered (the switch state is
    not re-queried, which would be a new ioctl); resume detection still
    sees the suspend it would have preceded.

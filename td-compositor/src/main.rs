@@ -1851,10 +1851,11 @@ unsafe impl Send for MappedRegion {}"#;
         let prose = occurrences(production_sys, "ioctl(2)");
         let every = occurrences(production_sys, "ioctl(") - prose;
         let drm = occurrences(production_sys, "drm_ioctl(");
-        // One definition plus exactly two call sites for the evdev entry
-        // point: a third wrapper reusing a pinned request would satisfy every
-        // other assertion here.
-        assert_eq!(every - drm, 3);
+        // One definition plus exactly one call site for the evdev entry
+        // point, the axes; the clock goes through `ioctl_checked` itself, to
+        // keep its errno. A third wrapper reusing a pinned request would
+        // satisfy every other assertion here.
+        assert_eq!(every - drm, 2);
         // One definition plus the seventeen requests the fourteen DRM wrappers
         // issue: two each for the three that ask a count before they ask for
         // data, one for the encoder, whose answer is a fixed-size struct, one
@@ -1865,7 +1866,10 @@ unsafe impl Send for MappedRegion {}"#;
         // Both entry points reach the SAME allow-list, and it is defined once.
         // This is the assertion that stops a second `syscall5(SYS_IOCTL, ..)`
         // growing beside the roster instead of behind it.
-        assert_eq!(occurrences(production_sys, "ioctl_checked("), 3);
+        assert_eq!(occurrences(production_sys, "ioctl_checked("), 4);
+        assert!(SYS.contains(
+            "    let raw = ioctl_checked(\n        device.as_raw_fd(),\n        EVIOCSCLOCKID,\n"
+        ));
         assert_eq!(occurrences(production_sys, "syscall5(SYS_IOCTL"), 1);
         // The absolute-axis wrapper takes its request from an AXIS rather than
         // being handed one, so the two evdev numbers are unreachable from any
@@ -2266,16 +2270,41 @@ pub struct MappedRegion {
             ),
             2
         );
-        assert_eq!(
-            occurrences(
-                production(include_str!("input.rs")),
-                "sys::input_monotonic_clock(&file)?"
-            ),
-            1
-        );
-        assert!(production(include_str!("input.rs")).contains(
-            "if attention_enabled {\n            sys::input_monotonic_clock(&file)?;\n        }"
+        // One caller, which startup and the hotplug poll share: fatal at
+        // startup, and for a late node only after the open and the sysfs
+        // reads it proves (td-compositor/DESIGN.md, "Input hotplug").
+        let input = production(include_str!("input.rs"));
+        assert_eq!(occurrences(input, "sys::input_monotonic_clock(file)"), 1);
+        assert!(input.contains(
+            "fn select_monotonic(file: &File) -> std::io::Result<()> {\n    \
+             sys::input_monotonic_clock(file)\n}"
         ));
+        assert_eq!(occurrences(input, "select_monotonic("), 2);
+        assert!(input.contains(
+            "        if attention_enabled {\n            \
+             select_monotonic(&file).map_err(|error| format!(\"EVIOCSCLOCKID: {error}\"))?;\n        }"
+        ));
+        assert!(input.contains("        let mut clock = select_monotonic;\n"));
+        assert_eq!(occurrences(input, "(io.clock)(&file)"), 1);
+        assert!(input.contains("        if paired {\n            match (io.clock)(&file) {\n"));
+        // The clock proves the reads before it, so it comes after each.
+        let admit = input
+            .split_once("    /// Steps 1 to 4 for one candidate.\n")
+            .unwrap()
+            .1
+            .split_once("\n    }\n")
+            .unwrap()
+            .0;
+        let clock = admit.find("(io.clock)(&file)").unwrap();
+        for read in [
+            "lid_switch(&self.sysfs, path)",
+            "probe_complete(&self.sysfs, path)",
+            "absolute_kind(&self.sysfs, path)",
+            "security_key_keyboard(&self.sysfs, path)",
+            "describe(&self.sysfs, path, excluded)",
+        ] {
+            assert!(admit.rfind(read).unwrap() < clock, "{read}");
+        }
         assert_eq!(
             occurrences(production(include_str!("runtime.rs")), "sys::"),
             2
@@ -3259,12 +3288,26 @@ pub struct MappedRegion {
         // Read only where start admits it, on the answer at connect in the
         // paired profile.
         assert_eq!(occurrences(input, "read_lid("), 1);
-        let lids = input
-            .split_once("    for (path, mut file, device) in lids {\n")
+        let spawn = input
+            .split_once("    fn spawn(&self, admission: Admission) -> std::io::Result<()> {\n")
             .unwrap()
             .1;
-        assert!(lids.contains(
-            "                let read = read_lid(&path, &mut file, target.as_ref(), bindings.as_ref());\n"
+        assert!(spawn.contains(
+            "        if lid {\n            return thread::Builder::new()\n                \
+             .name(\"input-lid\".into())\n                .spawn(move || {\n                    \
+             let read = read_lid(&path, &mut file, target.as_ref(), bindings.as_ref());\n"
+        ));
+        // A lid reaches that reader from startup's admitted lids, or from the
+        // poll only where startup's decision admits one.
+        assert_eq!(occurrences(input, "lid: true,"), 1);
+        assert!(input.contains("    for (path, file, device) in lids {\n"));
+        assert!(input.contains(
+            "        if lid && !self.lid {\n            \
+             lock(roster, \"input roster\")?.lids.insert(inode);\n            \
+             return Ok(Outcome::Drop);\n        }\n"
+        ));
+        assert!(input.contains(
+            "    let mut hotplug = Hotplug::new(input_dir, sysfs, attention_enabled, lid);\n"
         ));
         assert!(input.contains("    let lids = open_lids(lids);\n"));
         // Each reader, a lid's included, is retired once it returns, by its
@@ -3330,7 +3373,7 @@ pub struct MappedRegion {
         // A reader gates each batch before routing it, and its teardown
         // before releasing what its device held.
         let reader = input
-            .split_once("\nfn read_device<T: InputTarget>(\n")
+            .split_once("\nfn read_device_from<T: InputTarget>(\n")
             .unwrap()
             .1
             .split_once("\n}\n")

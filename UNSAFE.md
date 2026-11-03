@@ -1152,19 +1152,22 @@ forever", which is the one way td could paint itself out of hardware
 rendering.
 
 The trusted evdev profile selects `CLOCK_MONOTONIC` with the additional
-`EVIOCSCLOCKID` request `0x400445a0`. Its operand is one live four-byte
-`i32`, fixed to clock ID 1; no caller supplies a clock or a request. Refusal
-is fatal before that reader starts. The compositor's `clock_gettime(2)`
-(syscall 228 on x86-64) uses the same fixed clock and a live 16-byte
-`[i64; 2]` timespec. It validates the seconds/nanoseconds ranges and returns
-nonwrapping nanoseconds. Both operations reuse the existing syscall body
-and add no scoped allow. Source confinement pins the clock, operand widths,
-request, syscall, and caller modules. Input selects the clock; runtime
-orders its cutoff sample after ordinary-screen restoration, exercised by
-its transition tests. The presentation sample bounds a disk installation's
+`EVIOCSCLOCKID` request `0x400445a0`. Its operand is one live four-byte `i32`,
+fixed to clock ID 1; no caller supplies a clock or a request. At startup a
+refusal is fatal before that reader starts. A node the hotplug poll admits
+later (td-compositor/DESIGN.md, "Input hotplug") is dropped on `ENODEV`, left
+a candidate on `EINTR` and otherwise retired, and its reader is not started;
+no request, operand or caller module changes. The compositor's
+`clock_gettime(2)` (syscall 228 on x86-64) uses the same fixed clock and a
+live 16-byte `[i64; 2]` timespec. It validates the seconds/nanoseconds ranges
+and returns nonwrapping nanoseconds. Both operations reuse the existing
+syscall body and add no scoped allow. Source confinement pins the clock,
+operand widths, request, syscall, and caller modules. Input selects the clock;
+runtime orders its cutoff sample after ordinary-screen restoration, exercised
+by its transition tests. The presentation sample bounds a disk installation's
 Enter confirmation and every elevation's approving Enter, an update's
-included: only a later physical evdev timestamp can confirm the
-still-visible exact request. No clock or request value changes.
+included: only a later physical evdev timestamp can confirm the still-visible
+exact request. No clock or request value changes.
 
 
 ## 7. `td-util` — the diagnostics multicall

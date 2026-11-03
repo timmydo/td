@@ -307,6 +307,11 @@ struct KeyBindings {
     /// but never selects or confirms with: a security key's own keyboard
     /// (`security_key_keyboard`).
     attention_excluded: BTreeSet<usize>,
+    /// Devices recorded while the current attention lifetime was open or
+    /// draining, which read in it as excluded devices do
+    /// (td-compositor/DESIGN.md, "Input hotplug"). Read only while
+    /// attention is not closed, and emptied when a lifetime opens.
+    attention_late: BTreeSet<usize>,
     /// One operation per attention lifetime: set once one is selected, or
     /// once a refusal or a failed screen consumed the lifetime.
     secret_selected: bool,
@@ -323,6 +328,9 @@ struct KeyBindings {
     /// profile's alone.
     resume: Option<Arc<Resume>>,
     cutoff: Option<u128>,
+    /// Counts each new `cutoff`, so a late device can tell whether a close
+    /// came between its open and its record.
+    cutoff_generation: u64,
     /// The screen draining now began closing without a key
     /// (`Seat::close_itself`, `lock_for_suspend`).
     keyless_close: Option<KeylessClose>,
@@ -466,9 +474,7 @@ impl KeyBindings {
         // These physical controls remain usable on the lock and attention
         // screens; neither half of the key pair is a client keyboard event.
         if event.kind == EV_KEY && matches!(event.code, KEY_BRIGHTNESSDOWN | KEY_BRIGHTNESSUP) {
-            if matches!(event.value, KEY_PRESS | KEY_REPEAT)
-                && !self.attention_excluded.contains(&device)
-            {
+            if matches!(event.value, KEY_PRESS | KEY_REPEAT) && !self.excluded(device) {
                 decision.brightness = Some(event.code == KEY_BRIGHTNESSUP);
             }
             return decision;
@@ -495,7 +501,7 @@ impl KeyBindings {
         if self.attention != AttentionState::Closed {
             // An excluded device is tracked above so the drain completes, and
             // its Escape still cancels; it never selects or confirms.
-            let readable = !self.attention_excluded.contains(&device);
+            let readable = !self.excluded(device);
             // Only a press after this lifetime's operation was chosen can
             // type: never the press that chose it.
             let chosen = self.secret_selected;
@@ -548,10 +554,11 @@ impl KeyBindings {
             && (self.pressed(KEY_LEFTALT) || self.pressed(KEY_RIGHTALT))
         {
             let held = |left, right| self.attention_pressed(left) || self.attention_pressed(right);
-            decision.unlock = !self.attention_excluded.contains(&device)
+            decision.unlock = !self.excluded(device)
                 && !attention_held
                 && held(KEY_LEFTCTRL, KEY_RIGHTCTRL)
                 && held(KEY_LEFTALT, KEY_RIGHTALT);
+            self.attention_late.clear();
             self.attention = AttentionState::Open;
             self.keyless_close = None;
             self.secret_selected = false;
@@ -1104,7 +1111,15 @@ impl KeyBindings {
     fn attention_pressed(&self, code: u16) -> bool {
         self.pressed
             .iter()
-            .any(|(device, pressed)| *pressed == code && !self.attention_excluded.contains(device))
+            .any(|(device, pressed)| *pressed == code && !self.excluded(*device))
+    }
+
+    /// Whether secure attention reads `device` as excluded now: a security
+    /// key's own keyboard, or, while a lifetime is open or draining, a
+    /// device recorded during it.
+    fn excluded(&self, device: usize) -> bool {
+        self.attention_excluded.contains(&device)
+            || (self.attention != AttentionState::Closed && self.attention_late.contains(&device))
     }
 
     fn settle_launcher(&mut self, visible: Option<bool>) {
@@ -1285,6 +1300,7 @@ impl KeyBindings {
     /// no later device is ever given it.
     fn forget_device(&mut self, device: usize) {
         self.attention_excluded.remove(&device);
+        self.attention_late.remove(&device);
         self.pressed.retain(|(owner, _)| *owner != device);
         self.consumed.retain(|(owner, _)| *owner != device);
         self.forwarded.retain(|(owner, _)| *owner != device);
@@ -1710,7 +1726,7 @@ fn touch_pixels(units: i64, (numerator, denominator): (i64, i64), remainder: &mu
     i32::try_from(pixels).unwrap_or(if pixels < 0 { i32::MIN } else { i32::MAX })
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct EventTimeline {
     cutoff: Option<u128>,
     discard: bool,
@@ -1836,6 +1852,11 @@ trait InputTarget {
         None
     }
     fn attention_closed(&mut self) {}
+    /// A late keyboard or pointer was admitted while attention was closed:
+    /// an advisory notice where the session is unlocked.
+    fn input_added(&mut self, _kind: InputKind) -> Result<(), String> {
+        Ok(())
+    }
     /// Whether the lock surface is up; a target with none never is.
     fn session_locked(&mut self) -> bool {
         false
@@ -2780,6 +2801,12 @@ impl LiveInputTarget {
 }
 
 impl InputTarget for LiveInputTarget {
+    fn input_added(&mut self, kind: InputKind) -> Result<(), String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .input_notice(kind.notice())
+    }
     fn brightness(&mut self, brighter: bool) -> Result<(), String> {
         self.runtime
             .lock()
@@ -3346,61 +3373,789 @@ fn device_lost(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(ENODEV)
 }
 
+/// An open of an evdev node racing its removal (`evdev_open` on a node
+/// whose minor has no device).
+const ENXIO: i32 = 6;
+/// Opens refused for want of memory or descriptors, which pass.
+const ENOMEM: i32 = 12;
+const ENFILE: i32 = 23;
+const EMFILE: i32 = 24;
+
+/// The hotplug poll's period (td-compositor/DESIGN.md, "Input hotplug").
+const HOTPLUG_PERIOD: Duration = Duration::from_millis(250);
+/// `/dev/input` entries a tick reads, in read order: the input core allots
+/// at most 1024 character devices.
+const INPUT_DIRECTORY_ENTRIES: usize = 2048;
+/// Live readers, lid readers included. Startup's count toward it but are
+/// never refused by it.
+const MAX_READERS: usize = 64;
+/// How long a node may stay refused before it is reported, and a USB
+/// device stay incomplete before it is classified as it then reads.
+const HOTPLUG_PATIENCE: Duration = Duration::from_secs(5);
+/// The most interfaces a USB configuration declares.
+const USB_INTERFACES: u8 = 32;
+/// A sysfs attribute read for completeness, kind or name.
+const SYSFS_ATTRIBUTE_BYTES: u64 = 64;
+/// The most bytes of a device's own name an announcement carries.
+const ANNOUNCED_NAME_BYTES: usize = 64;
+pub(crate) const INPUT_ADDED_MARKER: &str = "TD-INPUT-ADDED";
+pub(crate) const INPUT_REMOVED_MARKER: &str = "TD-INPUT-REMOVED";
+
 /// The live readers of one generation (td-compositor/DESIGN.md, "Input
-/// hotplug"), lid readers included: each one's descriptor's inode and its
-/// device id. Ids are never reused within the generation, so bookkeeping
-/// keyed by a retired id never names a later device. A reader that ends by
-/// its device's loss frees its entry; any other end also retires its
-/// inode, in the same hold of this lock, so that node is not opened again
-/// until it is recreated. Never held with the bindings lock.
+/// hotplug"), lid readers included: each one's node name, its descriptor's
+/// inode and its device id. Ids are never reused within the generation,
+/// so bookkeeping keyed by a retired id never names a later device. A
+/// reader that ends by its device's loss frees its entry; any other end
+/// also retires its inode, in the same hold of this lock, so that node is
+/// not opened again until it is recreated. Never held with the bindings
+/// lock.
 #[derive(Default)]
 struct Roster {
     entries: Vec<RosterEntry>,
     retired: BTreeSet<u64>,
+    /// Unadmitted lid switches' inodes, never opened again while present.
+    lids: BTreeSet<u64>,
     next_device: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RosterEntry {
+    name: std::ffi::OsString,
     inode: u64,
     device: usize,
+    /// What its removal says, in the paired profile, for a keyboard or a
+    /// pointer.
+    announcement: Option<Announcement>,
 }
 
 impl Roster {
-    /// Records a live reader of `inode`, answering its new device id.
-    fn admit(&mut self, inode: u64) -> Result<usize, String> {
+    /// Records a live reader of `inode` at `name`, answering its new id.
+    fn admit(
+        &mut self,
+        name: std::ffi::OsString,
+        inode: u64,
+        announcement: Option<Announcement>,
+    ) -> Result<usize, String> {
         let device = self.next_device;
         self.next_device = device.checked_add(1).ok_or("input device ids exhausted")?;
-        self.entries.push(RosterEntry { inode, device });
+        self.entries.push(RosterEntry {
+            name,
+            inode,
+            device,
+            announcement,
+        });
         Ok(device)
     }
 
-    /// `device`'s reader ended, by its device's loss when `lost`.
-    fn end(&mut self, device: usize, lost: bool) {
-        let Some(at) = self.entries.iter().position(|entry| entry.device == device) else {
-            return;
-        };
+    fn describe(&mut self, device: usize, announcement: Option<Announcement>) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.device == device) {
+            entry.announcement = announcement;
+        }
+    }
+
+    /// `device`'s reader ended, by its device's loss when `lost`. Answers
+    /// its entry.
+    fn end(&mut self, device: usize, lost: bool) -> Option<RosterEntry> {
+        let at = self
+            .entries
+            .iter()
+            .position(|entry| entry.device == device)?;
         let entry = self.entries.remove(at);
         if !lost {
             self.retired.insert(entry.inode);
         }
+        Some(entry)
+    }
+}
+
+/// What a late admission or a removal says it was.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputKind {
+    Keyboard,
+    Pointer,
+}
+
+impl InputKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keyboard => "keyboard",
+            Self::Pointer => "pointer",
+        }
+    }
+
+    pub(crate) fn notice(self) -> &'static str {
+        match self {
+            Self::Keyboard => "KEYBOARD ADDED",
+            Self::Pointer => "POINTER ADDED",
+        }
+    }
+}
+
+/// A keyboard's or a pointer's line on standard error: the node, the
+/// device id, its kind, whether the security-key exclusion reads it, and
+/// last its own name, escaped. Never a key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Announcement {
+    node: PathBuf,
+    kind: InputKind,
+    excluded: bool,
+    name: String,
+}
+
+impl Announcement {
+    fn line(&self, marker: &str, device: usize) -> String {
+        format!(
+            "{marker} node={} device={device} kind={} attention={} name=\"{}\"",
+            self.node.display(),
+            self.kind.label(),
+            if self.excluded { "excluded" } else { "read" },
+            self.name
+        )
+    }
+}
+
+/// A node's announcement, or none when it declares neither `KEY_ENTER`
+/// nor `BTN_LEFT`. Read with the lid classifier's plain file reads.
+fn describe(sysfs: &Path, node: &Path, excluded: bool) -> Option<Announcement> {
+    let device = sysfs.join(node.file_name()?).join("device");
+    let keys = read_bitmap(&device.join("capabilities").join("key"))?;
+    let kind = if bitmap_bit(&keys, usize::from(KEY_ENTER))? {
+        InputKind::Keyboard
+    } else if bitmap_bit(&keys, usize::from(BTN_LEFT))? {
+        InputKind::Pointer
+    } else {
+        return None;
+    };
+    let mut name = Vec::new();
+    if let Ok(file) = File::open(device.join("name")) {
+        let _ = file
+            .take(SYSFS_ATTRIBUTE_BYTES.saturating_add(1))
+            .read_to_end(&mut name);
+    }
+    if name.last() == Some(&b'\n') {
+        name.pop();
+    }
+    name.truncate(ANNOUNCED_NAME_BYTES);
+    Some(Announcement {
+        node: node.to_path_buf(),
+        kind,
+        excluded,
+        name: escape_name(&name),
+    })
+}
+
+/// A device's chosen name, so it cannot forge a field: every byte outside
+/// printable ASCII, and every quote or backslash, escaped.
+fn escape_name(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        match byte {
+            b'"' => text.push_str("\\\""),
+            b'\\' => text.push_str("\\\\"),
+            0x20..=0x7e => text.push(char::from(byte)),
+            _ => text.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    text
+}
+
+/// A short sysfs attribute, trimmed. `None` when unreadable or too long.
+fn read_attribute(path: &Path) -> Option<String> {
+    let mut text = String::new();
+    File::open(path)
+        .ok()?
+        .take(SYSFS_ATTRIBUTE_BYTES.saturating_add(1))
+        .read_to_string(&mut text)
+        .ok()?;
+    (u64::try_from(text.len()).ok()? <= SYSFS_ATTRIBUTE_BYTES).then(|| text.trim().to_string())
+}
+
+/// Whether a node's USB device has finished probing (td-compositor/
+/// DESIGN.md, "Probe completeness"): its `bNumInterfaces` is 1 to 32 and
+/// counts its interface directories, and every HID-class interface has a
+/// HID child with a non-empty report descriptor. A node with no USB device
+/// above it has nothing to wait for; anything unreadable is incomplete.
+fn probe_complete(sysfs: &Path, node: &Path) -> bool {
+    let Some(name) = node.file_name() else {
+        return true;
+    };
+    usb_device(&sysfs.join(name).join("device")).is_none_or(|usb| usb_complete(&usb))
+}
+
+fn usb_complete(usb: &Path) -> bool {
+    let Some(name) = usb.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(declared) = read_attribute(&usb.join("bNumInterfaces"))
+        .and_then(|count| count.parse::<u8>().ok())
+        .filter(|count| (1..=USB_INTERFACES).contains(count))
+    else {
+        return false;
+    };
+    let prefix = format!("{name}:");
+    let Some(directories) = sysfs_directories(usb) else {
+        return false;
+    };
+    let interfaces: Vec<&PathBuf> = directories
+        .iter()
+        .filter(|(interface, _)| interface.starts_with(&prefix))
+        .map(|(_, interface)| interface)
+        .collect();
+    interfaces.len() == usize::from(declared)
+        && interfaces.iter().all(|interface| {
+            match read_attribute(&interface.join("bInterfaceClass")).as_deref() {
+                Some("03") => sysfs_directories(interface).is_some_and(|children| {
+                    children.iter().any(|(_, child)| {
+                        read_report_descriptor(&child.join("report_descriptor"))
+                            .is_some_and(|descriptor| !descriptor.is_empty())
+                    })
+                }),
+                Some(_) => true,
+                None => false,
+            }
+        })
+}
+
+/// The one caller of `EVIOCSCLOCKID`, for startup and the poll alike.
+fn select_monotonic(file: &File) -> std::io::Result<()> {
+    sys::input_monotonic_clock(file)
+}
+
+/// A reader about to start: its node, handle and id, and, for an ordinary
+/// reader, its axes and the timeline it starts from.
+struct Admission {
+    path: PathBuf,
+    file: File,
+    device: usize,
+    lid: bool,
+    absolute: Option<(AbsoluteAxes, AbsoluteKind)>,
+    timeline: EventTimeline,
+}
+
+/// What every reader's thread shares.
+struct Readers {
+    target: Arc<Mutex<LiveInputTarget>>,
+    bindings: Arc<Mutex<KeyBindings>>,
+    roster: Arc<Mutex<Roster>>,
+}
+
+impl Readers {
+    /// Starts one reader, startup's or the poll's: `read_lid` for a lid
+    /// switch, `read_device` otherwise, each retired when it returns.
+    fn spawn(&self, admission: Admission) -> std::io::Result<()> {
+        let Admission {
+            path,
+            mut file,
+            device,
+            lid,
+            absolute,
+            timeline,
+        } = admission;
+        let target = Arc::clone(&self.target);
+        let bindings = Arc::clone(&self.bindings);
+        let roster = Arc::clone(&self.roster);
+        if lid {
+            return thread::Builder::new()
+                .name("input-lid".into())
+                .spawn(move || {
+                    let read = read_lid(&path, &mut file, target.as_ref(), bindings.as_ref());
+                    if let Err(error) = &read {
+                        let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
+                    }
+                    retire_reader(bindings.as_ref(), roster.as_ref(), device, read.is_ok());
+                })
+                .map(|_| ());
+        }
+        // A second handle purely so a dropped batch can ask the device where
+        // it is now. The reader takes an `impl Read` so its tests can drive it
+        // from a byte slice, and a slice has no descriptor to ask.
+        //
+        // `try_clone` rather than opening the node again: it is `dup(2)`, so
+        // both handles are the same open file and the same evdev CLIENT. A
+        // second `open` would make a second client with a buffer of its own,
+        // and the kernel writes every event to every client — so the reader
+        // would be racing a queue nothing drains, which is what produces the
+        // dropped batches this exists to recover from.
+        // A touchpad's recovery asks nothing, so only a tablet keeps one.
+        let tablet = absolute.filter(|(_, kind)| *kind == AbsoluteKind::Tablet);
+        let resync_handle = tablet.and_then(|_| match file.try_clone() {
+            Ok(handle) => Some(handle),
+            // Reported rather than swallowed: the device still works, but a
+            // dropped batch can no longer be recovered from, and every other
+            // failure on this path says so.
+            Err(error) => {
+                eprintln!(
+                    "td-compositor: no resync handle for {}: {error}",
+                    path.display()
+                );
+                None
+            }
+        });
+        thread::Builder::new()
+            .name(format!(
+                "input-{}",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("event")
+            ))
+            .spawn(move || {
+                let mut resync = move || resync_handle.as_ref().and_then(absolute_axes);
+                let read = read_device_from(
+                    &path,
+                    &mut file,
+                    device,
+                    target.as_ref(),
+                    bindings.as_ref(),
+                    absolute,
+                    &mut resync,
+                    timeline,
+                );
+                if let Err(error) = &read {
+                    eprintln!("td-compositor: {error}");
+                }
+                retire_reader(bindings.as_ref(), roster.as_ref(), device, read.is_ok());
+            })
+            .map(|_| ())
     }
 }
 
 /// What a reader's thread does once its reader returns: its id leaves the
 /// bindings' sets, then its entry leaves the roster, never under both
-/// locks. A reader that returned `Ok` ended by its device's loss; one
-/// whose release failed after that loss is retired too, which costs
-/// nothing, since the loss also removed the node.
+/// locks, and a keyboard's or a pointer's removal is said. A reader that
+/// returned `Ok` ended by its device's loss; one whose release failed
+/// after that loss is retired too, which costs nothing, since the loss
+/// also removed the node.
 fn retire_reader(bindings: &Mutex<KeyBindings>, roster: &Mutex<Roster>, device: usize, lost: bool) {
     match bindings.lock() {
         Ok(mut bindings) => bindings.forget_device(device),
         Err(_) => say_line("td-compositor: input bindings lock poisoned"),
     }
-    match roster.lock() {
+    let ended = match roster.lock() {
         Ok(mut roster) => roster.end(device, lost),
-        Err(_) => say_line("td-compositor: input roster lock poisoned"),
+        Err(_) => {
+            say_line("td-compositor: input roster lock poisoned");
+            None
+        }
+    };
+    if let Some(announcement) = ended.and_then(|entry| entry.announcement) {
+        say_line(&announcement.line(INPUT_REMOVED_MARKER, device));
     }
+}
+
+/// Opens an input node, with its descriptor's inode.
+fn open_node(path: &Path) -> std::io::Result<(File, u64)> {
+    let file = File::open(path)?;
+    let inode = file.metadata()?.ino();
+    Ok((file, inode))
+}
+
+/// `/dev/input`'s `eventN` entries: name, path and listed inode.
+type Listing = Vec<(std::ffi::OsString, PathBuf, u64)>;
+
+/// A node the poll has seen and not admitted: when, and what it has said.
+#[derive(Clone, Copy)]
+struct Candidate {
+    first_seen: Instant,
+    refused_said: bool,
+    transient_said: bool,
+    incomplete_said: bool,
+    bound_said: bool,
+}
+
+/// The poll's ways out, so its tests need no evdev node: opening a node,
+/// selecting its clock, asking its axes, starting its reader, and the
+/// notice a late keyboard or pointer shows.
+struct HotplugIo<'a> {
+    open: &'a mut dyn FnMut(&Path) -> std::io::Result<(File, u64)>,
+    clock: &'a mut dyn FnMut(&File) -> std::io::Result<()>,
+    axes: &'a mut dyn FnMut(&File) -> Option<AbsoluteAxes>,
+    spawn: &'a mut dyn FnMut(Admission) -> std::io::Result<()>,
+    notify: &'a mut dyn FnMut(InputKind),
+}
+
+/// The `input-hotplug` thread's state (td-compositor/DESIGN.md, "Input
+/// hotplug"): every 250 ms it reads `/dev/input` and admits each node
+/// root has assigned that no reader holds.
+struct Hotplug {
+    input_dir: PathBuf,
+    sysfs: PathBuf,
+    attention_enabled: bool,
+    lid: bool,
+    candidates: std::collections::BTreeMap<u64, Candidate>,
+    /// The directory read's last failure or overflow was said.
+    directory_said: bool,
+}
+
+fn lock<'a, T>(mutex: &'a Mutex<T>, what: &str) -> Result<MutexGuard<'a, T>, String> {
+    mutex.lock().map_err(|_| format!("{what} lock poisoned"))
+}
+
+impl Hotplug {
+    fn new(input_dir: &Path, sysfs: &Path, attention_enabled: bool, lid: bool) -> Self {
+        Self {
+            input_dir: input_dir.to_path_buf(),
+            sysfs: sysfs.to_path_buf(),
+            attention_enabled,
+            lid,
+            candidates: std::collections::BTreeMap::new(),
+            directory_said: false,
+        }
+    }
+
+    /// Polls until a lock is poisoned, which stops hotplug for the
+    /// generation while existing readers continue.
+    fn watch(&mut self, readers: &Readers) {
+        let mut open = open_node;
+        let mut clock = select_monotonic;
+        let mut axes = absolute_axes;
+        let mut spawn = |admission| readers.spawn(admission);
+        let mut notify = |kind: InputKind| match readers.target.lock() {
+            Ok(mut target) => {
+                if let Err(error) = target.input_added(kind) {
+                    say_line(&format!("td-compositor: input notice: {error}"));
+                }
+            }
+            Err(_) => say_line("td-compositor: input target lock poisoned"),
+        };
+        let mut io = HotplugIo {
+            open: &mut open,
+            clock: &mut clock,
+            axes: &mut axes,
+            spawn: &mut spawn,
+            notify: &mut notify,
+        };
+        loop {
+            if let Err(error) =
+                self.tick(Instant::now(), &readers.roster, &readers.bindings, &mut io)
+            {
+                say_line(&format!(
+                    "td-compositor: input hotplug stopped for this generation: {error}"
+                ));
+                return;
+            }
+            thread::sleep(HOTPLUG_PERIOD);
+        }
+    }
+
+    fn say_directory(&mut self, problem: Option<String>) {
+        match problem {
+            Some(problem) if !self.directory_said => {
+                say_line(&format!("td-compositor: input hotplug: {problem}"));
+                self.directory_said = true;
+            }
+            Some(_) => {}
+            None => self.directory_said = false,
+        }
+    }
+
+    /// The `eventN` entries of `/dev/input` with their listed inodes, at
+    /// most `INPUT_DIRECTORY_ENTRIES` read, and whether there were more.
+    fn listing(&self) -> Result<(Listing, bool), String> {
+        use std::os::unix::fs::DirEntryExt;
+        let entries = fs::read_dir(&self.input_dir)
+            .map_err(|e| format!("read {}: {e}", self.input_dir.display()))?;
+        let mut listing = Vec::new();
+        for (index, entry) in entries.enumerate() {
+            if index >= INPUT_DIRECTORY_ENTRIES {
+                return Ok((listing, true));
+            }
+            let entry = entry.map_err(|e| format!("read input entry: {e}"))?;
+            let name = entry.file_name();
+            if name.to_str().is_some_and(event_name) {
+                listing.push((name, entry.path(), entry.ino()));
+            }
+        }
+        Ok((listing, false))
+    }
+
+    /// One poll: admits what it can, in read order, and never sleeps on a
+    /// node. Errs only on a poisoned lock.
+    fn tick(
+        &mut self,
+        now: Instant,
+        roster: &Mutex<Roster>,
+        bindings: &Mutex<KeyBindings>,
+        io: &mut HotplugIo<'_>,
+    ) -> Result<(), String> {
+        let listing = match self.listing() {
+            Ok((listing, overflow)) => {
+                self.say_directory(overflow.then(|| {
+                    format!(
+                        "{} has more than {INPUT_DIRECTORY_ENTRIES} entries; reading the first",
+                        self.input_dir.display()
+                    )
+                }));
+                listing
+            }
+            Err(error) => {
+                self.say_directory(Some(error));
+                return Ok(());
+            }
+        };
+        let present: BTreeSet<u64> = listing.iter().map(|(_, _, inode)| *inode).collect();
+        self.candidates.retain(|inode, _| present.contains(inode));
+        let (candidates, mut live) = {
+            let mut roster = lock(roster, "input roster")?;
+            roster.retired.retain(|inode| present.contains(inode));
+            roster.lids.retain(|inode| present.contains(inode));
+            let candidates: Vec<_> = listing
+                .into_iter()
+                .filter(|(name, _, inode)| {
+                    !roster.entries.iter().any(|entry| entry.name == *name)
+                        && !roster.retired.contains(inode)
+                        && !roster.lids.contains(inode)
+                })
+                .collect();
+            (candidates, roster.entries.len())
+        };
+        for (name, path, listed) in candidates {
+            let state = *self.candidates.entry(listed).or_insert(Candidate {
+                first_seen: now,
+                refused_said: false,
+                transient_said: false,
+                incomplete_said: false,
+                bound_said: false,
+            });
+            let patient = now.saturating_duration_since(state.first_seen) < HOTPLUG_PATIENCE;
+            if live >= MAX_READERS {
+                if !state.bound_said {
+                    say_line(&format!(
+                        "td-compositor: input {} waits: {MAX_READERS} readers are live",
+                        path.display()
+                    ));
+                    self.mark(listed, |state| state.bound_said = true);
+                }
+                continue;
+            }
+            match self.admit(&name, &path, listed, state, patient, roster, bindings, io)? {
+                Outcome::Yes => {
+                    self.candidates.remove(&listed);
+                    live = live.saturating_add(1);
+                }
+                Outcome::Drop => {
+                    self.candidates.remove(&listed);
+                }
+                Outcome::Wait => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn mark(&mut self, listed: u64, change: impl FnOnce(&mut Candidate)) {
+        if let Some(state) = self.candidates.get_mut(&listed) {
+            change(state);
+        }
+    }
+
+    /// Steps 1 to 4 for one candidate.
+    #[allow(clippy::too_many_arguments)]
+    fn admit(
+        &mut self,
+        name: &std::ffi::OsStr,
+        path: &Path,
+        listed: u64,
+        state: Candidate,
+        patient: bool,
+        roster: &Mutex<Roster>,
+        bindings: &Mutex<KeyBindings>,
+        io: &mut HotplugIo<'_>,
+    ) -> Result<Outcome, String> {
+        // Where startup's decision admits no lid, a lid switch is not
+        // opened at all, as at startup: remembered by its listed inode. A
+        // reused name can only make a later node read as a lid and wait for
+        // its own recreation, since its inode is not the one remembered.
+        if !self.lid && lid_switch(&self.sysfs, path) {
+            lock(roster, "input roster")?.lids.insert(listed);
+            return Ok(Outcome::Drop);
+        }
+        // 1. The cutoff generation before the open, then the open.
+        let generation = lock(bindings, "input bindings")?.cutoff_generation;
+        let (file, inode) = match (io.open)(path) {
+            Ok(opened) => opened,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                if !patient && !state.refused_said {
+                    say_line(&format!(
+                        "td-compositor: input {} is still refused after {}s; \
+                         root has not assigned it",
+                        path.display(),
+                        HOTPLUG_PATIENCE.as_secs()
+                    ));
+                    self.mark(listed, |state| state.refused_said = true);
+                }
+                return Ok(Outcome::Wait);
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || matches!(error.raw_os_error(), Some(ENODEV | ENXIO)) =>
+            {
+                return Ok(Outcome::Drop);
+            }
+            // Descriptors or memory short for now: not the node's fault.
+            Err(error) if matches!(error.raw_os_error(), Some(EMFILE | ENFILE | ENOMEM)) => {
+                if !state.transient_said {
+                    say_line(&format!(
+                        "td-compositor: input {} not opened yet: {error}",
+                        path.display()
+                    ));
+                    self.mark(listed, |state| state.transient_said = true);
+                }
+                return Ok(Outcome::Wait);
+            }
+            Err(error) => {
+                say_line(&format!(
+                    "td-compositor: input {} not opened: {error}; \
+                     not retried until it is recreated",
+                    path.display()
+                ));
+                lock(roster, "input roster")?.retired.insert(listed);
+                return Ok(Outcome::Drop);
+            }
+        };
+        // 2. Classification, after the open. A node that reads as a lid
+        // only now is remembered by the descriptor's inode.
+        let lid = lid_switch(&self.sysfs, path);
+        if lid && !self.lid {
+            lock(roster, "input roster")?.lids.insert(inode);
+            return Ok(Outcome::Drop);
+        }
+        let paired = self.attention_enabled && !lid;
+        if paired && !probe_complete(&self.sysfs, path) {
+            if patient {
+                return Ok(Outcome::Wait);
+            }
+            if !state.incomplete_said {
+                say_line(&format!(
+                    "td-compositor: input {}'s USB device is still incomplete after {}s; \
+                     classified as it reads",
+                    path.display(),
+                    HOTPLUG_PATIENCE.as_secs()
+                ));
+                self.mark(listed, |state| state.incomplete_said = true);
+            }
+        }
+        let absolute = if lid {
+            None
+        } else {
+            (io.axes)(&file).map(|axes| (axes, absolute_kind(&self.sysfs, path)))
+        };
+        let excluded = paired && security_key_keyboard(&self.sysfs, path);
+        let announcement = if paired {
+            describe(&self.sysfs, path, excluded)
+        } else {
+            None
+        };
+        // 3. The clock, whose success proves every read above described
+        // this descriptor's device.
+        if paired {
+            match (io.clock)(&file) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(ENODEV) => return Ok(Outcome::Drop),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    return Ok(Outcome::Wait)
+                }
+                Err(error) => {
+                    say_line(&format!(
+                        "td-compositor: input {} refused EVIOCSCLOCKID: {error}; \
+                         not retried until it is recreated",
+                        path.display()
+                    ));
+                    lock(roster, "input roster")?.retired.insert(inode);
+                    return Ok(Outcome::Drop);
+                }
+            }
+        }
+        // 4. The roster entry, then the seat's record, then the reader.
+        let device = lock(roster, "input roster")?.admit(
+            name.to_os_string(),
+            inode,
+            announcement.clone(),
+        )?;
+        let (timeline, closed) = {
+            let mut bindings = lock(bindings, "input bindings")?;
+            if excluded {
+                bindings.attention_excluded.insert(device);
+            }
+            if bindings.attention != AttentionState::Closed {
+                bindings.attention_late.insert(device);
+            }
+            let timeline = if bindings.cutoff_generation == generation {
+                EventTimeline {
+                    cutoff: bindings.cutoff,
+                    discard: false,
+                }
+            } else {
+                EventTimeline::default()
+            };
+            (timeline, bindings.attention == AttentionState::Closed)
+        };
+        // Said before the reader starts, so a reader that ends at once
+        // cannot say its removal first.
+        if let Some(announcement) = &announcement {
+            say_line(&announcement.line(INPUT_ADDED_MARKER, device));
+        }
+        let spawned = (io.spawn)(Admission {
+            path: path.to_path_buf(),
+            file,
+            device,
+            lid,
+            absolute,
+            timeline,
+        });
+        if let Err(error) = spawned {
+            say_line(&format!(
+                "td-compositor: spawn input reader for {}: {error}; \
+                 not retried until it is recreated",
+                path.display()
+            ));
+            lock(bindings, "input bindings")?.forget_device(device);
+            let ended = lock(roster, "input roster")?.end(device, false);
+            if let Some(announcement) = ended.and_then(|entry| entry.announcement) {
+                say_line(&announcement.line(INPUT_REMOVED_MARKER, device));
+            }
+            return Ok(Outcome::Drop);
+        }
+        if lid {
+            say_line(&format!(
+                "td-compositor: {} is a lid switch; closing it locks",
+                path.display()
+            ));
+        }
+        if excluded {
+            say_line(&format!(
+                "td-compositor: {} shares a USB device with a FIDO interface; \
+                 secure attention never selects or confirms with it",
+                path.display()
+            ));
+        }
+        if let (Some(announcement), true) = (&announcement, closed) {
+            (io.notify)(announcement.kind);
+        }
+        Ok(Outcome::Yes)
+    }
+}
+
+/// One candidate's outcome this tick.
+enum Outcome {
+    Yes,
+    /// Forget its state: gone, retired or remembered.
+    Drop,
+    /// Keep it a candidate for the next tick.
+    Wait,
+}
+
+/// Closes each opened startup node whose USB device is still probing,
+/// leaving it to the poll as a candidate.
+fn defer_probing<T>(sysfs: &Path, devices: &mut Opened<T>) {
+    devices.retain(|(path, _)| {
+        let complete = probe_complete(sysfs, path);
+        if !complete {
+            say_line(&format!(
+                "td-compositor: {} waits for its USB device to finish probing",
+                path.display()
+            ));
+        }
+        complete
+    });
 }
 
 /// Opened nodes with their descriptors' inodes, and then with their ids.
@@ -3414,7 +4169,10 @@ fn admit_startup<T>(
     devices: Opened<T>,
     lids: Opened<T>,
 ) -> Result<(Admitted<T>, Admitted<T>), String> {
-    let mut admit = |(path, (file, inode))| roster.admit(inode).map(|id| (path, file, id));
+    let mut admit = |(path, (file, inode)): (PathBuf, (T, u64))| {
+        let name = path.file_name().unwrap_or_default().to_os_string();
+        roster.admit(name, inode, None).map(|id| (path, file, id))
+    };
     Ok((
         devices
             .into_iter()
@@ -3422,13 +4180,6 @@ fn admit_startup<T>(
             .collect::<Result<_, _>>()?,
         lids.into_iter().map(&mut admit).collect::<Result<_, _>>()?,
     ))
-}
-
-/// Opens an input node, with its descriptor's inode.
-fn open_node(path: &Path) -> std::io::Result<(File, u64)> {
-    let file = File::open(path)?;
-    let inode = file.metadata()?.ino();
-    Ok((file, inode))
 }
 
 fn event_name(name: &str) -> bool {
@@ -3776,6 +4527,7 @@ fn finish_attention<T: InputTarget>(
             return Err(error);
         }
         bindings.cutoff = Some(cutoff);
+        bindings.cutoff_generation = bindings.cutoff_generation.wrapping_add(1);
         let close = bindings.keyless_close.take();
         bindings.settled = close.map(|_| cutoff.saturating_add(SELF_CLOSE_SETTLE));
         bindings.settle_dropped = close.zip(bindings.settled).map(|(close, settled)| {
@@ -4057,7 +4809,12 @@ fn flush_target<T: InputTarget>(target: &Mutex<T>) -> Result<(), String> {
         .flush()
 }
 
-fn read_device<T: InputTarget>(
+/// A device's reader. `timeline` is the cutoff it starts from: a late
+/// device adopts the one in force when it was opened, if no close came
+/// between its open and its record, rather than discarding its first
+/// report for it.
+#[allow(clippy::too_many_arguments)]
+fn read_device_from<T: InputTarget>(
     path: &Path,
     file: &mut impl Read,
     device: usize,
@@ -4065,6 +4822,7 @@ fn read_device<T: InputTarget>(
     bindings: &Mutex<KeyBindings>,
     absolute: Option<(AbsoluteAxes, AbsoluteKind)>,
     resync: &mut dyn FnMut() -> Option<AbsoluteAxes>,
+    timeline: EventTimeline,
 ) -> Result<(), String> {
     let mut buffer = [0u8; READ_BATCH_BYTES];
     let mut filled = 0usize;
@@ -4105,6 +4863,7 @@ fn read_device<T: InputTarget>(
         (bindings.attention_enabled, bindings.resume.clone())
     };
     let mut state = DeviceState::new(axes, kind, resync, attention_enabled);
+    state.pointer.timeline = timeline;
     let mut last_time = 0;
     let result = loop {
         // An empty tail, not just an out-of-range one: `get_mut(len..)` yields
@@ -4243,7 +5002,14 @@ pub fn start(
     };
     let lid = lid_admitted(attention_enabled, connected.as_ref());
     let (paths, lids) = admit_lids(event_paths(input_dir)?, Path::new(SYSFS_INPUT), lid);
-    let devices = open_event_devices(paths, open_node)?;
+    let sysfs = Path::new(SYSFS_INPUT);
+    let mut devices = open_event_devices(paths, open_node)?;
+    // A USB device still probing is left to the poll ("Probe
+    // completeness"): its FIDO interface may not have its descriptor yet.
+    // Opened, and so counted against the empty roster, before it is closed.
+    if attention_enabled {
+        defer_probing(sysfs, &mut devices);
+    }
     let lids = open_lids(lids);
     let count = devices.len().saturating_add(lids.len());
     let roster = Arc::new(Mutex::new(Roster::default()));
@@ -4254,12 +5020,23 @@ pub fn start(
         devices,
         lids,
     )?;
-    // Decided once against the fixed roster, as admission is.
+    // Decided once per device, at its admission.
     let attention_excluded = if attention_enabled {
-        attention_exclusions(Path::new(SYSFS_INPUT), &devices)
+        attention_exclusions(sysfs, &devices)
     } else {
         BTreeSet::new()
     };
+    if attention_enabled {
+        let mut roster = roster
+            .lock()
+            .map_err(|_| "input roster lock poisoned".to_string())?;
+        for (path, _, device) in &devices {
+            roster.describe(
+                *device,
+                describe(sysfs, path, attention_excluded.contains(device)),
+            );
+        }
+    }
     let resume = attention_enabled.then(|| {
         Arc::new(Resume::new(
             login.clone(),
@@ -4293,85 +5070,49 @@ pub fn start(
             },
         })
     });
-    for (path, mut file, device) in devices {
+    let readers = Readers {
+        target: Arc::clone(&target),
+        bindings: Arc::clone(&bindings),
+        roster,
+    };
+    for (path, file, device) in devices {
         if attention_enabled {
-            sys::input_monotonic_clock(&file)?;
+            select_monotonic(&file).map_err(|error| format!("EVIOCSCLOCKID: {error}"))?;
         }
         let axes = absolute_axes(&file);
         // Only a device with axes is classified; a mouse reads no sysfs.
         // `path` is under `/dev/input`, whose node names are sysfs's.
-        let absolute = axes.map(|axes| (axes, absolute_kind(Path::new(SYSFS_INPUT), &path)));
-        // A second handle purely so a dropped batch can ask the device where
-        // it is now. The reader takes an `impl Read` so its tests can drive it
-        // from a byte slice, and a slice has no descriptor to ask.
-        //
-        // `try_clone` rather than opening the node again: it is `dup(2)`, so
-        // both handles are the same open file and the same evdev CLIENT. A
-        // second `open` would make a second client with a buffer of its own,
-        // and the kernel writes every event to every client — so the reader
-        // would be racing a queue nothing drains, which is what produces the
-        // dropped batches this exists to recover from.
-        // A touchpad's recovery asks nothing, so only a tablet keeps one.
-        let tablet = absolute.filter(|(_, kind)| *kind == AbsoluteKind::Tablet);
-        let resync_handle = tablet.and_then(|_| match file.try_clone() {
-            Ok(handle) => Some(handle),
-            // Reported rather than swallowed: the device still works, but a
-            // dropped batch can no longer be recovered from, and every other
-            // failure on this path says so.
-            Err(error) => {
-                eprintln!(
-                    "td-compositor: no resync handle for {}: {error}",
-                    path.display()
-                );
-                None
-            }
-        });
-        let path = path.clone();
+        let absolute = axes.map(|axes| (axes, absolute_kind(sysfs, &path)));
         let label = path.display().to_string();
-        let target = Arc::clone(&target);
-        let bindings = Arc::clone(&bindings);
-        let roster = Arc::clone(&roster);
-        thread::Builder::new()
-            .name(format!(
-                "input-{}",
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("event")
-            ))
-            .spawn(move || {
-                let mut resync = move || resync_handle.as_ref().and_then(absolute_axes);
-                let read = read_device(
-                    &path,
-                    &mut file,
-                    device,
-                    target.as_ref(),
-                    bindings.as_ref(),
-                    absolute,
-                    &mut resync,
-                );
-                if let Err(error) = &read {
-                    eprintln!("td-compositor: {error}");
-                }
-                retire_reader(bindings.as_ref(), roster.as_ref(), device, read.is_ok());
+        readers
+            .spawn(Admission {
+                path,
+                file,
+                device,
+                lid: false,
+                absolute,
+                timeline: EventTimeline::default(),
             })
             .map_err(|e| format!("spawn input reader for {label}: {e}"))?;
     }
-    for (path, mut file, device) in lids {
+    for (path, file, device) in lids {
         let label = path.display().to_string();
-        let target = Arc::clone(&target);
-        let bindings = Arc::clone(&bindings);
-        let roster = Arc::clone(&roster);
-        thread::Builder::new()
-            .name("input-lid".into())
-            .spawn(move || {
-                let read = read_lid(&path, &mut file, target.as_ref(), bindings.as_ref());
-                if let Err(error) = &read {
-                    let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
-                }
-                retire_reader(bindings.as_ref(), roster.as_ref(), device, read.is_ok());
+        readers
+            .spawn(Admission {
+                path,
+                file,
+                device,
+                lid: true,
+                absolute: None,
+                timeline: EventTimeline::default(),
             })
             .map_err(|e| format!("spawn lid reader for {label}: {e}"))?;
     }
+    let mut hotplug = Hotplug::new(input_dir, sysfs, attention_enabled, lid);
+    thread::Builder::new()
+        .name("input-hotplug".into())
+        .spawn(move || hotplug.watch(&readers))
+        .map_err(|e| format!("spawn input hotplug: {e}"))?;
     if let Some(resume) = resume {
         thread::Builder::new()
             .name("resume".into())
@@ -4423,6 +5164,27 @@ mod tests {
         }
     }
 
+    fn read_device<T: InputTarget>(
+        path: &Path,
+        file: &mut impl Read,
+        device: usize,
+        target: &Mutex<T>,
+        bindings: &Mutex<KeyBindings>,
+        absolute: Option<(AbsoluteAxes, AbsoluteKind)>,
+        resync: &mut dyn FnMut() -> Option<AbsoluteAxes>,
+    ) -> Result<(), String> {
+        read_device_from(
+            path,
+            file,
+            device,
+            target,
+            bindings,
+            absolute,
+            resync,
+            EventTimeline::default(),
+        )
+    }
+
     #[test]
     fn roster_ids_are_never_reused_and_only_a_failed_reader_retires() {
         let mut roster = Roster::default();
@@ -4452,17 +5214,19 @@ mod tests {
         assert_eq!(
             roster.entries,
             [RosterEntry {
+                name: "event2".into(),
                 inode: 42,
-                device: 1
+                device: 1,
+                announcement: None,
             }]
         );
         // An id once given is never given again, and an unknown end is a
         // no-op.
-        assert_eq!(roster.admit(40).unwrap(), 3);
+        assert_eq!(roster.admit("event0".into(), 40, None).unwrap(), 3);
         roster.end(0, false);
         assert_eq!(roster.retired, BTreeSet::from([41]));
         roster.next_device = usize::MAX;
-        assert!(roster.admit(43).is_err());
+        assert!(roster.admit("event3".into(), 43, None).is_err());
         assert_eq!(roster.entries.len(), 2);
     }
 
@@ -4480,7 +5244,11 @@ mod tests {
         let roster = Mutex::new(Roster::default());
         // Ids 0 to 5, id 4 the reader of inode 10.
         for inode in 6..12 {
-            roster.lock().unwrap().admit(inode).unwrap();
+            roster
+                .lock()
+                .unwrap()
+                .admit(format!("event{inode}").into(), inode, None)
+                .unwrap();
         }
         retire_reader(&bindings, &roster, 4, false);
         let held = bindings.lock().unwrap();
@@ -6032,6 +6800,518 @@ mod tests {
             &format!("{keyboard}/0003:1050:0407.0001/input/input5"),
         );
         tree.hid(&format!("{device}/{port}:1.1"), "0003:1050:0407.0002", fido);
+    }
+
+    /// A scratch `/dev/input` of regular files beside a sysfs tree, and
+    /// the poll over them through test seams.
+    struct Poll {
+        tree: SysfsTree,
+        hotplug: Hotplug,
+        roster: Mutex<Roster>,
+        bindings: Mutex<KeyBindings>,
+        /// Node names whose open is refused with `EACCES`, or with
+        /// `transient` when that is set.
+        refused: BTreeSet<String>,
+        transient: Option<i32>,
+        /// The errno each clock selection answers, or none.
+        clock: Option<i32>,
+        /// A close the seat makes between a node's open and its record.
+        close_after_open: bool,
+        /// Whether starting a reader fails.
+        spawn_fails: bool,
+        opens: usize,
+        spawned: Vec<(PathBuf, usize, bool, EventTimeline)>,
+        notices: Vec<InputKind>,
+        start: Instant,
+    }
+
+    impl Poll {
+        fn new(attention_enabled: bool, lid: bool) -> Self {
+            let tree = SysfsTree::new();
+            let dev = tree.0.join("dev-input");
+            std::fs::create_dir_all(&dev).unwrap();
+            std::fs::create_dir_all(tree.class()).unwrap();
+            let hotplug = Hotplug::new(&dev, &tree.class(), attention_enabled, lid);
+            Self {
+                tree,
+                hotplug,
+                roster: Mutex::new(Roster::default()),
+                bindings: Mutex::new(KeyBindings {
+                    attention_enabled,
+                    ..KeyBindings::default()
+                }),
+                refused: BTreeSet::new(),
+                transient: None,
+                spawn_fails: false,
+                clock: None,
+                close_after_open: false,
+                opens: 0,
+                spawned: Vec::new(),
+                notices: Vec::new(),
+                start: Instant::now(),
+            }
+        }
+
+        fn dev(&self) -> PathBuf {
+            self.tree.0.join("dev-input")
+        }
+
+        /// Creates (or recreates, with a new inode) `/dev/input/<name>`.
+        fn node(&self, name: &str) {
+            let path = self.dev().join(name);
+            let _ = std::fs::remove_file(&path);
+            std::fs::write(path, b"").unwrap();
+        }
+
+        fn inode(&self, name: &str) -> u64 {
+            std::fs::metadata(self.dev().join(name)).unwrap().ino()
+        }
+
+        /// A keyboard's sysfs: `capabilities/key` declaring `KEY_ENTER`
+        /// and a `name`.
+        fn keyboard(&self, event: &str, name: &[u8]) {
+            self.tree.event(event, &format!("virtual/input/{event}"));
+            let device = self.tree.class().join(event).join("device");
+            std::fs::create_dir_all(device.join("capabilities")).unwrap();
+            std::fs::write(device.join("capabilities").join("key"), "10000000\n").unwrap();
+            std::fs::write(device.join("name"), name).unwrap();
+        }
+
+        fn tick_at(&mut self, seconds: u64) {
+            let now = self.start + Duration::from_secs(seconds);
+            let refused = self.refused.clone();
+            let transient = self.transient;
+            let clock = self.clock;
+            let close = self.close_after_open;
+            let bindings = &self.bindings;
+            let opens = &mut self.opens;
+            let mut open = |path: &Path| {
+                *opens += 1;
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                if refused.contains(&name) {
+                    return Err(transient.map_or_else(
+                        || std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                        std::io::Error::from_raw_os_error,
+                    ));
+                }
+                let opened = open_node(path)?;
+                if close {
+                    let mut bindings = bindings.lock().unwrap();
+                    bindings.cutoff = Some(9_000);
+                    bindings.cutoff_generation += 1;
+                }
+                Ok(opened)
+            };
+            let mut select = |_: &File| {
+                clock.map_or(Ok(()), |errno| {
+                    Err(std::io::Error::from_raw_os_error(errno))
+                })
+            };
+            let mut axes = |_: &File| None;
+            let spawned = &mut self.spawned;
+            let spawn_fails = self.spawn_fails;
+            let mut spawn = |admission: Admission| {
+                if spawn_fails {
+                    return Err(std::io::Error::other("no thread"));
+                }
+                spawned.push((
+                    admission.path,
+                    admission.device,
+                    admission.lid,
+                    admission.timeline,
+                ));
+                Ok(())
+            };
+            let notices = &mut self.notices;
+            let mut notify = |kind| notices.push(kind);
+            self.hotplug
+                .tick(
+                    now,
+                    &self.roster,
+                    &self.bindings,
+                    &mut HotplugIo {
+                        open: &mut open,
+                        clock: &mut select,
+                        axes: &mut axes,
+                        spawn: &mut spawn,
+                        notify: &mut notify,
+                    },
+                )
+                .unwrap();
+        }
+
+        fn ids(&self) -> Vec<usize> {
+            self.spawned.iter().map(|(_, id, _, _)| *id).collect()
+        }
+    }
+
+    #[test]
+    fn a_refused_node_is_admitted_once_root_assigns_it() {
+        let mut poll = Poll::new(true, false);
+        poll.node("event3");
+        poll.refused.insert("event3".into());
+        poll.tick_at(0);
+        poll.tick_at(6);
+        assert!(poll.spawned.is_empty());
+        assert!(poll.hotplug.candidates.contains_key(&poll.inode("event3")));
+        poll.refused.clear();
+        poll.tick_at(7);
+        assert_eq!(poll.ids(), [0]);
+        assert_eq!(poll.roster.lock().unwrap().entries.len(), 1);
+        // Live: the next tick opens nothing.
+        let opens = poll.opens;
+        poll.tick_at(8);
+        assert_eq!(poll.opens, opens);
+        assert_eq!(poll.ids(), [0]);
+    }
+
+    #[test]
+    fn a_lost_node_frees_its_name_and_a_failed_one_waits_for_recreation() {
+        let mut poll = Poll::new(true, false);
+        poll.node("event4");
+        poll.tick_at(0);
+        assert_eq!(poll.ids(), [0]);
+        // A reader ended by a parse error retires the inode: not reopened.
+        retire_reader(&poll.bindings, &poll.roster, 0, false);
+        poll.tick_at(1);
+        assert_eq!(poll.ids(), [0]);
+        // Recreated, it is a new node, with a new id.
+        poll.node("event4");
+        poll.tick_at(2);
+        assert_eq!(poll.ids(), [0, 1]);
+        // A lost one frees the name at once, and its id is never reused.
+        retire_reader(&poll.bindings, &poll.roster, 1, true);
+        poll.tick_at(3);
+        assert_eq!(poll.ids(), [0, 1, 2]);
+        // The retired set is pruned to present inodes.
+        retire_reader(&poll.bindings, &poll.roster, 2, false);
+        // The first retired inode left with its node when it was recreated.
+        assert_eq!(poll.roster.lock().unwrap().retired.len(), 1);
+        std::fs::remove_file(poll.dev().join("event4")).unwrap();
+        poll.tick_at(4);
+        assert!(poll.roster.lock().unwrap().retired.is_empty());
+        assert!(poll.hotplug.candidates.is_empty());
+    }
+
+    #[test]
+    fn the_clock_drops_retries_or_retires_a_late_node() {
+        let mut poll = Poll::new(true, false);
+        poll.node("event5");
+        poll.clock = Some(libc_eintr());
+        poll.tick_at(0);
+        assert!(poll.spawned.is_empty());
+        assert!(poll.hotplug.candidates.contains_key(&poll.inode("event5")));
+        poll.clock = Some(ENODEV);
+        poll.tick_at(1);
+        assert!(poll.spawned.is_empty());
+        assert!(poll.roster.lock().unwrap().retired.is_empty());
+        poll.clock = Some(25);
+        poll.tick_at(2);
+        assert_eq!(
+            poll.roster.lock().unwrap().retired,
+            BTreeSet::from([poll.inode("event5")])
+        );
+        poll.clock = None;
+        poll.tick_at(3);
+        assert!(poll.spawned.is_empty());
+        // The direct profile selects no clock.
+        let mut direct = Poll::new(false, false);
+        direct.node("event5");
+        direct.clock = Some(25);
+        direct.tick_at(0);
+        assert_eq!(direct.ids(), [0]);
+    }
+
+    fn libc_eintr() -> i32 {
+        4
+    }
+
+    #[test]
+    fn lid_switches_are_held_in_the_roster_or_remembered() {
+        let lid = |poll: &Poll| {
+            poll.tree
+                .event("event1", "LNXSYSTM:00/PNP0C0D:00/input/input1");
+            let capabilities = poll.tree.class().join("event1/device/capabilities");
+            std::fs::create_dir_all(&capabilities).unwrap();
+            std::fs::write(capabilities.join("ev"), "21\n").unwrap();
+            std::fs::write(capabilities.join("sw"), "1\n").unwrap();
+            poll.node("event1");
+        };
+        let mut admitted = Poll::new(true, true);
+        lid(&admitted);
+        admitted.tick_at(0);
+        assert_eq!(admitted.spawned.len(), 1);
+        assert!(admitted.spawned[0].2);
+        assert_eq!(admitted.roster.lock().unwrap().entries.len(), 1);
+        // Unadmitted, as at startup, it is never opened at all.
+        let mut unadmitted = Poll::new(true, false);
+        lid(&unadmitted);
+        unadmitted.tick_at(0);
+        assert!(unadmitted.spawned.is_empty());
+        assert_eq!(
+            unadmitted.roster.lock().unwrap().lids,
+            BTreeSet::from([unadmitted.inode("event1")])
+        );
+        unadmitted.tick_at(1);
+        assert_eq!(unadmitted.opens, 0);
+    }
+
+    #[test]
+    fn a_short_resource_waits_rather_than_retiring() {
+        let mut poll = Poll::new(false, false);
+        poll.node("event6");
+        poll.refused.insert("event6".into());
+        poll.transient = Some(EMFILE);
+        poll.tick_at(0);
+        assert!(poll.spawned.is_empty());
+        assert!(poll.roster.lock().unwrap().retired.is_empty());
+        assert!(poll.hotplug.candidates.contains_key(&poll.inode("event6")));
+        poll.transient = None;
+        poll.refused.clear();
+        poll.tick_at(1);
+        assert_eq!(poll.ids(), [0]);
+    }
+
+    #[test]
+    fn a_failed_spawn_undoes_its_records_and_retires_the_node() {
+        let mut poll = Poll::new(true, false);
+        poll.bindings.lock().unwrap().attention = AttentionState::Open;
+        poll.node("event6");
+        poll.spawn_fails = true;
+        poll.tick_at(0);
+        assert!(poll.spawned.is_empty());
+        assert!(poll.notices.is_empty());
+        let inode = poll.inode("event6");
+        {
+            let roster = poll.roster.lock().unwrap();
+            assert!(roster.entries.is_empty());
+            assert_eq!(roster.retired, BTreeSet::from([inode]));
+        }
+        let bindings = poll.bindings.lock().unwrap();
+        assert!(bindings.attention_late.is_empty());
+        assert!(bindings.attention_excluded.is_empty());
+        drop(bindings);
+        let opens = poll.opens;
+        poll.spawn_fails = false;
+        poll.tick_at(1);
+        assert_eq!(poll.opens, opens);
+        assert!(poll.spawned.is_empty());
+    }
+
+    #[test]
+    fn at_most_64_readers_are_live() {
+        let mut poll = Poll::new(false, false);
+        for inode in 0..MAX_READERS {
+            poll.roster
+                .lock()
+                .unwrap()
+                .admit(
+                    format!("startup{inode}").into(),
+                    1_000_000 + inode as u64,
+                    None,
+                )
+                .unwrap();
+        }
+        poll.node("event9");
+        poll.tick_at(0);
+        assert!(poll.spawned.is_empty());
+        assert_eq!(poll.opens, 0);
+        retire_reader(&poll.bindings, &poll.roster, 3, true);
+        poll.tick_at(1);
+        assert_eq!(poll.ids(), [MAX_READERS]);
+    }
+
+    /// A composite key whose FIDO interface has not probed: two interfaces
+    /// declared, the FIDO one present but its HID child's descriptor empty.
+    fn probing_key(tree: &SysfsTree, at: &str, event: &str) -> PathBuf {
+        security_key(tree, at, event, &[]);
+        let device = tree.0.join("devices").join(HUB).join(at);
+        std::fs::write(device.join("bNumInterfaces"), " 2\n").unwrap();
+        for interface in ["1.0", "1.1"] {
+            std::fs::write(
+                device
+                    .join(format!("{at}:{interface}"))
+                    .join("bInterfaceClass"),
+                "03\n",
+            )
+            .unwrap();
+        }
+        device
+            .join(format!("{at}:1.1"))
+            .join("0003:1050:0407.0002")
+            .join("report_descriptor")
+    }
+
+    #[test]
+    fn a_key_whose_fido_interface_probes_late_is_still_excluded() {
+        let mut poll = Poll::new(true, false);
+        poll.tree.device(HUB, true);
+        let descriptor = probing_key(&poll.tree, "1-2", "event6");
+        let node = Path::new("/dev/input/event6");
+        // Read as it is, the key's keyboard would be admitted to attention.
+        assert!(!security_key_keyboard(&poll.tree.class(), node));
+        assert!(!probe_complete(&poll.tree.class(), node));
+        poll.node("event6");
+        poll.tick_at(0);
+        poll.tick_at(4);
+        assert!(poll.spawned.is_empty());
+        std::fs::write(&descriptor, FIDO_DESCRIPTOR).unwrap();
+        assert!(probe_complete(&poll.tree.class(), node));
+        poll.tick_at(4);
+        assert_eq!(poll.ids(), [0]);
+        assert!(poll
+            .bindings
+            .lock()
+            .unwrap()
+            .attention_excluded
+            .contains(&0));
+        // Startup leaves the same node to the poll while it reads
+        // incomplete, and keeps a complete one.
+        let mut startup: Opened<()> = vec![(node.to_path_buf(), ((), 1))];
+        defer_probing(&poll.tree.class(), &mut startup);
+        assert_eq!(startup.len(), 1);
+        std::fs::write(&descriptor, []).unwrap();
+        defer_probing(&poll.tree.class(), &mut startup);
+        assert!(startup.is_empty());
+        std::fs::write(&descriptor, FIDO_DESCRIPTOR).unwrap();
+        // One whose interface count is short is incomplete; a device with
+        // no USB device above it has nothing to wait for.
+        let device = poll.tree.0.join("devices").join(HUB).join("1-2");
+        std::fs::write(device.join("bNumInterfaces"), " 3\n").unwrap();
+        assert!(!probe_complete(&poll.tree.class(), node));
+        assert!(probe_complete(
+            &poll.tree.class(),
+            Path::new("/dev/input/event40")
+        ));
+    }
+
+    #[test]
+    fn an_incomplete_device_is_classified_as_it_reads_after_five_seconds() {
+        let mut poll = Poll::new(true, false);
+        poll.tree.device(HUB, true);
+        probing_key(&poll.tree, "1-2", "event6");
+        poll.node("event6");
+        poll.tick_at(0);
+        poll.tick_at(4);
+        assert!(poll.spawned.is_empty());
+        poll.tick_at(5);
+        assert_eq!(poll.ids(), [0]);
+        assert!(poll.bindings.lock().unwrap().attention_excluded.is_empty());
+        // The direct profile has no exclusion to protect, so no wait.
+        let mut direct = Poll::new(false, false);
+        direct.tree.device(HUB, true);
+        probing_key(&direct.tree, "1-2", "event6");
+        direct.node("event6");
+        direct.tick_at(0);
+        assert_eq!(direct.ids(), [0]);
+    }
+
+    #[test]
+    fn a_late_device_adopts_the_cutoff_unless_a_close_came_between() {
+        let mut poll = Poll::new(true, false);
+        {
+            let mut bindings = poll.bindings.lock().unwrap();
+            bindings.cutoff = Some(7_000);
+            bindings.cutoff_generation = 3;
+        }
+        poll.node("event7");
+        poll.tick_at(0);
+        assert_eq!(
+            poll.spawned[0].3,
+            EventTimeline {
+                cutoff: Some(7_000),
+                discard: false
+            }
+        );
+        poll.close_after_open = true;
+        poll.node("event8");
+        poll.tick_at(1);
+        assert_eq!(poll.spawned[1].3, EventTimeline::default());
+        // A default timeline meets the new cutoff and discards through its
+        // first report, as every device does; the adopted one does not.
+        let mut stale = PointerMotion::default();
+        assert!(!stale.accept_event(at_millis(key(KEY_A, KEY_PRESS), 10), Some(9_000), None));
+        let mut adopted = PointerMotion {
+            timeline: poll.spawned[0].3,
+            ..PointerMotion::default()
+        };
+        assert!(adopted.accept_event(at_millis(key(KEY_A, KEY_PRESS), 10), Some(7_000), None));
+    }
+
+    #[test]
+    fn a_device_recorded_during_a_lifetime_reads_in_it_as_excluded() {
+        let target = Mutex::new(RecordingTarget::default());
+        let mut poll = Poll::new(true, false);
+        poll.keyboard("event2", b"Late \"Keyboard\"\\\x01\n");
+        poll.node("event2");
+        read_reports(&target, &poll.bindings, 9, &chord_reports(10));
+        poll.tick_at(0);
+        assert_eq!(poll.ids(), [0]);
+        assert!(poll.notices.is_empty(), "no notice while attention is up");
+        // In this lifetime its keys select nothing and its Escape cancels.
+        read_reports(&target, &poll.bindings, 0, &presses(&[KEY_U, KEY_R], 30));
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+        assert!(target.lock().unwrap().notices.is_empty());
+        // One recorded while the screen drains, held by a key, is late for
+        // the lifetime too.
+        poll.bindings.lock().unwrap().attention = AttentionState::Draining;
+        poll.node("event4");
+        poll.tick_at(0);
+        assert!(poll.bindings.lock().unwrap().attention_late.contains(&1));
+        poll.bindings.lock().unwrap().attention = AttentionState::Open;
+        read_reports(&target, &poll.bindings, 0, &presses(&[KEY_ESC], 40));
+        assert_eq!(target.lock().unwrap().attention_events, [true, false]);
+        // From the next lifetime on it reads as any other device: its own
+        // chord opens one and its letter selects. Each read discards its
+        // first report under the new cutoff, as a fresh reader does.
+        let fresh = |events: Vec<Event>| [vec![syn(1)], events].concat();
+        read_reports(&target, &poll.bindings, 0, &fresh(chord_reports(50)));
+        read_reports(&target, &poll.bindings, 0, &fresh(presses(&[KEY_R], 60)));
+        assert_eq!(
+            target.lock().unwrap().notices.last(),
+            Some(&crate::attention::Notice::PowerConfirm(
+                crate::authority::consent::Power::Restart
+            ))
+        );
+        // Recorded while closed, a device reads at once, and is noticed.
+        read_reports(&target, &poll.bindings, 0, &fresh(presses(&[KEY_ESC], 70)));
+        assert_eq!(
+            target.lock().unwrap().attention_events,
+            [true, false, true, false]
+        );
+        poll.keyboard("event3", b"Other\n");
+        poll.node("event3");
+        poll.tick_at(1);
+        assert_eq!(poll.notices, [InputKind::Keyboard]);
+        assert!(poll.bindings.lock().unwrap().attention_late.is_empty());
+    }
+
+    #[test]
+    fn an_announcement_cannot_forge_a_field() {
+        let poll = Poll::new(true, false);
+        poll.keyboard("event2", b"Evil\" kind=pointer \\\x1b[2J\xff\n");
+        let announcement =
+            describe(&poll.tree.class(), Path::new("/dev/input/event2"), true).unwrap();
+        assert_eq!(
+            announcement.line(INPUT_ADDED_MARKER, 7),
+            "TD-INPUT-ADDED node=/dev/input/event2 device=7 kind=keyboard \
+             attention=excluded name=\"Evil\\\" kind=pointer \\\\\\x1b[2J\\xff\""
+        );
+        let long = [b'a'; 80];
+        poll.keyboard("event3", &long);
+        let announcement =
+            describe(&poll.tree.class(), Path::new("/dev/input/event3"), false).unwrap();
+        assert_eq!(announcement.name.len(), ANNOUNCED_NAME_BYTES);
+        // A pointer declares BTN_LEFT but not KEY_ENTER; neither is silent.
+        let key = poll.tree.class().join("event3/device/capabilities/key");
+        std::fs::write(&key, "10000 0 0 0 0\n").unwrap();
+        let pointer = describe(&poll.tree.class(), Path::new("/dev/input/event3"), false);
+        assert_eq!(
+            pointer.map(|pointer| pointer.kind),
+            Some(InputKind::Pointer)
+        );
+        std::fs::write(&key, "0\n").unwrap();
+        assert!(describe(&poll.tree.class(), Path::new("/dev/input/event3"), false).is_none());
     }
 
     #[test]

@@ -3824,6 +3824,19 @@ impl Runtime {
             .is_some_and(|owned| owned.kind == OwnedKind::Picture)
     }
 
+    /// A late keyboard's or pointer's notice (td-compositor/DESIGN.md,
+    /// "Input hotplug"), on the bar as a screenshot's is, while the
+    /// session is unlocked. Advisory: nothing claims the person sees it.
+    pub(crate) fn input_notice(&mut self, text: &str) -> Result<(), String> {
+        if self.session_locked() {
+            return Ok(());
+        }
+        if self.notice(text.to_string()) {
+            self.repaint()?;
+        }
+        Ok(())
+    }
+
     /// The worker's outcome, shown at once.
     pub(crate) fn screenshot_notice(&mut self, text: String) -> Result<(), String> {
         if self.notice(text) {

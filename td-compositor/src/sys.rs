@@ -381,7 +381,8 @@ fn ioctl_checked(
     Ok(syscall5(SYS_IOCTL, fd as usize, request, argument, 0, 0))
 }
 
-/// The one `ioctl(2)` entry point, as every non-DRM caller sees it.
+/// The `ioctl(2)` entry point the axes see; the clock calls `ioctl_checked`
+/// itself to keep its errno, and DRM goes through `drm_ioctl`.
 fn ioctl(fd: RawFd, request: usize, argument: usize, operation: &str) -> Result<usize, String> {
     errno_result(ioctl_checked(fd, request, argument, operation)?, operation)
 }
@@ -482,16 +483,19 @@ pub struct AbsInfo {
 /// compiler reads as safe. Both numbers above encode that same 24.
 const ABSINFO_WORDS: usize = 6;
 
-/// Select a common clock before a trusted evdev reader starts.
-pub fn input_monotonic_clock(device: &impl AsRawFd) -> Result<(), String> {
+/// Select a common clock before a trusted evdev reader starts. Answers the
+/// kernel's errno, since a late node tells `ENODEV` (the device is gone)
+/// and `EINTR` from any other refusal.
+pub fn input_monotonic_clock(device: &impl AsRawFd) -> io::Result<()> {
     let clock: i32 = CLOCK_MONOTONIC;
-    ioctl(
+    let raw = ioctl_checked(
         device.as_raw_fd(),
         EVIOCSCLOCKID,
         (&clock as *const i32) as usize,
         "EVIOCSCLOCKID",
-    )?;
-    Ok(())
+    )
+    .map_err(io::Error::other)?;
+    raw_errno(raw).map_or(Ok(()), Err)
 }
 
 /// The same clock selected on each trusted evdev client, without wrapping.
