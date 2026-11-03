@@ -5,6 +5,9 @@ edition = "2021"
 description = "Static dependency-free multicall for td's credential switch (login, exec-as)"
 license = "MIT"
 
+[package.metadata.td-gate]
+clippy-all-targets = true
+
 [[bin]]
 name = "td-login"
 path = "src/main.rs"

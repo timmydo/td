@@ -5,6 +5,9 @@ edition = "2021"
 description = "Static dependency-free multicall for td's boot glue (init, reboot, poweroff, halt, switch_root, mount, umount, cttyhack, hostname)"
 license = "MIT"
 
+[package.metadata.td-gate]
+clippy-all-targets = true
+
 [[bin]]
 name = "td-init"
 path = "src/main.rs"

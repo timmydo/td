@@ -5,6 +5,9 @@ edition = "2021"
 description = "Static dependency-free multicall for td's diagnostics, pre-pivot and build-tool userland"
 license = "MIT"
 
+[package.metadata.td-gate]
+clippy-all-targets = true
+
 [[bin]]
 name = "td-util"
 path = "src/main.rs"
