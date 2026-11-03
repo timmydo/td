@@ -35,6 +35,9 @@ It also assigns only playback PCM nodes to the dedicated audio account and
 creates `/run/td-audio`; `APPLICATIONS.md` §K.5 owns that boundary.
 There is no multi-user arbitration, hotplug, VT switching or
 live seat reassignment. Deployment reboot discards earlier open descriptors.
+"Input hotplug (target)", under "Physical secure attention", specifies
+evdev hotplug; it is not implemented and waits on the owner's answer
+recorded there.
 
 Assignment uses safe std path ownership and permission operations, with a
 check/use window between rejecting a symlink and changing the node. The fixed
@@ -6029,6 +6032,8 @@ keeps its fixed roster and has no input hotplug service. The nonempty roster
 check does not prove that a usable keyboard remains or that the attention
 chord is reachable; removing the assigned keyboard can deny that input
 path. Startup input counts are not an authentication-readiness claim.
+"Input hotplug (target)" below specifies the replacement for this fixed
+roster; until it lands, this paragraph is what ships.
 
 Only the root-paired stock compositor profile reserves Ctrl+Alt+Esc. The
 Escape press opens an opaque, built-in screen with no pending authorization
@@ -6274,6 +6279,400 @@ still closes it. Unplugging the device drains its bookkeeping. The current
 fixed device roster requires compositor restart to add a replacement.
 Direct-profile readers retain their per-device partial-report fast path;
 they never claim secure attention or use the trusted timestamp cutoff.
+
+### Input hotplug (target)
+
+Not implemented. This subsection specifies how keyboards and pointers
+attached after boot become usable and how their removal is handled. It
+changes nothing above until an implementation lands, and implementation
+waits on the owner's answer to the open question at its end. Until then
+the fixed startup roster above is what ships, and a node that appears
+after the boot oneshot stays root-owned.
+
+**What changes and what does not.** Assignment stays root's decision: a
+node is usable only once root has made it the compositor's, and the
+compositor never changes an owner or a mode. The compositor admits a
+late node with the startup classification (lid switch, tablet or
+touchpad axes, a security key's own keyboard) and the same readers, the
+timestamp cutoff, the resume guard and the release drain included. It
+departs from startup in four places, each stated below: a node whose USB
+device has not finished probing waits ("Probe completeness"); a device
+recorded while attention is open reads in that lifetime as an excluded
+one ("Secure attention"); a late device adopts the cutoff in force when
+it is opened rather than discarding its first report for it; and a
+failure on one late node drops or retires that node instead of ending
+the compositor, since a running session must not die for one device.
+Token presence is inferred neither from keyboard events nor from a
+device's arrival or departure: the compositor's sysfs reads can only
+exclude a device from secure attention, and token workers find tokens
+through their own root-only hidraw path (`td-secret/DESIGN.md`, "USB
+token transport"). Only `/dev/input/event*` nodes are assigned late.
+hidraw nodes stay root-only, framebuffer, card, backlight and VM-port
+assignment stay boot snapshots, playback nodes keep their own
+reassignment at each audio start (`APPLICATIONS.md` §K.5), and no node
+moves between accounts: section 1's absent live seat reassignment stays
+absent.
+
+**Root: `td-seatd watch`.** A new root daemon unit, `[seat-watch]`
+(`type=daemon`, `after=seat`, `requires=seat`, `restart=always`, its own
+log), runs `td-seatd watch` with the oneshot's exact account arguments
+and validation. The `[seat]` oneshot stays, since the runtime
+directories and every `requires=seat` edge depend on its completion, and
+it still fails when `/dev/input` holds no event node at boot: hotplug
+does not rescue such a boot. Every 250 ms the watcher reads `/dev/input`
+and handles at most 2048 entries in read order (the input core allots at
+most 1024 character devices); a larger directory is reported once per
+transition. For each `eventN` entry whose `lstat` is not already a
+character device owned by the compositor UID and GID with mode 0600, it
+performs the boot node assignment, one function shared with `assign`:
+`lstat`, refuse a symlink or anything but a character device of major 13
+(`INPUT_MAJOR`), `lchown` to the compositor, `chmod` 0600 and verify.
+The major check is new for boot too and is the one tightening there; the
+existing scratch-tree tests' regular-file mode (`require_char: false`)
+skips it, and a test names that seam.
+
+This keeps section 1's path-based assignment and its check/use window
+rather than opening each node. The window has no attacker: only the
+kernel creates entries in root-owned `/dev/input`, every evdev node it
+creates there is one this policy assigns, and a node it removes and
+recreates in the window is such a node too. Opening each node as root
+instead would make an evdev client, wake the device, and can block in a
+driver's open, stalling a single-threaded loop, for no check the path
+form lacks. td-seatd stays `#![forbid(unsafe_code)]`: `read_dir`,
+`symlink_metadata`, `lchown` and `set_permissions` are `std`, so no
+syscall joins `UNSAFE.md`.
+
+The watcher makes no per-device distinction: every evdev node is the
+compositor's, as at boot, and it reads no sysfs. Classification stays in
+the compositor. Removal needs nothing from root: devtmpfs deletes the
+node, and a node recreated under the same name is root:root mode 0600
+until assigned. A node that fails assignment is reported once per inode
+and retried each tick without another report; the reported set is
+pruned each tick to inodes still present. A failed directory read is
+reported once per transition and retried. Neither ends the daemon; an
+argument error exits nonzero before the loop. Boot evidence keeps its
+snapshot meaning: `probe` and `probe-access` check the nodes present when
+they run, and a node mid-assignment is refused to the human either way.
+
+Polling is chosen over the alternatives, as td-disks' media watcher
+chose it. A `NETLINK_KOBJECT_UEVENT` listener (td-profiler's
+`UeventSocket`, `UNSAFE.md` §11) or inotify on `/dev/input` would wake
+only on change, but either is a new raw-syscall surface in a crate that
+forbids `unsafe`, and a netlink listener still needs a rescan after
+`ENOBUFS`; polling is that rescan alone. The kernel's usermode uevent
+helper needs `CONFIG_UEVENT_HELPER` and forks a root process per uevent.
+Folding assignment into td-disks' `[media]` daemon would give one root
+daemon two unrelated authorities. td-authd could instead take a typed
+request from its paired compositor to assign one named node; the open
+question weighs that. Polling costs each of the two pollers four wakeups
+a second for the whole session, with a directory read and an `lstat`
+per entry, which an idle laptop pays in residency.
+
+**Compositor: the hotplug poll.** Once startup has started its readers,
+one `input-hotplug` thread reads `/dev/input` every 250 ms under the same
+2048-entry rule, in both profiles. The roster becomes shared state: each
+live reader, lid readers included, has an entry of its name, its inode
+and a device id. Device ids are unique for the generation and never
+reused, so held-key, pointer, exclusion and lifetime bookkeeping keyed by
+a retired id never names a later device. A reader that ends performs the
+existing release first (`release_device`: keyboard and pointer cleanup,
+then the drain check). If it ended by device loss (end of file or
+`ENODEV`), it then removes its entry and its id from every set, freeing
+the name. Any other end (a parse error, an overrun batch, a failed
+delivery) also removes the entry but retires the inode, under the same hold
+of the roster lock, so the poll cannot reopen the name in between and a
+live device that failed is not reopened every tick; it returns once its
+node is recreated. The retired and remembered sets live under the
+roster lock beside the entries, and every inode recorded is the opened
+descriptor's (`fstat`), not the directory listing's, except a failed
+open's, which is the listing's and is pruned with it. The roster lock
+and the bindings lock are never held together.
+
+A name with no live entry, whose inode is neither retired nor a
+remembered unadmitted lid switch, is a candidate. Per candidate the
+thread keeps state across ticks and never sleeps on one. Each tick, in
+order:
+
+1. Notes the bindings' cutoff generation, under the bindings lock,
+   then opens it with `File::open`. `EACCES` means root has not assigned
+   it yet: it stays a candidate and is reported once if still refused 5 s
+   after first sight. `ENOENT`, `ENODEV` and `ENXIO` (an open racing
+   removal) drop it silently. Any other error is reported once and
+   retires the inode until the node is recreated.
+2. Classifies it from sysfs, after the open: lid switch, probe
+   completeness ("Probe completeness" below), the tablet or touchpad
+   kind after `EVIOCGABS`, and in the paired profile the security-key
+   walk, each as startup does. An unadmitted lid switch (startup's
+   `lid_admitted` decision is the late one too) is closed and its inode
+   remembered. A device that reads incomplete is closed and stays a
+   candidate, to the 5 s bound.
+3. In the paired profile, for every device but a lid switch, selects
+   `CLOCK_MONOTONIC` with `EVIOCSCLOCKID`. It comes after step 2 on
+   purpose: evdev refuses an ioctl on a disconnected device with
+   `ENODEV`, a disconnected device never comes back, and the minor is
+   freed only after the device is marked dead, so success proves the
+   device was live throughout, and a live device's `eventN` name is its
+   own. Every sysfs read of step 2, completeness included, therefore
+   described this descriptor's device. `ENODEV` drops the candidate,
+   `EINTR` closes it and leaves it a candidate, and any other refusal
+   retires the inode. At startup a refusal stays fatal; the implementing
+   landing amends `UNSAFE.md` §6's "Refusal is fatal before that reader
+   starts" accordingly, with no request, operand or caller module
+   changed. Selecting the clock flushes a non-empty client queue and
+   queues `SYN_DROPPED` (`evdev_set_clk_type`), which the reader's
+   dropped-report path discards through the next `SYN_REPORT`: keys
+   typed between the open and the selection are lost, not delivered
+   late.
+4. Inserts its roster entry, then, under the bindings lock, records its
+   exclusion and its lifetime status ("Secure attention" below). If the
+   cutoff generation is the one step 1 noted, it adopts that cutoff as
+   its own timeline's; if a close has set a new one since, its timeline
+   is left stale, so it discards its first report under the new cutoff
+   as every device does. Only then is its reader spawned (`read_lid` for
+   an admitted lid switch, `read_device` otherwise), so no event is
+   routed before its record exists. A failed spawn undoes both, closes
+   the handle and retires the inode.
+
+A lid switch's classification has no liveness proof, since startup
+selects no clock for it, and none is needed for safety: a reused name
+can only make a keyboard read as a lid and ignored until removal, or a
+lid read as an ordinary device, whose switch events no reader acts on.
+
+At most 64 readers are live, lid readers included: startup's count
+toward the bound but are never refused by it. A candidate beyond it is
+reported once per inode and reconsidered when a reader retires. The
+retired and remembered inode sets are pruned each tick to inodes still
+present, so the directory rule bounds them. A failed directory read is
+reported once per transition and retried. A poisoned lock ends the
+hotplug thread with a diagnostic, as it ends a reader: hotplug then
+stops for that generation, saying so, while existing readers continue.
+
+Startup keeps its order: it opens every admitted handle before any
+reader starts and skips a refused node, which the poll now retries. One
+change: a startup node whose USB device reads incomplete is closed and
+left to the poll as a candidate, so a key plugged in just before a
+generation starts, which a generation restart can now meet, waits as a
+late one does. The empty-roster refusal counts such candidates and still
+fails startup when there are none; td-svc's restart retries.
+
+**Probe completeness.** A composite USB device's interfaces probe one
+after another, so a security key's OTP keyboard can reach `/dev/input`
+before its FIDO interface's HID device has a report descriptor, and the
+startup walk would then admit it to secure attention. A node whose USB
+device the startup walk finds is therefore classified only once that
+device reads complete: its `bNumInterfaces`, which the kernel prints as
+`%2d` and is read with surrounding whitespace trimmed, is 1 to 32 and
+equals the number of its interface directories, and every interface
+whose `bInterfaceClass` (`%02x`) is `03` has a HID child with a
+non-empty `report_descriptor`, each read under the startup walk's
+bounds. Host fixtures write the kernel's formats. A node with no USB
+device above it has nothing to wait for. A device still incomplete 5 s
+after first sight is classified as it then reads, as startup classifies
+today, and reported once. Failing open there keeps startup's residual
+rather than adding one; failing closed would deny secure attention to
+any keyboard whose HID-class interface never gets a HID child (one bound
+by a non-HID driver, such as an Apple trackpad's `bcm5974`, or ignored by
+a HID quirk), which is option (B)'s lockout below. Such a device always
+pays the 5 s wait and its report.
+
+**Secure attention.** Under the recommended answer below, a late device
+is one secure attention reads, excluded as at startup when it shares a
+USB device with a FIDO interface, with one addition. A device whose
+record (step 4) is made while an attention lifetime is open or draining
+reads, for that lifetime, as an excluded device does: its keys never
+select, never confirm and are not a prompt's first press; its held keys
+neither block another keyboard's fresh press nor count as modifiers;
+its presses and releases are tracked, so the drain waits for them; and
+its Escape cancels. From the next lifetime on it reads as any other
+device. So nothing attached while a prompt is on screen can answer it.
+A device recorded before a lifetime opens reads fully in it, which is
+what lets a keyboard re-enumerated by a resume, or a replacement
+keyboard, open the lock surface's unlock.
+
+Device loss keeps its meaning: it clears that device's held state and
+cannot itself cancel the screen. Removing the last keyboard still denies
+the chord, until another is admitted, now without a restart. The resume
+guard runs before each batch of a late reader as for a startup one. The
+first-report discard absorbs a report straddling a close. A device
+attached after that close holds none from before it, since evdev queues
+to a client only reports flushed after it attached, and a driver
+flushes a report in the call that began it (above). That is why step 4
+adopts only the cutoff it noted before the open; a later cutoff
+resets the device as it resets every device.
+
+**Announcement.** In the paired profile each late admission and each
+removal of a keyboard or a pointer is said on standard error as
+`TD-INPUT-ADDED` or `TD-INPUT-REMOVED`, with the node, the device id,
+`kind=keyboard` or `kind=pointer`, `attention=read` or
+`attention=excluded`, and last the sysfs `name`, never a key. Kind is
+read from `capabilities/key` with the lid classifier's plain file read:
+a device declaring `KEY_ENTER` is a keyboard, one declaring `BTN_LEFT`
+but not `KEY_ENTER` a pointer, and a device declaring neither is
+silent. The name is the device's own choice, so it is printed quoted,
+at most 64 bytes, with every byte outside printable ASCII and every
+quote or backslash escaped, and cannot forge a field.
+Under the recommended answer the runtime also shows a short status
+notice, `KEYBOARD ADDED` or `POINTER ADDED`, while the session is
+unlocked and attention is closed. It is advisory: nothing claims the
+person sees it.
+
+**What is not claimed.** A late device is trusted exactly as a startup
+device is: USB provenance is not attestation, and this is no defense
+against a malicious keyboard or a peripheral presenting as one. What
+hotplug changes is when such a device can be attached: at any time,
+rather than before the compositor starts. TOKEN-LOGIN.md's Scope already
+leaves malicious input devices out. A virtual device root creates after
+boot (UHID or uinput, both root-only) has no USB parent and becomes an
+admitted keyboard, as one created before startup is today; root is
+trusted. Latency is best effort, about two poll periods. No claim is
+made that a keyboard is attached, or that the chord is reachable, at any
+moment; hotplug makes no authentication-readiness claim. The
+security-key exclusion keeps every startup residual, plus the 5 s bound
+above. Nothing here touches hidraw nodes, the token workers or their
+exclusive mediation.
+
+**Evidence owed.** td-seatd host tests over scratch trees: a late node
+is assigned, an assigned one is left alone, a recreated inode is
+assigned again, a failure is reported once and does not end the loop,
+and the regular-file seam is the only path that skips the major check.
+Compositor host tests over hand-built `/dev/input` and sysfs trees: a
+refused node admitted once it opens; a removed node retired with its id
+never reused; a reader ended by a parse error not reopened until its
+node is recreated; lid readers held in the roster and an unadmitted lid
+remembered; the 64-reader bound; an OTP interface probed before its
+FIDO interface still excluded, at startup and late; the in-lifetime rule
+through `read_device`, the late device's Escape cancelling included; a
+cutoff taken between open and record leaving the device to discard; and
+the announcement's escaping. A qemu oracle hot-adds a `usb-kbd` through
+the QEMU monitor after boot, types into the terminal, removes and
+re-adds it, and opens attention from it; UHID devices have no USB
+parent, so the exclusion itself stays a host test. The implementing
+landing adds to TOKEN-LOGIN.md's "Evidence" the hardware record of a
+suspend and resume that re-enumerates a composite key, whose OTP
+keyboard must come back excluded.
+
+**Increments, once answered.** Each compositor change lands before root
+assigns a single late node, because once root does, a generation restart
+admits every assigned node at startup.
+
+1. The compositor's shared roster with unique ids and reader retirement,
+   no behaviour change.
+2. The hotplug poll, probe completeness at startup and late, the
+   in-lifetime rule, the owner's answer to Q1 and the announcement, with
+   the `UNSAFE.md` §6 sentence. On an image it is inert, since nothing
+   yet assigns a late node, except startup's deferral of an incomplete
+   USB device, which makes three sentences false that it rewrites:
+   section 1's "opening all input nodes", the residual's "(a HID device
+   whose driver has not probed by compositor startup reads as zero
+   bytes)", and above, "an empty accessible roster still fails".
+3. td-seatd's major check, `watch` and the `[seat-watch]` unit, with
+   `APPLICATIONS.md` §L.1's td-seatd row and its item 1, the unit-edge
+   pins, TOKEN-LOGIN.md's "Evidence" addition, and every current-state
+   sentence this makes false rewritten in the same landing: section 1's
+   "There is no ... hotplug"; above, "late USB nodes can remain
+   root-owned", "A restart alone does not assign a new device", "keeps
+   its fixed roster", "The fixed startup roster means a key inserted
+   later adds no keyboard at all" and "requires compositor restart to add
+   a replacement"; item 6's "Since the roster is fixed"; and the
+   "Decided once against the fixed roster" comment in `input.rs`.
+4. The qemu oracle.
+
+**Open question for the repository owner (blocks implementation).**
+Two decisions here are the owner's, not an implementer's.
+
+*Q1: may a keyboard attached after boot operate secure attention?* The
+facts the answer rests on:
+
+- Much of attention needs only a keyboard. Restart, power off and sleep
+  take `R`, `P` or `Z` and a fresh Enter. Rollback, a queued update and
+  a queued hostname change take `B`, `I` or `H` and Enter ("Elevation
+  consent"); a queued update is one UID 1000 can choose. The storage
+  screen's `U` and `C` take a letter and Enter, and `P` with the TPM
+  shape and no recovery keys takes letters, a digit, Enter and a new
+  PIN ("The upgrade"). Where disk proofs apply, the typed disk recovery
+  key, knowledge rather than a token, authorizes a login-key
+  enrollment or addition (with its new keys) or a removal, and the
+  storage screen's `A` (with its key), `R`, `N`, `T` and `E`; only `X`
+  needs a disk security key ("Storage operations").
+  Every unlock and every credential write needs a token assertion, and
+  `L` only locks.
+- None of the keyboard-only operations is reachable from a locked
+  session: on the lock surface no menu letter selects, and the chord
+  opens only the token-gated unlock ("The lock surface"). They are
+  reachable from an unlocked session, and a walk-up attacker at an
+  unlocked session is out of scope by decision
+  (`APPLICATIONS.md` §L.1's threat table). An unenrolled machine is
+  never locked.
+- Attaching before boot gives the same parity, but on an enrolled
+  machine that route is visible: a forced restart loses work and starts
+  locked, needing the owner's key. A hot attach is silent and acts in
+  the current session.
+- Any rule but (E)'s that treats late devices differently is laundered
+  by a generation restart (a crash, an authority restart, td-svc's
+  `restart=always`), which admits every assigned node as a startup
+  device. Holding a difference across generations needs a record that
+  outlives them, such as td-seatd publishing the boot-time set under
+  `/run` for the compositor to read. That is more root code and state.
+- td-disks' nearest precedent, media inserted at the lock screen never
+  mounting until replugged (`td-disks/DESIGN.md`), does not transfer: a
+  resume locks first and a USB keyboard can re-enumerate after that, so
+  "attached while locked, excluded" is a lockout.
+
+The options:
+
+- (A) Parity: a late keyboard reads as a startup one, under the
+  in-lifetime rule, the security-key exclusion and the announcement. A
+  resumed, replugged or replacement keyboard can unlock and approve. A
+  device attached unseen to an unlocked session can, while it stays,
+  do what the built-in keyboard can, including approving an update UID
+  1000 queued. Attached at the lock screen, it gains that once the owner
+  unlocks.
+- (B) Ordinary input only, held across generations: a late keyboard
+  types into the session but reads in attention as an excluded device,
+  so it cannot select, confirm, unlock or enter a PIN. Where the only
+  keyboard is USB, a resume that re-enumerates it, or a replug, leaves
+  the lock surface unanswerable until reboot: a lockout on an enrolled
+  machine. It still types as UID 1000 into an unlocked session.
+- (C) Parity after consent: a late keyboard is ordinary until an
+  already-admitted keyboard approves it on the attention screen, held
+  across generations. It closes the unseen-device case only where
+  another keyboard exists, and is (B)'s lockout where none does.
+- (D) No late keyboards: hotplug admits pointers only. The goal is not
+  met for keyboards.
+- (E) Unlock first: a late keyboard may always use the chord's
+  token-gated unlock and Escape, and gains the keyboard-only operations
+  once a token unlock completes after its admission; on an unenrolled
+  machine it has parity at once. A restart on an enrolled machine starts
+  locked, so a restart does not launder it. It avoids the lockout, but
+  it withholds the operations only from a device attached to an
+  unlocked session; one attached at the lock screen gains them at the
+  owner's next unlock.
+
+Recommended: (A). The profile already trusts attached input hardware,
+and the delta (A) adds is a silent attach while the attacker is at the
+machine, which (E) closes only for an unlocked session already out of
+scope, and which (B) and (C) close only at the cost of a lockout and of
+state held across generations. If the owner wants a hot-attached device
+never to reach a keyboard-only root operation without a token unlock,
+(E) is the cheapest rule that does so without a lockout.
+
+*Q2: is a new long-running root service acceptable?* Late assignment
+needs root to act after boot. The options:
+
+- (i) The `[seat-watch]` daemon above. Recommended: safe `std`, no new
+  syscall, no sysfs reads, no per-device policy, at the cost of a root
+  poller.
+- (ii) td-authd, the existing paired root authority, takes a typed
+  request from the compositor to assign one named `/dev/input/eventN`.
+  No new daemon or root poller: root still decides, applies the same
+  fixed policy and gains nothing from a compromised compositor, which
+  owns every evdev node anyway. But it adds a request to the authority
+  protocol and its review, assigns only while a paired generation is
+  connected, and leaves the direct profile without late nodes.
+- (iii) A uevent listener, which needs a new unsafe surface.
+- (iv) The kernel's usermode helper, or folding assignment into
+  td-disks' root daemon, each weighed under "Root" above.
+- (v) No hotplug.
 
 
 ### Physical installation confirmation
