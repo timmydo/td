@@ -930,7 +930,7 @@ pub fn paint(raster: &mut Raster<'_, '_>, frame: &Frame<'_>) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unreachable)]
     use super::*;
 
     /// A view's text is admitted as the pane takes it and reloaded only

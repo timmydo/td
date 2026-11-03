@@ -23,6 +23,7 @@ name = "control_process"
 path = "tests/control_process.rs"
 
 [package.metadata.td-gate]
+clippy-all-targets = true
 # td-mail is a live Wayland client; its native case launches it offline
 # under the real headless td-compositor (tests/control_process.rs). This
 # opt-in builds that binary for the gate and adds it as a test-only reader

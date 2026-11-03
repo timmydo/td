@@ -1,7 +1,10 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
 mod mock_fetch;
 mod mock_jmap;
 
 #[path = "../src/testing.rs"]
+#[allow(dead_code, reason = "these tests use only the temporary directory")]
 mod testing;
 
 use mock_fetch::MockFetchSocket;
