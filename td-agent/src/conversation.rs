@@ -297,7 +297,10 @@ fn unasked(events: &[Event], to: &str) -> usize {
 
 /// Why an unconfined workspace's call is the person's (DESIGN.md §8,
 /// Unconfined workspaces), as its card says.
-const UNCONFINED_WHY: &str = "this workspace is unconfined, and this call runs outside any jail with everything you have: a command, or a file tool reaching outside the workspace";
+const UNCONFINED_WHY: &str = "this workspace is unconfined, and no allow rule releases a command, or a file tool reaching outside the workspace or into a repository's .git";
+
+/// What an unconfined workspace's call's card says first (DESIGN.md §8).
+const UNCONFINED_CARD: &str = "This workspace is unconfined, so this runs outside any jail as you, with your whole home, credentials, td-agent's own state and every host service.";
 
 /// Why an unconfined workspace's call judged contained does not run: a
 /// path it names resolves outside the workspace since (DESIGN.md §8).
@@ -328,8 +331,8 @@ enum Judged<'a> {
         acts: bool,
         repeated: bool,
         /// An unconfined workspace's call that does not keep to its
-        /// roots (DESIGN.md §8, Unconfined workspaces): the person's in
-        /// either mode, no allow releasing it.
+        /// roots (DESIGN.md §8, Unconfined workspaces): the classifier's
+        /// in `auto` mode, the person's otherwise, no allow releasing it.
         unconfined: bool,
     },
     Cross {
@@ -4209,7 +4212,7 @@ impl Session {
             _ => None,
         };
         // Outside any jail, a call that does not keep to the workspace's
-        // roots is judged as one that acts, and is the person's (§8).
+        // roots is judged as one that acts, and no allow releases it (§8).
         let unconfined = self.bench.unconfined() && !self.bench.contained(&call);
         let judged = Judged::Host {
             name,
@@ -4274,7 +4277,15 @@ impl Session {
             .workspace
             .as_ref()
             .and_then(|_| crate::rules::proposals(name, command));
-        if let Err(why) = self.sanction(
+        if unconfined {
+            // Outside any jail: the classifier's in `auto` mode, the
+            // person's otherwise and whenever it does not allow (§8).
+            let pending = |me: &Self, client: &Client| me.unconfined_pending(&call, client);
+            let make = |_: &Self| unconfined_card(&call, proposed.clone());
+            if let Err(why) = self.approve(started, &judged, repeated, &pending, &make)? {
+                return failed(why);
+            }
+        } else if let Err(why) = self.sanction(
             started, &judged, ruling, ruled_at, repeated, &card, proposed,
         )? {
             return failed(why);
@@ -5146,6 +5157,7 @@ impl Session {
             receiver: None,
             remote: None,
             destination: Some(named.clone()),
+            resolved: None,
             evidence: None,
             detail: format!(
                 "let a command this conversation runs connect to {named} through the workspace's proxy; the workspace's policy is allowlist and {named} is not on its allowlist"
@@ -5439,7 +5451,15 @@ impl Session {
                         // A crossing's `auto` is the classifier's, and a
                         // card it waits on stays.
                         Some(Ruling::Auto)
-                            if matches!(judged, Some(Judged::Host { .. } | Judged::Mcp { .. })) =>
+                            if matches!(
+                                judged,
+                                Some(
+                                    Judged::Host {
+                                        unconfined: false,
+                                        ..
+                                    } | Judged::Mcp { .. }
+                                )
+                            ) =>
                         {
                             break Some(Err(Ok(("mode", self.auto_reason().into()))))
                         }
@@ -5610,7 +5630,13 @@ impl Session {
                 tools::visible(&why)
             ))),
             crate::rules::Verdict::Ask(why) => Ruling::Card(Some(tools::visible(&why))),
-            // Outside any jail, neither an allow nor the mode releases it.
+            // Outside any jail no allow releases it; `auto`'s column is the
+            // classifier's, `ask`'s the person's (§8, §11).
+            // A repeated one `approve` gives the person (§11, Repetition).
+            _ if unconfined && self.workspace_mode() == crate::config::Mode::Auto => Ruling::Auto,
+            _ if unconfined && repeated => {
+                Ruling::Card(Some(format!("{UNCONFINED_WHY}; and {REPEATED_WHY}")))
+            }
             _ if unconfined => Ruling::Card(Some(UNCONFINED_WHY.into())),
             _ if repeated => Ruling::Card(None),
             crate::rules::Verdict::Allow(why) => Ruling::Run(acts.then(|| tools::visible(&why))),
@@ -6431,6 +6457,7 @@ impl Session {
             receiver: None,
             remote: None,
             destination: Some(named.clone()),
+            resolved: None,
             evidence: None,
             detail: format!(
                 "let td-agent fetch a URL on {named} for this conversation, outside the jail, its text coming back into the conversation; the URL's path and query reach {named}; the workspace's policy is allowlist and {named} is not on its allowlist"
@@ -6438,6 +6465,19 @@ impl Session {
             payload: Some(("url", url.to_string())),
             untrusted,
         }
+    }
+
+    /// What the classifier is asked of an unconfined workspace's call
+    /// (DESIGN.md §8, §11): what td-agent says it does, and what the
+    /// model wrote of it, untrusted.
+    fn unconfined_pending(&self, call: &host::Call, client: &Client) -> classifier::Pending {
+        let mut source = side(self.conversation.meta(), client);
+        source.workspace.push_str(", unconfined");
+        let mut pending = classifier::unconfined_call(call, source, self.bench.resolved(call));
+        if let Some(received) = self.received() {
+            pending.untrusted.push(("received", received));
+        }
+        pending
     }
 
     /// The card that asks the person whether td-agent may fetch `url`
@@ -7471,6 +7511,9 @@ impl Session {
                 )));
             }
         }
+        if let Some(why) = classifier::unjudgeable(&pending) {
+            return Ok(refused(why));
+        }
         let state = self.classifier_state(&pending);
         let head = classifier::reasoning_head(&client, &state);
         let bytes = head.len() as u64 + 2;
@@ -7681,10 +7724,21 @@ impl Session {
                     .and_then(|a| a.get("input").and_then(Json::as_str))
                     .and_then(|input| crate::patch::parse(input).ok())
                     .map(|patch| patch.paths().join(" "));
+                // A sed call's are its `paths`.
                 let path = patched.or_else(|| {
-                    arguments
-                        .as_ref()
-                        .and_then(|a| a.get("path").and_then(Json::as_str).map(str::to_string))
+                    let a = arguments.as_ref()?;
+                    a.get("path")
+                        .and_then(Json::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            let paths: Vec<&str> = a
+                                .get("paths")
+                                .and_then(Json::as_arr)?
+                                .iter()
+                                .filter_map(Json::as_str)
+                                .collect();
+                            (!paths.is_empty()).then(|| paths.join(" "))
+                        })
                 });
                 let tool = if tools::known(&call.name) {
                     call.name.clone()
@@ -7768,6 +7822,7 @@ impl Session {
             receiver: Some(receiver),
             remote: None,
             destination: None,
+            resolved: None,
             evidence: None,
             detail,
             payload,
@@ -7868,6 +7923,7 @@ impl Session {
             receiver: None,
             remote: Some(entry.remote.clone()),
             destination: None,
+            resolved: None,
             evidence: Some(classifier::push_evidence(evidence)),
             detail,
             payload: None,
@@ -7932,6 +7988,26 @@ fn side(meta: &store::Meta, client: &Client) -> classifier::Side {
         },
         model: meta.model.clone().unwrap_or_else(|| client.model.clone()),
     }
+}
+
+/// An unconfined workspace's call's card (DESIGN.md §8): the call's own,
+/// first saying that it runs outside any jail; its "always" answers deny
+/// alone, as no allow releases such a call.
+fn unconfined_card(call: &host::Call, proposed: Option<crate::rules::Always>) -> Card {
+    let (title, details) = tools::card(call);
+    // The call's own card says where a jailed one runs; this one is not.
+    let mut details: Vec<String> = details
+        .into_iter()
+        .map(|line| line.replace(", in a jail of its own:", ", outside any jail:"))
+        .collect();
+    details.insert(0, UNCONFINED_CARD.into());
+    let always = proposed.map(|always| {
+        crate::rules::Offer::Rules(crate::rules::Always {
+            allow: false,
+            ..always
+        })
+    });
+    (title, details, always)
 }
 
 /// What a failed request is charged: a retryable one its reported cost,

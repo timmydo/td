@@ -436,7 +436,7 @@ pub fn environment(created: u64, os: &str, place: Option<&Place>) -> String {
 
 /// What an unconfined workspace's environment says in place of the jail
 /// the tools' description names (DESIGN.md §8).
-pub const UNCONFINED: &str = "\n- Confinement: none. The person made this workspace unconfined: your tools run outside any jail, as the person, and reach their whole home, credentials, td-agent's own state and every host service, so the jail described above does not apply here. Every command, and every file tool that reaches outside the workspace and shared directories, asks the person first, in either mode; keep to the workspace unless they ask for more. MCP servers do not start here, and request_directory is not needed.";
+pub const UNCONFINED: &str = "\n- Confinement: none. The person made this workspace unconfined: your tools run outside any jail, as the person, and reach their whole home, credentials, td-agent's own state and every host service, so the jail described above does not apply here. Every command, and every file tool that reaches outside the workspace and shared directories, asks the person first in ask mode; in auto mode td-agent's classifier judges each against what the person asked for, and asks them when it does not allow it. Keep to the workspace and to what they asked for. MCP servers do not start here, and request_directory is not needed.";
 
 /// Where os-release(5) says the operating system is named, in order.
 const OS_RELEASE: &[&str] = &["/etc/os-release", "/usr/lib/os-release"];

@@ -334,11 +334,23 @@ impl Spent {
     }
 }
 
+/// The names a fixture's payload has: a crossing's, and an unconfined
+/// call's (`classifier::unconfined_call`).
+const PAYLOADS: &[&str] = &[
+    "message",
+    "query",
+    "command",
+    "content",
+    "new_string",
+    "patch",
+    "script",
+];
+
 /// Why a crossing would not ask the classifier of `state`, as a
 /// conversation refuses it: a payload past what the stages are shown,
 /// or a request past a line of the log.
 fn unasked(state: &Json, head: &str, jev_body: &str) -> Option<String> {
-    let payload = ["message", "query"]
+    let payload = PAYLOADS
         .iter()
         .find_map(|name| state.get_path(&["untrusted", name]).and_then(Json::as_str));
     if payload.is_some_and(|text| text.len() > classifier::MAX_PAYLOAD) {
@@ -581,6 +593,120 @@ mod tests {
                     .and_then(|call| call.get("tool"))
                     .and_then(Json::as_str),
                 Some("git_push"),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    /// The shipped unconfined calls: each the state the conversation
+    /// builds for an unconfined workspace's command or file call, its
+    /// detail what `classifier::unconfined_call` says of the call its
+    /// fields name, and its calls ending with that call's tool.
+    #[test]
+    fn the_shipped_unconfined_calls_are_states_the_classifier_is_given() {
+        use crate::host::Call;
+        let shipped = include_str!("../calibration/unconfined.json");
+        let cases = cases(shipped).unwrap();
+        assert!(cases.len() >= 20, "{}", cases.len());
+        assert!(cases.iter().any(|case| case.allow));
+        assert!(cases.iter().any(|case| !case.allow));
+        let side = classifier::Side {
+            conversation: "x".into(),
+            workspace: "directory /w, unconfined".into(),
+            remotes: Vec::new(),
+            model: "m".into(),
+        };
+        let policy = Json::Obj(vec![
+            ("mode".into(), Json::Str("auto".into())),
+            ("rules".into(), Json::Arr(vec![Json::Str("r".into())])),
+        ]);
+        for case in &cases {
+            let field = |name: &str| {
+                case.state
+                    .get_path(&["untrusted", name])
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+            };
+            let calls = case
+                .state
+                .get_path(&["untrusted", "calls"])
+                .and_then(Json::as_arr)
+                .unwrap();
+            let tool = calls
+                .last()
+                .and_then(|call| call.get("tool"))
+                .and_then(Json::as_str)
+                .unwrap();
+            let background = case
+                .state
+                .get_path(&["action", "detail"])
+                .and_then(Json::as_str)
+                .unwrap()
+                .contains("in the background");
+            let text = |name: &str| field(name).unwrap_or_default();
+            let call = match tool {
+                "shell" if background => Call::Background {
+                    command: text("command"),
+                    timeout_ms: None,
+                    workdir: field("directory"),
+                },
+                "shell" => Call::Shell {
+                    command: text("command"),
+                    timeout_ms: None,
+                    workdir: field("directory"),
+                },
+                "read_file" => Call::Read {
+                    path: text("path"),
+                    offset: None,
+                    limit: None,
+                },
+                "write_file" => Call::Write {
+                    path: text("path"),
+                    content: text("content"),
+                    expected: None,
+                },
+                "edit_file" => Call::Edit {
+                    path: text("path"),
+                    old: text("old_string"),
+                    new: text("new_string"),
+                    all: false,
+                    expected: None,
+                },
+                "grep" => Call::Grep {
+                    pattern: text("pattern"),
+                    path: field("path"),
+                    include: None,
+                    exclude: None,
+                    extended: false,
+                    ignore_case: false,
+                    context: None,
+                },
+                other => panic!("{}: no unconfined call is {other}", case.name),
+            };
+            let resolved = case
+                .state
+                .get_path(&["action", "resolved"])
+                .and_then(Json::as_str)
+                .map(str::to_string);
+            assert_eq!(resolved.is_some(), tool != "shell", "{}", case.name);
+            let mut pending = classifier::unconfined_call(&call, side.clone(), resolved);
+            pending.untrusted.push(("received", "r".into()));
+            let (action, detail) = (pending.action, pending.detail.clone());
+            let reference = classifier::state(
+                &["h".to_string()],
+                policy.clone(),
+                Some("p".into()),
+                &[("t".to_string(), Some("p".to_string()))],
+                &pending,
+            );
+            shaped(&case.state, &reference, "state")
+                .unwrap_or_else(|why| panic!("{}: {why}", case.name));
+            let at = |path: &[&str]| case.state.get_path(path).and_then(Json::as_str).unwrap();
+            assert_eq!(at(&["action", "kind"]), action, "{}", case.name);
+            assert_eq!(at(&["action", "detail"]), detail, "{}", case.name);
+            assert!(
+                at(&["action", "source", "workspace"]).ends_with(", unconfined"),
                 "{}",
                 case.name
             );

@@ -10282,7 +10282,9 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
         ],
     );
     h.setup(Client::default());
-    h.down(&auto_with("[everywhere]\nallow shell echo\n"));
+    // An allow is for one workspace: this one.
+    let rules = |more: &str| format!("[directory {}]\nallow shell echo\n{more}", work.display());
+    h.down(&auto_with(&rules("")));
 
     // Inside the workspace: runs, no card.
     h.say("Read the file.");
@@ -10292,7 +10294,8 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
         .iter()
         .any(|(_, result, error)| !*error && result.contains("inside text")));
 
-    // A command: the person's, the allow rule and the mode aside.
+    // A command: the allow rule aside, the classifier's in `auto` mode,
+    // which with no Jev to ask gives it to the person.
     h.say("Run it.");
     let (call, _, details) = h.until_ask();
     assert!(
@@ -10314,7 +10317,7 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
     h.down(&Down::Policy {
         version: 2,
         mode: td_agent::config::Mode::Auto,
-        rules: Ok("[everywhere]\nallow shell echo\nask read_file\n".into()),
+        rules: Ok(rules("ask read_file\n")),
     });
     h.say("Read the other one.");
     let (call, _, details) = h.until_ask();
@@ -10323,6 +10326,12 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
             .find("unconfined")
             .zip(line.find("; and "))
             .is_some_and(|(first, then)| first < then)),
+        "{details:?}"
+    );
+    assert!(
+        !details
+            .iter()
+            .any(|line| line.contains("could not be read")),
         "{details:?}"
     );
     h.down(&Down::Decision {
@@ -10360,6 +10369,114 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
     assert!(!outside.join("planted").exists());
     let (conversation, _) = h.close();
     assert!(conversation.meta().unconfined);
+}
+
+/// In `auto` mode an unconfined workspace's command is the classifier's
+/// (DESIGN.md §8, §11), an allow rule for it aside: asked with its own
+/// policy, as a `command`, the command whole among what the model wrote;
+/// allowed, it runs with no card; not allowed, it goes to the person,
+/// the card saying the workspace is unconfined.
+#[test]
+fn unconfined_commands_in_auto_mode_are_the_classifiers() {
+    let owned = td_fs::TempDir::new("unconfined-auto").unwrap();
+    let base = std::fs::canonicalize(owned.path()).unwrap();
+    let work = base.join("work");
+    std::fs::create_dir(&work).unwrap();
+    let proof = base.join("proof");
+    let command = |text: &str| {
+        access_reply(
+            "shell",
+            td_json::Json::Obj(vec![("command".into(), text.into())]),
+        )
+    };
+    let ran = format!("touch '{}'", proof.display());
+    let workspace = work.display().to_string();
+    let mut h = Harness::new_in_as(
+        "unconfined-auto",
+        Role::Conversation,
+        Some(&workspace),
+        false,
+        true,
+        vec![
+            command(&ran),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            command("echo again"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![
+            Reply::ok("classifier-allow.json"),
+            Reply::ok("classifier-prose.json"),
+        ],
+    );
+    h.setup(Client {
+        jev_required: false,
+        ..Client::default()
+    });
+    h.down(&auto_with(&format!(
+        "[directory {}]\nallow shell touch\n",
+        work.display()
+    )));
+    h.say("Run it.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(proof.exists());
+    assert!(
+        approvals(&events)
+            .iter()
+            .any(|a| a.1 == "allow" && a.2 == "classifier"),
+        "{:?}",
+        approvals(&events)
+    );
+    let asked = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Kind::Request {
+                purpose: td_agent::store::Purpose::Classify,
+                head,
+                ..
+            } => Some(head.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        asked.contains("unconfined workspace: the person chose"),
+        "{asked}"
+    );
+    assert!(asked.contains("\\\"kind\\\":\\\"command\\\""), "{asked}");
+    assert!(asked.contains("touch "), "{asked}");
+    // Not allowed: the person's, saying why.
+    h.say("Again.");
+    let (call, _, details) = h.until_ask();
+    assert!(
+        details
+            .iter()
+            .any(|line| line.contains("classifier did not allow")),
+        "{details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .any(|line| line.contains("This workspace is unconfined")),
+        "{details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .any(|line| line.ends_with(", outside any jail:"))
+            && !details.iter().any(|line| line.contains("jail of its own")),
+        "{details:?}"
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
 }
 
 #[test]

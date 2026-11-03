@@ -265,7 +265,7 @@ impl Confirm {
         let details: Vec<&str> = vec![
             &place_line,
             "Its commands and file tools run as you, with everything you have: your whole home, your keys and credentials, td-agent's own key, state and sockets, your SSH agent and every host service. A command could answer its own cards through td-agent's control socket.",
-            "Every command, and every file tool that reaches outside the workspace, asks you on a card in either mode; no \u{201c}always allow\u{201d} releases one. Stopping a command cannot guarantee that what it started stops.",
+            "In ask mode every command, and every file tool that reaches outside the workspace, asks you on a card; in auto mode td-agent's classifier, whose models are sent the call, lets one run that it judges you asked for, and asks you otherwise. No \u{201c}always allow\u{201d} releases one. In auto mode the agent's edits inside the folder run unasked, and a build, a test or a git command the classifier allows runs what they wrote, a hook kept in the folder included. Stopping a command cannot guarantee that what it started stops.",
             "Choose this only for a model and a task you would trust with your account.",
         ];
         let model = Model::new(UNCONFINE_TITLE, UNCONFINE, &details, Act::Confirm, revision)

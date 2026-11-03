@@ -123,7 +123,19 @@ impl Bench {
         let roots = canonical(policy.roots());
         let writable = canonical(policy.writable_roots());
         let inside = |path: &str| within(Path::new(path), &roots);
-        let changes = |path: &str| within(Path::new(path), &writable);
+        // A repository's own `.git` is never changed unasked: its hooks
+        // and configuration run in the next git command.
+        let changes = |path: &str| {
+            resolve(Path::new(path)).is_some_and(|resolved| {
+                writable.iter().any(|root| {
+                    resolved.strip_prefix(root).is_ok_and(|below| {
+                        !below
+                            .components()
+                            .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
+                    })
+                })
+            })
+        };
         match call {
             Call::Read { path, .. } => inside(path),
             Call::Write { path, .. } | Call::Edit { path, .. } => changes(path),
@@ -137,6 +149,46 @@ impl Bench {
             Call::Sed { paths, .. } => paths.iter().all(|path| changes(path)),
             _ => false,
         }
+    }
+
+    /// The paths `call` reads or writes, as `contained` resolves them,
+    /// each quoted, one a line; for a command, none (DESIGN.md §8). What
+    /// does not exist yet is as the model wrote it, quoted so that it
+    /// cannot make a line of its own.
+    pub fn resolved(&self, call: &Call) -> Option<String> {
+        let paths: Vec<String> = match call {
+            Call::Read { path, .. } | Call::Write { path, .. } | Call::Edit { path, .. } => {
+                vec![path.clone()]
+            }
+            Call::Patch { patch, .. } => crate::patch::parse(patch)
+                .map(|parsed| parsed.paths().into_iter().map(str::to_string).collect())
+                .unwrap_or_default(),
+            Call::Sed { paths, .. } => paths.clone(),
+            Call::Glob { path: None, .. } | Call::Grep { path: None, .. } => {
+                return Some("(the workspace's directory, the pattern applied there)".into())
+            }
+            Call::Glob {
+                path: Some(path), ..
+            }
+            | Call::Grep {
+                path: Some(path), ..
+            } => {
+                vec![path.clone()]
+            }
+            _ => return None,
+        };
+        let lines: Vec<String> = paths
+            .iter()
+            .map(|path| match resolve(Path::new(path)) {
+                Some(resolved) => format!("{:?}", resolved.display().to_string()),
+                None => "(unresolved: relative, with `..`, a link that leads nowhere, or naming the resolving process)".into(),
+            })
+            .collect();
+        Some(if lines.is_empty() {
+            "(none: a patch that cannot be read)".to_string()
+        } else {
+            lines.join("\n")
+        })
     }
 
     /// `call` with the digest a write or an edit must match: the one this
@@ -379,17 +431,22 @@ impl Bench {
 /// anywhere, or a link that leads nowhere yet, cannot be told, and is
 /// not; nor is one written under a tree naming the resolving process.
 fn within(path: &Path, roots: &[PathBuf]) -> bool {
+    resolve(path).is_some_and(|resolved| roots.iter().any(|root| resolved.starts_with(root)))
+}
+
+/// `path` as `within` resolves it, or none where it cannot be told.
+fn resolve(path: &Path) -> Option<PathBuf> {
     // What these name is the resolving process's own, which the tool host
     // is not; and with no `..`, none is reached but as written.
     if !path.is_absolute() || PROCESS_OWN.iter().any(|own| path.starts_with(own)) {
-        return false;
+        return None;
     }
     let mut existing = PathBuf::new();
     let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
     for component in path.components() {
         match component {
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => return false,
+            std::path::Component::ParentDir => return None,
             std::path::Component::Normal(name) if !rest.is_empty() => rest.push(name),
             other => {
                 let next = existing.join(other);
@@ -397,17 +454,15 @@ fn within(path: &Path, roots: &[PathBuf]) -> bool {
                     Ok(_) => existing = next,
                     Err(_) => match other {
                         std::path::Component::Normal(name) => rest.push(name),
-                        _ => return false,
+                        _ => return None,
                     },
                 }
             }
         }
     }
-    let Ok(mut resolved) = std::fs::canonicalize(&existing) else {
-        return false;
-    };
+    let mut resolved = std::fs::canonicalize(&existing).ok()?;
     resolved.extend(rest);
-    roots.iter().any(|root| resolved.starts_with(root))
+    Some(resolved)
 }
 
 /// Trees whose paths name the process that resolves them.
@@ -509,6 +564,39 @@ mod tests {
         assert!(!bench.contained(&read(Path::new("/proc/self/cwd/a"))));
         assert!(!bench.contained(&read(Path::new("/dev/fd/3"))));
         assert!(!bench.contained(&read(&work.join("../work/a"))));
+        // A repository's `.git` is read, never changed, unasked: its hooks
+        // run in the next git command.
+        std::fs::create_dir_all(work.join(".git/hooks")).unwrap();
+        std::os::unix::fs::symlink(work.join(".git"), work.join("meta")).unwrap();
+        assert!(bench.contained(&read(&work.join(".git/config"))));
+        assert!(!bench.contained(&write(&work.join(".git/hooks/pre-commit"))));
+        assert!(!bench.contained(&write(&work.join("meta/config"))));
+        assert!(!bench.contained(&write(&work.join("sub/.git/config"))));
+        // The classifier is told where a call's paths resolve.
+        assert_eq!(
+            bench.resolved(&read(&work.join("link"))),
+            Some(format!("{:?}", text(&outside.join("s"))))
+        );
+        // What the model wrote cannot make a line of its own.
+        assert_eq!(
+            bench.resolved(&write(&work.join("new\n/etc/passwd"))),
+            Some(format!("{:?}", text(&work.join("new\n/etc/passwd"))))
+        );
+        assert!(!bench
+            .resolved(&write(&work.join("new\n/etc/passwd")))
+            .is_some_and(|line| line.contains('\n')));
+        assert_eq!(
+            bench.resolved(&read(Path::new("a"))).as_deref(),
+            Some("(unresolved: relative, with `..`, a link that leads nowhere, or naming the resolving process)")
+        );
+        assert_eq!(
+            bench.resolved(&Call::Shell {
+                command: "true".into(),
+                timeout_ms: None,
+                workdir: None,
+            }),
+            None
+        );
         // A directory shared read-only is read, never changed, unasked.
         let notes = base.join("notes");
         std::fs::create_dir(&notes).unwrap();
