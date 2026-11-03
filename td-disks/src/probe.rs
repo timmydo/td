@@ -187,12 +187,13 @@ fn numbers(meta: &fs::Metadata) -> (u64, u64) {
     )
 }
 
-fn same(meta: &fs::Metadata, expected: (u64, u64)) -> bool {
+/// Whether `meta` is a block device numbered `expected`.
+pub fn same(meta: &fs::Metadata, expected: (u64, u64)) -> bool {
     meta.file_type().is_block_device() && numbers(meta) == expected
 }
 
-/// Whether the sysfs device behind `entry` hangs off a USB bus. Removable
-/// media are another increment's; an extra volume is an internal disk.
+/// Whether the sysfs device behind `entry` hangs off a USB bus: removable
+/// media (media.rs), never an extra volume.
 pub fn on_usb(entry: &Path) -> io::Result<bool> {
     let real = fs::canonicalize(entry)?;
     Ok(real.components().any(|part| {

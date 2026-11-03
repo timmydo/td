@@ -82,8 +82,9 @@ common Intel IGB and Realtek wired NICs, USB Ethernet (CDC, NCM, ASIX
 and Realtek, the chips most USB-C docks' ports use), USB Attached SCSI
 and USB audio playback, for any machine. Nothing in td hands
 `/dev/kvm` to a session yet; the owner's consented extra Btrfs and ext4
-volumes mount at boot (td-disks/DESIGN.md), and removable FAT and exFAT
-media do not mount yet. None of this has been tried on the machine.
+volumes mount at boot, and removable media mount for the owner while
+the session is unlocked (td-disks/DESIGN.md). None of this has been
+tried on the machine.
 
 Legacy BIOS, resizing, dual boot and RAID are outside v1. Preserving an
 existing td installation is limited to the explicit reinstall mode below.

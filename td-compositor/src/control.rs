@@ -83,6 +83,9 @@ impl ClipboardAction {
 pub enum Request {
     /// Report the public window layout without changing it.
     Layout,
+    /// Report whether the lock surface is up: `locked` or `unlocked`. What
+    /// the session's removable-media watcher reads before it mounts.
+    LockState,
     Workspace(u8),
     Send(u8),
     Focus(Direction),
@@ -185,6 +188,10 @@ pub const USAGE: &[(&str, &str)] = &[
     (
         "layout",
         "report the windows, their workspaces and their rectangles",
+    ),
+    (
+        "lock-state",
+        "report whether the session is locked: locked or unlocked",
     ),
     ("workspace <1-9>", "show that workspace"),
     (
@@ -307,6 +314,7 @@ impl Request {
             .ok_or_else(|| "empty request; try 'help'".to_string())?;
         let request = match verb {
             "layout" => Request::Layout,
+            "lock-state" => Request::LockState,
             "workspace" => Request::Workspace(workspace(words.next(), verb)?),
             "send" => send_request(&mut words, verb)?,
             "focus" => focus_request(&mut words, verb)?,
@@ -370,6 +378,7 @@ impl Request {
     pub fn render(self) -> String {
         match self {
             Request::Layout => "layout".to_string(),
+            Request::LockState => "lock-state".to_string(),
             Request::Workspace(number) => format!("workspace {number}"),
             Request::Send(number) => format!("send {number}"),
             Request::Focus(direction) => format!("focus {}", direction_word(direction)),
@@ -919,6 +928,14 @@ pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> 
                 .map(Answer::Report);
         }
         Request::Layout => return Ok(Answer::Report(report(&runtime.control_snapshot()))),
+        Request::LockState => {
+            let state = if runtime.session_locked() {
+                "locked"
+            } else {
+                "unlocked"
+            };
+            return Ok(Answer::Report(format!("{state}\n")));
+        }
         Request::Capture | Request::Observe | Request::ObserveClient { .. } => {
             return Ok(Answer::CaptureDisabled);
         }
@@ -1528,6 +1545,10 @@ pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
     if request.input_session().is_some() {
         return ask_input(path, request);
     }
+    if request == Request::LockState {
+        let answer = ask_bounded(path, b"lock-state\n", REQUEST_LIMIT)?;
+        return decode_lock_state(&answer).map(str::to_string);
+    }
     if let Request::Application {
         verb: CacheVerb::Status,
         ..
@@ -1644,6 +1665,17 @@ fn decode_observation(body: &str) -> Result<(), ControlFailure> {
         return Err(bad());
     }
     Ok(())
+}
+
+/// `lock-state`'s answer: exactly one of its two words, or the status.
+fn decode_lock_state(answer: &[u8]) -> Result<&str, ControlFailure> {
+    let bad = || ControlFailure::Unreachable("malformed lock-state reply".into());
+    let text = std::str::from_utf8(answer).map_err(|_| bad())?;
+    match text.strip_prefix("ok\n") {
+        Some(body @ ("locked\n" | "unlocked\n")) => Ok(body),
+        Some(_) => Err(bad()),
+        None => split_answer(text, false).and_then(|_| Err(bad())),
+    }
 }
 
 fn decode_clipboard_record(answer: &[u8], request: Request) -> Result<&str, ControlFailure> {
@@ -2416,6 +2448,7 @@ mod tests {
         // send. Every variant, since the pair is written by hand.
         let every = [
             Request::Layout,
+            Request::LockState,
             Request::Workspace(1),
             Request::Workspace(9),
             Request::Send(4),
@@ -5275,5 +5308,37 @@ mod tests {
             "error the session is locked\n"
         );
         assert_eq!(queued.supervised(), None);
+    }
+
+    #[test]
+    fn lock_state_reports_the_lock_surface_and_nothing_else() {
+        let (runtime, _cleanup) = session(SurfaceKey {
+            client: 1,
+            object: 3,
+        });
+        let state = |runtime: &Arc<Mutex<Runtime>>| match apply(
+            &mut runtime.lock().unwrap(),
+            Request::LockState,
+        )
+        .unwrap()
+        {
+            Answer::Report(report) => report,
+            _ => panic!("lock-state answers a report"),
+        };
+        assert_eq!(Request::parse("lock-state").unwrap(), Request::LockState);
+        assert_eq!(state(&runtime), "unlocked\n");
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.enable_attention(true);
+            runtime.lock_session(&crate::input::test_origin()).unwrap();
+        }
+        assert_eq!(state(&runtime), "locked\n");
+        assert_eq!(
+            decode_lock_state(b"ok\nunlocked\n").ok(),
+            Some("unlocked\n")
+        );
+        assert!(decode_lock_state(b"ok\nunlocked\nlocked\n").is_err());
+        assert!(decode_lock_state(b"ok\n").is_err());
+        assert!(decode_lock_state(b"error no such request 'lock-state'; try 'help'\n").is_err());
     }
 }

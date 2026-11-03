@@ -5242,7 +5242,12 @@ write one line to a Unix socket and print what comes back.
 
 The normal deployment channel orders the layout and, with the paired
 authority, carries td-software's application requests ("Application
-requests" below). Disposable `headless`
+requests" below). `lock-state` answers `locked` or `unlocked`, whether
+the lock surface (td-login/TOKEN-LOGIN.md, "Session lock") is up, on the
+same admission as `layout`; a session that never locks answers
+`unlocked`. The session's removable-media watcher reads it before it
+mounts (td-disks/DESIGN.md, "Removable media"), and `td-ctl` accepts
+only those two words. Disposable `headless`
 sessions also offer separately enabled input and public capture, specified in
 [AUTOMATION.md](AUTOMATION.md). Neither grant can be enabled by a request or
 reach physical-origin trusted attention.
@@ -5322,7 +5327,7 @@ degenerate case is an `ok` abandoned before its first record, which reads as a
 successful report of nothing — an ordering request answers with an empty body
 legitimately, and `split_answer` reads the answer WITHOUT the request beside
 it, so it cannot tell the two apart. That is a choice and not a limit of the
-protocol: `layout` is the only request with a body and `report` always writes
+protocol: `layout` is the only general request with a body and `report` always writes
 an `output` and a `workspace` record, so a request-aware client could refuse
 an empty one. Keeping the answer readable on its own is worth more than
 closing the narrowest case of a bound already named.

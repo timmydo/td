@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
 use std::io::Write;
+use td_disks::media;
 use td_disks::runtime::{self, Places};
 use td_disks::setting::Change;
 
-const USAGE: &str = "usage: td-disks [status | add NAME UUID btrfs|ext4 [--exec] | remove NAME]";
+const USAGE: &str = "usage: td-disks [status | add NAME UUID btrfs|ext4 [--exec] | remove NAME \
+     | media [list | mount DEVICE | unmount NAME | eject NAME]]";
 
 fn request(change: &Change) -> Result<(), String> {
     let mut args = vec!["volume".to_string()];
@@ -18,6 +20,20 @@ fn request(change: &Change) -> Result<(), String> {
     } else {
         Err("volume change did not complete".into())
     }
+}
+
+fn media_request(request: &str) -> Result<(), String> {
+    let reply = media::ask(std::path::Path::new(media::SOCKET), request)?;
+    if let Some(error) = reply.strip_prefix("error ") {
+        return Err(error.trim_end().to_string());
+    }
+    let text = reply
+        .strip_prefix("ok\n")
+        .or_else(|| reply.strip_prefix("ok "))
+        .unwrap_or(&reply);
+    std::io::stdout()
+        .write_all(text.as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 fn run() -> Result<(), String> {
@@ -39,6 +55,21 @@ fn run() -> Result<(), String> {
             request(&Change::parse(&["add", name, uuid, kind, "exec"])?)
         }
         ["remove", name] => request(&Change::parse(&["remove", name])?),
+        ["media"] => media_request("list"),
+        ["media", verb @ ("list" | "mount" | "unmount" | "eject"), rest @ ..] => {
+            let mut words = vec![*verb];
+            words.extend(rest);
+            media_request(&words.join(" "))
+        }
+        ["media-serve", owner] => {
+            let owner: u32 = owner.parse().map_err(|_| "media-serve OWNER_UID")?;
+            media::Serve::system(owner)?.serve()
+        }
+        ["media-watch", control] => media::watch(
+            std::path::Path::new("/sys/class/block"),
+            std::path::Path::new(control),
+            std::path::Path::new(media::SOCKET),
+        ),
         _ => Err(USAGE.into()),
     }
 }

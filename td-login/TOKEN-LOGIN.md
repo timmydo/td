@@ -661,6 +661,11 @@ While locked:
   refuse; bridge clipboard snapshots already require keyboard focus.
 - Queued credential writes and installations stay unselectable; their own
   intake deadlines apply.
+- The control socket's `lock-state` answers `locked`, so removable media
+  present now, inserted at the lock screen or there at a boot that
+  starts locked, do not mount, then or after the unlock, until
+  replugged or mounted by hand (`td-disks/DESIGN.md`, "Removable
+  media"). What is already mounted stays mounted.
 
 The lock protects the interactive surfaces, not running processes, as
 `td-install/ENCRYPTION.md` says of any locked running machine.

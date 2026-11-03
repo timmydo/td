@@ -1459,6 +1459,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "td-firstboot",
     "time",
     "volumes",
+    "media",
     "sandbox-default",
     "release-source",
     "rootcheck",
@@ -1482,6 +1483,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "wayland",
     "seat-access-evidence",
     "terminal",
+    "media-watch",
     "applications-workspace",
     "mail",
     "mail-evidence",
@@ -1843,6 +1845,17 @@ fn build_desktop_td_svc_conf() -> String {
          timeout=120\n\
          log=/var/log/svc/volumes.log\n\
          \n\
+         # Removable media (td-disks/DESIGN.md): root owns every mount and\n\
+         # answers only the owner's socket; media-watch below decides when.\n\
+         [media]\n\
+         type=daemon\n\
+         unless-exists={live_medium}\n\
+         exec=/bin/td-disks media-serve {ui_uid}\n\
+         after=td-firstboot\n\
+         requires=td-firstboot\n\
+         restart=on-failure\n\
+         log=/var/log/svc/media.log\n\
+         \n\
          [sandbox-default]\n\
          type=oneshot\n\
          cgroup=session\n\
@@ -2108,6 +2121,19 @@ fn build_desktop_td_svc_conf() -> String {
          ready=/bin/td-login exec-primary -- /bin/td-term probe /run/user/{ui_uid}/td-term-ready\n\
          ready-timeout=30\n\
          restart=always\n\
+         \n\
+         # Mounts removable media that arrive while the compositor says the\n\
+         # session is unlocked; one that arrives behind the lock waits for a\n\
+         # replug or `td-disks media mount`.\n\
+         [media-watch]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         unless-exists={live_medium}\n\
+         exec=/bin/td-login exec-primary -- /bin/td-disks media-watch {control_socket}\n\
+         after=wayland,media\n\
+         requires=wayland,media\n\
+         restart=always\n\
+         log=/var/log/svc/media-watch.log\n\
          \n\
          # The two source-built applications, a td-ui window each, launched\n\
          # direct as Firefox is with no terminal: the program runs in its own\n\
@@ -9004,6 +9030,9 @@ mod tests {
             "firefox-evidence",
             "mail",
             "mail-evidence",
+            // The installer's own medium is USB: a live boot mounts no media.
+            "media",
+            "media-watch",
             "news",
             "news-evidence",
             "placement-evidence",
@@ -9291,6 +9320,8 @@ mod tests {
             ("wayland", vec!["seat", "sandbox-default"]),
             ("sandbox-default", vec!["td-firstboot"]),
             ("terminal", vec!["wayland"]),
+            ("media", vec!["td-firstboot"]),
+            ("media-watch", vec!["wayland", "media"]),
             ("applications-workspace", vec!["terminal"]),
             (
                 "mail",
