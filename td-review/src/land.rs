@@ -1033,7 +1033,7 @@ impl Pushed {
 
 /// Never deleted whatever `--base` says: an integration branch is one typo away
 /// from a mirror that has no `HEAD` ref to consult.
-const PROTECTED: [&str; 2] = ["main", "master"];
+const PROTECTED: &[&str] = &["main", "master"];
 
 /// A pushable remote carrying a branch, pinned to the tip we last fetched.
 pub struct DeleteTarget {

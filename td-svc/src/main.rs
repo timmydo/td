@@ -112,7 +112,7 @@ enum Route {
 }
 
 /// The verbs that address a running supervisor rather than a file.
-const CTL_VERBS: [&str; 8] = [
+const CTL_VERBS: &[&str] = &[
     "status", "start", "stop", "restart", "reload", "reboot", "poweroff", "halt",
 ];
 

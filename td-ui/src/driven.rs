@@ -30,7 +30,7 @@ pub const WHEEL_LIMIT: i32 = 16_777_216;
 /// The generic verbs. One of these with fields it does not take is
 /// `protocol` at the router; only other names reach a consumer's
 /// `request`.
-pub const VERBS: [&str; 13] = [
+pub const VERBS: &[&str] = &[
     "state",
     "actions",
     "action",

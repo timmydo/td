@@ -170,7 +170,7 @@ pub fn child_command(shell: &Path, command: &[OsString]) -> Result<ChildCommand,
 /// What the desktop profile replaces in the environment it inherits: the
 /// outer terminal's description, the terminal's own display connection, a
 /// size the child must ask the terminal for, and the value it sets.
-const DESKTOP_REPLACED: [&str; 6] = [
+const DESKTOP_REPLACED: &[&str] = &[
     "COLORTERM",
     "COLUMNS",
     "LINES",

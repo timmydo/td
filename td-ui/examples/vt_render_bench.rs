@@ -28,7 +28,7 @@ type Result<T> = std::result::Result<T, String>;
 
 const USAGE: &str = "usage: vt_render_bench [WIDTH HEIGHT [FRAMES]], each at least 1";
 
-const WORDS: [&str; 12] = [
+const WORDS: &[&str] = &[
     "fn", "let", "match", "self", "render", "pixels", "width", "Some", "None", "return", "=>",
     "0x7f",
 ];
@@ -149,7 +149,7 @@ fn screens(columns: usize, rows: usize) -> Vec<(&'static str, Vec<u8>)> {
     for row in 0..rows {
         let mut used = 0;
         while used < columns {
-            let word = random.pick(&WORDS);
+            let word = random.pick(WORDS);
             let word = word.get(..columns - used).unwrap_or(word);
             let sgr = match random.next() % 4 {
                 0 => format!("\x1b[1;38;5;{}m", random.next() % 256),
@@ -198,7 +198,7 @@ fn feed_cost(columns: usize, rows: usize) -> Result<()> {
     let mut random = Random(7);
     let mut bytes = Vec::with_capacity(FEED_BYTES);
     while bytes.len() < FEED_BYTES {
-        bytes.extend_from_slice(random.pick(&WORDS).as_bytes());
+        bytes.extend_from_slice(random.pick(WORDS).as_bytes());
         if random.next().is_multiple_of(12) {
             bytes.extend_from_slice(b"\r\n");
         } else {

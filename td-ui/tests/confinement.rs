@@ -93,7 +93,7 @@ const TERMINAL: [(&str, &str); 3] = [
 ];
 
 /// Specification files compiled only as those modules' tests.
-const TERMINAL_SPECS: [&str; 2] = ["vt_spec.rs", "vt_render_spec.rs"];
+const TERMINAL_SPECS: &[&str] = &["vt_spec.rs", "vt_render_spec.rs"];
 
 #[test]
 fn source_inventory_and_shared_mounts_are_closed() {

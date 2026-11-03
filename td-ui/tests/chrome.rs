@@ -22,7 +22,7 @@ use td_ui::raster::{
     LINE_NUMBER, PAPER, SELECTED,
 };
 
-const LABELS: [&str; 5] = ["File", "Edit", "Format", "Help", "Directory"];
+const LABELS: &[&str] = &["File", "Edit", "Format", "Help", "Directory"];
 
 fn surface(width: usize, height: usize, scale: u8) -> Surface {
     Surface::new(width, height, Scale::new(scale).unwrap()).unwrap()
@@ -77,7 +77,7 @@ fn the_menu_bar_fills_its_row_and_lays_the_labels_from_column_one() {
     for scale in 1..=4u8 {
         let s = scale as usize;
         let surface = surface(400 * s, 200, scale);
-        let bar = Bar::new(surface, &LABELS);
+        let bar = Bar::new(surface, LABELS);
         let draws = run(surface, |damage, sink| bar.emit(damage, sink));
         // One CHROME fill, the first row across the surface.
         assert_eq!(
@@ -130,7 +130,7 @@ fn the_menu_bar_fills_its_row_and_lays_the_labels_from_column_one() {
 fn a_menu_panel_paints_selection_disabled_ink_checks_and_right_aligned_shortcuts() {
     let s = 2usize;
     let surface = surface(320 * s, 600, 2);
-    let header = Bar::new(surface, &LABELS).header(0).unwrap();
+    let header = Bar::new(surface, LABELS).header(0).unwrap();
     let rows = [
         Row {
             label: "New",

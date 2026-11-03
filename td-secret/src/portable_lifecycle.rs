@@ -2050,7 +2050,7 @@ pub(in crate::portable) mod tests {
         use super::*;
         use crate::fido_fixtures::{assertion, enrollment, entropy, fixture, Script};
 
-        const LABELS: [&str; 4] = ["p1-legacy", "p1-scoped", "p2-legacy", "p2-scoped"];
+        const LABELS: &[&str] = &["p1-legacy", "p1-scoped", "p2-legacy", "p2-scoped"];
 
         #[test]
         fn the_adapter_returns_only_verified_transcript_results() {

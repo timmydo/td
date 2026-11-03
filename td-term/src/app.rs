@@ -117,9 +117,9 @@ const PASTE_CHORD: &str = "C-S-v";
 /// foot's scrollback-search chord, which opens the search; inside it,
 /// foot's search chords.
 const SEARCH_CHORD: &str = "C-S-r";
-const SEARCH_OLDER_CHORDS: [&str; 2] = ["C-r", "C-S-r"];
-const SEARCH_NEWER_CHORDS: [&str; 2] = ["C-s", "C-S-s"];
-const SEARCH_CANCEL_CHORDS: [&str; 3] = ["Escape", "C-g", "C-c"];
+const SEARCH_OLDER_CHORDS: &[&str] = &["C-r", "C-S-r"];
+const SEARCH_NEWER_CHORDS: &[&str] = &["C-s", "C-S-s"];
+const SEARCH_CANCEL_CHORDS: &[&str] = &["Escape", "C-g", "C-c"];
 /// td-ui's keymap names keypad Enter `Return` too.
 const SEARCH_COMMIT_CHORD: &str = "Return";
 const SEARCH_ERASE_CHORD: &str = "Backspace";
@@ -127,7 +127,7 @@ const SEARCH_ERASE_CHORD: &str = "Backspace";
 /// step, with `-` shrinks it, and with `0` restores the size td-term
 /// started at. Each is silent to the child (`vt_keys`), so none is taken
 /// from it.
-const ZOOM_IN_CHORDS: [&str; 2] = ["C-+", "C-="];
+const ZOOM_IN_CHORDS: &[&str] = &["C-+", "C-="];
 const ZOOM_OUT_CHORD: &str = "C--";
 const ZOOM_RESET_CHORD: &str = "C-0";
 /// foot's prompt chords, which scroll the view to the shell's previous

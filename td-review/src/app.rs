@@ -1982,7 +1982,7 @@ fn heading(text: &str) -> Line {
 /// Colour a diff line by its leading marker. `+++`/`---` are file headers and
 /// must be matched before the single-character add/remove markers.
 pub fn diff_style(line: &str) -> Style {
-    const FILE_HEADERS: [&str; 7] = [
+    const FILE_HEADERS: &[&str] = &[
         "diff --git",
         "index ",
         "new file",

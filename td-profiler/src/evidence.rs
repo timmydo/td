@@ -16,7 +16,7 @@ const EVIDENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ATTRIBUTION_WORK_SLICE: Duration = Duration::from_millis(50);
 const ATTRIBUTION_REST_SLICE: Duration = Duration::from_millis(50);
 const MAX_EVIDENCE_WAIT: Duration = Duration::from_secs(MAX_EVIDENCE_WAIT_SECS as u64);
-const REQUIRED_FILES: [&str; 9] = [
+const REQUIRED_FILES: &[&str] = &[
     "manifest.json",
     "overview.jsonl",
     "processes.jsonl",
