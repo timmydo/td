@@ -31,7 +31,6 @@
 //!     set and override order (the TMPDIR group wins over drv env). The trusted
 //!     mesboot runner receives the hashed TD_STEPS data path through TD_STEPS_FILE.
 
-#![allow(clippy::unwrap_used, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 #![allow(unsafe_code)] // confined raw-syscall / low-level layer (UNSAFE.md)
 
 use std::collections::BTreeSet;
@@ -61,6 +60,27 @@ const GUEST_GID: u32 = 30000;
 
 fn err(what: String) -> io::Error {
     io::Error::new(io::ErrorKind::Other, what)
+}
+
+/// A syscall argument as a C string. Bytes with an interior NUL cannot be
+/// one; they are refused rather than truncated at the NUL.
+fn c_string(bytes: impl Into<Vec<u8>>) -> io::Result<CString> {
+    CString::new(bytes).map_err(|e| {
+        let at = e.nul_position();
+        let bytes = e.into_vec();
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{:?}: interior NUL byte at {at}, not a C string",
+                String::from_utf8_lossy(&bytes)
+            ),
+        )
+    })
+}
+
+/// A path as a C string, refused as `c_string` refuses one.
+fn cstr(p: &Path) -> io::Result<CString> {
+    c_string(p.as_os_str().as_encoded_bytes())
 }
 
 /// Called only after mounting a fresh procfs in the private PID namespace,
@@ -416,10 +436,16 @@ fn store_path_name_in<'a>(prefix: &str, path: &'a str) -> io::Result<&'a str> {
     let base = path
         .strip_prefix(prefix)
         .ok_or_else(|| err(format!("{path}: not a store path")))?;
-    if base.len() > 33 && base.as_bytes()[32] == b'-' && !base.contains('/') {
-        Ok(&base[33..])
-    } else {
-        Err(err(format!("{path}: malformed store path basename")))
+    // Byte 32 is an ASCII `-`, so byte 33 is a char boundary.
+    match base.get(33..) {
+        Some(name)
+            if base.as_bytes().get(32) == Some(&b'-')
+                && !name.is_empty()
+                && !base.contains('/') =>
+        {
+            Ok(name)
+        }
+        _ => Err(err(format!("{path}: malformed store path basename"))),
     }
 }
 
@@ -1642,18 +1668,17 @@ pub fn build(
     // that namespace, not the invoking one.
     let newroot = scratch.join("buildroot");
     fs::create_dir_all(&newroot)?;
-    let cstr = |p: &Path| CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
-    let newstore_c = cstr(&newstore);
-    let root_c = CString::new("/").unwrap();
-    let tmpfs_c = CString::new("tmpfs").unwrap();
-    let procfs_c = CString::new("proc").unwrap();
-    let newroot_c = cstr(&newroot);
+    let newstore_c = cstr(&newstore)?;
+    let root_c = c"/".to_owned();
+    let tmpfs_c = c"tmpfs".to_owned();
+    let procfs_c = c"proc".to_owned();
+    let newroot_c = cstr(&newroot)?;
     // The store dir INSIDE the new root, e.g. <newroot>/gnu/store or <newroot>/td/store
     // (store_dir_str is absolute; strip the leading '/' to make it root-relative).
     let store_dir = newroot.join(store_dir_str.trim_start_matches('/'));
-    let store_dir_c = cstr(&store_dir);
+    let store_dir_c = cstr(&store_dir)?;
     let tmp_dir = newroot.join("tmp");
-    let tmp_dir_c = cstr(&tmp_dir);
+    let tmp_dir_c = cstr(&tmp_dir)?;
     let build_tmp = scratch.join("build-tmp");
     let build_tmp_lease_path = scratch.join(".build-tmp.lock");
     let build_tmp_lease = fs::OpenOptions::new()
@@ -1673,17 +1698,17 @@ pub fn build(
         path: build_tmp.clone(),
         _lease: build_tmp_lease,
     };
-    let build_tmp_c = cstr(&build_tmp);
+    let build_tmp_c = cstr(&build_tmp)?;
     let dev_dir = newroot.join("dev");
-    let dev_dir_c = cstr(&dev_dir);
+    let dev_dir_c = cstr(&dev_dir)?;
     let proc_dir = newroot.join("proc");
-    let proc_dir_c = cstr(&proc_dir);
+    let proc_dir_c = cstr(&proc_dir)?;
     let etc_dir = newroot.join("etc");
     let etc_passwd = etc_dir.join("passwd");
     let etc_group = etc_dir.join("group");
     let oldroot_rel = newroot.join("oldroot");
-    let oldroot_rel_c = cstr(&oldroot_rel);
-    let oldroot_abs_c = CString::new("/oldroot").unwrap();
+    let oldroot_rel_c = cstr(&oldroot_rel)?;
+    let oldroot_abs_c = c"/oldroot".to_owned();
     // EXTRA store prefixes the closure spans beyond the active one (e.g. /td/store toolchain
     // inputs in a /gnu/store-native corpus build — brick 8). newstore is rbind'd at each of
     // these too, so those inputs are visible at their canonical prefix. Empty for the common
@@ -1707,14 +1732,17 @@ pub fn build(
         .iter()
         .map(|p| newroot.join(p.trim_start_matches('/')))
         .collect();
-    let extra_store_cs: Vec<CString> = extra_store_dirs.iter().map(|d| cstr(d)).collect();
+    let extra_store_cs: Vec<CString> = extra_store_dirs
+        .iter()
+        .map(|d| cstr(d))
+        .collect::<io::Result<_>>()?;
     // /dev is rbind'd whole from the invoking namespace rather than rebuilt node by
     // node: re-binding a device node onto a fresh unprivileged-userns tmpfs strips
     // device access (the re-bound /dev/null returns EACCES on write), whereas an
     // rbind preserves the source mount's working device binds. In the loop the
     // source is host_shell's ALREADY-minimal /dev (null/zero/…/shm/pts, no host
     // device tree); a future standalone daemon would reuse that minimal-/dev builder.
-    let dev_src_c = CString::new("/dev").unwrap();
+    let dev_src_c = c"/dev".to_owned();
     // Minimal /etc (daemon build-chroot parity): passwd + group so getpwuid/getgrgid
     // resolve the build user, with NO host /etc reachable.
     let passwd_body = format!(
@@ -1745,10 +1773,10 @@ pub fn build(
             fs::write(&passwd, &passwd_body)?;
             fs::write(&group, &group_body)?;
             Some((
-                cstr(&passwd),
-                cstr(&etc_passwd),
-                cstr(&group),
-                cstr(&etc_group),
+                cstr(&passwd)?,
+                cstr(&etc_passwd)?,
+                cstr(&group)?,
+                cstr(&etc_group)?,
             ))
         }
         None => None,
@@ -1892,8 +1920,8 @@ pub fn build(
             // … and at every EXTRA prefix the closure spans (e.g. /td/store toolchain inputs):
             // the SAME newstore (basename-keyed) rbind'd there too, so those canonical paths
             // resolve. Empty for a single-store build, so this is a no-op in the common case.
-            for (i, dst) in extra_store_cs.iter().enumerate() {
-                fs::create_dir_all(&extra_store_dirs[i])?;
+            for (dir, dst) in extra_store_dirs.iter().zip(&extra_store_cs) {
+                fs::create_dir_all(dir)?;
                 sys::mount(
                     Some(&newstore_c),
                     dst,
@@ -2070,19 +2098,19 @@ pub fn host_shell(
     // identity uid map (below) that is unmapped, so set the owner explicitly to
     // the host uid/gid via the tmpfs `uid=/gid=` mount data — keeps the dirs
     // writable while the process stays the (non-root) host uid.
-    let tmpfs_data = CString::new(format!("uid={host_uid},gid={host_gid}")).unwrap();
-    let newroot_c = CString::new(newroot.as_os_str().as_encoded_bytes()).unwrap();
-    let root_c = CString::new("/").unwrap();
-    let tmpfs_c = CString::new("tmpfs").unwrap();
+    let tmpfs_data = c_string(format!("uid={host_uid},gid={host_gid}"))?;
+    let newroot_c = cstr(&newroot)?;
+    let root_c = c"/".to_owned();
+    let tmpfs_c = c"tmpfs".to_owned();
     // A FRESH procfs is mounted at <newroot>/proc by the PID-1 child (below), so
     // /proc reflects the sandbox's OWN PID namespace, not the host's. The host
     // /proc is no longer bound in (main.rs drops it from the exposure set).
-    let proc_c = CString::new("proc").unwrap();
+    let proc_c = c"proc".to_owned();
     let proc_target_dir = newroot.join("proc");
-    let proc_target_c = CString::new(proc_target_dir.as_os_str().as_encoded_bytes()).unwrap();
+    let proc_target_c = cstr(&proc_target_dir)?;
     let oldroot_rel = newroot.join("oldroot");
-    let oldroot_rel_c = CString::new(oldroot_rel.as_os_str().as_encoded_bytes()).unwrap();
-    let oldroot_abs_c = CString::new("/oldroot").unwrap();
+    let oldroot_rel_c = cstr(&oldroot_rel)?;
+    let oldroot_abs_c = c"/oldroot".to_owned();
 
     // Everything the child's pre_exec needs per bind, precomputed in the
     // parent: the C paths, whether the source is a directory (the mountpoint
@@ -2162,30 +2190,25 @@ pub fn host_shell(
     // only these named nodes are reachable), /dev/shm, a private devpts, and the
     // fd symlinks.
     let dev_dir = newroot.join("dev");
-    let dev_dir_c = CString::new(dev_dir.as_os_str().as_encoded_bytes()).unwrap();
-    let dev_data = CString::new(format!("uid={host_uid},gid={host_gid},mode=0755")).unwrap();
+    let dev_dir_c = cstr(&dev_dir)?;
+    let dev_data = c_string(format!("uid={host_uid},gid={host_gid},mode=0755"))?;
     let mut dev_node_specs: Vec<(CString, PathBuf, CString)> = Vec::new();
     for n in ["null", "zero", "full", "random", "urandom", "tty"] {
         let src = format!("/dev/{n}");
         if Path::new(&src).exists() {
             let target = dev_dir.join(n);
-            dev_node_specs.push((
-                CString::new(src).unwrap(),
-                target.clone(),
-                CString::new(target.as_os_str().as_encoded_bytes()).unwrap(),
-            ));
+            dev_node_specs.push((c_string(src)?, target.clone(), cstr(&target)?));
         }
     }
     let dev_shm_dir = dev_dir.join("shm");
-    let dev_shm_c = CString::new(dev_shm_dir.as_os_str().as_encoded_bytes()).unwrap();
-    let dev_shm_data = CString::new(format!("uid={host_uid},gid={host_gid},mode=1777")).unwrap();
+    let dev_shm_c = cstr(&dev_shm_dir)?;
+    let dev_shm_data = c_string(format!("uid={host_uid},gid={host_gid},mode=1777"))?;
     let dev_pts_dir = dev_dir.join("pts");
-    let dev_pts_c = CString::new(dev_pts_dir.as_os_str().as_encoded_bytes()).unwrap();
-    let devpts_c = CString::new("devpts").unwrap();
-    let devpts_data = CString::new(format!(
+    let dev_pts_c = cstr(&dev_pts_dir)?;
+    let devpts_c = c"devpts".to_owned();
+    let devpts_data = c_string(format!(
         "newinstance,ptmxmode=0666,mode=0620,gid={host_gid}"
-    ))
-    .unwrap();
+    ))?;
     // (symlink path under <newroot>/dev, its target). /dev/ptmx → the private pts
     // instance; the std-stream links point into the private /proc mounted below.
     let dev_symlinks: Vec<(PathBuf, &str)> = vec![
@@ -3652,6 +3675,34 @@ mod tests {
             "/gnu/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-hello-2.12.1"
         )
         .is_err());
+        // Exactly hash and dash, or no dash at byte 32, is no name.
+        assert!(
+            store_path_name_in("/td/store/", "/td/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-")
+                .is_err()
+        );
+        assert!(store_path_name_in(
+            "/td/store/",
+            "/td/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dzéhello"
+        )
+        .is_err());
+    }
+
+    // These were `CString::new(..).unwrap()` and panicked the builder on a
+    // path or mount option holding a NUL; they are now refused as input.
+    #[test]
+    fn interior_nul_is_an_error_not_a_panic() {
+        let error = cstr(Path::new("/tmp/a\0b")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("interior NUL byte at 6"),
+            "{error}"
+        );
+        assert!(c_string("uid=1\0").is_err());
+        assert_eq!(
+            cstr(Path::new("/td/store")).unwrap().as_bytes(),
+            b"/td/store"
+        );
+        assert_eq!(c_string("mode=0755").unwrap().as_bytes(), b"mode=0755");
     }
 
     #[test]
