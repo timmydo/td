@@ -5,6 +5,9 @@ edition = "2021"
 description = "td's guest-side kexec helper: kexec_file_load(2) + reboot(KEXEC), and a sealed memfd for the volume-key handoff; a confined four-syscall surface"
 license = "MIT"
 
+[package.metadata.td-gate]
+clippy-all-targets = true
+
 # Own workspace root. The engine root manifest carries no `exclude` list, and
 # never needed one: an `exclude` stops cargo only at that manifest, and this
 # crate's lock must never mix into the dependency-free engine lock. From a
