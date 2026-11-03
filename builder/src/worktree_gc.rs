@@ -18,8 +18,12 @@ struct Worktree {
 }
 
 fn command(repo: &Path, args: &[&str]) -> io::Result<std::process::Output> {
-    Command::new("git")
-        .current_dir(repo)
+    base(repo).args(args).output()
+}
+
+fn base(repo: &Path) -> Command {
+    let mut git = Command::new("git");
+    git.current_dir(repo)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
@@ -34,9 +38,8 @@ fn command(repo: &Path, args: &[&str]) -> io::Result<std::process::Output> {
             "core.hooksPath=/dev/null",
             "-c",
             "maintenance.auto=false",
-        ])
-        .args(args)
-        .output()
+        ]);
+    git
 }
 
 fn git(repo: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
@@ -248,6 +251,206 @@ fn process_uses(proc: &Path, roots: &[PathBuf], owner: u32) -> io::Result<bool> 
     Ok(false)
 }
 
+/// A commit as a landing must reproduce it: its exact patch id (None for
+/// a commit with no diff) and its whole message, the review record.
+type Landing = (Option<String>, String);
+
+/// Main's non-merge commits since a merge base, with their messages.
+type MainSide = Vec<(String, String)>;
+
+/// What a sweep learns of main once and every tree shares: each (main,
+/// merge bases) side's messages, and the patch ids of main commits asked.
+#[derive(Default)]
+struct Upstream {
+    sides: std::cell::RefCell<std::collections::HashMap<(String, Vec<String>), MainSide>>,
+    ids: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
+}
+
+/// Each non-merge commit `revs` (rev-list arguments) name, oldest last,
+/// with its whole message.
+fn messages(repo: &Path, revs: &[&str]) -> io::Result<MainSide> {
+    let out = git(
+        repo,
+        &[
+            &[
+                "log",
+                "--no-merges",
+                "--no-show-signature",
+                "-z",
+                "--format=%H%n%B",
+            ],
+            revs,
+            &["--"],
+        ]
+        .concat(),
+    )?;
+    let out = String::from_utf8(out).map_err(io::Error::other)?;
+    Ok(out
+        .split('\0')
+        .filter(|r| !r.is_empty())
+        .map(|record| {
+            let record = record.trim_start_matches('\n');
+            let (oid, message) = record.split_once('\n').unwrap_or((record, ""));
+            (oid.to_owned(), message.to_owned())
+        })
+        .collect())
+}
+
+/// The `--verbatim` patch id, whitespace included, of each non-merge
+/// commit `revs` name that has a diff, over a diff whose options are all
+/// given here, so no user diff configuration narrows it.
+fn patch_ids(repo: &Path, revs: &[&str]) -> io::Result<std::collections::HashMap<String, String>> {
+    use std::process::Stdio;
+    let mut log = base(repo)
+        .args([
+            "log",
+            "-p",
+            "--no-merges",
+            "--no-renames",
+            "--full-index",
+            "--binary",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--unified=3",
+            "--no-relative",
+            "--ignore-submodules=none",
+            "--submodule=short",
+            "--no-show-signature",
+            "--format=commit %H",
+        ])
+        .args(revs)
+        .arg("--")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let diffs = log
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("git log has no output"))?;
+    let ids = base(repo)
+        .args(["patch-id", "--verbatim"])
+        .stdin(Stdio::from(diffs))
+        .stderr(Stdio::null())
+        .output()?;
+    if !log.wait()?.success() || !ids.status.success() {
+        return Err(io::Error::other("cannot compute patch ids"));
+    }
+    let ids = String::from_utf8(ids.stdout).map_err(io::Error::other)?;
+    Ok(ids
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(id, oid)| (oid.to_owned(), id.to_owned()))
+        .collect())
+}
+
+/// Whether everything `oid` reaches is on `main`: it is an ancestor, or,
+/// for work that landed rebased or cherry-picked, none of the commits main
+/// lacks is a merge, whose own resolution no patch id covers, and each has
+/// a landing on main since the merge base with the same exact patch and
+/// message. A landing amended, even by whitespace or only in its message,
+/// or squashed, is not landed here. Only main commits whose message is one
+/// of the work's are diffed, which a landing must have anyway.
+fn landed(repo: &Path, oid: &str, main: &str, upstream: &Upstream) -> io::Result<bool> {
+    let ancestor = command(repo, &["merge-base", "--is-ancestor", oid, main])?;
+    match ancestor.status.code() {
+        Some(0) => return Ok(true),
+        Some(1) => (),
+        _ => return Err(io::Error::other("cannot establish ancestry")),
+    }
+    let range = format!("{main}..{oid}");
+    if !text(
+        repo,
+        &["rev-list", "--merges", "--max-count=1", &range, "--"],
+    )?
+    .is_empty()
+    {
+        return Ok(false);
+    }
+    let work = messages(repo, &[&range])?;
+    if work.is_empty() {
+        return Ok(false);
+    }
+    let work_ids = patch_ids(repo, &[&range])?;
+    let commits: Vec<String> = work.iter().map(|(oid, _)| oid.clone()).collect();
+    let work: Vec<Landing> = work
+        .into_iter()
+        .map(|(oid, message)| (work_ids.get(&oid).cloned(), message))
+        .collect();
+    // main ^bases is main ^oid: what main reaches that oid does not.
+    let mut bases: Vec<String> = text(repo, &["merge-base", "--all", oid, main])?
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    bases.sort();
+    let key = (main.to_owned(), bases);
+    let busy = |_| io::Error::other("landing cache already in use");
+    let mut sides = upstream.sides.try_borrow_mut().map_err(busy)?;
+    if !sides.contains_key(&key) {
+        let excluded: Vec<String> = key.1.iter().map(|b| format!("^{b}")).collect();
+        let mut revs = vec![main];
+        revs.extend(excluded.iter().map(String::as_str));
+        sides.insert(key.clone(), messages(repo, &revs)?);
+    }
+    let side = sides
+        .get(&key)
+        .ok_or_else(|| io::Error::other("main side lost from its cache"))?;
+    let wanted: std::collections::HashSet<&str> =
+        work.iter().map(|(_, message)| message.as_str()).collect();
+    let candidates: Vec<&(String, String)> = side
+        .iter()
+        .filter(|(_, message)| wanted.contains(message.as_str()))
+        .collect();
+    let mut ids = upstream.ids.try_borrow_mut().map_err(busy)?;
+    let unknown: Vec<&str> = candidates
+        .iter()
+        .map(|(oid, _)| oid.as_str())
+        .filter(|oid| !ids.contains_key(*oid))
+        .collect();
+    if !unknown.is_empty() {
+        let found = patch_ids(repo, &[&["--no-walk"], unknown.as_slice()].concat())?;
+        for oid in unknown {
+            ids.insert(oid.to_owned(), found.get(oid).cloned());
+        }
+    }
+    let on_main: std::collections::HashSet<Landing> = candidates
+        .iter()
+        .filter_map(|(oid, message)| Some((ids.get(oid)?.clone(), message.clone())))
+        .collect();
+    if !work.iter().all(|landing| on_main.contains(landing)) {
+        return Ok(false);
+    }
+    // A patch id ignores where a hunk applies, so the same change moved
+    // elsewhere in a file matches too: each commit's own change must also
+    // already be in main, applying it there leaving main's tree as it is.
+    let tree = text(repo, &["rev-parse", &format!("{main}^{{tree}}")])?;
+    for commit in &commits {
+        let parent = format!("{commit}^");
+        let merged = command(
+            repo,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                "--merge-base",
+                &parent,
+                main,
+                commit,
+            ],
+        )?;
+        match merged.status.code() {
+            Some(0) => (),
+            Some(1) => return Ok(false),
+            _ => return Err(io::Error::other("cannot merge a commit onto main")),
+        }
+        let out = String::from_utf8(merged.stdout).map_err(io::Error::other)?;
+        if out.lines().next() != Some(tree.as_str()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn eligible(
     repo: &Path,
     row: &Worktree,
@@ -255,6 +458,7 @@ fn eligible(
     idle: Duration,
     now: SystemTime,
     proc: &Path,
+    upstream: &Upstream,
 ) -> io::Result<Option<String>> {
     if row.primary {
         return Ok(Some("primary checkout".into()));
@@ -278,11 +482,8 @@ fn eligible(
     if actual != row.head {
         return Ok(Some("HEAD changed".into()));
     }
-    let ancestor = command(repo, &["merge-base", "--is-ancestor", &actual, main])?;
-    match ancestor.status.code() {
-        Some(0) => (),
-        Some(1) => return Ok(Some("commits absent from origin/main".into())),
-        _ => return Err(io::Error::other("cannot establish ancestry")),
+    if !landed(repo, &actual, main, upstream)? {
+        return Ok(Some("commits absent from origin/main".into()));
     }
     if !git(
         &row.path,
@@ -346,15 +547,8 @@ fn eligible(
         if retained.contains(oid) || !seen.insert(oid) {
             continue;
         }
-        let result = command(repo, &["merge-base", "--is-ancestor", oid, main])?;
-        match result.status.code() {
-            Some(0) => (),
-            Some(1) => return Ok(Some("unlanded private Git history".into())),
-            _ => {
-                return Err(io::Error::other(
-                    "cannot establish private history ancestry",
-                ))
-            }
+        if !landed(repo, oid, main, upstream)? {
+            return Ok(Some("unlanded private Git history".into()));
         }
     }
     let newest = last_change(&row.path)?.max(last_change(&admin)?);
@@ -414,8 +608,9 @@ fn sweep_inner(repo: &Path, days: u64, dry: bool, fetch: bool, proc: &Path) -> i
         return Err(io::Error::other("worktree GC refuses grafted history"));
     }
     let idle = Duration::from_secs(seconds);
+    let upstream = Upstream::default();
     for row in worktrees(repo)? {
-        let decide = || eligible(repo, &row, &main, idle, SystemTime::now(), proc);
+        let decide = || eligible(repo, &row, &main, idle, SystemTime::now(), proc, &upstream);
         match decide() {
             Ok(None) if dry => println!("would remove {}", row.path.display()),
             Ok(None) => {
@@ -425,7 +620,15 @@ fn sweep_inner(repo: &Path, days: u64, dry: bool, fetch: bool, proc: &Path) -> i
                 let Some(fresh) = fresh else {
                     continue;
                 };
-                match eligible(repo, &fresh, &main, idle, SystemTime::now(), proc) {
+                match eligible(
+                    repo,
+                    &fresh,
+                    &main,
+                    idle,
+                    SystemTime::now(),
+                    proc,
+                    &upstream,
+                ) {
                     Ok(None) if fresh.head == row.head => {
                         let Some(path) = row.path.to_str() else {
                             println!("keep {}: non-UTF-8 removal path", row.path.display());
@@ -515,7 +718,16 @@ mod tests {
     }
 
     fn reason(repo: &Path, row: &Worktree, main: &str, proc: &Path) -> Option<String> {
-        eligible(repo, row, main, Duration::ZERO, SystemTime::now(), proc).unwrap()
+        eligible(
+            repo,
+            row,
+            main,
+            Duration::ZERO,
+            SystemTime::now(),
+            proc,
+            &Upstream::default(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -549,7 +761,8 @@ mod tests {
                 &main,
                 Duration::from_secs(86400),
                 SystemTime::now(),
-                &proc
+                &proc,
+                &Upstream::default()
             )
             .unwrap()
             .as_deref(),
@@ -562,13 +775,188 @@ mod tests {
                 &main,
                 Duration::from_secs(86400),
                 SystemTime::now() + Duration::from_secs(172800),
-                &proc
+                &proc,
+                &Upstream::default()
             )
             .unwrap(),
             None
         );
         row.branch = "refs/heads/work-rolling".into();
         assert!(reason(&repo, &row, &main, &proc).is_some());
+    }
+
+    /// A branch whose commits main took as new commits with the same patch
+    /// (a rebase or cherry-pick landing) is reclaimed, its private rebase
+    /// history too; one amended before landing, or one that reaches main's
+    /// copy through a merge, is not.
+    #[test]
+    fn a_branch_landed_rebased_is_reclaimed_but_not_one_amended_or_merged() {
+        let (_root, repo, mut row, proc, main) = fixture();
+        fs::write(row.path.join("file"), "work").unwrap();
+        git(&row.path, &["commit", "-am", "work"]).unwrap();
+        let work = text(&row.path, &["rev-parse", "HEAD"]).unwrap();
+        row.head = work.clone();
+        // Main moves on, then takes the work as a new commit.
+        fs::write(repo.join("other"), "main").unwrap();
+        git(&repo, &["add", "other"]).unwrap();
+        git(&repo, &["commit", "-m", "elsewhere"]).unwrap();
+        git(&repo, &["cherry-pick", &work]).unwrap();
+        let replayed = text(&repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(replayed, work);
+        assert_eq!(reason(&repo, &row, &replayed, &proc), None);
+
+        // A rebase leaves the pre-rebase commit in the tree's private HEAD
+        // reflog; its patch landed too.
+        git(&row.path, &["checkout", "--detach"]).unwrap();
+        row.branch.clear();
+        git(&row.path, &["reset", "--hard", &replayed]).unwrap();
+        row.head = replayed.clone();
+        assert_eq!(reason(&repo, &row, &replayed, &proc), None);
+
+        // Amended before landing: main's patch differs from the work's.
+        git(&row.path, &["reset", "--hard", &work]).unwrap();
+        row.head = work.clone();
+        git(&repo, &["reset", "--hard", "HEAD~1"]).unwrap();
+        fs::write(repo.join("file"), "work, amended").unwrap();
+        git(&repo, &["commit", "-am", "work"]).unwrap();
+        let amended = text(&repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            reason(&repo, &row, &amended, &proc).as_deref(),
+            Some("commits absent from origin/main")
+        );
+
+        // The work merges a side branch main also took as a new commit:
+        // every non-merge commit's patch is on main, but the merge's own
+        // resolution need not be.
+        git(&row.path, &["checkout", "--detach", &main]).unwrap();
+        fs::write(row.path.join("side"), "side").unwrap();
+        git(&row.path, &["add", "side"]).unwrap();
+        git(&row.path, &["commit", "-m", "side"]).unwrap();
+        let side = text(&row.path, &["rev-parse", "HEAD"]).unwrap();
+        git(&repo, &["reset", "--hard", &replayed]).unwrap();
+        git(&repo, &["cherry-pick", &side]).unwrap();
+        let both = text(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git(&row.path, &["checkout", "--detach", &work]).unwrap();
+        git(&row.path, &["merge", "--no-ff", "-m", "merge", &side]).unwrap();
+        row.head = text(&row.path, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            reason(&repo, &row, &both, &proc).as_deref(),
+            Some("commits absent from origin/main")
+        );
+    }
+
+    /// What main took differently from the work is not a landing of it: a
+    /// whitespace-only difference (git cherry ignores whitespace), another
+    /// message (the review record), an empty commit main has none like,
+    /// or a branch main took only one of two commits from. An empty commit
+    /// main took with its message is a landing.
+    #[test]
+    fn only_an_exact_patch_and_message_on_main_count_as_landed() {
+        let (_root, repo, mut row, proc, _main) = fixture();
+        let absent = Some("commits absent from origin/main");
+        // The work, then main's own commit of it with `with` in the file
+        // and `message`, on a fresh main from the fixture's base.
+        let land = |content: &str, message: &str| -> String {
+            git(&repo, &["reset", "--hard", "refs/remotes/origin/main"]).unwrap();
+            fs::write(repo.join("other"), "main").unwrap();
+            git(&repo, &["add", "other"]).unwrap();
+            git(&repo, &["commit", "-m", "elsewhere"]).unwrap();
+            fs::write(repo.join("file"), content).unwrap();
+            git(&repo, &["commit", "-am", message]).unwrap();
+            text(&repo, &["rev-parse", "HEAD"]).unwrap()
+        };
+        fs::write(row.path.join("file"), "x y").unwrap();
+        git(&row.path, &["commit", "-am", "work"]).unwrap();
+        row.head = text(&row.path, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(reason(&repo, &row, &land("x y", "work"), &proc), None);
+        assert_eq!(
+            reason(&repo, &row, &land("xy", "work"), &proc).as_deref(),
+            absent
+        );
+        assert_eq!(
+            reason(&repo, &row, &land("x y", "work, reworded"), &proc).as_deref(),
+            absent
+        );
+
+        // A second commit main did not take.
+        fs::write(row.path.join("file"), "x y z").unwrap();
+        git(&row.path, &["commit", "-am", "more"]).unwrap();
+        row.head = text(&row.path, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            reason(&repo, &row, &land("x y", "work"), &proc).as_deref(),
+            absent
+        );
+
+        // An empty commit: landed only where main has one with its message.
+        git(&row.path, &["reset", "--hard", "HEAD~1"]).unwrap();
+        git(&row.path, &["commit", "--allow-empty", "-m", "note"]).unwrap();
+        row.head = text(&row.path, &["rev-parse", "HEAD"]).unwrap();
+        let without = land("x y", "work");
+        assert_eq!(reason(&repo, &row, &without, &proc).as_deref(), absent);
+        git(&repo, &["commit", "--allow-empty", "-m", "other note"]).unwrap();
+        let other = text(&repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(reason(&repo, &row, &other, &proc).as_deref(), absent);
+        git(&repo, &["commit", "--allow-empty", "-m", "note"]).unwrap();
+        let with = text(&repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(reason(&repo, &row, &with, &proc), None);
+    }
+
+    /// A patch id ignores where a hunk applies: the same change made at
+    /// another place in a file, after main took it at the first, is not on
+    /// main, and neither is a landing main later reverted.
+    #[test]
+    fn a_change_moved_elsewhere_in_its_file_or_reverted_on_main_is_not_landed() {
+        let (_root, repo, mut row, proc, _main) = fixture();
+        // Identical context around each X, and no line a hunk header could
+        // name as its function, so the two changes' patch ids are equal.
+        let block = "1\n2\n3\nX\n4\n5\n6\n";
+        let file = |first: &str, second: &str| {
+            let filler = "0\n".repeat(12);
+            format!(
+                "{}{filler}{}",
+                block.replace('X', first),
+                block.replace('X', second)
+            )
+        };
+        let base = |dir: &Path| {
+            fs::write(dir.join("file"), file("X", "X")).unwrap();
+            git(dir, &["commit", "-am", "two blocks"]).unwrap();
+        };
+        base(&repo);
+        let start = text(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git(&row.path, &["checkout", "--detach", &start]).unwrap();
+        row.branch.clear();
+        fs::write(row.path.join("file"), file("Y", "X")).unwrap();
+        git(&row.path, &["commit", "-am", "fix the X"]).unwrap();
+        let first = text(&row.path, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(repo.join("other"), "main").unwrap();
+        git(&repo, &["add", "other"]).unwrap();
+        git(&repo, &["commit", "-m", "elsewhere"]).unwrap();
+        git(&repo, &["cherry-pick", &first]).unwrap();
+        let took = text(&repo, &["rev-parse", "HEAD"]).unwrap();
+        row.head = first.clone();
+        assert_eq!(reason(&repo, &row, &took, &proc), None);
+
+        // Amended to fix the second X instead; the private reflog still
+        // holds the first, but HEAD is what is not on main.
+        git(&row.path, &["reset", "--hard", &start]).unwrap();
+        fs::write(row.path.join("file"), file("X", "Y")).unwrap();
+        git(&row.path, &["commit", "-am", "fix the X"]).unwrap();
+        row.head = text(&row.path, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            reason(&repo, &row, &took, &proc).as_deref(),
+            Some("commits absent from origin/main")
+        );
+
+        // Main took the first and then reverted it.
+        git(&row.path, &["reset", "--hard", &first]).unwrap();
+        row.head = first;
+        git(&repo, &["revert", "--no-edit", "HEAD"]).unwrap();
+        let reverted = text(&repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            reason(&repo, &row, &reverted, &proc).as_deref(),
+            Some("commits absent from origin/main")
+        );
     }
 
     #[test]
@@ -608,7 +996,16 @@ mod tests {
         assert_eq!(reason(&repo, &row, &main, &proc), None);
         // Missing/uninspectable process surfaces refuse deletion.
         fs::remove_dir(pid.join("fd")).unwrap();
-        assert!(eligible(&repo, &row, &main, Duration::ZERO, SystemTime::now(), &proc).is_err());
+        assert!(eligible(
+            &repo,
+            &row,
+            &main,
+            Duration::ZERO,
+            SystemTime::now(),
+            &proc,
+            &Upstream::default()
+        )
+        .is_err());
     }
 
     #[test]

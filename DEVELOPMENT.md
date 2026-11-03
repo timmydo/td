@@ -680,16 +680,29 @@ td-builder worktree-gc --idle-days 7 --dry-run
 td-builder worktree-gc --idle-days 7
 ```
 
-The command fetches `origin/main` and checks exact HEAD ancestry: every
-commit reachable from HEAD must be on main. Patch-equivalent replay or
-squash landings are deliberately retained. Unlanded private HEAD reflog
-and worktree-ref commits retain the tree unless they also survive in the
-retained branch's global reflog; ordinary amendments remain recoverable
-there after removing the worktree. It keeps primary and invoking
-checkouts, main, rolling workstreams, locked worktrees, and any tree with
-uncommitted or untracked files or a Git operation in progress. Local and
-remote branch refs and their reflogs are retained. `--idle-days 0` disables
-the age check; `--dry-run` still fetches but removes no trees.
+The command fetches `origin/main` and checks that HEAD landed: every
+commit reachable from HEAD is on main, either as an ancestor or, for a
+branch the integrator rebased or cherry-picked, as a commit main lacks
+for which main has, since their merge base, a commit with the same
+verbatim patch id (whitespace included) and the same whole message, the
+review record, and whose own change main's tree already holds in place
+(merging the commit onto main from its parent leaves main's tree as it
+is), since a patch id ignores where a hunk applies. None of them may be
+a merge, since no patch id covers a merge's own resolution, and an empty
+commit lands only as an empty one with its message. A landing amended on
+the way, even only in whitespace, its message or the place of a change,
+or squashed, retains the tree, and so does one main later reverted or
+rewrote over the same lines, or one its author reworded before landing.
+Each diff's options are given on the command line where they could
+narrow it (relative paths, submodules, context). Unlanded
+private HEAD reflog and worktree-ref commits, by the same rule, retain
+the tree unless they also survive in the retained branch's global
+reflog; ordinary amendments remain recoverable there after removing the
+worktree. It keeps primary and invoking checkouts, main, rolling
+workstreams, locked worktrees, and any tree with uncommitted or
+untracked files or a Git operation in progress. Local and remote branch
+refs and their reflogs are retained. `--idle-days 0` disables the age
+check; `--dry-run` still fetches but removes no trees.
 Idle age is the newest
 mtime or ctime anywhere in the checkout (ignored build output included)
 or its private Git metadata. Reads alone do not restart the age, and
