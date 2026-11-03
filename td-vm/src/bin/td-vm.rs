@@ -2892,9 +2892,8 @@ mod tests {
         }
     }
 
-    // Host preflight opts into ignored tests; the target gate has no QEMU.
     #[test]
-    #[ignore]
+    #[ignore = "needs QEMU; only the host preflight runs ignored tests"]
     fn real_qemu_two_overlays_lifecycle_and_supervisor_loss_exclusion() {
         let scratch = Scratch::new();
         let manager = Manager::new(&scratch.0.join("state")).unwrap();

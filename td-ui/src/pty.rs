@@ -957,7 +957,7 @@ mod tests {
     /// The child half of the test above: it runs only when the parent asks for
     /// it, and reports what it sees on its own stdin.
     #[test]
-    #[ignore]
+    #[ignore = "run as a child process by the spawn and waiter tests"]
     fn pty_child_fixture() {
         if std::env::var_os(FIXTURE).is_none() {
             return;

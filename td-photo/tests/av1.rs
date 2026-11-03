@@ -653,7 +653,7 @@ fn the_encoder_refuses_rows_that_do_not_fit() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "explicit encoder timing over a 24-megapixel picture"]
 fn bench() {
     let (w, h) = (6000, 4000);
     let rgb = picture(w, h);
@@ -673,7 +673,7 @@ fn bench() {
 /// AVIF against the JPEG encoder export uses, td-jpeg's, over the camera thumbnail
 /// fixture, at matched qualities: bytes and luma PSNR.
 #[test]
-#[ignore]
+#[ignore = "explicit size and PSNR report against td-jpeg"]
 fn compare_with_jpeg() {
     let data = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
