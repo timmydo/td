@@ -404,6 +404,25 @@ normal absolute descendants of `/td/store`; rows containing parent traversal,
 symlink leaves, duplicate order keys, or conflicting hard-link identities are
 refused. Hard-linked aliases with identical identity metadata select the first
 sorted path as their canonical report spelling.
+The image build writes the index with `td-profiler index` over the whole
+deployment root, after every source-built closure and application table
+exists, and that walk is the deployment's companion coverage check. The
+selector and deployment initramfs cpios are not walked. Their ELFs are
+copies of store runtimes the root carries, except the selector-only
+td-kexec, which no walk checks. The walk excludes only the `glibc-x86-64`
+and `gcc-runtime` store items (§2) and the package and runtime roots the
+application registry's catalog policy marks foreign and none marks
+source. Symlinks are not followed, and a `lib/debug` tree holds
+companions: only a file named `*.debug` there is read, as a companion.
+Every other ELF executable or shared object (ET_EXEC or ET_DYN) is a
+runtime. Its companion is the `.debug` file at the mirrored path below its
+store item's `lib/debug`, or failing that the first companion, in path
+order, with the same build ID; a companion from another store
+item is recorded as `debug-store-item`. Among other refusals, an ELF that
+is not little-endian ELF64 x86-64, a runtime outside `/td/store`, one
+without a build ID or a build-ID-matched companion, or one whose
+companion's build ID disagrees fails the index, and with it the image
+build.
 During privileged startup the daemon stats those exact paths through the outer
 mount and builds a same-boot device/inode inventory. MMAP2 records request
 device, inode, and inode generation rather than their build-ID union. Only a

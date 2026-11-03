@@ -334,9 +334,11 @@ toolchain out, so its frames report as unresolved symbol coverage.
 
 The first `td-profiler/DESIGN.md` implementation increment enforces the
 producer side in compiler flags, per-output runtime/debug pair checks, size
-ceilings, and reproducibility oracles. The image-integration increment owns
-the whole-deployment coverage walk; until that increment is present, this
-paragraph is a target contract rather than a whole-image completeness claim.
+ceilings, and reproducibility oracles. The image-integration increment adds
+the whole-deployment coverage walk: the image build indexes each runtime ELF
+in the deployment root, apart from the glibc and gcc-runtime outputs and the
+marked foreign application roots it excludes, and fails on one without a
+build-ID-matched companion (`td-profiler/DESIGN.md` §4).
 
 # Principles
 
