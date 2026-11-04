@@ -33,8 +33,9 @@ const FILES: u32 = 1;
 const COMPLETION: u32 = 2;
 /// The argument a window starts the far side with.
 pub const HOST_ARGUMENT: &str = "--file-host";
-/// A file's bytes, with room for its path and the reply around them. A listing
-/// is smaller: 4096 entries and 1 MiB of names.
+/// A file's bytes, with room for its path, the other tabs' it reserves (at most
+/// 64 of 4 KiB) and the reply around them. A listing is smaller: 4096 entries and
+/// 1 MiB of names.
 const MAX_MESSAGE: usize = MAX_FILE_BYTES + (1 << 20);
 pub const OPTIONS: Options = Options {
     hello: Hello {
@@ -228,8 +229,14 @@ fn encode_job(keep: &BTreeSet<FileId>, operation: &Operation) -> Result<Vec<u8>>
             w.u8(JOB_RELOAD);
             w.u64(*file);
         }
-        Operation::Save { file, path, bytes } => {
+        Operation::Save {
+            file,
+            path,
+            bytes,
+            reserved,
+        } => {
             w.u8(JOB_SAVE);
+            put_paths(&mut w, reserved);
             match file {
                 None => w.u8(0),
                 Some(file) => {
@@ -277,6 +284,7 @@ fn decode_job(bytes: &[u8]) -> std::result::Result<Job, LinkError> {
         },
         JOB_RELOAD => Operation::Reload(r.u64()?),
         JOB_SAVE => {
+            let reserved = get_paths(&mut r)?;
             let file = match r.u8()? {
                 0 => None,
                 1 => Some(r.u64()?),
@@ -291,6 +299,7 @@ fn decode_job(bytes: &[u8]) -> std::result::Result<Job, LinkError> {
                 file,
                 path,
                 bytes: r.bytes(MAX_FILE_BYTES)?.to_vec(),
+                reserved,
             }
         }
         tag => return Err(LinkError::Protocol(format!("a job's tag {tag}"))),
@@ -803,7 +812,9 @@ impl FileClient<'_> {
                 }),
             Operation::Open(path) => self.open(path),
             Operation::Reload(id) => self.reload(id),
-            Operation::Save { file, path, bytes } => self.save(file, path, bytes),
+            Operation::Save {
+                file, path, bytes, ..
+            } => self.save(file, path, bytes),
             mut changing => {
                 let generation = self.ready()?;
                 self.guard(&changing)?;
@@ -949,14 +960,12 @@ impl FileClient<'_> {
             }
             Some(Some(known)) => known.host,
         };
-        if let Some(target) = &path {
-            let taken = self.known.iter().any(|(id, other)| {
-                Some(*id) != file && other.host.is_none() && &other.path == target
-            });
-            if taken {
-                return Err("Save As refused: another tab holds that path; nothing written".into());
-            }
-        }
+        // The host's guards name tabs it knows of; these it may not. A plain save
+        // goes where its own association is.
+        let reserved = (self.known.iter())
+            .filter(|(id, other)| path.is_some() && Some(**id) != file && other.host.is_none())
+            .map(|(_, other)| other.path.clone())
+            .collect();
         let effect = if path.is_some() {
             Effect::WroteNew
         } else {
@@ -967,6 +976,7 @@ impl FileClient<'_> {
             file: host,
             path,
             bytes,
+            reserved,
         };
         let done = self.exchange(generation, effect, &operation);
         let Operation::Save { bytes, .. } = operation else {
@@ -1540,6 +1550,75 @@ mod tests {
             .unwrap();
         poll(&mut files, &mut ui).unwrap_err();
         assert!(!sub.exists());
+    }
+
+    #[test]
+    fn a_save_as_spelled_another_way_cannot_take_the_path_of_a_tab_with_no_association() {
+        let dir = scratch();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, b"a\n").unwrap();
+        std::fs::write(&b, b"b\n").unwrap();
+        let (remote, ends, _silence, _connections) = remote();
+        let mut files = Session::start_remote(remote).unwrap();
+        let mut ui = Controller::default();
+        let writer = opened(&mut files, &mut ui, &a);
+        let stale = opened(&mut files, &mut ui, &b);
+        type_text(&mut ui, stale, "x");
+        // A directory cannot be opened as its file, so the host holds nothing
+        // there; with it gone, the path is free but for the tab.
+        drop_link(&ends, || {
+            std::fs::remove_file(&b).unwrap();
+            std::fs::create_dir(&b).unwrap();
+        });
+        conflict(&mut files, &mut ui, stale);
+        std::fs::remove_dir(&b).unwrap();
+        let revision = ui.editor().document(writer).unwrap().revision();
+        let spelled = dir.path().join("sub/../b");
+        files.save(&ui, writer, revision, Some(spelled)).unwrap();
+        let refused = poll(&mut files, &mut ui).unwrap_err();
+        assert!(refused.contains("another tab"), "{refused}");
+        assert!(!b.exists());
+        // Both go on as they were: the writer on its own file, the stale tab
+        // able to put its text where it belongs.
+        type_text(&mut ui, writer, "y");
+        save(&mut files, &mut ui, writer).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"ya\n");
+        let revision = ui.editor().document(stale).unwrap().revision();
+        files.save(&ui, stale, revision, Some(b.clone())).unwrap();
+        poll(&mut files, &mut ui).unwrap();
+        assert_eq!(std::fs::read(&b).unwrap(), b"xb\n");
+    }
+
+    #[test]
+    fn a_save_as_cannot_take_a_tabs_path_whose_parent_became_a_link() {
+        let dir = scratch();
+        let (a, d, real) = (
+            dir.path().join("a"),
+            dir.path().join("d"),
+            dir.path().join("real"),
+        );
+        std::fs::create_dir(&d).unwrap();
+        let b = d.join("b");
+        std::fs::write(&a, b"a\n").unwrap();
+        std::fs::write(&b, b"b\n").unwrap();
+        let (remote, ends, _silence, _connections) = remote();
+        let mut files = Session::start_remote(remote).unwrap();
+        let mut ui = Controller::default();
+        let writer = opened(&mut files, &mut ui, &a);
+        let stale = opened(&mut files, &mut ui, &b);
+        type_text(&mut ui, stale, "x");
+        drop_link(&ends, || {
+            std::fs::remove_dir_all(&d).unwrap();
+            std::fs::create_dir(&real).unwrap();
+            std::os::unix::fs::symlink(&real, &d).unwrap();
+        });
+        conflict(&mut files, &mut ui, stale);
+        let revision = ui.editor().document(writer).unwrap().revision();
+        files.save(&ui, writer, revision, Some(b.clone())).unwrap();
+        let refused = poll(&mut files, &mut ui).unwrap_err();
+        assert!(refused.contains("another tab"), "{refused}");
+        assert!(!real.join("b").exists());
     }
 
     #[test]
@@ -2255,6 +2334,7 @@ mod tests {
             file: Some(loaded.file),
             path: None,
             bytes: saved.clone(),
+            reserved: Vec::new(),
         };
         let keep = BTreeSet::from([loaded.file]);
         sender
@@ -2304,6 +2384,7 @@ mod tests {
             file: Some(9),
             path: Some("/a/\u{e9}".into()),
             bytes: vec![0, 255, 10],
+            reserved: vec!["/b".into()],
         };
         let mut bytes = encode_job(&keep, &save).unwrap();
         let job = decode_job(&bytes).unwrap();
@@ -2312,10 +2393,12 @@ mod tests {
             file,
             path,
             bytes: saved,
+            reserved,
         } = job.operation
         else {
             panic!("not a save");
         };
+        assert_eq!(reserved, [PathBuf::from("/b")]);
         assert_eq!(
             (file, path.unwrap(), saved),
             (Some(9), PathBuf::from("/a/\u{e9}"), vec![0, 255, 10])

@@ -968,6 +968,19 @@ impl Session {
             }
         }
         let directory = source.stamp.mode & 0o170000 == 0o040000;
+        // Only a directory carries what is under it, and the window moves every
+        // open path under what it renames. One recorded under anything else is
+        // a directory that has since become something else.
+        let below = |path: &Path| path != source.path && path.starts_with(&source.path);
+        if !directory
+            && (reserved.iter().any(|path| below(path))
+                || self.entries.values().any(|e| below(&e.location.path)))
+        {
+            return Err(Failure::new(
+                Kind::Conflict,
+                "an open tab's path leads through what is being renamed",
+            ));
+        }
         let mut paths = BTreeMap::new();
         for (&id, entry) in &self.entries {
             let path = &entry.location.path;
@@ -1514,6 +1527,11 @@ fn require_no_attributes(file: &File) -> Result<()> {
             format!("cannot inspect extended attributes: {e}"),
         )),
     }
+}
+
+/// Where `path` names, its parent resolved; none when it cannot yet be said.
+pub(crate) fn resolved(path: &Path) -> Option<PathBuf> {
+    Location::resolve(path).ok().map(|location| location.path)
 }
 
 fn verify_destination(
@@ -2474,6 +2492,36 @@ mod tests {
         assert_eq!(fs::read(dir.path("new")).unwrap(), b"edited\n");
         assert!(!old.exists());
         dir.no_temporaries();
+    }
+
+    #[test]
+    fn rename_refuses_what_is_no_longer_the_directory_above_an_open_path() {
+        let dir = Directory::new();
+        std::fs::create_dir(dir.path("held")).unwrap();
+        std::fs::create_dir(dir.path("kept")).unwrap();
+        dir.write("held/file", b"body");
+        let mut files = Session::default();
+        files.open(&dir.path("held/file")).unwrap();
+        std::fs::remove_dir_all(dir.path("held")).unwrap();
+        let held = dir.write("held", b"now a file");
+        let refused = files
+            .rename(RenameSource::inspect(&held).unwrap(), "moved".as_ref())
+            .err()
+            .unwrap();
+        assert_eq!(refused.kind, Kind::Conflict);
+        assert!(held.exists() && !dir.path("moved").exists());
+        // And by what another tab reserved, which the host does not hold.
+        let kept = dir.write("kept/file", b"body");
+        std::fs::remove_dir_all(dir.path("kept")).unwrap();
+        let kept_dir = dir.write("kept", b"now a file");
+        let reserved = [kept];
+        let source = RenameSource::inspect(&kept_dir).unwrap();
+        let refused = files
+            .rename_reserved(source, "moved".as_ref(), &reserved)
+            .err()
+            .unwrap();
+        assert_eq!(refused.kind, Kind::Conflict);
+        assert!(kept_dir.exists());
     }
 
     #[test]

@@ -700,11 +700,16 @@ another tab's file; Save As writes a new file; Open selects the existing tab wit
 replacing its text. Its host association stands where the host could make one, so
 deleting it, renaming onto it or saving another tab over a path it reserves is
 refused as for any open file. Where the host could not, the window's worker refuses
-the deletion or rename itself, and a Save As naming that path or a new directory at
-or above it, and has the host refuse a copy or rename onto it, by the job's reserved
-list. A Save As spelling the path another way reaches the host, which writes the
-file if nothing is there; the stale tab's Save still meets the conflict dialog, its
-Reload is refused as another tab's file, and its text is kept.
+the deletion or rename itself and a new directory at or above it, and has the host
+refuse another tab's Save As, copy or rename onto it, by the job's reserved list,
+however the name is spelled; a Save As is also refused where that path now leads.
+The tab's own Save As may write its path, as a local window's may, unless another
+tab's recorded path now leads there too. A rename of what is no longer the directory above an open path is
+refused, in every window, since it would move that path without its file. So no Save
+As, copy or rename gives two file tabs one recorded path. Two names may still come to
+lead to one file, through a link made on the far side: the tab whose name no longer
+leads where it was opened stays stale, and its Reload is refused if the file is
+another tab's.
 
 Comparing bytes rather than stamps means a file merely touched while disconnected
 carries on. Before publication the new host's own full comparison still runs, against

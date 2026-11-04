@@ -48,6 +48,9 @@ pub(crate) enum Operation {
         file: Option<FileId>,
         path: Option<PathBuf>,
         bytes: Vec<u8>,
+        /// Paths of file tabs the host holds nothing for; empty for a local
+        /// window, whose host holds every file tab.
+        reserved: Vec<PathBuf>,
     },
 }
 pub(crate) struct Job {
@@ -565,7 +568,12 @@ impl Session {
         let file = self.save_arguments(ui, tab, revision, &path)?;
         let (point, bytes) = ui.editor().save_snapshot(tab).map_err(|e| e.to_string())?;
         self.submit(
-            Operation::Save { file, path, bytes },
+            Operation::Save {
+                file,
+                path,
+                bytes,
+                reserved: Vec::new(),
+            },
             Pending::Save { tab, point },
         )
     }
@@ -1188,7 +1196,27 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
                 missing: files.missing(file).map_err(|e| e.to_string())?,
             }))
         }
-        Operation::Save { file, path, bytes } => {
+        Operation::Save {
+            file,
+            path,
+            bytes,
+            reserved,
+        } => {
+            // Compared resolved, so another spelling is the same path, and so
+            // is the tab's own whose parent has since become a link.
+            if let Some(path) = &path {
+                let taken = |to: &std::path::Path| {
+                    reserved.iter().any(|open| {
+                        open.starts_with(to)
+                            || crate::files::resolved(open).is_some_and(|at| at.starts_with(to))
+                    })
+                };
+                if crate::files::resolved(path).is_some_and(|to| taken(&to)) {
+                    return Err(
+                        "Save As refused: another tab holds that path; nothing written".into(),
+                    );
+                }
+            }
             let file = match (file, path) {
                 (Some(file), Some(path)) => {
                     files.save_as(file, &path, bytes).map_err(file_error)?;
