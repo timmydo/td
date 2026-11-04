@@ -15,39 +15,11 @@ starting point for successive agents; the root `AGENTS.md` and
 
 ## Status
 
-Increments 3 to 13 and 16 of §18 are built, with the small steps between
-10 and 11. First came td-ui's message list; the crate with its gate, the
-window and conversation processes, the store and the host launch; the
-model client over `td-fetch 1`, with the key file, the models list, cost
-limits, credit and titles; td-net's streamed fetch; streamed replies
-over it, drawn as they arrive and interrupted by `Escape`; and the
-conversation tools, the first a model is given: the todo list,
-`history_search` and `history_read`, `conversations` and `send_message`,
-with the wake budget and pausing. After them came the window's File and
-Conversation menus, the key dialog, the model picker and reasoning
-effort, the system context and the diagnostics export (§4, §6);
-increments 9 and 10, the tool host and the `workspace` jail, with
-directory and scratch workspaces; the peers step, which made every
-conversation a peer (§3), templates, the Messages window, and the row's
-menu that archives and deletes (§4, §7); increment 11, the repository
-store, admitted remotes, background fetch, sparse worktrees prepared
-asynchronously, and notifications (§7, §9, §12; its step snapshots
-with undo were later removed); increment 12, background processes
-(§12); increment 13, rules, cards, modes, the two-stage classifier
-with its calibrated threshold, the circuit breaker and the trust mark
-(§11); and increment 16,
-compaction, by hand and past `compact_at`, and the card that asks how to
-resume a conversation whose cache has gone cold (§14). Increment 14,
-the push and fetch tools, is built; increment 15, the network, is
-built; and unconfined Empty and Directory… workspaces, beside the
-increments (§8, Unconfined workspaces). Development commands now share
-host networking; `network` controls
-only `web_fetch` (§10, §11). Where building
-an increment settled a point the design left open, the section says so
-under "As built". The `td-agent` recipe builds it for the image (§17).
-The decisions below that
-were the user's to make were made on 2026-10-01, 2026-10-02,
-2026-10-04 and 2026-10-07:
+Everything below is built, but for what §18 lists and what a section
+says it leaves out. The `td-agent` recipe builds it for the image
+(§17). Development commands share host networking; `network` controls
+only `web_fetch` (§10, §11). The decisions below were the user's to
+make:
 
 - **Use:** both coding and general assistance, coding first.
 - **Run target:** an unjailed installed launch on a development host first
@@ -55,7 +27,7 @@ were the user's to make were made on 2026-10-01, 2026-10-02,
   the harness can be exercised against OpenRouter at once; on td, a
   program of td's account outside application confinement, as td-review
   is, started from the launcher's card, rather than a jailed application
-  (2026-10-07; §8, "On td").
+  (§8, "On td").
 - **Coordination:** no orchestrator. Every conversation is a peer with
   the same tools and prompt; the human creates each and can archive or
   delete any; and reading or messaging another conversation is a
@@ -65,18 +37,17 @@ were the user's to make were made on 2026-10-01, 2026-10-02,
   worktrees and asynchronous fetch (§7, §15). Creating a workspace is
   the human's act, never a model's. Agents can commit and push (§9).
 - **Processes:** one subprocess per conversation, under which, on a
-  host, every process that conversation causes runs (§2). The first
-  increments set no resource limits, and nothing in them may prevent
-  per-conversation memory and CPU limits from being added later and
-  inherited (§8).
+  host, every process that conversation causes runs (§2). No resource
+  limits are set yet, and nothing may prevent per-conversation memory
+  and CPU limits from being added later and inherited (§8).
 - **Tool execution:** a jail per workspace (§8), a network policy wider
   than none (§10), and the host directories listed as `shared` in
   configuration or in the conversation's template bound in, none by
   default (§8, §15).
 - **Conversation features:** background processes, a todo list, search
   and reads over a conversation's full log, compaction and
-  auto-compaction, and messages between conversations (§3, §12, §14);
-  scheduled messages are designed now and built later (§3).
+  auto-compaction, messages between conversations and scheduled messages
+  (§3, §12, §14).
 - **Development cost:** an edit confined to `td-agent/` selects td-agent's
   own tests and lints, the workspace pass, and its recipe's checks, as
   any packaged program's does (§17).
@@ -88,15 +59,14 @@ were the user's to make were made on 2026-10-01, 2026-10-02,
   is selectable and a whole message copyable (§4).
 
 The design draws on Claude Code, Codex CLI, opencode, Aider, SWE-agent and
-mini-swe-agent as surveyed on those dates. Vendor behaviour moves quickly,
+mini-swe-agent. Vendor behaviour moves quickly,
 and the design depends on none of it beyond the wire formats of §5.
 
 ## 1. Boundary and philosophy
 
 Product references: Claude Code and Codex CLI for the loop, tools and
 approval model; opencode for workspaces and child sessions (§16 records
-what td-agent takes from it, and that its per-step snapshots were taken
-and dropped); mini-swe-agent for
+what td-agent takes from it); mini-swe-agent for
 how little scaffolding a strong model needs; Aider and SWE-agent for the
 measured effect of edit formats and tool ergonomics. td-agent
 reimplements none of them and inherits none of their compatibility claims.
@@ -121,12 +91,11 @@ ships as `/bin/grep` and `/bin/sed`, run as a program rather than
 reimplemented (§12). It is zone-one source: not a foreign payload, not a
 plugin host, and not a client of any td-run server (principle 5).
 
-Out of scope for the first increments, each a later reviewed addition: an
-MCP client (planned, §12, MCP servers: servers are commands in the jail,
-never loaded into td-agent), web search, a provider dialect other than
+Out of scope, each a later reviewed addition: web search, a provider dialect other than
 OpenAI Chat Completions, pictures other than the PNG and JPEG the person
 pastes or an MCP tool returns (§6, Pictures: a reply's pictures are a
-later increment), and plugins.
+later addition), and plugins. MCP servers are commands in the jail,
+never loaded into td-agent (§12).
 
 ## 2. Processes and trust
 
@@ -708,9 +677,9 @@ jail instances.
 human's rules, `deny everywhere` included, and each repository's
 `.td-agent/rules` as the git worker read them (§11); each workspace's
 mode, kept in the human's rules file, and whether it has dropped to
-`ask` (as built, each conversation counts the circuit breaker's verdicts
-in its own log and asks the window to drop its workspace: §11, As built
-(increment 13, the circuit breaker)); admitted remotes and allowlists;
+`ask` (each conversation counts the circuit breaker's verdicts
+in its own log and asks the window to drop its workspace: §11,
+"The circuit breaker"); admitted remotes and allowlists;
 and every protected entry of the git chain, which it creates itself
 (§8). Conversation processes report verdicts to it and it pushes
 every change down the socketpairs as a numbered policy version; a
@@ -908,10 +877,10 @@ starting one says at once what it said if it could not start. Between a broker's
 deciding to end and its sockets going, one that dials it is closed unanswered: a
 window tries again, and a far `attach` ends, for the far window to dial it anew.
 
-**As built (increment 4).** Nothing runs in the background yet, so only
-the open conversation has a process; switching shuts the old socketpair
-and that process exits, or is killed if it has not within 2 s, since it
-would hold its conversation's lock against the next.
+**Locks and switching.** Switching away from a conversation between
+turns shuts its socketpair and its process exits, or is killed if it has
+not within 2 s, since it would hold its conversation's lock against the
+next.
 
 - **Locks** are std's `File::try_lock`, `flock(LOCK_EX | LOCK_NB)`, on
   `window.lock` at the top of the state directory and `lock` in each
@@ -952,7 +921,7 @@ would hold its conversation's lock against the next.
   after any newer draft and never over its selection; one the composer
   cannot take is written whole to standard error.
 
-**As built (increment 5).** A turn now takes as long as its model, so a
+**Background children.** A turn takes as long as its model, so a
 conversation switched away from mid-turn keeps its process: the window
 keeps every child it has started, tracking each one's turn from its
 `started` and `finished` records, and retires a background child once
@@ -975,7 +944,7 @@ and the model client's configuration (§5, §15). The key crosses the
 socketpair in that one frame and in no argument, environment variable
 or file.
 
-**As built (increment 7).** Two frames join the socketpair's. Down,
+**Streaming frames.** Two frames serve a streamed turn. Down,
 `interrupt` asks the open conversation's process to interrupt its turn;
 between turns it means nothing. Up, `delta` carries what a streamed
 reply brought since the last, its reasoning and its text, with its
@@ -985,7 +954,7 @@ ends (§5), and a window that adopts a conversation mid-stream draws
 only the deltas after it opened, until the logged reply replaces them.
 A background conversation's deltas are dropped.
 
-**As built (a message during a turn).** A `user` frame that comes while
+**A message during a turn.** A `user` frame that comes while
 a turn runs is taken into the turn at its next step, before that
 step's request (the first step's too, so one sent as a turn starts,
 however it started, joins it), so the person can steer work under way: refused, or
@@ -1004,7 +973,7 @@ then applies after the message's turn.
 `prompt/conversation.txt` tells the model the person may write while
 it works, and that such a message comes before its plan.
 
-**As built (increment 8).** The window routes messages between
+**Messages between conversations.** The window routes messages between
 conversations. Up, `send` carries a `send_message` the human allowed
 (an id of the sender's, the receiver's id and the text), and `query`
 asks for the states the window knows; down, `sent` answers a send,
@@ -1043,7 +1012,7 @@ any background one is, when its turn ends, or at once when the message
 started none; one told to resume is kept until it logs the resumption,
 which comes after the start of any turn the resumption begins.
 
-**As built (the File menu).** A `setup` may come again, and replaces the
+**The File menu.** A `setup` may come again, and replaces the
 first: a conversation process takes it between turns, as it takes any
 frame that comes while a turn runs but the person's own message (§2, a
 message during a turn), so the turn under way finishes with
@@ -1080,7 +1049,7 @@ workspace, and is gone when it reports.
 - `conversations`: every conversation's id, workspace, state (idle,
   running, waiting for approval, paused, failed, archived), background
   process count, cost and last activity, which td-agent itself writes,
-  most recently active first; with repository workspaces (increment 11),
+  most recently active first; with repository workspaces,
   each worktree's state as well. Model-written fields, the title, the
   todo item in progress (§12) and background command lines, and what
   comes from refs a jail wrote, a worktree's branch and its commits
@@ -1124,13 +1093,11 @@ conversation counts as a workspace of its own, a fork included. So:
   office checks every message again, whatever the sender checked: the
   receiver exists, it is not the sender, the size bounds, and at most
   16 undelivered;
-- increment 13 brings the rest of §11's design. An "always" answer
-  admits one operation in one direction for one pair: allowing A to
-  read B lets neither B read A nor A message B (§11, As built
-  (increment 13, crossings answered for good)). In `auto` mode the
-  classifier decides a crossing, its `discloses` question covering
-  content carried to a conversation that can publish where the source
-  cannot. Until then every crossing is the human's, in both modes.
+- an "always" answer admits one operation in one direction for one pair:
+  allowing A to read B lets neither B read A nor A message B (§11,
+  "Crossings answered for good"). In `auto` mode the classifier decides
+  a crossing, its `discloses` question covering content carried to a
+  conversation that can publish where the source cannot.
 
 **Trust.** No conversation holds authority another lacks. None can
 answer a card, create, archive or delete a conversation or workspace,
@@ -1149,7 +1116,7 @@ workspace's conversation and to the window, which shows it, and to no
 other conversation. A worktree that became ready or failed and a base
 branch that advanced after a store fetch (§7) are notifications logged
 in the workspace's conversation between turns, which its model reads
-(§7, As built (increment 11, notifications)); a turn that finished, failed or
+(§7, "Notifications"); a turn that finished, failed or
 is waiting for approval is the window's to show, on the conversation's
 row and as a notice when the conversation is not the one open. A
 worktree that became ready or failed wakes its idle conversation; a base
@@ -1176,10 +1143,9 @@ Sending to them would need a socket listening outside a jail, which §1
 leaves out; seeing them could be read-only file access to their logs,
 which is not designed here (§19).
 
-**Schedules (later).** A schedule delivers a message to a conversation at
+**Schedules.** A schedule delivers a message to a conversation at
 set times, so recurring work (a nightly dependency check, a weekly triage)
-starts while the human is away. It is designed here and built after the
-increments of §18:
+starts while the human is away:
 
 - a schedule is a five-field cron expression (minute, hour, day of
   month, month, day of week; numbers, `*`, lists, ranges and steps, no
@@ -1219,8 +1185,8 @@ increments of §18:
   A firing to a conversation the human has paused is skipped and logged
   the same way.
 
-**As built (schedules, the clock).** `schedule.rs` reads when a schedule
-fires and nothing else yet: a cron expression parsed field by field into
+**Schedules, the clock.** `schedule.rs` reads when a schedule
+fires and nothing else: a cron expression parsed field by field into
 the set of values each allows (a field beginning with `*` does not
 restrict, so `*/2` in a day field leaves the other to decide, as cron
 reads it; `N/S` steps from N to the field's end; 7 is folded into 0), or
@@ -1238,7 +1204,7 @@ found however far off (29 February on a Sunday, decades), and an
 expression no date satisfies, `0 0 31 2 *`, never fires. Nothing fires
 past 9999.
 
-**As built (schedules, the person's).** The person makes a schedule
+**Schedules, the person's.** The person makes a schedule
 from the open conversation's composer, for that conversation:
 `/schedule [catch-up] WHEN TEXT`, `WHEN` five cron fields or one local
 time; `/schedules` lists every schedule over the open conversation, its
@@ -1281,7 +1247,7 @@ schedule ID]`, and the classifier counts its text with the person's
 messages: it is their words, written earlier. `history_search` finds it
 as a `schedule`.
 
-**As built (schedules, the model's).** Every conversation has
+**Schedules, the model's.** Every conversation has
 `schedule {when, to, text, catch_up?}`, `schedules` and
 `cancel_schedule {id}`. `when` is one field, five cron fields or one
 local time, checked as the composer's is; `to` is required, the
@@ -1315,14 +1281,14 @@ the schedule, its maker and its text, which the person read whole and
 approved to be delivered at its times: both classifiers count the work
 it plainly asks for as the person's, and nothing more.
 
-**As built (increment 8).** Every conversation has `todo_write`,
+**Conversation tools.** Every conversation has `todo_write`,
 `history_search`, `history_read`, `conversations` and `send_message`, a
 workspace's tools after them (§12). The crossing rules are those above:
 a conversation reads its own log, and every read of another's and every
-message to another is a crossing, decided as "As built (peers)" says.
+message to another is a crossing, decided as "Peers" says.
 No conversation messages itself. A send to an id the store does not
 hold is refused by name, and one to an archived conversation is refused
-saying so (§7, As built (archiving)). `conversations`
+saying so (§7, "Archiving"). `conversations`
 lists at most 200, the most recently active first, with how many more
 there are.
 
@@ -1360,13 +1326,13 @@ there are.
   resumes a paused conversation, logging the resumption, and is
   answered as always.
 
-**As built (peers).** No conversation is created at startup: the window
+**Peers.** No conversation is created at startup: the window
 opens the most recently active conversation, or none when the store
 holds none, and the human starts one with `C-n` (§4). Every conversation
 has the same tools and the same system prompt (§13), a workspace's tools
-and paragraph aside. Crossings are cards in both modes: the conversation
-process asks the window, as it does for a change (§11, "As built
-(increment 10)"), waits, and runs the read or sends the message only
+and paragraph aside. A crossing the classifier does not decide is a card:
+the conversation process asks the window, as it does for a change (§11,
+"Cards"), waits, and runs the read or sends the message only
 when the human allowed it; a refusal, or a card withdrawn, is the call's
 answer. `report` is gone, and a model that calls it is answered as for
 any tool it was not given. An old orchestrator conversation, whose
@@ -1381,7 +1347,7 @@ never asked.
 `conversations` lists by last activity alone, to the millisecond and
 then by id as the window's list does, at most 200.
 `orchestrator_model` is retired: a configuration that sets it loads,
-with a note that the key is no longer read (§15). The wake budget is
+with a note that the key is not read (§15). The wake budget is
 renewed only by the human's message to that conversation.
 
 ## 4. Window and layout
@@ -1406,8 +1372,8 @@ its worktrees with their state (fetching, checking out, ready, failed),
 any forked conversations, its background processes and the sub-agents it
 started (§12). A row waiting for approval is marked distinctly, so a run
 left in the background is visible from the list, and the notifications
-of §3 are shown on their conversation's row. A row's context menu (the
-context menus step of §18) archives the conversation or deletes it
+of §3 are shown on their conversation's row. A row's context menu
+archives the conversation or deletes it
 (below); archiving hides it from the list, which shows archived
 conversations when the human asks, each with a context menu that
 unarchives it. A repository workspace's worktrees go with either as §7
@@ -1587,22 +1553,18 @@ jail instance is ever given that directory.
 The window is a process of its own; the broker and the conversation
 processes draw nothing (§2).
 
-**As built (increment 4).** Each conversation counts as a workspace of
-its own: the list is every conversation, most recently active first,
-with the state of the open one (`starting`, `idle`, `restarting` or
-`failed`; a closed one shows none), and `C-n` started a conversation
-with no workspace; it now opens the chooser of §7 (As built
-(templates)). `F6` and `S-F6` move the focus between the list, the transcript
-and the composer, and `Return` on a list row opens it. The transcript
-holds what td-ui's message list bounds it to (16 MiB of text); past that
-it drops its oldest messages an eighth at a time and says so, and the
-log keeps every one. The status row is the state, a notice when there is
-one, `no model`, the mode, `no limits` and `0 background`. The split's
-share is the file `layout` in the state directory. The driven control
-socket is opt-in, `--control-socket PATH`, and its actions are `new`,
-`previous`, `next`, `send`, `focus-next` and `focus-previous`.
+**The list and focus.** A row shows its conversation's state
+(`starting`, `idle`, `restarting` or `failed`; a closed one shows
+none), and `C-n` opens the chooser of §7 ("Templates"). `F6` and
+`S-F6` move the focus between the list, the transcript and the
+composer, and `Return` on a list row opens it. The transcript holds
+what td-ui's message list bounds it to (16 MiB of text); past that it
+drops its oldest messages an eighth at a time and says so, and the log
+keeps every one. The split's share is the file `layout` in the state
+directory. The driven control socket is opt-in, `--control-socket
+PATH`.
 
-**As built (the list's tree).** The list's top rows, groups, are Empty,
+**The list's tree.** The list's top rows, groups, are Empty,
 Directory… and each configured template in the order written, always
 shown; then, only while a conversation names one, each template no
 longer configured, `NAME (not configured)`, by name; then `No
@@ -1637,7 +1599,7 @@ selected opens the open conversation's menu, and a right press on a
 group opens none. `C-n` keeps the chooser for the keyboard, and
 `C-PageUp`/`C-PageDown` still go by activity, not by the tree.
 
-**As built (sub-agents in the list).** A sub-agent's row
+**Sub-agents in the list.** A sub-agent's row
 (`Item::SubAgent`, its conversation and its `Task` event's sequence
 number) reads `KIND: PROMPT`, the prompt's first line that is not blank
 cut to 200 characters (`store::MAX_TASK_PROMPT`), and says `running`
@@ -1676,7 +1638,7 @@ alone. A jump not yet made is dropped when another conversation opens.
 Its menus are the open conversation's, as a group's are; it is folded
 away with its conversation's processes.
 
-**As built (increment 5).** A row's state may also be `running`, while
+**Turns in the window.** A row's state may also be `running`, while
 a turn is under way. A reply shows as an `assistant` message: its
 reasoning in a collapsed section, its text, and its usage as the
 message's status (prompt tokens with cached and written, completion
@@ -1692,7 +1654,7 @@ conversations, each against its limit where one is set, the key's
 credit, the mode, `no limits` (the resource limits of §8) and `0
 background` (the background processes of §12).
 
-**As built (increment 7).** A streamed reply is drawn as it arrives: its
+**Streamed replies.** A streamed reply is drawn as it arrives: its
 first delta adds an `assistant` message with the status `streaming`, its
 reasoning a collapsed section before its text, and each later delta is
 appended to its section, the reasoning's through the list's `append`,
@@ -1716,7 +1678,7 @@ generating, or billing, when a stream closes, and that `C-r` asks again.
 A turn whose reply is logged and whose title is being asked for (§13)
 does not hear an interrupt: the title request is short and counted.
 
-**As built (increment 8).** The open conversation's todo list is drawn
+**The todo list.** The open conversation's todo list is drawn
 above the composer, over the chrome, collapsed to one line: how many
 items are done of how many, then the item in progress, or the first
 pending, with its mark (`[ ]` pending, `[>]` in progress, `[x]` done,
@@ -1761,7 +1723,7 @@ line while a turn runs, or `sending: ` while none does. The lines are
 the supervisor's `pending`, which the window reads after each poll, so
 a restart's resend keeps them.
 
-**As built (the File menu).** A menu bar, td-ui's `chrome::Bar`, takes
+**The File menu.** A menu bar, td-ui's `chrome::Bar`, takes
 the window's top row, and the split lies under it. Its headers, `File`,
 `Conversation` (below) and `Help`, in that order, open td-ui's shared
 menu controller (td-ui/DESIGN.md, "Shared menu controller") in adaptive
@@ -1781,10 +1743,10 @@ painted after the window's frame. File's items are:
   the window); they have no chord;
 - `Set OpenRouter key…`, which opens the key dialog below; it has no
   chord;
-- `Export diagnostics`, the diagnostics export (below, "As built (the
-  diagnostics export)"); it has no chord;
+- `Export diagnostics`, the diagnostics export (below,
+  "The diagnostics export"); it has no chord;
 - `Messages…`, shown with `C-S-m`, which does what `C-S-m` does: the
-  Messages window (below, "As built (the Messages window)");
+  Messages window (below, "The Messages window");
 - `Quit`, which closes the window as the compositor's close does, what is
   running going on (§2); it has no chord.
 
@@ -1793,9 +1755,9 @@ is `keys::ITEM`: it shows the key list below, as `F1` does, and shows
 `F1`. A shortcut File shows is a chord the window binds, which a test
 holds; Help's `F1` is td-ui's window's own chord, which the program
 never sees. Pausing and the todo list are the open conversation's, not a
-file's, and stay chords only. The driven actions gain `menu` (`F10`)
+file's, and stay chords only. The driven actions include `menu` (`F10`)
 and `set-key`, which has no chord and opens the dialog through the
-item's own path; the driven state gains `menu` (`open` or `closed`),
+item's own path; the driven state holds `menu` (`open` or `closed`),
 `dialog` (`none`, or the part the dialog's keyboard is on: `entry`,
 `cancel`, `save`, or `replace` while the confirmation below asks) and
 `entry`, the masked entry's length, never its text.
@@ -1851,53 +1813,51 @@ Without a key the status row says `no key: F10` after the state, until
 one is stored, when a note says where it was stored and that every
 conversation uses it from now on.
 
-**As built (the Messages window).** The status row keeps to items of a
-fixed width: the state, `C-r asks again` while a turn may be asked
-again, else `Escape stops` while a turn runs, `no key: F10`, a count of
-the notes not yet read (`2 new messages: C-S-m`), `workspace: C-S-w` for
-a repository workspace (§7, As built (increment 11, the workspace
-card)), the mode and the network policy (§10), the model and effort, the
-context, the cost, today and the credit, `no limits` and `0 background`.
-A row too narrow for them all keeps whole items and never cuts one
-(`status_fitted`): it lets go of the background count, `no limits`, the
-credit and today, from the last; leaves the provider off the model's
-name (`claude-opus-5.5` for `anthropic/claude-opus-5.5`); lets go of the
-cost and the context, then the hints to keys (the workspace card, the
-unread count, `Escape stops` or `C-r asks again`); leaves off the
-effort, then the mode's `classifier without Jev`; lets go of `no key:
-F10`, then the model, whole, then the network, then the mode, which say
-what runs unasked and so outlast it; and cuts the state with an ellipsis
-only when it alone does not fit. The control socket reports the whole
-line. A note, which the row used to show cut to fit (a refusal said by
-name, a step done, a background conversation's notice under its title),
-goes to a log of the last 500, each with the time it came and kept whole
-up to 16 KiB, a longer one cut and saying so. `C-S-m` or File →
-`Messages…` opens the Messages window, modal over the body as the picker
-is: a title row and td-ui's message list (td-ui/DESIGN.md, "Shared
-message list"), a note to a message headed by its time in UTC, oldest
-first and following the newest, its keys the transcript's (`C-c` copies
-the selection, `C-S-c` the focused note); `Escape` or `C-S-m` closes it.
-Opening it reads every note, and a note that comes while it is open
-joins it, read; a paste while it is open is dropped and said. A held
-`Escape` or `C-S-m` closes nothing; only a press does. It does not open
-over another modal, and the key dialog replaces it. It always opens, so
-what it holds is never out of reach: where its list has no room it says
-so under its title and lays the list out once a resize gives it room,
-and a window too small for the split still draws it. A note the list
-refuses past its bounds takes the oldest shown with it, as the
-transcript's do, and the list keeps no more notes than the log. The
-workspace a conversation works in is given by its group; the workspace
-card and deletion question name directories whole. The list's default
-share is a third of the body, and its one column expands and contracts
-with that pane, reserving only the scrollbar gutter. The driven action
-is `messages`, and the state gains `notes` (`open` or `closed`),
-`unread` and `note`, the newest note whole on one line.
+**The Messages window.** The status row keeps to items of a fixed width:
+the state, `C-r asks again` while a turn may be asked again, else
+`Escape stops` while a turn runs, `no key: F10`, a count of the notes
+not yet read (`2 new messages: C-S-m`), `workspace: C-S-w` for a
+repository workspace (§7, "The workspace card"), the mode and the
+network policy (§10), the model and effort, the context, the cost, today
+and the credit, `no limits` and `0 background`. A row too narrow for
+them all keeps whole items and never cuts one (`status_fitted`): it lets
+go of the background count, `no limits`, the credit and today, from the
+last; leaves the provider off the model's name (`claude-opus-5.5` for
+`anthropic/claude-opus-5.5`); lets go of the cost and the context, then
+the hints to keys (the workspace card, the unread count, `Escape stops`
+or `C-r asks again`); leaves off the effort, then the mode's `classifier
+without Jev`; lets go of `no key: F10`, then the model, whole, then the
+network, then the mode, which say what runs unasked and so outlast it;
+and cuts the state with an ellipsis only when it alone does not fit. The
+control socket reports the whole line. A note (a refusal said by name, a
+step done, a background conversation's notice under its title) goes to a
+log of the last 500, each with the time it came and kept whole up to 16
+KiB, a longer one cut and saying so. `C-S-m` or File → `Messages…` opens
+the Messages window, modal over the body as the picker is: a title row
+and td-ui's message list (td-ui/DESIGN.md, "Shared message list"), a
+note to a message headed by its time in UTC, oldest first and following
+the newest, its keys the transcript's (`C-c` copies the selection,
+`C-S-c` the focused note); `Escape` or `C-S-m` closes it. Opening it
+reads every note, and a note that comes while it is open joins it, read;
+a paste while it is open is dropped and said. A held `Escape` or `C-S-m`
+closes nothing; only a press does. It does not open over another modal,
+and the key dialog replaces it. It always opens, so what it holds is
+never out of reach: where its list has no room it says so under its
+title and lays the list out once a resize gives it room, and a window
+too small for the split still draws it. A note the list refuses past its
+bounds takes the oldest shown with it, as the transcript's do, and the
+list keeps no more notes than the log. The workspace a conversation
+works in is given by its group; the workspace card and deletion question
+name directories whole. The list's default share is a third of the body,
+and its one column expands and contracts with that pane, reserving only
+the scrollbar gutter. The driven action is `messages`, and the state holds `notes` (`open` or `closed`), `unread` and `note`, the newest note
+whole on one line.
 
-**As built (row menus).** A right press on a conversation's row (td-ui's
+**Row menus.** A right press on a conversation's row (td-ui's
 `Context`, td-ui/DESIGN.md, "Widget window") opens its row menu at the
 pointer: `Archive`, or `Unarchive` for an archived conversation, then
 `Diagnostics`, a submenu whose `Export this conversation` writes that
-conversation's diagnostics archive (As built (the diagnostics export),
+conversation's diagnostics archive ("The diagnostics export",
 below), then `Delete…`, which puts the deletion question of that row's
 conversation, open or not. `S-F10` opens a row's menu under its row, at
 the list's corner when the row is out of view: with the list focused,
@@ -1915,13 +1875,13 @@ opens. An archived conversation (§7) leaves the list until Conversation
 their state `archived`; opening one is refused with a note naming
 Unarchive, `C-PageUp` and `C-PageDown` pass over it, and the window
 starts with the most recently active conversation not archived. The
-driven actions are `row-menu` and `show-archived`, and the state gains
+driven actions are `row-menu` and `show-archived`, and the state holds
 `archived` (how many there are), `shown` (`all` or `unarchived`) and
 `row-menu` (the conversation the open row menu is of, else `none`).
 `show-activity` is Show tool activity's, and the state's last value is
 `activity` (`shown` or `folded`).
 
-**As built (the key list).** `F1` shows td-ui's key list over the
+**The key list.** `F1` shows td-ui's key list over the
 window (td-ui/DESIGN.md, "Key list"). Its first section is every chord
 of the driven action table, `control::BINDINGS`, with its help line, so
 the list and the table an agent reads are one source; `set-key`,
@@ -1945,7 +1905,7 @@ before the input and reports it after, and `Session` answers
 `Return`, or its presses, choose the item and show nothing, and the
 choice they leave is cleared before the window's next input.
 
-**As built (the Conversation menu).** Each conversation has its own
+**The Conversation menu.** Each conversation has its own
 model and reasoning effort. The configuration's `model` and
 `reasoning_effort` (§15) are what every conversation starts with and
 keeps until the human chooses otherwise, and a choice is the open
@@ -2031,15 +1991,15 @@ window too (below).
   effort (`anthropic/claude-sonnet-5.5 medium`), or `no reasoning` for
   a model that does not take one, and its context length is looked up
   for whichever model that is.
-- **Driven.** The actions gain `model`, which has no chord and opens
-  the picker through the item's own path; the state gains `picker` (the
+- **Driven.** The actions include `model`, which has no chord and opens
+  the picker through the item's own path; the state holds `picker` (the
   selected model, `nothing`, or `none` when closed), `query` (the
   filter), `model` and `effort`; and `default-model`, which opens the
   default's picker, `picking` (`default`, `conversation`, `template`
   for the template chooser of §7, or `none`) and `default`, the default
   model.
 
-**As built (the system context).** The transcript shows what every
+**The system context.** The transcript shows what every
 request begins with. Its first message, headed `system`, is the
 conversation's prefix (§6, §13) read back: a section `system prompt`
 holding the system message's text, and a section `tools (N)` listing
@@ -2065,10 +2025,10 @@ message goes before any other, and opening the conversation again
 shows it again. A prefix of more messages than a message holds
 sections shows the first fourteen and says how many more there are.
 
-**As built (deleting a conversation).** Conversation → `Delete
+**Deleting a conversation.** Conversation → `Delete
 conversation…` deletes the open conversation for good, whichever it is;
 it is off only with none open. A row's menu asks it of that row's
-conversation, open or not (As built (row menus), below).
+conversation, open or not ("Row menus", below).
 
 - **The question** is td-ui's confirmation dialog (td-ui/DESIGN.md),
   modal and centred over the window's body: it names the conversation
@@ -2095,12 +2055,12 @@ conversation, open or not (As built (row menus), below).
   the outbox keeps the others'. Once renamed it is deleted; files a
   removal left are removed at the broker's next start, and messages the
   outbox could not remove at its next load.
-- **Driven.** The actions gain `delete-conversation`, which has no chord
-  and asks through the item's own path; the state gains `confirm`
+- **Driven.** The actions include `delete-conversation`, which has no chord
+  and asks through the item's own path; the state holds `confirm`
   (`none`, or where the question's keyboard is: `details`, `cancel` or
   `delete`).
 
-**As built (the diagnostics export).** File → `Export diagnostics`
+**The diagnostics export.** File → `Export diagnostics`
 writes one archive a human can attach to a report: everything td-agent
 keeps that bears on what it did, and never the key file.
 
@@ -2164,10 +2124,10 @@ keeps that bears on what it did, and never the key file.
 - **The window** runs the export on a thread of its own, says
   `exporting diagnostics…` and, when it ends, where the archive is,
   how many files it took and left out, and to read it before sharing.
-  One runs at a time. The driven actions gain `export-diagnostics`,
+  One runs at a time. The driven actions include `export-diagnostics`,
   which has no chord.
 - **One conversation's.** A row menu's Diagnostics → `Export this
-  conversation` (As built (row menus)) writes the same archive scoped to
+  conversation` ("Row menus") writes the same archive scoped to
   that conversation, open or not: of the state directory it takes only
   `conversations/<id>/` and `outbox/<id>/` (the messages queued for it;
   its own unsent ones are in their receivers' and in its log), each when
@@ -2333,7 +2293,7 @@ require usable endpoint metadata even without a per-turn limit. What it spends i
 is said on standard error, and the provider's own key limit is the
 bound across reviews. A `/review` differs: the
 conversation that ran it reserves its cap with the window and charges
-what its retained trace accounts (§15, As built (`/review`)).
+what its retained trace accounts (§15, "`/review`").
 
 Repository reviews always require a listed, priced model supporting tools
 and `max_tokens`. `--max-cost USD` caps the whole invocation, defaulting to
@@ -2361,12 +2321,10 @@ provider's message. With streaming, an `error` object can arrive inside a
 
 **Transport and streaming.** `td-fetch 1` answers a request with one
 buffered body by default, under a body cap and a five-minute deadline over
-the whole exchange. The first model-client increment uses that with
-`stream: false`: correct, but silent until each response completes, and a
-response that runs past five minutes fails. Streaming is its own work,
-in two increments (§18):
+the whole exchange, which a request that does not stream uses. A turn
+streams, in two layers:
 
-1. **td-net (landed):** the fetch service's streamed response mode. The
+1. **td-net:** the fetch service's streamed response mode. The
    request head carries `stream`, and the reply after its head is a
    sequence of `chunk N` frames ending in `end` or `error kind: reason`,
    read through the client module's `post_stream`. The five minutes are
@@ -2380,11 +2338,12 @@ in two increments (§18):
 Interrupting closes the fetch connection. Not every provider stops
 generating, or billing, when the stream closes; the interrupt says so.
 
-**As built (increment 5).** The conversation process makes each request
-with `td_fetch::post`, `stream` absent, the reply capped at 512 KiB so
+**Requests.** A request that does not stream is made with
+`td_fetch::post`, `stream` absent, the reply capped at 512 KiB so
 it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
 
-- **The body** is `{HEAD,"messages":[PREFIX…,MESSAGES…]}`. `HEAD` is the
+- **The body** is `HEAD`, the prefix and the messages, in the shape
+  "Tools in requests" gives. `HEAD` is the
   exact text of the other members, logged with the request: `model`,
   `max_tokens`, `reasoning: {effort}`, `tool_choice: "none"` in a
   turn's last request at a limit (§5), `provider: {require_parameters:
@@ -2392,9 +2351,7 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
   prefix's messages come from §6's prefix. `MESSAGES` are the user
   messages and turn replies logged before the request, a reply as
   `{"role":"assistant","content":…,"reasoning_details":…}` with the
-  stored bytes spliced in. With no tools there is no `tools` yet, and
-  the refusal of a model
-  lacking `tools` waits for the first tools (§18 increment 8).
+  stored bytes spliced in.
   `reasoning` is left out for a model whose cached `supported_parameters`
   lacks it, since `require_parameters` would otherwise route it nowhere.
 - **`max_tokens`** is 16,384, or the model's `max_completion_tokens` if
@@ -2482,7 +2439,7 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
   `limit_remaining` (a negative remainder as zero), or what the key has
   used when it has no limit.
 
-**As built (increment 7).** A turn's request streams. Its head gains
+**Streaming.** A turn's request streams. Its head has
 `"stream":true` after `max_tokens`, so the logged head still rebuilds
 the exact body; it is sent with `td_fetch::post_stream`, the frames'
 sum bounded at 32 MiB, since every delta is a JSON object of its own,
@@ -2520,7 +2477,7 @@ now the td-fetch-client crate.
   other fragment, an encrypted block always, is an entry of its own.
   Tool-call fragments are assembled by `index`, `id`,
   `type` and the function's `name` from the first fragment that carries
-  each and `arguments` appended, kept for the first tools (increment 8);
+  each and `arguments` appended;
   `finish_reason` and `usage` are the last given. Text, reasoning and
   reasoning details are held to 512 KiB as the log line carries them,
   JSON escaping counted (twice for the details, stored as a string),
@@ -2569,16 +2526,16 @@ now the td-fetch-client crate.
   never resent. Nothing of a stream is logged before it ends, so a
   process killed mid-stream leaves only that interruption.
 
-**As built (increment 8).** Every request carries the conversation's
-tools. They live in the prefix (§6, §13), which is now a JSON object
+**Tools in requests.** Every request carries the conversation's
+tools. They live in the prefix (§6, §13), which is a JSON object
 `{"tools":[…],"messages":[{system}]}`,
 `messages` its last member, so a body is `{HEAD,` then the object's
 members with its `messages` array left open, the log's messages, and
-`]}`. A prefix written as increment 7 wrote it, an array of messages,
+`]}`. A prefix in the older form, an array of messages,
 still rebuilds its requests byte for byte, and such a conversation gets
 the object as a `prefix` event before its next request, as does one
 whose prefix still carries the `tool_choice` and `parallel_tool_calls`
-this increment first sent. A model whose cached
+an older td-agent sent. A model whose cached
 `supported_parameters` lacks `tools` or `max_tokens` is refused before
 any request, naming the setting that chose it.
 
@@ -2844,11 +2801,9 @@ Messages between conversations carry delivery ids, the broker
 keeps undelivered ones in the state directory, and a receiver logs each
 id once, so a restart neither loses nor repeats a delivery.
 
-**As built (increment 4).** `meta` is a JSON object at version 1 whose
-workspace, model, mode and parent are null until the increments that set
-them. `prefix` is empty, since there is no request yet. The log holds a
-user message with its delivery id, a `turn` effect started and finished
-(`no model`), an interruption, and a notice. A user message and its
+**Meta and the log.** `meta` is a JSON object at version 1. The log holds
+a user message with its delivery id, a `turn` effect started and
+finished, an interruption, a notice, and the events below. A user message and its
 started record are synced together (one taken into a running turn at
 a step, §2, has no started record of its own), and the finished record
 when the turn ends. On load, a torn final line is truncated away and a notice
@@ -2862,12 +2817,11 @@ accepted only while the log has room for it at its longest and 64 KiB
 more for the records that follow it, and refused by name past that.
 Files are opened without following a final symbolic link, and
 directories are created mode 0700. The human's unacknowledged messages
-are kept in the broker's memory (§2), not the state directory:
-there is not yet a message between conversations to keep there. A broker
+are kept in the broker's memory (§2), not the state directory. A broker
 holding one does not end of its own accord; one killed with one held
 writes it whole to `serve.log`, if it lives to.
 
-**As built (increment 5).**
+**The key file and the prefix.**
 
 - **The key file** is read once, by the broker at start (and
   again, through the same checks, only by the diagnostics export of §4,
@@ -2886,10 +2840,9 @@ writes it whole to `serve.log`, if it lives to.
   missing file is not an error at start: every turn ends saying where to
   write the key. The key reaches no log, transcript, argument list,
   environment or standard error; its `Debug` form is redacted.
-- **The prefix** is a JSON array of the system message, written at
-  creation from `td-agent/prompt/`. A conversation whose prefix differs
-  from the one this program writes (an empty prefix from increment 4,
-  say) gets a `prefix` event holding the new one before its next
+- **The prefix** is written at creation from `td-agent/prompt/`, in the
+  form §5 gives. A conversation whose prefix differs from the one this
+  program writes gets a `prefix` event holding the new one before its next
   request, and requests name the prefix they used.
 - **New events.** A `request` (its turn, its purpose, `turn`, `title`,
   `classify`, `compact`, a sub-agent's `task` (§12) or a `/review`'s
@@ -2905,7 +2858,7 @@ writes it whole to `serve.log`, if it lives to.
   finished is interrupted, never resent, and its reservation counts as
   spent in the conversation's total.
 
-**As built (increment 7).** An `assistant` event may carry
+**Incomplete replies.** An `assistant` event may carry
 `incomplete: true`, absent when false, for what a stream that broke,
 failed or was interrupted had brought (§5). It is shown and kept in the
 log, and left out of every later request, so requests remain a pure
@@ -2913,8 +2866,8 @@ function of `prefix` and `log`. Only whole replies count toward the
 conversation's first reply, after which a title is asked for, and only
 a whole reply is quoted in the title request.
 
-**As built (increment 8).** `meta` gains `paused`, absent in older
-ones and read as false. New events:
+**Pausing and events.** `meta` holds `paused`, absent in older
+ones and read as false. Events:
 
 - `message`: a message from another conversation, with its delivery id,
   sender, sender's role (data only, §3), text, the status of a report an
@@ -2934,7 +2887,7 @@ ones and read as false. New events:
   failure, with its standard error's tail.
 - `approval`: the decision on a call, or on an MCP server's connection,
   naming its `mcp` start (§12), by whom (`human`; `td-agent` when
-  a card was withdrawn; from increment 13, `rule` when a rule refused or
+  a card was withdrawn; `rule` when a rule refused or
   allowed it, `mode` when `auto` mode ran it, and `classifier` when the
   classifier allowed it or, outcome `ask`, gave it to the human), and
   Jev's
@@ -2950,14 +2903,14 @@ interrupted; one never started is answered as not run. Neither runs
 again. A message logged without its turn's start, and not held, is
 given one, as a user message is.
 
-**As built (the Conversation menu).** `meta`'s `model` holds the model
+**The Conversation menu.** `meta`'s `model` holds the model
 the human chose for the conversation, and a new member `effort` the
 effort, each null for the configuration's and in older ones. A new
 event, `choice`, holds both, whole, each null for the configuration's;
 the last one is the record, and `meta` is put right from it on load
 (§4).
 
-**As built (the File menu).** The key file can also be written, by the
+**The File menu.** The key file can also be written, by the
 broker, from the key dialog of §4. Nothing else writes it.
 
 - **What is taken.** The entry holds at most 256 bytes. The text is a
@@ -3065,8 +3018,8 @@ creates nothing.
   built-ins never do.
 
 Choosing is the decision: no card follows it but a remote's admission
-(below). A template's repositories are prepared by increment 11's git
-worker (below; As built (increment 11, preparation)). The conversation
+(below). A template's repositories are prepared by the git worker
+(below; "Preparation"). The conversation
 starts on the human's first message,
 which can be sent at once. Two workspaces made from one template work
 on branches of the same name, each in a repository of its own (below),
@@ -3122,8 +3075,7 @@ and listed as none, or, when it cannot be moved, none is saved until it
 is mended; a template in the file named as a configured one is said, not
 listed, and kept.
 
-**As built (templates made in the window, storage).** The first step is
-the file and the chooser's list: `config::checked_repo` checks one
+**Templates made in the window, storage.** `config::checked_repo` checks one
 repository as above, the remote recorded as `Remote::url` gives it and
 the sparse paths through `repo::cone`; `config::templates_json` and
 `templates_from_json` write and read the file, the latter refusing a key
@@ -3138,7 +3090,7 @@ configuration's (`merged_templates`), each with its own shared
 directories admitted, or the top-level ones (a `template_shared` entry
 of `None`) when it names none.
 
-**As built (templates made in the window, the dialog).**
+**Templates made in the window, the dialog.**
 `templatedialog::TemplateDialog` is composed as the key dialog is, from
 td-ui's `entry_model` entries painted by `chrome::TextEntry`, each under
 its label, `chrome::Buttons` and td-ui's confirmation, centred and at
@@ -3188,23 +3140,16 @@ says there are none; the window hands the app the templates whole, so
 choosing one opens the dialog at once, before a card waiting behind the
 finder. Directory… over a repository asks the window first: when a card
 has opened meanwhile, the note names the repository and File → New
-template… instead. The driven actions gain `new-template` and
-`edit-template`, which have no chord, and the state gains `template`:
+template… instead. The driven actions include `new-template` and
+`edit-template`, which have no chord, and the state holds `template`:
 `none`, or the part the dialog's keyboard is on (`name`, `remote`,
 `base`, `branch`, `sparse`, `network`, `shared`, `system`, `cancel`,
 `remove`, `save`, or
-`confirm`); a dialog given input through them saves nothing (§10, As
-built (the policy)), so through the seam they open, cancel and remove.
+`confirm`); a dialog given input through them saves nothing (§10,
+"The policy"), so through the seam they open, cancel and remove.
 
-The templates step builds the chooser, `[[template]]` and the two
-built-ins, which replace File's two workspace items (As built
-(increment 10, workspaces), below); increment 11 builds what a
-template's `repos` asks for: the store, the git worker, workspace
-repositories and their worktrees, everything from Layout to Keeping
-current below, and the workspace card.
-
-**As built (templates).** `C-n` and File → `New conversation…`, now
-File's one New item, open the model picker's finder over Empty (its
+**Templates.** `C-n` and File → `New conversation…`, File's one New
+item, open the model picker's finder over Empty (its
 meta `scratch`), Directory… (`folder`) and each configured template in
 the order written (`scratch`, or `repositories` for one naming any),
 Empty selected, then `Empty, unconfined` and `Directory…, unconfined`
@@ -3231,10 +3176,8 @@ workspace `template NAME`, and the question before a deletion says,
 by the workspace's kind and not its name, that a template's scratch
 directory goes with the conversation.
 The list's groups start the same conversations with no finder
-(§4, As built (the list's tree)). A template naming repositories was
-listed then, the finder's note saying it was refused until increment
-11, and choosing it made nothing;
-increment 11 prepares it (As built (increment 11, preparation)). Choosing Directory… goes straight to the folder chooser: a card
+(§4, "The list's tree"). A template naming repositories is prepared as
+"Preparation" says. Choosing Directory… goes straight to the folder chooser: a card
 that waited behind the template chooser waits behind it too, and while the
 broker has yet to say what to list, the status row saying so. A key meanwhile
 acts on nothing behind it (Return there would send the draft) but Escape, which
@@ -3251,7 +3194,7 @@ recommends against opening the tree in tools that execute on open
 (§8). It decides nothing about the creation, which the human's choice
 of template already made.
 
-**As built (increment 11, the workspace card).** While the open
+**The workspace card.** While the open
 conversation has a repository workspace, the status row says `workspace:
 C-S-w` after its notes, and `C-S-w` or Conversation → `Workspace card…`
 (shown with `C-S-w`, off otherwise) opens its card, modal over the body
@@ -3281,9 +3224,9 @@ open is counted, not added to it. The control seam's state ends with
 `card`, `open` or `closed`, and its `workspace` action is `C-S-w`. Each
 entry also says what its repository's `.td-agent/rules` add at the
 commit, listed as the matcher reads them, or that there are none, or why
-they were not read (§11, As built (increment 13, a repository's rules)).
+they were not read (§11, "A repository's rules").
 Its last entry, once a worktree's instructions were found, is the trust
-mark (§11, As built (increment 13, the trust mark)): whether the
+mark (§11, "The trust mark"): whether the
 classifier is given the instructions shown, and `C-S-y`, which trusts
 them as shown or takes the trust back, from the person's keyboard only.
 
@@ -3375,11 +3318,11 @@ said, once while it stands, and nothing is fetched or pushed. A
 repository the human works in, `~/src/td` with its `.git`, may be one,
 its hooks then being theirs.
 
-**As built (increment 11, admission).** Choosing a template asks, on
+**Admission.** Choosing a template asks, on
 one modal card titled `Admit remotes`, about every remote it names that
 neither `remotes` in configuration nor an earlier card admits, each
 once as td-agent records it, and only once every other check of the
-template has passed (As built (increment 11, preparation)), so no
+template has passed ("Preparation"), so no
 admission outlasts a template refused for something else; a remote of
 another transport is refused that way, never asked about. The card
 names the template, how many remotes it asks about when more than one
@@ -3401,11 +3344,11 @@ would not have written, more than 256 lines) is moved aside, to
 card can admit again. An admission is the human's alone: nothing a
 conversation sends admits a remote, and a conversation's ask for a
 store is answered only for a remote and bases its own workspace record
-names, and only while an admission covers the remote (As built
-(increment 11, preparation)). Removing a line from the file, or from
+names, and only while an admission covers the remote
+("Preparation"). Removing a line from the file, or from
 the configuration, ends that admission at the broker's next start (§2).
 
-**Asynchronous from the first increment.** Creating a conversation from
+**Asynchronous.** Creating a conversation from
 a repository template returns at once. Each worktree then moves through
 `fetching` (clone or fetch of the store), `checking-out` (workspace
 repository, worktree, sparse checkout, done in a maintenance instance,
@@ -3422,7 +3365,7 @@ window shows too (§3, Notifications). A jail instance binds a worktree
 only once it is ready; the long-lived file-tool instance is replaced
 whenever the set of ready worktrees changes.
 
-**As built (increment 11, a call told a worktree's state).** Before
+**A call told a worktree's state.** Before
 any card is asked, a workspace tool's call is refused when an
 absolute path it names, or the working directory it runs in when it
 names none (`shell` without `workdir`, `glob` and `grep` without
@@ -3450,7 +3393,7 @@ any network in its jail, and notifies each workspace conversation whose
 base advanced, which the window shows too. Rebasing is the
 conversation's own work.
 
-**As built (increment 11, background fetch).** At its start and every
+**Background fetch.** At its start and every
 `fetch_interval` after, the window asks its store thread to fetch, in
 the background, each remote a repository workspace names whose
 conversation is neither archived nor gone with its archive, while the
@@ -3469,10 +3412,10 @@ in a note, `upstream moved: <base> of <remote> is at <commit>`. That
 is a cache of what the store said, blind to what moved while td-agent
 was not running, so it decides nothing for a workspace: a workspace's
 remote-tracking refs follow by comparing the store's commit with its
-conversation's own record (As built (increment 11, remote-tracking
-refs)).
+conversation's own record
+("Remote-tracking refs").
 
-**As built (increment 11, remote-tracking refs).** Once its worktrees
+**Remote-tracking refs.** Once its worktrees
 are checked out, a conversation's process sets each base's
 remote-tracking ref, `refs/remotes/origin/<base>` in the workspace
 repository, to the commit the worktree started at, in a maintenance
@@ -3495,7 +3438,7 @@ recorded, between turns (one told during a turn waits for its end),
 the process sets the ref there, whatever the jail left in it, records
 it, and logs a notice, `upstream's <base> moved from <commit> to
 <commit> in <remote>: each worktree's refs/remotes/origin/<base> names
-it now`, a notification (As built (increment 11, notifications)),
+it now`, a notification ("Notifications"),
 which the window shows; a base it had no record of, from a
 meta written before, is set and recorded silently. Every ref is set in
 one transaction, or none is, so the record is never half right. A
@@ -3508,7 +3451,7 @@ mend, not the model's news. Nothing wakes the conversation: the model
 reads the move at its next turn, as §3 has it. Rebasing stays the
 conversation's own work.
 
-**As built (increment 11, notifications).** td-agent's news of a
+**Notifications.** td-agent's news of a
 repository workspace is a `notification` in its conversation's log,
 beside the `notice` the store and td-agent's own troubles use: a
 repository checked out and ready or not prepared, and a base that
@@ -3528,10 +3471,10 @@ and cut to 1,000 characters. The sentence every conversation's prefix
 has about the received line is left as it was, so no other
 conversation's cache is lost; `history_search` takes `notification`
 as a name for `notice`, its schema unchanged. When a notification is
-logged, and whether it wakes the conversation, is As built (increment
-11, asynchronous preparation).
+logged, and whether it wakes the conversation, is
+"Asynchronous preparation".
 
-**As built (increment 11, asynchronous preparation).** The first turn
+**Asynchronous preparation.** The first turn
 waits for each store's answer, whose project instructions are
 recorded on the conversation process's main thread; the checkout then
 runs on a thread of its own (`Checkout`), holding nothing of the
@@ -3581,10 +3524,10 @@ repository; their maintenance instances share the conversation's
 maintenance home, which their git, its `HOME` `/nonexistent`, does
 not use, and each spec has a name of its own.
 
-**As built (increment 11, preparation).** Choosing a template that
+**Preparation.** Choosing a template that
 names repositories makes its workspace's record at once, in the
 window: every remote admitted (one that is not is asked about first,
-As built (increment 11, admission)),
+"Admission"),
 every base and branch a branch name td-agent passes to git, no branch
 named twice for one remote, at most 32 entries, no more directories
 bound than td-jail binds (32: its worktrees, repositories, stores and
@@ -3612,12 +3555,12 @@ jail, one fetch at a time (`fetch_concurrency` is not read yet, and
 the background fetches of Keeping current wait their turn there too),
 and answers with the human's identity and each
 base's commit, or why not. The process then lays the repository out
-and checks each worktree out in a maintenance instance (§8, As built
-(increment 11, the layout)), with the host's git by the path it
+and checks each worktree out in a maintenance instance (§8,
+"The layout"), with the host's git by the path it
 resolves to, records the repository in `meta`'s `prepared`, and says
 in a notification in its log that it is ready, or why it is not, which
-the window shows and the model reads (As built (increment 11,
-notifications)); one that fails is asked for again when a process for the
+the window shows and the model reads
+("Notifications"); one that fails is asked for again when a process for the
 conversation next starts, as on opening it again. From its ask until
 it says it is done (`Prepared`) the window keeps its process when the
 conversation is left, as it keeps one with a turn under way. Its
@@ -3636,21 +3579,21 @@ and one that names no directory while the first worktree is not ready
 is refused (the tool host is told its working directory,
 `--directory`, rather than taking its first root), never run in
 another root; the conversation says so first, naming the worktree's
-state (As built (increment 11, a call told a worktree's state)). The prefix names every worktree with its remote, branch,
+state ("A call told a worktree's state"). The prefix names every worktree with its remote, branch,
 base and paths whether or not it is ready, so it holds while they
 prepare. The first turn waits for each store's answer, which carries
-the project instructions (§13, As built (increment 11, project
-instructions)); the checkout then runs on a thread of its own, and its
-news wakes an idle conversation (As built (increment 11, asynchronous
-preparation)), and a call into a worktree not ready is told its state
-(As built (increment 11, a call told a worktree's state)). Rules from
+the project instructions (§13,
+"Project instructions"); the checkout then runs on a thread of its own, and its
+news wakes an idle conversation
+("Asynchronous preparation"), and a call into a worktree not ready is told its state
+("A call told a worktree's state"). Rules from
 the base are a later step (the background fetch,
-the remote-tracking refs and the notifications are As built
-(increment 11, background fetch), (increment 11, remote-tracking
-refs) and (increment 11, notifications)). Deleting the conversation removes its
-repository workspace (As built (increment 11, removal on deletion)),
-and archiving it does too (As built (increment 11, removal on
-archiving)).
+the remote-tracking refs and the notifications are
+"Background fetch",
+"Remote-tracking refs" and "Notifications"). Deleting the conversation removes its
+repository workspace ("Removal on deletion"),
+and archiving it does too
+("Removal on archiving").
 
 **Empty and directory workspaces.** The Empty template makes a scratch
 workspace under the jail directory, for a general-assistant conversation
@@ -3660,10 +3603,8 @@ whose top holds a `.git` is refused with a pointer to a repository
 template, and the template dialog opens with the repository as its
 remote (§7, Templates made in the window).
 
-**As built (increment 10, workspaces).** File had two workspace items,
-which the templates step folded into the chooser as its built-ins: New
-scratch conversation became Empty, and New conversation in a directory…
-became Directory…, which opens td-ui's finder over the human's folders
+**Workspaces.** The chooser's built-ins are Empty and Directory…, which
+opens td-ui's finder over the human's folders
 (Return enters one, Backspace goes up, Control+Return chooses the one
 listed; a repository's top is marked `git`, a link `link`, hidden names
 left out). The folders are read by the broker, which starts from the
@@ -3680,8 +3621,8 @@ directory are refused too; a work tree's subdirectory is admitted, since
 its `.git` is out of the jail's reach. The shared directories,
 `[[shared]]` in configuration, none by default, are admitted once at
 the window's start, each refused one named and left out. Without the
-launch's td-jail and td-txt no workspace is made (As built
-(templates)). A conversation's `meta` records its workspace,
+launch's td-jail and td-txt no workspace is made
+("Templates"). A conversation's `meta` records its workspace,
 `{"kind": "scratch"}` or `{"kind": "directory", "path": …}`, fixed at
 creation; its jail directory is `$XDG_STATE_HOME/td-agent/jail/<id>/`,
 holding the instances' `home/`, a scratch workspace's `scratch/`, and
@@ -3698,15 +3639,15 @@ question says whether a scratch workspace goes with the conversation;
 and the diagnostics export leaves `jail/` out, since it holds the
 human's work, and writes its archive, which holds every conversation's
 log, to the home directory rather than a `~/Downloads` that a workspace
-reaches. The model's tools in a workspace are §12's (As built (increment
-10, the tools)), each change and command decided by the human (§11).
+reaches. The model's tools in a workspace are §12's
+("The tools"), each change and command decided by the human (§11).
 
 **Archiving and deleting.** The human archives or deletes a conversation
 from its row in the list (§4); no model can. Archiving keeps the
 conversation's log and hides it from the list until unarchived; it
 stops the conversation's processes, its background ones included
 (§12), and its schedules (§3). Deleting removes the conversation for
-good (§4, As built (deleting a conversation)). A scratch workspace goes
+good (§4, "Deleting a conversation"). A scratch workspace goes
 with a deleted conversation and stays with an archived one; a directory
 workspace is the human's and is never removed.
 
@@ -3728,62 +3669,58 @@ left alone. An unarchived conversation whose repository workspace was
 removed keeps its log; its file, shell and git tools then refuse,
 saying the workspace went with the archive.
 
-**As built (increment 11, removal on deletion).** Deleting a repository
-workspace's conversation removes the workspace with it; archiving one
-does too, as the next paragraph says. The deletion question says
-what goes, that each worktree is asked first, and that files git
-ignores, such as build output, are not asked about. Once it is
-confirmed, the window stops the conversation's processes, as a
-deletion does, and holds the conversation while its worktrees are
-asked: the list says `deleting`, it does not open, previous and next
-pass over it, and the post delivers nothing to it. On a thread, each
-worktree of a repository `meta` records prepared is surveyed in a
-maintenance instance the window starts, its conversation having none
-left (`survey`, below), within ten minutes for the whole survey, a
-worktree not reached by then said not asked: how many of its files are
-changed or untracked, and how many commits reachable from any ref of
-its repository (every worktree's `HEAD`, branches, tags, the stash) are
-in none of the commits its repository's worktrees started at, which the
-conversation recorded with its project instructions. Until a push
-exists (increment 14) those commits are all a worktree's work can be
-compared against. A worktree never prepared was bound by no instance
-but maintenance, so is not asked; one whose checkout finished but was
-never recorded prepared, and anything of the human's in the workspace
-tree beside the checkouts, go unasked. When every worktree reports
-nothing, the conversation is deleted and the workspace removed at once;
-when any reports something, or cannot be asked (no jail, no recorded
-commit, a failed instance, the time spent), a loss card lists each such
-worktree by checkout and branch, a line each cut to 1 KiB, with what it
-reported (its repository's commits said once) or why it could not be
-asked, says that the answers come from git inside the workspace, which
-the model could have changed, and asks; it is asked until answered, set
-aside and asked again as a tool's card is, and said once when it cannot
-be shown. `Delete anyway` deletes both; `Cancel` keeps both, the
-human's messages it had not taken held for it again (in memory, as an
-archive holds them, so lost if the broker is killed meanwhile). Before the
-conversation is deleted, the workspace tree and the data directory's
-`ws/<name>/`, which holds its repositories, are each renamed beside
-itself to `.deleting-<name>` (a random suffix when an earlier removal
-left that), so a crash past that point leaves nothing the next start's
-sweep does not take; renamed back if the deletion fails, they are
-otherwise removed on a thread by the walk that follows no link. A
-crash after the renames and before the deletion leaves the
-conversation with its workspace swept, its repositories still recorded
-prepared, so its tools fail on the missing paths until it is deleted
-again, which the human had chosen; one whose renaming back fails is
-swept too, which is said. A
-directory not named for the workspace is left and said. At its start
-the window sweeps the workspace root and `ws/` of directories with
-names a removal gives (`.deleting-`, a workspace's name, ending in
-eight hex digits, and perhaps a suffix), since the root is the human's
-to name; a root since
+**Removal on deletion.** Deleting a repository workspace's conversation
+removes the workspace with it; archiving one does too, as the next
+paragraph says. The deletion question says what goes, that each worktree
+is asked first, and that files git ignores, such as build output, are
+not asked about. Once it is confirmed, the window stops the
+conversation's processes, as a deletion does, and holds the conversation
+while its worktrees are asked: the list says `deleting`, it does not
+open, previous and next pass over it, and the post delivers nothing to
+it. On a thread, each worktree of a repository `meta` records prepared
+is surveyed in a maintenance instance the window starts, its
+conversation having none left (`survey`, below), within ten minutes for
+the whole survey, a worktree not reached by then said not asked: how
+many of its files are changed or untracked, and how many commits
+reachable from any ref of its repository (every worktree's `HEAD`,
+branches, tags, the stash) are in none of the commits its repository's
+worktrees started at, which the conversation recorded with its project
+instructions. A worktree never prepared was bound by no instance but
+maintenance, so is not asked; one whose checkout finished but was never
+recorded prepared, and anything of the human's in the workspace tree
+beside the checkouts, go unasked. When every worktree reports nothing,
+the conversation is deleted and the workspace removed at once; when any
+reports something, or cannot be asked (no jail, no recorded commit, a
+failed instance, the time spent), a loss card lists each such worktree
+by checkout and branch, a line each cut to 1 KiB, with what it reported
+(its repository's commits said once) or why it could not be asked, says
+that the answers come from git inside the workspace, which the model
+could have changed, and asks; it is asked until answered, set aside and
+asked again as a tool's card is, and said once when it cannot be shown.
+`Delete anyway` deletes both; `Cancel` keeps both, the human's messages
+it had not taken held for it again (in memory, as an archive holds them,
+so lost if the broker is killed meanwhile). Before the conversation is
+deleted, the workspace tree and the data directory's `ws/<name>/`, which
+holds its repositories, are each renamed beside itself to
+`.deleting-<name>` (a random suffix when an earlier removal left that),
+so a crash past that point leaves nothing the next start's sweep does
+not take; renamed back if the deletion fails, they are otherwise removed
+on a thread by the walk that follows no link. A crash after the renames
+and before the deletion leaves the conversation with its workspace
+swept, its repositories still recorded prepared, so its tools fail on
+the missing paths until it is deleted again, which the human had chosen;
+one whose renaming back fails is swept too, which is said. A directory
+not named for the workspace is left and said. At its start the window
+sweeps the workspace root and `ws/` of directories with names a removal
+gives (`.deleting-`, a workspace's name, ending in eight hex digits, and
+perhaps a suffix), since the root is the human's to name; a root since
 renamed is not swept. A conversation whose record cannot be read is
 deleted as one with no workspace, any it had left and said. The
 conversation's jail directory, with the instances' home, goes with the
 conversation as before; the store stays. Archiving a conversation being
 deleted is refused.
 
-**As built (increment 11, removal on archiving).** Archiving a
+**Removal on archiving.** Archiving a
 repository workspace's conversation removes its workspace as deleting
 it does (above): the same survey, the list saying `archiving` while it
 runs and the conversation neither opening nor taking a message, and,
@@ -3792,7 +3729,7 @@ headed `Archive and lose work`, its action `Archive anyway`. Archive
 acts at once as it did, with no question first, so a clean workspace
 goes without one; the loss card is the question for one that is not.
 Kept, the conversation and its workspace stay as they were. Archived,
-its `meta` gains `removed`, which only the window writes, under the
+its `meta` holds `removed`, which only the window writes, under the
 conversation's lock while no process of it runs, and which unarchiving
 never clears; a conversation's own process keeps it as it found it.
 The directories are renamed away before `meta` is written, put back if
@@ -3815,31 +3752,31 @@ deletion. The instances' home in the conversation's jail directory
 stays with an archived conversation and goes with its deletion, as
 before.
 
-**As built (archiving).** `meta` holds `archived`, absent and false in
-one written before. Only the window writes it, under the conversation's
-lock, once the conversation's processes, open, in the background or
-retiring, are killed and waited for and its cards withdrawn, as a
-deletion's are, unless its `meta` cannot be read, as while it is still
-being made, which is refused before anything stops; a turn under way
-ends without a question, since archiving loses nothing and is undone by
-Unarchive. A lock not taken within two seconds leaves the conversation
-unarchived, which is said, and opens it again if it was open; one that
-was in the background starts again only when a message or the human
-opens it. A failure after the new `meta` is in place, syncing its
-directory, is judged by reading the mark back: stored, the conversation
-is archived and the trouble said. The human's messages it had not taken
-wait for its next process. What other conversations queued for it stays
-in the outbox, which hands nothing to an archived conversation and so
-starts no process for it, and the window refuses a new `send_message` to
-it saying it is archived; `conversations` names its state `archived`.
-Unarchiving clears the mark; what waited in the outbox is then handed to
-it, which starts its process in the background as any message does, and
-that process takes the human's messages parked with it; with nothing
-waiting, nothing starts until the human opens it. A conversation's own
-process keeps the mark as it found it when it rewrites `meta`. A scratch
-workspace stays with it; a repository workspace goes with it (As built
-(increment 11, removal on archiving)), and there are no schedules yet
-to stop.
+**Archiving.** `meta` holds `archived`, absent and false in one written
+before. Only the window writes it, under the conversation's lock, once
+the conversation's processes, open, in the background or retiring, are
+killed and waited for and its cards withdrawn, as a deletion's are,
+unless its `meta` cannot be read, as while it is still being made, which
+is refused before anything stops; a turn under way ends without a
+question, since archiving loses nothing and is undone by Unarchive. A
+lock not taken within two seconds leaves the conversation unarchived,
+which is said, and opens it again if it was open; one that was in the
+background starts again only when a message or the human opens it. A
+failure after the new `meta` is in place, syncing its directory, is
+judged by reading the mark back: stored, the conversation is archived
+and the trouble said. The human's messages it had not taken wait for its
+next process. What other conversations queued for it stays in the
+outbox, which hands nothing to an archived conversation and so starts no
+process for it, and the window refuses a new `send_message` to it saying
+it is archived; `conversations` names its state `archived`. Unarchiving
+clears the mark; what waited in the outbox is then handed to it, which
+starts its process in the background as any message does, and that
+process takes the human's messages parked with it; with nothing waiting,
+nothing starts until the human opens it. A conversation's own process
+keeps the mark as it found it when it rewrites `meta`. A scratch
+workspace stays with it; a repository workspace goes with it ("Removal
+on archiving"), and a schedule of its fires nothing while it is archived
+(§3).
 
 ## 8. The workspace jail
 
@@ -3897,7 +3834,7 @@ Every instance has:
 - **Network:** ordinary development shares host networking (§10). Review and
   maintenance instances retain isolated loopback. Development permits Unix
   sockets; reaching host services is an intentional part of its authority.
-- **Limits:** none in the first increments; the instance is placed
+- **Limits:** none yet; the instance is placed
   under its conversation, on a host as a descendant of its conversation
   process, where later limits attach (below).
 - **Isolation:** private PID, UTS, and, where the kernel provides it, IPC
@@ -4113,7 +4050,7 @@ td-agent then refuses, for every one of those sources, on top of §C:
   workspace may write; the checkout they were built from is never
   needed by them and is granted, or not, like any other directory.
 
-**Limits.** The first increments set none, and say so in the status row.
+**Limits.** None are set yet, and the status row says so.
 td-jail's application launch sets the package's `RLIMIT_DATA` on every
 instance even with `cgroup-root=none`; the `workspace` kind sets no data
 limit of its own, and keeps, never raises, any limit it inherits, as
@@ -4157,10 +4094,10 @@ design is then additive:
 
 To keep this open, the rule is placement: everything a conversation
 causes is placed under that conversation's node, and on a host and on td
-the means is ancestry. So there no increment may run a conversation's
+the means is ancestry. So there nothing may run a conversation's
 work in the broker or in any process not descended from that
 conversation's own; and nowhere may one conversation process serve two
-conversations, or an increment depend on td-jail moving an instance out
+conversations, or anything depend on td-jail moving an instance out
 of its launcher's cgroup on a host. The git worker's imports and pushes
 are children of the broker, which would take a limit of their
 own (§9); a `/review`'s staging import and its review are the
@@ -4171,8 +4108,7 @@ conversation process's own children (§15).
 a new td-jail launch kind, `workspace`, whose policy is the list above.
 It grants no Wayland, bus, audio, fetch or tty, binds the admitted sources
 and the git chain, and runs the tool host as its entry. That kind is
-specified and landed in td-jail, with its APPLICATIONS.md and UNSAFE.md
-amendments, in the increment that first exposes a file or shell tool (§18).
+specified by td-jail, APPLICATIONS.md and UNSAFE.md.
 
 **On a development host.** td-jail's `--host` launch (APPLICATIONS.md §X.1)
 already runs for an unprivileged caller inside a user namespace it
@@ -4198,12 +4134,12 @@ creates; the capability its stage 1 raises is the new namespace's. The
 - `./install-apps` builds td-jail and td-txt from the checkout and
   installs them beside td-agent, td-net's launch names them to it, and
   td-agent writes each instance's spec for td-jail under
-  `$XDG_STATE_HOME/td-agent/jail/` (As built, below).
+  `$XDG_STATE_HOME/td-agent/jail/` (below).
 
 If that amendment is not made, tool execution is refused by name on a
 host. There is no silent unconfined fallback.
 
-**As built (increment 10, the td-jail kind).** The `workspace` kind is
+**The td-jail kind.** The `workspace` kind is
 APPLICATIONS.md §C's `td-jail --workspace LAUNCHER-PID SPEC [ARG...]`,
 with §X.8
 naming its host divergences, and it settles four things this section
@@ -4223,15 +4159,14 @@ executable, since worktrees are executable anyway and test suites run
 scripts they write to `TMPDIR`; development's private home is executable. The kind refuses
 every overlap between its directories; the git chain's nesting is not
 an overlap of directories but mounts td-jail derives from a repository's
-fixed names (As built (increment 11, the chain), below). td-agent's own
+fixed names ("The chain", below). td-agent's own
 refusals above (its state, credential locations, `workspace_root`) are
 td-agent's, applied before it writes a spec; td-jail's are the reserved
-trees, the caller's real home, overlap and links. The killed-launcher
-tests named above run with td-agent's launch in the next commit; the
+trees, the caller's real home, overlap and links. The
 kind's own live test launches it on a socket, reads its plan back from
 inside, and is ignored where unprivileged user namespaces are absent.
 
-**As built (increment 11, the chain).** td-jail binds the chain above
+**The chain.** td-jail binds the chain above
 from two spec keys (APPLICATIONS.md §C, The `workspace` kind): a
 `checkout`, a worktree whose `.git` file is bound read-only over it,
 and a `repository`, a workspace repository read-write with every
@@ -4257,7 +4192,7 @@ mode, a writable one written and a read-only one refusing a write with
 `objects/` reaches an instance as a `read` directory at its own path.
 td-jail checks an entry's kind and names, not its content, so td-agent
 makes every `.git`, `gitdir` and `commondir` afresh, never one that
-was ever jail-writable (As built (increment 11, the layout), below). The
+was ever jail-writable ("The layout", below). The
 kind's live test lays out a linked worktree as td-agent will and, from
 inside, finds every protected file unwritable, unremovable and
 immovable, every protected directory unwritable and immovable, the
@@ -4268,11 +4203,10 @@ through its root. Mounting no chain, a writable one, or one lacking
 and the stacking check is proved apart, on mountinfo with a hidden and
 a doubled link.
 
-**As built (increment 11, the layout).** `src/repo.rs` lays a
+**The layout.** `src/repo.rs` lays a
 workspace repository out as the chain above protects it, as plain
 files td-agent writes outside any jail: `create` makes the repository
-over a store, `add_worktree` a linked worktree, and nothing calls them
-yet; the window's preparation arrives with repository templates. Each
+over a store, `add_worktree` a linked worktree. Each
 is built complete in a staging directory beside the repository, each
 file an exclusive create written through to the disk, and renamed into
 place whole: the repository at its path, a worktree's id directory
@@ -4319,8 +4253,8 @@ reads the branch's tree by its id with `read-tree --reset -u`, which
 the sparse patterns select and which overwrites what a broken run left;
 a checkout that fails after making the branch removes it while it is
 still where it was made, so the task can be asked again. It is run only
-before its repository is recorded prepared (§7, As built (increment
-11, preparation)), when nothing but these tasks writes the repository,
+before its repository is recorded prepared (§7,
+"Preparation"), when nothing but these tasks writes the repository,
 which it cannot itself check: so it clears the locks a killed git left
 (the worktree's `index.lock` and `HEAD.lock`, the branch's and
 `packed-refs.lock`) and keeps a branch already there, which only an
@@ -4352,7 +4286,7 @@ commits as the identity the configuration names, cannot write
 and cannot name the sparse mode, which leaves the patterns as they
 were.
 
-**As built (increment 10, the launch).** `./install-apps` installs
+**The launch.** `./install-apps` installs
 td-jail and td-txt from the checkout beside td-agent, and td-net's
 launch names them in `TD_AGENT_JAIL` and `TD_AGENT_TXT`; without them
 every tool is refused with that reason. `jail::launch` writes an
@@ -4393,8 +4327,8 @@ human's SSH agent, and the control socket, through which they could
 answer their own cards; it is a decision to trust the model with
 everything the human has, and its card says so.
 
-As built: the chooser lists `Empty, unconfined` and `Directory…,
-unconfined` after the templates (§7, As built (templates)); either
+The chooser lists `Empty, unconfined` and `Directory…,
+unconfined` after the templates (§7, "Templates"); either
 opens a card, the second once its folder is chosen, titled `Run without
 the jail`, which says what the tools reach and that stopping a command
 cannot guarantee that what it started stops, `Cancel` focused, and
@@ -4478,8 +4412,8 @@ and a `.git` is never written unasked, but hooks a repository keeps
 in its tree (`core.hooksPath`) are ordinary files, and nothing here
 reads the code a command will run. The workspace's card says so.
 `calibration/unconfined.json` is the shipped set of such calls, held
-to the state's shape and to `unconfined_call`'s detail; As built
-(unconfined calls, the calibration), §11, records its runs. The check
+to the state's shape and to `unconfined_call`'s detail;
+"Unconfined calls, the calibration", §11, records its runs. The check
 is made outside the tool host, when the
 call is judged and again just before it is sent, after any card, so a
 link moved while the card waited refuses the call rather than being
@@ -4498,7 +4432,7 @@ configuration, and chooses each workspace on its card still.
 
 **On td.** td-agent is a program of td's account outside application
 confinement, as td-review and td-editor are, which the user chose
-(2026-10-07) over a jailed application whose instances a new root
+over a jailed application whose instances a new root
 request listener would start. The launcher's card starts it through
 td-authd's request `0c` (td-authd/DESIGN.md) from the account home, with
 `TD_AGENT_JAIL=/bin/td-jail`, `TD_AGENT_TXT=/bin/td-txt` and
@@ -4509,7 +4443,7 @@ bound where its `/bin` links resolve; its tools' `PATH` is td's `/bin`.
 td-agent so holds what the human holds; what keeps the model to a
 workspace is the workspace jail and the approval policy (§11), as on a
 host, not an application jail around td-agent itself. td-agent is a
-standalone program: no boot test starts it (§18, 17).
+standalone program: no boot test starts it.
 
 ## 9. Git
 
@@ -4618,7 +4552,7 @@ holds no ssh agent either (td-authd/DESIGN.md, request `0c`). An askpass
 the person set in td-agent's own environment is not used: td-agent's git
 keeps only the variables above, where td-review keeps the person's.
 
-**As built (prompts).** `git::Prompt::here` finds td-pinentry and the
+**Prompts.** `git::Prompt::here` finds td-pinentry and the
 display; `Worker::asking` is the worker for a person's git, which
 `Service` uses for `Job::Prepare` and for a `Job::Push` whose
 `git::Push::asks` is set, which the conversation sets, through
@@ -4707,10 +4641,8 @@ A repository workspace's history is therefore the agent's to make and the
 human's, or the classifier's, to publish, as in td's own workflow, where a
 pushed branch is the submission.
 
-**As built (increment 11, the store).** The first step of increment 11
-is the git worker's outside half, `src/git.rs`, which nothing calls yet:
-the window's store fetch, base reads and admission arrive with
-repository templates. A remote parses as `https://host[:port]/path`,
+**The store.** The git worker's outside half is `src/git.rs`. A remote
+parses as `https://host[:port]/path`,
 `ssh://[user@]host[:port]/path` or the scp-like `[user@]host:path`;
 every other transport, a relative path, credentials in an https URL, a
 query, an empty, `.`, `..` or option-like path segment, and a user or
@@ -4759,7 +4691,7 @@ submodule or a missing path is none, and one past 64 KiB refused. The
 project instructions are `AGENTS.md`, else `CLAUDE.md`, at the commit's
 top.
 
-**As built (increment 14, fetching).** A conversation's tools come in
+**Fetching.** A conversation's tools come in
 three kits: its own, a workspace's beside them, and a repository
 workspace's beside both, which holds `git_fetch {worktree}`, the
 worktree's absolute path as the environment names it. The call is
@@ -4794,8 +4726,7 @@ outside `refs/remotes/`, so it needs no approval
 goes before queued background fetches, so many conversations asking at
 once can hold those back.
 
-**As built (increment 14, export and import).** The second step lays the
-push's first two stages, which nothing calls yet. A maintenance
+**Export and import.** A maintenance
 instance's `export-revision` task resolves the checkout's revision to a
 commit with `rev-parse --verify`, and runs `pack-objects --stdout --revs`
 over that immutable commit and not the base, a commit of the store. A
@@ -4821,9 +4752,8 @@ refuses a malformed object and an object naming one neither the pack nor
 the store has, and then requires the exported commit to be a commit
 there.
 
-**As built (increment 14, evidence and scan).** The third step computes
-a push's evidence in its publish repository once the export is imported,
-which nothing calls yet either. What the push carries is what `rev-list
+**Evidence and scan.** A push's evidence is computed in its publish
+repository once the export is imported. What the push carries is what `rev-list
 --objects` names from the exported commit, not reachable from the base
 or, when the remote branch is there, from its tip, both commits of the
 store. The scan reads it in two passes, each at most 512 MiB, streamed.
@@ -4864,9 +4794,7 @@ alone, at most 50 and the rest counted; output past a pass's bound is a
 match of its own. The evidence is clean when nothing matched and the
 push carries no binary file.
 
-**As built (increment 14, staging and the push).** The git worker's two
-halves of a push are built, which nothing calls yet: `git_push` will.
-`Worker::stage` fetches the remote's store, so the branch's tip is the
+**Staging and the push.** `Worker::stage` fetches the remote's store, so the branch's tip is the
 remote's as of that fetch, absent when the remote has no such branch
 (or, when the fetch fails, as last fetched: Prompts);
 makes the publish repository over the store if need be; imports the
@@ -4891,7 +4819,7 @@ remote said on standard error, a credential helper's or ssh's words
 included, made visible; an exit of 1 is the remote's refusal, any other
 a failure to push.
 
-**As built (increment 14, the push's wiring).** A conversation process
+**The push's wiring.** A conversation process
 asks the window to stage a push with `Up::Stage` (its call, the
 worktree's id, the exported commit, the base it was exported from, and
 the branch) and to send one with `Up::Push` (its call, the worktree's
@@ -4927,7 +4855,7 @@ evidence's bounds is refused. `publish()` makes `objects/info` itself
 before writing the alternates, so a stage that loses a race to make the
 repository does not fail on it.
 
-**As built (increment 14, `git_push`).** A repository workspace's kit
+**`git_push`.** A repository workspace's kit
 holds `git_push {worktree, remote_branch?, force?}` beside `git_fetch`,
 refused, asking nothing, as `git_fetch` is, and also for a branch
 `push_branch` refuses, the recorded branch when none is named, and for
@@ -4947,9 +4875,9 @@ of them, at most 40 lines each and the rest counted, so every part
 shows. Its first line says why it is asked when the push is to a
 protected branch (§9, Pushing), forced against a tip the remote has, or
 the scan matched, a binary file counting. Every other push is the
-person's in `ask` mode and the classifier's in `auto` mode (As built
-(increment 14, the classifier for pushes)), and the person's rules come
-first (As built (increment 14, rules for pushes)). Allowed and not
+person's in `ask` mode and the classifier's in `auto` mode
+("The classifier for pushes"), and the person's rules come
+first ("Rules for pushes"). Allowed and not
 interrupted, the conversation sends `Up::Push` with the commit, the
 branch and, when forced against a tip, that tip as the lease; to a
 branch the remote does not have, a forced push is a plain one. The model
@@ -4960,7 +4888,7 @@ preparation's checkout does, for at most twelve minutes in all, and an
 interrupt said meanwhile is heard when it ends, before anything is
 staged.
 
-**As built (increment 14, the classifier for pushes).** The table's push
+**The classifier for pushes.** The table's push
 row is the classifier's second: in `auto` mode a push with no reason to
 ask, to a branch not protected, not forced against a tip, its scan
 clean, goes to both stages, unless it is the third same call in a row or
@@ -4992,7 +4920,7 @@ the shipped set of pushes, held to the push's state in shape, its detail
 to `classifier::pushed`, and its calls to end with `git_push`; `td-agent
 calibrate` takes it as it takes the crossings.
 
-**As built (increment 14, rules for pushes).** A rule may name
+**Rules for pushes.** A rule may name
 `git_push` with no words, a remote, or a remote and a branch: `allow
 git_push git@example.org:a/td.git agent`. The remote is checked as a
 template's is and kept as td-agent records it (`git::Remote::url`), so
@@ -5023,7 +4951,7 @@ removed repository workspace's publish repositories go with it, renamed
 out of the way as its repositories are (`removal::doom`), and a start
 sweeps what a crash left in `publish/` as in `ws/`.
 
-**As built (local repositories).** `git::Transport::Local` is a remote
+**Local repositories.** `git::Transport::Local` is a remote
 with no host, user or port, its path in `segments`: `Remote::parse`
 takes `/<path>` or `file:///<path>`, a `file://` URL with a host
 refused, and `url()` gives `file:///<path>`; its store is
@@ -5122,8 +5050,8 @@ Creating a conversation and its workspace from a template, and archiving
 or deleting one, are the human's own acts (§7), never a model's, so the
 table has no row for them; admitting a template's remote and confirming
 what removing a workspace would lose are the human's cards there. A
-crossing between conversations is the human's in both modes until
-increment 13 brings the classifier's row and "always" answers (§3).
+crossing between conversations takes the classifier in `auto` mode and
+may have an "always" answer (§3).
 
 **Order.** Deny rules first, and they always win. Then ask rules, the
 human's and the workspace's. Then the human-only rows, which no rule can
@@ -5172,16 +5100,16 @@ runs but never widen it. A boundary the human states ("don't push")
 becomes a rule through a card, not text in the transcript; a boundary
 stated only in chat can be lost to compaction, and a rule cannot.
 
-**As built (increment 13, a repository's rules).** `.td-agent/rules`
+**A repository's rules.** `.td-agent/rules`
 holds one rule a line: `deny` or `ask`, then a tool the tool host runs
 (`read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`,
 `sed` or `shell`), `git_push` or `network`, then, for `shell`, the words of an
 argv prefix, parted by spaces or tabs, for `git_push` a remote and a
-branch, or the remote alone (As built (increment 14, rules for
-pushes)), and for `network` a destination as an allowlist writes it,
+branch, or the remote alone
+("Rules for pushes"), and for `network` a destination as an allowlist writes it,
 `HOST[:PORT]`, 443 unless named, or none, which matches every
 connection; an allow must name one, reaching anywhere being the `open`
-policy (§10, As built (crossings)). Blank
+policy (§10, "Crossings"). Blank
 lines and lines starting with `#` are skipped. A word may not hold what
 the shell would read rather than pass, or what the matcher could never
 match: a quote, `\`, `$`, a backtick, `;`, `&`, `|`, `<`, `>`, a
@@ -5226,10 +5154,10 @@ command. A command the matcher cannot see into asks while any shell deny
 or ask rule exists, not only a deny. A segment of redirections alone,
 such as `> notes.txt`, is kept as a segment with no words, which no rule
 with words matches. A call that acts and that no allow of the human's
-matches takes its workspace's mode's column (As built (increment 13,
-modes)).
+matches takes its workspace's mode's column
+("Modes").
 
-**As built (increment 13, the human's rules).** The human's rules are
+**The human's rules.** The human's rules are
 the state directory's `rules`, read when the broker starts and whenever a
 window attaches: a header,
 `[everywhere]` or `[<workspace>]`, then that scope's rules one a line as
@@ -5257,7 +5185,7 @@ which runs a call that acts with no card, its approval logged `by`
 human. The cards' "always" answers write the file; the human may edit it
 too, and it is read again when a window attaches.
 
-**As built (increment 13, card answers).** A card for a workspace's call
+**Card answers.** A card for a workspace's call
 offers its "always" answers with what they would remember (`{"type":
 "ask", ..., "always": {"allow", "rules"}}`): the tool alone, or for each
 segment of a command its program and, for a program whose second word
@@ -5290,7 +5218,7 @@ call run. Deleting a conversation takes its workspace's sections out of
 the file, a scratch or repository workspace being its own; a directory's
 stay, the directory being the human's.
 
-**As built (increment 13, crossings answered for good).** The human's
+**Crossings answered for good.** The human's
 file holds a `[crossings]` section, each line `allow` or `deny`, `read`
 or `message`, then the conversation that does it and the one it is done
 to, by id: one operation, one way, one pair, so allowing A to read B
@@ -5310,7 +5238,7 @@ and the card's wait, and the check before the crossing runs, take a
 changed policy as a tool call's do. Deleting a conversation takes every
 crossing to or from it out of the file.
 
-**As built (increment 13, modes).** A workspace's mode is a `mode ask`
+**Modes.** A workspace's mode is a `mode ask`
 or `mode auto` line under its header in the human's rules file, the last
 one counting, and the configuration's `mode` where there is none;
 `[everywhere]` and `[crossings]` hold none. The window sends the
@@ -5319,7 +5247,7 @@ its workspace's: in `auto`, a call that acts runs with no card once no
 deny, ask, unread file, repetition or allow has decided it, since each
 such call runs inside the jail, its approval logged `by` `mode` with the
 reason. A crossing is never the mode's: in `auto` the table gives it to
-the classifier (As built (increment 13, the classifier)).
+the classifier ("The classifier").
 A card that waits when the workspace goes to `auto` is taken back and
 its call runs, as a rule's allow would. A call the mode or a rule let
 run, the person not having answered it, is judged again when a policy
@@ -5340,7 +5268,7 @@ workspace's mode goes with its section, but a directory's, which
 outlives its conversations as its rules do; the blank line before a
 section that goes goes with it.
 
-**As built (increment 13, the classifier).** The classifier decides the
+**The classifier.** The classifier decides the
 one row of the table's `classifier` column that exists so far,
 crossings: in `auto` mode, a crossing no standing answer, ask, deny or
 unread file has decided, and that is neither repeated nor braked, goes
@@ -5362,8 +5290,8 @@ conversations sent. A payload longer than 32 KiB, which no tool takes,
 is the human's, as the stages would judge a part of it. The human's
 messages are kept newest first within 32 KiB, each at most 8 KiB, and
 the last 64 calls are named. Project instructions are in it, as
-`project`, only for a workspace the human marked trusted (As built
-(increment 13, the trust mark), below). Jev is asked only when
+`project`, only for a workspace the human marked trusted
+("The trust mark", below). Jev is asked only when
 `data_collection` is `allow` and `base_url` ends
 in `/v1`, and the models list, or for Jev, which it leaves out, Jev's
 endpoints listing, prices `classifier_fast_model` while a cost limit is
@@ -5393,10 +5321,9 @@ Jev's probabilities when it answered; the human's answer is logged after
 it. A card waiting on a crossing is not taken back when its workspace
 goes to `auto`. The status row says `classifier without Jev` beside the
 mode while `jev_required` is `false`. `jev_threshold` is shipped as
-0.775, as increment 13's calibration chose it (As built (increment 13,
-the calibration), below).
+0.775, as the calibration chose it ("The calibration", below).
 
-**As built (increment 13, the circuit breaker).** The breaker counts the
+**The circuit breaker.** The breaker counts the
 classifier's verdicts, the approvals logged `by` `classifier`, in the
 conversation's own log: a classifier that was not asked, for want of a
 key, Jev while required, a price or room under a limit, gives no
@@ -5422,7 +5349,7 @@ count is one conversation's: a directory workspace's other conversations
 keep their own, so twenty is counted per conversation, not per
 workspace, until the window keeps the counts.
 
-**As built (increment 13, the trust mark).** A repository workspace's
+**The trust mark.** A repository workspace's
 trust mark is a `trust` line in its section of the human's rules file,
 the SHA-256 of its project instructions as the model is given them in
 its prefix (§13), every worktree's together; it is refused in
@@ -5446,7 +5373,7 @@ has no project instructions, so no mark. A classifier request that,
 escaped once more, would be past a line of the conversation's log is not
 sent: the action goes to the person, not a failed turn.
 
-**As built (increment 13, the calibration runner).** `td-agent calibrate
+**The calibration runner.** `td-agent calibrate
 FIXTURES` is §16's live classifier check, run by hand and never in the
 gate. FIXTURES is a JSON array of cases, each a name of its own, an
 `expected` of `allow` for an action that should run without the person
@@ -5473,7 +5400,7 @@ thresholds from 0.500 to 0.999, and to standard error what the requests
 reported spending, failed ones included, and how many that ran reported
 nothing; it keeps nothing.
 
-**As built (increment 13, the calibration).** Two runs of the shipped
+**The calibration.** Two runs of the shipped
 set against OpenRouter, `classifier_model` and `classifier_fast_model`
 at their defaults, chose `jev_threshold` 0.775. At it both stages
 together allowed no case that should be asked about in either run, and
@@ -5489,7 +5416,7 @@ them messages Jev gives a `discloses` above 0.225. The commit that set
 it records each run's counts. Thirty cases and two runs are a small
 sample; §17's open question on Jev stands.
 
-**As built (unconfined calls, the calibration).**
+**Unconfined calls, the calibration.**
 `calibration/unconfined.json` is 35 calls of an unconfined workspace,
 16 the person asked for (tests, builds, formatting, a commit, a dev
 server, a tool's install, an alias, a build script they asked for, and
@@ -5520,7 +5447,7 @@ added it records each run's counts.
 arguments go to the human whatever the table says, as opencode's
 `doom_loop` does: a loop is a symptom worth a person's look.
 
-**As built (increment 13, repetition).** The run is counted over the
+**Repetition.** The run is counted over the
 tools the tool host runs (`read_file`, `write_file`, `edit_file`,
 `apply_patch`, `glob`, `grep`, `sed` and `shell`), back through earlier
 replies. The
@@ -5537,9 +5464,9 @@ own process and are not counted: waiting on a long process with
 `process_wait` repeats by design. Nor are the conversation tools:
 `send_message` and a search or read of another conversation are
 crossings, every one the human's, on a card or by a standing answer
-that a run of messages sends back to them (As built (increment 13,
-crossings answered for good)), or in `auto` mode the classifier's
-(As built (increment 13, the classifier)),
+that a run of messages sends back to them
+("Crossings answered for good"), or in `auto` mode the classifier's
+("The classifier"),
 and searching or reading this conversation's log, listing
 conversations or writing the todo list changes nothing outside it.
 When the classifier decides crossings, a repeated one must still reach
@@ -5662,10 +5589,9 @@ workspace's jail and the git worker may do, grant nothing beyond the
 human's own authority, and carry no secure-attention claim. An action
 needing elevation is out of td-agent's reach by design.
 
-**As built (increment 10).** There is only `ask` mode (modes come with
-increment 13), and the human
-rows that arise are a workspace's `write_file`, `edit_file`, `sed` and
-`shell`, and every conversation's crossings (§3, As built (peers)). For
+**Cards.** In `ask` mode the human
+rows that arise include a workspace's `write_file`, `edit_file`, `sed` and
+`shell`, and every conversation's crossings (§3, "Peers"). For
 each, the conversation process sends the window `{"type":
 "ask", "call", "title", "details"}`, `call` the call's `tool_call`
 record, and waits without a deadline, hearing the window meanwhile; the
@@ -5693,8 +5619,8 @@ decide it. Losing the keyboard sets the card aside, deciding nothing,
 and it comes back with the keyboard. Another conversation's card waits,
 its row saying `asks you`, until that conversation is opened; one the
 window cannot draw, in a window too small, waits and says so once. The
-choices are allow once and deny, and from increment 13 the "always"
-choices (§11, As built (increment 13, card answers)). An interrupt, or the window closing, withdraws the card
+choices are allow once and deny, and the "always"
+choices (§11, "Card answers"). An interrupt, or the window closing, withdraws the card
 (`{"type": "withdraw", "call"}`) and the call is answered as not run, as
 is an allowed call whose interrupt came with its decision; a
 conversation process that restarts, fails or is deleted takes its cards
@@ -5780,12 +5706,12 @@ directory and git tools, as far as the workspace has what they act on.
 - **`schedule`**, **`schedules`** and **`cancel_schedule`**: a schedule
   delivering a message at set times, made only on the person's card,
   and the ones delivering to the caller listed and cancelled
-  (As built (schedules, the model's), §3).
+  ("Schedules, the model's", §3).
 - **`question {question, options?}`**: asks the person and waits for
   their answer, as opencode's `question` does; every conversation has it
-  (As built (`question`), below).
+  ("`question`", below).
 - **`skill {name, file?}`**: one of the person's skills, which the
-  prefix lists, or one of its files (As built (skills), below).
+  prefix lists, or one of its files ("Skills", below).
 - **`request_directory {path, access?}`**: asks for an extra host directory
   bound into this conversation's later instances. `access` is `read` by
   default, `write`, or `revoke`; an unconfined workspace (§8) refuses it,
@@ -5821,29 +5747,26 @@ directory and git tools, as far as the workspace has what they act on.
 - **`task {prompt, agent?, model?, effort?, routing?}`**: hands a piece
   of work to a sub-agent, a
   general one or one that explores, in a conversation with a workspace
-  (As built (`task`), below).
+  ("`task`", below).
 
 Paths are absolute. Worktrees and shared directories are bound at their
 real paths, so the paths the model sees are the paths the human sees. A
 relative path is an error naming the worktrees.
 
-**No step snapshots or undo.** Step snapshots of a repository
-workspace's worktrees, with `C-z` undo and `C-S-z` redo, were built
-(increment 11) and removed at the user's choice (2026-10-07): git in the
-worktree is the record of a step's changes, and td-agent keeps none of
-its own. An older td-agent's `snapshot`, `undo` and `redo` records are
-read as retired (`store::Kind::Retired`), so its logs open, and are
-otherwise nothing: not shown, and rendered by `history_read` as a
-record of an older td-agent. A retired snapshot keeps each worktree's
-checkout and tree after its step, and a compaction's carried state
-lists each worktree's last as it did when snapshots were made ("[The
-workspace's worktrees, each with the tree its last step snapshot
-recorded …]"), so that a compaction made then is rebuilt byte for byte
-and an older conversation's cached prefix and Debug view hold; a
-conversation since has none. The refs it left under
-`refs/td-agent/snapshots/` keep their objects until the workspace is
-removed and are never counted as work (§9). `C-z` is no longer the
-window's; it reaches the composer.
+**No step snapshots or undo.** Git in the worktree is the record of a
+step's changes, and td-agent keeps none of its own. An older td-agent's
+`snapshot`, `undo` and `redo` records are read as retired
+(`store::Kind::Retired`), so its logs open, and are otherwise nothing:
+not shown, and rendered by `history_read` as a record of an older
+td-agent. A retired snapshot keeps each worktree's checkout and tree
+after its step, and a compaction's carried state lists each worktree's
+last as it did when snapshots were made ("[The workspace's worktrees,
+each with the tree its last step snapshot recorded …]"), so that a
+compaction made then is rebuilt byte for byte and an older
+conversation's cached prefix and Debug view hold; a conversation since
+has none. The refs it left under `refs/td-agent/snapshots/` keep their
+objects until the workspace is removed and are never counted as work
+(§9). `C-z` reaches the composer.
 
 **Background processes.** A `shell` call with `background: true` keeps
 its instance running after the call returns, for a build, a watcher or a
@@ -5885,7 +5808,7 @@ background process keeps its conversation process running (§2). Each
 instance shares host networking, so later calls and host programs can
 reach a background server through localhost while its job remains alive.
 
-**As built (increment 12, lifetime).** `shell` takes `background`; with
+**Lifetime.** `shell` takes `background`; with
 it the call is `host::Call::Background`, its `timeout_ms` from 1 ms to
 24 hours and 24 hours when left out, decided on a card of its own ("Run
 a command in the background"). It is refused before any card when
@@ -5915,12 +5838,11 @@ open the log records each process still running there as `lost`
 counts a conversation's running processes from those events (a restart,
 or a hello, zeroes the count before the log replays) and keeps its
 process while any runs. The output store, `process_output`,
-`process_wait` and the list's output size came next (As built
-(increment 12, output)), then the exit notice and `conversations`'
-count (As built (increment 12, notices)). The window's process list
-and the status row's count came last (As built (increment 12, window)).
+`process_wait` and the list's output size are in "Output", the exit
+notice and `conversations`' count in "Notices", and the window's process
+list and the status row's count in "Window".
 
-**As built (increment 12, output).** The tool host sends a background
+**Output.** The tool host sends a background
 call's output up as it comes, waiting for room rather than dropping what
 does not fit, as a foreground call's is dropped from the live view; and
 once the process ends it reads what is left until the pipe has been
@@ -5955,7 +5877,7 @@ conversation removes `processes/` under its lock once the archive is
 stored (`StateDir::set_archived`), and deleting it removes the rest with
 it.
 
-**As built (increment 12, notices).** A process's end is logged as an
+**Notices.** A process's end is logged as an
 `ended` event carrying, besides how it ended, the last 2 KiB of its
 output, each line made visible and marked `| ` so that none passes for a
 line of td-agent's, its last lines kept within 4 KiB as framed, the
@@ -5983,7 +5905,7 @@ process until its start arrives even when that end was its last
 process's. `conversations` counts each conversation's running processes
 from its log.
 
-**As built (increment 12, window).** The window keeps each
+**Window.** The window keeps each
 conversation's running processes from its events, the open one's and
 those working in the background alike: a `process` event adds one, an
 `ended` one takes it away, and a hello, a replay of the log or the
@@ -6251,7 +6173,7 @@ resources, prompts, sampling, roots, elicitation, progress shown, a row
 per server in the window with its own kill and restart, and MCP tools
 for sub-agents.
 
-**As built (MCP, the tool host's `serve`).** `serve {program, args,
+**MCP, the tool host's `serve`.** `serve {program, args,
 workdir?}` runs the program as given, no shell between, with a
 command's environment: the program and each argument at most 4 KiB
 with no NUL, at most 64 arguments, the program not empty. Its card
@@ -6272,9 +6194,9 @@ replies. Standard output goes up as raw bytes and standard error as
 text, both waiting for room; after the program ends, what is left is
 read until its pipes close or are quiet for 300 ms, for at most a
 minute; a cancel ends that reading too, and one that ends the program
-reads none of what is left. Nothing uses it yet.
+reads none of what is left.
 
-**As built (MCP, the protocol).** `src/mcp.rs` speaks to a server over
+**MCP, the protocol.** `src/mcp.rs` speaks to a server over
 a `Transport`, which never waits on the server to send: what cannot go
 yet it holds, within a bound of its own, and sends as it is next asked
 for output, which it waits for until a deadline; the servers' step puts
@@ -6312,7 +6234,7 @@ retries it in short slices as it waits, since a `took` frees room on
 the reader thread without waking a wait, and turns a wait with no call
 open, or the `serve` call's end, into the server's end.
 
-**As built (MCP, configuration and rules).** `[[template.mcp]]` is read
+**MCP, configuration and rules.** `[[template.mcp]]` is read
 and checked as §15 says, `name`, `command`, `tools` and `timeout` its
 only keys: a command of 1 to 64 strings, within a `serve` call's program
 and arguments, each at most 4 KiB with no control character, the program
@@ -6326,16 +6248,12 @@ template is no longer configured, as `shared_for` gives directories; a
 setup from before servers names none. A template made in the window
 names none, and its file has no key for them. A new conversation's
 template is found and refused in one place, `chosen`, which `start_from`
-goes through for every way a conversation is made from a template: one
-that named servers made nothing and said so in a note, until the
-servers' tools were offered (As built (MCP, tools and calls)), which
-lifted that. The rules grammar takes `mcp SERVER [TOOL]`, the server's
+goes through for every way a conversation is made from a template. The rules grammar takes `mcp SERVER [TOOL]`, the server's
 name as a template's and the tool's as the prefix would carry it, at
 most those two words; an allow names the tool, and a repository's rules
-may deny or ask. No call was named `mcp` then, so no such rule matched
-one, and a card offered no `mcp` answer to remember.
+may deny or ask.
 
-**As built (MCP, servers running).** A conversation process starts its
+**MCP, servers running.** A conversation process starts its
 template's servers at a turn's start, once its workspace is ready and
 there is a key, after the window's stores are awaited and before the
 turn's first request (`src/serving.rs`): each in an instance of its own
@@ -6372,12 +6290,11 @@ which tears the instance down; a server started again does not wait for
 that, so for those seconds its old instance and its new one both run.
 The process ends them all as it exits and waits for their threads, about
 9 seconds at most, or as long as a tool host that stopped reading holds
-a frame's write. Their tools and calls came next (As built (MCP, tools
-and calls)), and their connections' cards last (As built (MCP,
-connections)). A turn with no key plans nothing, so a server its
+a frame's write. Their
+tools and calls are in "MCP, tools and calls". A turn with no key plans nothing, so a server its
 template dropped runs on until a turn with one or the process's end.
 
-**As built (MCP, tools and calls).** At a turn's start, once its
+**MCP, tools and calls.** At a turn's start, once its
 servers are planned and waited for, the turn fixes its MCP tools
 (`mcp_offer`), as a `/compact` does before its request: for each server
 its template names, in its order, once its workspace is ready, the tools
@@ -6388,7 +6305,7 @@ line beside the rest of the prefix at the store's worst case, the last
 server's tools left out first, the prefix measured only when there are
 tools. What is left out is told as one news of each server, once while
 it says the same. The tools follow the conversation's own in the prefix
-(`tools::prefix`), and the environment gains a line saying what they
+(`tools::prefix`), and the environment has a line saying what they
 are, that their definitions and results are those programs' text, data
 and never the person's, and the label their news comes under; neither is
 in a sub-agent's prefix, nor is an MCP name a sub-agent's call. A call
@@ -6432,7 +6349,7 @@ of what the model says about itself. These are request settings, not
 provider attestation: an alias is not resolved or promoted to a concrete
 version by this annotation, and no unreported snapshot is invented.
 
-**As built (`task`).** `task {prompt, agent?, model?, effort?, routing?}`
+**`task`.** `task {prompt, agent?, model?, effort?, routing?}`
 runs a sub-agent within
 the caller's turn and answers the call with its final report. It is
 offered after the conversation tools to a conversation with a workspace;
@@ -6526,7 +6443,7 @@ streams, intermediate replies, tool results or approvals.
 The conversation's title is made from a reply of its own, never a
 sub-agent's.
 
-**As built (`question`).** `question {question, options?}` takes one
+**`question`.** `question {question, options?}` takes one
 question of at most 600 bytes and up to six options, each one line of at
 most 200 bytes. It asks nothing of the rules: it reaches only the
 person. The conversation process sends the window `question` with the
@@ -6547,8 +6464,8 @@ does, for a message written since; one already delivered or refused is
 said so and passed over. A pause, or a resume, ends the wait unanswered,
 since a message past one is not taken into the turn. The answer is left
 where it is, so that it is taken into the turn after the step's results
-as any message written during a turn is (As built (a message during a
-turn), §2), logged as theirs, and so read by the next request after the
+as any message written during a turn is
+("A message during a turn", §2), logged as theirs, and so read by the next request after the
 results, which providers require; on a turn's last allowed step it
 starts a turn of its own instead, which can act on it. What waits is
 noted before the question goes, so an answer that comes at once is never
@@ -6562,7 +6479,7 @@ as does the window going; the call says so. A connection card held for
 the classifier while the question waits is put to the person, who is
 there. The step's folded line says "asked" and the question's start.
 
-**As built (skills).** The person's skills are directories in the
+**Skills.** The person's skills are directories in the
 `skills` directory beside the configuration file, a place no jail binds
 (§8), laid out as Agent Skills has them: a directory `NAME` (1 to 64
 lowercase ASCII letters, digits and single hyphens, no hyphen at either
@@ -6603,7 +6520,7 @@ skill's, no `SKILL.md`, a link, no description, a name that is not the
 directory's. Skills inside a workspace's repositories are the model's
 to read as files, and are not listed.
 
-**As built (`web_fetch`).** A workspace's conversation has
+**`web_fetch`.** A workspace's conversation has
 `web_fetch {url, offset?, max_bytes?}`, which the conversation process
 runs, not the tool host: it fetches through the fetch service, whose
 socket no jail holds (§2). The URL is taken only as `http` or `https` of
@@ -6655,7 +6572,7 @@ untrusted content like any tool result, and the tool's description
 says so. A conversation with no workspace has no network
 policy, so it has no `web_fetch`.
 
-**As built (increment 8).** The conversation tools run in the
+**Where conversation tools run.** The conversation tools run in the
 conversation process; their definitions are JSON schemas with
 `additionalProperties: false`, in the prefix. An item's content is one
 line, since the window draws an item to a line. `todo_write` answers with
@@ -6680,10 +6597,9 @@ caller's own log, as when left out; `send_message`'s `to` is trimmed
 and refused when empty, never a default receiver. A conversation id
 that does not parse is refused quoting the value, cut to 64 characters.
 
-**As built (increment 9).** The tool host is `td-agent tool-host [--txt
+**The tool host.** The tool host is `td-agent tool-host [--txt
 PATH] [--root DIR]...`, every path absolute, serving over its standard
-input and output; until increment 10 launches it in a jail, only the
-tests start it, and no tool of this section is exposed to a model. Its
+input and output. Its
 frames are `frame`'s, at most 1 MiB. Down, `{call: ID, tool, args}`
 names a tool by the model's name for it, and `{cancel: ID}` kills that
 call's process; up, `{output: ID, text}` carries a process's output as
@@ -6725,7 +6641,7 @@ writes the file in place, so its mode and links stay; it is not atomic.
 `sed` for others, and refuses an empty `old_string` and one equal to
 `new_string`.
 
-**As built (apply_patch).** The conversation process parses the patch
+**Apply_patch.** The conversation process parses the patch
 before it asks anything, so a patch the grammar refuses, or one naming
 a relative path, is answered with what was wrong (and on which line,
 where a line is to blame), and never reaches a card. The card has a
@@ -6804,11 +6720,10 @@ counted. `sed` runs `--sandbox -i`, `-E` as asked, then `-e SCRIPT --`
 and its absolute paths, saying only how many files it ran over when it
 prints nothing. Both have `shell`'s default timeout.
 
-**As built (increment 10, the tools).** A conversation in a workspace is
+**The tools.** A conversation in a workspace is
 given `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `sed` and
-`shell` after its conversation tools, defined as above without
-`background`, which increment 12 adds; one outside a workspace is given
-none of them, and its prefix is byte for byte what it was. The
+`shell` after its conversation tools, defined as above; one outside a
+workspace is given none of them. The
 conversation process checks a call's arguments for shape, every member
 named and bounded, and leaves what they name to the tool host to judge
 inside the jail; the model never names a digest. The conversation fills
@@ -6822,8 +6737,8 @@ and again after one fails or the shared directories change, and each
 command leaves outlives its call. Every tool instance is started from
 the conversation process's main thread, which td-jail ties it to; a
 maintenance instance may start on a checkout's thread, which waits
-for it to end (§7, As built (increment 11, asynchronous
-preparation)). An
+for it to end (§7,
+"Asynchronous preparation"). An
 interrupt cancels the call under way; a window gone does not, so the
 call ends whole in the log. Since what runs in the jail can stop or
 replace its tool host, the conversation keeps each call's time too: its
@@ -6832,7 +6747,7 @@ Past that it tears the instance down and answers the call so. The result
 carries what the model is shown, and the log keeps a command's output's
 head and tail beside it as the result's `kept`, never sent back, and
 drops `kept` before the result when the line would be too long. The
-window does not yet show a command's output as it comes. `write_file`,
+window does not show a command's output as it comes. `write_file`,
 `edit_file`, `sed` and `shell` are decided by the human before they run
 (§11, `ask` mode); the rest run. A change the human allowed stays, and
 td-agent cannot take it back; in a repository workspace, git in the
@@ -6872,7 +6787,7 @@ paragraph.
    and the conversation's creation date. It holds for the whole
    conversation and changes only when what it names does; the current
    time stays out of it, since it would break the cache, and is on each
-   message instead (as built, below).
+   message instead (below).
 4. **Project instructions:** each worktree's top-level `AGENTS.md`, or its
    `CLAUDE.md` where there is none, labelled with its path, read from the
    base commit in the store by the git worker outside any jail as soon as
@@ -6901,12 +6816,10 @@ not written once.
 Titles come from a cheap model (`title_model`) after the first exchange,
 reserved like any request; the first line of the task stands until then.
 
-**As built (increment 5).** The prompt texts are
+**Prompt texts.** The prompt texts are
 `prompt/conversation.txt` and `prompt/title.txt`, with the workspace
-paragraphs below. With no tools, no environment block and no project
-instructions yet, the prefix is the static text alone, which says that
-the conversation has no tools and that the window renders its replies'
-Markdown (§4, "Markdown"), naming what it renders (headings, emphasis,
+paragraphs below. The static text says that the window renders its
+replies' Markdown (§4, "Markdown"), naming what it renders (headings, emphasis,
 strikethrough, code spans and fenced blocks, lists, quotes and links the
 person can click), that tables show as written in a fixed-width font,
 that an image shows as its alt text with a link and is never fetched,
@@ -6920,7 +6833,7 @@ quotation marks, becomes the title. A title request that is refused
 leaves the first line standing and says why in a notice, and one that
 fails records why in its request's finish; neither fails the turn.
 
-**As built (increment 8).** The prefix is the conversation's tool
+**The prefix.** The prefix is the conversation's tool
 definitions and its static text (§5), the same for every conversation
 but for a workspace's tools and paragraph. The static text names the
 tools the conversation has and what it still lacks; asks for a todo
@@ -6933,7 +6846,7 @@ be worked around; that messages are delivered later and not to wait for
 a reply; and that each message it sends can start a turn that costs
 money.
 
-**As built (the environment block and message times).** The system
+**The environment block and message times.** The system
 message is the static text, then an environment block of what holds for
 the whole conversation:
 
@@ -6961,8 +6874,7 @@ the whole conversation:
   person's, the shared directories, each read-only or read-write, and
   that there is no git.
 
-Worktrees and network policy are named when repository workspaces and
-the network land (§18). A workspace conversation's static text has its
+A workspace conversation's static text has its
 own paragraph where the others say they cannot read or change files
 (`prompt/workspace.txt` for `prompt/no-workspace.txt`): what its tools
 do, that a change or command may wait for the person's approval, so
@@ -6983,14 +6895,13 @@ the messages, not in the prefix: the line is the log event's time, so a
 message reads the same in every request and the cache holds. A message
 carries it only under a prefix that announces it, so a request sent
 before this is rebuilt from the log byte for byte (§6). UTC because a
-conversation process reads no time zone yet (§3 plans `TZ` and
-`/etc/localtime` for schedules); the model converts when the person
+conversation process reads no time zone; the model converts when the person
 names one. The OS is read for each request's prefix check. A
 conversation begun before this takes the new prefix as a `prefix` event
 before its next request (§6), as any prompt change does, and so does one
 whose operating system's name changes.
 
-**As built (increment 11, project instructions).** The window's store
+**Project instructions.** The window's store
 thread reads, at each base it resolves, `AGENTS.md`, else `CLAUDE.md`,
 at the commit's top through the git worker outside any jail (§9), each
 commit once, and answers with them beside the commits: absent, found
@@ -7038,7 +6949,7 @@ itself keeps everything (§6). The budget is the model's `context_length`
 from §5. The prompt is estimated as the last response's reported prompt
 tokens plus a bytes-over-four estimate of what has been appended since,
 each picture counted as §6's Pictures says.
-As built (increment 7), the last response is the last one answered
+The last response is the last one answered
 whole, its report counting its prompt and completion: a failed or
 incomplete reply's report is left out, since its completion is never
 sent back, and a retry then rebuilds the failed request's head exactly.
@@ -7099,7 +7010,7 @@ process's, not the context's, so they survive compaction; the model
 re-reads a file it needs to see again. A second compaction summarizes
 the view, earlier summary included, and carries the state again.
 
-**As built (increment 16, pruning).** A request whose estimate plus its
+**Pruning.** A request whose estimate plus its
 `max_tokens`, cut, where it alone is past the threshold, to what the
 threshold leaves of the context, so that a small context is not past it
 at once, is past `compact_at` of the model's context, once in that
@@ -7126,7 +7037,7 @@ the turn stops with the provider's words. A compaction is found by
 `history_search` as its kind. The transcript marks the event with a
 notice.
 
-**As built (increment 16, the summary).** When pruning leaves a request
+**The summary.** When pruning leaves a request
 past `compact_at`, or frees too little to be done, or a context refusal
 finds nothing to prune, the conversation asks for the handoff summary,
 once a request: of `compact_model`, or the conversation's model when
@@ -7169,7 +7080,7 @@ summary that fails leaves an earlier one in force. The transcript
 notices the compaction asking for it and shows the summary folded where
 it arrives, marked as not standing when it does not.
 
-**As built (increment 16, by hand).** `/compact`, alone or followed by a
+**By hand.** `/compact`, alone or followed by a
 focus of at most 2 KiB, sent from the composer is the human's command,
 never a message; Conversation > Compact conversation is the button,
 without a focus, and the control seam's `compact-conversation` action
@@ -7197,7 +7108,7 @@ still be asked again after one; one that could not be says why in a
 notice of td-agent's, one cut short by a restart says so, and one that
 stood says no more than its summary.
 
-**As built (increment 16, resuming cold).** Before a turn's first
+**Resuming cold.** Before a turn's first
 request, when its estimated prompt is past `cold_resume_tokens` but not
 past `compact_at` or the context (past them it is compacted or stopped
 whatever the answer), no request has yet been made for the turn, and the
@@ -7339,10 +7250,10 @@ default; `jev_threshold`'s is calibrated (§11):
   1,000,000, and `compact_model`; defaults `true`, 0.8, 20,000 and the
   conversation's model (§14)
 - `explore_model` and `explore_routing`, one of `routing`'s modes;
-  defaults the conversation's model and routing (§12, As built
-  (`task`))
+  defaults the conversation's model and routing (§12,
+"`task`")
 - `review_model` and `review_max_cost`, a number of credits above zero;
-  defaults `opus-latest` and 1 (As built (`/review`), below)
+  defaults `opus-latest` and 1 ("`/review`", below)
 - `cache_ttl`, a whole number of seconds up to 86,400, 0 taking every
   resumption as cold, and `cold_resume_tokens`, from 1,000 to
   10,000,000, or `none`; defaults 300 and 32,000 (§14)
@@ -7375,18 +7286,17 @@ branch = "agent"
 sparse = ["td-agent", "td-ui"]
 ```
 
-**As built (increment 4).** Every key above is known by name. `mode` is
-read and checked. Each other key that is present is accepted and named
-on standard error with the §18 increment that first reads it, and the
-status row counts them, so a setting that does nothing yet is said and
-never silently ignored; its value is checked by that increment. `limits`
+**Keys.** Every key above is known by name. A key not read yet
+(`fetch_concurrency`) is accepted and named on standard error, and the
+status row counts it, so a setting that does nothing is said and never
+silently ignored. `limits`
 is refused with the reason above, and any other key is refused with the
 list of known keys. A missing file is every default, and a file longer
 than 1 MiB is refused. A relative `XDG_CONFIG_HOME` or `XDG_STATE_HOME`
 is ignored, as the XDG base directory rules say, for `$HOME/.config` or
 `$HOME/.local/state`.
 
-**As built (increment 5).** `base_url`, `model`, `title_model`,
+**Model and limit keys.** `base_url`, `model`, `title_model`,
 `reasoning_effort`, `data_collection` and the three cost limits are
 read and checked. The defaults are `https://openrouter.ai/api/v1`,
 `anthropic/claude-sonnet-5.5` for conversations,
@@ -7403,19 +7313,19 @@ this file records neither. `routing` is likewise what every
 conversation starts with until Conversation → Routing chooses another
 (§5, Routing). The key file is not a key of this file (§6).
 
-**As built (templates).** `template` is read. A `name` is visible text
+**Templates.** `template` is read. A `name` is visible text
 of at most 64 bytes with no space at either end and nothing a card
 would show as `<U+XXXX>` (§11), unique among the templates and neither
 `Empty` nor `Directory…` (nor `Directory...`), each ASCII case aside;
 there are at most 64 templates. Each of `repos` has a `remote`, a
 `base` and a `branch`, text of at most 2,048 bytes with no control
 character, and an optional `sparse` list of paths, each relative, with
-no `..` and no control character; increment 11 prepares them.
+no `..` and no control character; the git worker prepares them.
 `shared` is checked as the top-level key is, its errors naming
 `template.shared`. `network` is `off`, `allowlist` or `open`, and any
 other key is refused by name.
 
-**As built (commands).** The person's commands are files `NAME.md` in
+**Commands.** The person's commands are files `NAME.md` in
 the `commands` directory beside the configuration file, a place no jail
 binds (§8), so their text is the person's. A name is 1 to 32 lowercase
 ASCII letters, digits and `-`, starting with a letter; the composer's
@@ -7438,7 +7348,7 @@ directory gives, each with its first line that is not blank in its
 first 4 KiB, cut to 120 characters, and how many more there are; a file named as one of the composer's own commands is listed
 as never used.
 
-**As built (`/review`).** `/review`, alone or followed by one revision,
+**`/review`.** `/review`, alone or followed by one revision,
 sent from the composer is the person's command, never a message, and
 reviews that revision, HEAD by default, of the open conversation's first
 worktree with `td-agent review --repo` (§2, the review command), its
@@ -7517,7 +7427,7 @@ kind. td-agent's position on its features:
 
 | Feature | td-agent |
 |---|---|
-| Shadow-git step snapshots, undo and redo | not adopted: built in increment 11 and removed, since git in the worktree is the record (§12) |
+| Shadow-git step snapshots, undo and redo | not adopted: git in the worktree is the record (§12) |
 | `doom_loop`: three identical calls ask | adopted (§11) |
 | `question` tool | adopted (§12) |
 | Child sessions, background subagents that notify | adapted as peer conversations that message and read one another through crossings (§3) |
@@ -7600,7 +7510,7 @@ kind. td-agent's position on its features:
   result, a card that does not take focus, a card answered after focusing
   it, and a refused key file shown in the window. The message list's own
   tests live in td-ui with its other widgets.
-- **Jail tests**, in the td-jail `workspace` increment: a tool cannot read
+- **Jail tests:** a tool cannot read
   the caller's home, the key file or the store's writable state; cannot
   write, rename or redirect any read-only entry of the git chain,
   including by renaming an ancestor; cannot create a linked worktree;
@@ -7617,34 +7527,7 @@ kind. td-agent's position on its features:
   calibration, are recorded in the commit that changes a classifier
   prompt, model or threshold.
 
-**Gate cost.** An edit confined to `td-agent/` should run td-agent's own
-tests and lints and nothing else. `builder/src/affected.rs` decides that
-in two places. `map_path` maps each changed path to preflights and
-targets; `cargo_test_cmds` then narrows the `cargo-test` preflight to the
-roster crates a diff touches and every crate that reads them. Measured on
-2026-10-02:
-
-- a path in no roster crate selects every crate and the `check` target,
-  which is what `td-agent/src/` did before `td-agent/Cargo.toml` existed,
-  so the crate increment added its manifest and lock in the same commit
-  as its source;
-- a path in a discovered crate with no `map_path` arm of its own selects
-  that crate's preflight and also the whole `check` target, since which
-  recipe embeds a new crate is for its author to say;
-- every narrowed preflight keeps the tests and clippy of the builder,
-  recipes and engine workspace, because recipes embed crate sources and
-  the builder's tests assert exact reader sets;
-- td-mta escaped both, and still does: its own `map_path` arm adds
-  only the `cargo-test` preflight, and `cargo_test_cmds` drops the
-  workspace pass while its only outgoing edge is exactly `td-crypto`. A
-  builder test holds that no recipe and no seed roster names it.
-
-td-agent had td-mta's treatment until its packaging: `WORKSPACE_EXEMPT`
-in `affected.rs` lists each exempt crate with its sorted, pinned edges,
-and `workspace_exemption_requires_no_distribution_recipe` holds every
-crate on it to no recipe and no seed roster. The packaging made a recipe
-name td-agent and took it off the list, as planned. It is now routed as
-td-review is:
+**Gate cost.** td-agent is routed as td-review is:
 
 - `recipes/src/recipes/td-agent.rs` builds it as a static target recipe
   over its own tree with its path dependencies staged beside it (the
@@ -7667,515 +7550,50 @@ td-review is:
   companion;
 - its gate metadata is `clippy-all-targets` and `trusted-test-root`, the
   latter because its control-socket tests bind under owner-checked
-  fixtures as td-ui's do. `native-compositor-tests`, which adds a
-  compositor build to every td-agent preflight (cached after the first),
-  is declared only by the increment whose window tests first need it,
-  and those tests stay few, in one process-test file; the rest of the
-  window's logic is tested against td-ui's widget state without a
-  compositor.
+  fixtures as td-ui's do, and `native-compositor-tests`, which adds a
+  compositor build to every td-agent preflight (cached after the
+  first). Those tests stay few, in `tests/control_process.rs`; the rest
+  of the window's logic is tested against td-ui's widget state without
+  a compositor.
 
-**As built (increment 4).** The window increment declared
-`native-compositor-tests`, with one case in `tests/control_process.rs`:
-keys typed through the headless compositor's seat start a conversation
-and send there, start a second and send there (`S-Return` a newline,
-`Return` and `C-Return` the send), and switch back, each result
-read from the store.
-`tests/processes.rs` drives the built program's conversation personality
-over real socketpairs: a killed child restarted from its log and going
-on from it, a child failing every start left failed after three
-restarts, a child exiting when its socketpair closes, a second writer
-of one conversation and a second broker refused, a window through `attach`
-told all there is, refused auto mode and taken over from, a broker ending with
-the last window and after a linger, `--stop`, a log past every bound reaching a
-window slow to read it, a request for what is no longer open coming back, a
-state directory by a link or left open, a broker coming by a launch, and the
-configuration refusals. The window's keys, focus, list order, status row and divider
-are tested against its widget state in `src/ui.rs` and the driven
-actions in `src/control.rs`.
+**Test support.** `tests/support/mock_fetch.rs` serves the `td-fetch 1`
+protocol from a thread, records every request, and answers from
+`tests/fixtures/openrouter/`. The fixtures are written by hand in the
+shapes OpenRouter returns; none is a recording of a live exchange, and
+no test reaches the network. `tests/model_client.rs` and
+`tests/processes.rs` drive the built program's conversation personality
+over real socketpairs, as the window would.
 
-**As built (increment 5).** Unit tests cover request building, response
-parsing, the splice's byte identity through the log, a log replayed to
-the bytes sent, money parsing and reservation arithmetic, the day's
-ledger, each error path, and each key-file refusal against temporary
-trees. `tests/model_client.rs` drives the built program's conversation
-personality over its socketpair, as the window would, with
-`XDG_RUNTIME_DIR` pointing at `tests/support/mock_fetch.rs`. That mock
-fetch service serves the `td-fetch 1` protocol from a thread, records
-every request, and answers from `tests/fixtures/openrouter/`. The
-fixtures are written by hand in the shapes OpenRouter returns; none is
-a recording of a live exchange, and no test reaches the network. The
-cases are a turn's exact headers and body and its title; a second turn
-from a restarted process, whose body begins with every byte the first
-sent and carries the first reply's `reasoning_details` unchanged; 429
-retried three times and no more; a 502 offered for a retry and asked
-again only when told; 401 and 402; an error inside a 200; the turn's,
-the day's and an unpriced model's limits; a model without `reasoning`;
-a request in flight when its process is killed, interrupted and never
-resent; no key; and the key absent from the log, `meta`, `prefix` and
-standard error. `tests/processes.rs` adds a message sent just before
-switching away, whose turn still runs in the background. The shared
-`td_fetch.rs` joins `json.rs` and `toml.rs` in
-`tests/shared_modules.rs`; all three have since left for the td-json,
-td-toml and td-fetch-client crates, and the test with them.
-
-**As built (increment 7).** Pure units cover the SSE reader in
-`src/sse.rs`: comment lines, `[DONE]` and nothing read after it, an
-OpenRouter-shaped stream, one with CRLF endings and one with
-multibyte text each split at every byte boundary and fed a byte at a
-time, LF, CRLF and lone-CR endings, multi-line `data`, the other fields
-and a byte order mark, the per-line, per-event and total bounds, and a
-sink's error stopping the reading. `src/assemble.rs` covers text and
-reasoning deltas and what is handed to the window once, reasoning
-details joined and serialized once, distinct blocks that share an index
-kept apart, a block whose members vary by delta kept whole and an empty
-signature giving way, fragmented tool calls assembled by index, an
-error mid-stream with its usage, a string error code, a choice's error,
-a bare error finish and a chunk that is not JSON, and the reply's
-bounds, counted as logged. `client.rs` keeps a failed request's report
-out of the prompt estimate. The window's units draw a reply as its
-deltas come, settle it kept or replaced, mark one incomplete or
-interrupted by its process failing, make room at the transcript's limit
-mid-stream, and give `Escape` to a running turn alone.
-`tests/support/mock_fetch.rs` serves the stream mode: a request with
-`stream` gets its reply as `chunk N` frames of a chosen size, ending
-`end`, `error`, or kept open with comment frames until the client
-closes it, which the mock counts; a counted reply scripted for a
-stream is framed as the service would. The fixtures
-`stream-sonnet.sse`, `stream-gemini.sse` (served with CRLF endings) and
-`stream-error.sse` are written by hand in OpenRouter's streamed shape,
-in 61-byte frames so events straddle them. `tests/model_client.rs`
-streams every turn: the exact head with `stream` and the 32 MiB limit,
-the deltas and the reply logged whole with its details as assembled, a
-restarted process sending them back byte for byte, an error mid-stream
-charged as reported with its text kept incomplete and a retry sending
-the same body, a stream broken by a transport error and one ended
-before its finish, each charged its reservation, a finish without
-`[DONE]` whole and `[DONE]` without a finish cut short, an interrupt
-that ends the turn, closes the connection and is asked again whole, and
-one that ends a rate limit's wait. A 200
-answering a stream with one JSON body keeps increment 5's error case.
-
-**As built (increment 8).** `src/tools.rs` covers each tool's
-arguments and bounds: the todo list's 50 items, 500 bytes and one item
-in progress, unknown and mistyped members, malformed JSON and empty
-arguments, the search and read limits, and a message's 32 KiB; the
-crossing rules, a conversation's own log free and every other a
-crossing; the listing's field filtering and order; and the definitions
-in the prefix, one set for every conversation.
-`src/history.rs` covers search (every term, case folded, newest first,
-kinds, the limit, excerpts on character boundaries), the cursor over a
-3,000-character tool result paged back whole, an offset inside a
-character, a page always taking one, and an approval's redaction in
-both tools. `src/wake.rs` covers the budget's count, an older log's
-reports and retries not counting, its renewal by the human's message to
-the conversation alone, and its one notice; `src/post.rs` the outbox
-across a restart and the window's own check; `src/store.rs` the new
-events replayed exactly, `paused` in `meta`, and calls without results
-answered at load once; `src/assemble.rs` and `src/client.rs` a call
-without an id or name, a counted reply's calls, and the wire form of
-messages, calls and results; and the window's units the todo panel and
-its keys, pausing, messages, calls and results in the transcript, and a
-streamed reply's calls kept once it is logged. `client::check_calls`
-covers ids missing, shared or too long and names missing or too long.
-`tests/support/mock_fetch.rs` can route a request by a marker its body
-carries to a script of its own. The fixtures `stream-tool-todo.sse`,
-`stream-tool-parallel.sse`, `stream-tool-malformed.sse` and
-`stream-tool-send.sse` are hand-written tool-call streams in 17-byte
-argument fragments, and `models.json` gains a model without `tools`.
-`tests/model_client.rs` runs a tool call's round trip (the second body
-rebuilt from the log byte for byte), two parallel calls answered in
-their order, malformed arguments answered with an error, the step bound,
-a model without tools refused, the wake budget held past twenty and
-renewed by the human, a paused conversation holding a message and
-starting its turn when resumed, a pause sent mid-turn holding a message
-that came before it, a message handed on twice logged once, a crossing
-refused as the call's result, a conversation a message woke first titled
-after the human's first turn, and a restart that finds a call started
-and not finished; and, through a `Supervisor` and the window's `Post`,
-one conversation messaging another that is closed, which is woken and
-answers; and an interrupt that comes while a call waits on the window,
-which lets that call finish, answers the next as not run and offers
-`C-r`, whose request carries both results.
-
-**As built (increment 9).** `src/files.rs` covers a relative path
-refused naming the worktrees; a read's numbering, its 2,000 lines and
-100 KiB, the next offset, an offset past the end, a cut line, and the
-whole file's digest on every partial read; binary, empty, non-UTF-8 and
-missing files and a directory naming `glob`; a write creating its
-directories, refusing an unread file and one changed since, and
-replacing one read or written; an edit's empty, identical, missing and
-repeated `old_string`, `replace_all`, a stale digest and a non-UTF-8
-file; and `glob`'s segments, `**`, classes, braces, dot files, `.git`,
-order and cap. `src/shell.rs` covers the exit status and interleaved
-output, empty input and the cleared environment, a timeout and a cancel
-killing the process with the output streamed before it, a descendant
-holding the pipe not holding the call, a process that closes its output
-still waited for, a process writing without pause timed out and
-cancelled and a descendant writing after its parent held no longer than
-the drain, a character split between head and tail, the head and tail
-kept and shown with the omitted count, the timeout's bounds, grep's and
-sed's argv with a pattern and a path that look like options, td-txt run
-under the applet's name through a stand-in script, and grep's rendering
-of no matches, its line cap and its errors. `src/files.rs` also covers
-lines split across pieces, a CRLF among them, a line of a million
-two-byte characters, and patterns that would be exponential to a naive
-matcher; a device and a FIFO refused by each file tool, a read
-cancelled, eight replacements of one read of which one lands and four
-creations of which one does, and nested, chained and over-long brace
-groups and patterns. `src/host.rs` covers every call and reply
-round-tripping, an unknown tool, a malformed reply, and replies to calls
-not in flight dropped; `src/toolhost.rs` the read-before-write rule
-across the protocol, two shell calls side by side with one streaming and
-cancelled, calls past 16 refused, a call with a missing argument refused
-and the host serving on, a result past the frame sent as an error, live
-output cut between characters, a host without worktrees or td-txt, and
-its arguments. `tests/tool_host.rs` runs the built program as a tool
-host over a pipe, and its input closing, which interrupts the call it
-was running and ends it. Its `grep_and_sed_run_td_txt` runs td-txt's
-grep and sed, `--sandbox` refusing a `w` command, against a td-txt named
-by `TD_AGENT_TXT`; it is ignored by default, since the gate builds no
-td-txt for td-agent's tests.
-
-**As built (the File menu).** `src/menu.rs` covers each item's action
-in order, File's shortcuts being chords the window binds and Help's
-`F1` none of them, `F10` and `Escape` closing it, other chords
-consumed, a press on the header and on an item, and Help after
-Conversation, its `Keys` chosen by `Right`, `Right` and `Return` or by
-presses. The window's
-units hold that every focus's key list passes `keys::check` with no row
-for Help → Keys, that the live pointer's and keyboard's choice of it
-asks for the list once, and that the control seam's keys and presses
-choosing it ask for nothing. `src/key.rs` covers the dialog's check and
-the paste's trimming; the write making a 0700 directory and a 0600 file
-holding the key and a newline, read back, leaving no temporary file and
-the key in no other file, and using an existing directory as it is; a
-stored key replaced only when asked, a refused one included; refusals
-by name of a group-writable ancestor (with nothing made under it), a
-missing configuration home, a link or a file where the temporary file
-goes (left as it was, the link not followed), a key path that is a
-directory or a link, and a text that is no key; the read-back's check
-of the bytes and of the read's rules; and that the fixture feature
-below moves only the walk's top. `src/keydialog.rs` covers the entry
-masked in what is drawn and in `Debug`, copy and cut refused without
-the clipboard being asked, a paste trimmed, two lines and an overlong
-paste refused whole, the message as typed and on Save, the warning,
-`Tab`, `Space`, `Return` and `Escape`, the entry cleared on cancel and
-close, buttons chosen by a press and a release on one, the replace
-confirmation (Cancel first, Replace chosen, and placed away from the
-press), the explanation's wrapping, a long refusal shown wrapped, and
-a window too small. The window's
-units cover the bar over the split, the menu's keys and pointer with
-the window's chords consumed while it is open, the status row's `no
-key` until a key is stored, the dialog's modality, a refusal kept in
-it, the replace confirmation through the window, a paste reaching the
-dialog that asked, dropped when it comes after the dialog closed or
-was not asked for, the composer's once the clipboard gave the
-dialog's up, and the composer's otherwise, the chord the menu
-shows doing what its item does, and no key path; each
-holds that the key is in no text drawn, status line, notice or `Debug`.
-`src/control.rs` drives the menu and the dialog through the seam,
-holding that `state` and `text` never carry the key; and
-`src/conversation.rs` holds that a later `setup` gives a conversation
-its key between turns and that its log never holds it, and that a queued
-`setup` or `choose` is taken first, in the order they came, while a
-pause still goes ahead of the messages before it. A umask that takes the
-owner's read access is not covered: std cannot set one without a foreign
-call, and it is the whole process's, which would race the other tests.
-
-For the Messages window, `src/notes.rs` covers the log's bound, its
-oldest dropped, a long note cut on a character boundary with the walk
-back taken, the unread count, the window's keys with a held one closing
-nothing, a refused copy said, a window too small saying so and laying
-out once resized, and a full window dropping its oldest as the log
-does. The window's units cover notes counted and not shown in the row,
-`C-S-m` and the File item opening it modal, a note joining it while
-open, a paste dropped, its closing, its refusal over another modal, the
-key dialog replacing it, its drawing in a window too narrow for the
-split, a background notice kept under its conversation's title, and the
-list's workspace grouping and title-width allocation; the key
-tests hold that no note kept, not only the newest, carries the key. And
-`src/control.rs` drives `messages` and reads `notes`, `unread` and
-`note`.
-
-For the store, `src/git.rs` covers remote parsing and every refused
-form, admission by remote and by whole-segment prefix, distinct store
-names for one repository's https and ssh remotes, branch names, and,
-against a local repository fetched over the file transport: the copied
-global file keeping the identity and both helpers and dropping a hooks
-path, a URL rewrite and an alias; a `GIT_CONFIG_PARAMETERS` in
-td-agent's environment not reaching git; the local remote refused
-without the test's admission; a store hook not running on fetch; the
-store made with no remote configured; a base resolved and its
-`AGENTS.md` and `.td-agent/rules` read, a tree, a link and a missing
-path none; a branch fetched and then pruned; a file past the bound
-refused; a store recording another remote refused; and a run whose
-standard error is long draining it, and one past its time killed. These
-run where a `git` is on PATH, as in the host preflight; the in-sandbox
-gate's toolchain has none, and there the test says it is skipped.
-
-For the git mount chain, td-jail's `workspace.rs` covers the spec's
-`checkout` and `repository` keys in order and a repository admitted
-with its whole chain in mount order, and refuses a protected entry
-missing, a link, a file with a second name, a file where a directory
-belongs, a linked entry that is no directory, a checkout whose `.git`
-is a directory or absent, a directory overlapping a repository, a plain
-worktree holding `.git` beside a repository, and a plan past its bytes;
-`transition.rs` round-trips the chain to stage 2 and refuses a link
-outside every repository and worktree, at a top, named twice, a
-writable file, or anything in a worktree but its read-only `.git`
-file. Its ignored live test, run where unprivileged user
-namespaces are, is As built (increment 11, the chain)'s.
-
-For the workspace repository's layout, `src/repo.rs` covers cone
-patterns as git writes them (the whole tree, the top alone, nested and
-overlapping paths, refused segments), the configuration (the identity
-quoted, the hooks path, the settings §8 names, no `[user]` without an
-identity, a control character refused), a repository and a worktree
-made whole and once (each file's content, paths named as they resolve
-through a link, no staging debris left, a second call refused and the
-first kept, a refused call removing only what it made, a planted link
-never written through, a bad id or branch refused, the 33rd worktree
-refused), a task's words round-tripping and refusing what they cannot
-name, and the one-line answer; with `git` on PATH, the checkout task
-run outside a jail removes the branch it made when the checkout fails,
-sets a `HEAD` the jail rewrote, checks the cone out on a new branch,
-refuses a second run by its index and another worktree on the branch
-without moving it, and a commit there carries the configuration's
-identity. `src/jail.rs` covers the spec's `checkout`, `repository` and
-store `read` lines in td-jail's order and that neither a repository nor
-the store is a root. The ignored live test is As built (increment 11,
-the layout)'s.
-
-For repository workspaces' preparation, `src/workspace.rs` covers a
-template's record (its name, a shared repository for one remote's
-entries and a worktree each, another remote of the same name a
-repository of its own, the paths under the data directory and the
-workspace root, its round trip through `meta` and the process's
-argument; refused: an unadmitted remote, a branch twice for one
-remote, a branch git would misread, a transport other than https and
-ssh, no repositories) and that its policy binds only what is prepared,
-a repository's checkouts its roots; `src/store.rs` that `prepared` is
-kept once, through the window's archiving, absent in a meta written
-before and refused relative; `src/protocol.rs` the round trips of
-`Fetch`, `Fetched` and `Prepared`, and a `Fetch` past 32 bases refused;
-`src/git.rs` that the store service answers each ask for its
-conversation; `src/config.rs` `remotes`; `src/prompt.rs` the worktrees
-in the environment block; `src/repo.rs` a checkout resumed after a
-crash, its branch kept where it was made though the base moved and its
-stale locks cleared, and a failed checkout (a blob missing from the
-store) removing its branch; `src/workspace.rs` too a name reserved
-once, the bound on directories and on the record, the policy's
-working directory and its bound, and the data directory narrowed and
-refused as a link; and `src/toolhost.rs` a call naming no directory
-refused while the working directory is not bound. `tests/processes.rs`
-has a new repository conversation ask once for its store, with its
-bases, be kept while it prepares though left and retired once done,
-and say a refusal in its log, recording nothing; the ignored
-live test in `tests/jail.rs` answers a conversation's ask with a real
-store and finds its worktree checked out, its notice said and its
-repository recorded prepared.
-
-For the admission card, `src/workspace.rs` covers which of a
-template's remotes are asked about (each once, as recorded, none
-another admission covers) and that a template refused for anything
-else (a plain http remote, a branch named twice, a bad base) is
-refused before any card; `src/store.rs` that the remotes admitted are
-kept once, read back as written, refused whole when a line is not one
-td-agent writes or there are more than 256, and once set aside admit
-nothing and let a card admit again; `src/confirm.rs` that the card
-admits only on its action; and `src/ui.rs` that it is shown with
-`Cancel` focused, asks the window to admit only on `Admit`, says a
-refusal in a note, takes no key as it is shown, is set aside with the
-keyboard and asked again when it comes back, and is not asked over
-another question.
-
-For project instructions, `src/git.rs` covers that each commit's are
-read once and held to the answer's bound, unread with why when past it,
-not UTF-8 or when git fails; `src/protocol.rs` that an answer at that
-bound fits a frame however its text escapes, that one past it is
-refused, that a workspace's every worktree at one commit at the bound
-still fits, the text crossing once, and that a reference to a base at
-another commit is refused; `src/store.rs` that a worktree's record is
-replaced in its place, that a commit's text counts once against the
-conversation's bound and a later worktree's past it is unread, that
-they survive reopening, and that a file td-agent would not write
-refuses the conversation; and `src/prompt.rs` that they follow the
-environment block, grouped by commit and remote, fenced past any run
-of backticks, controls made plain, an absent and an unread one said,
-none said before any is recorded, and that the most the record holds,
-of the text that escapes most, keeps the prefix's event within a line.
-`tests/processes.rs` has a first turn wait for the store's answer,
-ending only after it, with its instructions recorded though the
-checkout then fails, and an interrupt end a waiting turn, sent with
-its message or after; the live test finds them recorded for the
-prepared worktree.
-
-For removal on deletion, `src/repo.rs` covers a survey's words
-crossing with one base and two, a clean worktree, a changed and an
-untracked file counted with an index lock left in place, commits on
-`HEAD`, on a branch `HEAD` is not on, in a stash and kept by a tag
-counted, a commit in a second base not, and an answer or a base that
-is not one refused; `src/removal.rs` what would be lost listed a
-worktree a line (changes, commits once a repository, too many to
-count, could not be asked, cut to its bound) and nothing for a clean
-one, the tree and repositories' directory renamed away then put back,
-or removed, a link not followed, a taken name passed over, a directory
-not named for the workspace left, removing again no matter, and a
-sweep taking a leftover but not the human's `.deleting-notes`, with
-the names a sweep knows; `src/ui.rs` a conversation being deleted
-closed, refusing to open, given nothing by the post and named
-`deleting`, and its loss card, Cancel focused, set aside with the
-keyboard and asked again, Cancel keeping and the action deleting.
-For the background fetch, `src/config.rs` covers `fetch_interval`'s
-default and bounds; `src/git.rs` a refresh against a local upstream
-finding the new commit and a deleted base failing alone, and the store
-thread answering a refresh for the window with its bases;
-`src/upstream.rs` the stores in use, from live workspaces' admitted
-remotes only, each once with its bases once, none whose fetch is
-pending, and a base moving only from a commit known before; the store
-thread's queue a preparation before queued background fetches.
-For the retired step snapshots, `src/store.rs` covers an older log's
-`snapshot`, `undo` and `redo` records read as retired, a snapshot's
-trees kept, and any other unknown kind still refused, and the replay
-test round-trips a retired record; `src/compact.rs` a retired
-snapshot's tree carried as before; `src/repo.rs` an older td-agent's
-snapshot ref not counted as work.
-For a call told a worktree's state, `src/conversation.rs` covers a
-read into a worktree still checking out, a command in a ready first
-worktree and a path outside every worktree passing, a path climbing
-through `..` into a worktree not ready, a relative path left to the
-tool host, a command with no directory while the first could not be
-prepared, a `sed` naming one such path among others, and every
-worktree ready;
-`tests/model_client.rs` a command with no directory refused so, with
-no card, in a turn.
-For the asynchronous preparation, `tests/model_client.rs` covers a
-checkout's news, idle, waking nothing before the person has written;
-then a refused store's news and a checkout's each waking a turn of its
-own that reads it, announced before `Prepared`; nothing woken while
-paused; and a failure the same as the last news waking nothing. The
-live `tests/jail.rs` preparation test covers `Prepared` only after
-the ready notification and `Heads` asked once ready. Not pinned, as a
-test cannot time them without a hook: a checkout done during a turn
-taken up before the next request or a retry rather than after the
-turn; a second answer while checking out; a closing window waking
-nothing; and a panicking thread.
-For the notifications, `src/client.rs` covers one given to the model
-labelled, with and without the received line, and a notice not, its
-history rendering, and `notification` searching as `notice`;
-`src/conversation.rs` a failure's reason quoted on one bounded line;
-`src/prompt.rs` the repository environment naming the label and the
-news; and `tests/processes.rs` and the live `tests/jail.rs` a refused
-store, a ready repository and a moved base each logged as one, and a
-failure to set the refs logged as a notice.
-For the remote-tracking refs, `src/repo.rs` covers `track` setting a
-ref over what was there, a stale lock stopping a later run but cleared
-by one preparing, its words crossing in both forms and bad words
-refused, a commit the repository lacks refused, and a second base's
-missing commit leaving the first ref as it was; `src/store.rs` `tracked` read
-back, absent as empty, a bad commit refused, and a base's later record
-replacing its earlier; `src/protocol.rs` both `Heads` crossing and a
-base without its commit refused; `tests/processes.rs` a prepared
-repository asking `Heads` and not its store, a recorded commit doing
-nothing, and two remotes failing in turn each said once; and the live test in `tests/jail.rs`
-the ref set and recorded at preparation, and, started again and told
-upstream moved, set there, recorded and said.
-For removal on archiving, `src/store.rs` covers `removed` read back,
-absent as false, refused when not a boolean, kept by unarchiving and by
-a process's own write; `src/ui.rs` a conversation being archived named
-`archiving` and its card headed for archiving; `tests/processes.rs` an
-unarchived one whose workspace went asking for no store, letting a late
-answer go with nothing laid out or recorded, its prefix saying so;
-`src/card.rs` its worktrees said removed; and `tests/model_client.rs`
-its read and shell calls refused without a card, the turn going on. The
-live test in `tests/jail.rs` surveys the worktree it prepared in a
-real maintenance instance, clean, then with an untracked file, then
-with a commit, and removes the workspace, the store left.
-
-For the workspace card, `src/card.rs` covers the recommendation first,
-the worktrees of a remote at one commit grouped, each saying whether
-it is checked out, the text the model is given with a right-to-left
-override named, a control as the model gets it and the text's own
-`<U+202E>` told from a name, an absent, an unread and a not yet read
-entry, an unreadable record said with nothing claimed of what it held,
-and a header held to td-ui's label bound; `src/notes.rs` that a card
-longer than its panel opens at its first entry while the Messages
-window follows the newest; `src/menu.rs` that its item is on only for
-a repository workspace; `src/control.rs` that `workspace` with none
-says so and leaves `card` closed; and `src/ui.rs` the status row's
-item for a repository workspace and none otherwise, `C-S-w` and the
-menu item asking for it, an answer for another conversation or over
-another modal showing nothing, a note counted and kept out of it, a
-paste dropped naming it, a prepared repository asking nothing, opening
-it again reading again, and `C-S-w`, not `C-S-m`, closing it.
-
-For row menus and archiving, `src/menu.rs` covers the row menu's items
-for a live and an archived conversation, each activating its action,
-and Show archived checked while they show; `src/store.rs` holds that
-`archived` is written under the conversation's lock, refused while its
-process holds it, kept by a process that rewrites `meta`, and never
-makes a conversation the store does not hold; `src/post.rs` refuses a
-message to an archived conversation. The window's units cover a right
-press on a row opening that row's menu without opening it, one
-elsewhere opening nothing, `S-F10` under the open row, Archive and
-Unarchive asked of the window, Delete… putting the question of that
-row's conversation, an archived conversation hidden, shown with Show
-archived, refused when opened, passed over by `C-PageDown` and not
-the most recent, `S-F10` reaching the selected archived row from the
-list, kept selected through an update, the open one closed when
-archived, and the bar's menu back at
-`F10` after a row menu; `src/menu.rs` also holds `S-F10` closing a row
-menu. The window's own archiving, its processes ended, its refusal for
-a conversation whose `meta` is not yet written, its lock failure and a
-read-back after a failed sync, is not unit-tested: the window session
-has no test seam of its own; and `src/control.rs` drives `row-menu`
-and `show-archived` and reads `archived`, `shown` and `row-menu`.
-
-`tests/control_process.rs` gains two native cases. In the default build,
-`F10` through the seat opens the File menu, `Down` and `Return` open the
-dialog, a key typed on the seat reaches the masked entry, which the
-window shows as bullets and the control socket's state as a length,
-`Escape` closes it emptied, and no file holds the key. A test's `/` is
-shared (the trusted-root fixture's is mode 1777, and the test's tree
-lies under `/tmp`), which the key file's walk refuses, so the case that
-saves runs in a build of its own: the gate metadata names
+**The key fixture.** A test's `/` is shared (the trusted-root fixture's
+is mode 1777, and the test's tree lies under `/tmp`), which the key
+file's walk refuses, so the native case that saves a key runs in a build
+of its own: the gate metadata names
 `native-compositor-fixture-feature = "test-key-root"`, whose one effect
 is that the walk checks from the directory `TD_AGENT_TEST_KEY_ROOT`
 names, which the case makes canonical, rather than `/`; nothing ships
-with it. That case,
-`native_compositor::fixture::`, sends a message without a key and sees
-its turn stop for want of one; stores a key typed into the dialog,
-finding `openrouter.key` mode 0600 with one link, holding the key and
-a newline, in a directory made 0700, with no temporary file, and the
-status row no longer asking; sends again and sees the running
-conversation's turn go past the key, to the price check, which stops
-it with no models list fetched; and finds the key in no other file
-under the test's directory and not on standard error. The fixture
-build costs every td-agent native run a second build of the crate, in a
-target directory of its own, its library tests and its strict Clippy.
+with it. That build costs every td-agent native run a second build of
+the crate, in a target directory of its own, its library tests and its
+strict Clippy.
 
-**As built (templates).** `src/config.rs` covers templates read in
-order, their own shared lists, an empty one included, `network`,
-and each refusal (no name, an empty, padded, control-bearing or
-invisible one, a built-in's, a duplicate in any case, an unknown key,
-`repos` that is no list or lacks a field, a `sparse` that is no list,
-absolute, climbing or control-bearing, a shared list that is no list
-or has a relative path, too many), and which list a workspace binds:
-a template's own, the top-level one for a template naming none, none
-for one gone, through the setup's round trip; `tests/model_client.rs`
-holds that a conversation process made from a template sends its own
-list, and none once its template is gone, never the top-level one;
-`tests/processes.rs` that a template workspace reaches the meta;
-`src/ui.rs` covers the chooser's rows in order with Empty selected,
-the note, what each choice asks, Directory… opening the folder chooser
-even with a card waiting, `Escape`, and `C-n` with no workspaces
-starting one with none; `src/broker.rs` covers a repository template's
-refusal; `src/control.rs` drives `new` both ways; `src/confirm.rs`
-covers what the deletion question says of each kind of workspace; and
-`src/workspace.rs` round-trips a template workspace, refuses a bad
-`template:` argument, and labels one `template NAME`. The native
-compositor tests run without the jail, so their `C-n` starts a
-conversation with no workspace as before.
+**Tests the ordinary run leaves out.** The git units run where a `git`
+is on PATH, as in the host preflight; the in-sandbox gate's toolchain
+has none, and there they say they are skipped. Ignored by default, and
+run with `--ignored`: `grep_and_sed_run_td_txt` in `tests/tool_host.rs`,
+which needs a td-txt named by `TD_AGENT_TXT`, since the gate builds none
+for td-agent's tests; the live tests in `tests/jail.rs` and td-jail's
+own, run where unprivileged user namespaces are; and
+`tests/review_process.rs`, which needs user namespaces and explicit
+`TD_AGENT_JAIL` and `TD_AGENT_TXT` binaries.
+
+**Not covered.** A umask that takes the owner's read access: std cannot
+set one without a foreign call, and it is the whole process's, which
+would race the other tests. As a test cannot time them without a hook:
+a checkout done during a turn taken up before the next request or a
+retry rather than after the turn; a second answer while checking out; a
+closing window waking nothing; and a panicking thread. The window's own
+archiving, its processes ended, its refusal for a conversation whose
+`meta` is not yet written, its lock failure and a read-back after a
+failed sync: the window session has no test seam of its own.
 
 The live check is by hand. Run td-agent as `./install-apps` installs it
 from a checkout, with the key written as one line to
@@ -8191,175 +7609,10 @@ used, the cost, today's total and the key's credit. The conversation's
 `log` under `$XDG_STATE_HOME/td-agent/` holds the request, the reply
 with its `reasoning_details`, and the usage.
 
-For the review command, `src/review.rs` covers its options (each once,
-`-` naming the input, `--` before a FILE starting with `-`, an option's
-value never another option, bounds and refusals), the input's bound and
-an empty input refused, its prompt estimate (a third of ASCII bytes,
-every other byte whole), its plan (the default and the model's own
-completion limit, a worst case past `max_cost_per_turn` refused, an
-unlisted or unpriced model refused while that limit is set and planned
-without one, effort refused for a model without reasoning), the
-request's body (the model, no cache request, effort only when asked, the
-instruction naming the markers and the commit id, the commit quoted
-between them, a commit holding them refused), a stream as OpenRouter
-sends it (a processing comment, an event split across chunks, the finish
-then the usage) written as it comes with its model and provider named,
-and as no review: `[DONE]` or an end with no finish, an error inside the
-stream, an error reply said by its status and message, a 429 asked
-again `client::RETRIES` times after the provider's `Retry-After` and
-not when it asks for longer than td-agent waits, a counted reply with
-no finish, and one that stopped empty, was
-cut at its limit or was filtered.
+## 18. Not built
 
-Repository review tests cover the cumulative budget and missing usage,
-exact reasoning-detail echo, and the absence of write, publication and
-peer tools. `tests/review_process.rs` additionally runs real Git and jails
-with an offline fetch fixture: source writes fail, scratch writes succeed,
-sparse expansion reads the same revision, forbidden tools and incomplete
-reviews fail, a zero budget sends no completion, and a killed owner's
-workspace is collected by the next invocation. These tests are ignored in
-the ordinary Cargo suite because they require user namespaces and explicit
-`TD_AGENT_JAIL` and `TD_AGENT_TXT` binaries; run them with `--ignored`.
-
-## 18. Increments
-
-Each is one green, separately landable commit, except the revisions of
-2, each its own. The td-agent increments stack on one rolling branch; 3
-and 6 touch only td-ui and td-net and land from branches of their own,
-in parallel with it.
-
-1. **The design**, and the AGENTS.md route to it.
-2. **The revisions**, two commits: coordination, workspaces, git,
-   network, shared directories, the two-stage classifier and the chat
-   components; then a process per conversation with limits deferred, the
-   conversation features of §3, §12 and §14, and the gate cost of §17.
-3. **td-ui chat components.** The message list with selection and whole-
-   message copy, tested in td-ui, amending td-ui/DESIGN.md.
-4. **Window, processes and store.** The crate with its manifest, lock and
-   gate metadata, and the generalized exemption of §17; the broker
-   and conversation processes over their socketpairs, a conversation
-   restarted from its log; the split window with the conversation tree,
-   message list and composer; the store with local echo and no model;
-   driven window tests; and the host launch, td-net's launch roster
-   learning the name (`net/src/launch.rs`) and `./install-apps` installing
-   it (`builder/src/install_apps.rs`), adding no logic in shell.
-5. **Model client over `td-fetch 1`.** Non-streaming chat with no tools, in
-   the conversation process; the key file; the models list; usage, cost
-   limits and credit in the status row; titles; mock fetch tests. This is
-   the first live OpenRouter use.
-6. **Fetch streaming in td-net**, with its §W.8 amendment.
-7. **The SSE reader in td-agent.**
-8. **Conversation tools.** The todo list; `history_search` and
-   `history_read`; `conversations` and `send_message`, with their labels
-   and the wake budget. These are the first tools exposed to a model, and
-   none touches a file. A conversation counts as a workspace of its own,
-   and every read or message that §3 makes a crossing goes to the human
-   from the peers step below.
-9. **Tool host and tool semantics.** The framed, multiplexed protocol and
-   the §12 file and shell tools, tested in-process against fixtures,
-   td-txt included. No such tool is exposed to a model.
-10. **The `workspace` jail.** The td-jail launch kind with its
-    APPLICATIONS.md (§C, §X) and UNSAFE.md amendments: its seccomp
-    variant, shared directories from configuration, and the host-mode
-    divergences of §8, with no cgroup work, since instances stay in their
-    launcher's cgroup (§8); the launch's td-jail, td-txt and
-    the tool host; directory and scratch workspaces, with file and shell
-    tools exposed for the first time, in `ask` mode.
-
-    Then, before increment 11, small steps of their own, each one
-    commit:
-
-    - **Peers.** No orchestrator and no conversation made at startup;
-      the same tools and prompt for every conversation; `report`
-      removed; every crossing of §3 decided by the human on a card, in
-      both modes; an old orchestrator conversation made ordinary, its
-      old labels kept; `orchestrator_model` retired with a note (§3,
-      §15).
-    - **Templates.** `[[template]]` in configuration and the chooser at
-      `C-n` and File → `New conversation…`, with Empty and Directory…
-      built in and replacing File's two workspace items; a template
-      naming repositories refused until increment 11 (§7, §15).
-    - **Messages window.** The status row keeps only items of a fixed
-      width (the state, model and effort, context, cost, today, credit,
-      mode, limits and background count); td-agent's notes to the
-      human, which the row showed cut to fit, go instead to a
-      Messages window that keeps them whole, in order and with their
-      times, which the human opens to read them (§4).
-    - **Context menus and archive.** A context menu on a conversation's
-      row with Archive and Delete…, archived conversations hidden from
-      the list with a way to show them and unarchive one, and `archived`
-      in `meta` (§4, §6, §7).
-11. **Repository store and workspaces.** The git worker and maintenance
-    instances; admitted remotes; the store and its background fetch;
-    workspace repositories over alternates with the git mount chain;
-    sparse worktrees prepared asynchronously; local commits and step
-    snapshots with undo and redo, built here and removed later (§12);
-    repository templates, refused until now, and the workspace card;
-    the worktree cleanup on archiving or deleting a repository
-    workspace's conversation; and the notifications of §3.
-12. **Background processes.** `background` on `shell`, the process tools,
-    the output store, exit notices, and the window's process list.
-13. **Rules and auto mode.** Rules, cards, repetition, both classifier
-    stages, the circuit breaker, the calibrated `jev_threshold`, the
-    workspace card's trust mark and its listing of each repository's
-    `.td-agent/rules`, and,
-    for the crossings between conversations, "always" answers for a
-    pair and direction and the classifier's deciding them in `auto`
-    mode (§3).
-14. **Push and fetch tools.** The publish repository, export and strict
-    import, evidence and scan, and the bound push; and `git_fetch` (§9),
-    the one fetch a model asks for beside increment 11's background
-    fetch.
-15. **Network.** The egress relay applet with its §W.8 amendment and its
-    address predicate, the in-jail proxy, the policies and allowlist
-    crossings.
-16. **Compaction.** Automatic and manual compaction, the carried state,
-    stubs that `history_read` resolves, and the card that offers to
-    compact a long conversation whose cache has gone cold before
-    resending it (§14, "Resuming cold").
-17. **Packaging.** td-agent as a program of td's account (§8, "On
-    td"), the user's choice over a jailed application: td-jail admitting
-    the workspace kind for td's account with td's trees and below its
-    home on td's volume (APPLICATIONS.md §C); the `td-agent`
-    recipe, its realized-output check, `/bin/td-agent`, and the
-    `egressd` unit (§10, §17); and the launcher's card through
-    td-authd's request `0c`. git ships on td as an explicitly reviewed
-    non-Rust package (AGENTS.md). td-agent is a standalone program: no
-    boot test starts it, its window or its model.
-
-After these: resource limits (§8), moving a conversation between
-workspaces, and a native Anthropic Messages dialect. The MCP client
-(§12, MCP servers) came in four steps, each one commit, and is built:
-
-- **The tool host's `serve`.** The call that starts a program with
-  piped standard input, the binary `input` and `close` frames written
-  by the call's own thread under a window of credit, its output and
-  standard error waiting for room; tested in the tool host and over a
-  socketpair through `host::Client`, used by nothing yet.
-- **The protocol.** The client side in its own module: line framing
-  and its bounds, `initialize`, `tools/list` and its pages, `tools/call`
-  and its results, the server's requests and notifications, timeouts,
-  cancelling and abandoned replies, and the tools checked, cut and
-  encoded as offered; tested against a server in the test, in memory
-  and over a socket.
-- **Configuration and rules.** `template.mcp` read and checked and
-  carried to the conversation in its template settings, refused in a
-  template made in the window; a conversation made from a template
-  that names servers refused until the next step, as one naming
-  repositories was before increment 11 (§7); `mcp SERVER [TOOL]` in
-  the rules grammar, the person's file and a repository's.
-- **Servers and their tools.** Each server started in its instance of
-  its own, its client on a thread of its own, logged as `mcp` events,
-  restarted as allowed and on a change of mounts, policy or template;
-  its connections' cards; its tools in the prefix and the prompt's line
-  on them; `mcp__SERVER__TOOL` calls dispatched with their cards,
-  rules and results; failures told as notifications; tested with a
-  fake server in the test and, jailed, with a small stdio server run
-  by `sh`.
-
-`web_fetch`, `question`, `task`'s sub-agents, schedules, skills, the
-person's commands, `/review` and the MCP client are built (§3, §12,
-§15).
+Resource limits (§8), moving a conversation between workspaces, and a
+native Anthropic Messages dialect.
 
 ## 19. Open questions
 
