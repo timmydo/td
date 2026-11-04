@@ -1276,3 +1276,13 @@ than stacking a permanent `fix review nits` commit. Hard-wrap body prose at 72
 columns; let genuinely unbreakable commands, paths, and diagnostics run long.
 
 If a `Next:` block is needed, it belongs above the closing review trailers.
+
+# Design documents
+
+A design document states the current contract, not how it came to be. What an
+increment built, the tests it added, finished plans and removed features go in
+the commit message, which already carries them. Keep history in a design
+document only where it still binds behaviour: a compatibility rule for data an
+older version wrote, or a decision the user made and why. Name a passage for
+its topic, never for an increment or a landing, and amend the passage a change
+overtakes rather than adding another beside it.
