@@ -30,6 +30,9 @@ pub enum Event<'a> {
     MissingFile,
     /// Opaque token for the exact state successfully published by the adapter.
     Saved(crate::editor_model::SavePoint),
+    /// A save may or may not have reached the disk: no state of this tab may
+    /// read as saved until one is confirmed.
+    SaveUnconfirmed(crate::editor_model::TabId),
     /// Single-use, editor/revision-bound approval from the dialog coordinator.
     Discard(crate::editor_dialog::Discard),
     Reload {
@@ -610,6 +613,10 @@ impl Controller {
             }
             Event::Saved(point) => {
                 self.editor.acknowledge_saved(point)?;
+                Ok(Outcome::Changed)
+            }
+            Event::SaveUnconfirmed(tab) => {
+                self.editor.forget_saved(tab)?;
                 Ok(Outcome::Changed)
             }
             Event::Reload {

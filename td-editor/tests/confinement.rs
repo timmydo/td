@@ -52,6 +52,7 @@ fn source_inventory_and_allowances_are_closed() {
         "number.rs",
         "path_completion.rs",
         "preview.rs",
+        "remote.rs",
         "replace.rs",
         "replay.rs",
         "search.rs",

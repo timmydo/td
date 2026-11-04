@@ -7,6 +7,8 @@ const HELP: &str = concat!(
     "td-editor [--keys=windows|emacs] [--] [FILE...]\n",
     "With no file, open an Untitled tab. --window is an optional alias.\n",
     "Window option: --dictionary PATH loads an explicit local English word list.\n",
+    "Window option: --remote HOST edits HOST's files over ssh; FILE names its paths.\n",
+    "HOST needs td-editor; --remote-program PATH finds it off a non-login PATH.\n",
     "Window option: --control-socket PATH enables private state/text and edits.\n",
     "Control edits and queued Save/Save As check expected revisions.\n",
     "Control Open queues a file job; state reports its resulting tab and revision.\n",
@@ -87,6 +89,8 @@ fn main() -> ExitCode {
             .try_for_each(|notice| output.write_all(notice.as_bytes()))
         }
         [arg] if arg == "--help" => io::stdout().lock().write_all(HELP.as_bytes()),
+        // Another machine's window asked for this one's files, over ssh.
+        [arg] if arg == td_editor::remote::HOST_ARGUMENT => td_editor::remote::file_host(),
         _ => file_window(&args),
     };
     match result {
@@ -107,10 +111,32 @@ fn window_args(args: &[std::ffi::OsString]) -> io::Result<WindowArgs> {
     let mut paths = Vec::new();
     let mut dictionary = None;
     let mut control = None;
+    let mut host = None;
+    let mut program = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if !literal && arg == "--" {
             literal = true;
+        } else if !literal && arg == "--remote" {
+            if host.is_some() {
+                return Err(io::Error::other("--remote may be specified only once"));
+            }
+            let text = args
+                .next()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| io::Error::other("--remote needs a host"))?;
+            host = Some(td_remote::Host::parse(text).map_err(io::Error::other)?);
+        } else if !literal && arg == "--remote-program" {
+            if program.is_some() {
+                return Err(io::Error::other(
+                    "--remote-program may be specified only once",
+                ));
+            }
+            let text = args
+                .next()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| io::Error::other("--remote-program needs a path"))?;
+            program = Some(td_remote::RemoteProgram::parse(text).map_err(io::Error::other)?);
         } else if !literal && arg == "--keys=emacs" {
             profile = td_ui::editor_keys::Profile::Emacs;
         } else if !literal && arg == "--keys=windows" {
@@ -165,11 +191,23 @@ fn window_args(args: &[std::ffi::OsString]) -> io::Result<WindowArgs> {
             paths.push(std::path::PathBuf::from(arg));
         }
     }
+    let remote = match (host, program) {
+        (None, None) => None,
+        (None, Some(_)) => return Err(io::Error::other("--remote-program needs --remote")),
+        (Some(host), program) => {
+            let program = match program {
+                Some(program) => program,
+                None => td_remote::RemoteProgram::parse("td-editor").map_err(io::Error::other)?,
+            };
+            Some(td_editor::remote::Remote::ssh(host, program))
+        }
+    };
     Ok(WindowArgs {
         profile,
         paths,
         dictionary,
         control,
+        remote,
     })
 }
 
@@ -183,6 +221,38 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn remote_options_take_a_host_and_a_literal_program_or_are_refused() {
+        let parsed =
+            window_args(&["--remote".into(), "me@box".into(), "/there/file".into()]).unwrap();
+        assert_eq!(parsed.remote.unwrap().label(), "me@box");
+        assert_eq!(parsed.paths, vec![std::path::PathBuf::from("/there/file")]);
+        let parsed = window_args(&[
+            "--remote".into(),
+            "box".into(),
+            "--remote-program".into(),
+            ".local/bin/td-editor".into(),
+        ])
+        .unwrap();
+        assert!(parsed.remote.is_some());
+        // After `--` it is a file like any other.
+        let parsed = window_args(&["--".into(), "--remote".into()]).unwrap();
+        assert!(parsed.remote.is_none());
+        assert_eq!(parsed.paths, vec![std::path::PathBuf::from("--remote")]);
+        for refused in [
+            vec!["--remote"],
+            vec!["--remote", "-oProxyCommand=x"],
+            vec!["--remote", "a b"],
+            vec!["--remote", "a", "--remote", "b"],
+            vec!["--remote-program", "td-editor"],
+            vec!["--remote", "a", "--remote-program", "$(id)"],
+            vec!["--remote", "a", "--remote-program"],
+        ] {
+            let args: Vec<OsString> = refused.iter().map(OsString::from).collect();
+            assert!(window_args(&args).is_err(), "{refused:?}");
+        }
+    }
 
     #[test]
     fn help_describes_foreground_invocation_without_claiming_mail_integration() {
@@ -271,9 +341,11 @@ mod tests {
             paths,
             dictionary,
             control,
+            remote,
         } = window_args(&args).unwrap();
         assert!(dictionary.is_none());
         assert!(control.is_none());
+        assert!(remote.is_none());
         assert_eq!(profile, td_ui::editor_keys::Profile::Emacs);
         assert_eq!(paths, vec![std::path::PathBuf::from("-file"), raw.into()]);
         assert!(window_args(&["--keys=other".into()]).is_err());

@@ -573,6 +573,12 @@ impl Editor {
         Ok(())
     }
 
+    /// No state of this document is known to be what is on disk.
+    pub fn forget_saved(&mut self, id: TabId) -> Result<()> {
+        self.document_mut(id)?.saved = None;
+        Ok(())
+    }
+
     fn checked(&self, id: TabId, revision: u64) -> Result<&Document> {
         let doc = self.document(id)?;
         if doc.revision != revision {

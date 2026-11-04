@@ -363,11 +363,18 @@ impl Window {
             }
             self.notify("No wl_seat v5+; scratch input unavailable");
         }
-        self.client.set_title(if self.files.is_some() {
-            "td-editor — experimental file window"
-        } else {
-            "td-editor — scratch preview (NO SAVE)"
-        })?;
+        // The machine a save lands on is named wherever the window is.
+        let remote = self
+            .files
+            .as_ref()
+            .and_then(|files| files.remote())
+            .map(|remote| format!("td-editor — {} — experimental file window", remote.label()));
+        self.client
+            .set_title(match (&remote, self.files.is_some()) {
+                (Some(title), _) => title,
+                (None, true) => "td-editor — experimental file window",
+                (None, false) => "td-editor — scratch preview (NO SAVE)",
+            })?;
         self.client.set_app_id("td-editor")?;
         self.client.commit()
     }
@@ -4595,12 +4602,13 @@ impl Window {
             .checked_add(1)
             .ok_or("completion counter exhausted")?;
         if self.path_completion.is_none() {
-            self.path_completion = Some(crate::path_completion::Worker::start()?);
+            let remote = self.files.as_ref().and_then(|files| files.remote());
+            self.path_completion = Some(crate::path_completion::Worker::start_for(remote)?);
         }
         self.path_completion
             .as_mut()
             .ok_or("completion worker unavailable")?
-            .request(id, text)?;
+            .request(id, text, matches!(prompt.action, PathAction::Dictionary))?;
         self.last_completion = id;
         prompt.completion = crate::path_completion::State::Pending(id);
         Ok(())
@@ -5287,6 +5295,7 @@ fn prepare_files(
     profile: Profile,
     paths: Vec<PathBuf>,
     dictionary: Option<PathBuf>,
+    remote: Option<crate::remote::Remote>,
 ) -> Result<(
     Controller,
     crate::session::Session,
@@ -5295,7 +5304,10 @@ fn prepare_files(
     if paths.len() > 64 {
         return Err("at most 64 input paths".into());
     }
-    let mut files = crate::session::Session::start()?;
+    let mut files = match remote {
+        Some(remote) => crate::session::Session::start_remote(remote)?,
+        None => crate::session::Session::start()?,
+    };
     let mut ui = Controller::default();
     for path in paths {
         files.initial_open(&mut ui, path)?;
@@ -5321,6 +5333,9 @@ pub struct FileWindowOptions {
     pub paths: Vec<PathBuf>,
     pub dictionary: Option<PathBuf>,
     pub control: Option<PathBuf>,
+    /// The machine this window's files are on, when not this one. `paths`
+    /// are its paths; `dictionary` is still this machine's.
+    pub remote: Option<crate::remote::Remote>,
 }
 
 /// Foreground file window; caller integration does not imply mail submission.
@@ -5330,13 +5345,14 @@ pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
         paths,
         dictionary,
         control,
+        remote,
     } = options;
     let work = || -> Result<()> {
         let socket = control
             .map(|path| td_ui::control_socket::Socket::bind(&path))
             .transpose()
             .map_err(error)?;
-        let (ui, files, spelling) = prepare_files(profile, paths, dictionary)?;
+        let (ui, files, spelling) = prepare_files(profile, paths, dictionary, remote)?;
         let endpoint = endpoint(
             std::env::var_os("WAYLAND_SOCKET"),
             std::env::var_os("WAYLAND_DISPLAY"),
@@ -13446,6 +13462,7 @@ mod tests {
             paths: Vec::new(),
             dictionary: Some(dictionary.clone()),
             control: Some(path.clone()),
+            remote: None,
         });
         assert!(failed.is_err());
         assert!(!path.exists());
@@ -13456,6 +13473,7 @@ mod tests {
             paths: Vec::new(),
             dictionary: Some(dictionary),
             control: Some(path.clone()),
+            remote: None,
         })
         .is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"do not replace");
@@ -14081,8 +14099,13 @@ mod tests {
         let text = directory.path("text");
         std::fs::write(&words, b"known\nother").unwrap();
         std::fs::write(&text, b"known wrong").unwrap();
-        let (ui, files, spelling) =
-            prepare_files(Profile::Emacs, vec![text.clone()], Some(words.clone())).unwrap();
+        let (ui, files, spelling) = prepare_files(
+            Profile::Emacs,
+            vec![text.clone()],
+            Some(words.clone()),
+            None,
+        )
+        .unwrap();
         assert_eq!(spelling.dictionary_entries(), Some(2));
         assert!(!spelling.running());
         assert!(spelling.view(ui.editor()).0.contains("not checked"));
@@ -14092,13 +14115,14 @@ mod tests {
         assert!(!ui.editor().document(1).unwrap().dirty());
         assert_eq!(std::fs::read(&text).unwrap(), b"known wrong");
         assert_eq!(std::fs::read(&words).unwrap(), b"known\nother");
-        let (ui, files, spelling) = prepare_files(Profile::Windows, Vec::new(), None).unwrap();
+        let (ui, files, spelling) =
+            prepare_files(Profile::Windows, Vec::new(), None, None).unwrap();
         assert_eq!(spelling.dictionary_entries(), None);
         assert!(ui.editor().active().is_some());
         assert_eq!(files.labels().count(), 0);
         std::fs::write(&words, b"bad data").unwrap();
         assert!(
-            prepare_files(Profile::Windows, Vec::new(), Some(words.clone()))
+            prepare_files(Profile::Windows, Vec::new(), Some(words.clone()), None)
                 .err()
                 .unwrap()
                 .contains("dictionary selection unchanged")
@@ -14109,6 +14133,7 @@ mod tests {
             paths: Vec::new(),
             dictionary: Some(missing.clone()),
             control: None,
+            remote: None,
         })
         .is_err());
         assert!(!missing.exists());

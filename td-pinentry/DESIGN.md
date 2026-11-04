@@ -199,6 +199,11 @@ configured `core.askPass` still answers git's own prompts. A display
 inherited but not in front of the person, as in tmux reattached over
 ssh, still gets the window, and ssh waits on it until its timeout.
 
+`td-remote`, under `td-editor --remote`, sets `SSH_ASKPASS` and
+`SSH_ASKPASS_REQUIRE=force` for its ssh child with a Wayland display, a non-empty
+`SSH_ASKPASS` or `SSH_ASKPASS_REQUIRE` being the person's choice; where it looks
+for td-pinentry is in td-remote/DESIGN.md.
+
 td-agent sets `GIT_ASKPASS` and `SSH_ASKPASS` naming td-pinentry and
 `SSH_ASKPASS_REQUIRE=force`, with its Wayland display, for the git a
 person is there for alone: a repository template's preparation and a

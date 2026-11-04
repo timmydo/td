@@ -88,7 +88,9 @@ described under Rendering and reuse.
 
 The implementation uses Rust and `std`, with no external Cargo dependencies,
 toolkit, libwayland, libxkbcommon, spell-check subprocess, language server,
-network service, or plugin runtime. Font and dictionary files are data with
+network service, or plugin runtime. The one network path is the `ssh` child of
+a window given `--remote` ("Editing another machine's files"): ssh is the
+network code, and the editor listens nowhere. Font and dictionary files are data with
 explicit provenance, licensing, and size limits. A new bundled dictionary is
 a reviewed data input, not an undeclared host build dependency.
 
@@ -607,6 +609,131 @@ byte/work bounds, not deadlines for a stalled filesystem. Tests use actual
 temporary files and explicit stage-failure injection; a model integration
 test edits while a snapshot is pending and acknowledges only the written
 content state. The scratch-window warning remains unchanged.
+
+## Editing another machine's files
+
+`td-editor --remote HOST [FILE...]` opens a window here on HOST's files. The
+window, its text, undo, clipboard, spelling and dictionary are this machine's;
+FILE and every path entered name HOST's files, and a relative one starts from
+the account's home there. One window has one machine, named in its title, so
+a person can tell where a save lands and no tab's meaning depends on another's.
+A dictionary path is still this machine's, and Tab completes it here: it is the
+window's, not a document.
+
+`ssh HOST td-editor --file-host` is started for the connection, over
+`td-remote` (`td-remote/DESIGN.md`), which owns the argument rules, the
+handshake and the framing. `--remote-program` names a program a non-interactive
+`PATH` does not reach. HOST needs a td-editor of the same protocol version; a
+mismatch is refused, naming both. Its protocol is `remote::OPTIONS`: bump the
+version when a job or completion's encoding changes.
+
+**The host is the local worker.** `--file-host` feeds decoded jobs to the same
+`session::worker` a local window runs, so every rule of the file adapter above
+(no-follow opens, baselines, publication, conflicts, the reload borrow) runs
+beside the file, unchanged, on one connection; a rename whose confirmation failed
+is judged by bytes on the next one. There is no second implementation and no generic
+remote read or write that would split a save's check from its publication. A
+network filesystem would meet this section's own refusals: hard-link
+publication, attribute listing and parent synchronization are required of the
+filesystem. The host holds no state past its connection and starts no daemon.
+
+Observations are values, not handles: a directory listing's stamps and parent
+identity cross to the window and come back in a rename, copy or delete, to be
+judged there against the file as it then is. The same goes for a keep set, so
+closing a tab forgets its association there at the next job, and a reload's
+candidate is committed or dropped by the next job's keep set exactly as locally.
+Path completion is its own stream, so a 16 MiB save does not hold up a Tab.
+
+**The far side is another machine.** A decoded listing is held to a local one's
+bounds, and each name to what a directory can hold, because the window joins it
+to a path it sends back; listing text and titles are made here from those values.
+A file's bytes are at most `MAX_FILE_BYTES`, and a job or completion that does
+not parse is refused whole. A sentence from there reaches a notice with its
+control characters replaced. None of this is a security boundary for the file
+contents: the person chose to open them. It keeps a bad peer to failed requests.
+
+**A lost connection.** The window never blocks on it: every wait is on the file
+worker or the completion worker, including ssh's passphrase prompts, except at
+startup, when a host that cannot be reached is an error before a window opens.
+The connection is made again at the next job, never in the background.
+
+`td-remote` distinguishes what the person is told:
+
+- nothing was sent: `Cannot reach HOST … Nothing was sent. Text remains unsaved.`;
+- a save sent and unanswered: the same unconfirmed outcome a worker loss is (`The
+  write may have reached disk`). The model is not told saved, and from then until
+  a save is confirmed no state of that document reads as saved, undoing back to
+  the last confirmed one included: the disk may hold the text undone. A local save
+  that failed having attempted publication, and a worker lost with a save in hand,
+  are the same outcome;
+- a Save As sent and unanswered: `The new file may have been written`, since saving
+  to that name again is refused if it landed. The old file is as it was, so its
+  saved state stands;
+- a rename, copy, delete or new directory sent and unanswered: `It may have taken
+  effect; use g to refresh`;
+- an answer that cannot be read, one to a save that says it saved something else
+  or is no answer to a save, or one to a rename that names another file: the same
+  sentences, saying so.
+  The job may have run and what the host now holds is unknown, so the connection is
+  given up and the next job judges every file on a new one.
+
+A new host has lost every file ID and baseline, so the window's worker keeps its
+own: the IDs the window sees, translated at each job, and each file's baseline
+(bounded with the host's, since it held them first). Before the first job on a
+new connection it opens every file again, so that the host's guards for an open
+file take it up, and judges what it finds.
+
+- The same file at the same path, with the same bytes and missing state: the file
+  carries on.
+- The bytes of a save that was left unanswered: it landed. They become the baseline,
+  and saving again succeeds; the model was not told saved, so the person sees this
+  as one more save.
+- Anything else: the file is **stale**. A path that now leads somewhere else, the
+  parent having become a link, is included, because a local save would refuse that
+  too; so is an answer naming a file another tab holds, and a read failure.
+
+A stale file stays so across every later connection, whatever it comes to hold,
+until Reload or Save As replaces it: being equal again later does not show nobody
+else wrote it. A Save meets the ordinary conflict dialog, with nothing sent; Reload
+reads what is there now, and is refused if that path now leads elsewhere or to
+another tab's file; Save As writes a new file; Open selects the existing tab without
+replacing its text. Its host association stands where the host could make one, so
+deleting it, renaming onto it or saving another tab over a path it reserves is
+refused as for any open file. Where the host could not, the window's worker refuses
+the deletion or rename itself, and a Save As naming that path or a new directory at
+or above it, and has the host refuse a copy or rename onto it, by the job's reserved
+list. A Save As spelling the path another way reaches the host, which writes the
+file if nothing is there; the stale tab's Save still meets the conflict dialog, its
+Reload is refused as another tab's file, and its text is kept.
+
+Comparing bytes rather than stamps means a file merely touched while disconnected
+carries on. Before publication the new host's own full comparison still runs, against
+what it read when it reopened the file. So a write between that reopening and a save
+is caught as locally; a write and its reversal while disconnected, which restores
+identical bytes, is not seen, as it would not be by a local baseline comparison. Only
+the window's bytes are at risk, and those it still has.
+
+A job in hand when the window goes runs to its end, since a save publishes whole
+or not at all and a host killed instead could leave its temporary behind. The host
+exits once the file worker has finished. So two hosts can be alive for a moment. A
+save an old host publishes after a new one reopened the file reads there as another
+writer's change, a conflict over the person's own bytes, which Reload settles. It is
+the same not-compare-and-swap window the local adapter names: a publication between
+a host's recheck and its rename is not seen.
+
+A far program that hangs with its connection alive, on a stuck filesystem or in a
+startup file that never writes the magic, holds the job pending as a hung local disk
+would: Save is refused as busy and closing waits. Killing the `ssh` child ends the
+link, and the job reports as lost. ssh's keepalives end a dead connection by themselves.
+
+The link keeps at most one unread message per stream, so a far side can make the
+window hold at most 68 MiB beyond what it asked for, two streams of one whole and one
+partial message of 17 MiB. One sending more than was asked ends the link.
+
+Out of scope: several machines in one window; a local file and a remote file in
+one window; watching a remote file for changes, which a local window does not do
+either; and compressing or sending deltas of a file. ssh may compress if
+configured.
 
 ## Isolated file-worker test build
 

@@ -20,6 +20,7 @@ mod menu;
 mod number;
 mod path_completion;
 pub mod preview;
+pub mod remote;
 mod replace;
 pub mod replay;
 mod search;

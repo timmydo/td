@@ -1367,6 +1367,373 @@ fn disposable_weston_transfers_clipboard_between_editor_processes() {
     weston.assert_serving();
 }
 
+/// `ssh` for these cases: what it was asked is recorded, and `script` stands
+/// in for the login shell on the far side, which here is this machine.
+fn ssh_stub(directory: &Directory, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = directory.0.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let stub = bin.join("ssh");
+    let args = directory.0.join("ssh-args");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n{script}\n",
+            args.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+fn remote_command(directory: &Directory, bin: &Path, file: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_td-editor"));
+    command
+        .args(["--window", "--remote", "testhost", "--control-socket"])
+        .arg(directory.0.join("control"))
+        .arg("--")
+        .arg(file)
+        .env_clear()
+        .env("PATH", bin)
+        .env("XDG_RUNTIME_DIR", &directory.0)
+        .env("TMPDIR", &directory.0)
+        .env("TD_UI_FACE", "bitmap")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    command
+}
+
+#[test]
+fn production_process_edits_a_file_through_an_ssh_child_and_its_file_host() {
+    let directory = Directory::new("td-editor-process");
+    let display_path = directory.0.join("wayland");
+    let mut display = Display::start(&display_path, false);
+    let file = directory.0.join("-draft");
+    std::fs::write(&file, b"there\n").unwrap();
+    // The window's argument list ends the options, and the far side gets only
+    // fixed words: a path never crosses as an argument.
+    let bin = ssh_stub(
+        &directory,
+        &format!("exec '{}' --file-host", env!("CARGO_BIN_EXE_td-editor")),
+    );
+    let log = directory.0.join("stderr");
+    let child = remote_command(&directory, &bin, &file)
+        .env("WAYLAND_DISPLAY", &display_path)
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut editor = EditorProcess {
+        child,
+        socket: directory.0.join("control"),
+        log,
+        next: 0,
+    };
+    editor.wait_tab(0, "there\n");
+    editor.ok("insert\t1\t0\t0\t0\t686572652c20");
+    assert!(editor.job("save\t1\t1").contains(",save,1,1,"));
+    assert_eq!(std::fs::read(&file).unwrap(), b"here, there\n");
+    let args = std::fs::read_to_string(directory.0.join("ssh-args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let end = args.iter().position(|arg| *arg == "--").unwrap();
+    assert!(args.iter().take(end).any(|arg| *arg == "-T"), "{args:?}");
+    assert_eq!(
+        args.get(end + 1..).unwrap(),
+        ["testhost", "td-editor", "--file-host"]
+    );
+    editor.rendered();
+    editor.quit();
+    display.finish().assert_rendered();
+}
+
+/// A private sshd on loopback, its own keys and configuration in `directory`,
+/// and an `ssh` beside them told to use that configuration. Dropped, it stops.
+struct LiveSshd {
+    child: Child,
+    bin: PathBuf,
+}
+
+impl LiveSshd {
+    fn start(directory: &Directory) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = |name| td_fs::executable_on_path(name).expect("sshd, ssh, ssh-keygen on PATH");
+        let (sshd, ssh, keygen) = (tool("sshd"), tool("ssh"), tool("ssh-keygen"));
+        let keys = directory.0.join("keys");
+        std::fs::create_dir(&keys).unwrap();
+        for name in ["host", "user"] {
+            let made = Command::new(&keygen)
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(keys.join(name))
+                .status()
+                .unwrap();
+            assert!(made.success());
+        }
+        std::fs::copy(keys.join("user.pub"), keys.join("authorized")).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let server = directory.0.join("sshd_config");
+        std::fs::write(
+            &server,
+            format!(
+                "ListenAddress 127.0.0.1:{port}\nHostKey {keys}/host\nAuthorizedKeysFile {keys}/authorized\n\
+                 PidFile none\nStrictModes no\nUsePAM no\n",
+                keys = keys.display()
+            ),
+        )
+        .unwrap();
+        let child = Command::new(&sshd)
+            .args(["-D", "-e", "-f"])
+            .arg(&server)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(directory.0.join("sshd-log")).unwrap())
+            .spawn()
+            .unwrap();
+        let client = directory.0.join("ssh_config");
+        std::fs::write(
+            &client,
+            format!(
+                "Host testhost\n  HostName 127.0.0.1\n  Port {port}\n  IdentityFile {keys}/user\n  \
+                 UserKnownHostsFile /dev/null\n  StrictHostKeyChecking no\n  BatchMode yes\n  LogLevel ERROR\n",
+                keys = keys.display()
+            ),
+        )
+        .unwrap();
+        let bin = directory.0.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(
+            bin.join("ssh"),
+            format!(
+                "#!/bin/sh\nexec '{}' -F '{}' \"$@\"\n",
+                ssh.display(),
+                client.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "sshd did not listen");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Self { child, bin }
+    }
+}
+
+impl Drop for LiveSshd {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Real ssh, a real sshd and a real login shell, which the stub above stands in
+/// for: it needs all three on `PATH`, so it runs by hand. A host killed under the
+/// window is reconnected to at the next save, and a change made while it was gone
+/// is a conflict, not an overwrite.
+#[test]
+#[ignore = "needs sshd, ssh and ssh-keygen on PATH: cargo test -- --ignored live_sshd"]
+fn live_sshd_edits_reconnects_and_refuses_to_overwrite_a_change() {
+    let directory = Directory::new("td-editor-live-sshd");
+    let sshd = LiveSshd::start(&directory);
+    let display_path = directory.0.join("wayland");
+    let mut display = Display::start(&display_path, false);
+    let file = directory.0.join("draft");
+    std::fs::write(&file, b"there\n").unwrap();
+    // The far side's program records its pid, so the case can end that one.
+    let pid = directory.0.join("host-pid");
+    let host = directory.0.join("file-host");
+    std::fs::write(
+        &host,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec '{}' \"$@\"\n",
+            pid.display(),
+            env!("CARGO_BIN_EXE_td-editor")
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let log = directory.0.join("stderr");
+    let path = format!(
+        "{}:{}",
+        sshd.bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_td-editor"));
+    let child = command
+        .args(["--remote", "testhost", "--remote-program"])
+        .arg(&host)
+        .arg("--control-socket")
+        .arg(directory.0.join("control"))
+        .arg("--")
+        .arg(&file)
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", &directory.0)
+        .env("XDG_RUNTIME_DIR", &directory.0)
+        .env("TMPDIR", &directory.0)
+        .env("TD_UI_FACE", "bitmap")
+        .env("WAYLAND_DISPLAY", &display_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut editor = EditorProcess {
+        child,
+        socket: directory.0.join("control"),
+        log,
+        next: 0,
+    };
+    editor.wait_tab(0, "there\n");
+    editor.ok("insert\t1\t0\t0\t0\t686572652c20");
+    assert!(editor.job("save\t1\t1").contains(",save,1,1,"));
+    assert_eq!(std::fs::read(&file).unwrap(), b"here, there\n");
+
+    let kill = |pid: &Path| {
+        let pid = std::fs::read_to_string(pid).unwrap();
+        let killed = Command::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+    };
+    // Unchanged while gone: the save lands through a new host. The first attempt
+    // may find the old link dead on its way, and say so.
+    kill(&pid);
+    editor.ok("insert\t1\t1\t6\t6\t78");
+    let response = editor.request("save\t1\t2").unwrap();
+    let id = response.strip_prefix("pending\t").expect(&response);
+    let deadline = Instant::now() + TIMEOUT;
+    let done = loop {
+        let state = editor.ok("state");
+        let job = field_starting(&state, &format!("job={id},"))
+            .unwrap()
+            .to_owned();
+        if !job.contains(",pending,") {
+            break job;
+        }
+        assert!(Instant::now() < deadline, "job deadline: {state}");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    if !done.ends_with(",complete,-") {
+        assert!(editor.job("save\t1\t2").contains(",save,1,2,"), "{done}");
+    }
+    assert_eq!(std::fs::read(&file).unwrap(), b"here, xthere\n");
+
+    // Changed while gone: nothing is written over it.
+    kill(&pid);
+    std::fs::write(&file, b"someone else's\n").unwrap();
+    editor.ok("insert\t1\t2\t7\t7\t79");
+    for _ in 0..2 {
+        let response = editor.request("save\t1\t3").unwrap();
+        if let Some(id) = response.strip_prefix("pending\t") {
+            let id = id.to_owned();
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                let state = editor.ok("state");
+                if !field_starting(&state, &format!("job={id},"))
+                    .unwrap()
+                    .contains(",pending,")
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "job deadline: {state}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    assert_eq!(std::fs::read(&file).unwrap(), b"someone else's\n");
+    let dialog = editor.ok("state");
+    assert!(dialog.contains(",conflict,"), "{dialog}");
+    drop(editor);
+    display.finish();
+}
+
+fn field_starting<'a>(state: &'a str, prefix: &str) -> Option<&'a str> {
+    state.split('\t').find(|field| field.starts_with(prefix))
+}
+
+#[test]
+fn production_process_says_why_it_could_not_reach_the_host_and_opens_no_window() {
+    for (script, said) in [
+        (
+            "echo 'ssh: connect to host testhost port 22: No route to host' >&2; exit 255",
+            "No route to host",
+        ),
+        (
+            "echo 'sh: td-editor: command not found' >&2; exit 127",
+            "command not found",
+        ),
+        ("echo 'Welcome to testhost'; exec sleep 60", "startup file"),
+    ] {
+        let directory = Directory::new("td-editor-process");
+        let file = directory.0.join("draft");
+        let bin = ssh_stub(&directory, script);
+        // Nowhere for a window to open: it fails before it would try.
+        let output = remote_command(&directory, &bin, &file)
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("testhost"), "{stderr}");
+        assert!(stderr.contains(said), "{stderr}");
+    }
+}
+
+#[test]
+fn production_process_refuses_a_host_that_could_be_an_ssh_option() {
+    let output = Command::new(env!("CARGO_BIN_EXE_td-editor"))
+        .args(["--remote", "-oProxyCommand=false", "file"])
+        .env_clear()
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is not a host"));
+}
+
+#[test]
+fn the_file_host_says_the_magic_first_and_ends_if_the_window_goes_in_the_handshake() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_td-editor"))
+        .arg(td_editor::remote::HOST_ARGUMENT)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The window goes before saying who it is: the host has nothing to do.
+    drop(child.stdin.take());
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the host did not end");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert!(!status.success());
+    // It has ended, so this read cannot wait.
+    let mut magic = [0u8; 12];
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut magic)
+        .unwrap();
+    assert_eq!(&magic, b"td-remote 1\n");
+}
+
 #[test]
 fn production_process_roundtrips_remote_edit_jobs_frames_and_close_dialogs() {
     let directory = Directory::new("td-editor-process");

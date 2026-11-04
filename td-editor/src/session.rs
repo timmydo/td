@@ -25,7 +25,7 @@ impl PollFailure {
     }
 }
 
-enum Operation {
+pub(crate) enum Operation {
     Copy {
         source: crate::files::RenameSource,
         name: std::ffi::OsString,
@@ -50,17 +50,17 @@ enum Operation {
         bytes: Vec<u8>,
     },
 }
-struct Job {
-    keep: BTreeSet<FileId>,
-    operation: Operation,
+pub(crate) struct Job {
+    pub(crate) keep: BTreeSet<FileId>,
+    pub(crate) operation: Operation,
 }
-struct Loaded {
-    file: FileId,
-    path: PathBuf,
-    bytes: Vec<u8>,
-    missing: bool,
+pub(crate) struct Loaded {
+    pub(crate) file: FileId,
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) missing: bool,
 }
-enum Completion {
+pub(crate) enum Completion {
     CreatedPath {
         path: PathBuf,
         notice: String,
@@ -79,6 +79,8 @@ enum Completion {
     },
     Reload(Loaded),
     Conflict(String),
+    /// A plain save that may or may not have reached the disk.
+    Unconfirmed(String),
     Saved {
         file: FileId,
         path: PathBuf,
@@ -121,17 +123,37 @@ pub(crate) struct Session {
     failed: bool,
     conflict: Option<td_ui::editor_dialog::Target>,
     dictionary: Option<crate::spelling::Dictionary>,
+    remote: Option<std::sync::Arc<crate::remote::Remote>>,
 }
 
 impl Session {
     pub(crate) fn start() -> Result<Self> {
+        Self::start_with(None, worker)
+    }
+
+    /// The same coordinator over another machine's files: the worker is a
+    /// client of `td-editor --file-host` there, and connects before this
+    /// returns so that a host that cannot be reached is said at startup.
+    pub(crate) fn start_remote(remote: crate::remote::Remote) -> Result<Self> {
+        remote.connect()?;
+        let remote = std::sync::Arc::new(remote);
+        let client = std::sync::Arc::clone(&remote);
+        Self::start_with(Some(remote), move |jobs, results| {
+            crate::remote::client_worker(&client, jobs, results)
+        })
+    }
+
+    fn start_with(
+        remote: Option<std::sync::Arc<crate::remote::Remote>>,
+        work: impl FnOnce(Receiver<Job>, SyncSender<Result<Completion>>) + Send + 'static,
+    ) -> Result<Self> {
         #[cfg(feature = "test-file-barrier")]
         let queue_gate = crate::test_file_barrier::QueueGate::start()?;
         let (sender, jobs) = mpsc::sync_channel(1);
         let (results, receiver) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("td-editor-files".into())
-            .spawn(move || worker(jobs, results))
+            .spawn(move || work(jobs, results))
             .map_err(|e| e.to_string())?;
         Ok(Self {
             #[cfg(feature = "test-file-barrier")]
@@ -144,7 +166,13 @@ impl Session {
             failed: false,
             conflict: None,
             dictionary: None,
+            remote,
         })
+    }
+
+    /// The machine this window's files are on, when not this one.
+    pub(crate) fn remote(&self) -> Option<&std::sync::Arc<crate::remote::Remote>> {
+        self.remote.as_ref()
     }
 
     pub(crate) fn busy(&self) -> bool {
@@ -631,6 +659,9 @@ impl Session {
             Err(TryRecvError::Disconnected) if self.failed => return None,
             Err(TryRecvError::Disconnected) => {
                 self.failed = true;
+                if let Some(Pending::Save { tab, .. }) = &self.pending {
+                    let _ = ui.dispatch(Event::SaveUnconfirmed(*tab));
+                }
                 Err("File worker disconnected; a pending write may have reached disk. Verify the destination; text remains unsaved.".into())
             }
         };
@@ -846,6 +877,13 @@ impl Session {
                 }
                 Err(detail)
             }
+            // Undoing back to the last confirmed state must not read as clean
+            // when the disk may hold this one.
+            (Some(Pending::Save { tab, .. }), Completion::Unconfirmed(detail)) => {
+                ui.dispatch(Event::SaveUnconfirmed(tab))
+                    .map_err(|e| format!("{detail} ({e})"))?;
+                Err(detail)
+            }
             (Some(Pending::Reload { permit }), Completion::Reload(loaded)) => {
                 let Some(permit) = permit else {
                     return Ok("Reload cancelled; text and old baseline retained".into());
@@ -982,7 +1020,7 @@ impl Session {
     }
 }
 
-fn worker(jobs: Receiver<Job>, results: SyncSender<Result<Completion>>) {
+pub(crate) fn worker(jobs: Receiver<Job>, results: SyncSender<Result<Completion>>) {
     #[cfg(feature = "test-file-barrier")]
     let mut barrier = match crate::test_file_barrier::Barrier::connect() {
         Ok(barrier) => barrier,
@@ -1158,19 +1196,7 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
                 }
                 (Some(file), None) => {
                     if let Err(detail) = files.save(file, bytes) {
-                        let conflict = !detail.published
-                            && !detail.publication_attempted
-                            && detail.residual.is_none()
-                            && matches!(
-                                detail.kind,
-                                crate::files::Kind::Conflict | crate::files::Kind::Exists
-                            );
-                        let detail = file_error(detail);
-                        return if conflict {
-                            Ok(Completion::Conflict(detail))
-                        } else {
-                            Err(detail)
-                        };
+                        return failed_save(detail);
                     }
                     file
                 }
@@ -1210,6 +1236,27 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
                 path: files.path(file).map_err(|e| e.to_string())?.to_owned(),
             })
         }
+    }
+}
+
+/// How a plain save's failure is told: only one that cannot have published is
+/// a conflict or a refusal, and one that may have leaves no state reading saved.
+fn failed_save(detail: crate::files::Failure) -> Result<Completion> {
+    let conflict = !detail.published
+        && !detail.publication_attempted
+        && detail.residual.is_none()
+        && matches!(
+            detail.kind,
+            crate::files::Kind::Conflict | crate::files::Kind::Exists
+        );
+    let unconfirmed = detail.published || detail.publication_attempted;
+    let detail = file_error(detail);
+    if conflict {
+        Ok(Completion::Conflict(detail))
+    } else if unconfirmed {
+        Ok(Completion::Unconfirmed(detail))
+    } else {
+        Err(detail)
     }
 }
 
@@ -1253,6 +1300,7 @@ impl Session {
             failed: false,
             conflict: None,
             dictionary: None,
+            remote: None,
         }
     }
 }
@@ -1260,6 +1308,62 @@ impl Session {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+    #[test]
+    fn a_failed_save_that_may_have_published_is_unconfirmed_and_only_then() {
+        let failure = |kind, published, attempted| {
+            let mut failure = crate::files::Failure::new(kind, "no");
+            failure.published = published;
+            failure.publication_attempted = attempted;
+            failed_save(failure)
+        };
+        use crate::files::Kind;
+        assert!(matches!(
+            failure(Kind::Conflict, false, false),
+            Ok(Completion::Conflict(_))
+        ));
+        assert!(failure(Kind::Metadata, false, false).is_err());
+        for (published, attempted) in [(true, false), (false, true), (true, true)] {
+            assert!(matches!(
+                failure(Kind::Conflict, published, attempted),
+                Ok(Completion::Unconfirmed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_worker_lost_with_a_save_in_hand_leaves_no_state_reading_saved() {
+        let mut files = Session::start_with(None, |_jobs, _results| {}).unwrap();
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Load(b"one")).unwrap();
+        let tab = ui.editor().active().unwrap();
+        let revision = ui.editor().document(tab).unwrap().revision();
+        ui.dispatch(Event::Edit {
+            tab,
+            revision,
+            command: td_ui::editor_model::Command::Insert("x".into()),
+        })
+        .unwrap();
+        // Sending may find it gone already, so the save is set up by hand.
+        let (point, _bytes) = ui.editor().save_snapshot(tab).unwrap();
+        files.pending = Some(Pending::Save { tab, point });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let done = loop {
+            if let Some(done) = files.poll(&mut ui) {
+                break done;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert!(done.is_err());
+        let revision = ui.editor().document(tab).unwrap().revision();
+        ui.dispatch(Event::Edit {
+            tab,
+            revision,
+            command: td_ui::editor_model::Command::Undo,
+        })
+        .unwrap();
+        assert!(ui.editor().document(tab).unwrap().dirty());
+    }
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1966,6 +2070,7 @@ mod tests {
                     failed: false,
                     conflict: None,
                     dictionary: None,
+                    remote: None,
                 },
                 jobs,
                 results,

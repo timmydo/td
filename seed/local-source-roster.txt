@@ -13,7 +13,7 @@
 td-agent-source td-agent td-civil,td-encoding,td-fetch-client,td-fs,td-html,td-jpeg,td-json,td-markdown,td-png,td-remote,td-toml,td-ui,td-util,td-compositor,engine,td-test-compositor
 td-disks-source td-disks td-btrfs,td-fs
 td-dua-source td-dua td-civil,td-json,td-ui,td-compositor
-td-editor-source td-editor td-civil,td-ui,td-compositor,td-fs,td-test-compositor
+td-editor-source td-editor td-civil,td-remote,td-ui,td-compositor,td-fs,td-test-compositor
 td-install-qemu-test-source td-install-qemu-test
 td-mail-source td-mail td-civil,td-encoding,td-fetch-client,td-fs,td-html,td-json,td-kv,td-regex,td-toml,td-ui,td-compositor,td-test-compositor
 td-net-source net engine,td-fs,td-civil

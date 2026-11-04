@@ -12,6 +12,7 @@ version = "0.1.0"
 dependencies = [
  "td-civil",
  "td-fs",
+ "td-remote",
  "td-test-compositor",
  "td-ui",
 ]
@@ -19,6 +20,13 @@ dependencies = [
 [[package]]
 name = "td-fs"
 version = "0.1.0"
+
+[[package]]
+name = "td-remote"
+version = "0.1.0"
+dependencies = [
+ "td-fs",
+]
 
 [[package]]
 name = "td-test-compositor"

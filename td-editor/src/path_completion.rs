@@ -16,6 +16,42 @@ pub(crate) struct Matches {
 }
 
 impl Matches {
+    pub(crate) fn encode(&self, w: &mut td_remote::codec::Writer) {
+        w.count(self.paths.len());
+        for path in &self.paths {
+            w.bytes(path.as_bytes());
+        }
+        w.u64(u64::try_from(self.skipped).unwrap_or(u64::MAX));
+    }
+
+    pub(crate) fn decode(
+        r: &mut td_remote::codec::Reader<'_>,
+    ) -> std::result::Result<Self, td_remote::Error> {
+        let count = r.count(ENTRIES)?;
+        let mut paths = Vec::with_capacity(count);
+        let mut names = 0usize;
+        for _ in 0..count {
+            let path = r.text(PATH_BYTES)?;
+            names = names.saturating_add(path.len());
+            if names > ENTRIES.saturating_mul(PATH_BYTES) || path.contains('\0') {
+                return Err(td_remote::Error::Protocol("a completion's path".into()));
+            }
+            paths.push(path.to_string());
+        }
+        let skipped = usize::try_from(r.u64()?).unwrap_or(usize::MAX);
+        Ok(Self {
+            paths,
+            selected: None,
+            skipped,
+        })
+    }
+
+    /// Whether these could be completions of `text`, as a local scan's always
+    /// are: a far side's replace what the person typed.
+    pub(crate) fn complete(&self, text: &str) -> bool {
+        !self.paths.is_empty() && self.paths.iter().all(|path| path.starts_with(text))
+    }
+
     pub(crate) fn prefix(&self) -> &str {
         let Some(first) = self.paths.first() else {
             return "";
@@ -160,20 +196,44 @@ impl State {
 }
 
 pub(crate) struct Worker {
-    requests: SyncSender<(u64, String)>,
+    requests: SyncSender<(u64, String, bool)>,
     replies: Receiver<(u64, Result<Matches>)>,
     pending: Option<u64>,
 }
 
 impl Worker {
     pub(crate) fn start() -> Result<Self> {
-        let (requests, input) = mpsc::sync_channel::<(u64, String)>(1);
+        Self::start_with(|text, _| scan(text))
+    }
+
+    /// Whichever machine the window's files are on: a worker's wait for a far
+    /// side is the same to the window as its wait for a slow disk.
+    pub(crate) fn start_for(
+        remote: Option<&std::sync::Arc<crate::remote::Remote>>,
+    ) -> Result<Self> {
+        match remote {
+            None => Self::start(),
+            Some(remote) => {
+                let remote = std::sync::Arc::clone(remote);
+                Self::start_with(move |text, here| {
+                    if here {
+                        scan(text)
+                    } else {
+                        remote.complete(text)
+                    }
+                })
+            }
+        }
+    }
+
+    fn start_with(scan: impl Fn(&str, bool) -> Result<Matches> + Send + 'static) -> Result<Self> {
+        let (requests, input) = mpsc::sync_channel::<(u64, String, bool)>(1);
         let (output, replies) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("editor-path-completion".into())
             .spawn(move || {
-                while let Ok((id, text)) = input.recv() {
-                    if output.send((id, scan(&text))).is_err() {
+                while let Ok((id, text, here)) = input.recv() {
+                    if output.send((id, scan(&text, here))).is_err() {
                         break;
                     }
                 }
@@ -186,12 +246,14 @@ impl Worker {
         })
     }
 
-    pub(crate) fn request(&mut self, id: u64, text: String) -> Result<()> {
+    /// `here` asks of this machine even in a window of another's files: a
+    /// dictionary is the window's own.
+    pub(crate) fn request(&mut self, id: u64, text: String, here: bool) -> Result<()> {
         if self.pending.is_some() {
             return Err("previous directory scan pending; retry Tab".into());
         }
         self.requests
-            .try_send((id, text))
+            .try_send((id, text, here))
             .map_err(|error| error.to_string())?;
         self.pending = Some(id);
         Ok(())
@@ -403,8 +465,8 @@ mod tests {
         let directory = Directory::new();
         std::fs::write(directory.0.join("file"), b"").unwrap();
         let mut worker = Worker::start().unwrap();
-        worker.request(7, directory.prefix("fi")).unwrap();
-        assert!(worker.request(8, directory.prefix("fi")).is_err());
+        worker.request(7, directory.prefix("fi"), false).unwrap();
+        assert!(worker.request(8, directory.prefix("fi"), false).is_err());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some((id, result)) = worker.poll() {

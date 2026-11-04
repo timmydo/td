@@ -5,6 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use td_remote::codec::{Reader, Writer};
 
 const ENTRIES: usize = 4096;
 const NAME_BYTES: usize = 1024 * 1024;
@@ -59,6 +60,81 @@ struct Entry {
 }
 
 impl Snapshot {
+    /// What crosses from the machine that listed it. The text and title are
+    /// made again on arrival, from these, so a far side supplies no display
+    /// string; marks and sort order are the window's own.
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        crate::remote::put_path(w, &self.path);
+        w.u64(self.parent_identity.0);
+        w.u64(self.parent_identity.1);
+        w.count(self.entries.len());
+        for entry in &self.entries {
+            w.bytes(entry.name.as_bytes());
+            w.u32(u32::from(entry.kind));
+            w.u32(entry.mode);
+            w.u64(entry.links);
+            w.u32(entry.uid);
+            w.u32(entry.gid);
+            w.u64(entry.size);
+            w.i64(entry.modified.0);
+            w.i64(entry.modified.1);
+            entry.stamp.encode(w);
+        }
+    }
+
+    /// Holds a far side's listing to the bounds a local one meets, and each
+    /// name to what a directory can hold: a name is joined to the path and
+    /// sent back as one, so it may not climb out or carry a separator.
+    pub(crate) fn decode(r: &mut Reader<'_>) -> Result<Self, td_remote::Error> {
+        let refuse = |detail: &str| td_remote::Error::Protocol(format!("a listing's {detail}"));
+        let path = crate::remote::get_path(r)?;
+        let parent_identity = (r.u64()?, r.u64()?);
+        let count = r.count(ENTRIES)?;
+        let mut entries = Vec::with_capacity(count);
+        let mut names = 0usize;
+        for _ in 0..count {
+            let name = r.bytes(NAME_BYTES)?;
+            names = names.saturating_add(name.len());
+            if names > NAME_BYTES {
+                return Err(refuse("names are past the bound"));
+            }
+            if name.is_empty()
+                || matches!(name, b"." | b"..")
+                || name.contains(&b'/')
+                || name.contains(&0)
+            {
+                return Err(refuse("entry is no directory entry's name"));
+            }
+            let kind = char::from_u32(r.u32()?)
+                .filter(|kind| "d-lbcps?".contains(*kind))
+                .ok_or_else(|| refuse("entry has an unknown kind"))?;
+            entries.push(Entry {
+                delete: false,
+                name: std::ffi::OsStr::from_bytes(name).to_os_string(),
+                kind,
+                mode: r.u32()?,
+                links: r.u64()?,
+                uid: r.u32()?,
+                gid: r.u32()?,
+                size: r.u64()?,
+                modified: (r.i64()?, r.i64()?),
+                stamp: crate::files::Stamp::decode(r)?,
+            });
+        }
+        let title = title(&path);
+        let mut snapshot = Self {
+            path,
+            title,
+            text: String::new(),
+            entries,
+            sort: Sort::Name,
+            reverse: false,
+            parent_identity,
+        };
+        snapshot.arrange(Sort::Name, false);
+        Ok(snapshot)
+    }
+
     pub(crate) fn creation_source(&self) -> crate::files::DirectorySource {
         crate::files::DirectorySource::observed(self.path.clone(), self.parent_identity)
     }

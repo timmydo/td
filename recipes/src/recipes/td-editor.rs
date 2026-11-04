@@ -7,10 +7,11 @@ use crate::types::Recipe;
 /// `#[path]`, and embeds the licence notices under `td-compositor/assets` by
 /// `include_str!`, so both sibling trees are staged beside td-editor and
 /// cargo compiles exactly what the crate names: the td-taskmgr shape. Its
-/// lock lists only itself, td-civil, td-ui, and td-fs and
-/// td-test-compositor, the PATH lookup and native harness its tests use
-/// (each staged too: cargo reads a dev-dependency to resolve the lock), so
-/// the closure is std and the vendor set is empty; the binary is linked
+/// lock lists only itself, td-civil, td-remote, td-ui, td-fs (td-remote's,
+/// and the PATH lookup its tests use) and td-test-compositor, the native
+/// harness its tests use (each staged too: cargo reads a dev-dependency to
+/// resolve the lock), so the closure is std and the vendor set is empty; the
+/// binary is linked
 /// fully static, as every td-owned program in the system tree is; td-mail
 /// and td-news compile the crate as a library. The system image copies the
 /// complete output, debug companion included, and links `/bin/td-editor` to
@@ -20,6 +21,7 @@ pub fn recipe() -> Recipe {
         .local_source("td-editor")
         .local_source_trees(&[
             "td-civil",
+            "td-remote",
             "td-ui",
             "td-compositor",
             "td-fs",
@@ -46,6 +48,7 @@ mod tests {
             recipe.local_source_trees,
             Some(vec![
                 "td-civil".to_string(),
+                "td-remote".to_string(),
                 "td-ui".to_string(),
                 "td-compositor".to_string(),
                 "td-fs".to_string(),
@@ -62,7 +65,7 @@ mod tests {
     }
 
     /// The staged siblings are exactly the trees the crate reaches: td-civil,
-    /// td-ui, td-fs and td-test-compositor by the manifest's path
+    /// td-remote, td-ui, td-fs and td-test-compositor by the manifest's path
     /// dependencies, and td-compositor through td-ui's `#[path]` mounts and
     /// embedded notices.
     /// A crate that grew another reach, or td-ui a mount elsewhere, would
@@ -83,6 +86,7 @@ mod tests {
             declared,
             [
                 "td-civil = { path = \"../td-civil\" }",
+                "td-remote = { path = \"../td-remote\" }",
                 "td-ui = { path = \"../td-ui\" }",
                 "td-fs = { path = \"../td-fs\" }",
                 "td-test-compositor = { path = \"../td-test-compositor\" }"

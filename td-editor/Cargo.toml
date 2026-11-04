@@ -7,12 +7,14 @@ license = "MIT"
 
 [workspace]
 
-# td's civil calendar and the shared UI toolkit, by the one
-# sibling-dependency spelling the lock guard admits (AGENTS.md 'Rust code'):
-# the toolkit's input layer, and the font and wire codecs it mounts, reach
-# this crate only through `td_ui::`.
+# td's civil calendar, the shared UI toolkit, and the transport a window
+# editing another machine's files uses, by the one sibling-dependency
+# spelling the lock guard admits (AGENTS.md 'Rust code'): the toolkit's input
+# layer, and the font and wire codecs it mounts, reach this crate only
+# through `td_ui::`.
 [dependencies]
 td-civil = { path = "../td-civil" }
+td-remote = { path = "../td-remote" }
 td-ui = { path = "../td-ui" }
 
 [features]

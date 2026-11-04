@@ -9,6 +9,7 @@ use std::os::unix::fs::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use td_remote::codec::{Reader, Writer};
 use td_ui::editor_text as text;
 
 const O_NOFOLLOW: i32 = 0o400000;
@@ -47,7 +48,7 @@ pub struct Failure {
 }
 
 impl Failure {
-    fn new(kind: Kind, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: Kind, detail: impl Into<String>) -> Self {
         Self {
             kind,
             published: false,
@@ -204,7 +205,55 @@ pub struct RenameSource {
     stamp: Stamp,
 }
 
+// An observation is values, not a handle, so one made on the machine that has
+// the file crosses to the window and back, and is judged there against the
+// file as it then is.
+impl Stamp {
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        w.u64(self.dev);
+        w.u64(self.ino);
+        w.u32(self.uid);
+        w.u32(self.gid);
+        w.u32(self.mode);
+        w.u64(self.links);
+        w.u64(self.len);
+        w.i64(self.mtime.0);
+        w.i64(self.mtime.1);
+        w.i64(self.ctime.0);
+        w.i64(self.ctime.1);
+    }
+
+    pub(crate) fn decode(r: &mut Reader<'_>) -> std::result::Result<Self, td_remote::Error> {
+        Ok(Self {
+            dev: r.u64()?,
+            ino: r.u64()?,
+            uid: r.u32()?,
+            gid: r.u32()?,
+            mode: r.u32()?,
+            links: r.u64()?,
+            len: r.u64()?,
+            mtime: (r.i64()?, r.i64()?),
+            ctime: (r.i64()?, r.i64()?),
+        })
+    }
+}
+
 impl RenameSource {
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        crate::remote::put_path(w, &self.path);
+        w.u64(self.parent_identity.0);
+        w.u64(self.parent_identity.1);
+        self.stamp.encode(w);
+    }
+
+    pub(crate) fn decode(r: &mut Reader<'_>) -> std::result::Result<Self, td_remote::Error> {
+        Ok(Self {
+            path: crate::remote::get_path(r)?,
+            parent_identity: (r.u64()?, r.u64()?),
+            stamp: Stamp::decode(r)?,
+        })
+    }
+
     pub(crate) fn copy_destination(&self, name: &std::ffi::OsStr) -> Result<PathBuf> {
         let raw = name.as_bytes();
         let leaf = raw.rsplit(|b| *b == b'/').next().unwrap_or_default();
@@ -275,6 +324,19 @@ pub struct DirectorySource {
 }
 
 impl DirectorySource {
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        crate::remote::put_path(w, &self.path);
+        w.u64(self.identity.0);
+        w.u64(self.identity.1);
+    }
+
+    pub(crate) fn decode(r: &mut Reader<'_>) -> std::result::Result<Self, td_remote::Error> {
+        Ok(Self {
+            path: crate::remote::get_path(r)?,
+            identity: (r.u64()?, r.u64()?),
+        })
+    }
+
     pub fn inspect(path: &Path) -> Result<Self> {
         let path = fs::canonicalize(path)?;
         if path.as_os_str().as_bytes().len() > 4096 {
@@ -342,6 +404,22 @@ pub struct DeletePlan {
 }
 
 impl DeletePlan {
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        w.count(self.sources.len());
+        for source in &self.sources {
+            source.encode(w);
+        }
+    }
+
+    pub(crate) fn decode(r: &mut Reader<'_>) -> std::result::Result<Self, td_remote::Error> {
+        let count = r.count(64)?;
+        let mut sources = Vec::with_capacity(count);
+        for _ in 0..count {
+            sources.push(RenameSource::decode(r)?);
+        }
+        Self::new(sources).map_err(|e| td_remote::Error::Protocol(e.to_string()))
+    }
+
     pub fn new(sources: Vec<RenameSource>) -> Result<Self> {
         let first = sources
             .first()
@@ -876,7 +954,7 @@ impl Session {
         if reserved.iter().any(|path| path.starts_with(&to)) {
             return Err(Failure::new(
                 Kind::Exists,
-                "move destination belongs to an open directory",
+                "move destination belongs to an open tab",
             ));
         }
         for path in reserved {
