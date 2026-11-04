@@ -199,11 +199,13 @@ pub fn run_named(name: &str, args: &[String]) {
 }
 
 /// What fetches nothing and may run where there is no session, as at the far end
-/// of ssh: td-agent's way to a broker, whose own launch serves what it needs,
-/// and its stopping one.
+/// of ssh: td-agent's way to a broker, whose own launch serves what it needs, its
+/// stopping one, and a window on another machine's, whose conversations are there.
 fn needs_no_service(name: &str, args: &[String]) -> bool {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    name == "td-agent" && matches!(args.as_slice(), ["attach"] | ["serve", "--stop"])
+    name == "td-agent"
+        && (matches!(args.as_slice(), ["attach"] | ["serve", "--stop"])
+            || args.contains(&"--remote"))
 }
 
 /// What is given no display but one the session named: td-agent's broker, which
@@ -920,6 +922,8 @@ mod tests {
         assert!(!needs_no_service("td-agent", &args(&[])));
         assert!(!needs_no_service("td-agent", &args(&["attach", "x"])));
         assert!(!needs_no_service("td-news", &args(&["attach"])));
+        assert!(needs_no_service("td-agent", &args(&["--remote", "box"])));
+        assert!(!needs_no_service("td-news", &args(&["--remote", "box"])));
         // The window has the default display, and names it to its broker.
         assert!(display_only_if_named("td-agent", &args(&["serve"])));
         assert!(!display_only_if_named("td-agent", &args(&[])));

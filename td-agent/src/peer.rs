@@ -1,7 +1,8 @@
 //! One end of the connection between a window and its broker (DESIGN.md §2):
-//! `td_remote`'s link over a unix socket, whichever way that socket came, with
-//! its sends and its receipts on threads of their own so that neither side's
-//! loop ever waits on the other's, nor the link on either.
+//! `td_remote`'s link over a unix socket, whichever way that socket came, or over
+//! ssh to a `td-agent attach` on another machine, with its sends and its receipts
+//! on threads of their own so that neither side's loop ever waits on the other's,
+//! nor the link on either.
 
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,9 +11,11 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use td_remote::{frame, Hello, Link, Options, Sender};
+use td_remote::{frame, Error, Hello, Host, Link, Options, RemoteProgram, Sender};
 
 const STREAM: u32 = 1;
+/// The last thing said, which must pass whatever is queued on `STREAM`.
+const BYE: u32 = 2;
 
 /// A replay brings a whole log, at most `store::MAX_LOG`, and its pictures.
 const MAX_MESSAGE: usize = 512 * 1024 * 1024;
@@ -45,9 +48,9 @@ pub const OPTIONS: Options = Options {
     hello: Hello {
         program: "td-agent-window",
         // Raised by hand with the forms of `window_wire`.
-        version: 1,
+        version: 2,
     },
-    streams: &[STREAM],
+    streams: &[STREAM, BYE],
     max_message: MAX_MESSAGE,
     unread: UNREAD,
 };
@@ -60,6 +63,20 @@ fn weight(message: &[u8]) -> usize {
     message.len().min(LARGE)
 }
 
+/// Whether `error` needs something other than time: more tries at a login that
+/// fails would count against the person's address at the far end.
+fn lasting(error: &Error) -> bool {
+    match error {
+        Error::Refused(_) | Error::Garbage(_) => true,
+        Error::Closed(said) => {
+            said.contains("Permission denied")
+                || said.contains("Too many authentication failures")
+                || said.contains("Host key verification failed")
+        }
+        _ => false,
+    }
+}
+
 /// A connection to the other half.
 pub struct Peer {
     heard: Receiver<Result<Vec<u8>, String>>,
@@ -70,8 +87,19 @@ pub struct Peer {
     waiting: Arc<AtomicUsize>,
     behind: usize,
     writer: Option<JoinHandle<()>>,
-    stream: UnixStream,
-    _link: Link,
+    /// The socket, when there is one: ssh's streams end with its process.
+    stream: Option<UnixStream>,
+    link: Option<Link>,
+}
+
+/// Why a connection over ssh could not be made.
+#[derive(Debug)]
+pub struct Unreached {
+    pub why: String,
+    /// Trying again unasked will not help: the far side answered and is not this
+    /// program of this version, or printed something else first, or ssh will not
+    /// log in without a person.
+    pub lasting: bool,
 }
 
 impl Peer {
@@ -101,19 +129,62 @@ impl Peer {
             .map_err(|e| format!("the connection's thread: {e}"))?;
         let linked = Link::over(reader, writer, OPTIONS);
         drop(greeted);
-        let mut link = linked.map_err(|e| e.to_string())?;
+        let link = linked.map_err(|e| e.to_string())?;
+        let ender = clone("end")?;
+        Self::started(link, Some(stream), Some(ender))
+    }
+
+    /// Runs `td-agent attach` on `host` over ssh. When a person `asked` for this
+    /// it takes as long as they take to answer ssh's questions; when none did, ssh
+    /// asks nothing.
+    pub fn ssh(host: &Host, program: &RemoteProgram, asked: bool) -> Result<Self, Unreached> {
+        let unreached = |error: Error| Unreached {
+            lasting: lasting(&error),
+            why: error.to_string(),
+        };
+        let linked = if asked {
+            Link::ssh(host, program, &["attach"], OPTIONS)
+        } else {
+            Link::ssh_unattended(host, program, &["attach"], OPTIONS)
+        };
+        let link = linked.map_err(unreached)?;
+        Self::started(link, None, None).map_err(|why| Unreached {
+            why,
+            lasting: false,
+        })
+    }
+
+    /// Serves a link that has said hello. `ender` shuts it when this side has
+    /// stopped reading; without one that is for `recv`'s caller, dropping this.
+    fn started(
+        mut link: Link,
+        stream: Option<UnixStream>,
+        ender: Option<UnixStream>,
+    ) -> Result<Self, String> {
         let inbox = link
             .take_inbox(STREAM)
             .ok_or("the connection has no stream")?;
         let (hear, heard) = mpsc::channel();
         let unread = Arc::new(AtomicUsize::new(0));
-        let (held, ender) = (Arc::clone(&unread), clone("end")?);
+        let bye = link.take_inbox(BYE).ok_or("the connection has no stream")?;
+        let (held, heard_bye, hear_bye) = (Arc::clone(&unread), Arc::clone(&unread), hear.clone());
+        let bye = std::thread::Builder::new()
+            .name("td-agent-peer-bye".into())
+            .spawn(move || {
+                while let Ok(message) = bye.recv() {
+                    heard_bye.fetch_add(message.len(), Ordering::Relaxed);
+                    let _ = hear_bye.send(Ok(message));
+                }
+            })
+            .map_err(|e| format!("the connection's thread: {e}"))?;
         std::thread::Builder::new()
             .name("td-agent-peer-read".into())
             .spawn(move || loop {
                 let message = match inbox.recv() {
                     Ok(message) => message,
                     Err(why) => {
+                        // Its end comes after whatever was said on the other.
+                        let _ = bye.join();
                         let _ = hear.send(Err(why.to_string()));
                         return;
                     }
@@ -123,7 +194,9 @@ impl Peer {
                     .saturating_add(message.len());
                 if total > READ_BEHIND {
                     let _ = hear.send(Err("this side has stopped reading".to_string()));
-                    let _ = ender.shutdown(std::net::Shutdown::Both);
+                    if let Some(ender) = &ender {
+                        let _ = ender.shutdown(std::net::Shutdown::Both);
+                    }
                     return;
                 }
                 if hear.send(Ok(message)).is_err() {
@@ -155,7 +228,7 @@ impl Peer {
             behind: BEHIND,
             writer: Some(writer),
             stream,
-            _link: link,
+            link: Some(link),
         })
     }
 
@@ -187,6 +260,25 @@ impl Peer {
         }
     }
 
+    /// Says `message` ahead of whatever is queued and closes, in a moment if the
+    /// far side has stopped reading.
+    pub fn goodbye(self, message: Vec<u8>) {
+        let Some(sender) = self.link.as_ref().map(Link::sender) else {
+            return;
+        };
+        let deadline = Instant::now() + DRAIN;
+        let sending = std::thread::Builder::new()
+            .name("td-agent-peer-bye".into())
+            .spawn(move || {
+                let _ = sender.send(BYE, &message);
+            });
+        if let Ok(sending) = sending {
+            while !sending.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
     /// Lets what was queued go, for a moment, before the connection closes.
     pub fn finish(mut self) {
         self.out = None;
@@ -199,13 +291,19 @@ impl Peer {
                 let _ = writer.join();
             }
         }
+        // ssh's process has yet to carry it, and dropping the link would kill it.
+        if let Some(link) = self.link.take() {
+            link.finish(deadline.saturating_duration_since(Instant::now()));
+        }
     }
 }
 
 impl Drop for Peer {
     /// Ends the threads, which a far side that stopped reading would hold.
     fn drop(&mut self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(stream) = &self.stream {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
@@ -326,5 +424,93 @@ mod tests {
         let far = std::thread::spawn(move || Link::over(reader, writer, other).map(|_| ()));
         assert!(Peer::over(a).is_err());
         assert!(far.join().unwrap().is_err());
+    }
+
+    /// A window closing as it sends over ssh: what it sent gets there, where
+    /// dropping the link would kill ssh with it unsent.
+    #[test]
+    fn what_was_sent_over_a_child_goes_before_it_is_finished() {
+        let scratch = td_fs::TempDir::new("td-agent-peer").unwrap();
+        let (hello, out) = (scratch.path().join("hello"), scratch.path().join("out"));
+        let mut said = b"td-remote 1\n".to_vec();
+        let mut greeting = OPTIONS.hello.version.to_be_bytes().to_vec();
+        greeting.extend_from_slice(OPTIONS.hello.program.as_bytes());
+        said.extend_from_slice(&frame::encode(&greeting).unwrap());
+        std::fs::write(&hello, said).unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "cat '{}'; sleep 0.2; cat > '{}'",
+                hello.display(),
+                out.display()
+            ),
+        ]);
+        let link = Link::spawn(command, OPTIONS).unwrap();
+        let peer = Peer::started(link, None, None).unwrap();
+        assert!(peer.send(b"the last words".to_vec()));
+        peer.finish();
+        let got = std::fs::read(&out).unwrap();
+        assert!(got.windows(14).any(|w| w == b"the last words"), "{got:?}");
+    }
+
+    #[test]
+    fn only_a_login_or_a_program_that_will_not_do_stops_the_tries() {
+        for lasting_one in [
+            Error::Refused("another version".into()),
+            Error::Garbage("a banner".into()),
+            Error::Closed("me@box: Permission denied (publickey).".into()),
+            Error::Closed("Host key verification failed.".into()),
+            Error::Closed("Received disconnect: Too many authentication failures".into()),
+        ] {
+            assert!(lasting(&lasting_one), "{lasting_one:?}");
+        }
+        for passing in [
+            Error::Closed("ssh: connect to host box port 22: No route to host".into()),
+            Error::Closed(String::new()),
+            Error::Io("a pipe".into()),
+        ] {
+            assert!(!lasting(&passing), "{passing:?}");
+        }
+    }
+
+    /// A message crawls over a slow link and the goodbye passes it, which
+    /// a window needs to tell being let go from a link that failed.
+    #[test]
+    fn a_goodbye_passes_what_is_queued_on_a_slow_link() {
+        let (near, relay_near) = UnixStream::pair().unwrap();
+        let (far, relay_far) = UnixStream::pair().unwrap();
+        let back = (
+            relay_far.try_clone().unwrap(),
+            relay_near.try_clone().unwrap(),
+        );
+        std::thread::spawn(move || {
+            let (mut from, mut to) = back;
+            let _ = std::io::copy(&mut from, &mut to);
+        });
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut from, mut to) = (relay_near, relay_far);
+            let mut piece = vec![0u8; 256 * 1024];
+            while let Ok(read) = from.read(&mut piece) {
+                if read == 0 || to.write_all(piece.get(..read).unwrap()).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = to.shutdown(std::net::Shutdown::Write);
+        });
+        let far = std::thread::spawn(move || Peer::over(far).unwrap());
+        let near = Peer::over(near).unwrap();
+        let far = far.join().unwrap();
+        // One message longer than a goodbye gets to wait, a replay say, under way.
+        assert!(near.send(vec![1u8; 64 * 1024 * 1024]));
+        std::thread::sleep(Duration::from_millis(100));
+        near.goodbye(b"bye".to_vec());
+        let mut said = false;
+        while let Ok(message) = wait(&far) {
+            said |= message == b"bye";
+        }
+        assert!(said, "only the link's end came");
     }
 }

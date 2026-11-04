@@ -13,6 +13,10 @@ own account that such a child reaches.
 
 ## The ssh child
 
+Dropping a link kills its child with whatever it had yet to pass on;
+`Link::finish` ends the child's input first and gives it a moment to carry that
+and end by itself.
+
 `Link::ssh` runs `ssh OPTIONS -- HOST PROGRAM WORDS…` and nothing else.
 
 - `Host` is `[user@]name` of letters, digits and `. - _ @ :`, neither part
@@ -96,7 +100,10 @@ bounds' here.
 
 `Client` owns a `Connector` and makes a new link when asked after the last one
 was lost. It never reconnects on its own, so an idle window holds no retry loop
-and asks for no passphrase unbidden.
+and asks for no passphrase unbidden. td-agent's window does try on its own, its
+far side going on without it, by `Link::ssh_unattended`, which turns ssh's prompts
+and askpass off, for a `ProxyJump`'s ssh too: its dialogs come only of something the
+person did. Run from a terminal, a jump's ssh can still ask on that terminal.
 
 Each connection has a generation. A far side that keeps per-connection state
 lost it, so its client must notice before asking again: `request_on` takes the
@@ -133,4 +140,4 @@ child frees it; `Client` offers no way to, since no program has yet asked for on
   the connection owns that.
 - No compression or delta: whole messages, which ssh may compress if configured.
 - td-agent's git transport still spells the ssh keepalive values itself; its
-  remote window will share them with `Link::ssh`. Its own framing is this crate's.
+  remote window shares them with `Link::ssh`. Its own framing is this crate's.

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Chain, Cursor, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -277,6 +277,8 @@ pub struct Link {
     sender: Sender,
     inboxes: BTreeMap<u32, Inbox>,
     child: Option<Child>,
+    /// The child's input when there is a child.
+    input: Option<Arc<Mutex<Option<ChildStdin>>>>,
 }
 
 impl Drop for Link {
@@ -288,7 +290,51 @@ impl Drop for Link {
     }
 }
 
+/// A child's standard input, which `Link::finish` can close from outside.
+struct ChildInput(Arc<Mutex<Option<ChildStdin>>>);
+
+impl Write for ChildInput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self.0.lock().as_deref_mut() {
+            Ok(Some(input)) => input.write(bytes),
+            _ => Err(std::io::ErrorKind::BrokenPipe.into()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.lock().as_deref_mut() {
+            Ok(Some(input)) => input.flush(),
+            _ => Ok(()),
+        }
+    }
+}
+
 impl Link {
+    /// Ends the child's input, so that it carries what it was given and ends of
+    /// its own, and waits up to `within` for that: dropping the link kills it,
+    /// with what it had yet to pass on. A write under way, one the far side has
+    /// stopped reading, is not waited for.
+    pub fn finish(mut self, within: Duration) {
+        let closed = self
+            .input
+            .as_ref()
+            .and_then(|input| input.try_lock().ok())
+            .map(|mut input| input.take())
+            .is_some();
+        if !closed {
+            return;
+        }
+        let deadline = Instant::now() + within;
+        if let Some(child) = self.child.as_mut() {
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                    _ => return,
+                }
+            }
+        }
+    }
+
     /// Starts `command` with its standard streams as the link: `ssh` in
     /// production, the program itself in a test.
     pub fn spawn(mut command: Command, options: Options) -> Result<Self, Error> {
@@ -298,20 +344,27 @@ impl Link {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| Error::Io(format!("cannot run {:?}: {e}", command.get_program())))?;
+        let input = Arc::new(Mutex::new(None));
         let streams = child
             .stderr
             .take()
             .map(Tail::start)
             .transpose()
             .and_then(|tail| match (child.stdin.take(), child.stdout.take()) {
-                (Some(input), Some(output)) => Ok((input, output, tail)),
+                (Some(opened), Some(output)) => {
+                    if let Ok(mut held) = input.lock() {
+                        *held = Some(opened);
+                    }
+                    Ok((output, tail))
+                }
                 _ => Err(Error::Io("the child's streams are missing".into())),
             });
-        let started =
-            streams.and_then(|(input, output, tail)| Self::start(output, input, options, tail));
+        let writer = ChildInput(Arc::clone(&input));
+        let started = streams.and_then(|(output, tail)| Self::start(output, writer, options, tail));
         match started {
             Ok(mut link) => {
                 link.child = Some(child);
+                link.input = Some(input);
                 Ok(link)
             }
             Err(error) => {
@@ -402,6 +455,7 @@ impl Link {
             },
             inboxes,
             child: None,
+            input: None,
         })
     }
 
@@ -995,6 +1049,30 @@ mod tests {
 
     /// `sh`'s printf for a hello of `HELLO`, for a child that speaks.
     const SAY_HELLO: &str = r"printf 'td-remote 1\n\000\000\000\013\000\000\000\003td-test'";
+
+    /// What a link's child was given reaches the far side when it is finished,
+    /// where dropping the link would kill the child with it unsent.
+    #[test]
+    fn finishing_a_link_lets_its_child_carry_what_it_was_given() {
+        let scratch = td_fs::TempDir::new("td-remote-finish").unwrap();
+        let (out, ended) = (scratch.path().join("out"), scratch.path().join("ended"));
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "{SAY_HELLO}; sleep 0.2; cat > '{}'; echo ended > '{}'",
+                out.display(),
+                ended.display()
+            ),
+        ]);
+        let link = Link::spawn(command, OPTIONS).unwrap();
+        link.sender().send(1, b"the last words").unwrap();
+        link.finish(Duration::from_secs(30));
+        // It saw the end of its input, and ended of itself rather than be killed.
+        assert!(ended.exists());
+        let got = std::fs::read(&out).unwrap();
+        assert!(got.windows(14).any(|w| w == b"the last words"), "{got:?}");
+    }
 
     #[test]
     fn dropping_a_link_ends_and_reaps_its_child() {

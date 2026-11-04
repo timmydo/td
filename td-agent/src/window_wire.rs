@@ -989,6 +989,7 @@ pub fn encode_view(view: &View) -> Vec<u8> {
             ("open_new_template", vec![field("remote", optional(remote))])
         }
         View::FocusComposer => ("focus_composer", Vec::new()),
+        View::Bye(why) => ("bye", vec![field("why", text(why))]),
         View::Folders(answer) => (
             "folders",
             vec![
@@ -1194,6 +1195,7 @@ pub fn decode_view(bytes: &[u8]) -> Result<View, String> {
         Some("set_default_model") => View::SetDefaultModel(string(value, "model")?),
         Some("open_new_template") => View::OpenNewTemplate(maybe(value, "remote")?),
         Some("focus_composer") => View::FocusComposer,
+        Some("bye") => View::Bye(string(value, "why")?),
         Some("folders") => View::Folders(FoldersAnswer {
             asked: items(value, "asked", path_from)?,
             from: maybe(value, "from")?,
@@ -1288,6 +1290,14 @@ pub fn encode_request(request: &Request) -> Vec<u8> {
             ],
         ),
         Request::Redraw => ("redraw", Vec::new()),
+        Request::Received => ("received", Vec::new()),
+        Request::Claim { token, asked } => (
+            "claim",
+            vec![
+                field("token", text(token)),
+                field("asked", Json::Bool(*asked)),
+            ],
+        ),
         Request::SaveShare(first, total) => (
             "save_share",
             vec![
@@ -1501,6 +1511,11 @@ fn request_from(value: &Json) -> Result<Request, String> {
             choice: Resumed::parse(&string(value, "choice")?).ok_or("no such choice")?,
         },
         Some("redraw") => Request::Redraw,
+        Some("received") => Request::Received,
+        Some("claim") => Request::Claim {
+            token: string(value, "token")?,
+            asked: flag(value, "asked")?,
+        },
         Some("save_share") => Request::SaveShare(narrow(value, "first")?, narrow(value, "total")?),
         Some("save_key") => {
             let secret = string(value, "secret")?;
@@ -2087,6 +2102,7 @@ mod tests {
             View::OpenNewTemplate(None),
             View::OpenNewTemplate(Some("https://github.com/a/b".into())),
             View::FocusComposer,
+            View::Bye("why".into()),
             View::Folders(FoldersAnswer {
                 asked: vec![not_utf8("asked"), PathBuf::from("/plain")],
                 from: Some(AWKWARD.into()),
@@ -2213,6 +2229,11 @@ mod tests {
                 choice: Resumed::Stop,
             },
             Request::Redraw,
+            Request::Received,
+            Request::Claim {
+                token: "t".into(),
+                asked: true,
+            },
             Request::SaveShare(u32::MAX, 0),
             Request::SaveKey {
                 secret: Secret::new(SECRET.into()),
@@ -2366,6 +2387,7 @@ mod tests {
             View::SetDefaultModel(..) => "SetDefaultModel",
             View::OpenNewTemplate(..) => "OpenNewTemplate",
             View::FocusComposer => "FocusComposer",
+            View::Bye(_) => "Bye",
             View::Folders(..) => "Folders",
         }
     }
@@ -2395,6 +2417,8 @@ mod tests {
             Request::Skills => "Skills",
             Request::Resume { .. } => "Resume",
             Request::Redraw => "Redraw",
+            Request::Received => "Received",
+            Request::Claim { .. } => "Claim",
             Request::SaveShare(..) => "SaveShare",
             Request::SaveKey { .. } => "SaveKey",
             Request::Export => "Export",

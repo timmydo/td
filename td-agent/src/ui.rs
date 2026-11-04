@@ -390,6 +390,11 @@ impl Group {
 /// What the window asks of the session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
+    /// A message given back has reached this far window.
+    Received,
+    /// A far window's first word: which it is, and whether a person asked for
+    /// this connection, as only that may displace another window.
+    Claim { token: String, asked: bool },
     /// Open this conversation in its own process; the one open before is
     /// closed.
     Open(Id),
@@ -533,6 +538,30 @@ pub enum Request {
     /// The open conversation's routing as the human chose it; none is the
     /// default.
     Route { routing: Option<String> },
+}
+
+impl Request {
+    /// What the person typed that this carries, and its pictures: what goes back
+    /// to the composer if it cannot be done.
+    pub fn as_typed(&self) -> Option<(String, Vec<Attached>)> {
+        match self {
+            Request::Send(text, pictures) => Some((text.clone(), pictures.clone())),
+            Request::Command {
+                typed, pictures, ..
+            } => Some((typed.clone(), pictures.clone())),
+            Request::Schedule(crate::schedule::Command::Add {
+                when,
+                text,
+                catch_up,
+            }) => {
+                let catching = if *catch_up { "catch-up " } else { "" };
+                Some((format!("/schedule {catching}{when} {text}"), Vec::new()))
+            }
+            Request::Compact(Some(text)) => Some((format!("/compact {text}"), Vec::new())),
+            Request::Review(text) => Some((format!("/review {text}"), Vec::new())),
+            _ => None,
+        }
+    }
 }
 
 /// What has the keyboard.
@@ -924,6 +953,8 @@ pub struct App {
     /// What was last asked for the chooser and is not yet answered: to open
     /// it, while it is shut, else to list another folder.
     folders_asked: Option<Vec<PathBuf>>,
+    /// Why what is shown may be old: a far broker that cannot be reached.
+    away: Option<String>,
     /// Why no workspace can be made, when none can: said at once, before
     /// a directory is chosen.
     no_workspaces: Option<String>,
@@ -1116,6 +1147,7 @@ impl App {
             chooser: None,
             chooser_start: None,
             folders_asked: None,
+            away: None,
             no_workspaces: None,
             jailless: None,
             chooser_unconfined: false,
@@ -1369,7 +1401,11 @@ impl App {
             .active
             .as_ref()
             .and_then(|id| self.book.rows.iter().find(|r| &r.id == id));
-        let state = row.map_or("no conversation", Row::word);
+        // A far side not there outweighs what was last heard of it.
+        let state = match &self.away {
+            Some(away) => away.as_str(),
+            None => row.map_or("no conversation", Row::word),
+        };
         // Only items of a fixed width: a note, however long, is counted
         // here and read whole in the Messages window.
         let unread = match self.log.unread() {
@@ -3782,6 +3818,9 @@ impl App {
     /// showing the sub-agent's start, the sub-agent's row kept selected:
     /// at once when the transcript has it, else once the log brings it.
     fn open_sub_agent(&mut self, id: Id, seq: u64) {
+        if self.away.is_some() {
+            return self.requests.push(Request::Open(id));
+        }
         let item = Item::SubAgent(id.clone(), seq);
         self.open(id.clone());
         // Refused, it said why and selected the open conversation.
@@ -4175,6 +4214,13 @@ impl App {
     /// Opens conversation `id`; opening the one already open again
     /// retries it when its process failed.
     pub(crate) fn open(&mut self, id: Id) {
+        // Nothing here can show it: what is shown stays, and the far side not
+        // being there is said.
+        if self.away.is_some() {
+            self.list.select(self.shown_active(), false);
+            self.touch();
+            return self.requests.push(Request::Open(id));
+        }
         if let Some(row) = self.book.rows.iter().find(|r| r.id == id && r.archived) {
             let said = format!(
                 "{:?} is archived: Unarchive in its row's menu opens it again",
@@ -4302,6 +4348,11 @@ impl App {
     fn send(&mut self) {
         let text = self.composer.text().to_string();
         if text.trim().is_empty() {
+            // With the far side away it is how the person asks for it back, as the
+            // status row says, and any request is that.
+            if self.away.is_some() {
+                self.requests.push(Request::Redraw);
+            }
             return;
         }
         if text.len() > MAX_TEXT {
@@ -4748,6 +4799,58 @@ impl App {
             self.attached.push((reference, bytes));
         }
         self.restore(&text, why);
+    }
+
+    /// Whether what is shown is as of a far broker now out of reach.
+    pub fn set_away(&mut self, away: Option<String>) {
+        // What was asked of it has no answer coming.
+        if let Some(why) = away.as_ref().filter(|_| self.folders_asked.is_some()) {
+            self.folders_asked = None;
+            if let Some(chooser) = self.chooser.as_mut() {
+                chooser.answered(Err(why.clone()), None);
+            }
+        }
+        self.away = away;
+        self.touch();
+    }
+
+    #[cfg(test)]
+    fn holding_folders(&self) -> bool {
+        self.folders_asked.is_some()
+    }
+
+    /// Whether a row may open.
+    pub fn opens(&self, id: &Id) -> bool {
+        self.book.opens(id)
+    }
+
+    /// Whether the person is in the middle of something a new `App` would end.
+    pub fn holding_input(&self) -> bool {
+        self.modal() || self.menu.is_open() || self.capture.is_some() || self.chooser_coming()
+    }
+
+    /// What a window on a connection that failed and came back keeps of the one
+    /// it replaces, which the far side does not have: what the person has typed
+    /// and been told, where the keyboard was and how the list was shown. The rest
+    /// it is told anew.
+    pub fn take_over_from(&mut self, old: &mut App) {
+        self.folded = std::mem::take(&mut old.folded);
+        self.show_archived = old.show_archived;
+        self.show_activity = old.show_activity;
+        self.set_focus(old.focus());
+        self.attached = std::mem::take(&mut old.attached);
+        let text = old.composer.text().to_string();
+        if let Err(e) = self.composer.append(&text) {
+            logged!(
+                "td-agent: {e}; a message could not be kept:
+{text}"
+            );
+            self.note(format!(
+                "a message could not be kept ({e}) and is on standard error"
+            ));
+        }
+        std::mem::swap(&mut self.log, &mut old.log);
+        self.chooser_start = old.chooser_start.take();
     }
 
     /// The split as the person left it, when the session has it to say.
@@ -10397,6 +10500,123 @@ pub mod tests {
         assert_eq!(app.unread(), told);
         app.background(&id(3), &notice(6, "new"), 0);
         assert_eq!(app.unread(), told + 1);
+    }
+
+    /// Going to another row with the far side away keeps what is shown, and asks,
+    /// which is what says it is not there.
+    #[test]
+    fn a_row_chosen_while_away_changes_nothing_shown() {
+        let mut app = app();
+        app.set_rows(vec![row(1, 0), row(2, 0)]);
+        app.set_active(id(1));
+        turn(&mut app, 1, "hello");
+        let shown = app.transcript().len();
+        assert!(shown > 0);
+        app.take_requests();
+        app.set_away(Some("not connected to box".into()));
+        app.open(id(2));
+        assert_eq!(app.take_requests(), [Request::Open(id(2))]);
+        assert_eq!(app.active(), Some(&id(1)));
+        assert_eq!(app.transcript().len(), shown);
+    }
+
+    /// A new `App` waits for the person to be done with what has their keys.
+    #[test]
+    fn a_dialog_or_a_menu_is_holding_the_input() {
+        let mut app = app();
+        assert!(!app.holding_input());
+        app.set_key_path(Some("/nowhere/key".into()));
+        app.open_key_dialog();
+        assert!(app.holding_input());
+        key(&mut app, "Escape");
+        assert!(!app.holding_input());
+        key(&mut app, "F10");
+        assert!(app.holding_input());
+    }
+
+    /// What was on its way when the far side went is not waited for, by the status
+    /// row's word or a chooser that took only Escape.
+    #[test]
+    fn going_away_ends_the_wait_for_folders() {
+        let mut app = app();
+        app.settle = Duration::ZERO;
+        ask_for_the_chooser(&mut app);
+        app.set_away(Some("not connected to box".into()));
+        assert!(!app.chooser_coming());
+        assert!(!app.status_line().contains("reading folders"));
+
+        app.set_away(None);
+        let asked = ask_for_the_chooser(&mut app);
+        app.apply(told(&asked, "/there", &["a"]));
+        key(&mut app, "Return");
+        app.set_away(Some("not connected to box".into()));
+        assert_eq!(app.chooser().unwrap().folder(), Path::new("/there"));
+        assert!(!app.holding_folders());
+    }
+
+    /// The status row says Return retries, so an empty composer's does.
+    #[test]
+    fn return_with_nothing_typed_asks_only_while_away() {
+        let mut app = app();
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), []);
+        app.set_away(Some("not connected to box: Return tries again".into()));
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::Redraw]);
+    }
+
+    /// Text that goes unsent goes back as it was typed; nothing else has any.
+    #[test]
+    fn what_a_request_carries_of_what_was_typed() {
+        let typed = |request: Request| request.as_typed().map(|(text, _)| text);
+        assert_eq!(typed(Request::Send("a".into(), Vec::new())).unwrap(), "a");
+        assert_eq!(
+            typed(Request::Compact(Some("b".into()))).unwrap(),
+            "/compact b"
+        );
+        assert_eq!(typed(Request::Compact(None)), None);
+        assert_eq!(typed(Request::Review("c".into())).unwrap(), "/review c");
+        assert_eq!(
+            typed(Request::Schedule(crate::schedule::Command::Add {
+                when: "daily".into(),
+                text: "d".into(),
+                catch_up: true,
+            }))
+            .unwrap(),
+            "/schedule catch-up daily d"
+        );
+        assert_eq!(typed(Request::Interrupt), None);
+    }
+
+    /// A connection that came back starts from nothing but what is in hand.
+    #[test]
+    fn a_window_taking_over_keeps_what_was_typed_and_told() {
+        let mut old = app();
+        for letter in ["h", "i"] {
+            key(&mut old, letter);
+        }
+        old.note("a note");
+        turn(&mut old, 1, "hello");
+        old.ask(Card {
+            conversation: id(1),
+            call: 4,
+            title: "Run a command".into(),
+            details: vec!["make".into()],
+            always: None,
+            resume: false,
+        });
+        old.set_away(Some("not connected to box".into()));
+        assert!(old.status_line().contains("not connected to box"));
+        let mut fresh = app();
+        old.set_focus(Focus::List);
+        old.show_archived = true;
+        fresh.take_over_from(&mut old);
+        assert!(!fresh.status_line().contains("not connected"));
+        assert_eq!(fresh.focus(), Focus::List);
+        assert!(fresh.show_archived);
+        assert_eq!(fresh.composer.text(), "hi");
+        assert!(fresh.cards().is_empty());
+        assert!(fresh.log.texts().any(|text| text == "a note"));
     }
 
     /// What is said of a conversation left, before the session has heard of the

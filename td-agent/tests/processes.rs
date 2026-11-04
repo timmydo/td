@@ -816,7 +816,117 @@ fn attach(scratch: &Scratch) -> (std::process::Child, td_agent::peer::Peer) {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    (child, td_agent::peer::Peer::over(ours).unwrap())
+    (child, claimed(td_agent::peer::Peer::over(ours).unwrap()))
+}
+
+/// A far window's first word, as one a person asked for.
+fn claimed(window: td_agent::peer::Peer) -> td_agent::peer::Peer {
+    claim(&window, Id::random().unwrap().as_str(), true);
+    window
+}
+
+fn claim(window: &td_agent::peer::Peer, token: &str, asked: bool) {
+    let claim = Request::Claim {
+        token: token.to_string(),
+        asked,
+    };
+    assert!(window.send(td_agent::window_wire::encode_asked(
+        &Showing::Nothing,
+        &claim
+    )));
+}
+
+/// One yet to say which it is, when the broker stops, is told too: it would
+/// otherwise take that for a link that failed, and start another.
+#[test]
+fn a_stop_is_told_to_a_window_that_has_not_yet_said_which_it_is() {
+    let scratch = Scratch::new("stop-claiming");
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let mut child = Command::new(PROGRAM)
+        .arg("attach")
+        .env_clear()
+        .env("HOME", &scratch.0)
+        .env("XDG_STATE_HOME", &scratch.0)
+        .env("XDG_CONFIG_HOME", scratch.0.join("config"))
+        .stdin(Stdio::from(OwnedFd::from(theirs.try_clone().unwrap())))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let window = td_agent::peer::Peer::over(ours).unwrap();
+    let output = Command::new(PROGRAM)
+        .args(["serve", "--stop"])
+        .env_clear()
+        .env("HOME", &scratch.0)
+        .env("XDG_STATE_HOME", &scratch.0)
+        .env("XDG_CONFIG_HOME", scratch.0.join("config"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let told = told_until(&window, |view| matches!(view, View::Bye(_)));
+    assert!(matches!(told.last(), Some(View::Bye(said)) if said.contains("stopped")));
+    drop(window);
+    assert!(child.wait().unwrap().success());
+}
+
+/// A window trying again unasked takes back only its own dead connection; one a
+/// person asked for takes over from any.
+#[test]
+fn only_a_window_asked_for_puts_out_another() {
+    let scratch = Scratch::new("claims");
+    let join = |token: &str, asked: bool| {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let child = Command::new(PROGRAM)
+            .arg("attach")
+            .env_clear()
+            .env("HOME", &scratch.0)
+            .env("XDG_STATE_HOME", &scratch.0)
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
+            .stdin(Stdio::from(OwnedFd::from(theirs.try_clone().unwrap())))
+            .stdout(Stdio::from(OwnedFd::from(theirs)))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let window = td_agent::peer::Peer::over(ours).unwrap();
+        claim(&window, token, asked);
+        (child, window)
+    };
+    let bye = |window: &td_agent::peer::Peer, why: &str| {
+        let told = told_until(window, |view| matches!(view, View::Bye(_)));
+        assert!(
+            matches!(told.last(), Some(View::Bye(said)) if said.contains(why)),
+            "{told:#?}"
+        );
+    };
+    let told = |window: &td_agent::peer::Peer| {
+        told_until(window, |view| matches!(view, View::SetShare(_)));
+    };
+    // With no window there, one trying unasked is as good as any.
+    let (mut a_child, a) = join("a", false);
+    told(&a);
+    // Another's unasked try is sent away, and the first goes on.
+    let (mut b_child, b) = join("b", false);
+    bye(&b, "another window is open");
+    drop(b);
+    assert!(b_child.wait().unwrap().success());
+    assert!(a.send(td_agent::window_wire::encode_asked(
+        &Showing::Nothing,
+        &Request::Redraw
+    )));
+    // Its own, after its link died with the broker unaware, takes it back.
+    let (mut again_child, again) = join("a", false);
+    told(&again);
+    bye(&a, "taken over");
+    drop(a);
+    assert!(a_child.wait().unwrap().success());
+    // One a person asked for takes it from anyone.
+    let (mut c_child, c) = join("c", true);
+    told(&c);
+    bye(&again, "taken over");
+    drop(again);
+    assert!(again_child.wait().unwrap().success());
+    drop(c);
+    assert!(c_child.wait().unwrap().success());
 }
 
 /// What the broker says until `seen` holds of something it said.
@@ -855,6 +965,14 @@ fn ask(peer: &td_agent::peer::Peer, request: &Request) {
 /// none left and nothing under way the broker ends and takes its sockets.
 #[test]
 fn a_far_window_attaches_and_a_second_takes_over_and_the_broker_ends_with_the_last() {
+    // Told why, so that it does not take this for a link that failed.
+    fn let_go(window: &td_agent::peer::Peer, why: &str) {
+        let told = told_until(window, |view| matches!(view, View::Bye(_)));
+        assert!(
+            matches!(told.last(), Some(View::Bye(said)) if said.contains(why)),
+            "{told:#?}"
+        );
+    }
     let scratch = Scratch::new("attach");
     let state = scratch.state();
     let made = Id::random().unwrap();
@@ -894,6 +1012,7 @@ fn a_far_window_attaches_and_a_second_takes_over_and_the_broker_ends_with_the_la
         "{told:#?}"
     );
     // The first is let go, and its `attach` ends.
+    let_go(&first, "another window");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         assert!(Instant::now() < deadline, "the first stayed");
@@ -1066,7 +1185,12 @@ fn a_message_given_back_keeps_the_broker_until_a_window_has_taken_it() {
         matches!(told.last(), Some(View::GiveBack(text, ..)) if text == "for the other"),
         "{told:#?}"
     );
-    drop(window);
+    // It says it has it, since a link can die with neither end knowing.
+    assert!(window.send(td_agent::window_wire::encode_asked(
+        &Showing::Nothing,
+        &Request::Received
+    )));
+    window.finish();
     assert!(child.wait().unwrap().success());
     let deadline = Instant::now() + Duration::from_secs(30);
     while socket.exists() {
@@ -1228,7 +1352,7 @@ fn a_broker_listens_in_a_state_directory_by_a_link_and_shuts_one_left_open() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let window = td_agent::peer::Peer::over(ours).unwrap();
+    let window = claimed(td_agent::peer::Peer::over(ours).unwrap());
     told_until(&window, |view| matches!(view, View::SetShare(_)));
     let mode = std::fs::metadata(real.join("td-agent"))
         .unwrap()
@@ -1314,7 +1438,7 @@ fn a_launch_of_another_program_is_not_obeyed() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let window = td_agent::peer::Peer::over(ours).unwrap();
+    let window = claimed(td_agent::peer::Peer::over(ours).unwrap());
     told_until(&window, |view| matches!(view, View::SetShare(_)));
     assert!(!said.exists());
     drop(window);
@@ -1355,7 +1479,7 @@ fn a_broker_comes_by_the_launch_that_started_the_window() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let window = td_agent::peer::Peer::over(ours).unwrap();
+    let window = claimed(td_agent::peer::Peer::over(ours).unwrap());
     told_until(&window, |view| matches!(view, View::SetShare(_)));
     let said = std::fs::read_to_string(&said).unwrap();
     assert!(said.ends_with("serve /the/session /\n"), "{said}");

@@ -438,6 +438,9 @@ impl Session {
                         Err(why) => self.view.give_back(&typed, pictures, why),
                     }
                 }
+                Request::Received => self.view.received(),
+                // Said first, and heard then.
+                Request::Claim { .. } => {}
                 Request::ListFolders {
                     candidates,
                     or_home,
@@ -2541,6 +2544,39 @@ struct Attached {
     peer: Peer,
     /// By way of `td-agent attach`, so from the far end of ssh perhaps.
     far: bool,
+    /// Which window, for a far one.
+    token: Option<String>,
+}
+
+/// How long a stop waits for connections still saying hello.
+const GREETING_AT_STOP: Duration = Duration::from_secs(1);
+
+/// How long a far window has to say which it is.
+const CLAIMING: Duration = Duration::from_secs(30);
+
+/// What a far window said of itself, when it has.
+fn claim_of(peer: &Peer) -> Result<Option<(String, bool)>, String> {
+    let Some(bytes) = peer.recv()? else {
+        return Ok(None);
+    };
+    match crate::window_wire::decode_asked(&bytes)? {
+        (_, Request::Claim { token, asked }) => Ok(Some((token, asked))),
+        _ => Err("its first word was not who it is".to_string()),
+    }
+}
+
+/// Says why this window is being let go, ahead of what is queued for it.
+fn goodbye(peer: Peer, why: &str) {
+    peer.goodbye(crate::window_wire::encode_view(&crate::view::View::Bye(
+        why.to_string(),
+    )));
+}
+
+/// `goodbye`, with this loop going on: the window may have stopped reading.
+fn goodbye_aside(peer: Peer, why: &'static str) {
+    let _ = std::thread::Builder::new()
+        .name("td-agent-bye".into())
+        .spawn(move || goodbye(peer, why));
 }
 
 /// One of the broker's ways in.
@@ -2657,11 +2693,34 @@ impl Session {
         let mut window: Option<Attached> = None;
         // Connections still saying hello.
         let mut greeting = 0usize;
+        // Far ones yet to say which they are.
+        let mut claiming: Vec<(Peer, Instant)> = Vec::new();
         let mut last_needed = Instant::now();
         let mut next_look_at_log = Instant::now();
         loop {
             if stop.listener.accept().is_ok() {
                 logged!("td-agent: asked to stop");
+                if let Some(window) = window.take() {
+                    self.view.detach();
+                    goodbye(window.peer, "td-agent serve was stopped");
+                }
+                // Those yet to say which they are, or hello, are told too: they
+                // would try again all the same, and start another.
+                for door in doors {
+                    greeting = greeting.saturating_add(door.accept(&hellos));
+                }
+                let deadline = Instant::now() + GREETING_AT_STOP;
+                while greeting > 0 {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let Ok((_, peer)) = said.recv_timeout(left) else {
+                        break;
+                    };
+                    greeting -= 1;
+                    claiming.extend(peer.ok().map(|peer| (peer, Instant::now())));
+                }
+                for (peer, _) in claiming {
+                    goodbye(peer, "td-agent serve was stopped");
+                }
                 return;
             }
             if Instant::now() >= next_look_at_log {
@@ -2674,14 +2733,29 @@ impl Session {
             for (far, peer) in said.try_iter() {
                 greeting = greeting.saturating_sub(1);
                 match peer {
-                    // One window at a time: the newest is the person's.
-                    Ok(peer) => {
-                        // What the last had asked counts: it had cleared it.
-                        self.heard(&mut window);
-                        window = Some(Attached { peer, far });
-                        self.attached();
-                    }
+                    // A far one first says which it is.
+                    Ok(peer) if far => claiming.push((peer, Instant::now())),
+                    Ok(peer) => self.take_over(&mut window, peer, false, None),
                     Err(why) => logged!("td-agent: a window could not attach: {why}"),
+                }
+            }
+            for (peer, since) in std::mem::take(&mut claiming) {
+                match claim_of(&peer) {
+                    Ok(None) if since.elapsed() < CLAIMING => claiming.push((peer, since)),
+                    Ok(None) => logged!("td-agent: a window said nothing of itself"),
+                    Err(why) => logged!("td-agent: a window could not attach: {why}"),
+                    Ok(Some((token, asked))) => {
+                        let another = window
+                            .as_ref()
+                            .is_some_and(|window| window.token.as_ref() != Some(&token));
+                        // Trying again by itself, it does not put out a window in
+                        // use: its own dead connection is another matter.
+                        if another && !asked {
+                            goodbye_aside(peer, "another window is open there");
+                        } else {
+                            self.take_over(&mut window, peer, true, Some(token));
+                        }
+                    }
                 }
             }
             self.heard(&mut window);
@@ -2707,7 +2781,7 @@ impl Session {
                     window = None;
                 }
             }
-            if window.is_some() || greeting > 0 || !self.idle() {
+            if window.is_some() || greeting > 0 || !claiming.is_empty() || !self.idle() {
                 last_needed = Instant::now();
             } else if last_needed.elapsed() >= LINGER {
                 // One that dials just now is closed unanswered, and tries again.
@@ -2715,6 +2789,24 @@ impl Session {
             }
             std::thread::sleep(if window.is_some() { BUSY_POLL } else { POLL });
         }
+    }
+
+    /// One window at a time: the newest is the person's.
+    fn take_over(
+        &mut self,
+        window: &mut Option<Attached>,
+        peer: Peer,
+        far: bool,
+        token: Option<String>,
+    ) {
+        // What the last had asked counts: it had cleared it.
+        self.heard(window);
+        if let Some(old) = window.take() {
+            goodbye_aside(old.peer, "another window has taken over");
+        }
+        self.view.remember_told(far);
+        *window = Some(Attached { peer, far, token });
+        self.attached();
     }
 
     /// Carries out what the window asked, one at a time, each against what it
@@ -2757,29 +2849,9 @@ impl Session {
         };
         if moved && of_the_shown(&request) {
             const WHY: &str = "the open conversation changed before this reached it";
-            return match request {
-                Request::Send(text, pictures) => {
-                    self.view.give_back(&text, pictures, WHY.to_string());
-                }
-                Request::Command {
-                    typed, pictures, ..
-                } => self.view.give_back(&typed, pictures, WHY.to_string()),
-                Request::Schedule(crate::schedule::Command::Add {
-                    when,
-                    text,
-                    catch_up,
-                }) => {
-                    let catching = if catch_up { "catch-up " } else { "" };
-                    self.view
-                        .restore(&format!("/schedule {catching}{when} {text}"), WHY.into());
-                }
-                Request::Compact(Some(text)) => {
-                    self.view.restore(&format!("/compact {text}"), WHY.into());
-                }
-                Request::Review(text) => {
-                    self.view.restore(&format!("/review {text}"), WHY.into());
-                }
-                _ => self.view.note(format!("{WHY}, so it was not done")),
+            return match request.as_typed() {
+                Some((text, pictures)) => self.view.give_back(&text, pictures, WHY.to_string()),
+                None => self.view.note(format!("{WHY}, so it was not done")),
             };
         }
         let makes_one = matches!(

@@ -84,6 +84,9 @@ pub enum View {
     /// What came of a `Request::ListFolders`: for the window that asked, so
     /// not kept for another.
     Folders(crate::chooser::FoldersAnswer),
+    /// The broker is letting this window go, on purpose, and says why: not a
+    /// failed link, for a far window to come back from unasked.
+    Bye(String),
 }
 
 /// The session's end: what it tells the window, kept in order until the
@@ -108,6 +111,9 @@ pub struct Port {
     /// What was said for a person who was not there, to tell them when one is.
     later: Vec<View>,
     /// The last open was of what has closed.
+    remember_told: bool,
+    /// Given back to a far window and not yet said to have arrived.
+    told: Vec<View>,
     refused_open: bool,
 }
 
@@ -163,6 +169,8 @@ impl Port {
             counted: std::collections::BTreeMap::new(),
             replaying: std::collections::BTreeMap::new(),
             later: Vec::new(),
+            remember_told: false,
+            told: Vec::new(),
             refused_open: false,
         }
     }
@@ -174,6 +182,7 @@ impl Port {
         for view in std::mem::take(&mut self.out) {
             self.keep(view);
         }
+        self.told_may_not_have_arrived();
         self.attached = true;
         self.out.push(View::Opened(Box::new(self.book.clone())));
         self.out.extend(self.settings.iter().cloned());
@@ -191,6 +200,7 @@ impl Port {
     /// The window has gone: what is said is kept as far as `attach` needs it.
     pub fn detach(&mut self) {
         self.attached = false;
+        self.told_may_not_have_arrived();
         for view in std::mem::take(&mut self.out) {
             self.keep(view);
         }
@@ -198,6 +208,7 @@ impl Port {
 
     /// The window has gone with these unsent.
     pub fn lost(&mut self, views: Vec<View>) {
+        self.told.retain(|view| !views.contains(view));
         self.detach();
         for view in views {
             self.keep(view);
@@ -365,7 +376,31 @@ impl Port {
 
     /// What is waiting for the window, in order.
     pub fn take(&mut self) -> Vec<View> {
-        std::mem::take(&mut self.out)
+        let out = std::mem::take(&mut self.out);
+        if self.remember_told {
+            let given_back = |view: &&View| matches!(view, View::GiveBack(..) | View::Restore(..));
+            self.told.extend(out.iter().filter(given_back).cloned());
+        }
+        out
+    }
+
+    /// Whether what is given back to this window is kept until it is heard from:
+    /// a far one may have lost its link without either end yet knowing.
+    pub fn remember_told(&mut self, remember: bool) {
+        self.remember_told = remember;
+    }
+
+    /// The far window has what was given back longest ago.
+    pub fn received(&mut self) {
+        if !self.told.is_empty() {
+            self.told.remove(0);
+        }
+    }
+
+    fn told_may_not_have_arrived(&mut self) {
+        for view in std::mem::take(&mut self.told) {
+            self.keep(view);
+        }
     }
 
     /// What the window asks changes what it shows before it is served, so
@@ -801,6 +836,7 @@ impl App {
             View::OpenNewTemplate(remote) => self.open_new_template(remote.as_deref()),
             View::FocusComposer => self.focus_composer(),
             View::Folders(answer) => self.folders(answer),
+            View::Bye(why) => self.note(why),
         }
     }
 }
@@ -1175,6 +1211,46 @@ mod tests {
         port.lost(unsent);
         port.attach();
         assert_eq!(told(&mut port), 0, "lost with that window");
+    }
+
+    /// A message given back into a link that had died comes to the next window.
+    #[test]
+    fn what_a_far_window_did_not_answer_after_being_given_is_given_again() {
+        let scratch = TempDir::new("td-agent-view").unwrap();
+        let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+        let given = |port: &mut Port| {
+            port.take()
+                .iter()
+                .filter(|view| matches!(view, View::GiveBack(..)))
+                .count()
+        };
+        port.remember_told(true);
+        port.attach();
+        port.take();
+        port.give_back("m", Vec::new(), "w".into());
+        assert_eq!(given(&mut port), 1);
+        port.detach();
+        assert!(port.given_back_waits());
+        port.attach();
+        assert_eq!(given(&mut port), 1, "again");
+        port.received();
+        port.detach();
+        assert!(!port.given_back_waits(), "it had it");
+        // Lost unsent, it is kept once.
+        port.attach();
+        port.take();
+        port.give_back("n", Vec::new(), "w".into());
+        let unsent = port.take();
+        port.lost(unsent);
+        port.attach();
+        assert_eq!(given(&mut port), 1);
+        // A window here, which shows what it is given or says why not.
+        port.received();
+        port.remember_told(false);
+        port.give_back("o", Vec::new(), "w".into());
+        port.take();
+        port.detach();
+        assert!(!port.given_back_waits());
     }
 
     /// A stored key is the next window's to know of.

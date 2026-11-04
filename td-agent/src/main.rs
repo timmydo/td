@@ -13,6 +13,7 @@ use td_agent::store::{Id, Role, StateDir};
 use td_agent::workspace::Workspace;
 
 const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
+\x20                [--remote HOST [--remote-program PATH]]\n\
 \x20      td-agent serve [--stop]\n\
 \x20      td-agent attach\n\
 \x20      td-agent review --commit REV [--model opus-latest|gpt-sol-latest]\n\
@@ -32,8 +33,10 @@ checkout, whose launch serves that.\n\
 \n\
 The conversations run in td-agent serve, which the window starts when none\n\
 is running: closing the window leaves what is running going on, and serve\n\
-ends when nothing is. td-agent attach joins standard input and output to it,\n\
-for a window on another machine at the far end of ssh.\n\
+ends when nothing is. td-agent --remote HOST opens a window here on HOST's\n\
+conversations, over ssh, which needs td-agent there; --remote-program PATH\n\
+finds it off a non-login PATH. It runs td-agent attach there, which joins\n\
+standard input and output to HOST's td-agent serve.\n\
 \n\
 Keys: Return in the composer sends it (S-Return is a newline, and\n\
 C-Return sends from outside a dialog); C-r asks a failed turn again;\n\
@@ -109,22 +112,66 @@ fn conversation(args: &[String]) -> Result<(), String> {
     td_agent::conversation::run(&StateDir::at(state), &id, create, workspace, unconfined)
 }
 
-fn window(args: &[String]) -> Result<(), String> {
-    let control = match args {
-        [] => None,
-        [flag, path] if flag == "--control-socket" => {
-            let path = PathBuf::from(path);
-            if !path.is_absolute() {
-                return Err(format!(
-                    "the control socket {} is not an absolute path",
-                    path.display()
-                ));
+/// What a window was asked for.
+#[derive(Debug, Default)]
+struct WindowArgs {
+    control: Option<PathBuf>,
+    host: Option<td_remote::Host>,
+    program: Option<td_remote::RemoteProgram>,
+}
+
+fn window_args(args: &[String]) -> Result<WindowArgs, String> {
+    let mut parsed = WindowArgs::default();
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let Some(value) = args.next() else {
+            return Err(USAGE.trim_end().into());
+        };
+        match flag.as_str() {
+            "--control-socket" if parsed.control.is_none() => {
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    return Err(format!(
+                        "the control socket {} is not an absolute path",
+                        path.display()
+                    ));
+                }
+                parsed.control = Some(path);
             }
-            Some(path)
+            "--remote" if parsed.host.is_none() => {
+                parsed.host = Some(td_remote::Host::parse(value).map_err(|e| e.to_string())?);
+            }
+            "--remote-program" if parsed.program.is_none() => {
+                parsed.program =
+                    Some(td_remote::RemoteProgram::parse(value).map_err(|e| e.to_string())?);
+            }
+            _ => return Err(USAGE.trim_end().into()),
         }
-        _ => return Err(USAGE.trim_end().into()),
+    }
+    Ok(parsed)
+}
+
+fn window(args: &[String]) -> Result<(), String> {
+    let WindowArgs {
+        control,
+        host,
+        program,
+    } = window_args(args)?;
+    let broker = match (host, program) {
+        (None, None) => td_agent::window::Broker::Here {
+            state: state()?,
+            program: self::program()?,
+        },
+        (None, Some(_)) => return Err("--remote-program needs --remote".into()),
+        (Some(host), program) => td_agent::window::Broker::Over {
+            host,
+            program: match program {
+                Some(program) => program,
+                None => td_remote::RemoteProgram::parse("td-agent").map_err(|e| e.to_string())?,
+            },
+        },
     };
-    td_agent::window::run(&state()?, &program()?, control)
+    td_agent::window::run(broker, control)
 }
 
 fn state() -> Result<StateDir, String> {
@@ -195,5 +242,46 @@ fn main() -> ExitCode {
             let _ = writeln!(std::io::stderr().lock(), "td-agent: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn args(args: &[&str]) -> Result<WindowArgs, String> {
+        window_args(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_window_takes_each_of_its_options_once_and_refuses_the_rest() {
+        let parsed = args(&[]).unwrap();
+        assert!(parsed.control.is_none() && parsed.host.is_none());
+        let parsed = args(&[
+            "--remote",
+            "me@box",
+            "--remote-program",
+            "bin/td-agent",
+            "--control-socket",
+            "/a",
+        ])
+        .unwrap();
+        assert_eq!(parsed.host.unwrap().as_str(), "me@box");
+        assert_eq!(parsed.control.unwrap(), PathBuf::from("/a"));
+        for refused in [
+            &["--remote"][..],
+            &["--remote", "-oProxyCommand=x"],
+            &["--remote", "a", "--remote", "b"],
+            &["--remote-program", "a b", "--remote", "c"],
+            &["--control-socket", "relative"],
+            &["--other", "x"],
+        ] {
+            assert!(args(refused).is_err(), "{refused:?}");
+        }
+        assert!(window(&["--remote-program".into(), "x".into()])
+            .unwrap_err()
+            .contains("needs --remote"));
     }
 }

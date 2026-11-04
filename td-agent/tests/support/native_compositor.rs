@@ -20,6 +20,8 @@ use td_test_compositor::{remaining, write_until, Compositor, Controls};
 use td_ui::control::{frame, Decoder};
 
 const KEY_ESC: u32 = 1;
+const KEY_BACKSPACE: u32 = 14;
+const KEY_Q: u32 = 16;
 const KEY_1: u32 = 2;
 const KEY_MINUS: u32 = 12;
 const KEY_R: u32 = 19;
@@ -62,6 +64,16 @@ struct AgentProcess {
 }
 impl AgentProcess {
     fn launch(directory: &Directory, display: &Path, control: bool, env: &[(&str, &Path)]) -> Self {
+        Self::launch_with(directory, display, control, env, &[])
+    }
+
+    fn launch_with(
+        directory: &Directory,
+        display: &Path,
+        control: bool,
+        env: &[(&str, &Path)],
+        args: &[&str],
+    ) -> Self {
         // A case may have put state there first.
         let home = directory.0.join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -72,6 +84,7 @@ impl AgentProcess {
         if let Some(socket) = &socket {
             command.arg("--control-socket").arg(socket);
         }
+        command.args(args);
         for (name, value) in env {
             command.env(name, value);
         }
@@ -229,6 +242,389 @@ fn wait<T>(agent: &AgentProcess, what: &str, mut ready: impl FnMut() -> Option<T
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A window on another machine's conversations: all it does happens there, as
+/// the far account's store shows. Here "ssh" is a script and the far account a
+/// directory. Its link fails: what is typed then stays in hand and a message is
+/// given back, and when the link returns the window shows the same again and
+/// the message goes.
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn a_window_over_ssh_works_on_the_far_side_and_comes_back_when_its_link_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let compositor_directory = Directory::new("td-agent-process");
+    let mut compositor = Compositor::start(&compositor_directory.0, Controls::default());
+    let client_directory = Directory::new("td-agent-process");
+    let (far, bin) = (
+        client_directory.0.join("far"),
+        client_directory.0.join("bin"),
+    );
+    std::fs::create_dir_all(&far).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let (pid, down) = (far.join("ssh.pid"), far.join("down"));
+    let tries = far.join("ssh.tries");
+    // What the last try was run with: only one a person asked for may prompt.
+    let last_try_prompts = || {
+        !std::fs::read_to_string(&tries)
+            .unwrap()
+            .lines()
+            .next_back()
+            .unwrap()
+            .contains("BatchMode=yes")
+    };
+    let ssh = bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\n\
+             if [ -e '{down}' ]; then echo 'ssh: no route to host' >&2; exit 255; fi\n\
+             echo $$ > '{pid}'\n\
+             echo \"$*\" >> '{tries}'\n\
+             export HOME='{far}' XDG_STATE_HOME='{far}/state' XDG_CONFIG_HOME='{far}/config'\n\
+             unset WAYLAND_DISPLAY\n\
+             exec '{program}' attach\n",
+            down = down.display(),
+            pid = pid.display(),
+            tries = tries.display(),
+            far = far.display(),
+            program = env!("CARGO_BIN_EXE_td-agent"),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut agent = AgentProcess::launch_with(
+        &client_directory,
+        &compositor.display(),
+        true,
+        &[("PATH", &bin)],
+        &["--remote", "box"],
+    );
+    agent.conversations = far.join("state/td-agent/conversations");
+    wait(&agent, "the far window maps with the keyboard", || {
+        compositor.focused("td-agent").then_some(())
+    });
+    compositor.chord(&[KEY_LEFTCTRL], KEY_N);
+    wait(&agent, "Control-N starts a conversation there", || {
+        (agent.conversations().len() == 1).then_some(())
+    });
+    compositor.chord(&[], KEY_H);
+    compositor.chord(&[], KEY_I);
+    compositor.chord(&[], KEY_ENTER);
+    let logged = |agent: &AgentProcess, messages: &[&str]| {
+        agent
+            .conversations()
+            .first()
+            .is_some_and(|(_, _, users)| users == messages)
+    };
+    wait(&agent, "hi lands in the far log", || {
+        logged(&agent, &["hi"]).then_some(())
+    });
+    wait(&agent, "hi's turn ends", || {
+        let shown = agent.text();
+        (shown.contains("no model") || shown.contains("not answered")).then_some(())
+    });
+    assert!(
+        !agent.home.join("state/td-agent").exists(),
+        "this machine's state is not used"
+    );
+
+    // A draft, and the link goes for good a while.
+    compositor.chord(&[], KEY_Y);
+    wait(&agent, "y is in the composer", || {
+        agent.state().contains("composer=1	").then_some(())
+    });
+    std::fs::write(&down, "").unwrap();
+    let was = std::fs::read_to_string(&pid).unwrap();
+    let killed = Command::new("sh")
+        .args(["-c", &format!("kill {was}")])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    wait(&agent, "the window says it is not connected", || {
+        let state = agent.state();
+        (state.contains("not connected to box") && state.contains("no route to host")).then_some(())
+    });
+    assert!(
+        agent.state().contains("conversations=1	"),
+        "it goes on showing"
+    );
+    // Sent with no link, it comes back whole.
+    compositor.chord(&[], KEY_ENTER);
+    wait(&agent, "the message comes back", || {
+        agent.state().contains("the message is back").then_some(())
+    });
+    assert!(agent.state().contains("composer=1	"));
+    assert!(logged(&agent, &["hi"]));
+
+    // The first, before there was a window, could ask; these could not.
+    assert!(last_try_prompts(), "the first");
+
+    // A dialog open as the link returns is not closed under the person: its keys
+    // stay its own, and do not reach the composer behind it.
+    compositor.chord(&[], KEY_F10);
+    wait(&agent, "F10 opens the File menu", || {
+        agent.state().contains("menu=open").then_some(())
+    });
+    for _ in 0..3 {
+        compositor.chord(&[], KEY_DOWN);
+    }
+    compositor.chord(&[], KEY_ENTER);
+    wait(&agent, "the item opens the key dialog", || {
+        agent.state().contains("dialog=entry").then_some(())
+    });
+    let before = std::fs::read_to_string(&pid).unwrap();
+    std::fs::remove_file(&down).unwrap();
+    wait(&agent, "the far side is reached again", || {
+        (std::fs::read_to_string(&pid).unwrap() != before).then_some(())
+    });
+    assert!(!last_try_prompts(), "nobody asked for that one");
+    compositor.chord(&[], KEY_S);
+    compositor.chord(&[], KEY_K);
+    assert!(agent.state().contains("not connected to box"), "it waits");
+    assert!(agent.state().contains("composer=1\t"));
+    compositor.chord(&[], KEY_ESC);
+
+    // Its link back, it is the same window, on the same conversations.
+    wait(&agent, "the window connects again", || {
+        (!agent.state().contains("not connected to box")).then_some(())
+    });
+    wait(&agent, "the far side says it all over", || {
+        let state = agent.state();
+        (state.contains("conversations=1	") && !state.contains("active=none")).then_some(())
+    });
+    assert!(
+        agent.state().contains("composer=1	"),
+        "the draft stayed, and hi not with it"
+    );
+    compositor.chord(&[], KEY_ENTER);
+    wait(&agent, "y goes to the far log", || {
+        logged(&agent, &["hi", "y"]).then_some(())
+    });
+    assert_eq!(agent.conversations().len(), 1);
+    wait(&agent, "y's turn ends", || {
+        let shown = agent.text();
+        (shown.contains("no model") || shown.contains("not answered")).then_some(())
+    });
+
+    // Another window takes over, as one at that machine might. This one says so,
+    // and logs in no more: left alone, two would take it back from each other.
+    let before = std::fs::read_to_string(&pid).unwrap();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let mut other = Command::new(env!("CARGO_BIN_EXE_td-agent"))
+        .arg("attach")
+        .env_clear()
+        .env("HOME", &far)
+        .env("XDG_STATE_HOME", far.join("state"))
+        .env("XDG_CONFIG_HOME", far.join("config"))
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(
+            theirs.try_clone().unwrap(),
+        )))
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let elsewhere = td_agent::peer::Peer::over(ours).unwrap();
+    let claim = td_agent::ui::Request::Claim {
+        token: "elsewhere".into(),
+        asked: true,
+    };
+    assert!(elsewhere.send(td_agent::window_wire::encode_asked(
+        &td_agent::window_wire::Showing::Nothing,
+        &claim
+    )));
+    wait(&agent, "the window says it was let go", || {
+        agent
+            .state()
+            .contains("Return in composer retries")
+            .then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        std::fs::read_to_string(&pid).unwrap(),
+        before,
+        "no more logins"
+    );
+    drop(elsewhere);
+    other.wait().unwrap();
+
+    // Asked, it comes back, and that one may ask.
+    let open = |agent: &AgentProcess| -> String {
+        agent
+            .state()
+            .split('\t')
+            .find_map(|field| field.strip_prefix("active=").map(str::to_string))
+            .unwrap()
+    };
+    let hi = open(&agent);
+    compositor.chord(&[], KEY_ENTER);
+    wait(&agent, "asked, it connects again", || {
+        (std::fs::read_to_string(&pid).unwrap() != before
+            && !agent.state().contains("not connected to box"))
+        .then_some(())
+    });
+    assert!(last_try_prompts(), "that one was asked for");
+    wait(&agent, "it has what it had open", || {
+        (open(&agent) == hi).then_some(())
+    });
+
+    // A message into a link already dead, which only the far side's end says:
+    // nothing of it was heard of, so it comes back when ssh notices.
+    let before = std::fs::read_to_string(&pid).unwrap();
+    let signal = |signal: &str, pid: &str| {
+        let sent = Command::new("sh")
+            .args(["-c", &format!("kill -{signal} {pid}")])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+    };
+    signal("STOP", before.trim());
+    compositor.chord(&[], KEY_Q);
+    compositor.chord(&[], KEY_ENTER);
+    wait(&agent, "the composer has let it go", || {
+        agent.state().contains("composer=0\t").then_some(())
+    });
+    signal("KILL", before.trim());
+    wait(&agent, "it comes back", || {
+        agent.state().contains("composer=1\t").then_some(())
+    });
+    wait(&agent, "the window connects again", || {
+        (std::fs::read_to_string(&pid).unwrap() != before
+            && !agent.state().contains("not connected to box"))
+        .then_some(())
+    });
+
+    // A window opened there while this one's link is dying: this one never hears
+    // it was let go, tries again by itself when ssh notices, and does not put the
+    // other out, but says so and leaves it to the person.
+    let before = std::fs::read_to_string(&pid).unwrap();
+    signal("STOP", before.trim());
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let mut other = Command::new(env!("CARGO_BIN_EXE_td-agent"))
+        .arg("attach")
+        .env_clear()
+        .env("HOME", &far)
+        .env("XDG_STATE_HOME", far.join("state"))
+        .env("XDG_CONFIG_HOME", far.join("config"))
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(
+            theirs.try_clone().unwrap(),
+        )))
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let elsewhere = td_agent::peer::Peer::over(ours).unwrap();
+    assert!(elsewhere.send(td_agent::window_wire::encode_asked(
+        &td_agent::window_wire::Showing::Nothing,
+        &claim
+    )));
+    let heard_bye = || {
+        std::iter::from_fn(|| elsewhere.recv().ok().flatten()).any(|bytes| {
+            matches!(
+                td_agent::window_wire::decode_view(&bytes),
+                Ok(td_agent::view::View::Bye(_))
+            )
+        })
+    };
+    wait(&agent, "the other is told what is there", || {
+        elsewhere.recv().ok().flatten()
+    });
+    signal("KILL", before.trim());
+    wait(&agent, "this one tried again, and was sent away", || {
+        agent
+            .state()
+            .contains("Return in composer retries")
+            .then_some(())
+    });
+    assert_ne!(std::fs::read_to_string(&pid).unwrap(), before);
+    assert!(!last_try_prompts(), "nobody asked for that one");
+    assert!(
+        agent.state().contains("conversations=1\t"),
+        "it still shows what it had"
+    );
+    assert!(!heard_bye(), "the other was not put out");
+    drop(elsewhere);
+    other.wait().unwrap();
+    assert!(agent.state().contains("composer=1\t"), "q stayed");
+    let before = std::fs::read_to_string(&pid).unwrap();
+    compositor.chord(&[], KEY_ENTER);
+    wait(&agent, "asked, it connects again", || {
+        (std::fs::read_to_string(&pid).unwrap() != before
+            && !agent.state().contains("not connected to box"))
+        .then_some(())
+    });
+
+    // Another conversation, the more recent, and back on the first: where a far
+    // side started anew opens the other, and the window goes back to what it had.
+    compositor.chord(&[], KEY_BACKSPACE);
+    wait(&agent, "the composer is empty", || {
+        agent.state().contains("composer=0\t").then_some(())
+    });
+    compositor.chord(&[KEY_LEFTCTRL], KEY_N);
+    wait(&agent, "Control-N starts another there", || {
+        (agent.conversations().len() == 2).then_some(())
+    });
+    compositor.chord(&[], KEY_O);
+    compositor.chord(&[], KEY_ENTER);
+    wait(&agent, "o lands in its log", || {
+        agent
+            .conversations()
+            .iter()
+            .any(|(_, _, users)| users == &["o"])
+            .then_some(())
+    });
+    wait(&agent, "o's turn ends", || {
+        let shown = agent.text();
+        (shown.contains("no model") || shown.contains("not answered")).then_some(())
+    });
+    compositor.chord(&[KEY_LEFTCTRL], KEY_PAGEDOWN);
+    wait(&agent, "the first opens", || {
+        (open(&agent) == hi).then_some(())
+    });
+
+    // Stopped there, it stays stopped, however long the wait.
+    let before = std::fs::read_to_string(&pid).unwrap();
+    let stopped = Command::new(env!("CARGO_BIN_EXE_td-agent"))
+        .args(["serve", "--stop"])
+        .env_clear()
+        .env("HOME", &far)
+        .env("XDG_STATE_HOME", far.join("state"))
+        .env("XDG_CONFIG_HOME", far.join("config"))
+        .output()
+        .unwrap();
+    assert!(stopped.status.success(), "{stopped:?}");
+    wait(&agent, "the window says it was stopped", || {
+        agent
+            .state()
+            .contains("Return in composer retries")
+            .then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(std::fs::read_to_string(&pid).unwrap(), before);
+    assert!(!far.join("state/td-agent/stop.sock").exists());
+
+    // Asked, what starts there opens its most recent, which is not what was open.
+    compositor.chord(&[], KEY_ENTER);
+    wait(&agent, "asked, it connects again", || {
+        (std::fs::read_to_string(&pid).unwrap() != before
+            && !agent.state().contains("not connected to box"))
+        .then_some(())
+    });
+    wait(&agent, "it goes back to what it had open", || {
+        (open(&agent) == hi).then_some(())
+    });
+    compositor.chord(&[], KEY_K);
+    wait(&agent, "k is in the composer", || {
+        agent.state().contains("composer=1\t").then_some(())
+    });
+    compositor.chord(&[], KEY_ENTER);
+    wait(&agent, "k goes to the conversation that was open", || {
+        agent
+            .conversations()
+            .iter()
+            .any(|(_, _, users)| users == &["hi", "y", "k"])
+            .then_some(())
+    });
 }
 
 /// The window opens with no conversation and makes none; Control-N

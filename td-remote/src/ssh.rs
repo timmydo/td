@@ -25,6 +25,10 @@ const OPTIONS: &[&str] = &[
     "-a",
     "-o",
     "ClearAllForwardings=yes",
+    // A configured `QUIET` would leave a failed login with nothing to say; and it
+    // is at this level that ssh says a keepalive went unanswered.
+    "-o",
+    "LogLevel=INFO",
     "-o",
     "RemoteCommand=none",
     "-o",
@@ -105,8 +109,29 @@ impl RemoteProgram {
 }
 
 fn command(host: &Host, program: &RemoteProgram, words: &[&'static str]) -> Command {
+    command_with(&[], host, program, words)
+}
+
+fn unattended(host: &Host, program: &RemoteProgram, words: &[&'static str]) -> Command {
+    let mut command = command_with(&["-o", "BatchMode=yes"], host, program, words);
+    command
+        .env_remove("SSH_ASKPASS")
+        .env("SSH_ASKPASS_REQUIRE", "never");
+    command
+}
+
+fn command_with(
+    options: &[&str],
+    host: &Host,
+    program: &RemoteProgram,
+    words: &[&'static str],
+) -> Command {
     let mut command = Command::new("ssh");
-    command.args(OPTIONS).arg("--").arg(host.as_str());
+    command
+        .args(OPTIONS)
+        .args(options)
+        .arg("--")
+        .arg(host.as_str());
     command.arg(program.as_str()).args(words);
     let chosen = ["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"]
         .into_iter()
@@ -166,6 +191,19 @@ impl Link {
         options: Options,
     ) -> Result<Self, Error> {
         Self::spawn(command(host, program, words), options)
+    }
+
+    /// `ssh` for a try nobody asked for: a key that needs a passphrase is a
+    /// failure, not a dialog out of nowhere. `BatchMode` does not reach the ssh a
+    /// `ProxyJump` runs, which has only the environment to go by. On a terminal
+    /// that one can still ask there, as nothing here can stop it.
+    pub fn ssh_unattended(
+        host: &Host,
+        program: &RemoteProgram,
+        words: &[&'static str],
+        options: Options,
+    ) -> Result<Self, Error> {
+        Self::spawn(unattended(host, program, words), options)
     }
 }
 
@@ -245,6 +283,8 @@ mod tests {
                 "-o",
                 "ClearAllForwardings=yes",
                 "-o",
+                "LogLevel=INFO",
+                "-o",
                 "RemoteCommand=none",
                 "-o",
                 "ControlPath=none",
@@ -312,5 +352,30 @@ mod tests {
                 (OsStr::new("SSH_ASKPASS_REQUIRE"), Some(OsStr::new("force"))),
             ]
         );
+    }
+
+    #[test]
+    fn an_unattended_link_asks_nobody_and_says_so_where_an_option_may_be() {
+        let host = Host::parse("box").unwrap();
+        let program = RemoteProgram::parse("p").unwrap();
+        let built = unattended(&host, &program, &["w"]);
+        let env = |name: &str| {
+            built
+                .get_envs()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value)
+        };
+        assert_eq!(env("SSH_ASKPASS"), Some(None));
+        assert_eq!(
+            env("SSH_ASKPASS_REQUIRE"),
+            Some(Some(std::ffi::OsStr::new("never")))
+        );
+        let args: Vec<_> = built
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().to_string())
+            .collect();
+        let at = |word: &str| args.iter().position(|arg| arg == word).unwrap();
+        assert!(at("BatchMode=yes") < at("--"));
+        assert!(at("--") < at("box"));
     }
 }

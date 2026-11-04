@@ -781,9 +781,62 @@ finder's bounds as untrusted; it is for the window that asked, kept for no other
 The broker reads them on a thread, one read at a time: a folder that hangs, as over
 a dead mount, holds up that thread alone, and anything else asked meanwhile is
 told it is still being read.
-The pictures the person pastes are read by the window, on its own machine, as is
-a link they click opened; a window that is not on the broker's machine does not
-yet have those, the next increment's work.
+The pictures the person pastes are read by the window, on its own machine, and
+go with the message, as a link they click is opened there.
+
+**A window on another machine.** `td-agent --remote HOST` opens a window here on
+HOST's broker, by running `td-agent attach` there over ssh (`td-remote/DESIGN.md`)
+with the keepalives and no forwarding that link has; `--remote-program PATH` finds
+it off a non-login `PATH`. Everything that is the broker's is HOST's: conversations,
+workspaces and their folders, the configuration and key, what File's menu stores
+or exports, git's prompts, which go to HOST's display if any, and `/schedule`'s
+times, which are HOST's zone. Turning auto mode on is not to be had from afar,
+though a default of auto in HOST's configuration stands. What is this window's
+stays here: the composer, the clipboard, a link opened, the transcript's times shown
+in this machine's zone. The two hellos meet end to end through `attach`, so another
+version of td-agent is refused at the start with both versions named. A launch of
+`--remote` starts no fetch service: there are no conversations here to need one.
+
+The first connection is made before there is a window, so ssh's questions go to
+whoever ran it and a refusal ends it with ssh's words. Later ones cannot be: when
+the link fails the window stays, showing what it had with "not connected to HOST"
+on its status row and in its title, and tries again on a thread, at once and then
+after a second, ever more slowly up to 30 s, or from the last wait doubled if the
+connection did not last 30 s. These tries ask nobody anything (`BatchMode`, and no
+askpass, for a `ProxyJump`'s ssh too, though one run from a terminal can still ask
+there), and stop at a failed login or a far side that cannot be spoken to, the status
+row then saying that Return in the composer retries.
+
+The broker letting the window go on purpose, by `View::Bye` on a stream of its own
+that passes whatever is queued, for another window taking over or `serve --stop`,
+stops them too. So that a window that never heard that does not put out the one in
+use, a far window's first word says which it is and whether a person asked for this
+connection: a try nobody asked for takes over only from that window's own dead
+connection, and is otherwise told another window is open. So two windows do not take
+each other back and a stop stays stopped. Anything the person asks of a stopped window
+tries again, which alone may ask for a passphrase and may take over; asked of one
+still trying, it brings the next try forward. A try under way when the window closes
+is not ended: a passphrase dialog can outlast the window. A window on this machine
+let go puts what was in its composer on standard error.
+
+Meanwhile what the person typed comes back to the composer, and anything else is
+refused with a note. A send goes into ssh's queue whether or not anything is at the
+far end, and ssh takes a minute to notice, so text sent (a message, or a command or
+schedule, which there is no telling has arrived) is kept for 2 minutes from sending
+unless heard of again in the open conversation; when the link fails it comes back to
+the composer as what may not have arrived, where it may be there twice, the safe way
+round. A message sent on a link too slow to carry it in that time, as with large
+pictures, is not kept past it. What else was asked in that time, an interrupt say, is
+noted as perhaps not arrived. A message the broker gives back to a far window stays
+kept for the next until that window says it has it. At close, what is unconfirmed
+goes to standard error.
+
+On coming back, once the person has closed whatever has their keys, the window is a
+new `App`, told all over as any window is, keeping the composer and its pictures,
+the notes, the focus, how the list was shown and where the chooser last started; it
+opens again the conversation that was open, the far side having perhaps started again
+on another. So a reconnection replays the conversation whole, with the transcript
+empty until it comes, up to the log's bound on a slow link.
 
 **Listening.** The broker listens on three unix sockets at the top of the state
 directory: `window.sock`, for a window on this machine; `attach.sock`, which
@@ -801,9 +854,10 @@ of who is asking: the socket's and the account's ownership are all that stands
 between another program of this account and the conversations, as they are
 between it and the state directory.
 
-**One window at a time.** A window that attaches takes over from the one there,
-which closes; a draft in that one's composer goes with it, as it did when a
-window closed. The broker tells the new one, before anything else, the book, the
+**One window at a time.** A window that attaches takes over from the one there.
+One on this machine closes, what was in its composer going to standard error; a
+far one stays, keeping its draft and trying no more until asked. A far try nobody
+asked for takes over from no other window (§2). The broker tells the new one, before anything else, the book, the
 last of each setting, what is still asked of the person, what each
 conversation's log has said of its processes and sub-agents, what was said while
 no window was there (the last 256 notes, and every message given back, each of
@@ -812,8 +866,7 @@ the open conversation's log; and it reads the
 person's rules again. So there is one answer to any card, and no window has to
 be told it lost. A connection that has stopped being read is let go past 512 MiB
 waiting behind what is being written, more than any log, a replay counting for
-64 MiB of that however large, and it can attach again. A window whose broker has
-gone closes.
+64 MiB of that however large, and it can attach again. A window on this machine whose broker has gone closes.
 
 **Closing the window closes the window.** What was running goes on: a turn keeps
 spending, within the day's limit (§5), and a card waits for a window to answer
