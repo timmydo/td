@@ -8115,6 +8115,9 @@ Notebook token descriptions use the shared consent tag 41 and its
 `asks_pin` predicate for the protected PIN field. The operation and exact
 step are rendered by the shared codec; ordinary notebook windows never
 receive PIN input. The attention menu's N opens the notebook or selects its pending
-operation in the one authority slot. Each exchange requires its own physical
+operation in the one authority slot. Root's `a9 03`, a window or vault
+service that exited unsuccessfully, shows THE NOTEBOOK WINDOW STOPPED and
+the log root wrote its reason to (td-authd/DESIGN.md, "Notebook token
+descriptions"); the notice is fixed text, never the process's. Each exchange requires its own physical
 approval; each PIN remains bound to the exact acknowledged description.
 Notebook completion never unlocks the login screen.

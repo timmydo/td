@@ -1399,6 +1399,7 @@ mod tests {
         Notice::Login(&["A RETAINED SYSTEM CANNOT READ KEYS"]),
         Notice::Login(&["THE OPERATION FAILED"]),
         Notice::Login(crate::secret_client::TOO_SMALL),
+        Notice::Login(crate::secret_client::NOTEBOOK_FAILED),
         Notice::Uncertain(&["LOGIN KEY STATE UNAVAILABLE:", "DIRECTORY DAMAGED"]),
         Notice::Restarting,
     ];

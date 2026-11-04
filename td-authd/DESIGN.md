@@ -3736,9 +3736,41 @@ standalone fallback supplies notebook credentials.
 The paired session's requests 28, 29 and 2a open the notebook, select its
 pending hardware operation, and query whether one waits. Their replies are
 `a8 00/01`, `a9 01 NONCE`, `a9 00` (nothing selected), `a9 02`
-(launch unavailable), and `aa BOOL`. Selecting with no
+(launch unavailable), `a9 03` (the last window failed) and `aa BOOL`.
+Selecting with no
 window opens it and starts no token operation. Selecting while another
-operation owns the slot starts nothing. The fixed human GUI command is
+operation owns the slot starts nothing.
+
+Each process's stderr is a nonblocking socketpair whose root end keeps
+its last 512 bytes, drained on every poll and every ceremony advance.
+When a poll finds the bridge failed, root drains both and waits for an
+exit status: up to 250 ms in all once either process has closed its
+stderr, 20 ms otherwise, since the vault service never exits by itself
+while root holds its endpoint. The window's successful exit is the
+person closing it and says nothing more. Otherwise root writes one line
+to its own stderr, which the `[wayland]` unit keeps in
+`/var/log/svc/wayland.log`: root's reason, then each process's exit
+status and, quoted as its own words, its last line of stderr as
+printable ASCII, a quotation mark included as `?` so that the line
+cannot close root's quotation. A process's first panic ends with Rust's
+backtrace note, and root then says only that it panicked: the message
+above it may quote what the process held. A later panic in another
+thread prints no note; td-secret aborts on its first, and both
+programs' lints deny panicking code. td-pass and td-secret put no password, PIN or token in
+their failure texts. When a process exited unsuccessfully on its own,
+the next selection with no window answers `a9 03` once instead of
+opening one, and the compositor shows a fixed notice naming the log;
+the selection after that opens a window again. The process's words
+never reach the attention screen: they are the human account's, and
+the screen is the trusted path. During a hardware operation a process
+that exits unsuccessfully is logged the same way, and the operation's
+own failure is the screen's to show; a token's ordinary refusal is not
+logged, and neither arms `a9 03`. A lock, suspend or the generation's
+close drops the bridge without a line and clears `a9 03`, as a newly
+opened window does; the vault heartbeat's expiry is logged like a
+failed poll but arms nothing.
+
+The fixed human GUI command is
 `td-login exec-as PRIMARY -- /bin/td-authd notebook-ui 1000`; the checked
 helper sets only the fixed Wayland endpoint and execs `/bin/td-pass
 --trusted`. The service command is `td-login exec-service-as tdv1000 --

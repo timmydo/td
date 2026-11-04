@@ -81,6 +81,7 @@ mod set_hostname;
 #[path = "../../engine/src/sha256.rs"]
 mod sha256;
 mod software;
+mod stderr_tail;
 mod storage;
 mod suspend;
 mod sys;

@@ -57,6 +57,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "session.rs",
             "set_hostname.rs",
             "software.rs",
+            "stderr_tail.rs",
             "storage.rs",
             "suspend.rs",
             "sys.rs",
@@ -80,6 +81,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("rollback.rs", 0),
         ("set_hostname.rs", 0),
         ("software.rs", 0),
+        ("stderr_tail.rs", 0),
         ("backoff.rs", 0),
         ("sys.rs", 4),
         ("launch.rs", 0),
@@ -1359,8 +1361,8 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 const CACHE_FINGERPRINT: u64 = 0xca9ca5668a3cec8c;
 const SOFTWARE_FINGERPRINT: u64 = 0xedb33f4ba9468adf;
 const LAUNCH_FINGERPRINT: u64 = 0x917d816a91d3a16e;
-const MAIN_FINGERPRINT: u64 = 0x8f723a974f31a2be;
-const SESSION_FINGERPRINT: u64 = 0xbc41e16634b78938;
+const MAIN_FINGERPRINT: u64 = 0x2057ef8b5cd2c138;
+const SESSION_FINGERPRINT: u64 = 0xbdd3fc839ac097d8;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xad60fdb29c45fd9b;

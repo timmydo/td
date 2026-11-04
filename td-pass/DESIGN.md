@@ -542,6 +542,10 @@ The shell-based password-store importer is unavailable in trusted mode.
 
 Root owns session lock, suspend, generation loss and GUI-loss revocation.
 A cancellation closes the notebook window and destroys its vault session.
+A trusted window that refuses to start, or ends on an error, says why on
+stderr and exits 1; root keeps that line in its log and the attention
+screen names the log (td-authd/DESIGN.md, "Notebook token descriptions").
+Closing the window exits 0, which root takes as the person's choice.
 The service has a fifteen-minute absolute unlock ceiling; root closes the
 window when its heartbeat observes expiry. No host logind watcher or
 standalone token worker is started by this backend. Ordinary human-account

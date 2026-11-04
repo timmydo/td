@@ -2546,6 +2546,46 @@ fn notebook_lock_is_idempotent_and_takes_no_operation_slot() {
     }
 }
 
+/// A window that exits unsuccessfully is reported once, to the next
+/// selection, as `a9 03`, and only once: the selection after it opens a
+/// window again.
+#[test]
+fn a_notebook_window_that_failed_answers_the_next_selection_once() {
+    let mut session = quiet();
+    let (bridge, _) = crate::notebook::tests::refusing_bridge();
+    session.notebook = Some(bridge);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.notebook.is_some() {
+        session.tick().unwrap();
+        assert!(Instant::now() < deadline, "the failed window went unseen");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(session.notebook_failed);
+    assert_eq!(
+        session
+            .answer_with(
+                Request::NotebookBegin,
+                |_| panic!("cleanup"),
+                unexpected_begin
+            )
+            .unwrap(),
+        [0xa9, 3]
+    );
+    assert!(!session.notebook_failed);
+    // Said once: the next selection is an ordinary one (this session was
+    // never prepared, so it opens nothing).
+    assert_eq!(
+        session
+            .answer_with(
+                Request::NotebookBegin,
+                |_| panic!("cleanup"),
+                unexpected_begin
+            )
+            .unwrap(),
+        [0xa9, 0]
+    );
+}
+
 #[test]
 fn notebook_lock_stops_an_active_ceremony_and_both_private_processes() {
     let mut session = quiet();

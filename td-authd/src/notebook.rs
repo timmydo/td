@@ -6,32 +6,97 @@ use crate::notebook_token::Token;
 use crate::notebook_wire::{
     put_binding, read_binding, Bytes, MailBinding, PendingWire, Reader, MAIL_PENDING,
 };
+use crate::stderr_tail::Tail;
 use crate::unlock::Event;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+/// How long a failed bridge waits for a process to finish exiting, so its
+/// status and last words reach the log rather than the kill's.
+const EXIT_GRACE: Duration = Duration::from_millis(250);
+/// The wait for an exit before either process is seen to close its stderr:
+/// an exiting process closes its descriptors one by one, its endpoint
+/// first, so root may see that before its stderr's end.
+const EXIT_FLOOR: Duration = Duration::from_millis(20);
+const EXIT_STEP: Duration = Duration::from_millis(10);
 
 struct Process {
     child: Child,
     wire: PendingWire,
+    stderr: Tail,
+    exited: Option<ExitStatus>,
 }
 impl Process {
     fn start(mut command: Command) -> Result<Self, String> {
         let (root, child) = UnixStream::pair().map_err(|_| "create notebook capability")?;
         let wire = PendingWire::new(root)?;
+        let (stderr, child_stderr) = Tail::pair()?;
         let child = command
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::from(OwnedFd::from(child)))
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(child_stderr))
             .spawn()
             .map_err(|_| "start notebook process")?;
-        Ok(Self { child, wire })
+        Ok(Self {
+            child,
+            wire,
+            stderr,
+            exited: None,
+        })
     }
+
+    /// Whether it has exited, reaping it if so.
+    fn reap(&mut self) -> Option<ExitStatus> {
+        if self.exited.is_none() {
+            self.exited = self.child.try_wait().ok().flatten();
+        }
+        self.exited
+    }
+
+    /// Its exit as the log gives it, with its last line of stderr quoted
+    /// as its own words.
+    fn describe(&mut self) -> String {
+        if self.exited.is_some() {
+            self.stderr.finish();
+        } else {
+            self.stderr.drain();
+        }
+        let state = match self.exited {
+            None => "was still running".to_string(),
+            Some(status) => match (status.code(), status.signal()) {
+                (Some(code), _) => format!("exited {code}"),
+                (None, Some(signal)) => format!("was killed by signal {signal}"),
+                (None, None) => "exited".to_string(),
+            },
+        };
+        match self.stderr.last_line() {
+            Some(line) => format!("{state}, its last words \"{line}\""),
+            None => format!("{state}, saying nothing"),
+        }
+    }
+}
+
+/// One line in root's log, which its unit keeps (td-authd/DESIGN.md,
+/// "Notebook token descriptions").
+pub(crate) fn log(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "td-authd: {line}");
+}
+
+/// What root says of a notebook bridge it ends.
+pub(crate) struct Ending {
+    /// The line for root's log; none when the person closed the window.
+    pub line: Option<String>,
+    /// A process exited unsuccessfully on its own, which the next
+    /// selection reports on the attention screen.
+    pub failed: bool,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -177,7 +242,53 @@ impl Bridge {
                 .is_some_and(|p| action(&p.0).is_some())
     }
 
+    /// What root logs of the bridge it is about to drop for `why`: each
+    /// process's exit and last line of stderr. A process that closed its
+    /// stderr is exiting, and root waits a short grace for its status;
+    /// otherwise it waits for nothing, since the vault service never
+    /// exits by itself while root holds its endpoint. The window's
+    /// successful exit is the person closing it, which is neither logged
+    /// nor a failure.
+    pub fn ending(&mut self, why: &str) -> Ending {
+        let start = Instant::now();
+        loop {
+            self.gui.stderr.drain();
+            self.service.stderr.drain();
+            let exited = self.gui.reap().is_some() | self.service.reap().is_some();
+            let grace = if self.gui.stderr.eof() || self.service.stderr.eof() {
+                EXIT_GRACE
+            } else {
+                EXIT_FLOOR
+            };
+            if exited || start.elapsed() >= grace {
+                break;
+            }
+            std::thread::sleep(EXIT_STEP);
+        }
+        let failed = [self.gui.exited, self.service.exited]
+            .iter()
+            .any(|status| status.is_some_and(|status| !status.success()));
+        if !failed && self.gui.exited.is_some_and(|status| status.success()) {
+            return Ending {
+                line: None,
+                failed: false,
+            };
+        }
+        Ending {
+            line: Some(format!(
+                "notebook ended: {why}; its window {}; its vault service {}",
+                self.gui.describe(),
+                self.service.describe()
+            )),
+            failed,
+        }
+    }
+
     pub fn poll(&mut self) -> Result<(), String> {
+        // Drained every poll, and every ceremony advance, so neither
+        // process fills its channel.
+        self.gui.stderr.drain();
+        self.service.stderr.drain();
         if let Some(reply) = self.service.wire.poll()? {
             match self
                 .waiting
@@ -352,7 +463,14 @@ impl Ceremony {
                 self.event = event.clone();
                 Ok(event)
             }
-            Err(_) => {
+            Err(why) => {
+                // A token's own failure is the screen's to say; a process
+                // that died under the operation is the log's.
+                if let Some(ending) = self.bridge.as_mut().map(|b| b.ending(&why)) {
+                    if let (true, Some(line)) = (ending.failed, ending.line) {
+                        log(&line);
+                    }
+                }
                 self.cancel()?;
                 Ok(self.event.clone())
             }
@@ -360,6 +478,8 @@ impl Ceremony {
     }
     fn advance(&mut self) -> Result<Event, String> {
         let bridge = self.bridge.as_mut().ok_or("missing notebook processes")?;
+        bridge.gui.stderr.drain();
+        bridge.service.stderr.drain();
         if bridge.gui.wire.poll()?.is_some() {
             return Err("window changed a pending notebook operation".into());
         }
@@ -447,14 +567,41 @@ pub(crate) mod tests {
         (bridge.begin().unwrap(), pids)
     }
 
+    #[test]
+    #[ignore = "child process: a window that refuses to start"]
+    fn refusing_process() {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "td-pass: refused\x1b by its startup check"
+        );
+        std::process::exit(1);
+    }
+
+    #[test]
+    #[ignore = "child process: a window the person closes"]
+    fn closing_process() {
+        std::process::exit(0);
+    }
+
+    fn process(name: &str) -> Process {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", name, "--ignored", "--nocapture", "-q"]);
+        Process::start(command).unwrap()
+    }
+
     pub(crate) fn bridge() -> (Bridge, [u32; 2]) {
-        let process = || {
-            let mut command = Command::new(std::env::current_exe().unwrap());
-            command.args(["--exact", "notebook::tests::idle_process", "--ignored"]);
-            Process::start(command).unwrap()
-        };
-        let gui = process();
-        let service = process();
+        bridge_with(process("notebook::tests::idle_process"))
+    }
+
+    /// A bridge whose window refuses to start, as td-pass does when a
+    /// startup check fails.
+    pub(crate) fn refusing_bridge() -> (Bridge, [u32; 2]) {
+        bridge_with(process("notebook::tests::refusing_process"))
+    }
+
+    fn bridge_with(gui: Process) -> (Bridge, [u32; 2]) {
+        let service = process("notebook::tests::idle_process");
         let pids = [gui.child.id(), service.child.id()];
         (
             Bridge {
@@ -557,6 +704,52 @@ pub(crate) mod tests {
         bridge.poll().unwrap();
         assert_eq!(service.receive(Duration::from_secs(1)).unwrap().0, [11]);
     }
+    /// A window that exits unsuccessfully on its own is a failure, its
+    /// last line of stderr in root's log line; the vault service, still
+    /// running, says so. A window that exits 0 was closed by the person.
+    #[test]
+    fn a_failed_window_reaches_the_log_and_a_closed_one_does_not() {
+        let (mut bridge, _) = refusing_bridge();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let why = loop {
+            if let Err(why) = bridge.poll() {
+                break why;
+            }
+            assert!(Instant::now() < deadline, "the window's end went unseen");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let ending = bridge.ending(&why);
+        assert!(ending.failed);
+        let line = ending.line.unwrap();
+        assert!(
+            line.starts_with(&format!("notebook ended: {why}; ")),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "its window exited 1, its last words \"td-pass: refused? by its startup check\";"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.ends_with("its vault service was still running, saying nothing"),
+            "{line}"
+        );
+
+        let (mut bridge, _) = bridge_with(process("notebook::tests::closing_process"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let why = loop {
+            if let Err(why) = bridge.poll() {
+                break why;
+            }
+            assert!(Instant::now() < deadline, "the window's end went unseen");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let ending = bridge.ending(&why);
+        assert!(!ending.failed);
+        assert!(ending.line.is_none());
+    }
+
     #[test]
     fn request_list_poll_still_schedules_due_vault_heartbeat() {
         use crate::notebook_wire::Wire;

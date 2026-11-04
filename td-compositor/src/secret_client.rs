@@ -871,6 +871,15 @@ impl Removal {
 /// rather than clipped: the operation ends before its token I/O.
 pub(crate) const TOO_SMALL: &[&str] = &["THIS SCREEN IS TOO SMALL", "FOR THIS PROMPT"];
 
+/// Root's `a9 03`: the last notebook window or vault service exited
+/// unsuccessfully. Its words are the person's account's, so they go to
+/// root's log, never this screen, which names only where they are.
+pub(crate) const NOTEBOOK_FAILED: &[&str] = &[
+    "THE NOTEBOOK WINDOW STOPPED",
+    "ITS REASON IS IN",
+    "/VAR/LOG/SVC/WAYLAND.LOG",
+];
+
 /// `1a`'s unavailable cause for an unenrolled protected machine
 /// (td-authd/DESIGN.md, amendment 9), which no failure kind shares.
 pub(crate) const PROTECTED: u8 = 0x0d;
@@ -1676,6 +1685,7 @@ impl Client {
         let answer = selection.answer();
         let nonce = match response.as_slice() {
             [0xa9, 2] if answer == 0xa9 => return attempt.notice(Notice::NotAvailable),
+            [0xa9, 3] if answer == 0xa9 => return attempt.notice(Notice::Login(NOTEBOOK_FAILED)),
             [0xa9, 0] if answer == 0xa9 => {
                 return attempt.notice(Notice::Login(&[
                     "CHOOSE AN OPERATION IN THE NOTEBOOK WINDOW",
@@ -2923,6 +2933,40 @@ mod tests {
                 assert!(wire.calls.contains(&pin_request(&pin, PIN)));
             }
         }
+    }
+
+    /// Root's `a9 03` shows the fixed notice and starts no operation.
+    #[test]
+    fn a_failed_notebook_window_names_root_s_log() {
+        let temp = crate::temp_dir::TempDir::new("td-notebook-failed").unwrap();
+        let path = temp.path().join("frame");
+        let mut runtime = Runtime::new(
+            crate::framebuffer::Framebuffer::test_file(&path, 800, 600, 3200).unwrap(),
+        );
+        runtime.enable_attention(true);
+        runtime
+            .attention(&crate::input::test_origin(), true)
+            .unwrap();
+        let screen = Screen {
+            path,
+            attempt: Attempt::new(
+                crate::input::test_origin(),
+                Arc::new(Mutex::new(runtime)),
+                Selection::Login(LoginSelection::Notebook),
+            ),
+        };
+        let mut wire = Wire {
+            replies: VecDeque::from([vec![0xa9, 3]]),
+            calls: Vec::new(),
+            typist: None,
+        };
+        let mut client = Client::trusting_memory();
+        client
+            .start(&mut wire, Arc::clone(&screen.attempt))
+            .unwrap();
+        assert!(client.login.is_none());
+        assert_eq!(wire.calls, [vec![0x29]]);
+        assert_eq!(screen.shown(), Some(Notice::Login(NOTEBOOK_FAILED)));
     }
 
     struct Wire {

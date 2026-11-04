@@ -11,6 +11,10 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/notebook.rs"),
     ),
     (
+        "src/stderr_tail.rs",
+        include_str!("../../../td-authd/src/stderr_tail.rs"),
+    ),
+    (
         "src/notebook_token.rs",
         include_str!("../../../td-authd/src/notebook_token.rs"),
     ),

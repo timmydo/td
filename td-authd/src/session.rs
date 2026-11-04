@@ -349,6 +349,9 @@ impl Drop for Cleanup {
 pub(crate) struct Session {
     owner: u32,
     notebook: Option<crate::notebook::Bridge>,
+    /// The last notebook bridge ended with a process's own failed exit,
+    /// which the next selection answers with `a9 03` once.
+    notebook_failed: bool,
     notebook_mail: Option<crate::notebook_mail::Intake>,
     intake: Option<crate::secret_intake::Intake>,
     writing: bool,
@@ -389,6 +392,7 @@ impl Session {
         Ok(Self {
             owner,
             notebook: None,
+            notebook_failed: false,
             notebook_mail: None,
             intake: None,
             writing: false,
@@ -476,6 +480,7 @@ impl Session {
             }
             Request::NotebookLock => {
                 self.notebook = None;
+                self.notebook_failed = false;
                 if let Some(intake) = &mut self.notebook_mail {
                     intake.revoke();
                 }
@@ -490,7 +495,10 @@ impl Session {
                 }
                 if self.notebook.is_none() && !matches!(self.operation, Some(Active::Notebook(_))) {
                     match crate::notebook::Bridge::start(self.owner) {
-                        Ok(bridge) => self.notebook = Some(bridge),
+                        Ok(bridge) => {
+                            self.notebook = Some(bridge);
+                            self.notebook_failed = false;
+                        }
                         Err(_) => return Ok(vec![0xa8, 1]),
                     }
                 }
@@ -505,6 +513,10 @@ impl Session {
             }
             Request::NotebookBegin => {
                 self.tick()?;
+                // Said once; the selection after it opens a window again.
+                if self.notebook.is_none() && std::mem::take(&mut self.notebook_failed) {
+                    return Ok(vec![0xa9, 3]);
+                }
                 if self.prepared
                     && self.cleanup.is_none()
                     && self.operation.is_none()
@@ -712,6 +724,7 @@ impl Session {
             return Ok(vec![0xa5, 2]);
         }
         self.notebook = None;
+        self.notebook_failed = false;
         if let Some(intake) = &mut self.notebook_mail {
             intake.revoke();
         }
@@ -1031,11 +1044,15 @@ impl Session {
 
     /// Terminal traffic also advances watchdogs without consuming events.
     pub fn tick(&mut self) -> Result<(), String> {
-        if self
+        let ended = self
             .notebook
             .as_mut()
-            .is_some_and(|bridge| bridge.poll().is_err())
-        {
+            .and_then(|bridge| bridge.poll().err().map(|why| bridge.ending(&why)));
+        if let Some(ending) = ended {
+            if let Some(line) = &ending.line {
+                crate::notebook::log(line);
+            }
+            self.notebook_failed = ending.failed;
             self.notebook = None;
             if let Some(intake) = &mut self.notebook_mail {
                 intake.revoke();
@@ -1261,6 +1278,7 @@ impl Session {
             }
         }
         self.notebook = None;
+        self.notebook_failed = false;
         if let Some(intake) = &mut self.notebook_mail {
             intake.revoke();
         }
