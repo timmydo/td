@@ -46,6 +46,8 @@ use td_ui::tree_table::{self, Cell, Column, Model, Row as TreeRow};
 use td_ui::window::{Clipboard, Input, PointerPhase};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
+use crate::book::Book;
+pub use crate::book::{Row, RowState};
 use crate::chooser::Chooser;
 use crate::config::{Mode, Network};
 use crate::confirm::{self, Confirm};
@@ -55,6 +57,7 @@ use crate::keydialog::{KeyDialog, Reply};
 use crate::menu;
 use crate::picker::{Offer, Picker};
 use crate::picture::Reference;
+#[cfg(test)]
 use crate::post::Entry;
 use crate::protocol::{Up, MAX_TEXT};
 use crate::store::{Event, Held, Id, Kind, Purpose, Role, Status, TaskStart, TodoItem};
@@ -93,32 +96,6 @@ const COLUMNS: &[Column<'static>] = &[Column {
     preferred: 320,
     numeric: false,
 }];
-
-/// A conversation's process as the list shows it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RowState {
-    /// Not open: it has no process.
-    Closed,
-    Starting,
-    Idle,
-    /// A turn is under way.
-    Running,
-    Restarting,
-    Failed,
-}
-
-impl RowState {
-    pub fn word(self) -> &'static str {
-        match self {
-            Self::Closed => "",
-            Self::Starting => "starting",
-            Self::Idle => "idle",
-            Self::Running => "running",
-            Self::Restarting => "restarting",
-            Self::Failed => "failed",
-        }
-    }
-}
 
 /// A card a conversation asks the human, until decided or withdrawn: may
 /// its call `call` run?
@@ -289,37 +266,6 @@ enum Asker {
 const MAX_PROCESS_LABEL: usize = 120;
 /// How many lines of a process's output make one entry of its view.
 const OUTPUT_LINES: usize = 40;
-
-/// One conversation in the list.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Row {
-    pub id: Id,
-    pub title: String,
-    /// When it was last active, in milliseconds since the epoch: what the
-    /// list orders the conversations by, then their ids.
-    pub activity: u64,
-    pub state: RowState,
-    /// The human paused it: messages from other conversations wait.
-    pub paused: bool,
-    /// What it works in; the list groups conversations by workspace.
-    pub workspace: Option<Workspace>,
-    /// Its tools run outside any jail (DESIGN.md §8): the list marks it.
-    pub unconfined: bool,
-    /// The human archived it: the list hides it unless archived ones
-    /// show, and it opens only once unarchived.
-    pub archived: bool,
-}
-
-impl Row {
-    /// Its state as the list names it.
-    pub fn word(&self) -> &'static str {
-        match self.state {
-            _ if self.archived => "archived",
-            RowState::Closed | RowState::Idle if self.paused => "paused",
-            state => state.word(),
-        }
-    }
-}
 
 /// What `item`'s fold is kept as: a template's by its name, whether it is
 /// configured or not, so a fold outlasts its template's removal.
@@ -817,14 +763,14 @@ const COMPOSER_KEYS: &[(&str, &str)] = &[
 /// The window's state.
 pub struct App {
     surface: Surface,
-    rows: Vec<Row>,
-    active: Option<Id>,
+    /// The conversations, as the session's messages have them.
+    book: Book,
     /// The pictures pasted into the composer and not yet sent, each named
     /// in its text by its label (DESIGN.md §4, Pictures).
     attached: Vec<Attached>,
-    /// Where the open conversation's pictures are kept, for showing them;
-    /// none for an app without a store, whose pictures show as text.
-    state: Option<crate::store::StateDir>,
+    /// The pictures of the message being shown, as the session sent them;
+    /// one not here shows as text.
+    pictures: crate::view::Pictures,
     list: tree_table::Controller<usize>,
     split: split::Controller,
     transcript: messages::Controller,
@@ -904,8 +850,6 @@ pub struct App {
     /// Each message that came of a request, and so has a Debug button:
     /// the request's sequence number and the message's index.
     exchanges: Vec<(u64, usize)>,
-    /// The turn each conversation in the background is running.
-    background_turns: Vec<(Id, u64)>,
     /// The last event shown, so one heard twice (read from the log when a
     /// running conversation is opened again, then from its process) is
     /// shown once.
@@ -990,10 +934,6 @@ pub struct App {
     /// An admission card set aside when the window lost the keyboard:
     /// its template and remotes, asked again when it comes back.
     admission: Option<(String, Vec<String>)>,
-    /// Conversations being deleted or archived whose workspaces are being
-    /// asked what removing them would lose, each with the list's word for
-    /// it: none opens or takes a message meanwhile.
-    closing: Vec<(Id, &'static str)>,
     /// Loss cards not yet answered, each conversation's with its title,
     /// what its workspace reported and whether it is being archived:
     /// asked until answered, since the conversation stays stopped until
@@ -1081,10 +1021,9 @@ impl App {
         let model = Model::new(&[], COLUMNS).map_err(|e| e.to_string())?;
         let mut app = Self {
             attached: Vec::new(),
-            state: None,
+            pictures: crate::view::Pictures::new(),
             surface,
-            rows: Vec::new(),
-            active: None,
+            book: Book::default(),
             list: tree_table::Controller::new(model, surface, surface.bounds())
                 .map_err(|e| e.to_string())?,
             split,
@@ -1126,7 +1065,6 @@ impl App {
             turns: Vec::new(),
             reviews: Vec::new(),
             last_seq: 0,
-            background_turns: Vec::new(),
             meter: Meter::default(),
             streaming: None,
             undrawn: None,
@@ -1163,7 +1101,6 @@ impl App {
             settle: CARD_SETTLE,
             card_trouble: None,
             admission: None,
-            closing: Vec::new(),
             removals: Vec::new(),
             removal_trouble: None,
             menu_revision: 1,
@@ -1233,28 +1170,23 @@ impl App {
     }
 
     pub fn active(&self) -> Option<&Id> {
-        self.active.as_ref()
+        self.book.active()
+    }
+
+    /// The conversations, as the session's messages have them.
+    #[cfg(test)]
+    pub fn book(&self) -> &Book {
+        &self.book
     }
 
     pub fn rows(&self) -> &[Row] {
-        &self.rows
+        &self.book.rows
     }
 
     /// The conversations as the post routes between them.
+    #[cfg(test)]
     pub fn directory(&self) -> Vec<Entry> {
-        self.rows
-            .iter()
-            .map(|row| Entry {
-                id: row.id.clone(),
-                state: match row.word() {
-                    "" => "idle",
-                    word => word,
-                }
-                .to_string(),
-                failed: row.state == RowState::Failed || self.closing(&row.id),
-                archived: row.archived,
-            })
-            .collect()
+        self.book.directory()
     }
 
     /// The open conversation's todo list.
@@ -1301,16 +1233,17 @@ impl App {
     /// Whether the open conversation's workspace is unconfined
     /// (DESIGN.md §8).
     fn unconfined(&self) -> bool {
-        self.active
+        self.book
+            .active
             .as_ref()
-            .and_then(|id| self.rows.iter().find(|r| &r.id == id))
+            .and_then(|id| self.book.rows.iter().find(|r| &r.id == id))
             .is_some_and(|row| row.unconfined)
     }
 
     /// The open conversation's repository workspace, if it has one.
     fn repositories(&self) -> Option<(&Id, &crate::workspace::Repositories)> {
-        let id = self.active.as_ref()?;
-        match &self.rows.iter().find(|r| &r.id == id)?.workspace {
+        let id = self.book.active.as_ref()?;
+        match &self.book.rows.iter().find(|r| &r.id == id)?.workspace {
             Some(Workspace::Repositories(repositories)) => Some((id, repositories)),
             _ => None,
         }
@@ -1407,9 +1340,10 @@ impl App {
     /// narrow row lets it go, the highest first; 0 is never let go.
     fn status_items(&self) -> Vec<StatusPart> {
         let row = self
+            .book
             .active
             .as_ref()
-            .and_then(|id| self.rows.iter().find(|r| &r.id == id));
+            .and_then(|id| self.book.rows.iter().find(|r| &r.id == id));
         let state = row.map_or("no conversation", Row::word);
         // Only items of a fixed width: a note, however long, is counted
         // here and read whole in the Messages window.
@@ -1559,9 +1493,10 @@ impl App {
     /// open.
     fn shown_network(&self) -> Network {
         let open = self
+            .book
             .active
             .as_ref()
-            .and_then(|id| self.rows.iter().find(|r| &r.id == id));
+            .and_then(|id| self.book.rows.iter().find(|r| &r.id == id));
         match open {
             None => self.networks.network,
             Some(row) => row.workspace.as_ref().map_or(Network::Off, |workspace| {
@@ -1582,9 +1517,10 @@ impl App {
     /// open.
     fn shown_mode(&self) -> Mode {
         let open = self
+            .book
             .active
             .as_ref()
-            .and_then(|id| self.rows.iter().find(|r| &r.id == id));
+            .and_then(|id| self.book.rows.iter().find(|r| &r.id == id));
         match open {
             Some(row) if row.workspace.is_none() => Mode::Ask,
             _ => self.workspace_mode().unwrap_or(self.mode),
@@ -1595,8 +1531,8 @@ impl App {
     /// the configuration's, `ask` while the rules cannot be read; none
     /// with no workspace open.
     fn workspace_mode(&self) -> Option<Mode> {
-        let id = self.active.as_ref()?;
-        let row = self.rows.iter().find(|r| &r.id == id)?;
+        let id = self.book.active.as_ref()?;
+        let row = self.book.rows.iter().find(|r| &r.id == id)?;
         let key = row.workspace.as_ref()?.key(id);
         Some(match &self.modes {
             None => Mode::Ask,
@@ -1678,7 +1614,7 @@ impl App {
     pub fn set_sub_agents(&mut self, read: Vec<(Id, Vec<TaskStart>)>) {
         let mut added = false;
         for (id, starts) in read {
-            if !self.rows.iter().any(|row| row.id == id) || starts.is_empty() {
+            if !self.book.rows.iter().any(|row| row.id == id) || starts.is_empty() {
                 continue;
             }
             let known = &mut self.sub_agents.entry(id).or_default().starts;
@@ -1729,11 +1665,9 @@ impl App {
 
     /// The most recently active conversation's id, archived ones aside,
     /// when the list holds any.
+    #[cfg(test)]
     pub fn most_recent(&self) -> Option<Id> {
-        self.rows
-            .iter()
-            .find(|r| !r.archived && !self.closing(&r.id))
-            .map(|r| r.id.clone())
+        self.book.most_recent()
     }
 
     /// Conversation `id` is being deleted or archived, `doing` saying
@@ -1741,17 +1675,12 @@ impl App {
     /// lose, or no longer: while it is, it does not open, takes no
     /// message, and is closed when it was open.
     pub fn set_closing(&mut self, id: &Id, doing: Option<&'static str>) {
-        self.closing.retain(|(other, _)| other != id);
-        if let Some(doing) = doing {
-            self.closing.push((id.clone(), doing));
-            self.background_turns.retain(|(of, _)| of != id);
+        let was_open = self.book.active() == Some(id);
+        self.book.set_closing(id, doing);
+        if doing.is_some() {
             // Its process is ended with them, saying nothing more.
             self.processes.remove(id);
-            if let Some(row) = self.rows.iter_mut().find(|r| &r.id == id) {
-                row.state = RowState::Closed;
-            }
-            if self.active.as_ref() == Some(id) {
-                self.active = None;
+            if was_open {
                 self.clear_transcript();
             }
         } else {
@@ -1764,15 +1693,12 @@ impl App {
     /// Whether conversation `id` is being deleted or archived, its
     /// workspace asked.
     pub fn closing(&self, id: &Id) -> bool {
-        self.closing.iter().any(|(of, _)| of == id)
+        self.book.closing(id)
     }
 
     /// The list's word for a conversation being deleted or archived.
     fn closing_word(&self, id: &Id) -> Option<&'static str> {
-        self.closing
-            .iter()
-            .find(|(of, _)| of == id)
-            .map(|(_, doing)| *doing)
+        self.book.closing_word(id)
     }
 
     /// Asks whether conversation `id`, titled `title`, is deleted, or
@@ -1823,6 +1749,7 @@ impl App {
     /// its options numbered, and how to answer.
     pub fn question_lines(&self) -> Vec<String> {
         let Some(asked) = self
+            .book
             .active
             .as_ref()
             .and_then(|id| self.questions.iter().find(|q| &q.conversation == id))
@@ -1880,7 +1807,7 @@ impl App {
     /// tool activity does: the open conversation is drawn again.
     pub fn toggle_activity(&mut self) {
         self.show_activity = !self.show_activity;
-        if self.active.is_some() {
+        if self.book.active.is_some() {
             self.requests.push(Request::Redraw);
         }
         self.touch();
@@ -1896,18 +1823,12 @@ impl App {
     /// Conversation `id` is archived, or back: the list hides an archived
     /// one unless archived ones show, and it is closed when it was open.
     pub fn set_archived(&mut self, id: &Id, archived: bool) {
-        if let Some(row) = self.rows.iter_mut().find(|r| &r.id == id) {
-            row.archived = archived;
-            if archived {
-                row.state = RowState::Closed;
-            }
-        }
+        let was_open = self.book.active() == Some(id);
+        self.book.set_archived(id, archived);
         if archived {
-            self.background_turns.retain(|(of, _)| of != id);
             // Its process is ended with them, saying nothing more.
             self.processes.remove(id);
-            if self.active.as_ref() == Some(id) {
-                self.active = None;
+            if was_open {
                 self.clear_transcript();
             }
         }
@@ -1946,12 +1867,11 @@ impl App {
     /// Conversation `id` is deleted: its row goes, and the transcript with
     /// it when it was the one open.
     pub fn remove_row(&mut self, id: &Id) {
-        self.rows.retain(|row| &row.id != id);
-        self.background_turns.retain(|(of, _)| of != id);
+        let was_open = self.book.active() == Some(id);
+        self.book.remove_row(id);
         self.processes.remove(id);
         self.sub_agents.remove(id);
-        if self.active.as_ref() == Some(id) {
-            self.active = None;
+        if was_open {
             self.clear_transcript();
         }
         self.refresh_list();
@@ -2033,14 +1953,13 @@ impl App {
 
     /// The conversations the store holds, replacing the list's.
     pub fn set_rows(&mut self, rows: Vec<Row>) {
-        self.rows = rows;
+        self.book.set_rows(rows);
         self.refresh_list();
     }
 
     /// A conversation the session started, its process starting.
     pub fn add_row(&mut self, row: Row) {
-        self.rows.retain(|r| r.id != row.id);
-        self.rows.push(row);
+        self.book.add_row(row);
         self.refresh_list();
     }
 
@@ -2053,33 +1972,12 @@ impl App {
         }
         // The conversation left goes on in the background while its turn
         // runs (its process is kept); the others keep what they showed.
-        let running = self.turns.last().map(|(turn, _)| *turn).filter(|_| {
-            self.active_row()
-                .is_some_and(|r| r.state == RowState::Running)
-        });
-        if let (Some(left), Some(turn)) = (self.active.clone(), running) {
-            if left != id {
-                self.background_turns.retain(|(of, _)| *of != left);
-                self.background_turns.push((left, turn));
-            }
-        }
-        self.background_turns.retain(|(of, _)| *of != id);
-        let background = &self.background_turns;
-        for row in &mut self.rows {
-            if row.id == id {
-                row.state = RowState::Starting;
-            } else if !background.iter().any(|(of, _)| *of == row.id)
-                && row.state != RowState::Failed
-            {
-                row.state = RowState::Closed;
-            }
-        }
+        self.book.set_active(id.clone());
         // The conversation opened shows in the list, its group unfolded.
-        if let Some(row) = self.rows.iter().find(|r| r.id == id) {
+        if let Some(row) = self.book.rows.iter().find(|r| r.id == id) {
             let group = Group::of(row.workspace.as_ref(), &self.templates);
             self.folded.remove(&fold_key(&Item::Group(group)));
         }
-        self.active = Some(id);
         self.focus_task = None;
         self.transcript_task = None;
         self.clear_transcript();
@@ -2186,6 +2084,7 @@ impl App {
             return;
         }
         let Some(card) = self
+            .book
             .active
             .as_ref()
             .and_then(|id| self.cards.iter().find(|c| &c.conversation == id))
@@ -2318,22 +2217,15 @@ impl App {
     /// store, its process's later events to follow.
     pub fn replay(&mut self, prefix: Result<&str, &str>, events: Vec<Event>) {
         self.clear_transcript();
+        self.book.replay(&events);
         self.replaying_to = events.last().map_or(0, |event| event.seq);
         // Counted again from the log.
-        if let Some(id) = self.active.clone() {
+        if let Some(id) = self.book.active.clone() {
             self.processes.remove(&id);
         }
         self.system(prefix, false);
         for event in events {
             self.event(event);
-        }
-        // The replayed turns set the state: `running` while the last is
-        // open, `idle` once it has ended (it may have ended between the
-        // window's last poll and the opening).
-        if let Some(row) = self.active_row() {
-            if row.state == RowState::Starting {
-                row.state = RowState::Idle;
-            }
         }
         self.refresh_list();
         self.show_task();
@@ -2353,87 +2245,33 @@ impl App {
             }
             _ => {}
         }
-        let Some(row) = self.rows.iter_mut().find(|r| &r.id == id) else {
+        self.book.background(id, update, now);
+        let Some(row) = self.book.rows.iter().find(|r| &r.id == id) else {
             return;
         };
-        let mut notice = None;
-        let state = match update {
-            // A turn's start, or the human's compaction's.
-            Update::Up(Up::Event(Event {
-                seq,
-                kind: Kind::Started { .. },
-                ..
-            })) => {
-                self.background_turns.retain(|(turn_of, _)| turn_of != id);
-                self.background_turns.push((id.clone(), *seq));
-                Some(RowState::Running)
-            }
-            // The turn's end, not one of its requests': its process is
-            // let go, so the row is closed.
-            Update::Up(Up::Event(Event {
-                kind: Kind::Finished { started, .. } | Kind::Interrupted { started },
-                ..
-            })) => {
-                row.activity = now;
-                let at = self
-                    .background_turns
-                    .iter()
-                    .position(|(turn_of, turn)| turn_of == id && turn == started);
-                at.map(|at| {
-                    self.background_turns.swap_remove(at);
-                    RowState::Closed
-                })
-            }
-            Update::Up(Up::Delivered { .. }) => {
-                row.activity = now;
-                None
-            }
-            Update::Up(Up::Event(Event {
-                kind: Kind::Pause { paused },
-                ..
-            })) => {
-                row.paused = *paused;
-                None
-            }
-            // What td-agent tells the human there, such as a wake budget
-            // spent, is said here too.
+        // What td-agent tells the human there, such as a wake budget spent,
+        // is said here too.
+        let notice = match update {
             Update::Up(Up::Event(Event {
                 kind: Kind::Notice { text } | Kind::Notification { text, .. },
                 ..
-            })) => {
-                notice = Some(format!("{}: {text}", row.title));
-                None
-            }
-            Update::Failed { .. } => Some(RowState::Failed),
-            Update::Up(Up::Title { title }) => {
-                row.title = crate::store::title(title);
-                None
-            }
+            })) => Some(format!("{}: {text}", row.title)),
             _ => None,
         };
-        if let Some(state) = state {
-            row.state = state;
-        }
         self.refresh_list();
         if let Some(notice) = notice {
             self.note(notice);
         }
     }
 
-    fn active_row(&mut self) -> Option<&mut Row> {
-        let id = self.active.as_ref()?;
-        self.rows.iter_mut().find(|r| &r.id == id)
-    }
-
     /// What the open conversation's process said, or what became of it;
     /// `now` is in milliseconds.
     pub fn update(&mut self, update: Update, now: u64) {
+        self.book.update(&update, now);
         match update {
             Update::Up(Up::Hello {
-                title,
                 torn,
                 interrupted,
-                paused,
                 prefix,
                 last,
                 ..
@@ -2441,15 +2279,10 @@ impl App {
                 self.clear_transcript();
                 self.replaying_to = last;
                 // Its log, replayed next, counts its processes again.
-                if let Some(id) = self.active.clone() {
+                if let Some(id) = self.book.active.clone() {
                     self.processes.remove(&id);
                 }
                 self.system(prefix.as_deref().ok_or(LONG_PREFIX), false);
-                if let Some(row) = self.active_row() {
-                    row.title = crate::store::title(&title);
-                    row.state = RowState::Idle;
-                    row.paused = paused;
-                }
                 if let Some(bytes) = torn {
                     self.note(format!("dropped a torn final log line of {bytes} bytes"));
                 }
@@ -2478,18 +2311,7 @@ impl App {
                 | Up::Schedule { .. }
                 | Up::Brake { .. },
             ) => {}
-            Update::Up(Up::Delivered { .. }) => {
-                if let Some(row) = self.active_row() {
-                    row.activity = now;
-                }
-                self.refresh_list();
-            }
-            Update::Up(Up::Title { title }) => {
-                if let Some(row) = self.active_row() {
-                    row.title = crate::store::title(&title);
-                }
-                self.refresh_list();
-            }
+            Update::Up(Up::Delivered { .. } | Up::Title { .. }) => self.refresh_list(),
             Update::Refused {
                 text: Some(text),
                 reason,
@@ -2521,9 +2343,6 @@ impl App {
             }) => self.delta(request, &reasoning, &content),
             Update::Restarting { reason } => {
                 self.stream_died();
-                if let Some(row) = self.active_row() {
-                    row.state = RowState::Restarting;
-                }
                 self.note(format!(
                     "the conversation's process failed ({reason}); restarting it from its log"
                 ));
@@ -2532,11 +2351,8 @@ impl App {
             Update::Failed { reason } => {
                 self.stream_died();
                 // Its background processes went with its process.
-                if let Some(id) = self.active.clone() {
+                if let Some(id) = self.book.active.clone() {
                     self.processes.remove(&id);
-                }
-                if let Some(row) = self.active_row() {
-                    row.state = RowState::Failed;
                 }
                 self.note(format!(
                     "the conversation's process failed ({reason}); open it again to retry"
@@ -2552,7 +2368,7 @@ impl App {
             return;
         }
         self.last_seq = event.seq;
-        if let Some(id) = self.active.clone() {
+        if let Some(id) = self.book.active.clone() {
             if self.heard_process(&id, event.seq, &event.kind) {
                 self.relist();
             }
@@ -2642,9 +2458,6 @@ impl App {
                 if of != 0 {
                     self.meter.retry = false;
                 }
-                if let Some(row) = self.active_row() {
-                    row.state = RowState::Running;
-                }
                 self.relist();
                 if let Some(index) = message_of(&self.messages, &self.turns, event.seq) {
                     let _ = self
@@ -2666,6 +2479,10 @@ impl App {
                             .transcript
                             .set_status(streaming.index, Some(("not logged", Tone::Bad)));
                     }
+                    // A turn this view forgot, clearing itself, still ends.
+                    if self.book.is_turn(started) {
+                        self.relist();
+                    }
                     return self.touch();
                 }
                 let compaction = self
@@ -2674,11 +2491,6 @@ impl App {
                     .any(|(turn, of)| *turn == started && *of == 0);
                 if !compaction {
                     self.meter.retry = retry;
-                }
-                if let Some(row) = self.active_row() {
-                    if row.state == RowState::Running {
-                        row.state = RowState::Idle;
-                    }
                 }
                 self.relist();
                 let replied = outcome.starts_with("replied");
@@ -2730,12 +2542,7 @@ impl App {
                 if let Some((_, reserved)) = self.meter.request(started).filter(|_| !charged) {
                     self.meter.spent = self.meter.spent.saturating_add(reserved);
                 }
-                if self.turns.iter().any(|(turn, _)| *turn == started) {
-                    if let Some(row) = self.active_row() {
-                        if row.state == RowState::Running {
-                            row.state = RowState::Idle;
-                        }
-                    }
+                if self.book.is_turn(started) {
                     self.relist();
                 }
                 if let Some(index) = message_of(&self.messages, &self.turns, started) {
@@ -3154,9 +2961,6 @@ impl App {
                 self.touch();
             }
             Kind::Pause { paused } => {
-                if let Some(row) = self.active_row() {
-                    row.paused = paused;
-                }
                 self.relist();
                 if self.transcript_task.is_none() {
                     self.notice_message(if paused {
@@ -3228,14 +3032,7 @@ impl App {
     /// Conversation `id` as a message's header names it: its title, short,
     /// and the start of its id.
     pub fn named(&self, id: &Id) -> String {
-        let short: String = id.as_str().chars().take(8).collect();
-        match self.rows.iter().find(|r| &r.id == id) {
-            Some(row) => {
-                let title: String = row.title.chars().take(48).collect();
-                format!("{title} ({short})")
-            }
-            None => short,
-        }
+        self.book.named(id)
     }
 
     /// The rows the todo list takes.
@@ -3618,16 +3415,14 @@ impl App {
             .selected()
             .and_then(|id| self.items.get(&id))
             .cloned();
-        self.rows
-            .sort_by(|a, b| b.activity.cmp(&a.activity).then(a.id.cmp(&b.id)));
         // Folds of conversations since deleted are let go.
-        let ids: BTreeSet<&Id> = self.rows.iter().map(|row| &row.id).collect();
+        let ids: BTreeSet<&Id> = self.book.rows.iter().map(|row| &row.id).collect();
         self.folded
             .retain(|item| !matches!(item, Item::Conversation(id) if !ids.contains(id)));
         let show = self.show_archived;
         // Each shown conversation's group, once.
         let mut under: BTreeMap<Group, Vec<usize>> = BTreeMap::new();
-        for (at, row) in self.rows.iter().enumerate() {
+        for (at, row) in self.book.rows.iter().enumerate() {
             if show || !row.archived {
                 let group = Group::of(row.workspace.as_ref(), &self.templates);
                 under.entry(group).or_default().push(at);
@@ -3685,7 +3480,7 @@ impl App {
                 continue;
             }
             for &at in conversations {
-                let Some(row) = self.rows.get(at) else {
+                let Some(row) = self.book.rows.get(at) else {
                     continue;
                 };
                 let running = self.processes.get(&row.id).filter(|p| !p.is_empty());
@@ -3947,7 +3742,7 @@ impl App {
         let item = Item::SubAgent(id.clone(), seq);
         self.open(id.clone());
         // Refused, it said why and selected the open conversation.
-        if self.active.as_ref() != Some(&id) {
+        if self.book.active.as_ref() != Some(&id) {
             return;
         }
         // Rebuild from the durable log even when switching views of the
@@ -3973,7 +3768,7 @@ impl App {
         let Some((id, seq)) = self.focus_task.clone() else {
             return;
         };
-        if self.active.as_ref() != Some(&id) {
+        if self.book.active.as_ref() != Some(&id) {
             self.focus_task = None;
             return;
         }
@@ -3998,7 +3793,7 @@ impl App {
 
     /// The open conversation's row in the list, when it shows it.
     fn shown_active(&self) -> Option<usize> {
-        let id = self.active.as_ref()?;
+        let id = self.book.active.as_ref()?;
         match self.transcript_task {
             Some(seq) => self.listed(&Item::SubAgent(id.clone(), seq)),
             None => self.listed(&Item::Conversation(id.clone())),
@@ -4314,12 +4109,14 @@ impl App {
     /// Archived conversations are passed over.
     fn switch(&mut self, step: isize) {
         let live: Vec<&Id> = self
+            .book
             .rows
             .iter()
             .filter(|r| !r.archived && !self.closing(&r.id))
             .map(|r| &r.id)
             .collect();
         let at = self
+            .book
             .active
             .as_ref()
             .and_then(|id| live.iter().position(|r| *r == id));
@@ -4335,7 +4132,7 @@ impl App {
     /// Opens conversation `id`; opening the one already open again
     /// retries it when its process failed.
     fn open(&mut self, id: Id) {
-        if let Some(row) = self.rows.iter().find(|r| r.id == id && r.archived) {
+        if let Some(row) = self.book.rows.iter().find(|r| r.id == id && r.archived) {
             let said = format!(
                 "{:?} is archived: Unarchive in its row's menu opens it again",
                 row.title
@@ -4346,6 +4143,7 @@ impl App {
             return self.note(said);
         }
         if let Some((row, doing)) = self
+            .book
             .rows
             .iter()
             .find(|r| r.id == id)
@@ -4359,7 +4157,7 @@ impl App {
             self.touch();
             return self.note(said);
         }
-        if self.active.as_ref() != Some(&id) || self.active_failed() {
+        if self.book.active.as_ref() != Some(&id) || self.active_failed() {
             self.set_active(id.clone());
             self.requests.push(Request::Open(id));
         } else {
@@ -4420,16 +4218,18 @@ impl App {
 
     /// Whether the open conversation is running a turn.
     fn running(&self) -> bool {
-        self.active.as_ref().is_some_and(|active| {
-            self.rows
+        self.book.active.as_ref().is_some_and(|active| {
+            self.book
+                .rows
                 .iter()
                 .any(|row| &row.id == active && row.state == RowState::Running)
         })
     }
 
     fn active_failed(&self) -> bool {
-        self.active.as_ref().is_some_and(|active| {
-            self.rows
+        self.book.active.as_ref().is_some_and(|active| {
+            self.book
+                .rows
                 .iter()
                 .any(|row| &row.id == active && row.state == RowState::Failed)
         })
@@ -4534,7 +4334,7 @@ impl App {
                 ));
                 return;
             }
-            if self.active.is_none() {
+            if self.book.active.is_none() {
                 self.note("no conversation is open");
                 return;
             }
@@ -4553,7 +4353,7 @@ impl App {
                     return;
                 }
             };
-            if self.active.is_none() {
+            if self.book.active.is_none() {
                 self.note("no conversation is open");
                 return;
             }
@@ -4584,7 +4384,7 @@ impl App {
     /// Asks the open conversation to compact itself, from the composer or
     /// the Conversation menu.
     pub fn compact(&mut self, focus: Option<String>) {
-        if self.active.is_none() {
+        if self.book.active.is_none() {
             self.note("no conversation is open");
             return;
         }
@@ -4877,9 +4677,15 @@ impl App {
         self.restore(&text, why);
     }
 
-    /// Where the open conversation's pictures are kept.
-    pub fn set_state(&mut self, state: crate::store::StateDir) {
-        self.state = Some(state);
+    /// Shows a message with the pictures the session sent with it.
+    pub(crate) fn with_pictures(
+        &mut self,
+        pictures: crate::view::Pictures,
+        show: impl FnOnce(&mut Self),
+    ) {
+        self.pictures = pictures;
+        show(self);
+        self.pictures.clear();
     }
 
     /// A message's pictures as the transcript shows them: each decoded
@@ -4902,12 +4708,14 @@ impl App {
     }
 
     fn load_picture(&self, reference: &Reference) -> Result<td_ui::picture::Picture, String> {
-        let (Some(state), Some(id)) = (&self.state, &self.active) else {
-            return Err("no store to read it from".into());
-        };
-        let bytes = crate::picture::read(&state.conversation(id), reference)?;
+        let bytes = self
+            .pictures
+            .get(&reference.digest)
+            .ok_or("no store to read it from")?
+            .as_ref()
+            .map_err(String::clone)?;
         // A JPEG decoded at the scale that shows it at most this wide.
-        let (width, height, rgba) = crate::picture::decode(reference.mime, &bytes, SHOWN_AXIS)?;
+        let (width, height, rgba) = crate::picture::decode(reference.mime, bytes, SHOWN_AXIS)?;
         td_ui::picture::Picture::new(width, height, rgba).map_err(|e| e.to_string())
     }
 
@@ -5039,7 +4847,7 @@ impl App {
             menu::Action::DefaultModel => self.open_default_picker(),
             menu::Action::AutoMode => {
                 if let (true, Some(id), Some(mode)) =
-                    (self.live, self.active.clone(), self.workspace_mode())
+                    (self.live, self.book.active.clone(), self.workspace_mode())
                 {
                     let mode = match mode {
                         Mode::Auto => Mode::Ask,
@@ -5104,7 +4912,7 @@ impl App {
                 prompt,
                 ..
             } => {
-                if !self.rows.iter().any(|row| &row.id == id) {
+                if !self.book.rows.iter().any(|row| &row.id == id) {
                     return false;
                 }
                 let known = self.sub_agents.entry(id.clone()).or_default();
@@ -5301,7 +5109,7 @@ impl App {
             self.note(none);
             return;
         }
-        let Some(id) = self.active.clone() else {
+        let Some(id) = self.book.active.clone() else {
             for (header, _) in entries {
                 self.note(header.clone());
             }
@@ -5350,7 +5158,7 @@ impl App {
             .rev()
             .find(|(_, at)| *at == index)
             .map(|(request, _)| *request);
-        match (request, self.active.clone()) {
+        match (request, self.book.active.clone()) {
             (Some(request), Some(id)) => {
                 self.requests.push(Request::Debug { id, request });
                 self.touch();
@@ -5450,7 +5258,13 @@ impl App {
     /// Opens conversation `id`'s row menu at `x`, `y`, in the menu's
     /// controller: Archive, or Unarchive, then Delete….
     fn open_row_menu(&mut self, id: Id, x: i64, y: i64) {
-        let Some(archived) = self.rows.iter().find(|r| r.id == id).map(|r| r.archived) else {
+        let Some(archived) = self
+            .book
+            .rows
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.archived)
+        else {
             return;
         };
         self.cancel_pointer();
@@ -5478,7 +5292,7 @@ impl App {
         let revision = self.menu_revision.wrapping_add(1);
         let model = self.model();
         let state = menu::State {
-            open: self.active.is_some(),
+            open: self.book.active.is_some(),
             workspace: self.repositories().is_some(),
             effort: self.effort(),
             routing: self.routing(),
@@ -5510,7 +5324,7 @@ impl App {
 
     /// Asks for the open conversation's routing to be `mode`.
     fn route(&mut self, mode: &str) {
-        if self.active.is_none() {
+        if self.book.active.is_none() {
             return self.note("no conversation is open to choose for");
         }
         let routing = Some(mode.to_string());
@@ -5521,7 +5335,7 @@ impl App {
 
     /// Asks for the open conversation's model and effort to be these.
     fn choose(&mut self, model: Option<String>, effort: Option<String>) {
-        if self.active.is_none() {
+        if self.book.active.is_none() {
             return self.note("no conversation is open to choose for");
         }
         self.asked.push_back((model.clone(), effort.clone()));
@@ -5535,7 +5349,7 @@ impl App {
         if self.modal() {
             return;
         }
-        if self.active.is_none() {
+        if self.book.active.is_none() {
             return self.note("no conversation is open to choose a model for");
         }
         let wanted = self.wanted().0;
@@ -6022,7 +5836,7 @@ impl App {
         if self.modal() {
             return;
         }
-        let Some(id) = self.active.clone() else {
+        let Some(id) = self.book.active.clone() else {
             return self.note("no conversation is open to delete");
         };
         self.ask_delete(id);
@@ -6059,7 +5873,7 @@ impl App {
         if self.modal() {
             return;
         }
-        let Some(row) = self.rows.iter().find(|r| r.id == id) else {
+        let Some(row) = self.book.rows.iter().find(|r| r.id == id) else {
             return;
         };
         let (title, workspace) = (row.title.clone(), row.workspace.clone());
@@ -6660,9 +6474,10 @@ impl App {
             }
             "C-S-p" if !repeat => {
                 let paused = self
+                    .book
                     .active
                     .as_ref()
-                    .and_then(|id| self.rows.iter().find(|r| &r.id == id))
+                    .and_then(|id| self.book.rows.iter().find(|r| &r.id == id))
                     .map(|r| r.paused);
                 if let Some(paused) = paused {
                     self.requests.push(Request::Pause(!paused));
@@ -10062,10 +9877,38 @@ pub mod tests {
     }
 
     #[test]
+    fn a_turn_that_ends_after_its_view_was_cleared_leaves_the_list_running_no_more() {
+        let mut app = app();
+        app.set_active(id(1));
+        let said = |seq, kind| Update::Up(Up::Event(Event { seq, time: 0, kind }));
+        let started = Kind::Started {
+            effect: crate::store::Effect::Turn,
+            of: 0,
+        };
+        app.update(said(1, started), 0);
+        let at = row_of(&app, &Item::Conversation(id(1)));
+        assert!(app.cell(at, 0).text().starts_with("▶ "));
+        // What changing to a sub-agent's view does, its log then unreadable.
+        app.clear_transcript();
+        let finished = Kind::Finished {
+            started: 1,
+            outcome: "replied".into(),
+            retry: false,
+        };
+        app.update(said(2, finished), 0);
+        assert!(app.cell(at, 0).text().starts_with("○ "));
+    }
+
+    #[test]
     fn titles_use_the_list_width_and_state_prefixes_follow_updates() {
         let mut app = app();
         let title = "Review storage snapshots";
-        app.rows.iter_mut().find(|r| r.id == id(1)).unwrap().title = title.into();
+        app.book
+            .rows
+            .iter_mut()
+            .find(|r| r.id == id(1))
+            .unwrap()
+            .title = title.into();
         for (state, prefix) in [
             (RowState::Closed, ""),
             (RowState::Starting, "… "),
@@ -10074,7 +9917,12 @@ pub mod tests {
             (RowState::Restarting, "↻ "),
             (RowState::Failed, "! "),
         ] {
-            app.rows.iter_mut().find(|r| r.id == id(1)).unwrap().state = state;
+            app.book
+                .rows
+                .iter_mut()
+                .find(|r| r.id == id(1))
+                .unwrap()
+                .state = state;
             app.refresh_list();
             let at = row_of(&app, &Item::Conversation(id(1)));
             assert_eq!(app.cell(at, 0).text(), format!("{prefix}{title}"));
@@ -12332,7 +12180,7 @@ pub mod tests {
             ],
             ..crate::config::Client::default()
         });
-        app.active = None;
+        app.book.active = None;
         assert_eq!(network(&app), "allowlist");
         for (n, workspace, said) in [
             (9, Some(Workspace::Scratch), "allowlist"),

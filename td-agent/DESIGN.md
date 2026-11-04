@@ -732,6 +732,22 @@ human and both hold the key; the jail is the boundary, as before. A
 conversation with nothing running that is not open has no process, and
 opening it starts one from its log.
 
+**The window process has two halves.** `Session` holds the state
+above and everything outside the window; `App` is the window's widgets
+and what they show. Neither holds the other. `Window`, which td-ui
+drives, passes messages between them: `App` asks by `Request`s, and
+`Session` tells it by `view::View`s, in order, through `view::Port`.
+Which conversations there are and how each stands is `book::Book`, one
+reducer over those messages of which each half keeps a copy, so
+`Session` answers what it asks of the conversations (where a message
+may go, which opens next) from its own. `App` changes its book itself
+in one place, opening a row as it asks for that row; `Port::asked` has
+the session's follow before it serves the request. A picture travels
+with the message that shows it, read by `Session` and decoded by `App`.
+`App` is still built with the saved split and the configured mode,
+still reads the person's folders for the workspace chooser, and takes
+the pictures they paste from the clipboard; those are this machine's.
+
 **As built (increment 4).** Nothing runs in the background yet, so only
 the open conversation has a process; switching shuts the old socketpair
 and that process exits, or is killed if it has not within 2 s, since it

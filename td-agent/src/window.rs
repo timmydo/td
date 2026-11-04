@@ -1,8 +1,9 @@
 //! The window process (DESIGN.md §2, §4): td-ui's widget window drives
-//! the `App` with its inputs, and each turn the session hands the app
-//! what the conversation processes said, answers their reservations from
-//! the day's ledger, serves the driven control socket when there is one,
-//! and carries out what the app asked.
+//! the `App` with its inputs, and each turn the session tells the app, by
+//! `view::View` messages, what the conversation processes said, answers
+//! their reservations from the day's ledger, and carries out what the app
+//! asked. The `Window` holds the two and the driven control socket when
+//! there is one, and no other path joins them.
 //!
 //! It also holds what crosses conversations: the API key, read once at
 //! startup and handed to each conversation process over its socketpair,
@@ -36,6 +37,7 @@ use crate::protocol::{Down, Up};
 use crate::store::{self, Event, Id, Kind, Role, StateDir};
 use crate::supervisor::{Opened, Supervisor, Update};
 use crate::ui::{Answer, App, Card, Request, Row, RowState};
+use crate::view::Port;
 use crate::workspace::{self, Places, Workspace};
 
 /// The longest a turn waits before polling the conversation again.
@@ -291,10 +293,10 @@ fn credit(base_url: &str, key: Option<&Secret>) -> Result<Credit, String> {
 
 /// The window's state and what it owns outside the window.
 pub struct Session {
-    app: App,
+    /// What the window is told, and what the session knows of it.
+    view: Port,
     supervisor: Supervisor,
     state: StateDir,
-    control: Option<Worker<Payload>>,
     ledger: Ledger,
     fetcher: Option<Fetcher>,
     client: Client,
@@ -315,9 +317,6 @@ pub struct Session {
     tasks: Option<Receiver<TasksRead>>,
     /// Every key this window has held, which the export looks for.
     keys: Vec<Secret>,
-    /// Help → Keys was chosen by the live pointer or keyboard: td-ui's
-    /// window shows its key list.
-    show_keys: bool,
     /// Where no workspace may be, or why there are no workspaces.
     places: Result<Places, String>,
     /// Why there is no jail, when `unconfined_without_jail` makes Empty
@@ -388,8 +387,9 @@ struct Removal {
 
 impl Session {
     /// Carries out what the app asked.
-    fn serve(&mut self) {
-        for request in self.app.take_requests() {
+    fn serve(&mut self, requests: Vec<Request>) {
+        self.view.asked(&requests);
+        for request in requests {
             match request {
                 Request::Open(id) => self.open(id, None),
                 Request::New => self.start(None, false),
@@ -400,17 +400,17 @@ impl Session {
                     template,
                     replacing,
                 } => match self.save_template(template, replacing.as_deref()) {
-                    Ok(said) => self.app.template_saved(said),
-                    Err(why) => self.app.template_refused(why),
+                    Ok(said) => self.view.template_saved(said),
+                    Err(why) => self.view.template_refused(why),
                 },
                 Request::RemoveTemplate(name) => match self.remove_template(&name) {
-                    Ok(said) => self.app.template_saved(said),
-                    Err(why) => self.app.template_refused(why),
+                    Ok(said) => self.view.template_saved(said),
+                    Err(why) => self.view.template_refused(why),
                 },
                 Request::Send(text, pictures) => self.send_message(text, pictures),
                 Request::OpenLink(url) => match td_ui::open::url(&url, None) {
-                    Ok(_) => self.app.note(format!("opened {url} in the browser")),
-                    Err(why) => self.app.note(format!("could not open the link: {why}")),
+                    Ok(_) => self.view.note(format!("opened {url} in the browser")),
+                    Err(why) => self.view.note(format!("could not open the link: {why}")),
                 },
                 Request::Command {
                     name,
@@ -426,81 +426,81 @@ impl Session {
                     // it expands to.
                     match expanded {
                         Ok(text) => self.send_message(text.unwrap_or(typed), pictures),
-                        Err(why) => self.app.give_back(&typed, pictures, why),
+                        Err(why) => self.view.give_back(&typed, pictures, why),
                     }
                 }
                 Request::Commands => match self.commands.as_deref().map(crate::commands::list) {
-                    Some(Ok((listed, more))) => self.app.show_commands(&listed, more),
-                    Some(Err(why)) => self.app.note(why),
-                    None => self.app.note(
+                    Some(Ok((listed, more))) => self.view.show_commands(&listed, more),
+                    Some(Err(why)) => self.view.note(why),
+                    None => self.view.note(
                         "neither XDG_CONFIG_HOME nor HOME is an absolute path, so there are no commands",
                     ),
                 },
                 Request::Skills => match self.skills.as_deref().map(crate::skills::scan) {
-                    Some(Ok(found)) => self.app.show_skills(&found),
-                    Some(Err(why)) => self.app.note(why),
-                    None => self.app.note(
+                    Some(Ok(found)) => self.view.show_skills(&found),
+                    Some(Err(why)) => self.view.note(why),
+                    None => self.view.note(
                         "neither XDG_CONFIG_HOME nor HOME is an absolute path, so there are no skills",
                     ),
                 },
                 Request::Retry => {
                     if let Err(e) = self.supervisor.retry() {
-                        self.app.note(e);
+                        self.view.note(e);
                     }
                 }
                 Request::Interrupt => {
                     if let Err(e) = self.supervisor.interrupt() {
-                        self.app.note(e);
+                        self.view.note(e);
                     }
                 }
                 Request::Pause(paused) => {
                     if let Err(e) = self.supervisor.tell(&Down::Pause { paused }) {
-                        self.app.note(e);
+                        self.view.note(e);
                     }
                 }
                 Request::Compact(focus) => {
                     if let Err(e) = self.supervisor.compact(focus) {
-                        self.app.note(e);
+                        self.view.note(e);
                     }
                 }
                 Request::Review(revision) => {
                     if let Err(e) = self.supervisor.review(revision) {
-                        self.app.note(e);
+                        self.view.note(e);
                     }
                 }
                 Request::Schedule(command) => self.schedule(command),
                 Request::ClearTodo => {
                     if let Err(e) = self.supervisor.tell(&Down::ClearTodo) {
-                        self.app.note(e);
+                        self.view.note(e);
                     }
                 }
                 Request::Choose { model, effort } => {
                     if let Err(e) = self.supervisor.tell(&Down::Choose { model, effort }) {
-                        self.app.note(e);
+                        self.view.note(e);
                     }
                 }
                 Request::Route { routing } => {
                     if let Err(e) = self.supervisor.tell(&Down::Route { routing }) {
-                        self.app.note(e);
+                        self.view.note(e);
                     }
                 }
                 // The open conversation's log read again and replayed, as
                 // opening an adopted one does.
                 Request::Redraw => {
-                    if let Some(id) = self.app.active().cloned() {
+                    if let Some(id) = self.view.active().cloned() {
                         match store::read_log(&self.state, &id) {
                             Ok(events) => {
                                 let prefix = store::read_prefix(&self.state, &id);
-                                self.app
+                                self.view
                                     .replay(prefix.as_deref().map_err(String::as_str), events);
                             }
-                            Err(e) => self.app.note(format!("the conversation's log: {e}")),
+                            Err(e) => self.view.note(format!("the conversation's log: {e}")),
                         }
                     }
                 }
                 Request::SaveShare(first, total) => {
                     if let Err(e) = self.state.save_share(first, total) {
-                        self.app.note(e);
+                        self.view.note(e);
                     }
                 }
                 Request::SaveKey { secret, replace } => self.save_key(&secret, replace),
@@ -508,7 +508,7 @@ impl Session {
                 Request::ExportConversation(id) => self.export(Some(id)),
                 Request::Workspace(id) => {
                     let record = self.card_record(&id);
-                    self.app.show_workspace(&id, &record);
+                    self.view.show_workspace(&id, &record);
                 }
                 Request::Delete(id) => self.delete(&id),
                 Request::Remove { id, remove } => self.finish_removal(&id, remove),
@@ -523,7 +523,7 @@ impl Session {
                         number,
                         crate::output::READ_BYTES,
                     );
-                    self.app.show_output(&id, number, read);
+                    self.view.show_output(&id, number, read);
                 }
                 // Read here, the whole log and one record, once a press:
                 // they are the conversation's, only read meanwhile
@@ -541,7 +541,7 @@ impl Session {
                             "the stored key cannot be read to keep it out of the view: {problem}"
                         )),
                     };
-                    self.app.show_debug(&id, request, view);
+                    self.view.show_debug(&id, request, view);
                 }
                 Request::Admit { template, remotes } => self.admit(&template, &remotes),
                 // To whichever conversation asked, open or not; one whose
@@ -601,7 +601,7 @@ impl Session {
         let always = match remembered {
             None => None,
             Some(Ok(said)) => {
-                self.app.note(format!("remembered {said}"));
+                self.view.note(format!("remembered {said}"));
                 Some(said)
             }
             Some(Err(e)) => {
@@ -609,7 +609,7 @@ impl Session {
                     "your answer holds this once; it could not be added to your rules: {e}"
                 );
                 eprintln!("td-agent: {said}");
-                self.app.note(said);
+                self.view.note(said);
                 None
             }
         };
@@ -636,7 +636,7 @@ impl Session {
         // written is sent in `ask` all the same.
         let rules = held(self.state.load_rules(), &self.held);
         match &rules {
-            Ok(text) => self.app.set_modes(
+            Ok(text) => self.view.set_modes(
                 crate::rules::parse_policy(text)
                     .ok()
                     .map(|policy| policy.modes),
@@ -644,8 +644,8 @@ impl Session {
             Err(e) => {
                 let said = format!("your rules could not be read, so every call that changes a workspace or runs a command asks: {e}");
                 eprintln!("td-agent: {said}");
-                self.app.note(said);
-                self.app.set_modes(None);
+                self.view.note(said);
+                self.view.set_modes(None);
             }
         }
         self.supervisor.repolicy(rules, self.mode);
@@ -683,18 +683,18 @@ impl Session {
         });
         match written {
             Ok(()) => {
-                self.app.note(match digest {
+                self.view.note(match digest {
                     Some(_) => "the classifier is now given this workspace's project instructions, as the card shows them",
                     None => "the classifier is no longer given this workspace's project instructions",
                 });
                 self.repolicy();
             }
             Err(e) => self
-                .app
+                .view
                 .note(format!("the workspace's trust mark is unchanged: {e}")),
         }
         let record = self.card_record(conversation);
-        self.app.reshow_workspace(conversation, &record);
+        self.view.reshow_workspace(conversation, &record);
     }
 
     /// Puts `conversation`'s workspace in `mode`, in the human's rules
@@ -706,12 +706,12 @@ impl Session {
                 if let Ok(key) = workspace_key(&self.state, conversation) {
                     self.held.retain(|held| held != &key);
                 }
-                self.app
+                self.view
                     .note(format!("this workspace is now in {} mode", mode.word()));
                 self.repolicy();
             }
             Err(e) => self
-                .app
+                .view
                 .note(format!("the workspace's mode is unchanged: {e}")),
         }
     }
@@ -721,7 +721,7 @@ impl Session {
     /// fetch; a stored key is replaced only when `replace` says so.
     fn save_key(&mut self, secret: &Secret, replace: bool) {
         let Some(path) = self.key_path.clone() else {
-            self.app.key_refused(
+            self.view.key_refused(
                 "there is nowhere to store a key: neither XDG_CONFIG_HOME nor HOME is an absolute path"
                     .into(),
             );
@@ -736,12 +736,12 @@ impl Session {
                 if let Some(fetcher) = self.fetcher.as_mut() {
                     fetcher.rekey(stored, Instant::now());
                 }
-                self.app.key_saved(&path.display().to_string());
+                self.view.key_saved(&path.display().to_string());
             }
-            Err(Unwritten::Exists) => self.app.key_exists(),
+            Err(Unwritten::Exists) => self.view.key_exists(),
             Err(Unwritten::Refused(why)) => {
                 eprintln!("td-agent: saving the key: {why}");
-                self.app.key_refused(why);
+                self.view.key_refused(why);
             }
         }
     }
@@ -767,7 +767,7 @@ impl Session {
     fn opened(&mut self, opened: Result<Opened, String>) {
         let Some(id) = self.supervisor.open_id().cloned() else {
             if let Err(reason) = opened {
-                self.app.update(Update::Failed { reason }, store::now_ms());
+                self.view.update(Update::Failed { reason }, store::now_ms());
             }
             return;
         };
@@ -776,12 +776,12 @@ impl Session {
             Ok(Opened::Adopted) => match store::read_log(&self.state, &id) {
                 Ok(events) => {
                     let prefix = store::read_prefix(&self.state, &id);
-                    self.app
+                    self.view
                         .replay(prefix.as_deref().map_err(String::as_str), events);
                 }
-                Err(e) => self.app.note(format!("the conversation's log: {e}")),
+                Err(e) => self.view.note(format!("the conversation's log: {e}")),
             },
-            Err(reason) => self.app.update(Update::Failed { reason }, store::now_ms()),
+            Err(reason) => self.view.update(Update::Failed { reason }, store::now_ms()),
         }
     }
 
@@ -790,11 +790,11 @@ impl Session {
     fn start_in(&mut self, folder: Option<PathBuf>, unconfined: bool) {
         let places = match &self.places {
             Ok(places) => places,
-            Err(why) => return self.app.note(why.clone()),
+            Err(why) => return self.view.note(why.clone()),
         };
         if let (Some(why), false) = (&self.jailless, unconfined) {
             return self
-                .app
+                .view
                 .note(format!("no jailed workspace can be made: {why}"));
         }
         let workspace = match folder {
@@ -803,13 +803,13 @@ impl Session {
                 match workspace::admit_directory(&folder, places, &self.client.shared) {
                     Ok(admitted) => Workspace::Directory(admitted),
                     Err(why) => {
-                        self.app.note(format!("no conversation there: {why}"));
+                        self.view.note(format!("no conversation there: {why}"));
                         // A repository is a template's remote: the dialog
                         // offers one (DESIGN.md §7).
                         if let Some(repository) = workspace::repository_remote(&folder) {
                             match repository.to_str() {
-                                Some(remote) => self.app.open_new_template(Some(remote)),
-                                None => self.app.note(format!(
+                                Some(remote) => self.view.open_new_template(Some(remote)),
+                                None => self.view.note(format!(
                                     "{} cannot be a remote: it is not UTF-8",
                                     repository.display()
                                 )),
@@ -830,16 +830,16 @@ impl Session {
     fn start_from(&mut self, name: &str) {
         let root = match &self.places {
             Ok(places) => places.root.clone(),
-            Err(why) => return self.app.note(why.clone()),
+            Err(why) => return self.view.note(why.clone()),
         };
         if let Some(why) = &self.jailless {
-            return self.app.note(format!(
+            return self.view.note(format!(
                 "a template's workspace is always jailed, and there is no jail: {why}"
             ));
         }
         let template = match chosen(&self.templates, name) {
             Ok(template) => template,
-            Err(why) => return self.app.note(why),
+            Err(why) => return self.view.note(why),
         };
         if template.repos.is_empty() {
             return self.start(Some(Workspace::Template(name.to_string())), false);
@@ -870,9 +870,9 @@ impl Session {
             Ok(Ok((id, repositories))) => {
                 self.start_as(id, Some(Workspace::Repositories(repositories)), false)
             }
-            Ok(Err(unadmitted)) => self.app.ask_admission(name.to_string(), unadmitted),
+            Ok(Err(unadmitted)) => self.view.ask_admission(name.to_string(), unadmitted),
             Err(why) => self
-                .app
+                .view
                 .note(format!("no conversation from template {name:?}: {why}")),
         }
     }
@@ -977,7 +977,7 @@ impl Session {
             );
         }
         self.state.save_templates(&saved)?;
-        self.app.set_templates(
+        self.view.set_templates(
             templates
                 .iter()
                 .map(|template| (template.name.clone(), !template.repos.is_empty()))
@@ -985,9 +985,9 @@ impl Session {
         );
         self.templates = templates;
         self.saved = Ok(saved);
-        self.app
+        self.view
             .set_saved_templates(self.saved.as_deref().unwrap_or_default().to_vec());
-        self.app.set_networks(&client);
+        self.view.set_networks(&client);
         self.client = client;
         self.supervisor.reconfigure(self.client.clone());
         Ok(())
@@ -1015,7 +1015,7 @@ impl Session {
                 self.start_from(name);
             }
             Err(why) => self
-                .app
+                .view
                 .note(format!("no conversation from template {name:?}: {why}")),
         }
     }
@@ -1024,14 +1024,14 @@ impl Session {
     fn start(&mut self, workspace: Option<Workspace>, unconfined: bool) {
         match Id::random() {
             Ok(id) => self.start_as(id, workspace, unconfined),
-            Err(e) => self.app.note(format!("a new conversation: {e}")),
+            Err(e) => self.view.note(format!("a new conversation: {e}")),
         }
     }
 
     /// `start`, with the conversation's id given.
     /// `unconfined` runs its tools outside any jail (DESIGN.md §8).
     fn start_as(&mut self, id: Id, workspace: Option<Workspace>, unconfined: bool) {
-        self.app.add_row(Row {
+        self.view.add_row(Row {
             id: id.clone(),
             title: Role::Conversation.first_title().to_string(),
             activity: store::now_ms(),
@@ -1041,8 +1041,8 @@ impl Session {
             unconfined,
             archived: false,
         });
-        self.app.set_active(id.clone());
-        self.app.focus_composer();
+        self.view.set_active(id.clone());
+        self.view.focus_composer();
         match workspace {
             None => self.open(id, Some(Role::Conversation)),
             Some(workspace) => {
@@ -1061,14 +1061,14 @@ impl Session {
     /// the ledger, messages between them routed, the rest to the app.
     fn hear(&mut self) {
         let now = store::now();
-        let directory = self.app.directory();
+        let directory = self.view.directory();
         for (id, update) in self.supervisor.poll() {
             if let Some(note) = self
                 .post
                 .hear(&id, &update, &mut self.supervisor, &directory)
             {
                 eprintln!("td-agent: {note}");
-                self.app.note(note);
+                self.view.note(note);
             }
             if let Update::Up(Up::Schedule { id: ask, op }) = &update {
                 self.schedule_for(&id, *ask, op.clone(), &directory);
@@ -1081,7 +1081,7 @@ impl Session {
                     details,
                     always,
                 }) => {
-                    self.app.ask(Card {
+                    self.view.ask(Card {
                         conversation: id.clone(),
                         call: *call,
                         title: title.clone(),
@@ -1096,7 +1096,7 @@ impl Session {
                     title,
                     details,
                 }) => {
-                    self.app.ask(Card {
+                    self.view.ask(Card {
                         conversation: id.clone(),
                         call: *turn,
                         title: title.clone(),
@@ -1107,7 +1107,7 @@ impl Session {
                     continue;
                 }
                 Update::Up(Up::Withdraw { call }) => {
-                    self.app.withdraw(&id, Some(*call));
+                    self.view.withdraw(&id, Some(*call));
                     continue;
                 }
                 Update::Up(Up::Question {
@@ -1115,7 +1115,7 @@ impl Session {
                     question,
                     options,
                 }) => {
-                    self.app.question(crate::ui::Asked {
+                    self.view.question(crate::ui::Asked {
                         conversation: id.clone(),
                         call: *call,
                         question: question.clone(),
@@ -1129,7 +1129,7 @@ impl Session {
                     let why = crate::tools::visible(why);
                     match set_mode(&self.state, &id, crate::config::Mode::Ask) {
                         Ok(()) => {
-                            self.app.note(format!("the classifier's circuit breaker tripped ({why}), so this conversation's workspace is in ask mode; only you can put it back in auto mode"));
+                            self.view.note(format!("the classifier's circuit breaker tripped ({why}), so this conversation's workspace is in ask mode; only you can put it back in auto mode"));
                             self.repolicy();
                         }
                         // Held in `ask` in what every conversation is sent
@@ -1140,14 +1140,14 @@ impl Session {
                                     self.held.push(key);
                                 }
                             }
-                            self.app.note(format!("the classifier's circuit breaker tripped ({why}), but its workspace's mode could not be written: {e}; it is held in ask mode until you choose its mode"));
+                            self.view.note(format!("the classifier's circuit breaker tripped ({why}), but its workspace's mode could not be written: {e}; it is held in ask mode until you choose its mode"));
                             self.repolicy();
                         }
                     }
                 }
                 // A process started again asks nothing yet.
                 Update::Up(Up::Hello { .. }) => {
-                    self.app.withdraw(&id, None);
+                    self.view.withdraw(&id, None);
                     ended_pushes(&mut self.pushes, &id);
                 }
                 Update::Up(Up::Reserve {
@@ -1249,12 +1249,12 @@ impl Session {
                     amount,
                 }) => {
                     if let Err(e) = self.ledger.settle(&id, *request, *amount, now) {
-                        self.app.note(e);
+                        self.view.note(e);
                     }
                 }
                 Update::Restarting { .. } | Update::Failed { .. } => {
                     self.ledger.forget(&id);
-                    self.app.withdraw(&id, None);
+                    self.view.withdraw(&id, None);
                     ended_pushes(&mut self.pushes, &id);
                 }
                 Update::Up(Up::Event(Event {
@@ -1282,9 +1282,10 @@ impl Session {
                 let back = crate::picture::unstage_all(&self.state, &id, pictures, |digest| {
                     self.supervisor.stages(&id, digest)
                 });
-                self.app.give_back(text, back, format!("refused: {reason}"));
+                self.view
+                    .give_back(text, back, format!("refused: {reason}"));
             } else if open {
-                self.app.update(update, store::now_ms());
+                self.view.update(update, store::now_ms());
             } else if let Update::Refused {
                 text,
                 pictures,
@@ -1330,19 +1331,19 @@ impl Session {
                     }
                     None => format!("conversation {id} refused: {reason}"),
                 };
-                self.app.note(note);
+                self.view.note(note);
             } else {
-                self.app.background(&id, &update, store::now_ms());
+                self.view.background(&id, &update, store::now_ms());
             }
         }
-        let directory = self.app.directory();
+        let directory = self.view.directory();
         for note in self.post.deliver(&mut self.supervisor, &directory) {
             eprintln!("td-agent: {note}");
-            self.app.note(note);
+            self.view.note(note);
         }
         let today = self.ledger.today(now);
-        self.app.set_today(today);
-        self.app.set_queued(self.supervisor.queued());
+        self.view.set_today(today);
+        self.view.set_queued(self.supervisor.queued());
         self.fetched();
         self.exported();
         self.surveyed();
@@ -1366,7 +1367,7 @@ impl Session {
             });
         match spawned {
             Ok(_) => self.tasks = Some(receive),
-            Err(e) => self.app.note(format!("the list's sub-agents: {e}")),
+            Err(e) => self.view.note(format!("the list's sub-agents: {e}")),
         }
     }
 
@@ -1388,7 +1389,7 @@ impl Session {
             }
         }
         if !read.is_empty() {
-            self.app.set_sub_agents(read);
+            self.view.set_sub_agents(read);
         }
     }
 
@@ -1414,13 +1415,13 @@ impl Session {
         if let Err(e) = self.state.save_default_model(&model, over.as_deref()) {
             eprintln!("td-agent: the default model: {e}");
             return self
-                .app
+                .view
                 .note(format!("the default model was not saved: {e}"));
         }
         self.client.model = model;
         self.supervisor.reconfigure(self.client.clone());
-        self.app.set_default_model(&self.client.model);
-        self.app.note(format!(
+        self.view.set_default_model(&self.client.model);
+        self.view.note(format!(
             "the default model is {}: new conversations, and those with no model of their own, use it from their next turn",
             self.client.model
         ));
@@ -1715,7 +1716,7 @@ impl Session {
                 .collect();
             let note = format!("upstream moved: {}", said.join("; "));
             eprintln!("td-agent: {note}");
-            self.app.note(note);
+            self.view.note(note);
         }
         for remote in learnt {
             self.tell_heads(&remote);
@@ -1792,7 +1793,7 @@ impl Session {
         if self.next_fire.is_none_or(|at| now < at) {
             return;
         }
-        let directory = self.app.directory();
+        let directory = self.view.directory();
         let target = |id: &Id| crate::schedule::target(&directory, id);
         match self.schedules.due(now, &target) {
             Ok(due) => {
@@ -1800,7 +1801,7 @@ impl Session {
                     let schedule = due.schedule.clone();
                     if let Err(e) = self.post.fire(due) {
                         eprintln!("td-agent: schedule {schedule} could not fire: {e}");
-                        self.app
+                        self.view
                             .note(format!("schedule {schedule} could not fire: {e}"));
                     }
                 }
@@ -1810,7 +1811,7 @@ impl Session {
             // minute, said each time.
             Err(e) => {
                 eprintln!("td-agent: the schedules could not be saved, so none fired: {e}");
-                self.app.note(format!(
+                self.view.note(format!(
                     "the schedules could not be saved, so none fired: {e}"
                 ));
                 self.next_fire = now.checked_add(60);
@@ -1837,14 +1838,14 @@ impl Session {
                 to,
                 written,
                 next,
-            }) => self.app.note(format!(
+            }) => self.view.note(format!(
                 "{} made schedule {id}, to {}: {written}, next {next}; /unschedule {id} removes it",
-                self.app.named(from),
-                self.app.named(to),
+                self.view.named(from),
+                self.view.named(to),
             )),
             Some(Change::Cancelled(id)) => self
-                .app
-                .note(format!("{} cancelled schedule {id}", self.app.named(from))),
+                .view
+                .note(format!("{} cancelled schedule {id}", self.view.named(from))),
             None => {}
         }
         if change.is_some() {
@@ -1883,9 +1884,9 @@ impl Session {
                 }),
         };
         if let Err(e) = sent {
-            self.app.give_back(&text, pictures, e);
+            self.view.give_back(&text, pictures, e);
         }
-        self.app.set_queued(self.supervisor.queued());
+        self.view.set_queued(self.supervisor.queued());
     }
 
     /// The composer's schedule commands (DESIGN.md §3).
@@ -1898,8 +1899,8 @@ impl Session {
                 text,
                 catch_up,
             } => {
-                let Some(to) = self.app.active().cloned() else {
-                    self.app.note("no conversation is open");
+                let Some(to) = self.view.active().cloned() else {
+                    self.view.note("no conversation is open");
                     return;
                 };
                 match self
@@ -1913,7 +1914,7 @@ impl Session {
                         } else {
                             ""
                         };
-                        self.app.note(format!(
+                        self.view.note(format!(
                             "schedule {} made: {}, next {next}{catching}",
                             made.id, made.written
                         ));
@@ -1923,7 +1924,7 @@ impl Session {
                     // that could not be sent does.
                     Err(e) => {
                         let catching = if catch_up { "catch-up " } else { "" };
-                        self.app.restore(
+                        self.view.restore(
                             &format!("/schedule {catching}{when} {text}"),
                             format!("no schedule was made: {e}"),
                         );
@@ -1931,7 +1932,7 @@ impl Session {
                 }
             }
             Command::List => {
-                let directory = self.app.directory();
+                let directory = self.view.directory();
                 let entries: Vec<(String, String)> = self
                     .schedules
                     .list()
@@ -1940,13 +1941,13 @@ impl Session {
                         let to = match directory.iter().find(|e| e.id == s.to) {
                             None => "a conversation since deleted, so it fires nothing".into(),
                             Some(e) if e.archived => {
-                                format!("{}, archived, so it fires nothing", self.app.named(&s.to))
+                                format!("{}, archived, so it fires nothing", self.view.named(&s.to))
                             }
                             Some(e) if e.failed => format!(
                                 "{}, whose process failed, so it fires nothing until reopened",
-                                self.app.named(&s.to)
+                                self.view.named(&s.to)
                             ),
-                            Some(_) => self.app.named(&s.to),
+                            Some(_) => self.view.named(&s.to),
                         };
                         let next = self.schedules.upcoming(s, now, 3);
                         let next = match next.is_empty() {
@@ -1955,7 +1956,7 @@ impl Session {
                         };
                         let by = match &s.author {
                             None => "you".to_string(),
-                            Some(author) => self.app.named(author),
+                            Some(author) => self.view.named(author),
                         };
                         let catching = if s.catch_up { "; catches up" } else { "" };
                         // The expression in the body: a header has a bound
@@ -1969,14 +1970,14 @@ impl Session {
                         )
                     })
                     .collect();
-                self.app.show_schedules(&entries);
+                self.view.show_schedules(&entries);
             }
             Command::Remove(id) => match self.schedules.remove(&id) {
                 Ok(removed) => {
-                    self.app.note(format!("schedule {} removed", removed.id));
+                    self.view.note(format!("schedule {} removed", removed.id));
                     self.next_fire = self.schedules.soonest();
                 }
-                Err(e) => self.app.note(format!("no schedule was removed: {e}")),
+                Err(e) => self.view.note(format!("no schedule was removed: {e}")),
             },
         }
     }
@@ -2027,17 +2028,17 @@ impl Session {
                 return self.begin_removal(id, repositories, false);
             }
             // Its record unread, a workspace it may have is not known.
-            Err(e) => self.app.note(format!(
+            Err(e) => self.view.note(format!(
                 "the conversation's record could not be read, so a repository workspace it may have is left: {e}"
             )),
             Ok(_) => {}
         }
         // The window's open conversation, whether or not its process runs.
-        let was_open = self.app.active() == Some(id);
+        let was_open = self.view.active() == Some(id);
         let held = self.supervisor.remove(id);
         // Its process has ended, as a crash ends one.
         self.ledger.forget(id);
-        self.app.withdraw(id, None);
+        self.view.withdraw(id, None);
         self.delete_now(id, was_open, held);
     }
 
@@ -2061,7 +2062,7 @@ impl Session {
             Ok(unremoved) => unremoved,
             Err(e) => {
                 eprintln!("td-agent: deleting {id}: {e}");
-                self.app
+                self.view
                     .note(format!("the conversation was not deleted: {e}"));
                 // Untouched: the human's messages are parked again, the
                 // outbox still holds the others', and opening it again
@@ -2092,11 +2093,11 @@ impl Session {
                 said.push_str(&format!("; its rules stay in your rules file: {e}"));
             }
         }
-        self.app.remove_row(id);
-        self.app.note(said);
+        self.view.remove_row(id);
+        self.view.note(said);
         if was_open {
-            if let Some(next) = self.app.most_recent() {
-                self.app.set_active(next.clone());
+            if let Some(next) = self.view.most_recent() {
+                self.view.set_active(next.clone());
                 self.open(next, None);
             }
         }
@@ -2116,22 +2117,16 @@ impl Session {
     ) {
         if self.removals.iter().any(|removal| &removal.id == id) {
             return self
-                .app
+                .view
                 .note("that conversation is already being archived or deleted");
         }
         let doing = if archive { "archiving" } else { "deleting" };
-        let was_open = self.app.active() == Some(id);
+        let was_open = self.view.active() == Some(id);
         let held = self.supervisor.remove(id);
         self.ledger.forget(id);
-        self.app.withdraw(id, None);
-        self.app.set_closing(id, Some(doing));
-        let title = self
-            .app
-            .rows()
-            .iter()
-            .find(|r| &r.id == id)
-            .map(|r| r.title.clone())
-            .unwrap_or_default();
+        self.view.withdraw(id, None);
+        self.view.set_closing(id, Some(doing));
+        let title = self.view.title(id);
         let (tell, survey) = mpsc::channel();
         let (state, of, asked) = (self.state.clone(), id.clone(), repositories.clone());
         let spawned = std::thread::Builder::new()
@@ -2140,13 +2135,13 @@ impl Session {
                 let programs = Programs::from_env();
                 let _ = tell.send(crate::removal::survey(&state, &of, &asked, programs));
             });
-        self.app.note(format!(
+        self.view.note(format!(
             "{title:?}: asking its workspace what removing it would lose, before {doing} it"
         ));
         let survey = match spawned {
             Ok(_) => Some(survey),
             Err(e) => {
-                self.app.ask_removal(
+                self.view.ask_removal(
                     id.clone(),
                     title.clone(),
                     vec![format!("its worktrees could not be asked: {e}")],
@@ -2164,8 +2159,8 @@ impl Session {
             survey,
         });
         if was_open {
-            if let Some(next) = self.app.most_recent() {
-                self.app.set_active(next.clone());
+            if let Some(next) = self.view.most_recent() {
+                self.view.set_active(next.clone());
                 self.open(next, None);
             }
         }
@@ -2198,7 +2193,7 @@ impl Session {
             if lost.is_empty() {
                 self.finish_removal(&id, true);
             } else {
-                self.app.ask_removal(id, title, lost, archive);
+                self.view.ask_removal(id, title, lost, archive);
             }
         }
     }
@@ -2211,7 +2206,7 @@ impl Session {
             return;
         };
         let removal = self.removals.remove(at);
-        self.app.set_closing(id, None);
+        self.view.set_closing(id, None);
         let done = if removal.archive {
             "archived"
         } else {
@@ -2219,7 +2214,7 @@ impl Session {
         };
         if !remove {
             self.supervisor.park(id.clone(), removal.held);
-            return self.app.note(format!(
+            return self.view.note(format!(
                 "{:?} is not {done}: it and its workspace stay as they were",
                 removal.title
             ));
@@ -2246,7 +2241,7 @@ impl Session {
             }
         };
         eprintln!("td-agent: {said}");
-        self.app.note(said);
+        self.view.note(said);
     }
 
     /// Archives conversation `id`, or brings it back (DESIGN.md §7). An
@@ -2256,14 +2251,14 @@ impl Session {
     fn archive(&mut self, id: &Id, archived: bool) {
         if self.removals.iter().any(|removal| &removal.id == id) {
             return self
-                .app
+                .view
                 .note("that conversation is being archived or deleted already");
         }
         // One still being made has no `meta` to mark: stopping its
         // process would leave it half made.
         if let Err(e) = self.state.archived(id) {
             return self
-                .app
+                .view
                 .note(format!("the conversation cannot be archived yet: {e}"));
         }
         // Its repository workspace goes with it, asked first (DESIGN.md
@@ -2277,17 +2272,17 @@ impl Session {
                 Ok(Some(crate::workspace::Workspace::Repositories(repositories))) => {
                     return self.begin_removal(id, repositories, true);
                 }
-                Err(e) => self.app.note(format!(
+                Err(e) => self.view.note(format!(
                     "the conversation's record could not be read, so a repository workspace it may have is left: {e}"
                 )),
                 Ok(_) => {}
             }
         }
-        let was_open = self.app.active() == Some(id);
+        let was_open = self.view.active() == Some(id);
         let held = if archived {
             let held = self.supervisor.remove(id);
             self.ledger.forget(id);
-            self.app.withdraw(id, None);
+            self.view.withdraw(id, None);
             held
         } else {
             Vec::new()
@@ -2319,7 +2314,7 @@ impl Session {
             if self.state.archived(id) != Ok(archived)
                 || (removed && self.state.removed(id) != Ok(true))
             {
-                self.app
+                self.view
                     .note(format!("the conversation was not {done}: {e}"));
                 self.supervisor.park(id.clone(), held);
                 if was_open {
@@ -2330,21 +2325,15 @@ impl Session {
             trouble = Some(e);
         }
         self.supervisor.park(id.clone(), held);
-        self.app.set_archived(id, archived);
-        let title = self
-            .app
-            .rows()
-            .iter()
-            .find(|r| &r.id == id)
-            .map(|r| r.title.clone())
-            .unwrap_or_default();
-        self.app.note(match trouble {
+        self.view.set_archived(id, archived);
+        let title = self.view.title(id);
+        self.view.note(match trouble {
             None => format!("{title:?} is {done}"),
             Some(e) => format!("{title:?} is {done}, though writing it said: {e}"),
         });
         if was_open {
-            if let Some(next) = self.app.most_recent() {
-                self.app.set_active(next.clone());
+            if let Some(next) = self.view.most_recent() {
+                self.view.set_active(next.clone());
                 self.open(next, None);
             }
         }
@@ -2374,14 +2363,14 @@ impl Session {
     /// reaches, since the archive holds conversations' logs.
     fn export(&mut self, conversation: Option<Id>) {
         if self.export.is_some() {
-            return self.app.note("a diagnostics export is already under way");
+            return self.view.note("a diagnostics export is already under way");
         }
         let Some(home) = std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|home| home.is_absolute())
         else {
             return self
-                .app
+                .view
                 .note("no diagnostics: HOME is not an absolute path to write them under");
         };
         let downloads = home.join("Downloads");
@@ -2402,7 +2391,7 @@ impl Session {
         let (keys, key_problem) = match self.known_keys() {
             Ok(known) => known,
             Err(problem) => {
-                return self.app.note(format!(
+                return self.view.note(format!(
                 "no diagnostics: the stored key cannot be read to keep it out of them: {problem}"
             ))
             }
@@ -2426,9 +2415,9 @@ impl Session {
         match spawned {
             Ok(_) => {
                 self.export = Some(receive);
-                self.app.note("exporting diagnostics\u{2026}");
+                self.view.note("exporting diagnostics\u{2026}");
             }
-            Err(e) => self.app.note(format!("the diagnostics export: {e}")),
+            Err(e) => self.view.note(format!("the diagnostics export: {e}")),
         }
     }
 
@@ -2464,7 +2453,7 @@ impl Session {
             Err(e) => format!("the diagnostics export: {e}"),
         };
         eprintln!("td-agent: {note}");
-        self.app.note(note);
+        self.view.note(note);
     }
 
     /// What the fetcher brought.
@@ -2478,11 +2467,11 @@ impl Session {
                 Fetched::Models(Ok(models)) => self.show_models(&models),
                 Fetched::Models(Err(e)) => {
                     eprintln!("td-agent: the models list: {e}");
-                    self.app.note(format!("the models list: {e}"));
+                    self.view.note(format!("the models list: {e}"));
                 }
-                Fetched::Credit(Ok(credit)) => self.app.set_credit(Some(credit.show())),
+                Fetched::Credit(Ok(credit)) => self.view.set_credit(Some(credit.show())),
                 Fetched::Credit(Err(e)) => {
-                    self.app.set_credit(Some("credit unknown".into()));
+                    self.view.set_credit(Some("credit unknown".into()));
                     eprintln!("td-agent: the key's credit: {e}");
                 }
             }
@@ -2496,9 +2485,34 @@ impl Session {
             .iter()
             .filter_map(|m| Some((m.id.clone(), m.context_length?)))
             .collect();
-        self.app.set_models(&self.client.model, contexts);
+        self.view.set_models(&self.client.model, contexts);
         let offers = models.models.iter().map(Offer::of).collect();
-        self.app.set_offers(offers, &self.client.reasoning_effort);
+        self.view.set_offers(offers, &self.client.reasoning_effort);
+    }
+}
+
+/// The window: the app, and the session it talks to by messages alone.
+struct Window {
+    app: App,
+    session: Session,
+    control: Option<Worker<Payload>>,
+    /// Help → Keys was chosen by the live pointer or keyboard: td-ui's
+    /// window shows its key list.
+    show_keys: bool,
+}
+
+impl Window {
+    /// Shows what the session said.
+    fn flush(&mut self) {
+        for view in self.session.view.take() {
+            self.app.apply(view);
+        }
+    }
+
+    /// The session carries out what the app asked.
+    fn serve(&mut self) {
+        self.session.serve(self.app.take_requests());
+        self.flush();
     }
 
     /// Answers what the control socket asked, through the same paths the
@@ -2528,7 +2542,7 @@ impl Session {
     }
 }
 
-impl Handler for Session {
+impl Handler for Window {
     fn app_id(&self) -> &str {
         "td-agent"
     }
@@ -2549,18 +2563,19 @@ impl Handler for Session {
         // through `App::input`, which reports none.
         self.show_keys |= self.app.input_live(input, clipboard);
         self.serve();
-        self.flow()
+        self.session.flow()
     }
 
     fn poll(&mut self, now: u64) -> Flow {
         self.app.tick(now);
-        self.hear();
-        self.stored();
-        self.refresh();
-        self.fire();
+        self.session.hear();
+        self.session.stored();
+        self.session.refresh();
+        self.session.fire();
+        self.flush();
         self.control();
         self.serve();
-        self.flow()
+        self.session.flow()
     }
 
     fn wait_ms(&self, _now: u64) -> u64 {
@@ -2695,34 +2710,34 @@ pub fn run(
     let stream = td_ui::wayland::connect(endpoint)?;
     let surface = Surface::new(1280, 800, Scale::default()).map_err(|e| e.to_string())?;
     let mut app = App::new(surface, state.load_share(), config.mode)?;
-    app.set_state(state.clone());
-    app.set_without_jev(!config.client.jev_required);
+    let mut view = Port::new(state.clone());
+    view.set_without_jev(!config.client.jev_required);
     for note in &config.notes {
         eprintln!("td-agent: configuration: {note}");
     }
     if !config.notes.is_empty() {
-        app.note(format!(
+        view.note(format!(
             "{} configuration key(s) are read by later increments, or no more; see standard error",
             config.notes.len()
         ));
     }
     if let Err(why) = &key {
         eprintln!("td-agent: {why}");
-        app.note(why.clone());
+        view.note(why.clone());
     }
-    app.set_keyed(key.is_ok());
-    app.set_key_path(key_path.as_ref().map(|p| p.display().to_string()));
+    view.set_keyed(key.is_ok());
+    view.set_key_path(key_path.as_ref().map(|p| p.display().to_string()));
     let (rows, problems) = rows(&state);
     for problem in &problems {
         eprintln!("td-agent: the store: {problem}");
     }
     if let Some(problem) = problems.last() {
-        app.note(format!("the store: {problem}"));
+        view.note(format!("the store: {problem}"));
     }
     // The most recently active first, whose sub-agents are read first.
     let mut ids: Vec<(u64, Id)> = rows.iter().map(|r| (r.activity, r.id.clone())).collect();
     ids.sort_by(|a, b| b.cmp(a));
-    app.set_rows(rows);
+    view.set_rows(rows);
     let mut remotes = config.remotes.clone();
     match state.load_admitted().and_then(|urls| {
         urls.iter()
@@ -2741,7 +2756,7 @@ pub fn run(
                 ),
             };
             eprintln!("td-agent: {said}");
-            app.note(said);
+            view.note(said);
         }
     }
     // The configuration's templates, then those made in the window.
@@ -2762,16 +2777,16 @@ pub fn run(
             ),
         };
         eprintln!("td-agent: {said}");
-        app.note(said);
+        view.note(said);
         saved
     });
     let (templates, clashes) =
         merged_templates(&config.templates, saved.as_deref().unwrap_or_default());
     for clash in clashes {
         eprintln!("td-agent: {clash}");
-        app.note(clash);
+        view.note(clash);
     }
-    app.set_saved_templates(saved.as_deref().unwrap_or_default().to_vec());
+    view.set_saved_templates(saved.as_deref().unwrap_or_default().to_vec());
     let mut client = config.client.clone();
     // Workspaces, and the shared directories each gets, admitted once
     // here; without the jail there are none, and asking says why. No
@@ -2786,8 +2801,8 @@ pub fn run(
             "there is no jail, so a new Empty or Directory\u{2026} workspace is unconfined (unconfined_without_jail): {why}"
         );
         eprintln!("td-agent: {note}");
-        app.note(note);
-        app.set_jailless(Some(why.clone()));
+        view.note(note);
+        view.set_jailless(Some(why.clone()));
     }
     match &places {
         Ok(places) => {
@@ -2814,8 +2829,8 @@ pub fn run(
             }
             match notes.as_slice() {
                 [] => {}
-                [note] => app.note(note.clone()),
-                more => app.note(format!(
+                [note] => view.note(note.clone()),
+                more => view.note(format!(
                     "{} shared directories are not given to workspaces; see standard error",
                     more.len()
                 )),
@@ -2828,16 +2843,16 @@ pub fn run(
                 client.template_shared.clear();
                 let note = "the templates' shared directories, network policies and MCP servers are too many to hand to conversations; their workspaces bind none, reach no network and run no server";
                 eprintln!("td-agent: {note}");
-                app.note(note);
+                view.note(note);
             }
         }
         Err(why) => {
             eprintln!("td-agent: {why}");
-            app.set_no_workspaces(Some(why.clone()));
+            view.set_no_workspaces(Some(why.clone()));
         }
     }
-    app.set_networks(&client);
-    app.set_templates(
+    view.set_networks(&client);
+    view.set_templates(
         templates
             .iter()
             .map(|template| (template.name.clone(), !template.repos.is_empty()))
@@ -2858,15 +2873,15 @@ pub fn run(
             client.model
         );
         eprintln!("td-agent: {said}");
-        app.note(said);
+        view.note(said);
         if let Err(e) = state.forget_default_model() {
             eprintln!("td-agent: the default model: {e}");
         }
     }
-    app.set_models(&client.model, Vec::new());
-    app.set_offers(Vec::new(), &client.reasoning_effort);
-    app.set_default_routing(&client.routing);
-    app.set_limits(client.limits);
+    view.set_models(&client.model, Vec::new());
+    view.set_offers(Vec::new(), &client.reasoning_effort);
+    view.set_default_routing(&client.routing);
+    view.set_limits(client.limits);
     let setup = Down::Setup {
         key: key.clone(),
         client: Box::new(client.clone()),
@@ -2879,7 +2894,7 @@ pub fn run(
     ) {
         Ok(fetcher) => Some(fetcher),
         Err(e) => {
-            app.note(e);
+            view.note(e);
             None
         }
     };
@@ -2887,24 +2902,23 @@ pub fn run(
     let (schedules, problem) = crate::schedule::Schedules::load(&state, td_civil::Zone::local());
     if let Some(problem) = problem {
         eprintln!("td-agent: the schedules: {problem}");
-        app.note(format!("the schedules: {problem}"));
+        view.note(format!("the schedules: {problem}"));
     }
     let (outbox, problems) = Outbox::load(&state);
     for problem in &problems {
         eprintln!("td-agent: the outbox: {problem}");
     }
     if let Some(problem) = problems.last() {
-        app.note(format!("the outbox: {problem}"));
+        view.note(format!("the outbox: {problem}"));
     }
     // The stores and workspace repositories live in the data directory;
     // the git worker's own files in the state directory.
     let data = workspace::data_dir();
     let git_dir = state.root().join("git");
     let mut session = Session {
-        app,
+        view,
         supervisor,
         state,
-        control,
         ledger,
         fetcher,
         client,
@@ -2915,7 +2929,6 @@ pub fn run(
         export: None,
         tasks: None,
         keys: key.iter().cloned().collect(),
-        show_keys: false,
         places,
         jailless,
         templates,
@@ -2951,7 +2964,7 @@ pub fn run(
     };
     // Before anything is opened: an adopted conversation is replayed as it
     // opens, and its times are shown in this zone.
-    session.app.set_zone(td_civil::Zone::local());
+    app.set_zone(td_civil::Zone::local());
     session.read_tasks(ids.into_iter().map(|(_, id)| id).collect());
     // Before any conversation starts.
     session.repolicy();
@@ -2970,15 +2983,15 @@ pub fn run(
     match Models::load(session.state.root()) {
         Ok(Some(models)) => session.show_models(&models),
         Ok(None) => {}
-        Err(e) => session.app.note(format!("the models cache: {e}")),
+        Err(e) => session.view.note(format!("the models cache: {e}")),
     }
     if let Some(fetcher) = session.fetcher.as_mut() {
         let _ = fetcher.jobs.send(Job::Models(session.client.wanted()));
         fetcher.credit(Instant::now());
     }
     // Nothing is made here: with none yet, the human starts one.
-    if let Some(id) = session.app.most_recent() {
-        session.app.set_active(id.clone());
+    if let Some(id) = session.view.most_recent() {
+        session.view.set_active(id.clone());
         session.open(id, None);
     }
     // Four styles: a reply's bold and italic Markdown draws in its own.
@@ -2988,8 +3001,15 @@ pub fn run(
     );
     // The pinned face draws the transcript's icons; the bitmap one has
     // none, so its buttons keep their captions.
-    session.app.set_icons(typeface.is_some());
-    td_ui::window::run(&mut session, stream, std::env::temp_dir(), typeface)
+    app.set_icons(typeface.is_some());
+    let mut window = Window {
+        app,
+        session,
+        control,
+        show_keys: false,
+    };
+    window.flush();
+    td_ui::window::run(&mut window, stream, std::env::temp_dir(), typeface)
 }
 
 /// The templates the chooser lists (DESIGN.md §7): `configured`, then
