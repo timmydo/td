@@ -1,13 +1,11 @@
 //! Bounded, length-framed messages over a byte stream: a four-byte
-//! big-endian length, then that many bytes. The window process and each
-//! conversation process speak it over their socketpair (DESIGN.md §2);
-//! a length past `MAX_FRAME` is refused before anything is allocated
-//! for it, so neither side can make the other hold more than that.
+//! big-endian length, then that many bytes. A length past `MAX_FRAME` is
+//! refused before anything is allocated for it, so neither side can make
+//! the other hold more than that for one frame.
 
 use std::io::{self, Read, Write};
 
-/// The largest payload either side sends or accepts: room for the
-/// longest message text (`protocol::MAX_TEXT`) after JSON escaping.
+/// The largest payload either side sends or accepts.
 pub const MAX_FRAME: usize = 1 << 20;
 
 /// Why a frame could not be read.
@@ -57,7 +55,7 @@ pub fn encode(payload: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 /// The next frame, or `None` when the stream ends cleanly between frames.
-pub fn read(stream: &mut impl Read) -> Result<Option<Vec<u8>>, Error> {
+pub fn read(stream: &mut (impl Read + ?Sized)) -> Result<Option<Vec<u8>>, Error> {
     let mut head = [0u8; 4];
     let mut got = 0usize;
     while let Some(rest) = head.get_mut(got..).filter(|rest| !rest.is_empty()) {

@@ -1564,6 +1564,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         "td-json/",
         "td-kv/",
         "td-regex/",
+        "td-remote/",
         "td-test-compositor/",
         "td-toml/",
     ];
@@ -2712,6 +2713,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-json/src/lib.rs",
         "td-kv/src/lib.rs",
         "td-regex/src/lib.rs",
+        "td-remote/src/lib.rs",
         "td-test-compositor/src/lib.rs",
         "td-toml/src/lib.rs",
         "td-json/Cargo.toml",

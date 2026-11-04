@@ -50,7 +50,7 @@ pub mod cost;
 pub mod diagnostics;
 pub mod egress;
 pub mod files;
-pub mod frame;
+pub use td_remote::frame;
 pub mod git;
 pub mod history;
 pub mod host;

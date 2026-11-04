@@ -15,6 +15,7 @@ dependencies = [
  "td-json",
  "td-markdown",
  "td-png",
+ "td-remote",
  "td-test-compositor",
  "td-toml",
  "td-ui",
@@ -55,6 +56,13 @@ version = "0.1.0"
 [[package]]
 name = "td-png"
 version = "0.1.0"
+
+[[package]]
+name = "td-remote"
+version = "0.1.0"
+dependencies = [
+ "td-fs",
+]
 
 [[package]]
 name = "td-test-compositor"

@@ -668,6 +668,7 @@ mod tests {
                 "td-portal",
                 "td-protector",
                 "td-regex",
+                "td-remote",
                 "td-review",
                 "td-sandbox",
                 "td-secret",

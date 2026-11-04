@@ -30,6 +30,8 @@ needs them:
 - For shared Markdown parsing, read `td-markdown/DESIGN.md`.
 - For shared JPEG decoding or encoding, read `td-jpeg/DESIGN.md`.
 - For shared PNG decoding or encoding, read `td-png/DESIGN.md`.
+- For the transport to a td program on another machine over ssh, read
+  `td-remote/DESIGN.md`.
 - For making or checking Btrfs volumes (`mkfs.btrfs`), read
   `td-btrfs/DESIGN.md`; for mounting extra data volumes or removable
   media, read

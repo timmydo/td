@@ -102,11 +102,11 @@ measured effect of edit formats and tool ergonomics. td-agent
 reimplements none of them and inherits none of their compatibility claims.
 
 td-agent is its own crate, `td-agent/`, and its own static binary, built by
-td's pinned Rust toolchain. Its manifest declares eleven
+td's pinned Rust toolchain. Its manifest declares twelve
 dependencies, all td crates by path: `td-civil`, `td-encoding`,
 `td-fetch-client`, `td-fs`, `td-html`, `td-jpeg`, `td-json`,
-`td-markdown`, `td-png`, `td-toml` and `td-ui`, and its lock lists
-exactly those and td-agent. The person's pictures are read by td-png and
+`td-markdown`, `td-png`, `td-remote`, for its frames, `td-toml` and
+`td-ui`, and its lock lists exactly those and td-agent. The person's pictures are read by td-png and
 td-jpeg, the decoders td-ui's other programs share, one too large to
 send is written anew by td-jpeg's encoder, and each is sent in base64
 by td-encoding's (§6, Pictures). It

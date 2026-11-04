@@ -1,0 +1,29 @@
+[package]
+name = "td-remote"
+version = "0.1.0"
+edition = "2021"
+description = "td's transport to a program of its own on another machine, over an ssh child's standard streams"
+license = "MIT"
+
+# Own workspace root, so cargo behaves the same from a nested worktree. A
+# consumer names this crate as `td-remote = { path = "../td-remote" }`
+# (AGENTS.md 'Rust code'). It opens no socket and carries no TLS: ssh does.
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[lib]
+doctest = false
+
+[dependencies]
+td-fs = { path = "../td-fs" }
