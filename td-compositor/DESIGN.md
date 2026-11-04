@@ -4504,8 +4504,11 @@ output geometry and stride the runtime renders at. `TD-COMPOSITOR-FLIP-OK
 cookie=... flip=ok` follows, once per process, the first completion the
 runtime accepts: the frame in flight's, or a recovered frame's late one. A
 recovery by modeset alone prints nothing. Each is one write beginning with a
-newline, since the console is shared with unbuffered stderr and the boot check
-reads a marker only at a line's start. A marker that cannot be written is
+newline, since outside td-svc's capture the console is shared with
+unbuffered stderr and the boot check reads a marker only at a line's start.
+The `[wayland]` unit logs the pair's output to `/var/log/svc/wayland.log`
+and td-svc copies each line to the console behind `wayland: `, so the check
+reads the marker after that name. A marker that cannot be written is
 logged rather than fatal. The fbdev backend prints
 neither. No separate probe subcommand touches the card: it would contend
 with the running compositor for mastership.

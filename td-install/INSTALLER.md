@@ -2324,8 +2324,9 @@ or attaching a USB Ethernet adapter obtains a fresh lease. Failed DHCP attempts
 retry after 15 seconds. Boot and desktop health do not require a DHCP server.
 
 `td-netd status` shows the latest connection state, address, gateway and DNS
-servers, or the most recent failure. The root-only rotated service log is
-`/var/log/svc/network.log`; status is readable by the session owner.
+servers, or the most recent failure. The rotated service log is
+`/var/log/svc/network.log`, which the session owner reads through the
+`svc-log` group (td-svc/DESIGN.md §8); status is readable by the owner too.
 For slow transfers, run `td-netd diagnose` before and after the transfer:
 it reports negotiated link speed/duplex, MTU, device errors/drops, TCP
 configuration and cumulative TCP retransmission counters without elevation.

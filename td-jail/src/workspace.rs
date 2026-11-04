@@ -91,8 +91,27 @@ pub(crate) const SYNTHESIZED_ETC: &[&str] =
 /// What no admitted directory may be, contain or lie inside: the jail's
 /// own mount points and the host trees bound for it.
 const RESERVED: &[&str] = &[
-    "/bin", "/boot", "/dev", "/etc", "/gnu", "/lib", "/lib32", "/lib64", "/libx32", "/nix", "/opt",
-    "/proc", "/run", "/sbin", "/sys", "/td", "/tmp", "/usr", "/var/tmp",
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/gnu",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/nix",
+    "/opt",
+    "/proc",
+    "/run",
+    "/sbin",
+    "/sys",
+    "/td",
+    "/tmp",
+    "/usr",
+    "/var/tmp",
+    // td-svc's logs, which the human account's svc-log group may read.
+    "/var/log/svc",
 ];
 const FORMAT_LINE: &str = "format=1";
 const O_NOFOLLOW: i32 = 0o400_000;
@@ -1303,6 +1322,12 @@ mod tests {
             );
         }
         assert!(refuse_reserved(Path::new("/var/home"), home, RESERVED).is_err());
+        for refused in ["/var/log", "/var/log/svc", "/var/log/svc/wayland.log"] {
+            assert!(
+                refuse_reserved(Path::new(refused), home, RESERVED).is_err(),
+                "{refused}"
+            );
+        }
         for admitted in ["/home/u/src/td", "/srv/data", "/var/lib/x"] {
             assert!(
                 refuse_reserved(Path::new(admitted), home, RESERVED).is_ok(),

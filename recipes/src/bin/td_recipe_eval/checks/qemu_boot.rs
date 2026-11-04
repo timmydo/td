@@ -245,6 +245,10 @@ const TD_PORTAL_FILE_CHOOSER_PRESENTED_PREFIX: &str = "portal: TD-PORTAL-FILE-CH
 const TD_PORTAL_FILE_CHOOSER_COMPLETED_MARKER: &str = "TD-PORTAL-FILE-CHOOSER-COMPLETED";
 const TD_APPLICATION_CURSOR_PREFIX: &str =
     "TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox ";
+/// td-svc's console copy of a line from the `[wayland]` unit, which logs
+/// td-authd's and td-compositor's output to /var/log/svc/wayland.log and
+/// copies each line here behind its name, as every `console=yes` unit's.
+const WAYLAND_CONSOLE_PREFIX: &str = "wayland: ";
 const FIREFOX_INPUT_CMDLINE_TOKEN: &str = td_recipe::shared::FIREFOX_INPUT_CMDLINE_TOKEN;
 const FIREFOX_AUDIT_CMDLINE_TOKEN: &str = td_recipe::shared::FIREFOX_AUDIT_CMDLINE_TOKEN;
 const KERNEL_AUDIT_CMDLINE_TOKEN: &str = td_recipe::shared::KERNEL_AUDIT_CMDLINE_TOKEN;
@@ -579,6 +583,9 @@ struct ConsoleEvidence {
     /// that still has a card but has stopped offering a usable mode would
     /// satisfy a boolean while failing the thing the marker is for.
     td_compositor_kms: Option<String>,
+    /// The KMS marker anywhere, whoever printed it: a server that must run
+    /// no compositor is refused one from any unit, not only `[wayland]`.
+    td_compositor_kms_anywhere: bool,
     td_compositor_flip: Option<String>,
     td_jail_kill_reaps: bool,
     td_firefox: bool,
@@ -6623,8 +6630,8 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         // the window is dropped at a chunk boundary and surfaces as "the
         // marker was absent", which reads as a broken card rather than as a
         // retention bug.
-        TD_COMPOSITOR_KMS_MARKER.len() + 1 + DRM_REPORT_MAX,
-        TD_COMPOSITOR_FLIP_MARKER.len() + 1 + DRM_REPORT_MAX,
+        WAYLAND_CONSOLE_PREFIX.len() + TD_COMPOSITOR_KMS_MARKER.len() + 1 + DRM_REPORT_MAX,
+        WAYLAND_CONSOLE_PREFIX.len() + TD_COMPOSITOR_FLIP_MARKER.len() + 1 + DRM_REPORT_MAX,
         exact_line_window(TD_SECRET_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_CONSOLE_MARKER),
         exact_line_window(TD_PORTAL_REQUEST_CONSOLE_MARKER),
@@ -6668,7 +6675,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_FIREFOX_FILE_CHOOSER_MARKER),
         exact_line_window(TD_FIREFOX_SOAK_MARKER),
         exact_line_window(TD_FIREFOX_SECCOMP_AUDIT_MARKER),
-        TD_APPLICATION_CURSOR_PREFIX.len().saturating_add(32),
+        (WAYLAND_CONSOLE_PREFIX.len() + TD_APPLICATION_CURSOR_PREFIX.len()).saturating_add(32),
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
             .saturating_add(exact_line_window(TD_PROFILER_ATTRIBUTION_MARKER)),
@@ -6961,12 +6968,19 @@ fn latch_console_evidence_from(
     latch_reported_line(
         &mut evidence.td_compositor_kms,
         buf,
+        WAYLAND_CONSOLE_PREFIX.as_bytes(),
         TD_COMPOSITOR_KMS_MARKER.as_bytes(),
         starts_at_stream_boundary,
+    );
+    latch_marker(
+        &mut evidence.td_compositor_kms_anywhere,
+        buf,
+        TD_COMPOSITOR_KMS_MARKER.as_bytes(),
     );
     latch_reported_line(
         &mut evidence.td_compositor_flip,
         buf,
+        WAYLAND_CONSOLE_PREFIX.as_bytes(),
         TD_COMPOSITOR_FLIP_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
@@ -7366,6 +7380,7 @@ fn latch_prefixed_line_marker(
 fn latch_reported_line(
     found: &mut Option<String>,
     haystack: &[u8],
+    prefix: &[u8],
     marker: &[u8],
     starts_at_stream_boundary: bool,
 ) {
@@ -7378,10 +7393,15 @@ fn latch_reported_line(
         {
             continue;
         }
-        let Some(after) = start.checked_add(marker.len()) else {
+        let (Some(marker_at), Some(after)) = (
+            start.checked_add(prefix.len()),
+            start.checked_add(prefix.len() + marker.len()),
+        ) else {
             return;
         };
-        if haystack.get(start..after) != Some(marker) {
+        if haystack.get(start..marker_at) != Some(prefix)
+            || haystack.get(marker_at..after) != Some(marker)
+        {
             continue;
         }
         let Some(rest) = haystack.get(after..) else {
@@ -7410,6 +7430,7 @@ fn latch_application_cursor(found: &mut bool, haystack: &[u8], starts_at_stream_
     if *found {
         return;
     }
+    let unit = WAYLAND_CONSOLE_PREFIX.as_bytes();
     let prefix = TD_APPLICATION_CURSOR_PREFIX.as_bytes();
     for start in 0..haystack.len() {
         if (start != 0 || !starts_at_stream_boundary)
@@ -7417,10 +7438,15 @@ fn latch_application_cursor(found: &mut bool, haystack: &[u8], starts_at_stream_
         {
             continue;
         }
-        let Some(body_start) = start.checked_add(prefix.len()) else {
+        let (Some(prefix_at), Some(body_start)) = (
+            start.checked_add(unit.len()),
+            start.checked_add(unit.len() + prefix.len()),
+        ) else {
             return;
         };
-        if haystack.get(start..body_start) != Some(prefix) {
+        if haystack.get(start..prefix_at) != Some(unit)
+            || haystack.get(prefix_at..body_start) != Some(prefix)
+        {
             continue;
         }
         let Some(rest) = haystack.get(body_start..) else {
@@ -10242,15 +10268,20 @@ mod tests {
         let mut evidence = ConsoleEvidence::default();
         latch_console_evidence(
             &mut evidence,
-            b"\nTD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=24 height=32\r\n",
+            b"\nwayland: TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=24 \
+              height=32\r\n",
             b"unrelated",
         );
         assert!(evidence.td_application_cursor);
         for invalid in [
-            "\nTD-APPLICATION-CURSOR-READY app-id=other width=24 height=32\n",
-            "\nTD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=0 height=32\n",
-            "\nTD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=257 height=32\n",
-            "\nTD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=24 height=32 trailing\n",
+            "\nwayland: TD-APPLICATION-CURSOR-READY app-id=other width=24 height=32\n",
+            "\nwayland: TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=0 height=32\n",
+            "\nwayland: TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=257 height=32\n",
+            "\nwayland: TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=24 height=32 \
+             trailing\n",
+            // Not the compositor's unit: td-svc copies only its lines behind its name.
+            "\nTD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=24 height=32\n",
+            "\nportal: TD-APPLICATION-CURSOR-READY app-id=org.mozilla.firefox width=24 height=32\n",
         ] {
             let mut rejected = ConsoleEvidence::default();
             latch_console_evidence(&mut rejected, invalid.as_bytes(), b"unrelated");
@@ -11739,6 +11770,7 @@ mod tests {
         latch_reported_line(
             &mut found,
             format!("boot noise\n{line}").as_bytes(),
+            b"",
             TD_COMPOSITOR_KMS_MARKER.as_bytes(),
             true,
         );
@@ -11756,10 +11788,35 @@ mod tests {
         latch_reported_line(
             &mut found,
             format!("look: {TD_COMPOSITOR_KMS_MARKER} driver=evil output=1x1\n").as_bytes(),
+            b"",
             TD_COMPOSITOR_KMS_MARKER.as_bytes(),
             true,
         );
         assert_eq!(found, None);
+    }
+
+    /// The console reads the compositor's report behind the `[wayland]`
+    /// unit's name, and no other: a bare line or another unit's is no
+    /// report, though the server's refusal still sees it.
+    #[test]
+    fn a_kms_report_is_read_behind_the_wayland_unit_s_name_only() {
+        let report = format!("{TD_COMPOSITOR_KMS_MARKER} driver=virtio_gpu output=1280x800");
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!("\n{WAYLAND_CONSOLE_PREFIX}{report}\n").as_bytes(),
+            b"unrelated",
+        );
+        assert_eq!(
+            evidence.td_compositor_kms.as_deref(),
+            Some("driver=virtio_gpu output=1280x800")
+        );
+        for other in [format!("\n{report}\n"), format!("\nportal: {report}\n")] {
+            let mut evidence = ConsoleEvidence::default();
+            latch_console_evidence(&mut evidence, other.as_bytes(), b"unrelated");
+            assert_eq!(evidence.td_compositor_kms, None, "{other:?}");
+            assert!(evidence.td_compositor_kms_anywhere, "{other:?}");
+        }
     }
 
     /// A line still arriving is not a malformed one: it waits for the rescan.
@@ -11771,6 +11828,7 @@ mod tests {
         latch_reported_line(
             &mut found,
             whole.get(..cut).unwrap_or_default().as_bytes(),
+            b"",
             TD_COMPOSITOR_KMS_MARKER.as_bytes(),
             true,
         );
@@ -11778,6 +11836,7 @@ mod tests {
         latch_reported_line(
             &mut found,
             whole.as_bytes(),
+            b"",
             TD_COMPOSITOR_KMS_MARKER.as_bytes(),
             true,
         );
@@ -11835,7 +11894,9 @@ mod tests {
             DRM_REPORT_MAX,
             "the widest report the latch takes"
         );
-        let evidence = drain_across_a_read_boundary(&format!("{TD_COMPOSITOR_KMS_MARKER}{field}"));
+        let evidence = drain_across_a_read_boundary(&format!(
+            "{WAYLAND_CONSOLE_PREFIX}{TD_COMPOSITOR_KMS_MARKER}{field}"
+        ));
         assert_eq!(
             evidence.td_compositor_kms.as_deref(),
             Some(field.trim()),
@@ -11857,7 +11918,9 @@ mod tests {
             DRM_REPORT_MAX,
             "the widest report the latch takes"
         );
-        let evidence = drain_across_a_read_boundary(&format!("{TD_COMPOSITOR_FLIP_MARKER}{field}"));
+        let evidence = drain_across_a_read_boundary(&format!(
+            "{WAYLAND_CONSOLE_PREFIX}{TD_COMPOSITOR_FLIP_MARKER}{field}"
+        ));
         assert_eq!(
             evidence.td_compositor_flip.as_deref(),
             Some(field.trim()),
@@ -11874,6 +11937,7 @@ mod tests {
         latch_reported_line(
             &mut found,
             format!("{TD_COMPOSITOR_KMS_MARKER} {padding}\n").as_bytes(),
+            b"",
             TD_COMPOSITOR_KMS_MARKER.as_bytes(),
             true,
         );

@@ -256,9 +256,9 @@ const SSHD_PRIVSEP_USER: &str = "sshd";
 const SSHD_PRIVSEP_UID: u32 = 995;
 const SSHD_PRIVSEP_GID: u32 = 995;
 const SSHD_PRIVSEP_PATH: &str = "/run/sshd-empty";
-/// A server's observer group: its members read td-svc's status socket and
+/// The observer group: its members read td-svc's status socket and
 /// `/var/log/svc` (td-svc/DESIGN.md §8, "Observation"). Only the primary
-/// account is one. Reserved: no principal may take 988 as its id.
+/// account is one, on every image. Reserved: no principal may take 988 as its id.
 const SVC_LOG_GROUP: &str = "svc-log";
 const SVC_LOG_GID: u32 = 988;
 const AUDIO_USER: &str = "audio";
@@ -1284,18 +1284,19 @@ fn build_group(sys: &SystemDef) -> String {
     // enrolled by default; an analysis identity must be granted it explicitly.
     s.push_str(&format!("profiler-read:x:{PROFILER_READ_GID}:\n"));
     s.push_str("tty:x:5:\n");
-    if !sys.desktop() {
-        let primary: Vec<&str> = sys
-            .users
-            .iter()
-            .filter(|u| u.uid == UI_UID)
-            .map(|u| u.name)
-            .collect();
-        s.push_str(&format!(
-            "{SVC_LOG_GROUP}:x:{SVC_LOG_GID}:{}\n",
-            primary.join(",")
-        ));
-    }
+    // The primary account observes its services, on a desktop as on a
+    // server: it is the machine's one administrator, and with no root
+    // login their logs are where a failure root saw is told.
+    let primary: Vec<&str> = sys
+        .users
+        .iter()
+        .filter(|u| u.uid == UI_UID)
+        .map(|u| u.name)
+        .collect();
+    s.push_str(&format!(
+        "{SVC_LOG_GROUP}:x:{SVC_LOG_GID}:{}\n",
+        primary.join(",")
+    ));
     s
 }
 
@@ -2094,6 +2095,8 @@ fn build_desktop_td_svc_conf() -> String {
          \n\
          # The private pair admits the enrolled compositor before display access.\n\
          # It drives the card; the framebuffer only on a machine without one.\n\
+         # Both halves' output is kept, td-authd's account of the helpers it\n\
+         # starts included, and copied to the console behind the unit's name.\n\
          [wayland]\n\
          type=daemon\n\
          cgroup=service\n\
@@ -2104,6 +2107,8 @@ fn build_desktop_td_svc_conf() -> String {
          ready=/bin/td-login exec-primary -- /bin/td-compositor probe {wayland_socket}\n\
          ready-timeout=30\n\
          restart=always\n\
+         log=/var/log/svc/wayland.log\n\
+         console=yes\n\
          \n\
          [seat-access-evidence]\n\
          type=oneshot\n\
@@ -8591,6 +8596,19 @@ mod tests {
         );
     }
 
+    /// The `[wayland]` pair, td-authd and the compositor, is captured where
+    /// the desktop's owner can read it (td-svc/DESIGN.md §8) and still
+    /// reaches the console, where the boot oracles read the compositor's
+    /// markers behind the unit's name.
+    #[test]
+    fn the_wayland_pair_is_captured_and_still_reaches_the_console() {
+        assert_eq!(
+            unit_key("wayland", "log").as_deref(),
+            Some("/var/log/svc/wayland.log")
+        );
+        assert_eq!(unit_key("wayland", "console").as_deref(), Some("yes"));
+    }
+
     /// sshd stops its whole service leaf, so a stop, restart or shutdown ends
     /// the OpenSSH sessions that left its process group
     /// (td-login/TOKEN-LOGIN.md, increment 5's A1). The key needs the leaf
@@ -10406,7 +10424,7 @@ mod tests {
                 u.shell
             );
             // build_group materialises only `wheel` from a declared supplementary
-            // group (a server's svc-log follows the primary by uid instead); any
+            // group (svc-log follows the primary by uid instead); any
             // other declared group would be silently dropped from /etc/group (its
             // membership lost), so reject it until build_group learns to emit it.
             for g in u.groups {
@@ -16128,23 +16146,24 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
         // ...and the group set must be DERIVED from the generated /etc/group, not a constant
         // that quietly stops matching it. wheel is the membership the stock SYSTEM grants.
-        // A server's primary also observes its services; the desktop has no
-        // such group.
-        assert_eq!(supplementary_gids(&SERVER, "tester"), vec![10, SVC_LOG_GID]);
-        assert!(!build_group(&SYSTEM).contains(SVC_LOG_GROUP));
-        assert_eq!(
-            build_group(&SERVER)
-                .lines()
-                .filter(|line| line.starts_with("svc-log:"))
-                .collect::<Vec<_>>(),
-            ["svc-log:x:988:tester"]
-        );
+        // The primary also observes its services, on the desktop as on a
+        // server.
+        for sys in [&SERVER, &SYSTEM] {
+            assert_eq!(supplementary_gids(sys, "tester"), vec![10, SVC_LOG_GID]);
+            assert_eq!(
+                build_group(sys)
+                    .lines()
+                    .filter(|line| line.starts_with("svc-log:"))
+                    .collect::<Vec<_>>(),
+                ["svc-log:x:988:tester"]
+            );
+        }
         assert_eq!(
             supplementary_gids(&SYSTEM, "tester"),
-            vec![10],
-            "the shipped /etc/group grants tester wheel(10) and nothing else; if that changed \
-             deliberately, the probe follows it automatically and this line records the new \
-             expectation"
+            vec![10, SVC_LOG_GID],
+            "the shipped /etc/group grants tester wheel(10) and svc-log and nothing else; if \
+             that changed deliberately, the probe follows it automatically and this line \
+             records the new expectation"
         );
         assert!(
             supplementary_gids(&SYSTEM, "root").is_empty(),

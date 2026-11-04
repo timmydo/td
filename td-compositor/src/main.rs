@@ -682,9 +682,11 @@ fn announce_kms_ready(
     write_marker(out, &line)
 }
 
-/// One write that begins a line of its own. The console is shared with
-/// unbuffered stderr, this process's and others', whose fragments need not
-/// end a line, and the boot check reads a marker only at a line's start.
+/// One write that begins a line of its own. Run outside td-svc's capture,
+/// the console is shared with unbuffered stderr, this process's and
+/// others', whose fragments need not end a line, and the boot check reads
+/// a marker only at a line's start; under `[wayland]`'s capture the
+/// newline costs one empty line.
 fn write_marker(out: &mut impl Write, line: &str) -> Result<(), String> {
     out.write_all(line.as_bytes())
         .and_then(|()| out.flush())

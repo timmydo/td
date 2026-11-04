@@ -1312,8 +1312,16 @@ come back mid-teardown, forever, and the walk would never reach the handoff.
 
 An image whose `/etc/group` defines `svc-log` with a gid other than
 root's names that group the observer: its members may read service
-status and logs, and nothing else. The server's primary account is its
-one member; the desktop defines no such group and gets neither path.
+status and logs, and nothing else. The primary account is its one
+member, on the desktop as on the server: with no root login, a log is
+where a failure root saw is told, as the `[wayland]` pair's
+`/var/log/svc/wayland.log` carries td-authd's own diagnostics and the
+stderr of the root helpers it lets inherit it. Every process of that
+account holds the group, its shell and what it runs included. A jailed
+application keeps it too, as it keeps `wheel`, but reaches a log or the
+status socket only through its jail's mounts: `/run` and `/var/log/svc`
+are reserved trees no application grant or workspace directory may
+name, contain or lie inside.
 td-svc reads the gid once, before any service starts.
 
 - **Status.** `/run/td-svc-status/socket`, inside a directory created

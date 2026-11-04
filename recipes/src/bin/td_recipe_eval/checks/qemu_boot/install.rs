@@ -2385,6 +2385,10 @@ pub(super) fn validate_installed_as(
     validate_compositor_boot(result)
 }
 
+/// The compositor's clock line as td-svc copies the `[wayland]` unit's
+/// output to the console, behind the unit's name.
+const CLOCK_ZONE_LINE: &str = "wayland: td-compositor: clock zone";
+
 /// Each compositor process says on a line of its own which zone its clock
 /// loaded, or that none was set or it could not load; a supervised restart
 /// says it again. At least one, and every one this boot printed, must name
@@ -2394,9 +2398,10 @@ fn require_clock_zone(result: &BootResult, zone: &str) -> Result<(), String> {
         .console
         .lines()
         .map(str::trim_end)
-        .filter(|line| line.starts_with("td-compositor: clock zone"))
+        .filter(|line| line.starts_with(CLOCK_ZONE_LINE))
         .map(|line| {
-            line.strip_prefix("td-compositor: clock zone ")
+            line.strip_prefix(CLOCK_ZONE_LINE)
+                .and_then(|rest| rest.strip_prefix(' '))
                 .unwrap_or_default()
         })
         .collect();
@@ -2761,7 +2766,7 @@ mod tests {
         BootResult {
             evidence, exited_clean: false, marker_killed: true,
             reason: "fixture".into(),
-            console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\ntd-firstboot: machine-id created\ntd-firstboot: host key created ssh-ed25519 AAAA\nTD-HOSTNAME-READY {}\ntd-firstboot: primary home created /var/home/{}\nTD-PRIMARY-PROFILE-READY {}\ntd-compositor: clock zone {}\n{SYSTEM_BOOT_SUCCESS_MARKER}\n", protocol::HOSTNAME, protocol::USERNAME, protocol::USERNAME, protocol::TIMEZONE_ID),
+            console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\ntd-firstboot: machine-id created\ntd-firstboot: host key created ssh-ed25519 AAAA\nTD-HOSTNAME-READY {}\ntd-firstboot: primary home created /var/home/{}\nTD-PRIMARY-PROFILE-READY {}\nwayland: td-compositor: clock zone {}\n{SYSTEM_BOOT_SUCCESS_MARKER}\n", protocol::HOSTNAME, protocol::USERNAME, protocol::USERNAME, protocol::TIMEZONE_ID),
             elapsed: Duration::ZERO, firefox_audio: FirefoxAudioCapture::NotRequested,
         }
     }
@@ -2852,30 +2857,33 @@ mod tests {
             ..installed
         };
         assert!(validate_installed_as(&result, "/dev/vda2", &tokyo, true).is_err());
-        let fixture_zone = format!("td-compositor: clock zone {}\n", protocol::TIMEZONE_ID);
+        let fixture_zone = format!(
+            "wayland: td-compositor: clock zone {}\n",
+            protocol::TIMEZONE_ID
+        );
         assert_eq!(result.console.matches(&fixture_zone).count(), 1);
         let console = result.console.replace(&fixture_zone, "");
         for (lines, ok) in [
-            ("td-compositor: clock zone Asia/Tokyo\n", true),
+            ("wayland: td-compositor: clock zone Asia/Tokyo\n", true),
             (
-                "td-compositor: clock zone Asia/Tokyo\r\ntd-compositor: clock zone Asia/Tokyo\n",
+                "wayland: td-compositor: clock zone Asia/Tokyo\r\nwayland: td-compositor: clock zone Asia/Tokyo\n",
                 true,
             ),
-            ("td-compositor: clock zone Asia/Seoul\n", false),
-            ("td-compositor: clock zone none\n", false),
+            ("wayland: td-compositor: clock zone Asia/Seoul\n", false),
+            ("wayland: td-compositor: clock zone none\n", false),
             (
-                "td-compositor: clock zone Asia/Tokyo\ntd-compositor: clock zone none\n",
+                "wayland: td-compositor: clock zone Asia/Tokyo\nwayland: td-compositor: clock zone none\n",
                 false,
             ),
-            ("td-compositor: clock zone Asia/Tokyo/X\n", false),
-            ("td-compositor: clock zone Asia/Tokyo \n", true),
-            ("td-compositor: clock zone unavailable\n", false),
+            ("wayland: td-compositor: clock zone Asia/Tokyo/X\n", false),
+            ("wayland: td-compositor: clock zone Asia/Tokyo \n", true),
+            ("wayland: td-compositor: clock zone unavailable\n", false),
             (
-                "td-compositor: clock zone Asia/Tokyo\ntd-compositor: clock zone \n",
+                "wayland: td-compositor: clock zone Asia/Tokyo\nwayland: td-compositor: clock zone \n",
                 false,
             ),
             (
-                "td-compositor: clock zone Asia/Tokyo\ntd-compositor: clock zoneAsia/Tokyo\n",
+                "wayland: td-compositor: clock zone Asia/Tokyo\nwayland: td-compositor: clock zoneAsia/Tokyo\n",
                 false,
             ),
         ] {
@@ -3498,14 +3506,17 @@ mod tests {
             "td-firstboot: primary home present /var/home/{}\n",
             protocol::USERNAME
         );
-        let zone = format!("td-compositor: clock zone {}\n", protocol::TIMEZONE_ID);
+        let zone = format!(
+            "wayland: td-compositor: clock zone {}\n",
+            protocol::TIMEZONE_ID
+        );
         for broken in [
             kept.replace("primary home present", "primary home created"),
             kept.replace(&home, ""),
             kept.replace(&home, &format!("{home}{home}")),
             kept.replace(&zone, ""),
-            kept.replace(&zone, "td-compositor: clock zone none\n"),
-            kept.replace(&zone, "td-compositor: clock zone unavailable\n"),
+            kept.replace(&zone, "wayland: td-compositor: clock zone none\n"),
+            kept.replace(&zone, "wayland: td-compositor: clock zone unavailable\n"),
         ] {
             second.console = broken;
             assert!(

@@ -20,8 +20,13 @@ pub(crate) const STEP_TIMEOUT: Duration = Duration::from_secs(300);
 /// compositor says it finished.
 pub(crate) const INSTALL_TIMEOUT: Duration = Duration::from_secs(1800);
 /// Begin the lines a failed drive repeats from the whole console: the
-/// compositor's attention evidence and errors, and td-setup's states.
-const MARKER_PREFIXES: &[&str] = &["TD-ATTENTION-", "td-compositor: ", "TD-SETUP-SHOWN "];
+/// compositor's attention evidence and errors, which td-svc copies behind
+/// the `[wayland]` unit's name, and td-setup's states.
+const MARKER_PREFIXES: &[&str] = &[
+    "wayland: TD-ATTENTION-",
+    "wayland: td-compositor: ",
+    "TD-SETUP-SHOWN ",
+];
 /// How many of those lines a failure repeats, the last ones.
 const MARKERS_KEPT: usize = 16;
 
@@ -427,8 +432,8 @@ mod tests {
     #[test]
     fn a_failed_drive_repeats_the_last_markers() {
         let mut console =
-            String::from("noise\r\ntd-compositor: close attention after consent: x\r\n");
-        console.push_str("TD-ATTENTION-SELF-CLOSE cutoff=1 settle-until=2\n");
+            String::from("noise\r\nwayland: td-compositor: close attention after consent: x\r\n");
+        console.push_str("wayland: TD-ATTENTION-SELF-CLOSE cutoff=1 settle-until=2\n");
         for n in 1..=MARKERS_KEPT {
             console.push_str(&format!("BTRFS info\nTD-SETUP-SHOWN n={n} page=a\n"));
         }
@@ -437,10 +442,13 @@ mod tests {
         assert_eq!(kept.lines().count(), MARKERS_KEPT);
         assert!(kept.starts_with("TD-SETUP-SHOWN n=1 page=a\n"));
         assert!(kept.ends_with(&format!("n={MARKERS_KEPT} page=a")));
-        let short = markers("x\ntd-compositor: e\r\nTD-ATTENTION-SETTLED cutoff=1 dropped=0\n");
+        let short = markers(
+            "x\nwayland: td-compositor: e\r\nwayland: TD-ATTENTION-SETTLED cutoff=1 dropped=0\n\
+             td-compositor: unprefixed\n",
+        );
         assert_eq!(
             short,
-            "td-compositor: e\nTD-ATTENTION-SETTLED cutoff=1 dropped=0"
+            "wayland: td-compositor: e\nwayland: TD-ATTENTION-SETTLED cutoff=1 dropped=0"
         );
         assert_eq!(markers("nothing here"), "");
     }

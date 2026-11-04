@@ -1181,9 +1181,10 @@ in this language. Blanket `host`/`home`, the Flatpak repositories,
 `/.flatpak-info`, and the
 `/app`, `/usr`, `/opt`, `/bin`, `/run`, `/proc`, `/sys`, `/dev`, `/tmp`,
 `/home`, `/root`, `/var/home`, `/var/root`, `/var/run`, `/var/tmp`, `/etc`,
-`/boot`, and td's `/var/lib/td` system state are refused here. The refusal
-includes a recursive grant above one of those fixed trees: `/var/lib` cannot
-smuggle the system Flatpak repository or td system state in, and `~/.local`
+`/boot`, td's `/var/lib/td` system state and td-svc's `/var/log/svc` logs are
+refused here. The refusal includes a recursive grant above one of those fixed
+trees: `/var/lib` cannot smuggle the system Flatpak repository or td system
+state in, `/var/log` cannot smuggle the service logs in, and `~/.local`
 cannot smuggle the per-user repository in.
 The package and application-state roots remain configuration, not paths baked
 into this context-free parser. The rung-6 spec preserves these typed grants;
@@ -3274,7 +3275,8 @@ lifecycle remains pending.
 `filesystem=home`, `/`, `/usr`, `/opt`, `/bin`, `/app`, `/run`, `/proc`,
 `/sys`, `/tmp`, `/home`, `/root`, `/var/home`, `/var/root`, `/var/run`,
 `/var/tmp`, `/etc`, `/boot`, `/.flatpak-info`, the flatpak repo itself, td's
-`/var/lib/td` system state, socket paths, and device trees. The configured
+`/var/lib/td` system state, td-svc's `/var/log/svc` logs, socket paths, and
+device trees. The configured
 package and application-state roots are also refused after source resolution,
 whatever their spelling. An app that genuinely needs blanket home access gets
 a reviewed per-app override rather than a default.
@@ -3711,7 +3713,8 @@ with the kind's own departures:
   path or by mount identity is refused, as is any overlap with the
   reserved trees (`/bin`, `/boot`, `/dev`, `/etc`, `/gnu`, `/lib*`,
   `/nix`, `/opt`, `/proc`, `/run`, `/sbin`, `/sys`, `/td`, `/tmp`,
-  `/usr`, `/var/tmp`, a linked one by what it resolves to), by path or by mount
+  `/usr`, `/var/tmp`, td-svc's `/var/log/svc`, a linked one by what it
+  resolves to), by path or by mount
   identity. As for an application grant, a reserved mount identity that
   strictly contains the identity of the caller's home as it resolves
   (td's maintenance mount of its whole volume at `/run/td-volume`) does

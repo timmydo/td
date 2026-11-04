@@ -856,7 +856,7 @@ fn no_desktop(result: &BootResult, label: &str) -> Result<(), String> {
     let desktop = [
         (evidence.greeter, GREETER_MARKER),
         (
-            evidence.td_compositor_kms.is_some(),
+            evidence.td_compositor_kms_anywhere,
             TD_COMPOSITOR_KMS_MARKER,
         ),
         (evidence.td_busd_runtime, TD_BUSD_RUNTIME_MARKER),

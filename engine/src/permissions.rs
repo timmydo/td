@@ -46,6 +46,8 @@ pub const RESERVED_FILESYSTEM_TREES: &[&str] = &[
     "/.flatpak-info",
     "/var/lib/td",
     "/var/lib/flatpak",
+    // td-svc's logs, which the human account's svc-log group may read.
+    "/var/log/svc",
 ];
 const PAGE_SIZE_BYTES: u64 = 4096;
 // The largest aligned value below Linux x86-64's page-counter `max` sentinel.
@@ -1643,7 +1645,7 @@ mod tests {
             "~/.local-other",
             "/mnt/media",
             "/td/other",
-            "/var/log",
+            "/var/cache",
         ] {
             PermissionPolicy::new()
                 .with_filesystem(location, FilesystemAccess::ReadOnly, false)
@@ -1665,6 +1667,7 @@ mod tests {
             ("/", false, "root `/`"),
             ("/", true, "root `/`"),
             ("/var/lib", false, "reserved filesystem tree"),
+            ("/var/log", false, "reserved filesystem tree"),
             ("/mnt/new", true, "only for xdg"),
         ] {
             let got = PermissionPolicy::new()
