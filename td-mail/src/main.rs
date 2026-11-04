@@ -41,12 +41,24 @@ fn default_config_path() -> PathBuf {
     }
 }
 
+/// What a password_command failure begins with when there is no `sh` to
+/// run it, as in td's mail jail, so the window can say what to use instead.
+pub const NO_SHELL: &str = "password_command needs sh, and sh could not be started";
+
 pub fn run_password_command(cmd: &str) -> Result<String, String> {
-    let output = Command::new("sh")
+    run_password_command_with("sh", cmd)
+}
+
+fn run_password_command_with(shell: &str, cmd: &str) -> Result<String, String> {
+    let output = Command::new(shell)
         .arg("-c")
         .arg(cmd)
         .output()
-        .map_err(|e| format!("failed to execute password command: {}", e))?;
+        .map_err(|e| match e.kind() {
+            // The shell itself is absent: the command was never looked at.
+            std::io::ErrorKind::NotFound => format!("{NO_SHELL} ({shell}: {e})"),
+            _ => format!("failed to execute password command: {}", e),
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -145,6 +157,24 @@ mod portal_tests {
         )
         .unwrap();
         assert_eq!(result, "token\n");
+    }
+
+    /// Without a shell, as in td's mail jail, the failure says so rather
+    /// than reading as a missing password file; a shell that cannot find
+    /// the command is the command's failure.
+    #[test]
+    fn a_missing_shell_is_named_as_the_shell() {
+        let root = td_fs::TempDir::new("mail-no-shell").unwrap();
+        let absent = root.path().join("sh");
+        let err =
+            super::run_password_command_with(&absent.to_string_lossy(), "cat /x").unwrap_err();
+        assert!(err.starts_with(super::NO_SHELL), "{err}");
+        assert!(err.contains(&*absent.to_string_lossy()), "{err}");
+        assert!(err.contains("os error 2"), "{err}");
+
+        let err = super::run_password_command("/nonexistent/td-mail-password").unwrap_err();
+        assert!(!err.contains(super::NO_SHELL), "{err}");
+        assert!(err.starts_with("password command exited with"), "{err}");
     }
 
     fn helper(dir: &std::path::Path, body: &str) -> String {

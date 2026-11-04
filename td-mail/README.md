@@ -348,13 +348,12 @@ approval, then boot the new deployment; an explicitly enrolled administrator
 can use the [trusted-main update interface](../td-update/ADMIN.md).
 Updating the system preserves application data and configuration.
 
-The packaged app has its own protected home. Copying a host config into the
-human user's `~/.config/td-mail` does not configure that app, and a password
-command naming `/home/USER/...` does not grant access to that file. Use the
-app's server/address setup form and its credential portal. The provisioned
-account is named `main`; its portal credential is `mail/main`. The credential
-write and release require the physical authorization described below; SSH
-access to the human account does not confer it.
+The packaged app reads the human user's `~/.config/td-mail`, mounted into its
+jail, and keeps its cache, data and state under `~/.td/app/mail`. It carries
+no shell, so no `password_command` can run there: use `secret = "td-pass"`,
+as the provisioned account `main` does, and the app's server/address setup
+form. Approving the account in td-pass requires the physical authorization
+described below; SSH access to the human account does not confer it.
 
 For a direct connection to td-mta, set the account's HTTPS discovery URL and
 username in the app, for example `https://mx.timmydouglas.com/.well-known/jmap`
@@ -474,6 +473,10 @@ loopback. The host launcher installed by `./install-apps` permits local
 mail-server requests while keeping public-content fetches off loopback.
 
 Each account sets exactly one of `secret = "td-pass"`, `secret = "portal"`, or `password_command`.
+
+`password_command` runs through `sh -c`, so it works only where td-mail has
+a shell: td's `mail` application carries none, and there the window says so
+and points at td-pass rather than at the server or address.
 
 On td, use `secret = "td-pass"`. Try connecting the account, then open
 td-pass with Ctrl+Alt+Esc followed by N. Unlock it, select a saved entry

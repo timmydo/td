@@ -10200,12 +10200,15 @@ unenrolled boot's refusal above is unchanged, but never contacts the
 server. Its window says so, and `s` opens a two-field form (server host
 or `https://` discovery URL, then address); the same form is offered
 when a connection fails for a reason other than the portal, so a typing
-mistake is corrected the same way. td-mail replaces exactly those two
-lines of that `[account.NAME]` section, and only while the file still
-holds the server and address td-mail is running with; it parses the
-new text whole before writing it to a sibling and renaming it into
-place. A legacy `[jmap]` section, a duplicated key, an inline table and
-an offline session are refused, and the window says why. The password
+mistake is corrected the same way. td-mail replaces exactly the server
+and address lines of that `[account.NAME]` section, and only while the
+file still holds the server and address td-mail is running with; it
+parses the new text whole before writing it to a sibling and renaming
+it into place. A legacy `[jmap]` section, a duplicated key, an inline
+table and an offline session are refused, and the window says why. A
+`password_command` that cannot run because the jail has no shell is not
+a reason for the form: the server was never asked, so the window offers
+none and says to replace that line with `secret = "td-pass"` by hand. The password
 is never typed into td-mail. When the portal refuses the credential,
 the window shows the td-pass unlock and binding steps for notebook accounts,
 or the legacy store enrollment and write steps for portal accounts, with the

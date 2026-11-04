@@ -92,6 +92,8 @@ enum Screen {
     Placeholder,
     /// The portal did not hand over the account's password.
     Credential,
+    /// The account's password_command could not run: there is no shell.
+    Shell,
     /// A connection was tried and failed for another reason.
     Unreachable,
 }
@@ -162,6 +164,34 @@ fn credential_text(name: &str, error: &str) -> String {
          4. Then {AGAIN} here to connect again.\n\n\
          What td-mail was told: {error}",
         store_steps(name),
+    )
+}
+
+/// What the window says when the account's password_command could not run
+/// for want of a shell: td's mail jail has none, so the command cannot be
+/// fixed in place, and td-pass is the source that works there. The server
+/// was never asked, so the form is not offered.
+fn shell_text(account: &str, error: &str) -> String {
+    // A legacy [jmap] section is the account named "default".
+    let section = if account == "default" {
+        "[account.default], or [jmap] in an older configuration".to_string()
+    } else {
+        format!("[account.{account}]")
+    };
+    format!(
+        "td-mail could not get the password for the account \"{account}\": it runs \
+         password_command with sh, and sh could not be started here. td's mail \
+         application carries no shell, so on td no password_command can work, \
+         whatever the command is.\n\n\
+         Keep the password in td-pass instead:\n\n\
+         1. In ~/.config/td-mail/config.toml, under {section}, replace the \
+         password_command line with secret = \"td-pass\".\n\
+         2. Close this window and type mail in a terminal to start it again: R \
+         reconnects with the configuration td-mail started with.\n\
+         3. Open td-pass with Ctrl+Alt+Esc then N and unlock it. Select an entry \
+         holding this account's password/token, choose Mail, and approve this exact \
+         account, server URL and username. Then press R in the new mail window.\n\n\
+         What td-mail was told: {error}"
     )
 }
 
@@ -298,6 +328,9 @@ impl MailboxListView {
         {
             return Some(Screen::Credential);
         }
+        if error.contains(crate::NO_SHELL) {
+            return self.setup.online.then_some(Screen::Shell);
+        }
         self.setup.online.then_some(Screen::Unreachable)
     }
 
@@ -334,6 +367,7 @@ impl MailboxListView {
                 let name = self.setup.portal.as_deref()?;
                 Some(credential_text(name, error))
             }
+            Screen::Shell => Some(shell_text(&self.current_account, error)),
             Screen::Unreachable => {
                 Some(unreachable_text(&self.current_account, &self.setup, error))
             }
@@ -1522,6 +1556,57 @@ mod tests {
         });
         view.on_response(&failed(&refused));
         assert!(!body_text(&view).contains("td-secret set"));
+    }
+
+    /// A password_command with no shell to run it says td-pass is the way
+    /// on td, not that the server or address may be wrong, and offers no
+    /// form: the server was never asked.
+    #[test]
+    fn a_password_command_without_a_shell_says_to_use_td_pass() {
+        let missing = format!(
+            "{} (sh: No such file or directory (os error 2))",
+            crate::NO_SHELL
+        );
+        let (view, _cmd_rx) = make_view();
+        let mut view = view.with_setup(AccountSetup {
+            portal: None,
+            ..setup(false)
+        });
+        view.on_response(&failed(&missing));
+        let text = body_text(&view);
+        assert!(text.contains("sh could not be started here"), "{text}");
+        assert!(text.contains("under [account.personal], replace"), "{text}");
+        assert!(text.contains("secret = \"td-pass\""), "{text}");
+        assert!(text.contains("type mail in a terminal"), "{text}");
+        assert!(text.contains("Ctrl+Alt+Esc then N"), "{text}");
+        assert!(text.contains(&missing), "{text}");
+        assert!(!text.contains("press s"), "{text}");
+        assert!(view.scene().status.contains("R:reconnect"));
+        assert_eq!(view.scene().labels, LABELS);
+        view.handle_key(Key::Char('s'), 10);
+        assert!(view.scene().entry.is_none());
+
+        // A legacy [jmap] section is named as such.
+        assert!(shell_text("default", &missing).contains("or [jmap] in an older configuration"));
+
+        // Started --offline, nothing was asked: the bare error stands.
+        let (view, _cmd_rx) = make_view();
+        let mut view = view.with_setup(AccountSetup {
+            portal: None,
+            online: false,
+            ..setup(false)
+        });
+        view.on_response(&failed(&missing));
+        assert!(!body_text(&view).contains("td-pass"));
+
+        // Any other command failure is still the server's screen.
+        let (view, _cmd_rx) = make_view();
+        let mut view = view.with_setup(AccountSetup {
+            portal: None,
+            ..setup(false)
+        });
+        view.on_response(&failed("password command exited with exit status: 1: "));
+        assert!(body_text(&view).contains("press s to change them"));
     }
 
     /// A form that could not write says why instead of offering itself:
