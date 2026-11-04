@@ -20,6 +20,7 @@ use td_json::Json;
 
 use crate::book::{closing_from, Book, Row};
 use crate::card::Record;
+use crate::chooser::{Folders, FoldersAnswer};
 use crate::config::{Client, Mode, Template};
 use crate::cost::Limits;
 use crate::key::Secret;
@@ -83,6 +84,27 @@ fn path_json(path: &std::path::Path) -> Json {
 
 fn path_from(value: &Json) -> Result<PathBuf, String> {
     Ok(PathBuf::from(OsString::from_vec(bytes_from(value)?)))
+}
+
+fn paths_json(paths: &[PathBuf]) -> Json {
+    Json::Arr(paths.iter().map(|path| path_json(path)).collect())
+}
+
+fn folders_json(folders: &Folders) -> Json {
+    Json::Obj(vec![
+        field("folder", path_json(&folders.folder)),
+        field("entries", rows_json(&folders.entries)),
+        field("truncated", Json::Bool(folders.truncated)),
+    ])
+}
+
+/// As it was said: `chooser::Folders::listing` holds it to what can be shown.
+fn folders_from(value: &Json) -> Result<Folders, String> {
+    Ok(Folders {
+        folder: member(value, "folder", path_from)?,
+        entries: member(value, "entries", rows_from)?,
+        truncated: flag(value, "truncated")?,
+    })
 }
 
 /// A result, whichever it is, as one member of two.
@@ -967,6 +989,14 @@ pub fn encode_view(view: &View) -> Vec<u8> {
             ("open_new_template", vec![field("remote", optional(remote))])
         }
         View::FocusComposer => ("focus_composer", Vec::new()),
+        View::Folders(answer) => (
+            "folders",
+            vec![
+                field("asked", paths_json(&answer.asked)),
+                field("from", optional(&answer.from)),
+                field("read", result_json(&answer.read, folders_json)),
+            ],
+        ),
     };
     typed(kind, pairs)
 }
@@ -1164,6 +1194,11 @@ pub fn decode_view(bytes: &[u8]) -> Result<View, String> {
         Some("set_default_model") => View::SetDefaultModel(string(value, "model")?),
         Some("open_new_template") => View::OpenNewTemplate(maybe(value, "remote")?),
         Some("focus_composer") => View::FocusComposer,
+        Some("folders") => View::Folders(FoldersAnswer {
+            asked: items(value, "asked", path_from)?,
+            from: maybe(value, "from")?,
+            read: member(value, "read", |read| result_from(read, folders_from))?,
+        }),
         _ => return Err("a view of an unknown type".into()),
     })
 }
@@ -1223,6 +1258,18 @@ pub fn encode_request(request: &Request) -> Vec<u8> {
                 field("args", text(args)),
                 field("typed", text(said)),
                 field("pictures", attached_json(pictures)),
+            ],
+        ),
+        Request::ListFolders {
+            candidates,
+            or_home,
+            from,
+        } => (
+            "list_folders",
+            vec![
+                field("candidates", paths_json(candidates)),
+                field("or_home", Json::Bool(*or_home)),
+                field("from", optional(from)),
             ],
         ),
         Request::Commands => ("commands", Vec::new()),
@@ -1439,6 +1486,11 @@ fn request_from(value: &Json) -> Result<Request, String> {
             args: string(value, "args")?,
             typed: string(value, "typed")?,
             pictures: attached_from(value, "pictures")?,
+        },
+        Some("list_folders") => Request::ListFolders {
+            candidates: items(value, "candidates", path_from)?,
+            or_home: flag(value, "or_home")?,
+            from: maybe(value, "from")?,
         },
         Some("commands") => Request::Commands,
         Some("open_link") => Request::OpenLink(string(value, "url")?),
@@ -2035,6 +2087,32 @@ mod tests {
             View::OpenNewTemplate(None),
             View::OpenNewTemplate(Some("https://github.com/a/b".into())),
             View::FocusComposer,
+            View::Folders(FoldersAnswer {
+                asked: vec![not_utf8("asked"), PathBuf::from("/plain")],
+                from: Some(AWKWARD.into()),
+                read: Ok(Folders {
+                    folder: not_utf8("folder"),
+                    entries: vec![
+                        ("plain".into(), String::new()),
+                        (AWKWARD.into(), "git, link".into()),
+                    ],
+                    truncated: true,
+                }),
+            }),
+            View::Folders(FoldersAnswer {
+                asked: Vec::new(),
+                from: None,
+                read: Ok(Folders {
+                    folder: PathBuf::from("/"),
+                    entries: Vec::new(),
+                    truncated: false,
+                }),
+            }),
+            View::Folders(FoldersAnswer {
+                asked: vec![PathBuf::from("/a//b")],
+                from: None,
+                read: Err(AWKWARD.into()),
+            }),
         ];
         for update in updates() {
             all.push(View::Update(None, update.clone(), u64::MAX, pictures()));
@@ -2074,6 +2152,22 @@ mod tests {
             Request::Open(id(1)),
             Request::New,
             Request::NewScratch(true),
+            Request::ListFolders {
+                candidates: vec![not_utf8("folder"), PathBuf::from("/a//b")],
+                or_home: true,
+                from: Some(AWKWARD.into()),
+            },
+            Request::ListFolders {
+                candidates: Vec::new(),
+                or_home: false,
+                from: None,
+            },
+            // A relative one crosses, for the broker to refuse by name.
+            Request::ListFolders {
+                candidates: vec![PathBuf::from("relative")],
+                or_home: false,
+                from: None,
+            },
             Request::NewIn(not_utf8("folder"), true),
             Request::NewIn(PathBuf::from("/plain"), false),
             Request::NewFrom("td".into()),
@@ -2272,6 +2366,7 @@ mod tests {
             View::SetDefaultModel(..) => "SetDefaultModel",
             View::OpenNewTemplate(..) => "OpenNewTemplate",
             View::FocusComposer => "FocusComposer",
+            View::Folders(..) => "Folders",
         }
     }
 
@@ -2294,6 +2389,7 @@ mod tests {
             Request::Review(..) => "Review",
             Request::Schedule(..) => "Schedule",
             Request::Command { .. } => "Command",
+            Request::ListFolders { .. } => "ListFolders",
             Request::Commands => "Commands",
             Request::OpenLink(..) => "OpenLink",
             Request::Skills => "Skills",
@@ -2677,6 +2773,12 @@ mod tests {
             format!(r#"{{"type":"resume","conversation":"{first}","turn":1,"choice":"never"}}"#),
             r#"{"type":"new_in","path":"not base64!","unconfined":true}"#.to_string(),
             r#"{"type":"new_in","path":7,"unconfined":true}"#.to_string(),
+            r#"{"type":"list_folders","candidates":["not base64!"],"or_home":true,"from":null}"#
+                .to_string(),
+            r#"{"type":"list_folders","candidates":[7],"or_home":true,"from":null}"#.to_string(),
+            r#"{"type":"list_folders","candidates":"Lw==","or_home":true,"from":null}"#.to_string(),
+            r#"{"type":"list_folders","candidates":[],"or_home":"yes","from":null}"#.to_string(),
+            r#"{"type":"list_folders","candidates":[],"or_home":true,"from":7}"#.to_string(),
             format!(
                 r#"{{"type":"decide","conversation":"{first}","call":1,"answer":{{"answer":"always","allow":true,"everywhere":false,"bodies":["shell a\nallow shell b"]}}}}"#
             ),
@@ -2700,6 +2802,16 @@ mod tests {
             r#"{"type":"update","update":{"type":"failed","reason":"r"},"now":1,"pictures":[{"digest":"d","read":{"ok":"!"}}]}"#.to_string(),
             r#"{"type":"update","update":{"type":"failed","reason":"r"},"now":1,"pictures":[{"digest":"d","read":{"err":"a"}},{"digest":"d","read":{"err":"b"}}]}"#.to_string(),
             format!(r#"{{"type":"give_back","text":"t","why":"w","pictures":[{{"reference":{},"bytes":"AA"}}]}}"#, reference(1).to_json()),
+            r#"{"type":"folders","asked":["!"],"from":null,"read":{"err":"why"}}"#.to_string(),
+            r#"{"type":"folders","asked":[],"from":7,"read":{"err":"why"}}"#.to_string(),
+            r#"{"type":"folders","asked":[],"from":null,"read":{}}"#.to_string(),
+            r#"{"type":"folders","asked":[],"from":null,"read":{"err":7}}"#.to_string(),
+            r#"{"type":"folders","asked":[],"from":null,"read":{"err":"why","ok":{"folder":"Lw==","entries":[],"truncated":false}}}"#.to_string(),
+            r#"{"type":"folders","asked":[],"from":null,"read":{"ok":{"entries":[],"truncated":false}}}"#.to_string(),
+            r#"{"type":"folders","asked":[],"from":null,"read":{"ok":{"folder":"!","entries":[],"truncated":false}}}"#.to_string(),
+            r#"{"type":"folders","asked":[],"from":null,"read":{"ok":{"folder":"Lw==","entries":[["only one"]],"truncated":false}}}"#.to_string(),
+            r#"{"type":"folders","asked":[],"from":null,"read":{"ok":{"folder":"Lw==","entries":[["a",7]],"truncated":false}}}"#.to_string(),
+            r#"{"type":"folders","asked":[],"from":null,"read":{"ok":{"folder":"Lw==","entries":[],"truncated":"no"}}}"#.to_string(),
         ] {
             assert!(decode_view(frame.as_bytes()).is_err(), "{frame}");
         }

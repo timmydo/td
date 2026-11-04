@@ -369,6 +369,8 @@ pub struct Session {
     held: Vec<String>,
     /// The conversation open after the last request for a new one was served.
     made: Option<Id>,
+    /// What reads folders for the chooser.
+    folders: crate::chooser::FolderReader,
 }
 
 /// A deletion of a repository workspace's conversation under way
@@ -434,6 +436,16 @@ impl Session {
                     match expanded {
                         Ok(text) => self.send_message(text.unwrap_or(typed), pictures),
                         Err(why) => self.view.give_back(&typed, pictures, why),
+                    }
+                }
+                Request::ListFolders {
+                    candidates,
+                    or_home,
+                    from,
+                } => {
+                    let home = std::env::var_os("HOME").map(PathBuf::from);
+                    if let Some(refused) = self.folders.ask(candidates, or_home, from, home) {
+                        self.view.folders(refused);
                     }
                 }
                 Request::Commands => match self.commands.as_deref().map(crate::commands::list) {
@@ -2677,6 +2689,9 @@ impl Session {
             self.stored();
             self.refresh();
             self.fire();
+            if let Some(answer) = self.folders.answered() {
+                self.view.folders(answer);
+            }
             let views = self.view.take();
             if let Some(attached) = &window {
                 let mut unsent = Vec::new();
@@ -3126,6 +3141,7 @@ pub fn run(
         troubles: std::collections::BTreeMap::new(),
         mode: config.mode,
         made: None,
+        folders: crate::chooser::FolderReader::default(),
         held: Vec::new(),
     };
     session.read_tasks(ids.into_iter().map(|(_, id)| id).collect());

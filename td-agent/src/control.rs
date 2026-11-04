@@ -340,7 +340,14 @@ impl Controller for Remote<'_> {
         // The chooser's folder: a path of the human's, as the deletion
         // question would name it once chosen.
         let chooser = app.chooser().map_or_else(
-            || "none".to_string(),
+            || {
+                if app.chooser_coming() {
+                    "coming"
+                } else {
+                    "none"
+                }
+                .to_string()
+            },
             |chooser| chooser.folder().display().to_string(),
         );
         Ok(format!(

@@ -772,9 +772,17 @@ the person. On the answer `App` takes that book as its own. A row that closed
 before the broker heard is not opened: the answer says what is open instead.
 
 A picture travels with the message that shows it, read by `Session` and
-decoded by `App`. The person's folders in the workspace chooser and the
-pictures they paste are read by the window, on its own machine, as is a
-link they click opened; a window that is not on the broker's machine does not
+decoded by `App`. The person's folders in the workspace chooser are the
+broker's too, as the workspaces they are for are made on its machine: `App` asks
+with `Request::ListFolders` and is answered with `View::Folders`, for a window on
+this machine as for one far away, and never reads a folder of its own. The
+answer says back what was asked and is plain data, which `App` holds to the
+finder's bounds as untrusted; it is for the window that asked, kept for no other.
+The broker reads them on a thread, one read at a time: a folder that hangs, as over
+a dead mount, holds up that thread alone, and anything else asked meanwhile is
+told it is still being read.
+The pictures the person pastes are read by the window, on its own machine, as is
+a link they click opened; a window that is not on the broker's machine does not
 yet have those, the next increment's work.
 
 **Listening.** The broker listens on three unix sockets at the top of the state
@@ -2986,7 +2994,7 @@ creates nothing.
   git checkouts, for general assistance or scratch work (Empty and
   directory workspaces, below).
 - **Directory…** is always listed: the folder chooser, over a directory
-  of the human's, admitted per §8.
+  of the human's on the broker's machine, admitted per §8.
 - **A configured template** is listed by its `name`. It names the git
   repositories to check out, each a remote, a base, a branch and sparse
   paths; the shared directories its workspaces bind, when it names
@@ -3174,7 +3182,10 @@ The list's groups start the same conversations with no finder
 listed then, the finder's note saying it was refused until increment
 11, and choosing it made nothing;
 increment 11 prepares it (As built (increment 11, preparation)). Choosing Directory… goes straight to the folder chooser: a card
-that waited behind the template chooser waits behind it too.
+that waited behind the template chooser waits behind it too, and while the
+broker has yet to say what to list, the status row saying so. A key meanwhile
+acts on nothing behind it (Return there would send the draft) but Escape, which
+goes on without it and shows the card, as does a press, or another modal opening.
 Without the launch's jail no workspace can be made and there is nothing
 to choose: `C-n` starts a conversation with none at once, the reason on
 standard error, which is how the native compositor tests run.
@@ -3602,7 +3613,14 @@ scratch conversation became Empty, and New conversation in a directory…
 became Directory…, which opens td-ui's finder over the human's folders
 (Return enters one, Backspace goes up, Control+Return chooses the one
 listed; a repository's top is marked `git`, a link `link`, hidden names
-left out). The window admits the directory when it is chosen, before the
+left out). The folders are read by the broker, which starts from the
+folder last chosen from, else its own home, else the root, and each one
+entered or gone up to is asked of it: the chooser shows what it had until
+told, saying what it is reading and taking only Escape and the wheel, so that
+nothing done is done to the folder being left, an answer for a folder since left
+dropped, and a folder that cannot be read is said on its status row, the chooser
+staying. The broker admits the
+directory when it is chosen, before the
 conversation exists, and says a refusal by name (§8, Admission). A
 repository's top, a work tree's or a bare one, and anything inside a git
 directory are refused too; a work tree's subdirectory is admitted, since

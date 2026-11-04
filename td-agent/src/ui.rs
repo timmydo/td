@@ -403,6 +403,15 @@ pub enum Request {
     NewIn(PathBuf, bool),
     /// Start a new conversation from the configured template named.
     NewFrom(String),
+    /// List folders for the directory chooser, as the workspaces they are for
+    /// are the broker's: the first of `candidates` that can be read, each
+    /// absolute, then, when `or_home` says so, the broker's home and the root,
+    /// `from` said back; the session answers through `folders`.
+    ListFolders {
+        candidates: Vec<PathBuf>,
+        or_home: bool,
+        from: Option<String>,
+    },
     /// Keep the template from the template dialog, in place of the one
     /// made in the window named `replacing`; the session answers through
     /// `template_saved` or `template_refused`.
@@ -908,9 +917,13 @@ pub struct App {
     /// The templates made in the window, which Edit template… lists.
     saved_templates: Vec<crate::config::Template>,
     /// The directory chooser while it is open, modal over the window, and
-    /// the folder it opens on.
+    /// the folder it last chose from, as the window's own home says nothing
+    /// of the broker's machine.
     chooser: Option<Chooser>,
-    chooser_start: PathBuf,
+    chooser_start: Option<PathBuf>,
+    /// What was last asked for the chooser and is not yet answered: to open
+    /// it, while it is shut, else to list another folder.
+    folders_asked: Option<Vec<PathBuf>>,
     /// Why no workspace can be made, when none can: said at once, before
     /// a directory is chosen.
     no_workspaces: Option<String>,
@@ -1101,10 +1114,8 @@ impl App {
             templates: Vec::new(),
             saved_templates: Vec::new(),
             chooser: None,
-            chooser_start: std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|home| home.is_absolute())
-                .unwrap_or_else(|| PathBuf::from("/")),
+            chooser_start: None,
+            folders_asked: None,
             no_workspaces: None,
             jailless: None,
             chooser_unconfined: false,
@@ -1366,7 +1377,9 @@ impl App {
             1 => "1 new message: C-S-m".to_string(),
             n => format!("{n} new messages: C-S-m"),
         };
-        let retry = if self.meter.retry {
+        let retry = if self.chooser_coming() {
+            "reading folders: Escape cancels"
+        } else if self.meter.retry {
             "C-r asks again"
         } else if self.running() {
             "Escape stops"
@@ -1618,7 +1631,7 @@ impl App {
 
     /// The folder the directory chooser opens on.
     pub fn set_chooser_start(&mut self, folder: PathBuf) {
-        self.chooser_start = folder;
+        self.chooser_start = Some(folder);
     }
 
     /// The sub-agents conversations' logs were read to have: each one the
@@ -2065,7 +2078,7 @@ impl App {
     /// in a window too small, say, waits, and that is said once; the
     /// human can still interrupt the turn, which withdraws it.
     fn offer(&mut self) {
-        if self.modal() || !self.focused || self.menu.is_open() {
+        if self.modal() || self.chooser_coming() || !self.focused || self.menu.is_open() {
             return;
         }
         if let Some((template, remotes)) = self.admission.take() {
@@ -4453,6 +4466,35 @@ impl App {
     }
 
     fn handle(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
+        // Something modal came first: the keys are its, and the person has gone on.
+        if self.chooser_coming() && self.modal() {
+            self.folders_asked = None;
+        }
+        if self.chooser_coming() {
+            match input {
+                // The press that asked for it, held.
+                Input::Key { repeat: true, .. } => return,
+                // Backing out, which is nothing else's: not a turn's interrupt.
+                Input::Key {
+                    chord: "Escape", ..
+                } => {
+                    self.folders_asked = None;
+                    self.touch();
+                    return;
+                }
+                // Meant for the chooser, not for what is behind it: a Return
+                // here would send the draft, and letters go to the composer.
+                // The status row says what is going on.
+                Input::Key { .. } => return,
+                // Aimed at something in sight, so the person has gone on.
+                Input::Context { .. }
+                | Input::Pointer {
+                    phase: PointerPhase::Press,
+                    ..
+                } => self.folders_asked = None,
+                _ => {}
+            }
+        }
         // Focus follows the pointer in, so its gain is no reason to.
         if !matches!(input, Input::Hover(_) | Input::Resize(_) | Input::Focus(_)) {
             self.put_tip_away();
@@ -5711,9 +5753,9 @@ impl App {
         }
     }
 
-    /// Opens the directory chooser, as the template chooser's Directory…
-    /// does: modal over the window's body, on the folder it last chose
-    /// from, else the home directory.
+    /// Asks for the directory chooser, as the template chooser's Directory…
+    /// does: modal over the window's body once the broker answers, on the
+    /// folder it last chose from, else the broker's home directory.
     fn open_chooser(&mut self) {
         self.open_chooser_for(false);
     }
@@ -5730,37 +5772,69 @@ impl App {
         self.chooser_unconfined = unconfined;
         self.cancel_pointer();
         self.menu.dismiss();
-        // Where it last chose from, else the home directory, else the
-        // root: a folder gone since is not a dead end.
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|home| home.is_absolute());
-        let mut opened = Err("nowhere to start".to_string());
-        for start in [
-            Some(self.chooser_start.clone()),
-            home,
-            Some(PathBuf::from("/")),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            opened = Chooser::open(self.surface, body(self.surface), &start);
-            if opened.is_ok() {
-                break;
-            }
+        let start = self.chooser_start.iter().cloned().collect();
+        self.ask_folders(start, true, None);
+    }
+
+    /// Asks the broker to list folders for the chooser; what is asked already,
+    /// by a held key say, is not asked again.
+    fn ask_folders(&mut self, candidates: Vec<PathBuf>, or_home: bool, from: Option<String>) {
+        if self.folders_asked.as_ref() == Some(&candidates) {
+            return;
         }
+        self.folders_asked = Some(candidates.clone());
+        self.touch();
+        self.requests.push(Request::ListFolders {
+            candidates,
+            or_home,
+            from,
+        });
+    }
+
+    /// Whether the chooser has been asked for and the broker is yet to say:
+    /// a card waits behind this as it would behind the chooser, rather than
+    /// open first and leave Directory… undone.
+    pub(crate) fn chooser_coming(&self) -> bool {
+        self.chooser.is_none() && self.folders_asked.is_some()
+    }
+
+    /// What the broker says of the folders last asked for, it may be from a
+    /// far machine: the chooser opens on them, or goes to them, or says why
+    /// not. An answer to anything else, a folder since left or a chooser the
+    /// person has gone on from, is dropped, as it is over another modal.
+    pub fn folders(&mut self, answer: crate::chooser::FoldersAnswer) {
+        if self.folders_asked.as_ref() != Some(&answer.asked) {
+            return;
+        }
+        self.folders_asked = None;
+        let crate::chooser::FoldersAnswer { from, read, .. } = answer;
+        if let Some(chooser) = self.chooser.as_mut() {
+            chooser.answered(read, from.as_deref());
+            return self.touch();
+        }
+        if self.modal() {
+            return;
+        }
+        let opened = read.and_then(|folders| {
+            Chooser::open(self.surface, body(self.surface), &folders, from.as_deref())
+        });
         match opened {
             Ok(chooser) => {
                 self.chooser = Some(chooser);
                 self.apply_focus();
                 self.touch();
             }
-            Err(e) => self.note(format!("the directory chooser: {e}")),
+            Err(e) => {
+                let e = crate::tools::visible(&e);
+                self.note(format!("the directory chooser: {e}"));
+                self.offer();
+            }
         }
     }
 
     fn close_chooser(&mut self) {
         self.chooser = None;
+        self.folders_asked = None;
         self.apply_focus();
         self.touch();
         self.offer();
@@ -5780,6 +5854,25 @@ impl App {
             }
             _ => {}
         }
+        // What it shows is about to be replaced, and a key means what is coming:
+        // Control+Return here would choose the folder being left.
+        if self.folders_asked.is_some()
+            && !matches!(
+                input,
+                Input::Key {
+                    chord: "Escape",
+                    ..
+                } | Input::Wheel { .. }
+                    | Input::Hover(_)
+                    | Input::CancelPointer
+                    | Input::Pointer {
+                        phase: PointerPhase::Move | PointerPhase::Release,
+                        ..
+                    }
+            )
+        {
+            return;
+        }
         let Some(chooser) = self.chooser.as_mut() else {
             return;
         };
@@ -5790,13 +5883,16 @@ impl App {
                 }
             }
             crate::chooser::Reply::Closed => self.close_chooser(),
+            crate::chooser::Reply::List { folder, from } => {
+                chooser.reading(&folder);
+                self.ask_folders(vec![folder], false, from);
+            }
             crate::chooser::Reply::Chosen(folder) => {
-                if let Some(parent) = folder.parent() {
-                    self.chooser_start = parent.to_path_buf();
-                }
+                self.chooser_start = folder.parent().map(std::path::Path::to_path_buf);
                 if std::mem::take(&mut self.chooser_unconfined) {
                     // Straight on to its card, before a waiting one.
                     self.chooser = None;
+                    self.folders_asked = None;
                     self.apply_focus();
                     self.touch();
                     self.ask_unconfine(Some(folder));
@@ -5900,18 +5996,14 @@ impl App {
                     }
                     Picking::Template if name == crate::config::DIRECTORY_UNCONFINED => {
                         self.open_chooser_for(true);
-                        if self.chooser.is_none() {
-                            self.offer();
-                        }
+                        self.offer();
                     }
                     // Straight on to the folder chooser: a card that waited
-                    // behind the picker waits behind the chooser too, rather
-                    // than open first and leave Directory… undone.
+                    // behind the picker waits behind the chooser too, and
+                    // while it is coming, unless it was not asked for.
                     Picking::Template if name == crate::config::DIRECTORY => {
                         self.open_chooser();
-                        if self.chooser.is_none() {
-                            self.offer();
-                        }
+                        self.offer();
                     }
                     // Straight on to the template dialog, as Directory… goes
                     // to the chooser.
@@ -6215,6 +6307,7 @@ impl App {
                 self.notes = None;
                 self.card_trust = None;
                 self.chooser = None;
+                self.folders_asked = None;
                 self.confirm = None;
                 self.dialog = Some(dialog);
                 self.apply_focus();
@@ -7078,6 +7171,8 @@ fn body(surface: Surface) -> Rect {
 pub mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
+    use crate::view::View;
+    use std::path::Path;
     use td_ui::raster::Scale;
     use td_ui::window::NoClipboard;
 
@@ -7110,6 +7205,28 @@ pub mod tests {
 
     fn key(app: &mut App, chord: &str) {
         app.key(chord, false, &mut NoClipboard);
+    }
+
+    /// The broker's part: what the app has asked of folders, read and told
+    /// to it as the session would. What else it asked stays asked.
+    fn answer_folders(app: &mut App) {
+        for request in app.take_requests() {
+            match request {
+                Request::ListFolders {
+                    candidates,
+                    or_home,
+                    from,
+                } => {
+                    let home = std::env::var_os("HOME").map(PathBuf::from);
+                    app.apply(View::Folders(crate::chooser::FoldersAnswer {
+                        read: crate::chooser::first_readable(&candidates, or_home, home),
+                        asked: candidates,
+                        from,
+                    }));
+                }
+                other => app.requests.push(other),
+            }
+        }
     }
 
     fn text(app: &App) -> String {
@@ -9972,6 +10089,7 @@ pub mod tests {
         press(&mut app, Group::Empty);
         assert_eq!(app.take_requests(), [Request::NewScratch(false)]);
         press(&mut app, Group::Directory);
+        answer_folders(&mut app);
         assert!(app.chooser().is_some());
         key(&mut app, "Escape");
         // One no longer configured starts none, and says why.
@@ -12022,6 +12140,7 @@ pub mod tests {
                 key(app, "Down");
             }
             key(app, "Return");
+            answer_folders(app);
         };
         let answer = |app: &mut App, focus: &str| {
             for _ in 0..8 {
@@ -12135,6 +12254,486 @@ pub mod tests {
         assert!(text(&app).contains(UNCONFINED_MARK), "{}", text(&app));
     }
 
+    /// Directory…, all the way: `C-n`, its row, and what was asked.
+    fn ask_for_the_chooser(app: &mut App) -> Vec<PathBuf> {
+        key(app, "C-n");
+        key(app, "Down");
+        key(app, "Return");
+        assert!(app.picker().is_none());
+        let asked = app.take_requests();
+        let [Request::ListFolders {
+            candidates,
+            or_home: true,
+            from: None,
+        }] = asked.as_slice()
+        else {
+            panic!("it did not ask");
+        };
+        candidates.clone()
+    }
+
+    fn told(asked: &[PathBuf], folder: &str, names: &[&str]) -> View {
+        told_from(asked, folder, names, None)
+    }
+
+    fn told_from(asked: &[PathBuf], folder: &str, names: &[&str], from: Option<&str>) -> View {
+        View::Folders(crate::chooser::FoldersAnswer {
+            asked: asked.to_vec(),
+            from: from.map(str::to_string),
+            read: Ok(crate::chooser::Folders {
+                folder: folder.into(),
+                entries: names
+                    .iter()
+                    .map(|name| (name.to_string(), String::new()))
+                    .collect(),
+                truncated: false,
+            }),
+        })
+    }
+
+    fn refused(asked: &[PathBuf], why: &str) -> View {
+        View::Folders(crate::chooser::FoldersAnswer {
+            asked: asked.to_vec(),
+            from: None,
+            read: Err(why.into()),
+        })
+    }
+
+    fn listed(app: &App) -> Vec<String> {
+        app.chooser()
+            .unwrap()
+            .listing()
+            .entries()
+            .iter()
+            .map(|entry| entry.name().to_string())
+            .collect()
+    }
+
+    /// The window reads no folder of its own, for the chooser or to start it:
+    /// it opens on what the broker says, of folders no disk here has, and
+    /// everything from there on is asked.
+    #[test]
+    fn the_chooser_shows_only_what_the_broker_says() {
+        let mut app = app();
+        // No home of the window's is asked for: the broker's own is its to find.
+        assert_eq!(ask_for_the_chooser(&mut app), Vec::<PathBuf>::new());
+        assert!(app.chooser().is_none(), "nothing has been told");
+        for _ in 0..3 {
+            app.input(Input::Hover(None), &mut NoClipboard);
+        }
+        assert!(app.chooser().is_none());
+        app.apply(told(&[], "/far/away", &["one", "two"]));
+        assert_eq!(app.chooser().unwrap().folder(), Path::new("/far/away"));
+        assert_eq!(listed(&app), ["one", "two"]);
+
+        // In: it is asked for, and until told the chooser shows what it had,
+        // however often the key comes.
+        let inside = [PathBuf::from("/far/away/one")];
+        for _ in 0..3 {
+            key(&mut app, "Return");
+        }
+        assert_eq!(
+            app.take_requests(),
+            [Request::ListFolders {
+                candidates: inside.to_vec(),
+                or_home: false,
+                from: None,
+            }]
+        );
+        assert_eq!(app.chooser().unwrap().folder(), Path::new("/far/away"));
+        // It cannot be read: said, and the chooser stays.
+        app.apply(refused(&inside, "/far/away/one: no such folder"));
+        assert_eq!(app.chooser().unwrap().folder(), Path::new("/far/away"));
+        assert_eq!(listed(&app), ["one", "two"]);
+        assert!(
+            text(&app).contains("/far/away/one: no such folder"),
+            "{}",
+            text(&app)
+        );
+        // Now it can; and up again, with where it came from selected.
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests().len(), 1);
+        app.apply(told(&inside, "/far/away/one", &["in"]));
+        assert_eq!(app.chooser().unwrap().folder(), Path::new("/far/away/one"));
+        key(&mut app, "Backspace");
+        let parent = [PathBuf::from("/far/away")];
+        assert_eq!(
+            app.take_requests(),
+            [Request::ListFolders {
+                candidates: parent.to_vec(),
+                or_home: false,
+                from: Some("one".into()),
+            }]
+        );
+        // What was asked before that is no answer to it.
+        app.apply(told(&inside, "/far/away/one", &["other"]));
+        assert_eq!(listed(&app), ["in"]);
+        app.apply(refused(&inside, "too late"));
+        assert!(!text(&app).contains("too late"), "{}", text(&app));
+        app.apply(told_from(
+            &parent,
+            "/far/away",
+            &["one", "two"],
+            Some("two"),
+        ));
+        assert_eq!(app.chooser().unwrap().folder(), Path::new("/far/away"));
+        // Heard once: the same again answers nothing.
+        app.apply(told(&parent, "/far/away", &["three"]));
+        assert_eq!(listed(&app), ["one", "two"]);
+        // It chooses there, and opens next by asking for where it chose from.
+        key(&mut app, "C-Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::NewIn("/far/away".into(), false)]
+        );
+        assert_eq!(ask_for_the_chooser(&mut app), [PathBuf::from("/far")]);
+    }
+
+    #[test]
+    fn keys_while_the_chooser_comes_do_nothing_behind_it() {
+        let typed = |app: &mut App, chord| {
+            app.input(
+                Input::Key {
+                    chord,
+                    repeat: false,
+                },
+                &mut NoClipboard,
+            );
+        };
+        let mut app = app();
+        app.settle = Duration::ZERO;
+        for letter in ["h", "i"] {
+            typed(&mut app, letter);
+        }
+        app.take_requests();
+        let asked = ask_for_the_chooser(&mut app);
+        for chord in ["n", "Return", "C-Return", "Backspace"] {
+            typed(&mut app, chord);
+        }
+        assert_eq!(app.take_requests(), []);
+        assert_eq!(app.composer.text(), "hi");
+        app.apply(told(&asked, "/there", &["a"]));
+        assert_eq!(app.chooser().unwrap().folder(), Path::new("/there"));
+
+        // Backing out does nothing but that: a turn being run goes on.
+        let mut app = self::app();
+        app.settle = Duration::ZERO;
+        turn(&mut app, 1, "hello");
+        let asked = ask_for_the_chooser(&mut app);
+        typed(&mut app, "Escape");
+        assert_eq!(app.take_requests(), []);
+        app.apply(told(&asked, "/there", &["a"]));
+        assert!(app.chooser().is_none());
+    }
+
+    #[test]
+    fn a_chooser_waiting_for_a_folder_chooses_nothing_of_the_one_it_is_leaving() {
+        let typed = |app: &mut App, chord| {
+            app.input(
+                Input::Key {
+                    chord,
+                    repeat: false,
+                },
+                &mut NoClipboard,
+            );
+        };
+        let mut app = app();
+        app.settle = Duration::ZERO;
+        let asked = ask_for_the_chooser(&mut app);
+        app.apply(told(&asked, "/there", &["a"]));
+        app.take_requests();
+        typed(&mut app, "Return");
+        let requests = app.take_requests();
+        let [Request::ListFolders { candidates, .. }] = requests.as_slice() else {
+            panic!("asked for no folder: {requests:?}");
+        };
+        let candidates = candidates.clone();
+        assert_eq!(candidates, [PathBuf::from("/there/a")]);
+        typed(&mut app, "C-Return");
+        typed(&mut app, "Backspace");
+        assert_eq!(app.take_requests(), []);
+        assert_eq!(app.chooser().unwrap().folder(), Path::new("/there"));
+        app.apply(told(&candidates, "/there/a", &[]));
+        typed(&mut app, "C-Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::NewIn(PathBuf::from("/there/a"), false)]
+        );
+    }
+
+    /// An answer may be a while, which the person is shown as soon as it is asked.
+    #[test]
+    fn a_folder_asked_for_is_said_at_once() {
+        let mut app = app();
+        app.settle = Duration::ZERO;
+        app.painted();
+        let asked = ask_for_the_chooser(&mut app);
+        assert!(app.dirty());
+        assert!(app
+            .status_line()
+            .contains("reading folders: Escape cancels"));
+        app.apply(told(&asked, "/there", &["a"]));
+        assert!(!app.status_line().contains("reading folders"));
+        app.painted();
+        key(&mut app, "Return");
+        assert!(app.dirty());
+        assert!(text(&app).contains("reading /there/a"));
+    }
+
+    /// A scrollbar let go while a folder was asked for is let go.
+    #[test]
+    fn a_chooser_waiting_for_a_folder_lets_the_pointer_go() {
+        let mut app = app();
+        app.settle = Duration::ZERO;
+        let asked = ask_for_the_chooser(&mut app);
+        let many: Vec<String> = (0..200).map(|n| format!("folder{n:03}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        app.apply(told(&asked, "/there", &many));
+        let list = app.chooser().unwrap().list_rect();
+        let at = |app: &mut App, phase, y| {
+            app.input(
+                Input::Pointer {
+                    phase,
+                    x: list.x + i64::from(list.width) - 1,
+                    y,
+                    extend: false,
+                    follow: false,
+                },
+                &mut NoClipboard,
+            );
+        };
+        at(&mut app, PointerPhase::Press, list.y);
+        let bottom = list.y + i64::from(list.height) - 1;
+        at(&mut app, PointerPhase::Move, bottom);
+        assert!(app.chooser().unwrap().first() > 0, "the bar is held");
+        at(&mut app, PointerPhase::Move, list.y);
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests().len(), 1);
+        at(&mut app, PointerPhase::Release, list.y);
+        let first = app.chooser().unwrap().first();
+        at(
+            &mut app,
+            PointerPhase::Move,
+            list.y + i64::from(list.height) - 1,
+        );
+        assert_eq!(app.chooser().unwrap().first(), first, "not held");
+    }
+
+    /// An answer that comes after the person has gone on is dropped, and what
+    /// waited behind the chooser no longer waits.
+    #[test]
+    fn folders_told_after_the_person_moved_on_are_dropped() {
+        let press = |app: &mut App, phase| {
+            app.input(
+                Input::Pointer {
+                    phase,
+                    x: 1,
+                    y: 1,
+                    extend: false,
+                    follow: false,
+                },
+                &mut NoClipboard,
+            );
+        };
+        let held = |app: &mut App, chord| {
+            app.input(
+                Input::Key {
+                    chord,
+                    repeat: true,
+                },
+                &mut NoClipboard,
+            );
+        };
+        let typed = |app: &mut App, chord| {
+            app.input(
+                Input::Key {
+                    chord,
+                    repeat: false,
+                },
+                &mut NoClipboard,
+            );
+        };
+        let there = |app: &mut App, asked: &[PathBuf]| app.apply(told(asked, "/there", &["a"]));
+
+        // Backing out.
+        let mut app = app();
+        app.settle = Duration::ZERO;
+        let asked = ask_for_the_chooser(&mut app);
+        typed(&mut app, "Escape");
+        there(&mut app, &asked);
+        assert!(app.chooser().is_none());
+        assert!(!app.modal());
+
+        // A press; a release is of the one that asked, and is no move at all.
+        let asked = ask_for_the_chooser(&mut app);
+        press(&mut app, PointerPhase::Release);
+        there(&mut app, &asked);
+        assert!(app.chooser().is_some());
+        key(&mut app, "Escape");
+        assert!(app.chooser().is_none());
+        let asked = ask_for_the_chooser(&mut app);
+        press(&mut app, PointerPhase::Press);
+        press(&mut app, PointerPhase::Release);
+        there(&mut app, &asked);
+        assert!(app.chooser().is_none());
+
+        // A held key is the one that asked: it moves nothing, not the composer.
+        let asked = ask_for_the_chooser(&mut app);
+        let composed = app.composed().to_string();
+        held(&mut app, "Return");
+        assert_eq!(app.composed(), composed);
+        there(&mut app, &asked);
+        assert!(app.chooser().is_some());
+        key(&mut app, "Escape");
+
+        // Another modal opened meanwhile, and shut again.
+        let asked = ask_for_the_chooser(&mut app);
+        app.open_messages();
+        there(&mut app, &asked);
+        assert!(app.chooser().is_none(), "over the Messages window");
+        assert!(app.messages_window().is_some());
+        typed(&mut app, "Escape");
+        assert!(app.messages_window().is_none());
+        let asked = ask_for_the_chooser(&mut app);
+        app.open_messages();
+        typed(&mut app, "Escape");
+        assert!(app.messages_window().is_none(), "its keys are its");
+        there(&mut app, &asked);
+        assert!(app.chooser().is_none(), "the person went on");
+
+        // A folder asked for by a chooser since shut opens nothing.
+        let asked = ask_for_the_chooser(&mut app);
+        there(&mut app, &asked);
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests().len(), 1);
+        key(&mut app, "Escape");
+        assert!(app.chooser().is_none());
+        there(&mut app, &[PathBuf::from("/there/a")]);
+        assert!(app.chooser().is_none());
+
+        // The answer to an earlier question, the person having asked again.
+        app.set_chooser_start("/later".into());
+        let asked = ask_for_the_chooser(&mut app);
+        assert_eq!(asked, [PathBuf::from("/later")]);
+        there(&mut app, &[]);
+        assert!(app.chooser().is_none(), "of a question not the last");
+        there(&mut app, &asked);
+        assert!(app.chooser().is_some());
+        key(&mut app, "Escape");
+
+        // Nor one that went for the key dialog, nor for its unconfined card.
+        let inside = [PathBuf::from("/there/a")];
+        let asked = ask_for_the_chooser(&mut app);
+        there(&mut app, &asked);
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests().len(), 1);
+        app.set_key_path(Some("/nowhere/key".into()));
+        app.open_key_dialog();
+        assert!(app.dialog().is_some() && app.chooser().is_none());
+        key(&mut app, "Escape");
+        assert!(app.dialog().is_none());
+        there(&mut app, &inside);
+        assert!(app.chooser().is_none());
+        app.set_chooser_start("/there".into());
+        key(&mut app, "C-n");
+        for _ in 0..3 {
+            key(&mut app, "Down");
+        }
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests().len(), 1);
+        there(&mut app, &[PathBuf::from("/there")]);
+        key(&mut app, "C-Return");
+        assert!(matches!(
+            app.confirm().map(|c| c.purpose()),
+            Some(confirm::Purpose::Unconfine(Some(_)))
+        ));
+        key(&mut app, "Return");
+        assert!(app.confirm().is_none());
+        there(&mut app, &inside);
+        assert!(app.chooser().is_none(), "the card was answered");
+        assert!(app.take_requests().is_empty());
+
+        // A chooser that was not asked for holds no card back.
+        key(&mut app, "C-n");
+        app.ask(Card {
+            conversation: id(1),
+            call: 5,
+            title: "Run a command".into(),
+            details: vec!["make".into()],
+            always: None,
+            resume: false,
+        });
+        assert!(app.confirm().is_none());
+        app.set_no_workspaces(Some("no workspace jail".into()));
+        key(&mut app, "Down");
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        assert!(app.confirm().is_some());
+        app.withdraw(&id(1), None);
+        app.set_no_workspaces(None);
+
+        // A card held for the chooser is shown when the person goes on, and
+        // when it turns out it cannot open.
+        let card = Card {
+            conversation: id(1),
+            call: 4,
+            title: "Run a command".into(),
+            details: vec!["make".into()],
+            always: None,
+            resume: false,
+        };
+        let asked = ask_for_the_chooser(&mut app);
+        app.ask(card.clone());
+        assert!(app.confirm().is_none(), "the chooser is coming");
+        typed(&mut app, "x");
+        assert!(app.confirm().is_none(), "a key does nothing while it comes");
+        typed(&mut app, "Escape");
+        assert!(app.confirm().is_some());
+        there(&mut app, &asked);
+        assert!(app.chooser().is_none());
+        app.withdraw(&id(1), None);
+        assert!(app.confirm().is_none());
+        let asked = ask_for_the_chooser(&mut app);
+        app.ask(card);
+        assert!(app.confirm().is_none());
+        app.apply(refused(&asked, "nowhere to read"));
+        assert!(app.chooser().is_none() && app.confirm().is_some());
+        assert!(app
+            .log
+            .last()
+            .is_some_and(|n| n.contains("nowhere to read")));
+        app.withdraw(&id(1), None);
+    }
+
+    /// What cannot be shown is a note, whatever a far broker says of it.
+    #[test]
+    fn folders_that_cannot_be_shown_are_a_note() {
+        let mut app = app();
+        for (folder, name) in [
+            ("relative", "a"),
+            ("/a", "../up"),
+            ("/a", "in/side"),
+            ("/a", "b\nc"),
+            ("/a\nb", "a"),
+        ] {
+            let asked = ask_for_the_chooser(&mut app);
+            app.apply(told(&asked, folder, &[name]));
+            assert!(app.chooser().is_none(), "{folder:?} {name:?}");
+            assert!(app
+                .log
+                .last()
+                .is_some_and(|n| n.starts_with("the directory chooser: ")));
+        }
+        // And over a folder entered, it stays.
+        let asked = ask_for_the_chooser(&mut app);
+        app.apply(told(&asked, "/good", &["a"]));
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests().len(), 1);
+        app.apply(told(&[PathBuf::from("/good/a")], "/good/a", &["in/side"]));
+        assert_eq!(app.chooser().unwrap().folder(), Path::new("/good"));
+        assert_eq!(listed(&app), ["a"]);
+    }
+
     #[test]
     fn a_new_conversation_chooses_its_workspace_template() {
         let mut app = app();
@@ -12208,6 +12807,7 @@ pub mod tests {
             key(app, "C-n");
             key(app, "Down");
             key(app, "Return");
+            answer_folders(app);
         };
         directory(&mut app);
         assert!(app.picker().is_none());
@@ -12216,6 +12816,7 @@ pub mod tests {
         key(&mut app, "C-n");
         assert!(app.take_requests().is_empty());
         key(&mut app, "Return");
+        answer_folders(&mut app);
         assert_eq!(app.chooser().unwrap().folder(), base.join("notes"));
         key(&mut app, "C-Return");
         assert!(app.chooser().is_none());
@@ -12249,6 +12850,11 @@ pub mod tests {
         assert!(app.confirm().is_none());
         key(&mut app, "Down");
         key(&mut app, "Return");
+        // And while it is coming, whatever else comes.
+        assert!(app.chooser().is_none() && app.confirm().is_none());
+        app.input(Input::Focus(true), &mut NoClipboard);
+        assert!(app.chooser().is_none() && app.confirm().is_none());
+        answer_folders(&mut app);
         assert!(app.chooser().is_some() && app.confirm().is_none());
         key(&mut app, "Escape");
         assert!(app.chooser().is_none() && app.confirm().is_some());

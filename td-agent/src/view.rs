@@ -81,6 +81,9 @@ pub enum View {
     SetDefaultModel(String),
     OpenNewTemplate(Option<String>),
     FocusComposer,
+    /// What came of a `Request::ListFolders`: for the window that asked, so
+    /// not kept for another.
+    Folders(crate::chooser::FoldersAnswer),
 }
 
 /// The session's end: what it tells the window, kept in order until the
@@ -716,6 +719,10 @@ impl Port {
     pub fn focus_composer(&mut self) {
         self.say(View::FocusComposer);
     }
+
+    pub fn folders(&mut self, answer: crate::chooser::FoldersAnswer) {
+        self.say(View::Folders(answer));
+    }
 }
 
 impl App {
@@ -793,6 +800,7 @@ impl App {
             View::SetDefaultModel(model) => self.set_default_model(&model),
             View::OpenNewTemplate(remote) => self.open_new_template(remote.as_deref()),
             View::FocusComposer => self.focus_composer(),
+            View::Folders(answer) => self.folders(answer),
         }
     }
 }
@@ -1136,6 +1144,37 @@ mod tests {
         let told = port.take();
         assert!(told.contains(&View::Note("unsent".into())));
         assert!(!told.iter().any(|view| matches!(view, View::GiveBack(..))));
+    }
+
+    /// The folders asked for are the asker's: the next window asks for its own.
+    #[test]
+    fn folders_listed_are_told_to_the_window_there_and_kept_for_no_other() {
+        let scratch = TempDir::new("td-agent-view").unwrap();
+        let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+        let answer = crate::chooser::FoldersAnswer {
+            asked: Vec::new(),
+            from: None,
+            read: Err("why".into()),
+        };
+        let told = |port: &mut Port| {
+            port.take()
+                .iter()
+                .filter(|view| matches!(view, View::Folders(_)))
+                .count()
+        };
+        port.folders(answer.clone());
+        port.attach();
+        assert_eq!(told(&mut port), 0, "no window was there");
+        port.folders(answer.clone());
+        assert_eq!(told(&mut port), 1);
+        port.folders(answer.clone());
+        port.attach();
+        assert_eq!(told(&mut port), 0, "the last window's");
+        port.folders(answer);
+        let unsent = port.take();
+        port.lost(unsent);
+        port.attach();
+        assert_eq!(told(&mut port), 0, "lost with that window");
     }
 
     /// A stored key is the next window's to know of.

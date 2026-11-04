@@ -1114,6 +1114,67 @@ fn a_refused_new_lets_no_message_through_to_what_the_broker_moved_to() {
     assert!(child.wait().unwrap().success());
 }
 
+/// The folders the chooser lists are the broker's, whichever machine the window
+/// is on: read there, the first that can be, or why not.
+#[test]
+fn a_far_windows_folders_are_read_by_the_broker_and_a_refusal_is_said() {
+    let scratch = Scratch::new("folders");
+    let home = std::fs::canonicalize(&scratch.0).unwrap();
+    let base = home.join("folders");
+    for dir in ["Beta", "alpha", ".hidden", "repo/.git"] {
+        std::fs::create_dir_all(base.join(dir)).unwrap();
+    }
+    std::fs::write(base.join("file"), "").unwrap();
+    let (mut child, window) = attach(&scratch);
+    told_until(&window, |view| matches!(view, View::SetShare(_)));
+    let answer = |candidates: Vec<PathBuf>, or_home: bool, from: Option<&str>| {
+        ask(
+            &window,
+            &Request::ListFolders {
+                candidates: candidates.clone(),
+                or_home,
+                from: from.map(str::to_string),
+            },
+        );
+        let told = told_until(&window, |view| matches!(view, View::Folders(_)));
+        let Some(View::Folders(answer)) = told.into_iter().last() else {
+            panic!("told of no folders");
+        };
+        assert_eq!(answer.asked, candidates);
+        assert_eq!(answer.from.as_deref(), from);
+        answer.read
+    };
+    let read = answer(vec![base.clone()], false, Some("Beta")).unwrap();
+    assert_eq!(read.folder, base);
+    assert_eq!(
+        read.entries,
+        [
+            ("alpha".to_string(), String::new()),
+            ("Beta".to_string(), String::new()),
+            ("repo".to_string(), "git".to_string()),
+        ]
+    );
+    assert!(!read.truncated);
+    // What cannot be read is said, not gone around.
+    let gone = base.join("gone");
+    let why = answer(vec![gone.clone()], false, None).unwrap_err();
+    assert!(why.contains(gone.to_str().unwrap()), "{why}");
+    let why = answer(vec![base.join("file")], false, None).unwrap_err();
+    assert!(why.contains("file"), "{why}");
+    // Nor is a relative path read, from wherever the broker happens to be.
+    let why = answer(vec![PathBuf::from("folders")], true, None).unwrap_err();
+    assert!(why.contains("folders is not an absolute path"), "{why}");
+    // In order, and, when opening, on to the broker's own home.
+    let read = answer(vec![gone.clone(), base.clone()], false, None).unwrap();
+    assert_eq!(read.folder, base);
+    let read = answer(vec![gone], true, None).unwrap();
+    assert_eq!(std::fs::canonicalize(read.folder).unwrap(), home);
+    let read = answer(Vec::new(), true, None).unwrap();
+    assert_eq!(std::fs::canonicalize(read.folder).unwrap(), home);
+    drop(window);
+    assert!(child.wait().unwrap().success());
+}
+
 /// `--stop` ends a broker that a window would keep, and a second says there is
 /// none.
 #[test]
