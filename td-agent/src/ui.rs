@@ -2573,7 +2573,7 @@ impl App {
                 }
                 self.relist();
                 let replied = outcome.starts_with("replied");
-                // "no model" is how increment 4's turns ended.
+                // "no model" is how an older td-agent's turns ended.
                 let status = if replied {
                     ("replied", Tone::Good)
                 } else if outcome == "no model" {

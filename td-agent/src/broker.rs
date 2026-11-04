@@ -2970,7 +2970,7 @@ pub fn run(
     }
     if !config.notes.is_empty() {
         view.note(format!(
-            "{} configuration key(s) are read by later increments, or no more; see serve.log",
+            "{} configuration key(s) are not read; see serve.log",
             config.notes.len()
         ));
     }

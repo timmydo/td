@@ -1,9 +1,8 @@
 //! `$XDG_CONFIG_HOME/td-agent/config`, TOML (DESIGN.md §15). Every key the
-//! design lists is known here: the ones built so far are parsed and
-//! checked, each other one is accepted by name and reported as read by the
-//! increment that first uses it, a retired one is accepted and said to be
-//! read no more, and an unknown key, `limits` included, is refused by
-//! name. A missing file is every default.
+//! design lists is known here: most are parsed and checked, one not read
+//! yet is accepted by name and said not to be, a retired one is accepted
+//! and said to be read no more, and an unknown key, `limits` included, is
+//! refused by name. A missing file is every default.
 
 use std::path::{Path, PathBuf};
 
@@ -1031,13 +1030,13 @@ impl Mode {
     }
 }
 
-/// What this increment does with a key.
+/// What td-agent does with a key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Use {
-    /// Parsed and checked now.
+    /// Parsed and checked.
     Read,
-    /// Accepted by name; the DESIGN.md §18 increment given reads it.
-    Later(u8),
+    /// Accepted by name, and said not to be read yet.
+    Later,
 }
 
 /// Every key DESIGN.md §15 lists, in its order.
@@ -1064,7 +1063,7 @@ const KEYS: &[(&str, Use)] = &[
     ("network_allowlist", Use::Read),
     ("protected_branches", Use::Read),
     ("fetch_interval", Use::Read),
-    ("fetch_concurrency", Use::Later(11)),
+    ("fetch_concurrency", Use::Later),
     ("max_background", Use::Read),
     ("host_commands", Use::Read),
     ("unconfined_without_jail", Use::Read),
@@ -1094,7 +1093,7 @@ const REFUSED: &[(&str, &str)] = &[(
     "there is no `limits` key until resource limits land (DESIGN.md §8, §15)",
 )];
 
-/// The configuration this increment uses.
+/// The configuration td-agent uses.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Config {
     pub mode: Mode,
@@ -1102,8 +1101,8 @@ pub struct Config {
     /// The `model` key as the file gives it, none when it is left out:
     /// what a default chosen in the window is set over (DESIGN.md §4).
     pub model_key: Option<String>,
-    /// One line per key present that a later increment reads, so a
-    /// setting that does nothing yet is said, never silently ignored.
+    /// One line per key present that is not read, so a setting that
+    /// does nothing is said, never silently ignored.
     pub notes: Vec<String>,
     /// `workspace_root` as the file gives it, `~` unexpanded; none is
     /// `DEFAULT_WORKSPACE_ROOT`.
@@ -1151,8 +1150,7 @@ impl Config {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Template {
     pub name: String,
-    /// The repositories to check out, which increment 11 prepares; until
-    /// then a template naming any is refused at creation.
+    /// The repositories to check out (DESIGN.md §7).
     pub repos: Vec<Repo>,
     /// Its own `[[shared]]`, `~` unexpanded, in place of the top-level
     /// list; none is the top-level list.
@@ -2015,9 +2013,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
                         .join(", ")
                 ))
             }
-            Some((_, Use::Later(increment))) => config.notes.push(format!(
-                "`{key}` is accepted and not read yet: increment {increment} reads it"
-            )),
+            Some((_, Use::Later)) => config
+                .notes
+                .push(format!("`{key}` is accepted and not read yet")),
             Some((_, Use::Read)) => {}
         }
     }
@@ -2343,8 +2341,6 @@ mod tests {
         assert!(e.contains("`limits`"), "{e}");
     }
 
-    /// The design's example parses, every key it sets accepted and each
-    /// one a later increment reads said.
     #[test]
     fn workspaces_and_shared_directories_are_configured() {
         let home = Path::new("/home/u");
@@ -2459,11 +2455,9 @@ mod tests {
             let config = parse(&format!("[{key}]\nx = 1")).map(|c| c.notes);
             match use_ {
                 Use::Read => assert!(config.is_err(), "{key} is checked"),
-                Use::Later(n) => assert_eq!(
+                Use::Later => assert_eq!(
                     config.unwrap(),
-                    [format!(
-                        "`{key}` is accepted and not read yet: increment {n} reads it"
-                    )]
+                    [format!("`{key}` is accepted and not read yet")]
                 ),
             }
         }

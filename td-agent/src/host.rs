@@ -1132,7 +1132,8 @@ impl Client {
     }
 
     /// Starts `program tool-host` over its standard input and output, for
-    /// `roots` with td-txt at `txt`. The jail launch replaces this (§8).
+    /// `roots` with td-txt at `txt`. Only tests start one this way; a
+    /// conversation's goes through the launch of §8.
     pub fn spawn(program: &Path, roots: &[PathBuf], txt: Option<&Path>) -> Result<Self, String> {
         let mut command = Command::new(program);
         command.arg("tool-host");

@@ -1,7 +1,7 @@
 //! The tool host as a process of the built program (DESIGN.md §2, §12):
 //! `td-agent tool-host` serves calls over its standard input and output,
-//! and ends when its input does, cancelling what still runs. The jail it
-//! will run in is a later increment's (§8, §18).
+//! and ends when its input does, cancelling what still runs. These tests
+//! run it without §8's jail.
 #![forbid(unsafe_code)]
 #![allow(
     clippy::unwrap_used,

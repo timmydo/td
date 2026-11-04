@@ -2615,9 +2615,10 @@ human deleted (§4) is renamed `.deleting-<id>` under its lock and then
 removed; a listing skips it, and the window at its start finishes a
 removal whose lock nobody holds), holding:
 
-- `meta`: title, workspace, model, mode, parent conversation when forked,
-  creation time, whether it is archived, and a `role` kept only as data
-  (§3).
+- `meta`: title, workspace, model, creation time, whether it is archived,
+  a `role` kept only as data (§3), and `mode` and `parent`, written null:
+  a workspace's mode is in the human's rules (§2), and forking is not
+  built (§18).
 - `pictures/`: the person's pictures its messages carry, each named by
   its SHA-256 and written once (Pictures, below).
 - `prefix`: the exact bytes of the request prefix (§13), written once at
@@ -2659,10 +2660,10 @@ and fsynced at turn boundaries, and before any effect runs its started
 record is synced as well (Recovery, below). A torn final line is dropped
 on load, and dropping it is reported. The log doubles as the audit
 trail: no jail instance can write it, and the classifier's and the
-human's verdicts are in it. A conversation can be forked at any
-message, which copies its prefix and log up to there into a new
-conversation, with the pictures those messages carry, and exported to a
-local file; nothing is shared through any service.
+human's verdicts are in it. A conversation can be exported to a local
+file (§4); nothing is shared through any service. Forking one at a
+message, which is not built (§18), would copy its prefix and log up to
+there into a new conversation, with the pictures those messages carry.
 
 **Pictures.** A picture the person pastes (§4) is a PNG or a JPEG by its
 first bytes, whatever the clipboard named it, at most 5 MB (the least of
@@ -7431,7 +7432,8 @@ kind. td-agent's position on its features:
 | `doom_loop`: three identical calls ask | adopted (§11) |
 | `question` tool | adopted (§12) |
 | Child sessions, background subagents that notify | adapted as peer conversations that message and read one another through crossings (§3) |
-| Fork at a message; local export | adopted (§6) |
+| Fork at a message | adopted, not built (§6, §18) |
+| Local export | adopted (§4) |
 | Event-sourced session log | adopted, as a per-conversation file log (§6) |
 | Prune old tool output, then summarize | adopted, with its thresholds (§14) |
 | Small model for titles | adopted (§13) |
@@ -7611,8 +7613,8 @@ with its `reasoning_details`, and the usage.
 
 ## 18. Not built
 
-Resource limits (§8), moving a conversation between workspaces, and a
-native Anthropic Messages dialect.
+Resource limits (§8), forking a conversation (§6), moving a conversation
+between workspaces, and a native Anthropic Messages dialect.
 
 ## 19. Open questions
 

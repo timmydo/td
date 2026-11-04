@@ -21,8 +21,8 @@ pub fn message(prefix: &str, replaced: bool) -> Result<Option<Message>, String> 
         return Ok(None);
     }
     let parsed = td_json::parse(prefix).ok();
-    // An object of tools and messages, or, as increment 7 wrote it, an
-    // array of messages.
+    // An object of tools and messages, or, in the older form, an array of
+    // messages.
     let (messages, tools) = match &parsed {
         Some(value @ Json::Obj(_)) => (
             value.get("messages").and_then(Json::as_arr),

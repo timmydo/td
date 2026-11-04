@@ -854,8 +854,9 @@ pub(crate) fn replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String
     td_fs::replace(&dir.join(name), bytes, 0o600).map_err(|e| e.to_string())
 }
 
-/// A conversation's `meta` (DESIGN.md §6). The mode and parent are null
-/// until the increments that give them values.
+/// A conversation's `meta` (DESIGN.md §6). Its `mode` and `parent` are
+/// written null: a workspace's mode is in the human's rules, and forking
+/// is not built.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Meta {
     pub id: Id,
@@ -1533,7 +1534,7 @@ pub enum Kind {
     /// A request prefix (DESIGN.md §6, §13) superseding the `prefix` file
     /// and any earlier one from here on, as exact text: a JSON object of
     /// the tools and the messages every request of the conversation begins
-    /// with, its `messages` last, or, as increment 7 wrote it, an array of
+    /// with, its `messages` last, or, in the older form, an array of
     /// the messages alone (`client::turn_body`).
     Prefix { text: String },
     /// A sub-agent's start (DESIGN.md §12, `task`): the `task` call it
@@ -1715,9 +1716,7 @@ pub enum Kind {
     /// An approval decision (DESIGN.md §6, §11): the `ToolCall` it
     /// decided, its outcome, who decided it (a rule, a classifier stage or
     /// the human), Jev's probabilities where it gave them, and the reason.
-    /// The human's decisions on cards write one (increment 10), rules and
-    /// the classifier later (increment 13); the history tools show a model
-    /// only its outcome and who decided.
+    /// The history tools show a model only its outcome and who decided.
     Approval {
         call: u64,
         outcome: String,
