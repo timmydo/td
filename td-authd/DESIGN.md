@@ -83,9 +83,10 @@ The fixed root-only `release-portal-files` operation runs after services stop
 and before `/var` is unmounted. It accepts no arguments and checks the bounded
 mount table. An absent view succeeds, including failed preparation. A present
 view invokes the existing td-init `/bin/umount` applet with exactly that path,
-from `/`, with a cleared environment and null standard descriptors, then
-requires the mount to be absent. It reports unmount failure; it does not use
-lazy detach or fall back to another path. This uses no new raw syscall surface.
+from `/`, with a cleared environment, null stdin and stdout and a
+stderr tail quoted in its failure, then requires the mount to be absent.
+It reports unmount failure; it does not use lazy detach or fall back to
+another path. This uses no new raw syscall surface.
 
 ## Portal handoff
 
@@ -580,7 +581,8 @@ home, and the review window's one argument, the coding agent's three
 variables and td-software's control-socket variable are fixed by the
 authority. All
 authority-spawned credential-helper children replace stdin, stdout and stderr
-with `/dev/null`, clear the environment, and start from `/`. The task variant's
+with `/dev/null`, but the validator's stderr, root's private tail of it ("Root
+helpers' stderr"), clear the environment, and start from `/`. The task variant's
 eventual td-term child enters only the fixed worktree described below. Replacing
 stdin also replaces the original private endpoint on fd 0: relying only on
 Channel's CLOEXEC clone would leak authority. All subsequently created channel
@@ -640,7 +642,7 @@ account, and a launch fetches nothing (td-software/DESIGN.md §4.1).
 
 `0f` lets the compositor say what became of a `0d`: it reads
 `/bin/td-svc status NAME`, the fixed client with the same cleared
-environment, `/` and null stdin and stderr, its standard output a socket
+environment, `/`, null stdin and a stderr tail, its standard output a socket
 read without blocking, at most 256 bytes within five seconds. Root
 follows one application at a time, the last a `0d` or `0f` named, and
 what follows is of that application. At most one such client is in
@@ -883,8 +885,9 @@ including a double poll of a retired handle. There is no clean-success exit
 that can leave only one authority peer alive, and no soft recovery from a
 caller protocol error. The compositor must serialize requests and discard
 handles when that generation ends. Root diagnostics include validator exit
-status and spawn errors; subprocess stderr remains null. An operator can run
-the fixed read-only firstboot check directly to diagnose its refusal.
+status, its last line of stderr and spawn errors; a terminal child's stderr
+remains null. An operator can run the fixed read-only firstboot check
+directly to diagnose its refusal.
 
 Host tests execute a real child through the same descriptor/environment
 sanitizer and verify its inherited kernel descriptors, bounded records,
@@ -954,9 +957,10 @@ terminal and exclusive standard descriptors as the terminal authority.
 The conservative shared audit also requires neither log to alias stdin;
 a unit with all three descriptors pointing to /dev/null is refused. A
 child runs only `/bin/td-firstboot check-launch-application OWNER APP` with
-an empty environment, `/` working directory, null stdin/stderr and a private
-stdout socketpair. The read-only check verifies immutable account files and
-that the deployment is already durably enrolled. It selects only an active
+an empty environment, `/` working directory, null stdin, a stderr
+tail quoted in its refusal, and a private stdout socketpair. The
+read-only check verifies immutable account files and that the
+deployment is already durably enrolled. It selects only an active
 current application account, never a retired reservation or caller UID.
 Its exact bounded reply carries the canonical UID. One two-second deadline
 covers reply reads and observed child completion; failure kills and reaps
@@ -1502,7 +1506,8 @@ of presentation receipts; no public socket admits this request.
 
 Root starts the fixed `/bin/td-authd suspend-system` helper through the
 existing bounded inspection launcher, with empty environment, `/` cwd,
-null stdin/stderr and private stdout. The helper requires the existing root,
+null stdin, a stderr tail and private stdout. The helper requires the
+existing root,
 single-thread, no-controlling-terminal and standard-descriptor admission.
 It holds an exclusive root-only `/run/td-suspend.lock`, requires `mem` and
 `s2idle` in the kernel's power interfaces, selects `s2idle`, reads the bounded
@@ -1577,9 +1582,9 @@ Cancellation closes the endpoint, kills the exact unreaped child, and
 polls for its exit before spawning the fixed root-only `td-secret
 lock-session --uid 1000` cleanup. That helper clears volatile release
 state without opening the persistent store or accessing hardware.
-Cleanup runs with empty environment, `/` cwd and null standard
-descriptors. Its observed deadline is two seconds; expiry kills the
-helper. Polling waits for reaping even after a kill, so a blocked kernel
+Cleanup runs with empty environment, `/` cwd, null stdin and stdout,
+and a stderr tail quoted when it fails. Its observed deadline is two
+seconds; expiry kills the helper. Polling waits for reaping even after a kill, so a blocked kernel
 task cannot be abandoned and later publish into a subsequent operation.
 Normal cancellation and cleanup never block the caller in `wait`; the
 caller continues heartbeats while polling. A successfully relocked
@@ -1660,7 +1665,8 @@ helper has already exited.
 
 Prepare is single use. It runs only the fixed root `td-secret
 lock-session --uid 1000` helper with an empty environment, root cwd,
-and null standard descriptors. Polling requires successful observed
+null stdin and stdout, and a stderr tail that root's log quotes when the
+cleanup fails. Polling requires successful observed
 exit within two seconds before admitting any secret operation. Expiry kills and
 retains the child until reaping; failed cleanup ends the generation.
 This does not open a persistent store or access hardware. A new operation
@@ -1787,8 +1793,8 @@ responses are the bare 93/94 tags, while poll results carry descriptions.
 The admitted paired peer may send exact request `17` only after Prepare
 has completed and while neither an operation nor an unconsumed inspection
 is retained. Root fixes owner 1000 and starts `/bin/td-secret inspect-store
---uid 1000` with an empty environment, `/` cwd, null stdout/stderr, and a
-private stdin socketpair. The immediate response is `97` (started).
+--uid 1000` with an empty environment, `/` cwd, null stdout, a stderr
+tail, and a private stdin socketpair. The immediate response is `97` (started).
 The peer continues polling at least every 250 ms. Poll `11` returns `91
 08` while pending, `91 09 STATE` for a completed structural snapshot, or
 `91 0a` for unavailable state. STATE is 0 file master, 1 TPM-only, 2 token
@@ -2460,7 +2466,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    record name exists does root run a fixed read-only `td-secret
    inspect-login --uid 1000` child to tell enrolled from a damaged record.
    It shares store inspection's fixed helper launch (empty environment,
-   `/` cwd, null stdout and stderr, private stdin socketpair), its exact
+   `/` cwd, null stdout, a stderr tail, private stdin socketpair), its exact
    bounded result (here at most 36 bytes, the parent reading at most
    one past them) and its two-second observed deadline, but not its
    protocol (`td-secret/DESIGN.md`, "Read-only enrollment-state
@@ -3708,6 +3714,48 @@ this intake. This is a separate authorization from `deploy-publish`; the
 remote policy, private build identity and durable job service are specified
 in `td-update/ADMIN.md`. Tag 40 does not authorize a credential-store or
 disk-protector operation.
+
+## Root helpers' stderr
+
+Root's log is its own stderr, which the `[wayland]` unit keeps in
+`/var/log/svc/wayland.log` (td-svc/DESIGN.md §8). Three root workers
+inherit it, as their sections say ("authority stderr"): td-update's
+apply operation, td-boot's rollback and td-install's serve, whose
+progress is root's own account. Every other helper's stderr is null, or
+a tail: a private socketpair whose nonblocking root end keeps the
+helper's last 512 bytes (`stderr_tail.rs`).
+
+Root gives a tail to the fixed root helpers whose failure it reports,
+and quotes it there as `, saying "..."`, the last line as printable
+ASCII, a quotation mark as `?`: the session-reservation validator, the
+application admission check, both `lock-session` cleanups (the
+generation's and a cancelled unlock's), the three fixed `umount` runs,
+and, through the bounded inspection launcher, the power request, the
+revocation's `render-ssh-policy` and its `td-svc` clients. td-app's
+cache operations and td-software's requests give their last line
+unquoted, as the refusal's reason, a quotation mark kept. A last line
+that is Rust's panic note says only that it panicked, since the message
+above it may quote what the process held. The launcher's other helpers
+keep a tail that no text quotes yet, since root reports their outcome
+as a state or their own printed result: store and login inspection,
+`td-svc status`, `suspend-system`, `td-admin accept-key`, `td-time
+apply`, `td-disks apply`. The notebook's two processes have their own
+rule ("Notebook token descriptions").
+
+Root drains a tail on every poll or wait step of its helper, `umount`'s
+wait without a deadline included, so no helper blocks on a full channel.
+A holder that drops a running helper kills it first, so the helper
+cannot write into the closed channel; the inspection launcher's drop
+then only tries to reap it, so as not to wedge on a helper the kernel
+cannot kill. td-software's runs are the exception: a run dropped while
+its child still runs leaves it to its own bound, as before. Null
+stderr is kept by the terminal launches, the programs the person runs;
+`0d`'s `td-svc start`, whose exit status root logs; the portal mapping
+helper, which only waits on its endpoint; and the token (`unlock.rs`),
+login-key and storage workers, whose framed endpoint carries their
+failure. A helper that prints its usage after a refusal (td-firstboot)
+has the usage's last line quoted, not the refusal: an operator runs the
+check by hand to read the whole of it.
 
 ## Notebook token descriptions
 

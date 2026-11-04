@@ -10,6 +10,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(2);
+/// How long one wait for the check looks before draining its stderr again.
+const READ_STEP: Duration = Duration::from_millis(10);
 const APPLICATION_UIDS: std::ops::RangeInclusive<u32> = 65536..=2147483647;
 const REPLY: &str = "TD-LAUNCH-APPLICATION-CHECK-OK\t";
 
@@ -137,7 +139,8 @@ fn admit(owner: u32, name: &str) -> Result<u32, String> {
         .checked_add(DEADLINE)
         .ok_or("application check deadline overflow")?;
     let (parent, child) = UnixStream::pair().map_err(|e| e.to_string())?;
-    // The temporary Command drops its retained child endpoint here. Keeping
+    let (mut said, said_end) = crate::stderr_tail::Tail::pair()?;
+    // The temporary Command drops its retained child endpoints here. Keeping
     // that Command alive would prevent the reply's required EOF.
     let mut check = CheckedChild(
         Command::new("/bin/td-firstboot")
@@ -146,31 +149,42 @@ fn admit(owner: u32, name: &str) -> Result<u32, String> {
             .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::from(OwnedFd::from(child)))
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(said_end))
             .spawn()
             .map_err(|e| format!("start application admission check: {e}"))?,
     );
-    let reply = read_reply(parent, deadline)?;
-    loop {
-        if Instant::now() >= deadline {
-            return Err("application admission check timed out".into());
-        }
-        match check.0.try_wait().map_err(|e| e.to_string())? {
-            Some(status) if status.success() => {
-                let text = std::str::from_utf8(&reply)
-                    .map_err(|_| "invalid application admission encoding")?;
-                return reply_uid(text);
+    let checked = (|| {
+        let reply = read_reply(parent, deadline, &mut said)?;
+        loop {
+            said.drain();
+            if Instant::now() >= deadline {
+                return Err("application admission check timed out".into());
             }
-            Some(status) => return Err(format!("application admission failed: {status}")),
-            None => std::thread::sleep(Duration::from_millis(10)),
+            match check.0.try_wait().map_err(|e| e.to_string())? {
+                Some(status) if status.success() => {
+                    let text = std::str::from_utf8(&reply)
+                        .map_err(|_| "invalid application admission encoding")?;
+                    return reply_uid(text);
+                }
+                Some(status) => return Err(format!("application admission failed: {status}")),
+                None => std::thread::sleep(READ_STEP),
+            }
         }
-    }
+    })();
+    checked.map_err(|why: String| format!("{why}{}", said.said()))
 }
 
-fn read_reply(mut parent: UnixStream, deadline: Instant) -> Result<Vec<u8>, String> {
+/// Reads the check's reply, draining `said` between reads so a check that
+/// writes its stderr full never stalls the reply.
+fn read_reply(
+    mut parent: UnixStream,
+    deadline: Instant,
+    said: &mut crate::stderr_tail::Tail,
+) -> Result<Vec<u8>, String> {
     let mut reply = Vec::with_capacity(97);
     let mut byte = [0u8; 1];
     loop {
+        said.drain();
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err("application admission reply timed out".into());
@@ -179,7 +193,7 @@ fn read_reply(mut parent: UnixStream, deadline: Instant) -> Result<Vec<u8>, Stri
             return Err("application admission response exceeded 96 bytes".into());
         }
         parent
-            .set_read_timeout(Some(remaining))
+            .set_read_timeout(Some(remaining.min(READ_STEP)))
             .map_err(|e| e.to_string())?;
         match parent.read(&mut byte) {
             Ok(0) => return Ok(reply),
@@ -189,10 +203,7 @@ fn read_reply(mut parent: UnixStream, deadline: Instant) -> Result<Vec<u8>, Stri
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Err("application admission reply timed out".into());
-            }
+                ) => {}
             Err(e) => return Err(format!("application admission reply: {e}")),
         }
     }
@@ -309,7 +320,7 @@ mod tests {
             let (reader, mut writer) = UnixStream::pair().unwrap();
             writer.write_all(&bytes).unwrap();
             drop(writer);
-            let result = read_reply(reader, Instant::now() + Duration::from_secs(1));
+            let result = read_reply(reader, Instant::now() + Duration::from_secs(1), &mut said());
             if bytes.len() > 96 {
                 assert!(result.unwrap_err().contains("96 bytes"));
             } else {
@@ -320,6 +331,11 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A stderr tail whose child end is already closed.
+    fn said() -> crate::stderr_tail::Tail {
+        crate::stderr_tail::Tail::pair().unwrap().0
     }
 
     #[test]
@@ -335,7 +351,7 @@ mod tests {
             }
         });
         let begin = Instant::now();
-        let error = read_reply(reader, begin + Duration::from_millis(40)).unwrap_err();
+        let error = read_reply(reader, begin + Duration::from_millis(40), &mut said()).unwrap_err();
         assert!(error.contains("timed out"));
         assert!(begin.elapsed() < Duration::from_secs(1));
         worker.join().unwrap();
@@ -343,11 +359,13 @@ mod tests {
         retained
             .write_all(b"TD-LAUNCH-APPLICATION-CHECK-OK\t65537\n")
             .unwrap();
-        assert!(
-            read_reply(reader, Instant::now() + Duration::from_millis(20))
-                .unwrap_err()
-                .contains("timed out")
-        );
+        assert!(read_reply(
+            reader,
+            Instant::now() + Duration::from_millis(20),
+            &mut said()
+        )
+        .unwrap_err()
+        .contains("timed out"));
     }
 
     #[test]

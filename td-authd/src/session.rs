@@ -36,8 +36,9 @@ fn power_request(choice: crate::consent::Power) -> Option<Vec<u8>> {
         };
         let _ = writeln!(
             std::io::stderr(),
-            "td-authd: power {}: {reason}",
-            choice.verb()
+            "td-authd: power {}: {reason}{}",
+            choice.verb(),
+            helper.said()
         );
     }
     helper.reap_within(Duration::from_millis(50));
@@ -275,6 +276,8 @@ impl Active {
 
 struct Cleanup {
     child: Option<Child>,
+    /// Its stderr, which root's log quotes when it fails.
+    said: crate::stderr_tail::Tail,
     deadline: Instant,
     expired: bool,
     terminal: Option<Result<bool, String>>,
@@ -287,8 +290,7 @@ fn cleanup_command(owner: u32) -> Command {
         .env_clear()
         .current_dir("/")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
     command
 }
 
@@ -298,11 +300,14 @@ impl Cleanup {
         let deadline = Instant::now()
             .checked_add(time)
             .ok_or("session cleanup deadline overflow")?;
+        let (said, said_end) = crate::stderr_tail::Tail::pair()?;
         let child = command
+            .stderr(Stdio::from(said_end))
             .spawn()
             .map_err(|e| format!("start session cleanup: {e}"))?;
         Ok(Self {
             child: Some(child),
+            said,
             deadline,
             expired: false,
             terminal: None,
@@ -314,6 +319,7 @@ impl Cleanup {
             return result.clone();
         }
         let child = self.child.as_mut().ok_or("missing session cleanup child")?;
+        self.said.drain();
         if Instant::now() >= self.deadline && !self.expired {
             child
                 .kill()
@@ -328,6 +334,8 @@ impl Cleanup {
         };
         self.child = None;
         let result = if !status.success() || self.expired || Instant::now() >= self.deadline {
+            let said = self.said.said();
+            crate::notebook::log(&format!("session cleanup: {status}{said}"));
             Err("session cleanup failed; end authority generation".into())
         } else {
             Ok(true)

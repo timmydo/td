@@ -199,6 +199,7 @@ fn complete_bytes_alone_and_an_open_endpoint_never_report_state() {
         failed: false,
         exit_failed: false,
         missed: false,
+        stderr: None,
         terminal: None,
         stop: Child::kill,
     };

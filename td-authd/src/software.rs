@@ -6,6 +6,7 @@
 
 use crate::application_cache::Verb;
 use crate::flathub_app::{self, Status};
+use crate::stderr_tail;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
@@ -34,8 +35,6 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
 const BACKSTOP: Duration = Duration::from_secs(60);
 /// The longest refusal reason an answer carries.
 pub(crate) const REASON_BYTES: usize = 200;
-/// The diagnostics' tail root keeps while an operation runs.
-const TAIL_BYTES: usize = 512;
 /// What one advance reads of a child at most, so a request's answer is
 /// never held by a child writing.
 const READ_BUDGET: usize = 16 * 1024;
@@ -195,8 +194,7 @@ impl Run {
                             self.bytes.clear();
                         }
                     } else {
-                        let excess = self.bytes.len().saturating_sub(TAIL_BYTES);
-                        self.bytes.drain(..excess);
+                        stderr_tail::push(&mut self.bytes, &[]);
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -508,9 +506,8 @@ fn flathub(name: &str) -> bool {
 /// The operation's last diagnostic line as printable ASCII, without the
 /// `td-authd: ` every one of its refusals begins with.
 fn reason(tail: &[u8]) -> String {
-    let text = String::from_utf8_lossy(tail);
-    let line = text.trim_end().rsplit('\n').next().unwrap_or_default();
-    let line = line.strip_prefix("td-authd: ").unwrap_or(line);
+    let line = stderr_tail::last_reason(tail).unwrap_or_default();
+    let line = line.strip_prefix("td-authd: ").unwrap_or(&line);
     let reason: String = flathub_app::reason_text(line)
         .chars()
         .take(REASON_BYTES)

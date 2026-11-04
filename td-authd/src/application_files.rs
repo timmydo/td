@@ -152,16 +152,22 @@ pub(crate) fn release(arguments: &[String]) -> Result<(), String> {
     if portal_files::mount_options_at(&path)?.is_none() {
         return Ok(());
     }
-    let status = Command::new("/bin/umount")
-        .arg(&path)
-        .env_clear()
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("unmount application file grant: {e}"))?;
-    if !status.success() || portal_files::mount_options_at(&path)?.is_some() {
+    let (status, mut umount) = crate::stderr_tail::status(
+        Command::new("/bin/umount")
+            .arg(&path)
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
+    .map_err(|e| format!("unmount application file grant: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "application file-grant unmount failed: {status}{}",
+            umount.said()
+        ));
+    }
+    if portal_files::mount_options_at(&path)?.is_some() {
         return Err("application file-grant unmount did not complete".into());
     }
     Ok(())

@@ -435,12 +435,14 @@ fn answer(child: &mut Inspection, request: &str) -> Reply {
         Ok(Some(Some(answer))) => answer,
         Ok(Some(None)) if child.missed() => {
             return Reply::Fault(Fault::Refused(format!(
-                "{request}: no exit within its bound"
+                "{request}: no exit within its bound{}",
+                child.said()
             )))
         }
         Ok(Some(None)) => {
             return Reply::Fault(Fault::Refused(format!(
-                "{request}: an unreadable or oversized reply"
+                "{request}: an unreadable or oversized reply{}",
+                child.said()
             )))
         }
     };
@@ -453,7 +455,8 @@ fn answer(child: &mut Inspection, request: &str) -> Reply {
     match (success, text.is_empty()) {
         (true, _) => Reply::Text(text),
         (false, true) => Reply::Fault(Fault::Transient(format!(
-            "{request}: the client failed with no reply"
+            "{request}: the client failed with no reply{}",
+            child.said()
         ))),
         (false, false) => Reply::Fault(Fault::Refused(format!("{request}: {}", text.trim_end()))),
     }
@@ -751,7 +754,13 @@ impl Revocation {
                 },
                 None => self.fail("render-ssh-policy printed no form"),
             },
-            Some(Ok(Some(None))) => self.fail("render-ssh-policy failed"),
+            Some(Ok(Some(None))) => {
+                let said = match &mut self.phase {
+                    Phase::Render(render) => render.said(),
+                    _ => String::new(),
+                };
+                self.fail(&format!("render-ssh-policy failed{said}"))
+            }
             Some(Err(why)) => self.fail(&format!("render-ssh-policy: {why}")),
         }
         let progress = match &mut self.phase {

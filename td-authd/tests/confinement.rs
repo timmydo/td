@@ -137,6 +137,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "inspection.rs"
                     | "notebook.rs"
                     | "notebook_token.rs"
+                    | "stderr_tail.rs"
             ) && ["::Command", "::thread", ".spawn(", ".exec("]
                 .contains(&forbidden);
             let mapping_child_api = matches!(name, "portal_files.rs" | "application_files.rs")
@@ -145,6 +146,26 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 assert!(!source.contains(forbidden), "{name}: {forbidden}");
             }
         }
+    }
+    // The shared tail launches one child, waits by sleeping, and hands it
+    // nothing but the tail's own end as stderr.
+    let tail = include_str!("../src/stderr_tail.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(fingerprint(tail), STDERR_TAIL_FINGERPRINT);
+    assert_eq!(tail.matches(".spawn(").count(), 1);
+    assert_eq!(tail.matches("::thread").count(), 1);
+    assert_eq!(tail.matches("std::thread::sleep(WAIT_STEP)").count(), 1);
+    assert_eq!(tail.matches(".stderr(").count(), 2);
+    assert_eq!(
+        tail.matches(".stderr(Stdio::from(child_end)).spawn()")
+            .count(),
+        1
+    );
+    assert_eq!(tail.matches("command.stderr(Stdio::null());").count(), 1);
+    for forbidden in [".exec(", "inherit", "pre_exec", ".env(", "Command::new("] {
+        assert!(!tail.contains(forbidden), "stderr_tail.rs: {forbidden}");
     }
     let time_setting = include_str!("../../td-time/src/request.rs");
     assert_eq!(time_setting.matches("unsafe").count(), 0);
@@ -167,7 +188,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0xaa06bfa9fb9de6f8,
+        0x605ce7ad6a78ead6,
         "private unlock supervisor changed"
     );
     let login = include_str!("../src/login.rs")
@@ -369,7 +390,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x80211204b12d9166,
+        0x2c7e51db738098fa,
         "read-only store controller changed"
     );
     let inspection = include_str!("../src/inspection.rs")
@@ -979,7 +1000,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(
         fingerprint(application),
-        0x92d1b77af83e2e8d,
+        0x2715b08a429b96ba,
         "application launch controller changed"
     );
     for forbidden in [
@@ -999,7 +1020,14 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(application.matches(".spawn(").count(), 1);
     assert_eq!(application.matches(".exec()").count(), 2);
     assert_eq!(application.matches(".stdin(Stdio::null())").count(), 2);
-    assert_eq!(application.matches(".stderr(Stdio::null())").count(), 2);
+    // The admission check's stderr is root's private tail, quoted in its refusal.
+    assert_eq!(application.matches(".stderr(Stdio::null())").count(), 1);
+    assert_eq!(
+        application
+            .matches(".stderr(Stdio::from(said_end))")
+            .count(),
+        1
+    );
     assert_eq!(application.matches(".stdout(Stdio::null())").count(), 1);
     // The cache operation runs one fixed program, the credential drop into
     // the admitted account, and td-app's verb and the name after it.
@@ -1186,7 +1214,13 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!launch.contains("firefox-update"));
     assert_eq!(launch.matches(".stdin(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stdout(Stdio::null())").count(), 1);
-    assert_eq!(launch.matches(".stderr(Stdio::null())").count(), 1);
+    // Every child's stderr is null but the session check's, root's private tail.
+    assert_eq!(launch.matches(".stderr(stderr)").count(), 1);
+    assert_eq!(
+        launch.matches("spawn_with(command, Stdio::null())").count(),
+        1
+    );
+    assert_eq!(launch.matches("spawn_with(").count(), 3);
     // The one peer-named program argument is td-software's selection, a
     // registry name checked before the command is built.
     assert_eq!(
@@ -1268,7 +1302,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     let files = include_str!("../src/portal_files.rs");
     assert_eq!(
         fingerprint(files),
-        0xfe21b1ca9dfaac8a,
+        0x0a84523165fc906c,
         "root portal grant controller changed"
     );
     assert_eq!(files.matches("Command::new(\"/bin/td-authd\")").count(), 1);
@@ -1293,7 +1327,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(files.matches("admitted_uid(\"firefox\")").count(), 1);
     assert_eq!(files.matches("mount_sys::publish(").count(), 2);
     let application_files = include_str!("../src/application_files.rs");
-    assert_eq!(fingerprint(application_files), 0x93ebcf68b60f3614);
+    assert_eq!(fingerprint(application_files), 0x865a0468a9b2aae8);
     assert_eq!(
         application_files
             .matches("mount_sys::clone_directory(")
@@ -1358,11 +1392,12 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0x10b1af1d87d02b94;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const CACHE_FINGERPRINT: u64 = 0xca9ca5668a3cec8c;
-const SOFTWARE_FINGERPRINT: u64 = 0xedb33f4ba9468adf;
-const LAUNCH_FINGERPRINT: u64 = 0x917d816a91d3a16e;
+const CACHE_FINGERPRINT: u64 = 0xc55759a7b94b9e9d;
+const SOFTWARE_FINGERPRINT: u64 = 0x2637cc331de38b7c;
+const LAUNCH_FINGERPRINT: u64 = 0x9b5957fe029e436e;
 const MAIN_FINGERPRINT: u64 = 0x2057ef8b5cd2c138;
-const SESSION_FINGERPRINT: u64 = 0xbdd3fc839ac097d8;
+const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
+const SESSION_FINGERPRINT: u64 = 0xd7705b7717a76af5;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xad60fdb29c45fd9b;
@@ -1375,7 +1410,7 @@ const ELEVATION_FINGERPRINT: u64 = 0xed15ae917aaaa734;
 const SET_HOSTNAME_FINGERPRINT: u64 = 0x93106fbc28219f20;
 const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
-const REVOCATION_FINGERPRINT: u64 = 0xae6413da1bcf5b12;
+const REVOCATION_FINGERPRINT: u64 = 0x7090a6da9e98d2e9;
 const SHARED_CUTOVER_FINGERPRINT: u64 = 0x358939aac41ef40a;
 const DISK_INSTALL_FINGERPRINT: u64 = 0x45e5e48767f17d03;
 const CONSENT_CODEC_FINGERPRINT: u64 = 0x855c6ad96aa12772;

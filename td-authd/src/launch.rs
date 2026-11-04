@@ -449,15 +449,21 @@ fn generation() -> Result<String, String> {
 }
 
 fn spawn(command: &mut Command) -> Result<Child, String> {
-    // The original private endpoint is fd 0, even though Channel's clone is
-    // CLOEXEC. Replace all standard descriptors for every child, validator
-    // included; no endpoint or root log descriptor crosses either exec.
+    spawn_with(command, Stdio::null())
+}
+
+/// The original private endpoint is fd 0, even though Channel's clone is
+/// CLOEXEC. Replace all standard descriptors for every child, validator
+/// included; no endpoint or root log descriptor crosses either exec. A
+/// terminal child's stderr is null; the validator's is root's private
+/// tail of it.
+fn spawn_with(command: &mut Command, stderr: Stdio) -> Result<Child, String> {
     command
         .env_clear()
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .map_err(|e| format!("start terminal authority child: {e}"))
 }
@@ -466,12 +472,21 @@ fn check_session(config: &Config) -> Result<(), String> {
     let deadline = Instant::now()
         .checked_add(CHECK_TIMEOUT)
         .ok_or("launch check deadline overflow")?;
-    let mut child = spawn(&mut config.checker())?;
-    wait_check(&mut child, deadline)
+    let (mut said, said_end) = crate::stderr_tail::Tail::pair()?;
+    // The temporary Command drops root's copy of the tail's child end.
+    let mut child = spawn_with(&mut config.checker(), Stdio::from(said_end))?;
+    wait_check(&mut child, deadline, &mut said)
 }
 
-fn wait_check(child: &mut Child, deadline: Instant) -> Result<(), String> {
+/// Drains `said`, the validator's stderr, while it waits, and quotes it in
+/// a refusal.
+fn wait_check(
+    child: &mut Child,
+    deadline: Instant,
+    said: &mut crate::stderr_tail::Tail,
+) -> Result<(), String> {
     let result = loop {
+        said.drain();
         match child.try_wait() {
             Ok(Some(status)) => {
                 break if Instant::now() >= deadline {
@@ -491,7 +506,7 @@ fn wait_check(child: &mut Child, deadline: Instant) -> Result<(), String> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    result
+    result.map_err(|why| format!("{why}{}", said.said()))
 }
 
 #[derive(Debug, PartialEq, Eq)]

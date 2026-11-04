@@ -248,17 +248,20 @@ pub(crate) fn release() -> Result<(), String> {
     if mount_options()?.is_none() {
         return Ok(());
     }
-    let status = Command::new("/bin/umount")
-        .arg(VIEW)
-        .env_clear()
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("start fixed portal unmount: {e}"))?;
+    let (status, mut umount) = crate::stderr_tail::status(
+        Command::new("/bin/umount")
+            .arg(VIEW)
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
+    .map_err(|e| format!("start fixed portal unmount: {e}"))?;
     if !status.success() {
-        return Err(format!("fixed portal unmount failed: {status}"));
+        return Err(format!(
+            "fixed portal unmount failed: {status}{}",
+            umount.said()
+        ));
     }
     if mount_options()?.is_some() {
         return Err("file-grant mount remains after unmount".into());
@@ -350,17 +353,20 @@ pub(crate) fn release_handoff() -> Result<(), String> {
     if mount_options_at(HANDOFF_VIEW)?.is_none() {
         return Ok(());
     }
-    let status = Command::new("/bin/umount")
-        .arg(HANDOFF_VIEW)
-        .env_clear()
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("start fixed handoff unmount: {e}"))?;
+    let (status, mut umount) = crate::stderr_tail::status(
+        Command::new("/bin/umount")
+            .arg(HANDOFF_VIEW)
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    )
+    .map_err(|e| format!("start fixed handoff unmount: {e}"))?;
     if !status.success() {
-        return Err(format!("fixed handoff unmount failed: {status}"));
+        return Err(format!(
+            "fixed handoff unmount failed: {status}{}",
+            umount.said()
+        ));
     }
     if mount_options_at(HANDOFF_VIEW)?.is_some() {
         return Err("handoff mount remains after unmount".into());

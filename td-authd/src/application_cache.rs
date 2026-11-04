@@ -4,6 +4,7 @@
 //! No caller supplies an executable, UID, path or ref.
 
 use crate::flathub_app::{self, Status};
+use crate::stderr_tail;
 use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -19,8 +20,6 @@ const REMOVE_TIME: Duration = Duration::from_secs(600);
 /// A status walks at most the two generations' deploys, on every poll; a
 /// cold cache holding a platform runtime is the case this bound must fit.
 const STATUS_TIME: Duration = Duration::from_secs(60);
-/// The tail of td-app's diagnostics kept for the refusal this reports.
-const DIAGNOSTIC_TAIL: usize = 512;
 const WAIT_STEP: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,10 +147,7 @@ fn collect(
                         return Err("td-app's answer exceeds its bound".into());
                     }
                     Some(_) => {}
-                    None => {
-                        let excess = output.len().saturating_sub(DIAGNOSTIC_TAIL);
-                        output.drain(..excess);
-                    }
+                    None => stderr_tail::push(&mut output, &[]),
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -180,14 +176,7 @@ fn collect(
 
 /// The last line of td-app's diagnostics as printable ASCII.
 fn diagnostic(tail: &[u8]) -> String {
-    let text = String::from_utf8_lossy(tail);
-    let line = text
-        .trim_end()
-        .rsplit('\n')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    flathub_app::reason_text(&line)
+    flathub_app::reason_text(&stderr_tail::last_reason(tail).unwrap_or_default())
 }
 
 /// A status as root relays it: exactly td-app's canonical record for the
@@ -430,7 +419,7 @@ mod tests {
         let (guard, wire) = child(2);
         let (output, status) = collect(guard, wire, soon(), None).unwrap();
         assert!(status.success());
-        assert!(output.len() <= DIAGNOSTIC_TAIL);
+        assert!(output.len() <= stderr_tail::TAIL_BYTES);
         assert_eq!(diagnostic(&output), "last");
 
         let begin = Instant::now();

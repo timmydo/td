@@ -220,6 +220,8 @@ pub(crate) struct Unlock {
     failure: Option<String>,
     terminal: Option<Result<Event, String>>,
     cleanup_expired: bool,
+    /// The cancellation cleanup's stderr, quoted when it fails.
+    cleanup_said: Option<crate::stderr_tail::Tail>,
     acknowledgement_deadline: Option<Instant>,
 }
 
@@ -317,6 +319,7 @@ impl Unlock {
             failure: None,
             terminal: None,
             cleanup_expired: false,
+            cleanup_said: None,
             acknowledgement_deadline: None,
         })
     }
@@ -520,6 +523,9 @@ impl Unlock {
                 .map_err(|e| format!("stop expired unlock cleanup: {e}"))?;
             self.cleanup_expired = true;
         }
+        if let Some(said) = &mut self.cleanup_said {
+            said.drain();
+        }
         let Some(status) = self
             .child
             .as_mut()
@@ -544,17 +550,32 @@ impl Unlock {
                 Ok(deadline) => deadline,
                 Err(reason) => return self.cleanup_failed(reason),
             };
-            match cleanup(self.request.owner()).spawn() {
+            let (said, said_end) = match crate::stderr_tail::Tail::pair() {
+                Ok(pair) => pair,
+                Err(reason) => return self.cleanup_failed(reason),
+            };
+            // The temporary Command drops root's copy of the tail's child end.
+            match cleanup(self.request.owner())
+                .stderr(Stdio::from(said_end))
+                .spawn()
+            {
                 Ok(child) => self.child = Some(child),
                 Err(error) => return self.cleanup_failed(format!("start unlock cleanup: {error}")),
             }
+            self.cleanup_said = Some(said);
             self.deadline = deadline;
             self.phase = Phase::Locking;
             return Ok(Event::Waiting);
         }
         if !status.success() || self.cleanup_expired || Instant::now() >= self.deadline {
-            return self
-                .cleanup_failed("unlock cleanup did not finish successfully in time".into());
+            let said = self
+                .cleanup_said
+                .as_mut()
+                .map(crate::stderr_tail::Tail::said)
+                .unwrap_or_default();
+            return self.cleanup_failed(format!(
+                "unlock cleanup did not finish successfully in time{said}"
+            ));
         }
         let reason = self
             .failure

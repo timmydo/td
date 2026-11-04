@@ -537,7 +537,8 @@ fn root_startup_checks_every_credential_column_and_single_threadedness() {
 fn a_late_validator_success_is_refused_even_after_reaping() {
     let mut child = spawn(&mut probe_command()).unwrap();
     wait_for_probe(&mut child);
-    assert!(wait_check(&mut child, Instant::now())
+    let (mut said, _) = crate::stderr_tail::Tail::pair().unwrap();
+    assert!(wait_check(&mut child, Instant::now(), &mut said)
         .unwrap_err()
         .contains("timed out"));
     assert!(CHECK_TIMEOUT < crate::channel::TIMEOUT);
@@ -560,9 +561,12 @@ fn a_validator_timeout_kills_and_reaps_the_owned_child() {
     ]);
     let mut child = spawn(&mut command).unwrap();
     let start = Instant::now();
-    assert!(wait_check(&mut child, start + Duration::from_millis(50))
-        .unwrap_err()
-        .contains("timed out"));
+    let (mut said, _) = crate::stderr_tail::Tail::pair().unwrap();
+    assert!(
+        wait_check(&mut child, start + Duration::from_millis(50), &mut said)
+            .unwrap_err()
+            .contains("timed out")
+    );
     assert!(start.elapsed() < Duration::from_secs(2));
     assert!(child.try_wait().unwrap().is_some());
 }

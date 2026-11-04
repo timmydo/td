@@ -84,6 +84,8 @@ pub(crate) struct Inspection {
     exit_failed: bool,
     /// The deadline, not the helper, ended the run.
     missed: bool,
+    /// Its stderr, for the log of a caller whose helper failed.
+    stderr: Option<crate::stderr_tail::Tail>,
     terminal: Option<Event>,
     /// Sends SIGKILL; a test's stands for one that has not taken effect,
     /// as for a child in uninterruptible sleep.
@@ -138,14 +140,18 @@ impl Inspection {
             Writes::Stdin => (output, Stdio::null()),
             Writes::Stdout => (Stdio::null(), output),
         };
+        let (stderr, stderr_end) = crate::stderr_tail::Tail::pair()?;
         let child = command
             .env_clear()
             .current_dir("/")
             .stdin(stdin)
             .stdout(stdout)
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr_end))
             .spawn()
             .map_err(|e| format!("start inspection: {e}"))?;
+        // The command still holds the child ends; dropping it here leaves
+        // the helper their only writer.
+        drop(command);
         Ok(Self {
             child: Some(child),
             wire: Some(parent),
@@ -156,6 +162,7 @@ impl Inspection {
             failed: false,
             exit_failed: false,
             missed: false,
+            stderr: Some(stderr),
             terminal: None,
             stop: Child::kill,
         })
@@ -169,6 +176,9 @@ impl Inspection {
     }
 
     fn receive(&mut self) -> Result<(), String> {
+        if let Some(stderr) = &mut self.stderr {
+            stderr.drain();
+        }
         if self.eof {
             return Ok(());
         }
@@ -306,6 +316,15 @@ impl Inspection {
     /// Whether the deadline ended the run.
     pub fn missed(&self) -> bool {
         self.missed
+    }
+
+    /// What a failure message adds for the helper: its last line of stderr
+    /// quoted, or nothing.
+    pub fn said(&mut self) -> String {
+        self.stderr
+            .as_mut()
+            .map(crate::stderr_tail::Tail::said)
+            .unwrap_or_default()
     }
 
     /// Whether the helper is gone, reaping it if it has exited; it never
