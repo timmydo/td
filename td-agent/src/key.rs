@@ -1,5 +1,5 @@
 //! The API key on a development host (DESIGN.md §6): the one line of
-//! `$XDG_CONFIG_HOME/td-agent/openrouter.key`, read by the window process
+//! `$XDG_CONFIG_HOME/td-agent/openrouter.key`, read by the broker
 //! alone, which hands it to each conversation process over their
 //! socketpair. There is no environment-variable form.
 //!

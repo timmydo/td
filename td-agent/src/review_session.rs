@@ -433,7 +433,7 @@ fn run_workspace(
         &mut out,
         journal,
     );
-    eprintln!("td-agent review: {} model requests; total {} (unreported usage charged at reservation), cap {}", budget.requests, cost::show(budget.charged), cost::show(budget.limit));
+    logged!("td-agent review: {} model requests; total {} (unreported usage charged at reservation), cap {}", budget.requests, cost::show(budget.charged), cost::show(budget.limit));
     let summary = journal.event(
         "budget_total",
         Json::Obj(vec![
@@ -774,7 +774,7 @@ fn loop_review(
             }
             Err(failure) => return Err(failure.message),
         };
-        eprintln!("{}", review::spent(&reply, &served, plan.reserved));
+        logged!("{}", review::spent(&reply, &served, plan.reserved));
         let settled = budget.settle(plan.reserved, reply.usage);
         journal.event(
             "budget_settlement",
@@ -865,7 +865,7 @@ fn loop_review(
         messages.push(assistant(&reply)?);
         context.observe(client::turn_body("", prefix, messages)?.len(), reply.usage);
         for call in &reply.calls {
-            eprintln!("td-agent review: tool {}", tools::visible(&call.name));
+            logged!("td-agent review: tool {}", tools::visible(&call.name));
             journal.event(
                 "tool_call",
                 Json::Obj(vec![

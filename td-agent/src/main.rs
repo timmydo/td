@@ -1,5 +1,6 @@
-//! td-agent's program: the window process by default, a conversation
-//! process when the window starts one, and the tool host a conversation
+//! td-agent's program: the window by default, the broker as `serve`, what
+//! joins a far window to it as `attach`, a conversation process when the
+//! broker starts one, and the tool host a conversation
 //! starts for its tools (DESIGN.md §2).
 
 #![forbid(unsafe_code)]
@@ -12,6 +13,8 @@ use td_agent::store::{Id, Role, StateDir};
 use td_agent::workspace::Workspace;
 
 const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
+\x20      td-agent serve [--stop]\n\
+\x20      td-agent attach\n\
 \x20      td-agent review --commit REV [--model opus-latest|gpt-sol-latest]\n\
 \x20                      [--max-cost USD] [--repo DIRECTORY]\n\
 \x20      td-agent review-log FILE\n\
@@ -26,6 +29,11 @@ Each message is a turn with the configured model through OpenRouter, by\n\
 way of td's fetch service: on td, start it from the launcher's CODING\n\
 AGENT card; on a host, run it as ./install-apps installs it from a td\n\
 checkout, whose launch serves that.\n\
+\n\
+The conversations run in td-agent serve, which the window starts when none\n\
+is running: closing the window leaves what is running going on, and serve\n\
+ends when nothing is. td-agent attach joins standard input and output to it,\n\
+for a window on another machine at the far end of ssh.\n\
 \n\
 Keys: Return in the composer sends it (S-Return is a newline, and\n\
 C-Return sends from outside a dialog); C-r asks a failed turn again;\n\
@@ -116,6 +124,19 @@ fn window(args: &[String]) -> Result<(), String> {
         }
         _ => return Err(USAGE.trim_end().into()),
     };
+    td_agent::window::run(&state()?, &program()?, control)
+}
+
+fn state() -> Result<StateDir, String> {
+    StateDir::from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+fn program() -> Result<PathBuf, String> {
+    std::env::current_exe().map_err(|e| format!("this program's path: {e}"))
+}
+
+/// The broker: the one that reads the configuration and holds the key.
+fn serve() -> Result<(), String> {
     let config_path = td_agent::config::path(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
@@ -136,15 +157,20 @@ fn window(args: &[String]) -> Result<(), String> {
                 .to_string(),
         ),
     };
-    let state = StateDir::from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))?;
-    let program = std::env::current_exe().map_err(|e| format!("this program's path: {e}"))?;
-    td_agent::window::run(config, key, key_path, state, program, control)
+    td_agent::broker::run(config, key, key_path, state()?, program()?)
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((first, rest)) if first == "conversation" => conversation(rest),
+        Some((first, [])) if first == "serve" => serve(),
+        Some((first, [flag])) if first == "serve" && flag == "--stop" => {
+            state().and_then(|state| td_agent::window::stop(&state))
+        }
+        Some((first, [])) if first == "attach" => {
+            state().and_then(|state| td_agent::window::attach(&state, &program()?))
+        }
         Some((first, rest)) if first == "review-logs" => td_agent::review_inventory::run(rest),
         Some((first, rest)) if first == "review-log" => td_agent::review_metrics::run(rest),
         Some((first, rest)) if first == "review" => td_agent::review::run(rest),

@@ -1,7 +1,7 @@
 //! What has been spent (DESIGN.md §5). A conversation's spending is a
 //! function of its log: every request's recorded cost, and for a request
 //! a restart found started and never finished, its whole reservation. The
-//! day's spending crosses conversations, so the window process keeps it
+//! day's spending crosses conversations, so the broker keeps it
 //! (`Ledger`), in the state directory's `spend`, granting each reservation
 //! a conversation process asks for only while the day's limit holds.
 

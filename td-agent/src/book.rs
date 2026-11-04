@@ -227,6 +227,11 @@ impl Book {
         })
     }
 
+    /// The conversations, the most recently active first.
+    pub fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
     /// The conversation shown, if any.
     pub fn active(&self) -> Option<&Id> {
         self.active.as_ref()
@@ -253,6 +258,11 @@ impl Book {
     /// a request of one.
     pub fn is_turn(&self, started: u64) -> bool {
         self.turns.contains(&started)
+    }
+
+    /// Whether a conversation may open: one listed, not archived or closing.
+    pub fn opens(&self, id: &Id) -> bool {
+        !self.closing(id) && self.rows.iter().any(|row| &row.id == id && !row.archived)
     }
 
     /// The first conversation listed that may open.
@@ -397,8 +407,17 @@ impl Book {
     /// The open conversation's log, read again from its start.
     pub fn replay(&mut self, events: &[Event]) {
         self.clear_open();
+        // One with no process stays so, whatever its log's last turn left.
+        let failed = self
+            .active_row()
+            .is_some_and(|row| row.state == RowState::Failed);
         for event in events {
             self.event(event);
+        }
+        if failed {
+            if let Some(row) = self.active_row_mut() {
+                row.state = RowState::Failed;
+            }
         }
         // The replayed turns set the state: `running` while the last is
         // open, `idle` once it has ended (it may have ended between the

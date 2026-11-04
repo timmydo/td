@@ -1,5 +1,5 @@
 //! What td-agent knows of the provider's models and of the key's credit
-//! (DESIGN.md §5). `GET /models` is fetched by the window process at
+//! (DESIGN.md §5). `GET /models` is fetched by the broker at
 //! startup and cached in the state directory as `models`, then again once
 //! each configured model it leaves out is looked for in its own `GET
 //! /models/{id}/endpoints` (Jev's is listed only there), each model cut
@@ -68,7 +68,7 @@ pub fn look_up(base_url: &str, models: &mut Models, wanted: &[&str]) -> bool {
                 models.models.push(model);
                 added = true;
             }
-            Err(why) => eprintln!(
+            Err(why) => logged!(
                 "td-agent: {id} is not in the models list, nor found by its endpoints: {why}"
             ),
         }

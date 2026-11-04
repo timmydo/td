@@ -1,8 +1,9 @@
 //! The window's and its session's messages, `View` and `Request`, as bytes
 //! (DESIGN.md §2): one JSON object a message, a `"type"` naming its variant,
 //! as `protocol`'s are. What decodes here is untrusted, and every fault in it
-//! is an `Err`; no fault's text quotes what was sent, so a key in a malformed
-//! `SaveKey` reaches no error.
+//! is an `Err`; a fault in a `SaveKey` does not quote what was sent, so a key
+//! reaches no error. What goes on to a file or a path is held to that file's or
+//! path's own rule here, as the sink holds it again.
 //!
 //! Each payload with a form of its own keeps it, unchanged. Those forms write
 //! a path as text, which a path that is not UTF-8 does not survive and which
@@ -64,7 +65,7 @@ fn rows_json(rows: &[(String, String)]) -> Json {
     )
 }
 
-/// Bytes as text: the one form of pictures and of paths that are not UTF-8.
+/// Bytes as text: the one form of bytes: pictures, and any path that is carried exactly.
 fn bytes_json(bytes: &[u8]) -> Json {
     Json::Str(td_encoding::base64(bytes))
 }
@@ -695,6 +696,24 @@ fn frame(bytes: &[u8]) -> Result<Json, String> {
 pub fn encode_view(view: &View) -> Vec<u8> {
     let (kind, pairs): (&str, Pairs) = match view {
         View::Opened(book) => ("opened", vec![field("book", book.to_json())]),
+        View::SetMode(mode) => (
+            "set_mode",
+            vec![field("mode", Json::Str(mode.word().into()))],
+        ),
+        View::Counted(id, events, ended) => (
+            "counted",
+            vec![
+                field("id", id_json(id)),
+                field(
+                    "events",
+                    Json::Arr(events.iter().map(Event::to_json).collect()),
+                ),
+                field(
+                    "ended",
+                    Json::Arr(ended.iter().map(|call| Json::from(*call)).collect()),
+                ),
+            ],
+        ),
         View::SetShare(share) => (
             "set_share",
             vec![field(
@@ -713,9 +732,10 @@ pub fn encode_view(view: &View) -> Vec<u8> {
             ],
         ),
         View::SetActive(id) => ("set_active", vec![field("id", id_json(id))]),
-        View::Update(update, now, pictures) => (
+        View::Update(of, update, now, pictures) => (
             "update",
             vec![
+                field("of", of.as_ref().map_or(Json::Null, id_json)),
                 field("update", update_json(update)),
                 field("now", Json::from(*now)),
                 field("pictures", pictures_json(pictures)),
@@ -729,9 +749,10 @@ pub fn encode_view(view: &View) -> Vec<u8> {
                 field("now", Json::from(*now)),
             ],
         ),
-        View::Replay(prefix, events, pictures) => (
+        View::Replay(of, prefix, events, pictures) => (
             "replay",
             vec![
+                field("of", of.as_ref().map_or(Json::Null, id_json)),
                 field("prefix", result_json(prefix, |prefix| text(prefix))),
                 field(
                     "events",
@@ -952,11 +973,32 @@ pub fn encode_view(view: &View) -> Vec<u8> {
 
 /// One message from the session to the window, back. It is refused for any
 /// fault, a word the session never says for a closing conversation included.
+/// The conversation a message is of, when one was open.
+fn of_from(value: &Json) -> Result<Option<Id>, String> {
+    match value.get("of") {
+        Some(Json::Null) => Ok(None),
+        Some(_) => id_from(value, "of").map(Some),
+        None => Err("no conversation it is of".into()),
+    }
+}
+
 pub fn decode_view(bytes: &[u8]) -> Result<View, String> {
     let value = frame(bytes)?;
     let value = &value;
     Ok(match value.get("type").and_then(Json::as_str) {
         Some("opened") => View::Opened(Box::new(member(value, "book", Book::from_json)?)),
+        Some("set_mode") => View::SetMode(
+            value
+                .get("mode")
+                .and_then(Json::as_str)
+                .and_then(Mode::parse)
+                .ok_or("no mode")?,
+        ),
+        Some("counted") => View::Counted(
+            id_from(value, "id")?,
+            items(value, "events", Event::from_json)?,
+            numbers(value, "ended")?,
+        ),
         Some("set_share") => View::SetShare(match value.get("share") {
             Some(Json::Null) => None,
             Some(share) => match share.as_arr() {
@@ -981,6 +1023,7 @@ pub fn decode_view(bytes: &[u8]) -> Result<View, String> {
         ),
         Some("set_active") => View::SetActive(id_from(value, "id")?),
         Some("update") => View::Update(
+            of_from(value)?,
             member(value, "update", update_from)?,
             number(value, "now")?,
             pictures_from(value)?,
@@ -991,6 +1034,7 @@ pub fn decode_view(bytes: &[u8]) -> Result<View, String> {
             number(value, "now")?,
         ),
         Some("replay") => View::Replay(
+            of_from(value)?,
             member(value, "prefix", |prefix| {
                 result_from(prefix, |prefix| {
                     prefix
@@ -1302,9 +1346,70 @@ pub fn encode_request(request: &Request) -> Vec<u8> {
 
 /// One message from the window to the session, back. A key is held to what
 /// the key dialog takes, and its refusals name the fault, never the text.
-pub fn decode_request(bytes: &[u8]) -> Result<Request, String> {
+/// What a window meant by "the open conversation" when it asked (`broker`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Showing {
+    /// None was open.
+    Nothing,
+    Conversation(Id),
+    /// Whichever comes of the new one it has asked for and not yet heard of: a
+    /// message typed straight after asking is for that one. It goes on showing
+    /// this one if none comes.
+    New(Option<Id>),
+}
+
+/// A request with what the window was showing when it asked: the one a request
+/// that names no conversation means.
+pub fn encode_asked(showing: &Showing, request: &Request) -> Vec<u8> {
+    let mut bytes = br#"{"of":"#.to_vec();
+    match showing {
+        Showing::Conversation(of) => {
+            bytes.push(b'"');
+            bytes.extend_from_slice(of.as_str().as_bytes());
+            bytes.push(b'"');
+        }
+        Showing::Nothing => bytes.extend_from_slice(b"null"),
+        Showing::New(prior) => {
+            bytes.extend_from_slice(br#""new","prior":"#);
+            match prior {
+                Some(prior) => {
+                    bytes.push(b'"');
+                    bytes.extend_from_slice(prior.as_str().as_bytes());
+                    bytes.push(b'"');
+                }
+                None => bytes.extend_from_slice(b"null"),
+            }
+        }
+    }
+    bytes.extend_from_slice(br#","request":"#);
+    bytes.extend_from_slice(&encode_request(request));
+    bytes.push(b'}');
+    bytes
+}
+
+/// What `encode_asked` made.
+pub fn decode_asked(bytes: &[u8]) -> Result<(Showing, Request), String> {
     let value = frame(bytes)?;
-    let value = &value;
+    let showing = match value.get("of") {
+        Some(Json::Str(new)) if new == "new" => Showing::New(match value.get("prior") {
+            Some(Json::Null) => None,
+            Some(_) => Some(id_from(&value, "prior")?),
+            None => return Err("a new one and no word of what it was asked from".into()),
+        }),
+        _ => match of_from(&value)? {
+            Some(of) => Showing::Conversation(of),
+            None => Showing::Nothing,
+        },
+    };
+    let request = value.get("request").ok_or("no request")?;
+    Ok((showing, request_from(request)?))
+}
+
+pub fn decode_request(bytes: &[u8]) -> Result<Request, String> {
+    request_from(&frame(bytes)?)
+}
+
+fn request_from(value: &Json) -> Result<Request, String> {
     Ok(match value.get("type").and_then(Json::as_str) {
         Some("open") => Request::Open(id_from(value, "id")?),
         Some("new") => Request::New,
@@ -1328,7 +1433,9 @@ pub fn decode_request(bytes: &[u8]) -> Result<Request, String> {
         Some("review") => Request::Review(string(value, "revision")?),
         Some("schedule") => Request::Schedule(member(value, "command", command_from)?),
         Some("command") => Request::Command {
-            name: string(value, "name")?,
+            name: Some(string(value, "name")?)
+                .filter(|name| crate::commands::name_ok(name))
+                .ok_or("a command's name is not one")?,
             args: string(value, "args")?,
             typed: string(value, "typed")?,
             pictures: attached_from(value, "pictures")?,
@@ -1377,7 +1484,12 @@ pub fn decode_request(bytes: &[u8]) -> Result<Request, String> {
         },
         Some("trust") => Request::Trust {
             conversation: id_from(value, "conversation")?,
-            digest: maybe(value, "digest")?,
+            digest: match maybe(value, "digest")? {
+                Some(digest) if !crate::rules::digest_hex(&digest) => {
+                    return Err("a trust mark is a SHA-256 in lowercase hex".into());
+                }
+                digest => digest,
+            },
         },
         Some("workspace") => Request::Workspace(id_from(value, "id")?),
         Some("remove") => Request::Remove {
@@ -1809,14 +1921,18 @@ mod tests {
         let mut all = vec![
             View::Opened(Box::default()),
             View::Opened(Box::new(book())),
+            View::SetMode(Mode::Ask),
+            View::SetMode(Mode::Auto),
+            View::Counted(id(1), events(), vec![u64::MAX]),
+            View::Counted(id(2), Vec::new(), Vec::new()),
             View::SetShare(None),
             View::SetShare(Some((u32::MAX, 1))),
             View::Note(AWKWARD.into()),
             View::Withdraw(id(1), None),
             View::Withdraw(id(1), Some(u64::MAX)),
             View::SetActive(id(1)),
-            View::Replay(Ok(AWKWARD.into()), events(), pictures()),
-            View::Replay(Err("no prefix".into()), Vec::new(), Pictures::new()),
+            View::Replay(Some(id(1)), Ok(AWKWARD.into()), events(), pictures()),
+            View::Replay(None, Err("no prefix".into()), Vec::new(), Pictures::new()),
             View::GiveBack(AWKWARD.into(), attached(), "why".into()),
             View::GiveBack(String::new(), Vec::new(), String::new()),
             View::Restore(AWKWARD.into(), "why".into()),
@@ -1921,7 +2037,13 @@ mod tests {
             View::FocusComposer,
         ];
         for update in updates() {
-            all.push(View::Update(update.clone(), u64::MAX, pictures()));
+            all.push(View::Update(None, update.clone(), u64::MAX, pictures()));
+            all.push(View::Update(
+                Some(id(2)),
+                update.clone(),
+                0,
+                Pictures::new(),
+            ));
             all.push(View::Background(id(1), update, 0));
         }
         for client in clients() {
@@ -2036,7 +2158,7 @@ mod tests {
             },
             Request::Trust {
                 conversation: id(1),
-                digest: Some("d".into()),
+                digest: Some("d".repeat(64)),
             },
             Request::Workspace(id(1)),
             Request::Remove {
@@ -2098,6 +2220,8 @@ mod tests {
     fn view_name(view: &View) -> &'static str {
         match view {
             View::Opened(..) => "Opened",
+            View::SetMode(..) => "SetMode",
+            View::Counted(..) => "Counted",
             View::SetShare(..) => "SetShare",
             View::Note(..) => "Note",
             View::Withdraw(..) => "Withdraw",
@@ -2214,6 +2338,58 @@ mod tests {
         assert_eq!(encode_view(&back), bytes, "{view:?}");
     }
 
+    /// Neither goes on to its file or path unless it is what that file or path
+    /// holds.
+    #[test]
+    fn a_command_name_or_a_trust_mark_that_would_lead_elsewhere_is_refused() {
+        for name in ["../outside", "/etc/passwd", "a/b", ""] {
+            let frame = encode_request(&Request::Command {
+                name: name.into(),
+                args: String::new(),
+                typed: String::new(),
+                pictures: Vec::new(),
+            });
+            assert!(decode_request(&frame).is_err(), "{name}");
+        }
+        for digest in [
+            String::new(),
+            "d".repeat(63),
+            "D".repeat(64),
+            format!("{}\nallow shell rm -rf /", "d".repeat(64)),
+        ] {
+            let frame = encode_request(&Request::Trust {
+                conversation: id(1),
+                digest: Some(digest.clone()),
+            });
+            assert!(decode_request(&frame).is_err(), "{digest}");
+        }
+    }
+
+    #[test]
+    fn a_request_says_what_the_window_was_showing() {
+        for showing in [
+            Showing::Nothing,
+            Showing::Conversation(id(1)),
+            Showing::New(None),
+            Showing::New(Some(id(3))),
+        ] {
+            for request in [Request::Retry, Request::Open(id(2))] {
+                let frame = encode_asked(&showing, &request);
+                assert_eq!(decode_asked(&frame).unwrap(), (showing.clone(), request));
+            }
+        }
+        for frame in [
+            r#"{"request":{"type":"retry"}}"#.to_string(),
+            r#"{"of":null}"#.to_string(),
+            r#"{"of":"x","request":{"type":"retry"}}"#.to_string(),
+            r#"{"of":"new","request":{"type":"retry"}}"#.to_string(),
+            r#"{"of":"new","prior":"x","request":{"type":"retry"}}"#.to_string(),
+            r#"{"of":null,"request":{"type":"never"}}"#.to_string(),
+        ] {
+            assert!(decode_asked(frame.as_bytes()).is_err(), "{frame}");
+        }
+    }
+
     fn round_trip_request(request: &Request) {
         let bytes = encode_request(request);
         let back = decode_request(&bytes).unwrap_or_else(|why| panic!("{request:?}: {why}"));
@@ -2317,7 +2493,7 @@ mod tests {
     /// closing words are the same ones, by the same static.
     #[test]
     fn a_closing_word_is_one_the_session_says() {
-        let window = include_str!("window.rs");
+        let window = include_str!("broker.rs");
         assert!(window.contains("let doing = if archive { \"archiving\" } else { \"deleting\" };"));
         let word = |frame: &str| decode_view(frame.as_bytes());
         let conversation = id(1);

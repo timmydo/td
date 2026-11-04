@@ -1,4 +1,4 @@
-//! The window process's side of the conversation processes (DESIGN.md
+//! The broker's side of the conversation processes (DESIGN.md
 //! §2): it starts `td-agent conversation <id>` as its child over a framed
 //! socketpair, sends it the model client's settings and the key first,
 //! reads what the child says on a thread of its own so the window never
@@ -397,6 +397,26 @@ impl Supervisor {
             .and_then(|at| self.children.get(at))
             .map(|running| running.pending.iter().map(|p| p.text.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// Whether any conversation has something under way, the open one too:
+    /// what keeps a process past the conversation's closing keeps the broker.
+    pub fn working(&self) -> bool {
+        self.children
+            .iter()
+            .any(|running| !running.failed && running.working())
+    }
+
+    /// Whether a message waits for a conversation that `opens` says may yet take
+    /// it: one with no process, or one whose process failed.
+    pub fn held_for(&self, opens: impl Fn(&Id) -> bool) -> bool {
+        self.parked
+            .iter()
+            .any(|(id, pending)| !pending.is_empty() && opens(id))
+            || self
+                .children
+                .iter()
+                .any(|running| running.failed && !running.pending.is_empty() && opens(&running.id))
     }
 
     /// The open conversation's process id, while it runs.
@@ -947,11 +967,11 @@ impl Drop for Supervisor {
         for running in std::mem::take(&mut self.children) {
             self.retire(running);
         }
-        // Nothing keeps these past the window: each is said, whole, so
+        // Nothing keeps these past the broker: each is said, whole, so
         // what was typed is not lost without a word.
         for (id, pending) in &self.parked {
             for Pending { text, .. } in pending {
-                eprintln!("td-agent: a message to conversation {id} was not delivered:\n{text}");
+                logged!("td-agent: a message to conversation {id} was not delivered:\n{text}");
             }
         }
         let deadline = Instant::now() + EXIT_WAIT;

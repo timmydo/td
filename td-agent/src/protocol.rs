@@ -1,4 +1,4 @@
-//! What the window process and a conversation process say to each other,
+//! What the broker and a conversation process say to each other,
 //! one JSON object per frame (`frame`), over their socketpair (DESIGN.md
 //! §2). The API key crosses here, in the `Setup` the window sends each
 //! conversation process first, and never through argv, the environment

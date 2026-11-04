@@ -1,4 +1,4 @@
-//! Messages between conversations, the window process's side (DESIGN.md
+//! Messages between conversations, the broker's side (DESIGN.md
 //! §3, §6): it routes them. A conversation's `send_message`, which the
 //! human allowed on a card in its own process, reaches the window as a
 //! `Send`, is checked again here (both ends exist, the sender is not the

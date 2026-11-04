@@ -25,12 +25,19 @@ pub enum View {
     Opened(Box<Book>),
     /// The list and transcript's share of the window, as the person left it.
     SetShare(Option<(u32, u32)>),
+    /// The configuration's mode.
+    SetMode(Mode),
+    /// What a conversation's log has said of its processes and sub-agents, and
+    /// the sub-agents' calls that have ended, for a window that has just
+    /// attached and has not seen that log.
+    Counted(Id, Vec<Event>, Vec<u64>),
     Note(String),
     Withdraw(Id, Option<u64>),
     SetActive(Id),
-    Update(Update, u64, Pictures),
+    /// Of the conversation named, the one shown when the session said it.
+    Update(Option<Id>, Update, u64, Pictures),
     Background(Id, Update, u64),
-    Replay(Result<String, String>, Vec<Event>, Pictures),
+    Replay(Option<Id>, Result<String, String>, Vec<Event>, Pictures),
     GiveBack(String, Vec<Attached>, String),
     Restore(String, String),
     TemplateSaved(String),
@@ -83,7 +90,62 @@ pub struct Port {
     book: Book,
     /// Where each conversation keeps its pictures.
     state: StateDir,
+    /// Whether a window is there to tell.
+    attached: bool,
     out: Vec<View>,
+    /// The last of each setting said, in the order said, and what is still
+    /// asked of the person: what a window that attaches is told at once.
+    settings: Vec<View>,
+    asked: Vec<View>,
+    /// What each conversation has said of its processes and sub-agents.
+    counted: std::collections::BTreeMap<Id, Counted>,
+    /// The last event each conversation's process read back from its log when it
+    /// started, which is not news.
+    replaying: std::collections::BTreeMap<Id, u64>,
+    /// What was said for a person who was not there, to tell them when one is.
+    later: Vec<View>,
+    /// The last open was of what has closed.
+    refused_open: bool,
+}
+
+/// How many notes wait for a window; the oldest go first.
+const LATER_NOTES: usize = 256;
+
+/// What a window needs of a log it has not seen to list its conversation.
+#[derive(Default)]
+struct Counted {
+    events: Vec<Event>,
+    ended: Vec<u64>,
+}
+
+impl Counted {
+    /// As `App::heard_process` takes them.
+    fn heard(&mut self, event: &Event) {
+        match &event.kind {
+            Kind::Process { .. } => self.events.push(event.clone()),
+            Kind::Task { .. } => self.events.push(event.clone()),
+            Kind::Ended { number, .. } => self.events.retain(
+                |kept| !matches!(&kept.kind, Kind::Process { number: of, .. } if of == number),
+            ),
+            Kind::ToolResult { call, .. } => {
+                let of_a_task = self
+                    .events
+                    .iter()
+                    .any(|kept| matches!(&kept.kind, Kind::Task { call: of, .. } if of == call));
+                if of_a_task {
+                    self.ended.push(*call);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Its process has gone, and its background processes with it. One started
+    /// again says its whole log: `Port::count` starts afresh for that.
+    fn process_gone(&mut self) {
+        self.events
+            .retain(|kept| !matches!(kept.kind, Kind::Process { .. }));
+    }
 }
 
 impl Port {
@@ -91,8 +153,211 @@ impl Port {
         Self {
             book: Book::default(),
             state,
+            attached: false,
             out: Vec::new(),
+            settings: Vec::new(),
+            asked: Vec::new(),
+            counted: std::collections::BTreeMap::new(),
+            replaying: std::collections::BTreeMap::new(),
+            later: Vec::new(),
+            refused_open: false,
         }
+    }
+
+    /// A window has attached: it is told all there is to know. What it is shown
+    /// of the open conversation comes after, as the log is read again.
+    pub fn attach(&mut self) {
+        // What the last window's last requests brought is the person's still.
+        for view in std::mem::take(&mut self.out) {
+            self.keep(view);
+        }
+        self.attached = true;
+        self.out.push(View::Opened(Box::new(self.book.clone())));
+        self.out.extend(self.settings.iter().cloned());
+        self.out.extend(self.asked.iter().cloned());
+        for (id, counted) in &self.counted {
+            self.out.push(View::Counted(
+                id.clone(),
+                counted.events.clone(),
+                counted.ended.clone(),
+            ));
+        }
+        self.out.append(&mut self.later);
+    }
+
+    /// The window has gone: what is said is kept as far as `attach` needs it.
+    pub fn detach(&mut self) {
+        self.attached = false;
+        for view in std::mem::take(&mut self.out) {
+            self.keep(view);
+        }
+    }
+
+    /// The window has gone with these unsent.
+    pub fn lost(&mut self, views: Vec<View>) {
+        self.detach();
+        for view in views {
+            self.keep(view);
+        }
+    }
+
+    /// What must reach the person is kept for when one is there.
+    fn keep(&mut self, view: View) {
+        match &view {
+            View::GiveBack(..) | View::Restore(..) => {}
+            View::Note(_) => {
+                let notes = self
+                    .later
+                    .iter()
+                    .filter(|kept| matches!(kept, View::Note(_)))
+                    .count();
+                if notes >= LATER_NOTES {
+                    if let Some(oldest) = self
+                        .later
+                        .iter()
+                        .position(|kept| matches!(kept, View::Note(_)))
+                    {
+                        self.later.remove(oldest);
+                    }
+                }
+            }
+            _ => return,
+        }
+        self.later.push(view);
+    }
+
+    /// Whether a message given back waits for a person to take it.
+    pub fn given_back_waits(&self) -> bool {
+        self.later
+            .iter()
+            .any(|view| matches!(view, View::GiveBack(..) | View::Restore(..)))
+    }
+
+    /// The split the window saved: it knows, and the next is to be told.
+    pub fn saved_share(&mut self, share: Option<(u32, u32)>) {
+        self.settings
+            .retain(|said| !matches!(said, View::SetShare(_)));
+        self.settings.push(View::SetShare(share));
+    }
+
+    /// Whether the last open was of what has closed, asked once.
+    pub fn take_refused_open(&mut self) -> bool {
+        std::mem::take(&mut self.refused_open)
+    }
+
+    /// Conversation `id`'s process ended, saying nothing more, as it is archived
+    /// or closed.
+    fn gone_with_them(&mut self, id: &Id) {
+        if let Some(counted) = self.counted.get_mut(id) {
+            counted.process_gone();
+        }
+    }
+
+    /// Whether a conversation may open.
+    pub fn opens(&self, id: &Id) -> bool {
+        self.book.opens(id)
+    }
+
+    /// What `update` says of `id`'s processes and sub-agents.
+    fn count(&mut self, id: &Id, update: &Update) {
+        match update {
+            Update::Up(crate::protocol::Up::Event(event)) => {
+                self.counted.entry(id.clone()).or_default().heard(event);
+            }
+            Update::Up(crate::protocol::Up::Hello { last, .. }) => {
+                self.counted.remove(id);
+                self.replaying.insert(id.clone(), *last);
+            }
+            Update::Failed { .. } => {
+                if let Some(counted) = self.counted.get_mut(id) {
+                    counted.process_gone();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn say(&mut self, view: View) {
+        match &view {
+            View::SetShare(_)
+            | View::SetMode(_)
+            | View::SetTemplates(_)
+            | View::SetSavedTemplates(_)
+            | View::SetQueued(_)
+            | View::SetOffers(..)
+            | View::SetNetworks(_)
+            | View::SetModes(_)
+            | View::SetModels(..)
+            | View::SetCredit(_)
+            | View::SetKeyPath(_)
+            | View::SetKeyed(_)
+            | View::SetWithoutJev(_)
+            | View::SetToday(_)
+            | View::SetNoWorkspaces(_)
+            | View::SetJailless(_)
+            | View::SetLimits(_)
+            | View::SetDefaultRouting(_)
+            | View::SetDefaultModel(_) => {
+                // Said every turn, most of these, and worth saying when changed:
+                // a window at the far end of ssh pays for each.
+                if self.settings.contains(&view) {
+                    return;
+                }
+                let kind = std::mem::discriminant(&view);
+                self.settings
+                    .retain(|said| std::mem::discriminant(said) != kind);
+                self.settings.push(view.clone());
+            }
+            // Each says more than the last; the window keeps what it has.
+            View::SetSubAgents(_) => {
+                if self.settings.contains(&view) {
+                    return;
+                }
+                self.settings.push(view.clone());
+            }
+            View::Ask(_) | View::Question(_) | View::AskRemoval(..) => {
+                self.asked.push(view.clone())
+            }
+            View::Withdraw(conversation, call) => {
+                self.asked.retain(|asked| match asked {
+                    View::Ask(card) => {
+                        &card.conversation != conversation
+                            || call.is_some_and(|call| call != card.call)
+                    }
+                    View::Question(question) => {
+                        &question.conversation != conversation
+                            || call.is_some_and(|call| call != question.call)
+                    }
+                    _ => true,
+                });
+            }
+            _ => {}
+        }
+        if self.attached {
+            self.out.push(view);
+        } else {
+            self.keep(view);
+        }
+    }
+
+    /// A card, or a question about a removal or an admission, is answered.
+    fn answered(&mut self, request: &Request) {
+        self.asked.retain(|asked| match (request, asked) {
+            (
+                Request::Decide {
+                    conversation, call, ..
+                },
+                View::Ask(card),
+            ) => &card.conversation != conversation || card.call != *call,
+            (
+                Request::Resume {
+                    conversation, turn, ..
+                },
+                View::Ask(card),
+            ) => &card.conversation != conversation || card.call != *turn,
+            (Request::Remove { id, .. }, View::AskRemoval(of, ..)) => of != id,
+            _ => true,
+        });
     }
 
     /// What is waiting for the window, in order.
@@ -107,9 +372,21 @@ impl Port {
     /// said without that, so the window is sent this book to take.
     pub fn asked(&mut self, requests: &[Request]) {
         for request in requests {
+            self.answered(request);
             if let Request::Open(id) = request {
-                self.book.set_active(id.clone());
-                self.out.push(View::Opened(Box::new(self.book.clone())));
+                // It may have closed before the window heard: the answer says.
+                // A sub-agent may be there before the list has heard of it.
+                let listed = self.book.rows.iter().any(|row| &row.id == id);
+                if self.book.opens(id) || (!listed && self.state.conversation(id).is_dir()) {
+                    self.book.set_active(id.clone());
+                } else {
+                    self.refused_open = true;
+                }
+                // Until it hears this the window ignores what is queued, so it
+                // is said again, even if it is the same.
+                self.settings
+                    .retain(|said| !matches!(said, View::SetQueued(_)));
+                self.say(View::Opened(Box::new(self.book.clone())));
             }
         }
     }
@@ -161,21 +438,25 @@ impl Port {
         read
     }
 
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.say(View::SetMode(mode));
+    }
+
     pub fn set_share(&mut self, share: Option<(u32, u32)>) {
-        self.out.push(View::SetShare(share));
+        self.say(View::SetShare(share));
     }
 
     pub fn note(&mut self, message: impl Into<String>) {
-        self.out.push(View::Note(message.into()));
+        self.say(View::Note(message.into()));
     }
 
     pub fn withdraw(&mut self, conversation: &Id, call: Option<u64>) {
-        self.out.push(View::Withdraw(conversation.clone(), call));
+        self.say(View::Withdraw(conversation.clone(), call));
     }
 
     pub fn set_active(&mut self, id: Id) {
         self.book.set_active(id.clone());
-        self.out.push(View::SetActive(id));
+        self.say(View::SetActive(id));
     }
 
     pub fn update(&mut self, update: Update, now: u64) {
@@ -184,131 +465,173 @@ impl Port {
             _ => Pictures::new(),
         };
         self.book.update(&update, now);
-        self.out.push(View::Update(update, now, pictures));
+        let of = self.book.active().cloned();
+        if let Some(of) = &of {
+            self.count(of, &update);
+        }
+        self.say(View::Update(of, update, now, pictures));
     }
 
     pub fn background(&mut self, id: &Id, update: &Update, now: u64) {
         self.book.background(id, update, now);
-        self.out
-            .push(View::Background(id.clone(), update.clone(), now));
+        self.count(id, update);
+        // The window makes a note of what td-agent tells the person there.
+        if !self.attached {
+            let read_back = self.replaying.get(id).copied().unwrap_or(0);
+            if let Update::Up(crate::protocol::Up::Event(Event {
+                seq,
+                kind: Kind::Notice { text } | Kind::Notification { text, .. },
+                ..
+            })) = update
+            {
+                if *seq <= read_back {
+                    return self.say(View::Background(id.clone(), update.clone(), now));
+                }
+                let title = self
+                    .book
+                    .rows
+                    .iter()
+                    .find(|row| &row.id == id)
+                    .map_or(id.as_str(), |row| row.title.as_str());
+                let said = format!("{title}: {text}");
+                self.keep(View::Note(said));
+            }
+        }
+        self.say(View::Background(id.clone(), update.clone(), now));
     }
 
     pub fn replay(&mut self, prefix: Result<&str, &str>, events: Vec<Event>) {
         let pictures = self.pictures(events.iter());
         self.book.replay(&events);
         let prefix = prefix.map(str::to_string).map_err(str::to_string);
-        self.out.push(View::Replay(prefix, events, pictures));
+        let of = self.book.active().cloned();
+        if let Some(of) = &of {
+            // The whole log, so what was counted is counted afresh.
+            let counted = self.counted.entry(of.clone()).or_default();
+            *counted = Counted::default();
+            for event in &events {
+                counted.heard(event);
+            }
+        }
+        self.say(View::Replay(of, prefix, events, pictures));
     }
 
+    /// Said whole to the log too: it may never reach a window, one that takes it
+    /// and goes before showing it among them.
     pub fn give_back(&mut self, text: &str, pictures: Vec<Attached>, why: String) {
-        self.out.push(View::GiveBack(text.into(), pictures, why));
+        logged!("td-agent: {why}; a message given back:\n{text}");
+        self.say(View::GiveBack(text.into(), pictures, why));
     }
 
+    /// Said whole to the log too, as `give_back` is.
     pub fn restore(&mut self, text: &str, why: String) {
-        self.out.push(View::Restore(text.into(), why));
+        logged!("td-agent: {why}; a message given back:\n{text}");
+        self.say(View::Restore(text.into(), why));
     }
 
     pub fn template_saved(&mut self, said: String) {
-        self.out.push(View::TemplateSaved(said));
+        self.say(View::TemplateSaved(said));
     }
 
     pub fn template_refused(&mut self, why: String) {
-        self.out.push(View::TemplateRefused(why));
+        self.say(View::TemplateRefused(why));
     }
 
     pub fn set_templates(&mut self, templates: Vec<(String, bool)>) {
-        self.out.push(View::SetTemplates(templates));
+        self.say(View::SetTemplates(templates));
     }
 
     pub fn set_saved_templates(&mut self, templates: Vec<Template>) {
-        self.out.push(View::SetSavedTemplates(templates));
+        self.say(View::SetSavedTemplates(templates));
     }
 
     pub fn set_queued(&mut self, queued: Vec<String>) {
-        self.out.push(View::SetQueued(queued));
+        self.say(View::SetQueued(queued));
     }
 
     pub fn set_offers(&mut self, offers: Vec<crate::picker::Offer>, effort: &str) {
-        self.out.push(View::SetOffers(offers, effort.into()));
+        self.say(View::SetOffers(offers, effort.into()));
     }
 
     pub fn set_networks(&mut self, client: &Client) {
-        self.out.push(View::SetNetworks(Box::new(client.clone())));
+        self.say(View::SetNetworks(Box::new(client.clone())));
     }
 
     pub fn set_modes(&mut self, modes: Option<Vec<(String, Mode)>>) {
-        self.out.push(View::SetModes(modes));
+        self.say(View::SetModes(modes));
     }
 
     pub fn set_models(&mut self, default: &str, contexts: Vec<(String, u64)>) {
-        self.out.push(View::SetModels(default.into(), contexts));
+        self.say(View::SetModels(default.into(), contexts));
     }
 
     pub fn set_credit(&mut self, credit: Option<String>) {
-        self.out.push(View::SetCredit(credit));
+        self.say(View::SetCredit(credit));
     }
 
     pub fn set_closing(&mut self, id: &Id, doing: Option<&'static str>) {
         self.book.set_closing(id, doing);
-        self.out.push(View::SetClosing(id.clone(), doing));
+        if doing.is_some() {
+            self.gone_with_them(id);
+        }
+        self.say(View::SetClosing(id.clone(), doing));
     }
 
     pub fn key_saved(&mut self, path: &str) {
-        self.out.push(View::KeySaved(path.into()));
+        self.set_keyed(true);
+        self.say(View::KeySaved(path.into()));
     }
 
     pub fn key_exists(&mut self) {
-        self.out.push(View::KeyExists);
+        self.say(View::KeyExists);
     }
 
     pub fn key_refused(&mut self, why: String) {
-        self.out.push(View::KeyRefused(why));
+        self.say(View::KeyRefused(why));
     }
 
     pub fn set_key_path(&mut self, path: Option<String>) {
-        self.out.push(View::SetKeyPath(path));
+        self.say(View::SetKeyPath(path));
     }
 
     pub fn set_keyed(&mut self, keyed: bool) {
-        self.out.push(View::SetKeyed(keyed));
+        self.say(View::SetKeyed(keyed));
     }
 
     pub fn ask_removal(&mut self, id: Id, title: String, lost: Vec<String>, archive: bool) {
-        self.out.push(View::AskRemoval(id, title, lost, archive));
+        self.say(View::AskRemoval(id, title, lost, archive));
     }
 
     pub fn ask(&mut self, card: Card) {
-        self.out.push(View::Ask(card));
+        self.say(View::Ask(card));
     }
 
     pub fn question(&mut self, asked: Asked) {
-        self.out.push(View::Question(asked));
+        self.say(View::Question(asked));
     }
 
     pub fn ask_admission(&mut self, template: String, remotes: Vec<String>) {
-        self.out.push(View::AskAdmission(template, remotes));
+        self.say(View::AskAdmission(template, remotes));
     }
 
     pub fn show_workspace(&mut self, id: &Id, record: &crate::card::Record) {
-        self.out
-            .push(View::ShowWorkspace(id.clone(), Box::new(record.clone())));
+        self.say(View::ShowWorkspace(id.clone(), Box::new(record.clone())));
     }
 
     pub fn reshow_workspace(&mut self, id: &Id, record: &crate::card::Record) {
-        self.out
-            .push(View::ReshowWorkspace(id.clone(), Box::new(record.clone())));
+        self.say(View::ReshowWorkspace(id.clone(), Box::new(record.clone())));
     }
 
     pub fn show_skills(&mut self, found: &crate::skills::Found) {
-        self.out.push(View::ShowSkills(found.clone()));
+        self.say(View::ShowSkills(found.clone()));
     }
 
     pub fn show_schedules(&mut self, entries: &[(String, String)]) {
-        self.out.push(View::ShowSchedules(entries.to_vec()));
+        self.say(View::ShowSchedules(entries.to_vec()));
     }
 
     pub fn show_commands(&mut self, commands: &[(String, String)], more: usize) {
-        self.out.push(View::ShowCommands(commands.to_vec(), more));
+        self.say(View::ShowCommands(commands.to_vec(), more));
     }
 
     pub fn show_output(
@@ -317,7 +640,7 @@ impl Port {
         number: u64,
         read: Result<crate::output::Output, String>,
     ) {
-        self.out.push(View::ShowOutput(id.clone(), number, read));
+        self.say(View::ShowOutput(id.clone(), number, read));
     }
 
     pub fn show_debug(
@@ -326,68 +649,72 @@ impl Port {
         request: u64,
         view: Result<Vec<(String, String)>, String>,
     ) {
-        self.out.push(View::ShowDebug(id.clone(), request, view));
+        self.say(View::ShowDebug(id.clone(), request, view));
     }
 
     pub fn set_without_jev(&mut self, without: bool) {
-        self.out.push(View::SetWithoutJev(without));
+        self.say(View::SetWithoutJev(without));
     }
 
     pub fn set_today(&mut self, today: u64) {
-        self.out.push(View::SetToday(today));
+        self.say(View::SetToday(today));
     }
 
     pub fn set_sub_agents(&mut self, read: Vec<(Id, Vec<TaskStart>)>) {
-        self.out.push(View::SetSubAgents(read));
+        self.say(View::SetSubAgents(read));
     }
 
     pub fn set_rows(&mut self, rows: Vec<Row>) {
         self.book.set_rows(rows.clone());
-        self.out.push(View::SetRows(rows));
+        self.say(View::SetRows(rows));
     }
 
     pub fn add_row(&mut self, row: Row) {
         self.book.add_row(row.clone());
-        self.out.push(View::AddRow(row));
+        self.say(View::AddRow(row));
     }
 
     pub fn remove_row(&mut self, id: &Id) {
         self.book.remove_row(id);
-        self.out.push(View::RemoveRow(id.clone()));
+        self.counted.remove(id);
+        self.replaying.remove(id);
+        self.say(View::RemoveRow(id.clone()));
     }
 
     pub fn set_archived(&mut self, id: &Id, archived: bool) {
         self.book.set_archived(id, archived);
-        self.out.push(View::SetArchived(id.clone(), archived));
+        if archived {
+            self.gone_with_them(id);
+        }
+        self.say(View::SetArchived(id.clone(), archived));
     }
 
     pub fn set_no_workspaces(&mut self, why: Option<String>) {
-        self.out.push(View::SetNoWorkspaces(why));
+        self.say(View::SetNoWorkspaces(why));
     }
 
     pub fn set_jailless(&mut self, why: Option<String>) {
-        self.out.push(View::SetJailless(why));
+        self.say(View::SetJailless(why));
     }
 
     pub fn set_limits(&mut self, limits: crate::cost::Limits) {
-        self.out.push(View::SetLimits(limits));
+        self.say(View::SetLimits(limits));
     }
 
     pub fn set_default_routing(&mut self, routing: &str) {
-        self.out.push(View::SetDefaultRouting(routing.into()));
+        self.say(View::SetDefaultRouting(routing.into()));
     }
 
     pub fn set_default_model(&mut self, model: &str) {
-        self.out.push(View::SetDefaultModel(model.into()));
+        self.say(View::SetDefaultModel(model.into()));
     }
 
     pub fn open_new_template(&mut self, remote: Option<&str>) {
-        self.out
-            .push(View::OpenNewTemplate(remote.map(str::to_string)));
+        self.say(View::OpenNewTemplate(remote.map(str::to_string)));
     }
 
     pub fn focus_composer(&mut self) {
-        self.out.push(View::FocusComposer);
+        self.say(View::FocusComposer);
     }
 }
 
@@ -396,18 +723,27 @@ impl App {
     pub fn apply(&mut self, view: View) {
         match view {
             View::Opened(book) => self.opened(*book),
-            // The conversation left's, or one the session opened before it
-            // heard of this one.
-            View::SetActive(_) | View::Update(..) | View::Replay(..) if self.opening() => {}
+            // Of what it left, or one the session opened before it heard of
+            // this one: all of it but what would be drawn in this transcript.
+            View::SetActive(_) if self.opening() => {}
+            View::SetQueued(_) if self.opening() => {}
+            View::Update(of, update, now, _) if self.opening() => {
+                self.heard_of_left(of.as_ref(), update, now);
+            }
+            View::Replay(of, _, events, _) if self.opening() => {
+                self.replayed_of_left(of.as_ref(), &events);
+            }
             View::SetShare(share) => self.set_share(share),
+            View::SetMode(mode) => self.set_mode(mode),
+            View::Counted(id, events, ended) => self.counted(&id, &events, &ended),
             View::Note(message) => self.note(message),
             View::Withdraw(conversation, call) => self.withdraw(&conversation, call),
             View::SetActive(id) => self.set_active(id),
-            View::Update(update, now, pictures) => {
+            View::Update(_, update, now, pictures) => {
                 self.with_pictures(pictures, |app| app.update(update, now));
             }
             View::Background(id, update, now) => self.background(&id, &update, now),
-            View::Replay(prefix, events, pictures) => {
+            View::Replay(_, prefix, events, pictures) => {
                 self.with_pictures(pictures, |app| {
                     app.replay(prefix.as_deref().map_err(String::as_str), events);
                 });
@@ -569,6 +905,7 @@ mod tests {
         for seed in 1..=40u64 {
             let mut dice = Dice(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+            port.attach();
             let mut app = App::new(surface, None, Mode::Auto).unwrap();
             let mut seq = 0;
             port.set_rows((1..=4).map(row).collect());
@@ -622,12 +959,386 @@ mod tests {
         }
     }
 
+    fn card(conversation: u8, call: u64) -> Card {
+        Card {
+            conversation: id(conversation),
+            call,
+            title: "may it?".into(),
+            details: Vec::new(),
+            always: None,
+            resume: false,
+        }
+    }
+
+    /// A window that attaches is told what one there all along would know, of
+    /// what is still so.
+    #[test]
+    fn a_window_that_attaches_is_told_the_last_of_each_setting_and_what_is_still_asked() {
+        let scratch = TempDir::new("td-agent-view").unwrap();
+        let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+        port.set_rows(vec![row(1), row(2)]);
+        port.set_credit(Some("old".into()));
+        port.set_today(1);
+        port.set_credit(Some("new".into()));
+        port.note("said while no window was there");
+        port.ask(card(1, 1));
+        port.ask(card(1, 2));
+        port.ask(card(1, 3));
+        port.ask(card(2, 4));
+        port.ask(card(2, 5));
+        assert!(port.take().is_empty());
+        port.withdraw(&id(1), Some(1));
+        port.withdraw(&id(2), None);
+        port.asked(&[Request::Decide {
+            conversation: id(1),
+            call: 2,
+            answer: crate::ui::Answer::Once(true),
+        }]);
+        port.ask_removal(id(2), "two".into(), Vec::new(), false);
+        // Asked only of a window that asked for that template, so never kept.
+        port.ask_admission("template".into(), Vec::new());
+        port.attach();
+        let told = port.take();
+        let Some(View::Opened(book)) = told.first() else {
+            unreachable!("the book first");
+        };
+        assert_eq!(book.rows.len(), 2);
+        let rest: Vec<View> = told.into_iter().skip(1).collect();
+        assert_eq!(
+            rest,
+            [
+                View::SetToday(1),
+                View::SetCredit(Some("new".into())),
+                View::Ask(card(1, 3)),
+                View::AskRemoval(id(2), "two".into(), Vec::new(), false),
+                View::Note("said while no window was there".into()),
+            ]
+        );
+        // A setting said again unchanged is not said again.
+        port.set_today(1);
+        assert!(port.take().is_empty());
+        // Except what the window ignored while it waited for an opening.
+        port.set_queued(vec!["q".into()]);
+        port.asked(&[Request::Open(id(1))]);
+        port.take();
+        port.set_queued(vec!["q".into()]);
+        assert_eq!(port.take(), [View::SetQueued(vec!["q".into()])]);
+        // And what is said to it from now on.
+        port.note("heard");
+        assert_eq!(port.take(), [View::Note("heard".into())]);
+        port.detach();
+        port.note("not heard");
+        assert!(port.take().is_empty());
+    }
+
+    /// What comes of the conversation left while the session has yet to hear
+    /// of the opening is not drawn in the one opened, nor lost.
+    #[test]
+    fn what_the_conversation_left_says_while_another_opens_reaches_the_person() {
+        let scratch = TempDir::new("td-agent-view").unwrap();
+        let surface = Surface::new(1280, 800, Scale::default()).unwrap();
+        let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+        let mut app = App::new(surface, None, Mode::Auto).unwrap();
+        port.attach();
+        port.set_rows(vec![row(1), row(2)]);
+        port.set_active(id(1));
+        for view in port.take() {
+            app.apply(view);
+        }
+        port.update(
+            Update::Refused {
+                text: Some("the message".into()),
+                pictures: Vec::new(),
+                reason: "it is full".into(),
+            },
+            1,
+        );
+        port.update(
+            Update::Failed {
+                reason: "it fell over".into(),
+            },
+            2,
+        );
+        port.set_queued(vec!["queued in the one left".into()]);
+        app.open(id(2));
+        for view in port.take() {
+            app.apply(view);
+        }
+        assert_eq!(app.composed().trim_end(), "the message");
+        // The refusal's and the failure's.
+        assert_eq!(app.unread(), 2);
+        assert!(app.queued_lines().is_empty());
+        port.asked(&app.take_requests());
+        for view in port.take() {
+            app.apply(view);
+        }
+        assert_eq!(app.book(), &port.book);
+        assert!(!app.opening());
+    }
+
+    /// A person who was not there is told what was said for them, once; a
+    /// message refused meanwhile is not lost.
+    #[test]
+    fn what_was_said_while_no_window_was_there_reaches_the_next_once() {
+        let scratch = TempDir::new("td-agent-view").unwrap();
+        let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+        port.set_rows(vec![row(1)]);
+        assert!(!port.given_back_waits());
+        port.give_back("the message", Vec::new(), "refused".into());
+        assert!(port.given_back_waits());
+        port.restore("another", "refused".into());
+        for n in 0..LATER_NOTES + 2 {
+            port.note(n.to_string());
+        }
+        port.background(
+            &id(1),
+            &Update::Up(crate::protocol::Up::Event(Event {
+                seq: 1,
+                time: 0,
+                kind: Kind::Notice {
+                    text: "out of wakes".into(),
+                },
+            })),
+            0,
+        );
+        port.attach();
+        let told = port.take();
+        assert!(told.contains(&View::GiveBack(
+            "the message".into(),
+            Vec::new(),
+            "refused".into()
+        )));
+        assert!(told.contains(&View::Restore("another".into(), "refused".into())));
+        let notes = told
+            .iter()
+            .filter_map(|view| match view {
+                View::Note(said) => Some(said.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notes.len(), LATER_NOTES);
+        assert!(
+            notes.last().unwrap().ends_with(": out of wakes"),
+            "{notes:?}"
+        );
+        assert!(!notes.contains(&"0"), "the oldest went");
+        assert!(!port.given_back_waits());
+        // What a window's last request brought, as another takes over from it,
+        // is the next one's.
+        port.note("while taken over");
+        port.attach();
+        assert!(port.take().contains(&View::Note("while taken over".into())));
+        // A window lost with something unsent keeps it for the next.
+        port.note("unsent");
+        let unsent = port.take();
+        port.lost(unsent);
+        port.attach();
+        let told = port.take();
+        assert!(told.contains(&View::Note("unsent".into())));
+        assert!(!told.iter().any(|view| matches!(view, View::GiveBack(..))));
+    }
+
+    /// A stored key is the next window's to know of.
+    #[test]
+    fn a_key_saved_is_told_to_the_next_window() {
+        let scratch = TempDir::new("td-agent-view").unwrap();
+        let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+        port.set_keyed(false);
+        port.key_saved("the path");
+        port.attach();
+        let told = port.take();
+        assert!(told.contains(&View::SetKeyed(true)));
+        assert!(!told.contains(&View::SetKeyed(false)));
+    }
+
+    /// What a window is told of processes goes with the process, and a process
+    /// started again does not count its log twice, nor make news of it.
+    #[test]
+    fn what_is_told_of_processes_goes_with_them_and_a_log_read_back_is_not_news() {
+        let scratch = TempDir::new("td-agent-view").unwrap();
+        let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+        let event =
+            |seq, kind| Update::Up(crate::protocol::Up::Event(Event { seq, time: 0, kind }));
+        let process = Kind::Process {
+            number: 1,
+            call: 1,
+            command: "make".into(),
+        };
+        let task = Kind::Task {
+            call: 2,
+            agent: "helper".into(),
+            model: "a/b".into(),
+            prefix: "p".into(),
+            prompt: "do it".into(),
+        };
+        let hello = Update::Up(crate::protocol::Up::Hello {
+            title: "t".into(),
+            torn: None,
+            interrupted: Vec::new(),
+            paused: false,
+            prefix: None,
+            last: 3,
+        });
+        let notice = Kind::Notice { text: "old".into() };
+        port.set_rows(vec![row(1), row(2), row(3)]);
+        for of in 1..=3 {
+            port.background(&id(of), &event(1, process.clone()), 0);
+        }
+        port.background(&id(1), &event(2, task.clone()), 0);
+        // Started again, it says all of it once more, 5 times over.
+        for _ in 0..5 {
+            port.background(&id(1), &hello, 0);
+            port.background(&id(1), &event(1, process.clone()), 0);
+            port.background(&id(1), &event(2, task.clone()), 0);
+            port.background(&id(1), &event(3, notice.clone()), 0);
+        }
+        port.background(&id(1), &event(4, Kind::Notice { text: "new".into() }), 0);
+        port.set_archived(&id(2), true);
+        port.remove_row(&id(3));
+        port.attach();
+        let told = port.take();
+        let counted = |of: u8| {
+            told.iter().find_map(|view| match view {
+                View::Counted(id_of, events, _) if *id_of == id(of) => Some(events.len()),
+                _ => None,
+            })
+        };
+        assert_eq!(counted(1), Some(2), "the process and the task, once each");
+        assert_eq!(counted(2), Some(0), "archiving ended its process");
+        assert_eq!(counted(3), None, "deleted");
+        let notes: Vec<&View> = told
+            .iter()
+            .filter(|view| matches!(view, View::Note(_)))
+            .collect();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(matches!(notes.first(), Some(View::Note(said)) if said.ends_with(": new")));
+    }
+
+    /// The split a window saved is the next one's, unsaid to the one that saved
+    /// it, which may have moved it again by then.
+    #[test]
+    fn a_split_saved_is_told_to_the_next_window_and_not_back_to_this_one() {
+        let scratch = TempDir::new("td-agent-view").unwrap();
+        let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+        port.set_share(None);
+        port.attach();
+        port.take();
+        port.saved_share(Some((3, 10)));
+        assert!(port.take().is_empty());
+        port.attach();
+        let told = port.take();
+        assert!(told.contains(&View::SetShare(Some((3, 10)))));
+        assert!(!told.contains(&View::SetShare(None)));
+    }
+
+    /// A failed conversation has no process to finish what its log left open:
+    /// reading the log again does not make it look as if it were running.
+    #[test]
+    fn a_replay_of_a_failed_conversation_leaves_it_failed() {
+        let mut book = Book::default();
+        book.set_rows(vec![row(1)]);
+        book.set_active(id(1));
+        book.update(
+            &Update::Failed {
+                reason: "it fell over".into(),
+            },
+            0,
+        );
+        book.replay(&[Event {
+            seq: 1,
+            time: 0,
+            kind: Kind::Started {
+                effect: crate::store::Effect::Turn,
+                of: 1,
+            },
+        }]);
+        assert_eq!(
+            book.rows.first().unwrap().state,
+            crate::book::RowState::Failed
+        );
+    }
+
+    /// A window that attaches lists what each conversation is running, though it
+    /// has not read that conversation's log.
+    #[test]
+    fn a_window_that_attaches_is_told_each_conversations_processes_and_sub_agents() {
+        let scratch = TempDir::new("td-agent-view").unwrap();
+        let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+        let event =
+            |seq, kind| Update::Up(crate::protocol::Up::Event(Event { seq, time: 0, kind }));
+        let process = |number| Kind::Process {
+            number,
+            call: 1,
+            command: "make".into(),
+        };
+        port.set_rows(vec![row(1), row(2)]);
+        port.background(&id(1), &event(1, process(1)), 0);
+        port.background(&id(1), &event(2, process(2)), 0);
+        port.background(
+            &id(1),
+            &event(
+                3,
+                Kind::Ended {
+                    number: 1,
+                    how: "killed".into(),
+                    held: Default::default(),
+                    tail: Default::default(),
+                },
+            ),
+            0,
+        );
+        port.background(&id(2), &event(1, process(3)), 0);
+        port.background(
+            &id(2),
+            &Update::Failed {
+                reason: "it fell over".into(),
+            },
+            0,
+        );
+        port.attach();
+        let told = port.take();
+        let counted = |of: u8| {
+            told.iter().find_map(|view| match view {
+                View::Counted(id_of, events, _) if *id_of == id(of) => Some(events.len()),
+                _ => None,
+            })
+        };
+        assert_eq!(counted(1), Some(1), "the one still running");
+        assert_eq!(counted(2), Some(0), "its process took them with it");
+    }
+
+    /// An open that crossed a closing is answered with the closing's book.
+    #[test]
+    fn a_row_that_closed_before_the_window_heard_does_not_open() {
+        let scratch = TempDir::new("td-agent-view").unwrap();
+        let surface = Surface::new(1280, 800, Scale::default()).unwrap();
+        let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+        let mut app = App::new(surface, None, Mode::Auto).unwrap();
+        port.attach();
+        port.set_rows(vec![row(1), row(2)]);
+        for view in port.take() {
+            app.apply(view);
+        }
+        port.set_closing(&id(2), Some("deleting"));
+        app.open(id(2));
+        assert_eq!(app.active(), Some(&id(2)));
+        port.asked(&app.take_requests());
+        assert!(port.take_refused_open());
+        for view in port.take() {
+            app.apply(view);
+        }
+        assert_eq!(port.active(), None);
+        assert_eq!(app.book(), &port.book);
+        assert_eq!(app.active(), None);
+    }
+
     /// A picture reaches the window with the message that shows it, and goes
     /// when the message has been shown.
     #[test]
     fn a_message_brings_its_pictures_and_says_why_one_cannot_be_read() {
         let scratch = TempDir::new("td-agent-view").unwrap();
         let mut port = Port::new(StateDir::at(scratch.path().to_path_buf()));
+        port.attach();
         port.set_rows(vec![row(1)]);
         port.set_active(id(1));
         port.take();
@@ -651,7 +1362,7 @@ mod tests {
             0,
         );
         match port.take().as_slice() {
-            [View::Update(_, _, pictures)] => {
+            [View::Update(_, _, _, pictures)] => {
                 let read = pictures.get("absent").unwrap();
                 assert!(read.as_ref().is_err_and(|why| why.contains("absent")));
             }

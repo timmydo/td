@@ -145,7 +145,7 @@ fn sweep(base: &Path) -> Result<(), String> {
         let held = match lock(&entry.path().join("owner.lock")) {
             Ok(held) => held,
             Err(why) => {
-                eprintln!(
+                logged!(
                     "td-agent review: cannot collect {}: {why}",
                     entry.path().display()
                 );
@@ -154,7 +154,7 @@ fn sweep(base: &Path) -> Result<(), String> {
         };
         if held.try_lock().is_ok() {
             if let Err(why) = workspace::remove_tree(&entry.path()) {
-                eprintln!(
+                logged!(
                     "td-agent review: cannot collect {}: {why}",
                     entry.path().display()
                 );
@@ -718,7 +718,7 @@ impl Workspace {
 impl Drop for Workspace {
     fn drop(&mut self) {
         if let Err(why) = self.cleanup() {
-            eprintln!("td-agent review: {why}");
+            logged!("td-agent review: {why}");
         }
     }
 }

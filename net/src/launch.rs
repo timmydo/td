@@ -33,7 +33,10 @@
 // left in the caller's shell never pairs it with another build's. For
 // td-agent it serves the egress relay too, td-egressd, at
 // `td-egress/socket` in the same runtime directory: the one way its
-// workspaces' proxied connections leave (td-agent/DESIGN.md §10).
+// workspaces' proxied connections leave (td-agent/DESIGN.md §10). And since
+// its window starts a broker that outlives the window, and so these services,
+// it names this binary and the session's runtime directory to the program, for
+// the broker to be launched again, with services of its own lifetime.
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -107,6 +110,8 @@ struct LaunchOptions {
     allow_loopback: bool,
     allow_private_loopback: bool,
     discover_mail_unix: bool,
+    /// Give the program no display but one the session named, not the default.
+    display_only_if_named: bool,
 }
 
 /// `td-launch PROGRAM [ARG...]`, `args[0]` being the applet's name.
@@ -129,6 +134,7 @@ pub fn run(args: &[String]) {
                     allow_loopback: true,
                     allow_private_loopback: false,
                     discover_mail_unix: false,
+                    display_only_if_named: false,
                 },
             )),
             None => {
@@ -148,6 +154,7 @@ pub fn run(args: &[String]) {
                     allow_loopback: false,
                     allow_private_loopback: false,
                     discover_mail_unix: false,
+                    display_only_if_named: false,
                 },
             ))
         }
@@ -172,6 +179,9 @@ pub fn run_named(name: &str, args: &[String]) {
         .and_then(|exe| {
             let program = beside(&exe, name)?;
             let named = companions_beside(&exe, name)?;
+            if needs_no_service(name, args) {
+                return run_as_is(&program, args, &named, &exe);
+            }
             launch_here(
                 &program,
                 args,
@@ -180,11 +190,52 @@ pub fn run_named(name: &str, args: &[String]) {
                 LaunchOptions {
                     allow_private_loopback: name == "td-mail",
                     discover_mail_unix: name == "td-mail",
+                    display_only_if_named: display_only_if_named(name, args),
                     ..LaunchOptions::default()
                 },
             )
         });
     std::process::exit(say(launched));
+}
+
+/// What fetches nothing and may run where there is no session, as at the far end
+/// of ssh: td-agent's way to a broker, whose own launch serves what it needs,
+/// and its stopping one.
+fn needs_no_service(name: &str, args: &[String]) -> bool {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    name == "td-agent" && matches!(args.as_slice(), ["attach"] | ["serve", "--stop"])
+}
+
+/// What is given no display but one the session named: td-agent's broker, which
+/// from ssh has none, and whose window, were there one, would have named it.
+fn display_only_if_named(name: &str, args: &[String]) -> bool {
+    name == "td-agent" && args.first().is_some_and(|arg| arg == "serve")
+}
+
+/// Becomes `program`, serving nothing, naming what `launch` would name to it.
+fn run_as_is(
+    program: &Path,
+    args: &[String],
+    named: &[(&str, Option<PathBuf>)],
+    exe: &Path,
+) -> Result<(), String> {
+    let runtime = nonempty("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let mut command = Command::new(program);
+    command.args(args);
+    for (var, path) in named {
+        match path {
+            Some(path) => command.env(var, path),
+            None => command.env_remove(var),
+        };
+    }
+    for (var, value) in relaunch(Some(exe.to_path_buf()), runtime.as_deref()) {
+        match value {
+            Some(value) => command.env(var, value),
+            None => command.env_remove(var),
+        };
+    }
+    let e = command.exec();
+    Err(format!("cannot run {}: {e}", program.display()))
 }
 
 /// Each of `name`'s companions with the variable it is named in: its path
@@ -285,6 +336,8 @@ fn launch_here(
         nonempty("WAYLAND_SOCKET").as_deref(),
         nonempty("WAYLAND_DISPLAY").as_deref(),
     )?;
+    let display =
+        display.filter(|_| !options.display_only_if_named || nonempty("WAYLAND_DISPLAY").is_some());
     launch(
         program,
         args,
@@ -506,6 +559,14 @@ fn launch(
     }
     let mut command = Command::new(program);
     command.args(args).env("XDG_RUNTIME_DIR", &private);
+    if egress {
+        for (var, value) in relaunch(std::env::current_exe().ok(), Some(runtime)) {
+            match value {
+                Some(value) => command.env(var, value),
+                None => command.env_remove(var),
+            };
+        }
+    }
     for (var, path) in named {
         match path {
             Some(path) => command.env(var, path),
@@ -522,6 +583,16 @@ fn launch(
     }
     let _ = std::fs::remove_dir_all(&private);
     Err(format!("cannot run {}: {e}", program.display()))
+}
+
+/// How td-agent's window starts its broker through this launch: this binary, by
+/// the name td-agent, under the session's runtime directory and not this launch's,
+/// which goes when the window does. None for what is not known.
+fn relaunch(exe: Option<PathBuf>, runtime: Option<&Path>) -> [(&'static str, Option<PathBuf>); 2] {
+    [
+        ("TD_AGENT_LAUNCHER", exe),
+        ("TD_AGENT_SESSION_RUNTIME", runtime.map(Path::to_path_buf)),
+    ]
 }
 
 fn mail_needs_endpoints(args: &[String]) -> bool {
@@ -816,6 +887,43 @@ mod tests {
             "{refused}"
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn the_agents_broker_is_launched_under_the_session_and_not_this_launch() {
+        let session = Path::new("/run/user/1000");
+        assert_eq!(
+            relaunch(Some(PathBuf::from("/lib/td/td-net")), Some(session)),
+            [
+                ("TD_AGENT_LAUNCHER", Some(PathBuf::from("/lib/td/td-net"))),
+                (
+                    "TD_AGENT_SESSION_RUNTIME",
+                    Some(PathBuf::from("/run/user/1000"))
+                ),
+            ]
+        );
+        assert_eq!(
+            relaunch(None, None),
+            [
+                ("TD_AGENT_LAUNCHER", None),
+                ("TD_AGENT_SESSION_RUNTIME", None)
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_agents_way_to_a_broker_and_its_stopping_go_without_a_session() {
+        let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert!(needs_no_service("td-agent", &args(&["attach"])));
+        assert!(needs_no_service("td-agent", &args(&["serve", "--stop"])));
+        assert!(!needs_no_service("td-agent", &args(&["serve"])));
+        assert!(!needs_no_service("td-agent", &args(&[])));
+        assert!(!needs_no_service("td-agent", &args(&["attach", "x"])));
+        assert!(!needs_no_service("td-news", &args(&["attach"])));
+        // The window has the default display, and names it to its broker.
+        assert!(display_only_if_named("td-agent", &args(&["serve"])));
+        assert!(!display_only_if_named("td-agent", &args(&[])));
+        assert!(!display_only_if_named("td-news", &args(&["serve"])));
     }
 
     #[test]

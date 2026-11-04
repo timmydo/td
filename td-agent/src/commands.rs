@@ -158,7 +158,8 @@ pub fn real(path: &Path, label: &str, most: u64, whole: bool) -> Result<Option<V
 /// Command `name`'s file in `dir`, read whole: at most `most` bytes of
 /// UTF-8. None when there is none.
 fn read(dir: &Path, name: &str, most: usize) -> Result<Option<String>, String> {
-    if !real_dir(dir)? {
+    // A name comes from a window, which may be at the far end of ssh.
+    if !name_ok(name) || !real_dir(dir)? {
         return Ok(None);
     }
     let path = dir.join(format!("{name}.md"));

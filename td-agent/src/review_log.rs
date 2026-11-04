@@ -177,8 +177,8 @@ impl Journal {
             .custom_flags(crate::store::O_NOFOLLOW)
             .open(&path)
             .map_err(|e| format!("creating review log {}: {e}", path.display()))?;
-        eprintln!("{TRACE_PATH_PREFIX}{}", path.display());
-        eprintln!("td-agent review: keep retained traces when cleaning up sessions and scratch");
+        logged!("{TRACE_PATH_PREFIX}{}", path.display());
+        logged!("td-agent review: keep retained traces when cleaning up sessions and scratch");
         File::open(&directory)
             .and_then(|parent| parent.sync_all())
             .map_err(|e| format!("syncing review log directory: {e}"))?;

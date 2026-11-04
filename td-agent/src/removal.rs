@@ -303,7 +303,7 @@ fn removing(doomed: Vec<PathBuf>) -> Result<(), String> {
         .spawn(move || {
             for dir in doomed {
                 if let Err(e) = crate::workspace::remove_tree(&dir) {
-                    eprintln!("td-agent: {}: {e}", dir.display());
+                    logged!("td-agent: {}: {e}", dir.display());
                 }
             }
         })
@@ -345,7 +345,7 @@ pub fn sweep(dirs: &[PathBuf]) {
         .collect();
     if !doomed.is_empty() {
         if let Err(e) = removing(doomed) {
-            eprintln!("td-agent: sweeping workspaces: {e}");
+            logged!("td-agent: sweeping workspaces: {e}");
         }
     }
 }

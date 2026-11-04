@@ -1,5 +1,5 @@
 //! `td-agent conversation <id>`: one conversation's process (DESIGN.md
-//! §2). The window process starts it over a socketpair handed to it as
+//! §2). The broker starts it over a socketpair handed to it as
 //! its standard input and output. It locks the conversation's directory,
 //! the only writer of it while it runs, replays the log up the socketpair,
 //! and then serves the window's messages until the socketpair closes,
@@ -659,11 +659,11 @@ pub fn serve_in(
     };
     if conversation.meta().workspace.is_some() {
         if let Err(e) = crate::workspace::clear_specs(state, id) {
-            eprintln!("td-agent: conversation {id}: {e}");
+            logged!("td-agent: conversation {id}: {e}");
         }
     }
     if let Some(bytes) = load.torn {
-        eprintln!("td-agent: conversation {id}: dropped a torn final log line of {bytes} bytes");
+        logged!("td-agent: conversation {id}: dropped a torn final log line of {bytes} bytes");
     }
     let reader = stream
         .try_clone()
@@ -1082,7 +1082,7 @@ impl Session {
                 e.kind(),
                 io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
             ) {
-                eprintln!("td-agent: the window: {e}");
+                logged!("td-agent: the window: {e}");
             }
             self.gone = true;
         }
@@ -1651,7 +1651,7 @@ impl Session {
     /// Waits for the window's answer, `wanted`, still hearing it: an
     /// interrupt is noted for the turn, an earlier request's grant that
     /// came after it gave up is released, and anything else waits its
-    /// turn. Why not, when the window closes or does not answer.
+    /// turn. Why not, when the broker ends or does not answer.
     fn wait(&mut self, wanted: impl Fn(&Down) -> bool) -> Result<Down, String> {
         self.wait_for(wanted, Some(ANSWER_WAIT))
     }
@@ -2655,7 +2655,7 @@ impl Session {
                     self.unclassified();
                 }
                 Ok(Inbound::Broken(why)) => {
-                    eprintln!("td-agent: the window: {why}");
+                    logged!("td-agent: the window: {why}");
                     self.gone = true;
                 }
                 Ok(Inbound::Closed) | Err(_) => self.gone = true,
@@ -4050,7 +4050,7 @@ impl Session {
         for grant in &meta.directory_grants {
             match crate::access::admitted(&state, std::slice::from_ref(grant)) {
                 Ok(admitted) => shared.extend(admitted),
-                Err(why) => eprintln!("td-agent: directory grant not mounted: {why}"),
+                Err(why) => logged!("td-agent: directory grant not mounted: {why}"),
             }
         }
         self.bench.set_unconfined(meta.unconfined);
@@ -5481,7 +5481,7 @@ impl Session {
                     self.unclassified();
                 }
                 Ok(Inbound::Broken(why)) => {
-                    eprintln!("td-agent: the window: {why}");
+                    logged!("td-agent: the window: {why}");
                     self.gone = true;
                 }
                 Ok(Inbound::Closed) | Err(_) => self.gone = true,
@@ -6308,7 +6308,7 @@ impl Session {
                     self.unclassified();
                 }
                 Ok(Inbound::Broken(why)) => {
-                    eprintln!("td-agent: the window: {why}");
+                    logged!("td-agent: the window: {why}");
                     self.gone = true;
                 }
                 Ok(Inbound::Closed) | Err(_) => self.gone = true,
@@ -7194,7 +7194,7 @@ impl Session {
         let dir = StateDir::at(self.state.clone()).conversation(&self.conversation.meta().id);
         let text = record.text(&crate::wire::key_forms(key.expose()));
         if let Err(e) = crate::wire::write(&dir, request, &text) {
-            eprintln!("td-agent: request {request}'s record: {e}");
+            logged!("td-agent: request {request}'s record: {e}");
         }
     }
 

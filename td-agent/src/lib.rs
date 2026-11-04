@@ -3,8 +3,9 @@
 //! The crate is `std` and td's own crates: td-ui, td-json, td-toml and
 //! td-fetch-client, the fetch service's client.
 //!
-//! The binary is two personalities of one program (DESIGN.md §2): the
-//! window process (`window`, over `ui`, `control` and `supervisor`) and a
+//! The binary is three personalities of one program (DESIGN.md §2): the
+//! window (`window`, over `ui` and `control`), the broker (`broker`, over
+//! `supervisor`), which speak `window_wire` through a `peer`, and a
 //! conversation process per open or running conversation
 //! (`conversation`), which speak `protocol` in `frame`s over a socketpair.
 //! Only a conversation process writes its conversation's directory of the
@@ -30,12 +31,22 @@
 
 #![forbid(unsafe_code)]
 
+/// `eprintln!` that does not panic: standard error is `serve.log` for the broker
+/// and its conversations, on the state directory's filesystem, which can be full.
+macro_rules! logged {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
+
 pub mod access;
 pub mod accounts;
 pub mod activity;
 pub mod assemble;
 pub mod bench;
 pub mod book;
+pub mod broker;
 pub mod calibrate;
 pub mod card;
 pub mod chooser;
@@ -67,6 +78,7 @@ pub mod models;
 pub mod notes;
 pub mod output;
 pub mod patch;
+pub mod peer;
 pub mod picker;
 pub mod picture;
 pub mod post;

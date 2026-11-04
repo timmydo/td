@@ -1358,7 +1358,7 @@ impl Service {
                 }
             });
         if let Err(e) = spawned {
-            eprintln!("td-agent: the store thread did not start: {e}");
+            logged!("td-agent: the store thread did not start: {e}");
         }
         Self { jobs, done }
     }
@@ -3353,7 +3353,7 @@ pub(crate) mod tests {
     pub(crate) fn have_git() -> bool {
         let found = Command::new("git").arg("--version").output().is_ok();
         if !found {
-            eprintln!("skipped: no git on PATH; the host preflight runs this test");
+            logged!("skipped: no git on PATH; the host preflight runs this test");
         }
         found
     }
@@ -4150,7 +4150,7 @@ pub(crate) mod tests {
     #[test]
     fn a_slow_sink_takes_all_git_said() {
         if Command::new("sh").arg("-c").arg("true").status().is_err() {
-            eprintln!("skipped: no sh on PATH");
+            logged!("skipped: no sh on PATH");
             return;
         }
         let mut taken = 0usize;
@@ -4174,7 +4174,7 @@ pub(crate) mod tests {
     #[test]
     fn a_helper_chattering_on_its_error_holds_no_run() {
         if Command::new("sh").arg("-c").arg("true").status().is_err() {
-            eprintln!("skipped: no sh on PATH");
+            logged!("skipped: no sh on PATH");
             return;
         }
         let started = Instant::now();
@@ -4199,7 +4199,7 @@ pub(crate) mod tests {
     #[test]
     fn a_runs_sink_takes_its_output_as_it_comes_or_ends_it() {
         if Command::new("sh").arg("-c").arg("true").status().is_err() {
-            eprintln!("skipped: no sh on PATH");
+            logged!("skipped: no sh on PATH");
             return;
         }
         let mut taken = Vec::new();
@@ -4243,7 +4243,7 @@ pub(crate) mod tests {
     #[test]
     fn a_run_drains_a_long_error_and_ends_at_its_time() {
         if Command::new("sh").arg("-c").arg("true").status().is_err() {
-            eprintln!("skipped: no sh on PATH");
+            logged!("skipped: no sh on PATH");
             return;
         }
         let mut chatty = Command::new("sh");

@@ -135,7 +135,13 @@ later increment), and plugins.
                 |  window, keyboard, clipboard (td-ui)
                 v
   +----------------------------------+
-  | td-agent: window process         |--> git worker -> git remotes
+  | td-agent: the window             |
+  |  what the person sees and types  |
+  +----------------------------------+
+                | messages over a socket, or `attach` over ssh
+                v
+  +----------------------------------+
+  | td-agent serve: the broker       |--> git worker -> git remotes
   |  store index, cards, schedules,  |
   |  routing between conversations   |
   +----------------------------------+
@@ -158,8 +164,8 @@ later increment), and plugins.
 
 There are four parties, and the design is the separation between them:
 
-1. **The agent processes** are the window process and one conversation
-   process per running conversation, the same binary under two
+1. **The agent processes** are the window, the broker and one conversation
+   process per running conversation, the same binary under three
    personalities. Together they own the window, the conversation store,
    the model client, the API key, the fetch grant, the repository store
    and every decision of §11. Ordinary workspace content and execution
@@ -668,21 +674,20 @@ disk cleanup. Cleanup failures are reported. A stale entry that cannot
 be safely collected is reported and left alone so it cannot prevent a
 new review; a successfully cleaned run is not cleaned again by `Drop`.
 
-**One process per conversation.** The window process, `td-agent`, is the
-one the human starts. It owns the window, the configuration, a lock on the
-state directory that refuses a second window process, the index of
-conversations, every card, the git worker's work on shared repositories
+**One process per conversation.** The broker, `td-agent serve`, is the one
+that stays while conversations run; a window starts it when none answers. It
+owns the configuration, a lock on the state directory that refuses a second
+broker, the index of conversations, every card, the git worker's work on shared repositories
 (the store's clones and fetches, and the publish repositories' imports
 and pushes, §9), the day's cost total, the schedule timer and the routing
 of messages between conversations (§3). For each conversation that is
-running, has a background process (§12) or is open in the window, it
-starts `td-agent conversation <id>` as its child over a framed socketpair
+running, has a background process (§12) or is the open one, it starts `td-agent conversation <id>` as its child over a framed socketpair
 and passes it the API key over that socketpair, never through argv, the
 environment or a file. The conversation process runs that conversation's
 loop. It builds and sends the model requests, reserving against the day's
-limit through the window process (§5); it is the only writer of its
+limit through the broker (§5); it is the only writer of its
 conversation's directory (§6), which it holds an exclusive lock on, so a
-restarted window process cannot start a second writer while an old
+restarted broker cannot start a second writer while an old
 conversation process is still exiting; it runs the rules and the
 classifier of §11; and it starts every jail instance the conversation
 uses, on a host and on td alike (§8): its own file-tool
@@ -691,15 +696,15 @@ maintenance instances, forks included. Workspace maintenance that no
 turn asks for (the periodic remote-tracking update, the counts
 `conversations` shows, the check before archiving or deleting, §7)
 runs in the workspace's own conversation process; when that
-conversation has no process, the window process starts one for the
+conversation has no process, the broker starts one for the
 purpose, without the key, and it exits when
 the work is done; if the human opens the conversation meanwhile, the
-window process hands that process the key and it goes on as the
+broker hands that process the key and it goes on as the
 conversation's process. A card goes up the socketpair as a request and
 its answer comes back down. A conversation with no workspace has no
 jail instances.
 
-**State shared across conversations** is the window process's: the
+**State shared across conversations** is the broker's: the
 human's rules, `deny everywhere` included, and each repository's
 `.td-agent/rules` as the git worker read them (§11); each workspace's
 mode, kept in the human's rules file, and whether it has dropped to
@@ -718,7 +723,7 @@ on.
 The split buys two things:
 
 - **Faults stay in one conversation.** A crash, a stuck parse or an
-  exhausted allocation ends one conversation process. The window process
+  exhausted allocation ends one conversation process. The broker
   marks the conversation failed and can restart it from its log, which
   replays exactly (§6). A conversation process whose socketpair closes
   exits, and every instance it started dies with it (§8).
@@ -732,21 +737,115 @@ human and both hold the key; the jail is the boundary, as before. A
 conversation with nothing running that is not open has no process, and
 opening it starts one from its log.
 
-**The window process has two halves.** `Session` holds the state
-above and everything outside the window; `App` is the window's widgets
-and what they show. Neither holds the other. `Window`, which td-ui
-drives, passes messages between them: `App` asks by `Request`s, and
-`Session` tells it by `view::View`s, in order, through `view::Port`.
-Which conversations there are and how each stands is `book::Book`, one
-reducer over those messages of which each half keeps a copy, so
-`Session` answers what it asks of the conversations (where a message
-may go, which opens next) from its own. `App` changes its book itself
-in one place, opening a row as it asks for that row; `Port::asked` has
-the session's follow before it serves the request. A picture travels
-with the message that shows it, read by `Session` and decoded by `App`.
-`App` is still built with the saved split and the configured mode,
-still reads the person's folders for the workspace chooser, and takes
-the pictures they paste from the clipboard; those are this machine's.
+**The window and the broker are two processes.** Sections below that say the
+window reserves, grants, routes or answers something a conversation asks mean
+the broker, from when they were one process. `Session`, in
+`src/broker.rs`, holds the state above and everything outside the window;
+`App` is the window's widgets and what they show, driven by `Window` in
+`src/window.rs`. They speak only by messages: `App` asks by `Request`s, and
+`Session` tells it by `view::View`s, in order, through `view::Port`. Each is
+one JSON object (`window_wire`), and an object's text is sent by `peer` as one
+message of `td_remote`'s link, whose hello names `td-agent-window` and a
+version, raised by hand with those forms, so that a window and a broker of
+versions known to differ refuse each other at once; one of a version not told
+apart fails on the first message it cannot read, and says `td-agent serve
+--stop` ends it. Decoding takes what it is given as untrusted: what goes on to a
+file or a path is held to that file's or path's rule there and again at the
+file. No message but `SaveKey`, going up from the key dialog, carries a key.
+
+Which conversations there are and how each stands is `book::Book`, one reducer
+over those messages of which each side keeps a copy, so `Session` answers what
+it asks of the conversations (where a message may go, which opens next) from
+its own. `App` changes its book itself in one place, opening a row as it asks
+for that row, because the person is looking at it. A request that names no
+conversation (a message, an interrupt, a compaction) goes with the one the
+window was showing, or word that it has asked for a new one and means that, as
+someone typing straight after `C-n` does; a broker that has moved on refuses
+it, a message going back to the composer: never to another conversation's
+model. Across a socket `Session`
+has by then said things it said of the conversation left, so `Port::asked`
+answers the `Open` with `View::Opened`, carrying its book, and until each is
+answered `App` draws nothing of any conversation: an update or a replay names
+its conversation, and what it says outside the transcript (a refusal, which
+goes back to the composer; a failure; the processes it counts) still reaches
+the person. On the answer `App` takes that book as its own. A row that closed
+before the broker heard is not opened: the answer says what is open instead.
+
+A picture travels with the message that shows it, read by `Session` and
+decoded by `App`. The person's folders in the workspace chooser and the
+pictures they paste are read by the window, on its own machine, as is a
+link they click opened; a window that is not on the broker's machine does not
+yet have those, the next increment's work.
+
+**Listening.** The broker listens on three unix sockets at the top of the state
+directory: `window.sock`, for a window on this machine; `attach.sock`, which
+`td-agent attach` joins to its standard streams, for a window at the far end of
+ssh; and `stop.sock`, which ends it when anything dials, version or no, for
+`td-agent serve --stop`. It listens on no port. The directory is this
+account's and mode 0700, one left open by hand being shut when the broker
+starts, one of another account refused, and that is what keeps the sockets to
+this account, whatever their own modes; a path past the kernel's 107 bytes is
+refused, by name. `window.sock` and `attach.sock` say the same things but for
+one: nothing at the far end of ssh is the person at this machine's keyboard,
+and nothing else in td-agent asks whether auto mode (§11) is what they mean, so
+a `SetMode` to auto from `attach.sock` is refused with a note. It says nothing
+of who is asking: the socket's and the account's ownership are all that stands
+between another program of this account and the conversations, as they are
+between it and the state directory.
+
+**One window at a time.** A window that attaches takes over from the one there,
+which closes; a draft in that one's composer goes with it, as it did when a
+window closed. The broker tells the new one, before anything else, the book, the
+last of each setting, what is still asked of the person, what each
+conversation's log has said of its processes and sub-agents, what was said while
+no window was there (the last 256 notes, and every message given back, each of
+which also goes whole to `serve.log`, since one may never reach a window), and
+the open conversation's log; and it reads the
+person's rules again. So there is one answer to any card, and no window has to
+be told it lost. A connection that has stopped being read is let go past 512 MiB
+waiting behind what is being written, more than any log, a replay counting for
+64 MiB of that however large, and it can attach again. A window whose broker has
+gone closes.
+
+**Closing the window closes the window.** What was running goes on: a turn keeps
+spending, within the day's limit (§5), and a card waits for a window to answer
+it. The broker ends itself when no window has been attached for 5 s and nothing
+is under way in any conversation, the open one included: no turn, background
+process, repository being prepared or message not yet taken, nor removal,
+export, push being staged, or message held for a conversation that can still
+take it, one with no process or one whose process failed, or given back for a
+composer no window is there to show: it waits for the person to come back. Nor any schedule with a time to come and a conversation to fire to:
+a broker with one stays until the machine shuts down or `td-agent serve --stop`;
+that is what a schedule asks. Messages between conversations are kept on disk
+(§3), so they do not hold it; nor one held for an archived conversation, which
+says so when it is archived and is in `serve.log` if the broker ends first.
+What ends it, however, each conversation process exits as its socketpair closes,
+and the next window starts a broker that takes up from the logs.
+
+So a broker can outlive what it read when it started. The configuration, the
+key, the admitted remotes and the td-agent it is hold until it ends; the rules
+are read again whenever a window attaches. `td-agent serve --stop`, or nothing
+being under way when the window closes, brings the next broker's reading of
+them. A td-agent installed over a running one is not noticed until then.
+
+**Whose environment.** The broker has the environment of whatever started it,
+the directory `/`, no descriptor of the window's (which is why the window refuses
+an inherited `WAYLAND_SOCKET`), and a process group of its own. Started from a
+display it is the display git's prompts go to (§9), even while the window is
+elsewhere; started from ssh, they have none. Started where there is no fetch
+service it has none for life, each turn saying so, and `--stop` lets a window
+where there is one start the next. A launch (§8, "the launch") gives
+the window a fetch service and a relay that end with the window, so the window
+starts the broker by that launch again, under the session's runtime directory:
+it then has services of its own that last as long as it does. `attach` and
+`--stop` need no service and go through the launch without one or a session; a
+launch that must serve a broker and has no session says so; and the window obeys
+a launcher only if the td-agent beside it is this one. Its standard error
+is `serve.log` in the state directory, added to from every start and put aside
+for one old copy past 1 MiB, which it looks at each minute, and a window
+starting one says at once what it said if it could not start. Between a broker's
+deciding to end and its sockets going, one that dials it is closed unanswered: a
+window tries again, and a far `attach` ends, for the far window to dial it anew.
 
 **As built (increment 4).** Nothing runs in the background yet, so only
 the open conversation has a process; switching shuts the old socketpair
@@ -761,8 +860,8 @@ would hold its conversation's lock against the next.
   one (a child forked while one is held holds it too until then). It needs
   no `unsafe`. A conversation process waits up to 3 s for its directory's
   lock, for an earlier process of the same conversation still exiting,
-  and is then refused; a second window process is refused at once,
-  before it connects to the display.
+  and is then refused; a second broker is refused at once. `window.lock`
+  keeps the name it had when it was the window's.
 - **Frames** are a four-byte big-endian length and that many bytes of one
   JSON object, at most 1 MiB, refused from the header before anything is
   allocated for it. A stream may end only between frames. A human's
@@ -799,7 +898,7 @@ keeps every child it has started, tracking each one's turn from its
 its turn ends. A child that holds a message it has not acknowledged, or
 a retry just asked for, counts as mid-turn, so a message sent just
 before a switch is answered rather than logged and abandoned. A turn
-that the closing window cuts short before its request is sent ends
+that an ending broker cuts short before its request is sent ends
 with `C-r` offered when the conversation is next opened. Opening a
 conversation whose child is still running adopts that child: the
 window reads the conversation's log from the store, dropping a final
@@ -927,7 +1026,7 @@ workspace, and is gone when it reports.
   ahead of and behind its base, are shown only for the caller itself, so
   the listing is not a channel between conversations.
 - `send_message {to, text}`: queues a message for another conversation,
-  which the window process routes. A message is delivered between turns:
+  which the broker routes. A message is delivered between turns:
   when the receiver's running turn ends, or at once if it is idle, it
   starts a turn as a user-role message labelled with its sender. Messages
   are asynchronous; a reply is a `send_message` back, which reaches the
@@ -1041,9 +1140,10 @@ increments of §18:
   other is the human's;
 - a schedule whose target is archived or deleted stops firing and is
   shown as such until the human removes it;
-- schedules live in the state directory, written by the window process,
-  and fire only while it runs; there is no system timer or service.
-  Before delivering, the window process journals each occurrence by
+- schedules live in the state directory, written by the broker,
+  and fire only while it runs, which it does while there is one; there is
+  no system timer or service.
+  Before delivering, the broker journals each occurrence by
   schedule and its UTC instant, so a restart or a clock set back never
   fires one twice. A firing missed while td-agent was not running is
   dropped unless `catch_up` asks for one at startup, and never more than
@@ -1423,8 +1523,8 @@ agent drive it. That socket can answer cards, so it is created under the
 caller's runtime directory with the toolkit's ownership contract, and no
 jail instance is ever given that directory.
 
-The window is the window process's alone; conversation processes draw
-nothing (§2).
+The window is a process of its own; the broker and the conversation
+processes draw nothing (§2).
 
 **As built (increment 4).** Each conversation counts as a workspace of
 its own: the list is every conversation, most recently active first,
@@ -1624,8 +1724,8 @@ painted after the window's frame. File's items are:
   diagnostics export)"); it has no chord;
 - `Messages…`, shown with `C-S-m`, which does what `C-S-m` does: the
   Messages window (below, "As built (the Messages window)");
-- `Quit`, which closes the window as the compositor's close does; it has
-  no chord.
+- `Quit`, which closes the window as the compositor's close does, what is
+  running going on (§2); it has no chord.
 
 The header `Help` is td-ui's `keys::BUTTON`, and its one item, `Keys`,
 is `keys::ITEM`: it shows the key list below, as `F1` does, and shows
@@ -1932,7 +2032,7 @@ conversation, open or not (As built (row menus), below).
   the rename says why, and the conversation stays whole: the human's
   messages it had not acknowledged are parked for its next process and
   the outbox keeps the others'. Once renamed it is deleted; files a
-  removal left are removed at the window's next start, and messages the
+  removal left are removed at the broker's next start, and messages the
   outbox could not remove at its next load.
 - **Driven.** The actions gain `delete-conversation`, which has no chord
   and asks through the item's own path; the state gains `confirm`
@@ -1956,8 +2056,11 @@ keeps that bears on what it did, and never the key file.
   turn and compaction request after; a title or classifier request
   carries its whole prompt in its head), how the key was kept out, every file taken with its
   size, and every file left out with why, in order of name. td-agent
-  writes no log of its own beyond the conversations' (its standard
-  error is the launcher's), so nothing else is collected.
+  writes no log of its own beyond the conversations' but `serve.log` (§2),
+  which the export takes as it takes any file of the state directory: every
+  message given back to the composer is written whole to it, so one the person
+  then deleted can be in an export, as a sent one is in its conversation's log.
+  The broker's sockets are listed as left out.
 - **The key.** Three things keep it out, each enough alone. The key
   file, its temporary (a crash during a replacement leaves the new key
   there) and the directory holding them are never taken: a file of
@@ -2156,7 +2259,7 @@ routing, balanced included, it keeps it; the configuration's `routing`
 is only where one that never chose starts.
 
 The review command (§2) has no conversation and no day's ledger, which
-the window process alone keeps: default reviews fetch the models list and
+the broker alone keeps: default reviews fetch the models list and
 explicit routing/filter choices fetch eligible endpoint metadata (§2).
 Each reserves as a turn does, its prompt estimated at one token per
 three ASCII bytes and one per byte of anything else, at the highest
@@ -2274,7 +2377,7 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
   only when no `usage` of it was logged before its process died.
 - **The limits.** The conversation process checks the turn's and the
   conversation's limits against its own log before each request; the
-  day's is the window process's. The child asks the window to reserve
+  day's is the broker's. The child asks the window to reserve
   each request's amount; the window grants it only while the day's
   total stays within `max_cost_per_day`, and the child sends its cost
   when known, which replaces the reservation. The day is the UTC day,
@@ -2676,7 +2779,7 @@ it and its effect is unknown, so the model checks the state; a model
 request is recorded as interrupted, its reservation counted as spent at
 its full amount, and the turn waits for the human or the next message
 rather than resending; a background process is recorded as lost.
-Messages between conversations carry delivery ids, the window process
+Messages between conversations carry delivery ids, the broker
 keeps undelivered ones in the state directory, and a receiver logs each
 id once, so a restart neither loses nor repeats a delivery.
 
@@ -2698,13 +2801,14 @@ accepted only while the log has room for it at its longest and 64 KiB
 more for the records that follow it, and refused by name past that.
 Files are opened without following a final symbolic link, and
 directories are created mode 0700. The human's unacknowledged messages
-are kept in the window process's memory (§2), not the state directory:
-there is not yet a message between conversations to keep there. One
-still held when the window closes is written whole to standard error.
+are kept in the broker's memory (§2), not the state directory:
+there is not yet a message between conversations to keep there. A broker
+holding one does not end of its own accord; one killed with one held
+writes it whole to `serve.log`, if it lives to.
 
 **As built (increment 5).**
 
-- **The key file** is read once, by the window process at start (and
+- **The key file** is read once, by the broker at start (and
   again, through the same checks, only by the diagnostics export of §4,
   which reads it to leave out any file holding it), with std alone and
   no `unsafe`. The path is walked a component at a time,
@@ -2793,7 +2897,7 @@ the last one is the record, and `meta` is put right from it on load
 (§4).
 
 **As built (the File menu).** The key file can also be written, by the
-window process, from the key dialog of §4. Nothing else writes it.
+broker, from the key dialog of §4. Nothing else writes it.
 
 - **What is taken.** The entry holds at most 256 bytes. The text is a
   key when it is one line of printable ASCII, with no spaces, at most
@@ -3235,7 +3339,7 @@ conversation sends admits a remote, and a conversation's ask for a
 store is answered only for a remote and bases its own workspace record
 names, and only while an admission covers the remote (As built
 (increment 11, preparation)). Removing a line from the file, or from
-the configuration, ends that admission at the window's next start.
+the configuration, ends that admission at the broker's next start (§2).
 
 **Asynchronous from the first increment.** Creating a conversation from
 a repository template returns at once. Each worktree then moves through
@@ -3585,7 +3689,7 @@ the model could have changed, and asks; it is asked until answered, set
 aside and asked again as a tool's card is, and said once when it cannot
 be shown. `Delete anyway` deletes both; `Cancel` keeps both, the
 human's messages it had not taken held for it again (in memory, as an
-archive holds them, so lost if the window quits meanwhile). Before the
+archive holds them, so lost if the broker is killed meanwhile). Before the
 conversation is deleted, the workspace tree and the data directory's
 `ws/<name>/`, which holds its repositories, are each renamed beside
 itself to `.deleting-<name>` (a random suffix when an earlier removal
@@ -3692,7 +3796,7 @@ expected parent, as stage 1's is, and a lifetime pipe from the
 conversation process whose closing ends the instance. The death signal
 follows the parent thread, not the process, so the pipe is the bound
 that holds whichever thread starts td-jail; the jail tests kill a
-conversation process and the window process with `SIGKILL` and find no
+conversation process and the broker with `SIGKILL` and find no
 instance left.
 
 Every instance has:
@@ -3951,7 +4055,7 @@ requires today, leaves each instance in its launcher's cgroup. The later
 design is then additive:
 
 - **A node per conversation.** On a host with a delegated cgroup v2
-  subtree, the window process moves itself into a leaf of its own,
+  subtree, the broker moves itself into a leaf of its own,
   never the delegated root, and creates one node per conversation; each
   conversation process joins its node by writing to the node's
   `cgroup.procs` before starting anything. Every instance inherits the
@@ -3983,11 +4087,11 @@ design is then additive:
 To keep this open, the rule is placement: everything a conversation
 causes is placed under that conversation's node, and on a host and on td
 the means is ancestry. So there no increment may run a conversation's
-work in the window process or in any process not descended from that
+work in the broker or in any process not descended from that
 conversation's own; and nowhere may one conversation process serve two
 conversations, or an increment depend on td-jail moving an instance out
 of its launcher's cgroup on a host. The git worker's imports and pushes
-are children of the window process, which would take a limit of their
+are children of the broker, which would take a limit of their
 own (§9); a `/review`'s staging import and its review are the
 conversation process's own children (§15).
 
@@ -4010,7 +4114,7 @@ creates; the capability its stage 1 raises is the new namespace's. The
   instance runs the installed tool host and td-txt, which the same
   `./install-apps` that installs td-agent builds from the checkout, bound
   read-only into the instance, with no package, no Wayland and no bus.
-  A td-agent window running when `./install-apps` replaces it starts
+  A td-agent broker running when `./install-apps` replaces it starts
   later conversations from the new file, which work. The conversations
   it already runs, and its own archive and delete survey, find their
   file gone: their workspace preparation and tracking are refused, and
@@ -4340,7 +4444,7 @@ standalone program: no boot test starts it (§18, 17).
 
 **The git worker** is the part of td-agent that runs git. It does so in
 two places, and the line between them is the design. Outside a jail it
-is the window process's, which holds the shared repositories, but for a
+is the broker's, which holds the shared repositories, but for a
 `/review`'s staging, which the conversation process does in its own
 directory (§15); a
 maintenance instance is started by the conversation process whose work
@@ -5055,7 +5159,8 @@ matches takes its workspace's mode's column (As built (increment 13,
 modes)).
 
 **As built (increment 13, the human's rules).** The human's rules are
-the state directory's `rules`, read when the window starts: a header,
+the state directory's `rules`, read when the broker starts and whenever a
+window attaches: a header,
 `[everywhere]` or `[<workspace>]`, then that scope's rules one a line as
 a repository's are written, an `allow` among them only under a
 workspace's header; blank lines and `#` comments are skipped, and a
@@ -5079,7 +5184,7 @@ asks for an opaque command and an unread file, then the human's allow,
 which runs a call that acts with no card, its approval logged `by`
 `rule` with the rule as the reason. A repeated call still goes to the
 human. The cards' "always" answers write the file; the human may edit it
-too, and it is read again when the window starts.
+too, and it is read again when a window attaches.
 
 **As built (increment 13, card answers).** A card for a workspace's call
 offers its "always" answers with what they would remember (`{"type":
@@ -5771,7 +5876,7 @@ says the process's state, the bytes read, how many were written, the
 next offset, how many were dropped, and when an offset it was given lies
 before what is kept or past what was written; 32 KiB by default, 100 KiB
 at most, as `read_file`'s. `process_wait` waits, hearing the window,
-until the process ends, the person interrupts, the window closes, or
+until the process ends, the person interrupts, the broker ends, or
 `timeout_ms` (at most ten minutes) passes, and says how it stands with
 the last 15 KiB of its output, a foreground call's shown tail.
 `process_list` says each process's bytes written. Archiving the
@@ -7417,7 +7522,7 @@ kind. td-agent's position on its features:
   defers or denies, a malformed reply, and a Jev outage with and without
   `jev_required`. A conversation process is a child process here as in
   the window, driven over its socketpair by a test harness standing in
-  for the window process.
+  for the broker.
 - **Window tests:** native compositor process tests through the driven
   seam: the layout, the workspace tree, switching conversations, selecting
   text across messages and copying it, copying a whole message and a tool
@@ -7432,7 +7537,7 @@ kind. td-agent's position on its features:
   loopback; isolated review and maintenance retain their socket restrictions;
   can commit and `git switch -c`; and
   leaves no process running after a timed-out call, a killed
-  background process, or a conversation or window process killed with
+  background process, or a conversation or broker killed with
   `SIGKILL`. Admission refuses `$HOME`, the store, a credential
   location, and a shared directory containing a worktree.
 - **Live checks, by hand and never in the gate:** td-agent against
@@ -7508,8 +7613,12 @@ read from the store.
 over real socketpairs: a killed child restarted from its log and going
 on from it, a child failing every start left failed after three
 restarts, a child exiting when its socketpair closes, a second writer
-of one conversation and a second window refused, and the configuration
-refusals. The window's keys, focus, list order, status row and divider
+of one conversation and a second broker refused, a window through `attach`
+told all there is, refused auto mode and taken over from, a broker ending with
+the last window and after a linger, `--stop`, a log past every bound reaching a
+window slow to read it, a request for what is no longer open coming back, a
+state directory by a link or left open, a broker coming by a launch, and the
+configuration refusals. The window's keys, focus, list order, status row and divider
 are tested against its widget state in `src/ui.rs` and the driven
 actions in `src/control.rs`.
 
@@ -7989,7 +8098,7 @@ list, and none once its template is gone, never the top-level one;
 `src/ui.rs` covers the chooser's rows in order with Empty selected,
 the note, what each choice asks, Directory… opening the folder chooser
 even with a card waiting, `Escape`, and `C-n` with no workspaces
-starting one with none; `src/window.rs` covers a repository template's
+starting one with none; `src/broker.rs` covers a repository template's
 refusal; `src/control.rs` drives `new` both ways; `src/confirm.rs`
 covers what the deletion question says of each kind of workspace; and
 `src/workspace.rs` round-trips a template workspace, refuses a bad
@@ -8056,7 +8165,7 @@ in parallel with it.
 3. **td-ui chat components.** The message list with selection and whole-
    message copy, tested in td-ui, amending td-ui/DESIGN.md.
 4. **Window, processes and store.** The crate with its manifest, lock and
-   gate metadata, and the generalized exemption of §17; the window process
+   gate metadata, and the generalized exemption of §17; the broker
    and conversation processes over their socketpairs, a conversation
    restarted from its log; the split window with the conversation tree,
    message list and composer; the store with local echo and no model;

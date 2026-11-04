@@ -1,7 +1,7 @@
 //! Schedules (DESIGN.md §3): when one fires, a five-field cron expression
 //! or a single local time, and the instants either gives in a zone, a
 //! local time that does not exist skipped and one that repeats taken at
-//! its first instance; and the schedules the window process keeps in the
+//! its first instance; and the schedules the broker keeps in the
 //! state directory, each with its journal, and which are due.
 
 use td_civil::{Civil, Zone};
@@ -537,6 +537,15 @@ impl Schedules {
     }
 
     /// When the soonest schedule fires next.
+    /// Whether any schedule can still fire: it has a time to come and something
+    /// to fire to, which a deleted conversation is not.
+    pub fn can_fire(&self, target: &dyn Fn(&crate::store::Id) -> Target) -> bool {
+        self.list.iter().any(|schedule| {
+            schedule.next(&self.zone, schedule.through).is_some()
+                && matches!(target(&schedule.to), Target::Live(_))
+        })
+    }
+
     pub fn soonest(&self) -> Option<u64> {
         self.list
             .iter()

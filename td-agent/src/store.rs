@@ -3,7 +3,7 @@
 //! `meta`, `prefix` and an append-only `log` of newline-delimited JSON
 //! events with sequence numbers, and a `lock` its conversation process
 //! holds exclusively for as long as it runs: that process is the
-//! directory's only writer. The window process reads `meta` for its list
+//! directory's only writer. The broker reads `meta` for its list
 //! and keeps its own `window.lock` and split share at the top.
 //!
 //! Locks are `File::try_lock`, std's `flock(LOCK_EX | LOCK_NB)`: the
@@ -39,6 +39,9 @@ const DEFAULT_MODEL: &str = "default-model";
 const DELETING: &str = ".deleting-";
 /// The longest log loaded; a longer one is refused rather than read.
 pub const MAX_LOG: u64 = 256 * 1024 * 1024;
+
+/// What a broker that lost the race for the lock says.
+pub const SERVING: &str = "another td-agent serve is running";
 /// What a log keeps free past an accepted message, for the records that
 /// follow it: its turn's start and finish, an interruption, a notice.
 pub const LOG_RESERVE: u64 = 64 * 1024;
@@ -211,7 +214,7 @@ impl StateDir {
         Ok(())
     }
 
-    /// The window process's lock, which refuses a second window process
+    /// The broker's lock, which refuses a second broker
     /// over the same state directory (DESIGN.md §2).
     pub fn lock_window(&self) -> Result<File, String> {
         let path = self.root.join("window.lock");
@@ -219,7 +222,7 @@ impl StateDir {
         match file.try_lock() {
             Ok(()) => Ok(file),
             Err(TryLockError::WouldBlock) => Err(format!(
-                "another td-agent window is running over {} (it holds {})",
+                "{SERVING} over {} (it holds {})",
                 self.root.display(),
                 path.display()
             )),
@@ -268,7 +271,7 @@ impl StateDir {
                     .name("td-agent-jail-removal".into())
                     .spawn(move || {
                         if let Err(e) = crate::workspace::remove_tree(&removing) {
-                            eprintln!("td-agent: {}: {e}", removing.display());
+                            logged!("td-agent: {}: {e}", removing.display());
                         }
                     });
                 spawned
@@ -361,7 +364,7 @@ impl StateDir {
                 .spawn(move || {
                     for path in doomed {
                         if let Err(e) = crate::workspace::remove_tree(&path) {
-                            eprintln!("td-agent: {}: {e}", path.display());
+                            logged!("td-agent: {}: {e}", path.display());
                         }
                     }
                 });
@@ -4831,7 +4834,7 @@ pub mod tests {
         let state = scratch.state();
         let held = state.lock_window().unwrap();
         let refused = state.lock_window().unwrap_err();
-        assert!(refused.contains("another td-agent window"), "{refused}");
+        assert!(refused.contains("another td-agent serve"), "{refused}");
         drop(held);
         // Tried again for a while, as above: a child forked while it was
         // held holds it too until it execs.

@@ -493,7 +493,7 @@ fn trust_line(line: &str) -> Option<Result<String, String>> {
 }
 
 /// Whether `text` is a SHA-256 in lowercase hex.
-fn digest_hex(text: &str) -> bool {
+pub(crate) fn digest_hex(text: &str) -> bool {
     text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
@@ -655,6 +655,10 @@ pub fn set_trust(text: &str, key: &str, digest: Option<&str>) -> Result<String, 
         kept.push('\n');
     }
     match digest {
+        // One line, whatever a window sent: this file is what is allowed.
+        Some(digest) if !digest_hex(digest) => {
+            Err("a trust mark is a SHA-256 in lowercase hex".into())
+        }
         Some(digest) => append(&kept, &header, &[format!("trust {digest}")]),
         None => {
             parse_policy(&kept)?;

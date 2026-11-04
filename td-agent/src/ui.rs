@@ -838,6 +838,9 @@ pub struct App {
     /// The questions conversations ask, the open one's above its
     /// composer.
     questions: Vec<Asked>,
+    /// The last event each conversation's process read back from its log when it
+    /// started, which is not news.
+    read_back: BTreeMap<Id, u64>,
     /// The open conversation's todo list, and whether it is shown whole.
     todo: Vec<TodoItem>,
     todo_open: bool,
@@ -1068,6 +1071,7 @@ impl App {
             show_activity: false,
             queued: Vec::new(),
             questions: Vec::new(),
+            read_back: BTreeMap::new(),
             todo: Vec::new(),
             todo_open: false,
             messages: Vec::new(),
@@ -1983,8 +1987,13 @@ impl App {
         // The conversation left goes on in the background while its turn
         // runs (its process is kept); the others keep what they showed.
         self.book.set_active(id.clone());
+        self.show_opened(&id);
+    }
+
+    /// Conversation `id` has just become the one shown.
+    fn show_opened(&mut self, id: &Id) {
         // The conversation opened shows in the list, its group unfolded.
-        if let Some(row) = self.book.rows.iter().find(|r| r.id == id) {
+        if let Some(row) = self.book.rows.iter().find(|r| &r.id == id) {
             let group = Group::of(row.workspace.as_ref(), &self.templates);
             self.folded.remove(&fold_key(&Item::Group(group)));
         }
@@ -2250,7 +2259,11 @@ impl App {
             }
             // Its log, replayed next, counts them again; a failed process
             // took them with it.
-            Update::Up(Up::Hello { .. }) | Update::Failed { .. } => {
+            Update::Up(Up::Hello { last, .. }) => {
+                self.processes.remove(id);
+                self.read_back.insert(id.clone(), *last);
+            }
+            Update::Failed { .. } => {
                 self.processes.remove(id);
             }
             _ => {}
@@ -2263,9 +2276,12 @@ impl App {
         // is said here too.
         let notice = match update {
             Update::Up(Up::Event(Event {
+                seq,
                 kind: Kind::Notice { text } | Kind::Notification { text, .. },
                 ..
-            })) => Some(format!("{}: {text}", row.title)),
+            })) if self.read_back.get(id).is_none_or(|last| seq > last) => {
+                Some(format!("{}: {text}", row.title))
+            }
             _ => None,
         };
         self.refresh_list();
@@ -2286,6 +2302,10 @@ impl App {
                 last,
                 ..
             }) => {
+                // What follows may be heard once another is open.
+                if let Some(id) = self.book.active.clone() {
+                    self.read_back.insert(id, last);
+                }
                 self.clear_transcript();
                 self.replaying_to = last;
                 // Its log, replayed next, counts its processes again.
@@ -4257,7 +4277,7 @@ impl App {
                 let e = refused
                     .err()
                     .unwrap_or_else(|| "the composer took nothing".into());
-                eprintln!("td-agent: {why}; a message could not be put back ({e}):\n{text}");
+                logged!("td-agent: {why}; a message could not be put back ({e}):\n{text}");
                 self.note(format!(
                     "{why}; the message could not be put back ({e}) and is on standard error"
                 ));
@@ -4705,9 +4725,73 @@ impl App {
     pub(crate) fn opened(&mut self, book: Book) {
         self.opening = self.opening.saturating_sub(1);
         if !self.opening() {
+            let shown = self.book.active().cloned();
             self.book = book;
-            self.refresh_list();
+            match self.book.active().cloned() {
+                // One this window did not open: it has just attached.
+                Some(id) if shown.as_ref() != Some(&id) => self.show_opened(&id),
+                _ => self.refresh_list(),
+            }
         }
+    }
+
+    /// A conversation's update that came while the session had yet to hear this
+    /// window open another. It is not drawn; what it says is not lost.
+    pub(crate) fn heard_of_left(&mut self, of: Option<&Id>, update: Update, now: u64) {
+        if let Some(of) = of {
+            self.background(of, &update, now);
+        }
+        match update {
+            Update::Refused {
+                text: Some(text),
+                reason,
+                ..
+            } => self.restore(&text, format!("refused: {reason}")),
+            Update::Refused {
+                text: None, reason, ..
+            }
+            | Update::Up(Up::Refused { reason, .. }) => self.note(format!("refused: {reason}")),
+            Update::Restarting { reason } => self.note(format!(
+                "the conversation's process failed ({reason}); restarting it from its log"
+            )),
+            Update::Failed { reason } => self.note(format!(
+                "the conversation's process failed ({reason}); open it again to retry"
+            )),
+            _ => {}
+        }
+    }
+
+    /// A conversation's log, read again while the session had yet to hear this
+    /// window open another: what it counts holds, though it is not drawn.
+    pub(crate) fn replayed_of_left(&mut self, of: Option<&Id>, events: &[Event]) {
+        if let Some(of) = of {
+            self.processes.remove(of);
+            for event in events {
+                self.heard_process(of, event.seq, &event.kind);
+            }
+            self.relist();
+        }
+    }
+
+    /// What conversation `id`'s log has said of its processes and sub-agents,
+    /// told to a window that has not seen that log.
+    pub(crate) fn counted(&mut self, id: &Id, events: &[Event], ended: &[u64]) {
+        self.processes.remove(id);
+        for event in events {
+            self.heard_process(id, event.seq, &event.kind);
+        }
+        if let Some(known) = self.sub_agents.get_mut(id) {
+            for call in ended {
+                known.running.remove(call);
+            }
+        }
+        self.relist();
+    }
+
+    /// The configuration's mode, for a workspace with none of its own.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.touch();
     }
 
     /// Shows a message with the pictures the session sent with it.
@@ -10143,6 +10227,92 @@ pub mod tests {
     /// A conversation folds its background processes away, and each item
     /// keeps its id while listed, so a row coming above another moves no
     /// id, and the view stays where it was.
+    /// A conversation woken reads its log back; what it told the person then is
+    /// not said again, and what it says now is.
+    #[test]
+    fn a_log_read_back_in_the_background_is_not_news() {
+        let mut app = app();
+        let notice = |seq, text: &str| at(seq, Kind::Notice { text: text.into() });
+        app.background(&id(3), &notice(1, "first"), 0);
+        let told = app.unread();
+        assert!(told > 0);
+        app.background(
+            &id(3),
+            &Update::Up(Up::Hello {
+                title: "t".into(),
+                torn: None,
+                interrupted: Vec::new(),
+                paused: false,
+                prefix: None,
+                last: 1,
+            }),
+            0,
+        );
+        app.background(&id(3), &notice(1, "first"), 0);
+        assert_eq!(app.unread(), told);
+        app.background(&id(3), &notice(2, "second"), 0);
+        assert_eq!(app.unread(), told + 1);
+    }
+
+    /// A process started while open reads its log back too, some of which may
+    /// be heard once another has opened.
+    #[test]
+    fn a_log_read_back_of_a_conversation_left_is_not_news() {
+        let mut app = app();
+        app.open(id(3));
+        app.take_requests();
+        app.update(
+            Update::Up(Up::Hello {
+                title: "t".into(),
+                torn: None,
+                interrupted: Vec::new(),
+                paused: false,
+                prefix: None,
+                last: 5,
+            }),
+            0,
+        );
+        let told = app.unread();
+        let notice = |seq, text: &str| at(seq, Kind::Notice { text: text.into() });
+        app.heard_of_left(Some(&id(3)), notice(3, "old"), 0);
+        app.background(&id(3), &notice(4, "old"), 0);
+        assert_eq!(app.unread(), told);
+        app.background(&id(3), &notice(6, "new"), 0);
+        assert_eq!(app.unread(), told + 1);
+    }
+
+    /// What is said of a conversation left, before the session has heard of the
+    /// opening, still counts its processes though it is not drawn.
+    #[test]
+    fn a_conversation_left_keeps_its_count_of_processes_while_another_opens() {
+        let mut app = app();
+        let process = |seq, number| Event {
+            seq,
+            time: 0,
+            kind: Kind::Process {
+                number,
+                call: 1,
+                command: "sleep 60".into(),
+            },
+        };
+        let shown = |app: &App| app.listed(&Item::Process(id(3), 1)).is_some();
+        let update = |seq, number| Update::Up(Up::Event(process(seq, number)));
+        app.heard_of_left(Some(&id(3)), update(4, 1), 0);
+        assert!(shown(&app), "an update counts one");
+        app.heard_of_left(
+            Some(&id(3)),
+            Update::Failed {
+                reason: "it fell over".into(),
+            },
+            0,
+        );
+        assert!(!shown(&app), "a failure took it with it");
+        app.replayed_of_left(Some(&id(3)), &[process(4, 1)]);
+        assert!(shown(&app), "a replay counts one again");
+        app.replayed_of_left(Some(&id(3)), &[]);
+        assert!(!shown(&app), "and counts afresh");
+    }
+
     #[test]
     fn a_conversation_folds_its_processes_and_ids_stay() {
         let mut app = app();

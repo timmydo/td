@@ -37,7 +37,7 @@ pub const DEFAULT_ROUTING: &str = "balanced";
 /// The longest base URL or model id taken.
 pub(crate) const MAX_NAME: usize = 2048;
 
-/// What the model client reads of the configuration: the window process
+/// What the model client reads of the configuration: the broker
 /// parses it and hands it to every conversation process (DESIGN.md §2).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Client {

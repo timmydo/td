@@ -17,11 +17,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use td_agent::config::Client;
+use td_agent::config::{Client, Mode};
 use td_agent::frame;
 use td_agent::protocol::{Down, Up};
 use td_agent::store::{Conversation, Id, Kind, Role, StateDir};
 use td_agent::supervisor::{Supervisor, Update, MAX_RESTARTS};
+use td_agent::ui::Request;
+use td_agent::view::View;
+use td_agent::window_wire::Showing;
 use td_agent::workspace::Workspace;
 
 /// The settings with no key: each turn ends at once, saying so.
@@ -146,6 +149,8 @@ fn a_message_sent_just_before_moving_away_is_delivered_on_reopening() {
     // Sent while A's process is still starting, then away at once: the
     // process may go before it reads the message.
     supervisor.send("kept".into(), Vec::new()).unwrap();
+    // A message the open one has yet to take is something under way.
+    assert!(supervisor.working());
     // Queued, the window shows, until the process takes it: B's own
     // queue is its, empty.
     assert_eq!(supervisor.queued(), ["kept"]);
@@ -748,11 +753,12 @@ fn a_second_process_for_one_conversation_is_refused() {
 }
 
 #[test]
-fn a_second_window_process_is_refused_before_it_connects_a_display() {
+fn a_second_broker_is_refused_while_the_first_holds_the_lock() {
     let scratch = Scratch::new("window");
     let state = scratch.state();
     let _held = state.lock_window().unwrap();
     let output = Command::new(PROGRAM)
+        .arg("serve")
         .env_clear()
         .env("HOME", &scratch.0)
         .env("XDG_STATE_HOME", &scratch.0)
@@ -761,7 +767,7 @@ fn a_second_window_process_is_refused_before_it_connects_a_display() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("another td-agent window"), "{stderr}");
+    assert!(stderr.contains("another td-agent serve"), "{stderr}");
 }
 
 #[test]
@@ -779,7 +785,11 @@ fn a_relative_control_socket_and_an_unknown_key_are_refused() {
     let config = scratch.0.join("config/td-agent");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(config.join("config"), "limits = 1\n").unwrap();
+    // The broker reads the configuration; `attach`, which starts one, says what
+    // it said, and without waiting to see whether it will listen.
+    let began = Instant::now();
     let output = Command::new(PROGRAM)
+        .arg("attach")
         .env_clear()
         .env("HOME", &scratch.0)
         .env("XDG_STATE_HOME", &scratch.0)
@@ -789,6 +799,507 @@ fn a_relative_control_socket_and_an_unknown_key_are_refused() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("`limits`"), "{stderr}");
+    assert!(began.elapsed() < Duration::from_secs(15));
+}
+
+/// `td-agent attach`, as a far window would run it, and the connection through it.
+fn attach(scratch: &Scratch) -> (std::process::Child, td_agent::peer::Peer) {
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let child = Command::new(PROGRAM)
+        .arg("attach")
+        .env_clear()
+        .env("HOME", &scratch.0)
+        .env("XDG_STATE_HOME", &scratch.0)
+        .env("XDG_CONFIG_HOME", scratch.0.join("config"))
+        .stdin(Stdio::from(OwnedFd::from(theirs.try_clone().unwrap())))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    (child, td_agent::peer::Peer::over(ours).unwrap())
+}
+
+/// What the broker says until `seen` holds of something it said.
+fn told_until(peer: &td_agent::peer::Peer, seen: impl Fn(&View) -> bool) -> Vec<View> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut told = Vec::new();
+    loop {
+        assert!(Instant::now() < deadline, "not told: {told:#?}");
+        match peer.recv().unwrap() {
+            Some(bytes) => {
+                let view = td_agent::window_wire::decode_view(&bytes).unwrap();
+                let done = seen(&view);
+                told.push(view);
+                if done {
+                    return told;
+                }
+            }
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
+std::thread_local! {
+    /// What the window `ask` stands for is showing.
+    static SHOWN: std::cell::RefCell<Option<Id>> = const { std::cell::RefCell::new(None) };
+}
+
+fn ask(peer: &td_agent::peer::Peer, request: &Request) {
+    let shown = SHOWN.with(|shown| shown.borrow().clone());
+    let showing = shown.map_or(Showing::Nothing, Showing::Conversation);
+    assert!(peer.send(td_agent::window_wire::encode_asked(&showing, request)));
+}
+
+/// A window at the far end of `td-agent attach` is told all there is, starts a
+/// conversation, and is refused auto mode; a second takes over from it; and with
+/// none left and nothing under way the broker ends and takes its sockets.
+#[test]
+fn a_far_window_attaches_and_a_second_takes_over_and_the_broker_ends_with_the_last() {
+    let scratch = Scratch::new("attach");
+    let state = scratch.state();
+    let made = Id::random().unwrap();
+    Conversation::create(
+        &state,
+        &made,
+        Role::Conversation,
+        Some(Workspace::Scratch),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let (mut first_child, first) = attach(&scratch);
+    let told = told_until(&first, |view| matches!(view, View::Replay(..)));
+    assert!(
+        matches!(told.first(), Some(View::Opened(book)) if book.active() == Some(&made)),
+        "{told:#?}"
+    );
+    assert!(told.iter().any(|view| matches!(view, View::SetShare(_))));
+    SHOWN.with(|shown| *shown.borrow_mut() = Some(made.clone()));
+
+    ask(
+        &first,
+        &Request::SetMode {
+            conversation: made.clone(),
+            mode: Mode::Auto,
+        },
+    );
+    told_until(
+        &first,
+        |view| matches!(view, View::Note(said) if said.contains("on this machine")),
+    );
+
+    let (mut second_child, second) = attach(&scratch);
+    let told = told_until(&second, |view| matches!(view, View::Replay(..)));
+    assert!(
+        matches!(told.first(), Some(View::Opened(book)) if book.active() == Some(&made)),
+        "{told:#?}"
+    );
+    // The first is let go, and its `attach` ends.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(Instant::now() < deadline, "the first stayed");
+        if first.recv().is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(first_child.wait().unwrap().success());
+
+    let left = Instant::now();
+    drop(second);
+    assert!(second_child.wait().unwrap().success());
+    let socket = state.root().join(td_agent::window::WINDOW_SOCKET);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while socket.exists() {
+        assert!(Instant::now() < deadline, "the broker stayed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A window started just now, or opened again, finds it there.
+    assert!(
+        left.elapsed() >= Duration::from_secs(4),
+        "it did not linger"
+    );
+}
+
+/// A conversation whose log is longer than the link holds messages unread opens,
+/// through `attach`, with a window that is slow to read: one replay, with a log
+/// past the bound on what may wait, and what is said behind it, reach it too.
+#[test]
+fn a_very_long_log_reaches_a_window_that_reads_it_a_while_later() {
+    let scratch = Scratch::new("long");
+    let state = scratch.state();
+    let made = Id::random().unwrap();
+    let (mut writer, _) = Conversation::create(
+        &state,
+        &made,
+        Role::Conversation,
+        Some(Workspace::Scratch),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let text = "x".repeat(16 * 1024);
+    for _ in 0..6000 {
+        writer.append(Kind::Notice { text: text.clone() }).unwrap();
+    }
+    drop(writer);
+    let (mut child, window) = attach(&scratch);
+    std::thread::sleep(Duration::from_secs(2));
+    let told = told_until(&window, |view| matches!(view, View::Replay(..)));
+    let replay = told
+        .iter()
+        .find_map(|view| match view {
+            View::Replay(_, _, events, _) => Some(events.len()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(replay >= 6000, "{replay}");
+    drop(window);
+    assert!(child.wait().unwrap().success());
+}
+
+/// A request that names no conversation is of the one the window was showing:
+/// one that has moved on gets it back, not another's model. Two opens in one turn
+/// of the broker are two opens.
+#[test]
+fn a_message_for_what_is_no_longer_open_comes_back_and_opens_in_a_row_all_open() {
+    let scratch = Scratch::new("shown");
+    let state = scratch.state();
+    let (a, b) = (Id::random().unwrap(), Id::random().unwrap());
+    for id in [&a, &b] {
+        Conversation::create(
+            &state,
+            id,
+            Role::Conversation,
+            Some(Workspace::Scratch),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    }
+    let (mut child, window) = attach(&scratch);
+    let told = told_until(&window, |view| matches!(view, View::Replay(..)));
+    let Some(View::Opened(book)) = told.first() else {
+        panic!("{told:#?}");
+    };
+    let open = book.active().unwrap().clone();
+    let other = if open == a { b.clone() } else { a.clone() };
+    let ask_of = |of: &Id, request: &Request| {
+        let showing = Showing::Conversation(of.clone());
+        assert!(window.send(td_agent::window_wire::encode_asked(&showing, request)));
+    };
+    ask_of(&other, &Request::Send("for the other".into(), Vec::new()));
+    let told = told_until(&window, |view| matches!(view, View::GiveBack(..)));
+    assert!(
+        matches!(told.last(), Some(View::GiveBack(text, ..)) if text == "for the other"),
+        "{told:#?}"
+    );
+    ask_of(&open, &Request::Open(other.clone()));
+    ask_of(&other, &Request::Open(open.clone()));
+    ask_of(&open, &Request::Open(other.clone()));
+    let told = told_until(&window, |view| {
+        matches!(view, View::Opened(book) if book.active() == Some(&other))
+            || matches!(view, View::Note(said) if said.contains("has closed"))
+    });
+    assert!(
+        !told
+            .iter()
+            .any(|view| matches!(view, View::Note(said) if said.contains("has closed"))),
+        "{told:#?}"
+    );
+    drop(window);
+    assert!(child.wait().unwrap().success());
+}
+
+/// Two conversations, the broker told of them through a window on `attach`, and
+/// which of them it has open and which it has not.
+fn two_conversations(scratch: &Scratch) -> (std::process::Child, td_agent::peer::Peer, Id, Id) {
+    let state = scratch.state();
+    let (a, b) = (Id::random().unwrap(), Id::random().unwrap());
+    for id in [&a, &b] {
+        Conversation::create(
+            &state,
+            id,
+            Role::Conversation,
+            Some(Workspace::Scratch),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    }
+    let (child, window) = attach(scratch);
+    let told = told_until(&window, |view| matches!(view, View::Replay(..)));
+    let Some(View::Opened(book)) = told.first() else {
+        panic!("{told:#?}");
+    };
+    let open = book.active().unwrap().clone();
+    let other = if open == a { b } else { a };
+    (child, window, open, other)
+}
+
+/// A message given back with no window there waits for a person, past the
+/// linger, and the broker ends once one has taken it.
+#[test]
+fn a_message_given_back_keeps_the_broker_until_a_window_has_taken_it() {
+    // A broker can hear the message a turn before it hears the window go, and
+    // then gives it to that window, as it would to any there. So a broker that
+    // ends can be innocent, once or twice under load; one not kept for the
+    // message ends every time.
+    let scratch = (0..5)
+        .find_map(|_| {
+            let scratch = Scratch::new("waits");
+            let (mut child, window, _, other) = two_conversations(&scratch);
+            let showing = Showing::Conversation(other);
+            let send = Request::Send("for the other".into(), Vec::new());
+            assert!(window.send(td_agent::window_wire::encode_asked(&showing, &send)));
+            window.finish();
+            assert!(child.wait().unwrap().success());
+            std::thread::sleep(Duration::from_secs(8));
+            let there = scratch
+                .state()
+                .root()
+                .join(td_agent::window::WINDOW_SOCKET)
+                .exists();
+            there.then_some(scratch)
+        })
+        .expect("the broker went, with a message waiting");
+    let socket = scratch.state().root().join(td_agent::window::WINDOW_SOCKET);
+    let (mut child, window) = attach(&scratch);
+    let told = told_until(&window, |view| matches!(view, View::GiveBack(..)));
+    assert!(
+        matches!(told.last(), Some(View::GiveBack(text, ..)) if text == "for the other"),
+        "{told:#?}"
+    );
+    drop(window);
+    assert!(child.wait().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while socket.exists() {
+        assert!(Instant::now() < deadline, "the broker stayed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A new conversation that was refused is no reason to send a message to the one
+/// the broker moved to: what was shown has gone, and it comes back.
+#[test]
+fn a_refused_new_lets_no_message_through_to_what_the_broker_moved_to() {
+    let scratch = Scratch::new("refused-new");
+    let (mut child, window, open, other) = two_conversations(&scratch);
+    let ask = |showing: &Showing, request: &Request| {
+        assert!(window.send(td_agent::window_wire::encode_asked(showing, request)));
+    };
+    let shown = Showing::Conversation(open.clone());
+    ask(
+        &shown,
+        &Request::Archive {
+            id: open.clone(),
+            archived: true,
+        },
+    );
+    told_until(
+        &window,
+        |view| matches!(view, View::SetActive(id) if id == &other),
+    );
+    // There is no jail here, so nothing can start in a folder.
+    ask(
+        &Showing::New(Some(open.clone())),
+        &Request::NewIn(PathBuf::from("/nonexistent"), false),
+    );
+    ask(
+        &Showing::New(Some(open)),
+        &Request::Send("for what was shown".into(), Vec::new()),
+    );
+    let told = told_until(&window, |view| matches!(view, View::GiveBack(..)));
+    assert!(
+        matches!(told.last(), Some(View::GiveBack(text, ..)) if text == "for what was shown"),
+        "{told:#?}"
+    );
+    drop(window);
+    assert!(child.wait().unwrap().success());
+}
+
+/// `--stop` ends a broker that a window would keep, and a second says there is
+/// none.
+#[test]
+fn stop_ends_a_broker_that_would_stay() {
+    let scratch = Scratch::new("stop");
+    let state = scratch.state();
+    let (_child, window) = attach(&scratch);
+    told_until(&window, |view| matches!(view, View::SetShare(_)));
+    let stop = |scratch: &Scratch| {
+        Command::new(PROGRAM)
+            .args(["serve", "--stop"])
+            .env_clear()
+            .env("HOME", &scratch.0)
+            .env("XDG_STATE_HOME", &scratch.0)
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
+            .output()
+            .unwrap()
+    };
+    let output = stop(&scratch);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!state.root().join(td_agent::window::WINDOW_SOCKET).exists());
+    // Gone, not going: a broker can start at once.
+    drop(state.lock_window().unwrap());
+    let output = stop(&scratch);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"no td-agent serve is running\n");
+}
+
+/// A state directory reached by a link, or left open by hand, serves as well.
+#[test]
+fn a_broker_listens_in_a_state_directory_by_a_link_and_shuts_one_left_open() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("link");
+    let real = scratch.0.join("real");
+    std::fs::create_dir_all(real.join("td-agent")).unwrap();
+    std::fs::set_permissions(
+        real.join("td-agent"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&real, scratch.0.join("by-link")).unwrap();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let mut child = Command::new(PROGRAM)
+        .arg("attach")
+        .env_clear()
+        .env("HOME", &scratch.0)
+        .env("XDG_STATE_HOME", scratch.0.join("by-link"))
+        .env("XDG_CONFIG_HOME", scratch.0.join("config"))
+        .stdin(Stdio::from(OwnedFd::from(theirs.try_clone().unwrap())))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let window = td_agent::peer::Peer::over(ours).unwrap();
+    told_until(&window, |view| matches!(view, View::SetShare(_)));
+    let mode = std::fs::metadata(real.join("td-agent"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o077, 0, "{mode:o}");
+    drop(window);
+    assert!(child.wait().unwrap().success());
+}
+
+/// Standard error is a file now, which can be full: that ends nothing.
+#[test]
+fn a_broker_goes_on_with_standard_error_full() {
+    let scratch = Scratch::new("full");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let status = Command::new(PROGRAM)
+        .arg("serve")
+        .env_clear()
+        .env("HOME", &scratch.0)
+        .env("XDG_STATE_HOME", &scratch.0)
+        .env("XDG_CONFIG_HOME", scratch.0.join("config"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(full))
+        .status()
+        .unwrap();
+    assert!(status.success(), "{status}");
+}
+
+/// A far window going is no fault of `attach`'s, while the broker is saying
+/// something or not.
+#[test]
+fn attach_ends_quietly_when_the_far_window_stops_reading() {
+    let scratch = Scratch::new("pipe");
+    let state = scratch.state();
+    let made = Id::random().unwrap();
+    let (mut writer, _) = Conversation::create(
+        &state,
+        &made,
+        Role::Conversation,
+        Some(Workspace::Scratch),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let text = "x".repeat(16 * 1024);
+    for _ in 0..2000 {
+        writer.append(Kind::Notice { text: text.clone() }).unwrap();
+    }
+    drop(writer);
+    let (mut child, window) = attach(&scratch);
+    told_until(&window, |view| matches!(view, View::Opened(_)));
+    drop(window);
+    assert!(child.wait().unwrap().success());
+}
+
+/// A variable left in a shell names no launch but one of this program.
+#[test]
+fn a_launch_of_another_program_is_not_obeyed() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("stale");
+    let said = scratch.0.join("said");
+    let launcher = scratch.0.join("launcher");
+    std::fs::write(
+        &launcher,
+        format!("#!/bin/sh\ntouch {}\nexit 7\n", said.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let mut child = Command::new(PROGRAM)
+        .arg("attach")
+        .env_clear()
+        .env("HOME", &scratch.0)
+        .env("XDG_STATE_HOME", &scratch.0)
+        .env("XDG_CONFIG_HOME", scratch.0.join("config"))
+        .env("TD_AGENT_LAUNCHER", &launcher)
+        .env("TD_AGENT_SESSION_RUNTIME", "/the/session")
+        .stdin(Stdio::from(OwnedFd::from(theirs.try_clone().unwrap())))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let window = td_agent::peer::Peer::over(ours).unwrap();
+    told_until(&window, |view| matches!(view, View::SetShare(_)));
+    assert!(!said.exists());
+    drop(window);
+    assert!(child.wait().unwrap().success());
+}
+
+/// A launch's broker comes by that launch, under the session's runtime directory
+/// and not the one that goes with the window.
+#[test]
+fn a_broker_comes_by_the_launch_that_started_the_window() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("launcher");
+    let said = scratch.0.join("said");
+    std::fs::create_dir(scratch.0.join("lib")).unwrap();
+    let launcher = scratch.0.join("lib/launcher");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\necho \"$0 $* $XDG_RUNTIME_DIR $PWD\" > {}\nexec {PROGRAM} \"$@\"\n",
+            said.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(PROGRAM, scratch.0.join("lib/td-agent")).unwrap();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let mut child = Command::new(PROGRAM)
+        .arg("attach")
+        .env_clear()
+        .env("HOME", &scratch.0)
+        .env("XDG_STATE_HOME", &scratch.0)
+        .env("XDG_CONFIG_HOME", scratch.0.join("config"))
+        .env("XDG_RUNTIME_DIR", "/the/launchs/own")
+        .env("TD_AGENT_LAUNCHER", &launcher)
+        .env("TD_AGENT_SESSION_RUNTIME", "/the/session")
+        .stdin(Stdio::from(OwnedFd::from(theirs.try_clone().unwrap())))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let window = td_agent::peer::Peer::over(ours).unwrap();
+    told_until(&window, |view| matches!(view, View::SetShare(_)));
+    let said = std::fs::read_to_string(&said).unwrap();
+    assert!(said.ends_with("serve /the/session /\n"), "{said}");
+    drop(window);
+    assert!(child.wait().unwrap().success());
 }
 
 /// A message sent just before the human switches away is answered: the
