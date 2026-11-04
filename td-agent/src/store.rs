@@ -772,15 +772,14 @@ fn read_instructions(dir: &Path) -> Result<Vec<Instructed>, String> {
     };
     let text = std::str::from_utf8(&bytes).map_err(|_| format!("{}: not UTF-8", path.display()))?;
     let value = td_json::parse(text).map_err(|e| format!("{}: {e}", path.display()))?;
+    instructions_from_json(&value).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// `instructions_json`'s value back.
+pub(crate) fn instructions_from_json(value: &Json) -> Result<Vec<Instructed>, String> {
     let mut read: Vec<Instructed> = Vec::new();
-    for (at, item) in value
-        .as_arr()
-        .ok_or_else(|| format!("{}: not a list", path.display()))?
-        .iter()
-        .enumerate()
-    {
-        let one = Instructed::from_json(item, &read, at)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+    for (at, item) in value.as_arr().ok_or("not a list")?.iter().enumerate() {
+        let one = Instructed::from_json(item, &read, at)?;
         read.push(one);
     }
     Ok(read)
@@ -790,7 +789,7 @@ fn read_instructions(dir: &Path) -> Result<Vec<Instructed>, String> {
 /// earlier one was, the same read, names that one (`"same": <index>`)
 /// rather than holding the text again, so the file's bound holds
 /// however many worktrees start there.
-fn instructions_json(all: &[Instructed]) -> Json {
+pub(crate) fn instructions_json(all: &[Instructed]) -> Json {
     Json::Arr(
         all.iter()
             .enumerate()

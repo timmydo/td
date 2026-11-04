@@ -1021,6 +1021,14 @@ impl Mode {
             Self::Ask => "ask",
         }
     }
+
+    pub(crate) fn parse(word: &str) -> Option<Self> {
+        match word {
+            "auto" => Some(Self::Auto),
+            "ask" => Some(Self::Ask),
+            _ => None,
+        }
+    }
 }
 
 /// What this increment does with a key.
@@ -1300,7 +1308,7 @@ fn mcp_servers(servers: Vec<McpServer>) -> Result<Vec<McpServer>, String> {
 
 impl McpServer {
     /// As a conversation's setup carries it.
-    fn to_json(&self) -> Json {
+    pub(crate) fn to_json(&self) -> Json {
         let strings = |list: &[String]| Json::Arr(list.iter().cloned().map(Json::Str).collect());
         Json::Obj(vec![
             ("name".into(), Json::Str(self.name.clone())),
@@ -1315,7 +1323,7 @@ impl McpServer {
 }
 
 /// `McpServer::to_json`'s list back, each checked as the file's is.
-fn mcp_from_json(value: &Json) -> Result<Vec<McpServer>, String> {
+pub(crate) fn mcp_from_json(value: &Json) -> Result<Vec<McpServer>, String> {
     let wrong = "MCP servers are a list, each a name, a command, its tools or null, and a timeout";
     let strings = |value: Option<&Json>| -> Option<Vec<String>> {
         value?
@@ -1676,66 +1684,59 @@ pub fn shared_text(shared: Option<&[Shared]>) -> String {
 /// network policy and shared directories when it names its own, and its
 /// repositories, none for a scratch workspace's.
 pub fn templates_json(templates: &[Template]) -> Json {
-    Json::Arr(
-        templates
-            .iter()
-            .map(|template| {
-                let mut fields = vec![("name".into(), Json::Str(template.name.clone()))];
-                // Only a template given one names a network policy.
-                if let Some(network) = template.network {
-                    fields.push(("network".into(), Json::Str(network.name().into())));
-                }
-                // Only a template that turns it on names the system view.
-                if template.system {
-                    fields.push(("system".into(), Json::Bool(true)));
-                }
-                if let Some(shared) = &template.shared {
-                    fields.push((
-                        "shared".into(),
-                        Json::Arr(
-                            shared
-                                .iter()
-                                .map(|shared| {
-                                    Json::Obj(vec![
-                                        (
-                                            "path".into(),
-                                            Json::Str(shared.path.display().to_string()),
-                                        ),
-                                        ("write".into(), Json::Bool(shared.write)),
-                                    ])
-                                })
-                                .collect(),
+    Json::Arr(templates.iter().map(template_json).collect())
+}
+
+/// One template of `templates_json`.
+pub(crate) fn template_json(template: &Template) -> Json {
+    let mut fields = vec![("name".into(), Json::Str(template.name.clone()))];
+    // Only a template given one names a network policy.
+    if let Some(network) = template.network {
+        fields.push(("network".into(), Json::Str(network.name().into())));
+    }
+    // Only a template that turns it on names the system view.
+    if template.system {
+        fields.push(("system".into(), Json::Bool(true)));
+    }
+    if let Some(shared) = &template.shared {
+        fields.push((
+            "shared".into(),
+            Json::Arr(
+                shared
+                    .iter()
+                    .map(|shared| {
+                        Json::Obj(vec![
+                            ("path".into(), Json::Str(shared.path.display().to_string())),
+                            ("write".into(), Json::Bool(shared.write)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ));
+    }
+    fields.push((
+        "repos".into(),
+        Json::Arr(
+            template
+                .repos
+                .iter()
+                .map(|repo| {
+                    Json::Obj(vec![
+                        ("remote".into(), Json::Str(repo.remote.clone())),
+                        ("base".into(), Json::Str(repo.base.clone())),
+                        ("branch".into(), Json::Str(repo.branch.clone())),
+                        (
+                            "sparse".into(),
+                            repo.sparse.as_ref().map_or(Json::Null, |paths| {
+                                Json::Arr(paths.iter().cloned().map(Json::Str).collect())
+                            }),
                         ),
-                    ));
-                }
-                fields.push((
-                    "repos".into(),
-                    Json::Arr(
-                        template
-                            .repos
-                            .iter()
-                            .map(|repo| {
-                                Json::Obj(vec![
-                                    ("remote".into(), Json::Str(repo.remote.clone())),
-                                    ("base".into(), Json::Str(repo.base.clone())),
-                                    ("branch".into(), Json::Str(repo.branch.clone())),
-                                    (
-                                        "sparse".into(),
-                                        repo.sparse.as_ref().map_or(Json::Null, |paths| {
-                                            Json::Arr(
-                                                paths.iter().cloned().map(Json::Str).collect(),
-                                            )
-                                        }),
-                                    ),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ));
-                Json::Obj(fields)
-            })
-            .collect(),
-    )
+                    ])
+                })
+                .collect(),
+        ),
+    ));
+    Json::Obj(fields)
 }
 
 /// Whether `value` is an object whose keys are all among `keys`.
@@ -1757,10 +1758,7 @@ const CHECK_PATH: usize = 256;
 /// as `shared_field` takes them, and one naming repositories planned as
 /// a workspace would be (`workspace::plan`), shared directories aside.
 pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
-    let wrong = "not a list of templates, each a name and its repositories";
-    let wrong_shared =
-        "a template's shared directories are a list, each a path and whether it may be written";
-    let items = value.as_arr().ok_or(wrong)?;
+    let items = value.as_arr().ok_or(NOT_TEMPLATES)?;
     if items.len() > MAX_TEMPLATES {
         return Err(format!("more than {MAX_TEMPLATES} templates"));
     }
@@ -1768,123 +1766,137 @@ pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
     let id = crate::store::Id::parse(&"0".repeat(32)).ok_or("no placeholder id")?;
     let place = std::path::PathBuf::from(format!("/{}", "x".repeat(CHECK_PATH)));
     for item in items {
-        if !only_keys(item, &["name", "network", "system", "shared", "repos"]) {
-            return Err(wrong.into());
-        }
-        let network = match item.get("network") {
-            None => None,
-            Some(named) => Some(
-                named
-                    .as_str()
-                    .and_then(Network::parse)
-                    .ok_or("a template's network is off, allowlist or open")?,
-            ),
-        };
-        // Written only as true, so it reads back as written.
-        let system = match item.get("system") {
-            None => false,
-            Some(Json::Bool(true)) => true,
-            Some(_) => return Err("a template's system view is written only as true".into()),
-        };
-        let name = template_name(item.get("name").and_then(Json::as_str).ok_or(wrong)?)?;
-        if templates.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
+        let template = template_from_json(item)?;
+        let name = &template.name;
+        if templates.iter().any(|t| t.name.eq_ignore_ascii_case(name)) {
             return Err(format!("two templates are named {name:?}"));
         }
-        let shared = match item.get("shared") {
-            None => None,
-            Some(list) => {
-                let list = list.as_arr().ok_or(wrong_shared)?;
-                if list.len() > MAX_TEMPLATE_SHARED {
-                    return Err(format!(
-                        "template {name:?} shares more than {MAX_TEMPLATE_SHARED} directories"
-                    ));
-                }
-                let shared = list
-                    .iter()
-                    .map(|entry| {
-                        if !only_keys(entry, &["path", "write"]) {
-                            return Err(wrong_shared.to_string());
-                        }
-                        let path = entry
-                            .get("path")
-                            .and_then(Json::as_str)
-                            .ok_or(wrong_shared)?;
-                        let write = entry
-                            .get("write")
-                            .and_then(Json::as_bool)
-                            .ok_or(wrong_shared)?;
-                        Ok(Shared {
-                            path: configured_path("shared", path)?,
-                            write,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()
-                    .map_err(|e| format!("template {name:?}: {e}"))?;
-                // As the dialog would take them, so the file reads back
-                // as written.
-                let text = shared_text(Some(&shared));
-                if shared_field(&text).ok().flatten().as_ref() != Some(&shared) {
-                    return Err(format!(
-                        "template {name:?}: shared directories the dialog would not take"
-                    ));
-                }
-                Some(shared)
-            }
-        };
-        let repos = item.get("repos").and_then(Json::as_arr).ok_or(wrong)?;
-        if repos.len() > crate::workspace::MAX_ENTRIES {
+        if template.repos.len() > crate::workspace::MAX_ENTRIES {
             return Err(format!(
                 "template {name:?} has more than {} repositories",
                 crate::workspace::MAX_ENTRIES
             ));
         }
-        let repos = repos
-            .iter()
-            .map(|repo| {
-                if !only_keys(repo, &["remote", "base", "branch", "sparse"]) {
-                    return Err(wrong.into());
-                }
-                let text = |key: &str| repo.get(key).and_then(Json::as_str).ok_or(wrong);
-                let sparse = match repo.get("sparse") {
-                    None | Some(Json::Null) => None,
-                    Some(paths) => Some(
-                        paths
-                            .as_arr()
-                            .ok_or(wrong)?
-                            .iter()
-                            .map(|path| path.as_str().map(str::to_string).ok_or(wrong))
-                            .collect::<Result<Vec<_>, _>>()?,
-                    ),
-                };
-                let checked =
-                    checked_repo(text("remote")?, text("base")?, text("branch")?, sparse)?;
-                // As td-agent records it, so the file reads back as written.
-                if Some(checked.remote.as_str()) != repo.get("remote").and_then(Json::as_str) {
-                    return Err(format!(
-                        "{:?} is not a remote as td-agent records one",
-                        checked.remote
-                    ));
-                }
-                Ok(checked)
-            })
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(|e| format!("template {name:?}: {e}"))?;
-        // A template made in the window names no MCP server; its file's
-        // keys leave no room for one.
-        let template = Template {
-            system,
-            network,
-            name,
-            repos,
-            shared,
-            mcp: Vec::new(),
-        };
         if !template.repos.is_empty() {
             crate::workspace::plan(&template, &id, &place, &place, 0)?;
         }
         templates.push(template);
     }
     Ok(templates)
+}
+
+const NOT_TEMPLATES: &str = "not a list of templates, each a name and its repositories";
+
+/// `template_json`'s value back, its fields checked: what a whole file
+/// asks of it beside the others, and of its plan, is `templates_from_json`'s,
+/// so that the session can say what is wrong with one the dialog made.
+pub(crate) fn template_from_json(item: &Json) -> Result<Template, String> {
+    let wrong = NOT_TEMPLATES;
+    let wrong_shared =
+        "a template's shared directories are a list, each a path and whether it may be written";
+    if !only_keys(item, &["name", "network", "system", "shared", "repos"]) {
+        return Err(wrong.into());
+    }
+    let network = match item.get("network") {
+        None => None,
+        Some(named) => Some(
+            named
+                .as_str()
+                .and_then(Network::parse)
+                .ok_or("a template's network is off, allowlist or open")?,
+        ),
+    };
+    // Written only as true, so it reads back as written.
+    let system = match item.get("system") {
+        None => false,
+        Some(Json::Bool(true)) => true,
+        Some(_) => return Err("a template's system view is written only as true".into()),
+    };
+    let name = template_name(item.get("name").and_then(Json::as_str).ok_or(wrong)?)?;
+    let shared = match item.get("shared") {
+        None => None,
+        Some(list) => {
+            let list = list.as_arr().ok_or(wrong_shared)?;
+            if list.len() > MAX_TEMPLATE_SHARED {
+                return Err(format!(
+                    "template {name:?} shares more than {MAX_TEMPLATE_SHARED} directories"
+                ));
+            }
+            let shared = list
+                .iter()
+                .map(|entry| {
+                    if !only_keys(entry, &["path", "write"]) {
+                        return Err(wrong_shared.to_string());
+                    }
+                    let path = entry
+                        .get("path")
+                        .and_then(Json::as_str)
+                        .ok_or(wrong_shared)?;
+                    let write = entry
+                        .get("write")
+                        .and_then(Json::as_bool)
+                        .ok_or(wrong_shared)?;
+                    Ok(Shared {
+                        path: configured_path("shared", path)?,
+                        write,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(|e| format!("template {name:?}: {e}"))?;
+            // As the dialog would take them, so the file reads back
+            // as written.
+            let text = shared_text(Some(&shared));
+            if shared_field(&text).ok().flatten().as_ref() != Some(&shared) {
+                return Err(format!(
+                    "template {name:?}: shared directories the dialog would not take"
+                ));
+            }
+            Some(shared)
+        }
+    };
+    let repos = item
+        .get("repos")
+        .and_then(Json::as_arr)
+        .ok_or(wrong)?
+        .iter()
+        .map(|repo| {
+            if !only_keys(repo, &["remote", "base", "branch", "sparse"]) {
+                return Err(wrong.into());
+            }
+            let text = |key: &str| repo.get(key).and_then(Json::as_str).ok_or(wrong);
+            let sparse = match repo.get("sparse") {
+                None | Some(Json::Null) => None,
+                Some(paths) => Some(
+                    paths
+                        .as_arr()
+                        .ok_or(wrong)?
+                        .iter()
+                        .map(|path| path.as_str().map(str::to_string).ok_or(wrong))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            };
+            let checked = checked_repo(text("remote")?, text("base")?, text("branch")?, sparse)?;
+            // As td-agent records it, so the file reads back as written.
+            if Some(checked.remote.as_str()) != repo.get("remote").and_then(Json::as_str) {
+                return Err(format!(
+                    "{:?} is not a remote as td-agent records one",
+                    checked.remote
+                ));
+            }
+            Ok(checked)
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(|e| format!("template {name:?}: {e}"))?;
+    // A template made in the window names no MCP server; its file's keys
+    // leave no room for one.
+    Ok(Template {
+        system,
+        network,
+        name,
+        repos,
+        shared,
+        mcp: Vec::new(),
+    })
 }
 
 impl Template {

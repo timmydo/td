@@ -37,7 +37,7 @@ impl Resumed {
             Self::Stop => "stop",
         }
     }
-    fn parse(word: &str) -> Option<Self> {
+    pub(crate) fn parse(word: &str) -> Option<Self> {
         match word {
             "resend" => Some(Self::Resend),
             "compact" => Some(Self::Compact),
@@ -377,12 +377,16 @@ pub enum ScheduleOp {
     Cancel { schedule: String },
 }
 
-fn typed(kind: &str, mut pairs: Vec<(String, Json)>) -> Vec<u8> {
-    pairs.insert(0, ("type".into(), Json::Str(kind.into())));
-    Json::Obj(pairs).to_string().into_bytes()
+pub(crate) fn typed(kind: &str, pairs: Vec<(String, Json)>) -> Vec<u8> {
+    typed_json(kind, pairs).to_string().into_bytes()
 }
 
-fn string(value: &Json, name: &str) -> Result<String, String> {
+fn typed_json(kind: &str, mut pairs: Vec<(String, Json)>) -> Json {
+    pairs.insert(0, ("type".into(), Json::Str(kind.into())));
+    Json::Obj(pairs)
+}
+
+pub(crate) fn string(value: &Json, name: &str) -> Result<String, String> {
     value
         .get(name)
         .and_then(Json::as_str)
@@ -399,12 +403,12 @@ pub fn delivery_ok(delivery: &str) -> bool {
 }
 
 /// An optional text as a frame carries it: the text, or null.
-fn optional(text: &Option<String>) -> Json {
+pub(crate) fn optional(text: &Option<String>) -> Json {
     text.clone().map_or(Json::Null, Json::Str)
 }
 
 /// An optional text member, which a frame must carry, as null when none.
-fn maybe(value: &Json, name: &str) -> Result<Option<String>, String> {
+pub(crate) fn maybe(value: &Json, name: &str) -> Result<Option<String>, String> {
     match value.get(name) {
         Some(Json::Null) => Ok(None),
         Some(Json::Str(text)) => Ok(Some(text.clone())),
@@ -430,6 +434,46 @@ fn strings(value: &Json, name: &str) -> Result<Vec<String>, String> {
         return Err(format!("{name} holds more than {MAX_STRINGS} items"));
     }
     Ok(strings)
+}
+
+/// What a card's "always" answers would remember, as it crosses.
+pub(crate) fn offer_json(offer: &crate::rules::Offer) -> Json {
+    match offer {
+        crate::rules::Offer::Rules(always) => Json::Obj(vec![
+            ("allow".into(), Json::Bool(always.allow)),
+            (
+                "rules".into(),
+                Json::Arr(always.bodies.iter().cloned().map(Json::Str).collect()),
+            ),
+        ]),
+        crate::rules::Offer::Crossing { op, to } => Json::Obj(vec![
+            ("crossing".into(), Json::Str(op.name().into())),
+            ("to".into(), Json::Str(to.clone())),
+        ]),
+    }
+}
+
+/// `offer_json`'s value back, checked.
+pub(crate) fn offer_from_json(always: &Json) -> Result<crate::rules::Offer, String> {
+    Ok(match always.get("crossing") {
+        Some(op) => crate::rules::Offer::Crossing {
+            op: op
+                .as_str()
+                .and_then(crate::rules::Crossed::parse)
+                .ok_or("a crossing that neither reads nor messages")?,
+            to: crate::store::Id::parse(&string(always, "to")?)
+                .ok_or("a crossing to no conversation")?
+                .as_str()
+                .to_string(),
+        },
+        None => crate::rules::Offer::Rules(crate::rules::Always::checked(
+            always
+                .get("allow")
+                .and_then(Json::as_bool)
+                .ok_or("always without allow")?,
+            strings(always, "rules")?,
+        )?),
+    })
 }
 
 /// A `Fetched`'s project instructions as they cross: a base at a commit
@@ -713,7 +757,7 @@ fn staged(value: &Json) -> Result<crate::git::Staged, String> {
     })
 }
 
-fn number(value: &Json, name: &str) -> Result<u64, String> {
+pub(crate) fn number(value: &Json, name: &str) -> Result<u64, String> {
     value
         .get(name)
         .and_then(Json::as_u64)
@@ -1093,11 +1137,11 @@ impl Down {
                     .get("version")
                     .and_then(Json::as_u64)
                     .ok_or("a policy with no version")?,
-                mode: match value.get("mode").and_then(Json::as_str) {
-                    Some("ask") => crate::config::Mode::Ask,
-                    Some("auto") => crate::config::Mode::Auto,
-                    _ => return Err("a policy with no mode".into()),
-                },
+                mode: value
+                    .get("mode")
+                    .and_then(Json::as_str)
+                    .and_then(crate::config::Mode::parse)
+                    .ok_or("a policy with no mode")?,
                 rules: match (value.get("rules"), value.get("error")) {
                     (Some(text), None) => {
                         let text = text.as_str().ok_or("a policy whose rules are not text")?;
@@ -1258,6 +1302,11 @@ impl Down {
 
 impl Up {
     pub fn encode(&self) -> Vec<u8> {
+        self.to_json().to_string().into_bytes()
+    }
+
+    /// The value `encode` writes, for a message that carries one.
+    pub(crate) fn to_json(&self) -> Json {
         match self {
             Self::Hello {
                 title,
@@ -1266,7 +1315,7 @@ impl Up {
                 paused,
                 prefix,
                 last,
-            } => typed(
+            } => typed_json(
                 "hello",
                 vec![
                     ("title".into(), Json::Str(title.clone())),
@@ -1283,30 +1332,32 @@ impl Up {
                     ("last".into(), Json::from(*last)),
                 ],
             ),
-            Self::Event(event) => typed("event", vec![("event".into(), event.to_json())]),
-            Self::Delivered { delivery } => typed(
+            Self::Event(event) => typed_json("event", vec![("event".into(), event.to_json())]),
+            Self::Delivered { delivery } => typed_json(
                 "delivered",
                 vec![("delivery".into(), Json::Str(delivery.clone()))],
             ),
             Self::Title { title } => {
-                typed("title", vec![("title".into(), Json::Str(title.clone()))])
+                typed_json("title", vec![("title".into(), Json::Str(title.clone()))])
             }
-            Self::Brake { why } => typed("brake", vec![("why".into(), Json::Str(why.clone()))]),
-            Self::Refused { delivery, reason } => typed(
+            Self::Brake { why } => {
+                typed_json("brake", vec![("why".into(), Json::Str(why.clone()))])
+            }
+            Self::Refused { delivery, reason } => typed_json(
                 "refused",
                 vec![
                     ("delivery".into(), Json::Str(delivery.clone())),
                     ("reason".into(), Json::Str(reason.clone())),
                 ],
             ),
-            Self::Reserve { id, amount } => typed(
+            Self::Reserve { id, amount } => typed_json(
                 "reserve",
                 vec![
                     ("id".into(), Json::from(*id)),
                     ("amount".into(), Json::from(*amount)),
                 ],
             ),
-            Self::Spent { id, amount } => typed(
+            Self::Spent { id, amount } => typed_json(
                 "spent",
                 vec![
                     ("id".into(), Json::from(*id)),
@@ -1317,7 +1368,7 @@ impl Up {
                 request,
                 reasoning,
                 content,
-            } => typed(
+            } => typed_json(
                 "delta",
                 vec![
                     ("request".into(), Json::from(*request)),
@@ -1325,7 +1376,7 @@ impl Up {
                     ("content".into(), Json::Str(content.clone())),
                 ],
             ),
-            Self::Send { id, to, text } => typed(
+            Self::Send { id, to, text } => typed_json(
                 "send",
                 vec![
                     ("id".into(), Json::from(*id)),
@@ -1333,7 +1384,7 @@ impl Up {
                     ("text".into(), Json::Str(text.clone())),
                 ],
             ),
-            Self::Query { id } => typed("query", vec![("id".into(), Json::from(*id))]),
+            Self::Query { id } => typed_json("query", vec![("id".into(), Json::from(*id))]),
             Self::Schedule { id, op } => {
                 let mut pairs = vec![("id".into(), Json::from(*id))];
                 match op {
@@ -1359,14 +1410,14 @@ impl Up {
                         ("schedule".into(), Json::Str(schedule.clone())),
                     ]),
                 }
-                typed("schedule", pairs)
+                typed_json("schedule", pairs)
             }
-            Self::Waking => typed("waking", Vec::new()),
-            Self::Prepared { remote } => typed(
+            Self::Waking => typed_json("waking", Vec::new()),
+            Self::Prepared { remote } => typed_json(
                 "prepared",
                 vec![("remote".into(), Json::Str(remote.clone()))],
             ),
-            Self::Heads { remote, bases } => typed(
+            Self::Heads { remote, bases } => typed_json(
                 "heads",
                 vec![
                     ("remote".into(), Json::Str(remote.clone())),
@@ -1382,7 +1433,7 @@ impl Up {
                 commit,
                 base,
                 branch,
-            } => typed(
+            } => typed_json(
                 "stage",
                 vec![
                     ("call".into(), Json::from(*call)),
@@ -1399,7 +1450,7 @@ impl Up {
                 branch,
                 lease,
                 asks,
-            } => typed(
+            } => typed_json(
                 "push",
                 vec![
                     ("call".into(), Json::from(*call)),
@@ -1414,7 +1465,7 @@ impl Up {
                 call,
                 remote,
                 bases,
-            } => typed(
+            } => typed_json(
                 "refetch",
                 vec![
                     ("call".into(), Json::from(*call)),
@@ -1425,7 +1476,7 @@ impl Up {
                     ),
                 ],
             ),
-            Self::Fetch { remote, bases } => typed(
+            Self::Fetch { remote, bases } => typed_json(
                 "fetch",
                 vec![
                     ("remote".into(), Json::Str(remote.clone())),
@@ -1439,7 +1490,7 @@ impl Up {
                 turn,
                 title,
                 details,
-            } => typed(
+            } => typed_json(
                 "resume",
                 vec![
                     ("turn".into(), Json::from(*turn)),
@@ -1464,34 +1515,19 @@ impl Up {
                         Json::Arr(details.iter().cloned().map(Json::Str).collect()),
                     ),
                 ];
-                match always {
-                    None => {}
-                    Some(crate::rules::Offer::Rules(always)) => members.push((
-                        "always".into(),
-                        Json::Obj(vec![
-                            ("allow".into(), Json::Bool(always.allow)),
-                            (
-                                "rules".into(),
-                                Json::Arr(always.bodies.iter().cloned().map(Json::Str).collect()),
-                            ),
-                        ]),
-                    )),
-                    Some(crate::rules::Offer::Crossing { op, to }) => members.push((
-                        "always".into(),
-                        Json::Obj(vec![
-                            ("crossing".into(), Json::Str(op.name().into())),
-                            ("to".into(), Json::Str(to.clone())),
-                        ]),
-                    )),
+                if let Some(always) = always {
+                    members.push(("always".into(), offer_json(always)));
                 }
-                typed("ask", members)
+                typed_json("ask", members)
             }
-            Self::Withdraw { call } => typed("withdraw", vec![("call".into(), Json::from(*call))]),
+            Self::Withdraw { call } => {
+                typed_json("withdraw", vec![("call".into(), Json::from(*call))])
+            }
             Self::Question {
                 call,
                 question,
                 options,
-            } => typed(
+            } => typed_json(
                 "question",
                 vec![
                     ("call".into(), Json::from(*call)),
@@ -1507,9 +1543,14 @@ impl Up {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         let value = td_json::parse_slice(bytes).map_err(|e| e.to_string())?;
+        Self::from_json(&value)
+    }
+
+    /// `to_json`'s value back.
+    pub(crate) fn from_json(value: &Json) -> Result<Self, String> {
         Ok(match value.get("type").and_then(Json::as_str) {
             Some("hello") => Self::Hello {
-                title: string(&value, "title")?,
+                title: string(value, "title")?,
                 torn: value.get("torn").and_then(Json::as_u64),
                 interrupted: value
                     .get("interrupted")
@@ -1533,64 +1574,64 @@ impl Up {
                 value.get("event").ok_or("an event message with no event")?,
             )?),
             Some("delivered") => Self::Delivered {
-                delivery: string(&value, "delivery")?,
+                delivery: string(value, "delivery")?,
             },
             Some("title") => Self::Title {
-                title: string(&value, "title")?,
+                title: string(value, "title")?,
             },
             Some("brake") => Self::Brake {
-                why: string(&value, "why")?,
+                why: string(value, "why")?,
             },
             Some("refused") => Self::Refused {
-                delivery: string(&value, "delivery")?,
-                reason: string(&value, "reason")?,
+                delivery: string(value, "delivery")?,
+                reason: string(value, "reason")?,
             },
             Some("reserve") => Self::Reserve {
-                id: number(&value, "id")?,
-                amount: number(&value, "amount")?,
+                id: number(value, "id")?,
+                amount: number(value, "amount")?,
             },
             Some("spent") => Self::Spent {
-                id: number(&value, "id")?,
-                amount: number(&value, "amount")?,
+                id: number(value, "id")?,
+                amount: number(value, "amount")?,
             },
             Some("delta") => Self::Delta {
-                request: number(&value, "request")?,
-                reasoning: string(&value, "reasoning")?,
-                content: string(&value, "content")?,
+                request: number(value, "request")?,
+                reasoning: string(value, "reasoning")?,
+                content: string(value, "content")?,
             },
             Some("send") => Self::Send {
-                id: number(&value, "id")?,
-                to: Id::parse(&string(&value, "to")?).ok_or("a malformed receiver")?,
-                text: string(&value, "text")?,
+                id: number(value, "id")?,
+                to: Id::parse(&string(value, "to")?).ok_or("a malformed receiver")?,
+                text: string(value, "text")?,
             },
             Some("query") => Self::Query {
-                id: number(&value, "id")?,
+                id: number(value, "id")?,
             },
             Some("schedule") => Self::Schedule {
-                id: number(&value, "id")?,
-                op: match string(&value, "op")?.as_str() {
+                id: number(value, "id")?,
+                op: match string(value, "op")?.as_str() {
                     "add" => ScheduleOp::Add {
-                        when: string(&value, "when")?,
-                        to: Id::parse(&string(&value, "to")?).ok_or("a malformed receiver")?,
-                        text: string(&value, "text")?,
+                        when: string(value, "when")?,
+                        to: Id::parse(&string(value, "to")?).ok_or("a malformed receiver")?,
+                        text: string(value, "text")?,
                         catch_up: value
                             .get("catch_up")
                             .and_then(Json::as_bool)
                             .ok_or("no catch_up")?,
                     },
                     "times" => ScheduleOp::Times {
-                        when: string(&value, "when")?,
+                        when: string(value, "when")?,
                     },
                     "list" => ScheduleOp::List,
                     "cancel" => ScheduleOp::Cancel {
-                        schedule: string(&value, "schedule")?,
+                        schedule: string(value, "schedule")?,
                     },
                     _ => return Err("an unknown schedule operation".into()),
                 },
             },
             Some("resume") => Self::Resume {
-                turn: number(&value, "turn")?,
-                title: string(&value, "title")?,
+                turn: number(value, "turn")?,
+                title: string(value, "title")?,
                 details: value
                     .get("details")
                     .and_then(Json::as_arr)
@@ -1604,8 +1645,8 @@ impl Up {
                     .collect::<Result<_, _>>()?,
             },
             Some("ask") => Self::Ask {
-                call: number(&value, "call")?,
-                title: string(&value, "title")?,
+                call: number(value, "call")?,
+                title: string(value, "title")?,
                 details: value
                     .get("details")
                     .and_then(Json::as_arr)
@@ -1617,68 +1658,47 @@ impl Up {
                             .ok_or("a detail not a string")
                     })
                     .collect::<Result<_, _>>()?,
-                always: match value.get("always") {
-                    None => None,
-                    Some(always) => Some(match always.get("crossing") {
-                        Some(op) => crate::rules::Offer::Crossing {
-                            op: op
-                                .as_str()
-                                .and_then(crate::rules::Crossed::parse)
-                                .ok_or("a crossing that neither reads nor messages")?,
-                            to: crate::store::Id::parse(&string(always, "to")?)
-                                .ok_or("a crossing to no conversation")?
-                                .as_str()
-                                .to_string(),
-                        },
-                        None => crate::rules::Offer::Rules(crate::rules::Always::checked(
-                            always
-                                .get("allow")
-                                .and_then(Json::as_bool)
-                                .ok_or("always without allow")?,
-                            strings(always, "rules")?,
-                        )?),
-                    }),
-                },
+                always: value.get("always").map(offer_from_json).transpose()?,
             },
             Some("withdraw") => Self::Withdraw {
-                call: number(&value, "call")?,
+                call: number(value, "call")?,
             },
             Some("question") => Self::Question {
-                call: number(&value, "call")?,
-                question: string(&value, "question")?,
-                options: strings(&value, "options")?,
+                call: number(value, "call")?,
+                question: string(value, "question")?,
+                options: strings(value, "options")?,
             },
             Some("fetch") => Self::Fetch {
-                remote: string(&value, "remote")?,
-                bases: strings(&value, "bases")?,
+                remote: string(value, "remote")?,
+                bases: strings(value, "bases")?,
             },
             Some("stage") => Self::Stage {
-                call: number(&value, "call")?,
-                worktree: string(&value, "worktree")?,
-                commit: string(&value, "commit")?,
-                base: string(&value, "base")?,
-                branch: string(&value, "branch")?,
+                call: number(value, "call")?,
+                worktree: string(value, "worktree")?,
+                commit: string(value, "commit")?,
+                base: string(value, "base")?,
+                branch: string(value, "branch")?,
             },
             Some("push") => Self::Push {
-                call: number(&value, "call")?,
-                worktree: string(&value, "worktree")?,
-                commit: string(&value, "commit")?,
-                branch: string(&value, "branch")?,
-                lease: maybe(&value, "lease")?,
+                call: number(value, "call")?,
+                worktree: string(value, "worktree")?,
+                commit: string(value, "commit")?,
+                branch: string(value, "branch")?,
+                lease: maybe(value, "lease")?,
                 asks: value.get("asks").and_then(Json::as_bool).ok_or("no asks")?,
             },
             Some("refetch") => Self::Refetch {
-                call: number(&value, "call")?,
-                remote: string(&value, "remote")?,
-                bases: strings(&value, "bases")?,
+                call: number(value, "call")?,
+                remote: string(value, "remote")?,
+                bases: strings(value, "bases")?,
             },
             Some("waking") => Self::Waking,
             Some("prepared") => Self::Prepared {
-                remote: string(&value, "remote")?,
+                remote: string(value, "remote")?,
             },
             Some("heads") => Self::Heads {
-                remote: string(&value, "remote")?,
-                bases: strings(&value, "bases")?,
+                remote: string(value, "remote")?,
+                bases: strings(value, "bases")?,
             },
             other => return Err(format!("unknown message {other:?}")),
         })

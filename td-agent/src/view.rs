@@ -18,7 +18,13 @@ use crate::ui::{App, Asked, Attached, Card, Request};
 pub type Pictures = BTreeMap<String, Result<Vec<u8>, String>>;
 
 /// One change to what the window shows.
+#[derive(Clone, Debug, PartialEq)]
 pub enum View {
+    /// The session took the app's opening of a row: everything before this
+    /// was said without it, so the app takes this book for its own.
+    Opened(Box<Book>),
+    /// The list and transcript's share of the window, as the person left it.
+    SetShare(Option<(u32, u32)>),
     Note(String),
     Withdraw(Id, Option<u64>),
     SetActive(Id),
@@ -97,11 +103,13 @@ impl Port {
     /// What the window asks changes what it shows before it is served, so
     /// the book follows first: a row it opened stands for every request of
     /// the batch, whichever came first, as it did when the session read the
-    /// window's own state.
+    /// window's own state. What was on its way to the window meanwhile was
+    /// said without that, so the window is sent this book to take.
     pub fn asked(&mut self, requests: &[Request]) {
         for request in requests {
             if let Request::Open(id) = request {
                 self.book.set_active(id.clone());
+                self.out.push(View::Opened(Box::new(self.book.clone())));
             }
         }
     }
@@ -151,6 +159,10 @@ impl Port {
             }
         }
         read
+    }
+
+    pub fn set_share(&mut self, share: Option<(u32, u32)>) {
+        self.out.push(View::SetShare(share));
     }
 
     pub fn note(&mut self, message: impl Into<String>) {
@@ -383,6 +395,11 @@ impl App {
     /// Shows what the session said.
     pub fn apply(&mut self, view: View) {
         match view {
+            View::Opened(book) => self.opened(*book),
+            // The conversation left's, or one the session opened before it
+            // heard of this one.
+            View::SetActive(_) | View::Update(..) | View::Replay(..) if self.opening() => {}
+            View::SetShare(share) => self.set_share(share),
             View::Note(message) => self.note(message),
             View::Withdraw(conversation, call) => self.withdraw(&conversation, call),
             View::SetActive(id) => self.set_active(id),
@@ -560,12 +577,17 @@ mod tests {
                 match dice.roll(12) {
                     0 | 1 => port.set_active(id(n)),
                     2 => {
-                        // As `App::open_row` and the session's `serve` do.
-                        for view in port.take() {
-                            app.apply(view);
+                        // With what the session said still on its way, half
+                        // the time, as it can be across a socket.
+                        if dice.roll(2) == 0 {
+                            for view in port.take() {
+                                app.apply(view);
+                            }
                         }
-                        app.set_active(id(n));
-                        port.asked(&[Request::Interrupt, Request::Open(id(n))]);
+                        app.open(id(n));
+                        let mut asked = vec![Request::Interrupt];
+                        asked.extend(app.take_requests());
+                        port.asked(&asked);
                         seq = 0;
                     }
                     3 => port.add_row(row(n)),

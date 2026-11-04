@@ -4,10 +4,13 @@
 //! copy that reads the same: the session's answers what it asks itself, such
 //! as where a message may go, without asking the window.
 
+use td_json::Json;
+
 use crate::post::Entry;
-use crate::protocol::Up;
+use crate::protocol::{maybe, number, string, Up};
 use crate::store::{Event, Id, Kind};
 use crate::supervisor::Update;
+use crate::window_wire::{flag, id_from, list, numbers, workspace_from_json, workspace_json};
 use crate::workspace::Workspace;
 
 /// A conversation's process as the list shows it.
@@ -34,6 +37,28 @@ impl RowState {
             Self::Failed => "failed",
         }
     }
+
+    fn parse(word: &str) -> Option<Self> {
+        [
+            Self::Closed,
+            Self::Starting,
+            Self::Idle,
+            Self::Running,
+            Self::Restarting,
+            Self::Failed,
+        ]
+        .into_iter()
+        .find(|state| state.word() == word)
+    }
+}
+
+/// What the list calls a conversation being closed: the session's two
+/// words for it, the only ones a message may carry.
+const CLOSING: &[&str] = &["archiving", "deleting"];
+
+/// The closing word that reads as `word`, none when nobody uses it.
+pub(crate) fn closing_from(word: &str) -> Option<&'static str> {
+    CLOSING.iter().find(|closing| **closing == word).copied()
 }
 
 /// One conversation in the list.
@@ -65,6 +90,41 @@ impl Row {
             state => state.word(),
         }
     }
+
+    /// As a message carries it: its state as such, not as the list names it.
+    pub(crate) fn to_json(&self) -> Json {
+        Json::Obj(vec![
+            ("id".into(), Json::Str(self.id.to_string())),
+            ("title".into(), Json::Str(self.title.clone())),
+            ("activity".into(), Json::from(self.activity)),
+            ("state".into(), Json::Str(self.state.word().into())),
+            ("paused".into(), Json::Bool(self.paused)),
+            (
+                "workspace".into(),
+                self.workspace.as_ref().map_or(Json::Null, workspace_json),
+            ),
+            ("unconfined".into(), Json::Bool(self.unconfined)),
+            ("archived".into(), Json::Bool(self.archived)),
+        ])
+    }
+
+    /// `to_json`'s value back.
+    pub(crate) fn from_json(value: &Json) -> Result<Self, String> {
+        Ok(Self {
+            id: id_from(value, "id")?,
+            title: string(value, "title")?,
+            activity: number(value, "activity")?,
+            state: RowState::parse(&string(value, "state")?).ok_or("a row in no known state")?,
+            paused: flag(value, "paused")?,
+            workspace: match value.get("workspace") {
+                Some(Json::Null) => None,
+                Some(workspace) => Some(workspace_from_json(workspace)?),
+                None => return Err("no workspace".into()),
+            },
+            unconfined: flag(value, "unconfined")?,
+            archived: flag(value, "archived")?,
+        })
+    }
 }
 
 /// The conversations, as the messages to the window have them.
@@ -86,6 +146,87 @@ pub struct Book {
 }
 
 impl Book {
+    /// All of it, as a message carries it.
+    pub(crate) fn to_json(&self) -> Json {
+        let turns = |turns: &[u64]| Json::Arr(turns.iter().map(|n| Json::from(*n)).collect());
+        Json::Obj(vec![
+            (
+                "rows".into(),
+                Json::Arr(self.rows.iter().map(Row::to_json).collect()),
+            ),
+            (
+                "active".into(),
+                self.active
+                    .as_ref()
+                    .map_or(Json::Null, |id| Json::Str(id.to_string())),
+            ),
+            (
+                "closing".into(),
+                Json::Arr(
+                    self.closing
+                        .iter()
+                        .map(|(id, doing)| {
+                            Json::Arr(vec![
+                                Json::Str(id.to_string()),
+                                Json::Str((*doing).to_string()),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "background_turns".into(),
+                Json::Arr(
+                    self.background_turns
+                        .iter()
+                        .map(|(id, turn)| {
+                            Json::Arr(vec![Json::Str(id.to_string()), Json::from(*turn)])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("turns".into(), turns(&self.turns)),
+            ("seen".into(), Json::from(self.seen)),
+        ])
+    }
+
+    /// `to_json`'s value back, as it stood: nothing is put in order again.
+    pub(crate) fn from_json(value: &Json) -> Result<Self, String> {
+        let conversation = |text: &str| Id::parse(text).ok_or("a book names no conversation");
+        Ok(Self {
+            rows: list(value, "rows")?
+                .iter()
+                .map(Row::from_json)
+                .collect::<Result<_, _>>()?,
+            active: match maybe(value, "active")? {
+                Some(text) => Some(conversation(&text)?),
+                None => None,
+            },
+            closing: list(value, "closing")?
+                .iter()
+                .map(|item| match item.as_arr() {
+                    Some([Json::Str(id), Json::Str(word)]) => Ok((
+                        conversation(id)?,
+                        closing_from(word).ok_or("a closing word nobody uses")?,
+                    )),
+                    _ => Err("a closing conversation is not an id and a word"),
+                })
+                .collect::<Result<_, _>>()?,
+            background_turns: list(value, "background_turns")?
+                .iter()
+                .map(|item| match item.as_arr() {
+                    Some([Json::Str(id), turn]) => Ok((
+                        conversation(id)?,
+                        turn.as_u64().ok_or("a background turn is not a number")?,
+                    )),
+                    _ => Err("a background turn is not an id and a number"),
+                })
+                .collect::<Result<_, _>>()?,
+            turns: numbers(value, "turns")?,
+            seen: number(value, "seen")?,
+        })
+    }
+
     /// The conversation shown, if any.
     pub fn active(&self) -> Option<&Id> {
         self.active.as_ref()

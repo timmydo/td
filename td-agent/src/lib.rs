@@ -114,5 +114,6 @@ pub mod view;
 pub mod wake;
 pub mod web;
 pub mod window;
+pub mod window_wire;
 pub mod wire;
 pub mod workspace;

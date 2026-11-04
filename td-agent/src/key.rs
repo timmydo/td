@@ -88,8 +88,8 @@ impl Secret {
         Self(text)
     }
 
-    /// The key itself, for the one header and the one frame that carry
-    /// it.
+    /// The key itself, for the one header and the frames that carry it:
+    /// the window's `Setup`, and its key dialog's `SaveKey`.
     pub fn expose(&self) -> &str {
         &self.0
     }

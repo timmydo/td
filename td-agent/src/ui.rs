@@ -765,6 +765,8 @@ pub struct App {
     surface: Surface,
     /// The conversations, as the session's messages have them.
     book: Book,
+    /// Rows opened here that the session has not answered yet.
+    opening: u32,
     /// The pictures pasted into the composer and not yet sent, each named
     /// in its text by its label (DESIGN.md §4, Pictures).
     attached: Vec<Attached>,
@@ -1000,30 +1002,38 @@ pub struct App {
     generation: u64,
 }
 
+/// The window's split at `share` (first and total pixels), or a third.
+fn split_at(
+    share: Option<(u32, u32)>,
+    surface: Surface,
+) -> Result<split::Controller, split::Error> {
+    let share = share
+        .and_then(|(first, total)| split::Share::new(first, total))
+        .unwrap_or_else(|| split::Share::new(1, 3).unwrap_or_default());
+    split::Controller::new(
+        split::Config {
+            axis: split::Axis::Horizontal,
+            first_min: LIST_MIN,
+            second_min: CONVERSATION_MIN,
+        },
+        share,
+        surface,
+        body(surface),
+    )
+}
+
 impl App {
     /// The window over `surface`, its split at `share` (first and total
     /// pixels) when one was saved.
     pub fn new(surface: Surface, share: Option<(u32, u32)>, mode: Mode) -> Result<Self, String> {
-        let share = share
-            .and_then(|(first, total)| split::Share::new(first, total))
-            .unwrap_or_else(|| split::Share::new(1, 3).unwrap_or_default());
-        let split = split::Controller::new(
-            split::Config {
-                axis: split::Axis::Horizontal,
-                first_min: LIST_MIN,
-                second_min: CONVERSATION_MIN,
-            },
-            share,
-            surface,
-            body(surface),
-        )
-        .map_err(|e| e.to_string())?;
+        let split = split_at(share, surface).map_err(|e| e.to_string())?;
         let model = Model::new(&[], COLUMNS).map_err(|e| e.to_string())?;
         let mut app = Self {
             attached: Vec::new(),
             pictures: crate::view::Pictures::new(),
             surface,
             book: Book::default(),
+            opening: 0,
             list: tree_table::Controller::new(model, surface, surface.bounds())
                 .map_err(|e| e.to_string())?,
             split,
@@ -4131,7 +4141,7 @@ impl App {
 
     /// Opens conversation `id`; opening the one already open again
     /// retries it when its process failed.
-    fn open(&mut self, id: Id) {
+    pub(crate) fn open(&mut self, id: Id) {
         if let Some(row) = self.book.rows.iter().find(|r| r.id == id && r.archived) {
             let said = format!(
                 "{:?} is archived: Unarchive in its row's menu opens it again",
@@ -4159,6 +4169,7 @@ impl App {
         }
         if self.book.active.as_ref() != Some(&id) || self.active_failed() {
             self.set_active(id.clone());
+            self.opening += 1;
             self.requests.push(Request::Open(id));
         } else {
             self.parent_transcript();
@@ -4675,6 +4686,28 @@ impl App {
             self.attached.push((reference, bytes));
         }
         self.restore(&text, why);
+    }
+
+    /// The split as the person left it, when the session has it to say.
+    pub fn set_share(&mut self, share: Option<(u32, u32)>) {
+        if let Ok(split) = split_at(share, self.surface) {
+            self.split = split;
+            self.place();
+        }
+    }
+
+    /// Whether a row opened here is yet to be answered.
+    pub(crate) fn opening(&self) -> bool {
+        self.opening > 0
+    }
+
+    /// The session answered a row opened here, with what it now holds.
+    pub(crate) fn opened(&mut self, book: Book) {
+        self.opening = self.opening.saturating_sub(1);
+        if !self.opening() {
+            self.book = book;
+            self.refresh_list();
+        }
     }
 
     /// Shows a message with the pictures the session sent with it.
