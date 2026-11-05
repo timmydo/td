@@ -1,9 +1,15 @@
 //! td's own cryptographic primitives. DESIGN.md is normative: it says what
 //! is here, what each one claims and what none of them claims.
 
+#[cfg(target_arch = "x86_64")]
+mod accel;
 pub mod aes_gcm;
+#[cfg(target_arch = "x86_64")]
+mod aes_ni;
 mod bignum;
 pub mod chacha20_poly1305;
+#[cfg(target_arch = "x86_64")]
+mod chacha_avx2;
 pub mod ct;
 pub mod curve25519;
 mod der;
@@ -12,6 +18,10 @@ pub mod hmac;
 pub mod random;
 pub mod rsa;
 pub mod sha;
+#[cfg(target_arch = "x86_64")]
+mod sha_ni;
+#[cfg(test)]
+mod test_corpus;
 
 /// A check failed or an input is out of bounds. It deliberately says no more:
 /// a reason is an oracle.

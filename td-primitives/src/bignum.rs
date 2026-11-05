@@ -2,6 +2,7 @@
 //! curves and RSA share. Nothing here branches on a limb's value: selections
 //! are masks, and only the lengths and the public moduli steer it.
 
+use std::cell::Cell;
 use std::hint::black_box;
 
 /// `value == 0` as all ones or zero, without a branch.
@@ -10,6 +11,7 @@ pub(crate) fn zero_mask(words: &[u64]) -> u64 {
     black_box(((any | any.wrapping_neg()) >> 63).wrapping_sub(1))
 }
 
+#[inline]
 pub(crate) fn select(out: &mut [u64], other: &[u64], mask: u64) {
     let mask = black_box(mask);
     for (word, replacement) in out.iter_mut().zip(other) {
@@ -17,6 +19,7 @@ pub(crate) fn select(out: &mut [u64], other: &[u64], mask: u64) {
     }
 }
 
+#[inline]
 fn subtract_in_place(out: &mut [u64], other: &[u64], mask: u64) -> u64 {
     let mut borrow = 0u64;
     for (word, take) in out.iter_mut().zip(other) {
@@ -29,6 +32,7 @@ fn subtract_in_place(out: &mut [u64], other: &[u64], mask: u64) -> u64 {
 }
 
 /// All ones when `a < b`.
+#[inline]
 pub(crate) fn less_mask(a: &[u64], b: &[u64]) -> u64 {
     let mut borrow = 0u64;
     for (word, take) in a.iter().zip(b) {
@@ -41,6 +45,7 @@ pub(crate) fn less_mask(a: &[u64], b: &[u64]) -> u64 {
 
 /// Subtract `m` once when `carry` is set or `out >= m`. `out` then holds the
 /// value below `m`, given that `carry:out < 2m`.
+#[inline]
 fn reduce_once(out: &mut [u64], m: &[u64], carry: u64) {
     let below = less_mask(out, m);
     let subtract = black_box(carry.wrapping_neg() | !below);
@@ -48,6 +53,7 @@ fn reduce_once(out: &mut [u64], m: &[u64], carry: u64) {
 }
 
 /// out = a + b mod m, for a and b below m.
+#[inline]
 pub(crate) fn add_mod(out: &mut [u64], a: &[u64], b: &[u64], m: &[u64]) {
     let mut carry = 0u64;
     for ((word, x), y) in out.iter_mut().zip(a).zip(b) {
@@ -60,6 +66,7 @@ pub(crate) fn add_mod(out: &mut [u64], a: &[u64], b: &[u64], m: &[u64]) {
 }
 
 /// out = a - b mod m, for a and b below m.
+#[inline]
 pub(crate) fn sub_mod(out: &mut [u64], a: &[u64], b: &[u64], m: &[u64]) {
     for (word, x) in out.iter_mut().zip(a) {
         *word = *x;
@@ -84,41 +91,48 @@ pub(crate) fn negated_inverse(m0: u64) -> u64 {
     inverse.wrapping_neg()
 }
 
-/// CIOS Montgomery multiplication: out = a * b / 2^(64n) mod m, for an odd `m`,
-/// `a` below 2^(64n) and `b` below `m`, all of n limbs. It takes `a` unreduced
-/// so that a value can be brought below `m` by multiplying it by R^2 and 1.
+/// Montgomery multiplication, the two passes of each word folded into one: out =
+/// a * b / 2^(64n) mod m, for an odd `m`, `a` below 2^(64n) and `b` below `m`, all
+/// of n limbs. It takes `a` unreduced so that a value can be brought below `m` by
+/// multiplying it by R^2 and 1.
+#[inline]
 pub(crate) fn mont_mul(out: &mut [u64], a: &[u64], b: &[u64], m: &[u64], n0: u64) {
-    if out.is_empty() {
-        return;
-    }
     out.fill(0);
+    let (Some(&b0), Some(&m0)) = (b.first(), m.first()) else {
+        return;
+    };
     let mut high = 0u64;
-    for &multiplier in a {
-        let mut carry = 0u64;
-        for (word, y) in out.iter_mut().zip(b) {
-            let sum =
-                u128::from(*word) + u128::from(multiplier) * u128::from(*y) + u128::from(carry);
-            *word = sum as u64;
-            carry = (sum >> 64) as u64;
+    {
+        // Each word's result lands one limb down: the division by 2^64.
+        let cells = Cell::from_mut(&mut *out).as_slice_of_cells();
+        let (Some(first), Some(last)) = (cells.first(), cells.last()) else {
+            return;
+        };
+        for &multiplier in a {
+            let low = u128::from(first.get()) + u128::from(multiplier) * u128::from(b0);
+            let quotient = (low as u64).wrapping_mul(n0);
+            // Its low limb is zero by the choice of quotient.
+            let cleared = u128::from(low as u64) + u128::from(quotient) * u128::from(m0);
+            let mut carry_b = (low >> 64) as u64;
+            let mut carry_m = (cleared >> 64) as u64;
+            for (pair, (y, z)) in cells.windows(2).zip(b.iter().zip(m).skip(1)) {
+                let [below, word] = pair else {
+                    continue;
+                };
+                let sum = u128::from(word.get())
+                    + u128::from(multiplier) * u128::from(*y)
+                    + u128::from(carry_b);
+                let reduced = u128::from(sum as u64)
+                    + u128::from(quotient) * u128::from(*z)
+                    + u128::from(carry_m);
+                below.set(reduced as u64);
+                carry_b = (sum >> 64) as u64;
+                carry_m = (reduced >> 64) as u64;
+            }
+            let sum = u128::from(high) + u128::from(carry_b) + u128::from(carry_m);
+            last.set(sum as u64);
+            high = (sum >> 64) as u64;
         }
-        let sum = u128::from(high) + u128::from(carry);
-        high = sum as u64;
-        let top = (sum >> 64) as u64;
-
-        let quotient = out.first().copied().unwrap_or_default().wrapping_mul(n0);
-        let mut carry = 0u64;
-        for (word, y) in out.iter_mut().zip(m) {
-            let sum = u128::from(*word) + u128::from(quotient) * u128::from(*y) + u128::from(carry);
-            *word = sum as u64;
-            carry = (sum >> 64) as u64;
-        }
-        // The lowest limb is now zero; dividing by 2^64 is a rotation.
-        out.rotate_left(1);
-        let sum = u128::from(high) + u128::from(carry);
-        if let Some(last) = out.last_mut() {
-            *last = sum as u64;
-        }
-        high = top + ((sum >> 64) as u64);
     }
     reduce_once(out, m, high);
 }
@@ -184,18 +198,21 @@ impl<const N: usize> Modulus<N> {
         }
     }
 
+    #[inline]
     pub(crate) fn mul(&self, a: &[u64; N], b: &[u64; N]) -> [u64; N] {
         let mut out = [0u64; N];
         mont_mul(&mut out, a, b, &self.m, self.n0);
         out
     }
 
+    #[inline]
     pub(crate) fn add(&self, a: &[u64; N], b: &[u64; N]) -> [u64; N] {
         let mut out = [0u64; N];
         add_mod(&mut out, a, b, &self.m);
         out
     }
 
+    #[inline]
     pub(crate) fn sub(&self, a: &[u64; N], b: &[u64; N]) -> [u64; N] {
         let mut out = [0u64; N];
         sub_mod(&mut out, a, b, &self.m);

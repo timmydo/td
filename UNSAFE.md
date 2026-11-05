@@ -13,10 +13,11 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 `sandbox.rs`. Those three files carry `#![allow(unsafe_code)]` so builder
 can stay `libc`-free. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-FIVE
-numbered target-side exceptions, TWENTY-THREE of them live, each a standalone
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-SIX
+numbered target-side exceptions, TWENTY-FOUR of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
-`#[allow]` around its recorded raw Linux boundary (the crate itself
+`#[allow]` around its recorded raw Linux boundary, or in the twenty-sixth's case
+its CPU instructions (the crate itself
 `#![deny(unsafe_code)]`s); the seventeenth and eighteenth are retired and
 their crates forbid `unsafe` outright.
 The first nine confine that boundary to their syscall-instruction layer except
@@ -51,7 +52,7 @@ value-pinned requests, and `poll(2)` — recorded twice because the
 one-package locks the gate required of a root crate when the two were
 imported left no shared crate to put it in; both now draw in a td-ui
 window and forbid `unsafe` crate-wide, so §17 and §18 are retired and the
-roster counts twenty-three live surfaces in twenty-five numbered entries. The
+roster counts twenty-four live surfaces in twenty-six numbered entries. The
 twentieth, `td-taskmgr`, has one function-scoped instruction for
 process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
@@ -68,7 +69,9 @@ file's descriptor to the portal and adopts none. The twenty-fourth,
 `td-luks`, keeps its library safe and confines device-mapper activation
 to one function-scoped ioctl instruction in its binary. The twenty-fifth,
 `td-time`, confines system and RTC clock writes to one function-scoped
-instruction in its binary.
+instruction in its binary. The twenty-sixth, `td-primitives`, makes no syscall
+of its own: its six function-scoped allowances call cryptographic instructions
+that a runtime check found on the CPU.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -166,12 +169,14 @@ authorization to a raw boundary of the consumer's own, which gets its
 own entry.
 
 The confinement tests of `td-busd`, `td-init`, `td-jail`, `td-login`,
-`td-sh`, `td-svc` and `td-util` read their sources through
-`td-source-scan`. All seven take its comment stripper; `td-init`,
-`td-login`, `td-sh`, `td-svc` and `td-util` also its whitespace squeeze,
-and the four other than `td-sh` also the tokens after each `unsafe`, the
-allow and block counts, module coverage, and the constructs that would
-decouple the scanned text from the compiled crate. It is a
+`td-primitives`, `td-sh`, `td-svc` and `td-util` read their sources through
+`td-source-scan`. All eight take its comment stripper; `td-init`,
+`td-login`, `td-primitives`, `td-sh`, `td-svc` and `td-util` also its
+whitespace squeeze; `td-init`, `td-login`, `td-svc` and `td-util` also the
+tokens after each `unsafe`, the allow and block counts, module coverage,
+and the constructs that would decouple the scanned text from the compiled
+crate; and `td-primitives` also the tokens after each `unsafe` and the
+allow and block counts. It is a
 dev-dependency only, absent from every recipe and shipped binary, and
 forbids `unsafe` itself. A change to how it reads comments, literals or
 tokens is a change to each consumer's confinement and is reviewed as
@@ -206,6 +211,7 @@ one.
 | 23 | `td-open` | the shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` module of §12, called only to send one descriptor; no adoption or disposal call — see [§23](#23-td-open--one-descriptor-to-the-portal) |
 | 24 | `td-luks` | device-mapper ioctl requests; see §24 |
 | 25 | `td-time` | CLOCK_REALTIME clock_settime and RTC_SET_TIME ioctl; see §25 |
+| 26 | `td-primitives` | none: six calls into AES-NI, PCLMULQDQ, AVX2 and SHA code behind a runtime CPU check, touching no pointer; see §26 |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -3743,6 +3749,51 @@ layouts and caller inventory. Host tests never issue clock_settime or a
 real RTC write. The QEMU oracle owns the mutable clocks. Any additional
 syscall, request, clock ID, caller or allowance amends this section and
 `td-time/DESIGN.md` in the same landing.
+
+## 26. `td-primitives` — instructions a runtime check found
+
+This surface is no syscall. The crate reaches the kernel only through std,
+to read `/dev/random`. It denies unsafe code, with six function-scoped
+allowances in `src/accel.rs`. Each holds one call to a `#[target_feature]`
+function from code compiled without that feature, which is sound only on a CPU
+that has it:
+
+| Proof | Calls | Features asked and enabled |
+|---|---|---|
+| `AesClmul` | `aes_ni::new_key`, `encrypt_block`, `ctr`, `ghash` | `aes`, `pclmulqdq`, `ssse3`, `sse4.1` |
+| `Avx2` | `chacha_avx2::crypt` | `avx2` |
+| `ShaNi` | `sha_ni::compress256` | `sha`, `ssse3`, `sse4.1` |
+
+Each method takes a proof value. A proof's field is private, and its only
+constructor, `detect`, asks std's `is_x86_feature_detected!` for exactly the
+features its module enables, so holding one means the question was asked in
+this process. std's check includes the kernel's support for the AVX state.
+The three modules hold no `unsafe`: since target-feature 1.1, functions with
+matching features call each other safely, as they do the intrinsics that touch no
+pointer, and these are the only intrinsics they use. Values enter registers
+from integers through `set` and `insert`, and leave through `extract` and
+`cvtsi128`, so there is no load, store, gather, raw pointer, `transmute`, `asm!`,
+FFI or mapping, and every memory access is an ordinary bounds-checked Rust one. A
+CPUID that lies, as a hypervisor could, faults the process on an illegal
+instruction.
+
+All of this is compiled only for x86-64; elsewhere the crate is safe Rust. Without
+the features, its software paths run. A wrong answer from a backend is not a memory
+matter and `td-primitives/DESIGN.md` owns it, with what is claimed about side
+channels and the registers and stack these calls leave uncleared.
+
+`td-primitives/tests/confinement.rs` holds the whole of `accel.rs` and `lib.rs`,
+comments aside, against expected text, so each `detect`, each call and its proof,
+the absence of any other constructor, and the modules' privacy are pinned at once.
+It also pins that `accel.rs` alone holds `unsafe` and the three modules alone hold
+`target_feature`; that each called function is defined in its module under exactly
+the features its `detect` asks, with no `cfg` there; the banned forms above; the
+absence of macro definitions, `include!` and module paths anywhere in `src/`, of
+a leading `#!` on any file, and of another crate root in the manifest. A unit test
+compares each `detect` with `/proc/cpuinfo`. This stops mistakes and makes a way
+round it visible in review; it is not proof against a hostile author, who could
+edit the test. Any additional instruction family, call or allowance amends this
+section and `td-primitives/DESIGN.md` in the same landing.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 

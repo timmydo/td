@@ -2,15 +2,17 @@
 
 td writes its own cryptography when that makes the system smaller and easier
 to audit than the library it replaces. This crate is where that code lives.
-It is std only, depends on no crate, forbids `unsafe`, and contains no
-assembly, so it adds nothing to `UNSAFE.md`.
+Its library is std only and depends on no crate, and it contains no assembly.
+Its one `unsafe` surface, `UNSAFE.md` §26, is calling CPU instructions a runtime
+check found.
 
 ## Rules
 
 - **A primitive needs a named consumer.** Nothing is here for completeness;
   an algorithm goes when its last consumer does.
-- **No choice inside.** No runtime algorithm negotiation, modes, parameters
-  or backends. Callers name the exact algorithm.
+- **No choice inside.** No runtime algorithm negotiation, modes or parameters.
+  Callers name the exact algorithm. Which instructions run it is not theirs to
+  choose: the CPU decides, the bytes are the same, and tests hold them so.
 - **No protocol.** Records, handshakes, certificate paths, key files and trust
   decisions belong to the caller. The crate only says whether a check held.
 - **Refusals carry no reason.** `Refused` is one value, so it is not an oracle.
@@ -44,6 +46,22 @@ for, in place of `ring`: `net/src/tls_crypto.rs` puts them behind rustls's
 with ECDHE in TLS 1.2, over X25519, P-256 and P-384. Key-file formats, as td-subst's
 and td-test-https's PKCS#8, belong to td-net too.
 
+## CPU instructions
+
+| Module | Replaces, when the CPU has it | Instructions | Asked |
+|---|---|---|---|
+| `aes_ni` | Bitsliced AES and integer GHASH | AES-NI and PCLMULQDQ, with SSSE3 and SSE4.1 | Once per key |
+| `chacha_avx2` | One ChaCha20 block at a time | AVX2 | Once per message |
+| `sha_ni` | SHA-256's compression | The SHA extensions, with SSSE3 and SSE4.1 | Once per block |
+
+`accel.rs` holds all of the crate's `unsafe`. Key expansion stays software on every
+path, so AES has one schedule to check, and the hardware path loads the result.
+Each software path stays, because a CPU or hypervisor may not offer the
+instructions, and neither it nor its corpora may lapse. VAES, wide PCLMULQDQ and
+AVX-512 are absent: they are more code for a speed well past the links td uses.
+SHA-1, SHA-384, SHA-512, Poly1305 and the public-key algorithms are plain Rust on
+every CPU. `-C target-cpu` is not used, so a binary still runs on any x86-64.
+
 ## What is claimed about side channels
 
 The source claim is narrow and exact: **in the code above, no branch and no
@@ -57,23 +75,32 @@ An HMAC key's length counts as public, so a
 caller must not key HMAC with a value whose length is secret, such as a TLS 1.2
 finite-field premaster with its zeros stripped; td negotiates no such group.
 
-- AES is bitsliced over four blocks, with no S-box table.
-- GHASH multiplies with integer multiplication, with no table of multiples of
-  H, and Poly1305 takes 64-by-64 products. Both assume those instructions are
-  constant time, as they are on the x86-64 CPUs td targets.
-- ChaCha20 is additions, XORs and rotations.
-- SHA-1 and SHA-2 are fixed sequences for a given input length.
+- Which backend runs depends on the CPU and nothing secret, and each of the
+  statements below holds on whichever does.
+- With its instructions, AES is `AESENC` and `AESENCLAST`, and GHASH is
+  `PCLMULQDQ` over powers of H, with no table indexed by a secret. This assumes
+  those instructions' timing does not depend on their data, which is what they
+  were introduced for and which td has not measured.
+- Without them AES is bitsliced over four blocks, with no S-box table.
+- Without them GHASH multiplies with integer multiplication, with no table of
+  multiples of H. Poly1305 always takes 64-by-64 products. Both assume those
+  instructions are constant time, as they are on the x86-64 CPUs td targets.
+- ChaCha20 is additions, XORs and rotations, by register or by word.
+- SHA-1 and SHA-2 are fixed sequences for a given input length, by the SHA
+  extensions or not.
 - X25519 is a Montgomery ladder with masked swaps, in 5x51-bit limbs.
 - Ed25519 signing is a fixed double-and-add-always over complete addition,
   selecting by mask. Its nonce is derived as RFC 8032 says.
-- P-256 and P-384 secret operations are double-and-add-always over the complete
-  formulas of Renes, Costello and Batina (eprint 2015/1060, a = -3, one formula
-  for add and double), selecting by mask, with Fermat inversion and
-  word-by-word Montgomery multiplication whose final subtraction is masked.
-  ECDSA nonces are RFC 6979's, so a bad random source cannot leak the key.
+- P-256 and P-384 secret operations take fixed four-bit windows over the
+  complete formulas of Renes, Costello and Batina (eprint 2015/1060, a = -3, one
+  formula for add and double), reading every table entry and selecting by mask,
+  with Fermat inversion and word-by-word Montgomery multiplication whose final
+  subtraction is masked. The table holds multiples of a public point. ECDSA
+  nonces are RFC 6979's, so a bad random source cannot leak the key.
 - Verification, of every kind, and all of RSA take only public inputs and
-  may branch on them. `bignum` is shared, so RSA pays for the masks it does
-  not need rather than keeping a second multiplier.
+  may branch on them. ECDSA verification and secret scalars share one windowed
+  routine rather than have a faster public one beside it. `bignum` is shared, so RSA
+  pays for the masks it does not need rather than keeping a second multiplier.
 
 What is **not** claimed:
 
@@ -90,8 +117,11 @@ What is **not** claimed:
   hash states are key-equivalent and stay in memory until overwritten, and a
   long key's tail stays in the temporary hash that shortened it. Key expansion
   uses two buffers that never grow and clears both, so it leaves no freed copy
-  of the key; the round keys live in one box, cleared on drop, so moving a cipher
-  copies only H.
+  of the key; the round keys live in one box, cleared on drop, so moving a
+  software cipher copies only H and a hardware one only a pointer. The hardware
+  paths are the same bargain made more often: each call copies round keys, H and
+  its powers, ChaCha20's key, or SHA-256's state and block into registers, and
+  where those run out onto the stack, and leaves them there.
 
 ## Decisions on what to accept
 
@@ -121,21 +151,32 @@ sandbox, and a read that fails refuses rather than falling back.
 
 ## Speed
 
-Measured on a Ryzen 7 5700G at `opt-level = 3`, sealing 16 KiB records. td-net
-builds at that level, so a transfer with a server that picks AES runs at about
-130 MB/s rather than `ring`'s several GB/s, ahead of most network links:
+Measured on a Ryzen 7 5700G at `opt-level = 3`, sealing 16 KiB records, with
+the instructions and without. td-net builds at that level. The last column is `ring`
+on the same machine, measured before td-net left it:
 
-| Primitive | MB/s |
+| Primitive | MB/s | Software path, MB/s | `ring`, MB/s |
+|---|---|---|---|
+| AES-128-GCM | 4650 | 138 | 5522 |
+| AES-256-GCM | 4000 | 114 | |
+| ChaCha20-Poly1305 | 1820 | 500 | 2435 |
+| SHA-256 | 1900 | 280 | |
+| SHA-512 | 445 | same | |
+
+| Operation | µs |
 |---|---|
-| ChaCha20-Poly1305 | 415 |
-| AES-128-GCM | 130 |
-| AES-256-GCM | 109 |
-| SHA-512 | 324 |
-| SHA-256 | 211 |
+| X25519 | 49 |
+| P-256 ECDH | 191 |
+| P-256 sign | 208 |
+| P-256 verify | 249 |
+| P-384 ECDH | 500 |
+| Ed25519 sign | 91 |
+| Ed25519 verify | 164 |
+| RSA-2048-size PSS verify | 37 |
 
-AES-GCM is slow because it uses no AES-NI or PCLMULQDQ: reaching either needs
-`unsafe` and an `UNSAFE.md` amendment. For the same reason `ring`, which has
-them, measured about 5500 MB/s for AES-128-GCM on the same machine.
+td-net offers ChaCha20-Poly1305 first, on every CPU: AES is faster where the
+instructions are, but both are ahead of a network link, and one order is what
+its tests freeze.
 A crate compiled as a dependency takes the consuming build's `opt-level`, so a
 consumer that moves bulk data must not build at `opt-level = "s"`.
 
@@ -144,9 +185,12 @@ consumer that moves bulk data must not build at `opt-level = "s"`.
 `aes_gcm` translates BearSSL's `aes_ct64` and `ghash_ctmul64`, with its S-box
 being Boyar and Peralta's circuit (eprint 2009/191). One difference is
 deliberate: round keys are stored fully expanded rather than compressed, which
-costs memory and drops a routine. Poly1305's limbs and finish follow
-poly1305-donna-64. `THIRD-PARTY.md` names both. The rest is written from the
-specifications named in the inventory.
+costs memory and drops a routine. Poly1305's limbs and finish follow the 64-bit
+path of OpenSSL's `poly1305.c`. `THIRD-PARTY.md` names both. `aes_ni`'s GHASH
+follows Gueron and Kounavis's carry-less multiplication paper for Intel, with its
+reduction and bit reflection, and folds eight blocks before each reduction as their
+aggregated form does. The rest is written from the specifications named in the
+inventory and the vendor's instruction documentation.
 
 ## Tests and how to regenerate them
 
@@ -157,6 +201,21 @@ specifications named in the inventory.
 | `tests/aead_long.txt` | A naive reference in `aead_long.py`, written for this purpose and sharing no code with the crate: table AES, bit-at-a-time GHASH, big-integer Poly1305. Its rows were also checked against OpenSSL in review. Wycheproof's longest message is 513 bytes, and these reach TLS records and pass 2^16 counter blocks | `python3 -I aead_long.py > aead_long.txt`, from `tests/` |
 | `tests/edge_vectors.txt` | Python big integers in `edge_vectors.py`: P-256 and P-384 points with a coordinate that fits again after adding p, a P-256 signature over SHA-384, a 2049-bit RSA key for PSS's short encoded message and an 8192-bit key at the top of the range, signatures made here | `python3 -I edge_vectors.py > edge_vectors.txt`, from `tests/` |
 | Inline | FIPS 180, FIPS 197, RFC 4231, RFC 5903, RFC 6979, RFC 7748, RFC 8032, RFC 8439 including A.3's reduction edges, and a few values from Python big integers, each marked where it stands | none |
+
+`tests/vectors.rs` goes through the public API, so on a given CPU it reaches
+only one backend. Unit tests beside each backend therefore run the corpora on
+every one this machine has, the software path always: the AES-GCM and
+ChaCha20-Poly1305 Wycheproof files and `aead_long.txt`, and `digest_vectors.txt`'s
+SHA-256 rows. AES-GCM's backends also agree on a list of lengths around their
+batch sizes, with each of those below 300 as AAD, open each other's records, and
+continue GHASH across a split at each of those up to 576. Both ciphers' counters
+are checked against one block at a time through a 32-bit wrap inside a batch.
+Scalar multiplication is checked against one bit at a time. Each `detect` is
+compared with the kernel's `/proc/cpuinfo`, so one that wrongly says no shows up
+rather than quietly leaving a backend untested. On a CPU without the
+instructions, those tests have only the software path to run. A scratch copy with
+`target_arch` renamed compiled only the software paths and passed the crate's suite
+when this landed; that run is a record in the landing commit, as nothing gates it.
 
 The importer drops what the API cannot express and prints the counts: of
 Wycheproof's AES-GCM rows 133 are kept and 183 dropped (other nonce, tag and key
@@ -170,7 +229,8 @@ a mutation of the changed line against the suite and records in its commit
 message that the suite went red, or why that mutant is equivalent. Erasure is
 the exception, since safe Rust cannot observe it. Gaps found this way include
 Poly1305's final subtraction and top-limb carry, which survived Wycheproof and
-RFC 8439's AEAD vector, and counters and length fields truncated to 16 bits or
+RFC 8439's AEAD vector, a carry that reaches its top limb only through a full
+high limb, which survived those and `aead_long.txt`, and counters and length fields truncated to 16 bits or
 fewer, which survived every corpus until `aead_long.txt`. Wider counters, and
 AES-GCM bit lengths cut at 24 bits or more, still survive it: those lengths need
 more data than a suite should hold and more than a TLS record can carry.

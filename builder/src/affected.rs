@@ -6904,7 +6904,14 @@ mod tests {
         assert_eq!(
             readers_of("td-source-scan"),
             [
-                "td-busd", "td-init", "td-jail", "td-login", "td-netd", "td-sh", "td-svc",
+                "td-busd",
+                "td-init",
+                "td-jail",
+                "td-login",
+                "td-netd",
+                "td-primitives",
+                "td-sh",
+                "td-svc",
                 "td-util"
             ]
         );

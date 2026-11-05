@@ -110,13 +110,23 @@ impl Digest for Sha256 {
 }
 
 fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(cpu) = crate::accel::ShaNi::detect() {
+        cpu.compress256(h, block);
+        return;
+    }
+    compress256_software(h, block);
+}
+
+fn compress256_software(h: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 16];
     for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
         *word = u32::from_be_bytes(*bytes);
     }
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut last] = *h;
-    for k in K256 {
-        let [w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15] = w;
+    for (round, k) in K256.into_iter().enumerate() {
+        let at = |later: usize| w.get((round + later) % 16).copied().unwrap_or_default();
+        let (w0, w1, w9, w14) = (at(0), at(1), at(9), at(14));
         let t1 = last
             .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
             .wrapping_add((e & f) ^ (!e & g))
@@ -136,9 +146,9 @@ fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
             .wrapping_add(w1.rotate_right(7) ^ w1.rotate_right(18) ^ (w1 >> 3))
             .wrapping_add(w9)
             .wrapping_add(w14.rotate_right(17) ^ w14.rotate_right(19) ^ (w14 >> 10));
-        w = [
-            w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15, next,
-        ];
+        if let Some(word) = w.get_mut(round % 16) {
+            *word = next;
+        }
     }
     for (word, add) in h.iter_mut().zip([a, b, c, d, e, f, g, last]) {
         *word = word.wrapping_add(add);
@@ -174,8 +184,9 @@ fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
         *word = u64::from_be_bytes(*bytes);
     }
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut last] = *h;
-    for k in K512 {
-        let [w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15] = w;
+    for (round, k) in K512.into_iter().enumerate() {
+        let at = |later: usize| w.get((round + later) % 16).copied().unwrap_or_default();
+        let (w0, w1, w9, w14) = (at(0), at(1), at(9), at(14));
         let t1 = last
             .wrapping_add(e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41))
             .wrapping_add((e & f) ^ (!e & g))
@@ -195,9 +206,9 @@ fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
             .wrapping_add(w1.rotate_right(1) ^ w1.rotate_right(8) ^ (w1 >> 7))
             .wrapping_add(w9)
             .wrapping_add(w14.rotate_right(19) ^ w14.rotate_right(61) ^ (w14 >> 6));
-        w = [
-            w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15, next,
-        ];
+        if let Some(word) = w.get_mut(round % 16) {
+            *word = next;
+        }
     }
     for (word, add) in h.iter_mut().zip([a, b, c, d, e, f, g, last]) {
         *word = word.wrapping_add(add);
@@ -304,7 +315,7 @@ fn compress1(h: &mut [u32; 5], block: &[u8; 64]) {
     }
 }
 
-const K256: [u32; 64] = [
+pub(crate) const K256: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
     0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
@@ -495,5 +506,57 @@ mod tests {
         splits::<Sha256>();
         splits::<Sha384>();
         splits::<Sha512>();
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
+    use super::{compress256_software, Blocks, IV256};
+    use crate::test_corpus::{expand, hex};
+
+    type Compress = Box<dyn Fn(&mut [u32; 8], &[u8; 64])>;
+
+    fn digest(compress: &Compress, data: &[u8]) -> Vec<u8> {
+        let mut h = IV256;
+        let mut blocks = Blocks::<64>::new();
+        blocks.absorb(data, &mut |block| compress(&mut h, block));
+        blocks.pad(8, &mut |block| compress(&mut h, block));
+        h.iter().flat_map(|word| word.to_be_bytes()).collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn hardware() -> Option<Compress> {
+        let cpu = crate::accel::ShaNi::detect()?;
+        Some(Box::new(move |h, block| cpu.compress256(h, block)))
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn hardware() -> Option<Compress> {
+        None
+    }
+
+    /// Each backend this machine has, which is always the software one.
+    fn backends() -> Vec<Compress> {
+        let software: Compress = Box::new(compress256_software);
+        let mut all = vec![software];
+        all.extend(hardware());
+        all
+    }
+
+    #[test]
+    fn every_backend_answers_python() {
+        let mut rows = 0;
+        for line in include_str!("../tests/digest_vectors.txt").lines() {
+            let fields: Vec<&str> = line.split(' ').collect();
+            if let ["sha256", seed, length, want] = fields[..] {
+                let data = expand(seed.parse().unwrap(), length.parse().unwrap());
+                for compress in &backends() {
+                    assert_eq!(digest(compress, &data), hex(want), "{line}");
+                }
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 263);
     }
 }

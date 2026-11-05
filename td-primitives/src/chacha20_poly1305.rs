@@ -2,8 +2,10 @@
 //! Poly1305 adds 64-by-64 products, so its time depends only on the lengths,
 //! given that those products are constant time. Poly1305 is reachable only
 //! through the AEAD: every block it sees is whole, padded by RFC 8439's
-//! construction, which is why it has no short-final-block path. Its limbs and
-//! finish follow poly1305-donna-64 (THIRD-PARTY.md).
+//! construction, which is why it has no short-final-block path. A block takes
+//! four full products and two by the small top limb of h, which stays below 2p
+//! between blocks. Its limbs, reduction and finish are modified from the 64-bit
+//! path of OpenSSL's `crypto/poly1305/poly1305.c`, Apache-2.0 (THIRD-PARTY.md).
 
 use crate::{ct, Refused};
 
@@ -14,9 +16,7 @@ pub const TAG_LEN: usize = 16;
 /// RFC 8439 2.8: a 32-bit block counter starting at 1 covers this much.
 const MAX_LEN: u64 = ((1 << 32) - 1) * 64;
 
-const SIGMA: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
-const MASK_44: u64 = (1 << 44) - 1;
-const MASK_42: u64 = (1 << 42) - 1;
+pub(crate) const SIGMA: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
 
 /// Encrypt `in_out` where it lies and return the tag. A nonce must never
 /// repeat under one key: that reveals the keystream and the Poly1305 key.
@@ -73,7 +73,16 @@ impl Cipher {
     }
 
     fn crypt(&self, data: &mut [u8]) {
-        let mut counter = 1u32;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(cpu) = crate::accel::Avx2::detect() {
+            cpu.chacha20(&self.key, &self.nonce, 1, data);
+            return;
+        }
+        self.crypt_software(1, data);
+    }
+
+    fn crypt_software(&self, first: u32, data: &mut [u8]) {
+        let mut counter = first;
         for chunk in data.chunks_mut(64) {
             let stream = block(&self.key, counter, &self.nonce);
             for (byte, pad) in chunk.iter_mut().zip(stream) {
@@ -147,10 +156,9 @@ fn block(key: &[u32; 8], counter: u32, nonce: &[u32; 3]) -> [u8; 64] {
     out
 }
 
-/// Poly1305 in 44/44/42-bit limbs over 128-bit products.
+/// Poly1305 in 64/64/3-bit limbs over 128-bit products.
 struct Poly1305 {
-    r: [u64; 3],
-    s: [u64; 2],
+    r: [u64; 2],
     h: [u64; 3],
     pad: [u64; 2],
 }
@@ -172,39 +180,37 @@ impl Poly1305 {
         let (p0, p1) = two_words(&pad);
         ct::zero(&mut clamp);
         ct::zero(&mut pad);
-        let r0 = t0 & 0xffc0fffffff;
-        let r1 = ((t0 >> 44) | (t1 << 20)) & 0xfffffc0ffff;
-        let r2 = (t1 >> 24) & 0x00ffffffc0f;
         Self {
-            r: [r0, r1, r2],
-            s: [r1 * 20, r2 * 20],
+            r: [t0 & 0x0ffffffc0fffffff, t1 & 0x0ffffffc0ffffffc],
             h: [0; 3],
             pad: [p0, p1],
         }
     }
 
-    /// One whole 16-byte block with its 2^128 bit set.
+    /// One whole 16-byte block with its 2^128 bit set: h = (h + block) * r, reduced
+    /// partly. r1 has its low two bits clear, so r1 * 2^128 = r1 * 5 / 4 mod p.
     fn block(&mut self, block: &[u8; 16]) {
         let (t0, t1) = two_words(block);
-        let [r0, r1, r2] = self.r;
-        let [s1, s2] = self.s;
-        let [mut h0, mut h1, mut h2] = self.h;
-        h0 += t0 & MASK_44;
-        h1 += ((t0 >> 44) | (t1 << 20)) & MASK_44;
-        h2 += ((t1 >> 24) & MASK_42) | (1 << 40);
+        let [r0, r1] = self.r;
+        let s1 = r1 + (r1 >> 2);
+        let [h0, h1, h2] = self.h;
+
+        let (h0, carry) = h0.overflowing_add(t0);
+        let (h1, carry_a) = h1.overflowing_add(t1);
+        let (h1, carry_b) = h1.overflowing_add(u64::from(carry));
+        let h2 = h2 + u64::from(carry_a) + u64::from(carry_b) + 1;
+
         let wide = |a: u64, b: u64| u128::from(a) * u128::from(b);
-        let d0 = wide(h0, r0) + wide(h1, s2) + wide(h2, s1);
-        let mut d1 = wide(h0, r1) + wide(h1, r0) + wide(h2, s2);
-        let mut d2 = wide(h0, r2) + wide(h1, r1) + wide(h2, r0);
-        h0 = (d0 as u64) & MASK_44;
-        d1 += d0 >> 44;
-        h1 = (d1 as u64) & MASK_44;
-        d2 += d1 >> 44;
-        h2 = (d2 as u64) & MASK_42;
-        h0 += ((d2 >> 42) as u64) * 5;
-        h1 += h0 >> 44;
-        h0 &= MASK_44;
-        self.h = [h0, h1, h2];
+        let d0 = wide(h0, r0) + wide(h1, s1);
+        // r is clamped below 2^60 in each limb, so these sums fit in 128 bits.
+        let d1 = wide(h0, r1) + wide(h1, r0) + wide(h2, s1) + (d0 >> 64);
+        let top = h2 * r0 + ((d1 >> 64) as u64);
+
+        // Everything at 2^130 and up comes back multiplied by 5.
+        let back = (top >> 2) + (top & !3);
+        let (h0, carry) = (d0 as u64).overflowing_add(back);
+        let (h1, carry) = (d1 as u64).overflowing_add(u64::from(carry));
+        self.h = [h0, h1, (top & 3) + u64::from(carry)];
     }
 
     /// `data` in whole blocks, its tail padded with zeros (RFC 8439 2.8).
@@ -223,39 +229,21 @@ impl Poly1305 {
     }
 
     fn finish(self) -> [u8; 16] {
-        let [mut h0, mut h1, mut h2] = self.h;
-        for _ in 0..2 {
-            h2 += h1 >> 44;
-            h1 &= MASK_44;
-            h0 += (h2 >> 42) * 5;
-            h2 &= MASK_42;
-            h1 += h0 >> 44;
-            h0 &= MASK_44;
-        }
-        // h - p, kept when it did not borrow.
-        let g0 = h0.wrapping_add(5);
-        let g1 = h1.wrapping_add(g0 >> 44);
-        let g2 = h2.wrapping_add(g1 >> 44).wrapping_sub(1 << 42);
-        let keep_g = std::hint::black_box((g2 >> 63).wrapping_sub(1));
-        h0 = (h0 & !keep_g) | (g0 & MASK_44 & keep_g);
-        h1 = (h1 & !keep_g) | (g1 & MASK_44 & keep_g);
-        h2 = (h2 & !keep_g) | (g2 & keep_g);
+        let [h0, h1, h2] = self.h;
+        // h - p, by way of h + 5, kept when that reaches 2^130: a partly reduced h
+        // is below 2p, so one subtraction is enough.
+        let (g0, carry) = h0.overflowing_add(5);
+        let (g1, carry) = h1.overflowing_add(u64::from(carry));
+        let g2 = h2 + u64::from(carry);
+        let keep_g = std::hint::black_box(0u64.wrapping_sub(g2 >> 2));
+        let h0 = (h0 & !keep_g) | (g0 & keep_g);
+        let h1 = (h1 & !keep_g) | (g1 & keep_g);
 
         let [p0, p1] = self.pad;
-        h0 += p0 & MASK_44;
-        h1 += (((p0 >> 44) | (p1 << 20)) & MASK_44) + (h0 >> 44);
-        h0 &= MASK_44;
-        h2 += (p1 >> 24) + (h1 >> 44);
-        h1 &= MASK_44;
-        h2 &= MASK_42;
-
+        let (low, carry) = h0.overflowing_add(p0);
+        let high = h1.wrapping_add(p1).wrapping_add(u64::from(carry));
         let mut tag = [0u8; 16];
-        for (bytes, word) in tag
-            .as_chunks_mut::<8>()
-            .0
-            .iter_mut()
-            .zip([h0 | (h1 << 44), (h1 >> 20) | (h2 << 24)])
-        {
+        for (bytes, word) in tag.as_chunks_mut::<8>().0.iter_mut().zip([low, high]) {
             *bytes = word.to_le_bytes();
         }
         tag
@@ -265,10 +253,9 @@ impl Poly1305 {
 impl Drop for Poly1305 {
     fn drop(&mut self) {
         self.r.fill(0);
-        self.s.fill(0);
         self.h.fill(0);
         self.pad.fill(0);
-        std::hint::black_box((&self.r, &self.s, &self.h, &self.pad));
+        std::hint::black_box((&self.r, &self.h, &self.pad));
     }
 }
 
@@ -276,6 +263,96 @@ impl Drop for Poly1305 {
 mod tests {
     #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
     use super::{block, open, seal, Cipher, Poly1305, MAX_LEN};
+    use crate::sha::{Digest, Sha256};
+    use crate::test_corpus::{expand, long_rows, rows, EDGE_LENGTHS};
+
+    /// One way of running the keystream from a given block.
+    type Backend = fn(&Cipher, u32, &mut [u8]);
+
+    fn software(cipher: &Cipher, first: u32, data: &mut [u8]) {
+        cipher.crypt_software(first, data);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn hardware() -> Option<Backend> {
+        crate::accel::Avx2::detect()?;
+        Some(|cipher, first, data| {
+            if let Some(cpu) = crate::accel::Avx2::detect() {
+                cpu.chacha20(&cipher.key, &cipher.nonce, first, data);
+            }
+        })
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn hardware() -> Option<Backend> {
+        None
+    }
+
+    /// Each backend this machine has, which is always the software one.
+    fn backends() -> Vec<Backend> {
+        let mut all: Vec<Backend> = vec![software];
+        all.extend(hardware());
+        all
+    }
+
+    fn cipher(key: &[u8], nonce: &[u8; 12]) -> Cipher {
+        Cipher::new(&key.try_into().unwrap(), nonce, 0).unwrap()
+    }
+
+    #[test]
+    fn every_backend_answers_wycheproof() {
+        let rows = rows(include_str!("../tests/wycheproof/chacha20_poly1305.txt"));
+        assert_eq!(rows.len(), 316);
+        for row in &rows {
+            let cipher = cipher(&row.key, &row.nonce);
+            assert_eq!(cipher.tag(&row.aad, &row.sealed) == row.tag, row.valid);
+            if row.valid {
+                for backend in backends() {
+                    let mut data = row.sealed.clone();
+                    backend(&cipher, 1, &mut data);
+                    assert_eq!(data, row.plain);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_backend_answers_the_long_records() {
+        let rows = long_rows("chacha");
+        assert_eq!(rows.len(), 4);
+        for row in &rows {
+            let cipher = cipher(&row.key, &row.nonce);
+            for backend in backends() {
+                let mut data = row.plain.clone();
+                backend(&cipher, 1, &mut data);
+                assert_eq!(Sha256::digest(&data).to_vec(), row.digest);
+                assert_eq!(cipher.tag(&row.aad, &data), row.tag);
+            }
+        }
+    }
+
+    // Every length around a batch, and a counter that wraps inside one, against
+    // one RFC 8439 block at a time.
+    #[test]
+    fn every_backend_matches_the_block_function() {
+        let cipher = cipher(&expand(3, 32), &expand(4, 12).try_into().unwrap());
+        for backend in backends() {
+            for first in [1, 2, u32::MAX - 20, u32::MAX - 3, u32::MAX, 0] {
+                for &len in EDGE_LENGTHS.iter().filter(|&&n| n <= 1025) {
+                    let plain = expand(u64::from(first) + len as u64, len);
+                    let mut data = plain.clone();
+                    backend(&cipher, first, &mut data);
+                    for (at, (chunk, plain)) in data.chunks(64).zip(plain.chunks(64)).enumerate() {
+                        let counter = first.wrapping_add(at as u32);
+                        let stream = block(&cipher.key, counter, &cipher.nonce);
+                        for ((byte, input), pad) in chunk.iter().zip(plain).zip(stream) {
+                            assert_eq!(*byte, input ^ pad, "{first} {len} {at}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn hex(text: &str) -> Vec<u8> {
         let text: Vec<u8> = text.bytes().filter(u8::is_ascii_hexdigit).collect();
@@ -325,6 +402,13 @@ mod tests {
         let mut seven_f = [0xff; 16];
         seven_f[15] = 0x7f;
         assert_eq!(one_time(two, zero, &[seven_f, one]), filled(8, 0));
+        // h is 5 after the zero block. The next, 2^128 - 5, carries out of the low
+        // limb into a high limb already full, so that carry alone reaches the top:
+        // 2^129 * 4 = 2^131 = 10 mod p. No RFC vector or corpus row lands there.
+        assert_eq!(
+            one_time(filled(4, 0), zero, &[zero, filled(0xfb, 0xff)]),
+            filled(10, 0)
+        );
     }
 
     #[test]

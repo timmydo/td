@@ -1,10 +1,13 @@
 //! P-256 and P-384 over one generic implementation: Renes, Costello and
 //! Batina's complete addition for a = -3 (eprint 2015/1060, algorithm 4), which
 //! has no exceptional case, so it also doubles and there is no second formula.
-//! Scalar multiplication always doubles and adds and selects with masks, whether
-//! or not its scalar is secret: one routine is less to audit than a fast public
-//! path beside a careful secret one. P-256 holds long-lived keys and signs;
-//! P-384 verifies certificate chains and holds only ephemeral ECDH keys.
+//! Scalar multiplication takes fixed four-bit windows, reading every table entry
+//! and selecting with masks, whether or not its scalars are secret: one routine
+//! is less to audit than a fast public path beside a careful secret one. P-256
+//! holds long-lived keys and signs; P-384 verifies certificate chains and holds
+//! only ephemeral ECDH keys.
+
+use std::sync::OnceLock;
 
 use crate::bignum::{from_be, less_mask, select, to_be, zero_mask, Modulus};
 use crate::hmac::Hmac;
@@ -175,20 +178,45 @@ impl<const N: usize> Curve<N> {
         }
     }
 
-    /// [scalar]point for a scalar in plain limbs: fixed work, masks only.
-    fn multiply(&self, scalar: &[u64; N], point: &Point<N>) -> Point<N> {
+    /// 0 to 15 times `point`, whose multiples are as public as it is.
+    fn multiples(&self, point: &Point<N>) -> [Point<N>; WINDOW_ENTRIES] {
+        let mut table = [self.identity(); WINDOW_ENTRIES];
+        let mut sum = self.identity();
+        for entry in table.iter_mut().skip(1) {
+            sum = self.add(&sum, point);
+            *entry = sum;
+        }
+        table
+    }
+
+    /// The sum of [scalar]point over `terms`, for scalars in plain limbs: one run of
+    /// doublings shared between them, fixed work, every entry read, masks only.
+    fn multiply_sum<const M: usize>(&self, terms: [(&[u64; N], &Point<N>); M]) -> Point<N> {
+        let tables = terms.map(|(_, point)| self.multiples(point));
         let mut result = self.identity();
-        for word in scalar.iter().rev() {
-            for shift in (0..64).rev() {
+        for window in (0..64 * N / WINDOW_BITS).rev() {
+            for _ in 0..WINDOW_BITS {
                 result = self.add(&result, &result);
-                let added = self.add(&result, point);
-                let mask = ((word >> shift) & 1).wrapping_neg();
-                select(&mut result.x, &added.x, mask);
-                select(&mut result.y, &added.y, mask);
-                select(&mut result.z, &added.z, mask);
+            }
+            let at = window * WINDOW_BITS;
+            for ((scalar, _), table) in terms.iter().zip(&tables) {
+                let word = scalar.get(at / 64).copied().unwrap_or_default();
+                let digit = (word >> (at % 64)) & (WINDOW_ENTRIES as u64 - 1);
+                let mut chosen = self.identity();
+                for (entry, index) in table.iter().zip(0u64..) {
+                    let mask = zero_mask(&[index ^ digit]);
+                    select(&mut chosen.x, &entry.x, mask);
+                    select(&mut chosen.y, &entry.y, mask);
+                    select(&mut chosen.z, &entry.z, mask);
+                }
+                result = self.add(&result, &chosen);
             }
         }
         result
+    }
+
+    fn multiply(&self, scalar: &[u64; N], point: &Point<N>) -> Point<N> {
+        self.multiply_sum([(scalar, point)])
     }
 
     /// Affine x and y in plain limbs. The identity is refused; for a valid
@@ -265,7 +293,7 @@ impl<const N: usize> Curve<N> {
         let w = self.n.invert(&self.n.enter(&s));
         let u1 = self.n.leave(&self.n.mul(&e, &w));
         let u2 = self.n.leave(&self.n.mul(&self.n.enter(&r), &w));
-        let sum = self.add(&self.multiply(&u1, &self.g), &self.multiply(&u2, &key));
+        let sum = self.multiply_sum([(&u1, &self.g), (&u2, &key)]);
         let (x, _) = self.affine(&sum)?;
         if self.n.leave(&self.n.enter(&x)) == r {
             Ok(())
@@ -339,13 +367,18 @@ impl<const N: usize> Curve<N> {
 }
 
 const MIN_DIGEST_LEN: usize = 32;
+const WINDOW_BITS: usize = 4;
+const WINDOW_ENTRIES: usize = 1 << WINDOW_BITS;
 
-fn p256_curve() -> Curve<4> {
-    Curve::new(P256_P, P256_N, P256_B, P256_GX, P256_GY)
+/// The constants take hundreds of modular doublings, so each curve makes them once.
+fn p256_curve() -> &'static Curve<4> {
+    static CURVE: OnceLock<Curve<4>> = OnceLock::new();
+    CURVE.get_or_init(|| Curve::new(P256_P, P256_N, P256_B, P256_GX, P256_GY))
 }
 
-fn p384_curve() -> Curve<6> {
-    Curve::new(P384_P, P384_N, P384_B, P384_GX, P384_GY)
+fn p384_curve() -> &'static Curve<6> {
+    static CURVE: OnceLock<Curve<6>> = OnceLock::new();
+    CURVE.get_or_init(|| Curve::new(P384_P, P384_N, P384_B, P384_GX, P384_GY))
 }
 
 pub mod p256 {
@@ -578,6 +611,72 @@ mod tests {
             .collect()
     }
 
+    /// Bit at a time, sharing only `add` with the windowed routine.
+    fn by_bits<const N: usize>(
+        curve: &Curve<N>,
+        scalar: &[u64; N],
+        point: &super::Point<N>,
+    ) -> super::Point<N> {
+        let mut result = curve.identity();
+        for word in scalar.iter().rev() {
+            for shift in (0..64).rev() {
+                result = curve.add(&result, &result);
+                if (word >> shift) & 1 == 1 {
+                    result = curve.add(&result, point);
+                }
+            }
+        }
+        result
+    }
+
+    fn windows_agree_with_bits<const N: usize>(curve: &Curve<N>) {
+        let same = |a: &super::Point<N>, b: &super::Point<N>| {
+            assert_eq!(zero_mask(&a.z) != 0, zero_mask(&b.z) != 0);
+            if zero_mask(&a.z) == 0 {
+                assert_eq!(curve.affine(a).unwrap(), curve.affine(b).unwrap());
+            }
+        };
+        let doubled = curve.add(&curve.g, &curve.g);
+        let mut scalars = vec![[0u64; N], curve.n.m, [u64::MAX; N]];
+        // Each digit value at each end of the scalar, and in the middle.
+        for digit in 1..16u64 {
+            for (word, shift) in [(0, 0), (0, 60), (N - 1, 60), (N / 2, 4)] {
+                let mut scalar = [0u64; N];
+                scalar[word] = digit << shift;
+                scalars.push(scalar);
+            }
+        }
+        let mut state = 0x9e3779b97f4a7c15u64;
+        for _ in 0..8 {
+            let mut scalar = [0u64; N];
+            for word in &mut scalar {
+                state = state.wrapping_mul(0x2545f4914f6cdd1d) ^ (state >> 29);
+                *word = state;
+            }
+            scalars.push(scalar);
+        }
+        for pair in scalars.windows(2) {
+            let (one, two) = (&pair[0], &pair[1]);
+            same(
+                &curve.multiply(one, &doubled),
+                &by_bits(curve, one, &doubled),
+            );
+            same(
+                &curve.multiply_sum([(one, &curve.g), (two, &doubled)]),
+                &curve.add(
+                    &by_bits(curve, one, &curve.g),
+                    &by_bits(curve, two, &doubled),
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_windows_agree_with_one_bit_at_a_time() {
+        windows_agree_with_bits(p256_curve());
+        windows_agree_with_bits(p384_curve());
+    }
+
     fn order_times_base_is_the_identity<const N: usize>(curve: &Curve<N>) {
         let product = curve.multiply(&curve.n.m, &curve.g);
         assert_ne!(zero_mask(&product.z), 0);
@@ -586,8 +685,8 @@ mod tests {
 
     #[test]
     fn the_order_annihilates_the_base_point() {
-        order_times_base_is_the_identity(&p256_curve());
-        order_times_base_is_the_identity(&p384_curve());
+        order_times_base_is_the_identity(p256_curve());
+        order_times_base_is_the_identity(p384_curve());
     }
 
     fn addition_handles_every_case<const N: usize>(curve: &Curve<N>) {
@@ -635,8 +734,8 @@ mod tests {
 
     #[test]
     fn complete_addition_handles_doubling_and_the_identity() {
-        addition_handles_every_case(&p256_curve());
-        addition_handles_every_case(&p384_curve());
+        addition_handles_every_case(p256_curve());
+        addition_handles_every_case(p384_curve());
     }
 
     // RFC 6979 A.2.5: P-256, SHA-256, message "sample".

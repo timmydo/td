@@ -1,8 +1,9 @@
 //! AES-128-GCM and AES-256-GCM (SP 800-38D) with 96-bit nonces and 128-bit
-//! tags. AES is bitsliced over four blocks and GHASH multiplies with integer
-//! multiplication, so neither indexes memory by a secret. Both are translated
-//! from BearSSL's `aes_ct64` and `ghash_ctmul64` (THIRD-PARTY.md); the S-box is
-//! Boyar and Peralta's circuit.
+//! tags. A CPU with AES-NI and PCLMULQDQ does the work (`aes_ni`). Otherwise AES
+//! is bitsliced over four blocks and GHASH multiplies with integer multiplication,
+//! so neither indexes memory by a secret. Both of those are translated from
+//! BearSSL's `aes_ct64` and `ghash_ctmul64` (THIRD-PARTY.md); the S-box is Boyar and
+//! Peralta's circuit.
 
 use crate::{ct, Refused};
 
@@ -26,8 +27,46 @@ struct RoundKeys {
 }
 
 pub struct AesGcm {
-    round_keys: RoundKeys,
-    hash_key: HashKey,
+    engine: Engine,
+}
+
+enum Engine {
+    Software {
+        round_keys: RoundKeys,
+        hash_key: HashKey,
+    },
+    #[cfg(target_arch = "x86_64")]
+    Hardware {
+        cpu: crate::accel::AesClmul,
+        key: Box<crate::aes_ni::Key>,
+    },
+}
+
+/// The schedule goes to the engine that will use it, then its caller clears it.
+fn engine(schedule: &[u32], wide: bool) -> Engine {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(cpu) = crate::accel::AesClmul::detect() {
+        return Engine::Hardware {
+            cpu,
+            key: cpu.new_key(schedule, wide),
+        };
+    }
+    software_engine(schedule, wide)
+}
+
+fn software_engine(schedule: &[u32], wide: bool) -> Engine {
+    let mut keys = Box::new([[0u64; 8]; 15]);
+    for (slot, words) in keys.iter_mut().zip(schedule.as_chunks::<4>().0) {
+        let (a, b) = interleave_in(*words);
+        *slot = [a, a, a, a, b, b, b, b];
+        ortho(slot);
+    }
+    let round_keys = RoundKeys { keys, wide };
+    let [zero, ..] = encrypt_blocks(&round_keys, [[0; 4]; 4]);
+    Engine::Software {
+        hash_key: HashKey::new(block_bytes(&zero)),
+        round_keys,
+    }
 }
 
 impl AesGcm {
@@ -43,20 +82,10 @@ impl AesGcm {
 
     fn new(key: &[u8], last_word: u32, wide: bool) -> Self {
         let mut schedule = expand_key(key, last_word, wide);
-        let mut keys = Box::new([[0u64; 8]; 15]);
-        for (slot, words) in keys.iter_mut().zip(schedule.as_chunks::<4>().0) {
-            let (a, b) = interleave_in(*words);
-            *slot = [a, a, a, a, b, b, b, b];
-            ortho(slot);
-        }
+        let engine = engine(&schedule, wide);
         schedule.fill(0);
         std::hint::black_box(&schedule);
-        let round_keys = RoundKeys { keys, wide };
-        let [zero, ..] = encrypt_blocks(&round_keys, [[0; 4]; 4]);
-        Self {
-            hash_key: HashKey::new(block_bytes(&zero)),
-            round_keys,
-        }
+        Self { engine }
     }
 
     /// Encrypt `in_out` where it lies and return the tag. A nonce must never
@@ -68,7 +97,7 @@ impl AesGcm {
         in_out: &mut [u8],
     ) -> Result<[u8; TAG_LEN], Refused> {
         check_len(in_out.len())?;
-        self.ctr(nonce, in_out);
+        self.ctr(nonce, 2, in_out);
         Ok(self.tag(nonce, aad, in_out))
     }
 
@@ -85,16 +114,22 @@ impl AesGcm {
         if !ct::eq(&self.tag(nonce, aad, in_out), tag) {
             return Err(Refused);
         }
-        self.ctr(nonce, in_out);
+        self.ctr(nonce, 2, in_out);
         Ok(())
     }
 
-    fn ctr(&self, nonce: &[u8; NONCE_LEN], data: &mut [u8]) {
-        let mut counter = 2u32;
+    /// `first` is 2 in every use but a test of the counter's wrap.
+    fn ctr(&self, nonce: &[u8; NONCE_LEN], first: u32, data: &mut [u8]) {
+        let round_keys = match &self.engine {
+            Engine::Software { round_keys, .. } => round_keys,
+            #[cfg(target_arch = "x86_64")]
+            Engine::Hardware { cpu, key } => return cpu.ctr(key, nonce, first, data),
+        };
+        let mut counter = first;
         for chunk in data.chunks_mut(64) {
             let blocks =
                 [0u32, 1, 2, 3].map(|lane| counter_block(nonce, counter.wrapping_add(lane)));
-            let stream = encrypt_blocks(&self.round_keys, blocks);
+            let stream = encrypt_blocks(round_keys, blocks);
             let mut pad = [0u8; 64];
             for (bytes, word) in pad
                 .as_chunks_mut::<4>()
@@ -113,8 +148,8 @@ impl AesGcm {
 
     fn tag(&self, nonce: &[u8; NONCE_LEN], aad: &[u8], ciphertext: &[u8]) -> [u8; TAG_LEN] {
         let mut y = [0u64; 2];
-        self.hash_key.padded(&mut y, aad);
-        self.hash_key.padded(&mut y, ciphertext);
+        self.ghash(&mut y, aad);
+        self.ghash(&mut y, ciphertext);
         let mut lengths = [0u8; 16];
         for (bytes, len) in lengths
             .as_chunks_mut::<8>()
@@ -124,10 +159,9 @@ impl AesGcm {
         {
             *bytes = (len as u64).wrapping_mul(8).to_be_bytes();
         }
-        self.hash_key.absorb(&mut y, &lengths);
+        self.ghash(&mut y, &lengths);
 
-        let [first, ..] = encrypt_blocks(&self.round_keys, [counter_block(nonce, 1); 4]);
-        let mut tag = block_bytes(&first);
+        let mut tag = self.encrypt_block(&block_bytes(&counter_block(nonce, 1)));
         let [high, low] = y;
         for (bytes, word) in tag.as_chunks_mut::<8>().0.iter_mut().zip([high, low]) {
             *bytes = (u64::from_be_bytes(*bytes) ^ word).to_be_bytes();
@@ -135,21 +169,43 @@ impl AesGcm {
         tag
     }
 
-    #[cfg(test)]
+    fn ghash(&self, y: &mut [u64; 2], data: &[u8]) {
+        match &self.engine {
+            Engine::Software { hash_key, .. } => hash_key.padded(y, data),
+            #[cfg(target_arch = "x86_64")]
+            Engine::Hardware { cpu, key } => cpu.ghash(key, y, data),
+        }
+    }
+
     fn encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
+        let round_keys = match &self.engine {
+            Engine::Software { round_keys, .. } => round_keys,
+            #[cfg(target_arch = "x86_64")]
+            Engine::Hardware { cpu, key } => return cpu.encrypt_block(key, block),
+        };
         let mut words = [0u32; 4];
         for (word, bytes) in words.iter_mut().zip(block.as_chunks::<4>().0) {
             *word = u32::from_le_bytes(*bytes);
         }
-        let [first, ..] = encrypt_blocks(&self.round_keys, [words; 4]);
+        let [first, ..] = encrypt_blocks(round_keys, [words; 4]);
         block_bytes(&first)
     }
 }
 
 impl Drop for AesGcm {
     fn drop(&mut self) {
-        ct::zero_words(self.round_keys.keys.as_flattened_mut());
-        self.hash_key.erase();
+        match &mut self.engine {
+            Engine::Software {
+                round_keys,
+                hash_key,
+            } => {
+                ct::zero_words(round_keys.keys.as_flattened_mut());
+                hash_key.erase();
+            }
+            // A hardware key clears itself: it has a `Drop` of its own.
+            #[cfg(target_arch = "x86_64")]
+            Engine::Hardware { .. } => {}
+        }
     }
 }
 
@@ -581,7 +637,167 @@ fn carryless(x: u64, y: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
-    use super::{check_len, interleave_in, interleave_out, ortho, sbox, AesGcm, MAX_LEN};
+    use super::{
+        check_len, expand_key, interleave_in, interleave_out, ortho, sbox, software_engine, AesGcm,
+        MAX_LEN,
+    };
+    use crate::sha::{Digest, Sha256};
+    use crate::test_corpus::{expand, long_rows, rows, EDGE_LENGTHS};
+
+    fn schedule(key: &[u8]) -> Vec<u32> {
+        let last = key.last_chunk::<4>().unwrap();
+        expand_key(key, u32::from_le_bytes(*last), key.len() == 32)
+    }
+
+    fn software(key: &[u8]) -> AesGcm {
+        AesGcm {
+            engine: software_engine(&schedule(key), key.len() == 32),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn hardware(key: &[u8]) -> Option<AesGcm> {
+        let cpu = crate::accel::AesClmul::detect()?;
+        Some(AesGcm {
+            engine: super::Engine::Hardware {
+                cpu,
+                key: cpu.new_key(&schedule(key), key.len() == 32),
+            },
+        })
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn hardware(_key: &[u8]) -> Option<AesGcm> {
+        None
+    }
+
+    /// Each backend this machine has, which is always the software one.
+    fn engines(key: &[u8]) -> Vec<AesGcm> {
+        let mut all = vec![software(key)];
+        all.extend(hardware(key));
+        all
+    }
+
+    #[test]
+    fn every_backend_answers_wycheproof() {
+        let rows = rows(include_str!("../tests/wycheproof/aes_gcm.txt"));
+        assert_eq!(rows.len(), 133);
+        for row in &rows {
+            for aes in engines(&row.key) {
+                let mut data = row.sealed.clone();
+                let opened = aes.open(&row.nonce, &row.aad, &mut data, &row.tag);
+                assert_eq!(opened.is_ok(), row.valid);
+                if !row.valid {
+                    assert_eq!(data, row.sealed);
+                    continue;
+                }
+                assert_eq!(data, row.plain);
+                let tag = aes.seal(&row.nonce, &row.aad, &mut data).unwrap();
+                assert_eq!(data, row.sealed);
+                assert_eq!(tag, row.tag);
+            }
+        }
+    }
+
+    #[test]
+    fn every_backend_answers_the_long_records() {
+        for (cipher, count) in [("aes128", 4), ("aes256", 4)] {
+            let rows = long_rows(cipher);
+            assert_eq!(rows.len(), count);
+            for row in &rows {
+                for aes in engines(&row.key) {
+                    let mut data = row.plain.clone();
+                    let tag = aes.seal(&row.nonce, &row.aad, &mut data).unwrap();
+                    assert_eq!(tag, row.tag);
+                    assert_eq!(Sha256::digest(&data).to_vec(), row.digest);
+                    aes.open(&row.nonce, &row.aad, &mut data, &tag).unwrap();
+                    assert!(data == row.plain);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_backends_agree_and_open_each_others_records() {
+        // The CPU may lack them, in which case the fallback has nothing to differ from.
+        let Some(_) = hardware(&[0; 16]) else {
+            return;
+        };
+        for (seed, key_len) in [(1u64, 16), (2, 32)] {
+            let key = expand(seed, key_len);
+            let (soft, hard) = (software(&key), hardware(&key).unwrap());
+            let nonce: [u8; 12] = expand(seed + 7, 12).try_into().unwrap();
+            for &len in EDGE_LENGTHS {
+                for &aad_len in EDGE_LENGTHS.iter().filter(|&&n| n < 300) {
+                    let plain = expand(seed + 11 + len as u64, len);
+                    let aad = expand(seed + 13 + aad_len as u64, aad_len);
+                    let (mut one, mut two) = (plain.clone(), plain.clone());
+                    let tag_one = soft.seal(&nonce, &aad, &mut one).unwrap();
+                    let tag_two = hard.seal(&nonce, &aad, &mut two).unwrap();
+                    assert!(one == two, "ciphertext at {len} with {aad_len}");
+                    assert_eq!(tag_one, tag_two, "tag at {len} with {aad_len}");
+
+                    let mut changed = one.clone();
+                    if let Some(byte) = changed.last_mut() {
+                        *byte ^= 1;
+                        let held = changed.clone();
+                        assert!(hard.open(&nonce, &aad, &mut changed, &tag_two).is_err());
+                        assert!(changed == held, "a refused record stays ciphertext");
+                    }
+                    hard.open(&nonce, &aad, &mut one, &tag_one).unwrap();
+                    soft.open(&nonce, &aad, &mut two, &tag_two).unwrap();
+                    assert!(one == plain && two == plain);
+                }
+            }
+        }
+    }
+
+    // SP 800-38D's inc32: the counter wraps within its own 32 bits and the nonce
+    // does not move, by each backend's batches. Block by block is the reference.
+    #[test]
+    fn the_counter_wraps_at_32_bits() {
+        for key_len in [16, 32] {
+            let key = expand(5, key_len);
+            let nonce: [u8; 12] = expand(6, 12).try_into().unwrap();
+            for aes in engines(&key) {
+                for first in [u32::MAX - 20, u32::MAX - 8, u32::MAX - 1, u32::MAX, 0] {
+                    for len in [1usize, 16, 17, 127, 128, 129, 400, 415] {
+                        let mut data = vec![0u8; len];
+                        aes.ctr(&nonce, first, &mut data);
+                        for (at, chunk) in data.chunks(16).enumerate() {
+                            let mut block = [0u8; 16];
+                            block[..12].copy_from_slice(&nonce);
+                            let counter = first.wrapping_add(at as u32);
+                            block[12..].copy_from_slice(&counter.to_be_bytes());
+                            let want = aes.encrypt_block(&block);
+                            assert_eq!(chunk, &want[..chunk.len()], "{first} {len} {at}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // GHASH is absorbed in three parts for a record, each starting from where the
+    // last left it, so what the state holds between them has to mean the same.
+    #[test]
+    fn ghash_continues_across_calls() {
+        let key = expand(9, 16);
+        let Some(hard) = hardware(&key) else {
+            return;
+        };
+        let soft = software(&key);
+        let data = expand(10, 600);
+        for &split in EDGE_LENGTHS.iter().filter(|&&n| n <= 576) {
+            let (mut one, mut two) = ([0u64; 2], [0u64; 2]);
+            let (head, tail) = data.split_at(split);
+            for part in [head, tail] {
+                soft.ghash(&mut one, part);
+                hard.ghash(&mut two, part);
+                assert_eq!(one, two, "split at {split}");
+            }
+        }
+    }
 
     fn hex(text: &str) -> Vec<u8> {
         let text: Vec<u8> = text.bytes().filter(u8::is_ascii_hexdigit).collect();
@@ -640,18 +856,22 @@ mod tests {
     fn fips_197_blocks() {
         let plain: [u8; 16] = hex("00112233445566778899aabbccddeeff").try_into().unwrap();
         let key128: [u8; 16] = hex("000102030405060708090a0b0c0d0e0f").try_into().unwrap();
-        assert_eq!(
-            AesGcm::new_128(&key128).encrypt_block(&plain).to_vec(),
-            hex("69c4e0d86a7b0430d8cdb78070b4c55a")
-        );
+        for aes in engines(&key128) {
+            assert_eq!(
+                aes.encrypt_block(&plain).to_vec(),
+                hex("69c4e0d86a7b0430d8cdb78070b4c55a")
+            );
+        }
         let key256: [u8; 32] = hex("000102030405060708090a0b0c0d0e0f\
                                     101112131415161718191a1b1c1d1e1f")
         .try_into()
         .unwrap();
-        assert_eq!(
-            AesGcm::new_256(&key256).encrypt_block(&plain).to_vec(),
-            hex("8ea2b7ca516745bfeafc49904b496089")
-        );
+        for aes in engines(&key256) {
+            assert_eq!(
+                aes.encrypt_block(&plain).to_vec(),
+                hex("8ea2b7ca516745bfeafc49904b496089")
+            );
+        }
     }
 
     #[test]

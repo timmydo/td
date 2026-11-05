@@ -10,8 +10,12 @@ clippy-all-targets = true
 
 [workspace]
 
+# The confinement test reads src/ through td-source-scan's shared scans.
+[dev-dependencies]
+td-source-scan = { path = "../td-source-scan" }
+
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 unwrap_used = "deny"
