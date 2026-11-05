@@ -180,7 +180,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::split_debug_tree("{out}", "/usr/bin/objcopy"));
 
-    Recipe::mesboot("openssh-x86-64", "10.6p1")
+    Recipe::mesboot("openssh-x86-64", "10.6p2")
         .source_input("openssh-x86-64-source")
         .build_root()
         .native_inputs(&["glibc-x86-64", "gcc-runtime"])

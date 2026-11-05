@@ -410,13 +410,13 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "openssh-x86-64-source",
         aliases: &[],
-        // OpenSSH Portable 10.6p1 supplies both halves of td's minimal SSH
+        // OpenSSH Portable 10.6p2 supplies both halves of td's minimal SSH
         // surface. The recipe builds only ssh, ssh-keygen, sshd and the two
         // mandatory privilege-separation helpers, without libcrypto or zlib.
-        url: "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.6p1.tar.gz",
-        sha256: "a9dc9565dffe8640f64d863cd29a32bc4a3dbdec0566a7fc44c5d6ee767d5f39",
-        file: "openssh-10.6p1.tar.gz",
-        version: "10.6p1",
+        url: "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.6p2.tar.gz",
+        sha256: "9ae44872090cf2f06b3cf9ff147e7f16f309671340763ed2f99248398ae29d5b",
+        file: "openssh-10.6p2.tar.gz",
+        version: "10.6p2",
     },
     PinDef {
         key: "ripgrep-seed-source",
