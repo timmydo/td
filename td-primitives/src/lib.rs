@@ -2,9 +2,15 @@
 //! is here, what each one claims and what none of them claims.
 
 pub mod aes_gcm;
+mod bignum;
 pub mod chacha20_poly1305;
 pub mod ct;
+pub mod curve25519;
+mod der;
+pub mod ec;
 pub mod hmac;
+pub mod random;
+pub mod rsa;
 pub mod sha;
 
 /// A check failed or an input is out of bounds. It deliberately says no more:

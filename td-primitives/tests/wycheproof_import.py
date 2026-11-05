@@ -6,10 +6,11 @@ in one directory, none of it executed:
 
     python3 -I wycheproof_import.py DIR
 
-Each row is space-separated, hex fields with "-" for an empty one, ending in
-Wycheproof's verdict (valid, invalid or acceptable). A group the primitive's
-API cannot express, such as a 128-bit GCM nonce, is dropped and counted here,
-never in the test: the printed counts are the coverage statement.
+Rows are space-separated, hex fields with "-" for an empty one, ending in
+Wycheproof's verdict (valid, invalid or acceptable). "K" rows name the key the
+"T" rows after them use. A group the primitive's API cannot express, such as a
+128-bit GCM nonce, is dropped and counted here, never in the test: the printed
+counts are the coverage statement.
 """
 
 import json
@@ -21,11 +22,28 @@ def field(value):
     return value if value else "-"
 
 
+def load(directory, name):
+    with open(os.path.join(directory, name + "_test.json")) as handle:
+        return json.load(handle)
+
+
+def write(out, rows):
+    with open(out, "w") as handle:
+        handle.write("\n".join(rows) + "\n")
+
+
+def report(out, rows, dropped):
+    tests = [row for row in rows if not row.startswith("K ")]
+    verdicts = {}
+    for row in tests:
+        verdict = row.rsplit(" ", 1)[1]
+        verdicts[verdict] = verdicts.get(verdict, 0) + 1
+    print(f"{out}: {len(tests)} tests {sorted(verdicts.items())}, {dropped} dropped")
+
+
 def aead(directory, name, key_bits):
-    with open(os.path.join(directory, name)) as handle:
-        data = json.load(handle)
     rows, dropped = [], 0
-    for group in data["testGroups"]:
+    for group in load(directory, name)["testGroups"]:
         usable = (
             group["keySize"] in key_bits
             and group["ivSize"] == 96
@@ -35,30 +53,91 @@ def aead(directory, name, key_bits):
             if not usable:
                 dropped += 1
                 continue
-            rows.append(
-                " ".join(
-                    field(test[k]) for k in ("key", "iv", "aad", "msg", "ct", "tag")
-                )
-                + " "
-                + test["result"]
-            )
+            fields = [field(test[k]) for k in ("key", "iv", "aad", "msg", "ct", "tag")]
+            rows.append(" ".join(fields + [test["result"]]))
     return rows, dropped
 
 
-def write(out, rows):
-    with open(out, "w") as handle:
-        handle.write("\n".join(rows) + "\n")
+def key_exchange(directory, name):
+    rows = []
+    for group in load(directory, name)["testGroups"]:
+        for test in group["tests"]:
+            fields = [field(test[k]) for k in ("private", "public", "shared")]
+            rows.append(" ".join(fields + [test["result"]]))
+    return rows, 0
+
+
+def signature(directory, name, key_of, label):
+    rows = []
+    for group in load(directory, name)["testGroups"]:
+        rows.append("K " + label + " " + key_of(group))
+        for test in group["tests"]:
+            rows.append(
+                f"T {field(test['msg'])} {field(test['sig'])} {test['result']}"
+            )
+    return rows, 0
+
+
+def ed25519_key(group):
+    return group["publicKey"]["pk"]
+
+
+def ecdsa_key(group):
+    return group["publicKey"]["uncompressed"]
+
+
+def rsa_key(group):
+    return group["publicKey"]["modulus"] + " " + group["publicKey"]["publicExponent"]
 
 
 def main():
     directory = sys.argv[1]
-    for name, out, bits in (
-        ("aes_gcm_test.json", "wycheproof/aes_gcm.txt", (128, 256)),
-        ("chacha20_poly1305_test.json", "wycheproof/chacha20_poly1305.txt", (256,)),
-    ):
-        rows, dropped = aead(directory, name, bits)
+    os.makedirs("wycheproof", exist_ok=True)
+    outputs = [
+        ("wycheproof/aes_gcm.txt", [("aes_gcm", aead, ((128, 256),))]),
+        ("wycheproof/chacha20_poly1305.txt", [("chacha20_poly1305", aead, ((256,),))]),
+        ("wycheproof/x25519.txt", [("x25519", key_exchange, ())]),
+        ("wycheproof/ecdh_p256.txt", [("ecdh_secp256r1_ecpoint", key_exchange, ())]),
+        ("wycheproof/ecdh_p384.txt", [("ecdh_secp384r1_ecpoint", key_exchange, ())]),
+        ("wycheproof/ed25519.txt", [("ed25519", signature, (ed25519_key, "ed25519"))]),
+        (
+            "wycheproof/ecdsa.txt",
+            [
+                ("ecdsa_secp256r1_sha256", signature, (ecdsa_key, "p256 sha256")),
+                ("ecdsa_secp384r1_sha256", signature, (ecdsa_key, "p384 sha256")),
+                ("ecdsa_secp384r1_sha384", signature, (ecdsa_key, "p384 sha384")),
+                ("ecdsa_secp256r1_sha512", signature, (ecdsa_key, "p256 sha512")),
+                ("ecdsa_secp384r1_sha512", signature, (ecdsa_key, "p384 sha512")),
+            ],
+        ),
+        (
+            "wycheproof/rsa_pkcs1.txt",
+            [
+                ("rsa_signature_2048_sha256", signature, (rsa_key, "sha256")),
+                ("rsa_signature_2048_sha384", signature, (rsa_key, "sha384")),
+                ("rsa_signature_2048_sha512", signature, (rsa_key, "sha512")),
+                ("rsa_signature_3072_sha256", signature, (rsa_key, "sha256")),
+                ("rsa_signature_4096_sha512", signature, (rsa_key, "sha512")),
+            ],
+        ),
+        (
+            "wycheproof/rsa_pss.txt",
+            [
+                ("rsa_pss_2048_sha256_mgf1_32", signature, (rsa_key, "sha256")),
+                ("rsa_pss_2048_sha384_mgf1_48", signature, (rsa_key, "sha384")),
+                ("rsa_pss_3072_sha256_mgf1_32", signature, (rsa_key, "sha256")),
+                ("rsa_pss_4096_sha512_mgf1_64", signature, (rsa_key, "sha512")),
+            ],
+        ),
+    ]
+    for out, sources in outputs:
+        rows, dropped = [], 0
+        for name, convert, arguments in sources:
+            more, gone = convert(directory, name, *arguments)
+            rows += more
+            dropped += gone
         write(out, rows)
-        print(f"{out}: {len(rows)} rows, {dropped} dropped")
+        report(out, rows, dropped)
 
 
 if __name__ == "__main__":
