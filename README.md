@@ -125,8 +125,9 @@ runs `./start`, and the guest writes go to a throwaway overlay so the image
 keeps matching its checksum.
 
 The bundle is a convenience for people evaluating td, not a distribution
-channel: nothing in the recipe graph names it, no build fetches it, and td
-updates remain a `git pull` and a rebuild.
+channel: nothing in the recipe graph names it and no build fetches it.
+Source updates remain available through `git pull` and a rebuild. Signed
+image updates require a separately provisioned publisher policy below.
 
 Published bundles also carry the checkout's committed Git history on the disk,
 at `/run/td-volume/td/source/repository.bundle` inside the guest. The adjacent
@@ -178,6 +179,30 @@ The checkout, build cache and other user state persist across updates and
 rollback. The source bundle is companion data outside the deployment;
 it does not authorize installation. See [td-update/DESIGN.md](td-update/DESIGN.md)
 for the source, build and installation contract and native VM regression.
+
+### Download signed system updates
+
+A provisioned desktop administrator can use `td-admin update` to acquire a signed
+system image from a configured static repository. It reuses verified cached
+chunks, checks signatures, expiry and replay protection, and passes the
+complete verified deployment through the existing installer and rollback
+mechanism. It reboots by default; `--no-reboot` defers that step.
+
+There is no default public service or publisher key. Initial local root
+setup selects the repository, trusted public root document and machine
+profile using `td-admin configure-release`. Keep private signing keys on the
+publisher side. A local filesystem repository and loopback HTTP are supported
+for testing; HTTPS is supported for subsequent hosting.
+
+If no valid release is available, `update` fails clearly. Use
+`td-admin update-from-source` explicitly to build trusted upstream main;
+there is no automatic build fallback. The stock server profile does not ship
+this administrator service and retains its replacement workflow.
+The interactive `./update` source-build
+workflow above remains available. See [remote administration](td-update/ADMIN.md)
+for enrollment/setup and [signed releases](net/RELEASES.md) for publication,
+key rotation and expiry/collection. [Controlled measurements](td-image-transfer/CONTROLLED-RESULTS.md)
+record bandwidth, request counts and the limits of reuse.
 
 ## Filesystem layout
 

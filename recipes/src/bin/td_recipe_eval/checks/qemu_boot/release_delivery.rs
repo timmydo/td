@@ -15,11 +15,12 @@ pub(super) struct Delivery {
     program: PathBuf,
     work: PathBuf,
     sequence: u64,
+    profile: &'static str,
     _owned: fixture_temp::TempDir,
 }
 
 impl Delivery {
-    pub(super) fn new(runner: &RecipeCheckRunner) -> Result<Self, String> {
+    pub(super) fn new(runner: &RecipeCheckRunner, profile: &'static str) -> Result<Self, String> {
         runner.prepare_recipe_target("td-net")?;
         let built = runner.build_plan("td-net")?;
         let program = runner.ladder_out_from(&built, "td-net")?.join("bin/td-net");
@@ -30,6 +31,7 @@ impl Delivery {
             program,
             work,
             sequence: 0,
+            profile,
             _owned: owned,
         };
         delivery.command(&[
@@ -57,7 +59,7 @@ impl Delivery {
                 "init",
                 &delivery.path(state)?,
                 &delivery.path("root")?,
-                "system-x86-64",
+                profile,
             ])?;
         }
         Ok(delivery)
@@ -104,7 +106,7 @@ impl Delivery {
             &self.path("repo")?,
             &self.path("root")?,
             &self.path("release.key")?,
-            "system-x86-64",
+            self.profile,
             COMMIT,
             &sequence,
             &issued,
@@ -122,7 +124,7 @@ impl Delivery {
             &self.path("repo")?,
             &self.path("root")?,
             &self.path("release.key")?,
-            "system-x86-64",
+            self.profile,
             index,
             &sequence,
             &issued,
@@ -157,8 +159,8 @@ impl Delivery {
         fs::rename(output, candidate)
             .map_err(|e| format!("stage verified downloaded fixture: {e}"))?;
         println!(
-            "[qemu-boot-system] signed release {} acquired and independently verified: {id}",
-            self.sequence
+            "[signed-release] {} release {} acquired and independently verified: {id}",
+            self.profile, self.sequence
         );
         Ok(())
     }

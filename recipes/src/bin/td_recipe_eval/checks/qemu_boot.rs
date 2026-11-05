@@ -857,7 +857,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
 /// state, and clean self-exit; healthy boots assert the runtime target.
 pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
-    let mut release_delivery = release_delivery::Delivery::new(runner)?;
+    let mut release_delivery = release_delivery::Delivery::new(runner, "system-x86-64")?;
     let (bzimage, selector, deployment) = build_system(runner)?;
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
     let seccomp_probe = build_td_jail_seccomp_probe(runner)?;

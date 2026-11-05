@@ -1,5 +1,9 @@
 # Image transfer prototype measurements
 
+[Controlled signed HTTP measurements](CONTROLLED-RESULTS.md) record
+attributable source changes through the implemented downloader. The data
+below are the earlier offline simulations.
+
 These are local-cache simulations on retained real system deployments,
 not network downloads or controlled release-to-release benchmarks. Store
 names identify cached builds; their source commits and causal changes were

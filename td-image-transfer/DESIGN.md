@@ -103,8 +103,9 @@ External per-process measurement supplies elapsed time and peak RSS.
 
 ## Interpretation
 
-RESULTS.md records measured artifacts, identities and limitations, including
-controlled comparisons through the streaming signed HTTP downloader. The
+RESULTS.md records the earlier offline simulations. CONTROLLED-RESULTS.md
+records controlled comparisons through the streaming signed HTTP downloader,
+including artifact identities and measurement limits. The
 simulator's byte reuse establishes no authentication or update guarantee.
 `net/RELEASES.md` owns the implemented signed transport, freshness, rotation,
 resumption and retention contract; `td-update/ADMIN.md` owns admission to

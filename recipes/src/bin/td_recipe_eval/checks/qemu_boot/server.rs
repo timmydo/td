@@ -208,6 +208,7 @@ impl Boot<'_> {
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
+    let mut delivery = super::release_delivery::Delivery::new(runner, STEM)?;
     // Resolved first: the image boot that needs it runs last.
     let firmware = efi::firmware(&qemu)?;
     let (bzimage, selector, deployment) = build_system_stem(runner, STEM)?;
@@ -226,7 +227,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         _ => {}
     }
     let login = HostLogin::prepare(&client, STEM, ACCOUNT)?;
-    let fresh_volume = || {
+    let mut fresh_volume = || {
         create_persistent_volume_layout(
             &deployment,
             &mkfs,
@@ -239,7 +240,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             VolumePurpose::Fixture,
             None,
             Some(login.account()),
-            None,
+            Some(&mut delivery),
         )
     };
     let fixture = fresh_volume()?;

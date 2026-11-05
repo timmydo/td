@@ -134,6 +134,13 @@ there is no claim of global commit ordering across that operator choice.
 
 ## Source and build boundary
 
+The existing source builder targets `system-x86-64`; it is not a
+profile-preserving fallback for a server. The stock `server-x86-64` profile
+ships neither td-admin nor its service or administrator accounts. Server
+profile support in the release transport and host-side boot oracle does
+not provide installed-server remote updates: servers retain the replacement
+and reprovisioning workflow in `td-svc/DESIGN.md` §10.
+
 The explicit `update-from-source` path owns `/var/lib/td-admin/repository.git`. It fetches exactly
 `refs/heads/main` from the compiled HTTPS URL, records its full commit ID,
 and requires it to descend from the last accepted commit. A rewritten or

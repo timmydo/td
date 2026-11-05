@@ -12,7 +12,9 @@ the publisher applied security fixes. It is a td protocol, not TUF.
 
 The operator provisions a root document and profile out of band with
 `td-net release init STATE ROOT PROFILE`. The supported profiles are
-`system-x86-64` and `server-x86-64`. State must be protected by its caller;
+`system-x86-64` and `server-x86-64`. This is transport support: only the
+desktop ships td-admin; stock servers retain replacement/reprovisioning.
+State must be protected by its caller;
 copying or deleting it loses replay protection. There is no trust-on-first-use
 network key, reset flag, automatic source fallback or automatic key recovery.
 
@@ -187,10 +189,11 @@ delivery tests; they do not claim an installed-machine or boot oracle.
 
 ## Boot oracle
 
-`qemu-boot-system` publishes its transaction candidates with ephemeral fixture
+`qemu-boot-system` and `qemu-boot-server` publish their transaction candidates with ephemeral fixture
 keys, acquires them from a local static repository, and independently verifies
 them with a separate state before staging the guest installation offer.
-The existing failed-health-boot rollback case then exercises that acquired
-candidate. This covers signed acquisition through installation and rollback;
+Each existing failed-health-boot rollback case then exercises an acquired
+candidate. The headless profile exercises this without the desktop oracle's
+Firefox readiness/input dependency. This covers signed acquisition through installation and rollback;
 it does not exercise the SSH administration service or HTTP inside the VM.
 The network tests separately cover loopback HTTP and interrupted transfers.
