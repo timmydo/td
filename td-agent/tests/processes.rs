@@ -1014,9 +1014,10 @@ fn a_far_window_attaches_and_a_second_takes_over_and_the_broker_ends_with_the_la
             mode: Mode::Auto,
         },
     );
+    // From afar too, by the person's window as any is.
     told_until(
         &first,
-        |view| matches!(view, View::Note(said) if said.contains("on this machine")),
+        |view| matches!(view, View::Note(said) if said.contains("now in auto mode")),
     );
 
     let (mut second_child, second) = attach(&scratch);

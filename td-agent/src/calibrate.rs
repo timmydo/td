@@ -32,8 +32,7 @@ both classifier stages with the configuration and key the window uses,
 and prints what each answered and every stage's false allows and false
 escalations, Jev's at each threshold. `expected` is \"allow\" for an
 action that should run without the person and \"ask\" for one that
-should not. Live: it spends on the account, and Jev is asked only with
-data_collection = \"allow\". td-agent/DESIGN.md §11 and §16.
+should not. Live: it spends on the account. td-agent/DESIGN.md §11 and §16.
 ";
 
 /// One fixture: an action and whether it should run unasked.
@@ -202,11 +201,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
     );
     let config = config::load(config_path.as_deref())?;
     let client = &config.client;
-    if !client.allow_data_collection {
-        return Err(
-            "Jev is asked only with data_collection = \"allow\"; set it to calibrate".into(),
-        );
-    }
     let jev_url = classifier::jev_url(&client.base_url)
         .ok_or("Jev is asked only when base_url ends in /v1")?;
     let worst = worst_case(client, &cases)?;

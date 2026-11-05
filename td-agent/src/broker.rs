@@ -2571,8 +2571,6 @@ impl Session {
 /// The window attached, if any.
 struct Attached {
     peer: Peer,
-    /// By way of `td-agent attach`, so from the far end of ssh perhaps.
-    far: bool,
     /// Which window, for a far one.
     token: Option<String>,
 }
@@ -2703,18 +2701,6 @@ fn private_root(state: &StateDir) -> Result<(), String> {
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).map_err(named)?;
     }
     Ok(())
-}
-
-/// What the far end of ssh may not ask: nothing there is the person at this
-/// machine's keyboard. Said in the window asked.
-fn refused_from_far(request: &Request) -> Option<&'static str> {
-    match request {
-        Request::SetMode {
-            mode: crate::config::Mode::Auto,
-            ..
-        } => Some("auto mode can be turned on only at a window on this machine"),
-        _ => None,
-    }
 }
 
 /// Whether `request` is of whichever conversation is open, naming none. Such a
@@ -2856,7 +2842,7 @@ impl Session {
             goodbye_aside(old.peer, "another window has taken over");
         }
         self.view.remember_told(far);
-        *window = Some(Attached { peer, far, token });
+        *window = Some(Attached { peer, token });
         self.attached();
     }
 
@@ -2870,7 +2856,7 @@ impl Session {
             match attached.peer.recv() {
                 Ok(Some(bytes)) => match crate::window_wire::decode_asked(&bytes) {
                     Ok((showing, request)) => {
-                        self.asked_by_window(showing, request, attached.far);
+                        self.asked_by_window(showing, request);
                     }
                     Err(why) => break Some(format!("it said something unreadable: {why}")),
                 },
@@ -2886,10 +2872,7 @@ impl Session {
     }
 
     /// One request of a window showing `of`.
-    fn asked_by_window(&mut self, showing: Showing, request: Request, far: bool) {
-        if let Some(why) = refused_from_far(&request).filter(|_| far) {
-            return self.view.note(why);
-        }
+    fn asked_by_window(&mut self, showing: Showing, request: Request) {
         let moved = match &showing {
             Showing::Nothing => self.view.active().is_some(),
             Showing::Conversation(of) => self.view.active() != Some(of),

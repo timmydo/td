@@ -6930,9 +6930,10 @@ fn three_crossings_the_classifier_does_not_allow_trip_its_breaker() {
     );
 }
 
-/// With Jev unavailable, `data_collection` being `deny`: a crossing is
-/// the person's while Jev is required, and the reasoning stage's alone
-/// when not; nothing is asked of Jev either way.
+/// With Jev unavailable, its price falling on its output, which its
+/// reservation does not cover, or `base_url` having no `/v1` for its endpoint:
+/// a crossing is the person's while Jev is required, and the reasoning stage's
+/// alone when not; nothing is asked of Jev either way.
 #[test]
 fn without_jev_the_classifier_allows_only_when_jev_is_not_required() {
     let mut h = Harness::new_in(
@@ -6964,6 +6965,14 @@ fn without_jev_the_classifier_allows_only_when_jev_is_not_required() {
         )
         .unwrap(),
     );
+    let list = String::from_utf8(fixture("models.json")).unwrap().replace(
+        r#""pricing":{"prompt":"0.000000042","completion":"0"}"#,
+        r#""pricing":{"prompt":"0.000000042","completion":"0.000001"}"#,
+    );
+    Models::from_provider(list.as_bytes())
+        .unwrap()
+        .save(h.state.root())
+        .unwrap();
     h.setup(Client::default());
     h.down(&Down::Policy {
         version: 1,
@@ -6972,9 +6981,11 @@ fn without_jev_the_classifier_allows_only_when_jev_is_not_required() {
     });
     h.say("What did the other conversation say?");
     let (call, _, details) = h.until_ask();
-    assert_eq!(
-        details[0],
-        "Asked because the classifier did not allow it: Jev is unavailable, and `jev_required`: `data_collection = \"deny\"` leaves it no provider."
+    assert!(
+        details[0].starts_with(
+            "Asked because the classifier did not allow it: Jev is unavailable, and `jev_required`: "
+        ) && details[0].contains("output"),
+        "{details:?}"
     );
     h.down(&Down::Decision {
         call,
@@ -7007,31 +7018,15 @@ fn without_jev_the_classifier_allows_only_when_jev_is_not_required() {
         (decided.1.as_str(), decided.2.as_str()),
         ("allow", "classifier")
     );
-    assert!(decided
-        .3
-        .unwrap()
-        .starts_with("Jev is unavailable: `data_collection = \"deny\"` leaves it no provider; the reasoning stage answers allow: "));
-    // A Jev whose price falls on its output, which its reservation does
-    // not cover, is not asked either.
-    let list = String::from_utf8(fixture("models.json")).unwrap().replace(
-        r#""pricing":{"prompt":"0.000000042","completion":"0"}"#,
-        r#""pricing":{"prompt":"0.000000042","completion":"0.000001"}"#,
-    );
-    Models::from_provider(list.as_bytes())
-        .unwrap()
-        .save(h.state.root())
-        .unwrap();
+    assert!(decided.3.unwrap().starts_with("Jev is unavailable: "));
+    // Nor a Jev with no endpoint beside the configured root.
     h.setup(Client {
-        allow_data_collection: true,
-        jev_threshold: 900,
+        base_url: "https://openrouter.ai/api".into(),
         ..Client::default()
     });
     h.say("Once more.");
     let (call, _, details) = h.until_ask();
-    assert_eq!(
-        details[0],
-        "Asked because the classifier did not allow it: Jev is unavailable, and `jev_required`: Jev's listing prices its output, which td-agent reserves nothing for."
-    );
+    assert!(details[0].contains("does not end in `/v1`"), "{details:?}");
     h.down(&Down::Decision {
         call,
         allow: false,
@@ -7486,8 +7481,7 @@ fn an_interrupt_between_calls_answers_the_rest_as_not_run() {
 /// with the configuration and key the window uses, each case is put to
 /// both stages, the cost bounded from the models list first, and each
 /// stage's false allows and escalations are counted, Jev's at each
-/// threshold. It asks nothing without `data_collection = "allow"` or a
-/// `/v1` root, and, as a crossing does, of a reasoning model that takes
+/// threshold. It asks nothing without a `/v1` root, and, as a crossing does, of a reasoning model that takes
 /// no `max_tokens`, an unpriced model under a limit, or a worst case past
 /// `max_cost_per_turn`; a refused key stops it after the first request.
 #[test]
@@ -7567,36 +7561,34 @@ fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
             String::from_utf8(output.stderr).unwrap(),
         )
     };
-    let allow = "data_collection = \"allow\"\n";
     for (settings, why) in [
-        (String::new(), "data_collection"),
         (
-            format!("{allow}base_url = \"https://example.org/api\"\n"),
+            "base_url = \"https://example.org/api\"\n".to_string(),
             "base_url ends in /v1",
         ),
         (
-            format!("{allow}classifier_model = \"example/no-max-tokens\"\n"),
+            "classifier_model = \"example/no-max-tokens\"\n".to_string(),
             "takes no max_tokens",
         ),
         (
-            format!("{allow}classifier_fast_model = \"example/unlisted\"\n"),
+            "classifier_fast_model = \"example/unlisted\"\n".to_string(),
             "example/unlisted is not in the provider's models list",
         ),
         // Any limit, not the turn's alone, wants a price, and a list.
         (
-            format!("{allow}max_cost_per_turn = \"none\"\n"),
+            "max_cost_per_turn = \"none\"\n".to_string(),
             "typesafe/jev-1.13 has no price",
         ),
         (
-            format!("{allow}max_cost_per_turn = \"none\"\n"),
+            "max_cost_per_turn = \"none\"\n".to_string(),
             "Jev's listing prices its output",
         ),
         (
-            format!("{allow}max_cost_per_turn = \"none\"\n"),
+            "max_cost_per_turn = \"none\"\n".to_string(),
             "the models list: status 502",
         ),
         (
-            format!("{allow}max_cost_per_turn = 0.0001\n"),
+            "max_cost_per_turn = 0.0001\n".to_string(),
             "is past max_cost_per_turn",
         ),
     ] {
@@ -7614,7 +7606,7 @@ fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
         .ancestors()
         .any(|dir| std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o022 != 0));
     if shared {
-        let (ok, _, stderr) = run(allow);
+        let (ok, _, stderr) = run("");
         assert!(
             !ok && stderr.contains("the API key file is refused"),
             "{stderr}"
@@ -7624,7 +7616,7 @@ fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
         let _ = std::fs::remove_dir_all(&home);
         return;
     }
-    let (ok, stdout, stderr) = run(allow);
+    let (ok, stdout, stderr) = run("");
     assert!(ok, "{stderr}");
     assert!(
         stdout.starts_with("asked: expected allow; reasoning allow; Jev request matches"),
@@ -7655,7 +7647,7 @@ fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
         "the lists, Jev's endpoints and four requests"
     );
     // A refused key stops the run: Jev is not asked, no case after it.
-    let (ok, stdout, stderr) = run(allow);
+    let (ok, stdout, stderr) = run("");
     assert!(!ok);
     assert!(stderr.contains("stopped after 1 of 2 cases"), "{stderr}");
     assert!(
@@ -10458,6 +10450,12 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
             Reply::sse("stream-sonnet.sse"),
         ],
     );
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![Reply::ok("classifier-prose.json")],
+    );
+    h.mock
+        .route("typesafe/jev", vec![Reply::ok("jev-exceeds.json")]);
     h.setup(Client::default());
     // An allow is for one workspace: this one.
     let rules = |more: &str| format!("[directory {}]\nallow shell echo\n{more}", work.display());
@@ -10472,7 +10470,7 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
         .any(|(_, result, error)| !*error && result.contains("inside text")));
 
     // A command: the allow rule aside, the classifier's in `auto` mode,
-    // which with no Jev to ask gives it to the person.
+    // which not allowing it gives it to the person.
     h.say("Run it.");
     let (call, _, details) = h.until_ask();
     assert!(
@@ -10589,10 +10587,10 @@ fn unconfined_commands_in_auto_mode_are_the_classifiers() {
             Reply::ok("classifier-prose.json"),
         ],
     );
-    h.setup(Client {
-        jev_required: false,
-        ..Client::default()
-    });
+    h.mock
+        .route("typesafe/jev", vec![Reply::ok("jev-matches.json"); 2]);
+    // With `data_collection` at its default of `deny`, as auto mode needs no more.
+    h.setup(Client::default());
     h.down(&auto_with(&format!(
         "[directory {}]\nallow shell touch\n",
         work.display()
@@ -10647,6 +10645,18 @@ fn unconfined_commands_in_auto_mode_are_the_classifiers() {
             && !details.iter().any(|line| line.contains("jail of its own")),
         "{details:?}"
     );
+    // Jev had all the person asked in this conversation, and is told nothing of
+    // providers, unlike the conversation's own requests.
+    let requests = h.mock.requests();
+    let jev = requests
+        .iter()
+        .rfind(|r| r.text().contains("typesafe/jev"))
+        .unwrap();
+    let body = flat(&jev.text());
+    assert_eq!(body["state.human.0"], "Run it.");
+    assert_eq!(body["state.human.1"], "Again.");
+    assert_eq!(body["state.action.kind"], "command");
+    assert!(!body.keys().any(|k| k.starts_with("provider")), "{body:?}");
     h.down(&Down::Decision {
         call,
         allow: false,

@@ -7493,27 +7493,25 @@ impl Session {
             return Ok(refused("no turn is under way".into()));
         };
         // Jev, when it can be asked: its endpoint and price.
-        let jev = if !client.allow_data_collection {
-            Err("`data_collection = \"deny\"` leaves it no provider".to_string())
-        } else {
-            match classifier::jev_url(&client.base_url) {
-                None => Err(
-                    "`base_url` does not end in `/v1`, beside which Jev's endpoint is".to_string(),
-                ),
-                Some(url) => self
-                    .model(
-                        "`classifier_fast_model`",
-                        &client.classifier_fast_model,
-                        &client,
-                    )
-                    .and_then(|model| {
-                        let pricing = model.and_then(|m| m.pricing);
-                        match classifier::jev_unbounded(pricing) {
-                            Some(why) => Err(why),
-                            None => Ok((url, pricing)),
-                        }
-                    }),
+        // Auto mode asks it whatever `data_collection` says of a conversation's
+        // own requests (DESIGN.md §11).
+        let jev = match classifier::jev_url(&client.base_url) {
+            None => {
+                Err("`base_url` does not end in `/v1`, beside which Jev's endpoint is".to_string())
             }
+            Some(url) => self
+                .model(
+                    "`classifier_fast_model`",
+                    &client.classifier_fast_model,
+                    &client,
+                )
+                .and_then(|model| {
+                    let pricing = model.and_then(|m| m.pricing);
+                    match classifier::jev_unbounded(pricing) {
+                        Some(why) => Err(why),
+                        None => Ok((url, pricing)),
+                    }
+                }),
         };
         if let (Err(why), true) = (&jev, client.jev_required) {
             return Ok(refused(format!(

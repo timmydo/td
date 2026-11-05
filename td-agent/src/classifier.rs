@@ -707,8 +707,7 @@ pub fn reasoning_verdict(content: &str) -> Result<(Verdict, String), String> {
 /// What Jev came to.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Fast {
-    /// Not asked, and why: no provider, no endpoint, or no price, or a
-    /// price on its output.
+    /// Not asked, and why: no endpoint, or no price, or a price on its output.
     Unavailable(String),
     /// Asked, and no answer could be read.
     Failed(String),

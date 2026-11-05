@@ -759,9 +759,7 @@ with the keepalives and no forwarding that link has; `--remote-program PATH` fin
 it off a non-login `PATH`. Everything that is the broker's is HOST's: conversations,
 workspaces and their folders, the configuration and key, what File's menu stores
 or exports, git's prompts, which go to HOST's display if any, and `/schedule`'s
-times, which are HOST's zone. Turning auto mode on is not to be had from afar, though "Allow all" for one
-conversation is (§11),
-though a default of auto in HOST's configuration stands. What is this window's
+times, which are HOST's zone. What is this window's
 stays here: the composer, the clipboard, a link opened, the transcript's times shown
 in this machine's zone. The two hellos meet end to end through `attach`, so another
 version of td-agent is refused at the start with both versions named. A launch of
@@ -2188,7 +2186,7 @@ OpenAI's or Google's), and no `tool_choice`, which some do not
 are sent, but in a turn's last request at a limit, which says `none` to
 a model the models list says takes it ("Spending limits", below). A model that runs calls in parallel does so unasked.
 `provider.data_collection` is configuration (§15); the shipped default
-is `deny`.
+is `deny`. Jev's request carries no `provider` (§11).
 
 **Responses.** `finish_reason` is one of `tool_calls`, `stop`, `length`,
 `content_filter` or `error`. Each `tool_calls[i].function.arguments` is a
@@ -5093,8 +5091,8 @@ forced push or one a scan matched, `request_directory`, a network policy,
 works inside that conversation, so it is that sub-agent's too. With the rules
 unread there is none. Only the window's own keyboard or pointer gives it,
 as Auto mode's item does: a card answered through the control socket answers
-that call. From a far window it is given, unlike Auto mode, as that window
-may answer each call anyway. In an unconfined workspace this is a decision
+that call. A far window gives it as it gives Auto mode, as that window may answer
+each call anyway. In an unconfined workspace this is a decision
 that the model, and whatever text it reads, acts as the person with no one
 asked.
 
@@ -5332,8 +5330,10 @@ is the human's, as the stages would judge a part of it. The human's
 messages are kept newest first within 32 KiB, each at most 8 KiB, and
 the last 64 calls are named. Project instructions are in it, as
 `project`, only for a workspace the human marked trusted
-("The trust mark", below). Jev is asked only when
-`data_collection` is `allow` and `base_url` ends
+("The trust mark", below). Auto mode asks Jev whatever `data_collection` says,
+which is for a conversation's own requests: Jev is in beta from a single provider
+that `deny` would leave out, so auto mode, the default, sends it the state, the
+person's messages among them, and `ask` mode does not. It is asked only when `base_url` ends
 in `/v1`, and the models list, or for Jev, which it leaves out, Jev's
 endpoints listing, prices `classifier_fast_model` while a cost limit is
 set, and prices nothing of its output, which its reservation does not
@@ -5424,8 +5424,8 @@ test holds each of its states to the shape the conversation's state has
 at every level, its `detail` to what td-agent says of the crossing
 (`classifier::described`, which the conversation uses too), and its
 calls to end with the pending call, as a live state's do. With the
-configuration and key the window uses, and only with `data_collection =
-"allow"` and a `/v1` root, so that Jev can be asked, it refuses as a
+configuration and key the window uses, and only with a `/v1` root, so
+that Jev can be asked, it refuses as a
 crossing does a stage's model the models list leaves out, a reasoning
 model that takes no `max_tokens` and, while any cost limit is set, a
 model the list prices not or a list it could not fetch, and bounds the
@@ -5571,8 +5571,7 @@ reply, an error, or a timeout, sends the action to the human, with the
 reasoning stage's reason when it gave one and Jev's probabilities. Jev is
 in beta from a single provider and gives no reason; requiring both lets
 it add its calibrated second opinion without ever being the only allower.
-If Jev is unavailable, including because `data_collection = "deny"` leaves
-it no provider, its rows go to the human; `jev_required = false` lets the
+If Jev is unavailable its rows go to the human; `jev_required = false` lets the
 reasoning stage decide alone, and the status row says so. `jev_threshold`
 is shipped as calibrated on the fixture set of §17, and the commit that
 changes it records the counts.
@@ -7231,7 +7230,8 @@ default; `jev_threshold`'s is calibrated (§11):
 - `routing`: one of `balanced`, `cheapest`, `floor`, `fastest`, `nitro`
   and `latency` (§5, Routing); default `balanced`
 - `mode`: `auto` or `ask`; default `auto`
-- `data_collection`: `deny` or `allow`; default `deny`
+- `data_collection`: `deny` or `allow`; default `deny`; of a conversation's
+  own requests, not Jev's (§11)
 - `max_cost_per_turn`, `max_cost_per_conversation` and `max_cost_per_day`,
   in credits (§5); defaults 5, 10 and 25, and `none` disables any
 - `workspace_root`; default `~/td-agent`
