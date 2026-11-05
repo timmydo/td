@@ -831,12 +831,13 @@ the escape hatch") runs on unenrolled images, and root is refused in
 both forms.
 
 The enforced form omits `.ssh/authorized_keys` and adds the line
-`AllowUsers NAME` right after `PermitRootLogin no`, still in the global
-section before the primary's `Match User NAME` block, NAME being the
-admitted primary account; every other byte is the same. The shared
-account validation admits only a lowercase letter
+`AllowUsers NAME td-admin` (`AllowUsers NAME` alone on a provisioned
+server, which has no `td-admin`) right after `PermitRootLogin no`, still
+in the global section before the primary's `Match User NAME` block, NAME
+being the admitted primary account; every other byte is the same. The
+shared account validation admits only a lowercase letter
 followed by lowercase letters, digits, `_` and `-`, so NAME carries none
-of OpenSSH's pattern characters and `AllowUsers` names that one account.
+of OpenSSH's pattern characters and `AllowUsers` names only those accounts.
 Firstboot reads the accounts first, whose failure still stops boot, then
 the state under the same root it renders under, for UID 1000's record
 with root:root as the owner. The predicate answers every failure to read
