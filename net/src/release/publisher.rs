@@ -1,6 +1,5 @@
 use super::*;
 use format::{Object, Payload, DAY, FILES, RECORD_LIMIT};
-use ring::signature::KeyPair;
 use std::collections::BTreeSet;
 use std::io::BufReader;
 use td_engine::image_chunks::{Chunker, MAX};
@@ -14,12 +13,12 @@ pub(super) fn root(
     output: &Path,
 ) -> Result<()> {
     let private = read(private, SMALL)?;
-    let key = ring::signature::Ed25519KeyPair::from_pkcs8(&private).map_err(|e| e.to_string())?;
+    let root_public = sig::public_key(&private)?;
     let public = text(release_public, SMALL)?;
     let public = format::hex(public.trim_end_matches('\n'), 32)?;
     let body = format!(
         "td-release-root-v1\n{version}\n{expires}\n{}\n{}\n",
-        sig::to_hex(key.public_key().as_ref()),
+        sig::to_hex(&root_public),
         sig::to_hex(&public)
     );
     let old = format::signed(&body, &read(previous_private, SMALL)?)?;

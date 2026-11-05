@@ -96,6 +96,11 @@ fn from_pkcs8(pkcs8: &[u8]) -> Result<SigningKey, String> {
     Ok(key)
 }
 
+/// A key file's public half, refused on the same damage `sign_msg` refuses.
+pub(crate) fn public_key(pkcs8: &[u8]) -> Result<[u8; PUBLIC_LEN], String> {
+    Ok(from_pkcs8(pkcs8)?.public_key())
+}
+
 /// A fresh keypair: pkcs8 private half, raw 32-byte public half.
 ///
 /// Fallible rather than panicking: both steps are reachable from a `keygen`
@@ -226,6 +231,16 @@ mod tests {
         assert!(sign_msg(&long, b"m").is_err(), "trailing");
         assert!(!verify_msg(&[0; 31], b"m", &[0; 64]), "short public key");
         assert!(!verify_msg(&[0; 32], b"m", &[0; 63]), "short signature");
+    }
+
+    #[test]
+    fn a_key_files_public_half_is_the_one_keygen_gave_and_damage_refuses_it() {
+        let (pkcs8, pubkey) = keygen().unwrap();
+        assert_eq!(public_key(&pkcs8).unwrap().as_slice(), pubkey.as_slice());
+        let mut seed_damaged = pkcs8.clone();
+        seed_damaged[16] ^= 1;
+        assert!(public_key(&seed_damaged).is_err(), "seed damaged");
+        assert!(public_key(&pkcs8[..pkcs8.len() - 1]).is_err(), "short");
     }
 
     #[test]
