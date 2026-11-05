@@ -297,6 +297,8 @@ fn unasked(events: &[Event], to: &str) -> usize {
 
 /// Why an unconfined workspace's call is the person's (DESIGN.md §8,
 /// Unconfined workspaces), as its card says.
+/// Why a call runs with no card once the person allowed all in its conversation.
+const ALL_ALLOWED: &str = "you allowed all calls in this conversation";
 const UNCONFINED_WHY: &str = "this workspace is unconfined, and no allow rule releases a command, or a file tool reaching outside the workspace or into a repository's .git";
 
 /// What an unconfined workspace's call's card says first (DESIGN.md §8).
@@ -343,6 +345,7 @@ enum Judged<'a> {
     /// `destination`, judged as a command's would be (DESIGN.md §10).
     Network {
         destination: &'a crate::config::Destination,
+        repeated: bool,
     },
     /// A call of MCP server `server`'s tool `tool` (DESIGN.md §12,
     /// Approval).
@@ -1798,6 +1801,15 @@ impl Session {
         {
             self.braked = false;
         }
+    }
+
+    /// Whether the person allowed all calls in this conversation; with their
+    /// rules unread, not.
+    fn all_allowed(&self) -> bool {
+        self.human
+            .1
+            .as_ref()
+            .is_ok_and(|policy| policy.all_allowed(self.conversation.meta().id.as_str()))
     }
 
     /// This conversation's workspace's mode: the human's rules', else the
@@ -5553,6 +5565,7 @@ impl Session {
                     crate::rules::Verdict::Ask(why) => Ruling::Card(Some(tools::visible(&why))),
                     _ if repeated => Ruling::Card(None),
                     crate::rules::Verdict::Allow(why) => Ruling::Run(Some(tools::visible(&why))),
+                    _ if self.all_allowed() => Ruling::Run(Some(ALL_ALLOWED.into())),
                     _ if self.workspace_mode() == crate::config::Mode::Auto => Ruling::Auto,
                     _ => Ruling::Card(None),
                 };
@@ -5570,6 +5583,7 @@ impl Session {
                     crate::rules::Verdict::Ask(why) => Ruling::Card(Some(tools::visible(&why))),
                     _ if theirs.is_some() => Ruling::Card(theirs.map(str::to_string)),
                     crate::rules::Verdict::Allow(why) => Ruling::Run(Some(tools::visible(&why))),
+                    _ if self.all_allowed() => Ruling::Run(Some(ALL_ALLOWED.into())),
                     _ if self.workspace_mode() == crate::config::Mode::Auto => Ruling::Auto,
                     _ => Ruling::Card(None),
                 };
@@ -5577,7 +5591,10 @@ impl Session {
             // By the workspace's network policy and the network rules, as
             // a command's connection is: the allowlist alone asking, in
             // `auto` mode, is the classifier's.
-            Judged::Network { destination } => {
+            Judged::Network {
+                destination,
+                repeated,
+            } => {
                 return match self.bench.judge(destination) {
                     crate::egress::Judgment::Open => Ruling::Run(Some(format!(
                         "the workspace's network policy and rules open {}",
@@ -5585,10 +5602,18 @@ impl Session {
                     ))),
                     crate::egress::Judgment::Refuse(why) => Ruling::Deny(tools::visible(&why)),
                     crate::egress::Judgment::Ask { allow: true, .. }
+                        if !repeated && self.all_allowed() =>
+                    {
+                        Ruling::Run(Some(ALL_ALLOWED.into()))
+                    }
+                    crate::egress::Judgment::Ask { allow: true, .. }
                         if self.workspace_mode() == crate::config::Mode::Auto =>
                     {
                         Ruling::Auto
                     }
+                    crate::egress::Judgment::Ask { why, .. } if repeated => Ruling::Card(Some(
+                        format!("{}; and {REPEATED_WHY}", tools::visible(&why)),
+                    )),
                     crate::egress::Judgment::Ask { why, .. } => {
                         Ruling::Card(Some(tools::visible(&why)))
                     }
@@ -5630,6 +5655,11 @@ impl Session {
                 tools::visible(&why)
             ))),
             crate::rules::Verdict::Ask(why) => Ruling::Card(Some(tools::visible(&why))),
+            // The person's own word for this conversation, as far as a repeated
+            // call, which `approve` and the arms below give them.
+            _ if !repeated && self.all_allowed() => {
+                Ruling::Run(acts.then(|| ALL_ALLOWED.to_string()))
+            }
             // Outside any jail no allow releases it; `auto`'s column is the
             // classifier's, `ask`'s the person's (§8, §11).
             // A repeated one `approve` gives the person (§11, Repetition).
@@ -6350,6 +6380,7 @@ impl Session {
                 }
                 let judged = Judged::Network {
                     destination: &url.destination,
+                    repeated,
                 };
                 if let Ruling::Deny(why) = self.ruling(&judged) {
                     self.log(Kind::Approval {
@@ -6366,6 +6397,7 @@ impl Session {
                 let destination = url.destination.clone();
                 let judged = Judged::Network {
                     destination: &destination,
+                    repeated,
                 };
                 let pending =
                     |me: &Self, client: &Client| me.fetch_pending(&destination, &text, client);

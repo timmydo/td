@@ -48,6 +48,7 @@ pub enum View {
     SetOffers(Vec<crate::picker::Offer>, String),
     SetNetworks(Box<Client>),
     SetModes(Option<Vec<(String, Mode)>>),
+    SetAllAllowed(Vec<String>),
     SetModels(String, Vec<(String, u64)>),
     SetCredit(Option<String>),
     SetClosing(Id, Option<&'static str>),
@@ -301,6 +302,7 @@ impl Port {
             | View::SetOffers(..)
             | View::SetNetworks(_)
             | View::SetModes(_)
+            | View::SetAllAllowed(_)
             | View::SetModels(..)
             | View::SetCredit(_)
             | View::SetKeyPath(_)
@@ -599,6 +601,10 @@ impl Port {
         self.say(View::SetModes(modes));
     }
 
+    pub fn set_all_allowed(&mut self, all_allowed: Vec<String>) {
+        self.say(View::SetAllAllowed(all_allowed));
+    }
+
     pub fn set_models(&mut self, default: &str, contexts: Vec<(String, u64)>) {
         self.say(View::SetModels(default.into(), contexts));
     }
@@ -800,6 +806,7 @@ impl App {
             View::SetOffers(offers, effort) => self.set_offers(offers, &effort),
             View::SetNetworks(client) => self.set_networks(&client),
             View::SetModes(modes) => self.set_modes(modes),
+            View::SetAllAllowed(all_allowed) => self.set_all_allowed(all_allowed),
             View::SetModels(default, contexts) => self.set_models(&default, contexts),
             View::SetCredit(credit) => self.set_credit(credit),
             View::SetClosing(id, doing) => self.set_closing(&id, doing),

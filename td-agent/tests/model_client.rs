@@ -10221,6 +10221,183 @@ fn host_execution_requires_a_human_even_in_auto_and_can_be_refused() {
     );
 }
 
+/// The person allowing all in a conversation (DESIGN.md §11, "Allow all"): a
+/// card waiting is released and a later command outside any jail runs with no
+/// card, its approval saying why; another conversation's word does nothing,
+/// and deny and ask rules still hold.
+#[test]
+fn allowing_all_in_a_conversation_ends_its_cards_and_nothing_else() {
+    let owned = td_fs::TempDir::new("allow-all").unwrap();
+    let base = std::fs::canonicalize(owned.path()).unwrap();
+    let work = base.join("work");
+    std::fs::create_dir(&work).unwrap();
+    let shell = |command: String| {
+        access_reply(
+            "shell",
+            td_json::Json::Obj(vec![("command".into(), command.into())]),
+        )
+    };
+    let first = base.join("first");
+    let second = base.join("second");
+    let denied = base.join("denied");
+    let asked = base.join("asked");
+    let workspace = work.display().to_string();
+    let mut h = Harness::new_in_as(
+        "allow-all",
+        Role::Conversation,
+        Some(&workspace),
+        false,
+        true,
+        vec![
+            shell(format!("touch '{}'", first.display())),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            shell(format!("echo x > '{}'", second.display())),
+            Reply::sse("stream-sonnet.sse"),
+            shell(format!("rm -f '{}'", denied.display())),
+            Reply::sse("stream-sonnet.sse"),
+            shell(format!("mkdir '{}'", asked.display())),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    let policy = |version: u64, rules: String| Down::Policy {
+        version,
+        mode: td_agent::config::Mode::Ask,
+        rules: Ok(rules),
+    };
+    let stranger = Id::random().unwrap();
+    let here = h.id.as_str().to_string();
+    let stranger = stranger.as_str().to_string();
+    let rules = "[everywhere]\ndeny shell rm\nask shell mkdir\n";
+    // Another conversation's word asks all the same.
+    h.down(&policy(
+        1,
+        format!("{rules}[conversations]\nallow all {stranger}\n"),
+    ));
+    h.say("Run it.");
+    let _ = h.until_ask();
+    assert!(!first.exists());
+    // Its own, sent as the broker sends it, takes back the card waiting.
+    h.down(&policy(
+        2,
+        format!("{rules}[conversations]\nallow all {here}\n"),
+    ));
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(first.exists(), "{}", h.said());
+    // Later ones ask nothing, and say why.
+    h.say("Again.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(second.exists(), "{}", h.said());
+    assert!(
+        approvals(&events).iter().any(|(_, _, by, why)| by == "rule"
+            && why.as_deref() == Some("you allowed all calls in this conversation")),
+        "{:?}",
+        approvals(&events)
+    );
+    // A deny rule still wins.
+    std::fs::write(&denied, "kept").unwrap();
+    h.say("Remove it.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(denied.exists(), "{}", h.said());
+    // An ask rule still asks.
+    h.say("Make it.");
+    let (call, _, _) = h.until_ask();
+    assert!(!asked.exists());
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(!asked.exists(), "{}", h.said());
+}
+
+/// Allow all stops at a repeated call, a command's or a fetch's, whose card says
+/// why (DESIGN.md §11).
+#[test]
+fn allowing_all_leaves_a_repeated_call_to_the_person() {
+    let owned = td_fs::TempDir::new("allow-all-repeated").unwrap();
+    let base = std::fs::canonicalize(owned.path()).unwrap();
+    let work = base.join("work");
+    std::fs::create_dir(&work).unwrap();
+    let workspace = work.display().to_string();
+    let same = access_reply(
+        "shell",
+        td_json::Json::Obj(vec![("command".into(), "echo same".into())]),
+    );
+    let page = || Reply::Http {
+        status: 200,
+        headers: vec![("content-type".into(), "text/plain".into())],
+        body: b"the page".to_vec(),
+    };
+    let fetch = || Reply::sse("stream-tool-web-fetch.sse");
+    for (mut h, runs) in [
+        (
+            Harness::new_in_as(
+                "allow-all-repeated-shell",
+                Role::Conversation,
+                Some(&workspace),
+                false,
+                true,
+                vec![
+                    same.clone(),
+                    same.clone(),
+                    same.clone(),
+                    Reply::sse("stream-sonnet.sse"),
+                    Reply::ok("title.json"),
+                ],
+            ),
+            "shell",
+        ),
+        (
+            Harness::new_in(
+                "allow-all-repeated-fetch",
+                Role::Conversation,
+                Some("scratch"),
+                false,
+                vec![
+                    fetch(),
+                    page(),
+                    fetch(),
+                    page(),
+                    fetch(),
+                    Reply::sse("stream-sonnet.sse"),
+                    Reply::ok("title.json"),
+                ],
+            ),
+            "fetch",
+        ),
+    ] {
+        h.setup(Client::default());
+        let here = h.id.as_str().to_string();
+        h.down(&Down::Policy {
+            version: 1,
+            mode: td_agent::config::Mode::Ask,
+            rules: Ok(format!("[conversations]\nallow all {here}\n")),
+        });
+        h.say("Do it.");
+        let (call, _, details) = h.until_ask();
+        assert!(details[0].contains("same call"), "{runs}: {details:?}");
+        // Two fetches went out before the third's card.
+        if runs == "fetch" {
+            assert!(details[0].contains("allowlist"), "{details:?}");
+            assert_eq!(gets(&h).len(), 2, "{}", h.said());
+        }
+        h.down(&Down::Decision {
+            call,
+            allow: false,
+            always: None,
+        });
+        let (_, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied", "{runs}: {}", h.said());
+    }
+}
+
 /// An unconfined workspace's tools run outside any jail (DESIGN.md §8,
 /// Unconfined workspaces): a file tool that keeps to the workspace runs
 /// in `auto` mode with no card; a command, or a file tool reaching

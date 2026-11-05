@@ -22,6 +22,8 @@ pub enum Act {
     AlwaysDenyHere,
     AlwaysDenyEverywhere,
     AlwaysAllowHere,
+    /// Allow this and every call the person may answer in this conversation.
+    AllowAll,
     /// A cold-resume card's other answer: send it whole.
     Resend,
 }
@@ -85,6 +87,7 @@ pub const ALLOW: &str = "Allow";
 pub const ALWAYS_DENY_HERE: &str = "Always deny here";
 pub const ALWAYS_DENY_EVERYWHERE: &str = "Always deny everywhere";
 pub const ALWAYS_ALLOW_HERE: &str = "Always allow here";
+pub const ALLOW_ALL: &str = "Allow all in this conversation";
 /// A crossing card's "always" answers.
 pub const ALWAYS_DENY: &str = "Always deny";
 pub const ALWAYS_ALLOW: &str = "Always allow";
@@ -109,6 +112,8 @@ pub struct Confirm {
     purpose: Purpose,
     dialog: Controller<Act, u64, ()>,
     revision: u64,
+    /// What the extra action's focus is called.
+    extra: &'static str,
 }
 
 /// What becomes of a deleted conversation's workspace: td-agent's
@@ -136,6 +141,16 @@ fn worked(workspace: Option<&Workspace>) -> String {
     }
 }
 
+/// Whether a card offering `always` offers to allow all in its conversation: one
+/// with no allow rule to offer, but for a connection's, which that does not answer.
+fn offers_allow_all(always: &crate::rules::Always) -> bool {
+    !always.allow
+        && !always
+            .bodies
+            .iter()
+            .any(|body| body.starts_with("network "))
+}
+
 /// What a card's "always" answers would add to the human's rules, as its
 /// last lines say, and why an allow for an interpreter or build tool is
 /// broad (DESIGN.md §11).
@@ -150,6 +165,14 @@ fn remembered(always: &crate::rules::Always) -> Vec<String> {
         );
     };
     let mut lines = Vec::new();
+    if offers_allow_all(always) {
+        lines.push(format!(
+            "{ALLOW_ALL} runs this and later calls here with no card until Conversation > {} is \
+             turned off, whatever they do; deny and ask rules, repeated calls, what only you may \
+             answer and other conversations still stop.",
+            crate::menu::ALLOW_ALL
+        ));
+    }
     if always.allow {
         lines.push(format!(
             "{ALWAYS_ALLOW_HERE} adds to your rules for this workspace, so a call they cover runs with no card:"
@@ -244,6 +267,7 @@ impl Confirm {
             purpose,
             dialog,
             revision,
+            extra: "always allow here",
         })
     }
 
@@ -277,6 +301,7 @@ impl Confirm {
             purpose,
             dialog,
             revision,
+            extra: "always allow here",
         })
     }
 
@@ -313,11 +338,17 @@ impl Confirm {
                     .with_alternate(ALWAYS_DENY_HERE, Act::AlwaysDenyHere)
                     .and_then(|m| m.with_further(ALWAYS_DENY_EVERYWHERE, Act::AlwaysDenyEverywhere))
                     .map_err(|e| format!("the card: {e}"))?;
-                if always.allow {
-                    model = model
+                model = if always.allow {
+                    model
                         .with_extra(ALWAYS_ALLOW_HERE, Act::AlwaysAllowHere)
-                        .map_err(|e| format!("the card: {e}"))?;
-                }
+                        .map_err(|e| format!("the card: {e}"))?
+                } else if offers_allow_all(always) {
+                    model
+                        .with_extra(ALLOW_ALL, Act::AllowAll)
+                        .map_err(|e| format!("the card: {e}"))?
+                } else {
+                    model
+                };
             }
             // A crossing's answers are for its pair and way: no
             // "everywhere".
@@ -328,6 +359,12 @@ impl Confirm {
                     .map_err(|e| format!("the card: {e}"))?;
             }
         }
+        let extra = match always {
+            Some(crate::rules::Offer::Rules(always)) if offers_allow_all(always) => {
+                "allow all in this conversation"
+            }
+            _ => "always allow here",
+        };
         let purpose = Purpose::Approve { conversation, call };
         let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
             .map_err(|e| format!("the card: {e}"))?;
@@ -335,6 +372,7 @@ impl Confirm {
             purpose,
             dialog,
             revision,
+            extra,
         })
     }
 
@@ -362,6 +400,7 @@ impl Confirm {
             purpose,
             dialog,
             revision,
+            extra: "always allow here",
         })
     }
 
@@ -402,6 +441,7 @@ impl Confirm {
             purpose,
             dialog,
             revision,
+            extra: "always allow here",
         })
     }
 
@@ -426,6 +466,7 @@ impl Confirm {
             purpose,
             dialog,
             revision,
+            extra: "always allow here",
         })
     }
 
@@ -445,7 +486,7 @@ impl Confirm {
                 _ => "always deny here",
             },
             confirmations::Focus::Further => "always deny everywhere",
-            confirmations::Focus::Extra => "always allow here",
+            confirmations::Focus::Extra => self.extra,
             confirmations::Focus::Confirm => match self.purpose {
                 Purpose::Delete(_) => "delete",
                 Purpose::Approve { .. } => "allow",
@@ -665,8 +706,18 @@ mod tests {
                 Reply::Confirmed(approve.clone(), act)
             );
         }
+        // A card with no rule to allow by offers the conversation instead.
         let mut confirm = card(false);
         for _ in 0..3 {
+            key(&mut confirm, "Tab");
+        }
+        assert_eq!(confirm.focus(), "allow all in this conversation");
+        assert_eq!(
+            key(&mut confirm, "Return"),
+            Reply::Confirmed(approve.clone(), Act::AllowAll)
+        );
+        let mut confirm = card(false);
+        for _ in 0..4 {
             key(&mut confirm, "Tab");
         }
         assert_eq!(confirm.focus(), "allow");
@@ -690,7 +741,34 @@ mod tests {
             allow: false,
             ..always
         });
-        assert_eq!(denies.len(), 3);
+        assert_eq!(denies.len(), 4);
+        // A connection's card, which allowing all does not answer, does not offer it.
+        let connection = crate::rules::Always {
+            allow: false,
+            bodies: vec!["network a.example".into()],
+        };
+        assert!(!offers_allow_all(&connection));
+        assert!(!remembered(&connection)
+            .iter()
+            .any(|line| line.contains(ALLOW_ALL)));
+        let surface = Surface::new(1024, 640, Scale::default()).unwrap();
+        let mut confirm = Confirm::approve(
+            surface,
+            surface.bounds(),
+            Id::parse(&"c".repeat(32)).unwrap(),
+            4,
+            "Let a command connect",
+            &["a.example".into()],
+            Some(&crate::rules::Offer::Rules(connection)),
+            3,
+        )
+        .unwrap();
+        for _ in 0..6 {
+            assert!(!confirm.focus().contains("allow all"));
+            assert!(!confirm.focus().contains("always allow"));
+            key(&mut confirm, "Tab");
+        }
+        assert!(denies.first().unwrap().starts_with(ALLOW_ALL), "{denies:?}");
         // The most a card offers, each rule its longest, still shows.
         let bodies: Vec<String> = (0..crate::rules::MAX_BODIES)
             .map(|n| format!("shell {n}{}", "x".repeat(crate::rules::MAX_LINE - 12)))

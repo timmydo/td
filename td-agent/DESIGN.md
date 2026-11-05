@@ -759,7 +759,8 @@ with the keepalives and no forwarding that link has; `--remote-program PATH` fin
 it off a non-login `PATH`. Everything that is the broker's is HOST's: conversations,
 workspaces and their folders, the configuration and key, what File's menu stores
 or exports, git's prompts, which go to HOST's display if any, and `/schedule`'s
-times, which are HOST's zone. Turning auto mode on is not to be had from afar,
+times, which are HOST's zone. Turning auto mode on is not to be had from afar, though "Allow all" for one
+conversation is (§11),
 though a default of auto in HOST's configuration stands. What is this window's
 stays here: the composer, the clipboard, a link opened, the transcript's times shown
 in this machine's zone. The two hellos meet end to end through `attach`, so another
@@ -4403,7 +4404,8 @@ state name a `sed` call's paths as an edit's path is named, and are its
 last 64. One with no command to judge, or
 whose paths, written or resolved, are past the 8 KiB a state's field is
 shown, goes to the human with nothing asked, as one whose payload is
-past 32 KiB does. A card offers no "always allow", and one already
+past 32 KiB does. A card offers no "always allow" rule, though it offers
+the person's "Allow all in this conversation" (§11), and one already
 waiting is not released to the classifier by a change to `auto`. The
 command's text goes to the classifier's models, as a crossing's
 content does, and its escalations count toward the breaker, three in a
@@ -5065,7 +5067,30 @@ may have an "always" answer (§3).
 
 **Order.** Deny rules first, and they always win. Then ask rules, the
 human's and the workspace's. Then the human-only rows, which no rule can
-lower. Then the human's allow rules. Then the table.
+lower. Then a repeated call, the person's. Then the human's allow rules
+and "Allow all". Then the table.
+
+**Allow all.** The person may let everything the table or a workspace
+being unconfined would ask of them run with no card in one conversation,
+whatever the mode and with no classifier, by `Allow all in this
+conversation` on a card that has rules to propose but no allow to offer, an
+unconfined workspace's among them and a connection's not, or Conversation > the
+same, for any other,
+which turns it off too. It is `allow all <conversation>` under `[conversations]` in the
+human's rules, so it lasts until turned off, a card waiting in that
+conversation is released when it comes, and it goes with the conversation.
+Its calls are logged `by` `rule` with that reason, and the status row says
+`all allowed`. Deny and ask rules, the human-only rows (a protected or
+forced push or one a scan matched, `request_directory`, a network policy,
+`host_shell`, and the like), a repeated call, a crossing and a connection's card
+(§10) still stop. It is one conversation's and no other's; a `task` sub-agent
+works inside that conversation, so it is that sub-agent's too. With the rules
+unread there is none. Only the window's own keyboard or pointer gives it,
+as Auto mode's item does: a card answered through the control socket answers
+that call. From a far window it is given, unlike Auto mode, as that window
+may answer each call anyway. In an unconfined workspace this is a decision
+that the model, and whatever text it reads, acts as the person with no one
+asked.
 
 **Rules.** A rule names a tool and, for `shell`, an argv prefix matched
 against every pipeline element and every `&&`, `||` and `;` segment of
@@ -5459,7 +5484,7 @@ arguments go to the human whatever the table says, as opencode's
 
 **Repetition.** The run is counted over the
 tools the tool host runs (`read_file`, `write_file`, `edit_file`,
-`apply_patch`, `glob`, `grep`, `sed` and `shell`), back through earlier
+`apply_patch`, `glob`, `grep`, `sed` and `shell`) and `web_fetch`, back through earlier
 replies. The
 human's message ends it; another conversation's message, a
 notification or a process's end does not, so a loop a peer drives

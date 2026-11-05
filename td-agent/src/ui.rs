@@ -180,6 +180,8 @@ pub enum Answer {
         op: crate::rules::Crossed,
         to: String,
     },
+    /// Allow this call and all the person may answer in its conversation.
+    AllowAll,
 }
 
 /// What the list says of a conversation that asks the human.
@@ -284,6 +286,8 @@ const DOUBLE_PRESS: Duration = Duration::from_millis(400);
 /// list puts after its conversations' titles (DESIGN.md §4, §8).
 pub const UNCONFINED_STATUS: &str = "unconfined: no jail";
 pub const UNCONFINED_MARK: &str = "[no jail]";
+/// What the status row says of a conversation whose calls are all allowed.
+pub const ALL_ALLOWED_STATUS: &str = "all allowed";
 
 /// Monochrome symbols keep the state small without needing emoji fonts.
 fn state_label(state: &str, title: &str) -> String {
@@ -501,6 +505,9 @@ pub enum Request {
     /// Put conversation `conversation`'s workspace in this mode, from
     /// Conversation → Auto mode in this workspace (DESIGN.md §11).
     SetMode { conversation: Id, mode: Mode },
+    /// Allow all calls in `conversation`, or stop, from Conversation > Allow
+    /// all in this conversation (DESIGN.md §11).
+    SetAllAllowed { conversation: Id, on: bool },
     /// Mark conversation `conversation`'s workspace as trusting the
     /// project instructions of `digest`, which its card showed, or as
     /// trusting none, from the card's chord (DESIGN.md §11).
@@ -825,6 +832,8 @@ pub struct App {
     /// Each workspace's mode as the human's rules set it, by its key;
     /// none while the rules cannot be read, every workspace then `ask`.
     modes: Option<Vec<(String, Mode)>>,
+    /// The conversations all calls are allowed in, by the human's rules.
+    all_allowed: Vec<String>,
     /// `jev_required = false`: the classifier may allow on its reasoning
     /// stage alone, which the status row says (DESIGN.md §11).
     without_jev: bool,
@@ -1093,6 +1102,7 @@ impl App {
             capture: None,
             mode,
             modes: Some(Vec::new()),
+            all_allowed: Vec::new(),
             without_jev: false,
             networks: crate::config::Client::default(),
             log: crate::notes::Log::default(),
@@ -1470,6 +1480,13 @@ impl App {
                 kind: StatusKind::Other,
             });
         }
+        if self.all_allowed() == Some(true) {
+            parts.push(StatusPart {
+                text: ALL_ALLOWED_STATUS.to_string(),
+                rank: 1,
+                kind: StatusKind::Other,
+            });
+        }
         // The mode and the network policy before the model, and kept
         // after it, as they say what runs unasked.
         parts.push(StatusPart {
@@ -1573,6 +1590,18 @@ impl App {
     pub fn set_modes(&mut self, modes: Option<Vec<(String, Mode)>>) {
         self.modes = modes;
         self.touch();
+    }
+
+    /// The conversations the human's rules allow all calls in.
+    pub fn set_all_allowed(&mut self, all_allowed: Vec<String>) {
+        self.all_allowed = all_allowed;
+        self.touch();
+    }
+
+    /// Whether all calls are allowed in the open conversation.
+    fn all_allowed(&self) -> Option<bool> {
+        let active = self.book.active.as_ref()?;
+        Some(self.all_allowed.iter().any(|id| id == active.as_str()))
     }
 
     /// The mode the status row says: the open conversation's workspace's,
@@ -2216,6 +2245,10 @@ impl App {
         let answer = match (act, always) {
             (None, _) => Answer::Once(false),
             (Some(confirm::Act::Confirm), _) => Answer::Once(true),
+            // The person's own, as a workspace's mode is: from the control seam,
+            // this one call and no standing word.
+            (Some(confirm::Act::AllowAll), _) if self.live => Answer::AllowAll,
+            (Some(confirm::Act::AllowAll), _) => Answer::Once(true),
             (Some(act), Some(crate::rules::Offer::Rules(always))) => Answer::Always {
                 allow: act == confirm::Act::AlwaysAllowHere && always.allow,
                 everywhere: act == confirm::Act::AlwaysDenyEverywhere,
@@ -5121,6 +5154,16 @@ impl App {
                     });
                 }
             }
+            menu::Action::AllowAll => {
+                if let (true, Some(id), Some(on)) =
+                    (self.live, self.book.active.clone(), self.all_allowed())
+                {
+                    self.requests.push(Request::SetAllAllowed {
+                        conversation: id,
+                        on: !on,
+                    });
+                }
+            }
             menu::Action::Effort(level) => self.choose(self.wanted().0, Some(level.to_string())),
             menu::Action::Routing(mode) => self.route(mode),
             // The list is the window's: `input_live` reports the choice.
@@ -5563,6 +5606,7 @@ impl App {
             show_activity: self.show_activity,
             running: self.running(),
             auto: self.workspace_mode().map(|mode| mode == Mode::Auto),
+            all_allowed: self.all_allowed(),
         };
         match menu::menu(self.surface, state, revision) {
             Ok(menu) => {
@@ -11642,6 +11686,48 @@ pub mod tests {
         assert!(!app.menu_open());
         // Asked once: the next input asks nothing.
         assert!(!key_live(&mut app, "Right"));
+    }
+
+    /// Only the live keyboard allows all in a conversation, by the card or the
+    /// menu; through the control seam a card's answer is for that call alone.
+    #[test]
+    fn only_the_live_keyboard_allows_all_in_a_conversation() {
+        let mut app = app();
+        app.add_row(row(9, 1));
+        app.set_active(id(9));
+        assert_eq!(app.all_allowed(), Some(false));
+        let toggled = |app: &App| {
+            matches!(
+                app.requests.last(),
+                Some(Request::SetAllAllowed { on: true, .. })
+            )
+        };
+        app.live = false;
+        app.menu_action(menu::Action::AllowAll);
+        assert!(!toggled(&app));
+        app.live = true;
+        app.menu_action(menu::Action::AllowAll);
+        assert!(toggled(&app));
+        app.set_all_allowed(vec![id(9).as_str().to_string()]);
+        assert_eq!(app.all_allowed(), Some(true));
+        assert!(app.status_line().contains(ALL_ALLOWED_STATUS));
+        app.menu_action(menu::Action::AllowAll);
+        assert!(matches!(
+            app.requests.last(),
+            Some(Request::SetAllAllowed { on: false, .. })
+        ));
+
+        let decided = |live: bool| {
+            let mut app = crate::ui::tests::app();
+            app.live = live;
+            app.decide(id(9), 1, Some(confirm::Act::AllowAll));
+            match app.requests.last() {
+                Some(Request::Decide { answer, .. }) => answer.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(decided(true), Answer::AllowAll);
+        assert_eq!(decided(false), Answer::Once(true));
     }
 
     /// Conversation → Auto mode in this workspace by the live keyboard

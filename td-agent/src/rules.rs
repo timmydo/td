@@ -370,6 +370,10 @@ pub struct Human {
 
 /// The header of the human's standing answers for crossings.
 pub const CROSSINGS: &str = "crossings";
+/// The section of the conversations the human allowed all calls in.
+pub const CONVERSATIONS: &str = "conversations";
+/// How a line of that section starts, before the conversation's id.
+const ALLOW_ALL: &str = "allow all ";
 
 /// What a crossing does to the other conversation (DESIGN.md §3).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -456,9 +460,16 @@ pub struct Policy {
     /// Each trust mark: the digest of the project instructions the
     /// human trusted (DESIGN.md §11).
     pub trusts: Vec<(String, String)>,
+    /// The conversations the human allowed all calls in (DESIGN.md §11).
+    pub all_allowed: Vec<String>,
 }
 
 impl Policy {
+    /// Whether the human allowed all calls in conversation `id`.
+    pub fn all_allowed(&self, id: &str) -> bool {
+        self.all_allowed.iter().any(|one| one == id)
+    }
+
     /// Workspace `key`'s mode, as its last `mode` line sets it.
     pub fn mode(&self, key: &str) -> Option<crate::config::Mode> {
         self.modes
@@ -521,6 +532,7 @@ pub fn parse_human(text: &str) -> Result<Vec<Human>, String> {
 enum Section {
     Scope(Scope),
     Crossings,
+    Conversations,
 }
 
 /// The human's rules file: a header, `[everywhere]`, `[<workspace>]` or
@@ -538,6 +550,7 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
     let mut crossings = Vec::new();
     let mut modes = Vec::new();
     let mut trusts = Vec::new();
+    let mut all_allowed = Vec::new();
     for (at, line) in text.lines().enumerate() {
         // Comments too: a control escapes to six bytes on the wire.
         if line.chars().any(|c| c.is_control() && c != '\t') {
@@ -551,13 +564,16 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
             section = Some(match key {
                 EVERYWHERE => Section::Scope(Scope::Everywhere),
                 CROSSINGS => Section::Crossings,
+                CONVERSATIONS => Section::Conversations,
                 key => Section::Scope(Scope::Workspace(
                     workspace_key(key).map_err(|why| format!("line {}: {why}", at + 1))?,
                 )),
             });
             continue;
         }
-        if rules.len() + crossings.len() + modes.len() + trusts.len() == MAX_HUMAN_RULES {
+        if rules.len() + crossings.len() + modes.len() + trusts.len() + all_allowed.len()
+            == MAX_HUMAN_RULES
+        {
             return Err(format!("more than {MAX_HUMAN_RULES} rules"));
         }
         let scope = match section.clone() {
@@ -570,6 +586,12 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
             Some(Section::Crossings) => {
                 crossings
                     .push(Crossing::parse(line).map_err(|why| format!("line {}: {why}", at + 1))?);
+                continue;
+            }
+            Some(Section::Conversations) => {
+                let id = allowed_line(line)
+                    .ok_or_else(|| format!("line {}: not `{ALLOW_ALL}<conversation>`", at + 1))?;
+                all_allowed.push(id.to_string());
                 continue;
             }
             Some(Section::Scope(scope)) => scope,
@@ -610,6 +632,7 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
         crossings,
         modes,
         trusts,
+        all_allowed,
     })
 }
 
@@ -617,6 +640,38 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
 /// `mode` line under its header taken out, then one added below the
 /// file's last header when that is its, else under a new one, every
 /// other line kept. Refused when `text` is, or the result would be.
+pub fn set_all_allowed(text: &str, id: &str, on: bool) -> Result<String, String> {
+    parse_policy(text)?;
+    let header = format!("[{CONVERSATIONS}]");
+    let mut kept = String::new();
+    let mut under = false;
+    for line in text.lines() {
+        let trimmed = line.trim_matches([' ', '\t']);
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            under = trimmed == header;
+        } else if under && allowed_line(trimmed) == Some(id) {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    if !on {
+        return Ok(kept);
+    }
+    if crate::store::Id::parse(id).is_none() {
+        return Err(format!("no conversation {id:?}"));
+    }
+    append(&kept, &header, &[format!("{ALLOW_ALL}{id}")])
+}
+
+/// The conversation a line of `[conversations]` names, when it reads as one.
+fn allowed_line(line: &str) -> Option<&str> {
+    line.strip_prefix(ALLOW_ALL)
+        .filter(|id| crate::store::Id::parse(id).is_some())
+}
+
+/// `text`, the human's rules file, with workspace `key` in `mode`: each `mode`
+/// line under its header taken out, then one added.
 pub fn set_mode(text: &str, key: &str, mode: crate::config::Mode) -> Result<String, String> {
     parse_policy(text)?;
     let header = format!("[{}]", workspace_key(key)?);
@@ -903,15 +958,18 @@ pub fn forget(text: &str, key: Option<&str>, id: &str) -> Result<Option<String>,
     parse_policy(text)?;
     let header = key.map(|key| format!("[{key}]"));
     let crossings = format!("[{CROSSINGS}]");
+    let conversations = format!("[{CONVERSATIONS}]");
     let mut out = String::new();
     let mut dropping = false;
     let mut crossing = false;
+    let mut allowing = false;
     let mut dropped = false;
     for line in text.lines() {
         let trimmed = line.trim_matches([' ', '\t']);
         let drop = if trimmed.starts_with('[') && trimmed.ends_with(']') {
             dropping = header.as_deref() == Some(trimmed);
             crossing = trimmed == crossings;
+            allowing = trimmed == conversations;
             // The blank line that parted it from the one before goes too.
             if dropping {
                 while out.ends_with("\n\n") {
@@ -923,6 +981,7 @@ pub fn forget(text: &str, key: Option<&str>, id: &str) -> Result<Option<String>,
             dropping
                 || (crossing
                     && Crossing::parse(trimmed).is_ok_and(|one| one.from == id || one.to == id))
+                || (allowing && allowed_line(trimmed) == Some(id))
         };
         dropped |= drop;
         if !drop {
@@ -1845,6 +1904,43 @@ mod tests {
             .iter()
             .map(|s| s.iter().map(|w| Some(w.to_string())).collect())
             .collect()
+    }
+
+    /// A grant is one line of its own section, taken out as it was put in and
+    /// with its conversation, and only a conversation's id reads as one.
+    #[test]
+    fn a_conversation_is_allowed_all_by_a_line_of_its_own() {
+        let id = crate::store::Id::random().unwrap();
+        let id = id.as_str();
+        let other = crate::store::Id::random().unwrap();
+        let other = other.as_str();
+        let text = "[everywhere]\ndeny shell rm\n";
+        assert!(!parse_policy(text).unwrap().all_allowed(id));
+        let on = set_all_allowed(text, id, true).unwrap();
+        assert!(on.starts_with(text), "{on}");
+        let policy = parse_policy(&on).unwrap();
+        assert!(policy.all_allowed(id));
+        assert!(!policy.all_allowed(other));
+        // Once, however often it is asked for.
+        let twice = set_all_allowed(&on, id, true).unwrap();
+        assert_eq!(parse_policy(&twice).unwrap().all_allowed.len(), 1);
+        let both = set_all_allowed(&twice, other, true).unwrap();
+        let off = set_all_allowed(&both, id, false).unwrap();
+        let policy = parse_policy(&off).unwrap();
+        assert!(!policy.all_allowed(id) && policy.all_allowed(other));
+        assert_eq!(policy.rules.len(), 1);
+        // Deleted with its conversation, and only its.
+        let gone = forget(&both, None, id).unwrap().unwrap();
+        let policy = parse_policy(&gone).unwrap();
+        assert!(!policy.all_allowed(id) && policy.all_allowed(other));
+        // Nothing else reads as one.
+        assert!(set_all_allowed(text, "not an id", true).is_err());
+        assert!(parse_policy("[conversations]\nallow all\n").is_err());
+        assert!(parse_policy("[conversations]\nallow shell rm\n").is_err());
+        assert!(parse_policy("[conversations]\nallow all nobody\n").is_err());
+        // Nor is a grant one in a workspace's section.
+        let elsewhere = format!("[everywhere]\nallow all {id}\n");
+        assert!(parse_policy(&elsewhere).map_or(true, |policy| !policy.all_allowed(id)));
     }
 
     #[test]

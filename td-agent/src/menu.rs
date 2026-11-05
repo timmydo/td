@@ -84,6 +84,8 @@ pub enum Action {
     /// Put the open conversation's workspace in `auto` mode, or back in
     /// `ask` (DESIGN.md §11).
     AutoMode,
+    /// Allow all calls in the open conversation, or stop.
+    AllowAll,
     /// Compact the open conversation, as `/compact` does (DESIGN.md
     /// §14).
     Compact,
@@ -130,6 +132,7 @@ pub const SHOW_ACTIVITY: &str = "Show tool activity";
 /// The Conversation menu's item, checked while the open conversation's
 /// workspace is in `auto` mode.
 pub const AUTO_MODE: &str = "Auto mode in this workspace";
+pub const ALLOW_ALL: &str = "Allow all in this conversation";
 /// The row menu's items.
 pub const ARCHIVE: &str = "Archive";
 pub const UNARCHIVE: &str = "Unarchive";
@@ -159,6 +162,9 @@ pub struct State<'a> {
     /// Whether the open conversation's workspace is in `auto` mode; none
     /// without one.
     pub auto: Option<bool>,
+    /// Whether all calls are allowed in the open conversation; none with no
+    /// conversation open.
+    pub all_allowed: Option<bool>,
 }
 
 pub type Menu = Controller<'static, Action, u64>;
@@ -239,6 +245,16 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
             state.auto == Some(true),
         ),
         item: Item::Action(Action::AutoMode),
+    });
+    nodes.push(Node {
+        parent: Some(conversation),
+        row: row(
+            ALLOW_ALL,
+            "",
+            state.all_allowed.is_some(),
+            state.all_allowed == Some(true),
+        ),
+        item: Item::Action(Action::AllowAll),
     });
     nodes.push(Node {
         parent: Some(conversation),
@@ -393,6 +409,7 @@ mod tests {
         show_activity: false,
         running: false,
         auto: None,
+        all_allowed: None,
     };
 
     fn surface() -> Surface {

@@ -537,6 +537,10 @@ fn asked_from(value: &Json) -> Result<Asked, String> {
 
 fn answer_json(answer: &Answer) -> Json {
     Json::Obj(match answer {
+        Answer::AllowAll => vec![
+            field("answer", text("allow_all")),
+            field("allow", Json::Bool(true)),
+        ],
         Answer::Once(allow) => vec![
             field("answer", text("once")),
             field("allow", Json::Bool(*allow)),
@@ -566,6 +570,7 @@ fn answer_from(value: &Json) -> Result<Answer, String> {
     let allow = flag(value, "allow")?;
     match value.get("answer").and_then(Json::as_str) {
         Some("once") => Ok(Answer::Once(allow)),
+        Some("allow_all") if allow => Ok(Answer::AllowAll),
         Some("always") => Ok(Answer::Always {
             allow,
             everywhere: flag(value, "everywhere")?,
@@ -832,6 +837,13 @@ pub fn encode_view(view: &View) -> Vec<u8> {
             vec![field(
                 "client",
                 carried(client.as_ref(), client.to_json(), client_paths),
+            )],
+        ),
+        View::SetAllAllowed(all_allowed) => (
+            "set_all_allowed",
+            vec![field(
+                "conversations",
+                Json::Arr(all_allowed.iter().map(|id| text(id)).collect()),
             )],
         ),
         View::SetModes(modes) => (
@@ -1102,6 +1114,7 @@ pub fn decode_view(bytes: &[u8]) -> Result<View, String> {
         Some("set_networks") => View::SetNetworks(Box::new(member(value, "client", |client| {
             carried_from(client, Client::from_json, client_paths)
         })?)),
+        Some("set_all_allowed") => View::SetAllAllowed(strings(value, "conversations")?),
         Some("set_modes") => View::SetModes(match value.get("modes") {
             Some(Json::Null) => None,
             Some(_) => Some(items(value, "modes", |one| match one.as_arr() {
@@ -1344,6 +1357,13 @@ pub fn encode_request(request: &Request) -> Vec<u8> {
             ],
         ),
         Request::SetDefault(model) => ("set_default", vec![field("model", text(model))]),
+        Request::SetAllAllowed { conversation, on } => (
+            "set_all_allowed",
+            vec![
+                field("conversation", id_json(conversation)),
+                field("on", Json::Bool(*on)),
+            ],
+        ),
         Request::SetMode { conversation, mode } => (
             "set_mode",
             vec![
@@ -1545,6 +1565,10 @@ fn request_from(value: &Json) -> Result<Request, String> {
             number: number(value, "number")?,
         },
         Some("set_default") => Request::SetDefault(string(value, "model")?),
+        Some("set_all_allowed") => Request::SetAllAllowed {
+            conversation: id_from(value, "conversation")?,
+            on: flag(value, "on")?,
+        },
         Some("set_mode") => Request::SetMode {
             conversation: id_from(value, "conversation")?,
             mode: mode_from(value, "mode")?,
@@ -2018,6 +2042,8 @@ mod tests {
                 }],
                 "high".into(),
             ),
+            View::SetAllAllowed(Vec::new()),
+            View::SetAllAllowed(vec!["id".into()]),
             View::SetModes(None),
             View::SetModes(Some(Vec::new())),
             View::SetModes(Some(vec![
@@ -2259,6 +2285,10 @@ mod tests {
                 number: 2,
             },
             Request::SetDefault("a/b".into()),
+            Request::SetAllAllowed {
+                conversation: id(1),
+                on: true,
+            },
             Request::SetMode {
                 conversation: id(1),
                 mode: Mode::Ask,
@@ -2310,6 +2340,7 @@ mod tests {
         }
         for answer in [
             Answer::Once(false),
+            Answer::AllowAll,
             Answer::Always {
                 allow: true,
                 everywhere: true,
@@ -2353,6 +2384,7 @@ mod tests {
             View::SetQueued(..) => "SetQueued",
             View::SetOffers(..) => "SetOffers",
             View::SetNetworks(..) => "SetNetworks",
+            View::SetAllAllowed(..) => "SetAllAllowed",
             View::SetModes(..) => "SetModes",
             View::SetModels(..) => "SetModels",
             View::SetCredit(..) => "SetCredit",
@@ -2429,6 +2461,7 @@ mod tests {
             Request::Kill { .. } => "Kill",
             Request::Output { .. } => "Output",
             Request::SetDefault(..) => "SetDefault",
+            Request::SetAllAllowed { .. } => "SetAllAllowed",
             Request::SetMode { .. } => "SetMode",
             Request::Trust { .. } => "Trust",
             Request::Workspace(..) => "Workspace",

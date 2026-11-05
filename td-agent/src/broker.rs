@@ -584,6 +584,9 @@ impl Session {
                     .answer(&conversation, &Down::Resumed { turn, choice }),
                 Request::SetDefault(model) => self.set_default(model),
                 Request::SetMode { conversation, mode } => self.set_mode(&conversation, mode),
+                Request::SetAllAllowed { conversation, on } => {
+                    self.set_all_allowed(&conversation, on)
+                }
                 Request::Trust {
                     conversation,
                     digest,
@@ -601,6 +604,13 @@ impl Session {
     fn decide(&mut self, conversation: &Id, call: u64, answer: Answer) {
         let (allow, remembered) = match answer {
             Answer::Once(allow) => (allow, None),
+            Answer::AllowAll => (
+                true,
+                Some(
+                    set_all_allowed(&self.state, conversation, true)
+                        .map(|()| "all calls in this conversation".to_string()),
+                ),
+            ),
             Answer::Always {
                 allow,
                 everywhere,
@@ -658,16 +668,21 @@ impl Session {
         // written is sent in `ask` all the same.
         let rules = held(self.state.load_rules(), &self.held);
         match &rules {
-            Ok(text) => self.view.set_modes(
-                crate::rules::parse_policy(text)
-                    .ok()
-                    .map(|policy| policy.modes),
-            ),
+            Ok(text) => {
+                let policy = crate::rules::parse_policy(text).ok();
+                self.view.set_all_allowed(
+                    policy
+                        .as_ref()
+                        .map_or_else(Vec::new, |policy| policy.all_allowed.clone()),
+                );
+                self.view.set_modes(policy.map(|policy| policy.modes));
+            }
             Err(e) => {
                 let said = format!("your rules could not be read, so every call that changes a workspace or runs a command asks: {e}");
                 logged!("td-agent: {said}");
                 self.view.note(said);
                 self.view.set_modes(None);
+                self.view.set_all_allowed(Vec::new());
             }
         }
         self.supervisor.repolicy(rules, self.mode);
@@ -719,8 +734,22 @@ impl Session {
         self.view.reshow_workspace(conversation, &record);
     }
 
-    /// Puts `conversation`'s workspace in `mode`, in the human's rules
-    /// (DESIGN.md §11), and sends every conversation the rules.
+    /// Allows all in `conversation`, or stops, in the human's rules (DESIGN.md §11),
+    /// and sends every conversation the rules.
+    fn set_all_allowed(&mut self, conversation: &Id, on: bool) {
+        match set_all_allowed(&self.state, conversation, on) {
+            Ok(()) => {
+                self.view.note(if on {
+                    "all calls in this conversation are allowed"
+                } else {
+                    "this conversation's calls are judged again"
+                });
+                self.repolicy();
+            }
+            Err(e) => self.view.note(format!("nothing changed: {e}")),
+        }
+    }
+
     fn set_mode(&mut self, conversation: &Id, mode: crate::config::Mode) {
         match set_mode(&self.state, conversation, mode) {
             Ok(()) => {
@@ -3510,6 +3539,12 @@ fn remember(
         "this workspace"
     };
     Ok(format!("{} in your rules for {whose}", rules.join(", ")))
+}
+
+/// Allows all calls in `conversation` in the human's rules, or stops.
+fn set_all_allowed(state: &StateDir, conversation: &Id, on: bool) -> Result<(), String> {
+    let text = crate::rules::set_all_allowed(&state.load_rules()?, conversation.as_str(), on)?;
+    state.save_rules(&text)
 }
 
 /// Puts `conversation`'s workspace in `mode` in the human's rules.
