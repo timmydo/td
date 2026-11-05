@@ -28,10 +28,10 @@ const PINS: &[PinDef] = &[
         // Mozilla's trust store as rendered in PEM form by curl. Pin the dated
         // extract rather than curl's moving cacert.pem URL so a reviewed update
         // changes both the source name and its published adjacent SHA-256.
-        url: "https://curl.se/ca/cacert-2026-10-20.pem",
-        sha256: "796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe",
-        file: "cacert-2026-10-20.pem",
-        version: "2026-10-20",
+        url: "https://curl.se/ca/cacert-2026-11-05.pem",
+        sha256: "427c064216761a1e72a8b30f0d954d08cb6e4435a82091fb865afd20c8497285",
+        file: "cacert-2026-11-05.pem",
+        version: "2026-11-05",
     },
     PinDef {
         key: "curl-x86-64-source",
