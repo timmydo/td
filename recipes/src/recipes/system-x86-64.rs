@@ -8295,7 +8295,7 @@ mod tests {
         );
         assert_eq!(
             TD_FIREFOX_SECCOMP_AUDIT_MARKER,
-            "TD-FIREFOX-SECCOMP-OK probes=17"
+            "TD-FIREFOX-SECCOMP-OK probes=18"
         );
         assert_eq!(FIREFOX_AUDIT_CMDLINE_TOKEN, "td.firefox-seccomp-audit=1");
         for declaration in [
@@ -8315,7 +8315,7 @@ mod tests {
             TD_JAIL_SECCOMP
                 .matches(
                     "pub(crate) const FIREFOX_AUDIT_MARKER: &str = \
-                     \"TD-FIREFOX-SECCOMP-OK probes=17\";"
+                     \"TD-FIREFOX-SECCOMP-OK probes=18\";"
                 )
                 .count(),
             1

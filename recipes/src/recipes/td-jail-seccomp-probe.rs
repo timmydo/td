@@ -108,6 +108,7 @@ pub(crate) fn source() -> &'static str {
 #define TD_SYS_CLONE3 435
 #define TD_SYS_PIDFD_GETFD 438
 #define TD_SYS_OPEN_TREE_ATTR 467
+#define TD_SYS_FCHROOT 472
 #define TD_X32_SYSCALL_BIT 0x40000000UL
 #define TD_PROBE_MARKER "TD-JAIL-SECCOMP-PROBE-OK"
 #define TD_ALLOW_INHERITED_CONFINEMENT "--allow-inherited-confinement"
@@ -375,6 +376,9 @@ static int prove_denied_calls(void) {
                      "open_tree_attr") != 0)
         return 1;
     errno = 0;
+    if (expect_errno(syscall(TD_SYS_FCHROOT, -1, 0), EPERM, "fchroot") != 0)
+        return 1;
+    errno = 0;
     if (expect_errno(syscall(SYS_userfaultfd, 0), EPERM,
                      "userfaultfd") != 0)
         return 1;
@@ -536,6 +540,7 @@ mod tests {
             "SYS_unshare",
             "SYS_mount",
             "TD_SYS_OPEN_TREE_ATTR",
+            "TD_SYS_FCHROOT",
             "SYS_userfaultfd",
             "SYS_bpf",
             "TD_SYS_IO_URING_SETUP",
@@ -546,7 +551,7 @@ mod tests {
             assert!(denied.contains(call), "inherited probe omitted {call}");
         }
         assert_eq!(denied.matches("SYS_ioctl").count(), 3);
-        assert_eq!(denied.matches("expect_errno(").count(), 16);
+        assert_eq!(denied.matches("expect_errno(").count(), 17);
         assert_eq!(denied.matches("return expect_x32_kill();").count(), 1);
     }
 

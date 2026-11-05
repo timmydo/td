@@ -11272,7 +11272,7 @@ mod tests {
         for invalid in [
             format!("noise {TD_FIREFOX_SECCOMP_AUDIT_MARKER}\n"),
             format!("\n{TD_FIREFOX_SECCOMP_AUDIT_MARKER} trailing\n"),
-            "\nTD-FIREFOX-SECCOMP-OK probes=16\n".to_string(),
+            "\nTD-FIREFOX-SECCOMP-OK probes=17\n".to_string(),
         ] {
             let mut rejected = ConsoleEvidence::default();
             latch_console_evidence(&mut rejected, invalid.as_bytes(), b"target");

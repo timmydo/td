@@ -12,7 +12,7 @@ const EPERM: u32 = 1;
 const ENOSYS: u32 = 38;
 const EAFNOSUPPORT: u32 = 97;
 
-pub(crate) const FIREFOX_AUDIT_MARKER: &str = "TD-FIREFOX-SECCOMP-OK probes=17";
+pub(crate) const FIREFOX_AUDIT_MARKER: &str = "TD-FIREFOX-SECCOMP-OK probes=18";
 pub(crate) const FIREFOX_PROBE_PATH: &str = "/opt/td-firefox-seccomp-probe";
 const FIREFOX_PROBE_EXE: &str = "\"/opt/td-firefox-seccomp-probe\"";
 const FIREFOX_AUDIT_PROBE_EXE: &str = "\"/var/lib/td-test/td-jail-seccomp-probe\"";
@@ -45,7 +45,7 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 const TIOCSTI: u32 = 0x5412;
 const TIOCLINUX: u32 = 0x541c;
 
-const FIREFOX_REQUIRED_AUDIT_SYSCALLS: [(u32, usize); 15] = [
+const FIREFOX_REQUIRED_AUDIT_SYSCALLS: &[(u32, usize)] = &[
     (SYS_PERSONALITY, 1),
     (SYS_SOCKET, 1),
     (101, 1),
@@ -55,6 +55,7 @@ const FIREFOX_REQUIRED_AUDIT_SYSCALLS: [(u32, usize); 15] = [
     (272, 1),
     (165, 1),
     (467, 1),
+    (472, 1),
     (323, 1),
     (321, 1),
     (425, 1),
@@ -328,6 +329,7 @@ define_policy!(
     438, // pidfd_getfd
     442, // mount_setattr
     467, // open_tree_attr
+    472, // fchroot
 );
 
 // Development permits ordinary execution and nested isolation. The paired
@@ -521,7 +523,7 @@ pub(crate) fn verify_firefox_audit(
             "Firefox seccomp audit expected PID and UID must be nonzero",
         ));
     }
-    let mut observed = FIREFOX_REQUIRED_AUDIT_SYSCALLS.map(|_| 0_usize);
+    let mut observed = vec![0_usize; FIREFOX_REQUIRED_AUDIT_SYSCALLS.len()];
     let mut records = 0_usize;
     let mut begun = false;
     let mut ended = false;
@@ -858,14 +860,14 @@ mod tests {
             (
                 AUDIT_ARCH_X86_64,
                 &[
-                    56, 435, 272, 165, 166, 155, 161, 308, 101, 298, 310, 425, 426, 427, 442,
+                    56, 435, 272, 165, 166, 155, 161, 472, 308, 101, 298, 310, 425, 426, 427, 442,
                 ][..],
                 16,
             ),
             (
                 AUDIT_ARCH_I386,
                 &[
-                    120, 435, 310, 21, 52, 217, 61, 346, 26, 336, 347, 425, 426, 427, 442,
+                    120, 435, 310, 21, 52, 217, 61, 472, 346, 26, 336, 347, 425, 426, 427, 442,
                 ][..],
                 54,
             ),
@@ -999,6 +1001,17 @@ mod tests {
         );
     }
 
+    // Linux 7.3's fchroot(FD_FAILFS_ROOT, 0) needs no capability from a caller
+    // with no_new_privs, an unshared fs_struct and no chroot, so unlike chroot
+    // no dropped capability refuses it. The page loop below would read a
+    // dropped entry as an allowed number.
+    #[test]
+    fn both_seccomp_programs_refuse_fchroot_by_number() {
+        for filter in [STANDARD_FILTER.as_slice(), WORKSPACE_FILTER.as_slice()] {
+            assert_eq!(interpret(filter, data(472)).unwrap(), errno(EPERM));
+        }
+    }
+
     #[test]
     fn every_rostered_number_and_an_allowed_page_have_the_expected_action() {
         for syscall in DENIED_SYSCALLS {
@@ -1015,7 +1028,7 @@ mod tests {
                 "kernel-owned probe syscall {syscall}"
             );
         }
-        for syscall in 0_u32..=471 {
+        for syscall in 0_u32..=472 {
             if DENIED_SYSCALLS.contains(&syscall)
                 || matches!(
                     syscall,
@@ -1088,7 +1101,7 @@ mod tests {
             SECCOMP_RET_ALLOW
         );
         // Everything else is the standard program's answer.
-        for syscall in 0_u32..=471 {
+        for syscall in 0_u32..=472 {
             if matches!(syscall, SYS_SOCKET | SYS_SOCKETPAIR) {
                 continue;
             }
@@ -1174,6 +1187,7 @@ mod tests {
             (272, SECCOMP_RET_ERRNO, 0),
             (165, SECCOMP_RET_ERRNO, 0),
             (467, SECCOMP_RET_ERRNO, 0),
+            (472, SECCOMP_RET_ERRNO, 0),
             (323, SECCOMP_RET_ERRNO, 0),
             (321, SECCOMP_RET_ERRNO, 0),
             (425, SECCOMP_RET_ERRNO, 0),
@@ -1200,7 +1214,7 @@ mod tests {
                 .iter()
                 .map(|(_, count)| count)
                 .sum::<usize>(),
-            17
+            18
         );
         assert_eq!(
             FIREFOX_AUDIT_MARKER,
@@ -1222,7 +1236,7 @@ mod tests {
                 "/app/lib/firefox/firefox",
             ),
         );
-        assert_eq!(verify_firefox_audit(&log).unwrap(), 18);
+        assert_eq!(verify_firefox_audit(&log).unwrap(), 19);
 
         let missing = complete_audit().replacen(
             &audit_line(65536, 310, SECCOMP_RET_ERRNO, 0, FIREFOX_PROBE_PATH),
@@ -1244,7 +1258,7 @@ mod tests {
         );
         assert_eq!(
             verify_firefox_audit(&before_end(complete_audit(), &standalone)).unwrap(),
-            18
+            19
         );
         let missing = complete_audit().replace(
             &audit_line(
@@ -1283,7 +1297,7 @@ mod tests {
         .replace("compat=0", "compat=1");
         assert_eq!(
             verify_firefox_audit(&before_end(complete_audit(), &standalone)).unwrap(),
-            18
+            19
         );
         let missing = complete_audit().replace(
             &audit_line(
@@ -1416,7 +1430,7 @@ mod tests {
             0,
             "/app/lib/firefox/firefox",
         );
-        let accepted = before_end(good, &runtime.repeat(MAX_AUDIT_RECORDS.saturating_sub(17)));
+        let accepted = before_end(good, &runtime.repeat(MAX_AUDIT_RECORDS.saturating_sub(18)));
         assert_eq!(verify_firefox_audit(&accepted).unwrap(), MAX_AUDIT_RECORDS);
         assert!(verify_firefox_audit(&before_end(accepted, &runtime)).is_err());
     }
