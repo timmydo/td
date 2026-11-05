@@ -12,7 +12,7 @@
 # re-derives from the pins every run and reds on disagreement.
 ca-certificates-source gwd0r7fyqs45rzrnwwbzl2p5c76zrfad-ca-certificates-source
 curl-x86-64-source s38hackr0p194d351xs9pc71gjknclls-curl-x86-64-source
-fd-source 3hg9h3s5x6qcs26fp90j0zknw2pd7z13-fd-source
+fd-source ky623w2y3nfb1ddjv8yrnv7bp70dw5c7-fd-source
 git-x86-64-source dsg8dzp8rizb8x2jfjzs50wqmlq29x44-git-x86-64-source
 jetbrains-mono-nerd-font-source 632myin1d84lnr23d9ma4f4iwgs13bk2-jetbrains-mono-nerd-font-source
 libressl-x86-64-source iad2rcbcs4301jyahxbd8cxv41y1r97h-libressl-x86-64-source

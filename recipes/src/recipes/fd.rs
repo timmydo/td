@@ -6,7 +6,7 @@ use crate::types::Recipe;
 // `build-plan --auto` share the same offline crate closure and toolchain,
 // in the build root.
 pub fn recipe() -> Recipe {
-    Recipe::rust("fd", "10.5.0")
+    Recipe::rust("fd", "10.5.1")
         .source_input("fd-source")
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])

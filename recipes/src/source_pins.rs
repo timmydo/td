@@ -47,10 +47,10 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "fd-source",
         aliases: &[],
-        url: "https://static.crates.io/crates/fd-find/fd-find-10.5.0.crate",
-        sha256: "f35becce49c551724fd26d9824ec01d6578868cecbcc4e3d060658f9f8ad1e4d",
-        file: "fd-find-10.5.0.crate",
-        version: "10.5.0",
+        url: "https://static.crates.io/crates/fd-find/fd-find-10.5.1.crate",
+        sha256: "d3d01f6d39c2cc05c28551a22ae66f82ef1526176ca9ad52073323528a7609f7",
+        file: "fd-find-10.5.1.crate",
+        version: "10.5.1",
     },
     PinDef {
         key: "git-x86-64-source",

@@ -753,7 +753,7 @@ mod tests {
         assert_eq!(pins[0].key, "fd-source");
         assert_eq!(
             pins[0].sha256,
-            "f35becce49c551724fd26d9824ec01d6578868cecbcc4e3d060658f9f8ad1e4d"
+            "d3d01f6d39c2cc05c28551a22ae66f82ef1526176ca9ad52073323528a7609f7"
         );
 
         let uutils = catalog::lookup("uutils").unwrap();

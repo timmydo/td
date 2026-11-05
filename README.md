@@ -227,12 +227,12 @@ Individual packages are recipes too — declarative Rust, no shell:
 
 ```rust
 pub fn recipe() -> Recipe {
-    Recipe::rust("fd", "10.5.0")
+    Recipe::rust("fd", "10.5.1")
         .source_pin(SourcePin::new(
             "fd-source",
-            "https://static.crates.io/crates/fd-find/fd-find-10.5.0.crate",
-            "f35becce49c551724fd26d9824ec01d6578868cecbcc4e3d060658f9f8ad1e4d",
-            "fd-find-10.5.0.crate",
+            "https://static.crates.io/crates/fd-find/fd-find-10.5.1.crate",
+            "d3d01f6d39c2cc05c28551a22ae66f82ef1526176ca9ad52073323528a7609f7",
+            "fd-find-10.5.1.crate",
         ))
         .bins(&["fd"])
         .no_default_features()
