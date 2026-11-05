@@ -195,6 +195,20 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// Where the socket was looked for, as there are two ways not to find it.
+fn no_socket(runtime: Option<&std::ffi::OsStr>) -> String {
+    match runtime.filter(|runtime| !runtime.is_empty()) {
+        Some(runtime) => format!(
+            "no td-fetch socket at {}",
+            PathBuf::from(runtime)
+                .join(SOCKET_DIRECTORY)
+                .join(SOCKET_FILE)
+                .display()
+        ),
+        None => "no td-fetch socket: XDG_RUNTIME_DIR is not set".to_string(),
+    }
+}
+
 /// `$XDG_RUNTIME_DIR/td-fetch/socket`, when it is a socket: the grant's
 /// whole contract, with no variable of its own.
 pub fn socket_path() -> Option<PathBuf> {
@@ -463,7 +477,8 @@ fn send(
         ));
     }
     check_head(url, headers)?;
-    let path = socket_path().ok_or_else(|| Error::Io("no td-fetch socket".into()))?;
+    let path = socket_path()
+        .ok_or_else(|| Error::Io(no_socket(std::env::var_os("XDG_RUNTIME_DIR").as_deref())))?;
     let mut socket = UnixStream::connect(&path).map_err(|e| Error::Io(format!("connect: {e}")))?;
     // Both directions: a service that stopped reading a large body would
     // otherwise hold the writer past the reply's own bound.
@@ -713,6 +728,20 @@ mod tests {
 
     fn reply(bytes: &[u8]) -> Result<Response, Error> {
         read_reply(&mut BufReader::new(bytes), DEFAULT_LIMIT)
+    }
+
+    #[test]
+    fn no_socket_says_where_it_looked_or_why_it_could_not() {
+        assert_eq!(
+            no_socket(Some(std::ffi::OsStr::new("/run/user/7"))),
+            "no td-fetch socket at /run/user/7/td-fetch/socket"
+        );
+        for unset in [None, Some(std::ffi::OsStr::new(""))] {
+            assert_eq!(
+                no_socket(unset),
+                "no td-fetch socket: XDG_RUNTIME_DIR is not set"
+            );
+        }
     }
 
     /// A body the service announces past what was asked for is refused

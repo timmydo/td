@@ -862,9 +862,13 @@ them. A td-agent installed over a running one is not noticed until then.
 the directory `/`, no descriptor of the window's (which is why the window refuses
 an inherited `WAYLAND_SOCKET`), and a process group of its own. Started from a
 display it is the display git's prompts go to (§9), even while the window is
-elsewhere; started from ssh, they have none. Started where there is no fetch
-service it has none for life, each turn saying so, and `--stop` lets a window
-where there is one start the next. A launch (§8, "the launch") gives
+elsewhere; started from ssh, they have none. The image's own td-agent, however it
+came, supplies what it lacks of the three variables the card gives it (§8, "On td").
+Where there is still no fetch socket it says so at once, in `serve.log` and as a note.
+Each request looks for the socket again, so one that appears is used; but the model
+list is asked for once, at the start, and a conversation's relay when it is set up.
+With `XDG_RUNTIME_DIR` unset there is none for life, each turn saying so, and `--stop`
+lets a window where there is one start the next. A launch (§8, "the launch") gives
 the window a fetch service and a relay that end with the window, so the window
 starts the broker by that launch again, under the session's runtime directory:
 it then has services of its own that last as long as it does. `attach` and
@@ -4441,6 +4445,11 @@ td-authd's request `0c` (td-authd/DESIGN.md) from the account home, with
 egress relay's sockets are. It runs `td-jail --workspace` itself, which
 td admits for its account alone (APPLICATIONS.md §C), with td's `/td`
 bound where its `/bin` links resolve; its tools' `PATH` is td's `/bin`.
+A broker of the image's `/bin/td-agent` lacking any of those three variables, as one
+started over ssh does, starts over with it, so it has the same reach. One started over
+ssh lives in sshd's cgroup leaf and ends when sshd stops; `td-jail --workspace` admits
+the account wherever it is, its caps being unenforced either way, though a product
+application that an unconfined workspace starts needs the session's cgroup.
 td-agent so holds what the human holds; what keeps the model to a
 workspace is the workspace jail and the approval policy (§11), as on a
 host, not an application jail around td-agent itself. td-agent is a

@@ -836,6 +836,20 @@ fn claim(window: &td_agent::peer::Peer, token: &str, asked: bool) {
     )));
 }
 
+/// A broker with no fetch service says so before anyone sends it anything.
+#[test]
+fn a_broker_with_no_fetch_service_says_so_at_once() {
+    let scratch = Scratch::new("no-fetch");
+    let (_child, window) = attach(&scratch);
+    let told = told_until(
+        &window,
+        |view| matches!(view, View::Note(said) if said.contains("no fetch service")),
+    );
+    assert!(!told.is_empty());
+    let log = std::fs::read_to_string(scratch.0.join("td-agent").join("serve.log")).unwrap();
+    assert!(log.contains("no fetch service: XDG_RUNTIME_DIR"), "{log}");
+}
+
 /// One yet to say which it is, when the broker stops, is told too: it would
 /// otherwise take that for a link that failed, and start another.
 #[test]

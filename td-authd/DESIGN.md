@@ -799,8 +799,9 @@ git's repository configuration. No shipped application's grant reaches
 `~/src` now. Its environment is the card's alone, as `0a`'s
 is: no ssh agent, so a remote that needs one fails from the card, and
 no passphrase prompt, since td-pinentry runs only on a host. A terminal
-start of td-agent with those variables has the same reach; the card
-adds a way to start.
+or ssh start of td-agent's broker has the same reach, as the image's
+td-agent supplies those variables where it lacks them
+(td-agent/DESIGN.md §8); the card adds a way to start.
 
 Request `22` is the same shape for td-software, the application manager
 (td-software/DESIGN.md): it execs `/bin/td-software` with no arguments,

@@ -2548,6 +2548,28 @@ struct Attached {
     token: Option<String>,
 }
 
+/// What a broker says of a fetch service it did not find: for serve.log and for
+/// the window. One may yet appear under a runtime directory; none can without one.
+fn no_fetch_service(runtime: Option<&std::ffi::OsStr>) -> (String, &'static str) {
+    match runtime.filter(|runtime| !runtime.is_empty()) {
+        Some(runtime) => (
+            format!(
+                "no fetch service under XDG_RUNTIME_DIR={} yet, and each request looks \
+                 again: on td it is the fetchd unit; on a host, run td-agent as \
+                 ./install-apps installs it, after td-agent serve --stop ends this one",
+                Path::new(runtime).display()
+            ),
+            "no fetch service here yet, so no turn can reach the model; see serve.log",
+        ),
+        None => (
+            "no fetch service: XDG_RUNTIME_DIR is not set, so none can be found; \
+             td-agent serve --stop ends this one, for one started with it set"
+                .to_string(),
+            "no fetch service, so no turn can reach the model; see serve.log",
+        ),
+    }
+}
+
 /// How long a stop waits for connections still saying hello.
 const GREETING_AT_STOP: Duration = Duration::from_secs(1);
 
@@ -2965,6 +2987,11 @@ pub fn run(
     view.set_share(state.load_share());
     view.set_mode(config.mode);
     view.set_without_jev(!config.client.jev_required);
+    if td_fetch_client::socket_path().is_none() {
+        let (log, note) = no_fetch_service(std::env::var_os("XDG_RUNTIME_DIR").as_deref());
+        logged!("td-agent: {log}");
+        view.note(note);
+    }
     for note in &config.notes {
         logged!("td-agent: configuration: {note}");
     }
@@ -3562,6 +3589,22 @@ mod tests {
     use crate::protocol::Down;
     use crate::workspace::Workspace;
     use std::path::PathBuf;
+
+    /// "Yet" only where one could still appear.
+    #[test]
+    fn a_missing_fetch_service_is_called_what_it_is() {
+        let (log, note) = super::no_fetch_service(Some(std::ffi::OsStr::new("/run/user/7")));
+        assert!(log.contains("/run/user/7 yet"), "{log}");
+        assert!(note.contains("yet"), "{note}");
+        for unset in [None, Some(std::ffi::OsStr::new(""))] {
+            let (log, note) = super::no_fetch_service(unset);
+            assert!(log.contains("XDG_RUNTIME_DIR is not set"), "{log}");
+            assert!(
+                !log.contains("yet") && !note.contains("yet"),
+                "{log} {note}"
+            );
+        }
+    }
 
     /// A card's "always" answer adds its rules under the conversation's
     /// workspace's header, or every workspace's, and says what it added;

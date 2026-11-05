@@ -6,8 +6,9 @@
 //! on another machine at the far end of ssh, whose window's way there is
 //! `--remote`: its connection, unlike one on this machine, can fail and come back.
 
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -49,6 +50,8 @@ const LOG_KEPT: u64 = 1024 * 1024;
 /// directory it goes under (td-net's launch sets them, `net/src/launch.rs`).
 const LAUNCHER: &str = "TD_AGENT_LAUNCHER";
 const SESSION_RUNTIME: &str = "TD_AGENT_SESSION_RUNTIME";
+/// Where a td image has its td-agent.
+const SYSTEM_PROGRAM: &str = "/bin/td-agent";
 
 /// Messages one turn of the window reads: a long log's opening is thousands, and
 /// the window stays drawn while they come.
@@ -140,6 +143,44 @@ fn launches(launcher: &Path, program: &Path) -> bool {
         .map(|dir| dir.join("td-agent"))
         .and_then(|beside| std::fs::canonicalize(beside).ok());
     beside.is_some() && beside == std::fs::canonicalize(program).ok()
+}
+
+/// What a broker lacks of what td-authd starts the image's td-agent with from the
+/// launcher's card (`desktop_environment` in `td-authd/src/launch.rs`, which this
+/// follows), as one that came over ssh does. Only the image's own program is given
+/// these: another build has its launch to name them, and one under test must not
+/// find the person's fetch service.
+pub fn system_environment(program: &Path) -> Vec<(&'static str, OsString)> {
+    let Ok(me) = std::fs::metadata("/proc/self") else {
+        return Vec::new();
+    };
+    lacking(program, Path::new(SYSTEM_PROGRAM), me.uid(), |name| {
+        std::env::var_os(name)
+    })
+}
+
+fn lacking(
+    program: &Path,
+    system: &Path,
+    uid: u32,
+    given: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(&'static str, OsString)> {
+    let is_system = std::fs::canonicalize(system)
+        .is_ok_and(|system| std::fs::canonicalize(program).is_ok_and(|ours| ours == system));
+    if !is_system {
+        return Vec::new();
+    }
+    [
+        (
+            "XDG_RUNTIME_DIR",
+            OsString::from(format!("/run/user/{uid}")),
+        ),
+        (crate::jail::JAIL_VAR, OsString::from("/bin/td-jail")),
+        (crate::jail::TXT_VAR, OsString::from("/bin/td-txt")),
+    ]
+    .into_iter()
+    .filter(|(name, _)| given(name).is_none_or(|value| value.is_empty()))
+    .collect()
 }
 
 /// How a broker is started: by the launch that started this process, where one
@@ -1235,6 +1276,40 @@ mod tests {
             .is_err());
         trying.hurry.send(()).unwrap();
         assert!(wait_for(&trying).is_err());
+    }
+
+    /// The image's own td-agent, however it came, has what the card gives it; what
+    /// it was given stays, and no other build finds the person's services.
+    #[test]
+    fn the_images_td_agent_has_what_the_card_gives_it() {
+        let owned = td_fs::TempDir::new("system-environment").unwrap();
+        let store = owned.path().join("td-agent");
+        std::fs::write(&store, b"").unwrap();
+        let link = owned.path().join("bin-td-agent");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        let other = owned.path().join("built-td-agent");
+        std::fs::write(&other, b"").unwrap();
+        let unset = |_: &str| None;
+        assert_eq!(
+            lacking(&store, &link, 1000, unset),
+            [
+                ("XDG_RUNTIME_DIR", OsString::from("/run/user/1000")),
+                ("TD_AGENT_JAIL", OsString::from("/bin/td-jail")),
+                ("TD_AGENT_TXT", OsString::from("/bin/td-txt")),
+            ]
+        );
+        // By the link too, and an empty value is none.
+        assert_eq!(lacking(&link, &link, 1000, |_| Some("".into())).len(), 3);
+        let given = |name: &str| (name == "XDG_RUNTIME_DIR").then(|| OsString::from("/mine"));
+        assert_eq!(
+            lacking(&store, &link, 1000, given)
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            ["TD_AGENT_JAIL", "TD_AGENT_TXT"]
+        );
+        assert!(lacking(&other, &link, 1000, unset).is_empty());
+        assert!(lacking(&store, &owned.path().join("none"), 1000, unset).is_empty());
     }
 
     /// However many presses came during a try, they bring forward one more.

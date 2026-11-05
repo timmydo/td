@@ -6,8 +6,9 @@
 #![forbid(unsafe_code)]
 
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use td_agent::store::{Id, Role, StateDir};
 use td_agent::workspace::Workspace;
@@ -28,8 +29,8 @@ td-agent is td's agent harness (td-agent/DESIGN.md). Its window lists the\n\
 conversations, the most recently active first, beside the open one.\n\
 Each message is a turn with the configured model through OpenRouter, by\n\
 way of td's fetch service: on td, start it from the launcher's CODING\n\
-AGENT card; on a host, run it as ./install-apps installs it from a td\n\
-checkout, whose launch serves that.\n\
+AGENT card or reach it with --remote; on a host, run it as ./install-apps\n\
+installs it from a td checkout, whose launch serves that.\n\
 \n\
 The conversations run in td-agent serve, which the window starts when none\n\
 is running: closing the window leaves what is running going on, and serve\n\
@@ -184,6 +185,16 @@ fn program() -> Result<PathBuf, String> {
 
 /// The broker: the one that reads the configuration and holds the key.
 fn serve() -> Result<(), String> {
+    // Its services are named by the environment, read all through this program, so
+    // what it lacks comes by starting over with it: only then is it all there.
+    let lacking = td_agent::window::system_environment(&program()?);
+    if !lacking.is_empty() {
+        let again = Command::new(program()?)
+            .args(std::env::args_os().skip(1))
+            .envs(lacking)
+            .exec();
+        return Err(format!("td-agent serve: {again}"));
+    }
     let config_path = td_agent::config::path(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
