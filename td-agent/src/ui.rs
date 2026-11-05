@@ -826,6 +826,9 @@ pub struct App {
     focus: Focus,
     focused: bool,
     capture: Option<Capture>,
+    /// A card was set aside for the press now under way, which ends on any
+    /// release, wherever it goes.
+    made_way: bool,
     /// The configuration's mode, a workspace's own when the human's rules
     /// set none.
     mode: Mode,
@@ -1100,6 +1103,7 @@ impl App {
             focus: Focus::Composer,
             focused: true,
             capture: None,
+            made_way: false,
             mode,
             modes: Some(Vec::new()),
             all_allowed: Vec::new(),
@@ -2143,7 +2147,13 @@ impl App {
     /// in a window too small, say, waits, and that is said once; the
     /// human can still interrupt the turn, which withdraws it.
     fn offer(&mut self) {
-        if self.modal() || self.chooser_coming() || !self.focused || self.menu.is_open() {
+        // A press the card made way for finishes first.
+        if self.modal()
+            || self.chooser_coming()
+            || !self.focused
+            || self.menu.is_open()
+            || self.made_way
+        {
             return;
         }
         if let Some((template, remotes)) = self.admission.take() {
@@ -4545,7 +4555,18 @@ impl App {
     /// `input_live`, or the control seam's. A card waiting is shown once
     /// it has made way for it.
     pub fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
+        let ended = matches!(
+            input,
+            Input::Pointer {
+                phase: PointerPhase::Release,
+                ..
+            } | Input::CancelPointer
+                | Input::Focus(false)
+        );
         self.handle(input, clipboard);
+        if ended {
+            self.made_way = false;
+        }
         self.offer();
     }
 
@@ -4612,7 +4633,7 @@ impl App {
         if self.chooser.is_some() {
             return self.chooser_input(input);
         }
-        if self.confirm.is_some() {
+        if self.confirm.is_some() && !self.card_makes_way(&input) {
             return self.confirm_input(input);
         }
         if self.menu.is_open() && self.menu_input(&input) {
@@ -6261,6 +6282,44 @@ impl App {
         self.offer();
     }
 
+    /// A tool's card holds its own conversation, not the window: `F10`, or a
+    /// press on the menu bar or the list, sets it aside as the window losing the
+    /// keyboard does, undecided, and it comes back when nothing else is in the way.
+    /// The card that comes back settles again, so what was meant for the menu
+    /// decides nothing.
+    fn card_makes_way(&mut self, input: &Input<'_>) -> bool {
+        let Some(confirm) = self.confirm.as_ref() else {
+            return false;
+        };
+        if !matches!(
+            confirm.purpose(),
+            confirm::Purpose::Approve { .. } | confirm::Purpose::Resume { .. }
+        ) {
+            return false;
+        }
+        let through = match *input {
+            Input::Key { chord, repeat } => chord == menu::OPEN && !repeat,
+            Input::Pointer {
+                phase: PointerPhase::Press,
+                x,
+                y,
+                ..
+            } => {
+                !confirm.contains(x, y)
+                    && (menu::bar(self.surface).rect().contains(x, y)
+                        || self.regions.is_some_and(|r| r.list.contains(x, y)))
+            }
+            _ => false,
+        };
+        if through {
+            self.made_way = matches!(input, Input::Pointer { .. });
+            self.confirm = None;
+            self.apply_focus();
+            self.touch();
+        }
+        through
+    }
+
     /// An input while the question is open, which is the question's: every
     /// key and the pointer. A resize and the window's focus are the
     /// window's too.
@@ -6801,7 +6860,7 @@ impl App {
         if self.chooser.is_some() {
             return self.chooser_input(Input::Key { chord, repeat });
         }
-        if self.confirm.is_some() {
+        if self.confirm.is_some() && !self.card_makes_way(&Input::Key { chord, repeat }) {
             return self.confirm_input(Input::Key { chord, repeat });
         }
         if self.menu.is_open() {
@@ -13797,6 +13856,83 @@ pub mod tests {
             app.take_requests(),
             [decided(2, 10, false), decided(2, 11, false)]
         );
+        // Set aside for the menu, decided nothing, and back when it closes.
+        let typed = |app: &mut App, chord: &str| {
+            app.input(
+                Input::Key {
+                    chord,
+                    repeat: false,
+                },
+                &mut NoClipboard,
+            );
+        };
+        app.ask(card(2, 9));
+        typed(&mut app, menu::OPEN);
+        assert!(app.confirm().is_none() && app.menu_open());
+        assert!(app.take_requests().is_empty());
+        typed(&mut app, "Escape");
+        assert!(!app.menu_open());
+        assert_eq!(shown(&app), Some((id(2), 9)));
+        assert!(app.take_requests().is_empty());
+        // Its menu reaches Quit, the card still undecided.
+        typed(&mut app, menu::OPEN);
+        app.menu_action(menu::Action::Quit);
+        assert_eq!(app.take_requests(), [Request::Quit]);
+        typed(&mut app, "Escape");
+        assert_eq!(shown(&app), Some((id(2), 9)));
+        // The bar and the list make way too; a press on the card does not.
+        let header = menu::bar(app.surface).header(2).unwrap();
+        press(&mut app, header.x + 1, header.y + 1);
+        assert!(app.confirm().is_none(), "the bar");
+        typed(&mut app, "Escape");
+        assert_eq!(shown(&app), Some((id(2), 9)));
+        // Another conversation is a press away, with its own card; this one
+        // stays undecided, to be back with its conversation.
+        press_row(&mut app, &Item::Conversation(id(3)), 8);
+        assert_eq!(app.take_requests(), [Request::Open(id(3))]);
+        assert_eq!(shown(&app), Some((id(3), 7)));
+        press_row(&mut app, &Item::Conversation(id(2)), 8);
+        assert_eq!(app.take_requests(), [Request::Open(id(2))]);
+        assert_eq!(shown(&app), Some((id(2), 9)));
+        // Where the card lies over the list, the press is the card's.
+        let rect = app.confirm().unwrap().rect();
+        assert!(app.regions.unwrap().list.contains(rect.x + 1, rect.y + 1));
+        typed(&mut app, "Tab");
+        assert_eq!(app.confirm().unwrap().focus(), "allow");
+        press(&mut app, rect.x + 1, rect.y + 1);
+        assert_eq!(app.confirm().unwrap().focus(), "allow");
+        assert_eq!(shown(&app), Some((id(2), 9)));
+        assert!(app.take_requests().is_empty());
+        app.withdraw(&id(2), Some(9));
+        assert!(app.take_requests().is_empty());
+        // A press ended by anything but its release brings the card back too.
+        app.ask(card(2, 9));
+        let row = |app: &App, phase| Input::Pointer {
+            phase,
+            x: app.regions.unwrap().list.x + 8,
+            y: app.regions.unwrap().list.y + 4,
+            extend: false,
+            follow: false,
+        };
+        let held = row(&app, PointerPhase::Press);
+        app.input(held, &mut NoClipboard);
+        assert!(app.confirm().is_none());
+        app.input(Input::CancelPointer, &mut NoClipboard);
+        assert_eq!(shown(&app), Some((id(2), 9)));
+        let held = row(&app, PointerPhase::Press);
+        app.input(held, &mut NoClipboard);
+        assert!(app.confirm().is_none());
+        app.input(Input::Focus(false), &mut NoClipboard);
+        app.input(Input::Focus(true), &mut NoClipboard);
+        assert_eq!(shown(&app), Some((id(2), 9)));
+        let _ = app.take_requests();
+        app.withdraw(&id(2), Some(9));
+        // A pointer held over something else does not hold a card back.
+        app.capture = Some(Capture::Transcript);
+        app.ask(card(2, 9));
+        assert_eq!(shown(&app), Some((id(2), 9)));
+        app.withdraw(&id(2), Some(9));
+        assert!(app.take_requests().is_empty());
         // Set aside with the keyboard, armed or not, and decided nothing.
         app.ask(card(2, 9));
         key(&mut app, "Tab");

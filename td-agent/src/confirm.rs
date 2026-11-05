@@ -475,6 +475,16 @@ impl Confirm {
         &self.purpose
     }
 
+    #[cfg(test)]
+    pub fn rect(&self) -> Rect {
+        self.dialog.rect()
+    }
+
+    /// Whether `x`, `y` is on the card.
+    pub fn contains(&self, x: i64, y: i64) -> bool {
+        self.dialog.rect().contains(x, y)
+    }
+
     /// Where its keyboard is: `details`, `cancel`, a card's "always"
     /// answer, or its action, `delete`, `allow`, `admit` or `remove`.
     pub fn focus(&self) -> &'static str {

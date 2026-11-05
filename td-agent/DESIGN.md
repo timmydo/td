@@ -5070,6 +5070,12 @@ human's and the workspace's. Then the human-only rows, which no rule can
 lower. Then a repeated call, the person's. Then the human's allow rules
 and "Allow all". Then the table.
 
+**A card holds its conversation, not the window.** While a tool's card waits,
+`F10` or a press on the menu bar or the list sets it aside, undecided, as the
+window losing the keyboard does, and it comes back, settling again, once nothing
+else is in the way. So the menus, Quit among them, and another conversation stay
+reachable; its own conversation's transcript and composer wait for the answer.
+
 **Allow all.** The person may let everything the table or a workspace
 being unconfined would ask of them run with no card in one conversation,
 whatever the mode and with no classifier, by `Allow all in this
