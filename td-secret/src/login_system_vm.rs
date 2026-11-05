@@ -611,7 +611,7 @@ fn sshd(enforced: bool) {
     assert!(!config.contains("prohibit-password"), "{config}");
     if enforced {
         assert!(
-            config.contains("PermitRootLogin no\nAllowUsers tester\n"),
+            config.contains("PermitRootLogin no\nAllowUsers tester td-admin\n"),
             "{config}"
         );
     } else {
