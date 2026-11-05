@@ -402,10 +402,10 @@ const PINS: &[PinDef] = &[
         key: "linux-kernel-source",
         aliases: &[],
         // The bootable kernel; libc's UAPI headers come from its own recipe.
-        url: "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.13.tar.xz",
-        sha256: "08e7b0c4f2dd1971f972da274b5e589a98989390ac56acd7a1a5af922363ea6c",
-        file: "linux-7.2.13.tar.xz",
-        version: "7.2.13",
+        url: "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.3.1.tar.xz",
+        sha256: "fa595aad93734f829c963c2a90ef7c3673224fd7fdae7b49406e397cde2de231",
+        file: "linux-7.3.1.tar.xz",
+        version: "7.3.1",
     },
     PinDef {
         key: "openssh-x86-64-source",

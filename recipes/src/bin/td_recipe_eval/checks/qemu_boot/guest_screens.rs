@@ -15,6 +15,13 @@
 //! hold, but for the capture taken while it slept, which is admitted only
 //! until the first capture after the wake that differs from it; and the
 //! wake's inactive output must show at least once after the wake.
+//!
+//! A suspension is also the one time a capture may be VGA's 720x400:
+//! virtio-gpu's freeze (Linux 7.3) resets QEMU's virtio-vga. Asleep that
+//! shows VGA's text memory, the early boot log, which no compositor writes.
+//! The wake's device reset leaves QEMU's own inactive frame at that size,
+//! and a capture of the text is admitted only as the capture taken asleep
+//! is.
 
 use super::serial_shell::SerialPort;
 use super::update::{ppm, read_capture};
@@ -29,6 +36,57 @@ pub(super) const SCREEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// and how long it may take to suspend once its screen is answered.
 pub(super) const SUSPEND_HOLD: Duration = Duration::from_secs(10);
 const SUSPEND_TIMEOUT: Duration = Duration::from_secs(60);
+
+const VGA_WIDTH: usize = 720;
+const VGA_BYTES: usize = VGA_WIDTH * 400 * 3;
+/// VGA's default text colour, which QEMU's inactive frame does not use.
+const VGA_TEXT: [u8; 3] = [0xa8, 0xa8, 0xa8];
+/// QEMU's inactive frame at VGA's size: black, and as many pixels of this
+/// colour as "Display output is not active." has, within its extent. Its
+/// glyphs are not compared.
+const VGA_INACTIVE: [u8; 3] = [0xaa, 0xaa, 0xaa];
+const VGA_INACTIVE_ROWS: std::ops::Range<usize> = 194..207;
+const VGA_INACTIVE_COLUMNS: std::ops::Range<usize> = 240..469;
+const VGA_INACTIVE_PIXELS: usize = 684;
+
+/// A capture's RGB pixels, if it is exactly a VGA-sized one.
+fn vga_frame(bytes: &[u8]) -> Option<&[u8]> {
+    bytes
+        .strip_prefix(b"P6\n720 400\n255\n")
+        .filter(|body| body.len() == VGA_BYTES)
+}
+
+/// Whether a VGA-sized capture is VGA's text: black and its text colour.
+fn vga_text(frame: &[u8]) -> bool {
+    let mut text = false;
+    for pixel in frame.chunks_exact(3) {
+        if pixel == VGA_TEXT {
+            text = true;
+        } else if pixel != [0; 3] {
+            return false;
+        }
+    }
+    text
+}
+
+/// Whether a VGA-sized capture has QEMU's inactive frame's colours, extent
+/// and pixel count, and nothing else.
+fn vga_inactive(frame: &[u8]) -> bool {
+    let mut text = 0_usize;
+    for (y, row) in frame.chunks_exact(VGA_WIDTH * 3).enumerate() {
+        for (x, pixel) in row.chunks_exact(3).enumerate() {
+            if pixel == VGA_INACTIVE
+                && VGA_INACTIVE_ROWS.contains(&y)
+                && VGA_INACTIVE_COLUMNS.contains(&x)
+            {
+                text += 1;
+            } else if pixel != [0; 3] {
+                return false;
+            }
+        }
+    }
+    text == VGA_INACTIVE_PIXELS
+}
 
 /// Whether a 1280x800 capture's RGB pixels show a screen, given the
 /// arguments the guest named it with; arguments it does not take are an
@@ -115,6 +173,34 @@ impl<'a> Suspension<'a> {
         if self.woken && (self.inactive)(pixels).map_err(|e| format!("after the wake: {e}"))? {
             self.inactive_seen = true;
         }
+        Ok(())
+    }
+
+    /// A VGA-sized capture, the card having been reset. Asleep, the text
+    /// or the inactive frame, which takes the place of the capture admitted
+    /// after the wake, so the desktop is not admitted past it. After the
+    /// wake, that capture until the display changes and then only the
+    /// inactive frame, which counts as the inactive output.
+    fn judge_vga(&mut self, frame: &[u8]) -> Result<(), String> {
+        let inactive = vga_inactive(frame);
+        if !self.woken {
+            if !inactive && !vga_text(frame) {
+                return Err("the reset card showed neither VGA's text nor QEMU's inactive frame while asleep".into());
+            }
+            self.asleep = Some(frame.to_vec());
+            return Ok(());
+        }
+        if self.asleep.as_deref() != Some(frame) {
+            self.asleep = None;
+            if !inactive {
+                return Err(
+                    "the display changed after the wake to a VGA frame that is not QEMU's \
+                     inactive output"
+                        .into(),
+                );
+            }
+        }
+        self.inactive_seen |= inactive;
         Ok(())
     }
 
@@ -302,15 +388,20 @@ impl<'a> ScreenSteps<'a> {
         let captured = self.capture();
         self.lost = captured.is_err();
         let bytes = captured?;
-        let pixels = ppm(&bytes)?;
-        // The first capture once QEMU reports the guest suspended is the
-        // display as it slept.
-        if let (Some(Sleep { since: Some(_), .. }), None, Some(wake)) =
-            (&self.sleep, &self.judge.suspension, &self.plan.wake)
-        {
-            self.judge.suspension = Some(Suspension::new(pixels, wake));
-        }
-        let verdict = self.judge.judge(pixels, now);
+        let verdict = match vga_frame(&bytes) {
+            Some(frame) => self.judge_reset_card(frame),
+            None => {
+                let pixels = ppm(&bytes)?;
+                // The first capture once QEMU reports the guest suspended
+                // is the display as it slept.
+                if let (Some(Sleep { since: Some(_), .. }), None, Some(wake)) =
+                    (&self.sleep, &self.judge.suspension, &self.plan.wake)
+                {
+                    self.judge.suspension = Some(Suspension::new(pixels, wake));
+                }
+                self.judge.judge(pixels, now)
+            }
+        };
         if due && verdict.is_ok() {
             self.wake()?;
             self.sleep = None;
@@ -335,6 +426,30 @@ impl<'a> ScreenSteps<'a> {
             Ok(None) => Ok(()),
             Err(error) => Err(self.refused(&bytes, error)),
         }
+    }
+
+    /// A VGA-sized capture: admitted only from the guest's going to sleep
+    /// on, which can reset the card before QEMU reports it suspended, and
+    /// only while no screen is asked for or holds, since none is drawn at
+    /// this size.
+    fn judge_reset_card(&mut self, frame: &[u8]) -> Result<Option<&'a str>, String> {
+        if self.judge.suspension.is_none() {
+            match (&self.sleep, &self.plan.wake) {
+                (Some(_), Some(wake)) => {
+                    self.judge.suspension = Some(Suspension::new(frame, wake));
+                }
+                _ => return Err("a VGA-sized capture outside a suspension".into()),
+            }
+        }
+        if self.judge.pending.is_some() || self.judge.holding.is_some() {
+            return Err("a VGA-sized capture while a screen is asked for or holds".into());
+        }
+        self.judge
+            .suspension
+            .as_mut()
+            .ok_or("the suspension disappeared")?
+            .judge_vga(frame)?;
+        Ok(None)
     }
 
     /// After the boot: every screen answered, and no request the host can
@@ -771,6 +886,180 @@ mod tests {
         assert!(judge.judge(b"d.", now).is_err());
     }
 
+    /// One pixel of VGA's text.
+    fn vga_text_frame() -> Vec<u8> {
+        let mut frame = vec![0_u8; VGA_BYTES];
+        frame[(2 * VGA_WIDTH) * 3..(2 * VGA_WIDTH) * 3 + 3].copy_from_slice(&VGA_TEXT);
+        frame
+    }
+
+    /// The shape of QEMU's inactive frame, with positions and count literal
+    /// rather than the band and count constants it tests: 684 pixels, with
+    /// both corners of the extent measured from a capture, x 240..=468,
+    /// y 194..=206. The next test pins its colour.
+    fn vga_inactive_frame() -> Vec<u8> {
+        let mut frame = vec![0_u8; VGA_BYTES];
+        let mut light = |x: usize, y: usize| {
+            let at = (y * VGA_WIDTH + x) * 3;
+            frame[at..at + 3].copy_from_slice(&VGA_INACTIVE);
+        };
+        light(240, 194);
+        light(468, 206);
+        for n in 0..682 {
+            light(240 + n % 229, 195 + n / 229);
+        }
+        frame
+    }
+
+    /// Only exactly VGA's size is a VGA capture, and the two frames cannot
+    /// be read for each other: their colours differ, and the inactive
+    /// frame's text must lie in its band.
+    #[test]
+    fn a_vga_capture_is_exact_and_its_two_frames_are_distinct() {
+        let body = vec![0_u8; VGA_BYTES];
+        let capture = [b"P6\n720 400\n255\n".as_slice(), &body].concat();
+        assert_eq!(vga_frame(&capture), Some(body.as_slice()));
+        assert_eq!(vga_frame(&capture[..capture.len() - 1]), None);
+        assert_eq!(vga_frame(&[capture.as_slice(), &[0]].concat()), None);
+        assert_eq!(vga_frame(b"P6\n1280 800\n255\n"), None);
+
+        // The colours measured from captures, which the fixtures take as given.
+        assert_eq!(VGA_TEXT, [0xa8; 3]);
+        assert_eq!(VGA_INACTIVE, [0xaa; 3]);
+
+        let (text, inactive) = (vga_text_frame(), vga_inactive_frame());
+        assert!(vga_text(&text) && !vga_inactive(&text));
+        assert!(vga_inactive(&inactive) && !vga_text(&inactive));
+        // All black is neither: nothing shows that it is either frame.
+        assert!(!vga_text(&body) && !vga_inactive(&body));
+        // A pixel of another colour is neither: a guest picture is refused.
+        for mut frame in [vga_text_frame(), vga_inactive_frame()] {
+            frame[9] = 0x10;
+            assert!(!vga_text(&frame) && !vga_inactive(&frame));
+        }
+        // A pixel of QEMU's colour past any edge of its extent is not its
+        // frame, even with the count kept: the last pixel moves there.
+        let last = |frame: &mut [u8]| {
+            let at = (206 * VGA_WIDTH + 468) * 3;
+            frame[at..at + 3].fill(0);
+        };
+        for (x, y) in [(239, 200), (469, 200), (300, 193), (300, 207)] {
+            let mut moved = vga_inactive_frame();
+            last(&mut moved);
+            let at = (y * VGA_WIDTH + x) * 3;
+            moved[at..at + 3].copy_from_slice(&VGA_INACTIVE);
+            assert!(!vga_inactive(&moved), "({x}, {y})");
+        }
+        // The real frame's count, neither one fewer nor one more.
+        let mut fewer = vga_inactive_frame();
+        last(&mut fewer);
+        assert!(!vga_inactive(&fewer));
+        let mut more = vga_inactive_frame();
+        let black = (200 * VGA_WIDTH + 300) * 3;
+        more[black..black + 3].copy_from_slice(&VGA_INACTIVE);
+        assert!(!vga_inactive(&more));
+    }
+
+    /// The sequence Linux 7.3's freeze gives on QEMU's virtio-vga. Asleep:
+    /// its inactive frame, then VGA's text. After the wake: that text until
+    /// the display changes, then only QEMU's frame.
+    #[test]
+    fn the_reset_card_admits_vga_text_only_asleep_and_requires_the_inactive_frame_after() {
+        let wake = Wake {
+            after: "asleep",
+            holds: &locked,
+            inactive: &inactive,
+        };
+        let (text, frame) = (vga_text_frame(), vga_inactive_frame());
+        let mut suspension = Suspension::new(b"d.", &wake);
+        assert_eq!(suspension.judge_vga(&text), Ok(()));
+        assert_eq!(
+            suspension.judge(b"d."),
+            Err(
+                "the display changed from its suspended capture to what its wake does not admit"
+                    .to_string()
+            )
+        );
+        suspension.woken = true;
+        assert_eq!(suspension.judge_vga(&text), Ok(()));
+        assert!(suspension.end().is_err());
+        assert_eq!(suspension.judge_vga(&frame), Ok(()));
+        assert_eq!(suspension.end(), Ok(()));
+        // The text does not come back, nor the desktop at its own size.
+        assert!(suspension.judge_vga(&text).is_err());
+        assert!(suspension.judge(b"d.").is_err());
+
+        // QEMU's frame asleep is not the inactive output after the wake,
+        // until it shows after the wake.
+        let mut suspension = Suspension::new(b"d.", &wake);
+        assert_eq!(suspension.judge_vga(&frame), Ok(()));
+        suspension.woken = true;
+        assert!(suspension.end().is_err());
+        assert_eq!(suspension.judge_vga(&frame), Ok(()));
+        assert_eq!(suspension.end(), Ok(()));
+
+        // Woken, text the guest did not sleep on is refused.
+        let mut suspension = Suspension::new(b"d.", &wake);
+        suspension.woken = true;
+        assert!(suspension.judge_vga(&text).is_err());
+
+        // Asleep, a frame that is neither is refused.
+        let mut suspension = Suspension::new(b"d.", &wake);
+        let mut picture = vga_text_frame();
+        picture[9] = 0x10;
+        assert!(suspension.judge_vga(&picture).is_err());
+    }
+
+    /// A VGA-sized capture is refused outside a suspension, and where a
+    /// screen is asked for or holds, since none is drawn at that size.
+    #[test]
+    fn a_vga_capture_counts_only_from_the_guest_going_to_sleep() {
+        let check = shows(b'l');
+        let screen = Screen {
+            name: "next",
+            check: &check,
+            then: None,
+        };
+        let wake = Wake {
+            after: "asleep",
+            holds: &locked,
+            inactive: &inactive,
+        };
+        let screens: [Screen; 0] = [];
+        let with_wake = GuestScreens {
+            prompt: "ASK",
+            answer: "SEEN",
+            screens: &screens,
+            order: &[],
+            keep: None,
+            wake: Some(wake),
+        };
+        let frame = vga_inactive_frame();
+        let mut steps = ScreenSteps::new(&with_wake, PathBuf::from("unused"), 0);
+        assert!(steps
+            .judge_reset_card(&frame)
+            .unwrap_err()
+            .contains("outside a suspension"));
+
+        let now = Instant::now();
+        steps.sleep = Some(Sleep::new(now).unwrap());
+        assert_eq!(steps.judge_reset_card(&frame), Ok(None));
+        assert!(steps.judge.suspension.is_some());
+
+        ask(&mut steps.judge, &screen, &[]);
+        assert!(steps
+            .judge_reset_card(&frame)
+            .unwrap_err()
+            .contains("asked for or holds"));
+        steps.judge.pending = None;
+        assert_eq!(steps.judge_reset_card(&frame), Ok(None));
+        steps.judge.holding = Some(("held", &locked));
+        assert!(steps
+            .judge_reset_card(&frame)
+            .unwrap_err()
+            .contains("asked for or holds"));
+    }
+
     /// After the wake the inactive output must show before the next screen
     /// is accepted, or before the boot ends; acceptance ends the
     /// suspension and the screen's own hold applies after it.
@@ -783,7 +1072,7 @@ mod tests {
             then: None,
         };
         let now = Instant::now();
-        // Only the lock after the wake: the dead-card premise is unshown.
+        // Only the lock after the wake: the reset card is unshown.
         let mut judge = suspended_judge(true);
         ask(&mut judge, &next, &[]);
         assert!(judge

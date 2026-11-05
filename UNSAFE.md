@@ -935,7 +935,7 @@ states the layout of the struct it is issued with: a Rust `#[repr(C)]` that
 drifts from its request is an out-of-bounds kernel write through code the
 compiler reads as safe. A test extracts that size field from each of the four
 and compares it to `size_of` of the struct, and a second test writes out the
-kernel's own byte counts — 64, 64, 80 and 20 for Linux 7.2.13 on x86-64 —
+kernel's own byte counts — 64, 64, 80 and 20 for Linux 7.3.1 on x86-64 —
 rather than deriving them from the request numbers, because deriving them
 would let both sides move together. `DrmModeInfo` is pinned at 68 bytes in
 that second test for a reason no request number can express: it is never an
@@ -1138,7 +1138,7 @@ test pins both halves.
 That ordering is hygiene, not a kernel requirement, and an earlier revision of
 this paragraph said "must". A review checked it and it is wrong:
 `drm_gem_mmap_obj` takes its own reference for the mapping
-(`drivers/gpu/drm/drm_gem.c:1238`, "Take a ref for this mapping of the object
+(`drivers/gpu/drm/drm_gem.c:1237`, "Take a ref for this mapping of the object
 ... cleaned up by the corresponding vm_close"), while `MODE_DESTROY_DUMB` is
 `drm_gem_handle_delete` and drops only the handle's reference. Closing the
 handle while mapped leaves the mapping valid, which is what libdrm and Mesa do

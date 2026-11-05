@@ -4016,13 +4016,13 @@ fn provision_selector_as(
 /// archive carries `/init`, that error only logs (`KERN_INFO`, with a copy of
 /// the initrd left in rootfs as `/initrd.image`, since `CONFIG_BLK_DEV_RAM` is
 /// on) and the boot CONTINUES with the identity absent
-/// (`init/initramfs.c:734-741`, `init/main.c:1675-1682`). Nothing
+/// (`init/initramfs.c:735-742`, `init/main.c:1687-1694`). Nothing
 /// downstream reports it, so the padding here is the only thing between a run
 /// and a selector that boots without its volume identity or live marker.
 ///
 /// The directory entries are emitted rather than assumed: neither phase of
 /// `build_initramfs_spec` creates `/etc`, and a missing parent is silent too —
-/// `filp_open` failing is `return 0` (`init/initramfs.c:393-395`).
+/// `filp_open` failing is `return 0` (`init/initramfs.c:394-396`).
 fn append_selector_identity(initramfs: &Path, role: SelectorRole) -> Result<(), String> {
     use td_engine::cpio::{Entry, Kind};
 

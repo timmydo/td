@@ -1735,10 +1735,10 @@ fn suspensions() -> u64 {
 
 /// Suspend to RAM from the desktop with `key` plugged, the boot's last
 /// step: the host sees the desktop, waits for QEMU to report the guest
-/// suspended, holds it and wakes it. This kernel's virtio-gpu has no
-/// restore, so the card stays reset; the host then admits only lock
-/// pixels or QEMU's inactive output, which it must see. The chord's
-/// first report is the keyboard's first input after the wake, and it
+/// suspended, holds it and wakes it. The freeze and the wake reset QEMU's
+/// virtio-vga and S3 recreates none of virtio-gpu's objects, so the host
+/// then admits only lock pixels or QEMU's inactive output, which it must
+/// see. The chord's first report is the keyboard's first input after the wake, and it
 /// starts the boot's one login worker since before the suspend, which
 /// the chord does only on a locked session, under the same compositor
 /// and authority: the session was locked when the first post-wake input

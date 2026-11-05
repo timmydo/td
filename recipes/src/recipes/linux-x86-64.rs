@@ -119,7 +119,7 @@ pub const FIRMWARE: &[(&str, &str)] = &[
     ),
 ];
 
-// linux-x86-64 (Linux 7.2.13): the latest STABLE mainline kernel (not a
+// linux-x86-64 (Linux 7.3.1): the latest STABLE mainline kernel (not a
 // longterm/LTS line), built in the Debian build root (AGENTS.md "Debian build
 // root"): Debian's gcc 14.2 as CC and HOSTCC, its binutils, make, flex, bison,
 // bc, perl, libelf and gzip, all at /usr/bin. Nothing of the root ships: vmlinux
@@ -331,10 +331,10 @@ pub fn recipe() -> Recipe {
     //    bzImage+initramfs. Only CONFIG_KEXEC_FILE (the file-based syscall) + the
     //    KEXEC_CORE it selects are used; CONFIG_KEXEC — the legacy segment-based
     //    kexec_load(2) — is pinned OFF and guarded, since nothing here uses it and it
-    //    would only widen the syscall surface (in 7.2.13 KEXEC and KEXEC_FILE are
+    //    would only widen the syscall surface (in 7.3.1 KEXEC and KEXEC_FILE are
     //    independent siblings — KEXEC_FILE does NOT depend on KEXEC — so dropping
     //    KEXEC leaves KEXEC_FILE intact, and reboot(LINUX_REBOOT_CMD_KEXEC) runs off
-    //    KEXEC_CORE). In 7.2.13 KEXEC_FILE `select`s CRYPTO_LIB_SHA256 + KEXEC_CORE on
+    //    KEXEC_CORE). In 7.3.1 KEXEC_FILE `select`s CRYPTO_LIB_SHA256 + KEXEC_CORE on
     //    its own (verified against kernel/Kconfig.kexec), so NO CRYPTO menuconfig is
     //    needed for kexec itself; dm-crypt below selects CRYPTO separately.
     //    CONFIG_RELOCATABLE=y is REQUIRED: the x86
@@ -352,7 +352,7 @@ pub fn recipe() -> Recipe {
     //    mount an EROFS file out of the btrfs. CONFIG_BTRFS_FS=y self-selects its whole
     //    dependency set (CRC32, CRYPTO_LIB_SHA256/BLAKE2B, ZLIB/LZO/ZSTD, RAID6_PQ,
     //    XOR_BLOCKS, XXHASH, FS_IOMAP — verified against fs/btrfs/Kconfig), so do NOT
-    //    pin those individually; note CONFIG_LIBCRC32C does NOT exist in 7.2.13 (btrfs
+    //    pin those individually; note CONFIG_LIBCRC32C does NOT exist in 7.3.1 (btrfs
     //    uses the CRC32 lib, not CRYPTO_CRC32C) — a guard on it would red the build
     //    permanently. BTRFS_FS sits under `if BLOCK` (BLOCK already =y) and
     //    BLK_DEV_LOOP under `menuconfig BLK_DEV` (already =y), so no new menuconfig
@@ -417,8 +417,8 @@ pub fn recipe() -> Recipe {
     //    are off today despite defaulting on.
     //
     //    SECCOMP is pinned; SECCOMP_FILTER is NOT, and must not be. SECCOMP carries an
-    //    explicit `prompt` line above `def_bool y` (arch/Kconfig:647), so allnoconfig
-    //    can answer it and a pin is what turns it back on. SECCOMP_FILTER (:664) has
+    //    explicit `prompt` line above `def_bool y` (arch/Kconfig:664), so allnoconfig
+    //    can answer it and a pin is what turns it back on. SECCOMP_FILTER (:681) has
     //    NO prompt at all — it is `def_bool y` on `HAVE_ARCH_SECCOMP_FILTER && SECCOMP
     //    && NET`, so kconfig computes it and a line naming it in this list would be
     //    dropped by olddefconfig rather than honoured. It is guarded below instead:
@@ -1008,8 +1008,12 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_USB_NET_NET1080[ =]/d; \
                   /^#? *CONFIG_USB_NET_CDC_SUBSET[ =]/d; \
                   /^#? *CONFIG_USB_NET_ZAURUS[ =]/d; \
+                  /^#? *CONFIG_SYSCALL_USER_DISPATCH[ =]/d; \
+                  /^#? *CONFIG_SERIAL_8250_MOXA_PCIE[ =]/d; \
                   /^#? *CONFIG_SND_ALOOP[ =]/d' .config && \
                  printf '%s\\n' \
+                   'CONFIG_SYSCALL_USER_DISPATCH=y' \
+                   '# CONFIG_SERIAL_8250_MOXA_PCIE is not set' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
                    '# CONFIG_UNWINDER_ORC is not set' \
                    '# CONFIG_MODULES is not set' \
@@ -1368,6 +1372,8 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_MOUSE_PS2=y' .config || { echo 'MOUSE_PS2 off — the qemu PS/2 pointer would not appear' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_INPUT=y' .config || { echo 'VIRTIO_INPUT off — the qemu virtio tablet would not appear, so the pointer could not reach the far edges of the screen' >&2; exit 1; }; \
                  grep -q '^CONFIG_SERIO_I8042=y' .config || { echo 'SERIO_I8042 off — qemu PS/2 input has no controller' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SYSCALL_USER_DISPATCH=y' .config || { echo 'SYSCALL_USER_DISPATCH off — allnoconfig answers n to the prompt Linux 7.3 gave it, removing a prctl applications could use on 7.2' >&2; exit 1; }; \
+                 if grep -q '^CONFIG_SERIAL_8250_MOXA_PCIE=' .config; then echo 'SERIAL_8250_MOXA_PCIE set — it defaults to SERIAL_8250 since Linux 7.3, and td supports no such card' >&2; exit 1; fi; \
                  grep -q '^CONFIG_VT_CONSOLE=y' .config || { echo 'VT_CONSOLE off — the framebuffer recovery console is unavailable' >&2; exit 1; }; \
                  grep -q '^CONFIG_FRAMEBUFFER_CONSOLE=y' .config || { echo 'FRAMEBUFFER_CONSOLE off — virtio fbdev cannot host the recovery console' >&2; exit 1; }; \
                  grep -q '^CONFIG_DRM_VIRTIO_GPU=y' .config || { echo 'DRM_VIRTIO_GPU off — qemu virtio-vga cannot expose /dev/fb0' >&2; exit 1; }; \
@@ -1791,7 +1797,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::run("{out}", &[SH, "-c", &initramfs_check]).env("PATH", PATH));
 
     // td-sh, td-init and td-util are initramfs contents; td-util also packs it.
-    Recipe::mesboot("linux-x86-64", "7.2.13")
+    Recipe::mesboot("linux-x86-64", "7.3.1")
         .source_input("linux-kernel-source")
         .build_root()
         .native_inputs(&["td-sh", "td-init", "td-util"])

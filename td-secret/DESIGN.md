@@ -2919,7 +2919,7 @@ a crash. The controls rest on two premises:
   order is what makes them harmless: a sync before the change can only
   make earlier state durable;
 - the kernel's rename and unlink do not sync the Btrfs log tree. On the
-  pinned 7.2 kernel a rename of an inode already logged in the running
+  pinned 7.3 kernel a rename of an inode already logged in the running
   transaction, as the synced temporary is, only updates the log tree in
   memory (`btrfs_log_new_name`), and an unlink of an inode not logged is
   memory-only. Some kernels from about 4.20 to 5.11 synced the log on
@@ -3016,8 +3016,13 @@ capture must be what a lock screen's hold admits, but for the capture
 taken while it slept, which is admitted only until the first capture
 after the wake that differs from it, so the desktop cannot return; and
 QEMU's inactive output must show at least once after the wake, so the
-dead card is observed, not assumed. Every enrolled or unavailable
-boot waits for the serial greeter's td-login to hold ttyS0 before it
+reset card is observed, not assumed. A capture at VGA's 720x400 is
+admitted only from the guest's going to sleep on, and only while no
+screen is asked for or holds: asleep if it is VGA's text or QEMU's
+inactive frame, when it replaces the capture admitted after the wake;
+after the wake if it is that capture, until the first change, or that
+frame, the only VGA capture counted as the inactive output. Every
+enrolled or unavailable boot waits for the serial greeter's td-login to hold ttyS0 before it
 asks for a screen, since its getty flushes the line's input first.
 
 | Phase | The boot |
@@ -3088,11 +3093,14 @@ logged and live `login-operation` worker under td-authd, an unlock's
 desktop it opens the menu), and the compositor and authority are the
 ones from before the suspend: the session was locked when the first
 post-wake input was routed, in the same generation. Escape then ends
-the worker. The lock surface itself cannot be seen: the wake resets the
-virtio-gpu card and Linux 7.2.13's driver has no freeze or restore, so
-the card stays dead and QEMU shows its inactive output, which the host
-requires. The suspend is the boot's last step, since the display does
-not return.
+the worker. The lock surface itself cannot be seen: Linux 7.3.1's
+virtio-gpu freeze resets QEMU's virtio-vga, the wake resets the machine's
+devices again, and the driver's restore recreates its objects only after
+hibernation, not S3. So asleep QEMU shows VGA's text memory, the early boot
+log, which no compositor writes, and after the wake its inactive output at
+that size, which the host requires, in place of any lock pixel. This is
+QEMU's card: nothing here says what a machine's own GPU shows after a wake.
+The suspend is the boot's last step, since the display does not return.
 
 The host requires, for each boot, the phase's pass line, QEMU's exit
 after the persistent shutdown marker (a capture lost after the last

@@ -120,9 +120,11 @@ fn install(booted: &str, pixels: &[u8], arguments: &[&str]) -> Result<bool, Stri
 }
 
 /// QEMU's own frame while no scanout is set, between a compositor's exit
-/// and its successor's first frame or after a wake: black, and its grey
-/// "Display output is not active." in the 16-pixel text row from 384,
-/// within 128 pixels of the centre, so no guest pixel.
+/// and its successor's first frame or as the guest's card resets for a
+/// suspend: black, and its grey "Display output is not active." in the
+/// 16-pixel text row from 384, within 128 pixels of the centre, so no guest
+/// pixel. After the wake QEMU shows the same frame at VGA's size, which
+/// guest_screens.rs reads.
 const INACTIVE: [u8; 3] = [0xaa, 0xaa, 0xaa];
 const INACTIVE_ROWS: std::ops::Range<usize> = 384..400;
 const INACTIVE_COLUMNS: std::ops::Range<usize> = 512..768;
@@ -625,7 +627,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          QEMU S3 the session was locked when the first post-wake input was routed, in the same \
          generation, and after its first change following the wake the display showed only \
          QEMU's inactive output or lock pixels; UHID keys and keyboard, scripted presence, no \
-         lock surface seen after the wake (virtio-gpu has no restore), no physical-presence, \
+         lock surface seen after the wake (S3 recreates none of virtio-gpu's objects), no physical-presence, \
          USB, lid, hardware suspend or YubiKey claim"
     );
     Ok(())
