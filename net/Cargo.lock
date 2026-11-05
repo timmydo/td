@@ -168,7 +168,6 @@ checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -230,14 +229,18 @@ version = "0.1.0"
 name = "td-net"
 version = "0.1.0"
 dependencies = [
- "ring",
  "rustls",
  "sha2",
  "td-engine",
  "td-fs",
+ "td-primitives",
  "ureq",
  "webpki-roots",
 ]
+
+[[package]]
+name = "td-primitives"
+version = "0.1.0"
 
 [[package]]
 name = "typenum"

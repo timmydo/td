@@ -6,21 +6,19 @@ use crate::types::Recipe;
 /// target's one network client, for the `td-fetchd` applet the jailed
 /// applications reach over a socket. `net/` is the crate; `engine/` is its
 /// path dependency. The engine also shares td-civil calendar conversion and
-/// td-fs helpers; all are staged beside it and the crate's
-/// manifest names the main tree. The lock is the crate's own committed one,
+/// td-fs helpers, and td-primitives is its TLS and signature cryptography; all are staged
+/// beside it and the crate's manifest names the main tree. The lock is the crate's own committed one,
 /// and the closure is the tier's reviewed vendored set; nothing else enters.
 /// Static, as every td-owned program on the image, so the system tree's
 /// `/bin/td-fetchd` link needs no loader.
 pub fn recipe() -> Recipe {
     Recipe::rust("td-net", "0.1.0")
         .local_source("net")
-        .local_source_trees(&["engine", "td-fs", "td-civil"])
+        .local_source_trees(&["engine", "td-fs", "td-civil", "td-primitives"])
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_subdir("net")
         .cargo_lock("net/Cargo.lock")
-        // ring 0.17.14's C and pregenerated x86_64 assembly.
-        .c_objects(30)
         .static_link()
         .bins(&["td-net"])
 }
@@ -39,14 +37,17 @@ mod tests {
             Some(vec![
                 "engine".to_string(),
                 "td-fs".to_string(),
-                "td-civil".to_string()
+                "td-civil".to_string(),
+                "td-primitives".to_string()
             ])
         );
         assert_eq!(recipe.cargo_subdir.as_deref(), Some("net"));
         assert_eq!(recipe.cargo_lock.as_deref(), Some("net/Cargo.lock"));
         assert_eq!(recipe.bins, Some(vec!["td-net".to_string()]));
         assert_eq!(recipe.static_link, Some(true));
-        assert_eq!(recipe.c_objects, Some(30));
+        // No C at all: ring's lock entry is inert, and any object it or anything
+        // else compiled would fail the build against this declaration.
+        assert_eq!(recipe.c_objects, None);
         // No fetch pin: the bytes are the committed trees, pinned by the
         // compiled seed-digest table.
         assert!(crate::source_pins::by_key("td-net-source").is_none());

@@ -38,8 +38,11 @@ assembly, so it adds nothing to `UNSAFE.md`.
 AES-192, other GCM nonce and tag sizes, a standalone Poly1305, a standalone
 AES block API, RSA signing and decryption, compressed points, P-384 signing and
 any other curve, P-521 included, are absent on purpose. Private
-`bignum` and `der` serve the modules above and are not an API. td-net's replacement of `ring` is the
-consumer these exist for; until that lands, nothing links this crate.
+`bignum` and `der` serve the modules above and are not an API. td-net is the consumer these exist
+for, in place of `ring`: `net/src/tls_crypto.rs` puts them behind rustls's
+`CryptoProvider`, whose suites are ChaCha20-Poly1305 and AES-GCM in TLS 1.3 and
+with ECDHE in TLS 1.2, over X25519, P-256 and P-384. Key-file formats, as td-subst's
+and td-test-https's PKCS#8, belong to td-net too.
 
 ## What is claimed about side channels
 
@@ -118,7 +121,9 @@ sandbox, and a read that fails refuses rather than falling back.
 
 ## Speed
 
-Measured on a Ryzen 7 5700G at `opt-level = 3`, sealing 16 KiB records:
+Measured on a Ryzen 7 5700G at `opt-level = 3`, sealing 16 KiB records. td-net
+builds at that level, so a transfer with a server that picks AES runs at about
+130 MB/s rather than `ring`'s several GB/s, ahead of most network links:
 
 | Primitive | MB/s |
 |---|---|
@@ -169,6 +174,12 @@ RFC 8439's AEAD vector, and counters and length fields truncated to 16 bits or
 fewer, which survived every corpus until `aead_long.txt`. Wider counters, and
 AES-GCM bit lengths cut at 24 bits or more, still survive it: those lengths need
 more data than a suite should hold and more than a TLS record can carry.
+
+Before td-net left `ring`, this crate was run against it: every Wycheproof
+signature row, and random inputs through every algorithm, with signatures
+cross-verified and bytes compared where the algorithm is deterministic. There
+was no disagreement in 585,540 comparisons. `ring` is not a dependency, so
+that run is a record in the landing commit, not a test to repeat.
 
 ## Relation to other crates
 

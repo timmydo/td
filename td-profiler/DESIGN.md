@@ -73,7 +73,7 @@ a named coverage boundary, not permission to certify the containing object as
 fully unwindable. Every split output records the conservative transitive union
 of applicable roster entries at `lib/debug/.td-assembly-exception`; this
 includes glibc startup and libgcc in downstream static executables, plus the
-Rust runtime and package-specific assembly where applicable. Every Rust
+Rust runtime where applicable. Every Rust
 output a recipe builds is linked by td-link (`td-link/DESIGN.md`) from
 gcc-runtime's start files and static libgcc, so its marker names
 gcc-runtime's libgcc assembly.
@@ -87,7 +87,8 @@ independent of what its companion retains. Every varying build path is
 remapped before it reaches the compiled objects. The canonical roots are
 `/td-build` for package source, `/td-build-root` for other build scratch,
 and `/td-cargo` for Cargo's working state; vendor source is mapped below
-`/td-cargo/vendor`. The Cargo runner hands build scripts' C the Rust
+`/td-cargo/vendor`. The Cargo runner hands build scripts' C, which no recipe
+has today, the Rust
 objects' policy above as CFLAGS: `-O2 -g1 -fno-omit-frame-pointer` and the
 same three remaps. `-g1` is what records the DWARF producer the runner
 checks. A crate's own flags follow CFLAGS, so a crate may raise `-g`,

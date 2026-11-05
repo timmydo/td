@@ -17,10 +17,8 @@
     clippy::indexing_slicing
 )]
 
-use ring::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
-use ring::signature::{
-    RsaParameters, RsaPublicKeyComponents, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA512,
-};
+use td_primitives::rsa::PublicKey;
+use td_primitives::sha::{sha1, Sha256, Sha512};
 
 const SIGNATURE_TAG: u8 = 2;
 const VERSION_4: u8 = 4;
@@ -78,8 +76,7 @@ impl RsaKey {
         framed.push(0x99);
         framed.extend_from_slice(&length.to_be_bytes());
         framed.extend_from_slice(body);
-        let fingerprint = <[u8; 20]>::try_from(digest(&SHA1_FOR_LEGACY_USE_ONLY, &framed).as_ref())
-            .map_err(|_| "SHA-1 fingerprint is not 20 bytes".to_string())?;
+        let fingerprint = sha1(&framed);
         Ok(Self {
             fingerprint,
             created,
@@ -171,28 +168,31 @@ pub(crate) fn verify(
     message.extend_from_slice(&signature.hashed);
     message.extend_from_slice(&[VERSION_4, 0xff]);
     message.extend_from_slice(&length.to_be_bytes());
-    let parameters: &RsaParameters = match signature.hash {
-        SHA256 => &RSA_PKCS1_2048_8192_SHA256,
-        SHA512 => &RSA_PKCS1_2048_8192_SHA512,
-        other => return Err(format!("signature hash algorithm {other} is refused")),
-    };
+    if signature.hash != SHA256 && signature.hash != SHA512 {
+        return Err(format!(
+            "signature hash algorithm {} is refused",
+            signature.hash
+        ));
+    }
     if signature.value.len() > key.n.len() {
         return Err("RSA signature is longer than the key's modulus".into());
     }
     // An MPI drops leading zero octets; PKCS #1 compares at the modulus width.
     let mut value = vec![0u8; key.n.len() - signature.value.len()];
     value.extend_from_slice(&signature.value);
-    RsaPublicKeyComponents {
-        n: key.n.as_slice(),
-        e: key.e.as_slice(),
-    }
-    .verify(parameters, &message, &value)
-    .map_err(|_| {
+    let refused = |_| {
         format!(
             "RSA signature does not verify under key {}",
             key.fingerprint_hex()
         )
-    })?;
+    };
+    let public = PublicKey::from_parts(&key.n, &key.e).map_err(refused)?;
+    if signature.hash == SHA256 {
+        public.verify_pkcs1::<Sha256>(&message, &value)
+    } else {
+        public.verify_pkcs1::<Sha512>(&message, &value)
+    }
+    .map_err(refused)?;
     Ok(Verified {
         created: signature.created,
     })
@@ -538,6 +538,33 @@ mod tests {
         let (tag, body) = one_packet(&framed).unwrap();
         assert_eq!(tag, 14);
         assert_eq!(RsaKey::from_packet_body(body).unwrap(), key);
+    }
+
+    // About one real signature in 256: PKCS #1 compares at the modulus's width, and
+    // the MPI on the wire has dropped the leading zero.
+    #[test]
+    fn a_signature_whose_mpi_lost_a_leading_zero_verifies() {
+        let answers = include_str!("../tests/signature_answers.txt");
+        let row = answers
+            .lines()
+            .find(|line| line.starts_with("PGP_SHORT_MPI "))
+            .unwrap();
+        let fields: Vec<&str> = row.split(' ').collect();
+        let (mut key, _, _) = real();
+        key.n = hex(fields[1]);
+        key.e = hex(fields[2]);
+        let value = hex(fields[5]);
+        assert_eq!(value.len(), key.n.len() - 1);
+        let packet = packet(BINARY_DOCUMENT, SHA256, &hex(fields[4]), &[], &value);
+        let now = u64::from(SIGNED_AT) + 60;
+        let data = hex(fields[3]);
+        assert_eq!(
+            verify(&key, &packet, &data, now).unwrap().created,
+            SIGNED_AT
+        );
+        assert!(verify(&key, &packet, b"other data", now)
+            .unwrap_err()
+            .contains("does not verify"));
     }
 
     #[test]

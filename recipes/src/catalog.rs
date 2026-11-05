@@ -496,12 +496,9 @@ mod tests {
                 "{stem}: a Cargo target's toolchain, linker and C headers"
             );
             crate::shared::assert_no_tool_farm(&recipe, &[]);
-            // Only these build scripts compile C, each to an exact count.
-            let objects = match stem {
-                "td-net" => Some(30),
-                _ => None,
-            };
-            assert_eq!(recipe.c_objects, objects, "{stem}: build-script C objects");
+            // No build script compiles C: with no count declared, the runner
+            // fails the build on any object one leaves.
+            assert_eq!(recipe.c_objects, None, "{stem}: build-script C objects");
         }
         cargo.sort_unstable();
         assert_eq!(
@@ -666,6 +663,7 @@ mod tests {
                 "td-photo",
                 "td-png",
                 "td-portal",
+                "td-primitives",
                 "td-protector",
                 "td-regex",
                 "td-remote",

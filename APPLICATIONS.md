@@ -1397,7 +1397,7 @@ The importer contract is narrower than Flatpak:
    refuses partial or indeterminate lengths, non-canonical integers,
    unknown critical hashed subpackets, an issuer hint naming another key,
    expiry, and a creation time before the key or more than a day ahead of
-   the clock; `ring` performs the PKCS #1 check. `net/src/flathub.rs`
+   the clock; `td-primitives` performs the PKCS #1 check. `net/src/flathub.rs`
    compiles Flathub's exact v4 RSA-4096 signing subkey packet, `54A6 CDDD
    8919 FB20 4200 D8AC 5627 02E9 E3ED 7EE8` under the primary key above,
    derives its fingerprint rather than trusting a constant, and requires
@@ -7408,8 +7408,8 @@ and image commits — showing:
    automated support snapshot together with item 4's sandbox evidence**;
 6. one HTTPS page loading and rendering — served by a **declared
    in-guest TLS origin**, not from the public internet: a fixture server
-   on the guest is td-net's `td-test-https` applet, rustls with ring as
-   the crate's existing reviewed closure already links. A trusted
+   on the guest is td-net's `td-test-https` applet, the rustls and
+   `td-primitives` the crate already links. A trusted
    autotest-only boot service runs its `mint`, which generates a one-day
    ECDSA P-256 CA and localhost server identity under `/run`; the CA's
    private key exists only inside that process, and neither the server's
@@ -10589,12 +10589,13 @@ protocol engine stays rustls's for now, as a choice rather than a rule.
 AGENTS.md foresees the control-plane programs rebuilt as
 target recipes once the target toolchain exists, and the td-net tier is
 the one tier with an external closure; it already carries a bounded
-HTTPS client, `net/src/http.rs`, ureq over rustls, ring and
+HTTPS client, `net/src/http.rs`, ureq over rustls, `td-primitives` and
 webpki-roots, and no decoder. So:
 
 1. `td-fetchd`, an applet of the td-net multicall, built as a target
-   recipe through the Cargo runner from the checkout's `net/`, `engine/`
-   and `td-boot/` trees and the committed lock's vendor closure: the
+   recipe through the Cargo runner from the checkout's `net/`, `engine/`,
+   `td-fs/`, `td-civil/` and `td-primitives/` trees and the committed
+   lock's vendor closure: the
    first target-built control-plane program, and the one target network
    client. The human `[fetchd]` remains at `/run/user/1000/td-fetch/socket`.
    Mail and news share this human fetch service. Its directory is mode
@@ -10703,7 +10704,8 @@ webpki-roots, and no decoder. So:
    what is left of the exchange's deadline, on a reused connection as on
    a new one, so the deadline needs no wrapper. Public roots are ureq's
    webpki-roots configuration, from the package td-net pins exactly,
-   over rustls with the ring provider and TLS 1.2/1.3; each agent builds
+   over rustls with td's own provider, `net/src/tls_crypto.rs`, and TLS
+   1.2/1.3; each agent builds
    its rustls configuration once, so session resumption is scoped to one
    agent. Custom roots replace public roots, each first held to rustls's
    trust-anchor parse, since ureq would skip one it cannot parse.

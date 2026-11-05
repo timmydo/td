@@ -16,7 +16,7 @@
 # its own manifest, which is where a reader adding one will be. One that is not
 # obvious from a crate name:
 #   net/       — the network tools (td-net); the ONLY crates allowed external
-#                deps (ureq/rustls/sha2/ring), so their vendored closure must
+#                deps (ureq/rustls/sha2), so their vendored closure must
 #                not mix into the engine's dependency-free lock. It is
 #                deliberately NOT `td-`-prefixed: that prefix is what
 #                builder/src/affected.rs discovers as a dependency-free crate.

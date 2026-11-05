@@ -1,6 +1,6 @@
 // td-feed — td's OWN local HTTP mirror of the artifacts this repo downloads over the
 // network. A sibling of fetch/ (td-fetch) reusing the same pure-Rust HTTP(S)+sha256 stack
-// (ureq + rustls/ring + sha2); the mirror server uses only std::net (no extra crate).
+// (ureq + rustls/td-primitives + sha2); the mirror server uses only std::net (no extra crate).
 //
 // It is run as a SHARED, persistent host daemon (`td-feed ensure-serve`) serving a shared
 // store across worktrees, so a td-native download happens ONCE. Two verification layers:

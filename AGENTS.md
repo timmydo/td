@@ -293,7 +293,8 @@ link, against td glibc's headers and GCC's own freestanding headers,
 archived by the root's `ar`, and the root's `objcopy` splits its
 companions. Each object the build leaves must show it: its dependency
 list resolves into those headers or the build's trees, and the recipe
-declares how many objects there are. Every other recipe that runs
+declares how many objects there are. No Cargo recipe declares any today,
+so an object from one fails its build. Every other recipe that runs
 rustc directly builds there too, but td-link-test, which builds outside
 it to prove td-link needs no GCC or binutils, and the root's `objcopy`
 splits its companions.

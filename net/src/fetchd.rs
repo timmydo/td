@@ -1070,13 +1070,13 @@ fn perform_with_pool(
     })
 }
 
-/// rustls on ring, both TLS 1.2 and 1.3 (ureq's `ALL_VERSIONS`), over the
+/// rustls on td-primitives, both TLS 1.2 and 1.3 (ureq's `ALL_VERSIONS`), over the
 /// given roots. Each agent builds its own rustls configuration from this
 /// once, so session resumption is scoped to one agent.
 fn tls(roots: ureq::tls::RootCerts) -> ureq::tls::TlsConfig {
     ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::Rustls)
-        .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .unversioned_rustls_crypto_provider(crate::tls_crypto::shared())
         .root_certs(roots)
         .build()
 }
@@ -2225,7 +2225,9 @@ mod tests {
         ))
         .unwrap();
         let config = Arc::new(
-            ServerConfig::builder()
+            ServerConfig::builder_with_provider(crate::tls_crypto::shared())
+                .with_safe_default_protocol_versions()
+                .unwrap()
                 .with_no_client_auth()
                 .with_single_cert(vec![cert], key)
                 .unwrap(),

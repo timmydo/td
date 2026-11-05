@@ -1,6 +1,6 @@
 // td-subst — the network + crypto half of td's OWN substitute (binary-cache) server. A
 // sibling of feed/ (td-feed) and fetch/ (td-fetch) reusing the same pure-Rust HTTP(S)
-// stack (ureq + rustls/ring + sha2); ed25519 signing/verification is ring's. Where
+// stack (ureq + rustls + sha2); ed25519 signing/verification is td-primitives'. Where
 // td-feed mirrors SOURCE downloads (content-addressed, self-verifying), td-subst serves
 // BUILT /td/store outputs: the dependency-free engine (`td-builder subst-export`) writes a
 // serve-able directory — a td-native `<basename>.narinfo` (StorePath/NarHash/NarSize/

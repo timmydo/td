@@ -1,11 +1,10 @@
-// td-subst's ed25519 + hex primitives: `ring` signs and verifies narinfos.
+// td-subst's ed25519 + hex primitives: td-primitives signs and verifies narinfos.
 // Nothing here generates or names a key — that is the applet's own verb.
 
-use ring::rand::SystemRandom;
-use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use td_primitives::curve25519::ed25519::{self, SigningKey, PUBLIC_LEN, SEED_LEN, SIGNATURE_LEN};
 
 pub(crate) fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -55,18 +54,46 @@ fn nibble(b: u8) -> Result<u8, String> {
 /// machine refuses to boot, or a builder refuses a cache. Checking here rather
 /// than at each call site is what makes it hold for both signing domains.
 pub(crate) fn sign_msg(pkcs8: &[u8], msg: &[u8]) -> Result<Vec<u8>, String> {
-    let kp = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|e| format!("bad private key: {e}"))?;
-    let sig = kp.sign(msg).as_ref().to_vec();
-    if !verify_msg(kp.public_key().as_ref(), msg, &sig) {
+    let key = from_pkcs8(pkcs8)?;
+    let sig = key
+        .sign(msg)
+        .map_err(|_| "ed25519 signing failed".to_string())?;
+    if !verify_msg(&key.public_key(), msg, &sig) {
         return Err("the signature just produced does not verify under its own key".into());
     }
-    Ok(sig)
+    Ok(sig.to_vec())
 }
 
 pub(crate) fn verify_msg(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
-    UnparsedPublicKey::new(&ED25519, pubkey)
-        .verify(msg, sig)
-        .is_ok()
+    let (Ok(pubkey), Ok(sig)) = (
+        <&[u8; PUBLIC_LEN]>::try_from(pubkey),
+        <&[u8; SIGNATURE_LEN]>::try_from(sig),
+    ) else {
+        return false;
+    };
+    ed25519::verify(pubkey, msg, sig).is_ok()
+}
+
+// The key files `keygen` has always written: an RFC 5958 v2 OneAsymmetricKey,
+// the seed and then its public half, each at a fixed offset. Machines hold these,
+// so the shape does not change.
+const PKCS8_HEAD: &[u8] = &[
+    0x30, 0x51, 0x02, 0x01, 0x01, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+];
+const PKCS8_MIDDLE: &[u8] = &[0x81, 0x21, 0x00];
+
+/// The public half must be the seed's, so a damaged file refuses to sign.
+fn from_pkcs8(pkcs8: &[u8]) -> Result<SigningKey, String> {
+    let bad = || "bad private key: not an ed25519 PKCS#8 v2 key".to_string();
+    let rest = pkcs8.strip_prefix(PKCS8_HEAD).ok_or_else(bad)?;
+    let (seed, rest) = rest.split_at_checked(SEED_LEN).ok_or_else(bad)?;
+    let public = rest.strip_prefix(PKCS8_MIDDLE).ok_or_else(bad)?;
+    let seed = <&[u8; SEED_LEN]>::try_from(seed).map_err(|_| bad())?;
+    let key = SigningKey::from_seed(seed).map_err(|_| bad())?;
+    if key.public_key().as_slice() != public {
+        return Err("bad private key: its public half is not the seed's".into());
+    }
+    Ok(key)
 }
 
 /// A fresh keypair: pkcs8 private half, raw 32-byte public half.
@@ -75,12 +102,16 @@ pub(crate) fn verify_msg(pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
 /// verb an operator runs, and a failed draw from the system RNG should print a
 /// diagnostic, not a backtrace.
 pub(crate) fn keygen() -> Result<(Vec<u8>, Vec<u8>), String> {
-    let rng = SystemRandom::new();
-    let pkcs8 =
-        Ed25519KeyPair::generate_pkcs8(&rng).map_err(|e| format!("generate ed25519 key: {e}"))?;
-    let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
-        .map_err(|e| format!("parse generated key: {e}"))?;
-    Ok((pkcs8.as_ref().to_vec(), kp.public_key().as_ref().to_vec()))
+    let failed = |_| "generate ed25519 key: no entropy".to_string();
+    let seed = SigningKey::generate_seed().map_err(failed)?;
+    let public = SigningKey::from_seed(&seed).map_err(failed)?.public_key();
+    let mut pkcs8 =
+        Vec::with_capacity(PKCS8_HEAD.len() + SEED_LEN + PKCS8_MIDDLE.len() + PUBLIC_LEN);
+    pkcs8.extend_from_slice(PKCS8_HEAD);
+    pkcs8.extend_from_slice(&seed);
+    pkcs8.extend_from_slice(PKCS8_MIDDLE);
+    pkcs8.extend_from_slice(&public);
+    Ok((pkcs8, public.to_vec()))
 }
 
 /// Write a freshly generated keypair, private half FIRST and restrictively.
@@ -150,6 +181,51 @@ mod tests {
         ] {
             assert!(from_hex(s).is_err(), "{s:?} must be refused, not fatal");
         }
+    }
+
+    // A key and signature written by ring's Ed25519KeyPair before td-net left
+    // it: the file every existing machine holds must go on signing identically.
+    const RING_PKCS8: &str = "3051020101300506032b6570042204205152af2a19d678300265f818bcd2f8ff44020c3a75c2876b3ff7f24440aad07f8121009b63491dc4a7378eb929a448da5aa11dac4946c74167753439d90d0cb8f81755";
+    const RING_PUBLIC: &str = "9b63491dc4a7378eb929a448da5aa11dac4946c74167753439d90d0cb8f81755";
+    const RING_SIGNATURE: &str = "c57935e941936373a7122fc30895b248e349b7275733926619f8ac3f2b2f2173a67361c1f609553a86b4c2b4ba1c22c8cb5f3959759dcda54652fb1822fecd0f";
+
+    #[test]
+    fn a_key_file_ring_wrote_signs_as_ring_signed() {
+        let pkcs8 = from_hex(RING_PKCS8).unwrap();
+        let sig = sign_msg(&pkcs8, b"td-deployment-v1\n").unwrap();
+        assert_eq!(to_hex(&sig), RING_SIGNATURE);
+        assert!(verify_msg(
+            &from_hex(RING_PUBLIC).unwrap(),
+            b"td-deployment-v1\n",
+            &sig
+        ));
+    }
+
+    #[test]
+    fn a_fresh_key_has_the_shape_ring_wrote() {
+        let (fresh, public) = keygen().unwrap();
+        let old = from_hex(RING_PKCS8).unwrap();
+        assert_eq!(fresh.len(), old.len());
+        assert_eq!(fresh[..16], old[..16]);
+        assert_eq!(fresh[48..51], old[48..51]);
+        assert_eq!(fresh[51..], public[..]);
+    }
+
+    #[test]
+    fn a_damaged_key_file_refuses_to_sign() {
+        let good = from_hex(RING_PKCS8).unwrap();
+        assert!(sign_msg(&good, b"m").is_ok());
+        for at in [0, 15, 16, 47, 48, 50, 51, good.len() - 1] {
+            let mut bad = good.clone();
+            bad[at] ^= 1;
+            assert!(sign_msg(&bad, b"m").is_err(), "byte {at}");
+        }
+        assert!(sign_msg(&good[..good.len() - 1], b"m").is_err(), "short");
+        let mut long = good.clone();
+        long.push(0);
+        assert!(sign_msg(&long, b"m").is_err(), "trailing");
+        assert!(!verify_msg(&[0; 31], b"m", &[0; 64]), "short public key");
+        assert!(!verify_msg(&[0; 32], b"m", &[0; 63]), "short signature");
     }
 
     #[test]

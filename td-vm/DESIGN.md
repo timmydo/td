@@ -307,8 +307,8 @@ must have no ELF interpreter, dynamic dependencies, or runtime search path;
 GNU static linkage is not a claim that libc name resolution can never load
 runtime modules. The standard td image provides that libc runtime. Compiler,
 linker, wrapper settings, and Cargo flags are pinned at helper build sites.
-td-link compiles no C, so the network helper, whose ring compiles C, does
-not build on a standard td system: the resolver uses the deployed
+td-link compiles no C and the network helper's native build provisions a C
+toolchain, so it does not build on a standard td system: the resolver uses the deployed
 target-built td-net that `/bin/td-feed` names, the deployed commit's rather
 than the checkout's, and host-only AWS-LC builds fail.
 Elsewhere the native network helper builds offline and frozen from the

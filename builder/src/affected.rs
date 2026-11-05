@@ -931,8 +931,8 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         // behavioral tier, a net-only change keeps that too — without it such a diff
         // would run nothing while waiving the full check. The union of BOTH former
         // rules. The host net-test preflight compiles and tests td-net. The target
-        // builds it too, as the `td-net` recipe's local source with `engine/` and
-        // `td-boot/` staged beside it (APPLICATIONS.md §W.8), but that identity is
+        // builds it too, as the `td-net` recipe's local source with its sibling trees
+        // staged beside it (APPLICATIONS.md §W.8), but that identity is
         // re-derived LIVE from the checkout by both td-recipe-eval and td-builder on
         // every run (re #469 local-source-roster split) — an edit here selects no
         // local-source preflight.
@@ -1090,6 +1090,17 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         // td-fs is staged into td-net's seed, but that identity is re-derived
         // LIVE from the checkout (re #469 local-source-roster split) — no
         // local-source preflight to select.
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        add_chain_targets(sel);
+        return;
+    }
+
+    // td-net's TLS and signatures: the crate's own suite cannot see a provider
+    // or key-file break, and td-net is built by the chain targets, as for td-fs.
+    if p.starts_with("td-primitives/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        sel.add_preflight("net-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");
         add_chain_targets(sel);
@@ -1755,7 +1766,7 @@ fn is_format_check(command: &str) -> bool {
 
 /// td-net's tests. td-net is outside the roster, so the format check rides its
 /// preflight too, ahead of them.
-const NET_TESTS: &str = "CC=gcc cargo test --frozen --manifest-path net/Cargo.toml --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"' --config 'env.TD_TEST_TRUSTED_ROOT.force=true'";
+const NET_TESTS: &str = "cargo test --frozen --manifest-path net/Cargo.toml --config 'env.TD_TEST_TRUSTED_ROOT.value=\"1\"' --config 'env.TD_TEST_TRUSTED_ROOT.force=true'";
 
 fn net_test_cmd() -> Result<String, String> {
     Ok(format!("{} && {NET_TESTS}", format_check_cmd()?))
@@ -2576,7 +2587,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_no_preflight!("net/Cargo.lock", "local-source-roster");
     assert_contains!(
         "net/src/ostree.rs",
-        "td-builder gate-crates fmt --all && CC=gcc cargo test --frozen --manifest-path net/Cargo.toml"
+        "td-builder gate-crates fmt --all && cargo test --frozen --manifest-path net/Cargo.toml"
     );
     // td-kexec/src is include_str!'d into the target artifact, so a helper-source edit
     // rides the host cargo preflight AND is recorded against recipe-checks,
@@ -2975,6 +2986,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_no_preflight!("td-boot/src/main.rs", "local-source-roster");
     assert_no_preflight!("td-boot/src/protocol.rs", "local-source-roster");
     assert_no_preflight!("td-fs/src/real_file.rs", "local-source-roster");
+    assert_preflight!("td-primitives/src/ec.rs", "net-test");
+    assert_preflight!("td-primitives/src/ec.rs", "cargo-test");
+    assert_target!("td-primitives/src/ec.rs", "recipe-checks");
     assert_target!("td-boot/Cargo.toml", "check");
     assert_target!("td-boot/Cargo.toml", "recipe-checks");
     // protocol.rs is the deployment contract the recipes and td-install

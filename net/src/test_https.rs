@@ -1,5 +1,5 @@
 // td-test-https — a test HTTPS origin and its verifying client, on the
-// rustls and ring this crate already links.
+// rustls and td-primitives this crate already links.
 // The system image's autotest-only Firefox proof uses it in place of
 // LibreSSL's `openssl req`/`x509`/`s_server`/`s_client`
 // (APPLICATIONS.md §B.8 item 6):
@@ -44,13 +44,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
 };
 use sha2::Digest;
+use td_primitives::ec::p256;
+use td_primitives::random;
 
 const VALID_SECS: u64 = 24 * 60 * 60;
 /// Validity starts this far back, so a guest clock that steps
@@ -132,29 +132,41 @@ fn flags<'a>(args: &'a [String], names: &[&str]) -> Result<Vec<&'a str>, String>
 /// One generated key pair and its PKCS#8 encoding.
 struct Key {
     pkcs8: Vec<u8>,
-    pair: EcdsaKeyPair,
+    secret: p256::SecretKey,
+    public: [u8; p256::PUBLIC_LEN],
 }
 
 impl Key {
-    fn generate(rng: &SystemRandom) -> Result<Self, String> {
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, rng)
-            .map_err(|_| "generate a P-256 key".to_string())?
-            .as_ref()
-            .to_vec();
-        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8, rng)
-            .map_err(|e| format!("load the generated key: {e}"))?;
-        Ok(Self { pkcs8, pair })
+    fn generate() -> Result<Self, String> {
+        let mut bytes = [0u8; p256::SECRET_LEN];
+        // A rejection loop over uniform bytes: nearly always the first draw.
+        let secret = loop {
+            random::fill(&mut bytes).map_err(|_| "generate a P-256 key".to_string())?;
+            if let Ok(secret) = p256::SecretKey::from_bytes(&bytes) {
+                break secret;
+            }
+        };
+        let public = secret
+            .public_key()
+            .map_err(|_| "derive a P-256 public key".to_string())?;
+        let pkcs8 = crate::tls_crypto::p256_to_pkcs8(&bytes, &public);
+        td_primitives::ct::zero(&mut bytes);
+        Ok(Self {
+            pkcs8,
+            secret,
+            public,
+        })
     }
 
     /// RFC 7093 §2 method 1: SHA-256 of the public key, cut to 160 bits.
     fn id(&self) -> Vec<u8> {
-        let digest = sha2::Sha256::digest(self.pair.public_key().as_ref());
+        let digest = sha2::Sha256::digest(self.public);
         digest.get(..20).unwrap_or(&[]).to_vec()
     }
 
     fn spki(&self) -> Vec<u8> {
         let algorithm = seq(&[&der(0x06, OID_EC_PUBLIC_KEY), &der(0x06, OID_P256)]);
-        seq(&[&algorithm, &bit_string(self.pair.public_key().as_ref())])
+        seq(&[&algorithm, &bit_string(&self.public)])
     }
 }
 
@@ -192,19 +204,17 @@ fn mint(dir: &Path) -> Result<(), String> {
 }
 
 fn mint_at(now: u64) -> Result<Minted, String> {
-    let rng = SystemRandom::new();
     let not_before = now.saturating_sub(BACKDATE_SECS);
     let not_after = now
         .checked_add(VALID_SECS)
         .ok_or("the clock is out of range")?;
     let validity = seq(&[&time(not_before)?, &time(not_after)?]);
-    let authority = Key::generate(&rng)?;
-    let server = Key::generate(&rng)?;
+    let authority = Key::generate()?;
+    let server = Key::generate()?;
     let ca_name = name(CA_NAME);
     let ca = certificate(
-        &rng,
         &authority,
-        &serial(&rng)?,
+        &serial()?,
         &ca_name,
         &validity,
         &ca_name,
@@ -219,9 +229,8 @@ fn mint_at(now: u64) -> Result<Minted, String> {
     let mut alt_names = der(0x82, SERVER_NAME.as_bytes());
     alt_names.extend(der(0x87, &SERVER_IP));
     let leaf = certificate(
-        &rng,
         &authority,
-        &serial(&rng)?,
+        &serial()?,
         &ca_name,
         &validity,
         &name(SERVER_NAME),
@@ -251,9 +260,7 @@ fn mint_at(now: u64) -> Result<Minted, String> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn certificate(
-    rng: &SystemRandom,
     signer: &Key,
     serial: &[u8],
     issuer: &[u8],
@@ -276,17 +283,16 @@ fn certificate(
         &der(0xa3, &seq(&extensions)),
     ]);
     let signature = signer
-        .pair
-        .sign(rng, &tbs)
+        .secret
+        .sign_sha256(&tbs)
         .map_err(|_| "sign a certificate".to_string())?;
-    Ok(seq(&[&tbs, &algorithm, &bit_string(signature.as_ref())]))
+    Ok(seq(&[&tbs, &algorithm, &bit_string(&signature)]))
 }
 
 /// A positive 16-byte serial number, as an INTEGER.
-fn serial(rng: &SystemRandom) -> Result<Vec<u8>, String> {
+fn serial() -> Result<Vec<u8>, String> {
     let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes)
-        .map_err(|_| "read random bytes".to_string())?;
+    random::fill(&mut bytes).map_err(|_| "read random bytes".to_string())?;
     if let Some(first) = bytes.first_mut() {
         // Positive, and minimally encoded without a leading zero byte.
         *first = (*first & 0x7f) | 0x40;
@@ -526,7 +532,9 @@ fn parse_serve(args: &[String]) -> Result<Serve, String> {
         return Err(format!("{cert} holds no certificate"));
     }
     let key = PrivateKeyDer::from_pem_slice(&read_pem(key)?).map_err(|e| format!("{key}: {e}"))?;
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_provider(crate::tls_crypto::shared())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("server versions: {e}"))?
         .with_no_client_auth()
         .with_single_cert(chain, key)
         .map_err(|e| format!("server identity: {e}"))?;
@@ -674,7 +682,9 @@ fn parse_probe(args: &[String]) -> Result<Probe, String> {
     if roots.is_empty() {
         return Err(format!("{ca} holds no certificate"));
     }
-    let config = ClientConfig::builder()
+    let config = ClientConfig::builder_with_provider(crate::tls_crypto::shared())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("client versions: {e}"))?
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(Probe {

@@ -101,8 +101,9 @@ Before the evaluator runs, the installed `/bin/td-feed` fetches the
 checkout's `net/Cargo.lock` closure with `warm crate-local net td-net`.
 This breaks the cold-start dependency where a C compiler exists: native
 `provision-net` rebuilds the fetch tool offline only after that verified
-vendor closure exists. A td system has none for td-net's ring, so there
-`provision-net` resolves to the installed multicall itself. A warm
+vendor closure exists. A td system has none, and that native build still
+provisions one though td-net compiles no C, so there `provision-net`
+resolves to the installed multicall itself. A warm
 that reports success without complete inputs still fails the evaluator's
 native vendor verification before any system build starts.
 

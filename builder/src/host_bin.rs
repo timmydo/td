@@ -407,11 +407,13 @@ pub(crate) fn host_td_net(root: &Path) -> Option<PathBuf> {
         .or_else(|| host_cargo_bin(root, "net", "td-net", None))
 }
 
-/// The deployed td-net applet `name` on a td host that cannot compile
-/// net/'s C (ring): its `cc` is td-link, so /bin's link to the image's
+/// The deployed td-net applet `name` on a td host: `host_cargo_bin` asks for
+/// a C toolchain and its `cc` is td-link, so /bin's link to the image's
 /// target-built multicall stands in. It is the deployed commit's td-net,
 /// not the checkout's, so a checkout needing a newer td-feed verb fails in
-/// that verb. None elsewhere, so a host with C builds net/.
+/// that verb. None elsewhere, so a host with C builds net/. net/ compiles no C
+/// itself, so this could go once a native build is proven on a td host: this
+/// is how such a host reaches its next update, and only the qemu tier runs it.
 pub(crate) fn deployed_net_applet(root: &Path, name: &str) -> Option<PathBuf> {
     deployed_applet(&crate::stage0::ProvisionEnv::from_env(root), name)
 }
@@ -433,7 +435,7 @@ fn deployed_applet(penv: &crate::stage0::ProvisionEnv, name: &str) -> Option<Pat
     static NOTE: std::sync::Once = std::sync::Once::new();
     NOTE.call_once(|| {
         eprintln!(
-            "td-builder: no C compiler builds net/ here; using the deployed {} \
+            "td-builder: the native net/ build needs a C toolchain, absent here; using the deployed {} \
              (the image's commit, not this checkout's)",
             multicall.display()
         )

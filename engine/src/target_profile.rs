@@ -86,11 +86,6 @@ pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
         "rust-toolchain",
         "upstream Rust 1.99.1 prebuilt standard library and compiler-runtime",
     ),
-    // The target-built td-net multicall, the fetch service's tier, links
-    // rustls through `ring`, whose pregenerated x86_64 assembly is compiled
-    // by its build script (APPLICATIONS.md §W.8). The terminal applications
-    // it serves are std alone and carry none.
-    ("td-net", "ring 0.17.14 x86_64 assembly"),
 ];
 
 /// Recipes whose linked outputs include the Rust runtime boundary. The glibc
@@ -176,8 +171,6 @@ pub fn output_assembly_exceptions(recipe: &str) -> Vec<(&'static str, &'static s
                     && (BUILD_ROOT_LINKED.contains(&recipe)
                         || RUST_PROFILED_RECIPES.contains(&recipe)))
                 || (*source == "rust-toolchain" && RUST_PROFILED_RECIPES.contains(&recipe))
-                // A package's own crate assembly reaches that package alone.
-                || (*source == recipe && recipe == "td-net")
         })
         .collect()
 }
@@ -296,7 +289,6 @@ mod tests {
                     "rust-toolchain",
                     "upstream Rust 1.99.1 prebuilt standard library and compiler-runtime"
                 ),
-                ("td-net", "ring 0.17.14 x86_64 assembly"),
             ]
         );
         // The toolchain is the boundary's source, not one of its outputs.
@@ -328,7 +320,6 @@ mod tests {
                     "rust-toolchain",
                     "upstream Rust 1.99.1 prebuilt standard library and compiler-runtime"
                 ),
-                ("td-net", "ring 0.17.14 x86_64 assembly"),
             ]
         );
         // The terminal applications are std alone: only the boundaries every
@@ -347,9 +338,6 @@ mod tests {
                 "{application}"
             );
         }
-        assert!(!output_assembly_exceptions("ripgrep")
-            .iter()
-            .any(|(source, _)| *source == "td-net"));
         assert_eq!(
             output_assembly_exceptions("glibc-x86-64"),
             vec![(

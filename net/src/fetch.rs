@@ -17,7 +17,7 @@
 //                                       the fetched bytes' sha256 equals SHA256-HEX —
 //                                       so a wrong hash (or a perturbed FILE) reds it.
 //
-// Pure-Rust TLS (ureq + rustls/ring), no node/curl/openssl. The loopback server uses
+// Pure-Rust TLS (ureq + rustls/td-primitives), no node/curl/openssl. The loopback server uses
 // only std::net, so it adds no crate to the vendored closure.
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
