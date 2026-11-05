@@ -255,7 +255,7 @@ again (`APPLICATIONS.md`, "Per-application allowlists").
 The lock's header comment is the authoritative procedure. In short:
 
 1. Set `image` to the newest tag of the same shape that `outdated` reports
-   (for example `library/debian:trixie-20261020-slim`), and `snapshot` to a
+   (for example `library/debian:trixie-20261104-slim`), and `snapshot` to a
    recent `snapshot.debian.org` timestamp, `YYYYMMDDT000000Z`.
 2. Resolve, review the diff, and pin the assembled tree:
 
