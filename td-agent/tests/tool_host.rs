@@ -85,9 +85,8 @@ fn the_tool_host_serves_calls_as_a_process() {
 }
 
 /// An unconfined workspace's host (DESIGN.md §8) runs outside any jail
-/// with only `PATH`, `HOME`, `TMPDIR` and `LANG` of its launcher's
-/// environment, and dropping its client ends the command it was running,
-/// not only the host.
+/// with the whole of its launcher's environment, and dropping its client
+/// ends the command it was running, not only the host.
 #[test]
 fn an_unjailed_host_ends_its_command_when_dropped() {
     let owned = td_fs::TempDir::new("unjailed").unwrap();
@@ -124,13 +123,15 @@ fn an_unjailed_host_ends_its_command_when_dropped() {
         .lines()
         .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_string()))
         .collect();
-    for name in &names {
-        assert!(
-            ["PATH", "HOME", "TMPDIR", "LANG", "TERM", "PWD", "SHLVL", "_", "OLDPWD"]
-                .contains(&name.as_str()),
-            "{name} reached the command: {names:?}"
-        );
-    }
+    // Cargo's, past the four a jailed command gets.
+    assert!(
+        names.iter().any(|name| name == "CARGO_MANIFEST_DIR"),
+        "{names:?}"
+    );
+    assert!(std::fs::read_to_string(&env)
+        .unwrap()
+        .lines()
+        .any(|line| line == "TERM=dumb"));
     let running = std::fs::read_to_string(&pid).unwrap();
     let proc = PathBuf::from(format!("/proc/{}", running.trim()));
     assert!(proc.exists());

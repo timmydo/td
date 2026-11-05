@@ -31,18 +31,25 @@ pub struct Config {
     /// Whether this instance serves the network proxy (DESIGN.md §10),
     /// and its commands are pointed at it.
     pub proxy: bool,
+    /// Whether its commands get all it has rather than the few names a jailed
+    /// one is given: an unconfined workspace's (DESIGN.md §8).
+    pub whole_environment: bool,
 }
 
 impl Config {
     /// `--root DIR` (repeated), `--txt PATH` and `--directory DIR`, each
-    /// absolute, and `--proxy`.
+    /// absolute, `--proxy` and `--whole-environment`.
     pub fn parse(args: &[String]) -> Result<Self, String> {
-        let usage = "usage: td-agent tool-host [--proxy] [--txt ABSOLUTE-PATH] [--directory ABSOLUTE-DIR] [--root ABSOLUTE-DIR]...";
+        let usage = "usage: td-agent tool-host [--proxy] [--whole-environment] [--txt ABSOLUTE-PATH] [--directory ABSOLUTE-DIR] [--root ABSOLUTE-DIR]...";
         let mut config = Self::default();
         let mut rest = args.iter();
         while let Some(flag) = rest.next() {
             if flag == "--proxy" {
                 config.proxy = true;
+                continue;
+            }
+            if flag == "--whole-environment" {
+                config.whole_environment = true;
                 continue;
             }
             let value = PathBuf::from(rest.next().ok_or(usage)?);
@@ -177,6 +184,9 @@ pub fn serve(
     mut output: impl Write + Send + 'static,
     config: Config,
 ) -> Result<(), String> {
+    if config.whole_environment {
+        shell::keep_whole_environment();
+    }
     let (outbox, frames) = mpsc::sync_channel::<Up>(OUTBOX);
     // Before any call, so a command never runs pointed at a proxy that is
     // not there.
@@ -1110,6 +1120,7 @@ mod tests {
         let mut client = hosted(Config {
             roots: vec![dir.clone()],
             proxy: false,
+            whole_environment: false,
             ..Default::default()
         });
         let expected = 16 * 1024 * 1024;
@@ -1377,6 +1388,7 @@ mod tests {
             txt: None,
             directory: Some("/w/not-yet".into()),
             proxy: false,
+            whole_environment: false,
         });
         let id = client
             .call(Call::Shell {
@@ -1400,8 +1412,15 @@ mod tests {
             txt: None,
             directory: Some("/w/ready".into()),
             proxy: false,
+            whole_environment: false,
         });
         let config = Config::parse(&["--directory".into(), "/w/ready".into()]).unwrap();
+        assert!(!config.whole_environment);
+        assert!(
+            Config::parse(&["--whole-environment".into()])
+                .unwrap()
+                .whole_environment
+        );
         assert_eq!(config.directory, Some(PathBuf::from("/w/ready")));
         assert!(Config::parse(&["--directory".into(), "w".into()]).is_err());
         let id = client

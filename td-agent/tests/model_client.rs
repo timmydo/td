@@ -10446,6 +10446,8 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
             Reply::sse("stream-sonnet.sse"),
             read(outside.join("secret.txt")),
             Reply::sse("stream-sonnet.sse"),
+            read(outside.join("another.txt")),
+            Reply::sse("stream-sonnet.sse"),
             moved,
             Reply::sse("stream-sonnet.sse"),
         ],
@@ -10487,8 +10489,8 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
     assert_eq!(outcome, "replied", "{}", h.said());
     assert_eq!(std::fs::read_to_string(&proof).unwrap(), "reached\n");
 
-    // A read outside the workspace: asked, an ask rule's reason after
-    // why it is the person's; refused, nothing read.
+    // A read outside the workspace: an ask rule asks, its reason the card's;
+    // refused, nothing read.
     h.down(&Down::Policy {
         version: 2,
         mode: td_agent::config::Mode::Auto,
@@ -10497,10 +10499,7 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
     h.say("Read the other one.");
     let (call, _, details) = h.until_ask();
     assert!(
-        details.iter().any(|line| line
-            .find("unconfined")
-            .zip(line.find("; and "))
-            .is_some_and(|(first, then)| first < then)),
+        details[0].starts_with("Asked because") && !details[0].contains("unconfined"),
         "{details:?}"
     );
     assert!(
@@ -10520,13 +10519,29 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
         .iter()
         .all(|(_, result, _)| !result.contains("outside text")));
 
-    // In `ask` mode a contained write waits on its card; a link moved in
-    // meanwhile does not take it out of the workspace.
+    // In `ask` mode it is the person's, and the mode, not the workspace being
+    // unconfined, is why.
     h.down(&Down::Policy {
         version: 3,
         mode: td_agent::config::Mode::Ask,
         rules: Ok(String::new()),
     });
+    h.say("Read that as well.");
+    let (call, _, details) = h.until_ask();
+    assert!(
+        details[0].starts_with("Asked because this workspace is in ask mode"),
+        "{details:?}"
+    );
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+
+    // There a contained write waits on its card; a link moved in meanwhile does
+    // not take it out of the workspace.
     h.say("Write it.");
     let (call, _, _) = h.until_ask();
     std::fs::remove_dir(work.join("sub")).unwrap();
@@ -10544,6 +10559,74 @@ fn unconfined_workspaces_run_outside_the_jail_and_ask_for_what_leaves_it() {
     assert!(!outside.join("planted").exists());
     let (conversation, _) = h.close();
     assert!(conversation.meta().unconfined);
+}
+
+/// An unconfined workspace stays in `auto` however often the classifier
+/// refuses: each refusal is the person's card, and the next call is the
+/// classifier's again (DESIGN.md §11).
+#[test]
+fn the_breaker_leaves_an_unconfined_workspace_in_auto() {
+    let owned = td_fs::TempDir::new("unconfined-brake").unwrap();
+    let base = std::fs::canonicalize(owned.path()).unwrap();
+    let work = base.join("work");
+    std::fs::create_dir(&work).unwrap();
+    let command = |text: &str| {
+        access_reply(
+            "shell",
+            td_json::Json::Obj(vec![("command".into(), text.into())]),
+        )
+    };
+    let workspace = work.display().to_string();
+    let mut script = vec![
+        command("echo 0"),
+        Reply::sse("stream-sonnet.sse"),
+        Reply::ok("title.json"),
+    ];
+    for n in 1..5 {
+        script.push(command(&format!("echo {n}")));
+        script.push(Reply::sse("stream-sonnet.sse"));
+    }
+    let mut h = Harness::new_in_as(
+        "unconfined-brake",
+        Role::Conversation,
+        Some(&workspace),
+        false,
+        true,
+        script,
+    );
+    h.mock
+        .route("typesafe/jev", vec![Reply::ok("jev-matches.json"); 5]);
+    let mut verdicts = vec![Reply::ok("classifier-prose.json"); 4];
+    verdicts.push(Reply::ok("classifier-allow.json"));
+    h.mock.route("gpt-oss-safeguard", verdicts);
+    h.setup(Client::default());
+    h.down(&auto_with(""));
+    for n in 0..4 {
+        h.say(&format!("Run it, {n}."));
+        let (call, _, details) = h.until_ask();
+        assert!(
+            details[0].starts_with("Asked because the classifier did not allow it"),
+            "{details:?}"
+        );
+        h.down(&Down::Decision {
+            call,
+            allow: false,
+            always: None,
+        });
+        let (_, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied", "{}", h.said());
+    }
+    assert!(h.brakes.is_empty(), "{:?}", h.brakes);
+    h.say("Run it once more.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(
+        approvals(&events)
+            .iter()
+            .any(|a| a.1 == "allow" && a.2 == "classifier"),
+        "{:?}",
+        approvals(&events)
+    );
 }
 
 /// In `auto` mode an unconfined workspace's command is the classifier's

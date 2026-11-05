@@ -295,11 +295,11 @@ fn unasked(events: &[Event], to: &str) -> usize {
         .count()
 }
 
-/// Why an unconfined workspace's call is the person's (DESIGN.md §8,
-/// Unconfined workspaces), as its card says.
 /// Why a call runs with no card once the person allowed all in its conversation.
 const ALL_ALLOWED: &str = "you allowed all calls in this conversation";
-const UNCONFINED_WHY: &str = "this workspace is unconfined, and no allow rule releases a command, or a file tool reaching outside the workspace or into a repository's .git";
+/// Why an unconfined workspace's call is the person's: being unconfined was their
+/// choice and no reason to ask (DESIGN.md §8).
+const ASK_MODE_WHY: &str = "this workspace is in ask mode, which Conversation > Auto mode in this workspace ends, for the classifier to judge these";
 
 /// What an unconfined workspace's call's card says first (DESIGN.md §8).
 const UNCONFINED_CARD: &str = "This workspace is unconfined, so this runs outside any jail as you, with your whole home, credentials, td-agent's own state and every host service.";
@@ -5650,10 +5650,6 @@ impl Session {
         let (rules, unread) = self.rules();
         match crate::rules::judge(&rules, &unread, name, command, acts) {
             crate::rules::Verdict::Deny(why) => Ruling::Deny(tools::visible(&why)),
-            crate::rules::Verdict::Ask(why) if unconfined => Ruling::Card(Some(format!(
-                "{UNCONFINED_WHY}; and {}",
-                tools::visible(&why)
-            ))),
             crate::rules::Verdict::Ask(why) => Ruling::Card(Some(tools::visible(&why))),
             // The person's own word for this conversation, as far as a repeated
             // call, which `approve` and the arms below give them.
@@ -5665,9 +5661,9 @@ impl Session {
             // A repeated one `approve` gives the person (§11, Repetition).
             _ if unconfined && self.workspace_mode() == crate::config::Mode::Auto => Ruling::Auto,
             _ if unconfined && repeated => {
-                Ruling::Card(Some(format!("{UNCONFINED_WHY}; and {REPEATED_WHY}")))
+                Ruling::Card(Some(format!("{ASK_MODE_WHY}; and {REPEATED_WHY}")))
             }
-            _ if unconfined => Ruling::Card(Some(UNCONFINED_WHY.into())),
+            _ if unconfined => Ruling::Card(Some(ASK_MODE_WHY.into())),
             _ if repeated => Ruling::Card(None),
             crate::rules::Verdict::Allow(why) => Ruling::Run(acts.then(|| tools::visible(&why))),
             // The table: in `auto` mode a call inside the jail runs.
@@ -7454,6 +7450,11 @@ impl Session {
     /// the workspace in `ask` mode, said in the log and asked of the
     /// window. Only the human puts it back in `auto`.
     fn brake(&mut self) -> Result<(), String> {
+        // Each refusal there is already the person's card, and they chose to be
+        // reached only for those (DESIGN.md §11).
+        if self.bench.unconfined() {
+            return Ok(());
+        }
         let Some(why) = tripped(self.conversation.events()) else {
             return Ok(());
         };

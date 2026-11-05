@@ -458,16 +458,10 @@ fn start(
     Ok(Client::linked(reader, ours, linked).owning(child, spec.to_path_buf(), tail))
 }
 
-/// The variables an unconfined workspace's tool host is given from this
-/// process's, as a jailed one's are given by td-jail (DESIGN.md §8): its
-/// commands take them as they are.
-const UNJAILED_ENVIRONMENT: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG"];
-
 /// Starts a tool host for an unconfined workspace (DESIGN.md §8,
 /// Unconfined workspaces): this program as `tool-host`, outside any jail,
-/// its roots and td-txt named as they are, with only `PATH`, `HOME`,
-/// `TMPDIR` and `LANG` of this process's environment, and in a process
-/// group of its own. Dropping the client shuts its channel, which the
+/// its roots and td-txt named as they are, with the whole of this process's
+/// environment, and in a process group of its own. Dropping the client shuts its channel, which the
 /// host ends on, cancelling its calls and so killing each command's `sh`,
 /// and kills it only if it has not ended within a few seconds; what a
 /// command started beside its `sh` is not ended.
@@ -480,12 +474,7 @@ pub fn launch_unjailed(programs: &Unjailed, policy: &Policy) -> Result<Client, S
     ours.set_write_timeout(Some(crate::egress::PIPE_STEP))
         .map_err(channel)?;
     let mut command = Command::new(&programs.agent);
-    command.env_clear().envs(
-        UNJAILED_ENVIRONMENT
-            .iter()
-            .filter_map(|name| Some((*name, std::env::var_os(name)?))),
-    );
-    command.arg("tool-host");
+    command.arg("tool-host").arg("--whole-environment");
     if let Some(txt) = &programs.txt {
         command.arg("--txt").arg(txt);
     }

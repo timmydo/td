@@ -4324,8 +4324,9 @@ left, the command it was running included.
 **Unconfined workspaces.** The one way to run tools without a jail is a
 choice the human makes when creating an Empty or Directory… workspace;
 a template's and a repository workspace are always jailed. It is shown
-in the status row and the list, and it is still given only the pipe and
-the scrubbed environment. Its commands can reach the key file, the
+in the status row and the list. Its commands have the whole of the conversation
+process's environment and nothing stands between them and the machine; what td
+itself does not ship they lack as the person does. They can reach the key file, the
 store and the publish repositories, the fetch and egress sockets, the
 human's SSH agent, and the control socket, through which they could
 answer their own cards; it is a decision to trust the model with
@@ -4345,9 +4346,8 @@ when it reads a meta. A meta written before reads as jailed.
 Its tool hosts are td-agent's own `tool-host`, started by the
 conversation process outside td-jail, one per call as a jailed
 instance is (§12), with its roots and td-txt named by their real paths,
-`PATH`, `HOME`, `TMPDIR` and `LANG` of the conversation process's own
-environment and nothing else, so `HOME` is the human's own, and in a
-process group of its own. With `TD_AGENT_TXT` unset, `grep` and `sed`
+`--whole-environment` and the conversation process's own environment, so
+`HOME` is the human's own, and in a process group of its own. With `TD_AGENT_TXT` unset, `grep` and `sed`
 are refused by name and the other tools run; one set but not an
 absolute path to an executable refuses the workspace's tools, saying
 why. A call ends as the tool host ends it: an interruption or a timeout
@@ -4381,9 +4381,10 @@ to such a path is resolved as the conversation process sees it, which
 differs from the tool host's view only in what names the process
 itself. Every other call, `shell` and
 its background form always, no allow rule releases: deny and ask rules
-still apply, an ask rule's reason after the workspace's, and a repeated
-call goes to the human (§11, Repetition). In `ask` mode it goes to the
-human, the card saying first why. In `auto` mode it is the
+still apply, and a repeated call goes to the human (§11, Repetition). In
+`ask` mode it goes to the human, the card naming that mode as why and how to
+end it: being unconfined is the person's choice, not a reason to ask them. In
+`auto` mode it is the
 classifier's (§11), asked as a crossing is but with a policy of its
 own, `prompt/classifier-unconfined.txt`: the state's action is of kind
 `command` or `file`, its `detail` what `classifier::unconfined_call`
@@ -4406,8 +4407,7 @@ past 32 KiB does. A card offers no "always allow" rule, though it offers
 the person's "Allow all in this conversation" (§11), and one already
 waiting is not released to the classifier by a change to `auto`. The
 command's text goes to the classifier's models, as a crossing's
-content does, and its escalations count toward the breaker, three in a
-row putting the conversation in `ask` mode (§11). The classifier sees
+content does; no breaker counts its escalations (§11). The classifier sees
 which files the agent wrote, not what it wrote: a contained edit runs
 unasked in `auto` mode, so a test, build script or package script the
 agent wrote runs as the person once a build or test command the
@@ -5364,7 +5364,9 @@ goes to `auto`. The status row says `classifier without Jev` beside the
 mode while `jev_required` is `false`. `jev_threshold` is shipped as
 0.775, as the calibration chose it ("The calibration", below).
 
-**The circuit breaker.** The breaker counts the
+**The circuit breaker.** An unconfined workspace has none: the person chose to
+be reached only for what the classifier refuses, each refusal is their card, and
+the next call is the classifier's again. Elsewhere the breaker counts the
 classifier's verdicts, the approvals logged `by` `classifier`, in the
 conversation's own log: a classifier that was not asked, for want of a
 key, Jev while required, a price or room under a limit, gives no
@@ -5577,8 +5579,8 @@ is shipped as calibrated on the fixture set of §17, and the commit that
 changes it records the counts.
 
 **Outcome.** A refusal by the human reaches the acting model as the tool's
-result with an instruction not to work around it. The circuit breaker
-counts only actions the table gives the classifier: after three
+result with an instruction not to work around it. The circuit breaker, outside
+an unconfined workspace, counts only actions the table gives the classifier: after three
 consecutive such actions it did not allow, or twenty in a workspace (as
 built, in a conversation), the
 workspace drops to `ask` mode and says why; a human allow does not reset

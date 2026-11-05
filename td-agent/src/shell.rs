@@ -208,9 +208,26 @@ impl Exit {
     }
 }
 
+/// Whether a call's process gets all this tool host has: an unconfined
+/// workspace's, which is the person's to use as they would (§8).
+static WHOLE_ENVIRONMENT: AtomicBool = AtomicBool::new(false);
+
+/// Gives every later call the whole of this tool host's environment.
+pub fn keep_whole_environment() {
+    WHOLE_ENVIRONMENT.store(true, Ordering::Relaxed);
+}
+
 /// The environment a call's process gets: `PATH`, `HOME`, `TMPDIR` and
-/// `LANG` as the tool host has them, and `TERM=dumb` (§8).
+/// `LANG` as the tool host has them, or everything it has in an unconfined
+/// workspace, and `TERM=dumb` (§8).
 pub fn environment() -> Vec<(OsString, OsString)> {
+    if WHOLE_ENVIRONMENT.load(Ordering::Relaxed) {
+        let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
+            .filter(|(name, _)| name != "TERM")
+            .collect();
+        env.push(("TERM".into(), "dumb".into()));
+        return env;
+    }
     let mut env: Vec<(OsString, OsString)> = ["PATH", "HOME", "TMPDIR", "LANG"]
         .into_iter()
         .filter_map(|name| Some((OsString::from(name), std::env::var_os(name)?)))
@@ -697,6 +714,21 @@ fn applet(txt: &Path, name: &str, argv: Vec<OsString>, workdir: &Path) -> Comman
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
+
+    /// A jailed tool host's command gets the few names, whatever its own
+    /// environment has; none of this test binary's turns the whole on.
+    #[test]
+    fn a_jailed_call_gets_only_the_names_it_is_given() {
+        assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
+        for (name, _) in environment() {
+            assert!(
+                ["PATH", "HOME", "TMPDIR", "LANG", "TERM"]
+                    .iter()
+                    .any(|given| name == *given),
+                "{name:?}"
+            );
+        }
+    }
 
     fn quick(command: &str) -> Exit {
         let never = AtomicBool::new(false);
