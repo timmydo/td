@@ -116,7 +116,10 @@ fn agent_no_redirects() -> ureq::Agent {
     idle_agent(false)
 }
 
-fn agent_before(deadline: Instant, allow_redirects: bool) -> Result<ureq::Agent, String> {
+pub(crate) fn agent_before(
+    deadline: Instant,
+    allow_redirects: bool,
+) -> Result<ureq::Agent, String> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .ok_or_else(|| "HTTP request exceeded its absolute deadline".to_string())?;

@@ -74,6 +74,7 @@ pub mod flathub_app;
 pub mod gpt;
 pub mod gzip;
 pub mod host_path;
+pub mod image_chunks;
 pub mod iso9660;
 pub mod json;
 pub mod launcher;

@@ -363,14 +363,18 @@ build-ID-matched companion (`td-profiler/DESIGN.md` §4).
    precedent for new control-plane or target logic.
 4. **Migrations are atomic.** Cut over completely and delete the old mechanism
    in the same landing. Git history carries dates and change narratives.
-5. **No maintainer-run server infrastructure.** No package repository, binary
-   cache population service, update server, or mirror. Recipes travel in git;
-   pins use upstream-owned URLs plus SHA-256; everything else builds locally.
+5. **No required maintainer-run server infrastructure.** Recipes travel in git;
+   pins use upstream-owned URLs plus SHA-256; the graph can build locally.
+   Optional signed whole-system releases may travel through a static repository
+   under `net/RELEASES.md`. This is the explicit image-delivery exception,
+   initially a local repository; it adds no package service or target input.
    `td-feed` is a host cache, and `td-subst` is a consumer for a cache nobody
    is required to operate. Never pin a td-produced artifact that would require
    td to publish or host it.
-6. **Updates are a git pull, not a package download.** The recipe graph is the
-   distribution. System deployments retain `current` and `previous` and boot
+6. **The recipe graph is the distribution.** Source updates travel in git;
+   optional signed image delivery materializes a complete deployment from that
+   graph, without changing its target trust roots. System deployments retain
+   `current` and `previous` and boot
    one; the future application tier retains versions side by side and selects
    one with a pointer. The system runs one thing; applications run many.
 7. **Passwordless, not authorization-less.** Human authentication defaults to

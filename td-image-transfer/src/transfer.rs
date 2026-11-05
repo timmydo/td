@@ -4,9 +4,9 @@ use std::io::Write;
 use std::ops::Range;
 use std::time::Duration;
 
-const MIN: usize = 16 * 1024;
-const TARGET: usize = 64 * 1024;
-const MAX: usize = 256 * 1024;
+#[cfg(test)]
+use crate::image_chunks::{gear, MAX, MIN};
+use crate::image_chunks::{Chunker, TARGET};
 const MAX_RECORDS: usize = 1_000_000;
 
 #[derive(Clone, Copy)]
@@ -44,28 +44,19 @@ fn key(bytes: &[u8]) -> Key {
     }
 }
 
-fn gear(byte: u8) -> u64 {
-    let mut n = u64::from(byte).wrapping_add(0x9e3779b97f4a7c15);
-    n = (n ^ (n >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    n = (n ^ (n >> 27)).wrapping_mul(0x94d049bb133111eb);
-    n ^ (n >> 31)
-}
-
 pub fn index(bytes: &[u8], method: Method) -> Result<Vec<Object>> {
     let mut spans = Vec::new();
     let mut start = 0;
-    let mut rolling = 0u64;
+    let mut chunker = Chunker::default();
     for (offset, byte) in bytes.iter().enumerate() {
-        rolling = rolling.wrapping_shl(1).wrapping_add(gear(*byte));
         let length = offset + 1 - start;
         let cut = match method {
             Method::Fixed => length == TARGET,
-            Method::Cdc => length >= MAX || (length >= MIN && rolling & (TARGET as u64 - 1) == 0),
+            Method::Cdc => chunker.push(*byte),
         };
         if cut {
             spans.push(start..offset + 1);
             start = offset + 1;
-            rolling = 0;
         }
     }
     if start < bytes.len() {

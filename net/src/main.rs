@@ -41,6 +41,7 @@ mod http;
 mod launch;
 mod openpgp;
 mod ostree;
+mod release;
 #[cfg(test)]
 #[allow(dead_code)]
 #[path = "../../engine/src/elf_synth.rs"]
@@ -90,6 +91,7 @@ fn main() {
         "td-egressd" => egress::run(&args),
         "td-launch" => launch::run(&args),
         "td-test-https" => test_https::run(&args),
+        "td-release" => release::run(&args),
         // An application's name, linked to this binary: that application,
         // beside this binary, with a fetch service of its own (launch.rs).
         _ if launch::launches(std::ffi::OsStr::new(base)).is_some() => {
@@ -109,9 +111,10 @@ fn main() {
                 Some("egressd") => "td-egressd",
                 Some("launch") => "td-launch",
                 Some("test-https") => "td-test-https",
+                Some("release") => "td-release",
                 _ => {
                     eprintln!(
-                        "usage: td-net <app|rust|fetch|feed|subst|fetchd|egressd|launch|test-https> ...\n  \
+                        "usage: td-net <app|rust|fetch|feed|subst|fetchd|egressd|launch|test-https|release> ...\n  \
                          (or invoke via the td-fetch / td-feed / td-subst / \
                          td-fetchd / td-test-https applet links)"
                     );
@@ -130,6 +133,7 @@ fn main() {
                 "td-egressd" => egress::run(&argv),
                 "td-launch" => launch::run(&argv),
                 "td-test-https" => test_https::run(&argv),
+                "td-release" => release::run(&argv),
                 _ => subst::run(&argv),
             }
         }

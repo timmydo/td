@@ -10081,11 +10081,12 @@ integrity, not authorship. A boot-attempt counter is decremented before trying,
 falls back. `/var` is a Btrfs subvolume minted once per machine by
 `td-firstboot`, so it survives every deployment.
 
-**What does not exist is the delivery.** Nothing in the tree moves a
-bundle from the builder to the machine: `td-boot publish` takes a
-directory that is already on the persistent volume. So today an update is
-*build on the host, copy the bundle across by whatever means, publish,
-reboot* — which is also, since §B.1, how applications arrive.
+**Optional image delivery** is `td-net release`, specified in
+`net/RELEASES.md`: signed indexes, a static object repository, streaming
+acquisition and an offline verifier. It reconstructs the existing deployment
+bundle and does not itself install it. It is independent of application
+package delivery. The existing installer and boot transaction still own
+publication and rollback.
 
 **The consequence, stated as a table because it is the specification of
 the work that is deferred:**
@@ -12097,9 +12098,12 @@ Three consequences that are easy to violate by accident:
    source, or §W.9's run-time fetch of upstream-hosted objects under
    signature and admission rules (§B.3.1's exact-commit import rotted
    when Flathub pruned the commit). Never host a repackaged copy.
-3. **Delta and chunking machinery is not needed** and should not be
-   built speculatively. It optimizes repeated pulls from a server that
-   does not exist.
+3. **Optional system-image delivery is the explicit exception.**
+   `net/RELEASES.md` specifies a static signed release repository and chunk
+   reuse. The initial workflow uses local storage and loopback HTTP; there
+   is no default public host or required maintainer service. A machine's
+   trusted publisher policy is provisioned separately. Source recipes do
+   not pin or consume these release artifacts.
 
 The scale at which this stops being sufficient is worth naming so the
 decision is revisited deliberately rather than suffered: **a second

@@ -7,6 +7,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 mod erofs;
+#[path = "../../engine/src/image_chunks.rs"]
+mod image_chunks;
 #[path = "../../engine/src/sha256.rs"]
 #[allow(dead_code)]
 mod sha256;
