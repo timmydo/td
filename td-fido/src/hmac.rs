@@ -1,7 +1,7 @@
 //! SHA-256 digest, HMAC-SHA256 (RFC 2104), HKDF (RFC 5869), one block
 //! (`hkdf`) or any length up to RFC 5869's bound (`hkdf_expand`), and
 //! PBKDF2-HMAC-SHA256 (RFC 8018) for td-luks's LUKS2 keyslots and digests,
-//! the one copy td's std-only crates share (td-fido/DESIGN.md, "Shared
+//! the one copy td's boot and login crates share (td-fido/DESIGN.md, "Shared
 //! HMAC-SHA256"), over the engine's SHA-256 its includer mounts as
 //! `super::sha256`: td-fido's `crypto.rs`, and td-secret's store crypto,
 //! which compiles this file by path.

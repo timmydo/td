@@ -1165,15 +1165,16 @@ Callers must recover durable state after process death. Test returned-error
 handling separately from process-death recovery and report which fatal paths
 were audited/exercised. Do not claim arbitrary provider panic/OOM survival.
 
-Future td-owned primitives replace the private backend within this same crate;
-they do not introduce another public mail dependency. The Rustls provider bridge
+Future td-owned primitives replace the private backend behind this same facade;
+their implementation lives in `td-primitives` (AGENTS.md principle 2), and they
+do not introduce another public mail dependency. The Rustls provider bridge
 also stays private here. Replacing AWS-LC still retains the Rustls TLS engine;
 it does not make the entire crate std-only. This crate owns the inventory of
 existing engine SHA/Ed25519 and td-fido P-256 implementations and their audit
 evidence before reusing any code. Reuse confers no unproven side-channel claim
 and does not migrate those consumers into this external-dependency crate.
-Cross-component primitive consolidation would require a separate design;
-it is outside F04. td-mta/IMPLEMENTATION.md F04 owns mail integration staging
+Cross-component primitive consolidation has its design in
+`td-primitives/DESIGN.md`; it is outside F04. td-mta/IMPLEMENTATION.md F04 owns mail integration staging
 and cutover. Each primitive needs
 independent cryptographic and exact-artifact side-channel review, including
 compiler/flags/target, nonce generation and entropy/optimization-barrier choices.

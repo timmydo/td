@@ -2891,7 +2891,7 @@ requested. Report support does not imply DMARC report generation.
 with predictable quota/admission behavior and tests for rejected domains. No
 plus addressing, external forwarding, or regex address rewriting rides with it.
 
-**F04 — Owned cryptographic primitives inside td-crypto.** The facade crate
+**F04 — Owned cryptographic primitives behind td-crypto.** The facade crate
 exists from M03a. Direct streaming SHA-256 is brought forward to satisfy v1
 allocation constraints; the rest of AWS-LC replacement remains future work
 and does not block v1. Its normative contracts live in td-crypto/DESIGN.md.
@@ -2902,7 +2902,8 @@ Mail code and its direct dependency do not change with backend selection.
    has landed. Specify algorithms, secret lifetimes/erasure limits,
    constant-time and failure contracts, ECDSA nonces, entropy and optimization
    barriers. New unsafe surfaces need the normal UNSAFE.md amendment first.
-2. Implement independently reviewed primitive increments privately in td-crypto,
+2. Implement independently reviewed primitive increments in `td-primitives`,
+   behind td-crypto's private bridge,
    with pinned/approved known-answer, adversarial and differential inputs.
    Require independent cryptographic and exact-artifact side-channel review,
    repeated when compiler/flags/target change. Tests alone are insufficient.

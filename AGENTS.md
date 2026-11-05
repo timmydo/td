@@ -23,8 +23,9 @@ needs them:
 - For shared MIME parsing or decoding, read `td-mime/DESIGN.md`.
 - For shared HTML rendering or text extraction, read `td-html/DESIGN.md`.
 - For td-crypto or its consumer boundary, read `td-crypto/DESIGN.md`.
-- For the shared FIDO2 client or SHA-256, HMAC and HKDF, read
-  `td-fido/DESIGN.md`.
+- For td's own cryptographic primitives, read `td-primitives/DESIGN.md`.
+- For the FIDO2 client, or the SHA-256, HMAC and HKDF the boot and login
+  crates share, read `td-fido/DESIGN.md`.
 - For shared header lexical syntax, read `td-header/DESIGN.md`.
 - For shared Unicode normalization, read `td-nfc/DESIGN.md`.
 - For shared Markdown parsing, read `td-markdown/DESIGN.md`.
@@ -353,7 +354,10 @@ build-ID-matched companion (`td-profiler/DESIGN.md` §4).
    remain pure `std` plus td's own crates: a sibling `td-*` crate in this
    repository, depended on by path as td-ui is, is not external and needs no
    sign-off. Code two crates need lives in one such crate, not in a copy per
-   consumer.
+   consumer. Cryptography is not exempt: td may write its own primitives, and
+   a crypto library is an external dependency like any other. New ones live
+   in `td-primitives`, small enough to audit, under the rules its design
+   states.
 3. **Avoid shell.** Prefer dependency-free Rust. Existing recipe shell is not
    precedent for new control-plane or target logic.
 4. **Migrations are atomic.** Cut over completely and delete the old mechanism

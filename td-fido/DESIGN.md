@@ -167,7 +167,7 @@ for cargo.
 ## Shared HMAC-SHA256
 
 `hmac.rs` is the one SHA-256 digest, HMAC-SHA256 and HKDF (RFC 5869)
-the std-only crates share: `hkdf` gives one 32-byte block, and
+the boot and login crates share (`td-primitives` has its own for TLS): `hkdf` gives one 32-byte block, and
 `hkdf_expand` fills an output of any length up to RFC 5869's 255
 blocks, its info the concatenation of parts, refusing a longer output
 and leaving it untouched. td-protector's lockout token takes 64 bytes

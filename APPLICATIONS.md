@@ -10583,8 +10583,10 @@ configuration contract does not narrow. Base64 by hand; `tempfile`
 replaced by a unique name under the std temporary directory. The
 `unwrap`s go in the import's rule pass.
 
-**The fetch service.** The one thing std cannot do is TLS, and td will
-not write one. AGENTS.md foresees the control-plane programs rebuilt as
+**The fetch service.** The one thing std cannot do is TLS. AGENTS.md
+principle 2 lets td write the primitives under it (`td-primitives`); the
+protocol engine stays rustls's for now, as a choice rather than a rule.
+AGENTS.md foresees the control-plane programs rebuilt as
 target recipes once the target toolchain exists, and the td-net tier is
 the one tier with an external closure; it already carries a bounded
 HTTPS client, `net/src/http.rs`, ureq over rustls, ring and

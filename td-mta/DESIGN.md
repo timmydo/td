@@ -1020,8 +1020,8 @@ bypass the store's commit API. TLS framing/cryptographic verification belongs
 to td-crypto; mail STARTTLS transitions, deadline/lease accounting and gateway
 allowlist authorization belong to td-mta. API section 1.1 owns that integration.
 
-Future td-owned cryptographic primitives replace AWS-LC internally within the
-same td-crypto facade. Its private Rustls provider bridge changes there too;
+Future td-owned cryptographic primitives, implemented in `td-primitives`,
+replace AWS-LC internally behind the same td-crypto facade. Its private Rustls provider bridge changes there too;
 mail/storage code and the direct dependency remain stable. F04 requires
 cryptographic, interoperability and resource qualification before deployment.
 Replacing only the direct digest/signing operations does not replace TLS's

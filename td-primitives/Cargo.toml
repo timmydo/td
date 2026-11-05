@@ -1,0 +1,23 @@
+[package]
+name = "td-primitives"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "td's own std-only cryptographic primitives: SHA-1/2, HMAC, ChaCha20-Poly1305 and bitsliced AES-GCM"
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
