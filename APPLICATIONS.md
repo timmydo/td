@@ -3405,8 +3405,8 @@ A number the reviewed table lacks returns `ENOSYS` too, as below.
 | `mount`, `umount`, `umount2`, `pivot_root`, `move_mount`, `open_tree`, `open_tree_attr`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr` → EPERM | the whole mount surface, old and new API — filtering only the old one is a hole; `open_tree_attr` is the Linux 7.1 addition |
 | `open_by_handle_at` → EPERM | the Shocker escape primitive |
 | `add_key`, `request_key`, `keyctl` → EPERM | shared kernel keyring |
-| `move_pages`, `mbind`, `get_mempolicy`, `set_mempolicy`, `migrate_pages` → EPERM | NUMA policy on other processes' pages |
-| `kexec_load`, `kexec_file_load`, `swapon`, `swapoff`, `reboot`, `sethostname`, `setdomainname`, `init_module`, `finit_module`, `delete_module`, `acct`, `quotactl`, `syslog`, `uselib`, `vhangup`, `modify_ldt`, `ustat`, `sysfs`, `_sysctl`, `create_module`, `get_kernel_syms`, `query_module`, `nfsservctl`, `getpmsg`, `putpmsg`, `afs_syscall`, `tuxcall`, `security`, `set_thread_area`, `get_thread_area`, `epoll_ctl_old`, `epoll_wait_old`, and `vserver` → EPERM | privileged or the exact named obsolete x86-64 table slots; denied so the answer never depends on capability arithmetic |
+| `move_pages`, `mbind`, `get_mempolicy`, `set_mempolicy`, `set_mempolicy_home_node`, `migrate_pages` → EPERM | NUMA policy on other processes' pages, and the family's own-process members alongside |
+| `kexec_load`, `kexec_file_load`, `swapon`, `swapoff`, `reboot`, `sethostname`, `setdomainname`, `init_module`, `finit_module`, `delete_module`, `acct`, `quotactl`, `quotactl_fd`, `syslog`, `settimeofday`, `clock_settime`, `iopl`, `ioperm`, `uselib`, `vhangup`, `modify_ldt`, `ustat`, `sysfs`, `_sysctl`, `create_module`, `get_kernel_syms`, `query_module`, `nfsservctl`, `getpmsg`, `putpmsg`, `afs_syscall`, `tuxcall`, `security`, `set_thread_area`, `get_thread_area`, `setgroups`, `epoll_ctl_old`, `epoll_wait_old`, `lookup_dcookie`, and `vserver` → EPERM | privileged or the exact named obsolete x86-64 table slots; denied so the answer never depends on capability arithmetic, or on whether the kernel's configuration builds the call. `quotactl_fd` and `quotactl` also have commands that need no privilege, which a jailed application has no reason to use |
 | `bpf`, `io_uring_setup`, `io_uring_enter`, `io_uring_register`, `pidfd_getfd`, `process_vm_readv`, `process_vm_writev` → EPERM | **td additions beyond Flatpak**, each recorded as such: bpf and io_uring are the two largest post-2015 kernel attack surfaces, `pidfd_getfd` steals descriptors, and `process_vm_*` is ptrace by another number |
 
 This is a policy lineage, not a byte-for-byte compatibility claim. Current
@@ -3431,6 +3431,14 @@ capability-free program can reach, and the same release gave
 kernel without the number the kernel answers `ENOSYS` itself, so the helper's
 returned errno cannot show the filter did it; the audit variant's record of that
 probe (layer 4 below) can, since it carries the filter's action.
+
+The denial roster above deliberately leaves out `adjtimex` and `clock_adjtime`,
+though their write forms need `CAP_SYS_TIME`: cBPF cannot read `modes` from the
+`struct timex` they point at, and `modes` zero is an ordinary read, which glibc's
+`ntp_gettime` makes through `clock_adjtime`. The one unprivileged write path, a
+dynamic clock's device through `clock_adjtime`, is not among a jail's devices.
+`name_to_handle_at` also stays: unlike `open_by_handle_at` it opens nothing, and a
+handle it returns is useless without that denied call.
 
 Everything else below the ceiling is allowed, including `seccomp(2)` and
 `prctl(PR_SET_SECCOMP)` — Firefox installs its own filters in every

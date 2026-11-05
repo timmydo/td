@@ -299,6 +299,7 @@ macro_rules! define_policy {
 define_policy!(
     101, // ptrace
     103, // syslog
+    116, // setgroups
     134, // uselib
     136, // ustat
     139, // sysfs
@@ -308,6 +309,7 @@ define_policy!(
     156, // _sysctl
     161, // chroot
     163, // acct
+    164, // settimeofday
     165, // mount
     166, // umount2 (the x86-64 umount entry)
     167, // swapon
@@ -315,6 +317,8 @@ define_policy!(
     169, // reboot
     170, // sethostname
     171, // setdomainname
+    172, // iopl
+    173, // ioperm
     174, // create_module
     175, // init_module
     176, // delete_module
@@ -329,8 +333,10 @@ define_policy!(
     185, // security
     205, // set_thread_area
     211, // get_thread_area
+    212, // lookup_dcookie
     214, // epoll_ctl_old
     215, // epoll_wait_old
+    227, // clock_settime
     236, // vserver
     237, // mbind
     238, // set_mempolicy
@@ -362,6 +368,8 @@ define_policy!(
     433, // fspick
     438, // pidfd_getfd
     442, // mount_setattr
+    443, // quotactl_fd
+    450, // set_mempolicy_home_node
     467, // open_tree_attr
     472, // fchroot
 );
@@ -1058,6 +1066,31 @@ mod tests {
     fn both_seccomp_programs_refuse_fchroot_by_number() {
         for filter in [STANDARD_FILTER.as_slice(), WORKSPACE_FILTER.as_slice()] {
             assert_eq!(interpret(filter, data(472)).unwrap(), errno(EPERM));
+        }
+    }
+
+    // The other loops read the roster they test, so a line dropped by a bad
+    // rebase would leave them all green. This one does not.
+    #[test]
+    fn the_roster_is_exactly_this() {
+        assert_eq!(
+            DENIED_SYSCALLS,
+            &[
+                101, 103, 116, 134, 136, 139, 153, 154, 155, 156, 161, 163, 164, 165, 166, 167,
+                168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183,
+                184, 185, 205, 211, 212, 214, 215, 227, 236, 237, 238, 239, 246, 248, 249, 250,
+                256, 272, 279, 298, 304, 308, 310, 311, 313, 320, 321, 323, 425, 426, 427, 428,
+                429, 430, 431, 432, 433, 438, 442, 443, 450, 467, 472
+            ]
+        );
+    }
+
+    // The default-allow development program must never refuse what these do
+    // not: iopl and ioperm once were the example.
+    #[test]
+    fn the_application_roster_covers_the_development_denials() {
+        for (native, _) in DEVELOPMENT_DENIED {
+            assert!(DENIED_SYSCALLS.contains(native), "syscall {native}");
         }
     }
 
