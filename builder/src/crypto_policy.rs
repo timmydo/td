@@ -49,8 +49,8 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
 pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "d05684e2af245c0a796e154148ced1bc85ea08d9f31799d65a4fe1a62b7fc66a",
-        "td-crypto" => "983d1e8148090181d5ff4c03bb499976123d295bfaa50e94ad1815b3d3b11f55",
-        "td-mta" => "eb5ceaab78715ea91d57d4afac3915f4049a110483b93c4b0f8d0308bd22ee3e",
+        "td-crypto" => "101fd34f66e0b38c153d6e8d11670f5cd757963fa50feb90336d3ebb71f8f92d",
+        "td-mta" => "26d27bb88497f325ac8935f0ae7cb3902fcafea1234766806dabf24051a2925f",
         "td-fs" => "d907e7d97198344c058b8403d2a07c08174081bcd8af0f4d9e276c0131766fe2",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-html" => "5bc92c6117fc17c612004a1b025a6ad42171c3d185d9af7eb47dd13a9168e8e3",
@@ -144,7 +144,7 @@ pub(crate) fn no_build_script(root: &Path, name: &str) -> Result<(), String> {
 // normal/build graph is checked separately from the complete locked sources.
 const ACTIVE: &str = "aws-lc-rs v1.19.0|alloc,aws-lc-sys,non-fips,prebuilt-nasm
 aws-lc-sys v0.47.0|prebuilt-nasm
-cc v1.10.0|parallel
+cc v1.11.0|parallel
 cmake v0.1.58|
 dunce v1.0.5|
 find-msvc-tools v0.1.15|
@@ -174,7 +174,7 @@ cmov v0.5.4|
 const-oid v0.10.2|
 cpufeatures v0.3.1|
 crypto-common v0.2.2|
-ctutils v0.4.6|
+ctutils v0.4.8|
 digest v0.11.3|alloc,block-api,default,mac,oid
 fallible-iterator v0.2.0|default,std
 futures-channel v0.3.34|alloc,default,futures-sink,sink,std
@@ -186,7 +186,7 @@ getrandom v0.4.3|std,sys_rng
 hmac v0.13.0|
 hybrid-array v0.4.15|
 lock_api v0.4.14|atomic_usize,default
-log v0.4.34|
+log v0.4.35|
 md-5 v0.11.0|alloc,default,oid
 memchr v2.8.3|alloc,default,std
 parking_lot v0.12.5|default
@@ -216,7 +216,7 @@ typenum v1.20.1|const-generics
 unicode-bidi v0.3.18|default,hardcoded-data,std
 unicode-ident v1.0.27|
 unicode-normalization v0.1.26|default,std
-unicode-properties v0.1.4|default,emoji,general-category
+unicode-properties v0.1.5|default,emoji,general-category
 whoami v2.1.3|default,std,wasi-wasite,wasm-web
 ";
 

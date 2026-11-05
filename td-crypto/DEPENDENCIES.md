@@ -49,7 +49,7 @@ artifact packaging must retain all applicable notices, including root data.
 | --- | --- | --- | --- |
 | aws-lc-rs | 1.19.0 | active | ISC AND (Apache-2.0 OR ISC) |
 | aws-lc-sys | 0.47.0 | active | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) |
-| cc | 1.10.0 | active | MIT OR Apache-2.0 |
+| cc | 1.11.0 | active | MIT OR Apache-2.0 |
 | cfg-if | 1.0.5 | inactive | MIT OR Apache-2.0 |
 | cmake | 0.1.58 | active | MIT OR Apache-2.0 |
 | dunce | 1.0.5 | active | CC0-1.0 OR MIT-0 OR Apache-2.0 |
@@ -132,7 +132,7 @@ manifest, lock and selected features are pinned by crypto_policy.rs.
 | const-oid | 0.10.2 | active | Apache-2.0 OR MIT |
 | cpufeatures | 0.3.1 | active | MIT OR Apache-2.0 |
 | crypto-common | 0.2.2 | active | MIT OR Apache-2.0 |
-| ctutils | 0.4.6 | active | Apache-2.0 OR MIT |
+| ctutils | 0.4.8 | active | Apache-2.0 OR MIT |
 | digest | 0.11.3 | active | MIT OR Apache-2.0 |
 | fallible-iterator | 0.2.0 | active | MIT/Apache-2.0 |
 | futures-channel | 0.3.34 | active | MIT OR Apache-2.0 |
@@ -142,10 +142,10 @@ manifest, lock and selected features are pinned by crypto_policy.rs.
 | futures-util | 0.3.34 | active | MIT OR Apache-2.0 |
 | hmac | 0.13.0 | active | MIT OR Apache-2.0 |
 | hybrid-array | 0.4.15 | active | MIT OR Apache-2.0 |
-| js-sys | 0.3.106 | inactive | MIT OR Apache-2.0 |
+| js-sys | 0.3.107 | inactive | MIT OR Apache-2.0 |
 | libredox | 0.1.25 | inactive | MIT |
 | lock_api | 0.4.14 | active | MIT OR Apache-2.0 |
-| log | 0.4.34 | active | MIT OR Apache-2.0 |
+| log | 0.4.35 | active | MIT OR Apache-2.0 |
 | md-5 | 0.11.0 | active | MIT OR Apache-2.0 |
 | memchr | 2.8.3 | active | Unlicense OR MIT |
 | objc2-core-foundation | 0.3.2 | inactive | Zlib OR Apache-2.0 OR MIT |
@@ -183,15 +183,15 @@ manifest, lock and selected features are pinned by crypto_policy.rs.
 | unicode-bidi | 0.3.18 | active | MIT OR Apache-2.0 |
 | unicode-ident | 1.0.27 | active | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-normalization | 0.1.26 | active | (MIT OR Apache-2.0) AND Unicode-3.0 |
-| unicode-properties | 0.1.4 | active | MIT/Apache-2.0 |
+| unicode-properties | 0.1.5 | active | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | wasi | 0.14.7+wasi-0.2.4 | inactive | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | wasip2 | 1.0.4+wasi-0.2.12 | inactive | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | wasite | 1.0.2 | inactive | Apache-2.0 OR BSL-1.0 OR MIT |
-| wasm-bindgen | 0.2.129 | inactive | MIT OR Apache-2.0 |
-| wasm-bindgen-macro | 0.2.129 | inactive | MIT OR Apache-2.0 |
-| wasm-bindgen-macro-support | 0.2.129 | inactive | MIT OR Apache-2.0 |
-| wasm-bindgen-shared | 0.2.129 | inactive | MIT OR Apache-2.0 |
-| web-sys | 0.3.106 | inactive | MIT OR Apache-2.0 |
+| wasm-bindgen | 0.2.130 | inactive | MIT OR Apache-2.0 |
+| wasm-bindgen-macro | 0.2.130 | inactive | MIT OR Apache-2.0 |
+| wasm-bindgen-macro-support | 0.2.130 | inactive | MIT OR Apache-2.0 |
+| wasm-bindgen-shared | 0.2.130 | inactive | MIT OR Apache-2.0 |
+| web-sys | 0.3.107 | inactive | MIT OR Apache-2.0 |
 | whoami | 2.1.3 | active | Apache-2.0 OR BSL-1.0 OR MIT |
 | windows-link | 0.2.1 | inactive | MIT OR Apache-2.0 |
 | windows-sys | 0.61.2 | inactive | MIT OR Apache-2.0 |
