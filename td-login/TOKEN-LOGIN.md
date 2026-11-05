@@ -743,7 +743,7 @@ path, is refused as `THREAT-MODEL.md` §3 specifies.
 The separately enrolled remote administrator (`td-update/ADMIN.md`) is an
 explicit exception to the primary-only account rule in this section.
 `AllowUsers` in the enforced form also names `td-admin`, whose root-owned
-key file and forced fixed-command interface authorize trusted-main updates,
+key file and forced fixed-command interface authorize configured signed-release and explicit trusted-main updates,
 rollback and reboot. This key does not unlock the primary session or access
 its credential store. Stopping sshd during a login-key cutover closes its
 connections too; admitted admin jobs belong to their separate supervised

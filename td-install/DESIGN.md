@@ -2005,10 +2005,17 @@ built td-luks over a header copy of a volume it formats: the file
 reproduces the key the volume itself dumps, through either keyslot, and
 a name that exists is refused.
 
-## 6. No deployment signatures
+## 6. Boot integrity and release authentication
 
-td does not sign deployments, and nothing on the boot, install or update
-path authenticates one. A deployment is its manifest and three payloads;
+Downloaded system releases are authenticated before installation by the
+installed verifier under a root-provisioned publisher policy
+(`net/RELEASES.md`, `td-update/ADMIN.md`). Their signed index binds the
+manifest and all payload hashes. Local source-built deployments still rely
+on the authority that requested their installation. Boot does not consult
+release signatures or expiry: an admitted deployment remains bootable and
+can be retained as rollback after its download metadata expires.
+
+A deployment is its manifest and three payloads;
 every reader checks the payloads against the manifest (D2) and the id is
 the manifest's hash (D3). What decides which deployment a machine runs is
 who can write its volume, and for a person's update, rollback or install,

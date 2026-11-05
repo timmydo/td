@@ -3076,7 +3076,8 @@ impl Request {
                 lines.push(format!("REQUESTER UID {requester}"));
                 lines.push("SSH ED25519 PUBLIC KEY:".into());
                 lines.push(blob.clone());
-                lines.push("CAN INSTALL TRUSTED MAIN AND REBOOT".into());
+                lines.push("CAN INSTALL CONFIGURED SIGNED RELEASES".into());
+                lines.push("OR BUILD TRUSTED MAIN, AND REBOOT".into());
                 lines.push("WITHOUT FURTHER PHYSICAL APPROVAL".into());
                 approval_lines(&mut lines);
             }

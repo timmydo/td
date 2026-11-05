@@ -527,6 +527,8 @@ fn root_epoch_recovers_poisoned_counters_and_retry_retains_the_rotation_proof() 
     save_state(&f.state, &state).unwrap();
     let independent = f.dir.join("privileged-state");
     save_state(&independent, &state).unwrap();
+    let failure_state = f.dir.join("privileged-failure-state");
+    save_state(&failure_state, &state).unwrap();
     let new_private = f.dir.join("new-root.key");
     let new_public = f.dir.join("new-release.pub");
     let new_key = f.dir.join("new-release.key");
@@ -582,6 +584,16 @@ fn root_epoch_recovers_poisoned_counters_and_retry_retains_the_rotation_proof() 
     let bytes = fs::read(&object).unwrap();
     fs::remove_file(&object).unwrap();
     assert!(f.fetch("out").is_err());
+    learn(&failure_state, &sidecar(&f.state, ".metadata")).unwrap();
+    let learned = State::parse(&text(&failure_state, SMALL * 3).unwrap()).unwrap();
+    assert_eq!(learned.root.version, 2);
+    assert_eq!(learned.sequence, 1);
+    let new_head = fs::read(f.repo.join("heads/system-x86-64")).unwrap();
+    fs::write(f.repo.join("heads/system-x86-64"), &poisoned_head).unwrap();
+    // Exactly the admin retry: its worker receives only privileged state.
+    replace(&f.state, learned.text().as_bytes()).unwrap();
+    assert!(f.fetch("out").unwrap_err().contains("root rollback"));
+    fs::write(f.repo.join("heads/system-x86-64"), new_head).unwrap();
     assert_eq!(
         State::parse(&text(&f.state, SMALL * 3).unwrap())
             .unwrap()
@@ -596,4 +608,70 @@ fn root_epoch_recovers_poisoned_counters_and_retry_retains_the_rotation_proof() 
         verify(&independent, &f.dir.join("out")).unwrap().0,
         "2".repeat(40)
     );
+}
+
+#[test]
+fn learning_expired_signed_evidence_preserves_floors_but_cannot_install_it() {
+    let f = Fixture::new();
+    let time = now().unwrap();
+    let evidence = f.dir.join("evidence");
+    directory(&evidence).unwrap();
+    let original = text(&f.repo.join("releases").join(&f.release), INDEX_LIMIT).unwrap();
+    let mut body: Vec<_> = original.lines().map(String::from).collect();
+    body.pop();
+    body[2] = "2".into();
+    body[3] = (time - 7200).to_string();
+    body[4] = (time + 7200).to_string();
+    let release = format::signed(&(body.join("\n") + "\n"), &fs::read(&f.key).unwrap()).unwrap();
+    let head = format::signed(
+        &format!(
+            "td-release-head-v1\n1\n2\n{}\n{}\nsystem-x86-64\n{}\n",
+            time - 7200,
+            time - 3600,
+            hash(release.as_bytes())
+        ),
+        &fs::read(&f.key).unwrap(),
+    )
+    .unwrap();
+    fs::write(evidence.join("head"), &head).unwrap();
+    fs::write(evidence.join("release"), &release).unwrap();
+    learn(&f.state, &evidence).unwrap();
+    let mut state = State::parse(&text(&f.state, SMALL * 3).unwrap()).unwrap();
+    assert_eq!((state.head_version, state.sequence), (2, 2));
+    assert!(metadata(&mut state, &head, &release, time).is_err());
+    let old = text(&f.repo.join("heads/system-x86-64"), SMALL).unwrap();
+    assert!(metadata(&mut state, &old, &original, time)
+        .err()
+        .unwrap()
+        .contains("replay"));
+    // A forged higher counter has no effect; learning only parses signed proofs.
+    fs::write(evidence.join("head"), head.replace("\n2\n", "\n99\n")).unwrap();
+    learn(&f.state, &evidence).unwrap();
+    assert_eq!(
+        State::parse(&text(&f.state, SMALL * 3).unwrap())
+            .unwrap()
+            .head_version,
+        2
+    );
+}
+
+#[test]
+fn learning_cannot_hide_a_protected_state_persistence_failure() {
+    let f = Fixture::new();
+    let evidence = f.dir.join("evidence");
+    directory(&evidence).unwrap();
+    fs::copy(f.repo.join("heads/system-x86-64"), evidence.join("head")).unwrap();
+    fs::copy(
+        f.repo.join("releases").join(&f.release),
+        evidence.join("release"),
+    )
+    .unwrap();
+    let before = fs::read(&f.state).unwrap();
+    fs::write(
+        sidecar(&f.state, ".roots"),
+        b"blocks protected history publication",
+    )
+    .unwrap();
+    assert!(learn(&f.state, &evidence).is_err());
+    assert_eq!(fs::read(&f.state).unwrap(), before);
 }

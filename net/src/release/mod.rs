@@ -199,13 +199,7 @@ fn advance_roots(
             .version
             .checked_add(1)
             .ok_or("root version overflow")?;
-        state.root = Root::parse(&get(next)?, Some(&state.root))?;
-        // The offline root authorizes a fresh online-key epoch. A revoked key
-        // cannot poison the replacement's counters by signing u64::MAX.
-        state.head_version = 0;
-        state.head_digest = "0".repeat(64);
-        state.sequence = 0;
-        state.release_digest = "0".repeat(64);
+        state.rotate(&get(next)?)?;
         // A learned revocation survives even if the later image download fails.
         persist(state)?;
     }
@@ -221,6 +215,61 @@ fn metadata(state: &mut State, head_text: &str, release_text: &str, time: u64) -
     let release = Release::parse(release_text, &state.root, time, &state.profile)?;
     state.accept(&head, head_text, &release, time)?;
     Ok(release)
+}
+
+/// Learn authenticated floors even when payloads or later metadata are absent.
+/// Untrusted evidence can be incomplete. Protected-state I/O must still fail closed.
+fn learn(state_path: &Path, evidence: &Path) -> Result<()> {
+    let _lock = lock(&sidecar(state_path, ".lock"))?;
+    let mut state = State::parse(&text(state_path, SMALL * 3)?)?;
+    let time = now()?;
+    state.clock(time)?;
+    let Ok(head_text) = text(&evidence.join("head"), SMALL) else {
+        return Ok(());
+    };
+    let Ok(target) = Head::root_hint(&head_text) else {
+        return Ok(());
+    };
+    if target < state.root.version || target - state.root.version > 64 {
+        return Ok(());
+    }
+    while state.root.version < target {
+        let version = state
+            .root
+            .version
+            .checked_add(1)
+            .ok_or("root version overflow")?;
+        let Ok(root) = text(&evidence.join(format!("root-{version}")), SMALL) else {
+            return Ok(());
+        };
+        if state.rotate(&root).is_err() {
+            return Ok(());
+        }
+        save_state(state_path, &state)?;
+    }
+    let Ok(release_text) = text(&evidence.join("release"), INDEX_LIMIT) else {
+        return Ok(());
+    };
+    let authenticated = (|| {
+        // Expired signed evidence can raise a floor but can never authorize an
+        // installation. Otherwise a crash until after expiry would lose it.
+        let head_issued = format::number(head_text.lines().nth(3).ok_or("head truncated")?)?;
+        let release_issued =
+            format::number(release_text.lines().nth(3).ok_or("release truncated")?)?;
+        if head_issued > time || release_issued > time {
+            return Err("future metadata".into());
+        }
+        let head = Head::parse(&head_text, &state.root, head_issued, &state.profile)?;
+        if hash(release_text.as_bytes()) != head.release {
+            return Err("release hash mismatch".into());
+        }
+        let release = Release::parse(&release_text, &state.root, release_issued, &state.profile)?;
+        state.accept(&head, &head_text, &release, time)
+    })();
+    if authenticated.is_ok() {
+        save_state(state_path, &state)?;
+    }
+    Ok(())
 }
 
 fn verify_payloads(bundle: &Path, release: &Release) -> Result<()> {
@@ -316,16 +365,28 @@ fn fetch(base: &str, state_path: &Path, cache: &Path, output: &Path) -> Result<(
     let _cache_lock = lock(&cache.join("lock"))?;
     let mut state = State::parse(&text(state_path, SMALL * 3)?)?;
     state.clock(now()?)?;
+    let evidence = sidecar(state_path, ".metadata");
+    directory(&evidence)?;
     let mut source = Source::new(base)?;
     let head_text = source.text(&format!("heads/{}", state.profile), SMALL)?;
+    // Evidence is public signed data, not a trusted worker receipt. Keep it
+    // before advancing any worker state so a drained failed job can be learned.
+    replace(&evidence.join("head"), head_text.as_bytes())?;
     advance_roots(
         &mut state,
         Head::root_hint(&head_text)?,
         |version| source.text(&format!("roots/{version}"), SMALL),
-        |state| save_state(state_path, state),
+        |state| {
+            replace(
+                &evidence.join(format!("root-{}", state.root.version)),
+                state.root.text.as_bytes(),
+            )?;
+            save_state(state_path, state)
+        },
     )?;
     let head = Head::parse(&head_text, &state.root, now()?, &state.profile)?;
     let release_text = source.text(&format!("releases/{}", head.release), INDEX_LIMIT)?;
+    replace(&evidence.join("release"), release_text.as_bytes())?;
     let release = metadata(&mut state, &head_text, &release_text, now()?)?;
     // Persist freshness before acquisition, so failed downloads cannot reset the floor.
     save_state(state_path, &state)?;
@@ -379,7 +440,7 @@ fn fetch(base: &str, state_path: &Path, cache: &Path, output: &Path) -> Result<(
     result
 }
 
-const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  fetch URL STATE CACHE OUTPUT\n  verify STATE BUNDLE\n  gc REPOSITORY ROOT [--delete]\n";
+const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  fetch URL STATE CACHE OUTPUT\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n";
 
 fn command(args: &[String]) -> Result<()> {
     let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
@@ -440,6 +501,7 @@ fn command(args: &[String]) -> Result<()> {
             println!("{commit} {deployment}");
             Ok(())
         }
+        ["learn", state, evidence] => learn(Path::new(state), Path::new(evidence)),
         ["gc", repo, root] => publisher::gc(Path::new(repo), Path::new(root), false),
         ["gc", repo, root, "--delete"] => publisher::gc(Path::new(repo), Path::new(root), true),
         _ => Err(HELP.into()),

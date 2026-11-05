@@ -178,7 +178,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!volume_setting.contains("std::fs"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xf7254be5c0db5c64,
+        0xd4421326953755f1,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(

@@ -399,8 +399,9 @@ elevation or authentication. See `td-install/INSTALLER.md`.
 
 The designated remote administrator is an explicit policy exception to
 per-operation physical consent: its separately provisioned SSH key may
-request a build and installation of the fixed upstream main branch and
-rollback to the retained deployment, and orderly reboot, without another prompt. The source revision is pinned per
+request acquisition and installation under a root-provisioned signed-release
+policy, an explicit build and installation of the fixed upstream main branch,
+and rollback to the retained deployment, and orderly reboot, without another prompt. The source revision is pinned per
 job, builds use a separate unprivileged identity, and no caller-supplied
 command or source is admitted. `td-update/ADMIN.md` owns this policy.
 

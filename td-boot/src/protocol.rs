@@ -8,8 +8,8 @@ pub const SELECTED_PREVIOUS_MARKER: &str = "TD-BOOT-SELECTED-PREVIOUS";
 // The manifest contract, shared because every writer and reader of a
 // deployment must agree about it: the recipes write it, td-boot reads and
 // verifies its payloads, and td-install checks the one a review approved. The
-// deployment id is sha256(manifest); nothing signs it (td-install/DESIGN.md
-// §6, "No deployment signatures").
+// deployment id is sha256(manifest). Download admission authenticates a
+// separate signed index; boot checks these hashes (td-install/DESIGN.md §6).
 pub const MANIFEST_HEADER: &[u8] = b"td-deployment-v1";
 pub const MANIFEST_NAME: &str = "manifest";
 pub const MAX_MANIFEST_BYTES: u64 = 4096;

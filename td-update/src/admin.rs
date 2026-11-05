@@ -1,4 +1,4 @@
-//! Restricted remote administration and durable trusted-main update jobs.
+//! Restricted remote administration and durable signed-release/source update jobs.
 
 use crate::{io, Result, O_NOFOLLOW, O_NONBLOCK};
 use std::fs::{self, File, OpenOptions};
@@ -19,12 +19,18 @@ const SOCKET: &str = "/run/td-admin/control";
 const OPERATION_GROUP: &str = "/sys/fs/cgroup/system/td-admin/operation";
 const GIT_GROUP: &str = "/sys/fs/cgroup/system/td-admin/git";
 const BUILD_GROUP: &str = "/sys/fs/cgroup/system/td-admin/build";
+const RELEASE_POLICY: &str = "/var/lib/td-admin/releases";
+const RELEASE_STATE: &str = "/var/lib/td-admin/releases/state";
+const DOWNLOAD: &str = "/var/lib/td-admin-build/download";
+const WORKER_STATE: &str = "/var/lib/td-admin-build/release-state";
+const RELEASE_EVIDENCE: &str = "/var/lib/td-admin-build/release-state.metadata";
 const UPSTREAM: &str = "https://github.com/timmydo/td.git";
-const HELP: &str = "td-admin update [--no-reboot] | rollback [--no-reboot] | status [JOB] | logs [JOB] | cancel | reboot\nSSH: ssh td-admin@HOST update [--no-reboot]\nUpdates build trusted upstream main and reboot by default. Jobs survive disconnects.\nInitial setup: td-admin enroll-key PUBLIC_KEY_FILE, then approve H on secure attention.\n";
+const HELP: &str = "td-admin update [--no-reboot] | update-from-source [--no-reboot] | rollback [--no-reboot] | status [JOB] | logs [JOB] | cancel | reboot\nSSH: ssh td-admin@HOST update [--no-reboot]\nUpdates download a valid signed release and reboot by default. Jobs survive disconnects.\nUse update-from-source explicitly to build trusted upstream main.\nInitial setup: td-admin enroll-key PUBLIC_KEY_FILE, then approve H on secure attention.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Request {
     Update { reboot: bool },
+    SourceUpdate { reboot: bool },
     Rollback { reboot: bool },
     Status(Option<u64>),
     Logs(Option<u64>),
@@ -36,6 +42,8 @@ fn parse(words: &[&str]) -> Result<Request> {
     match words {
         ["update"] => Ok(Request::Update { reboot: true }),
         ["update", "--no-reboot"] => Ok(Request::Update { reboot: false }),
+        ["update-from-source"] => Ok(Request::SourceUpdate { reboot: true }),
+        ["update-from-source", "--no-reboot"] => Ok(Request::SourceUpdate { reboot: false }),
         ["rollback"] => Ok(Request::Rollback { reboot: true }),
         ["rollback", "--no-reboot"] => Ok(Request::Rollback { reboot: false }),
         ["status"] => Ok(Request::Status(None)),
@@ -247,45 +255,54 @@ fn git(args: &[&str], log: &File, shared: &Shared) -> Result<String> {
 }
 
 fn capture(command: &mut Command, log: &File, shared: &Shared) -> Result<String> {
-    drain_group(GIT_GROUP)?;
+    capture_group(command, log, shared, GIT_GROUP)
+}
+
+fn capture_group(
+    command: &mut Command,
+    log: &File,
+    shared: &Shared,
+    group: &str,
+) -> Result<String> {
+    drain_group(group)?;
     cancelled(shared)?;
     command
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(io(log.try_clone(), "retain Git log")?));
-    let mut child = spawn_contained(command, GIT_GROUP)?;
-    let stdout = child.stdout.take().ok_or("missing Git output")?;
-    // Continue draining after the bound, so an oversized output cannot stall Git.
+        .stderr(Stdio::from(io(log.try_clone(), "retain helper log")?));
+    let mut child = spawn_contained(command, group)?;
+    let stdout = child.stdout.take().ok_or("missing helper output")?;
+    // Continue draining after the bound, so an oversized output cannot stall helper.
     let reader = std::thread::Builder::new()
-        .name("admin-git-output".into())
+        .name("admin-helper-output".into())
         .spawn(move || {
             let mut bytes = Vec::new();
             let mut stdout = stdout;
             io(
                 (&mut stdout).take(4097).read_to_end(&mut bytes),
-                "read Git output",
+                "read helper output",
             )?;
             io(
                 std::io::copy(&mut stdout, &mut std::io::sink()),
-                "drain Git output",
+                "drain helper output",
             )?;
             if bytes.len() > 4096 {
-                return Err("Git output exceeded its bound".into());
+                return Err("helper output exceeded its bound".into());
             }
-            String::from_utf8(bytes).map_err(|_| "Git output is not UTF-8".into())
+            String::from_utf8(bytes).map_err(|_| "helper output is not UTF-8".into())
         });
     let reader = match reader {
         Ok(reader) => reader,
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            drain_group(GIT_GROUP)?;
-            return Err(format!("start Git output reader: {error}"));
+            drain_group(group)?;
+            return Err(format!("start helper output reader: {error}"));
         }
     };
-    let status = wait_helper(&mut child, GIT_GROUP, Some(shared))?;
-    let output = reader.join().map_err(|_| "Git output reader failed")?;
+    let status = wait_helper(&mut child, group, Some(shared))?;
+    let output = reader.join().map_err(|_| "helper output reader failed")?;
     if !status.success() {
-        return Err("admin Git failed; see td-admin logs".into());
+        return Err("admin helper failed; see td-admin logs".into());
     }
     output
 }
@@ -432,7 +449,161 @@ fn build_job(shared: &Shared, revision: &str, log: &File) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn configure_release(endpoint: &str, trust: &Path, profile: &str) -> Result<()> {
+    root()?;
+    if endpoint.is_empty() || endpoint.len() > 4096 || endpoint.contains(['\n', '\r', '\0']) {
+        return Err("release endpoint must be one bounded URL".into());
+    }
+    directory(Path::new(STATE), 0, 0, 0o755)?;
+    // Initial provisioning only; replacing trust is a recovery operation.
+    io(
+        fs::DirBuilder::new().mode(0o700).create(RELEASE_POLICY),
+        "create initial release policy",
+    )?;
+    crate::success(
+        fixed("/bin/td-release")
+            .args(["init", RELEASE_STATE])
+            .arg(trust)
+            .arg(profile),
+        "initialize trusted release policy",
+    )?;
+    publish(
+        &Path::new(RELEASE_POLICY).join("endpoint"),
+        &format!("{endpoint}\n"),
+    )?;
+    io(
+        File::open(STATE).and_then(|file| file.sync_all()),
+        "persist release policy directory",
+    )
+}
+
+fn release_receipt(text: &str) -> Result<(&str, &str)> {
+    let line = text
+        .strip_suffix('\n')
+        .ok_or("unterminated release verification receipt")?;
+    let (commit, deployment) = line
+        .split_once(' ')
+        .ok_or("malformed release verification receipt")?;
+    commit_id(commit)?;
+    if !crate::protocol::valid_digest(deployment.as_bytes()) {
+        return Err("invalid verified deployment ID".into());
+    }
+    Ok((commit, deployment))
+}
+
 fn update(shared: &Shared, reboot: bool, log: &File) -> Result<()> {
+    let result = download_update(shared, reboot, log);
+    result.map_err(|error| format!("{error}\nNo automatic source fallback. To build upstream main explicitly, run: td-admin update-from-source{}",
+        if reboot { "" } else { " --no-reboot" }))
+}
+
+fn download_update(shared: &Shared, reboot: bool, log: &File) -> Result<()> {
+    if !crate::present(Path::new(RELEASE_POLICY))? {
+        return Err("no signed release repository has been provisioned".into());
+    }
+    directory(Path::new(RELEASE_POLICY), 0, 0, 0o700)?;
+    let endpoint = read(&Path::new(RELEASE_POLICY).join("endpoint"), 4097)?;
+    let endpoint = endpoint
+        .strip_suffix('\n')
+        .filter(|s| !s.is_empty() && !s.contains(['\n', '\r', '\0']))
+        .ok_or("invalid provisioned release endpoint")?;
+    drain_group(BUILD_GROUP)?;
+    // Learn retained evidence before replacing a worker snapshot after a crash.
+    learn_release(log)?;
+    let state = read(Path::new(RELEASE_STATE), 48 * 1024)?;
+    publish(Path::new(WORKER_STATE), &state)?;
+    io(
+        chown(WORKER_STATE, Some(BUILD_UID), Some(BUILD_UID)),
+        "give public trust snapshot to downloader",
+    )?;
+    if crate::present(Path::new(DOWNLOAD))? {
+        io(
+            fs::remove_dir_all(DOWNLOAD),
+            "remove previous downloaded candidate",
+        )?;
+    }
+    record(shared, "downloading signed release", endpoint)?;
+    let mut child = spawn_contained(
+        fixed("/bin/td-admin")
+            .args(["download-child", endpoint])
+            .stdout(Stdio::from(io(log.try_clone(), "retain download log")?))
+            .stderr(Stdio::from(io(log.try_clone(), "retain download log")?)),
+        BUILD_GROUP,
+    )?;
+    let fetched = wait_helper(&mut child, BUILD_GROUP, Some(shared));
+    // Even cancellation learns authenticated revocations/floors, never payloads.
+    // A failed drain must prevent reading any worker-owned evidence.
+    drain_group(BUILD_GROUP)?;
+    learn_release(log)?;
+    if !fetched?.success() {
+        return Err("no valid downloadable release was acquired; see td-admin logs".into());
+    }
+    record(
+        shared,
+        "verifying signed release",
+        "installed verifier; root-owned replay state",
+    )?;
+    let receipt = capture_group(
+        fixed("/bin/td-admin").arg("verify-release-child"),
+        log,
+        shared,
+        OPERATION_GROUP,
+    )?;
+    let (revision, deployment) = release_receipt(&receipt)?;
+    install(shared, reboot, revision, deployment, Path::new(DOWNLOAD))
+}
+
+fn learn_release(log: &File) -> Result<()> {
+    drain_group(OPERATION_GROUP)?;
+    let mut child = spawn_contained(
+        fixed("/bin/td-admin")
+            .arg("learn-release-child")
+            .stdout(Stdio::from(io(log.try_clone(), "retain metadata log")?))
+            .stderr(Stdio::from(io(log.try_clone(), "retain metadata log")?)),
+        OPERATION_GROUP,
+    )?;
+    if !wait_helper(&mut child, OPERATION_GROUP, None)?.success() {
+        return Err("could not persist trusted release metadata; see td-admin logs".into());
+    }
+    Ok(())
+}
+
+fn download_child(endpoint: &str) -> Result<()> {
+    join_group(BUILD_GROUP)?;
+    Err(format!(
+        "start download identity: {}",
+        fixed("/bin/td-login")
+            .args([
+                "exec-service-as",
+                "td-admin-build",
+                "--",
+                "/bin/td-admin",
+                "download-worker",
+                endpoint
+            ])
+            .exec()
+    ))
+}
+
+fn download_worker(endpoint: &str) -> Result<()> {
+    if io(fs::metadata("/proc/self"), "read download identity")?.uid() != BUILD_UID {
+        return Err("download worker requires its private identity".into());
+    }
+    Err(format!(
+        "start release downloader: {}",
+        fixed("/bin/td-release")
+            .args([
+                "fetch",
+                endpoint,
+                WORKER_STATE,
+                "/var/lib/td-admin-build/release-cache",
+                DOWNLOAD
+            ])
+            .exec()
+    ))
+}
+
+fn update_source(shared: &Shared, reboot: bool, log: &File) -> Result<()> {
     record(shared, "fetching main", UPSTREAM)?;
     let revision = select(log, shared)?;
     cancelled(shared)?;
@@ -447,6 +618,16 @@ fn update(shared: &Shared, reboot: bool, log: &File) -> Result<()> {
         crate::protocol::MAX_MANIFEST_BYTES,
     )?;
     let deployment = crate::sha256::hex_digest(manifest.as_bytes());
+    install(shared, reboot, &revision, &deployment, &source)
+}
+
+fn install(
+    shared: &Shared,
+    reboot: bool,
+    revision: &str,
+    deployment: &str,
+    source: &Path,
+) -> Result<()> {
     {
         let mut job = shared.lock().map_err(|_| "admin state lock poisoned")?;
         if job.cancel {
@@ -459,7 +640,7 @@ fn update(shared: &Shared, reboot: bool, log: &File) -> Result<()> {
     operation(&[
         "install-child",
         source.to_str().ok_or("deployment path is not UTF-8")?,
-        &deployment,
+        deployment,
     ])?;
     record(shared, "installed", &detail)?;
     if reboot {
@@ -556,13 +737,16 @@ fn request(shared: &Shared, request: Request) -> Result<String> {
             operation(&["reboot-child"])?;
             return Ok("Reboot requested.\n".into());
         }
-        Request::Update { .. } | Request::Rollback { .. } if job.active => {
+        Request::Update { .. } | Request::SourceUpdate { .. } | Request::Rollback { .. }
+            if job.active =>
+        {
             return Ok(job.text.clone())
         }
-        Request::Update { .. } | Request::Rollback { .. } => {}
+        Request::Update { .. } | Request::SourceUpdate { .. } | Request::Rollback { .. } => {}
     }
     let (reboot, operation) = match request {
         Request::Update { reboot } => (reboot, "update"),
+        Request::SourceUpdate { reboot } => (reboot, "source-update"),
         Request::Rollback { reboot } => (reboot, "rollback"),
         _ => return Err("invalid job request".into()),
     };
@@ -586,6 +770,8 @@ fn request(shared: &Shared, request: Request) -> Result<String> {
         .spawn(move || {
             let result = if operation == "update" {
                 update(&worker, reboot, &log)
+            } else if operation == "source-update" {
+                update_source(&worker, reboot, &log)
             } else {
                 rollback(&worker, reboot)
             };
@@ -1009,6 +1195,29 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         ["git-child", args @ ..] => git_child(args),
         ["build-child", revision] => build_child(revision),
         ["build-worker", revision] => build_worker(revision),
+        ["download-child", endpoint] => download_child(endpoint),
+        ["download-worker", endpoint] => download_worker(endpoint),
+        ["verify-release-child"] => {
+            join_group(OPERATION_GROUP)?;
+            Err(format!(
+                "start release verifier: {}",
+                fixed("/bin/td-release")
+                    .args(["verify", RELEASE_STATE, DOWNLOAD])
+                    .exec()
+            ))
+        }
+        ["learn-release-child"] => {
+            join_group(OPERATION_GROUP)?;
+            Err(format!(
+                "start release metadata verifier: {}",
+                fixed("/bin/td-release")
+                    .args(["learn", RELEASE_STATE, RELEASE_EVIDENCE])
+                    .exec()
+            ))
+        }
+        ["configure-release", endpoint, trust, profile] => {
+            configure_release(endpoint, Path::new(trust), profile)
+        }
         ["--help" | "-h"] | [] => io(
             std::io::stdout().write_all(HELP.as_bytes()),
             "write admin help",
@@ -1033,6 +1242,14 @@ mod tests {
             parse(&["update", "--no-reboot"]),
             Ok(Request::Update { reboot: false })
         );
+        assert_eq!(
+            parse(&["update-from-source"]),
+            Ok(Request::SourceUpdate { reboot: true })
+        );
+        assert_eq!(
+            parse(&["update-from-source", "--no-reboot"]),
+            Ok(Request::SourceUpdate { reboot: false })
+        );
         for words in [
             vec!["update", "--repo", "/tmp/repo"],
             vec!["update", "main"],
@@ -1040,8 +1257,35 @@ mod tests {
             vec!["sh"],
             vec!["serve"],
             vec!["update", "--no-reboot", "--no-reboot"],
+            vec!["update-from-source", "--repo", "/tmp/repo"],
+            vec![
+                "configure-release",
+                "file:/repo",
+                "/root/key",
+                "system-x86-64",
+            ],
+            vec!["download-worker", "file:/repo"],
+            vec!["verify-release-child"],
         ] {
             assert!(parse(&words).is_err());
+        }
+    }
+    #[test]
+    fn release_verification_receipt_is_exact_and_cannot_supply_a_path() {
+        let commit = "a".repeat(40);
+        let deployment = "b".repeat(64);
+        assert_eq!(
+            release_receipt(&format!("{commit} {deployment}\n")),
+            Ok((commit.as_str(), deployment.as_str()))
+        );
+        for bad in [
+            format!("{commit} {deployment}"),
+            format!("{commit} {deployment}\nextra\n"),
+            format!("{commit} /tmp/payload\n"),
+            format!("main {deployment}\n"),
+            format!("{commit}  {deployment}\n"),
+        ] {
+            assert!(release_receipt(&bad).is_err());
         }
     }
     #[test]

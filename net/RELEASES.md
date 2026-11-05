@@ -111,6 +111,20 @@ Publication requires all full-payload hashes and a final expiry recheck.
 and complete-payload verification, persists state, and prints exactly
 `COMMIT DEPLOYMENT_ID`. A privileged consumer must quiesce the producer and
 protect its own state; a successful worker receipt alone is not authority.
+`fetch` also retains received signed metadata in `STATE.metadata` before
+advancing worker state. Root proofs precede the corresponding state writes.
+`learn STATE EVIDENCE` independently authenticates those proofs without
+requiring completed payloads. It ignores incomplete, forged or stale evidence,
+but fails on protected-state parsing, clock rollback or persistence errors.
+Valid root transitions persist even when later head/index data is invalid.
+An expired but correctly signed head/index may raise version floors; future
+issue times refuse. Learning expired evidence cannot authorize installation:
+`verify` still requires current freshness and complete payload hashes. This
+preserves observations across a crash that lasts beyond metadata expiry.
+A privileged consumer must drain the worker before learning, learn after
+failed/cancelled attempts, and learn retained evidence before overwriting a
+worker snapshot on retry. It must never adopt unsigned worker counters.
+
 An installer must still copy and verify the exact admitted deployment.
 Neither command installs, changes boot selectors, or executes downloaded
 code. Expiration governs admission, not boot or retained rollback.

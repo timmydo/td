@@ -8106,7 +8106,8 @@ retry. QEMU exit and successful filesystem teardown are separate observations.
 
 H also selects the settings intake's initial remote-admin key enrollment
 (tag 40). The prompt displays the full Ed25519 key and the grant to install
-trusted main and reboot without further physical consent. It takes the
+configured signed releases or build trusted main, and reboot without further
+physical consent. It takes the
 same presented, fresh Enter as other elevations; success displays REMOTE
 ADMIN KEY ENROLLED. This does not replace an existing admin key.
 `td-update/ADMIN.md` owns the remote workflow and its authorization policy.

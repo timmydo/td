@@ -1,11 +1,17 @@
-# Trusted-main remote administration
+# Signed-release and trusted-main remote administration
 
-The designated admin SSH key authorizes a fixed policy: build and install
-`main` from `https://github.com/timmydo/td.git`, and reboot after successful
-installation unless `--no-reboot` was requested. There is no post-build
-consent prompt or unattended-approval deadline. Whoever can publish to that
-upstream branch can publish the next system. HTTPS authenticates the source
-server; this policy adds no commit-signature claim.
+The designated admin SSH key authorizes two fixed update paths. `update`
+acquires a release under the machine's separately provisioned publisher
+policy; `update-from-source` builds and installs `main` from
+`https://github.com/timmydo/td.git`. Both reboot after successful installation
+unless `--no-reboot` was requested. Neither needs a further physical consent
+prompt. Download failures never select the source path automatically.
+
+Whoever controls a trusted release key can authorize bytes for that policy's
+profile; a signed source commit is the publisher's assertion, not a proof of
+reproducibility or Git ancestry. The source path separately trusts upstream
+main over HTTPS and adds no commit-signature claim. Neither path admits a
+caller-selected source, command or deployment pathname.
 
 This is an explicit alternative to the local checkout's per-deployment
 secure-attention approval, not a remembered approval from that path. The
@@ -34,7 +40,8 @@ SSH command vocabulary cannot enroll or replace keys.
 ## Interface and identities
 
 `ssh td-admin@HOST update` submits a job and returns its ID immediately.
-`update --no-reboot` installs without rebooting. `rollback [--no-reboot]`
+`update --no-reboot` installs without rebooting.
+`update-from-source [--no-reboot]` explicitly selects a local source build. `rollback [--no-reboot]`
 restores the exact current/previous selector pair through td-boot and also
 reboots by default; a changed pair refuses inside the boot transaction. `status` returns the latest
 job's state (or `status ID` a retained job); `logs [ID]` returns the last 64 KiB of its build log; `cancel` requests
@@ -68,9 +75,66 @@ executable is setuid. The root service is a `stop=leaf` td-svc daemon, so its
 requested stops drain its children. On an unexpected leader exit, the new
 leader drains every helper subgroup before accepting commands.
 
+## Release policy and download boundary
+
+Initial publisher provisioning is a root-only recovery/setup operation:
+
+```text
+td-admin configure-release URL ROOT_DOCUMENT PROFILE
+```
+
+It creates `/var/lib/td-admin/releases` as root:root mode 0700, initializes
+`state` through the installed `/bin/td-release init`, and saves the fixed
+repository URL in `endpoint`. The root document is public metadata selected
+out of band; no private signing key goes onto the machine. The profile is
+`system-x86-64` or `server-x86-64`. An existing policy directory refuses
+replacement, including a partial failed setup; trusted recovery must inspect
+and remove an incomplete initial setup before retrying. This operation is
+not available to the remote admin key or ordinary session. Hosting and
+publisher-key rotation follow `net/RELEASES.md`; the SSH caller cannot change
+trust, repository, profile or version floors.
+
+An unconfigured `update`, or one without a valid available release, fails
+and names `td-admin update-from-source` (preserving `--no-reboot`) as an
+explicit alternative. Status and logs retain the failure. There is no
+silent build, downgrade, expired-metadata override or reboot after refusal.
+
+The root service drains the build cgroup, gives UID 985 a public snapshot
+of its trusted state, and runs the installed downloader under that identity.
+The worker retains verified objects in
+`/var/lib/td-admin-build/release-cache`; its completed candidate is always
+`/var/lib/td-admin-build/download`. It cannot write the privileged replay
+state. A failed job may retain verified cache objects for the next request.
+
+After draining the worker, including failure or cancellation, root runs the
+installed metadata learner over its fixed `release-state.metadata` evidence.
+It authenticates signatures and transitions, never copies worker counters,
+and persists learned revocations/floors even without payloads. Retained
+evidence is learned before a retry replaces the worker snapshot, including
+a retry after service restart. Invalid/incomplete evidence is ignored;
+protected-state or persistence errors prevent further work. Expired signed
+observations can raise floors but cannot authorize installation.
+
+After successful acquisition and metadata learning, the service runs the
+installed offline verifier over that fixed candidate using root's own
+policy state. The verifier authenticates root rotations, signatures,
+freshness, profile, monotonic versions, the manifest and every complete
+payload; only its bounded `COMMIT DEPLOYMENT_ID` receipt is authoritative.
+The source-build worker's receipt is not used by this path. The existing
+root-private installer then pins, copies and rehashes exactly that deployment
+before entering td-boot's serialized transaction. No downloaded executable
+runs as a verifier or installer. Replay state advances independently of boot
+selectors; cancellation, installation failure and local rollback do not reset
+it. Expiry is checked at admission and does not disable an installed current
+or previous deployment.
+
+Release sequences and the source path's Git ancestry are separate histories.
+An explicit switch between delivery paths can select different commits;
+there is no claim of global commit ordering across that operator choice.
+
 ## Source and build boundary
 
-The root service owns `/var/lib/td-admin/repository.git`. It fetches exactly
+The explicit `update-from-source` path owns `/var/lib/td-admin/repository.git`. It fetches exactly
 `refs/heads/main` from the compiled HTTPS URL, records its full commit ID,
 and requires it to descend from the last accepted commit. A rewritten or
 rewound branch refuses; there is no force flag. Git uses no ambient
@@ -131,8 +195,10 @@ A later explicit update is a new request. The admin job lock is independent
 of td-boot's writer lock, which serializes this path against local developer
 installation and rollback.
 
-The commit a job selected reaches the machine with its deployment: once that
-deployment boots, `BUILD_ID` in `/etc/os-release` is the full commit, whose
+A source build embeds its selected commit into the deployment. A release
+publisher must prepare the same boot metadata before signing if it wants the
+boot display to identify that revision; the signed index alone does not
+rewrite image contents. Once such a deployment boots, `BUILD_ID` in `/etc/os-release` is the full commit, whose
 short form the startup menu's label shows (`td-install/DESIGN.md`, "Installed
 startup menu"). `--no-reboot` therefore leaves the running system reporting the
 commit it booted from until the next boot. A rollback reports the commit of the

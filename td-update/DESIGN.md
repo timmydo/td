@@ -14,7 +14,8 @@ running kernel's UUID handoff inside the single writer, as specified in
 ## Remote administration
 
 The same installed executable provides `/bin/td-admin`; [ADMIN.md](ADMIN.md)
-owns its restricted SSH interface, trusted-main policy, separate builder,
+owns its restricted SSH interface, signed-release and trusted-main policies,
+separate downloader/builder,
 durable jobs and reboot-by-default behavior. This path has no secure-attention
 dependency. The local-checkout commands below retain their explicit consent.
 

@@ -31,7 +31,7 @@ pub(crate) fn run(expected: &str) -> Result<()> {
     apply(&source, expected, Path::new(STATE), 1000, &mut execute)
 }
 
-/// The trusted-main service installs only the stopped private builder's output.
+/// The admin service admits only a verified, stopped private worker's output.
 pub(crate) fn admin(source: &Path, expected: &str, owner: u32) -> Result<()> {
     if io(fs::metadata("/proc/self"), "read admin identity")?.uid() != 0 {
         return Err("admin installation requires root".into());

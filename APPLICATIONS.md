@@ -10071,7 +10071,8 @@ deployment.
 **What exists, and it is the hard half.** A deployment is a bundle —
 `{bzImage, initramfs.cpio, root.erofs, manifest}` — whose id is
 `sha256(manifest)`, with the manifest carrying a SHA-256 per payload;
-nothing signs it (td-install/DESIGN.md §6). On the machine,
+download admission authenticates a separate signed release index
+(td-install/DESIGN.md §6). On the machine,
 `td-boot publish` verifies and materializes it into
 `td/deployments/<id>/`; `td/boot/current` and `td/boot/previous` are
 symlinks naming two of them. At boot, `td-boot` prefers `current`, falls

@@ -5540,6 +5540,10 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-net}/bin/td-net".into(),
         link: "{root}/real-root/bin/td-feed".into(),
     });
+    steps.push(Step::Symlink {
+        target: "{in:td-net}/bin/td-net".into(),
+        link: "{root}/real-root/bin/td-release".into(),
+    });
     // The application cache, the Firefox fixture origin and the portal: a
     // server ships no application and has no session.
     if sys.desktop() {
@@ -10107,6 +10111,7 @@ mod tests {
             ),
             ("git-upload-pack", "{in:git-x86-64}/bin/git-upload-pack"),
             ("td-test-https", "{in:td-net}/bin/td-net"),
+            ("td-release", "{in:td-net}/bin/td-net"),
             ("rustc", "{in:td-net}/bin/td-net"),
             ("rustdoc", "{in:td-net}/bin/td-net"),
             ("cargo", "{in:td-net}/bin/td-net"),

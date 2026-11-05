@@ -304,6 +304,15 @@ pub struct State {
     pub profile: String,
 }
 impl State {
+    pub fn rotate(&mut self, text: &str) -> Result<()> {
+        self.root = Root::parse(text, Some(&self.root))?;
+        // An offline-root-authorized epoch cannot inherit poisoned online counters.
+        self.head_version = 0;
+        self.head_digest = "0".repeat(64);
+        self.sequence = 0;
+        self.release_digest = "0".repeat(64);
+        Ok(())
+    }
     pub fn init(root: &str, wanted: &str, now: u64) -> Result<Self> {
         profile(wanted)?;
         let root = Root::parse(root, None)?;
