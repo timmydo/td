@@ -70,7 +70,6 @@ impl Rejection {
         let reason = match bytes {
             b"554 5.6.0 Message line too long\r\n" => "data_line_too_long",
             b"554 5.6.0 Invalid message framing\r\n" => "invalid_data_framing",
-            b"554 5.6.0 8-bit data requires BODY=8BITMIME\r\n" => "undeclared_8bit_data",
             b"552 5.3.4 Message headers too large\r\n" => "headers_too_large",
             b"552 5.3.4 Message too large\r\n" => "message_too_large",
             b"550 5.1.1 Unknown local recipient\r\n" => "unknown_recipient",
@@ -283,16 +282,9 @@ impl<'a> Session<'a> {
                         || (self.cr && byte == b'\n')
                         || byte == b'\t'
                         || (32..=126).contains(&byte)))
-                || (data
-                    && (byte == 0
-                        || (!self.envelope.as_ref().is_some_and(|e| e.eight_bit) && byte >= 128)))
+                || (data && byte == 0)
             {
-                let reply = if data
-                    && byte >= 128
-                    && !self.envelope.as_ref().is_some_and(|e| e.eight_bit)
-                {
-                    "554 5.6.0 8-bit data requires BODY=8BITMIME\r\n"
-                } else if data {
+                let reply = if data {
                     "554 5.6.0 Invalid message framing\r\n"
                 } else {
                     "501 5.5.2 Invalid command framing\r\n"

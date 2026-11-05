@@ -135,33 +135,35 @@ fn transcript_every_split_preserves_octets_and_waits_for_publication() {
     fixture(|routes| {
         let wire = b"Subject: example\r\n\r\n..stuffed\r\n.dot\r\n\xff\r\n.\r\n";
         let expected = b"Subject: example\r\n\r\n.stuffed\r\ndot\r\n\xff\r\n";
-        for split in 0..=wire.len() {
-            let mut s = session(routes);
-            begin(&mut s, "BODY=8BITMIME SIZE=1");
-            let mut stored = Vec::new();
-            for mut input in [&wire[..split], &wire[split..]] {
-                while !input.is_empty() {
-                    let n = s.feed(input).unwrap();
-                    input = &input[n..];
-                    match s.pending() {
-                        Pending::Data(bytes) => {
-                            stored.extend_from_slice(bytes);
-                            s.data_written(Ok(())).unwrap();
+        for parameters in ["BODY=8BITMIME SIZE=1", "SIZE=1", "BODY=7BIT"] {
+            for split in 0..=wire.len() {
+                let mut s = session(routes);
+                begin(&mut s, parameters);
+                let mut stored = Vec::new();
+                for mut input in [&wire[..split], &wire[split..]] {
+                    while !input.is_empty() {
+                        let n = s.feed(input).unwrap();
+                        input = &input[n..];
+                        match s.pending() {
+                            Pending::Data(bytes) => {
+                                stored.extend_from_slice(bytes);
+                                s.data_written(Ok(())).unwrap();
+                            }
+                            Pending::Commit => assert!(input.is_empty()),
+                            Pending::Input => (),
+                            other => panic!("{other:?}"),
                         }
-                        Pending::Commit => assert!(input.is_empty()),
-                        Pending::Input => (),
-                        other => panic!("{other:?}"),
                     }
                 }
+                assert_eq!(stored, expected);
+                assert_eq!(s.pending(), Pending::Commit);
+                assert_eq!(s.feed(b"QUIT\r\n"), Err(Error::Conflict));
+                s.committed(Ok(Commits::new([receipt()]).unwrap())).unwrap();
+                assert!(reply(&s).starts_with("250 2.0.0 Message accepted"));
+                assert_eq!(s.feed(b"QUIT\r\n"), Err(Error::Conflict));
+                s.reply_sent().unwrap();
+                assert!(s.envelope().is_none());
             }
-            assert_eq!(stored, expected);
-            assert_eq!(s.pending(), Pending::Commit);
-            assert_eq!(s.feed(b"QUIT\r\n"), Err(Error::Conflict));
-            s.committed(Ok(Commits::new([receipt()]).unwrap())).unwrap();
-            assert!(reply(&s).starts_with("250 2.0.0 Message accepted"));
-            assert_eq!(s.feed(b"QUIT\r\n"), Err(Error::Conflict));
-            s.reply_sent().unwrap();
-            assert!(s.envelope().is_none());
         }
     });
 }
@@ -203,7 +205,6 @@ fn data_failures_are_terminal_and_cannot_smuggle_commands() {
             b"a\n.\nQUIT\r\n".as_slice(),
             b"a\rb\r\n.\r\n",
             b"\0\r\n.\r\n",
-            b"\xff\r\n.\r\n",
         ] {
             let mut s = session(routes);
             begin(&mut s, "BODY=7BIT");
@@ -510,7 +511,7 @@ fn command_lengths_follow_base_and_extended_limits() {
 }
 
 #[test]
-fn control_octets_default_seven_bit_and_tls_policy_refusals() {
+fn command_control_octets_and_tls_policy_refusals() {
     fixture(|routes| {
         for input in [b"NOOP\0\r\n".as_slice(), b"NOOP\xff\r\n"] {
             let mut s = session(routes);
@@ -518,10 +519,6 @@ fn control_octets_default_seven_bit_and_tls_policy_refusals() {
             assert_eq!(reply(&s), "501 5.5.2 Invalid command framing\r\n");
             assert!(matches!(s.pending(), Pending::Reply { close: true, .. }));
         }
-        let mut s = session(routes);
-        begin(&mut s, "");
-        s.feed(b"\xff\r\n").unwrap();
-        assert!(matches!(s.pending(), Pending::Reply { close: true, .. }));
         let mut s = session(routes);
         s.settings.starttls = false;
         s.feed(b"EHLO sender.test\r\n").unwrap();
@@ -622,7 +619,6 @@ fn data_refusals_have_content_free_diagnostics() {
         for (input, reason) in [
             (b"private\n".to_vec(), "invalid_data_framing"),
             (b"private\0\r\n".to_vec(), "invalid_data_framing"),
-            (b"private\xff\r\n".to_vec(), "undeclared_8bit_data"),
             (vec![b'x'; 1002], "data_line_too_long"),
         ] {
             let mut s = session(routes);

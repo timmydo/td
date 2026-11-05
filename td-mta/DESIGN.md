@@ -1873,7 +1873,13 @@ domainless Postmaster form, routing both to the configured postmaster account.
 Configuration defaults that account only for a singleton account registry;
 multiple accounts require an explicit declared `server.postmaster_account`.
 Configuration cannot disable the route or redirect it outside that account. Support VRFY with the standard non-enumerating 252 response.
-Unicode message display names and MIME content remain supported.
+Unicode message display names and MIME content remain supported. Incoming
+DATA preserves non-NUL 8-bit octets even when a sender omits BODY=8BITMIME
+or declares BODY=7BIT. This is an explicit local-delivery interoperability
+tolerance; BODY syntax is still validated. Commands and envelope addresses
+remain ASCII, and outbound capability negotiation is unchanged. CRLF,
+NUL rejection, dot termination, line/total size bounds and durable publication
+before acceptance still apply to these messages.
 
 Reject unknown/nonlocal recipients at RCPT. Resolve accepted aliases to stable
 account IDs and deduplicate delivery to the same account within one transaction;
