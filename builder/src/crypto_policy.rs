@@ -17,7 +17,7 @@ pub(crate) const LOCAL_SOURCES: &[&str] = &[
 ];
 
 pub(crate) const DEPENDENCIES: &[&str] = &[
-    "aws-lc-rs = { version = \"=1.18.2\", default-features = false, features = [\"alloc\", \"non-fips\"] }",
+    "aws-lc-rs = { version = \"=1.19.0\", default-features = false, features = [\"alloc\", \"non-fips\"] }",
     "rustls = { version = \"=0.23.46\", default-features = false, features = [\"std\", \"tls12\", \"aws_lc_rs\"] }",
     "webpki-roots = \"=1.0.11\"",
 ];
@@ -29,7 +29,7 @@ pub(crate) fn admitted(name: &str) -> bool {
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
-        "td-crypto" => "bde5f0081479e0e868de9776fdc9c43d20527213e334f864f8ba1f2ff926108f",
+        "td-crypto" => "d838d471f755e194e2001229e67b04c8281b46b7cd134737b7c2b65077ef7aec",
         "td-mta" => "24f2b491cd3b9be70711ffdcd47b19baf6615a2637a411e3b1abc8235be41f6b",
         "td-fs" => "e685546b8dc4353148f58034fc27b8bd59490281944f9226f295b5d6d72240fc",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
@@ -49,8 +49,8 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
 pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "d05684e2af245c0a796e154148ced1bc85ea08d9f31799d65a4fe1a62b7fc66a",
-        "td-crypto" => "91c8c0e24691c1966a3f3f0b365cca4018fde10e553aafdbf76cfc5618f52b93",
-        "td-mta" => "0a92943f38fc284ac2c3c66d5b1dd80c03b6f36c7a6a225ae5753f286f3da11c",
+        "td-crypto" => "983d1e8148090181d5ff4c03bb499976123d295bfaa50e94ad1815b3d3b11f55",
+        "td-mta" => "eb5ceaab78715ea91d57d4afac3915f4049a110483b93c4b0f8d0308bd22ee3e",
         "td-fs" => "d907e7d97198344c058b8403d2a07c08174081bcd8af0f4d9e276c0131766fe2",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-html" => "5bc92c6117fc17c612004a1b025a6ad42171c3d185d9af7eb47dd13a9168e8e3",
@@ -142,8 +142,8 @@ pub(crate) fn no_build_script(root: &Path, name: &str) -> Result<(), String> {
 
 // Cargo metadata can include inactive optional edges. Cargo tree's selected
 // normal/build graph is checked separately from the complete locked sources.
-const ACTIVE: &str = "aws-lc-rs v1.18.2|alloc,aws-lc-sys,non-fips,prebuilt-nasm
-aws-lc-sys v0.46.0|prebuilt-nasm
+const ACTIVE: &str = "aws-lc-rs v1.19.0|alloc,aws-lc-sys,non-fips,prebuilt-nasm
+aws-lc-sys v0.47.0|prebuilt-nasm
 cc v1.10.0|parallel
 cmake v0.1.58|
 dunce v1.0.5|
@@ -308,7 +308,7 @@ mod tests {
             "[env]\nAWS_LC_SYS_NO_ASM = \"1\"\n",
             "[env]\nAWS_LC_SYS_USE_SYSTEM_x86_64_unknown_linux_gnu = \"1\"\n",
             "[env]\nCC = { value = \"/unapproved/cc\", force = true }\n",
-            "[target.x86_64-unknown-linux-gnu.aws_lc_0_46_0]\nrustc-link-lib = [\"crypto\"]\n",
+            "[target.x86_64-unknown-linux-gnu.aws_lc_0_47_0]\nrustc-link-lib = [\"crypto\"]\n",
         ] {
             std::fs::write(&path, format!("{config}\n{extra}")).unwrap();
             assert!(cargo_config(&checkout).is_err());
@@ -443,7 +443,7 @@ mod tests {
                 assert!(manifest_pin(name, &bad).is_err());
             }
             for bad in [
-                lock.replace("version = \"0.46.0\"", "version = \"0.45.0\""),
+                lock.replace("version = \"0.47.0\"", "version = \"0.46.0\""),
                 lock.replace("checksum = \"", "checksum = \"0"),
                 format!("{lock}\n[[package]]\nname = \"unapproved\"\nversion = \"1.0.0\"\n"),
             ] {
@@ -461,7 +461,7 @@ mod tests {
             dirs.len(),
             ACTIVE.lines().count() + POSTGRES_ACTIVE.lines().count()
         );
-        assert!(dirs.contains("aws-lc-rs-1.18.2"));
+        assert!(dirs.contains("aws-lc-rs-1.19.0"));
         assert!(dirs.contains("async-trait-0.1.92"));
         assert!(dirs.contains("whoami-2.1.3"));
         assert!(!dirs.contains("objc2-core-foundation-0.3.2"));
@@ -493,7 +493,7 @@ mod tests {
         assert!(active_graph(&root, "td-crypto", &graph).is_ok());
         for bad in [
             format!("{graph}ring v0.17.14|alloc\n"),
-            graph.replace("aws-lc-sys v0.46.0", "aws-lc-sys v0.45.0"),
+            graph.replace("aws-lc-sys v0.47.0", "aws-lc-sys v0.46.0"),
             graph.replace(
                 "|aws-lc-rs,aws_lc_rs,std,tls12",
                 "|aws-lc-rs,aws_lc_rs,ring,std,tls12",

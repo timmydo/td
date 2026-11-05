@@ -12,10 +12,10 @@ td-html, td-json, td-mime and td-nfc. They add no registry source or private bac
 manifests, locks and source staging are admitted alongside td-crypto and
 td-mta.
 
-Direct inputs are Rustls 0.23.46 (std, TLS 1.2, AWS-LC), aws-lc-rs 1.18.2
+Direct inputs are Rustls 0.23.46 (std, TLS 1.2, AWS-LC), aws-lc-rs 1.19.0
 (alloc, non-FIPS), and webpki-roots 1.0.11 (compiled Mozilla root data).
 Rustls owns TLS, webpki validates certificates, pki-types represents their
-private backend forms; aws-lc-rs/sys supplies native crypto (AWS-LC 5.11.0).
+private backend forms; aws-lc-rs/sys supplies native crypto (AWS-LC 5.12.0).
 The remaining active packages are their build tools or small internal support
 libraries. Mail additionally selects the private PostgreSQL closure below.
 No async runtime is selected.
@@ -47,8 +47,8 @@ artifact packaging must retain all applicable notices, including root data.
 
 | Package | Version | Selected graph | Upstream license expression |
 | --- | --- | --- | --- |
-| aws-lc-rs | 1.18.2 | active | ISC AND (Apache-2.0 OR ISC) |
-| aws-lc-sys | 0.46.0 | active | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) |
+| aws-lc-rs | 1.19.0 | active | ISC AND (Apache-2.0 OR ISC) |
+| aws-lc-sys | 0.47.0 | active | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) |
 | cc | 1.10.0 | active | MIT OR Apache-2.0 |
 | cfg-if | 1.0.5 | inactive | MIT OR Apache-2.0 |
 | cmake | 0.1.58 | active | MIT OR Apache-2.0 |

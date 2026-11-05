@@ -11,7 +11,7 @@ description = "td-owned cryptography and TLS boundary"
 clippy-all-targets = true
 
 [dependencies]
-aws-lc-rs = { version = "=1.18.2", default-features = false, features = ["alloc", "non-fips"] }
+aws-lc-rs = { version = "=1.19.0", default-features = false, features = ["alloc", "non-fips"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 webpki-roots = "=1.0.11"
 
