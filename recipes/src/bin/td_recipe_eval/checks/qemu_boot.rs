@@ -42,6 +42,7 @@ pub(crate) mod live;
 pub(crate) mod media;
 mod nocloud;
 pub(crate) mod recovery_screen;
+mod release_delivery;
 pub(crate) mod secret;
 pub(crate) mod serial_shell;
 pub(crate) mod server;
@@ -856,6 +857,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
 /// state, and clean self-exit; healthy boots assert the runtime target.
 pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
+    let mut release_delivery = release_delivery::Delivery::new(runner)?;
     let (bzimage, selector, deployment) = build_system(runner)?;
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
     let seccomp_probe = build_td_jail_seccomp_probe(runner)?;
@@ -878,6 +880,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         VolumePurpose::Fixture,
         None,
         None,
+        Some(&mut release_delivery),
     )?;
     if fixture.initial_id == fixture.alternate_id {
         return Err("transaction fixture candidate did not change the deployment id".to_string());
@@ -1155,6 +1158,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         VolumePurpose::Fixture,
         None,
         None,
+        Some(&mut release_delivery),
     )?;
     if failure_fixture.initial_id != fixture.initial_id
         || failure_fixture.alternate_id != fixture.alternate_id
@@ -1343,6 +1347,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         VolumePurpose::Fixture,
         None,
         None,
+        Some(&mut release_delivery),
     )?;
     if fallback_fixture.initial_id != failure_fixture.initial_id
         || fallback_fixture.alternate_id == fallback_fixture.initial_id
@@ -3375,6 +3380,7 @@ fn build_persistent_system(
         VolumePurpose::Fixture,
         None,
         None,
+        None,
     )?;
     Ok((bzimage, initramfs, volume, btrfs))
 }
@@ -3469,6 +3475,7 @@ pub(crate) fn create_persistent_volume(
         purpose,
         None,
         None,
+        None,
     )
     .map(|_| ())
 }
@@ -3497,6 +3504,7 @@ pub(crate) fn create_release_volume(
             VolumePurpose::Published
         },
         Some(source),
+        None,
         None,
     )
     .map(|_| ())
@@ -3557,6 +3565,7 @@ fn create_persistent_volume_layout(
     purpose: VolumePurpose,
     source: Option<&Path>,
     account: Option<&crate::checks::provisioned_account::ProvisionedAccount>,
+    mut signed_delivery: Option<&mut release_delivery::Delivery>,
 ) -> Result<VolumeFixture, String> {
     if identity.installation != (purpose == VolumePurpose::Installation) {
         return Err("installation volume and identity must agree".into());
@@ -3622,6 +3631,9 @@ fn create_persistent_volume_layout(
             let channel = seed.join(td_boot_protocol::VOLUME_CHANNEL_DIR);
             let candidate = channel.join(td_boot_protocol::CHANNEL_CANDIDATE);
             let id = create_bootable_candidate(deployment, &candidate)?;
+            if let Some(delivery) = signed_delivery.as_deref_mut() {
+                delivery.materialize(&candidate)?;
+            }
             // `td-boot update` refuses a channel, a directory above it, a
             // candidate or a candidate file that others can write, and
             // `--rootdir` copies modes in verbatim, so none is left to the
@@ -3634,6 +3646,9 @@ fn create_persistent_volume_layout(
                 .join(td_boot_protocol::VOLUME_CHANNEL_DIR)
                 .join("corrupt-candidate");
             let id = create_bootable_candidate(deployment, &candidate)?;
+            if let Some(delivery) = signed_delivery.as_deref_mut() {
+                delivery.materialize(&candidate)?;
+            }
             let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
             fs::rename(&candidate, &installed).map_err(|e| {
                 format!(
@@ -3657,6 +3672,9 @@ fn create_persistent_volume_layout(
                 .join(td_boot_protocol::VOLUME_CHANNEL_DIR)
                 .join("rollback-current");
             let id = create_bootable_candidate(deployment, &candidate)?;
+            if let Some(delivery) = signed_delivery.as_deref_mut() {
+                delivery.materialize(&candidate)?;
+            }
             let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
             fs::rename(&candidate, &installed).map_err(|e| {
                 format!(

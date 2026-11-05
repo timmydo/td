@@ -440,7 +440,7 @@ fn fetch(base: &str, state_path: &Path, cache: &Path, output: &Path) -> Result<(
     result
 }
 
-const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  fetch URL STATE CACHE OUTPUT\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n";
+const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  fetch URL STATE CACHE OUTPUT\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n";
 
 fn command(args: &[String]) -> Result<()> {
     let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
@@ -479,6 +479,20 @@ fn command(args: &[String]) -> Result<()> {
                 format::number(issued)?,
                 format::number(expires)?,
                 Path::new(deployment),
+            )
+        }
+        ["publish-partitioned", repo, root, key, profile, commit, sequence, issued, expires, deployment, partitions] => {
+            publisher::publish_with_partitions(
+                Path::new(repo),
+                Path::new(root),
+                Path::new(key),
+                profile,
+                commit,
+                format::number(sequence)?,
+                format::number(issued)?,
+                format::number(expires)?,
+                Path::new(deployment),
+                Some(Path::new(partitions)),
             )
         }
         ["promote", repo, root, key, profile, release, version, issued, expires] => {

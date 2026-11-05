@@ -82,9 +82,34 @@ fn files_report(old: &erofs::Image, new: &erofs::Image, a: &[u8], b: &[u8]) -> R
 
 fn run() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let [command, method, deployment, out] = args.as_slice() {
+        if command == "partition" {
+            let hybrid = match method.to_str() {
+                Some("cdc") => false,
+                Some("hybrid") => true,
+                _ => return Err(invalid("partition method must be cdc or hybrid").into()),
+            };
+            let out = Path::new(out);
+            fs::create_dir(out)?;
+            for name in ["bzImage", "initramfs.cpio", "root.erofs"] {
+                let bytes = read(&Path::new(deployment).join(name))?;
+                let objects = if hybrid && name == "root.erofs" {
+                    let spans = erofs::Image::parse(&bytes)?.partition(bytes.len())?;
+                    transfer::ranges(&bytes, &spans)?
+                } else {
+                    transfer::index(&bytes, transfer::Method::Cdc)?
+                };
+                let mut file = output(&out.join(name))?;
+                file.write_all(transfer::lengths(&objects).as_bytes())?;
+                file.flush()?;
+                file.get_ref().sync_all()?;
+            }
+            return Ok(());
+        }
+    }
     let [old, new, out] = args.as_slice() else {
         return Err(
-            "usage: td-image-transfer OLD-DEPLOYMENT NEW-DEPLOYMENT NEW-OUTPUT-DIRECTORY".into(),
+            "usage: td-image-transfer OLD-DEPLOYMENT NEW-DEPLOYMENT NEW-OUTPUT-DIRECTORY\n       td-image-transfer partition cdc|hybrid DEPLOYMENT NEW-OUTPUT-DIRECTORY".into(),
         );
     };
     let old = Path::new(old);

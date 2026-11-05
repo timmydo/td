@@ -5,8 +5,8 @@ use std::ops::Range;
 use std::time::Duration;
 
 #[cfg(test)]
-use crate::image_chunks::{gear, MAX, MIN};
-use crate::image_chunks::{Chunker, TARGET};
+use crate::image_chunks::{gear, MIN};
+use crate::image_chunks::{Chunker, MAX, TARGET};
 const MAX_RECORDS: usize = 1_000_000;
 
 #[derive(Clone, Copy)]
@@ -33,6 +33,21 @@ pub struct Key {
 pub struct Object {
     key: Key,
     range: Range<usize>,
+}
+
+pub fn lengths(objects: &[Object]) -> String {
+    let mut plan = String::new();
+    for object in objects {
+        let mut remaining = object.key.size;
+        // Flat EROFS files may have one physical extent larger than a
+        // transport object. Preserve its boundaries while bounding pieces.
+        while remaining != 0 {
+            let length = remaining.min(MAX);
+            plan.push_str(&format!("{length}\n"));
+            remaining -= length;
+        }
+    }
+    plan
 }
 
 fn key(bytes: &[u8]) -> Key {
@@ -197,6 +212,17 @@ mod tests {
         let mut corrupt = b.clone();
         corrupt[0] ^= 1;
         assert!(reconstruct(&a, &corrupt, &old, &new, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn transport_plans_split_large_flat_extents_without_losing_tails() {
+        let bytes = vec![0; 8192 + 300 * 1024];
+        let objects = ranges(&bytes, &[0..8192, 8192..bytes.len()]).unwrap();
+        assert_eq!(lengths(&objects), "8192\n262144\n45056\n");
+        let exact = vec![0; MAX * 2];
+        let objects = ranges(&exact, std::slice::from_ref(&(0..exact.len()))).unwrap();
+        assert_eq!(lengths(&objects), "262144\n262144\n");
+        assert_eq!(lengths(&[]), "");
     }
 
     #[test]

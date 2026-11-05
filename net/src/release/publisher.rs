@@ -87,6 +87,27 @@ fn object(repo: &Path, bytes: &[u8]) -> Result<Object> {
     })
 }
 
+fn partition(path: &Path, size: u64) -> Result<std::collections::VecDeque<usize>> {
+    let text = text(path, INDEX_LIMIT)?;
+    if !text.ends_with('\n') {
+        return Err("unterminated object partition".into());
+    }
+    let mut lengths = std::collections::VecDeque::new();
+    let mut total = 0;
+    for line in text.lines() {
+        let length = format::number(line)?;
+        if length == 0 || length > MAX as u64 || lengths.len() >= RECORD_LIMIT {
+            return Err("object partition exceeds bounds".into());
+        }
+        total += length;
+        lengths.push_back(length as usize);
+    }
+    if total != size {
+        return Err("object partition does not cover payload".into());
+    }
+    Ok(lengths)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn publish(
     repo: &Path,
@@ -98,6 +119,24 @@ pub(super) fn publish(
     issued: u64,
     expires: u64,
     deployment: &Path,
+) -> Result<()> {
+    publish_with_partitions(
+        repo, root_path, key_path, profile, commit, sequence, issued, expires, deployment, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn publish_with_partitions(
+    repo: &Path,
+    root_path: &Path,
+    key_path: &Path,
+    profile: &str,
+    commit: &str,
+    sequence: u64,
+    issued: u64,
+    expires: u64,
+    deployment: &Path,
+    partitions: Option<&Path>,
 ) -> Result<()> {
     format::profile(profile)?;
     format::hex(commit, 20)?;
@@ -115,6 +154,9 @@ pub(super) fn publish(
         if meta.len() == 0 || meta.len() > maximum {
             return Err("published payload size exceeds bound".into());
         }
+        let mut plan = partitions
+            .map(|directory| partition(&directory.join(name), meta.len()))
+            .transpose()?;
         let mut reader = BufReader::new(file);
         let mut chunker = Chunker::default();
         let mut chunk = Vec::with_capacity(MAX);
@@ -135,7 +177,17 @@ pub(super) fn publish(
             hasher.update(data);
             for byte in data {
                 chunk.push(*byte);
-                if chunker.push(*byte) {
+                let cut = if let Some(plan) = &mut plan {
+                    if plan.front() == Some(&chunk.len()) {
+                        plan.pop_front();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    chunker.push(*byte)
+                };
+                if cut {
                     count += 1;
                     if count > RECORD_LIMIT {
                         return Err("too many release objects".into());

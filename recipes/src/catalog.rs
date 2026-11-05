@@ -1024,6 +1024,8 @@ mod named_dirs_tests {
     /// outside the integration tier as their own `td-recipe-eval` verbs,
     /// and qemu_boot is a boot harness no recipe check runs
     /// (`no_recipe_check_runs_a_boot_harness`), so no check scope is owed.
+    /// The primary-account codec and signed-delivery TempDir guard use
+    /// the same explicitly fingerprinted host-only mounting contract.
     #[test]
     fn the_evaluator_embeds_crate_files_only_in_its_test_modules() {
         use td_engine::embed_scan::{block_end, strip_comments};
@@ -1152,8 +1154,8 @@ mod named_dirs_tests {
             "the test modules' own embeds prove the spans: {in_tests}"
         );
         assert_eq!(
-            mounted, 9,
-            "the fingerprinted face, Unifont and server-account mounts"
+            mounted, 11,
+            "the fingerprinted face, Unifont, server-account and fixture mounts"
         );
     }
 }

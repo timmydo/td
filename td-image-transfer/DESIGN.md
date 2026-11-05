@@ -32,6 +32,21 @@ tool never overwrites an existing output directory or manages shared
 caches. Use worktree-owned `.td-build-cache/agent-scratch/` for disposable
 experiments. Test fixtures use td-fs's TempDir guard.
 
+## Partition plans for the signed transport
+
+```text
+td-image-transfer partition cdc|hybrid DEPLOYMENT NEW_PARTITIONS
+```
+
+This reads one payload at a time under the same 512 MiB bound and writes
+three files containing canonical decimal object lengths, one per line.
+`hybrid` selects physical EROFS extents for root.erofs and CDC for bzImage
+and initramfs.cpio; `cdc` selects CDC for all three. Physical spans larger
+than 256 KiB (possible for flat/plain files) are split at that limit. The new output directory
+must not exist. These are trusted producer hints, not authenticated metadata.
+`td-net release publish-partitioned` bounds and validates the plans, hashes
+source bytes and signs the ordinary release index. See `net/RELEASES.md`.
+
 ## Methods and measurements
 
 - `fixed`: 64-KiB chunks of each finished payload, including its tail.
@@ -86,15 +101,11 @@ not a production updater estimate. It writes `3 * new_root_size +
 2 * new_kernel_size + 2 * new_initramfs_size` bytes, plus a small report.
 External per-process measurement supplies elapsed time and peak RSS.
 
-## Interpretation and next decision
+## Interpretation
 
-RESULTS.md records measured local artifacts, their identities and the
-limitations of those comparisons. A protocol decision needs controlled
-single-component, kernel and toolchain/runtime changes, a request-latency
-model, serialized indexes and a streaming downloader/cache implementation.
-The present results alone do not select a release format.
-
-The eventual updater still needs signed metadata, key rotation, trusted
-freshness, channel/profile compatibility, download resumption, object
-retention and collection, disk admission and the existing installation
-authority boundary. None of those guarantees follows from byte reuse.
+RESULTS.md records measured artifacts, identities and limitations, including
+controlled comparisons through the streaming signed HTTP downloader. The
+simulator's byte reuse establishes no authentication or update guarantee.
+`net/RELEASES.md` owns the implemented signed transport, freshness, rotation,
+resumption and retention contract; `td-update/ADMIN.md` owns admission to
+installation. This tool remains an offline producer and measurement helper.

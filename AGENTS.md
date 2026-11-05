@@ -477,7 +477,8 @@ boundaries are:
   restoring owner directory permissions when fixtures removed them;
 - new or changed test fixtures own their temporary trees with the shared
   `td-fs::TempDir` guard
-  (the control-plane workspace includes its source only under `cfg(test)`),
+  (the control-plane workspace includes its source under `cfg(test)` or in
+  host-only QEMU oracle code),
   so normal return and assertion unwinding both reclaim them;
 - reserve the `-rolling` suffix for a long-lived stacked workstream that
   continues after partial landings; use a descriptive non-rolling branch for a

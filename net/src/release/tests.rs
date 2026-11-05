@@ -675,3 +675,65 @@ fn learning_cannot_hide_a_protected_state_persistence_failure() {
     assert!(learn(&f.state, &evidence).is_err());
     assert_eq!(fs::read(&f.state).unwrap(), before);
 }
+
+#[test]
+fn explicit_partitions_round_trip_through_the_same_signed_downloader() {
+    let f = Fixture::new();
+    let plans = f.dir.join("partitions");
+    directory(&plans).unwrap();
+    for (name, _) in format::FILES {
+        fs::write(
+            plans.join(name),
+            "131072\n131072\n131072\n131072\n131072\n44640\n",
+        )
+        .unwrap();
+    }
+    let time = now().unwrap();
+    publisher::publish_with_partitions(
+        &f.repo,
+        &f.root,
+        &f.key,
+        "system-x86-64",
+        &"2".repeat(40),
+        2,
+        time,
+        time + 7200,
+        &f.deployment,
+        Some(&plans),
+    )
+    .unwrap();
+    let entry = fs::read_dir(f.repo.join("releases"))
+        .unwrap()
+        .map(|e| e.unwrap())
+        .find(|e| text(&e.path(), INDEX_LIMIT).unwrap().lines().nth(2) == Some("2"))
+        .unwrap();
+    publisher::promote(
+        &f.repo,
+        &f.root,
+        &f.key,
+        "system-x86-64",
+        entry.file_name().to_str().unwrap(),
+        2,
+        time,
+        time + 3600,
+    )
+    .unwrap();
+    f.fetch("partitioned").unwrap();
+    verify(&f.state, &f.dir.join("partitioned")).unwrap();
+    for bad in ["0\n", "262145\n", "1\n", "700000", "01\n"] {
+        fs::write(plans.join("bzImage"), bad).unwrap();
+        assert!(publisher::publish_with_partitions(
+            &f.repo,
+            &f.root,
+            &f.key,
+            "system-x86-64",
+            &"3".repeat(40),
+            3,
+            time,
+            time + 7200,
+            &f.deployment,
+            Some(&plans)
+        )
+        .is_err());
+    }
+}

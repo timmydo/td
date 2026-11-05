@@ -458,6 +458,7 @@ pub(crate) fn compose(
         },
         None,
         Some(account),
+        None,
     )?;
     let selector = provision_selector(&inputs.selector, scratch, identity)?;
     let id = crate::sha256::sha256_file(&inputs.deployment.join(protocol::MANIFEST_NAME))

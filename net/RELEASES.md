@@ -59,7 +59,7 @@ restore permission to accept an earlier release.
 
 ## Bytes, objects and cache
 
-The production transport uses Gear content-defined chunks over the stored
+The default publisher uses Gear content-defined chunks over the stored
 bytes of all three payloads, including compressed EROFS bytes. The shared
 `engine/src/image_chunks.rs` also supplies the offline comparison prototype:
 16 KiB minimum, a 64 KiB boundary mask, 256 KiB maximum, reset at each cut.
@@ -129,6 +129,19 @@ An installer must still copy and verify the exact admitted deployment.
 Neither command installs, changes boot selectors, or executes downloaded
 code. Expiration governs admission, not boot or retained rollback.
 
+## Partition comparison
+
+`td-image-transfer partition cdc|hybrid DEPLOYMENT NEW_PARTITIONS` emits
+three length plans. `publish-partitioned` takes the same arguments as
+`publish`, followed by that directory. It accepts canonical positive decimal
+lengths, one per line, at most 256 KiB each and exactly covering each payload.
+It computes all hashes from the source bytes, verifies the deployment manifest,
+and emits the same signed index as the default publisher. The receiver has
+no EROFS parser or method flag: it verifies ordered objects and whole payloads.
+This permits actual HTTP/cache comparison with identical transport semantics.
+The experimental hybrid plan uses EROFS physical extents for root.erofs and
+CDC for boot payloads. The default remains CDC.
+
 ## Publishing and retention
 
 Commands use positional arguments; invoking `td-net release` prints syntax.
@@ -171,3 +184,13 @@ truncated loopback HTTP response and resumed acquisition, metadata-only warm
 downloads, an injected ENOSPC writer, replay, equivocation, time and profile
 checks, sequential revocation and conservative object collection. These are
 delivery tests; they do not claim an installed-machine or boot oracle.
+
+## Boot oracle
+
+`qemu-boot-system` publishes its transaction candidates with ephemeral fixture
+keys, acquires them from a local static repository, and independently verifies
+them with a separate state before staging the guest installation offer.
+The existing failed-health-boot rollback case then exercises that acquired
+candidate. This covers signed acquisition through installation and rollback;
+it does not exercise the SSH administration service or HTTP inside the VM.
+The network tests separately cover loopback HTTP and interrupted transfers.

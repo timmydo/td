@@ -428,6 +428,7 @@ const HOST_CHECK_SOURCES: &[&str] = &[
     "recipes/src/bin/td_recipe_eval/checks/release_source.rs",
     "recipes/src/bin/td_recipe_eval/checks/run.rs",
     "recipes/src/bin/td_recipe_eval/checks/vm_profile.rs",
+    "td-fs/src/temp_dir.rs",
     "td-authd/src/primary_account.rs",
     "td-encoding/src/lib.rs",
     "td-ui/src/atlas.rs",
@@ -802,6 +803,8 @@ fn evaluator_source_fingerprint(
         // Mounted by checks/provisioned_account.rs: key blobs and the
         // guest's primary-name grammar.
         "td-authd/src/primary_account.rs",
+        // Owned keys, cache and state for the signed-delivery boot oracle.
+        "td-fs/src/temp_dir.rs",
         "td-encoding/src/lib.rs",
         "td-ui/src/coverage.rs",
         "td-ui/src/face.rs",
