@@ -35,7 +35,7 @@ path = "src/main.rs"
 # webpki-roots is the trust store ureq's `RootCerts::WebPki` reads; the exact
 # pin is the reviewed store. ureq is pinned exactly too: fetchd implements its
 # `unversioned` resolver trait, which ureq may change in a minor release.
-ureq = { version = "=3.5.0", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+ureq = { version = "=3.5.1", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 rustls = { version = "0.23.46", default-features = false, features = ["custom-provider", "logging", "std", "tls12"] }
 sha2 = "0.11"
 webpki-roots = "=1.0.11"
