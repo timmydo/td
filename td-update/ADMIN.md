@@ -130,3 +130,10 @@ receipt remains uncertain; the boot transaction's recovery rules apply.
 A later explicit update is a new request. The admin job lock is independent
 of td-boot's writer lock, which serializes this path against local developer
 installation and rollback.
+
+The commit a job selected reaches the machine with its deployment: once that
+deployment boots, `BUILD_ID` in `/etc/os-release` is the full commit, whose
+short form the startup menu's label shows (`td-install/DESIGN.md`, "Installed
+startup menu"). `--no-reboot` therefore leaves the running system reporting the
+commit it booted from until the next boot. A rollback reports the commit of the
+deployment it restores, or none if that deployment predates this.

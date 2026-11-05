@@ -1547,6 +1547,21 @@ fn verify_persistence(guest: &mut Guest, expected: &str, source: &str, token: &s
     Ok(())
 }
 
+/// td-update assembled this successor from the checkout holding the oracle's
+/// uncommitted edit, as a `td-admin` job assembles a clean one, and the booted
+/// system names that checkout's commit. Needs `verify_persistence`'s `cd`.
+fn verify_build_reported(guest: &mut Guest) -> Result<()> {
+    let head = guest.scalar("git rev-parse HEAD", git_id)?;
+    guest
+        .command(&format!(
+            "test \"$(grep '^BUILD_ID=' /etc/os-release)\" = 'BUILD_ID=\"{head}+dirty\"'"
+        ))
+        .map_err(|error| {
+            format!("the successor should name {head}+dirty in /etc/os-release: {error}")
+        })?;
+    Ok(())
+}
+
 fn rollback(
     options: &Options,
     deadline: Instant,
@@ -1699,6 +1714,7 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
     }
     let mut guest = Guest::start(&options, 2, deadline)?;
     verify_persistence(&mut guest, &successor, &source, &token)?;
+    verify_build_reported(&mut guest)?;
     guest.command(&format!("/bin/td-update --help | grep -q {token}"))?;
     guest.command("sync")?;
     guest.stop()?;

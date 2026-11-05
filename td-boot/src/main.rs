@@ -129,6 +129,9 @@ const MAX_ATTEMPT_BYTES: u64 = 64;
 const MAX_CMDLINE_BYTES: usize = 2048;
 const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const UPDATE_LOCK_DIR: &str = "/run/td-boot-locks";
+const OS_RELEASE: &str = "etc/os-release";
+const OS_RELEASE_VIEW: &str = "run/td-os-release";
+const MAX_OS_RELEASE: u64 = 4096;
 
 enum Mode {
     Initramfs,
@@ -146,6 +149,11 @@ enum Mode {
     /// system's `/run` (td-install/ENCRYPTION.md "Verified account handoff").
     Admit {
         run: PathBuf,
+    },
+    /// The deployment initramfs names its build's commit in the system's
+    /// `/etc/os-release` (td-install/DESIGN.md "Installed startup menu").
+    OsRelease {
+        root: PathBuf,
     },
     MountVolume {
         device: PathBuf,
@@ -318,7 +326,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot initramfs /init\n       td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory>\n       td-boot update <device> <mountpoint> <volume> <channel>\n       td-boot reinstall <device> <mountpoint> <deployment-directory>\n       td-boot publish <volume-root> <deployment-directory>\n       td-boot rollback <device> <mountpoint> <current-id> <previous-id>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot validate-source <deployment-directory>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>\n       td-boot admit <run>\n       td-boot fido-worker <index> <inode> <rdev>",
+        "usage: td-boot initramfs /init\n       td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory>\n       td-boot update <device> <mountpoint> <volume> <channel>\n       td-boot reinstall <device> <mountpoint> <deployment-directory>\n       td-boot publish <volume-root> <deployment-directory>\n       td-boot rollback <device> <mountpoint> <current-id> <previous-id>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot validate-source <deployment-directory>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>\n       td-boot admit <run>\n       td-boot os-release <system-root>\n       td-boot fido-worker <index> <inode> <rdev>",
     )
 }
 
@@ -382,6 +390,13 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
                 return Err(usage_error());
             }
             Ok(Mode::Admit { run })
+        }
+        Some(mode) if mode == OsStr::new("os-release") => {
+            let root = PathBuf::from(args.next().ok_or_else(usage_error)?);
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::OsRelease { root })
         }
         Some(mode) if mode == OsStr::new("mount-root") || mode == OsStr::new("mount-var") => {
             let device = PathBuf::from(args.next().ok_or_else(usage_error)?);
@@ -3562,7 +3577,8 @@ fn run() -> io::Result<()> {
 /// `on-volume boot` and `live-boot`, and the deployment initramfs's
 /// `on-volume mount-root`, `on-volume mount-var`, `admit`, `root-loop`,
 /// `live-root` and `live-seed`. No other run mirrors, so the running system's VT, which
-/// the compositor's display covers, gets nothing from td-boot.
+/// the compositor's display covers, gets nothing from td-boot. `os-release` runs in
+/// that initramfs too, but after its `/sys` is gone, and can only cost its label.
 fn mirrors(mode: &Mode) -> bool {
     match mode {
         Mode::OnVolume { operation } => {
@@ -3884,6 +3900,95 @@ fn run_admit(run: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The image's os-release with the build's source appended. `dirty` marks
+/// a commit that does not identify every byte, as the startup menu's label does.
+fn os_release_with_build(base: &[u8], info: &boot_info::Info) -> io::Result<Vec<u8>> {
+    if !base.ends_with(b"\n")
+        || base
+            .split(|b| *b == b'\n')
+            .any(|l| l.starts_with(b"BUILD_ID="))
+    {
+        return Err(invalid(
+            "image os-release must end its last line and name no BUILD_ID",
+        ));
+    }
+    let state = if info.dirty { "+dirty" } else { "" };
+    let mut text = base.to_vec();
+    text.extend_from_slice(format!("BUILD_ID=\"{}{state}\"\n", info.commit).as_bytes());
+    Ok(text)
+}
+
+/// Stage `ROOT/run`'s os-release from the build information in `initramfs`.
+/// `None` for an initramfs that never had an appendix assembled onto it.
+fn stage_os_release(initramfs: &Path, root: &Path) -> io::Result<Option<PathBuf>> {
+    let member = initramfs.join(boot_info::MEMBER);
+    let read = read_bounded_real_file(
+        &member,
+        "build information",
+        boot_info::ARCHIVE_BYTES as u64,
+    );
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let info = boot_info::Info::decode(&bytes).map_err(invalid)?;
+    let base = read_bounded_real_file(&root.join(OS_RELEASE), "image os-release", MAX_OS_RELEASE)?;
+    let text = os_release_with_build(&base, &info)?;
+    let view = root.join(OS_RELEASE_VIEW);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o444)
+        .open(&view)?;
+    file.write_all(&text)?;
+    Ok(Some(view))
+}
+
+/// Bind the staged view read-only over `target`. A bind the remount left
+/// writable is taken away again: `/etc/rootcheck` would fail the boot over it.
+fn bind_os_release(
+    view: &Path,
+    target: &Path,
+    run: &mut impl FnMut(&mut Command, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    run(
+        Command::new(TD_MOUNT)
+            .args(["-o", "bind"])
+            .arg(view)
+            .arg(target),
+        "os-release bind",
+    )?;
+    let remounted = run(
+        Command::new(TD_MOUNT)
+            .args(["-o", "remount,bind,ro,nodev,nosuid,noexec"])
+            .arg(target)
+            .arg(target),
+        "os-release read-only remount",
+    );
+    if let Err(error) = remounted {
+        return match run(Command::new(TD_UMOUNT).arg(target), "os-release unbind") {
+            Ok(()) => Err(error),
+            Err(unbind) => Err(io::Error::other(format!("{error}; {unbind}"))),
+        };
+    }
+    Ok(())
+}
+
+/// `os-release ROOT`: the deployment init runs it once ROOT's `/run` is
+/// mounted. The initramfs is hash-verified, and its appendix is the one place
+/// the build's commit can be: the image is the recipe's output, which no
+/// checkout's identity enters. A failure leaves the image's own file showing
+/// (the init line ends in `|| :`), since a label must not cost a boot, unless
+/// the unbind failed too: a writable `/etc/os-release` fails `/etc/rootcheck`.
+fn run_os_release(root: &Path) -> io::Result<()> {
+    require_absolute(root, "system root")?;
+    let Some(view) = stage_os_release(Path::new("/"), root)? else {
+        return Ok(());
+    };
+    bind_os_release(&view, &root.join(OS_RELEASE), &mut run_command)
+}
+
 fn mount_volume(device: &Path, mountpoint: &Path, var: bool) -> io::Result<()> {
     require_absolute(device, "volume device")?;
     require_absolute(mountpoint, "mountpoint")?;
@@ -3907,6 +4012,7 @@ fn dispatch(mode: Mode) -> io::Result<()> {
         }
         Mode::OnVolume { operation } => on_volume(*operation),
         Mode::Admit { run } => run_admit(&run),
+        Mode::OsRelease { root } => run_os_release(&root),
         Mode::MountVolume {
             device,
             mountpoint,
@@ -4305,6 +4411,133 @@ mod tests {
         }
     }
 
+    fn os_release_info(dirty: bool) -> boot_info::Info {
+        boot_info::Info {
+            commit: "c".repeat(40),
+            commit_date: "2026-11-03".into(),
+            build_date: "2026-11-04".into(),
+            dirty,
+        }
+    }
+
+    #[test]
+    fn os_release_appends_the_commit_after_the_images_own_lines() {
+        let base = b"NAME=\"td\"\nID=td\n";
+        let clean = os_release_with_build(base, &os_release_info(false)).unwrap();
+        assert_eq!(
+            String::from_utf8(clean).unwrap(),
+            format!("NAME=\"td\"\nID=td\nBUILD_ID=\"{}\"\n", "c".repeat(40))
+        );
+        let dirty = os_release_with_build(base, &os_release_info(true)).unwrap();
+        assert!(String::from_utf8(dirty)
+            .unwrap()
+            .ends_with(&format!("BUILD_ID=\"{}+dirty\"\n", "c".repeat(40))));
+        // Not a second value beside the image's, nor a line run into its last.
+        for refused in [
+            &b"ID=td"[..],
+            b"ID=td\nBUILD_ID=x\n",
+            b"BUILD_ID=x\nID=td\n",
+        ] {
+            assert!(os_release_with_build(refused, &os_release_info(false)).is_err());
+        }
+    }
+
+    #[test]
+    fn os_release_stages_only_from_canonical_build_information() {
+        let temp = test_temp::TempDir::new("td-boot-os-release").unwrap();
+        let initramfs = temp.path().join("initramfs");
+        let root = temp.path().join("sysroot");
+        fs::create_dir_all(&initramfs).unwrap();
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::create_dir_all(root.join("run")).unwrap();
+        fs::write(root.join(OS_RELEASE), "ID=td\n").unwrap();
+
+        // A recipe's own initramfs has no appendix, and nothing is staged.
+        assert_eq!(stage_os_release(&initramfs, &root).unwrap(), None);
+        assert!(!root.join(OS_RELEASE_VIEW).exists());
+
+        let member = initramfs.join(boot_info::MEMBER);
+        fs::write(&member, "td-build-info-v1\ncommit=short\n").unwrap();
+        assert!(stage_os_release(&initramfs, &root).is_err());
+        assert!(!root.join(OS_RELEASE_VIEW).exists());
+
+        fs::write(&member, os_release_info(false).encode().unwrap()).unwrap();
+        let view = stage_os_release(&initramfs, &root).unwrap().unwrap();
+        assert_eq!(view, root.join(OS_RELEASE_VIEW));
+        assert_eq!(
+            fs::read_to_string(&view).unwrap(),
+            format!("ID=td\nBUILD_ID=\"{}\"\n", "c".repeat(40))
+        );
+        assert_eq!(fs::metadata(&view).unwrap().permissions().mode() & 0o222, 0);
+        // The image's file is left as it is: the view binds over it.
+        assert_eq!(
+            fs::read_to_string(root.join(OS_RELEASE)).unwrap(),
+            "ID=td\n"
+        );
+        // A view a previous run left is not silently replaced.
+        assert!(stage_os_release(&initramfs, &root).is_err());
+    }
+
+    /// What each command the bind runs was, as `program arg arg`.
+    fn os_release_bind_calls(fail: &[&str]) -> (io::Result<()>, Vec<String>) {
+        let mut calls = Vec::new();
+        let mut run = |command: &mut Command, label: &str| {
+            let mut words = vec![command.get_program().to_str().unwrap().to_string()];
+            words.extend(command.get_args().map(|a| a.to_str().unwrap().to_string()));
+            calls.push(words.join(" "));
+            if fail.contains(&label) {
+                Err(io::Error::other(label.to_string()))
+            } else {
+                Ok(())
+            }
+        };
+        let result = bind_os_release(Path::new("/r/view"), Path::new("/r/etc"), &mut run);
+        (result, calls)
+    }
+
+    #[test]
+    fn os_release_binds_read_only_or_not_at_all() {
+        let bind = "/bin/mount -o bind /r/view /r/etc";
+        let remount = "/bin/mount -o remount,bind,ro,nodev,nosuid,noexec /r/etc /r/etc";
+        let unbind = "/bin/umount /r/etc";
+
+        let (result, calls) = os_release_bind_calls(&[]);
+        assert!(result.is_ok());
+        assert_eq!(calls, [bind, remount]);
+
+        // No bind, nothing to take away.
+        let (result, calls) = os_release_bind_calls(&["os-release bind"]);
+        assert!(result.is_err());
+        assert_eq!(calls, [bind]);
+
+        // Never left writable, and the failure still says what failed.
+        let (result, calls) = os_release_bind_calls(&["os-release read-only remount"]);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "os-release read-only remount"
+        );
+        assert_eq!(calls, [bind, remount, unbind]);
+
+        let (result, _) =
+            os_release_bind_calls(&["os-release read-only remount", "os-release unbind"]);
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("remount") && message.contains("unbind"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn os_release_takes_exactly_a_system_root() {
+        assert!(matches!(
+            parse_args(args(&["os-release", "/sysroot"])).unwrap(),
+            Mode::OsRelease { root } if root == Path::new("/sysroot")
+        ));
+        for argv in [vec!["os-release"], vec!["os-release", "/sysroot", "extra"]] {
+            assert!(parse_args(args(&argv)).is_err(), "{argv:?}");
+        }
+    }
+
     /// The initramfs verbs mirror their console lines to the VT; nothing
     /// the running system runs does.
     #[test]
@@ -4318,6 +4551,7 @@ mod tests {
             (vec!["live-boot", "/media", "quiet"], true),
             (vec!["live-root", "/media", &id, "/dev/loop0"], true),
             (vec!["live-seed", "/media", &id, "/live-seed"], true),
+            (vec!["os-release", "/sysroot"], false),
             (vec!["on-volume", "success", "/run/td-update", &id], false),
             (
                 vec![

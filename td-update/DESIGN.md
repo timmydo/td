@@ -261,7 +261,9 @@ Success must publish that successor as current and the initial
 deployment as previous. A host test pins this order, since the oracle
 needs an operator's installation. After an
 explicit VM restart, boot health, kernel deployment ID, installed HELP
-marker, user file and source edit must all agree. `result.txt`
+marker, user file and source edit must all agree, and `/etc/os-release` must
+name the checkout's commit as dirty, which needs a guest source new enough to
+have that step. `result.txt`
 exists only after the complete sequence succeeds. Normal restarts sync the guest, request QMP quit and require a successful
 QEMU exit so its block driver can flush and close the overlay. This is a
 host-directed restart, not a guest filesystem unmount. Failure teardown

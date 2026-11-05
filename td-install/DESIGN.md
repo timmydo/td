@@ -563,6 +563,29 @@ containing public `td-build-info`. The reader accepts only the exact
 canonical archive, from the already hash-verified initramfs descriptor.
 No inode timestamp or current checkout supplies an old system's label.
 
+The booted system names the same commit in `/etc/os-release`, as
+`BUILD_ID="COMMIT"`, or `BUILD_ID="COMMIT+dirty"` for an uncommitted
+checkout. The kernel unpacks the appendix into the deployment initramfs's
+rootfs, and `td-boot os-release /sysroot` decodes that member strictly, stages
+the image's os-release plus that one line as `/run/td-os-release`, and binds it
+read-only over `/etc/os-release` before the switch to the real root. It stays a
+regular file, so td-jail's host `/etc` entries keep carrying it, which a
+`MUTABLE_ETC` link into `/run` would not. Because the commit comes from the
+booted deployment rather than from `/var`, a rollback reports the previous
+deployment's own commit, if that deployment's init has this step.
+A deployment no one assembled, such as a raw recipe output or `./build-qcow`'s,
+keeps the image's file and names no build; a failed step does the same, a bind
+left writable by a failed remount being unmounted again, and costs only its
+console line. `/etc/rootcheck` fails a boot whose `/etc/os-release` accepts a
+write and prints the line it found, which `qemu-boot-live` requires from a live
+and an installed boot of an assembled deployment; if the remount and the unbind
+both fail, that check fails the boot rather than let `/etc` stay writable. Each
+deployment carries its own `BUILD_ID`, since each replaces the whole image, and
+one commit assembled twice reports the same value. Like the account binds,
+the bind stops accidental writes, not root, who can write `/run/td-os-release`
+or remount it: it is a label, never evidence of what is running. The deployment
+ID on the kernel command line remains the authority.
+
 ISO and installed-update assembly add that data to a private copy of the
 recipe initramfs and regenerate the four-line manifest. The recipe outputs
 and source-bootstrap graph stay unchanged. Build date means deployment

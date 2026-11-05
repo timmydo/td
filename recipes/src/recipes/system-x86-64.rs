@@ -106,8 +106,9 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 // current/previous from the Btrfs volume and kexecs the selected deployment.
 // That deployment's distinct initramfs requires the td.deployment handoff,
 // re-verifies root.erofs, binds it to a read-only loop device, mounts @var from
-// Btrfs, publishes any saved-name account projection read-only, and switch_roots.
-// `/etc` keeps its deployment-owned directory and reviewed account mounts, with ONE
+// Btrfs, publishes any saved-name account projection and an assembled build's
+// os-release read-only, and switch_roots.
+// `/etc` keeps its deployment-owned directory and reviewed read-only mounts, with ONE
 // reviewed symlink per mutable file out to writable state (the `MUTABLE_ETC` table
 // below) rather than an overlay — so the read-only-`/etc` assertion survives while
 // per-machine identity still persists; `/home` and `/root` are root-image symlinks
@@ -2649,6 +2650,14 @@ pub(super) fn deployment_init_fixture() -> String {
 /// console line and no more: `|| :` keeps `set -e` from failing the boot.
 const LOGIN_DIRECTORY_STEP: &str = "/bin/td-firstboot ensure-login-directory /sysroot || :";
 
+/// Stage-1 init's build-identity step (td-install/DESIGN.md, "Installed startup
+/// menu"): an assembled deployment's commit reaches `/etc/os-release` by a
+/// read-only bind, the `/etc` file itself staying the recipe's. It needs `/run`
+/// mounted. A refusal is its one console line, since a label must not cost a
+/// boot; only a bind td-boot could neither make read-only nor take away fails
+/// `/etc/rootcheck`.
+const OS_RELEASE_STEP: &str = "/bin/td-boot os-release /sysroot || :";
+
 /// The deployment init's admission step (td-install/ENCRYPTION.md "Verified
 /// account handoff"), right after the system's `/run` tmpfs is mounted:
 /// `td-boot admit` moves a protected release's record there from the
@@ -2737,6 +2746,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/umount /sys\n\
      /bin/td-util printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment\n\
      /bin/td-util chmod 0600 /sysroot/run/td-deployment\n\
+     {OS_RELEASE_STEP}\n\
      if /bin/td-util test -n \"$feed\" && /bin/td-util test -n \"$autotest\"; then\n\
        /bin/td-util printf '%s' \"$feed\" > /sysroot{BOOT_FEED}\n\
        /bin/td-util chmod 0644 /sysroot{BOOT_FEED}\n\
@@ -2989,6 +2999,14 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     s.push_str(&format!(
         "if /bin/sh -c ': > /etc/.tdwr' 2>/dev/null; then /bin/td-util rm -f /etc/.tdwr; ok=0; else echo {SYSTEM_ETC_RO_MARKER}; fi\n"
     ));
+    // Read-only like the file it binds over, but for td-boot's unbind this would
+    // fail a boot. The line names what an assembled deployment reports, for the
+    // oracles that boot one.
+    s.push_str(
+        "if /bin/sh -c ': >> /etc/os-release' 2>/dev/null; then \
+         echo 'rootcheck: /etc/os-release accepts writes'; ok=0; fi\n\
+         if b=$(/bin/grep '^BUILD_ID=' /etc/os-release); then echo \"TD-OS-RELEASE $b\"; fi\n",
+    );
     // State is the persistent Btrfs @var subvolume; only run/tmp are volatile.
     // Homes remain stable paths through immutable symlinks into /var.
     // The td-volume line needs `ro` as a whole comma-delimited option, not a substring:
@@ -4308,6 +4326,7 @@ fn build_mutable_state() -> String {
          # passwd, group and shadow may instead be read-only account projections\n\
          # prepared by td-firstboot from signed base tables and the saved username.\n\
          # Those three file binds preserve numeric identities and authentication fields.\n\
+         # os-release may be a read-only bind that adds an assembled deployment's commit.\n\
          #\n\
          # volatile  = /run tmpfs, rebuilt every boot by td-netd\n\
          # persistent = /var Btrfs subvolume, minted once per machine by td-firstboot\n\
@@ -12249,6 +12268,25 @@ mod tests {
             .find("#!/bin/td-boot initramfs")
             .expect("API filesystem entry");
         assert!(sysfs < admit);
+    }
+
+    /// `/etc/os-release` names the commit only once `/run` can hold it and
+    /// before the system starts, and its failure is no failed boot.
+    #[test]
+    fn the_deployment_init_names_its_build_before_entering_the_system() {
+        let init = build_deployment_init(&SYSTEM);
+        assert_eq!(OS_RELEASE_STEP, "/bin/td-boot os-release /sysroot || :");
+        assert_eq!(init.lines().filter(|l| *l == OS_RELEASE_STEP).count(), 1);
+        let step = init.find(OS_RELEASE_STEP).expect("build identity step");
+        assert!(init.find("tmpfs /sysroot/run").expect("run") < step);
+        assert!(step < init.find("/bin/switch_root").expect("pivot"));
+        // The selector kexecs a deployment and names nothing.
+        assert!(!build_selector_init().contains("os-release"));
+        let rootcheck = build_rootcheck(&SYSTEM);
+        assert!(rootcheck.contains("': >> /etc/os-release'"));
+        assert!(rootcheck.contains("echo \"TD-OS-RELEASE $b\""));
+        // The image's own file keeps naming no build.
+        assert!(!build_os_release(&SYSTEM).contains("BUILD_ID"));
     }
 
     #[test]

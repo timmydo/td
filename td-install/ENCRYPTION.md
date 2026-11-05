@@ -808,7 +808,9 @@ initramfs, the same bytes to `/dev/tty1`, opened once, write-only,
 `on-volume mount-var`, `admit`, `root-loop`, `live-root` and
 `live-seed`, the verbs those inits run. No other run mirrors, so the
 running system's VT, which the compositor's display covers, gets
-nothing from td-boot. A line
+nothing from td-boot. The deployment initramfs's `os-release`
+(DESIGN.md, "Installed startup menu") does not mirror either: it runs
+once `/sys` is unmounted, and all it can lose is a label. A line
 is mirrored whole, after its standard-error write. There is no mirror
 when `/dev/console` is the VT, or when `active` cannot be read or
 parsed, so no line is written twice to one terminal. Nothing waits on

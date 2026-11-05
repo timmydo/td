@@ -192,6 +192,31 @@ const ZONE_ON_BAR: &str = " UTC+09:00";
 /// The recipe whose face the image's compositor draws its chrome in.
 const FACE_RECIPE: &str = "jetbrains-mono-nerd-font";
 
+/// The build this oracle assembles onto its deployment, as `./update` and
+/// `build-iso` do: fixed, since the proof is that the appendix reaches
+/// `/etc/os-release`, and the machinery reads no checkout's identity.
+fn oracle_build() -> td_engine::boot_info::Info {
+    td_engine::boot_info::Info {
+        commit: "0123456789abcdef0123456789abcdef01234567".into(),
+        commit_date: "2026-11-03".into(),
+        build_date: "2026-11-04".into(),
+        dirty: false,
+    }
+}
+
+/// `/etc/rootcheck` read this boot's assembled commit back from `/etc/os-release`.
+fn require_build_reported(result: &BootResult, what: &str) -> Result<(), String> {
+    let expected = format!("\"{}\"", oracle_build().commit);
+    let reported = result.evidence.os_release_build.as_deref();
+    if reported != Some(expected.as_str()) {
+        return Err(format!(
+            "{what} should report BUILD_ID={expected} from /etc/os-release, reported {reported:?}\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
     // Found before the long live run, which the cold boots follow.
@@ -213,11 +238,13 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let scratch = Scratch {
         dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
     };
+    let assembled = scratch.dir.join("deployment");
+    td_engine::boot_info_source::assemble(&deployment, &assembled, &oracle_build())?;
     let LiveMedium {
         id,
         selector: live,
         payloads,
-    } = live_medium(&selector, &deployment, &scratch.dir)?;
+    } = live_medium(&selector, &assembled, &scratch.dir)?;
     let iso = scratch.dir.join("live.iso");
     media::write_image_with_payloads(&iso, &kernel, &live, &payloads)?;
     let mut payload_bytes = 0u64;
@@ -233,7 +260,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let capacity = system_target_capacity(payload_bytes)?;
     let target = TargetDisk::with_capacity(&scratch.dir, target_name, capacity)?;
     println!("   [qemu-boot-live] booting deployment {id} live from its medium through firmware");
-    drive_wizard(&LiveRun {
+    let live_session = drive_wizard(&LiveRun {
         qemu: &qemu,
         code: &code,
         vars: &vars,
@@ -245,6 +272,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         scratch: &scratch.dir,
         label: "qemu-boot-live",
     })?;
+    require_build_reported(&live_session, "the live session")?;
     require_partitioned(&scratch.dir.join(target_name), capacity)?;
     // The medium is detached: the disk the wizard installed boots alone
     // through firmware, as the account and host it was given.
@@ -279,6 +307,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             session: true,
         },
     )?;
+    require_build_reported(&before_reinstall, "the installed system")?;
     let reinstall_wizard = Wizard {
         storage: WizardStorage::Reinstall,
         ..LIVE_WIZARD

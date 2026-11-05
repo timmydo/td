@@ -558,6 +558,8 @@ struct ConsoleEvidence {
     /// across reboots is what proves the identity persisted rather than merely
     /// that some key existed on each boot.
     host_key: Option<String>,
+    /// The `BUILD_ID` value `/etc/rootcheck` read from `/etc/os-release`.
+    os_release_build: Option<String>,
     state_writable: bool,
     state_owner: bool,
     uutils_runtime: bool,
@@ -6613,6 +6615,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_PRINCIPALS_MARKER.len(),
         exact_line_window(TD_COMPOSITOR_DEVICES_PRIVATE_MARKER),
         TD_FIRSTBOOT_HOST_KEY_PREFIX.len() + HOST_KEY_MAX,
+        OS_RELEASE_BUILD_PREFIX.len() + HOST_KEY_MAX,
         SYSTEM_STATE_WRITABLE_MARKER.len(),
         SYSTEM_STATE_OWNER_MARKER.len(),
         UUTILS_RUNTIME_MARKER.len(),
@@ -6867,6 +6870,11 @@ fn latch_console_evidence_from(
         &mut evidence.host_key,
         buf,
         TD_FIRSTBOOT_HOST_KEY_PREFIX.as_bytes(),
+    );
+    latch_token(
+        &mut evidence.os_release_build,
+        buf,
+        OS_RELEASE_BUILD_PREFIX.as_bytes(),
     );
     latch_marker(
         &mut evidence.state_writable,
@@ -7810,6 +7818,10 @@ fn latch_terminal_clipboard_target(
 /// `SHA256:` plus 43 base64 characters; the ceiling is generous enough for another
 /// hash without letting a console line of `x`s become an unbounded String.
 const HOST_KEY_MAX: usize = 64;
+/// What `/etc/rootcheck` prints before an assembled deployment's `BUILD_ID`
+/// value. Spelled here and in the recipe rather than in `td_recipe::shared`,
+/// which every recipe check is keyed on; `qemu-boot-live` reds if they part.
+const OS_RELEASE_BUILD_PREFIX: &str = "TD-OS-RELEASE BUILD_ID=";
 
 /// Latch the graphic-character token that follows `prefix` — used for the SSH
 /// host-key fingerprint, which is variable-length base64 rather than the
@@ -13085,6 +13097,25 @@ mod tests {
             overlap >= TD_FIRSTBOOT_HOST_KEY_PREFIX.len() + HOST_KEY_MAX + 1,
             "the drain overlap ({overlap}) cannot hold a whole host-key line, so one \
              split across two reads would never latch"
+        );
+    }
+
+    #[test]
+    fn os_release_build_latches_its_quoted_value_from_a_whole_line() {
+        let commit = "0".repeat(40);
+        let line = format!("{OS_RELEASE_BUILD_PREFIX}\"{commit}\"\n");
+        let overlap = evidence_marker_max_len(b"t").saturating_sub(1);
+        assert!(overlap >= OS_RELEASE_BUILD_PREFIX.len() + HOST_KEY_MAX + 1);
+
+        let (start, end) = line.split_at(line.len() / 2);
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(&mut evidence, start.as_bytes(), b"target");
+        assert_eq!(evidence.os_release_build, None);
+        latch_console_evidence(&mut evidence, format!("{start}{end}").as_bytes(), b"target");
+        assert_eq!(
+            evidence.os_release_build,
+            Some(format!("\"{commit}\"")),
+            "{line}"
         );
     }
 
