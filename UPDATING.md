@@ -143,6 +143,11 @@ and its licences), per commit.
    as `DEVELOPMENT.md` gives it (rebuild the evaluator, warm the cache, then
    write the table aside).
 
+   A new kernel series also needs its syscall table read before its pin can
+   land. `APPLICATIONS.md`, "The seccomp filter", says what that review
+   decides; a catalog test (`td-jail-seccomp-probe.rs`) reds until a reviewer
+   states the new series there.
+
 5. Run the checks it reaches:
 
    ```text

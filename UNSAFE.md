@@ -1986,7 +1986,7 @@ the ordinary filter still kills every non-x86-64 architecture before decoding
 syscall numbers.
 Only that exact standalone helper's i386-exit kill joins its existing x32
 kill as excluded concurrent activity in the Firefox audit parser. It never
-counts toward Firefox's 18-probe evidence set.
+counts toward Firefox's 19-probe evidence set.
 QEMU builds that helper directly, so host-policy
 smoke tests cannot prevent the target oracle from booting. A host with no
 filter but inherited no-new-privileges
@@ -1999,15 +1999,15 @@ dropping identity, gates guest health on the exact result, and recognizes only
 an exact marker line. Reaper descendants require the installed restriction
 and filter readbacks too. The Firefox physical-input boot separately reuses
 the static helper after td-jail has installed the outer filter with its exact
-LOG flag. The helper issues its 18 probes and then replaces itself with the
+LOG flag. The helper issues its 19 probes and then replaces itself with the
 authenticated Firefox entry in the same pid. A root-owned bounded parser
 requires the complete helper audit set between root-only begin/end records
 that traverse the same audit queue. It refuses audit loss anywhere in the
 bounded snapshot, plus kernel-log overrun or byte-ceiling truncation,
-malformed identities, wrong action classes, or any denial outside the compiled
-roster before QEMU accepts the distinct Firefox audit marker. Exact returned
-errno remains the C helper's behavioral check because Linux masks action data
-out of the audit record.
+malformed identities, wrong action classes, or any denial the compiled filter
+does not make before QEMU accepts the distinct Firefox audit marker. Exact
+returned errno remains the C helper's behavioral check because Linux masks
+action data out of the audit record.
 
 `wait4(2)` is pinned to pid -1, a null rusage pointer, and either zero or
 `WNOHANG`. `kill(2)` is likewise closed: its pid is always -1 and its signal

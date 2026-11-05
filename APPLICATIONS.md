@@ -3386,11 +3386,13 @@ Two cases return `KILL_PROCESS`: a wrong `arch`, and an x32 syscall
 number. `clone3` returns **`ENOSYS`** — its flags live in a struct cBPF
 cannot read, and `ENOSYS` makes glibc fall back to `clone`, where the
 flag check applies; `EPERM` would be believed and break thread creation.
+A number the reviewed table lacks returns `ENOSYS` too, as below.
 
 | rule | reason |
 |---|---|
 | `arch != AUDIT_ARCH_X86_64` (0xC000003E) → KILL | a filter keyed on numbers is meaningless under another table |
 | `(nr & 0xC0000000) == 0x40000000` (`__X32_SYSCALL_BIT` set, sign bit clear) → KILL | the x32 ABI aliases numbers past the filter. **TWO bits, not one, and not a magnitude compare** — both simpler forms kill `-1`, and review caught the second one after the first had been corrected to it. `nr >= 0x40000000` kills it because `0xFFFFFFFF` compares greater; `nr & 0x40000000` kills it because `0xFFFFFFFF & 0x40000000` is *also* nonzero. An x32 number is a small positive number with bit 30 set, so bit 31 is clear, and the two-bit mask names exactly that set. An invalid syscall number is something libraries genuinely probe with, and the kernel's own answer to it is `ENOSYS`; turning that into `SIGSYS` is a filter that kills for something the ABI permits. The interpreter test below asserts `-1` survives, which is what would have caught either draft |
+| `nr` the reviewed table lacks, sign bit clear → ENOSYS | a kernel bump must not widen this filter by itself. `HIGHEST_REVIEWED_SYSCALL` is the top of the newest `syscall_64.tbl` this policy was read against, and a higher number answers what a kernel without it answers, so a program falls back as it would on that kernel. The table's one hole, 337 through 423, answers the same: the table reserves only 387 through 423, and 337 through 386 is where an x86-only syscall lands, as `uretprobe` and `uprobe` did just below it. On the pinned kernel this changes no answer an application sees, since that kernel has none of these numbers either, unless the application nests its own filter returning `USER_NOTIF` or `TRACE` for one, which then loses to this `ERRNO`. A negative number passes to the kernel, whose answer is the same `ENOSYS` |
 | `socket` with `arg0` outside `{AF_UNIX, AF_INET, AF_INET6, AF_NETLINK}` → EAFNOSUPPORT | Flatpak's family filtering is the starting point, but td does not carry its `AF_UNSPEC`, `AF_CAN`, or `AF_BLUETOOTH` cases because td has no permission that needs them. Without this rule a jail reaches `AF_VSOCK`, `AF_XDP`, `AF_PACKET` and the rest of a large and unevenly audited surface. `EAFNOSUPPORT` is the answer a kernel without the family gives, and libraries already handle it |
 | `ptrace`, `perf_event_open` → EPERM (dropped under `allow-devel`) | cross-process inspection; kernel attack surface |
 | `userfaultfd` → EPERM | pause-kernel-paths primitive used by exploit chains |
@@ -3415,7 +3417,22 @@ values, returns `EPERM` across the mount surface, and adds the
 `pidfd_getfd`, and `process_vm_*` denials rostered above. Those stricter deltas
 are deliberate and tested rather than inherited accidentally.
 
-Everything else is allowed, including `seccomp(2)` and
+**A kernel bump is a policy review, and the build makes someone do it.** A
+forgotten ceiling fails closed, so a catalog test
+(`td-jail-seccomp-probe.rs`) states the kernel series reviewed, reds when the
+pinned kernel passes it, and holds the ceiling, the hole and the probe's number
+to that statement. It cannot read the table, so its values are the reviewer's
+word. Raising the series means reading the new table, denying what needs
+denying, and moving those values together. The table is the minimum: a release's
+notes must also be read for new behaviour on existing numbers. `fchroot` is why:
+Linux 7.3's number 472 needs no capability under `no_new_privs`, the case a
+capability-free program can reach, and the same release gave
+`fchdir(FD_FAILFS_ROOT)` that behaviour on a number no table diff shows. On a
+kernel without the number the kernel answers `ENOSYS` itself, so the helper's
+returned errno cannot show the filter did it; the audit variant's record of that
+probe (layer 4 below) can, since it carries the filter's action.
+
+Everything else below the ceiling is allowed, including `seccomp(2)` and
 `prctl(PR_SET_SECCOMP)` — Firefox installs its own filters in every
 content process, and filter stacking under `NO_NEW_PRIVS` is exactly what
 the kernel provides. A nested filter can only narrow.
@@ -3450,7 +3467,8 @@ two ioctls the truncation *is* the point.
    rostered number, both ioctls with and without high bits set, `clone`
    with and without the flag, `clone3`, a wrong arch, an x32 number,
    `-1` and a second negative number — the case two drafts of the x32
-   rule got wrong — and a page of allowed syscalls. This pins the
+   rule got wrong — both edges of every number the reviewed table lacks,
+   and a page of allowed syscalls. This pins the
    program's *meaning* against
    its bytes. Three cases are there because a review found the rule
    above them wrong, and they are the ones a reader would not think to
@@ -3473,7 +3491,7 @@ two ioctls the truncation *is* the point.
    private `td.firefox-seccomp-audit=1` token only alongside autotest, physical
    input, kernel audit, backlog, and log-buffer tokens, briefly binds that same
    non-shipped helper into the jail as an executable. It installs the ordinary
-   outer application filter with `SECCOMP_FILTER_FLAG_LOG`, runs the 18 blocked
+   outer application filter with `SECCOMP_FILTER_FLAG_LOG`, runs the 19 blocked
    calls under the installed filter, and `execve`s Firefox in the same process.
    Every helper record except the deliberately forked x32-kill probe must carry
    the exact main-process pid independently read before and after the soak. The
@@ -3512,7 +3530,7 @@ two ioctls the truncation *is* the point.
    rejects audit loss/suppression anywhere in the bounded snapshot, including
    a direct loss notice printed before the asynchronously queued begin record,
    plus malformed records, a uid other than 1000, and every syscall/action
-   class outside the compiled deny roster. The target kernel enables i386
+   class the compiled filter does not refuse. The target kernel enables i386
    execution for the development policy (§C), which admits ordinary i386
    code, and so the standalone probe below can prove the kill; x32 stays
    off.
@@ -3525,11 +3543,11 @@ two ioctls the truncation *is* the point.
    compatibility-ABI records remain refused rather than interpreted against
    an incomplete syscall roster. Linux omits
    `SECCOMP_RET_DATA` from the audit action, so the C helper proves each exact
-   returned errno while this parser proves the logged action class. All 18
+   returned errno while this parser proves the logged action class. All 19
    expected records must appear, including three records for ioctl and the x32
    kill; only the helper's behavioral check distinguishes the three ioctl
-   arguments. Rostered denials made later by Firefox may appear; an unrostered
-   denial cannot pass.
+   arguments. Denials the compiled filter makes later for Firefox may appear;
+   any other denial cannot pass.
 
 Plus negative tests: omitting `NO_NEW_PRIVS` must make installation fail,
 and a corrupted-jump or wrong-length program must be refused before
@@ -7621,15 +7639,16 @@ and image commits — showing:
 11. **blocked syscall probes still blocked in the outer app process, with no
     unrostered denial — LANDED.** A dedicated physical-input proof variant
     compiles audit into the target kernel and enables it only for this run. The
-    helper described in §C executes all 18 blocked calls after td-jail installs
+    helper described in §C executes all 19 blocked calls after td-jail installs
     its ordinary outer filter, then replaces itself with Firefox without
     changing pid or filter. The final root-owned unit queues an end barrier
     through the audit path after the complete physical-input workload and
     five-minute soak, then accepts only the bounded closed interval and exact
-    `TD-FIREFOX-SECCOMP-OK probes=18` result described there. This proves the
+    `TD-FIREFOX-SECCOMP-OK probes=19` result described there. This proves the
     probes are blocked in the real outer application process and that every
-    audited non-allow decision during the workload belongs to the compiled
-    roster. The concurrent standalone boot-health probe's x32-write and
+    audited non-allow decision during the workload is one the compiled
+    filter makes. The concurrent standalone boot-health probe's x32-write
+    and
     i386-exit kills are excluded only under the exact identity, ABI, syscall,
     signal and action requirements in §C. They contribute no Firefox probe
     evidence; every other record still requires the assigned external
@@ -7808,8 +7827,8 @@ Each row is one landing or a small family, leaving the tree green.
 | 27h | **Firefox Web Audio image proof — LANDED**; the deterministic audit-off physical-input boot uses its first trusted key to start one 440 Hz oscillator in Firefox, schedules 1.2 seconds at quarter gain plus a 500 ms 0.001-gain tail on the same audio clock, then closes the context after the oscillator ends and a bounded downstream-drain interval. The QEMU runs exposed cubeb's real 48 kHz stereo FLOAT32 stream, its 50 ms working target against a larger HDA ring, the built-in test loopback taking card 0 ahead of HDA, and TCG audio-clock progress that can outrun the frames cubeb delivers to HDA. `td-audio` now converts that one same-rate/channel shape into its fixed S16 mixer with saturating samples, negotiated-byte grants/indexes, one wire-frame-bounded scratch per connection and partial-frame refusal; default selection excludes the exact `snd-aloop` PCM while preserving explicit card/device access to it. The negotiated working target is raised to at least the selected device ring plus one transfer period, retaining bounded software refill headroom behind the initially primed ring. Pulse-compatible prebuffering, idle-output suppression and whole-period ALSA-ring priming keep continuous client frames contiguous instead of starting HDA on an empty period; moving the last private-queue frame into a live device ring is not an underflow; each stream rearms only if the shared playhead reaches its exhausted accepted endpoint before a refill extends it. `TRIGGER`, `DRAIN`, bounded shutdown, an initial completed prebuffer gate, a below-period target watermark, or an explicit zero prebuffer may release a complete shorter tail. The scheduled sub-oracle-floor tail and delayed close keep cubeb alive past the bounded downstream queues; that guest schedule is not evidence, and the host WAV duration and waveform checks remain authoritative. The selected HDA device writes through a private 48 kHz stereo S16 QEMU WAV backend. The proof-only codec disables QEMU's emulated gain/mute mixer because `td-audio` deliberately owns no ALSA control node, but retains the HDA PCM transport under test. QEMU writes silence for the whole bounded boot, so the host derives a live file ceiling from the selected timeout plus margin within an absolute 768 MiB bound, raised from 512 MiB to 640 MiB when the since-removed Claude Code terminal oracle lengthened the timeout and to 768 MiB when the applications' fetch did, and refuses a larger timeout before launch. The post-exit oracle streams that file through a fixed buffer, retains only the bounded active span, validates the canonical header, 900–1300 ms duration, peak and per-channel AC energy, no internal below-floor run over 64 frames, the median of each channel's overlapping 100 ms-window zero-crossing estimates inside 435–445 Hz, and both channels' mean correlation of at least 0.85 with one shared-frequency sine over those windows. No channel may have more than seven sub-0.9 windows or two contiguous transient runs. Window-local phase therefore tolerates the measured bounded HDA startup and recovery regions; half-window overlap makes repeated boundary-aligned phase resets cross too many measured windows or runs, so the combined checks reject silence, noise, an intermittent signal or an unrelated tone. The authoritative rung-27h landing run measured 1,174 ms active at fitted 440.00 Hz, 440.08/440.08 Hz median zero-crossing estimates, 5,792.4/5,792.4 AC RMS, 0.9990/0.9990 mean correlation, and no sub-0.9 transient window or run in either channel. Diagnostic failures report the exact active span, count above the sample floor and longest internal quiet run. Unit regressions reject malformed input, silence, DC with a negligible tone, a missing channel, a long quiet interval, repeated phase resets, a short tone, an overlong tone and low or high off-band frequencies, accept bounded phase-reset and clock-stretch fixtures, pin the exact float conversion, accounting, refill-before-endpoint continuity, device-ring-plus-period target floor, prebuffer/start continuity, mixed HDA/loopback selection and audio-clock tail, and pin the exact QEMU argv including comma-safe capture paths. The dedicated seccomp-audit variant repeats the real input/soak workload against a host-silent backend; other system boots and the interactive runner remain host-silent | Firefox Web Audio crosses cubeb, the jail's Pulse alias, `td-audio`, ALSA and emulated HDA into a machine-checked waveform without manual listening |
 | 27i | **unsupported portal discovery proof — LANDED**; the live uid-1000 portal client asks the version property and `GetAll` for `ScreenCast`, `RemoteDesktop`, `Camera`, `Secret`, and `Print`, calls one real entry member on each, and accepts only complete exact error replies from the activated service's unique sender. Live introspection must omit every interface, and QEMU requires a distinct trusted service-prefixed marker after the whole sequence | unsupported capture, remote-control, camera, secret, and print capabilities fail closed rather than appearing to succeed |
 | 27j | **Firefox five-minute connection soak — LANDED**; one Marionette session alternates 31 exact guest-local HTTPS navigations at ten-second boundaries through at least 300 seconds. Before/after equality pins Firefox's application instance, pid and procfs start time; the bus GUID plus its exact broker-authenticated Firefox connection/pid set; and the compositor generation. Its live-latched readiness answer separately proves the publishing Wayland client did not depart. Only the final unit can publish the greeter's completion, and QEMU requires its exact soak line | browser, bus and compositor connections survive a bounded real navigation workload without manual observation |
-| 27k | **Firefox outer-seccomp denial audit — LANDED**; a dedicated physical-input variant alone enables the target kernel audit path and asks the standard outer filter to log non-allow decisions without changing their actions. A root-owned, executable-only bind of the existing non-shipped helper makes all 18 blocked calls under that installed filter, then replaces itself with Firefox in the same pid. After the full input workload and five-minute soak, a bounded root parser requires every helper denial, rejects loss, suppression, malformed ABI/uid/action data and any unrostered denial, and emits one exact host-required result. The variant retains all real input, browser, bus and compositor continuity evidence but uses the host-silent audio backend because kernel audit work measurably perturbs the separate TCG HDA waveform oracle | the shipped Firefox path proves its outer deny filter blocks the rostered probes while completing its real workload without an unrostered denial |
-| 28 | **Firefox proof closure — LANDED**; §H's every-boot kill-reaps leg now creates a dedicated application cgroup through the production detached watcher, proves stage 2 and its descendant occupy it before killing only stage 1, and accepts only after PID-namespace teardown empties the leaf and the watcher removes it. The previously deferred real target-kernel `mount(2)` refusal is supplied by the landed 18-call outer-filter audit. `AGENTS.md` names the source graph, host control plane, and marked foreign payload as three distinct trust zones. The complete shipped source and confinement regressions were reconciled against application-path `UNSAFE.md` surfaces #9 (`td-jail`), #10 (`td-busd`), #12 (`td-portal`), and #13 (`td-audio`); their syscall, operation, flag, ancillary-data, pointer-provenance, and scoped-allow rosters remain exact and require no roster amendment | **Firefox portals, isolation, soak and sound are all proved without manual testing** |
+| 27k | **Firefox outer-seccomp denial audit — LANDED**; a dedicated physical-input variant alone enables the target kernel audit path and asks the standard outer filter to log non-allow decisions without changing their actions. A root-owned, executable-only bind of the existing non-shipped helper makes all 19 blocked calls under that installed filter, then replaces itself with Firefox in the same pid. After the full input workload and five-minute soak, a bounded root parser requires every helper denial, rejects loss, suppression, malformed ABI/uid/action data and any unrostered denial, and emits one exact host-required result. The variant retains all real input, browser, bus and compositor continuity evidence but uses the host-silent audio backend because kernel audit work measurably perturbs the separate TCG HDA waveform oracle | the shipped Firefox path proves its outer deny filter blocks the rostered probes while completing its real workload without an unrostered denial |
+| 28 | **Firefox proof closure — LANDED**; §H's every-boot kill-reaps leg now creates a dedicated application cgroup through the production detached watcher, proves stage 2 and its descendant occupy it before killing only stage 1, and accepts only after PID-namespace teardown empties the leaf and the watcher removes it. The previously deferred real target-kernel `mount(2)` refusal is supplied by the landed 19-call outer-filter audit. `AGENTS.md` names the source graph, host control plane, and marked foreign payload as three distinct trust zones. The complete shipped source and confinement regressions were reconciled against application-path `UNSAFE.md` surfaces #9 (`td-jail`), #10 (`td-busd`), #12 (`td-portal`), and #13 (`td-audio`); their syscall, operation, flag, ancillary-data, pointer-provenance, and scoped-allow rosters remain exact and require no roster amendment | **Firefox portals, isolation, soak and sound are all proved without manual testing** |
 | 29 | **native clock in local time — LANDED**: the bar snapshots rung 12k's saved name and source-built TZif v2/v3 data, including future DST recurrence. Absence stays UTC; invalid or unsupported data displays `CLOCK ?`. `td-compositor/DESIGN.md` owns bounds, session lifetime and tests | the bar shows local civil time with the actual UTC offset |
 | 30 | **fresh-terminal grant — LANDED** in the jail; `devices=tty` parses and is honoured. Stage 1 requires one pseudo-terminal slave on its own stdio, issues a single non-stealing `TIOCSCTTY` from the session the bootstrap proved, and reads the terminal back from procfs before any registration, namespace or cgroup; stage 2 re-proves the same device on its stdout before mounting, binds `/dev/tty`, and gives the entry three clones; `TERM` forwards under a closed grammar beside `TERMINFO`, with the one matching description bound; td-term `--command` is the producer of such terminals. Unit tests and confinement pins cover the grammar, the wire format, the procfs decoding, the devpts identity and the order; rung 31's boot oracle proves the acquisition end to end | a terminal application runs in the jail with a terminal of its own, and never the operator's |
 | 31 | **terminal applications — LANDED**: `mail` (td-mail) and `news` (td-news) are source-built static packages on the data-only `static-runtime`, `/bin/mail` and `/bin/news` launchers (since dropped: td-authd starts each by name, §A.0; restored once both ran as the login user, §W.7), and two td-svc units (since run at boot only on an oracle's, §W.7) that ran each as td-term's `--command` (until rung 36 moved both into td-ui windows) in a window of its own after the first terminal, on the second workspace, which the control channel makes active before they start and leaves for the shell's once both are decided, so that the first workspace stays the shell's and Firefox's, never restarted by the supervisor; a user-level relaunch is §W.7. td-firstboot provisions each a first configuration once under the login user's jail state. Each package carries its binary's debug companion and, at the root of that debug tree, the assembly marker, so the profiler's object index finds under this source-built root what it requires. Under the autotest token the evidence units, which require their window, print `TD-MAIL-RUNNING` and `TD-NEWS-RUNNING` only after td-jail finds the client itself, by the program its entry runs as, still in the instance five seconds past the window's readiness, and `TD-APPLICATIONS-PLACED` once the compositor's report shows the first workspace active, no workspace occupied but the first and the applications', and the shell's window alone on the first; the boot oracle requires all three. Neither holds a bus name; §D names the residual | the machine boots to mail and news beside the shell, each in a jail on a terminal td-term made for it (since only on an oracle's boot; the session starts them, §W.7) |

@@ -1465,7 +1465,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          navigations while the Firefox process, D-Bus connections, and Wayland connection \
          remained unchanged ({TD_FIREFOX_SOAK_MARKER}), \
          repeated that full physical workload in a dedicated audit boot and accepted only \
-         the compiled outer-denial roster ({TD_FIREFOX_SECCOMP_AUDIT_MARKER}), \
+         denials the compiled outer filter makes ({TD_FIREFOX_SECCOMP_AUDIT_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -1859,7 +1859,7 @@ fn validate_firefox_seccomp_audit(result: &BootResult, expected: bool) -> Result
         return Ok(());
     }
     let description = if expected {
-        "Firefox outer seccomp denials did not match the compiled roster"
+        "Firefox outer seccomp denials did not match the compiled filter"
     } else {
         "the HDA-authoritative Firefox boot unexpectedly enabled seccomp audit"
     };
@@ -11290,7 +11290,7 @@ mod tests {
         for invalid in [
             format!("noise {TD_FIREFOX_SECCOMP_AUDIT_MARKER}\n"),
             format!("\n{TD_FIREFOX_SECCOMP_AUDIT_MARKER} trailing\n"),
-            "\nTD-FIREFOX-SECCOMP-OK probes=17\n".to_string(),
+            "\nTD-FIREFOX-SECCOMP-OK probes=18\n".to_string(),
         ] {
             let mut rejected = ConsoleEvidence::default();
             latch_console_evidence(&mut rejected, invalid.as_bytes(), b"target");

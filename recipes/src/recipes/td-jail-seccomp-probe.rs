@@ -109,6 +109,7 @@ pub(crate) fn source() -> &'static str {
 #define TD_SYS_PIDFD_GETFD 438
 #define TD_SYS_OPEN_TREE_ATTR 467
 #define TD_SYS_FCHROOT 472
+#define TD_SYS_ABOVE_CEILING 473
 #define TD_X32_SYSCALL_BIT 0x40000000UL
 #define TD_PROBE_MARKER "TD-JAIL-SECCOMP-PROBE-OK"
 #define TD_ALLOW_INHERITED_CONFINEMENT "--allow-inherited-confinement"
@@ -379,6 +380,10 @@ static int prove_denied_calls(void) {
     if (expect_errno(syscall(TD_SYS_FCHROOT, -1, 0), EPERM, "fchroot") != 0)
         return 1;
     errno = 0;
+    if (expect_errno(syscall(TD_SYS_ABOVE_CEILING, -1, 0), ENOSYS,
+                     "above the reviewed ceiling") != 0)
+        return 1;
+    errno = 0;
     if (expect_errno(syscall(SYS_userfaultfd, 0), EPERM,
                      "userfaultfd") != 0)
         return 1;
@@ -480,6 +485,44 @@ int main(int argc, char **argv) {
 mod tests {
     use super::*;
 
+    // A kernel series this policy has not been read against reds here rather
+    // than landing unreviewed: its new syscalls would answer ENOSYS, which is
+    // safe, but nobody would have decided that. The values below are a
+    // reviewer's statement that the table was read; no test can check that
+    // without the kernel's tree, so raising one means doing what
+    // APPLICATIONS.md, "The seccomp filter", says.
+    #[test]
+    fn the_pinned_kernel_is_within_the_series_seccomp_was_reviewed_against() {
+        const REVIEWED_SERIES: (u32, u32) = (7, 3);
+        const CEILING: u32 = 472;
+        const HOLE: (u32, u32) = (337, 424);
+        let seccomp = include_str!("../../../td-jail/src/seccomp.rs");
+        assert!(seccomp.contains(&format!("const HIGHEST_REVIEWED_SYSCALL: u32 = {CEILING};")));
+        assert!(seccomp.contains(&format!(
+            "const FIRST_UNASSIGNED_SYSCALL: u32 = {};",
+            HOLE.0
+        )));
+        assert!(seccomp.contains(&format!(
+            "const FIRST_ASSIGNED_AFTER_HOLE: u32 = {};",
+            HOLE.1
+        )));
+        assert!(source().contains(&format!("#define TD_SYS_ABOVE_CEILING {}\n", CEILING + 1)));
+        let pins = include_str!("../source_pins.rs");
+        let version = pins
+            .split("key: \"linux-kernel-source\"")
+            .nth(1)
+            .and_then(|pin| pin.split("version: \"").nth(1))
+            .and_then(|rest| rest.split('"').next())
+            .expect("the kernel pin names its version");
+        let mut parts = version.split('.').map(|part| part.parse::<u32>().unwrap());
+        let series = (parts.next().unwrap(), parts.next().unwrap());
+        assert!(
+            series <= REVIEWED_SERIES,
+            "Linux {version} is newer than the {REVIEWED_SERIES:?} series seccomp was reviewed \
+             against: review its syscall_64.tbl (APPLICATIONS.md, \"The seccomp filter\")"
+        );
+    }
+
     #[test]
     fn it_builds_in_the_root_against_td_glibc_and_gcc_runtime() {
         let recipe = recipe();
@@ -541,6 +584,7 @@ mod tests {
             "SYS_mount",
             "TD_SYS_OPEN_TREE_ATTR",
             "TD_SYS_FCHROOT",
+            "TD_SYS_ABOVE_CEILING",
             "SYS_userfaultfd",
             "SYS_bpf",
             "TD_SYS_IO_URING_SETUP",
@@ -551,7 +595,7 @@ mod tests {
             assert!(denied.contains(call), "inherited probe omitted {call}");
         }
         assert_eq!(denied.matches("SYS_ioctl").count(), 3);
-        assert_eq!(denied.matches("expect_errno(").count(), 17);
+        assert_eq!(denied.matches("expect_errno(").count(), 18);
         assert_eq!(denied.matches("return expect_x32_kill();").count(), 1);
     }
 

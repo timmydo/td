@@ -1377,8 +1377,8 @@ pub const TD_FIREFOX_INPUT_MARKER: &str = "TD-FIREFOX-INPUT-OK";
 /// least five minutes.
 pub const TD_FIREFOX_SOAK_MARKER: &str = "TD-FIREFOX-SOAK-OK minimum-seconds=300 navigations=31";
 /// Emitted by the root audit oracle after the ordered end barrier proves every
-/// outer-filter denial in the interval arrived and matches the compiled roster.
-pub const TD_FIREFOX_SECCOMP_AUDIT_MARKER: &str = "TD-FIREFOX-SECCOMP-OK probes=18";
+/// outer-filter denial in the interval arrived and is one the filter makes.
+pub const TD_FIREFOX_SECCOMP_AUDIT_MARKER: &str = "TD-FIREFOX-SECCOMP-OK probes=19";
 pub const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = "TD-TERM-CLIPBOARD-FOCUS-READY serial=";
 pub const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = "TD-TERM-CLIPBOARD-TARGET-READY ";
 pub const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str = "TD-TERM-CLIPBOARD-SELECTION-READY bytes=7";

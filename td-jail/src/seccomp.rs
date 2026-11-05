@@ -12,7 +12,7 @@ const EPERM: u32 = 1;
 const ENOSYS: u32 = 38;
 const EAFNOSUPPORT: u32 = 97;
 
-pub(crate) const FIREFOX_AUDIT_MARKER: &str = "TD-FIREFOX-SECCOMP-OK probes=18";
+pub(crate) const FIREFOX_AUDIT_MARKER: &str = "TD-FIREFOX-SECCOMP-OK probes=19";
 pub(crate) const FIREFOX_PROBE_PATH: &str = "/opt/td-firefox-seccomp-probe";
 const FIREFOX_PROBE_EXE: &str = "\"/opt/td-firefox-seccomp-probe\"";
 const FIREFOX_AUDIT_PROBE_EXE: &str = "\"/var/lib/td-test/td-jail-seccomp-probe\"";
@@ -24,6 +24,7 @@ const MAX_AUDIT_LINE_BYTES: usize = 4096;
 
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
+const BPF_JMP_JGE_K: u16 = 0x35;
 const BPF_ALU_AND_K: u16 = 0x54;
 const BPF_RET_K: u16 = 0x06;
 
@@ -45,6 +46,18 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 const TIOCSTI: u32 = 0x5412;
 const TIOCLINUX: u32 = 0x541c;
 
+// The highest number reviewed for this policy, from Linux 7.3's syscall_64.tbl.
+// A higher one answers ENOSYS, as a kernel without it does, until a review
+// raises this (APPLICATIONS.md, "The seccomp filter"). The recipe catalog holds
+// the pinned kernel's series to the one reviewed.
+const HIGHEST_REVIEWED_SYSCALL: u32 = 472;
+// The hole in that table. An x86-only syscall lands here, as uprobe and
+// uretprobe did just below it, so it answers as above the ceiling does.
+const FIRST_UNASSIGNED_SYSCALL: u32 = 337;
+const FIRST_ASSIGNED_AFTER_HOLE: u32 = 424;
+// Sign bit set: no kernel has a syscall there, so its own answer stands.
+const NEGATIVE_SYSCALL: u32 = 0x8000_0000;
+
 const FIREFOX_REQUIRED_AUDIT_SYSCALLS: &[(u32, usize)] = &[
     (SYS_PERSONALITY, 1),
     (SYS_SOCKET, 1),
@@ -56,6 +69,7 @@ const FIREFOX_REQUIRED_AUDIT_SYSCALLS: &[(u32, usize)] = &[
     (165, 1),
     (467, 1),
     (472, 1),
+    (HIGHEST_REVIEWED_SYSCALL + 1, 1),
     (323, 1),
     (321, 1),
     (425, 1),
@@ -83,6 +97,10 @@ const fn load(offset: u32) -> SockFilter {
 
 const fn jump_eq(value: u32, yes: u8, no: u8) -> SockFilter {
     insn(BPF_JMP_JEQ_K, yes, no, value)
+}
+
+const fn jump_ge(value: u32, yes: u8, no: u8) -> SockFilter {
+    insn(BPF_JMP_JGE_K, yes, no, value)
 }
 
 const fn and(value: u32) -> SockFilter {
@@ -134,6 +152,14 @@ macro_rules! define_policy {
             jump_eq(X32_SYSCALL_BIT, 0, 1),
             ret(SECCOMP_RET_KILL_PROCESS),
             load(OFFSET_NR),
+
+            jump_ge(NEGATIVE_SYSCALL, 0, 1),
+            ret(SECCOMP_RET_ALLOW),
+            jump_ge(HIGHEST_REVIEWED_SYSCALL + 1, 0, 1),
+            ret(errno(ENOSYS)),
+            jump_ge(FIRST_ASSIGNED_AFTER_HOLE, 2, 0),
+            jump_ge(FIRST_UNASSIGNED_SYSCALL, 0, 1),
+            ret(errno(ENOSYS)),
 
             // A socket family outside the four compiled families fails as if
             // the kernel did not support it.
@@ -198,6 +224,14 @@ macro_rules! define_policy {
             jump_eq(X32_SYSCALL_BIT, 0, 1),
             ret(SECCOMP_RET_KILL_PROCESS),
             load(OFFSET_NR),
+
+            jump_ge(NEGATIVE_SYSCALL, 0, 1),
+            ret(SECCOMP_RET_ALLOW),
+            jump_ge(HIGHEST_REVIEWED_SYSCALL + 1, 0, 1),
+            ret(errno(ENOSYS)),
+            jump_ge(FIRST_ASSIGNED_AFTER_HOLE, 2, 0),
+            jump_ge(FIRST_UNASSIGNED_SYSCALL, 0, 1),
+            ret(errno(ENOSYS)),
 
             // A Unix socket is refused outright; the other three families
             // as the standard program has them.
@@ -406,6 +440,12 @@ struct AuditAction {
     signal: u32,
 }
 
+/// A number the reviewed table does not have, which both programs refuse.
+const fn unreviewed_number(syscall: u32) -> bool {
+    (HIGHEST_REVIEWED_SYSCALL < syscall && syscall < NEGATIVE_SYSCALL)
+        || (FIRST_UNASSIGNED_SYSCALL <= syscall && syscall < FIRST_ASSIGNED_AFTER_HOLE)
+}
+
 fn expected_audit_action(syscall: u32) -> Option<AuditAction> {
     if syscall & X32_SYSCALL_MASK == X32_SYSCALL_BIT {
         return Some(AuditAction {
@@ -419,6 +459,7 @@ fn expected_audit_action(syscall: u32) -> Option<AuditAction> {
             SYS_PERSONALITY | SYS_IOCTL | SYS_CLONE | SYS_CLONE3
         )
         || DENIED_SYSCALLS.contains(&syscall)
+        || unreviewed_number(syscall)
     {
         // Audit records omit SECCOMP_RET_DATA, so the helper proves the exact
         // errno while the log can prove only the ERRNO action class.
@@ -613,7 +654,7 @@ pub(crate) fn verify_firefox_audit(
         let action = expected_audit_action(syscall).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("seccomp audit denied unrostered syscall {syscall}"),
+                format!("seccomp audit denied syscall {syscall}, which the filter allows"),
             )
         })?;
         if action.code != code || action.signal != signal {
@@ -736,7 +777,7 @@ fn validate(instructions: &[SockFilter], declared_len: usize) -> io::Result<Prog
                     return Err(invalid_instruction(index));
                 }
             }
-            BPF_JMP_JEQ_K => {
+            BPF_JMP_JEQ_K | BPF_JMP_JGE_K => {
                 let next = index.saturating_add(1);
                 let yes = next.saturating_add(usize::from(instruction.jt));
                 let no = next.saturating_add(usize::from(instruction.jf));
@@ -833,6 +874,14 @@ mod tests {
                 }
                 BPF_JMP_JEQ_K => {
                     let distance = if accumulator == instruction.k {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    };
+                    pc += 1 + usize::from(distance);
+                }
+                BPF_JMP_JGE_K => {
+                    let distance = if accumulator >= instruction.k {
                         instruction.jt
                     } else {
                         instruction.jf
@@ -1012,6 +1061,81 @@ mod tests {
         }
     }
 
+    // A kernel bump must not widen either program by itself, whichever end of
+    // the table its new number lands at. The page loop and fchroot's test above
+    // hold the answers for the numbers the table has.
+    #[test]
+    fn numbers_the_reviewed_table_lacks_fail_as_on_a_kernel_without_them() {
+        for filter in [STANDARD_FILTER.as_slice(), WORKSPACE_FILTER.as_slice()] {
+            for syscall in [
+                FIRST_UNASSIGNED_SYSCALL,
+                386,
+                387,
+                FIRST_ASSIGNED_AFTER_HOLE - 1,
+                HIGHEST_REVIEWED_SYSCALL + 1,
+                HIGHEST_REVIEWED_SYSCALL + 2,
+                511,
+                512,
+                X32_SYSCALL_BIT - 1,
+            ] {
+                assert_eq!(
+                    interpret(filter, data(syscall as i32)).unwrap(),
+                    errno(ENOSYS),
+                    "syscall {syscall}"
+                );
+            }
+            // The boundary, and what the kernel still answers for itself.
+            for syscall in [
+                FIRST_UNASSIGNED_SYSCALL - 1,
+                FIRST_ASSIGNED_AFTER_HOLE,
+                HIGHEST_REVIEWED_SYSCALL,
+            ] {
+                assert_ne!(
+                    interpret(filter, data(syscall as i32)).unwrap(),
+                    errno(ENOSYS),
+                    "syscall {syscall}"
+                );
+            }
+            for syscall in [-1, i32::MIN, 0xc000_0000_u32 as i32] {
+                assert_eq!(
+                    interpret(filter, data(syscall)).unwrap(),
+                    SECCOMP_RET_ALLOW,
+                    "syscall {syscall}"
+                );
+            }
+            assert_eq!(
+                interpret(filter, data(X32_SYSCALL_BIT as i32)).unwrap(),
+                SECCOMP_RET_KILL_PROCESS
+            );
+        }
+    }
+
+    // The page loop skips what the predicate names, so widening the predicate
+    // would thin the loop rather than fail it, and the audit parser would then
+    // accept denials no filter makes. Both programs hold it to the exact set.
+    #[test]
+    fn the_refused_number_predicate_is_exactly_what_the_programs_refuse() {
+        for filter in [STANDARD_FILTER.as_slice(), WORKSPACE_FILTER.as_slice()] {
+            for syscall in 0_u32..=600 {
+                let enosys = interpret(filter, data(syscall as i32)).unwrap() == errno(ENOSYS);
+                assert_eq!(
+                    enosys,
+                    unreviewed_number(syscall) || syscall == SYS_CLONE3,
+                    "syscall {syscall}"
+                );
+            }
+        }
+    }
+
+    // The interpreter shares these constants with the programs, so it cannot
+    // tell JGE from JGT: under that, the first refused number reaches the
+    // kernel, which answers ENOSYS too, and only the audit oracle would see.
+    #[test]
+    fn jump_opcodes_are_the_kernel_values() {
+        assert_eq!(BPF_JMP_JEQ_K, 0x15);
+        assert_eq!(BPF_JMP_JGE_K, 0x35);
+    }
+
     #[test]
     fn every_rostered_number_and_an_allowed_page_have_the_expected_action() {
         for syscall in DENIED_SYSCALLS {
@@ -1028,8 +1152,9 @@ mod tests {
                 "kernel-owned probe syscall {syscall}"
             );
         }
-        for syscall in 0_u32..=472 {
+        for syscall in 0_u32..=HIGHEST_REVIEWED_SYSCALL {
             if DENIED_SYSCALLS.contains(&syscall)
+                || unreviewed_number(syscall)
                 || matches!(
                     syscall,
                     SYS_IOCTL | SYS_SOCKET | SYS_CLONE | SYS_PERSONALITY | SYS_CLONE3
@@ -1101,7 +1226,7 @@ mod tests {
             SECCOMP_RET_ALLOW
         );
         // Everything else is the standard program's answer.
-        for syscall in 0_u32..=472 {
+        for syscall in 0_u32..=HIGHEST_REVIEWED_SYSCALL {
             if matches!(syscall, SYS_SOCKET | SYS_SOCKETPAIR) {
                 continue;
             }
@@ -1188,6 +1313,7 @@ mod tests {
             (165, SECCOMP_RET_ERRNO, 0),
             (467, SECCOMP_RET_ERRNO, 0),
             (472, SECCOMP_RET_ERRNO, 0),
+            (HIGHEST_REVIEWED_SYSCALL + 1, SECCOMP_RET_ERRNO, 0),
             (323, SECCOMP_RET_ERRNO, 0),
             (321, SECCOMP_RET_ERRNO, 0),
             (425, SECCOMP_RET_ERRNO, 0),
@@ -1214,7 +1340,7 @@ mod tests {
                 .iter()
                 .map(|(_, count)| count)
                 .sum::<usize>(),
-            18
+            19
         );
         assert_eq!(
             FIREFOX_AUDIT_MARKER,
@@ -1236,14 +1362,16 @@ mod tests {
                 "/app/lib/firefox/firefox",
             ),
         );
-        assert_eq!(verify_firefox_audit(&log).unwrap(), 19);
+        assert_eq!(verify_firefox_audit(&log).unwrap(), 20);
 
-        let missing = complete_audit().replacen(
-            &audit_line(65536, 310, SECCOMP_RET_ERRNO, 0, FIREFOX_PROBE_PATH),
-            "",
-            1,
-        );
-        assert!(verify_firefox_audit(&missing).is_err());
+        for probe in [310, HIGHEST_REVIEWED_SYSCALL + 1] {
+            let missing = complete_audit().replacen(
+                &audit_line(65536, probe, SECCOMP_RET_ERRNO, 0, FIREFOX_PROBE_PATH),
+                "",
+                1,
+            );
+            assert!(verify_firefox_audit(&missing).is_err(), "probe {probe}");
+        }
     }
 
     #[test]
@@ -1258,7 +1386,7 @@ mod tests {
         );
         assert_eq!(
             verify_firefox_audit(&before_end(complete_audit(), &standalone)).unwrap(),
-            19
+            20
         );
         let missing = complete_audit().replace(
             &audit_line(
@@ -1297,7 +1425,7 @@ mod tests {
         .replace("compat=0", "compat=1");
         assert_eq!(
             verify_firefox_audit(&before_end(complete_audit(), &standalone)).unwrap(),
-            19
+            20
         );
         let missing = complete_audit().replace(
             &audit_line(
@@ -1361,7 +1489,38 @@ mod tests {
         assert!(verify_firefox_audit(&good.replace("comm=\"probe\"", "comm=\"kauditd\"")).is_ok());
         assert!(verify_firefox_audit(&before_end(
             good.clone(),
-            &audit_line(65536, 400, SECCOMP_RET_ERRNO, 0, "/app/lib/firefox/firefox",),
+            &audit_line(65536, 39, SECCOMP_RET_ERRNO, 0, "/app/lib/firefox/firefox",),
+        ))
+        .is_err());
+        // The filter refuses every number the table lacks, not only the probe's,
+        // and a negative one it leaves to the kernel, so no record names one.
+        for syscall in [
+            FIRST_UNASSIGNED_SYSCALL,
+            FIRST_ASSIGNED_AFTER_HOLE - 1,
+            HIGHEST_REVIEWED_SYSCALL + 2,
+            X32_SYSCALL_BIT - 1,
+        ] {
+            assert!(verify_firefox_audit(&before_end(
+                good.clone(),
+                &audit_line(
+                    65536,
+                    syscall,
+                    SECCOMP_RET_ERRNO,
+                    0,
+                    "/app/lib/firefox/firefox",
+                ),
+            ))
+            .is_ok());
+        }
+        assert!(verify_firefox_audit(&before_end(
+            good.clone(),
+            &audit_line(
+                65536,
+                NEGATIVE_SYSCALL,
+                SECCOMP_RET_ERRNO,
+                0,
+                "/app/lib/firefox/firefox",
+            ),
         ))
         .is_err());
         for uid in [0, 1000, 65537, 65538, 65539] {
@@ -1430,7 +1589,7 @@ mod tests {
             0,
             "/app/lib/firefox/firefox",
         );
-        let accepted = before_end(good, &runtime.repeat(MAX_AUDIT_RECORDS.saturating_sub(18)));
+        let accepted = before_end(good, &runtime.repeat(MAX_AUDIT_RECORDS.saturating_sub(19)));
         assert_eq!(verify_firefox_audit(&accepted).unwrap(), MAX_AUDIT_RECORDS);
         assert!(verify_firefox_audit(&before_end(accepted, &runtime)).is_err());
     }
