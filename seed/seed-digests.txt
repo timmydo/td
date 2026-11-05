@@ -64,4 +64,4 @@ rust-rustc-dist 3390kbk5914rr9rgmf7f1br1l9v9zsmr-rust-rustc-dist
 rust-std-dist pvkrzbqpml6v8y28q7zxib8siydhxm8l-rust-std-dist
 tzdata-source bq34q4np6if18wz4q1ma437fli4zg20p-tzdata-source
 uutils-source lbvl02m37zd8l069hrdcax519pikgjsn-uutils-source
-zlib-x86-64-source pamiaj7i38xzslsd712inwc7ix77cjlp-zlib-x86-64-source
+zlib-x86-64-source 8avibyadkia14l590f2s9hac9z81v036-zlib-x86-64-source

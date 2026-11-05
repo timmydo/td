@@ -436,8 +436,8 @@ int main(int argc, char **argv) {
         return fail_text("curl TLS backend", "a LibreSSL/4.4.0 value",
             version->ssl_version, 5);
     if (version->libz_version == NULL ||
-        strcmp(version->libz_version, "1.3.2") != 0)
-        return fail_text("curl zlib version", "1.3.2",
+        strcmp(version->libz_version, "1.4") != 0)
+        return fail_text("curl zlib version", "1.4",
             version->libz_version, 6);
     if (version->cainfo == NULL || strcmp(version->cainfo,
             "/etc/ssl/certs/ca-certificates.crt") != 0 ||
