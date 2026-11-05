@@ -474,10 +474,10 @@ const PINS: &[PinDef] = &[
         key: "tzdata-source",
         aliases: &[],
         // Approved IANA data-only input; compile with the existing td glibc zic.
-        url: "https://data.iana.org/time-zones/releases/tzdata2026e.tar.gz",
-        sha256: "b26882805f26aac59d5b222978e6580484b834ccdc98be89df2f05a6dc53a652",
-        file: "tzdata2026e.tar.gz",
-        version: "2026e",
+        url: "https://data.iana.org/time-zones/releases/tzdata2026f.tar.gz",
+        sha256: "01b4a91cec5167ed48c11e8ab78f2048cead78ce94b0cafcad0ae8c5a3044d3d",
+        file: "tzdata2026f.tar.gz",
+        version: "2026f",
     },
     PinDef {
         key: "uutils-source",

@@ -62,7 +62,7 @@ pub fn recipe() -> Recipe {
         .collect(),
         exec: false,
     });
-    Recipe::mesboot("tzdata", "2026e")
+    Recipe::mesboot("tzdata", "2026f")
         .source_input("tzdata-source")
         .native_inputs(&["glibc-x86-64"])
         .steps(steps)

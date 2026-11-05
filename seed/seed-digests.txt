@@ -62,6 +62,6 @@ rust-cargo-dist vv9hjbvrx25p93ai791gkcci9xy5vfzj-rust-cargo-dist
 rust-clippy-dist jrj59nm73bkic24bg9hpwga99xcg79yk-rust-clippy-dist
 rust-rustc-dist 3390kbk5914rr9rgmf7f1br1l9v9zsmr-rust-rustc-dist
 rust-std-dist pvkrzbqpml6v8y28q7zxib8siydhxm8l-rust-std-dist
-tzdata-source k7vlacf1y4h7hk6isx94ig6hq0cnl516-tzdata-source
+tzdata-source bq34q4np6if18wz4q1ma437fli4zg20p-tzdata-source
 uutils-source lbvl02m37zd8l069hrdcax519pikgjsn-uutils-source
 zlib-x86-64-source pamiaj7i38xzslsd712inwc7ix77cjlp-zlib-x86-64-source
