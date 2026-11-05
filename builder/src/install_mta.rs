@@ -7,6 +7,8 @@ use std::process::ExitCode;
 type Result<T> = std::result::Result<T, String>;
 #[path = "install_mta_backup.rs"]
 mod install_mta_backup;
+#[path = "install_mta_notifications.rs"]
+mod install_mta_notifications;
 #[path = "install_mta_operations.rs"]
 mod install_mta_operations;
 #[path = "install_mta_setup.rs"]
@@ -30,7 +32,11 @@ Database preparation and credentials remain explicit (td-mta/POSTGRES.md).
 Use --setup-replica --help to provision a new read-only local account copy.
 Use --setup-local --help to provision a new private local PostgreSQL account.
 Use --postgres-tls-renew --help for local PostgreSQL leaf renewal.
-Use --operations-services --help to generate backup and health schedules.
+Use --operations-services --help to generate backup, health and notification schedules.
+Use --notifications-resolve --config-file PATH --message-id ID --outcome accepted|not-delivered
+to resolve an inspected uncertain delivery.
+Use --notifications-monitor|--notifications-preview|--notifications-digest --config-file PATH
+for the generated bounded collector and local daily digest.
 Use --backup --help for bounded host PostgreSQL logical backups.
 Use --backup-status --help for read-only backup freshness checks.
 ";
@@ -439,6 +445,16 @@ fn install(root: &Path, opts: &Options) -> Result<()> {
 pub(crate) fn run(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|v| v == "--postgres-tls-renew") {
         return install_mta_tls::run(args.get(1..).unwrap_or_default());
+    }
+    for (flag, mode) in [
+        ("--notifications-monitor", "monitor"),
+        ("--notifications-preview", "preview"),
+        ("--notifications-digest", "digest"),
+        ("--notifications-resolve", "resolve"),
+    ] {
+        if args.first().is_some_and(|v| v == flag) {
+            return install_mta_notifications::run(args.get(1..).unwrap_or_default(), mode);
+        }
     }
     if args.first().is_some_and(|v| v == "--operations-services") {
         return install_mta_operations::run(args.get(1..).unwrap_or_default());

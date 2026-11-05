@@ -1,6 +1,7 @@
 //! Explicit host schedules for existing mail operations; no service activation.
 use super::install_mta_backup::Bounds;
 use super::{absolute, directory, profile_name, scheme, shell, systemd, text, write_new, Result};
+use crate::json::Json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -9,6 +10,9 @@ use std::process::ExitCode;
 
 const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PATH [--prefix PATH]
   [--mail-profile NAME ...]
+  [--notify-recipient EMAIL --notify-connection-file OWNER_PATH --notify-epoch HEX
+   [--notify-smtp LOOPBACK:PORT] [--notify-hour 0..23] [--notify-df-bin PATH]
+   [--notify-systemd-timezone IANA_NAME]]
   [--scrub-connection-file OWNER_PATH --scrub-epoch HEX --scrub-state-dir PATH]
   [--search-connection-file OWNER_PATH --search-epoch HEX --search-state-dir PATH]
   [--certificate-profile NAME ... --connection-file PATH]
@@ -19,6 +23,9 @@ const HELP: &str = "Usage: ./install-td-mta --operations-services --state-dir PA
   [--postgres-tls-dir PATH --postgres-data-dir PATH --postgres-port N
    --postgres-bin PATH --openssl-bin PATH [--tool-library-dir PATH]]
 
+Notification collection runs every minute; digests run at 08:00 (or --notify-hour)
+in the supervisor local timezone. Notification SMTP is loopback only; credentials
+are not needed. Optional df must be an explicit absolute host tool path.
 Generates independent systemd timers and Shepherd timed services, without starting
 anything. Search preparation runs one bounded page per minute, waits five minutes
 after each cycle, and has a separate freshness check. Body scrubbing runs one bounded page per minute, starts a new cycle
@@ -41,6 +48,16 @@ struct Options {
     scrub: Option<Scrub>,
     search: Option<Scrub>,
     renewal: Option<Renewal>,
+    notification: Option<Notification>,
+}
+struct Notification {
+    recipient: String,
+    connection: PathBuf,
+    epoch: String,
+    smtp: String,
+    hour: u8,
+    timezone: Option<String>,
+    df: Option<PathBuf>,
 }
 struct Scrub {
     connection: PathBuf,
@@ -107,7 +124,14 @@ fn options(args: &[String], home: &str) -> Result<Options> {
             | "--tool-library-dir"
             | "--postgres-tls-dir"
             | "--postgres-data-dir"
-            | "--postgres-port" => {
+            | "--postgres-port"
+            | "--notify-recipient"
+            | "--notify-connection-file"
+            | "--notify-epoch"
+            | "--notify-smtp"
+            | "--notify-hour"
+            | "--notify-systemd-timezone"
+            | "--notify-df-bin" => {
                 if values.insert(flag.as_str(), value.as_str()).is_some() {
                     return Err(format!("duplicate {flag}"));
                 }
@@ -295,6 +319,55 @@ fn options(args: &[String], home: &str) -> Result<Options> {
     {
         return Err("certificate profiles need --connection-file; TLS files need --openssl-bin (no unused options)".into());
     }
+    let notification = if values.keys().any(|k| k.starts_with("--notify-")) {
+        let recipient = values
+            .get("--notify-recipient")
+            .ok_or("missing --notify-recipient")?
+            .to_string();
+        let epoch = values
+            .get("--notify-epoch")
+            .ok_or("missing --notify-epoch")?
+            .to_string();
+        let smtp = values
+            .get("--notify-smtp")
+            .copied()
+            .unwrap_or("127.0.0.1:25")
+            .to_string();
+        let hour = values
+            .get("--notify-hour")
+            .copied()
+            .unwrap_or("8")
+            .parse::<u8>()
+            .map_err(|_| "invalid notification hour")?;
+        if hour > 23 {
+            return Err("notification hour must be 0..23".into());
+        }
+        let timezone = values
+            .get("--notify-systemd-timezone")
+            .map(|v| v.to_string());
+        if timezone.as_ref().is_some_and(|v| {
+            v.is_empty()
+                || v.len() > 128
+                || v.starts_with('/')
+                || v.contains("..")
+                || !v
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/_+-".contains(&b))
+        }) {
+            return Err("invalid systemd timezone".into());
+        }
+        Some(Notification {
+            recipient,
+            epoch,
+            smtp,
+            hour,
+            timezone,
+            connection: required("--notify-connection-file")?,
+            df: path("--notify-df-bin")?,
+        })
+    } else {
+        None
+    };
     if mail.is_empty()
         && certificates.is_empty()
         && tls.is_empty()
@@ -302,6 +375,7 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         && search.is_none()
         && backup.is_none()
         && renewal.is_none()
+        && notification.is_none()
     {
         return Err("select at least one operation".into());
     }
@@ -317,12 +391,14 @@ fn options(args: &[String], home: &str) -> Result<Options> {
         scrub,
         search,
         renewal,
+        notification,
     })
 }
 
 #[derive(Clone, Copy)]
 enum Schedule {
     Daily,
+    Digest(u8),
     QuarterHour,
     Minute,
 }
@@ -331,6 +407,7 @@ struct Job {
     argv: Vec<String>,
     environment: Vec<String>,
     schedule: Schedule,
+    timezone: Option<String>,
 }
 
 fn jobs(opts: &Options) -> Result<Vec<Job>> {
@@ -343,6 +420,7 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
             argv,
             environment,
             schedule,
+            timezone: None,
         });
     };
     for profile in &opts.mail {
@@ -488,6 +566,37 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
         }
         add("search-status".into(), argv, vec![], Schedule::QuarterHour);
     }
+    if let Some(notification) = &opts.notification {
+        let config = opts.state.join(".operations/notifications/config.json");
+        for (name, flag, schedule) in [
+            (
+                "notifications-monitor",
+                "--notifications-monitor",
+                Schedule::Minute,
+            ),
+            (
+                "notifications-digest",
+                "--notifications-digest",
+                Schedule::Digest(notification.hour),
+            ),
+        ] {
+            add(
+                name.into(),
+                vec![
+                    text(&helper)?.into(),
+                    "install-td-mta".into(),
+                    flag.into(),
+                    "--config-file".into(),
+                    text(&config)?.into(),
+                ],
+                vec![],
+                schedule,
+            );
+        }
+        if let Some(job) = jobs.last_mut() {
+            job.timezone = notification.timezone.clone();
+        }
+    }
     let mut names = BTreeSet::new();
     if jobs.iter().any(|j| !names.insert(&j.name)) {
         return Err("colliding operation names".into());
@@ -496,7 +605,7 @@ fn jobs(opts: &Options) -> Result<Vec<Job>> {
 }
 
 fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
-    let seconds = if matches!(job.schedule, Schedule::Daily) {
+    let seconds = if matches!(job.schedule, Schedule::Daily | Schedule::Digest(_)) {
         2700
     } else {
         120
@@ -513,13 +622,31 @@ fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
         .map(|v| format!("Environment={}\n", systemd(v)))
         .collect::<String>();
     let unit = format!("[Unit]\nDescription={}\n\n[Service]\nType=oneshot\nExecStart=:{exec}\n{env}UMask=0077\nTimeoutStartSec={seconds}\nNoNewPrivileges=yes\nPrivateTmp=yes\n", job.name);
+    let digest_calendar = if let Schedule::Digest(hour) = job.schedule {
+        format!(
+            "OnCalendar=*-*-* {hour:02}:00:00{}\nPersistent=true\n",
+            job.timezone
+                .as_ref()
+                .map(|v| format!(" {v}"))
+                .unwrap_or_default()
+        )
+    } else {
+        String::new()
+    };
     let schedule = match job.schedule {
+        Schedule::Digest(_) => &digest_calendar,
         Schedule::Daily => "OnCalendar=*-*-* 03:15:00\nPersistent=true\n",
         Schedule::QuarterHour => "OnBootSec=2min\nOnUnitActiveSec=15min\n",
         Schedule::Minute => "OnBootSec=2min\nOnUnitActiveSec=1min\n",
     };
     let timer = format!("[Unit]\nDescription=Schedule {}\n\n[Timer]\n{schedule}Unit={}.service\n\n[Install]\nWantedBy=timers.target\n", job.name, job.name);
+    let digest_event = if let Schedule::Digest(hour) = job.schedule {
+        format!("(calendar-event #:hours '({hour}) #:minutes '(0))")
+    } else {
+        String::new()
+    };
     let event = match job.schedule {
+ Schedule::Digest(_) => &digest_event,
  Schedule::Daily => "(calendar-event #:hours '(3) #:minutes '(15))",
  Schedule::QuarterHour => "(calendar-event #:minutes '(0 15 30 45))",
  Schedule::Minute => "(calendar-event #:minutes '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59))",
@@ -557,8 +684,83 @@ fn files(job: &Job, state: &Path) -> Result<Vec<(String, String)>> {
     ])
 }
 
+fn notification_config(opts: &Options, jobs: &[Job]) -> Result<Option<Json>> {
+    let Some(notification) = &opts.notification else {
+        return Ok(None);
+    };
+    let mut checks = Vec::new();
+    let mut check = |name: String, kind: &str, argv: Vec<String>| {
+        checks.push(Json::Obj(vec![
+            ("name".into(), Json::Str(name)),
+            ("kind".into(), Json::Str(kind.into())),
+            (
+                "argv".into(),
+                Json::Arr(argv.into_iter().map(Json::Str).collect()),
+            ),
+        ]));
+    };
+    for job in jobs {
+        let name = job
+            .name
+            .strip_prefix("td-mta-maint-")
+            .ok_or("invalid operation name")?;
+        if name.starts_with("mail-")
+            || name.starts_with("acme-")
+            || name.starts_with("tls-")
+            || ["backup-status", "search-status", "scrub-status"].contains(&name)
+        {
+            check(name.into(), "status", job.argv.clone());
+        }
+    }
+    for profile in &opts.mail {
+        check(
+            format!("performance-{profile}"),
+            "performance",
+            vec![
+                text(&opts.prefix.join("bin/td-mta"))?.into(),
+                "performance-status".into(),
+                "--runtime".into(),
+                text(&opts.state.join(profile).join("runtime"))?.into(),
+            ],
+        );
+    }
+    if let Some(df) = &notification.df {
+        check(
+            "disk".into(),
+            "disk",
+            vec![text(df)?.into(), "-Pk".into(), text(&opts.state)?.into()],
+        );
+    }
+    let mut fields = vec![("checks".into(), Json::Arr(checks))];
+    for (name, value) in [
+        ("mta", text(&opts.prefix.join("bin/td-mta"))?.to_string()),
+        (
+            "state",
+            text(&opts.state.join(".operations/notifications"))?.to_string(),
+        ),
+        ("connection", text(&notification.connection)?.to_string()),
+        ("epoch", notification.epoch.clone()),
+        ("recipient", notification.recipient.clone()),
+        ("smtp", notification.smtp.clone()),
+    ] {
+        fields.push((name.into(), Json::Str(value)));
+    }
+    let config = Json::Obj(fields);
+    super::install_mta_notifications::validate(&config)?;
+    Ok(Some(config))
+}
+
 fn install(opts: &Options) -> Result<()> {
     let jobs = jobs(opts)?;
+    let notification = notification_config(opts, &jobs)?;
+    let config_path = opts.state.join(".operations/notifications/config.json");
+    if let Some(config) = &notification {
+        if config_path.exists()
+            && fs::read_to_string(&config_path).map_err(|e| e.to_string())? != config.to_canonical()
+        {
+            return Err("notification configuration differs; retain or remove explicitly".into());
+        }
+    }
     let services = opts.prefix.join("share/td-mta/services");
     let mut output = Vec::new();
     for job in &jobs {
@@ -588,7 +790,13 @@ fn install(opts: &Options) -> Result<()> {
     directory(&opts.state, 0o700)?;
     directory(&opts.state.join(".operations"), 0o700)?;
     directory(&services, 0o700)?;
-    if opts.backup.is_some() || opts.renewal.is_some() {
+    if let Some(config) = notification {
+        directory(config_path.parent().ok_or("missing config parent")?, 0o700)?;
+        if !config_path.exists() {
+            write_new(&config_path, config.to_canonical().as_bytes())?;
+        }
+    }
+    if opts.backup.is_some() || opts.renewal.is_some() || opts.notification.is_some() {
         // A stable command path keeps schedules independent of the source checkout.
         let releases = opts.prefix.join("lib/td-mta/host-tools");
         directory(&releases, 0o755)?;
@@ -635,7 +843,7 @@ fn install(opts: &Options) -> Result<()> {
             job.name
         );
     }
-    println!("No services started. Inspect each job's last result; active timers alone do not prove success. Off-host copies and failure notification remain explicit.");
+    println!("No services started. Inspect each job's last result; active timers alone do not prove success. Off-host copies and external failure notification remain explicit. Local notification SMTP is not an independent uptime alert.");
     Ok(())
 }
 
@@ -962,6 +1170,58 @@ mod tests {
                 .flat_map(|(_, pair)| pair.iter().cloned())
                 .collect::<Vec<_>>();
             assert!(options(&input, "/home/a").is_err());
+        }
+    }
+    #[test]
+    fn notifications_generate_bounded_native_jobs_and_local_delivery_configuration() {
+        let input = args(&[
+            "--state-dir",
+            "/state",
+            "--prefix",
+            "/prefix",
+            "--mail-profile",
+            "receive",
+            "--notify-recipient",
+            "timmy@example.test",
+            "--notify-connection-file",
+            "/private/owner",
+            "--notify-epoch",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--notify-systemd-timezone",
+            "America/Los_Angeles",
+            "--notify-df-bin",
+            "/usr/bin/df",
+        ]);
+        let opts = options(&input, "/home/test").unwrap();
+        let jobs = jobs(&opts).unwrap();
+        let config = notification_config(&opts, &jobs).unwrap().unwrap();
+        assert_eq!(
+            config.get("smtp").and_then(Json::as_str),
+            Some("127.0.0.1:25")
+        );
+        let job = jobs
+            .iter()
+            .find(|job| job.name == "td-mta-maint-notifications-digest")
+            .unwrap();
+        let output = files(job, &opts.state).unwrap();
+        let timer = output
+            .iter()
+            .find(|(name, _)| name.ends_with(".timer"))
+            .unwrap();
+        assert!(timer
+            .1
+            .contains("OnCalendar=*-*-* 08:00:00 America/Los_Angeles"));
+        assert!(output
+            .iter()
+            .any(|(name, body)| name.ends_with(".scm") && body.contains("#:hours '(8)")));
+        assert!(!output.iter().any(|(_, body)| body.contains("python")));
+        assert!(config.to_canonical().contains("performance-status"));
+        for extra in [["--notify-smtp", "192.0.2.1:25"], ["--notify-hour", "24"]] {
+            let mut modified = input.clone();
+            modified.extend(extra.map(String::from));
+            assert!(options(&modified, "/home/test")
+                .and_then(|o| notification_config(&o, &jobs))
+                .is_err());
         }
     }
 }

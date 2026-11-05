@@ -90,7 +90,7 @@ fn fmt_secs(ns: u128) -> String {
 
 /// Unix seconds → `YYYY-MM-DDTHH:MM:SSZ` (pure std; civil-from-days,
 /// Howard Hinnant's algorithm — no chrono in the dependency-free engine).
-fn utc_iso(secs: u64) -> String {
+pub(crate) fn utc_iso(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);

@@ -1020,3 +1020,100 @@ rolled back. The next scheduled page clears failure status only after success.
 An epoch or search-version mismatch requires preserving the old evidence and
 provisioning a fresh dedicated progress directory. No certificates or packages
 are needed beyond the existing PostgreSQL installation and schema-40 extension.
+
+## Native operational notifications
+
+`--operations-services` can generate a bounded collector and a local daily
+mail digest alongside the existing readiness, certificate, backup, scrub and
+search jobs. These are host operator commands in `td-mta-operator`, built
+from this repository; no Python helper or source checkout is needed at runtime.
+They do not add a target distribution dependency.
+
+Add the following options to the operations configuration:
+
+```text
+--notify-recipient timmy@example.test
+--notify-connection-file /private/mail/owner-connection
+--notify-epoch CURRENT_EPOCH
+--notify-smtp 127.0.0.1:25
+--notify-hour 8
+```
+
+The recipient must be a configured local ASCII mailbox. SMTP is restricted to
+an explicit loopback address and nonzero port. The collector needs an owner
+connection for native `postgres logs`; a runtime connection is insufficient.
+Add `--notify-df-bin /usr/bin/df` to include free-space checks on the state
+filesystem, using that explicit host tool's `-Pk` output. No shell is invoked.
+Disk attention is reported at 90 percent usage or below 3 GiB available.
+Mail profiles add native readiness and performance inspections; configured
+certificate profiles and backup/scrub/search status jobs add those inspections
+to the digest. A failed inspection is reported as unavailable, never as zero.
+
+The generator writes `STATE/.operations/notifications/config.json` and
+`td-mta-maint-notifications-monitor` and `td-mta-maint-notifications-digest`
+service definitions. It refuses changed existing configuration/definitions.
+The collector runs each minute; the digest runs at the specified hour in the
+supervisor timezone. `--notify-systemd-timezone America/Los_Angeles` adds an
+explicit timezone to the systemd calendar. Shepherd calendars use the
+supervisor's timezone; that systemd-only option does not change Shepherd's
+process-wide timezone. Generated jobs are not enabled automatically. As with
+other operations, system services need the intended User/Group and private
+state directory ownership; generation as root does not authorize a daemon to
+read root-owned 0600 files. Preserve the installed helper and its previous
+version when changing the selected operator executable.
+
+Inspect or run the installed commands using the generated configuration:
+
+```text
+td-mta-operator install-td-mta --notifications-monitor --config-file PRIVATE_CONFIG
+td-mta-operator install-td-mta --notifications-preview --config-file PRIVATE_CONFIG
+td-mta-operator install-td-mta --notifications-digest --config-file PRIVATE_CONFIG
+```
+
+Preview performs the bounded inspections but sends no mail. The collector
+initially starts at the newest native log ID. Later runs persist pagination
+across at most sixteen pages of 100 records per invocation. The newest 512
+selected diagnostic events are retained, with cumulative eviction counts and
+native database suppression/eviction counters. Receive refusals, interrupted
+DATA, process suppression from every profile, and selected relay/certificate/service failures
+are samples, not a delivery ledger. PostgreSQL's independent bounded log
+retention remains authoritative for its retained diagnostics. An epoch change
+refuses until the operator provisions fresh state while retaining old evidence.
+
+One private directory lock covers collection, rendering and delivery. A digest
+waits at most 130 seconds for an ongoing collector (whose generated supervisor
+bound is 120 seconds); other invocations refuse contention. A digest
+advances its log-ID cursor only after acknowledged SMTP delivery; event
+wall-clock times do not discard late-collected samples. Ring eviction, a stale
+collector or an unfinished scan makes the report explicitly incomplete.
+Performance differences are calculated only within the same process boot;
+after restart, current-lifetime counters are labeled as partial window evidence.
+
+Local SMTP acceptance is recorded durably before connection cleanup. The same
+UTC day's acknowledged digest is not sent twice. A lost final SMTP reply or
+an interrupted state write can leave `pending.json`: subsequent delivery refuses
+instead of sending a possible duplicate. Inspect its exact Message-ID in the
+recipient mailbox and the supervisor journal before resolving it. Retain the
+pending and last-report records as evidence. Resolve only after checking the
+exact Message-ID (without angle brackets):
+
+```text
+td-mta-operator install-td-mta --notifications-resolve --config-file PRIVATE_CONFIG --message-id ID --outcome accepted
+```
+
+Use `not-delivered` instead of `accepted` only when non-delivery has been
+established; absence from a client cache alone is not proof. Resolution saves
+`resolution.json` before clearing pending state. Accepted resolution advances
+the digest cursor; non-delivery keeps the previous cursor for a future retry.
+Archive the evidence before another resolution overwrites that bounded file.
+Do not delete the directory to
+clear a delivery error. Configuration, monitor, report and acknowledgement
+files are bounded to 3 MiB each; each generated message is at most 64 KiB.
+Inspection subprocesses have 20-second deadlines and bounded stdout/stderr;
+SMTP has a 30-second exchange deadline. The service supervisor additionally
+bounds the overall invocation. No elapsed-time performance threshold is a test.
+
+This digest uses the local receive path and does not need SES or Migadu. It
+cannot reliably alert when that path or the host is unavailable. The failed
+oneshot result and private diagnostics remain independent local evidence;
+external uptime alerts and off-host backup copies are separate configuration.
