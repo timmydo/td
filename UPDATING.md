@@ -171,6 +171,9 @@ new release's MSRV against the pinned Rust toolchain.
 
 ## Rust toolchain
 
+A new toolchain can change which syscalls `mail` and `news` reach: derive their
+lists again (`APPLICATIONS.md`, "Per-application allowlists").
+
 The four `rust-*-dist` pins move together, to one dated directory of
 `static.rust-lang.org/dist`, with hashes from that date's
 `channel-rust-stable.toml`. `td-rust` downloads the same pinned components,
@@ -245,6 +248,9 @@ index, or the project's Git ref advertisement
 lives apart from the pins.
 
 # Debian build root
+
+A new glibc can change which syscalls `mail` and `news` reach: derive their lists
+again (`APPLICATIONS.md`, "Per-application allowlists").
 
 The lock's header comment is the authoritative procedure. In short:
 

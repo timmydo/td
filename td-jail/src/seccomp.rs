@@ -1,5 +1,6 @@
 //! Compiled x86-64 application syscall policy.
 
+use crate::authority::ApplicationFilter;
 use crate::sys::{self, SockFilter};
 use std::io::{self, Write};
 
@@ -11,6 +12,11 @@ const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const EPERM: u32 = 1;
 const ENOSYS: u32 = 38;
 const EAFNOSUPPORT: u32 = 97;
+const ENOTTY: u32 = 25;
+const ENOPROTOOPT: u32 = 92;
+const SOL_SOCKET: u32 = 1;
+const SO_RCVTIMEO: u32 = 20;
+const SO_SNDTIMEO: u32 = 21;
 
 pub(crate) const FIREFOX_AUDIT_MARKER: &str = "TD-FIREFOX-SECCOMP-OK probes=19";
 pub(crate) const FIREFOX_PROBE_PATH: &str = "/opt/td-firefox-seccomp-probe";
@@ -32,10 +38,12 @@ const OFFSET_NR: u32 = 0;
 const OFFSET_ARCH: u32 = 4;
 const OFFSET_ARG0_LOW: u32 = 16;
 const OFFSET_ARG1_LOW: u32 = 24;
+const OFFSET_ARG2_LOW: u32 = 32;
 
 const SYS_IOCTL: u32 = 16;
 const SYS_SOCKET: u32 = 41;
 const SYS_SOCKETPAIR: u32 = 53;
+const SYS_SETSOCKOPT: u32 = 54;
 const SYS_CLONE: u32 = 56;
 const SYS_GETPPID: u32 = 110;
 const SYS_PERSONALITY: u32 = 135;
@@ -45,6 +53,7 @@ const X32_SYSCALL_MASK: u32 = 0xc000_0000;
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 const TIOCSTI: u32 = 0x5412;
 const TIOCLINUX: u32 = 0x541c;
+const FIONBIO: u32 = 0x5421;
 
 // The highest number reviewed for this policy, from Linux 7.3's syscall_64.tbl.
 // A higher one answers ENOSYS, as a kernel without it does, until a review
@@ -732,9 +741,184 @@ pub(crate) fn workspace_program() -> io::Result<Program<'static>> {
     validate(&WORKSPACE_FILTER, WORKSPACE_FILTER.len())
 }
 
-pub(crate) fn write_standard_filter(mut output: impl Write) -> io::Result<()> {
-    let program = standard_program()?;
-    let len = u16::try_from(program.instructions().len()).map_err(|_| {
+// What a td-owned static application's jail reaches, by number. The derivation
+// is in APPLICATIONS.md, "Per-application allowlists": the realized binaries'
+// reachable set, without what only an option td never sets can arrive at, plus
+// the one call no instruction in them names. socket, socketpair, setsockopt,
+// ioctl and clone are not here:
+// each has its argument rule in `allowlist_program`.
+const APPLICATION_ALLOWED: &[u32] = &[
+    0,   // read
+    1,   // write
+    3,   // close
+    5,   // fstat
+    7,   // poll
+    8,   // lseek
+    9,   // mmap
+    10,  // mprotect
+    11,  // munmap
+    12,  // brk
+    13,  // rt_sigaction
+    14,  // rt_sigprocmask
+    15,  // rt_sigreturn
+    17,  // pread64
+    18,  // pwrite64
+    20,  // writev
+    24,  // sched_yield
+    25,  // mremap
+    28,  // madvise
+    32,  // dup
+    33,  // dup2
+    34,  // pause
+    39,  // getpid
+    42,  // connect
+    44,  // sendto
+    45,  // recvfrom
+    46,  // sendmsg
+    47,  // recvmsg
+    51,  // getsockname
+    52,  // getpeername
+    59,  // execve
+    60,  // exit
+    61,  // wait4
+    62,  // kill: stage 2 ends the namespace's survivors
+    63,  // uname
+    72,  // fcntl
+    73,  // flock
+    74,  // fsync
+    75,  // fdatasync
+    77,  // ftruncate
+    79,  // getcwd
+    80,  // chdir
+    81,  // fchdir
+    82,  // rename
+    83,  // mkdir
+    87,  // unlink
+    89,  // readlink
+    99,  // sysinfo
+    102, // getuid
+    104, // getgid
+    107, // geteuid
+    108, // getegid
+    115, // getgroups
+    131, // sigaltstack
+    143, // sched_getparam
+    145, // sched_getscheduler
+    157, // prctl
+    158, // arch_prctl
+    186, // gettid
+    202, // futex
+    204, // sched_getaffinity
+    217, // getdents64
+    218, // set_tid_address
+    219, // restart_syscall: the kernel's, after a signal, in no binary
+    228, // clock_gettime: also the vDSO's fallback
+    230, // clock_nanosleep
+    231, // exit_group
+    234, // tgkill
+    247, // waitid: glibc reaps a spawn whose exec failed
+    257, // openat
+    262, // newfstatat
+    267, // readlinkat
+    269, // faccessat
+    273, // set_robust_list
+    293, // pipe2
+    302, // prlimit64
+    318, // getrandom
+    332, // statx
+    334, // rseq
+    439, // faccessat2
+];
+
+// What td-mail and td-secret reach and td-news and td-open do not.
+const MAIL_ALLOWED: &[u32] = &[
+    55,  // getsockopt: td-secret's peer_uid
+    84,  // rmdir: td-mail
+    91,  // fchmod: td-mail and td-secret
+    93,  // fchown: td-secret
+    263, // unlinkat: td-mail
+    319, // memfd_create: td-secret's create_credential
+];
+
+// The news package adds nothing to what every application reaches.
+const NEWS_ALLOWED: &[u32] = &[];
+
+pub(crate) fn application_program(filter: ApplicationFilter) -> io::Result<Vec<SockFilter>> {
+    match filter {
+        ApplicationFilter::Standard => Ok(standard_program()?.instructions().to_vec()),
+        ApplicationFilter::Mail => allowlist_program(MAIL_ALLOWED),
+        ApplicationFilter::News => allowlist_program(NEWS_ALLOWED),
+    }
+}
+
+// ENOSYS for what the list lacks, as a kernel without the call answers, and
+// ENOTTY for an ioctl, as a descriptor without the request does. Neither
+// program has a terminal grant, so tcgetattr answers as it would anyway.
+// Neither is a kill: a program must be able to report what failed.
+fn allowlist_program(extra: &[u32]) -> io::Result<Vec<SockFilter>> {
+    let mut program = vec![
+        load(OFFSET_ARCH),
+        jump_eq(AUDIT_ARCH_X86_64, 1, 0),
+        ret(SECCOMP_RET_KILL_PROCESS),
+        load(OFFSET_NR),
+        and(X32_SYSCALL_MASK),
+        jump_eq(X32_SYSCALL_BIT, 0, 1),
+        ret(SECCOMP_RET_KILL_PROCESS),
+        load(OFFSET_NR),
+        // A Unix socket and nothing else: these programs reach the network
+        // through the fetch service's socket.
+        jump_eq(SYS_SOCKET, 0, 4),
+        load(OFFSET_ARG0_LOW),
+        jump_eq(AF_UNIX, 0, 1),
+        ret(SECCOMP_RET_ALLOW),
+        ret(errno(EAFNOSUPPORT)),
+        // As the workspace program has it: Rust's Command makes the second.
+        jump_eq(SYS_SOCKETPAIR, 0, 8),
+        load(OFFSET_ARG0_LOW),
+        jump_eq(AF_UNIX, 0, 5),
+        load(OFFSET_ARG1_LOW),
+        and(!(SOCK_NONBLOCK | SOCK_CLOEXEC)),
+        jump_eq(SOCK_STREAM, 1, 0),
+        jump_eq(SOCK_SEQPACKET, 0, 1),
+        ret(SECCOMP_RET_ALLOW),
+        ret(errno(EPERM)),
+        // A socket's two timeouts, which is all std's Unix stream sets. Among
+        // what this leaves out is SO_ATTACH_FILTER, a program of the caller's.
+        jump_eq(SYS_SETSOCKOPT, 0, 7),
+        load(OFFSET_ARG1_LOW),
+        jump_eq(SOL_SOCKET, 0, 4),
+        load(OFFSET_ARG2_LOW),
+        jump_eq(SO_RCVTIMEO, 1, 0),
+        jump_eq(SO_SNDTIMEO, 0, 1),
+        ret(SECCOMP_RET_ALLOW),
+        ret(errno(ENOPROTOOPT)),
+        // ioctl requests are unsigned 32-bit values in the kernel ABI. Why this
+        // is the one request: APPLICATIONS.md, "Per-application allowlists".
+        jump_eq(SYS_IOCTL, 0, 4),
+        load(OFFSET_ARG1_LOW),
+        jump_eq(FIONBIO, 0, 1),
+        ret(SECCOMP_RET_ALLOW),
+        ret(errno(ENOTTY)),
+        jump_eq(SYS_CLONE, 0, 5),
+        load(OFFSET_ARG0_LOW),
+        and(CLONE_NEWUSER),
+        jump_eq(0, 1, 0),
+        ret(errno(EPERM)),
+        ret(SECCOMP_RET_ALLOW),
+    ];
+    for syscall in APPLICATION_ALLOWED.iter().chain(extra) {
+        program.push(jump_eq(*syscall, 0, 1));
+        program.push(ret(SECCOMP_RET_ALLOW));
+    }
+    // clone3 is among what this refuses: libc retries with clone, above.
+    program.push(ret(errno(ENOSYS)));
+    validate(&program, program.len())?;
+    Ok(program)
+}
+
+pub(crate) fn write_filter(filter: ApplicationFilter, mut output: impl Write) -> io::Result<()> {
+    let program = application_program(filter)?;
+    let len = u16::try_from(program.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "seccomp filter exceeds the export format",
@@ -743,7 +927,7 @@ pub(crate) fn write_standard_filter(mut output: impl Write) -> io::Result<()> {
     output.write_all(b"TDB1")?;
     output.write_all(&len.to_le_bytes())?;
     output.write_all(&[0, 0])?;
-    for instruction in program.instructions() {
+    for instruction in &program {
         output.write_all(&instruction.code.to_le_bytes())?;
         output.write_all(&[instruction.jt, instruction.jf])?;
         output.write_all(&instruction.k.to_le_bytes())?;
@@ -774,7 +958,11 @@ fn validate(instructions: &[SockFilter], declared_len: usize) -> io::Result<Prog
                     || instruction.jf != 0
                     || !matches!(
                         instruction.k,
-                        OFFSET_NR | OFFSET_ARCH | OFFSET_ARG0_LOW | OFFSET_ARG1_LOW
+                        OFFSET_NR
+                            | OFFSET_ARCH
+                            | OFFSET_ARG0_LOW
+                            | OFFSET_ARG1_LOW
+                            | OFFSET_ARG2_LOW
                     )
                 {
                     return Err(invalid_instruction(index));
@@ -801,7 +989,9 @@ fn validate(instructions: &[SockFilter], declared_len: usize) -> io::Result<Prog
                         SECCOMP_RET_KILL_PROCESS
                             | SECCOMP_RET_ALLOW
                             | 0x0005_0001
+                            | 0x0005_0019
                             | 0x0005_0026
+                            | 0x0005_005c
                             | 0x0005_0061
                     )
                 {
@@ -872,6 +1062,7 @@ mod tests {
                         OFFSET_ARCH => data.arch,
                         OFFSET_ARG0_LOW => data.args[0] as u32,
                         OFFSET_ARG1_LOW => data.args[1] as u32,
+                        OFFSET_ARG2_LOW => data.args[2] as u32,
                         offset => return Err(format!("unsupported load offset {offset}")),
                     };
                     pc += 1;
@@ -968,7 +1159,7 @@ mod tests {
         assert!(validate(&oversized, oversized.len()).is_err());
 
         let mut exported = Vec::new();
-        write_standard_filter(&mut exported).unwrap();
+        write_filter(ApplicationFilter::Standard, &mut exported).unwrap();
         assert_eq!(exported.get(..4), Some(b"TDB1".as_slice()));
         let count = u16::try_from(STANDARD_FILTER.len()).unwrap().to_le_bytes();
         assert_eq!(exported.get(4..6), Some(count.as_slice()));
@@ -1285,6 +1476,226 @@ mod tests {
         assert_eq!(
             interpret(&WORKSPACE_FILTER, data((X32_SYSCALL_BIT | 1) as i32)).unwrap(),
             SECCOMP_RET_KILL_PROCESS
+        );
+    }
+
+    fn allowlist_programs() -> [(ApplicationFilter, Vec<SockFilter>); 2] {
+        [ApplicationFilter::Mail, ApplicationFilter::News].map(|filter| {
+            let program = application_program(filter).unwrap();
+            (filter, program)
+        })
+    }
+
+    // As for the roster: the other tests read these lists, so a line dropped by
+    // a bad rebase would stay green and fail for a person.
+    #[test]
+    fn the_allowlists_are_exactly_these() {
+        assert_eq!(
+            APPLICATION_ALLOWED,
+            &[
+                0, 1, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20, 24, 25, 28, 32, 33, 34,
+                39, 42, 44, 45, 46, 47, 51, 52, 59, 60, 61, 62, 63, 72, 73, 74, 75, 77, 79, 80, 81,
+                82, 83, 87, 89, 99, 102, 104, 107, 108, 115, 131, 143, 145, 157, 158, 186, 202,
+                204, 217, 218, 219, 228, 230, 231, 234, 247, 257, 262, 267, 269, 273, 293, 302,
+                318, 332, 334, 439
+            ]
+        );
+        assert_eq!(MAIL_ALLOWED, &[55, 84, 91, 93, 263, 319]);
+        assert!(NEWS_ALLOWED.is_empty());
+    }
+
+    #[test]
+    fn the_allowlists_are_sorted_distinct_real_and_never_a_denied_number() {
+        for list in [APPLICATION_ALLOWED, MAIL_ALLOWED, NEWS_ALLOWED] {
+            assert!(list.windows(2).all(|pair| pair[0] < pair[1]));
+            for syscall in list {
+                assert!(!DENIED_SYSCALLS.contains(syscall), "denied {syscall}");
+                assert!(!unreviewed_number(*syscall), "not in the table: {syscall}");
+                assert!(
+                    !matches!(
+                        *syscall,
+                        SYS_SOCKET
+                            | SYS_SOCKETPAIR
+                            | SYS_SETSOCKOPT
+                            | SYS_IOCTL
+                            | SYS_CLONE
+                            | SYS_CLONE3
+                    ),
+                    "has an argument rule: {syscall}"
+                );
+            }
+        }
+        for syscall in MAIL_ALLOWED.iter().chain(NEWS_ALLOWED) {
+            assert!(!APPLICATION_ALLOWED.contains(syscall), "repeated {syscall}");
+        }
+    }
+
+    // Everything on the list is allowed whatever its arguments, and everything
+    // off it is refused, across the whole table and past it.
+    #[test]
+    fn an_allowlist_answers_exactly_its_list_and_its_argument_rules() {
+        for (filter, program) in allowlist_programs() {
+            let extra = match filter {
+                ApplicationFilter::Mail => MAIL_ALLOWED,
+                _ => NEWS_ALLOWED,
+            };
+            for syscall in 0_u32..=600 {
+                if matches!(
+                    syscall,
+                    SYS_SOCKET | SYS_SOCKETPAIR | SYS_SETSOCKOPT | SYS_IOCTL | SYS_CLONE
+                ) {
+                    continue;
+                }
+                let listed = APPLICATION_ALLOWED.contains(&syscall) || extra.contains(&syscall);
+                let mut call = data(syscall as i32);
+                for args in [[0_u64; 6], [u64::MAX; 6]] {
+                    call.args = args;
+                    assert_eq!(
+                        interpret(&program, call).unwrap(),
+                        if listed {
+                            SECCOMP_RET_ALLOW
+                        } else {
+                            errno(ENOSYS)
+                        },
+                        "{filter:?} syscall {syscall}"
+                    );
+                }
+            }
+            for syscall in [X32_SYSCALL_BIT - 1, 0x8000_0000, u32::MAX] {
+                assert_eq!(
+                    interpret(&program, data(syscall as i32)).unwrap(),
+                    errno(ENOSYS),
+                    "{filter:?} syscall {syscall:#x}"
+                );
+            }
+            let mut wrong = data(0);
+            wrong.arch = 0x4000_0003;
+            assert_eq!(
+                interpret(&program, wrong).unwrap(),
+                SECCOMP_RET_KILL_PROCESS
+            );
+            assert_eq!(
+                interpret(&program, data((X32_SYSCALL_BIT | 1) as i32)).unwrap(),
+                SECCOMP_RET_KILL_PROCESS
+            );
+        }
+    }
+
+    #[test]
+    fn an_allowlist_narrows_sockets_ioctls_and_clone() {
+        for (_, program) in allowlist_programs() {
+            let mut socket = data(SYS_SOCKET as i32);
+            socket.args[0] = u64::from(AF_UNIX);
+            assert_eq!(interpret(&program, socket).unwrap(), SECCOMP_RET_ALLOW);
+            for family in [0, AF_INET, AF_INET6, AF_NETLINK, 17, u32::MAX] {
+                socket.args[0] = u64::from(family);
+                assert_eq!(
+                    interpret(&program, socket).unwrap(),
+                    errno(EAFNOSUPPORT),
+                    "family {family}"
+                );
+            }
+
+            let option = |level: u32, name: u32| {
+                let mut call = data(SYS_SETSOCKOPT as i32);
+                call.args[1] = (1_u64 << 32) | u64::from(level);
+                call.args[2] = (1_u64 << 32) | u64::from(name);
+                interpret(&program, call).unwrap()
+            };
+            for name in [SO_RCVTIMEO, SO_SNDTIMEO] {
+                assert_eq!(option(SOL_SOCKET, name), SECCOMP_RET_ALLOW);
+                assert_eq!(option(6, name), errno(ENOPROTOOPT));
+            }
+            // SO_ATTACH_FILTER, SO_ATTACH_REUSEPORT_CBPF, SO_REUSEADDR, SO_PASSCRED.
+            for name in [26, 51, 2, 16, 0, u32::MAX] {
+                assert_eq!(option(SOL_SOCKET, name), errno(ENOPROTOOPT), "{name}");
+            }
+
+            let mut ioctl = data(SYS_IOCTL as i32);
+            for high in [0, 1_u64 << 32] {
+                ioctl.args[1] = high | u64::from(FIONBIO);
+                assert_eq!(interpret(&program, ioctl).unwrap(), SECCOMP_RET_ALLOW);
+            }
+            for request in [
+                TIOCSTI,
+                TIOCLINUX,
+                0x5401,
+                0x5404,
+                0x5410,
+                0x5413,
+                0x541b,
+                0x5450,
+                0x5451,
+                0x8912,
+                0,
+                u32::MAX,
+            ] {
+                for high in [0, 1_u64 << 32] {
+                    ioctl.args[1] = high | u64::from(request);
+                    assert_eq!(
+                        interpret(&program, ioctl).unwrap(),
+                        errno(ENOTTY),
+                        "request {request:#x}"
+                    );
+                }
+            }
+
+            let pair = |family: u32, kind: u32| {
+                let mut call = data(SYS_SOCKETPAIR as i32);
+                call.args[0] = u64::from(family);
+                call.args[1] = u64::from(kind);
+                interpret(&program, call).unwrap()
+            };
+            for flags in [0, SOCK_NONBLOCK, SOCK_CLOEXEC, SOCK_NONBLOCK | SOCK_CLOEXEC] {
+                assert_eq!(pair(AF_UNIX, SOCK_STREAM | flags), SECCOMP_RET_ALLOW);
+                assert_eq!(pair(AF_UNIX, SOCK_SEQPACKET | flags), SECCOMP_RET_ALLOW);
+            }
+            for (family, kind) in [(AF_UNIX, 2), (AF_UNIX, 3), (AF_INET, SOCK_STREAM)] {
+                assert_eq!(pair(family, kind), errno(EPERM), "{family} {kind}");
+            }
+
+            let mut clone = data(SYS_CLONE as i32);
+            assert_eq!(interpret(&program, clone).unwrap(), SECCOMP_RET_ALLOW);
+            clone.args[0] = u64::from(CLONE_NEWUSER);
+            assert_eq!(interpret(&program, clone).unwrap(), errno(EPERM));
+            assert_eq!(
+                interpret(&program, data(SYS_CLONE3 as i32)).unwrap(),
+                errno(ENOSYS)
+            );
+        }
+    }
+
+    // A signal's return, the kernel's restart of what it interrupted, the vDSO's
+    // clock fallback, and the reap of a spawn whose exec failed. An omission is
+    // a program that dies on a signal or an unusual clocksource, or leaks a
+    // zombie against its pid limit, which no ordinary test reaches.
+    #[test]
+    fn every_allowlist_keeps_what_an_ordinary_test_never_reaches() {
+        for (_, program) in allowlist_programs() {
+            for syscall in [15, 219, 228, 247] {
+                assert_eq!(
+                    interpret(&program, data(syscall)).unwrap(),
+                    SECCOMP_RET_ALLOW,
+                    "syscall {syscall}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_filter_names_round_trip_and_refuse_anything_else() {
+        for filter in [
+            ApplicationFilter::Standard,
+            ApplicationFilter::Mail,
+            ApplicationFilter::News,
+        ] {
+            assert_eq!(ApplicationFilter::from_wire(filter.wire()), Some(filter));
+        }
+        assert_eq!(ApplicationFilter::from_wire(""), None);
+        assert_eq!(ApplicationFilter::from_wire("Mail"), None);
+        assert_eq!(
+            application_program(ApplicationFilter::Standard).unwrap(),
+            STANDARD_FILTER
         );
     }
 

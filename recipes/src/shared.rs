@@ -1214,6 +1214,11 @@ pub const TD_JAIL_TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 /// td-jail's exported filter and observes the compiled errno and kill actions.
 pub const TD_JAIL_SECCOMP_PROBE_MARKER: &str = "TD-JAIL-SECCOMP-PROBE-OK";
 
+/// What the same probe prints under a per-application allowlist. The QEMU leg
+/// requires it, with no allowance for inherited confinement, before it prints
+/// the marker above.
+pub const TD_JAIL_APPLICATION_FILTER_PROBE_MARKER: &str = "TD-JAIL-APPLICATION-FILTER-PROBE-OK";
+
 /// td-compositor opened the card as the compositor account, took DRM
 /// mastership, and set the mode it will scan out from: APPLICATIONS.md §M row
 /// 1, printed by the running compositor rather than by a probe beside it.
@@ -1315,7 +1320,8 @@ pub const TD_FIREFOX_BOOT_MARKER: &str = "TD-FIREFOX-FIRST-WINDOW-READY";
 // token once td-jail has found the client itself, by the program its entry
 // runs as, still in its jail instance a few seconds after its td-term window
 // reported ready: the program started on the configuration td-firstboot
-// provisioned and did not exit on it.
+// provisioned and did not exit on it. Its stage 2 must also hold its allowlist's
+// name, since on the wider program it would run as well as ever.
 pub const TD_MAIL_BOOT_MARKER: &str = "TD-MAIL-RUNNING";
 // Printed by the `setup-evidence` unit on a live boot under the autotest
 // token once the installer wizard's window is the focused one and

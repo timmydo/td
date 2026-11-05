@@ -27,10 +27,10 @@ use crate::shared::{
     TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER, TD_FETCH_BOOT_MARKER,
     TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER, TD_FIREFOX_INPUT_FAILED_MARKER,
     TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
-    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY,
-    TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
-    TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_JAIL_APPLICATION_FILTER_PROBE_MARKER, TD_JAIL_KILL_REAPS_MARKER,
+    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
+    TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY,
+    TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
     TD_SOFTWARE_INSTALL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
     UUTILS_RUNTIME_MARKER,
@@ -2208,7 +2208,7 @@ fn build_desktop_td_svc_conf() -> String {
          [mail-evidence]\n\
          type=oneshot\n\
          unless-exists={live_medium}\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-primary -- /bin/td-jail --probe-process-token {mail_name} {mail_program} && /bin/echo {mail_marker}'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-primary -- /bin/td-jail --probe-process-token {mail_name} {mail_program} && /bin/td-login exec-primary -- /bin/td-jail --probe-application-filter {mail_name} {mail_name} && /bin/echo {mail_marker}'\n\
          after=mail,firefox-tls-setup\n\
          requires=mail\n\
          timeout={application_evidence}\n\
@@ -2233,7 +2233,7 @@ fn build_desktop_td_svc_conf() -> String {
          [news-evidence]\n\
          type=oneshot\n\
          unless-exists={live_medium}\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-primary -- /bin/td-jail --probe-process-token {news_name} {news_program} && /bin/echo {news_marker}'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-primary -- /bin/td-jail --probe-process-token {news_name} {news_program} && /bin/td-login exec-primary -- /bin/td-jail --probe-application-filter {news_name} {news_name} && /bin/echo {news_marker}'\n\
          after=news,firefox-tls-setup\n\
          requires=news\n\
          timeout={application_evidence}\n\
@@ -3739,16 +3739,28 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          /run/td-jail-seccomp-probe/probe \
          && /bin/td-jail --internal-write-seccomp-filter \
          >/run/td-jail-seccomp-probe/filter.bpf \
+         && /bin/td-jail --internal-write-seccomp-filter mail \
+         >/run/td-jail-seccomp-probe/filter-mail.bpf \
+         && /bin/td-jail --internal-write-seccomp-filter news \
+         >/run/td-jail-seccomp-probe/filter-news.bpf \
          && /bin/chown 0:0 /run/td-jail-seccomp-probe \
          /run/td-jail-seccomp-probe/probe /run/td-jail-seccomp-probe/filter.bpf \
+         /run/td-jail-seccomp-probe/filter-mail.bpf \
+         /run/td-jail-seccomp-probe/filter-news.bpf \
          && /bin/chmod 0555 /run/td-jail-seccomp-probe \
          /run/td-jail-seccomp-probe/probe \
-         && /bin/chmod 0444 /run/td-jail-seccomp-probe/filter.bpf; then \
+         && /bin/chmod 0444 /run/td-jail-seccomp-probe/filter.bpf \
+         /run/td-jail-seccomp-probe/filter-mail.bpf \
+         /run/td-jail-seccomp-probe/filter-news.bpf; then \
          if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          '[ -x /run/td-jail-seccomp-probe/probe ] \
          && [ ! -w /run/td-jail-seccomp-probe/probe ] \
          && [ -r /run/td-jail-seccomp-probe/filter.bpf ] \
          && [ ! -w /run/td-jail-seccomp-probe/filter.bpf ] \
+         && [ -r /run/td-jail-seccomp-probe/filter-mail.bpf ] \
+         && [ ! -w /run/td-jail-seccomp-probe/filter-mail.bpf ] \
+         && [ -r /run/td-jail-seccomp-probe/filter-news.bpf ] \
+         && [ ! -w /run/td-jail-seccomp-probe/filter-news.bpf ] \
          && [ ! -w /run/td-jail-seccomp-probe ] || \
          {{ echo \"td-jail: target seccomp inputs are not immutable\"; exit 1; }}; \
          p=$(/run/td-jail-seccomp-probe/probe \
@@ -3756,6 +3768,18 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {{ echo \"td-jail: target seccomp behavior probe failed\"; exit 1; }}; \
          [ \"$p\" = {TD_JAIL_SECCOMP_PROBE_MARKER} ] || \
          {{ echo \"td-jail: target seccomp behavior returned unexpected output\"; \
+         exit 1; }}; \
+         p=$(/run/td-jail-seccomp-probe/probe --application-filter mail \
+         /run/td-jail-seccomp-probe/filter-mail.bpf 2>&1) || \
+         {{ echo \"td-jail: target mail filter probe failed\"; exit 1; }}; \
+         [ \"$p\" = {TD_JAIL_APPLICATION_FILTER_PROBE_MARKER} ] || \
+         {{ echo \"td-jail: target mail filter probe returned unexpected output\"; \
+         exit 1; }}; \
+         p=$(/run/td-jail-seccomp-probe/probe --application-filter news \
+         /run/td-jail-seccomp-probe/filter-news.bpf 2>&1) || \
+         {{ echo \"td-jail: target news filter probe failed\"; exit 1; }}; \
+         [ \"$p\" = {TD_JAIL_APPLICATION_FILTER_PROBE_MARKER} ] || \
+         {{ echo \"td-jail: target news filter probe returned unexpected output\"; \
          exit 1; }}'; then echo {TD_JAIL_SECCOMP_PROBE_MARKER}; mts=1; fi; \
          else echo \"td-jail: could not prepare immutable target seccomp inputs\"; fi; fi\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
@@ -8186,7 +8210,7 @@ mod tests {
             assert!(exec.contains(AUTOTEST_CMDLINE_TOKEN), "{exec}");
             assert!(
                 exec.contains(&format!(
-                    "/bin/td-jail --probe-process-token {name} {program} && /bin/echo {marker}'"
+                    "/bin/td-jail --probe-process-token {name} {program} && /bin/td-login exec-primary -- /bin/td-jail --probe-application-filter {name} {name} && /bin/echo {marker}'"
                 )),
                 "{exec}"
             );
@@ -8278,6 +8302,32 @@ mod tests {
         let layout = include_str!("../../../td-compositor/src/layout.rs");
         assert!(layout.contains("pub(crate) const INITIAL_WORKSPACE: u8 = 1;"));
         assert!(layout.contains("pub(crate) const FINAL_WORKSPACE: u8 = 9;"));
+    }
+
+    // A renamed package or a new runtime version would leave its application
+    // on the wider standard program, and nothing else would notice.
+    #[test]
+    fn the_allowlisted_applications_are_the_packages_td_jail_names() {
+        const AUTHORITY: &str = include_str!("../../../td-jail/src/authority.rs");
+        let runtime = super::super::static_runtime::recipe();
+        for declaration in [
+            format!(
+                "const STATIC_RUNTIME: &str = \"{}-{}\";",
+                runtime.name, runtime.version
+            ),
+            format!("const MAIL_NAME: &str = \"{TD_MAIL_NAME}\";"),
+            format!("const NEWS_NAME: &str = \"{TD_NEWS_NAME}\";"),
+        ] {
+            assert_eq!(AUTHORITY.matches(&declaration).count(), 1, "{declaration}");
+        }
+        // And a third static application is a decision, not a silent default.
+        let mut on_the_runtime: Vec<&str> = SHIPPED_APPLICATIONS
+            .iter()
+            .filter(|application| application.runtime == runtime.name)
+            .map(|application| application.name)
+            .collect();
+        on_the_runtime.sort_unstable();
+        assert_eq!(on_the_runtime, [TD_MAIL_NAME, TD_NEWS_NAME]);
     }
 
     #[test]
@@ -14090,6 +14140,9 @@ mod tests {
                 && bootsuccess.contains("/var/lib/td-test/td-jail-seccomp-probe")
                 && bootsuccess.contains("/run/td-jail-seccomp-probe/probe")
                 && bootsuccess.contains("[ ! -w /run/td-jail-seccomp-probe/filter.bpf ]")
+                && bootsuccess.contains("--application-filter mail")
+                && bootsuccess.contains("--application-filter news")
+                && bootsuccess.contains(TD_JAIL_APPLICATION_FILTER_PROBE_MARKER)
                 && bootsuccess.contains(TD_JAIL_SECCOMP_PROBE_MARKER)
                 && bootsuccess.contains(&format!(
                     "/bin/td-busd probe {SESSION_BUS_SOCKET}"

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 pub const PROBE_ARG: &str = "--probe-transition";
 pub const RESOURCE_PROBE_ARG: &str = "--probe-resource-caps";
 pub const PROCESS_TOKEN_PROBE_ARG: &str = "--probe-process-token";
+pub const APPLICATION_FILTER_PROBE_ARG: &str = "--probe-application-filter";
 pub const FIREFOX_SUPPORT_PROBE_ARG: &str = "--probe-firefox-support";
 pub const FIREFOX_NETWORK_PROBE_ARG: &str = "--probe-firefox-network";
 pub const FIREFOX_SOAK_PROBE_ARG: &str = "--probe-firefox-soak";
@@ -41,6 +42,7 @@ const STAGE2_MACHINE_ID_ARG: &str = "--machine-id";
 const STAGE2_TIMEZONE_ARG: &str = "--timezone";
 const STAGE2_FIREFOX_AUTOTEST_POLICY_ARG: &str = "--firefox-autotest-policy";
 const STAGE2_FIREFOX_SECCOMP_PROBE_ARG: &str = "--firefox-seccomp-probe";
+pub(crate) const STAGE2_APPLICATION_FILTER_ARG: &str = "--application-filter";
 const STAGE2_FETCH_SOCKET_ARG: &str = "--fetch-socket";
 const STAGE2_LOADER_LIBRARY_PATH_ARG: &str = "--loader-library-path";
 const STAGE2_RUNTIME_ALIASES_ARG: &str = "--runtime-aliases";
@@ -321,6 +323,10 @@ pub enum Mode {
     ResourceProbe {
         application: String,
     },
+    ApplicationFilterProbe {
+        application: String,
+        filter: authority::ApplicationFilter,
+    },
     ProcessTokenProbe {
         application: String,
         token: String,
@@ -335,7 +341,7 @@ pub enum Mode {
         stage: firefox::InputStage,
     },
     FirefoxDownloadProbe,
-    WriteFilter,
+    WriteFilter(authority::ApplicationFilter),
     ApplicationSession {
         parent: u32,
         argv0: OsString,
@@ -379,6 +385,7 @@ pub struct Stage2Launch {
     timezone: Option<String>,
     firefox_autotest_policy: bool,
     firefox_seccomp_probe: bool,
+    application_filter: authority::ApplicationFilter,
     /// The fetch service's directory is bound under the runtime directory
     /// (`sockets=fetch`), and the readback requires it there, its socket
     /// under it.
@@ -417,6 +424,16 @@ pub enum Stage2Action {
     Launch(Box<Stage2Launch>),
     /// The `workspace` kind: its own plan, filter and channel stdio.
     Workspace(Box<Stage2Workspace>),
+}
+
+impl Stage2Action {
+    /// Only a launch names one; every probe runs under the standard program.
+    fn application_filter(&self) -> authority::ApplicationFilter {
+        match self {
+            Stage2Action::Launch(launch) => launch.application_filter,
+            _ => authority::ApplicationFilter::Standard,
+        }
+    }
 }
 
 /// What stage 2 of a `workspace` launch was told: the plan it reads back
@@ -484,6 +501,7 @@ struct Stage2MountBinding<'a> {
     timezone: Option<&'a str>,
     firefox_autotest_policy: bool,
     firefox_seccomp_probe: bool,
+    application_filter: authority::ApplicationFilter,
     fetch_socket: bool,
     loader_library_path: Option<&'a str>,
     runtime_aliases: bool,
@@ -539,6 +557,26 @@ where
         }
         authority::validate_application_name(&application)?;
         return Ok(Mode::ResourceProbe { application });
+    }
+    if mode == APPLICATION_FILTER_PROBE_ARG {
+        let application = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
+        let filter = args
+            .next()
+            .as_deref()
+            .and_then(OsStr::to_str)
+            .and_then(authority::ApplicationFilter::from_wire)
+            .ok_or_else(usage_error)?;
+        if args.next().is_some() {
+            return Err(usage_error());
+        }
+        return Ok(Mode::ApplicationFilterProbe {
+            application,
+            filter,
+        });
     }
     if mode == PROCESS_TOKEN_PROBE_ARG {
         let application = args
@@ -603,10 +641,17 @@ where
         return Ok(Mode::FirefoxDownloadProbe);
     }
     if mode == FILTER_ARG {
+        let filter = match args.next() {
+            None => authority::ApplicationFilter::Standard,
+            Some(name) => name
+                .to_str()
+                .and_then(authority::ApplicationFilter::from_wire)
+                .ok_or_else(usage_error)?,
+        };
         if args.next().is_some() {
             return Err(usage_error());
         }
-        return Ok(Mode::WriteFilter);
+        return Ok(Mode::WriteFilter(filter));
     }
     if mode == APPLICATION_SESSION_ARG {
         let parent = parse_positive_pid(args.next())?;
@@ -789,6 +834,19 @@ where
             Some("absent") => false,
             _ => return Err(usage_error()),
         };
+        if args.next().as_deref() != Some(STAGE2_APPLICATION_FILTER_ARG.as_ref()) {
+            return Err(usage_error());
+        }
+        let application_filter = args
+            .next()
+            .as_deref()
+            .and_then(OsStr::to_str)
+            .and_then(authority::ApplicationFilter::from_wire)
+            .ok_or_else(usage_error)?;
+        // The audit proof's helper and its marker describe the standard program.
+        if firefox_seccomp_probe && application_filter != authority::ApplicationFilter::Standard {
+            return Err(usage_error());
+        }
         if args.next().as_deref() != Some(STAGE2_FETCH_SOCKET_ARG.as_ref()) {
             return Err(usage_error());
         }
@@ -948,6 +1006,7 @@ where
             timezone,
             firefox_autotest_policy,
             firefox_seccomp_probe,
+            application_filter,
             fetch_socket,
             runtime_aliases,
             terminal,
@@ -1054,6 +1113,8 @@ fn stage2_launch_arguments(
         } else {
             "absent"
         }),
+        OsString::from(STAGE2_APPLICATION_FILTER_ARG),
+        OsString::from(mounts.application_filter.wire()),
         OsString::from(STAGE2_FETCH_SOCKET_ARG),
         OsString::from(if mounts.fetch_socket {
             "present"
@@ -1141,7 +1202,7 @@ fn parse_count(value: Option<OsString>, name: &str) -> io::Result<usize> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "bare td-jail accepts only --probe-transition, --probe-kill-reaps, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-firefox-support, --probe-firefox-network, --probe-firefox-soak, --probe-firefox-seccomp-audit PID, --probe-firefox-download, or --probe-firefox-input arm|focus|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download|file-chooser|file-chooser-focus|file-chooser-result; installed applications are selected by argv[0]",
+        "bare td-jail accepts only --probe-transition, --probe-kill-reaps, --probe-resource-caps NAME, --probe-process-token NAME TOKEN, --probe-application-filter NAME FILTER, --probe-firefox-support, --probe-firefox-network, --probe-firefox-soak, --probe-firefox-seccomp-audit PID, --probe-firefox-download, or --probe-firefox-input arm|focus|menu|final|clipboard-refocus-arm|clipboard-refocus|clipboard|download|file-chooser|file-chooser-focus|file-chooser-result; installed applications are selected by argv[0]",
     )
 }
 
@@ -2675,8 +2736,11 @@ fn require_runtime_confinement() -> io::Result<()> {
     Ok(())
 }
 
-fn install_standard_seccomp_filter(log_denials: bool) -> io::Result<()> {
-    let program = seccomp::standard_program()?;
+fn install_application_seccomp_filter(
+    filter: authority::ApplicationFilter,
+    log_denials: bool,
+) -> io::Result<()> {
+    let program = seccomp::application_program(filter)?;
     sys::set_no_new_privileges()?;
     if !sys::no_new_privileges()? {
         return Err(io::Error::new(
@@ -2684,7 +2748,7 @@ fn install_standard_seccomp_filter(log_denials: bool) -> io::Result<()> {
             "PR_SET_NO_NEW_PRIVS succeeded without changing its readback",
         ));
     }
-    sys::install_seccomp_filter(program.instructions(), log_denials)?;
+    sys::install_seccomp_filter(&program, log_denials)?;
     require_runtime_confinement()
 }
 
@@ -4960,6 +5024,28 @@ pub fn probe_process_token(application: &str, token: &str) -> io::Result<()> {
     writeln!(io::stdout(), "{diagnostic}")
 }
 
+pub fn probe_application_filter(
+    application: &str,
+    filter: authority::ApplicationFilter,
+) -> io::Result<()> {
+    let identity = current_identity()?;
+    if identity.uid == 0 || identity.gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "td-jail requires the nonzero application identity",
+        ));
+    }
+    let limits = authority::resolve_resource_limits(application)?;
+    let diagnostic = cgroup::probe_application_filter(
+        application,
+        filter.wire(),
+        limits,
+        identity.uid,
+        identity.gid,
+    )?;
+    writeln!(io::stdout(), "{diagnostic}")
+}
+
 pub fn probe_firefox_support() -> io::Result<()> {
     let identity = current_identity()?;
     if identity.uid == 0 || identity.gid == 0 {
@@ -5294,6 +5380,7 @@ pub fn run_stage2(
         &action,
         Stage2Action::Launch(launch) if launch.cgroup_membership == NO_CGROUP_MEMBERSHIP
     );
+    let application_filter = action.application_filter();
     let (filesystems, etc, runtime_aliases, pulse, firefox_seccomp_probe, fetch_socket) =
         match &action {
             // Its own plan, returned to above.
@@ -5353,16 +5440,18 @@ pub fn run_stage2(
         identity,
     )?;
     clear_and_require_empty_capabilities()?;
-    install_standard_seccomp_filter(firefox_seccomp_probe).map_err(|error| {
-        if host_mode {
-            io::Error::new(
-                error.kind(),
-                format!("host mode requires the standard seccomp filter: {error}"),
-            )
-        } else {
-            error
-        }
-    })?;
+    install_application_seccomp_filter(application_filter, firefox_seccomp_probe).map_err(
+        |error| {
+            if host_mode {
+                io::Error::new(
+                    error.kind(),
+                    format!("host mode requires the standard seccomp filter: {error}"),
+                )
+            } else {
+                error
+            }
+        },
+    )?;
     match action {
         Stage2Action::Workspace(_) => Err(usage_error()),
         Stage2Action::Probe => {
@@ -5386,6 +5475,7 @@ pub fn run_stage2(
                 timezone: _,
                 firefox_autotest_policy: _,
                 firefox_seccomp_probe,
+                application_filter: _,
                 fetch_socket: _,
                 runtime_aliases: _,
                 terminal,
@@ -6224,6 +6314,7 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
                 timezone: application.timezone.as_ref().map(|zone| zone.name.as_str()),
                 firefox_autotest_policy: application.firefox_autotest_policy.is_some(),
                 firefox_seccomp_probe: application.firefox_seccomp_probe.is_some(),
+                application_filter: application.application_filter,
                 fetch_socket: application.fetch_socket.is_some(),
                 loader_library_path: application.loader_library_path.as_deref(),
                 runtime_aliases: application.runtime_aliases,
@@ -6403,8 +6494,8 @@ fn read_launch_diagnostic(reader: &mut impl Read) -> io::Result<String> {
         .map_err(|e| io::Error::other(format!("launch-stage diagnostic is not UTF-8: {e}")))
 }
 
-pub fn write_standard_filter() -> io::Result<()> {
-    seccomp::write_standard_filter(io::stdout().lock())
+pub fn write_filter(filter: authority::ApplicationFilter) -> io::Result<()> {
+    seccomp::write_filter(filter, io::stdout().lock())
 }
 
 // The `workspace` kind (APPLICATIONS.md §C). Its stages are the
@@ -8097,8 +8188,22 @@ mod tests {
         assert!(parse_mode(args(&[])).is_err());
         assert!(parse_mode(args(&["firefox"])).is_err());
         assert!(parse_mode(args(&[PROBE_ARG, "extra"])).is_err());
-        assert_eq!(parse_mode(args(&[FILTER_ARG])).unwrap(), Mode::WriteFilter);
+        assert_eq!(
+            parse_mode(args(&[FILTER_ARG])).unwrap(),
+            Mode::WriteFilter(authority::ApplicationFilter::Standard)
+        );
+        for (name, filter) in [
+            ("standard", authority::ApplicationFilter::Standard),
+            ("mail", authority::ApplicationFilter::Mail),
+            ("news", authority::ApplicationFilter::News),
+        ] {
+            assert_eq!(
+                parse_mode(args(&[FILTER_ARG, name])).unwrap(),
+                Mode::WriteFilter(filter)
+            );
+        }
         assert!(parse_mode(args(&[FILTER_ARG, "extra"])).is_err());
+        assert!(parse_mode(args(&[FILTER_ARG, "mail", "extra"])).is_err());
         assert_eq!(
             parse_mode(args(&[
                 APPLICATION_SESSION_ARG,
@@ -8239,6 +8344,88 @@ mod tests {
     }
 
     #[test]
+    fn stage2_carries_the_named_filter_and_refuses_one_it_cannot_hold() {
+        let encoded = encode_token(&[0_u8; TOKEN_LEN]);
+        let launch = |probe: &str, filter: &str| {
+            parse_mode(args(&[
+                STAGE2_ARG,
+                &encoded,
+                "1000",
+                "1000",
+                "1234",
+                "2345",
+                STAGE2_LAUNCH_ARG,
+                "/app/bin/app",
+                STAGE2_RESOLV_CONF_ARG,
+                "absent",
+                STAGE2_MACHINE_ID_ARG,
+                "0123456789abcdef0123456789abcdef\n",
+                STAGE2_TIMEZONE_ARG,
+                NO_TIMEZONE,
+                STAGE2_FIREFOX_AUTOTEST_POLICY_ARG,
+                "absent",
+                STAGE2_FIREFOX_SECCOMP_PROBE_ARG,
+                probe,
+                STAGE2_APPLICATION_FILTER_ARG,
+                filter,
+                STAGE2_FETCH_SOCKET_ARG,
+                "absent",
+                STAGE2_RUNTIME_ALIASES_ARG,
+                "absent",
+                STAGE2_LOADER_LIBRARY_PATH_ARG,
+                "absent",
+                STAGE2_TERMINAL_ARG,
+                "absent",
+                STAGE2_WORKING_DIRECTORY_ARG,
+                "absent",
+                STAGE2_ENVIRONMENT_ARG,
+                "6",
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/run/user/1000/bus",
+                "FLATPAK_ID",
+                "org.td.App",
+                "GLIBC_TUNABLES",
+                "glibc.malloc.perturb=1",
+                "HOME",
+                "/home/td",
+                "WAYLAND_DISPLAY",
+                "wayland-0",
+                "XDG_RUNTIME_DIR",
+                "/run/user/1000",
+                STAGE2_FILESYSTEMS_ARG,
+                "0",
+                STAGE2_RESOURCES_ARG,
+                "50331648",
+                "67108864",
+                "32",
+                "50000",
+                "100000",
+                "/td-user-1000/app-0123456789abcdef",
+                STAGE2_ARGUMENTS_ARG,
+            ]))
+        };
+        for filter in [
+            authority::ApplicationFilter::Standard,
+            authority::ApplicationFilter::Mail,
+            authority::ApplicationFilter::News,
+        ] {
+            let Mode::Stage2 { action, .. } = launch("absent", filter.wire()).unwrap() else {
+                panic!("not a stage 2 launch");
+            };
+            assert!(matches!(action, Stage2Action::Launch(_)));
+            assert_eq!(action.application_filter(), filter);
+        }
+        assert_eq!(
+            Stage2Action::Probe.application_filter(),
+            authority::ApplicationFilter::Standard
+        );
+        assert!(launch("present", "standard").is_ok());
+        assert!(launch("present", "mail").is_err());
+        assert!(launch("present", "news").is_err());
+        assert!(launch("absent", "extra").is_err());
+    }
+
+    #[test]
     fn stage2_token_round_trips_and_is_strict() {
         let mut token = [0_u8; TOKEN_LEN];
         for (index, byte) in token.iter_mut().enumerate() {
@@ -8279,6 +8466,8 @@ mod tests {
                 "present",
                 STAGE2_FIREFOX_SECCOMP_PROBE_ARG,
                 "present",
+                STAGE2_APPLICATION_FILTER_ARG,
+                "standard",
                 STAGE2_FETCH_SOCKET_ARG,
                 "absent",
                 STAGE2_RUNTIME_ALIASES_ARG,
@@ -8328,6 +8517,7 @@ mod tests {
                 timezone: Some("Europe/Berlin".into()),
                 firefox_autotest_policy: true,
                 firefox_seccomp_probe: true,
+                application_filter: authority::ApplicationFilter::Standard,
                 fetch_socket: false,
                 runtime_aliases: false,
                 terminal: false,
@@ -8643,33 +8833,51 @@ mod tests {
             source_device: 1,
             source_inode: 2,
         }];
-        let emitted = stage2_launch_arguments(
-            &token,
-            LaunchIdentityMap {
-                inside: identity,
-                outside: outside_identity,
-            },
-            "/app/bin/app",
-            &environment,
-            Stage2MountBinding {
-                filesystems: &filesystems,
-                resolv_conf: false,
-                machine_id,
-                timezone: Some("Europe/Berlin"),
-                firefox_autotest_policy: true,
-                firefox_seccomp_probe: true,
-                fetch_socket: false,
-                loader_library_path: Some("/app/lib:/app/lib/firefox"),
-                runtime_aliases: true,
-                terminal: false,
-                working_directory: Some(Path::new("/home/td/src/td")),
-            },
-            Stage2ResourceBinding {
-                limits: resources,
-                membership,
-            },
-            &arguments,
-        );
+        let emit = |firefox_seccomp_probe, application_filter| {
+            stage2_launch_arguments(
+                &token,
+                LaunchIdentityMap {
+                    inside: identity,
+                    outside: outside_identity,
+                },
+                "/app/bin/app",
+                &environment,
+                Stage2MountBinding {
+                    filesystems: &filesystems,
+                    resolv_conf: false,
+                    machine_id,
+                    timezone: Some("Europe/Berlin"),
+                    firefox_autotest_policy: true,
+                    firefox_seccomp_probe,
+                    application_filter,
+                    fetch_socket: false,
+                    loader_library_path: Some("/app/lib:/app/lib/firefox"),
+                    runtime_aliases: true,
+                    terminal: false,
+                    working_directory: Some(Path::new("/home/td/src/td")),
+                },
+                Stage2ResourceBinding {
+                    limits: resources,
+                    membership,
+                },
+                &arguments,
+            )
+        };
+        // A constant in the emitter would leave mail on the wider program, and
+        // only this could tell.
+        for filter in [
+            authority::ApplicationFilter::Mail,
+            authority::ApplicationFilter::News,
+        ] {
+            assert!(matches!(
+                parse_mode(emit(false, filter).into_iter()).unwrap(),
+                Mode::Stage2 {
+                    action: Stage2Action::Launch(launch),
+                    ..
+                } if launch.application_filter == filter && !launch.firefox_seccomp_probe
+            ));
+        }
+        let emitted = emit(true, authority::ApplicationFilter::Standard);
         // The sentinel is the value EVERY launch emits until a writer for
         // `/etc/timezone` exists, so it needs a POSITIVE assertion: every
         // other `NO_TIMEZONE` in these tests sits in a case that is refused
@@ -8739,6 +8947,7 @@ mod tests {
                 timezone: Some("Europe/Berlin"),
                 firefox_autotest_policy: true,
                 firefox_seccomp_probe: true,
+                application_filter: authority::ApplicationFilter::Standard,
                 fetch_socket: true,
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
                 runtime_aliases: true,
@@ -8880,6 +9089,7 @@ mod tests {
                 timezone: Some("Europe/Berlin"),
                 firefox_autotest_policy: true,
                 firefox_seccomp_probe: false,
+                application_filter: authority::ApplicationFilter::Standard,
                 fetch_socket: false,
                 loader_library_path: Some("/app/lib:/app/lib/firefox"),
                 runtime_aliases: true,
@@ -8907,6 +9117,7 @@ mod tests {
                     timezone: Some("Europe/Berlin".into()),
                     firefox_autotest_policy: true,
                     firefox_seccomp_probe: true,
+                    application_filter: authority::ApplicationFilter::Standard,
                     fetch_socket: false,
                     runtime_aliases: true,
                     terminal: false,
@@ -9071,6 +9282,17 @@ mod tests {
         assert!(parse_mode(args(&[RESOURCE_PROBE_ARG])).is_err());
         assert!(parse_mode(args(&[RESOURCE_PROBE_ARG, "bad/name"])).is_err());
         assert!(parse_mode(args(&[RESOURCE_PROBE_ARG, "app", "extra"])).is_err());
+
+        assert_eq!(
+            parse_mode(args(&[APPLICATION_FILTER_PROBE_ARG, "mail", "mail"])).unwrap(),
+            Mode::ApplicationFilterProbe {
+                application: "mail".into(),
+                filter: authority::ApplicationFilter::Mail,
+            }
+        );
+        assert!(parse_mode(args(&[APPLICATION_FILTER_PROBE_ARG, "mail"])).is_err());
+        assert!(parse_mode(args(&[APPLICATION_FILTER_PROBE_ARG, "mail", "extra"])).is_err());
+        assert!(parse_mode(args(&[APPLICATION_FILTER_PROBE_ARG, "mail", "mail", "x"])).is_err());
 
         assert_eq!(
             parse_mode(args(&[PROCESS_TOKEN_PROBE_ARG, "firefox", "-contentproc"])).unwrap(),

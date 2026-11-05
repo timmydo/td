@@ -90,6 +90,7 @@ pub(crate) fn source() -> &'static str {
 #include <linux/seccomp.h>
 #include <sched.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,8 +101,10 @@ pub(crate) fn source() -> &'static str {
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define TD_SYS_IO_URING_SETUP 425
@@ -112,6 +115,8 @@ pub(crate) fn source() -> &'static str {
 #define TD_SYS_ABOVE_CEILING 473
 #define TD_X32_SYSCALL_BIT 0x40000000UL
 #define TD_PROBE_MARKER "TD-JAIL-SECCOMP-PROBE-OK"
+#define TD_APPLICATION_MARKER "TD-JAIL-APPLICATION-FILTER-PROBE-OK"
+#define TD_APPLICATION_FILTER "--application-filter"
 #define TD_ALLOW_INHERITED_CONFINEMENT "--allow-inherited-confinement"
 #define TD_PROBE_INHERITED_EXEC "--probe-inherited-exec"
 #define TD_AUDIT_MARKER "--audit-marker"
@@ -405,10 +410,123 @@ static int prove_denied_calls(void) {
     return expect_x32_kill();
 }
 
+/* getppid, unshare and FIONREAD succeed on any kernel without the filter, so
+ * these answers can only be the filter's. The rest also hold it to its list,
+ * though a kernel built without one of those calls would answer the same. */
+static int expect_refused(long number, long a, long b, const char *what) {
+    errno = 0;
+    return expect_errno(syscall(number, a, b, 0, 0, 0, 0), ENOSYS, what);
+}
+
+static int prove_application_filter(int mail) {
+    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    char *spawn_argv[] = {(char *)"td-jail-probe", NULL};
+    char *spawn_envp[] = {NULL};
+    pid_t spawned;
+    int fds[2];
+    int one = 1;
+    int fd;
+    if (expect_refused(SYS_getppid, 0, 0, "getppid") != 0 ||
+        expect_refused(SYS_unshare, 0, 0, "unshare") != 0 ||
+        expect_refused(SYS_epoll_create1, 0, 0, "epoll_create1") != 0 ||
+        expect_refused(SYS_eventfd2, 0, 0, "eventfd2") != 0 ||
+        expect_refused(SYS_timerfd_create, CLOCK_MONOTONIC, 0, "timerfd_create") != 0 ||
+        expect_refused(SYS_msgget, 0, 0, "msgget") != 0 ||
+        expect_refused(SYS_shmget, 0, 0, "shmget") != 0 ||
+        expect_refused(SYS_mq_unlink, 0, 0, "mq_unlink") != 0 ||
+        expect_refused(SYS_setsid, 0, 0, "setsid") != 0 ||
+        expect_refused(SYS_setuid, 0, 0, "setuid") != 0 ||
+        expect_refused(SYS_personality, 0xffffffffL, 0, "personality query") != 0 ||
+        expect_refused(SYS_bind, -1, 0, "bind") != 0 ||
+        expect_refused(SYS_ptrace, PTRACE_TRACEME, 0, "ptrace") != 0 ||
+        expect_refused(SYS_mount, 0, 0, "mount") != 0 ||
+        expect_refused(TD_SYS_FCHROOT, -1, 0, "fchroot") != 0 ||
+        expect_refused(TD_SYS_IO_URING_SETUP, 1, 0, "io_uring_setup") != 0 ||
+        expect_refused(TD_SYS_CLONE3, 0, 0, "clone3") != 0 ||
+        expect_refused(-1L, 0, 0, "negative number") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(socket(AF_INET, SOCK_STREAM, 0), EAFNOSUPPORT, "AF_INET") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(socket(AF_INET6, SOCK_STREAM, 0), EAFNOSUPPORT, "AF_INET6") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(socket(AF_NETLINK, SOCK_RAW, 0), EAFNOSUPPORT, "AF_NETLINK") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_clone, CLONE_NEWUSER | SIGCHLD, 0, 0, 0, 0),
+                     EPERM, "clone user namespace") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(socketpair(AF_UNIX, SOCK_DGRAM, 0, fds), EPERM,
+                     "datagram socketpair") != 0)
+        return 1;
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) != 0)
+        return fail("stream socketpair was refused");
+    if (ioctl(fds[0], FIONBIO, &one) != 0)
+        return fail("FIONBIO was refused");
+    if (setsockopt(fds[0], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0)
+        return fail("SO_RCVTIMEO was refused");
+    if (setsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0)
+        return fail("SO_SNDTIMEO was refused");
+    /* SO_REUSEADDR succeeds on a socket on any kernel, and an empty
+     * SO_ATTACH_FILTER answers EINVAL: only the filter says ENOPROTOOPT. */
+    errno = 0;
+    if (expect_errno(setsockopt(fds[0], SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)),
+                     ENOPROTOOPT, "SO_REUSEADDR") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_setsockopt, fds[0], SOL_SOCKET, SO_ATTACH_FILTER, 0, 0),
+                     ENOPROTOOPT, "SO_ATTACH_FILTER") != 0)
+        return 1;
+    /* Each of these succeeds on a socket on any kernel. */
+    errno = 0;
+    if (expect_errno(syscall(SYS_ioctl, fds[0], FIOCLEX, 0), ENOTTY, "FIOCLEX") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_ioctl, fds[0], FIONREAD, &one), ENOTTY, "FIONREAD") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_ioctl, fds[0], (1UL << 32) | FIONREAD, &one), ENOTTY,
+                     "FIONREAD high-bit bypass") != 0)
+        return 1;
+    errno = 0;
+    if (expect_errno(syscall(SYS_ioctl, -1, TIOCSTI, 0), ENOTTY, "TIOCSTI") != 0)
+        return 1;
+    close(fds[0]);
+    close(fds[1]);
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return fail("AF_UNIX socket was refused");
+    close(fd);
+    if (syscall(SYS_kill, getpid(), 0) != 0)
+        return fail("kill was refused");
+    /* glibc reaps a spawn whose exec failed with waitid: refuse it and nothing
+     * fails here, but a zombie stays, charged to the jail's pid limit. */
+    if (posix_spawn(&spawned, "/nonexistent/td-jail-probe", NULL, NULL, spawn_argv,
+                    spawn_envp) == 0)
+        return fail("a spawn of no program succeeded");
+    errno = 0;
+    if (expect_errno(waitpid(-1, NULL, WNOHANG), ECHILD, "failed spawn's reap") != 0)
+        return 1;
+    if (mail) {
+        fd = (int)syscall(SYS_memfd_create, "td-jail-probe", 0);
+        if (fd < 0)
+            return fail("the mail filter refused memfd_create");
+        close(fd);
+    } else if (expect_refused(SYS_memfd_create, 0, 0, "memfd_create") != 0) {
+        return 1;
+    }
+    return expect_x32_kill();
+}
+
 int main(int argc, char **argv) {
     struct sock_fprog program;
     const char *filter_path;
     int allow_inherited_confinement = 0;
+    int application = 0;
+    int mail = 0;
     int initial_nnp;
     int initial_seccomp;
     int fd;
@@ -425,6 +543,15 @@ int main(int argc, char **argv) {
             return 1;
         execv(argv[2], &argv[2]);
         return fail("exec application after inherited filter probe");
+    }
+    if (argc >= 4 && strcmp(argv[1], TD_APPLICATION_FILTER) == 0) {
+        application = 1;
+        if (strcmp(argv[2], "mail") == 0)
+            mail = 1;
+        else if (strcmp(argv[2], "news") != 0)
+            return fail("application filter must be mail or news");
+        argc -= 2;
+        argv += 2;
     }
     if (argc == 3 && strcmp(argv[1], TD_ALLOW_INHERITED_CONFINEMENT) == 0) {
         allow_inherited_confinement = 1;
@@ -458,6 +585,12 @@ int main(int argc, char **argv) {
     free(program.filter);
     if (require_status() != 0)
         return 1;
+    if (application) {
+        if (prove_application_filter(mail) != 0 || prove_i386_boundary(1) != 0)
+            return 1;
+        puts(TD_APPLICATION_MARKER);
+        return 0;
+    }
 
     errno = 0;
     if (expect_errno(syscall(-1L), ENOSYS, "negative syscall number") != 0)
@@ -569,7 +702,7 @@ mod tests {
             .split_once("static int prove_denied_calls(void)")
             .unwrap()
             .1
-            .split_once("int main(")
+            .split_once("/* getppid, unshare and FIONREAD succeed")
             .unwrap()
             .0;
         for call in [
@@ -597,6 +730,51 @@ mod tests {
         assert_eq!(denied.matches("SYS_ioctl").count(), 3);
         assert_eq!(denied.matches("expect_errno(").count(), 18);
         assert_eq!(denied.matches("return expect_x32_kill();").count(), 1);
+    }
+
+    #[test]
+    fn the_application_mode_proves_witnesses_after_installing_the_named_filter() {
+        let source = source();
+        assert!(source.contains(&format!(
+            "#define TD_APPLICATION_MARKER \"{}\"",
+            crate::shared::TD_JAIL_APPLICATION_FILTER_PROBE_MARKER
+        )));
+        let main = source.split("int main(int argc").nth(1).unwrap();
+        let install = main
+            .find("syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0")
+            .unwrap();
+        let prove = main.find("prove_application_filter(mail)").unwrap();
+        assert!(install < prove);
+        let witnesses = source
+            .split_once("static int prove_application_filter(int mail)")
+            .unwrap()
+            .1
+            .split_once("int main(")
+            .unwrap()
+            .0;
+        // Answers no kernel gives by itself for these calls, so the filter
+        // must be what gave them.
+        for witness in [
+            "SYS_getppid",
+            "SYS_unshare",
+            "SYS_epoll_create1",
+            "SYS_setsid",
+            "FIONREAD",
+            "(1UL << 32) | FIONREAD",
+            "SO_ATTACH_FILTER",
+            "SO_REUSEADDR",
+            "failed spawn's reap",
+            "AF_INET6",
+            "AF_NETLINK",
+            "SOCK_DGRAM",
+            "SYS_memfd_create",
+            "expect_x32_kill",
+        ] {
+            assert!(
+                witnesses.contains(witness),
+                "application probe omitted {witness}"
+            );
+        }
     }
 
     #[test]

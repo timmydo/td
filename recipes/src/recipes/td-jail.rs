@@ -425,10 +425,7 @@ mod tests {
     fn the_kill_hold_arm_starts_its_watcher_after_the_filter_too() {
         let transition = source("transition").expect("transition source");
         let install = transition
-            .find(
-                "install_standard_seccomp_filter(firefox_seccomp_probe)\
-                 .map_err(|error|",
-            )
+            .find("install_application_seccomp_filter(application_filter, firefox_seccomp_probe)")
             .expect("seccomp installation");
         let dispatch = transition
             .find("Stage2Action::KillHold { cgroup_membership } => {")
@@ -522,10 +519,7 @@ mod tests {
             assert!(sys.contains(row), "td-jail syscall source lacks {row}");
         }
         let filter = transition
-            .find(
-                "install_standard_seccomp_filter(firefox_seccomp_probe)\
-                 .map_err(|error|",
-            )
+            .find("install_application_seccomp_filter(application_filter, firefox_seccomp_probe)")
             .expect("seccomp installation");
         let nondumpable = transition
             .find("sys::set_dumpable(false)?;")

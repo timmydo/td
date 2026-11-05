@@ -90,6 +90,9 @@ const MAX_APPLICATION_ARGUMENT_BYTES: usize = 64 * 1024;
 /// entry on it needs; `dynamic_runtime` admits it and its versioned
 /// successors.
 const DYNAMIC_RUNTIME: &str = "freedesktop-platform-25-08";
+const STATIC_RUNTIME: &str = "static-runtime-1";
+const MAIL_NAME: &str = "mail";
+const NEWS_NAME: &str = "news";
 const FIREFOX_LIBRARY_PATH: &str = "/app/lib:/app/lib/firefox";
 const FIREFOX_NAME: &str = "firefox";
 const PROC_CMDLINE_PATH: &str = "/proc/cmdline";
@@ -112,6 +115,34 @@ pub(crate) const FIREFOX_AUTOTEST_POLICY: &str = concat!(
     "]}}}\n",
 );
 
+/// Which compiled program a launch installs. An application outside these
+/// names, and every launch in host mode, gets the standard one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApplicationFilter {
+    Standard,
+    Mail,
+    News,
+}
+
+impl ApplicationFilter {
+    pub(crate) const fn wire(self) -> &'static str {
+        match self {
+            ApplicationFilter::Standard => "standard",
+            ApplicationFilter::Mail => "mail",
+            ApplicationFilter::News => "news",
+        }
+    }
+
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "standard" => Some(ApplicationFilter::Standard),
+            "mail" => Some(ApplicationFilter::Mail),
+            "news" => Some(ApplicationFilter::News),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct LaunchPlan {
     /// The application's td identity, which is also what the jail registers
@@ -126,6 +157,7 @@ pub(crate) struct LaunchPlan {
     pub(crate) timezone: Option<ResolvedTimezone>,
     pub(crate) firefox_autotest_policy: Option<FirefoxAutotestPolicy>,
     pub(crate) firefox_seccomp_probe: Option<ResolvedFile>,
+    pub(crate) application_filter: ApplicationFilter,
     pub(crate) state: StatePlan,
     pub(crate) wayland_socket: PathBuf,
     pub(crate) bus_socket: PathBuf,
@@ -703,6 +735,12 @@ where
         )?
     };
     let timezone = resolve_timezone(config.timezone.as_deref(), &runtime_files)?;
+    let application_filter = application_filter(
+        name,
+        &spec.runtime,
+        spec.flathub.is_some(),
+        config.host_mode,
+    );
 
     Ok(LaunchPlan {
         name: name.to_string(),
@@ -713,6 +751,7 @@ where
         timezone,
         firefox_autotest_policy,
         firefox_seccomp_probe,
+        application_filter,
         state,
         wayland_socket,
         bus_socket,
@@ -1378,6 +1417,26 @@ fn dynamic_runtime(runtime: &str, flathub: Option<FlathubSource>) -> io::Result<
         || output
             .strip_prefix(DYNAMIC_RUNTIME)
             .is_some_and(|suffix| suffix.starts_with('-')))
+}
+
+/// A narrower program for the two td-owned static applications, whose
+/// realized binaries its list was read from. Host mode runs whatever the host
+/// built, against the host's libc, so it keeps the standard program, and so
+/// does a package of either name on any other runtime.
+fn application_filter(
+    name: &str,
+    runtime: &str,
+    flathub: bool,
+    host_mode: bool,
+) -> ApplicationFilter {
+    if host_mode || flathub || runtime_output_name(runtime).ok() != Some(STATIC_RUNTIME) {
+        return ApplicationFilter::Standard;
+    }
+    match name {
+        MAIL_NAME => ApplicationFilter::Mail,
+        NEWS_NAME => ApplicationFilter::News,
+        _ => ApplicationFilter::Standard,
+    }
 }
 
 fn reviewed_loader_library_path(
@@ -4147,6 +4206,35 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn only_the_two_static_applications_in_product_mode_get_an_allowlist() {
+        let runtime = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-static-runtime-1";
+        let other = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-freedesktop-platform-25-08";
+        assert_eq!(
+            application_filter("mail", runtime, false, false),
+            ApplicationFilter::Mail
+        );
+        assert_eq!(
+            application_filter("news", runtime, false, false),
+            ApplicationFilter::News
+        );
+        for (name, runtime, flathub, host_mode) in [
+            ("firefox", runtime, false, false),
+            ("mail", runtime, false, true),
+            ("news", runtime, false, true),
+            ("mail", runtime, true, false),
+            ("mail", other, false, false),
+            ("mail", "/td/store/not-a-store-path", false, false),
+            ("mailx", runtime, false, false),
+        ] {
+            assert_eq!(
+                application_filter(name, runtime, flathub, host_mode),
+                ApplicationFilter::Standard,
+                "{name} {runtime} {flathub} {host_mode}"
+            );
+        }
     }
 
     #[test]

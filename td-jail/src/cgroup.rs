@@ -1,6 +1,7 @@
 //! Per-instance cgroup-v2 enforcement below td-svc's delegated subtree.
 
 use crate::authority::{self, ResolvedResourceLimits, CGROUP_ROOT};
+use crate::transition::STAGE2_APPLICATION_FILTER_ARG;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
@@ -530,6 +531,68 @@ pub(crate) fn probe_process_token(
             "process token must be 1..=64 restricted ASCII bytes",
         ));
     }
+    let (instance, found) = find_member(application, limits, uid, gid, |command, status| {
+        token_process_sandbox(command, token, status).is_some()
+    })?;
+    match found {
+        Some((pid, starttime)) => Ok(process_token_evidence(&instance, token, pid, starttime)),
+        None => Err(io::Error::other(format!(
+            "no process in active application cgroup {instance:?} runs as or has argument {token:?}"
+        ))),
+    }
+}
+
+/// Whether this is the instance's namespace-init stage, under its sandbox,
+/// told to install `filter`. The first such argument is the launch's own: an
+/// application's arguments come after it.
+fn stage2_holds_filter(command: &[u8], filter: &str, status: &str) -> bool {
+    let mut arguments = command.split(|byte| *byte == 0);
+    if !arguments.any(|argument| argument == STAGE2_APPLICATION_FILTER_ARG.as_bytes())
+        || arguments.next() != Some(filter.as_bytes())
+    {
+        return false;
+    }
+    sandbox_status(status).is_ok_and(|sandbox| {
+        sandbox.no_new_privileges == 1
+            && sandbox.seccomp == 2
+            && sandbox.filters > 0
+            && sandbox.namespace_pid == 1
+    })
+}
+
+/// Which program a running instance's stage 2 was told to install. An
+/// application that fell back to the standard program runs as well as ever, so
+/// nothing else on a booted system would notice.
+pub(crate) fn probe_application_filter(
+    application: &str,
+    filter: &str,
+    limits: ResolvedResourceLimits,
+    uid: u32,
+    gid: u32,
+) -> io::Result<String> {
+    let (instance, found) = find_member(application, limits, uid, gid, |command, status| {
+        stage2_holds_filter(command, filter, status)
+    })?;
+    match found {
+        Some((pid, starttime)) => Ok(format!(
+            "TD-JAIL-APPLICATION-FILTER-OK instance={instance} filter={filter} pid={pid} \
+             starttime={starttime}"
+        )),
+        None => Err(io::Error::other(format!(
+            "no stage 2 in active application cgroup {instance:?} holds filter {filter:?}"
+        ))),
+    }
+}
+
+/// The first process of the application's active instance that `accepts` its
+/// command line and status, confirmed a member and the same process afterward.
+fn find_member(
+    application: &str,
+    limits: ResolvedResourceLimits,
+    uid: u32,
+    gid: u32,
+    accepts: impl Fn(&[u8], &str) -> bool,
+) -> io::Result<(String, Option<(u32, u64)>)> {
     let (instance, directory, _) = active_instance(application, limits, uid, gid)?;
     let membership = membership_for_instance(&instance, uid)?;
     let processes = read_control(&directory.join("cgroup.procs"))?;
@@ -551,7 +614,7 @@ pub(crate) fn probe_process_token(
         let Ok(status) = read_bounded(&proc_directory.join("status")) else {
             continue;
         };
-        if token_process_sandbox(&command, token, &status).is_none() {
+        if !accepts(&command, &status) {
             continue;
         }
         let membership_path = format!("/proc/{pid}/cgroup");
@@ -564,11 +627,9 @@ pub(crate) fn probe_process_token(
         if revalidated_process_starttime(&stat_path, starttime).is_none() {
             continue;
         }
-        return Ok(process_token_evidence(&instance, token, pid, starttime));
+        return Ok((instance, Some((pid, starttime))));
     }
-    Err(io::Error::other(format!(
-        "no process in active application cgroup {instance:?} runs as or has argument {token:?}"
-    )))
+    Ok((instance, None))
 }
 
 pub(crate) fn process_sandboxes(
@@ -1448,6 +1509,35 @@ mod tests {
         assert_eq!(decimal_status_field(status, "Seccomp_filters:").unwrap(), 3);
         assert!(namespace_process_id(&status.replace("NSpid:", "Pidns:")).is_err());
         assert!(decimal_status_field(status, "NoNewPriv:").is_err());
+    }
+
+    #[test]
+    fn the_filter_probe_reads_only_a_sandboxed_namespace_init_and_its_own_word() {
+        let init =
+            "Name:\ttd-jail\nNSpid:\t8123\t1\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t1\n";
+        let command =
+            b"/app/td-jail\0--launch\0/app/bin/td-mail\0--application-filter\0mail\0--x\0";
+        assert!(stage2_holds_filter(command, "mail", init));
+        assert!(!stage2_holds_filter(command, "news", init));
+        assert!(!stage2_holds_filter(command, "standard", init));
+        // Only the program's own arguments follow the launch's word.
+        let forged = b"td-jail\0--application-filter\0standard\0--application-filter\0mail\0";
+        assert!(!stage2_holds_filter(forged, "mail", init));
+        assert!(!stage2_holds_filter(
+            b"td-jail\0--application-filter\0",
+            "mail",
+            init
+        ));
+        assert!(!stage2_holds_filter(b"td-jail\0mail\0", "mail", init));
+        for status in [
+            init.replace("\t1\nNoNewPrivs", "\t2\nNoNewPrivs"),
+            init.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"),
+            init.replace("Seccomp:\t2", "Seccomp:\t0"),
+            init.replace("Seccomp_filters:\t1", "Seccomp_filters:\t0"),
+            init.replace("NSpid:", "Pidns:"),
+        ] {
+            assert!(!stage2_holds_filter(command, "mail", &status), "{status}");
+        }
     }
 
     #[test]

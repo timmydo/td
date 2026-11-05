@@ -3371,8 +3371,9 @@ Freedesktop 25.08 receives only `/app/lib:/app/lib/firefox`.
 
 ### The seccomp filter
 
-**A Flatpak-derived, deliberately stricter deny list, not an allow list.**
-This diverges from td's instincts and is argued rather than slipped in:
+**The standard program is a Flatpak-derived, deliberately stricter deny list,
+not an allow list.** Two td-built applications get allow lists instead
+("Per-application allowlists" below). This diverges from td's instincts and is argued rather than slipped in:
 an allow list over the runtime glibc's whole syscall surface breaks every
 time that glibc updates — a new `*_time64` or `statx` variant appears and
 every app dies — and td does not control that glibc, Freedesktop SDK does. The deny
@@ -3458,9 +3459,9 @@ enforce. The ordinary tracing entry points remain denied through
 `{u16 code; u8 jt; u8 jf; u32 k}` — 8 bytes, built by one `insn()` whose
 bit placement is a tested function, because a swapped `jt`/`jf` is a
 well-formed program that jumps the wrong way and nothing at the call site
-shows it. The program is a `const` array whose length is part of its Rust
-type, so `sock_fprog.len` is derived from the array rather than written
-beside it: `len` is the kernel's read bound over the pointer, and a `len`
+shows it. The standard program is a `const` array whose length is part of its
+Rust type, and a program assembled at run time passes its slice's own length,
+so `sock_fprog.len` is derived from the program rather than written beside it: `len` is the kernel's read bound over the pointer, and a `len`
 larger than the array is an out-of-bounds kernel *read* from code the
 compiler reads as safe — the `pollfd`/`nfds` argument in the read
 direction. `seccomp_data` offsets are pinned constants (`nr`@0,
@@ -3566,6 +3567,102 @@ stack and the outer policy could change any result. The QEMU invocation passes
 no allowance, requires both states to begin at zero, and always runs the exact
 behavior checks on the target kernel.
 
+### Per-application allowlists
+
+The standard program is a deny list because td controls neither Firefox nor the
+runtime's glibc. Neither reason holds for `mail` and `news`: td builds each
+program in those two packages, statically, against the imported glibc, so the
+syscalls it can make are a property of bytes td has read. Each therefore gets an
+allowlist program in place of the standard one, selected by stage 1 from the
+authenticated name and the `static-runtime` output, and carried to stage 2 as a
+closed word it cannot widen. Host mode keeps the standard program, because there
+the binary is whatever the host built against the host's libc. So does any other
+application, and a package of either name on any other runtime.
+
+An allowlist answers `ENOSYS` for what it lacks, as a kernel without the call
+does, so that a program reports what failed. It keeps the arch and x32 kills. It
+allows `socket` only for `AF_UNIX`, since these programs reach the network through
+the fetch service's socket. Its `socketpair` and `clone` rules are the workspace
+program's and the standard program's. `setsockopt` is `SOL_SOCKET` with `SO_RCVTIMEO`
+or `SO_SNDTIMEO`, which td-ui's Wayland stream and the fetch client need, and
+`ENOPROTOOPT` for the rest, `SO_ATTACH_FILTER` among them. And its `ioctl` is an
+allowlist too: `FIONBIO`,
+and `ENOTTY` for any other. That is the one request whose path through the binaries
+any td program takes. The others they name are behind something these jails lack or
+an option td never asks for: `TCGETS`, `TCSETSF` and `TIOCSPGRP`, in `tcgetattr`,
+td-secret's PIN terminal and `tcsetpgrp`, need the terminal neither package has a
+grant for; `FIONREAD`, `SIOCGIFCONF` and the other `SIOCGIF*` requests are glibc's
+resolver and interface helpers, which no td program calls; `PIDFD_GET_INFO` needs a
+pidfd no td program asks for.
+
+**How the lists are derived, and how to do it again.** Tests cannot supply a list:
+they reach what they exercise, and what they miss would fail for a person. So the
+list starts from the realized binaries in each package, plus the td-jail binary
+whose stage 2 stays in the jail as PID 1 under the same program, and takes every
+number they can issue from their disassembly: the last immediate written to `eax`
+before each `syscall` instruction, and the argument at each call to a wrapper that
+takes the number (`syscall`, `__syscall_cancel`). Rust calls libc through the GOT, so
+a scan must read each slot's target: a static-PIE binary fills its slots from
+`R_X86_64_RELATIVE` relocations at load, so the target is the relocation's addend,
+and a non-PIE static one (td-secret and td-jail are) holds it in the slot's own bytes.
+A scan that does neither misses every `syscall()` site in the standard library,
+`statx` among them, which a first attempt here did. A symbol's name can mislead too:
+the linker folds identical functions, so `UnixStream::set_read_timeout` and
+`TcpStream::set_read_timeout` are one address, and a caller read off one name looks
+unreachable. `td-jail`'s `sys.rs` passes its
+numbers through one wrapper, so its calls after the filter are read from the source.
+
+Two things are then done by hand. `restart_syscall` is added, since the kernel issues
+it after a signal interrupts a sleep and no binary names it. And what linked code
+contains but only an option td never sets can reach is left out, because a call the
+program never makes is one an attacker in the jail has and it does not need: through
+`Command` or `posix_spawn`, `setsid`, `setpgid`, `getpgid`, `chroot`, the `setuid`
+family, `setgroups`, `close_range` and the `sched_set*` calls; a thread's priority
+protection, `sched_get_priority_max` and `_min`; a process's pidfd, `pidfd_open` and
+`pidfd_send_signal`; and the resolver, `bind` and `sendmmsg`. Linked
+code an ordinary path might reach stays, whether or not a test reached it: `pause`
+is how std parks a thread that loses a race to exit; `waitid` is how glibc reaps a
+spawn whose exec failed, so refusing it fails nothing at the time and leaks a zombie
+against the jail's pid limit, for a missing `password_command` or browser; and `uname`, `sysinfo`,
+`getgroups`, `sched_getparam` and `sched_getscheduler` are reads behind glibc calls
+not all traced to an option. Narrowing those would trade a call nothing misuses for a
+program that fails for a person.
+The vDSO adds nothing of its own: the fallbacks of `clock_gettime` and `getrandom`,
+the two vDSO-backed functions these binaries hold, are numbers already listed. The mail list adds
+what td-mail and td-secret reach and td-news and td-open do not.
+
+**What proves it.** The interpreter holds each program to exactly its list across
+the whole table, and to its argument rules. The realized C probe installs each
+exported program through witnesses: `getppid` and `FIONREAD` on a socket succeed on
+any kernel without the filter, so their refusal can only be the filter's. The QEMU
+leg runs that on the target kernel with no allowance for inherited confinement, as
+part of `TD-JAIL-SECCOMP-PROBE-OK`; `td-jail-test` also runs it, and skips it as it
+does the standard program's when its build is already confined. A boot then checks
+that each application's own stage 2 holds its filter's name, by
+`--probe-application-filter`, before it may print `TD-MAIL-RUNNING` or
+`TD-NEWS-RUNNING`, because an application on the standard program runs as well as ever
+and nothing else would notice. That reads what stage 2 was told; that stage 2
+installs what it was told is the launch path's unit test and its one call. Whether a
+list is sufficient is established by running under it: the boot starts both
+applications, and the deriving review ran the crates' end-to-end tests under the
+exported programs with the realized binaries.
+
+**What no oracle establishes is that the lists still fit.** A list goes stale when
+what the binaries can call changes: a change to the Rust toolchain or the Debian root's
+glibc, and more often an ordinary change to a program in those packages or a crate
+they link, such as td-mail, td-news, td-open, td-secret, td-ui, td-fs, td-kv or
+td-fetch-client. Each new reach for an operating-system facility is a question for
+this section: `std::fs::hard_link`, `UnixStream::shutdown`, `File::set_times`,
+`UnixListener`, td-ui's PTY and its `Connection::waker` datagram pair are all off
+these lists today. Deriving them again is
+the reviewer's to do; a number gone missing fails as `ENOSYS` in that program, not as
+a wider jail, and only on the path that reaches it.
+
+This does not reduce what the allowed calls can reach: a kernel bug in `read`, `mmap`
+or a Unix socket is reachable here as anywhere. It removes the rest: over two hundred
+calls and the whole `ioctl` space, for the two programs that parse the most untrusted
+mail and news.
+
 ### Firefox's nested sandbox
 
 **The two source designs disagreed here; the resolution below required an
@@ -3603,8 +3700,8 @@ that assertion, "Firefox runs" is compatible with Firefox having quietly
 disabled its own defences inside td's jail, which is the one outcome
 neither design wants and which nothing else here would detect.
 
-**Resolution — E2, 2026-08-25:** td ships the one standard deny filter; there
-is no `BROWSER_FILTER`. The development host had no seccomp filter and
+**Resolution — E2, 2026-08-25:** Firefox runs under the one standard deny filter;
+there is no `BROWSER_FILTER`. The development host had no seccomp filter and
 `unshare -Ur true` succeeded, so the kernel and host policy supported an
 unprivileged user namespace. Inside the exact pinned Firefox 154.0 deploy,
 the stock Flatpak sandbox reported `NoNewPrivs: 1`, seccomp mode 2 with one
@@ -7954,7 +8051,7 @@ Ranked by how likely they are to change the plan:
    runtime major still repeats the matrix (§F).
 3. ~~**Firefox's nested sandbox**~~ — **RETIRED by E2.** Stock Firefox keeps
    its effective level-6 content seccomp sandbox when Flatpak denies the
-   nested user namespace, so td selects one standard deny filter (§C). The
+   nested user namespace, so Firefox runs under the one standard deny filter (§C). The
    full per-process §H oracle remains implementation work.
 4. **Seed repackaging turns out to be lossy.** The seed path (§B.3)
    assumes a foreign deploy tree is a self-contained `files/` hierarchy

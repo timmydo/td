@@ -2158,7 +2158,7 @@ or `SOCK_SEQPACKET`, `SOCK_NONBLOCK` and `SOCK_CLOEXEC` masked off. The kind sel
 the program; no caller does. The interpreter test runs both programs
 over the standard/workspace roster and requires those two to differ only
 in their socket rules; development has its own two-ABI interpreter oracle; the C
-kernel probe covers the standard program alone, and the workspace
+kernel probe covers the standard, mail and news programs, and the workspace
 program's kernel behaviour is the ignored live launch tests', which
 need unprivileged user namespaces: a Rust probe inside an instance finds
 a Unix socket refused, a stream pair made, a datagram pair refused, a
@@ -2179,7 +2179,11 @@ There is likewise no `fork`, `pre_exec`, `clone`, `setns`, or caller-
 supplied namespace, mount set, or BPF program. A fifteenth syscall, a ninth
 prctl operation, a second seccomp operation, a seccomp flag outside the exact
 `{0, SECCOMP_FILTER_FLAG_LOG}` set, a fourth ambient sub-operation, a third
-unshare flag set, or a fourth compiled seccomp policy is an amendment here.
+unshare flag set, or a compiled seccomp policy beyond the standard, workspace,
+development, mail and news programs is an amendment here. The mail and news
+programs (APPLICATIONS.md, "Per-application allowlists") add no syscall or
+installation path: stage 2 installs one of them through the same wrapper and
+flags, in place of the standard program, for the name and runtime stage 1 selects.
 
 Section 9's development workspace device plan includes /dev/tty through the
 existing typed character-device bind, not a new syscall. Its offline variant

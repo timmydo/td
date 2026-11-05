@@ -2286,7 +2286,7 @@ fn validate_system_boot(
         return Err(format!(
             "td-jail completed its transition, but the non-shipped target seccomp probe marker \
              ({TD_JAIL_SECCOMP_PROBE_MARKER:?}) was absent - the booted kernel did not load \
-             td-jail's exported constant filter or return its pinned errno/SIGSYS actions. \
+             td-jail's exported filters or return their pinned errno/SIGSYS actions. \
              The Rust interpreter proves the program's bytes and the build-host run is only a \
              host-policy smoke test; this marker is the target-kernel behavior proof. Last \
              serial output:\n{}",
@@ -2384,7 +2384,8 @@ fn validate_system_boot(
              absent ({TD_MAIL_BOOT_MARKER:?} {}, {TD_NEWS_BOOT_MARKER:?} {}) — the /bin \
              launcher, the static package on its data-only runtime, the fresh-terminal grant, \
              td-firstboot's provisioned configuration, or the program itself failed within \
-             the settle window, or its td-term window never reported ready. \
+             the settle window, its td-term window never reported ready, or its stage 2 did \
+             not hold its allowlist's name (--probe-application-filter). \
              Last serial output:\n{}",
             if result.evidence.td_mail_running {
                 "seen"

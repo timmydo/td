@@ -89,6 +89,10 @@ fn run() -> std::io::Result<()> {
         transition::Mode::ResourceProbe { application } => {
             transition::probe_resource_caps(&application)
         }
+        transition::Mode::ApplicationFilterProbe {
+            application,
+            filter,
+        } => transition::probe_application_filter(&application, filter),
         transition::Mode::ProcessTokenProbe { application, token } => {
             transition::probe_process_token(&application, &token)
         }
@@ -100,7 +104,7 @@ fn run() -> std::io::Result<()> {
         }
         transition::Mode::FirefoxInputProbe { stage } => transition::probe_firefox_input(stage),
         transition::Mode::FirefoxDownloadProbe => transition::probe_firefox_download(),
-        transition::Mode::WriteFilter => transition::write_standard_filter(),
+        transition::Mode::WriteFilter(filter) => transition::write_filter(filter),
         transition::Mode::CgroupCleanupBootstrap { membership } => {
             transition::run_cgroup_cleanup_bootstrap(&membership)
         }
@@ -1329,8 +1333,9 @@ mod confinement {
         assert!(TRANSITION.contains(".into_raw_fd()"));
         assert!(TRANSITION.contains("require_descriptor_closed(descriptor)?;"));
         assert!(TRANSITION.contains("clear_and_require_empty_capabilities()?;"));
-        assert!(TRANSITION
-            .contains("install_standard_seccomp_filter(firefox_seccomp_probe).map_err(|error|"));
+        assert!(TRANSITION.contains(
+            "install_application_seccomp_filter(application_filter, firefox_seccomp_probe)"
+        ));
         assert!(TRANSITION.contains("probe_pid1_lifecycle()?;"));
         // The workspace kind's stage 2 and entry add two; its entry's
         // environment is the fixed `workspace::environment`, the spec's
