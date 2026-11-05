@@ -10212,7 +10212,26 @@ table and an offline session are refused, and the window says why. A
 `password_command` that cannot run because the jail has no shell is not
 a reason for the form: the server was never asked, so the window offers
 none and says to replace that line with `secret = "td-pass"` by hand. The password
-is never typed into td-mail. When the portal refuses the credential,
+is never typed into td-mail.
+
+An account may instead name `password_file`, a file td-mail reads itself,
+with no shell. It is the owner's choice to step outside the store, not a store
+that serves an application: the password rests unencrypted, with no token,
+consent or portal receipt. The account's unjailed processes and SSH sessions
+can read it, even while td-pass is locked; a jailed application without this
+mount cannot. Nothing binds it to a server: a changed `well_known_url` or an
+entry in the setup form sends it to the new server at once, where td-pass would
+ask for a new approval. `secret = "td-pass"` is the source that guards these.
+A relative name resolves against the configuration's directory, because the
+jail mounts `~/.config/td-mail` at another path; beyond the application's own
+state it holds only Downloads, which Firefox shares. `~` is not expanded and a
+relative name may not climb out of that directory, so the key means one file in
+and out of the jail. td-mail refuses anything but a regular file its owner
+alone can reach, of at most 64 KiB, and names the path and never the bytes. A
+file it cannot use is, like the missing shell, not a reason for the form: the
+window says where td lets the file be.
+
+When the portal refuses the credential,
 the window shows the td-pass unlock and binding steps for notebook accounts,
 or the legacy store enrollment and write steps for portal accounts, with the
 refusal reason. `a` connects again; neither flow names a root path.
@@ -10954,8 +10973,8 @@ terminal surface, once and once more for the copy. The credential
 portal (§W.4), which reached `tmc` as a source patch the recipe
 applied, is td-mail's own source from the import: `secret = "portal"`,
 the account name as the credential name, the packaged
-`/app/bin/td-secret get`; `password_file` is gone from the client and
-from what td-firstboot provisions. Per-user state the
+`/app/bin/td-secret get`; `password_file` is gone from what td-firstboot
+provisions. Per-user state the
 old names kept (`~/.config/tmc`, `~/.cache/tn`, drafts, the spam model)
 is abandoned rather than migrated: there was no release, only
 development VMs, and td-firstboot provisions the new directories on the

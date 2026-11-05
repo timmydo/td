@@ -544,7 +544,11 @@ success td-svc requires before startup. The portal consumes UID/GID 991;
 firstboot transfers credential-store ownership to it before human
 sessions and clears volatile releases independently of application-home
 validation. Sealed stores remain locked until a presented token operation
-succeeds; file and TPM-only stores cannot serve application credentials. Foreign application assignments are active service accounts.
+succeeds; file and TPM-only stores cannot serve application credentials.
+That is a rule of td-secret's stores: td-mail's `password_file`
+(`APPLICATIONS.md` §W.4) is a file the application reads itself, outside
+them by its owner's choice, and nothing in this document protects it.
+Foreign application assignments are active service accounts.
 The broker loads an immutable deployment table binding each installed name
 to its execution UID and exact bus grants. Personal mail and news share the
 human UID, but each requires registered jail lineage before its name is

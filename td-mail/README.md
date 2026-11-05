@@ -305,7 +305,7 @@ Older runtime drafts are not moved or deleted automatically.
   read through the `/app/bin/td-secret` helper packaged beside td-mail, so
   inside a td jail only; submit it from the human session with `td-secret set mail/NAME < file`, then press Ctrl+Alt+Esc and W, verify the target and touch the enrolled token), or
   a non-interactive credential command for `password_command` (for example
-  `pass`).
+  `pass`), or a file for `password_file`.
 
 ## Build
 
@@ -352,8 +352,10 @@ The packaged app reads the human user's `~/.config/td-mail`, mounted into its
 jail, and keeps its cache, data and state under `~/.td/app/mail`. It carries
 no shell, so no `password_command` can run there: use `secret = "td-pass"`,
 as the provisioned account `main` does, and the app's server/address setup
-form. Approving the account in td-pass requires the physical authorization
-described below; SSH access to the human account does not confer it.
+form, or a `password_file` kept in that directory (below), which needs no such
+approval and which SSH access can read. Approving the account in td-pass requires
+the physical authorization described below; SSH access to the human account does
+not confer it.
 
 For a direct connection to td-mta, set the account's HTTPS discovery URL and
 username in the app, for example `https://mx.timmydouglas.com/.well-known/jmap`
@@ -472,14 +474,37 @@ not change its destination policy: the td image service still refuses
 loopback. The host launcher installed by `./install-apps` permits local
 mail-server requests while keeping public-content fetches off loopback.
 
-Each account sets exactly one of `secret = "td-pass"`, `secret = "portal"`, or `password_command`.
+Each account sets exactly one of `secret = "td-pass"`, `secret = "portal"`, `password_file`, or `password_command`.
 
 `password_command` runs through `sh -c`, so it works only where td-mail has
 a shell: td's `mail` application carries none, and there the window says so
 and points at td-pass rather than at the server or address.
 
-On td, use `secret = "td-pass"`. Try connecting the account, then open
-td-pass with Ctrl+Alt+Esc followed by N. Unlock it, select a saved entry
+`password_file` names a file holding the password, which td-mail reads
+itself, so it needs no shell. A relative name is relative to the directory of
+`config.toml` and may not climb out of it, and `~` is not expanded:
+
+```toml
+[account.work]
+well_known_url = "https://mail.example.com/.well-known/jmap"
+username = "me@example.com"
+password_file = "work.password"
+```
+
+The file must be a regular file only its owner can reach (`chmod 600`), at
+most 64 KiB; trailing newlines are trimmed. td's jail mounts
+`~/.config/td-mail` at another path and holds little else of your home, so keep
+it there and name it relatively: an absolute path under your home does not exist
+in the jail.
+
+The password rests unencrypted. Your account's unjailed processes and SSH
+sessions can read it, even while td-pass is locked, and nothing binds it to a
+server: changing `well_known_url` or using the setup form sends it to the new
+server at once, where td-pass would ask for a new approval. td-pass is the
+source that guards these.
+
+On td, the protected source is `secret = "td-pass"`. Try connecting the
+account, then open td-pass with Ctrl+Alt+Esc followed by N. Unlock it, select a saved entry
 with a password/token, choose Mail, and approve the exact account, server
 URL and username shown. Retry mail. The binding is remembered, but the
 notebook must be unlocked for release. Changing the URL or username needs

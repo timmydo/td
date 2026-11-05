@@ -25,7 +25,7 @@ mod ui;
 
 use config::{AccountConfig, Config, PasswordSource};
 use jmap::client::{JmapClient, JmapError};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// `td-mail/config.toml` under the configuration home. With no usable
@@ -72,6 +72,48 @@ fn run_password_command_with(shell: &str, cmd: &str) -> Result<String, String> {
         .map_err(|e| format!("password command output is not valid UTF-8: {}", e))?;
 
     Ok(password.trim_end_matches('\n').to_string())
+}
+
+/// What a password_file failure begins with, so the window can say where td
+/// lets the file be rather than blaming the server or the address.
+pub const PASSWORD_FILE_FAILURE: &str = "could not use password_file ";
+/// The most of a password file that is read.
+const MAX_PASSWORD_FILE: u64 = 64 * 1024;
+
+/// The file's text with its trailing newlines trimmed, as the command source
+/// does, so a file an editor wrote works. A failure names the path and never
+/// the bytes. It must be a regular file that only its owner can reach, as ssh
+/// asks of a key; both are asked of the descriptor, so a link's target is what
+/// is judged and nothing can change between the check and the read, and a
+/// FIFO's missing writer cannot hold the open.
+pub fn read_password_file(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    let fail = |why: String| format!("{PASSWORD_FILE_FAILURE}{}: {why}", path.display());
+    let file = submit::open_regular(path).map_err(|e| fail(e.to_string()))?;
+    let metadata = file.metadata().map_err(|e| fail(e.to_string()))?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(fail(format!(
+            "others can reach it (mode {mode:o}); run chmod 600 on it"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PASSWORD_FILE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| fail(e.to_string()))?;
+    if bytes.len() as u64 > MAX_PASSWORD_FILE {
+        return Err(fail("it exceeds 64 KiB".to_string()));
+    }
+    // One buffer holds the secret: it is trimmed in place, not copied.
+    let mut password =
+        String::from_utf8(bytes).map_err(|_| fail("it is not valid UTF-8".to_string()))?;
+    let kept = password.trim_end_matches('\n').len();
+    password.truncate(kept);
+    if password.is_empty() {
+        return Err(fail("it holds no password".to_string()));
+    }
+    Ok(password)
 }
 
 /// The credential portal's helper, where the `mail` package puts it: td-secret
@@ -133,6 +175,92 @@ fn read_credential_from(
         password.truncate(kept);
     }
     Ok(password)
+}
+
+#[cfg(test)]
+mod password_file_tests {
+    use super::{read_password_file, PASSWORD_FILE_FAILURE};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn file(root: &td_fs::TempDir, name: &str, bytes: &[u8], mode: u32) -> std::path::PathBuf {
+        let path = root.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_private_file_gives_its_text_without_trailing_newlines() {
+        let root = td_fs::TempDir::new("mail-password-file").unwrap();
+        let path = file(&root, "p", b"hunter 2\n\n", 0o600);
+        assert_eq!(read_password_file(&path).unwrap(), "hunter 2");
+        let path = file(&root, "bare", b"token", 0o400);
+        assert_eq!(read_password_file(&path).unwrap(), "token");
+    }
+
+    /// A FIFO with no writer would hold a plain open forever, and with it the
+    /// thread that connects every account. A real one, not a pipe's /proc
+    /// link, whose open never waits; mkfifo's absence fails rather than skips,
+    /// as this is the one test of that.
+    #[test]
+    fn a_fifo_with_no_writer_is_refused_at_once() {
+        let root = td_fs::TempDir::new("mail-password-file-fifo").unwrap();
+        let fifo = root.path().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must exist");
+        assert!(made.success());
+        let err = read_password_file(&fifo).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    /// A link is judged by its target, the file that would be read.
+    #[test]
+    fn a_link_is_judged_by_its_target() {
+        let root = td_fs::TempDir::new("mail-password-file-link").unwrap();
+        let private = file(&root, "private", b"token\n", 0o600);
+        let shared = file(&root, "shared", b"hunter2\n", 0o644);
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        assert_eq!(read_password_file(&link).unwrap(), "token");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+        let err = read_password_file(&link).unwrap_err();
+        assert!(err.contains("mode 644"), "{err}");
+    }
+
+    /// Each refusal names the path and the reason and repeats none of the
+    /// file.
+    #[test]
+    fn a_file_that_cannot_serve_is_refused_by_name_without_its_bytes() {
+        let root = td_fs::TempDir::new("mail-password-file-refused").unwrap();
+        let cases = [
+            (file(&root, "group", b"hunter2", 0o640), "mode 640"),
+            (file(&root, "world", b"hunter2", 0o604), "mode 604"),
+            (file(&root, "empty", b"\n", 0o600), "holds no password"),
+            (
+                file(&root, "bytes", b"hunter2\xff", 0o600),
+                "not valid UTF-8",
+            ),
+            (
+                file(&root, "long", &[b'h'; 64 * 1024 + 1], 0o600),
+                "exceeds 64 KiB",
+            ),
+            (root.path().join("absent"), "os error 2"),
+            (root.path().to_path_buf(), "not a regular file"),
+        ];
+        for (path, reason) in cases {
+            let err = read_password_file(&path).unwrap_err();
+            assert!(err.starts_with(PASSWORD_FILE_FAILURE), "{err}");
+            assert!(err.contains(&*path.to_string_lossy()), "{err}");
+            assert!(err.contains(reason), "{err}");
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+        // The largest file served.
+        let path = file(&root, "full", &[b'h'; 64 * 1024], 0o600);
+        assert_eq!(read_password_file(&path).unwrap().len(), 64 * 1024);
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +390,7 @@ mod portal_tests {
 pub fn read_password(account: &AccountConfig) -> Result<String, String> {
     match &account.password {
         PasswordSource::Command(command) => run_password_command(command),
+        PasswordSource::File(path) => read_password_file(path),
         PasswordSource::Portal(name) => read_portal_credential(name),
         PasswordSource::Notebook => read_credential_from(
             PORTAL_HELPER,
@@ -428,9 +557,10 @@ archive_folder = "Old Mail"
 
 Rules:
 - At least one [account.NAME] section is required (or legacy [jmap] with the same three fields).
-- `well_known_url`, `username`, and exactly one of `password_command` or `secret` are required per account.
+- `well_known_url`, `username`, and exactly one of `password_command`, `password_file` or `secret` are required per account.
 - `secret = "portal"` asks td's credential portal for the secret stored as mail/NAME for [account.NAME] (mail/default for a legacy [jmap] section); it needs no shell and no file, and it works inside a td jail only, where the helper is packaged. Submit the secret from the human session with `td-secret set mail/NAME < file`, then press Ctrl+Alt+Esc and W, verify the target and touch the enrolled token. NAME is 1 to 64 bytes of [A-Za-z0-9_-].
 - `password_command` is a shell command that prints the password to stdout.
+- `password_file` names a file holding the password, relative to this configuration's directory or absolute; `~` is not expanded. Its owner alone may reach it (chmod 600), and it is at most 64 KiB, with trailing newlines trimmed. It needs no shell. A td jail mounts this configuration's directory at another path, so keep the file there and name it relatively. The password rests unencrypted, readable by the account's unjailed processes and SSH sessions even while td-pass is locked, and it goes to whatever server this account names, with no approval; `secret = "td-pass"` is the source that guards it.
 - Optional `unix_socket` names a private local socket and requires `http://localhost/.well-known/jmap` with no `tls_ca_file`. Install with `./install-apps`; the named launcher grants these exact paths. Restart after changing a socket path.
 - Optional `tls_ca_file` names an absolute path to a PEM CA bundle (at most 64 KiB), read on connect. It replaces public roots only for the HTTPS origin of `well_known_url`; other origins use public roots. Certificate and hostname verification remain enabled.
 - Quoted strings support \", \\, \n, \t escapes.
@@ -602,10 +732,11 @@ fn print_help_config() {
         "  well_known_url = \"https://.../.well-known/jmap\"  # JMAP discovery URL (required)"
     );
     println!("  username = \"user@example.com\"                    # Email address (required)");
-    println!("  secret = \"portal\"                                # The credential portal, mail/NAME (this or password_command)");
+    println!("  secret = \"portal\"                                # The credential portal, mail/NAME (this, password_file or password_command)");
     println!("  # unix_socket = \"/absolute/path/jmap/socket\"      # Local replica; use http://localhost/.well-known/jmap and no TLS CA");
     println!("  tls_ca_file = \"/absolute/path/ca.pem\"              # Optional private CA for this HTTPS origin");
     println!("  password_command = \"pass show email/example\"     # Shell command printing the password (or secret)");
+    println!("  password_file = \"mail.password\"                  # File holding it, beside this config, chmod 600 (or secret)");
     println!("  reply_from, archive_folder, deleted_folder,      # Optional: [mail]'s keys for this account alone");
     println!("  archive_mailbox_id, deleted_mailbox_id");
     println!();
@@ -621,7 +752,7 @@ fn print_help_config() {
     );
     println!();
     println!(
-        "Legacy: [jmap] section with well_known_url, username, password_command is also supported."
+        "Legacy: [jmap] section with well_known_url, username, and a password source is also supported."
     );
 }
 

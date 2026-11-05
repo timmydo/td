@@ -136,7 +136,9 @@ impl Setup {
             placeholder: account.placeholder(),
             portal: match &account.password {
                 PasswordSource::Portal(name) => Some(name.clone()),
-                PasswordSource::Command(_) | PasswordSource::Notebook => None,
+                PasswordSource::Command(_) | PasswordSource::File(_) | PasswordSource::Notebook => {
+                    None
+                }
             },
             server: account.well_known_url.clone(),
             username: account.username.clone(),

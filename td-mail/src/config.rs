@@ -1,6 +1,6 @@
 use crate::regex::UserRegex;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use td_toml::{Error as TomlError, Toml};
 
 #[derive(Debug, Clone)]
@@ -80,12 +80,17 @@ impl AccountMail {
 }
 
 /// Where an account's password comes from. `Command` runs a shell command
-/// and takes its stdout; `Portal` asks td's credential portal for the secret
-/// stored under the account's name, which needs no shell and no file in the
-/// jail. Exactly one is configured per account.
+/// and takes its stdout; `File` reads a file, which needs no shell; `Portal`
+/// asks td's credential portal for the secret stored under the account's
+/// name, which needs no shell and no file in the jail. Exactly one is
+/// configured per account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PasswordSource {
     Command(String),
+    /// Relative to the configuration's directory once `resolve_password_file`
+    /// has it: a td jail mounts that directory at another path, so a path
+    /// through the human's home names nothing there.
+    File(PathBuf),
     Portal(String),
     Notebook,
 }
@@ -97,32 +102,65 @@ const PORTAL: &str = "portal";
 fn password_source(
     password_command: Option<String>,
     secret: Option<String>,
-    password_file: bool,
+    password_file: Option<String>,
     name: &str,
     section: &str,
 ) -> Result<PasswordSource, ConfigError> {
-    if password_file {
-        return Err(ConfigError::Parse(format!(
-            "password_file in {} is no longer a password source: submit the password from the human session with `td-secret set mail/{} < file`, press Ctrl+Alt+Esc then W, verify the target and touch the token, and set secret = \"{}\"",
-            section, name, PORTAL
-        )));
-    }
-    match (password_command, secret.as_deref()) {
-        (Some(command), None) => Ok(PasswordSource::Command(command)),
-        (None, Some("td-pass")) => Ok(PasswordSource::Notebook),
-        (None, Some(PORTAL)) => portal_name(name, section).map(PasswordSource::Portal),
-        (None, Some(_)) => Err(ConfigError::Parse(format!(
+    match (password_command, password_file, secret.as_deref()) {
+        (Some(command), None, None) => Ok(PasswordSource::Command(command)),
+        (None, Some(file), None) => password_file_path(&file, section).map(PasswordSource::File),
+        (None, None, Some("td-pass")) => Ok(PasswordSource::Notebook),
+        (None, None, Some(PORTAL)) => portal_name(name, section).map(PasswordSource::Portal),
+        (None, None, Some(_)) => Err(ConfigError::Parse(format!(
             "secret in {} takes \"{}\" or \"td-pass\"",
             section, PORTAL
         ))),
-        (Some(_), Some(_)) => Err(ConfigError::Parse(format!(
-            "both password_command and secret set in {}; choose one",
+        (None, None, None) => Err(ConfigError::Parse(format!(
+            "missing password_command, password_file or secret in {}",
             section
         ))),
-        (None, None) => Err(ConfigError::Parse(format!(
-            "missing password_command or secret in {}",
+        _ => Err(ConfigError::Parse(format!(
+            "more than one of password_command, password_file and secret set in {}; choose one",
             section
         ))),
+    }
+}
+
+/// `~` is not expanded and a relative name does not climb: the home a td jail
+/// assembles is not the human's, so a path through it or above the
+/// configuration's directory would name a different file in and out of it.
+fn password_file_path(file: &str, section: &str) -> Result<PathBuf, ConfigError> {
+    if file.is_empty() {
+        return Err(ConfigError::Parse(format!(
+            "password_file in {} is empty",
+            section
+        )));
+    }
+    if file.starts_with('~') {
+        return Err(ConfigError::Parse(format!(
+            "password_file in {} does not expand ~; name the file relative to the directory of this configuration",
+            section
+        )));
+    }
+    let path = PathBuf::from(file);
+    if path.is_relative()
+        && path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(ConfigError::Parse(format!(
+            "password_file in {} climbs out of the directory of this configuration; keep the file there",
+            section
+        )));
+    }
+    Ok(path)
+}
+
+/// Every account read from the file at `path` has its relative password_file
+/// resolved here, so none is ever read against the working directory.
+fn resolve_password_file(account: &mut AccountConfig, path: &Path) {
+    if let PasswordSource::File(file) = &mut account.password {
+        *file = path.parent().unwrap_or(Path::new("")).join(&*file);
     }
 }
 
@@ -485,8 +523,7 @@ struct RawAccountFields {
     username: Option<String>,
     password_command: Option<String>,
     secret: Option<String>,
-    /// The retired key is recognised so its refusal can say what replaced it.
-    password_file: bool,
+    password_file: Option<String>,
     tls_ca_file: Option<String>,
     unix_socket: Option<String>,
     /// `[mail]`'s keys, set for this account alone.
@@ -501,6 +538,7 @@ const ACCOUNT_KEYS: &[&str] = &[
     "well_known_url",
     "username",
     "password_command",
+    "password_file",
     "secret",
     "tls_ca_file",
     "unix_socket",
@@ -513,13 +551,7 @@ const ACCOUNT_KEYS: &[&str] = &[
 
 impl RawAccountFields {
     fn from_toml(table: &Toml) -> Result<Self, TomlError> {
-        // The retired key is recognised, so its refusal can say what replaced
-        // it, and not advertised in the accepted-key list.
-        if let Some(key) = table
-            .unknown_keys(ACCOUNT_KEYS)
-            .iter()
-            .find(|key| key.as_str() != "password_file")
-        {
+        if let Some(key) = table.unknown_keys(ACCOUNT_KEYS).first() {
             return Err(TomlError::unknown_field(key, ACCOUNT_KEYS));
         }
         Ok(RawAccountFields {
@@ -527,7 +559,7 @@ impl RawAccountFields {
             username: table.optional_str("username")?.map(str::to_string),
             password_command: table.optional_str("password_command")?.map(str::to_string),
             secret: table.optional_str("secret")?.map(str::to_string),
-            password_file: table.get("password_file").is_some(),
+            password_file: table.optional_str("password_file")?.map(str::to_string),
             tls_ca_file: table.optional_str("tls_ca_file")?.map(str::to_string),
             unix_socket: table.optional_str("unix_socket")?.map(str::to_string),
             reply_from: table.optional_str("reply_from")?.map(str::to_string),
@@ -626,7 +658,11 @@ impl Config {
         if contents.len() as u64 > MAX_CONFIG {
             return Err(ConfigError::Parse("config exceeds 1 MiB".into()));
         }
-        Self::parse(&contents)
+        let mut config = Self::parse(&contents)?;
+        for account in &mut config.accounts {
+            resolve_password_file(account, path);
+        }
+        Ok(config)
     }
 
     fn parse(contents: &str) -> Result<Self, ConfigError> {
@@ -1051,6 +1087,7 @@ pub fn set_up_account(
     }
     let url = discovery_url(server)?;
     let username = setup_username(username)?;
+    let named = path;
     // A link is followed, so its target is what is replaced.
     let path =
         fs::canonicalize(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
@@ -1076,12 +1113,14 @@ pub fn set_up_account(
     }
     let updated = replace_account_server(&contents, name, &url, &username)?;
     let config = Config::parse(&updated).map_err(|e| e.to_string())?;
-    let account = config
+    let mut account = config
         .accounts
         .into_iter()
         .find(|account| account.name == name)
         .filter(|account| account.well_known_url == url && account.username == username)
         .ok_or_else(|| format!("[account.{name}] did not parse back as written"))?;
+    // As `load` does, by the name td-mail was given, not the link's target.
+    resolve_password_file(&mut account, named);
     write_replacing(&path, updated.as_bytes())
         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
     Ok(account)
@@ -1612,35 +1651,47 @@ secret = "portal"
         let jmap = Config::parse(
             "[jmap]\nwell_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"/p\"\n",
         )
-        .unwrap_err();
-        match jmap {
-            ConfigError::Parse(msg) => assert!(
-                msg.contains("password_file in [jmap] is no longer a password source: submit the password from the human session with `td-secret set mail/default < file`"),
-                "got: {}",
-                msg
-            ),
-            _ => panic!("expected parse error"),
-        }
+        .unwrap();
+        assert_eq!(
+            jmap.accounts[0].password,
+            PasswordSource::File(PathBuf::from("/p"))
+        );
         for (body, needle) in [
             (
                 "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\n",
-                "missing password_command or secret",
+                "missing password_command, password_file or secret",
             ),
             (
                 "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\nsecret = \"portal\"\nbogus = 1\n",
-                "unknown field `bogus`, expected one of `well_known_url`, `username`, `password_command`, `secret`, `tls_ca_file`",
+                "unknown field `bogus`, expected one of `well_known_url`, `username`, `password_command`, `password_file`, `secret`, `tls_ca_file`",
             ),
             (
                 "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_command = \"pass\"\nsecret = \"portal\"\n",
-                "both password_command and secret",
+                "more than one of password_command, password_file and secret",
             ),
             (
                 "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\nsecret = \"hunter2\"\n",
                 "secret in [account.td] takes \"portal\" or \"td-pass\"",
             ),
             (
-                "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"/home/td/.config/td-mail/password\"\n",
-                "submit the password from the human session with `td-secret set mail/td < file`, press Ctrl+Alt+Esc then W, verify the target and touch the token, and set secret = \"portal\"",
+                "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"p\"\nsecret = \"td-pass\"\n",
+                "more than one of password_command, password_file and secret",
+            ),
+            (
+                "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"p\"\npassword_command = \"pass\"\n",
+                "more than one of password_command, password_file and secret",
+            ),
+            (
+                "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"\"\n",
+                "password_file in [account.td] is empty",
+            ),
+            (
+                "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"~/p\"\n",
+                "does not expand ~",
+            ),
+            (
+                "well_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"dir/../../p\"\n",
+                "climbs out of the directory",
             ),
         ] {
             let err = Config::parse(&format!("[account.td]\n{}", body)).unwrap_err();
@@ -1654,6 +1705,74 @@ secret = "portal"
                 _ => panic!("expected parse error"),
             }
         }
+    }
+
+    /// A relative password_file is the configuration's sibling, whichever
+    /// directory that is, and an absolute one stands as written.
+    #[test]
+    fn load_resolves_a_relative_password_file_against_the_configuration() {
+        let root = td_fs::TempDir::new("mail-password-file-config").unwrap();
+        let path = root.path().join("config.toml");
+        let account = |name: &str, file: &str| {
+            format!(
+                "[account.{name}]\nwell_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"{file}\"\n"
+            )
+        };
+        std::fs::write(
+            &path,
+            account("near", "dir/near.password") + &account("far", "/abs/far.password"),
+        )
+        .unwrap();
+        let sources: Vec<_> = Config::load(&path)
+            .unwrap()
+            .accounts
+            .into_iter()
+            .map(|account| account.password)
+            .collect();
+        assert!(sources.contains(&PasswordSource::File(root.path().join("dir/near.password"))));
+        assert!(sources.contains(&PasswordSource::File(PathBuf::from("/abs/far.password"))));
+
+        // A legacy [jmap] section is read the same way.
+        std::fs::write(
+            &path,
+            "[jmap]\nwell_known_url = \"https://mx.example.com/.well-known/jmap\"\nusername = \"u@example.com\"\npassword_file = \"legacy.password\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().accounts[0].password,
+            PasswordSource::File(root.path().join("legacy.password"))
+        );
+    }
+
+    /// The setup form hands back the account the next connect reads: its
+    /// password_file is the configuration's sibling still, not a name for
+    /// the working directory to answer.
+    #[test]
+    fn the_setup_form_keeps_a_relative_password_file_resolved() {
+        let root = td_fs::TempDir::new("mail-password-file-setup").unwrap();
+        let path = root.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[account.main]\nwell_known_url = \"https://mail.example.com/.well-known/jmap\"\nusername = \"you@example.com\"\npassword_file = \"mail.password\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load(&path).unwrap().accounts.remove(0);
+        let resolved = PasswordSource::File(root.path().join("mail.password"));
+        assert_eq!(loaded.password, resolved);
+        let updated = set_up_account(&path, &loaded, "mx.td.dev", "me@td.dev").unwrap();
+        assert_eq!(updated.password, resolved);
+        assert_eq!(Config::load(&path).unwrap().accounts[0].password, resolved);
+
+        // Through a link, it is the sibling of the name td-mail was given,
+        // as `load` has it, though the link's target is what is rewritten.
+        let named = td_fs::TempDir::new("mail-password-file-setup-link").unwrap();
+        let link = named.path().join("config.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let loaded = Config::load(&link).unwrap().accounts.remove(0);
+        let beside_link = PasswordSource::File(named.path().join("mail.password"));
+        assert_eq!(loaded.password, beside_link);
+        let updated = set_up_account(&link, &loaded, "mx2.td.dev", "me@td.dev").unwrap();
+        assert_eq!(updated.password, beside_link);
     }
 
     /// td-secret refuses a name outside `[A-Za-z0-9_-]{1,64}`; the account

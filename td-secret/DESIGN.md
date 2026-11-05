@@ -107,16 +107,10 @@ The transport surface and source confinement are recorded in UNSAFE.md §15.
 
 ## Writers and migration
 
-Firstboot creates the per-user store and `mail/main` placeholder. It imports
-the former provisioner's `password` file before publishing portal-mode
-configuration and deleting the old file. Existing stored bytes survive every
-boot. A conflict between a stored credential and a legacy file is refused;
-neither is silently discarded. This migration supports the exact previous
-provisioner's path and main account, with explicit refusal for renamed
-accounts, custom password-file paths, multiline strings and ambiguous
-credential sources.
-A mail refusal leaves its source data intact and does not prevent news
-configuration from being provisioned.
+Firstboot creates the per-user store and provisions no placeholder credential.
+It neither imports nor removes a password file, and existing stored bytes
+survive every boot. td-mail's own `password_file` (`APPLICATIONS.md` §W.4) is
+outside the store.
 
 Before any human session starts, firstboot transfers each deployed
 session's existing store from the human UID to its reserved portal UID.
@@ -158,8 +152,7 @@ from the human session. The root console writer has been removed. Application
 and entry names remain typed fields, never paths. Physical secure attention
 selects the queued request and one fresh assertion authorizes its exact
 snapshot. Neither root's former console syntax nor an existing volatile
-release substitutes for that consent. Firstboot remains the initial writer
-of an unenrolled placeholder; see the named-write intake contract below.
+release substitutes for that consent.
 
 ## TPM protection and legacy migration
 
@@ -829,11 +822,9 @@ so malformed persistent bytes cannot bypass relocking. It recognizes the
 token format during isolation and provisioning, clears volatile release state and retires interrupted legacy store files
 without accessing a token or TPM. A locked store does not prevent
 application configuration or compositor startup. It neither reads nor
-creates a placeholder credential in an enrolled locked store. A legacy
-plaintext mail credential still present beside that application is
-refused and retained for explicit migration; it is never silently erased.
-The public console `release` command is removed; release requires the
-paired physical-attention flow.
+creates a placeholder credential in an enrolled locked store. The public
+console `release` command is removed; release requires the paired
+physical-attention flow.
 
 The paired authority invokes the private workers below after physical
 secure-attention selection and exact trusted presentation. Enrollment
@@ -1233,8 +1224,8 @@ Application-secret enrollment still uses the separate synthetic PCR 7
 extension, so this does not activate a measured-deployment release policy.
 Authenticated firmware entry and update authorization remain unimplemented.
 
-The creation boot requires firstboot's file-backed mail placeholder and
-portal-mode configuration without an application password file. E enrolls
+The creation boot requires firstboot's mail configuration without an
+application password file. E enrolls
 primary and recovery devices, U unlocks, and the public one-operation writer
 queues mail/main for W and a fresh assertion. The stock session starts mail
 and news at boot only on an autotest boot, which this is not, so the

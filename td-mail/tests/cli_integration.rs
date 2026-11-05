@@ -204,6 +204,42 @@ fn test_status_before_connect() {
     assert!(resp["account"].is_null());
 }
 
+/// The real program, with its working directory elsewhere: a relative
+/// password_file is the configuration's sibling, a missing one is named, and
+/// a private one connects.
+#[test]
+fn a_relative_password_file_beside_the_configuration_connects() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut h = CliHarness::start();
+    let dir = h._config_dir.path().to_path_buf();
+    let config = dir.join("config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let source = "password_command = \"echo test\"";
+    assert!(text.contains(source));
+    std::fs::write(
+        &config,
+        text.replace(source, "password_file = \"mail.password\""),
+    )
+    .unwrap();
+    h.restart();
+
+    let resp = h.send(json!({"command": "connect", "account": "test"}));
+    assert!(!resp["ok"].is_true(), "connected with no file: {}", resp);
+    let said = resp.to_string();
+    let file = dir.join("mail.password");
+    assert!(said.contains("could not use password_file"), "{said}");
+    assert!(said.contains(&*file.to_string_lossy()), "{said}");
+
+    std::fs::write(&file, "test\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let resp = h.send(json!({"command": "connect", "account": "test"}));
+    assert!(resp.to_string().contains("mode 644"), "{}", resp);
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let resp = h.send(json!({"command": "connect", "account": "test"}));
+    assert!(resp["ok"].is_true(), "connect failed: {}", resp);
+}
+
 #[test]
 fn test_connect_and_list_mailboxes() {
     let mut h = CliHarness::start();
