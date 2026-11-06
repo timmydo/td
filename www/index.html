@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="td: Timmy’s Distro. A personal, opinionated Linux distribution with a Rust-first desktop and an immutable system.">
+  <meta name="theme-color" content="#f7f6f2">
+  <title>td: Timmy’s Distro</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header wrap">
+    <a class="wordmark" href="#" aria-label="td home">td<span aria-hidden="true">.</span></a>
+    <nav aria-label="Main navigation">
+      <a href="#about">About</a>
+      <a href="https://github.com/timmydo/td">Source <span aria-hidden="true">↗</span></a>
+      <a href="#install">Download <span aria-hidden="true">↓</span></a>
+    </nav>
+  </header>
+
+  <main id="main" class="wrap">
+    <section class="hero" aria-labelledby="title">
+      <p class="eyebrow">A personal Linux distribution</p>
+      <h1 id="title"><span>td:</span> Timmy’s Distro</h1>
+      <p class="intro">Opinionated. Homemade.<br>A little “not invented here.”</p>
+      <p class="hero-note">An immutable system, a Rust-first desktop, and a growing collection
+        of tools built to fit together.</p>
+      <div class="actions">
+        <a class="button" href="#install">Download td <span aria-hidden="true">↓</span></a>
+        <a class="text-link" href="https://github.com/timmydo/td">Look around the source <span aria-hidden="true">↗</span></a>
+      </div>
+    </section>
+
+    <figure class="desktop">
+      <a href="assets/td-desktop.jpg" aria-label="View the full-size photo of td running on a ThinkPad">
+        <img src="assets/td-desktop.jpg" width="960" height="695"
+          alt="td running on a ThinkPad, with tiled windows for a terminal, Firefox, Mail, Software, and Task Manager."
+          fetchpriority="high">
+      </a>
+      <figcaption><span>A desktop of its own.</span> td running on a ThinkPad.</figcaption>
+    </figure>
+
+    <section id="about" class="about section" aria-labelledby="about-title">
+      <div>
+        <p class="eyebrow">The idea</p>
+        <h2 id="about-title">A distro with<br>a personal point of view.</h2>
+      </div>
+      <div class="prose">
+        <p>td has its own compositor, terminal, editor, mail client, news reader,
+          photo viewer, password manager, and agent harness. There’s a shared
+          UI toolkit underneath, also written here. “Not invented here” runs
+          pretty deep.</p>
+        <p>The compositor, terminal, editor, and UI toolkit have zero external
+          crate dependencies: just Rust’s standard library and td’s own code.
+          It’s a personal Linux distribution, with opinions and rough edges
+          to match.</p>
+        <a class="text-link" href="https://github.com/timmydo/td#readme">Read more about td <span aria-hidden="true">↗</span></a>
+      </div>
+    </section>
+
+    <section class="details section" aria-label="How td is built">
+      <article>
+        <p class="number" aria-hidden="true">01 /</p>
+        <h3>Hermetic builds.</h3>
+        <p>Builds run offline in sandboxes with declared inputs, pinned sources,
+          and pinned toolchains. The host’s tools and libraries stay outside
+          the target build.</p>
+      </article>
+      <article>
+        <p class="number" aria-hidden="true">02 /</p>
+        <h3>A Nix-like store.</h3>
+        <p>Content-addressed outputs live at their own hash-named paths in
+          /td/store. Rust recipes describe the graph, and td’s own builder
+          realizes it. No Nix runtime required.</p>
+      </article>
+      <article>
+        <p class="number" aria-hidden="true">03 /</p>
+        <h3>An immutable system.</h3>
+        <p>The system lives in a read-only image. Your data lives separately,
+          and updates retain the previous deployment for rollback.</p>
+      </article>
+      <article>
+        <p class="number" aria-hidden="true">04 /</p>
+        <h3>Passwordless by design.</h3>
+        <p>No account password to create or remember. Local administration asks
+          for explicit consent to a specific operation.</p>
+      </article>
+      <article>
+        <p class="number" aria-hidden="true">05 /</p>
+        <h3>No systemd. No PAM.</h3>
+        <p>td-init, td-svc, and td-login handle boot, service supervision, and
+          login. The system has its own path from PID 1 to the desktop.</p>
+      </article>
+      <article>
+        <p class="number" aria-hidden="true">06 /</p>
+        <h3>The recipe is the distro.</h3>
+        <p>The build system itself has zero external crate dependencies.
+          Pull the source, change the recipes, and build the system locally.</p>
+      </article>
+    </section>
+
+    <section id="install" class="install section" aria-labelledby="install-title">
+      <div>
+        <p class="eyebrow">Give it a try</p>
+        <h2 id="install-title">Install td.</h2>
+        <p>A personal project, still taking shape.<br>Start with the release instructions for your image.</p>
+      </div>
+      <div class="install-options">
+        <h3>Get an image</h3>
+        <p>Find downloads and release information at releases.tdlinux.org.</p>
+        <a class="button" href="https://releases.tdlinux.org/">Explore releases <span aria-hidden="true">↗</span></a>
+        <div class="source-option">
+          <h3>Prefer to build it yourself?</h3>
+          <p>The repository covers building td and trying it in QEMU.</p>
+          <a class="text-link" href="https://github.com/timmydo/td#try-it">Build from source <span aria-hidden="true">↗</span></a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer wrap">
+    <p><strong>td</strong> <span>Timmy’s Distro</span></p>
+    <a href="https://github.com/timmydo/td">Made in the open <span aria-hidden="true">↗</span></a>
+  </footer>
+</body>
+</html>
