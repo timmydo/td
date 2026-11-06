@@ -119,3 +119,42 @@ is pending.
 | new | initramfs.cpio | 12367360 | `bdee6667b98f9ebbc4a43bddfaa7534325965254f2b96b5ba339dc86fcdd615c` |
 | new | root.erofs | 93077504 | `940be4ea46b16b77fa107b5016138251edd8e24bed42bac64f7c4b533bd5c012` |
 | new | manifest | 249 | `03b6ccf5c33fb93aa2f7e1da9f45168cd8480167e3fd4b55c0f1cec62754eedc` |
+
+## Direct seed reads with remote-object retention
+
+A follow-up on 2026-11-05 compares the downloader at
+`35a8d944dd6063404ca86fa06e75f097095fb839` with
+`a8826d6a795f63edf613b0bb5cf0049a8ff314e8`. Both are release-mode musl
+builds using the same toolchain. The latter reads verified seed chunks
+directly into the output without also persisting them in the object cache;
+newly downloaded chunks still enter the cache. This implements the experiment
+proposed above; the earlier table describes the previous behavior.
+
+The image pair and independent payload verification are unchanged. Each
+case starts with an empty cache and the old deployment as its seed, using
+the default two-GiB cache limit. The HTTP shaping method is the same.
+These are single runs on the shared host with concurrent builds and VMs
+and uncontrolled page cache, not statistically controlled speed estimates.
+
+| Response delay / body cap | Downloader | Seconds | Retained object bytes |
+| --- | --- | ---: | ---: |
+| None / unlimited | before | 69.022 | 126,626,304 |
+| None / unlimited | direct seed | 7.671 | 5,119,158 |
+| 80 ms / 20 Mbps | before | 64.906 | 126,626,304 |
+| 80 ms / 20 Mbps | direct seed | 13.425 | 5,119,158 |
+
+Every case makes 47 GETs, receives 5,230,618 response-body bytes, downloads
+5,119,158 object bytes, and reuses 121,507,146 output bytes. Each reconstructs
+126,626,304 payload bytes. The improvement therefore concerns local cache
+writes and synchronization, not reduced network traffic. The changed default
+retains remote objects for resume without duplicating the installed seed.
+Future updates may rescan the installed image; a cache alone cannot reuse
+seed-only bytes after that image is removed.
+
+The 27 release tests pass, including repeated seed-only acquisition with
+repository objects absent, a complete cache avoiding a missing seed, and
+an interrupted mixed acquisition retaining completed remote chunks but
+neither seed chunks nor partial remote objects. The regression assertion
+failed before the change because seeded objects were retained. Public
+mirror, TLS/CDN, repeated timing runs and larger update pairs remain
+separate validation work.
