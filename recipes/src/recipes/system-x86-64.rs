@@ -3373,7 +3373,7 @@ fn build_td_txt_probes() -> String {
 ///
 /// Note what is NOT sound this way, since it looks like it should be:
 /// `/proc/sys/user/max_*_namespaces` exists whatever the namespace symbols say —
-/// `kernel/ucount.c` registers all seven entries under CONFIG_SYSCTL alone. Those are
+/// `kernel/ucount.c` registers all eight entries under CONFIG_SYSCTL alone. Those are
 /// read for their VALUE in [`SANDBOX_KERNEL_UCOUNTS`] instead.
 const SANDBOX_KERNEL_NODES: &[(&str, &str, &str)] = &[
     (

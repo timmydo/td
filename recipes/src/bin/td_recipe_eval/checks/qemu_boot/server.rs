@@ -661,7 +661,7 @@ fn image_boot(
     fs::remove_dir_all(&dir).map_err(|error| format!("remove {}: {error}", dir.display()))
 }
 
-/// The seed, the only drive on q35's AHCI, was read once, its hostname
+/// The seed, /dev/sr0 on q35's AHCI, was read once, its hostname
 /// taken and applied, one key written and the RSA key skipped, and the
 /// cloud sources stood aside.
 fn validate_seeded(result: &BootResult, label: &str) -> Result<(), String> {
