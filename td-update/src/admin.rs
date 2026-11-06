@@ -25,6 +25,8 @@ const DOWNLOAD: &str = "/var/lib/td-admin-build/download";
 const WORKER_STATE: &str = "/var/lib/td-admin-build/release-state";
 const RELEASE_EVIDENCE: &str = "/var/lib/td-admin-build/release-state.metadata";
 const UPSTREAM: &str = "https://github.com/timmydo/td.git";
+const OFFICIAL_ENDPOINT: &str = "https://releases.tdlinux.org";
+const OFFICIAL_ROOT: &str = include_str!("official.root");
 const HELP: &str = "td-admin update [--no-reboot] | update-from-source [--no-reboot] | rollback [--no-reboot] | status [JOB] | logs [JOB] | cancel | reboot\nSSH: ssh td-admin@HOST update [--no-reboot]\nUpdates download a valid signed release and reboot by default. Jobs survive disconnects.\nUse update-from-source explicitly to build trusted upstream main.\nInitial setup: td-admin enroll-key PUBLIC_KEY_FILE, then approve H on secure attention.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -451,30 +453,76 @@ fn build_job(shared: &Shared, revision: &str, log: &File) -> Result<PathBuf> {
 
 fn configure_release(endpoint: &str, trust: &Path, profile: &str) -> Result<()> {
     root()?;
+    directory(Path::new(STATE), 0, 0, 0o755)?;
+    let _lease = enrollment_lease(Path::new(STATE))?;
+    initialize_release(Path::new(STATE), endpoint, &read(trust, 16384)?, profile)
+}
+
+fn initialize_release(state: &Path, endpoint: &str, trust: &str, profile: &str) -> Result<()> {
+    initialize_release_with(state, endpoint, trust, |staging| {
+        crate::success(
+            fixed("/bin/td-release")
+                .arg("init")
+                .arg(staging.join("state"))
+                .arg(staging.join("root"))
+                .arg(profile),
+            "initialize trusted release policy",
+        )
+    })
+}
+
+fn initialize_release_with(
+    state: &Path,
+    endpoint: &str,
+    trust: &str,
+    initialize: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     if endpoint.is_empty() || endpoint.len() > 4096 || endpoint.contains(['\n', '\r', '\0']) {
         return Err("release endpoint must be one bounded URL".into());
     }
-    directory(Path::new(STATE), 0, 0, 0o755)?;
-    // Initial provisioning only; replacing trust is a recovery operation.
+    let destination = state.join("releases");
+    if crate::present(&destination)? {
+        return Err("a release policy already exists; initial setup cannot replace it".into());
+    }
+    // Only unpublished staging is reclaimed, under the root-owned enrollment lease.
+    let staging = state.join(".releases-initial");
+    if crate::present(&staging)? {
+        let metadata = io(fs::symlink_metadata(&staging), "inspect release staging")?;
+        if !metadata.is_dir()
+            || metadata.uid() != io(state.metadata(), "inspect policy owner")?.uid()
+        {
+            return Err("release staging is not an owned directory".into());
+        }
+        io(
+            fs::remove_dir_all(&staging),
+            "remove interrupted release staging",
+        )?;
+    }
     io(
-        fs::DirBuilder::new().mode(0o700).create(RELEASE_POLICY),
-        "create initial release policy",
+        fs::DirBuilder::new().mode(0o700).create(&staging),
+        "create staged release policy",
     )?;
-    crate::success(
-        fixed("/bin/td-release")
-            .args(["init", RELEASE_STATE])
-            .arg(trust)
-            .arg(profile),
-        "initialize trusted release policy",
-    )?;
-    publish(
-        &Path::new(RELEASE_POLICY).join("endpoint"),
-        &format!("{endpoint}\n"),
+    publish(&staging.join("root"), trust)?;
+    initialize(&staging)?;
+    publish(&staging.join("endpoint"), &format!("{endpoint}\n"))?;
+    io(
+        fs::rename(&staging, &destination),
+        "publish initial release policy",
     )?;
     io(
-        File::open(STATE).and_then(|file| file.sync_all()),
+        File::open(state).and_then(|file| file.sync_all()),
         "persist release policy directory",
     )
+}
+
+fn initialize_official_release() -> Result<()> {
+    let state = Path::new(STATE);
+    let _lease = enrollment_lease(state)?;
+    if !crate::present(Path::new(RELEASE_POLICY))? {
+        initialize_release(state, OFFICIAL_ENDPOINT, OFFICIAL_ROOT, "system-x86-64")?;
+        eprintln!("td-admin: initialized bundled publisher policy for {OFFICIAL_ENDPOINT}");
+    }
+    Ok(())
 }
 
 fn release_receipt(text: &str) -> Result<(&str, &str)> {
@@ -877,6 +925,10 @@ fn serve() -> Result<()> {
     drain_group(GIT_GROUP)?;
     drain_group(OPERATION_GROUP)?;
     drain_group(BUILD_GROUP)?;
+    // A failed bootstrap must not prevent explicit source updates or rollback.
+    if let Err(error) = initialize_official_release() {
+        eprintln!("td-admin: publisher initialization failed: {error}");
+    }
     let sequence = Path::new(STATE).join("sequence");
     let id = if crate::present(&sequence)? {
         read(&sequence, 32)?
@@ -1254,6 +1306,82 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn bundled_publisher_is_the_reviewed_nonexpiring_public_root() {
+        assert_eq!(OFFICIAL_ENDPOINT, "https://releases.tdlinux.org");
+        assert_eq!(
+            crate::sha256::hex_digest(OFFICIAL_ROOT.as_bytes()),
+            "08f59be2c8edcc7b0d2e91305b726784cd326a41e663c2ec47984d95b40d801e"
+        );
+        assert!(OFFICIAL_ROOT.starts_with("td-release-root-v1\n2\n0\n"));
+    }
+
+    #[test]
+    fn publisher_setup_is_atomic_retryable_and_never_replaces_saved_policy() {
+        let scratch = crate::temp_dir::TempDir::new("publisher-initialization").unwrap();
+        let state = scratch.path();
+        let initialize = |staging: &Path| {
+            assert_eq!(
+                fs::read_to_string(staging.join("root")).unwrap(),
+                OFFICIAL_ROOT
+            );
+            fs::write(staging.join("state"), b"verified state\n").map_err(|e| e.to_string())
+        };
+        assert!(
+            initialize_release_with(state, OFFICIAL_ENDPOINT, OFFICIAL_ROOT, |staging| {
+                initialize(staging)?;
+                Err("interrupted before publication".into())
+            })
+            .is_err()
+        );
+        assert!(!state.join("releases").exists());
+        initialize_release_with(state, OFFICIAL_ENDPOINT, OFFICIAL_ROOT, initialize).unwrap();
+        assert_eq!(
+            fs::read_to_string(state.join("releases/state")).unwrap(),
+            "verified state\n"
+        );
+        assert_eq!(
+            fs::read_to_string(state.join("releases/endpoint")).unwrap(),
+            format!("{OFFICIAL_ENDPOINT}\n")
+        );
+        assert_eq!(
+            fs::metadata(state.join("releases")).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert!(!state.join(".releases-initial").exists());
+        assert!(
+            initialize_release_with(state, "https://other.invalid", "replacement", |_| Ok(()))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(state.join("releases/root")).unwrap(),
+            OFFICIAL_ROOT
+        );
+    }
+
+    #[test]
+    fn publisher_setup_preserves_partial_policies_and_refuses_staging_links() {
+        let scratch = crate::temp_dir::TempDir::new("publisher-existing").unwrap();
+        let state = scratch.path();
+        fs::create_dir(state.join("releases")).unwrap();
+        assert!(
+            initialize_release_with(state, OFFICIAL_ENDPOINT, OFFICIAL_ROOT, |_| Ok(())).is_err()
+        );
+        assert_eq!(fs::read_dir(state.join("releases")).unwrap().count(), 0);
+        fs::remove_dir(state.join("releases")).unwrap();
+        std::os::unix::fs::symlink("missing", state.join("releases")).unwrap();
+        assert!(
+            initialize_release_with(state, OFFICIAL_ENDPOINT, OFFICIAL_ROOT, |_| Ok(())).is_err()
+        );
+        fs::remove_file(state.join("releases")).unwrap();
+        std::os::unix::fs::symlink("missing", state.join(".releases-initial")).unwrap();
+        assert!(
+            initialize_release_with(state, OFFICIAL_ENDPOINT, OFFICIAL_ROOT, |_| Ok(())).is_err()
+        );
+        assert!(fs::symlink_metadata(state.join(".releases-initial"))
+            .unwrap()
+            .is_symlink());
+    }
     #[test]
     fn rollback_reads_the_boot_protocol_volume_layout() {
         let scratch = crate::temp_dir::TempDir::new("admin-rollback-selectors").unwrap();

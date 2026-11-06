@@ -2,6 +2,7 @@ use crate::shared::{split_target_debug, target_rustc};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const ADMIN_RS: &str = include_str!("../../../td-update/src/admin.rs");
+const OFFICIAL_ROOT: &str = include_str!("../../../td-update/src/official.root");
 const APPLY_RS: &str = include_str!("../../../td-update/src/apply.rs");
 const UPSTREAM_RS: &str = include_str!("../../../td-update/src/upstream.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
@@ -26,6 +27,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-update/src/admin.rs".into(),
             content: ADMIN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-update/src/official.root".into(),
+            content: OFFICIAL_ROOT.into(),
             exec: false,
         },
         Step::WriteFile {

@@ -12236,10 +12236,11 @@ Three consequences that are easy to violate by accident:
    when Flathub pruned the commit). Never host a repackaged copy.
 3. **Optional system-image delivery is the explicit exception.**
    `net/RELEASES.md` specifies a static signed release repository and chunk
-   reuse. The initial workflow uses local storage and loopback HTTP; there
-   is no default public host or required maintainer service. A machine's
-   trusted publisher policy is provisioned separately. Source recipes do
-   not pin or consume these release artifacts.
+   reuse. The desktop image bundles the official public publisher root and
+   `https://releases.tdlinux.org`; td-admin initializes that policy only when
+   none exists (`td-update/ADMIN.md`). No periodic publisher activity is
+   required to keep existing signatures valid. Source builds remain
+   independent, and source recipes do not pin or consume release artifacts.
 
 The scale at which this stops being sufficient is worth naming so the
 decision is revisited deliberately rather than suffered: **a second

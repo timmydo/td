@@ -2,9 +2,11 @@
 
 `td-net release` publishes and acquires complete deployment images through a
 static repository. The repository may be local (`file:/absolute/path`),
-loopback HTTP, or HTTPS. It needs no executing server component. There is no
-default public repository or compiled publisher key. Source builds remain
-available independently. This protocol authenticates a publisher's assertion
+loopback HTTP, or HTTPS. It needs no executing server component. The transport
+requires an explicit trust state; the desktop's td-admin initializes an absent
+policy from its bundled official public root and `https://releases.tdlinux.org`
+as specified in `td-update/ADMIN.md`. Source builds remain available
+independently. This protocol authenticates a publisher's assertion
 about an image and source commit; it does not prove reproducibility or that
 the publisher applied security fixes. It is a td protocol, not TUF.
 

@@ -77,15 +77,30 @@ leader drains every helper subgroup before accepting commands.
 
 ## Release policy and download boundary
 
-Initial publisher provisioning is a root-only recovery/setup operation:
+The desktop image bundles the official public root (epoch 2, no expiry,
+SHA-256 `08f59be2c8edcc7b0d2e91305b726784cd326a41e663c2ec47984d95b40d801e`)
+and `https://releases.tdlinux.org`. At service startup, after draining old
+workers, td-admin initializes `system-x86-64` policy only if the entire
+`/var/lib/td-admin/releases` path is absent. It verifies the bundled root
+through the installed td-release, without a network request. Trust comes
+from the installed image, not from a key downloaded beside an update.
+No private signing key is bundled. Existing policy, including a partial,
+invalid or custom one, is never replaced. An initialization error is reported
+without withholding the source-update or rollback service.
+
+Initial explicit publisher provisioning remains a root-only recovery/setup operation:
 
 ```text
 td-admin configure-release URL ROOT_DOCUMENT PROFILE
 ```
 
-It creates `/var/lib/td-admin/releases` as root:root mode 0700, initializes
-`state` through the installed `/bin/td-release init`, and saves the fixed
-repository URL in `endpoint`. The root document is public metadata selected
+Both paths serialize with the root-owned enrollment lease, prepare a mode-0700
+`.releases-initial` directory beside the destination, and publish it only
+after successful initialization and endpoint persistence. Interrupted staging
+may be reclaimed under that lease; an existing destination is never reclaimed.
+The completed `/var/lib/td-admin/releases` is root:root mode 0700. The
+installed `/bin/td-release init` initializes `state`; `endpoint` holds the
+fixed repository URL. The root document is public metadata selected
 out of band; no private signing key goes onto the machine. The profile is
 `system-x86-64` or `server-x86-64`. An existing policy directory refuses
 replacement, including a partial failed setup; trusted recovery must inspect
@@ -93,6 +108,16 @@ and remove an incomplete initial setup before retrying. This operation is
 not available to the remote admin key or ordinary session. Hosting and
 publisher-key rotation follow `net/RELEASES.md`; the SSH caller cannot change
 trust, repository, profile or version floors.
+
+A source-only td-admin predating downloadable releases interprets SSH
+`update` as a trusted-main source build. With an already enrolled admin key,
+that command can install a main revision containing this bootstrap; its first
+boot initializes the publisher, and subsequent `update` requests download
+images. A transitional client where `update` already means download must use
+`update-from-source` explicitly if it lacks usable publisher policy. Very old
+systems without td-admin or an enrolled admin key require local installation
+or key enrollment first. This migration still depends on the old image being
+able to build current main; it is not a remote trust-bypass command.
 
 An unconfigured `update`, or one without a valid available release, fails
 and names `td-admin update-from-source` (preserving `--no-reboot`) as an
