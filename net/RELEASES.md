@@ -205,6 +205,71 @@ starts fresh head and release counters. All payload objects precede metadata dis
 cache files are private to their owner by default; hosting permissions are
 an explicit operator setup outside this local prototype.
 
+### Local operator workflow
+
+Use a clean, reviewed checkout and record `git rev-parse HEAD` as COMMIT.
+Build the image with the host control plane (the warm step may download
+pinned inputs; the recipe build itself remains offline):
+
+```text
+cargo build --release --manifest-path builder/Cargo.toml
+cargo build --release --manifest-path recipes/Cargo.toml --bin td-recipe-eval
+cargo build --release --manifest-path net/Cargo.toml
+target/release/td-recipe-eval warm system-x86-64
+target/release/td-recipe-eval build-run system-x86-64
+```
+
+The final build output names the staged system directory. Its `deployment`
+child is DEPLOYMENT below. Keep the checkout unchanged between recording
+COMMIT and building. The signing tool verifies payload hashes, but does not
+prove that an operator-supplied commit produced those bytes. For server
+images, use `server-x86-64` for both the build and profile.
+
+With an already provisioned ROOT document and RELEASE_PRIVATE key outside
+the local repository, stage a signed release:
+
+```text
+net/target/release/td-net release publish-next REPOSITORY ROOT RELEASE_PRIVATE system-x86-64 COMMIT DEPLOYMENT
+```
+
+`publish-next` holds the repository lease while choosing a sequence above
+all retained signed indexes for that profile and root epoch, including
+staged indexes. It publishes ordinary CDC objects and an index valid for
+up to 30 days, clipped to root expiry, and prints RELEASE_HASH. It leaves
+public discovery unchanged. Its scan admits at most 200,000 index entries
+and one hour; malformed or corrupt matching metadata refuses. Exact
+interrupted atomic-write temporaries are reclaimed under the lease; links
+are removed without following them and unrelated names refuse. A failed
+publication may leave unreachable immutable objects, which ordinary GC can
+later collect.
+
+After validating the candidate, select it explicitly:
+
+```text
+net/target/release/td-net release promote-next REPOSITORY ROOT RELEASE_PRIVATE system-x86-64 RELEASE_HASH
+```
+
+This verifies the index and every object, chooses the next head counter
+under the same lease, and atomically updates discovery. The head lasts at
+most 24 hours, clipped to index and root expiry. Existing rollback and
+same-sequence equivocation checks still apply. A new root epoch starts its
+head counter at one; the new index must be signed under that root.
+
+Renew the selected head before it expires with:
+
+```text
+net/target/release/td-net release renew REPOSITORY ROOT RELEASE_PRIVATE system-x86-64
+```
+
+Renewal advances the head counter without changing the selected index or
+objects and rechecks those objects before publication. An expired head can
+be renewed while its index and root remain valid. An expired index requires
+`publish-next` and `promote-next`; renewal never silently extends an image
+index's signed lifetime. A root rotation likewise requires a new index.
+Scheduling renewal and choosing which source revision to release remain
+operator decisions. These commands operate on a local repository and do
+not upload data or require public hosting.
+
 `gc REPOSITORY ROOT` is a dry run; `--delete` performs deletion under the
 same lease as publication. It retains the heads' selected indexes even when
 expired and all indexes until seven days after expiry. It computes object

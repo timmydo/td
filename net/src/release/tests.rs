@@ -922,3 +922,167 @@ fn seed_bytes_are_reverified_after_the_scan() {
         .unwrap_err()
         .contains("changed after scanning"));
 }
+
+#[test]
+fn operator_commands_stage_promote_and_renew_with_monotonic_counters() {
+    let f = Fixture::new();
+    let profile = "system-x86-64";
+    let original = fs::read(f.repo.join("heads").join(profile)).unwrap();
+    let root = Root::parse(&text(&f.root, SMALL).unwrap(), None).unwrap();
+    let mut latest = String::new();
+    for expected in [2, 3] {
+        publisher::publish_next(
+            &f.repo,
+            &f.root,
+            &f.key,
+            profile,
+            &"2".repeat(40),
+            &f.deployment,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(f.repo.join("heads").join(profile)).unwrap(),
+            original
+        );
+        let mut maximum = 0;
+        for entry in fs::read_dir(f.repo.join("releases")).unwrap() {
+            let entry = entry.unwrap();
+            let release = Release::parse(
+                &text(&entry.path(), INDEX_LIMIT).unwrap(),
+                &root,
+                now().unwrap(),
+                profile,
+            )
+            .unwrap();
+            if release.sequence > maximum {
+                maximum = release.sequence;
+                latest = entry.file_name().into_string().unwrap();
+            }
+        }
+        assert_eq!(maximum, expected);
+    }
+    publisher::promote_next(&f.repo, &f.root, &f.key, profile, Some(&latest)).unwrap();
+    let head = Head::parse(
+        &text(&f.repo.join("heads").join(profile), SMALL).unwrap(),
+        &root,
+        now().unwrap(),
+        profile,
+    )
+    .unwrap();
+    assert_eq!((head.version, &head.release), (2, &latest));
+    let release_count = fs::read_dir(f.repo.join("releases")).unwrap().count();
+    publisher::promote_next(&f.repo, &f.root, &f.key, profile, None).unwrap();
+    let head = Head::parse(
+        &text(&f.repo.join("heads").join(profile), SMALL).unwrap(),
+        &root,
+        now().unwrap(),
+        profile,
+    )
+    .unwrap();
+    assert_eq!((head.version, &head.release), (3, &latest));
+    assert_eq!(
+        fs::read_dir(f.repo.join("releases")).unwrap().count(),
+        release_count
+    );
+    f.fetch("operator").unwrap();
+    verify(&f.state, &f.dir.join("operator")).unwrap();
+}
+
+#[test]
+fn renewal_refuses_an_expired_index_without_replacing_the_head() {
+    let f = Fixture::new();
+    let profile = "system-x86-64";
+    let time = now().unwrap();
+    let original = text(&f.repo.join("releases").join(&f.release), INDEX_LIMIT).unwrap();
+    let mut lines: Vec<_> = original.lines().map(str::to_string).collect();
+    lines.pop();
+    lines[3] = (time - 7200).to_string();
+    lines[4] = (time - 3600).to_string();
+    let expired = format::signed(&(lines.join("\n") + "\n"), &fs::read(&f.key).unwrap()).unwrap();
+    let digest = hash(expired.as_bytes());
+    fs::write(f.repo.join("releases").join(&digest), expired).unwrap();
+    let head = format::signed(
+        &format!(
+            "td-release-head-v1\n1\n2\n{}\n{}\n{profile}\n{digest}\n",
+            time - 7200,
+            time - 3600
+        ),
+        &fs::read(&f.key).unwrap(),
+    )
+    .unwrap();
+    fs::write(f.repo.join("heads").join(profile), &head).unwrap();
+    assert!(
+        publisher::promote_next(&f.repo, &f.root, &f.key, profile, None)
+            .unwrap_err()
+            .contains("publish a fresh index")
+    );
+    assert_eq!(
+        text(&f.repo.join("heads").join(profile), SMALL).unwrap(),
+        head
+    );
+    publisher::publish_next(
+        &f.repo,
+        &f.root,
+        &f.key,
+        profile,
+        &"3".repeat(40),
+        &f.deployment,
+    )
+    .unwrap();
+}
+
+#[test]
+fn automatic_promotion_checks_objects_before_changing_discovery() {
+    let f = Fixture::new();
+    let path = f.repo.join("heads/system-x86-64");
+    let head = fs::read(&path).unwrap();
+    let object = fs::read_dir(f.repo.join("objects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::write(object, b"corrupt").unwrap();
+    assert!(
+        publisher::promote_next(&f.repo, &f.root, &f.key, "system-x86-64", None)
+            .unwrap_err()
+            .contains("corrupt or missing")
+    );
+    assert_eq!(fs::read(&path).unwrap(), head);
+}
+
+#[test]
+fn next_publication_reclaims_interrupted_index_writes_only() {
+    let f = Fixture::new();
+    let releases = f.repo.join("releases");
+    let partial = releases.join(format!(".{}.123.0.tmp", "a".repeat(64)));
+    fs::write(&partial, b"interrupted signed index").unwrap();
+    let outside = f.dir.join("outside");
+    fs::write(&outside, b"preserved").unwrap();
+    let linked = releases.join(format!(".{}.123.1.tmp", "b".repeat(64)));
+    std::os::unix::fs::symlink(&outside, &linked).unwrap();
+    publisher::publish_next(
+        &f.repo,
+        &f.root,
+        &f.key,
+        "system-x86-64",
+        &"2".repeat(40),
+        &f.deployment,
+    )
+    .unwrap();
+    assert!(!partial.exists());
+    assert!(!linked.exists());
+    assert_eq!(fs::read(&outside).unwrap(), b"preserved");
+    let unrelated = releases.join(".notes");
+    fs::write(&unrelated, b"keep").unwrap();
+    assert!(publisher::publish_next(
+        &f.repo,
+        &f.root,
+        &f.key,
+        "system-x86-64",
+        &"2".repeat(40),
+        &f.deployment
+    )
+    .is_err());
+    assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+}

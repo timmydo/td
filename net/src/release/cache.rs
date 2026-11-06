@@ -35,7 +35,7 @@ impl Cache {
                 continue;
             }
             let metadata = io(fs::symlink_metadata(entry.path()))?;
-            if temporary(&name) && (metadata.is_file() || metadata.is_symlink()) {
+            if digest_temporary(&name) && (metadata.is_file() || metadata.is_symlink()) {
                 io(fs::remove_file(entry.path()))?;
                 continue;
             }
@@ -138,21 +138,4 @@ impl Cache {
         self.bytes += size;
         Ok(())
     }
-}
-
-fn temporary(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix('.') else {
-        return false;
-    };
-    let mut fields = rest.split('.');
-    let (Some(digest), Some(pid), Some(serial), Some("tmp"), None) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    ) else {
-        return false;
-    };
-    format::hex(digest, 32).is_ok() && format::number(pid).is_ok() && format::number(serial).is_ok()
 }

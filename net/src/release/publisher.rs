@@ -142,6 +142,26 @@ pub(super) fn publish_with_partitions(
     format::lifetime(issued, expires, now()?, 30 * DAY)?;
     let (_lock, root) = prepare(repo, root_path)?;
     let key = signing_key(key_path, &root)?;
+    let digest = publish_locked(
+        repo, &root, &key, profile, commit, sequence, issued, expires, deployment, partitions,
+    )?;
+    println!("{digest}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_locked(
+    repo: &Path,
+    root: &Root,
+    key: &[u8],
+    profile: &str,
+    commit: &str,
+    sequence: u64,
+    issued: u64,
+    expires: u64,
+    deployment: &Path,
+    partitions: Option<&Path>,
+) -> Result<String> {
     let manifest = text(&deployment.join("manifest"), 4096)?;
     let mut payloads = Vec::new();
     let mut count = 0usize;
@@ -233,12 +253,11 @@ pub(super) fn publish_with_partitions(
             body.push_str(&format!("{} {}\n", object.size, object.digest));
         }
     }
-    let signed = format::signed(&body, &key)?;
-    Release::parse(&signed, &root, now()?, profile)?;
+    let signed = format::signed(&body, key)?;
+    Release::parse(&signed, root, now()?, profile)?;
     let digest = hash(signed.as_bytes());
     immutable(&repo.join("releases").join(&digest), signed.as_bytes())?;
-    println!("{digest}");
-    Ok(())
+    Ok(digest)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -257,11 +276,34 @@ pub(super) fn promote(
     format::lifetime(issued, expires, now()?, DAY)?;
     let (_lock, root) = prepare(repo, root_path)?;
     let key = signing_key(key_path, &root)?;
+    promote_locked(
+        repo,
+        &root,
+        &key,
+        profile,
+        release_digest,
+        version,
+        issued,
+        expires,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn promote_locked(
+    repo: &Path,
+    root: &Root,
+    key: &[u8],
+    profile: &str,
+    release_digest: &str,
+    version: u64,
+    issued: u64,
+    expires: u64,
+) -> Result<()> {
     let release_text = text(&repo.join("releases").join(release_digest), INDEX_LIMIT)?;
     if hash(release_text.as_bytes()) != release_digest {
         return Err("stored release digest mismatch".into());
     }
-    let release = Release::parse(&release_text, &root, now()?, profile)?;
+    let release = Release::parse(&release_text, root, now()?, profile)?;
     if expires > release.expires {
         return Err("head expires after release".into());
     }
@@ -312,9 +354,136 @@ pub(super) fn promote(
         "td-release-head-v1\n{}\n{version}\n{issued}\n{expires}\n{profile}\n{release_digest}\n",
         root.version
     );
-    let signed = format::signed(&body, &key)?;
-    Head::parse(&signed, &root, now()?, profile)?;
+    let signed = format::signed(&body, key)?;
+    Head::parse(&signed, root, now()?, profile)?;
     replace(&destination, signed.as_bytes())
+}
+
+fn selected(repo: &Path, root: &Root, profile: &str) -> Result<Option<Head>> {
+    let path = repo.join("heads").join(profile);
+    if !io(path.try_exists())? {
+        return Ok(None);
+    }
+    let head_text = text(&path, SMALL)?;
+    let epoch = Head::root_hint(&head_text)?;
+    if epoch > root.version {
+        return Err("publisher root rollback".into());
+    }
+    let old_root = Root::parse(&text(&repo.join(format!("roots/{epoch}")), SMALL)?, None)?;
+    let issued = format::number(head_text.lines().nth(3).ok_or("head truncated")?)?;
+    Head::parse(&head_text, &old_root, issued, profile).map(Some)
+}
+
+pub(super) fn publish_next(
+    repo: &Path,
+    root_path: &Path,
+    key_path: &Path,
+    profile: &str,
+    commit: &str,
+    deployment: &Path,
+) -> Result<()> {
+    format::profile(profile)?;
+    format::hex(commit, 20)?;
+    let (_lock, root) = prepare(repo, root_path)?;
+    let key = signing_key(key_path, &root)?;
+    selected(repo, &root, profile)?;
+    // Include staged indexes, so a retry never equivocates at their sequence.
+    let mut sequence = 0;
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    for (count, entry) in io(fs::read_dir(repo.join("releases")))?.enumerate() {
+        if count >= 200_000 || Instant::now() >= deadline {
+            return Err("release index scan exceeded its entry or time bound".into());
+        }
+        let entry = io(entry)?;
+        let digest = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "release name UTF-8")?;
+        if digest_temporary(&digest) {
+            let metadata = io(fs::symlink_metadata(entry.path()))?;
+            if !metadata.is_file() && !metadata.is_symlink() {
+                return Err("non-file interrupted release index".into());
+            }
+            io(fs::remove_file(entry.path()))?;
+            continue;
+        }
+        format::hex(&digest, 32)?;
+        let value = text(&entry.path(), INDEX_LIMIT)?;
+        if hash(value.as_bytes()) != digest {
+            return Err("stored release digest mismatch".into());
+        }
+        let epoch = format::number(value.lines().nth(1).ok_or("release truncated")?)?;
+        if epoch != root.version || value.lines().nth(5) != Some(profile) {
+            continue;
+        }
+        let issued = format::number(value.lines().nth(3).ok_or("release truncated")?)?;
+        let release = Release::parse(&value, &root, issued, profile)?;
+        sequence = sequence.max(release.sequence);
+    }
+    let sequence = sequence
+        .checked_add(1)
+        .ok_or("release sequence exhausted")?;
+    let issued = now()?;
+    let expires = issued
+        .checked_add(30 * DAY)
+        .ok_or("expiry overflow")?
+        .min(root.expires);
+    format::lifetime(issued, expires, issued, 30 * DAY)?;
+    let digest = publish_locked(
+        repo, &root, &key, profile, commit, sequence, issued, expires, deployment, None,
+    )?;
+    println!("{digest}");
+    Ok(())
+}
+
+pub(super) fn promote_next(
+    repo: &Path,
+    root_path: &Path,
+    key_path: &Path,
+    profile: &str,
+    requested: Option<&str>,
+) -> Result<()> {
+    format::profile(profile)?;
+    if let Some(digest) = requested {
+        format::hex(digest, 32)?;
+    }
+    let (_lock, root) = prepare(repo, root_path)?;
+    let key = signing_key(key_path, &root)?;
+    let selected = selected(repo, &root, profile)?;
+    let version = match selected.as_ref() {
+        Some(head) if head.root == root.version => head
+            .version
+            .checked_add(1)
+            .ok_or("head version exhausted")?,
+        _ => 1,
+    };
+    let digest = match requested {
+        Some(digest) => digest,
+        None => {
+            let head = selected.as_ref().ok_or("no selected release to renew")?;
+            if head.root != root.version {
+                return Err("root rotation requires publishing a new index".into());
+            }
+            &head.release
+        }
+    };
+    let issued = now()?;
+    let value = text(&repo.join("releases").join(digest), INDEX_LIMIT)?;
+    if hash(value.as_bytes()) != digest {
+        return Err("stored release digest mismatch".into());
+    }
+    let release = Release::parse(&value, &root, issued, profile).map_err(|error| {
+        format!("cannot promote or renew: {error}; publish a fresh index when expired")
+    })?;
+    let expires = issued
+        .checked_add(DAY)
+        .ok_or("expiry overflow")?
+        .min(release.expires)
+        .min(root.expires);
+    format::lifetime(issued, expires, issued, DAY)?;
+    promote_locked(repo, &root, &key, profile, digest, version, issued, expires)?;
+    println!("{digest}");
+    Ok(())
 }
 
 pub(super) fn gc(repo: &Path, root_path: &Path, delete: bool) -> Result<()> {
