@@ -18,6 +18,7 @@ needs them:
 - Before changing or adding `unsafe`, read `UNSAFE.md` and the touched crate's
   normative document.
 - For login or credentials, read `td-login/THREAT-MODEL.md`.
+- For the SSH client, server or key tooling, read `td-ssh/DESIGN.md`.
 - For trusted-main remote administration, read `td-update/ADMIN.md`.
 - For mail serving, storage, or submission, read `td-mta/DESIGN.md`.
 - For shared MIME parsing or decoding, read `td-mime/DESIGN.md`.
