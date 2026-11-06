@@ -188,11 +188,18 @@ fn host_usage_error() -> std::io::Error {
     )
 }
 
+/// One line to stderr in one write. `writeln!` and `eprintln!` write each format
+/// fragment on its own, and td-jail's stderr can be the console itself, where
+/// another writer's whole line then lands inside this one.
+fn write_stderr_line(text: &str) -> std::io::Result<()> {
+    std::io::stderr().write_all(format!("{text}\n").as_bytes())
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let _ = writeln!(std::io::stderr(), "td-jail: {error}");
+            let _ = write_stderr_line(&format!("td-jail: {error}"));
             ExitCode::FAILURE
         }
     }
@@ -220,7 +227,33 @@ mod confinement {
     const SECCOMP: &str = include_str!("seccomp.rs");
     const SYS: &str = include_str!("sys.rs");
     const TRANSITION: &str = include_str!("transition.rs");
+
     const WORKSPACE: &str = include_str!("workspace.rs");
+
+    #[test]
+    fn a_stderr_line_is_one_write() {
+        for (name, source) in [
+            ("authority.rs", AUTHORITY),
+            ("bus.rs", BUS),
+            ("cgroup.rs", CGROUP),
+            ("firefox.rs", FIREFOX),
+            ("flathub.rs", FLATHUB),
+            ("main.rs", MAIN),
+            ("seccomp.rs", SECCOMP),
+            ("sys.rs", SYS),
+            ("transition.rs", TRANSITION),
+            ("workspace.rs", WORKSPACE),
+        ] {
+            // Whitespace out, since rustfmt breaks a long call across lines.
+            let shipped: String = strip_comments(source.split("mod tests").next().unwrap())
+                .split_whitespace()
+                .collect();
+            // The helper, and transition.rs passing the descriptor on.
+            let handles = usize::from(name == "main.rs" || name == "transition.rs");
+            assert_eq!(shipped.matches("stderr()").count(), handles, "{name}");
+            assert!(!shipped.contains("eprint"), "{name}");
+        }
+    }
 
     /// The cache path (APPLICATIONS.md §W.9) adds one program td-jail runs:
     /// td-app, by its full path, with nothing of td-jail's environment, and

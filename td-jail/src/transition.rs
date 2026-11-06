@@ -4953,20 +4953,18 @@ fn start_probe_watchdog(role: &'static str) -> io::Result<ProbeWatchdog> {
                 Ok(()) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = writeln!(
-                        io::stderr(),
+                    let _ = crate::write_stderr_line(&format!(
                         "{role} gave up after {KILL_REAPS_CEILING:?} before teardown"
-                    );
+                    ));
                     std::process::exit(126);
                 }
             }
             match phases.recv_timeout(KILL_REAPS_POST_CEILING) {
                 Err(mpsc::RecvTimeoutError::Disconnected) => {}
                 Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = writeln!(
-                        io::stderr(),
+                    let _ = crate::write_stderr_line(&format!(
                         "{role} gave up after {KILL_REAPS_POST_CEILING:?} during teardown"
-                    );
+                    ));
                     std::process::exit(126);
                 }
             }
@@ -6283,8 +6281,8 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     .map_err(|e| io::Error::other(format!("register jail instance {instance:?}: {e}")))?;
 
     if application.host_mode {
-        writeln!(io::stderr(), "{HOST_DEGRADATION_CGROUP}")?;
-        writeln!(io::stderr(), "{HOST_DEGRADATION_WAYLAND}")?;
+        crate::write_stderr_line(HOST_DEGRADATION_CGROUP)?;
+        crate::write_stderr_line(HOST_DEGRADATION_WAYLAND)?;
     }
 
     let launch_result = (|| -> io::Result<()> {
@@ -6606,7 +6604,7 @@ pub fn launch_workspace(plan: WorkspacePlan) -> io::Result<()> {
     let before = NamespaceSnapshot::read()?;
     let token = random_token()?;
     let executable = std::env::current_exe()?;
-    writeln!(io::stderr(), "{WORKSPACE_DEGRADATION}")?;
+    crate::write_stderr_line(WORKSPACE_DEGRADATION)?;
     sys::unshare_namespaces(!plan.shared_network).map_err(|error| {
         io::Error::new(
             error.kind(),
