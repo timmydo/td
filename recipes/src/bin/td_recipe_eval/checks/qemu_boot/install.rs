@@ -1319,7 +1319,7 @@ fn validate_candidates(
 fn validate_candidate_record(console: &str, attempted: bool) -> Result<(), String> {
     let count = console
         .lines()
-        .filter(|line| line.trim_end() == protocol::CANDIDATE_RECORD_MARKER)
+        .filter(|line| super::reports_marker(line, protocol::CANDIDATE_RECORD_MARKER))
         .count();
     if count == usize::from(attempted) {
         Ok(())
@@ -1341,12 +1341,12 @@ fn validate_plan_observation(
     if !attempted {
         if console.lines().any(|line| {
             line.starts_with(protocol::PLAN_OBSERVATION_MARKER)
-                || line.trim_end() == protocol::PLAN_STALE_MARKER
-                || line.trim_end() == protocol::PLAN_BUSY_MARKER
+                || super::reports_marker(line, protocol::PLAN_STALE_MARKER)
+                || super::reports_marker(line, protocol::PLAN_BUSY_MARKER)
                 || line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
-                || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER
-                || line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER
-                || line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER
+                || super::reports_marker(line, protocol::SOURCE_PLAN_STALE_MARKER)
+                || super::reports_marker(line, protocol::SOURCE_PLAN_BUSY_MARKER)
+                || super::reports_marker(line, protocol::SOURCE_PLAN_CLAIM_MARKER)
         }) {
             return Err("plan observation ran for an unavailable target".into());
         }
@@ -1377,7 +1377,7 @@ fn validate_plan_observation(
         }
         if console
             .lines()
-            .filter(|line| line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER)
+            .filter(|line| super::reports_marker(line, protocol::SOURCE_PLAN_STALE_MARKER))
             .count()
             != 1
         {
@@ -1385,7 +1385,7 @@ fn validate_plan_observation(
         }
         if console
             .lines()
-            .filter(|line| line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER)
+            .filter(|line| super::reports_marker(line, protocol::SOURCE_PLAN_CLAIM_MARKER))
             .count()
             != 1
         {
@@ -1393,7 +1393,7 @@ fn validate_plan_observation(
         }
         if console
             .lines()
-            .filter(|line| line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER)
+            .filter(|line| super::reports_marker(line, protocol::SOURCE_PLAN_BUSY_MARKER))
             .count()
             != usize::from(partitioned)
         {
@@ -1401,15 +1401,15 @@ fn validate_plan_observation(
         }
     } else if console.lines().any(|line| {
         line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
-            || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER
-            || line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER
-            || line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER
+            || super::reports_marker(line, protocol::SOURCE_PLAN_STALE_MARKER)
+            || super::reports_marker(line, protocol::SOURCE_PLAN_BUSY_MARKER)
+            || super::reports_marker(line, protocol::SOURCE_PLAN_CLAIM_MARKER)
     }) {
         return Err("source plan observation ran without a validated source".into());
     }
     if console
         .lines()
-        .filter(|line| line.trim_end() == protocol::PLAN_STALE_MARKER)
+        .filter(|line| super::reports_marker(line, protocol::PLAN_STALE_MARKER))
         .count()
         != 1
     {
@@ -1417,7 +1417,7 @@ fn validate_plan_observation(
     }
     if console
         .lines()
-        .filter(|line| line.trim_end() == protocol::PLAN_BUSY_MARKER)
+        .filter(|line| super::reports_marker(line, protocol::PLAN_BUSY_MARKER))
         .count()
         != usize::from(partitioned)
     {
@@ -1531,14 +1531,14 @@ fn validate_media_protection(result: &BootResult) -> Result<(), String> {
         .lines()
         .map(str::trim_end)
         .filter(|line| {
-            matches!(
-                *line,
-                protocol::MEDIA_BUSY_MARKER | protocol::MEDIA_RELEASED_MARKER
-            )
+            super::reports_marker(line, protocol::MEDIA_BUSY_MARKER)
+                || super::reports_marker(line, protocol::MEDIA_RELEASED_MARKER)
         })
         .collect();
-    if sequence != [protocol::MEDIA_BUSY_MARKER, protocol::MEDIA_RELEASED_MARKER]
-        || media_records != [media.as_str()]
+    if !super::reports_markers(
+        &sequence,
+        &[protocol::MEDIA_BUSY_MARKER, protocol::MEDIA_RELEASED_MARKER],
+    ) || !super::reports_markers(&media_records, &[media.as_str()])
         || !result.evidence.target
         || !result.marker_killed
         || result.exited_clean
@@ -1695,7 +1695,7 @@ fn validate_interruption(
         if !result
             .console
             .lines()
-            .any(|line| line.trim_end() == expected)
+            .any(|line| super::reports_marker(line, &expected))
         {
             return Err(format!("interrupted installation lacks {expected}"));
         }
@@ -1720,7 +1720,7 @@ fn validate_interrupted_boot(result: &BootResult, refused: &str, uuid: &str) -> 
         if !result
             .console
             .lines()
-            .any(|line| line.trim_end() == expected)
+            .any(|line| super::reports_marker(line, &expected))
         {
             return Err(format!("interrupted boot lacks {expected}"));
         }
@@ -1759,7 +1759,11 @@ fn validate_fixture_boot(
         .filter_map(|line| line.strip_prefix("TD-INSTALL-VOLUME "))
         .collect();
     let expected_identity = format!("{uuid} {expected_device}");
-    if discovered.len() != 2 || discovered.iter().any(|line| *line != expected_identity) {
+    if discovered.len() != 2
+        || discovered
+            .iter()
+            .any(|line| !super::reports_marker(line, &expected_identity))
+    {
         return Err(format!(
             "selector/deployment did not resolve {expected_identity}: {discovered:?}\n{}",
             tail(&result.console, 80)
@@ -1782,7 +1786,7 @@ fn validate_fixture_boot(
     if !result
         .console
         .lines()
-        .any(|line| line.trim_end() == expected)
+        .any(|line| super::reports_marker(line, expected))
     {
         return Err(format!(
             "installed boot did not report expected deployment {id}"
@@ -2342,7 +2346,7 @@ pub(super) fn validate_installed_as(
         .map(str::trim_end)
         .filter(|line| line.starts_with("TD-HOSTNAME-READY "))
         .collect();
-    if hostnames != [expected_hostname.as_str()] {
+    if !super::reports_markers(&hostnames, &[expected_hostname.as_str()]) {
         return Err(format!(
             "installed system did not activate its saved hostname: {hostnames:?}\n{}",
             tail(&result.console, 100)
@@ -2405,7 +2409,7 @@ fn require_clock_zone(result: &BootResult, zone: &str) -> Result<(), String> {
                 .unwrap_or_default()
         })
         .collect();
-    if named.is_empty() || named.iter().any(|name| *name != zone) {
+    if named.is_empty() || named.iter().any(|name| !super::reports_marker(name, zone)) {
         return Err(format!(
             "installed session's clock named {named:?}, not {zone:?}\n{}",
             tail(&result.console, 100)
@@ -2443,7 +2447,7 @@ fn require_identity_files(result: &BootResult, username: &str, fresh: bool) -> R
             .map(str::trim_end)
             .filter(|line| line.starts_with(kind))
             .collect();
-        if reports != [expected.as_str()] {
+        if !super::reports_markers(&reports, &[expected.as_str()]) {
             return Err(format!(
                 "installed system reported {reports:?}, not only {expected:?}\n{}",
                 tail(&result.console, 100)
@@ -2453,7 +2457,7 @@ fn require_identity_files(result: &BootResult, username: &str, fresh: bool) -> R
     Ok(())
 }
 
-/// Read one exact post-format identity report before trusting it as an oracle input.
+/// Read one post-format identity report before trusting it as an oracle input.
 fn reported_volume_identity(console: &str, device: &str) -> Result<String, String> {
     let mut reports = console
         .lines()
@@ -2467,7 +2471,7 @@ fn reported_volume_identity(console: &str, device: &str) -> Result<String, Strin
         .strip_prefix(&prefix)
         .and_then(|fields| fields.split_once(' '))
         .ok_or("malformed formatted volume identity")?;
-    if !protocol::is_v4_volume_uuid(uuid) || actual_device != device {
+    if !protocol::is_v4_volume_uuid(uuid) || !super::reports_marker(actual_device, device) {
         return Err(format!(
             "invalid formatted volume identity or device: {line}"
         ));
@@ -2544,7 +2548,7 @@ fn require_installation(
     if !result
         .console
         .lines()
-        .any(|line| line.trim_end() == protocol::DIRECT_MARKER)
+        .any(|line| super::reports_marker(line, protocol::DIRECT_MARKER))
     {
         return Err("guest did not report direct publication after staging checks".into());
     }
@@ -2556,7 +2560,7 @@ fn require_installation(
     if !result
         .console
         .lines()
-        .any(|line| line.trim_end() == partition_evidence)
+        .any(|line| super::reports_marker(line, &partition_evidence))
     {
         return Err("guest did not prove refreshed partitions and busy-disk refusal".into());
     }
@@ -2564,7 +2568,7 @@ fn require_installation(
     if !result
         .console
         .lines()
-        .any(|line| line.trim_end() == media_evidence)
+        .any(|line| super::reports_marker(line, &media_evidence))
     {
         return Err("guest did not prove read-only ISO payload access".into());
     }
@@ -2623,10 +2627,10 @@ fn selector_offsets(console: &str, identity: &str, id: &str) -> (Option<usize>, 
     let mut selection = None;
     for (index, line) in console.lines().enumerate() {
         let line = line.trim_end();
-        if binding.is_none() && line == bound {
+        if binding.is_none() && super::reports_marker(line, &bound) {
             binding = Some(index);
         }
-        if selection.is_none() && line == selected {
+        if selection.is_none() && super::reports_marker(line, &selected) {
             selection = Some(index);
         }
         if binding.is_some() && selection.is_some() {
@@ -2648,7 +2652,7 @@ fn selector_binding_diagnostic(console: &str, identity: &str, id: &str) -> Strin
     let lines = console.lines().count();
     let bytes = console.len();
     let mut report = format!(
-        "retained console: {lines} lines, {bytes} bytes; line offsets (zero-based): first exact binding={binding:?}, first exact selection={selection:?}\nselector record excerpts (at most {MAX_RECORDS}, {MAX_RECORD_BYTES} UTF-8 bytes each before escaping):\n"
+        "retained console: {lines} lines, {bytes} bytes; line offsets (zero-based): first binding={binding:?}, first selection={selection:?}\nselector record excerpts (at most {MAX_RECORDS}, {MAX_RECORD_BYTES} UTF-8 bytes each before escaping):\n"
     );
     let records = console
         .lines()
@@ -2677,7 +2681,12 @@ fn selector_binding_diagnostic(console: &str, identity: &str, id: &str) -> Strin
 }
 
 pub(super) fn require(result: &BootResult, marker: &str, phase: &str) -> Result<(), String> {
-    if result.evidence.target && result.console.lines().any(|line| line.trim_end() == marker) {
+    if result.evidence.target
+        && result
+            .console
+            .lines()
+            .any(|line| super::reports_marker(line, marker))
+    {
         Ok(())
     } else {
         Err(format!(
@@ -3663,7 +3672,7 @@ mod tests {
         assert!(error.contains(early));
         assert!(error.contains("retained console:"));
         assert!(error.contains("console tail (last "));
-        assert!(error.contains("first exact binding=None, first exact selection=Some(1)"));
+        assert!(error.contains("first binding=None, first selection=Some(1)"));
         result.console.push_str("TD-INSTALL-VOLUME uuid /dev/vda2\nTD-INSTALL-VOLUME uuid /dev/vda2\nTD-INSTALL-STALE-MOUNT-RECOVERED\nTD-INSTALL-PERSISTED-1 deployment\n");
         let error = validate_fixture_boot(
             &result,
@@ -3676,7 +3685,7 @@ mod tests {
         assert!(error.contains(early));
         assert!(error.contains("retained console:"));
         assert!(error.contains("console tail (last "));
-        assert!(error.contains("first exact binding=None, first exact selection=Some(1)"));
+        assert!(error.contains("first binding=None, first selection=Some(1)"));
         let reversed = "TD-BOOT-SELECTED-CURRENT deployment\nTD-BOOT-VOLUME uuid /dev/vda2\n";
         assert!(!bound_selector_before_selection(
             reversed,
@@ -3685,7 +3694,7 @@ mod tests {
         ));
         assert!(
             selector_binding_diagnostic(reversed, "uuid /dev/vda2", "deployment")
-                .contains("first exact binding=Some(1), first exact selection=Some(0)")
+                .contains("first binding=Some(1), first selection=Some(0)")
         );
         assert!(
             selector_binding_diagnostic("kernel only\n", "uuid /dev/vda2", "deployment")
@@ -3719,7 +3728,7 @@ mod tests {
         ] {
             let report = selector_binding_diagnostic(malformed, "uuid /dev/vda2", "deployment");
             assert!(report.contains(&format!("0: {malformed:?}")));
-            assert!(report.contains("first exact selection=None"));
+            assert!(report.contains("first selection=None"));
         }
         let controls = format!("TD-BOOT-VOLUME {}\n", "\u{1b}".repeat(256)).repeat(8);
         let escaped = selector_binding_diagnostic(&controls, "uuid /dev/vda2", "deployment");

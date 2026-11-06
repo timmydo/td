@@ -578,7 +578,7 @@ fn restarted(console: &str) -> bool {
     let lines: Vec<&str> = console.lines().map(str::trim_end).collect();
     let shutdown = lines
         .iter()
-        .rposition(|line| *line == td_recipe::shared::SYSTEM_SHUTDOWN_MARKER);
+        .rposition(|line| super::reports_marker(line, td_recipe::shared::SYSTEM_SHUTDOWN_MARKER));
     let restart = lines
         .iter()
         .rposition(|line| line.ends_with(KERNEL_RESTART));
@@ -592,7 +592,7 @@ fn require_live_session(result: &BootResult) -> Result<(), String> {
     let ready = result
         .console
         .lines()
-        .any(|line| line.trim_end() == TD_SETUP_LIVE_MARKER);
+        .any(|line| super::reports_marker(line, TD_SETUP_LIVE_MARKER));
     if !result.evidence.td_setup_script_complete
         || !result.exited_clean
         || result.evidence.kernel_panic
@@ -620,6 +620,10 @@ mod tests {
         let marker = td_recipe::shared::SYSTEM_SHUTDOWN_MARKER;
         assert!(restarted(&format!(
             "{marker}\n[  812.004211] reboot: Restarting system\n"
+        )));
+        assert!(restarted(&format!(
+            "{marker}BTRFS info (device ram0): last unmount of filesystem 659de014\n\n\
+             reboot: Restarting system\n"
         )));
         for console in [
             format!("{marker}\n[  812.004211] reboot: Power down\n"),

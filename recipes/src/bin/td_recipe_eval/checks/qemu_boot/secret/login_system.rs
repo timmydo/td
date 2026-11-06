@@ -448,7 +448,7 @@ fn phase_result(result: &BootResult, phase: &str) -> Result<(), String> {
         result
             .console
             .lines()
-            .filter(|line| line.trim_end_matches('\r') == wanted)
+            .filter(|line| super::super::reports_marker(line, wanted))
             .count()
     };
     let failed = result

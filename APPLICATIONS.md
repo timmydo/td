@@ -1783,7 +1783,8 @@ closed autotest boot has no
 other programmed producer for the app id and fixed sentinel document, and
 that document exists only behind the declared localhost HTTPS origin.
 Firefox has no console descriptor, and the host oracle accepts only all three
-exact console lines. The Wayland peer is still not cryptographically bound to
+exact console lines, a kernel record on a line's end aside. The Wayland
+peer is still not cryptographically bound to
 the cgroup process, but the evidence now proves deterministic HTTPS document
 pixels entered an accepted application buffer, its paint succeeded, and both
 sentinel regions from that surface survived placement, stacking, clipping and
@@ -7390,7 +7391,8 @@ packaged selftest, boot oracle — with **network never in the gate**.
    `TD-FIREFOX-FIRST-WINDOW-READY` and
    `TD-FIREFOX-HTTPS-CONTENT-READY` followed by
    `TD-FIREFOX-SUPPORT-READY`, then publishes a completion record that lets the
-   autotest greeter exit. QEMU requires all three exact markers on every system
+   autotest greeter exit. QEMU requires all three exact markers, a kernel
+   record on a line's end aside, on every system
    boot.
    The separate operator-run network oracle attaches one explicit QEMU
    user-mode NIC with no `hostfwd`. Guest-initiated SLIRP traffic can reach the
@@ -7620,7 +7622,7 @@ and image commits — showing:
    state. Independently, the compositor emits one bounded marker only after
    the exact client whose painted content satisfied readiness selects and
    successfully repaints a non-null cursor image. Exact line parsers require
-   every staged marker, and the guest greeter cannot finish the input-enabled
+   every staged marker, a kernel record on a line's end aside, and the guest greeter cannot finish the input-enabled
    boot before the final atomic completion record. Other boots expose no QMP
    socket or Marionette input probe. td-term now supplies a bounded core
    data-device source: pointer drag selects and visibly inverts cells,
@@ -7743,7 +7745,8 @@ and image commits — showing:
     checks does the unit print
     `TD-FIREFOX-SOAK-OK minimum-seconds=300 navigations=31` and atomically
     replace the staging record with the completion the greeter accepts. The
-    host QEMU oracle requires that exact line. A fake-clock wire transcript
+    host QEMU oracle requires that exact line, a kernel record on its end
+    aside. A fake-clock wire transcript
     permanently checks all 31 alternating commands, their IDs, content
     validations, ten-second schedule, five-minute floor, and cleanup without
     adding five minutes to the ordinary test suite. The real system boot
@@ -10954,7 +10957,8 @@ webpki-roots, and no decoder. So:
    stage-2 readback already requires every granted socket to be present
    and mounted read-only, so `TD-MAIL-RUNNING` under the grant proves
    the socket reached the instance; the marker `TD-FETCH-OK` is latched
-   as an exact line and required by the oracle. Host side, the crate's
+   as an exact line, a kernel record on its end aside, and required by the
+   oracle. Host side, the crate's
    own tests, which the `net-test` preflight runs, serve the applet
    against a std `TcpListener` on loopback under an explicit allow flag
    and pin the framing, the caps, the header rules and the redirects,

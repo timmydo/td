@@ -1023,7 +1023,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     if !healthy_candidate
         .console
         .lines()
-        .any(|line| line.trim_end() == moved)
+        .any(|line| reports_marker(line, &moved))
     {
         return Err("reordered system boot did not resolve its UUID on /dev/vdb".into());
     }
@@ -2542,7 +2542,7 @@ fn require_primary_profile(result: &BootResult, name: &str) -> Result<(), String
         .map(str::trim_end)
         .filter(|line| line.starts_with("TD-PRIMARY-PROFILE-READY "))
         .collect();
-    if names != [expected.as_str()] {
+    if !reports_markers(&names, &[expected.as_str()]) {
         return Err(format!(
             "system did not activate its expected primary account {name}: {names:?}\n{}",
             tail(&result.console, 100)
@@ -6488,6 +6488,37 @@ fn validate_boot_plan_tokens(extra_append: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether what follows a marker on its line is a kernel record. Kernel output
+/// can arrive between a program's line and its newline, and Linux 7.3's threaded
+/// 8250 console appears to make that routine. A record opens with a letter,
+/// unlike a further field, a suffix or a digit running a value on, and has ": "
+/// or ", " in it. A value that runs on in letters and then meets a record cannot
+/// be told from this; that takes a wrong value and a splice at once.
+fn is_kernel_record(tail: &[u8]) -> bool {
+    tail.first().is_some_and(u8::is_ascii_alphabetic)
+        && tail.windows(2).any(|pair| pair == b": " || pair == b", ")
+}
+
+/// Whether a console line reports exactly `marker`, with or without a kernel
+/// record on the end of it.
+fn reports_marker(line: &str, marker: &str) -> bool {
+    match line.trim_end().strip_prefix(marker) {
+        Some("") => true,
+        Some(record) => is_kernel_record(record.as_bytes()),
+        None => false,
+    }
+}
+
+/// `lines`, in order, are `markers` and no others, each as `reports_marker`
+/// reads it.
+fn reports_markers(lines: &[&str], markers: &[impl AsRef<str>]) -> bool {
+    lines.len() == markers.len()
+        && lines
+            .iter()
+            .zip(markers)
+            .all(|(line, marker)| reports_marker(line, marker.as_ref()))
+}
+
 fn format_end_reason(end: EndReason, target_seen: bool) -> String {
     match end {
         EndReason::MarkerSeen => "the marker was seen".to_string(),
@@ -6793,8 +6824,12 @@ fn without_screen_records(window: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     blanked.map_or(std::borrow::Cow::Borrowed(window), std::borrow::Cow::Owned)
 }
 
+/// The marker, its line ending, and a kernel record that may land before it.
 fn exact_line_window(marker: &str) -> usize {
-    marker.len().saturating_add(3)
+    marker
+        .len()
+        .saturating_add(3)
+        .saturating_add(KERNEL_RECORD_MAX)
 }
 
 #[cfg(test)]
@@ -7349,6 +7384,10 @@ fn latch_marker(found: &mut bool, haystack: &[u8], marker: &[u8]) {
     }
 }
 
+/// The longest kernel record a marker latch is sure to read when a read's seam
+/// falls inside it. A longer one can leave the marker unlatched.
+const KERNEL_RECORD_MAX: usize = 1024;
+
 fn latch_line_marker(
     found: &mut bool,
     haystack: &[u8],
@@ -7385,10 +7424,16 @@ fn latch_prefixed_line_marker(
         {
             continue;
         }
-        let after_cr = after.checked_add(1).and_then(|index| haystack.get(index));
-        if haystack.get(after) == Some(&b'\n')
-            || (haystack.get(after) == Some(&b'\r') && after_cr == Some(&b'\n'))
-        {
+        let Some(rest) = haystack.get(after..) else {
+            continue;
+        };
+        // A line not yet ended waits for the next read, which the window keeps it for.
+        let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        let line = rest.get(..end).unwrap_or_default();
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() || is_kernel_record(line) {
             *found = true;
             return;
         }
@@ -9005,6 +9050,138 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
+
+    // The first three spliced lines are as Linux 7.3.1 guests printed them, and
+    // the next joins a marker to a record those boots printed.
+    #[test]
+    fn a_marker_line_may_carry_a_kernel_record_but_not_another_value() {
+        for (line, marker) in [
+            ("TD-SHUTDOWN-OK", "TD-SHUTDOWN-OK"),
+            ("TD-SHUTDOWN-OK\r", "TD-SHUTDOWN-OK"),
+            (
+                "TD-SHUTDOWN-OKBTRFS info (device ram0): last unmount of filesystem 659de014",
+                "TD-SHUTDOWN-OK",
+            ),
+            (
+                "TD-METADATA-SKIPPED 1 key(s) other than plain ssh-ed25519sr 2:0:0:0: [sr1] \
+                 tag#16 UNKNOWN(0x2003) Result: hostbyte=0x00 driverbyte=DRIVER_OK cmd_age=0s",
+                "TD-METADATA-SKIPPED 1 key(s) other than plain ssh-ed25519",
+            ),
+            (
+                "td-firstboot: machine-id presentrandom: crng init done",
+                "td-firstboot: machine-id present",
+            ),
+            (
+                "TD-SHUTDOWN-OKBuffer I/O error on dev sr1, logical block 66, async page read",
+                "TD-SHUTDOWN-OK",
+            ),
+        ] {
+            assert!(reports_marker(line, marker), "{line}");
+        }
+        for (line, marker) in [
+            ("TD-METADATA-APPLIED keys=10", "TD-METADATA-APPLIED keys=1"),
+            (
+                "TD-METADATA-APPLIED keys=10random: crng init done",
+                "TD-METADATA-APPLIED keys=1",
+            ),
+            (
+                "TD-BOOT-VOLUME 1111 /dev/vdb2BTRFS info (device vdb2): first mount",
+                "TD-BOOT-VOLUME 1111 /dev/vdb",
+            ),
+            (
+                "TD-HOSTNAME-READY td-seeded2",
+                "TD-HOSTNAME-READY td-seeded",
+            ),
+            ("TD-X one two", "TD-X one"),
+            ("TD-X one: two", "TD-X one"),
+            ("TD-SHUTDOWN-OK-LATER", "TD-SHUTDOWN-OK"),
+            ("sr 2:0:0:0: [sr1] TD-SHUTDOWN-OK", "TD-SHUTDOWN-OK"),
+            ("", "TD-SHUTDOWN-OK"),
+        ] {
+            assert!(!reports_marker(line, marker), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_line_latch_reads_a_record_on_its_marker_across_reads() {
+        let marker = b"TD-MARK";
+        let latched = |haystack: &[u8]| {
+            let mut found = false;
+            latch_line_marker(&mut found, haystack, marker, true);
+            found
+        };
+        assert!(latched(b"TD-MARK\n"));
+        assert!(latched(b"TD-MARK\r\n"));
+        assert!(latched(b"noise\nTD-MARK\r\n"));
+        assert!(latched(b"TD-MARKrandom: crng init done\n"));
+        assert!(latched(
+            b"TD-MARKBuffer I/O error on dev sr1, logical block 66\r\n"
+        ));
+        // Not ended yet: this read says nothing, and a later one holding it decides.
+        assert!(!latched(b"TD-MARK"));
+        assert!(!latched(b"TD-MARKrandom: crng in"));
+        for wrong in [
+            &b"TD-MARK-LATER\n"[..],
+            b"TD-MARK2\n",
+            b"TD-MARK2random: crng init done\n",
+            b"TD-MARK one: two\n",
+            b"noise TD-MARK\n",
+        ] {
+            assert!(!latched(wrong), "{}", String::from_utf8_lossy(wrong));
+        }
+    }
+
+    // The read's seam lands `into_record` bytes into the record, so the first read
+    // holds the marker and no line end, and only the second can decide.
+    fn latches_across_a_seam(record: &str, into_record: usize) -> bool {
+        const CHUNK: usize = 8192;
+        let dir = crate::test_temp::TempDir::new("td-console-splice").unwrap();
+        let path = dir.path().join("console.log");
+        let start = CHUNK - (TD_JAIL_SECCOMP_PROBE_MARKER.len() + into_record);
+        let mut bytes = vec![b'x'; start];
+        *bytes.last_mut().unwrap() = b'\n';
+        bytes.extend_from_slice(TD_JAIL_SECCOMP_PROBE_MARKER.as_bytes());
+        bytes.extend_from_slice(record.as_bytes());
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console_to_eof(
+            &path,
+            &mut file,
+            &mut buffer,
+            b"target-never-appears",
+            &mut evidence,
+        )
+        .unwrap();
+        evidence.td_jail_seccomp
+    }
+
+    #[test]
+    fn a_spliced_marker_line_survives_a_read_boundary() {
+        let record = "sr 2:0:0:0: [sr1] tag#16 UNKNOWN(0x2003) Result: hostbyte=0x00";
+        assert!(latches_across_a_seam(record, record.len() / 2));
+        // By value, so a window too small for 1024 bytes on this marker fails here.
+        // It is shared, so the longest marker's leaves this one some slack.
+        let longest = format!("random: {}", "x".repeat(1024 - "random: ".len()));
+        assert!(latches_across_a_seam(&longest, longest.len() - 1));
+    }
+
+    #[test]
+    fn marker_lines_must_all_match_in_order() {
+        let expected = ["TD-A", "TD-B"];
+        assert!(reports_markers(&["TD-A", "TD-B"], &expected));
+        assert!(reports_markers(
+            &["TD-Arandom: crng init done", "TD-B"],
+            &expected
+        ));
+        assert!(!reports_markers(&["TD-B", "TD-A"], &expected));
+        assert!(!reports_markers(&["TD-A"], &expected));
+        assert!(!reports_markers(&["TD-A", "TD-B", "TD-B"], &expected));
+        assert!(!reports_markers(&["TD-A", "TD-C"], &expected));
+    }
 
     #[test]
     fn volume_uuids_are_version_4_and_drawn_per_run() {
@@ -11095,8 +11272,8 @@ mod tests {
 
     /// Every marker the console scanner latches, enumerated once so a new one is added in a
     /// single place. `evidence_marker_max_len` deliberately does NOT check itself against
-    /// this: its result is dominated by the id-bearing markers (marker + space + 64-char
-    /// hex), so a "no marker exceeds the max" assertion cannot fail and would only look like
+    /// this: its result is dominated by the record allowance in each line marker's
+    /// window, so a "no marker exceeds the max" assertion cannot fail and would only look like
     /// a guard. The rescan window is covered behaviourally instead, by the split tests below.
     /// The terminal remains the first-client marker; the jailed demo's stdout
     /// is `/dev/null`. Rebinding this alias makes a boot run to its timeout
@@ -12799,10 +12976,13 @@ mod tests {
 
     #[test]
     fn exact_line_overlap_includes_prefix_and_crlf() {
-        assert_eq!(exact_line_window("marker"), "\nmarker\r\n".len());
+        assert_eq!(
+            exact_line_window("marker"),
+            "\nmarker\r\n".len() + KERNEL_RECORD_MAX
+        );
         assert_eq!(
             exact_line_window(TD_FIREFOX_BOOT_MARKER),
-            TD_FIREFOX_BOOT_MARKER.len() + 3
+            TD_FIREFOX_BOOT_MARKER.len() + 3 + KERNEL_RECORD_MAX
         );
     }
 

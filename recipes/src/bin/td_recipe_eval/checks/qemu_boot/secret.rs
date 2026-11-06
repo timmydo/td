@@ -46,12 +46,15 @@ fn system_result(result: &BootResult, phase: &str, cut: bool) -> Result<(), Stri
             && result
                 .console
                 .lines()
-                .filter(|line| *line == cut_marker)
+                .filter(|line| super::reports_marker(line, &cut_marker))
                 .count()
                 == 1
             && !result.console.lines().any(|line| {
-                line == SYSTEM_SHUTDOWN_MARKER
-                    || line == format!("secret-fixture: {}", fixture::SYSTEM_PASS)
+                super::reports_marker(line, SYSTEM_SHUTDOWN_MARKER)
+                    || super::reports_marker(
+                        line,
+                        &format!("secret-fixture: {}", fixture::SYSTEM_PASS),
+                    )
                     || line.starts_with("secret-fixture: test result:")
             })
     } else {
@@ -193,7 +196,12 @@ pub(crate) fn run_system(
             || result
                 .console
                 .lines()
-                .filter(|line| *line == "secret-fixture: system selector PCR verified after kexec")
+                .filter(|line| {
+                    super::reports_marker(
+                        line,
+                        "secret-fixture: system selector PCR verified after kexec",
+                    )
+                })
                 .count()
                 != 1
         {
@@ -512,7 +520,10 @@ fn powercut_result(result: &BootResult, phase: &str) -> Result<(), String> {
         result.marker_killed
             && !result.exited_clean
             && result.console.lines().filter(cuts).count() == 1
-            && result.console.lines().any(|line| line == cut)
+            && result
+                .console
+                .lines()
+                .any(|line| super::reports_marker(line, &cut))
             && !result
                 .console
                 .lines()

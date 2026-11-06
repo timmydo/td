@@ -441,7 +441,7 @@ fn require_release(
     let (opened, before) = lines
         .split_last()
         .ok_or_else(|| format!("{leg}: no release lines"))?;
-    if before != expected || opened_with(opened, uuid) != Some(keyslot) {
+    if !super::reports_markers(before, &expected) || opened_with(opened, uuid) != Some(keyslot) {
         return Err(format!(
             "{leg}: the selector's release lines were {lines:#?}, not {expected:#?} then the \
              volume opened with keyslot {keyslot}\n{}",
@@ -517,16 +517,16 @@ fn require_recovered<'a>(
     let head_ok = match head {
         [token, cap, nothing, asked, codec, wrong, opens, warning, keys] => {
             token.starts_with(&refusal)
-                && *cap == CAP_CLOSED
-                && *nothing == NOTHING_RELEASED
-                && *asked == RECOVERY_ASKED
+                && super::reports_marker(cap, CAP_CLOSED)
+                && super::reports_marker(nothing, NOTHING_RELEASED)
+                && super::reports_marker(asked, RECOVERY_ASKED)
                 && codec.ends_with(ENTER_AGAIN)
                 && !codec.starts_with(WRONG_KEY_PREFIX)
                 && wrong.starts_with(WRONG_KEY_PREFIX)
                 && wrong.ends_with(&format!("){ENTER_AGAIN}"))
-                && *opens == KEY_OPENS
-                && *warning == RESEAL_WARNING
-                && *keys == RESEAL_KEYS
+                && super::reports_marker(opens, KEY_OPENS)
+                && super::reports_marker(warning, RESEAL_WARNING)
+                && super::reports_marker(keys, RESEAL_KEYS)
         }
         _ => false,
     };
@@ -547,7 +547,7 @@ fn require_recovered<'a>(
                 Some(*step) == keyslot.map(|k| format!("keyslot {k} tested")).as_deref()
             })
     } else {
-        outcome.is_empty() && *reported == RESEAL_DECLINED
+        outcome.is_empty() && super::reports_marker(reported, RESEAL_DECLINED)
     };
     let prompts = |prompt: &str| result.console.matches(prompt).count();
     if !head_ok
@@ -1314,7 +1314,7 @@ fn install_leg<'a>(
     let sent_lines = result
         .console
         .lines()
-        .filter(|line| line.trim_end() == protocol::ENCRYPTED_KEY_SENT_MARKER)
+        .filter(|line| super::reports_marker(line, protocol::ENCRYPTED_KEY_SENT_MARKER))
         .count();
     if sent_lines != 1 {
         return Err("the installation did not report the key sent once".into());
@@ -1563,7 +1563,7 @@ fn reinstall(
         || result
             .console
             .lines()
-            .filter(|line| line.trim_end() == marker)
+            .filter(|line| super::reports_marker(line, &marker))
             .count()
             != 1
     {
@@ -1671,11 +1671,13 @@ fn interrupted(
         machine.keep(runner, &leg, &result, &result_raw)?;
         // The commit was reported, so the cut landed after it; the lines
         // that reached the console before the cut are the plan's, in order.
-        let lines = release_lines(&result.console, &|line| line == commit.line())
-            .ok_or_else(|| format!("{leg}: the commit line never arrived"))?;
+        let lines = release_lines(&result.console, &|line| {
+            super::reports_marker(line, commit.line())
+        })
+        .ok_or_else(|| format!("{leg}: the commit line never arrived"))?;
         let mut expected = vec![FIRST_BOOT_RELEASED, CAP_CLOSED];
         expected.extend_from_slice(FIRST_BOOT_STEPS.get(..commit.step()).unwrap_or_default());
-        if lines != expected || !result.marker_killed {
+        if !super::reports_markers(&lines, &expected) || !result.marker_killed {
             return Err(format!(
                 "{leg}: the cut boot reported {lines:#?}, not {expected:#?}, or was not cut"
             ));
@@ -1811,7 +1813,7 @@ fn live(
     machine.keep(runner, "live", &result, &raw)?;
     let lines = td_boot_lines(&result.console);
     let capped = matches!(lines.as_slice(), [capping, closed, ..]
-        if *capping == LIVE_CAPPING && *closed == CAP_CLOSED);
+        if super::reports_marker(capping, LIVE_CAPPING) && super::reports_marker(closed, CAP_CLOSED));
     let handed = lines
         .iter()
         .any(|line| line.starts_with(&format!("{LIVE_DEPLOYMENT_PREFIX}{} ", medium.id)));
@@ -1910,8 +1912,12 @@ fn headers(
     sorted.sort_unstable();
     let mut retiring = RETIRING_STEPS.to_vec();
     retiring.sort_unstable();
-    let released = lines.first() == Some(&DEVICE_BOUND_RELEASED)
-        && lines.contains(&"td-boot: td token 2 (device-bound) released")
+    let released = lines
+        .first()
+        .is_some_and(|line| super::reports_marker(line, DEVICE_BOUND_RELEASED))
+        && lines
+            .iter()
+            .any(|line| super::reports_marker(line, "td-boot: td token 2 (device-bound) released"))
         && steps.first() == Some(&"keyslot 2 tested");
     let after = encrypted::image_header(&disk.path, &machine.uuid)?;
     if sorted != retiring || !released || after != converged() || !booted.evidence.boot_success {

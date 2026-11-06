@@ -2015,7 +2015,8 @@ the outer policy could alter results. The target invocation allows neither case
 and requires both initial states to be zero.
 QEMU copies both inputs into a root-owned, non-writable `/run` tree before
 dropping identity, gates guest health on the exact result, and recognizes only
-an exact marker line. Reaper descendants require the installed restriction
+an exact marker line, a kernel record on its end aside. Reaper descendants
+require the installed restriction
 and filter readbacks too. The Firefox physical-input boot separately reuses
 the static helper after td-jail has installed the outer filter with its exact
 LOG flag. The helper issues its 19 probes and then replaces itself with the

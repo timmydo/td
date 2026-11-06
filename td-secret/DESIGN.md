@@ -1277,7 +1277,8 @@ the replacement; normal generation teardown must still relock it.
 
 The two cut boundaries emit exact root-fixture console lines and never
 return from libtest. The host requires successful marker-triggered SIGKILL
-and a reaped SIGKILL status, one exact boundary line, selected deployment
+and a reaped SIGKILL status, one exact boundary line (a kernel record on its
+end aside), selected deployment
 identity, and no panic, fixture failure, normal result or orderly shutdown.
 A marker seen only after natural exit or timeout cannot prove a cut.
 Only the normal creation and final recovery guests require libtest success,

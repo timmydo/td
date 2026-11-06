@@ -5958,7 +5958,8 @@ focused terminal window and its generation-specific private readiness socket
 (the real td-term first-frame/PTY readiness), then supplies Control+D. The
 probe requires the new window and socket to disappear while baseline windows
 remain before publishing `TD-TERMINAL-AUTHORITY-OK`. Three exact console
-markers gate the host stages. Each guest stage has 30 seconds and the
+markers, a kernel record on a line's end aside, gate the host stages.
+Each guest stage has 30 seconds and the
 oneshot has a 90-second backstop, including Unix connect stalls. This is a
 controlled stock-image integration regression, not adversarial process
 attestation or secure attention. Normal boots skip it without synthetic input.

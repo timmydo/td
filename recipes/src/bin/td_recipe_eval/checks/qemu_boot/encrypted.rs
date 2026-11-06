@@ -512,12 +512,12 @@ pub(super) fn seed_table(path: &Path, capacity: u64) -> Result<(), String> {
     read_table(&file, capacity, sector).map(drop)
 }
 
-/// Exactly one line equal to `line`.
+/// Exactly one line reporting `line`.
 fn require_once(result: &BootResult, line: &str, what: &str) -> Result<(), String> {
     let count = result
         .console
         .lines()
-        .filter(|each| each.trim_end() == line)
+        .filter(|each| super::reports_marker(each, line))
         .count();
     if count == 1 {
         Ok(())
@@ -547,14 +547,18 @@ fn field<'a>(result: &'a BootResult, prefix: &str) -> Result<&'a str, String> {
     }
 }
 
-/// The boot stopped on the bare `ENCRYPTED_END_MARKER` line, which the
+/// The boot stopped on the `ENCRYPTED_END_MARKER` line, which the
 /// guest prints after `record`, so `record` and every line before it
 /// arrived whole: the one record's arguments.
 fn reached<'a>(result: &'a BootResult, record: &str, phase: &str) -> Result<&'a str, String> {
     let lines: Vec<&str> = result.console.lines().map(str::trim_end).collect();
     let end = protocol::ENCRYPTED_END_MARKER;
     let ends: Vec<usize> = (0..lines.len())
-        .filter(|i| lines.get(*i) == Some(&end))
+        .filter(|i| {
+            lines
+                .get(*i)
+                .is_some_and(|line| super::reports_marker(line, end))
+        })
         .collect();
     let lead = format!("{record} ");
     let records: Vec<usize> = (0..lines.len())
@@ -570,7 +574,7 @@ fn reached<'a>(result: &'a BootResult, record: &str, phase: &str) -> Result<&'a 
     }
 }
 
-/// Exactly one line equal to `marker`, which ended the boot.
+/// Exactly one line reporting `marker`, which ended the boot.
 fn require_end(result: &BootResult, marker: &str, phase: &str) -> Result<(), String> {
     if result.evidence.target {
         require_once(result, marker, phase)

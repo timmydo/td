@@ -42,7 +42,7 @@ fn complete_lines(console: &str) -> impl Iterator<Item = &str> {
 fn answered(step: &ShellStep, console: &str) -> Result<bool, String> {
     let prefix = format!("{} ", step.report);
     let reports: Vec<_> = complete_lines(console)
-        .filter(|line| *line == step.report || line.starts_with(&prefix))
+        .filter(|line| super::reports_marker(line, &step.report) || line.starts_with(&prefix))
         .collect();
     match reports.as_slice() {
         [] => Ok(false),

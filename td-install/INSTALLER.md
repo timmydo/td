@@ -2303,7 +2303,7 @@ Use `qemu-install-system` for the optical/USB installation matrix and
 
 The small and full-system QEMU oracles keep their exact requirement that
 selector volume binding precede deployment selection. On a binding failure,
-they report the retained line/byte counts, the first exact binding and
+they report the retained line/byte counts, the first binding and
 selection line offsets, and up to eight lines containing binding or
 selection prefixes, including malformed selection delimiters. Each excerpt retains at most 256 UTF-8 bytes before escaping
 control characters; escaping can expand the excerpts beyond those input

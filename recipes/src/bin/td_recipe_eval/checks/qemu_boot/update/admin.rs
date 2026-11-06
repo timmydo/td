@@ -235,7 +235,7 @@ fn prepare(
 
 fn shutdown(mut guest: Guest) -> Result<()> {
     guest.until(Duration::from_secs(600), |line| {
-        Ok((line == td_recipe::shared::SYSTEM_SHUTDOWN_MARKER).then_some(()))
+        Ok(boot::reports_marker(line, td_recipe::shared::SYSTEM_SHUTDOWN_MARKER).then_some(()))
     })?;
     let end = Instant::now() + Duration::from_secs(60);
     loop {
@@ -309,7 +309,7 @@ pub(crate) fn run(runner: &crate::check_runner::RecipeCheckRunner) -> Result<()>
             "TD-ADMIN-ROOT-ROLLBACK-REFUSED",
             "TD-ADMIN-EXERCISE-OK",
         ] {
-            if !lines.iter().any(|line| line == marker) {
+            if !lines.iter().any(|line| boot::reports_marker(line, marker)) {
                 return Err(format!("missing {marker}: {lines:?}"));
             }
             println!("{marker}");
@@ -323,7 +323,7 @@ pub(crate) fn run(runner: &crate::check_runner::RecipeCheckRunner) -> Result<()>
         }
         guest.send(&format!("{CLIENT} bad"))?;
         guest.until(Duration::from_secs(60), |line| {
-            Ok((line == "TD-ADMIN-DEFAULT-REBOOT-SUBMITTED").then_some(()))
+            Ok(boot::reports_marker(line, "TD-ADMIN-DEFAULT-REBOOT-SUBMITTED").then_some(()))
         })?;
         shutdown(guest)?;
         for (pass, remaining) in [(3, 2), (4, 1), (5, 0)] {

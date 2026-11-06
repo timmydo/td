@@ -195,7 +195,7 @@ impl Guest {
         let mut guest = Self::spawn(options, pass, deadline, disk, "")?;
         guest.until(Duration::from_secs(1800), |line| {
             observe(line)?;
-            Ok((line == shared::SYSTEM_BOOT_SUCCESS_MARKER).then_some(()))
+            Ok(super::reports_marker(line, shared::SYSTEM_BOOT_SUCCESS_MARKER).then_some(()))
         })?;
         guest.qmp = Some(Qmp::connect_until(
             &options.work.join(format!("qmp-{pass}.sock")),
@@ -401,7 +401,7 @@ impl Guest {
         let mut bytes = 0usize;
         self.until(Duration::from_secs(600), |line| {
             if let Some(status) = line.strip_prefix(&marker) {
-                if status != "0" {
+                if !super::reports_marker(status, "0") {
                     return Err(format!("guest command refused ({status}): {command}"));
                 }
                 return Ok(Some(()));
@@ -425,9 +425,12 @@ impl Guest {
             }
             let state = self.scalar(
                     "if test -L /var/home/tester/src/td/update; then echo source-ready; else echo source-pending; fi",
-                    |line| matches!(line, "source-ready" | "source-pending"),
+                    |line| {
+                        super::reports_marker(line, "source-ready")
+                            || super::reports_marker(line, "source-pending")
+                    },
                 )?;
-            if state == "source-ready" {
+            if super::reports_marker(&state, "source-ready") {
                 return Ok(());
             }
             thread::sleep(Duration::from_secs(1));
@@ -638,14 +641,14 @@ impl Guest {
         let end = Instant::now() + Duration::from_secs(30);
         loop {
             let lines = self.command(&format!("cat {output}"))?;
-            if lines.contains(&waits) {
+            if lines.iter().any(|line| super::reports_marker(line, &waits)) {
                 return Ok(Requested::Waiting(output));
             }
             if let Some(status) = lines
                 .iter()
                 .find_map(|line| line.strip_prefix("TD-HOSTNAME-CLIENT="))
             {
-                if status == "0" {
+                if super::reports_marker(status, "0") {
                     return Err(format!(
                         "the hostname client succeeded unadmitted: {lines:?}"
                     ));
@@ -847,7 +850,7 @@ fn hostname_denied(guest: &mut Guest, work: &Path, old: &str) -> Result<u64> {
     let uid = guest.scalar("echo TD-ORACLE-UID=$(id -u)", |line| {
         line.starts_with("TD-ORACLE-UID=")
     })?;
-    if uid != "TD-ORACLE-UID=1000" {
+    if !super::reports_marker(&uid, "TD-ORACLE-UID=1000") {
         return Err(format!("the serial session is not UID 1000: {uid}"));
     }
     guest.hostname_menu(&capture, HOSTNAME_EMPTY)?;
@@ -880,7 +883,7 @@ fn hostname_denied(guest: &mut Guest, work: &Path, old: &str) -> Result<u64> {
         },
     )?;
     let (status, lines) = guest.client_result(&first)?;
-    if status == "0"
+    if super::reports_marker(&status, "0")
         || !lines
             .iter()
             .any(|line| line.contains("declined, expired or failed"))
@@ -967,7 +970,9 @@ fn hostname_approved(guest: &mut Guest, work: &Path, old: &str, admitted: u64) -
     let (status, lines) = guest.client_result(&waiting)?;
     let saved =
         format!("Settings change completed: {NEW_HOSTNAME}. Hostname changes require a restart.");
-    if status != "0" || !lines.contains(&saved) {
+    if !super::reports_marker(&status, "0")
+        || !lines.iter().any(|line| super::reports_marker(line, &saved))
+    {
         return Err(format!(
             "the approved client did not report the save: {lines:?}"
         ));
@@ -1427,23 +1432,29 @@ impl FailureEvidence {
         if line.starts_with("TD-BOOT-SELECTED-") {
             once(
                 &mut self.selected,
-                line == format!("{} {id}", td_boot_protocol::SELECTED_CURRENT_MARKER),
+                super::reports_marker(
+                    line,
+                    &format!("{} {id}", td_boot_protocol::SELECTED_CURRENT_MARKER),
+                ),
                 "failed-boot selection",
             )?;
         }
         if line.starts_with(td_boot_protocol::ATTEMPT_CONSUMED_MARKER) {
             once(
                 &mut self.consumed,
-                line == format!(
-                    "{} {id} remaining={remaining}",
-                    td_boot_protocol::ATTEMPT_CONSUMED_MARKER
+                super::reports_marker(
+                    line,
+                    &format!(
+                        "{} {id} remaining={remaining}",
+                        td_boot_protocol::ATTEMPT_CONSUMED_MARKER
+                    ),
                 ),
                 "failed-boot attempt",
             )?;
         }
         if line.starts_with(td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER)
-            || line == shared::SYSTEM_BOOT_SUCCESS_MARKER
-            || line == shared::GREETER_MARKER
+            || super::reports_marker(line, shared::SYSTEM_BOOT_SUCCESS_MARKER)
+            || super::reports_marker(line, shared::GREETER_MARKER)
             || line.contains("Kernel panic")
         {
             return Err(format!(
@@ -1451,7 +1462,7 @@ impl FailureEvidence {
             ));
         }
         for &marker in FAILURE_MARKERS {
-            if line == marker {
+            if super::reports_marker(line, marker) {
                 self.markers.insert(marker);
             }
         }
@@ -1485,7 +1496,7 @@ impl RollbackEvidence {
             };
             once(
                 &mut self.selected,
-                line == format!("{marker} {previous}"),
+                super::reports_marker(line, &format!("{marker} {previous}")),
                 "rollback selection",
             )?;
         }
@@ -1493,11 +1504,13 @@ impl RollbackEvidence {
             once(
                 &mut self.exhausted,
                 first
-                    && line
-                        == format!(
+                    && super::reports_marker(
+                        line,
+                        &format!(
                             "{} {failed} -> {previous}",
                             td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER
                         ),
+                    ),
                 "attempt exhaustion",
             )?;
         }

@@ -839,7 +839,8 @@ design:
    function attribution it exists to prove. The host recognizes that result
    as the exact
    `profiler-evidence: TD-PROFILER-ATTRIBUTION-OK` console line emitted through
-   td-svc's service-name prefix, not as an unframed marker substring. A host
+   td-svc's service-name prefix, a kernel record on its end aside, not as an
+   unframed marker substring. A host
    where collection cannot be exercised instead requires a precise
    unsupported-permission diagnostic.
 

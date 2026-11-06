@@ -633,7 +633,7 @@ fn image_boot(
     let rebooted = result
         .console
         .lines()
-        .any(|line| line.trim_end() == HEALTH_REBOOT_MARKER);
+        .any(|line| super::reports_marker(line, HEALTH_REBOOT_MARKER));
     if evidence.kernel_panic
         || !evidence.boot_success
         || !evidence.target
@@ -681,7 +681,7 @@ fn validate_seeded(result: &BootResult, label: &str) -> Result<(), String> {
                 || line.starts_with("TD-HOSTNAME-READY ")
         })
         .collect();
-    if metadata != expected {
+    if !super::reports_markers(&metadata, &expected) {
         return Err(format!(
             "the {label} should have reported {expected:?} for its NoCloud seed, but \
              reported {metadata:?}. Last serial output:\n{}",
@@ -709,7 +709,7 @@ fn validate_metadata(result: &BootResult, label: &str, expected: &[&str]) -> Res
         .map(str::trim_end)
         .filter(|line| line.starts_with("TD-METADATA-") || line.starts_with("TD-CLOUD-METADATA-"))
         .collect();
-    if metadata != expected {
+    if !super::reports_markers(&metadata, expected) {
         return Err(format!(
             "the {label} should have reported {expected:?} from its metadata units, but \
              reported {metadata:?}. Last serial output:\n{}",
@@ -772,7 +772,7 @@ fn validate_health(result: &BootResult, identity: Identity, label: &str) -> Resu
     let rebooted = result
         .console
         .lines()
-        .any(|line| line.trim_end() == HEALTH_REBOOT_MARKER);
+        .any(|line| super::reports_marker(line, HEALTH_REBOOT_MARKER));
     if !result.evidence.boot_success || !result.evidence.target || !result.marker_killed || rebooted
     {
         return Err(format!(
@@ -835,7 +835,12 @@ fn validate_health(result: &BootResult, identity: Identity, label: &str) -> Resu
 /// A boot that failed health must have been rebooted by healthwatch: its
 /// marker, td-svc's teardown through `/etc/shutdown`, and QEMU's own exit.
 fn validate_health_reboot(result: &BootResult, label: &str) -> Result<(), String> {
-    let printed = |marker: &str| result.console.lines().any(|line| line.trim_end() == marker);
+    let printed = |marker: &str| {
+        result
+            .console
+            .lines()
+            .any(|line| super::reports_marker(line, marker))
+    };
     if !result.evidence.target
         || !result.exited_clean
         || !printed(SYSTEM_SHUTDOWN_MARKER)
