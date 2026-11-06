@@ -7925,12 +7925,12 @@ fn latch_token(found: &mut Option<String>, haystack: &[u8], prefix: &[u8]) {
             };
             end = next;
         }
-        // Only a token followed by a real terminator counts. Anything else is
-        // either still being written (its newline has not arrived), or longer than
-        // the ceiling — and latching a PREFIX of a fingerprint would compare
-        // unequal against the same key next boot, reporting a rotation that did
-        // not happen.
-        if end == after_prefix || !matches!(haystack.get(end), Some(b) if !b.is_ascii_graphic()) {
+        // Only a token that ends its line counts. Anything else is still being
+        // written (its newline has not arrived), longer than the ceiling, or
+        // carrying a kernel record whose first word would run on from the token —
+        // and latching other than the whole fingerprint would compare unequal
+        // against the same key next boot, reporting a rotation that did not happen.
+        if end == after_prefix || !matches!(haystack.get(end), Some(b'\r' | b'\n')) {
             continue;
         }
         if let Some(Ok(token)) = haystack.get(after_prefix..end).map(std::str::from_utf8) {
@@ -13266,6 +13266,24 @@ mod tests {
             b"target",
         );
         assert_eq!(partial.host_key.as_deref(), Some(fingerprint));
+
+        // The real console ends its lines CRLF.
+        let mut crlf = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut crlf,
+            format!("{prefix}{fingerprint}\r\n").as_bytes(),
+            b"target",
+        );
+        assert_eq!(crlf.host_key.as_deref(), Some(fingerprint));
+
+        // A kernel record on the line: refused, not latched with its first word.
+        let mut spliced = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut spliced,
+            format!("{prefix}{fingerprint}random: crng init done\n").as_bytes(),
+            b"target",
+        );
+        assert_eq!(spliced.host_key, None);
 
         // Longer than the ceiling: refused outright rather than latched truncated.
         let mut oversized = ConsoleEvidence::default();
