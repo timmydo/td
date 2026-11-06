@@ -15,6 +15,7 @@ mod publisher;
 mod seed;
 #[cfg(test)]
 mod tests;
+mod upload;
 
 use crate::{sig, td_fs, td_fs_replace};
 use format::{Head, Release, Root, State, INDEX_LIMIT, SMALL};
@@ -496,11 +497,12 @@ fn fetch_budgeted(
     result
 }
 
-const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  publish-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT DEPLOYMENT\n  promote-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH\n  renew REPOSITORY ROOT RELEASE_PRIVATE PROFILE\n  fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT] [--cache-limit BYTES]\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n";
+const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  publish-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT DEPLOYMENT\n  promote-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH\n  renew REPOSITORY ROOT RELEASE_PRIVATE PROFILE\n  fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT] [--cache-limit BYTES]\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n  upload-s3 REPOSITORY ROOT PROFILE ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n";
 
 fn command(args: &[String]) -> Result<()> {
     let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
     match words.as_slice() {
+        ["upload-s3", rest @ ..] => upload::command(rest),
         ["keygen", private, public] => {
             let (secret, key) = sig::keygen()?;
             sig::write_keypair(private, &secret, public, &key)

@@ -1180,3 +1180,284 @@ fn direct_seed_reuse_preserves_remote_object_resume() {
     assert!(!f.cache.join(&first.digest).exists());
     assert!(f.cache.join(hash(&interrupted)).exists());
 }
+
+fn s3_args(f: &Fixture, mock: &crate::s3::tests::Mock, cred: &Path) -> Vec<String> {
+    vec![
+        f.repo.to_str().unwrap().into(),
+        f.root.to_str().unwrap().into(),
+        "system-x86-64".into(),
+        mock.endpoint.clone(),
+        "auto".into(),
+        "td-releases".into(),
+        cred.to_str().unwrap().into(),
+        "test".into(),
+    ]
+}
+fn s3_upload(args: &[String]) -> Result<()> {
+    upload::command(&args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+#[test]
+fn s3_release_upload_resumes_and_publishes_only_authenticated_files_head_last() {
+    let f = Fixture::new();
+    let mock = crate::s3::tests::Mock::new();
+    let cred = f.dir.join("credentials");
+    crate::s3::tests::write_credentials(&cred);
+    let args = s3_args(&f, &mock, &cred);
+    fs::write(f.repo.join("private.key"), b"DO NOT UPLOAD").unwrap();
+    let orphan = "f".repeat(64);
+    fs::write(f.repo.join("objects").join(&orphan), b"orphan").unwrap();
+    let mut dry = args.clone();
+    dry.push("--dry-run".into());
+    s3_upload(&dry).unwrap();
+    assert!(mock.store.lock().unwrap().requests.is_empty());
+    let index = format!("releases/{}", f.release);
+    mock.store.lock().unwrap().fail = Some((index.clone(), 503, 3));
+    assert!(s3_upload(&args).is_err());
+    {
+        let store = mock.store.lock().unwrap();
+        assert!(!store.files.contains_key("heads/system-x86-64"));
+        assert!(store.files.keys().any(|k| k.starts_with("objects/")));
+        assert!(!store.files.contains_key("private.key"));
+        assert!(!store.files.contains_key(&format!("objects/{orphan}")));
+    }
+    mock.store.lock().unwrap().requests.clear();
+    s3_upload(&args).unwrap();
+    {
+        let store = mock.store.lock().unwrap();
+        let puts: Vec<_> = store
+            .requests
+            .iter()
+            .filter(|(m, _)| m == "PUT")
+            .map(|(_, k)| k.as_str())
+            .collect();
+        assert_eq!(puts, vec![index.as_str(), "heads/system-x86-64"]);
+        assert_eq!(
+            store.files["heads/system-x86-64"].headers["cache-control"],
+            crate::s3::NO_STORE
+        );
+        assert_eq!(
+            store.files[&index].headers["cache-control"],
+            crate::s3::IMMUTABLE
+        );
+    }
+    // The published repository is usable by the real authenticated downloader.
+    let remote_repo = f.dir.join("remote");
+    fs::create_dir(&remote_repo).unwrap();
+    for (key, file) in &mock.store.lock().unwrap().files {
+        let path = remote_repo.join(key);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, &file.bytes).unwrap();
+    }
+    let output = f.dir.join("remote-output");
+    fetch(
+        &format!("file:{}", remote_repo.display()),
+        &f.state,
+        &f.cache,
+        &output,
+    )
+    .unwrap();
+    for (name, _) in format::FILES {
+        assert_eq!(
+            fs::read(output.join(name)).unwrap(),
+            fs::read(f.deployment.join(name)).unwrap()
+        );
+    }
+}
+
+#[test]
+fn s3_corrupt_local_object_refuses_before_network_and_remote_conflict_never_promotes() {
+    let f = Fixture::new();
+    let mock = crate::s3::tests::Mock::new();
+    let cred = f.dir.join("credentials");
+    crate::s3::tests::write_credentials(&cred);
+    let args = s3_args(&f, &mock, &cred);
+    let object = fs::read_dir(f.repo.join("objects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let original = fs::read(&object).unwrap();
+    fs::write(&object, b"broken").unwrap();
+    assert!(s3_upload(&args).is_err());
+    assert!(mock.store.lock().unwrap().requests.is_empty());
+    fs::write(&object, original).unwrap();
+    let key = format!("objects/{}", object.file_name().unwrap().to_str().unwrap());
+    mock.store.lock().unwrap().files.insert(
+        key,
+        crate::s3::tests::Stored {
+            bytes: b"foreign".to_vec(),
+            headers: Default::default(),
+        },
+    );
+    assert!(s3_upload(&args).is_err());
+    assert!(!mock
+        .store
+        .lock()
+        .unwrap()
+        .files
+        .contains_key("heads/system-x86-64"));
+}
+
+#[test]
+fn s3_head_compare_and_swap_refuses_races_and_stale_publishers() {
+    let f = Fixture::new();
+    let mock = crate::s3::tests::Mock::new();
+    let cred = f.dir.join("credentials");
+    crate::s3::tests::write_credentials(&cred);
+    let args = s3_args(&f, &mock, &cred);
+    s3_upload(&args).unwrap();
+    let path = f.repo.join("heads/system-x86-64");
+    let old = fs::read(&path).unwrap();
+    let time = now().unwrap();
+    publisher::promote(
+        &f.repo,
+        &f.root,
+        &f.key,
+        "system-x86-64",
+        &f.release,
+        2,
+        time,
+        time + 3600,
+    )
+    .unwrap();
+    let newer = fs::read(&path).unwrap();
+    publisher::promote(
+        &f.repo,
+        &f.root,
+        &f.key,
+        "system-x86-64",
+        &f.release,
+        3,
+        time,
+        time + 3600,
+    )
+    .unwrap();
+    let newest = fs::read(&path).unwrap();
+    fs::write(&path, &newer).unwrap();
+    mock.store.lock().unwrap().race_head = Some(newest.clone());
+    assert!(s3_upload(&args).is_err());
+    assert_eq!(
+        mock.store.lock().unwrap().files["heads/system-x86-64"].bytes,
+        newest
+    );
+    fs::write(&path, old).unwrap();
+    mock.store.lock().unwrap().requests.clear();
+    assert!(s3_upload(&args).is_err());
+    assert!(mock
+        .store
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .all(|(m, _)| m != "PUT"));
+    fs::write(&path, &newest).unwrap();
+    publisher::promote(
+        &f.repo,
+        &f.root,
+        &f.key,
+        "system-x86-64",
+        &f.release,
+        4,
+        time,
+        time + 3600,
+    )
+    .unwrap();
+    // Commit a changed head, lose its reply, then reject the old ETag on retry.
+    mock.store.lock().unwrap().requests.clear();
+    mock.store.lock().unwrap().lose_reply = Some("heads/system-x86-64".into());
+    s3_upload(&args).unwrap();
+    let store = mock.store.lock().unwrap();
+    assert_eq!(
+        store.files["heads/system-x86-64"].bytes,
+        fs::read(&path).unwrap()
+    );
+    assert_eq!(
+        store
+            .requests
+            .iter()
+            .filter(|(m, k)| m == "PUT" && k == "heads/system-x86-64")
+            .count(),
+        2
+    );
+    assert_eq!(
+        store.requests.last(),
+        Some(&("GET".into(), "heads/system-x86-64".into()))
+    );
+}
+
+#[test]
+fn s3_rotation_keeps_intermediate_roots_and_expired_head_is_not_uploaded() {
+    let f = Fixture::new();
+    let mock = crate::s3::tests::Mock::new();
+    let cred = f.dir.join("credentials");
+    crate::s3::tests::write_credentials(&cred);
+    let args = s3_args(&f, &mock, &cred);
+    s3_upload(&args).unwrap();
+    let head_path = f.repo.join("heads/system-x86-64");
+    let old = fs::read(&head_path).unwrap();
+    let root = f.dir.join("root2");
+    let key = f.dir.join("key2");
+    let public = f.dir.join("public2");
+    let (secret, pubkey) = sig::keygen().unwrap();
+    fs::write(&key, secret).unwrap();
+    fs::write(&public, sig::to_hex(&pubkey)).unwrap();
+    let time = now().unwrap();
+    publisher::root(
+        2,
+        time + format::DAY * 90,
+        &f.private,
+        &public,
+        &f.private,
+        &root,
+    )
+    .unwrap();
+    publisher::publish_next(
+        &f.repo,
+        &root,
+        &key,
+        "system-x86-64",
+        &"2".repeat(40),
+        &f.deployment,
+    )
+    .unwrap();
+    let selected = fs::read_dir(f.repo.join("releases"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .find(|s| s != &f.release)
+        .unwrap();
+    publisher::promote_next(&f.repo, &root, &key, "system-x86-64", Some(&selected)).unwrap();
+    let mut rotated = args.clone();
+    rotated[1] = root.to_str().unwrap().into();
+    s3_upload(&rotated).unwrap();
+    {
+        let store = mock.store.lock().unwrap();
+        assert!(store.files.contains_key("roots/1"));
+        assert!(store.files.contains_key("roots/2"));
+    }
+    fs::write(&head_path, old).unwrap();
+    mock.store.lock().unwrap().requests.clear();
+    assert!(s3_upload(&args).is_err());
+    assert!(mock
+        .store
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .all(|(m, _)| m != "PUT"));
+    let expired = format!(
+        "td-release-head-v1\n1\n2\n{}\n{}\nsystem-x86-64\n{}\n",
+        time - 100,
+        time - 1,
+        f.release
+    );
+    fs::write(
+        &head_path,
+        format::signed(&expired, &fs::read(&f.key).unwrap()).unwrap(),
+    )
+    .unwrap();
+    mock.store.lock().unwrap().requests.clear();
+    assert!(s3_upload(&args).is_err());
+    assert!(mock.store.lock().unwrap().requests.is_empty());
+}

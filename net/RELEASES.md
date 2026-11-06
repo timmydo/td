@@ -272,7 +272,10 @@ be renewed while its index and root remain valid. An expired index requires
 index's signed lifetime. A root rotation likewise requires a new index.
 Scheduling renewal and choosing which source revision to release remain
 operator decisions. These commands operate on a local repository and do
-not upload data or require public hosting.
+not upload data or require public hosting. The explicit `upload-s3` command
+uploads the selected signed release to an S3-compatible static bucket;
+[S3.md](S3.md) specifies credentials, conditional writes, publication order,
+cache policy, and bounds.
 
 `gc REPOSITORY ROOT` is a dry run; `--delete` performs deletion under the
 same lease as publication. It retains the heads' selected indexes even when

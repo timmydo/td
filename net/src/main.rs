@@ -48,6 +48,8 @@ mod release;
 #[allow(dead_code)]
 #[path = "../../engine/src/elf_synth.rs"]
 mod rust_elf_synth;
+mod s3;
+mod utc;
 #[cfg(test)]
 use td_engine::elf;
 mod rust_toolchain;
@@ -130,9 +132,10 @@ fn main() {
                 Some("launch") => "td-launch",
                 Some("test-https") => "td-test-https",
                 Some("release") => "td-release",
+                Some("s3") => "td-s3",
                 _ => {
                     eprintln!(
-                        "usage: td-net <app|rust|fetch|feed|subst|fetchd|egressd|launch|test-https|release> ...\n  \
+                        "usage: td-net <app|rust|fetch|feed|subst|fetchd|egressd|launch|test-https|release|s3> ...\n  \
                          (or invoke via the td-fetch / td-feed / td-subst / \
                          td-fetchd / td-test-https applet links)"
                     );
@@ -152,6 +155,7 @@ fn main() {
                 "td-launch" => launch::run(&argv),
                 "td-test-https" => test_https::run(&argv),
                 "td-release" => release::run(&argv),
+                "td-s3" => s3::run(&argv),
                 _ => subst::run(&argv),
             }
         }
