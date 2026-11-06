@@ -11,6 +11,7 @@
 
 #[cfg(test)]
 pub(crate) mod tests;
+mod website;
 
 use crate::{sig, td_fs};
 use std::collections::BTreeMap;
@@ -371,16 +372,7 @@ impl Client {
         if response.status().as_u16() != 200 {
             return Err(format!("S3 GET {key}: HTTP {}", response.status().as_u16()));
         }
-        let etag = header(&response, "etag")?
-            .ok_or("S3 response omitted ETag")?
-            .to_string();
-        if etag.len() > 256
-            || !etag.starts_with('"')
-            || !etag.ends_with('"')
-            || etag.bytes().any(|b| !(33..=126).contains(&b))
-        {
-            return Err("invalid S3 ETag".into());
-        }
+        let etag = etag(&response)?;
         let mut bytes = Vec::new();
         response
             .body_mut()
@@ -479,6 +471,17 @@ impl Client {
         }
     }
 }
+fn etag(response: &ureq::http::Response<ureq::Body>) -> Result<String> {
+    let value = header(response, "etag")?.ok_or("S3 response omitted ETag")?;
+    if value.len() > 256
+        || !value.starts_with('"')
+        || !value.ends_with('"')
+        || value.bytes().any(|b| !(33..=126).contains(&b))
+    {
+        return Err("invalid S3 ETag".into());
+    }
+    Ok(value.to_string())
+}
 fn header<'a>(
     response: &'a ureq::http::Response<ureq::Body>,
     name: &str,
@@ -529,7 +532,7 @@ pub(crate) fn file_hash_until(file: &mut File, size: u64, deadline: Instant) -> 
     Ok(sig::to_hex(&digest.finalize()))
 }
 
-const HELP: &str = "td-net s3 put FILE KEY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]";
+const HELP: &str = "td-net s3 put FILE KEY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]\n       td-net s3 website DIRECTORY ENDPOINT REGION BUCKET CREDENTIALS PROFILE [--dry-run]";
 fn command(args: &[String]) -> Result<()> {
     let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
     let (words, dry) = if words.last() == Some(&"--dry-run") {
@@ -537,6 +540,15 @@ fn command(args: &[String]) -> Result<()> {
     } else {
         (words.as_slice(), false)
     };
+    if let ["website", directory, endpoint, region, bucket, credentials, profile] = words {
+        let mut client = Client::new(endpoint, region, bucket, Path::new(credentials), profile)?;
+        return website::upload(
+            &mut client,
+            Path::new(directory),
+            Path::new(credentials),
+            dry,
+        );
+    }
     let ["put", path, key, endpoint, region, bucket, credentials, profile] = words else {
         return Err(HELP.into());
     };

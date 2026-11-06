@@ -118,6 +118,8 @@ pub(crate) struct Store {
     pub(crate) fail: Option<(String, u16, usize)>,
     pub(crate) lose_reply: Option<String>,
     pub(crate) race_head: Option<Vec<u8>>,
+    race_file: Option<(String, Stored)>,
+    fail_put: Option<(String, u16)>,
 }
 pub(crate) struct Mock {
     pub(crate) endpoint: String,
@@ -237,6 +239,12 @@ fn serve(mut stream: TcpStream, shared: &Mutex<Store>) {
     }
     match method {
         "PUT" => {
+            if let Some((target, status)) = &store.fail_put {
+                if target == &key {
+                    reply(&mut stream, *status, &[], &[], method);
+                    return;
+                }
+            }
             if key.starts_with("heads/") {
                 if let Some(bytes) = store.race_head.take() {
                     store.files.insert(
@@ -247,6 +255,14 @@ fn serve(mut stream: TcpStream, shared: &Mutex<Store>) {
                         },
                     );
                 }
+            }
+            if store
+                .race_file
+                .as_ref()
+                .is_some_and(|(target, _)| target == &key)
+            {
+                let (target, file) = store.race_file.take().unwrap();
+                store.files.insert(target, file);
             }
             let existing = store.files.get(&key);
             if headers.get("if-none-match").is_some_and(|s| s == "*") && existing.is_some()
@@ -274,7 +290,7 @@ fn serve(mut stream: TcpStream, shared: &Mutex<Store>) {
         "GET" | "HEAD" => {
             if let Some(file) = store.files.get(&key) {
                 let mut extra = vec![("etag".to_string(), format!("\"{}\"", hash(&file.bytes)))];
-                for name in ["cache-control", "x-amz-meta-sha256"] {
+                for name in ["cache-control", "x-amz-meta-sha256", "content-type"] {
                     if let Some(v) = file.headers.get(name) {
                         extra.push((name.into(), v.clone()));
                     }
@@ -417,4 +433,139 @@ fn single_file_dry_run_sends_nothing_and_reserved_names_refuse() {
     ] {
         assert!(Client::new(endpoint, "auto", "td-releases", &cred, "test").is_err());
     }
+}
+
+fn website_files(dir: &Path) {
+    fs::create_dir_all(dir.join("assets")).unwrap();
+    fs::write(dir.join("style.css"), b"body { color: black; }").unwrap();
+    fs::write(dir.join("assets/favicon.svg"), b"<svg/>").unwrap();
+    fs::write(dir.join("assets/td-desktop.jpg"), b"JPEG fixture").unwrap();
+    fs::write(dir.join("index.html"), b"<!doctype html><title>td</title>").unwrap();
+    fs::write(dir.join("README.md"), b"not public").unwrap();
+}
+
+#[test]
+fn website_upload_orders_types_reuses_and_replaces() {
+    let dir = crate::test_temp::TempDir::new("s3-website").unwrap();
+    website_files(&dir);
+    let cred = dir.join("credentials");
+    write_credentials(&cred);
+    let mock = Mock::new();
+    let args: Vec<String> = [
+        "s3",
+        "website",
+        dir.to_str().unwrap(),
+        &mock.endpoint,
+        "auto",
+        "td-releases",
+        cred.to_str().unwrap(),
+        "test",
+        "--dry-run",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    command(&args).unwrap();
+    assert!(mock.store.lock().unwrap().requests.is_empty());
+    let mut client = mock.client(&cred);
+    mock.store.lock().unwrap().lose_reply = Some("style.css".into());
+    website::upload(&mut client, &dir, &cred, false).unwrap();
+    {
+        let store = mock.store.lock().unwrap();
+        assert_eq!(store.files.len(), 4);
+        assert_eq!(
+            store.requests.iter().rfind(|(m, _)| m == "PUT").unwrap().1,
+            "index.html"
+        );
+        for (key, mime) in [
+            ("index.html", "text/html; charset=utf-8"),
+            ("style.css", "text/css; charset=utf-8"),
+            ("assets/favicon.svg", "image/svg+xml"),
+            ("assets/td-desktop.jpg", "image/jpeg"),
+        ] {
+            assert_eq!(store.files[key].headers["content-type"], mime);
+            assert_eq!(store.files[key].headers["cache-control"], "no-cache");
+        }
+    }
+    mock.store.lock().unwrap().requests.clear();
+    website::upload(&mut client, &dir, &cred, false).unwrap();
+    assert!(mock
+        .store
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .all(|(m, _)| m == "HEAD"));
+    fs::write(dir.join("index.html"), b"new page").unwrap();
+    website::upload(&mut client, &dir, &cred, false).unwrap();
+    assert_eq!(
+        mock.store.lock().unwrap().files["index.html"].bytes,
+        b"new page"
+    );
+    // Repair wrong HTTP metadata even when bytes are identical.
+    mock.store
+        .lock()
+        .unwrap()
+        .files
+        .get_mut("style.css")
+        .unwrap()
+        .headers
+        .insert("content-type".into(), "application/octet-stream".into());
+    website::upload(&mut client, &dir, &cred, false).unwrap();
+    assert_eq!(
+        mock.store.lock().unwrap().files["style.css"].headers["content-type"],
+        "text/css; charset=utf-8"
+    );
+}
+
+#[test]
+fn website_refuses_invalid_local_files_before_network_and_stops_on_asset_failure() {
+    let dir = crate::test_temp::TempDir::new("s3-website-refuse").unwrap();
+    website_files(&dir);
+    let cred = dir.join("credentials");
+    write_credentials(&cred);
+    let mock = Mock::new();
+    let mut client = mock.client(&cred);
+    fs::remove_file(dir.join("index.html")).unwrap();
+    assert!(website::upload(&mut client, &dir, &cred, false).is_err());
+    assert!(mock.store.lock().unwrap().requests.is_empty());
+    std::os::unix::fs::symlink(&cred, dir.join("index.html")).unwrap();
+    assert!(website::upload(&mut client, &dir, &cred, true).is_err());
+    fs::remove_file(dir.join("index.html")).unwrap();
+    fs::hard_link(&cred, dir.join("index.html")).unwrap();
+    assert!(website::upload(&mut client, &dir, &cred, true).is_err());
+    fs::remove_file(dir.join("index.html")).unwrap();
+    website_files(&dir);
+    mock.store.lock().unwrap().fail_put = Some(("assets/favicon.svg".into(), 403));
+    assert!(website::upload(&mut client, &dir, &cred, false).is_err());
+    let store = mock.store.lock().unwrap();
+    assert!(store.files.contains_key("style.css"));
+    assert!(!store
+        .requests
+        .iter()
+        .any(|(m, k)| m == "PUT" && k == "index.html"));
+}
+
+#[test]
+fn website_conflicting_page_write_is_not_overwritten() {
+    let dir = crate::test_temp::TempDir::new("s3-website-race").unwrap();
+    website_files(&dir);
+    let cred = dir.join("credentials");
+    write_credentials(&cred);
+    let mock = Mock::new();
+    let mut client = mock.client(&cred);
+    website::upload(&mut client, &dir, &cred, false).unwrap();
+    fs::write(dir.join("index.html"), b"our next page").unwrap();
+    mock.store.lock().unwrap().race_file = Some((
+        "index.html".into(),
+        Stored {
+            bytes: b"concurrent page".to_vec(),
+            headers: BTreeMap::new(),
+        },
+    ));
+    assert!(website::upload(&mut client, &dir, &cred, false).is_err());
+    assert_eq!(
+        mock.store.lock().unwrap().files["index.html"].bytes,
+        b"concurrent page"
+    );
 }

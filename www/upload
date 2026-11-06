@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+case "$0" in
+    */*) upload_dir=${0%/*} ;;
+    *) upload_dir=. ;;
+esac
+exec "$upload_dir/../net/target/release/td-net" s3 website "$upload_dir" "$@"
