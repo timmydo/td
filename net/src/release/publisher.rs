@@ -139,8 +139,8 @@ pub(super) fn publish_with_partitions(
 ) -> Result<()> {
     format::profile(profile)?;
     format::hex(commit, 20)?;
-    format::lifetime(issued, expires, now()?, 30 * DAY)?;
     let (_lock, root) = prepare(repo, root_path)?;
+    root.lifetime(issued, expires, now()?, 30 * DAY)?;
     let key = signing_key(key_path, &root)?;
     let digest = publish_locked(
         repo, &root, &key, profile, commit, sequence, issued, expires, deployment, partitions,
@@ -273,8 +273,8 @@ pub(super) fn promote(
 ) -> Result<()> {
     format::profile(profile)?;
     format::hex(release_digest, 32)?;
-    format::lifetime(issued, expires, now()?, DAY)?;
     let (_lock, root) = prepare(repo, root_path)?;
+    root.lifetime(issued, expires, now()?, DAY)?;
     let key = signing_key(key_path, &root)?;
     promote_locked(
         repo,
@@ -317,6 +317,7 @@ fn promote_locked(
         }
     }
     let destination = repo.join("heads").join(profile);
+    let mut protect_retention = root.expires == 0 || retention_hold(repo)?.is_some();
     if io(destination.try_exists())? {
         let old_text = text(&destination, SMALL)?;
         let old_root_version = Head::root_hint(&old_text)?;
@@ -327,6 +328,7 @@ fn promote_locked(
             &text(&repo.join(format!("roots/{old_root_version}")), SMALL)?,
             None,
         )?;
+        protect_retention |= old_root.expires == 0;
         // An expired head can be refreshed; its signed issued time permits parsing.
         let old_issued = format::number(old_text.lines().nth(3).ok_or("old head truncated")?)?;
         let old = Head::parse(&old_text, &old_root, old_issued, profile)?;
@@ -356,6 +358,9 @@ fn promote_locked(
     );
     let signed = format::signed(&body, key)?;
     Head::parse(&signed, root, now()?, profile)?;
+    if protect_retention {
+        hold_retention(repo)?;
+    }
     replace(&destination, signed.as_bytes())
 }
 
@@ -424,11 +429,8 @@ pub(super) fn publish_next(
         .checked_add(1)
         .ok_or("release sequence exhausted")?;
     let issued = now()?;
-    let expires = issued
-        .checked_add(30 * DAY)
-        .ok_or("expiry overflow")?
-        .min(root.expires);
-    format::lifetime(issued, expires, issued, 30 * DAY)?;
+    let expires = root.deadline(issued, 30 * DAY)?;
+    root.lifetime(issued, expires, issued, 30 * DAY)?;
     let digest = publish_locked(
         repo, &root, &key, profile, commit, sequence, issued, expires, deployment, None,
     )?;
@@ -441,12 +443,10 @@ pub(super) fn promote_next(
     root_path: &Path,
     key_path: &Path,
     profile: &str,
-    requested: Option<&str>,
+    digest: &str,
 ) -> Result<()> {
     format::profile(profile)?;
-    if let Some(digest) = requested {
-        format::hex(digest, 32)?;
-    }
+    format::hex(digest, 32)?;
     let (_lock, root) = prepare(repo, root_path)?;
     let key = signing_key(key_path, &root)?;
     let selected = selected(repo, &root, profile)?;
@@ -457,30 +457,15 @@ pub(super) fn promote_next(
             .ok_or("head version exhausted")?,
         _ => 1,
     };
-    let digest = match requested {
-        Some(digest) => digest,
-        None => {
-            let head = selected.as_ref().ok_or("no selected release to renew")?;
-            if head.root != root.version {
-                return Err("root rotation requires publishing a new index".into());
-            }
-            &head.release
-        }
-    };
     let issued = now()?;
     let value = text(&repo.join("releases").join(digest), INDEX_LIMIT)?;
     if hash(value.as_bytes()) != digest {
         return Err("stored release digest mismatch".into());
     }
-    let release = Release::parse(&value, &root, issued, profile).map_err(|error| {
-        format!("cannot promote or renew: {error}; publish a fresh index when expired")
-    })?;
-    let expires = issued
-        .checked_add(DAY)
-        .ok_or("expiry overflow")?
-        .min(release.expires)
-        .min(root.expires);
-    format::lifetime(issued, expires, issued, DAY)?;
+    let release = Release::parse(&value, &root, issued, profile)
+        .map_err(|error| format!("cannot promote: {error}; publish a fresh index when expired"))?;
+    let expires = root.deadline(issued, DAY)?.min(release.expires);
+    root.lifetime(issued, expires, issued, DAY)?;
     promote_locked(repo, &root, &key, profile, digest, version, issued, expires)?;
     println!("{digest}");
     Ok(())
@@ -507,10 +492,37 @@ pub(super) fn gc(repo: &Path, root_path: &Path, delete: bool) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn retention_hold(repo: &Path) -> Result<Option<u64>> {
+    let path = repo.join("retention-hold-until");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let value = text(&path, 64)?;
+            Ok(Some(format::number(
+                value
+                    .strip_suffix('\n')
+                    .ok_or("unterminated retention hold")?,
+            )?))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+pub(super) fn hold_retention(repo: &Path) -> Result<()> {
+    let until = now()?
+        .checked_add(7 * DAY)
+        .ok_or("retention hold overflow")?;
+    let until = until.max(retention_hold(repo)?.unwrap_or(0));
+    replace(
+        &repo.join("retention-hold-until"),
+        format!("{until}\n").as_bytes(),
+    )
+}
+
 pub(super) fn garbage(repo: &Path) -> Result<Vec<PathBuf>> {
     let time = now()?;
     let grace = 7 * DAY;
     let mut selected = BTreeSet::new();
+    let mut has_static_head = false;
     for name in ["system-x86-64", "server-x86-64"] {
         let path = repo.join("heads").join(name);
         if io(path.try_exists())? {
@@ -521,9 +533,18 @@ pub(super) fn garbage(repo: &Path) -> Result<Vec<PathBuf>> {
                 None,
             )?;
             let issued = format::number(text.lines().nth(3).ok_or("head truncated")?)?;
-            selected.insert(Head::parse(&text, &root, issued, name)?.release);
+            let head = Head::parse(&text, &root, issued, name)?;
+            if root.expires == 0 {
+                has_static_head = true;
+            }
+            selected.insert(head.release);
         }
     }
+    let hold = retention_hold(repo)?;
+    if has_static_head && hold.is_none() {
+        return Err("missing retention hold; upload the selected release before collection".into());
+    }
+    let transition_grace = hold.is_some_and(|until| time <= until);
     let mut reachable = BTreeSet::new();
     let mut obsolete = Vec::new();
     for entry in io(fs::read_dir(repo.join("releases")))? {
@@ -549,7 +570,15 @@ pub(super) fn garbage(repo: &Path) -> Result<Vec<PathBuf>> {
             None,
         )?;
         let release = Release::parse(&text, &root, issued, profile)?;
-        if selected.remove(&name) || time.saturating_sub(release.expires) <= grace {
+        let retain_until = if release.expires == 0 {
+            release.issued.saturating_add(30 * DAY)
+        } else {
+            release.expires
+        };
+        // A newly superseded, long-lived head needs the full acquisition grace,
+        // even when its index and shared objects are already old.
+        if selected.remove(&name) || time.saturating_sub(retain_until) <= grace || transition_grace
+        {
             for payload in release.payloads {
                 for object in payload.objects {
                     reachable.insert(object.digest);

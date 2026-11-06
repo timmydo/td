@@ -278,7 +278,7 @@ fn learn(state_path: &Path, evidence: &Path) -> Result<()> {
         let head_issued = format::number(head_text.lines().nth(3).ok_or("head truncated")?)?;
         let release_issued =
             format::number(release_text.lines().nth(3).ok_or("release truncated")?)?;
-        if head_issued > time || release_issued > time {
+        if state.root.expires != 0 && (head_issued > time || release_issued > time) {
             return Err("future metadata".into());
         }
         let head = Head::parse(&head_text, &state.root, head_issued, &state.profile)?;
@@ -499,12 +499,11 @@ fn fetch_budgeted(
     result
 }
 
-const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  publish-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT DEPLOYMENT\n  promote-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH\n  renew REPOSITORY ROOT RELEASE_PRIVATE PROFILE\n  fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT] [--cache-limit BYTES]\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n  renew-upload-s3 REPOSITORY ROOT RELEASE_PRIVATE PROFILE ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE\n  gc-s3 REPOSITORY ROOT ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--delete --exclusive-publisher]\n  iso-index CATALOG OUTPUT\n  upload-iso-index-s3 CATALOG OUTPUT ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n  sign-iso ROOT RELEASE_PRIVATE PROFILE COMMIT ISO SIGNATURE_DIRECTORY\n  verify-iso ROOT PROFILE SIGNATURE ISO\n  upload-iso-s3 ROOT PROFILE SIGNATURE ISO ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n  upload-s3 REPOSITORY ROOT PROFILE ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n";
+const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION [EXPIRES] ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  publish-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT DEPLOYMENT\n  promote-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH\n  fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT] [--cache-limit BYTES]\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n  gc-s3 REPOSITORY ROOT ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--delete --exclusive-publisher]\n  iso-index CATALOG OUTPUT\n  upload-iso-index-s3 CATALOG OUTPUT ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n  sign-iso ROOT RELEASE_PRIVATE PROFILE COMMIT ISO SIGNATURE_DIRECTORY\n  verify-iso ROOT PROFILE SIGNATURE ISO\n  upload-iso-s3 ROOT PROFILE SIGNATURE ISO ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n  upload-s3 REPOSITORY ROOT PROFILE ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n";
 
 fn command(args: &[String]) -> Result<()> {
     let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
     match words.as_slice() {
-        ["renew-upload-s3", rest @ ..] => maintenance::renew_upload(rest),
         ["gc-s3", rest @ ..] => maintenance::gc(rest),
         ["iso-index", catalog, output] => {
             iso::index::generate(Path::new(catalog), Path::new(output))
@@ -531,6 +530,14 @@ fn command(args: &[String]) -> Result<()> {
             let (secret, key) = sig::keygen()?;
             sig::write_keypair(private, &secret, public, &key)
         }
+        ["root", version, root_private, release_public, old_private, output] => publisher::root(
+            format::number(version)?,
+            0,
+            Path::new(root_private),
+            Path::new(release_public),
+            Path::new(old_private),
+            Path::new(output),
+        ),
         ["root", version, expires, root_private, release_public, old_private, output] => {
             publisher::root(
                 format::number(version)?,
@@ -630,14 +637,7 @@ fn command(args: &[String]) -> Result<()> {
             Path::new(root),
             Path::new(key),
             profile,
-            Some(digest),
-        ),
-        ["renew", repo, root, key, profile] => publisher::promote_next(
-            Path::new(repo),
-            Path::new(root),
-            Path::new(key),
-            profile,
-            None,
+            digest,
         ),
         ["verify", state, bundle] => {
             let (commit, deployment) = verify(Path::new(state), Path::new(bundle))?;

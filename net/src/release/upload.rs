@@ -165,8 +165,12 @@ pub(super) fn command(words: &[&str]) -> Result<()> {
     }
     let key = format!("heads/{profile}");
     let previous = client.get(&key, SMALL)?;
+    let mut protect_retention =
+        plan.root(plan.head.root)?.expires == 0 || publisher::retention_hold(repo)?.is_some();
     if let Some(remote) = &previous {
         plan.check_remote(&client, remote, profile)?;
+        let old = std::str::from_utf8(&remote.bytes).map_err(|_| "remote head is not UTF-8")?;
+        protect_retention |= plan.root(Head::root_hint(old)?)?.expires == 0;
     }
     for (digest, size) in &plan.objects {
         upload_file(
@@ -201,6 +205,11 @@ pub(super) fn command(words: &[&str]) -> Result<()> {
         || s3::file_hash(&mut file, meta.len(), &client)? != hash(plan.head_text.as_bytes())
     {
         return Err("local head changed during upload".into());
+    }
+    // Persist before the remote write, including an ambiguous successful PUT.
+    // A delayed upload must not inherit the earlier local promotion's cutoff.
+    if protect_retention {
+        publisher::hold_retention(repo)?;
     }
     client.head(
         &key,

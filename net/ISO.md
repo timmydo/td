@@ -19,7 +19,7 @@ Signing prints the created signature path. Verification prints the source
 commit, SHA-256, size and basename. Supply an independently trusted root:
 a self-signed root downloaded beside the ISO does not establish its identity.
 Verify its fingerprint through a trusted channel before accepting it.
-Verification is stateless: it checks the supplied root and record's expiry,
+Verification is stateless: it checks the supplied root and record's signed policy,
 not whether this is the newest release. It does not learn root rotations or
 persist rollback floors. Root rotation requires supplying the new trusted
 root through the existing release trust process or an independent channel.
@@ -30,13 +30,14 @@ requests, uploads `iso/ISO_SHA256/BASENAME`, then `roots/ROOT_VERSION`, then
 conditional upload and reuse rules in [S3.md](S3.md). A failed upload can leave
 unreferenced objects; retry resumes by reusing matching remote objects.
 There is no mutable latest-ISO pointer or remote deletion. Operators publish
-links to the exact image and signature. Expiry refuses verification; it does
-not delete files from storage or invalidate already written media.
+links to the exact image and signature. Legacy expiry refuses verification;
+it does not delete files or invalidate already written media.
 
-Records expire after 30 days, clipped to root expiry. Re-signing after time
-passes produces a new record address and can reuse the same ISO object.
-Keep old records until their consumers no longer need them. Configure any
-bucket lifecycle separately, ensuring it does not remove active releases.
+A non-expiring root requires zero record expiry: verification needs no
+periodic re-signing. Legacy expiring roots retain their 30-day maximum,
+clipped to root expiry. Old records remain valid according to their own
+signed policy. Configure storage retirement separately, retaining active
+releases; deletion does not revoke cached authentic bytes.
 
 Private keys must be owned regular files with no group/other permissions.
 Images must be nonempty regular files, at most four GiB; their ASCII basename
@@ -69,8 +70,9 @@ ED25519_SIGNATURE
 The Ed25519 signature covers every preceding line including its newline.
 Numbers are canonical decimal; commit, hash and signature are lowercase hex
 of 20, 32 and 64 bytes respectively. The marker separates this assertion from
-other release messages. Existing release lifetime rules reject future-issued records; both root
-and record must be fresh before and after hashing.
+other release messages. Under a zero-expiry root, record expiry must also be
+zero and wall-clock time does not gate admission. Legacy policy checks future
+issue times and expiry before and after hashing.
 
 ## Download listing
 
@@ -87,9 +89,10 @@ td-net release iso-index CATALOG index.html
 td-net release upload-iso-index-s3 CATALOG index.html ENDPOINT auto td-releases CREDENTIALS PROFILE --dry-run
 ```
 
-Both commands verify the complete local ISO bytes, signatures and freshness.
-Any invalid, expired or missing entry refuses the entire operation, preserving
-the old output. Remove expired entries explicitly or renew their signatures.
+Both commands verify the complete local ISO bytes, signatures and root policy.
+Invalid or missing entries, and expired legacy entries, refuse the entire
+operation. Non-expiring entries display "No expiry". Retire obsolete entries
+explicitly in the catalog; no recurring signature renewal is needed.
 For one ISO/profile select one signature; duplicate entries and conflicting
 roots for one epoch refuse. Multiple root epochs and profiles are supported.
 Keep the complete catalog: uploading it replaces the listing, it does not

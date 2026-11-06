@@ -3,30 +3,6 @@ use super::*;
 use crate::s3;
 use std::collections::BTreeMap;
 
-pub(super) fn renew_upload(words: &[&str]) -> Result<()> {
-    let [repo, root, key, profile, endpoint, region, bucket, credentials, credential_profile] =
-        words
-    else {
-        return Err(HELP.into());
-    };
-    publisher::promote_next(
-        Path::new(repo),
-        Path::new(root),
-        Path::new(key),
-        profile,
-        None,
-    )?;
-    upload::command(&[
-        repo,
-        root,
-        profile,
-        endpoint,
-        region,
-        bucket,
-        credentials,
-        credential_profile,
-    ])
-}
 fn remote_heads(client: &s3::Client, repo: &Path) -> Result<BTreeMap<String, Option<Vec<u8>>>> {
     let mut heads = BTreeMap::new();
     for profile in ["system-x86-64", "server-x86-64"] {

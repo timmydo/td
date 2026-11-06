@@ -101,11 +101,16 @@ impl Plan {
             } else {
                 "Server · x86-64"
             };
-            let expiry = date(r.expires);
+            let expiry = if r.expires == 0 {
+                "No expiry".to_string()
+            } else {
+                let date = date(r.expires);
+                format!("<time datetime=\"{date}\">{date}</time>")
+            };
             // All interpolated fields have passed the signed format's restricted ASCII grammar.
-            page.push_str(&format!("<article class=\"release\"><div><p class=\"eyebrow\">{profile}</p><h2>{}</h2><p class=\"size\">{:.1} MiB · {} bytes</p><a class=\"button\" href=\"/{}\">Download ISO <span aria-hidden=\"true\">↓</span></a><div class=\"links\"><a href=\"/iso/signatures/{}.sig\">Signature</a><a href=\"/roots/{}\">Public root</a></div></div><dl><dt>Source revision</dt><dd><a href=\"https://github.com/timmydo/td/commit/{}\"><code>{}</code></a></dd><dt>Signature expires (UTC)</dt><dd><time datetime=\"{expiry}\">{expiry}</time></dd><dt>SHA-256</dt><dd><code>{}</code></dd></dl></article>\n",r.name,r.size as f64 / 1048576.0,r.size,r.image_key(),hash(v.signature.as_bytes()),v.root.version,r.commit,r.commit,r.digest));
+            page.push_str(&format!("<article class=\"release\"><div><p class=\"eyebrow\">{profile}</p><h2>{}</h2><p class=\"size\">{:.1} MiB · {} bytes</p><a class=\"button\" href=\"/{}\">Download ISO <span aria-hidden=\"true\">↓</span></a><div class=\"links\"><a href=\"/iso/signatures/{}.sig\">Signature</a><a href=\"/roots/{}\">Public root</a></div></div><dl><dt>Source revision</dt><dd><a href=\"https://github.com/timmydo/td/commit/{}\"><code>{}</code></a></dd><dt>Signature expires (UTC)</dt><dd>{expiry}</dd><dt>SHA-256</dt><dd><code>{}</code></dd></dl></article>\n",r.name,r.size as f64 / 1048576.0,r.size,r.image_key(),hash(v.signature.as_bytes()),v.root.version,r.commit,r.commit,r.digest));
         }
-        page.push_str("</section><section class=\"verify\"><h2>Before you install</h2><p>Verify the ISO with its signature and an independently trusted public root before writing it to a USB drive. A root downloaded from this page alone does not establish trust.</p><p>Signatures expire: check the date above before downloading. This static listing is not proof that an image is current. Verification authenticates the download; it does not enable firmware Secure Boot.</p><a href=\"https://github.com/timmydo/td/blob/main/net/ISO.md\">Signature verification instructions ↗</a></section></main><footer class=\"site-footer wrap\"><p><strong>td</strong> Timmy’s Distro</p><a href=\"https://github.com/timmydo/td\">Made in the open ↗</a></footer></body></html>\n");
+        page.push_str("</section><section class=\"verify\"><h2>Before you install</h2><p>Verify the ISO with its signature and an independently trusted public root before writing it to a USB drive. A root downloaded from this page alone does not establish trust.</p><p>Check the signing policy shown above; non-expiring signatures require no periodic renewal. This static listing is not proof that an image is current. Verification authenticates the download; it does not enable firmware Secure Boot.</p><a href=\"https://github.com/timmydo/td/blob/main/net/ISO.md\">Signature verification instructions ↗</a></section></main><footer class=\"site-footer wrap\"><p><strong>td</strong> Timmy’s Distro</p><a href=\"https://github.com/timmydo/td\">Made in the open ↗</a></footer></body></html>\n");
         if page.len() as u64 > LIMIT {
             return Err("generated ISO index exceeds one MiB".into());
         }

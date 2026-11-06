@@ -943,7 +943,7 @@ fn seed_bytes_are_reverified_after_the_scan() {
 }
 
 #[test]
-fn operator_commands_stage_promote_and_renew_with_monotonic_counters() {
+fn operator_commands_stage_and_explicitly_promote_with_monotonic_counters() {
     let f = Fixture::new();
     let profile = "system-x86-64";
     let original = fs::read(f.repo.join("heads").join(profile)).unwrap();
@@ -980,7 +980,7 @@ fn operator_commands_stage_promote_and_renew_with_monotonic_counters() {
         }
         assert_eq!(maximum, expected);
     }
-    publisher::promote_next(&f.repo, &f.root, &f.key, profile, Some(&latest)).unwrap();
+    publisher::promote_next(&f.repo, &f.root, &f.key, profile, &latest).unwrap();
     let head = Head::parse(
         &text(&f.repo.join("heads").join(profile), SMALL).unwrap(),
         &root,
@@ -990,7 +990,7 @@ fn operator_commands_stage_promote_and_renew_with_monotonic_counters() {
     .unwrap();
     assert_eq!((head.version, &head.release), (2, &latest));
     let release_count = fs::read_dir(f.repo.join("releases")).unwrap().count();
-    publisher::promote_next(&f.repo, &f.root, &f.key, profile, None).unwrap();
+    publisher::promote_next(&f.repo, &f.root, &f.key, profile, &latest).unwrap();
     let head = Head::parse(
         &text(&f.repo.join("heads").join(profile), SMALL).unwrap(),
         &root,
@@ -1008,7 +1008,7 @@ fn operator_commands_stage_promote_and_renew_with_monotonic_counters() {
 }
 
 #[test]
-fn renewal_refuses_an_expired_index_without_replacing_the_head() {
+fn legacy_promotion_refuses_an_expired_index_without_replacing_the_head() {
     let f = Fixture::new();
     let profile = "system-x86-64";
     let time = now().unwrap();
@@ -1031,7 +1031,7 @@ fn renewal_refuses_an_expired_index_without_replacing_the_head() {
     .unwrap();
     fs::write(f.repo.join("heads").join(profile), &head).unwrap();
     assert!(
-        publisher::promote_next(&f.repo, &f.root, &f.key, profile, None)
+        publisher::promote_next(&f.repo, &f.root, &f.key, profile, &digest)
             .unwrap_err()
             .contains("publish a fresh index")
     );
@@ -1063,7 +1063,7 @@ fn automatic_promotion_checks_objects_before_changing_discovery() {
         .path();
     fs::write(object, b"corrupt").unwrap();
     assert!(
-        publisher::promote_next(&f.repo, &f.root, &f.key, "system-x86-64", None)
+        publisher::promote_next(&f.repo, &f.root, &f.key, "system-x86-64", &f.release)
             .unwrap_err()
             .contains("corrupt or missing")
     );
@@ -1427,7 +1427,7 @@ fn s3_rotation_keeps_intermediate_roots_and_expired_head_is_not_uploaded() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .find(|s| s != &f.release)
         .unwrap();
-    publisher::promote_next(&f.repo, &root, &key, "system-x86-64", Some(&selected)).unwrap();
+    publisher::promote_next(&f.repo, &root, &key, "system-x86-64", &selected).unwrap();
     let mut rotated = args.clone();
     rotated[1] = root.to_str().unwrap().into();
     s3_upload(&rotated).unwrap();
@@ -1616,41 +1616,217 @@ fn s3_cleanup_is_explicit_and_retains_selected_and_recent_content() {
 }
 
 #[test]
-fn s3_renew_upload_keeps_the_selected_image_and_advances_discovery() {
+fn static_policy_has_no_clock_deadline_but_keeps_authentication_and_floors() {
     let f = Fixture::new();
+    let root_path = f.dir.join("static-root");
+    let public = f.dir.join("release.pub");
+    command(
+        &[
+            "release",
+            "root",
+            "2",
+            f.private.to_str().unwrap(),
+            public.to_str().unwrap(),
+            f.private.to_str().unwrap(),
+            root_path.to_str().unwrap(),
+        ]
+        .map(str::to_string),
+    )
+    .unwrap();
+    let root = Root::parse(&text(&root_path, SMALL).unwrap(), None).unwrap();
+    assert_eq!(root.expires, 0);
+    root.fresh(u64::MAX).unwrap();
+    publisher::publish_next(
+        &f.repo,
+        &root_path,
+        &f.key,
+        "system-x86-64",
+        &"2".repeat(40),
+        &f.deployment,
+    )
+    .unwrap();
+    let release_path = fs::read_dir(f.repo.join("releases"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| text(p, INDEX_LIMIT).unwrap().lines().nth(1) == Some("2"))
+        .unwrap();
+    let digest = release_path.file_name().unwrap().to_str().unwrap();
+    publisher::promote_next(&f.repo, &root_path, &f.key, "system-x86-64", digest).unwrap();
+    f.fetch("static-upgrade").unwrap();
+    let mut state = State::parse(&text(&f.state, SMALL * 3).unwrap()).unwrap();
+    assert_eq!(state.root.version, 2);
+    let head = text(&f.repo.join("heads/system-x86-64"), SMALL).unwrap();
+    let release = text(&release_path, INDEX_LIMIT).unwrap();
+    for time in [0, u64::MAX] {
+        let admitted = metadata(&mut state, &head, &release, time).unwrap();
+        assert_eq!(admitted.expires, 0);
+    }
+    // Signed policy, rather than an online timestamp, decides whether expiry applies.
+    let old_root = Root::parse(&text(&f.root, SMALL).unwrap(), None).unwrap();
+    assert!(old_root.lifetime(0, 0, 0, format::DAY).is_err());
+    assert!(root.lifetime(0, 100, 0, format::DAY).is_err());
+    let mut changed: Vec<String> = head.lines().map(str::to_string).collect();
+    changed.pop();
+    changed[2] = "2".into();
+    let newer = format::signed(&(changed.join("\n") + "\n"), &fs::read(&f.key).unwrap()).unwrap();
+    metadata(&mut state, &newer, &release, 0).unwrap();
+    assert!(matches!(metadata(&mut state, &head, &release, 0), Err(e) if e.contains("replay")));
+    let mut bad = newer.into_bytes();
+    bad[0] = b'X';
+    assert!(metadata(&mut state, std::str::from_utf8(&bad).unwrap(), &release, 0).is_err());
+    assert!(Head::parse(&head, &root, 0, "server-x86-64").is_err());
+    assert!(command(&["release", "renew"].map(str::to_string)).is_err());
+    assert!(command(&["release", "renew-upload-s3"].map(str::to_string)).is_err());
+}
+
+#[test]
+fn static_collection_retains_selected_and_recently_superseded_indexes() {
+    let f = Fixture::new();
+    let root_path = f.dir.join("static-root");
+    publisher::root(
+        2,
+        0,
+        &f.private,
+        &f.dir.join("release.pub"),
+        &f.private,
+        &root_path,
+    )
+    .unwrap();
+    let root = Root::parse(&text(&root_path, SMALL).unwrap(), None).unwrap();
+    let time = now().unwrap();
+    let mut indexes = Vec::new();
+    for (sequence, days) in [(1, 60), (2, 40)] {
+        publisher::publish(
+            &f.repo,
+            &root_path,
+            &f.key,
+            "system-x86-64",
+            &"2".repeat(40),
+            sequence,
+            time - days * format::DAY,
+            0,
+            &f.deployment,
+        )
+        .unwrap();
+        let path = fs::read_dir(f.repo.join("releases"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                let text = text(p, INDEX_LIMIT).unwrap();
+                text.lines().nth(1) == Some("2")
+                    && text.lines().nth(2) == Some(&sequence.to_string())
+            })
+            .unwrap();
+        indexes.push(path);
+    }
+    let old = indexes[0].file_name().unwrap().to_str().unwrap();
+    let current = indexes[1].file_name().unwrap().to_str().unwrap();
+    publisher::promote(
+        &f.repo,
+        &root_path,
+        &f.key,
+        "system-x86-64",
+        old,
+        1,
+        time - 50 * format::DAY,
+        0,
+    )
+    .unwrap();
+    publisher::promote(
+        &f.repo,
+        &root_path,
+        &f.key,
+        "system-x86-64",
+        current,
+        2,
+        time,
+        0,
+    )
+    .unwrap();
+    assert!(!publisher::garbage(&f.repo).unwrap().contains(&indexes[0]));
+    let earlier = format::signed(
+        &format!(
+            "td-release-head-v1\n2\n2\n{}\n0\nsystem-x86-64\n{current}\n",
+            time - 8 * format::DAY
+        ),
+        &fs::read(&f.key).unwrap(),
+    )
+    .unwrap();
+    Head::parse(&earlier, &root, 0, "system-x86-64").unwrap();
+    fs::write(f.repo.join("heads/system-x86-64"), earlier).unwrap();
+    // Backdating the signed head cannot shorten its actual publication hold.
+    assert!(!publisher::garbage(&f.repo).unwrap().contains(&indexes[0]));
+    fs::write(
+        f.repo.join("retention-hold-until"),
+        format!("{}\n", time - 1),
+    )
+    .unwrap();
+    let garbage = publisher::garbage(&f.repo).unwrap();
+    assert!(garbage.contains(&indexes[0]));
+    assert!(!garbage.contains(&indexes[1]));
+    assert!(garbage
+        .iter()
+        .all(|p| p.parent() == Some(&f.repo.join("releases"))));
     let mock = crate::s3::tests::Mock::new();
     let cred = f.dir.join("credentials");
     crate::s3::tests::write_credentials(&cred);
-    s3_upload(&s3_args(&f, &mock, &cred)).unwrap();
-    mock.store.lock().unwrap().requests.clear();
-    maintenance::renew_upload(&[
-        f.repo.to_str().unwrap(),
-        f.root.to_str().unwrap(),
-        f.key.to_str().unwrap(),
-        "system-x86-64",
-        &mock.endpoint,
-        "auto",
-        "td-releases",
-        cred.to_str().unwrap(),
-        "test",
-    ])
-    .unwrap();
-    let store = mock.store.lock().unwrap();
-    let root = Root::parse(&text(&f.root, SMALL).unwrap(), None).unwrap();
-    let head = Head::parse(
-        std::str::from_utf8(&store.files["heads/system-x86-64"].bytes).unwrap(),
-        &root,
-        now().unwrap(),
-        "system-x86-64",
+    let mut args = s3_args(&f, &mock, &cred);
+    args[1] = root_path.to_str().unwrap().into();
+    let mut dry = args.clone();
+    dry.push("--dry-run".into());
+    s3_upload(&dry).unwrap();
+    assert!(publisher::garbage(&f.repo).unwrap().contains(&indexes[0]));
+    s3_upload(&args).unwrap();
+    assert!(!publisher::garbage(&f.repo).unwrap().contains(&indexes[0]));
+    fs::remove_file(f.repo.join("retention-hold-until")).unwrap();
+    assert!(publisher::garbage(&f.repo).is_err());
+    // Returning to explicitly finite policy must not drop acquisition grace.
+    fs::write(
+        f.repo.join("retention-hold-until"),
+        format!("{}\n", time - 1),
     )
     .unwrap();
-    assert_eq!(head.version, 2);
-    assert_eq!(head.release, f.release);
-    let puts: Vec<_> = store
-        .requests
-        .iter()
-        .filter(|(m, _)| m == "PUT")
-        .map(|(_, k)| k.as_str())
-        .collect();
-    assert_eq!(puts, vec!["heads/system-x86-64"]);
+    let finite = f.dir.join("finite-root");
+    publisher::root(
+        3,
+        time + 365 * format::DAY,
+        &f.private,
+        &f.dir.join("release.pub"),
+        &f.private,
+        &finite,
+    )
+    .unwrap();
+    publisher::publish_next(
+        &f.repo,
+        &finite,
+        &f.key,
+        "system-x86-64",
+        &"3".repeat(40),
+        &f.deployment,
+    )
+    .unwrap();
+    let next = fs::read_dir(f.repo.join("releases"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| text(p, INDEX_LIMIT).unwrap().lines().nth(1) == Some("3"))
+        .unwrap();
+    publisher::promote_next(
+        &f.repo,
+        &finite,
+        &f.key,
+        "system-x86-64",
+        next.file_name().unwrap().to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(!publisher::garbage(&f.repo).unwrap().contains(&indexes[0]));
+    assert!(!publisher::garbage(&f.repo).unwrap().contains(&indexes[1]));
+    // A delayed finite upload must extend the inherited static history's hold.
+    fs::write(
+        f.repo.join("retention-hold-until"),
+        format!("{}\n", time - 1),
+    )
+    .unwrap();
+    args[1] = finite.to_str().unwrap().into();
+    s3_upload(&args).unwrap();
+    assert!(!publisher::garbage(&f.repo).unwrap().contains(&indexes[0]));
 }

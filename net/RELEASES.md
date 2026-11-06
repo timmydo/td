@@ -8,56 +8,76 @@ available independently. This protocol authenticates a publisher's assertion
 about an image and source commit; it does not prove reproducibility or that
 the publisher applied security fixes. It is a td protocol, not TUF.
 
-## Trust and freshness
+## Trust and availability
 
 The operator provisions a root document and profile out of band with
-`td-net release init STATE ROOT PROFILE`. The supported profiles are
-`system-x86-64` and `server-x86-64`. This is transport support: only the
-desktop ships td-admin; stock servers retain replacement/reprovisioning.
-State must be protected by its caller;
-copying or deleting it loses replay protection. There is no trust-on-first-use
-network key, reset flag, automatic source fallback or automatic key recovery.
+`td-net release init STATE ROOT PROFILE`. Supported profiles are
+`system-x86-64` and `server-x86-64`; only the desktop ships td-admin.
+Protect client state: copying or deleting it loses replay protection.
+There is no network trust-on-first-use, reset flag, automatic source fallback
+or automatic key recovery.
 
-An offline Ed25519 root key authorizes one release key. The release key signs
-image indexes and short-lived channel heads. Keep the root private key away
-from the publishing host. A root document contains its positive version,
-expiration, root public key and release public key. Each rotation advances
-exactly one version and is signed by both the previous and new root keys.
-The old key signs the body; the new key signs that body and old signature.
-An initially provisioned document needs its self-signature; its identity
-comes from provisioning. A maximum of 64 sequential rotations is followed
-per acquisition. Root documents remain in the repository indefinitely.
+An offline Ed25519 root key authorizes one release key. A root contains its
+positive version, expiry field, root public key and release public key.
+**Zero in the signed root's expiry field selects the non-expiring policy.**
+It requires zero expiry in every head, image index and ISO assertion under
+that root. Those assertions have no wall-clock admission deadline; issue
+timestamps are informational and used for storage retention. Publication
+needs no recurring renewal job, and publisher inactivity does not invalidate
+an available signed release. Creating a root without an explicit EXPIRES
+argument selects this policy.
 
-Head and release counters are scoped to the root version. An authenticated
-root rotation resets those counters, so a compromised release key cannot
-block its replacement by signing maximum versions. The clock floor remains.
-Changing the release key in the next root revokes its predecessor for all
-subsequent admissions under that root. Learned roots persist even if later
-acquisition fails. An expired old root may authorize a sequential rotation;
-the final root must be unexpired. A client cannot discover a withheld
-rotation by cryptography alone. Compromise of the release key permits fresh
-forgeries for clients still trusting its old root, until they learn the
-rotation or that root expires. Lost or compromised root-key recovery needs
-trusted out-of-band reprovisioning.
+A nonzero root expiry retains the legacy expiring policy. Its root must be
+fresh at admission, heads last at most 24 hours and image/ISO assertions at
+most 30 days, clipped to root expiry. Future-issued metadata, expiration and
+clock rollback refuse under that policy. Zero expiry cannot bypass a legacy
+root's policy. This distinction is authorized by the offline root signature,
+not an online release key or an unsigned client option.
 
-An image index binds its root version, positive release sequence, issue and
-expiry times, profile, 40-hex source commit, exact deployment manifest, and
-the ordered object list and full SHA-256 for each payload. Its maximum
-lifetime is 30 days. A channel head binds its root version, positive head
-version, issue and expiry times, profile and index SHA-256. Its maximum
-lifetime is 24 hours. All signed bodies start with distinct versioned format
-headers. Numbers, lowercase hex, whitespace and newlines are canonical.
-Unknown fields and trailing records are refused.
+Every rotation advances exactly one root version and is signed by both the
+previous and new root keys. The old key signs the body; the new key signs
+that body and old signature. Initial trust comes from out-of-band provisioning
+of a self-signed document. Follow at most 64 sequential rotations per
+acquisition; retain all intermediate roots indefinitely. An expired old root
+may authorize its successor. The final root's own policy governs admission.
 
-Client state retains root metadata, head version and digest, release sequence
-and digest, profile and the last accepted wall-clock time. Lower versions,
-same-version/different-content metadata, future issue times, expiration and
-clock rollback refuse. Repeating identical metadata is allowed for retries.
-This needs a reasonably correct wall clock at initial provisioning; it does
-not establish secure time. Suppressing new releases can freeze a client only
-until its signed head expires when the signing key is uncompromised. State
-advances before object acquisition, so an unsuccessful acquisition does not
-restore permission to accept an earlier release.
+Head and release counters are scoped to the root version. A verified root
+rotation resets them so a compromised release key cannot block replacement
+by signing maximum counters. Learned roots persist even if acquisition fails.
+Changing the release key revokes its predecessor for subsequent admissions
+under the new root. A withheld rotation cannot be discovered by cryptography
+alone. With non-expiring policy, there is no time-based backstop for a stolen
+release key: clients must learn its revocation or be reprovisioned. Lost or
+compromised root-key recovery requires trusted out-of-band provisioning.
+
+An index binds root version, positive sequence, issue/expiry fields, profile,
+source commit, exact manifest, and ordered object hashes/lengths plus complete
+payload SHA-256s. A head binds root version, positive version, issue/expiry
+fields, profile and index hash. Existing versioned wire layouts remain;
+canonical numbers, lowercase hex, whitespace and newlines are required.
+Unknown fields and trailing records refuse.
+
+Client state retains root, head version/digest, release sequence/digest,
+profile and last accepted time. Lower versions and same-version/different-
+content metadata refuse; identical metadata can be retried. The clock floor
+is enforced only for a legacy expiring root. State advances before payload
+acquisition, so a failed download cannot undo learned floors.
+
+Non-expiring policy deliberately provides no freeze-detection deadline. A
+mirror may withhold a newer release or keep serving an authentic older one
+to a client that has not learned a higher version. This is the availability
+tradeoff; signatures do not establish that an image is newest or secure.
+
+### Migrating an expiring installation
+
+Clients predating zero-expiry policy reject it. Upgrade their downloader
+while the legacy channel remains valid, or use current trusted installation
+media or the explicit source-build path. Then create the next root with
+zero expiry, cross-sign it with the previous root key, publish a newly signed
+index under that epoch and select/upload its head. Never rewrite an immutable
+old root. Retain the old roots for verification of the rotation chain.
+A legacy installer or client does not acquire new policy semantics merely
+because the mirror stopped renewing its old head.
 
 ## Bytes, objects and cache
 
@@ -146,8 +166,8 @@ The output contains the manifest and three reconstructed payloads plus
 beside STATE in `STATE.roots` before advancing state, so a failed acquisition
 and retry retain their rotation proof. Provisioning at a newer root does
 not reconstruct history before that root.
-Publication requires all full-payload hashes and a final expiry recheck.
-`verify STATE BUNDLE` performs offline signature, policy, freshness, replay
+Publication requires all full-payload hashes and a final signed-policy recheck.
+`verify STATE BUNDLE` performs offline signature, signed-policy, replay
 and complete-payload verification, persists state, and prints exactly
 `COMMIT DEPLOYMENT_ID`. A privileged consumer must quiesce the producer and
 protect its own state; a successful worker receipt alone is not authority.
@@ -155,11 +175,12 @@ protect its own state; a successful worker receipt alone is not authority.
 advancing worker state. Root proofs precede the corresponding state writes.
 `learn STATE EVIDENCE` independently authenticates those proofs without
 requiring completed payloads. It ignores incomplete, forged or stale evidence,
-but fails on protected-state parsing, clock rollback or persistence errors.
+but fails on protected-state parsing or persistence errors, and on clock
+rollback for legacy expiring policy.
 Valid root transitions persist even when later head/index data is invalid.
-An expired but correctly signed head/index may raise version floors; future
-issue times refuse. Learning expired evidence cannot authorize installation:
-`verify` still requires current freshness and complete payload hashes. This
+Under legacy expiring policy, expired correctly signed metadata may raise
+version floors, while future issue times refuse. Learning expired evidence cannot authorize installation:
+`verify` still enforces that legacy policy and complete payload hashes. This
 preserves observations across a crash that lasts beyond metadata expiry.
 A privileged consumer must drain the worker before learning, learn after
 failed/cancelled attempts, and learn retained evidence before overwriting a
@@ -167,7 +188,7 @@ worker snapshot on retry. It must never adopt unsigned worker counters.
 
 An installer must still copy and verify the exact admitted deployment.
 Neither command installs, changes boot selectors, or executes downloaded
-code. Expiration governs admission, not boot or retained rollback.
+code. Legacy expiration governs admission, not boot or retained rollback.
 
 ## Partition comparison
 
@@ -190,8 +211,9 @@ seed then its public half and nothing else, and lowercase hexadecimal public
 form. `keygen PRIVATE PUBLIC` exclusively creates a private mode-0600 file and
 its public companion. Never put a private key inside the served repository.
 
-`root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUT`
-creates a root document. For version 1, use ROOT_PRIVATE in both private-key
+`root VERSION ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUT`
+creates a non-expiring root document. The legacy form inserts EXPIRES after
+VERSION and creates an explicitly expiring policy. For version 1, use ROOT_PRIVATE in both private-key
 positions. For rotations, retain every intermediate document. `publish`
 validates an existing deployment, emits immutable objects and a signed index,
 and prints its index hash. It installs the supplied root document into
@@ -201,9 +223,8 @@ holds a repository lease. Existing immutable files must match exactly.
 `promote` verifies every referenced object before atomically replacing
 `heads/PROFILE`. It requires a strictly newer head version, a nondecreasing
 release sequence, and no same-sequence/different-index substitution. Its head
-must expire no later than its image index. Renew freshness by promoting the
-same index with a higher head version and a new bounded lifetime. An expired
-image index needs a newly signed index and higher release sequence. Root
+must follow its root's expiry policy and, for legacy expiring roots, cannot
+outlive its index. Non-expiring heads need no maintenance publication. Root
 rotation requires re-signing under the new root; that authenticated epoch
 starts fresh head and release counters. All payload objects precede metadata discovery. Repository and
 cache files are private to their owner by default; hosting permissions are
@@ -225,7 +246,9 @@ target/release/td-recipe-eval build-run system-x86-64
 
 The final build output names the staged system directory. Its `deployment`
 child is DEPLOYMENT below. Keep the checkout unchanged between recording
-COMMIT and building. The signing tool verifies payload hashes, but does not
+COMMIT and building. Rebuild all three host tools for every release: recipes
+embed some program sources at evaluator compile time, so reusing an older
+evaluator can silently build older bytes. The signing tool verifies payload hashes, but does not
 prove that an operator-supplied commit produced those bytes. For server
 images, use `server-x86-64` for both the build and profile.
 
@@ -238,8 +261,9 @@ net/target/release/td-net release publish-next REPOSITORY ROOT RELEASE_PRIVATE s
 
 `publish-next` holds the repository lease while choosing a sequence above
 all retained signed indexes for that profile and root epoch, including
-staged indexes. It publishes ordinary CDC objects and an index valid for
-up to 30 days, clipped to root expiry, and prints RELEASE_HASH. It leaves
+staged indexes. It publishes ordinary CDC objects and a non-expiring index
+under a non-expiring root, and prints RELEASE_HASH. Legacy roots instead
+produce indexes valid for up to 30 days, clipped to root expiry. It leaves
 public discovery unchanged. Its scan admits at most 200,000 index entries
 and one hour; malformed or corrupt matching metadata refuses. Exact
 interrupted atomic-write temporaries are reclaimed under the lease; links
@@ -254,33 +278,24 @@ net/target/release/td-net release promote-next REPOSITORY ROOT RELEASE_PRIVATE s
 ```
 
 This verifies the index and every object, chooses the next head counter
-under the same lease, and atomically updates discovery. The head lasts at
-most 24 hours, clipped to index and root expiry. Existing rollback and
-same-sequence equivocation checks still apply. A new root epoch starts its
-head counter at one; the new index must be signed under that root.
-
-Renew the selected head before it expires with:
-
-```text
-net/target/release/td-net release renew REPOSITORY ROOT RELEASE_PRIVATE system-x86-64
-```
-
-Renewal advances the head counter without changing the selected index or
-objects and rechecks those objects before publication. An expired head can
-be renewed while its index and root remain valid. An expired index requires
-`publish-next` and `promote-next`; renewal never silently extends an image
-index's signed lifetime. A root rotation likewise requires a new index.
-Scheduling renewal and choosing which source revision to release remain
-operator decisions; [OPERATIONS.md](OPERATIONS.md) defines the suggested
-12-hour renewal and weekly release review. These commands operate on a local repository and do
-not upload data or require public hosting. The explicit `upload-s3` command
+under the same lease, and atomically updates discovery. Its lifetime follows
+the root policy. Rollback and same-sequence equivocation checks apply to both
+policies. A new root epoch starts its head counter at one and requires an
+index signed under that root. There is no renewal command or renewal timer.
+[OPERATIONS.md](OPERATIONS.md) describes manual publication and retention.
+These commands operate on a local repository and do not upload data.
+The explicit `upload-s3` command
 uploads the selected signed release to an S3-compatible static bucket;
 [S3.md](S3.md) specifies credentials, conditional writes, publication order,
 cache policy, and bounds.
 
 `gc REPOSITORY ROOT` is a dry run; `--delete` performs deletion under the
-same lease as publication. It retains the heads' selected indexes even when
-expired and all indexes until seven days after expiry. It computes object
+same lease as publication. It retains selected indexes indefinitely.
+Unselected non-expiring indexes are retained for 30 days after issue plus
+seven days' grace; legacy indexes until seven days after expiry. All indexes
+also survive for seven days after non-expiring head promotion or upload,
+so replacing a long-lived selection cannot immediately collect its objects.
+This is storage retention, not a client admission deadline. It computes object
 reachability from that retained set. An unreachable object must also be at
 least seven days old before deletion. Roots are never collected. The grace
 exceeds the client's one-hour acquisition budget; a longer suspended client

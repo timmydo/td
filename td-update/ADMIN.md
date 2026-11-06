@@ -127,15 +127,16 @@ observations can raise floors but cannot authorize installation.
 After successful acquisition and metadata learning, the service runs the
 installed offline verifier over that fixed candidate using root's own
 policy state. The verifier authenticates root rotations, signatures,
-freshness, profile, monotonic versions, the manifest and every complete
+the signed expiry policy, profile, monotonic versions, the manifest and every complete
 payload; only its bounded `COMMIT DEPLOYMENT_ID` receipt is authoritative.
 The source-build worker's receipt is not used by this path. The existing
 root-private installer then pins, copies and rehashes exactly that deployment
 before entering td-boot's serialized transaction. No downloaded executable
 runs as a verifier or installer. Replay state advances independently of boot
 selectors; cancellation, installation failure and local rollback do not reset
-it. Expiry is checked at admission and does not disable an installed current
-or previous deployment.
+it. Non-expiring roots impose no clock deadline on admission and require no
+publisher renewal. Legacy expiring policy is checked at admission; neither
+policy disables an installed current or previous deployment.
 
 Release sequences and the source path's Git ancestry are separate histories.
 An explicit switch between delivery paths can select different commits;

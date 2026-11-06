@@ -1,82 +1,70 @@
 # Public release operations
 
-The public mirror serves signed static artifacts. The local publisher
-repository, public root documents, signing keys and upload credentials
-live outside the source checkout. Back up the repository after publication;
-keep the root private key offline and the online release key private.
-A bucket backup alone does not restore signing authority or establish a
-trusted local publication history.
+Publish signed static artifacts on demand. No renewal timer or periodic
+signing job is required. A non-expiring root policy keeps its selected image
+and installer signatures valid while the publisher is offline. Signatures
+establish authenticity, not that a release is newest or free of security bugs.
 
-## Cadence
+Keep the local publisher repository, signing keys and upload credentials
+outside the checkout. Back up the repository after publication and keep the
+root private key offline. Retain the complete root rotation chain. Review
+source changes regularly and publish tested images when useful or required
+for security fixes; missing a release date does not disable downloads.
 
-- Renew and upload the selected head every 12 hours. Heads last at most
-  24 hours, clipped to image-index and root expiry. Treat any nonzero exit
-  as an operator incident; inspect the local log and public head expiry.
-- Review source changes and publish a tested image at least weekly, with
-  earlier releases for security fixes. This is a manual release decision.
-  An image index lasts at most 30 days. A renewal job does not rebuild,
-  select new code or keep an expired image eligible indefinitely.
-- Review root and installer-signature expiry during the weekly release
-  review. Rotate the root/key chain before expiry; system-head renewal
-  does not renew installer signatures.
-- Run remote cleanup first as a dry run during the weekly review. Delete
-  only in an exclusive publisher maintenance window. The same command
-  reclaims its exact local candidates after remote deletion; retain the
-  latest repository backup.
+## Publishing
 
-## Publish a new system image
+Follow [RELEASES.md](RELEASES.md#local-operator-workflow) from a clean reviewed
+checkout. Rebuild the builder, evaluator and network tool before every image:
+the evaluator embeds some target sources, so an old executable can build old
+code despite an updated checkout. Record the commit, deployment ID and index
+hash together. Run the installed admin oracle, explicitly promote the tested
+index and upload it; discovery is published last.
 
-Use the clean-checkout build and `publish-next` workflow in
-[RELEASES.md](RELEASES.md#local-operator-workflow). Record source revision,
-deployment ID and signed index hash together. Run the adversarial installed
-admin oracle on the candidate. Explicitly promote the tested index, then
-upload it with `release upload-s3`; discovery is uploaded last.
+Then run the [public HTTPS oracle](../td-update/ADMIN.md#installed-machine-oracle)
+from a compatible older deployment. Retain its transfer, healthy-boot and
+rollback logs with the publication record. Never attribute a boot result to
+another source revision or deployment.
 
-Run the public HTTPS installed-admin oracle from a retained older deployment
-as described in [ADMIN.md](../td-update/ADMIN.md#installed-machine-oracle).
-Retain its logs with the publication record: installed-deployment seeding,
-new object bytes, repeat-cache behavior, healthy boot identity and rollback.
-Boot/rollback evidence belongs to that exact published deployment, not to
-whatever source happens to be newest later.
-
-## Renewal job
-
-Configure the host's scheduler to execute this argv every 12 hours, using a
-reviewed installed td-net binary outside a changing development worktree:
+New roots default to non-expiring policy:
 
 ```text
-td-net release renew-upload-s3 REPOSITORY ROOT RELEASE_PRIVATE system-x86-64 ENDPOINT auto td-releases CREDENTIALS td-releases
+td-net release root VERSION ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE ROOT
 ```
 
-Arguments contain paths to secrets, never secret values. The scheduler must
-use the publisher account, preserve a private log, prevent overlapping jobs
-and report failures. Keep the host clock synchronized. This document does
-not install a scheduler or promise unattended monitoring.
+For the initial root, use the same private root key in both positions.
+Rotation advances exactly one version and requires the previous root key.
+A compromised release key is revoked by a new root delegating to a different
+release key. Clients must learn that rotation; there is no clock-driven
+revocation fallback. No root or release key needs periodic use merely to
+keep an existing release available.
 
-An interrupted upload can be retried; matching immutable objects are reused.
-A newer local head after failure is expected. An expired public head can be
-repaired by renewal while the selected index and root remain valid. If the
-index expired, test and publish a fresh index explicitly. If the root expired,
-follow the key-rotation procedure; never bypass client freshness checks.
+Clients that predate this policy must first upgrade through a still-valid
+legacy release, current trusted media or the explicit source-build path.
+They cannot interpret zero expiry. Publish current installation media as
+part of that migration. An existing immutable root is never edited.
 
-## Collection window
+## Storage retention
 
-Pause scheduled renewals and all other publishers for the whole window.
-Use the same endpoint, bucket, protected credentials and complete local
-repository used for publication:
+Run remote cleanup as a dry run before deciding to delete. Pause all other
+publishers, including those on other hosts, for the entire deletion window:
 
 ```text
 td-net release gc-s3 REPOSITORY ROOT ENDPOINT auto td-releases CREDENTIALS td-releases
 td-net release gc-s3 REPOSITORY ROOT ENDPOINT auto td-releases CREDENTIALS td-releases --delete --exclusive-publisher
 ```
 
-Review the dry-run output before the deletion command. Unknown remote
-indexes or different heads require reconciliation, not forced deletion.
-Do not run a separate local GC on the published repository: remote cleanup
-removes only its fixed candidate set locally after confirming remote deletion
-or absence. Resume renewal
-when the window closes. Current/previous installed deployments are outside
-this cleanup, and shared chunks survive as long as retained indexes use them.
-[S3.md](S3.md#release-renewal-and-remote-collection) specifies the bounds and
-concurrency assumptions. ISO retention is a separate explicit catalog
-operation; this collector never removes installer downloads.
+Selected indexes remain indefinitely. Older non-expiring indexes remain at
+least 30 days after issue plus seven days' grace, and all indexes remain for
+seven days after non-expiring head promotion or upload. Shared objects survive
+while any retained index needs them; unreachable objects must also be over
+seven days old. Thus image retirement is a storage operation, never a timed
+failure of signature verification. A suspended client may need the current
+release if its old objects were collected.
+
+The command reclaims exactly its planned local candidates after confirming
+remote deletion or absence. Do not run standalone local GC on this published
+repository: losing local history still present remotely blocks safe remote
+collection. Unknown remote indexes or differing heads require reconciliation.
+Keep the latest repository backup. [S3.md](S3.md#remote-collection) defines
+the bounds and exclusivity assumptions. ISO retirement is an explicit
+catalog operation; this collector never deletes installer downloads.

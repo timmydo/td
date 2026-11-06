@@ -137,8 +137,27 @@ impl Root {
             release_key,
         })
     }
+    pub fn lifetime(&self, issued: u64, expires: u64, now: u64, maximum: u64) -> Result<()> {
+        if self.expires == 0 {
+            if expires != 0 {
+                return Err("non-expiring root requires non-expiring metadata".into());
+            }
+            Ok(())
+        } else {
+            lifetime(issued, expires, now, maximum)
+        }
+    }
+    pub fn deadline(&self, issued: u64, duration: u64) -> Result<u64> {
+        if self.expires == 0 {
+            return Ok(0);
+        }
+        issued
+            .checked_add(duration)
+            .map(|v| v.min(self.expires))
+            .ok_or_else(|| "expiry overflow".into())
+    }
     pub fn fresh(&self, now: u64) -> Result<()> {
-        if self.expires <= now {
+        if self.expires != 0 && self.expires <= now {
             return Err("trusted release root expired; provision a newer root or rotate it".into());
         }
         Ok(())
@@ -179,7 +198,7 @@ impl Head {
         if result.root != root.version || result.profile != wanted || result.version == 0 {
             return Err("head root, version or profile mismatch".into());
         }
-        lifetime(result.issued, result.expires, now, DAY)?;
+        root.lifetime(result.issued, result.expires, now, DAY)?;
         root.fresh(now)?;
         Ok(result)
     }
@@ -198,6 +217,7 @@ pub struct Payload {
 }
 pub struct Release {
     pub sequence: u64,
+    pub issued: u64,
     pub expires: u64,
     pub commit: String,
     pub manifest: String,
@@ -216,7 +236,7 @@ impl Release {
         let sequence = l.num()?;
         let issued = l.num()?;
         let expires = l.num()?;
-        lifetime(issued, expires, now, 30 * DAY)?;
+        root.lifetime(issued, expires, now, 30 * DAY)?;
         if l.next()? != wanted {
             return Err("release profile mismatch".into());
         }
@@ -278,6 +298,7 @@ impl Release {
         }
         Ok(Self {
             sequence,
+            issued,
             expires,
             commit,
             manifest,
@@ -364,7 +385,7 @@ impl State {
         Ok(result)
     }
     pub fn clock(&self, now: u64) -> Result<()> {
-        if now < self.time {
+        if self.root.expires != 0 && now < self.time {
             return Err("clock moved behind trusted release time".into());
         }
         Ok(())

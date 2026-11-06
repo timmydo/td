@@ -25,7 +25,7 @@ impl Record {
         }
         let issued = lines.num()?;
         let expires = lines.num()?;
-        format::lifetime(issued, expires, time, 30 * format::DAY)?;
+        root.lifetime(issued, expires, time, 30 * format::DAY)?;
         if expires > root.expires {
             return Err("ISO signature outlives its root".into());
         }
@@ -128,10 +128,7 @@ pub(super) fn sign(
     let (mut file, meta) = io(td_fs::open_real_file(image, "ISO to sign"))?;
     let digest = s3::file_hash_until(&mut file, meta.len(), deadline)?;
     let issued = now()?;
-    let expires = issued
-        .checked_add(30 * format::DAY)
-        .ok_or("ISO expiry overflow")?
-        .min(root.expires);
+    let expires = root.deadline(issued, 30 * format::DAY)?;
     let body = format!(
         "td-release-iso-v1\n{}\n{issued}\n{expires}\n{profile}\n{commit}\n{name}\n{}\n{digest}\n",
         root.version,
@@ -666,5 +663,56 @@ mod tests {
         .unwrap();
         assert!(index::generate(&path, &output).is_err());
         assert_eq!(fs::read_to_string(output).unwrap(), html);
+    }
+    #[test]
+    fn static_iso_verification_and_listing_need_no_renewal() {
+        let f = Fixture::new();
+        let root_path = f.dir.join("static-root");
+        let root_key = f.dir.join("root.key");
+        publisher::root(
+            2,
+            0,
+            &root_key,
+            &f.dir.join("release.pub"),
+            &root_key,
+            &root_path,
+        )
+        .unwrap();
+        let signature = sign(
+            &root_path,
+            &f.key,
+            "system-x86-64",
+            &"a".repeat(40),
+            &f.image,
+            &f.dir.join("static-signatures"),
+        )
+        .unwrap();
+        let root = Root::parse(&text(&root_path, SMALL).unwrap(), None).unwrap();
+        let record = text(&signature, SMALL).unwrap();
+        for time in [0, u64::MAX] {
+            assert_eq!(
+                Record::parse(&record, &root, "system-x86-64", time)
+                    .unwrap()
+                    .expires,
+                0
+            );
+        }
+        verify_command(&root_path, "system-x86-64", &signature, &f.image).unwrap();
+        let catalog = f.dir.join("static-catalog");
+        fs::write(
+            &catalog,
+            format!(
+                "td-iso-catalog-v1\n{}\tsystem-x86-64\t{}\t{}\n",
+                root_path.display(),
+                signature.display(),
+                f.image.display()
+            ),
+        )
+        .unwrap();
+        let output = f.dir.join("static-index.html");
+        index::generate(&catalog, &output).unwrap();
+        let page = fs::read_to_string(output).unwrap();
+        assert!(page.contains("No expiry"));
+        assert!(!page.contains("1970-01-01"));
     }
 }
