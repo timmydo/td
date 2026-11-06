@@ -276,7 +276,8 @@ ships, and is a reviewed decision of its own.
 
 Every new crate name a lock gains is an external dependency under
 `AGENTS.md` principle 2: the commit calls it out and carries the owner's
-sign-off.
+sign-off. A crate that landed without one gets it in a later commit naming
+the crate and the commit that added it.
 
 - td-net: `cargo update --manifest-path net/Cargo.toml` takes the
   semver-compatible releases its dependents allow. Check each new
