@@ -151,16 +151,38 @@ to the privilege it already has:
   partition the system holds or has mounted (so a td installed to a
   USB disk keeps its EFI system partition from the owner, and an eject
   of that disk is refused), and its node is the block device sysfs
-  names before and after an `O_NOFOLLOW` open. Its type comes from
-  root's own read of the device, never the request: UDF's volume
-  recognition sequence from 32 KiB (BEA01 then NSR02/NSR03, 2 KiB or
-  4 KiB apart) or ISO 9660's primary descriptor there, then an exFAT or
-  FAT boot sector, then ext4's superblock. An ext4 superblock that
-  names an external journal (which would have the kernel open a device
-  the stick chose) or carries its own mount options is refused. Those
-  reads get fifteen seconds and `/bin/mount` or `/bin/umount` sixty,
-  then the request fails and a killed child is reaped on another
-  thread, so a stalled device holds the daemon only that long. Every
+  names before and after an `O_NOFOLLOW` open. Its type comes from the
+  device, never the request: UDF's volume recognition sequence from 32
+  KiB (BEA01 then NSR02/NSR03, 2 KiB or 4 KiB apart) or ISO 9660's
+  primary descriptor there, then an exFAT or FAT boot sector, then
+  ext4's superblock. An ext4 superblock that names an external journal
+  (which would have the kernel open a device the stick chose) or
+  carries its own mount options is refused. Root does not read those
+  bytes itself. It hands the descriptor it opened, as stdin, to
+  `td-disks media-identify`, started with an empty environment at `/`
+  as UID/GID 65532, which no account names and nothing else runs as
+  (td-time's network worker is 65534). The worker refuses to read if
+  any uid or gid column is 0 or it holds a permitted, effective or
+  ambient capability, and answers one line of at most 256 bytes,
+  `none`, `ok WORD [LABEL]` or `error WHY`. Root accepts only a word
+  it knows and maps the label through its own rule, and a failed or
+  malformed answer fails the request. So a parser fault costs that
+  request rather than the daemon. Code execution in the worker is
+  bounded to an unprivileged uid and no further: nothing confines that
+  uid, so it keeps the network and the device's bytes and may name any
+  type, as a stick's own bytes can, or skip the ext4 refusal, whose
+  purpose is to keep such a stick out of the kernel's reach. A process
+  it forks outlives the request, since only the worker itself is
+  killed: holding the device open stops the kernel rescanning that
+  disk, and with no Yama in this kernel it can attach to later workers
+  of the same uid, reading their sticks and forging their answers,
+  until `media` restarts. It has no process or memory limit either.
+  td-disks forbids `unsafe`, so a namespace or seccomp filter for the
+  worker is a separate design. The mount's options, source and target
+  stay root's. Those reads get fifteen seconds and `/bin/mount` or
+  `/bin/umount` sixty, then the request fails and a killed child is
+  reaped on another thread, so a stalled device holds the daemon only
+  that long, once it has opened; the open itself has no deadline. Every
   second it lazily unmounts what a vanished device held, or a card
   whose reader now reports no media: the whole disk's size drops to 0
   while a mounted partition keeps its own, as the kernel rescans no

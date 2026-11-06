@@ -5,17 +5,20 @@
 //! Two halves. `serve` runs as root and owns every mount; it answers one
 //! request per connection on a socket only the owner may open. `watch`
 //! runs as the owner inside the session, asks the compositor whether the
-//! session is locked, and asks `serve` to mount what appears.
+//! session is locked, and asks `serve` to mount what appears. `serve` reads
+//! no medium's bytes itself: `identify_stdin` does, as a worker of its own
+//! holding only the device root opened.
 
 use crate::probe;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const NOFOLLOW_NONBLOCK: i32 = 0o400000 | 0o4000;
@@ -27,8 +30,16 @@ const MAX_ENTRIES: usize = 4096;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// A whole request, however it trickles in.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
-/// Root's own reads of a device that may stall.
+/// The identify worker's reads of a device that may stall.
 const IDENTIFY_DEADLINE: Duration = Duration::from_secs(15);
+/// The identify worker's whole reply: a word and a mapped label.
+const MAX_IDENTITY: u64 = 256;
+/// What the identify worker runs as. No account names it and nothing else
+/// runs as it: td-time's network worker is 65534, and a shared uid could
+/// signal or trace it. `system_def_is_self_consistent` names this value too.
+const IDENTIFY_UID: u32 = 65532;
+/// The worker's verb, shared by the spawner and `main`'s router.
+pub const IDENTIFY_VERB: &str = "media-identify";
 /// `/bin/mount` and `/bin/umount`, journal replay included.
 const CHILD_DEADLINE: Duration = Duration::from_secs(60);
 /// How often root opens each USB disk so a card reader notices a card.
@@ -55,6 +66,18 @@ impl Media {
             Self::Iso9660 => "iso9660",
             Self::Udf => "udf",
         }
+    }
+
+    fn from_word(word: &str) -> Option<Self> {
+        [
+            Self::Vfat,
+            Self::Exfat,
+            Self::Ext4,
+            Self::Iso9660,
+            Self::Udf,
+        ]
+        .into_iter()
+        .find(|media| media.word() == word)
     }
 
     /// The `-o` words: never devices, setuid or programs; the owner's
@@ -199,6 +222,106 @@ pub fn identify(device: &File) -> io::Result<Option<(Media, Option<String>)>> {
     Ok(None)
 }
 
+/// What a worker found, as the one line root reads: `none`, `ok WORD`,
+/// `ok WORD LABEL` with the label already a mount-point name, or
+/// `error WHY`.
+pub fn identity_line(found: &io::Result<Option<(Media, Option<String>)>>) -> String {
+    match found {
+        Ok(None) => "none\n".into(),
+        Ok(Some((media, label))) => match label.as_deref().and_then(label_name) {
+            Some(label) => format!("ok {} {label}\n", media.word()),
+            None => format!("ok {}\n", media.word()),
+        },
+        Err(error) => format!("error {}\n", printable(&error.to_string())),
+    }
+}
+
+/// Root's reading of that line. The bytes came from a medium's parser, so
+/// nothing is taken unchecked: an unknown word or a second line is a
+/// refusal, a reason is reduced to printable ASCII before it reaches a
+/// reply, and the caller still maps a label through `label_name`.
+pub fn parse_identity(reply: &str) -> Result<Option<(Media, Option<String>)>, String> {
+    let line = reply
+        .strip_suffix('\n')
+        .filter(|line| !line.contains('\n'))
+        .ok_or("the identify worker's reply is not one line")?;
+    if line == "none" {
+        return Ok(None);
+    }
+    if let Some(why) = line.strip_prefix("error ") {
+        return Err(printable(why));
+    }
+    let found = line
+        .strip_prefix("ok ")
+        .ok_or("the identify worker's reply is malformed")?;
+    let (word, label) = found
+        .split_once(' ')
+        .map_or((found, None), |(word, label)| (word, Some(label)));
+    let media =
+        Media::from_word(word).ok_or("the identify worker named no filesystem td mounts")?;
+    Ok(Some((media, label.map(str::to_string))))
+}
+
+fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(MAX_LABEL * 4)
+        .collect()
+}
+
+/// Whether `/proc/self/status` shows a process with no root uid or gid in any
+/// column and no permitted, effective or ambient capability. The worker asks
+/// before it reads a byte, so a launch that kept privilege refuses rather than
+/// parses as root.
+pub fn unprivileged(status: &str) -> bool {
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+    };
+    let clear = |name: &str| {
+        field(name).is_some_and(|ids| {
+            let columns: Vec<&str> = ids.split_whitespace().collect();
+            columns.len() == 4 && columns.iter().all(|id| *id != "0")
+        })
+    };
+    clear("Uid")
+        && clear("Gid")
+        && ["CapPrm", "CapEff", "CapAmb"].into_iter().all(|name| {
+            field(name).is_some_and(|set| set.trim().bytes().all(|digit| digit == b'0'))
+        })
+}
+
+/// The `media-identify` worker: identify the device on stdin and print
+/// `identity_line`. Root opened that device and validated it; this holds
+/// nothing else of root's.
+pub fn identify_stdin() -> Result<(), String> {
+    let status = fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
+    if !unprivileged(&status) {
+        return Err(format!(
+            "{IDENTIFY_VERB} refuses to read a medium with privilege"
+        ));
+    }
+    let device = io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .map(File::from)
+        .map_err(|e| e.to_string())?;
+    let line = identity_line(&identify(&device));
+    io::stdout()
+        .write_all(line.as_bytes())
+        .map_err(|e| e.to_string())
+}
+
+/// SIGKILL waits out an uninterruptible read or mount(2), so the reaping is
+/// another thread's, never the caller's.
+fn abandon(mut child: Child) {
+    let _ = child.kill();
+    let _ = std::thread::Builder::new().spawn(move || {
+        let _ = child.wait();
+    });
+}
+
 /// A label as a mount-point name: `[A-Za-z0-9._-]`, at most 32, never
 /// starting with `.` or `-`.
 pub fn label_name(label: &str) -> Option<String> {
@@ -301,6 +424,10 @@ pub struct Serve {
     pub mounts: PathBuf,
     pub mount: PathBuf,
     pub umount: PathBuf,
+    /// The program that serves `IDENTIFY_VERB`.
+    pub worker: PathBuf,
+    /// How long that program has, spawn to exit.
+    pub identify_deadline: Duration,
     pub uid: u32,
     pub gid: u32,
     pub user: String,
@@ -354,6 +481,8 @@ impl Serve {
             mounts: "/proc/self/mounts".into(),
             mount: "/bin/mount".into(),
             umount: "/bin/umount".into(),
+            worker: "/bin/td-disks".into(),
+            identify_deadline: IDENTIFY_DEADLINE,
             uid,
             gid,
             user,
@@ -422,12 +551,7 @@ impl Serve {
                     std::thread::sleep(Duration::from_millis(50))
                 }
                 Ok(None) => {
-                    // SIGKILL waits out an uninterruptible mount(2), so
-                    // the reaping is another thread's, never this one's.
-                    let _ = child.kill();
-                    let _ = std::thread::Builder::new().spawn(move || {
-                        let _ = child.wait();
-                    });
+                    abandon(child);
                     return Err(format!("{} timed out", program.display()));
                 }
                 Err(e) => return Err(format!("{}: {e}", program.display())),
@@ -441,6 +565,81 @@ impl Serve {
             let _ = pipe.take(4096).read_to_string(&mut stderr);
         }
         Err(stderr.trim_end().to_string())
+    }
+
+    /// What `device` holds, asked of a worker that has it as stdin and
+    /// nothing else of root's. A hostile medium's bytes meet that parser, not
+    /// this process; a stall or a crash there costs this request and not the
+    /// daemon. Below root there is no identity to change to, which is how a
+    /// test runs this.
+    pub fn identify_confined(
+        &self,
+        device: File,
+    ) -> Result<Option<(Media, Option<String>)>, String> {
+        let (mut reader, writer) = UnixStream::pair().map_err(|e| e.to_string())?;
+        reader.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let mut command = Command::new(&self.worker);
+        command
+            .arg(IDENTIFY_VERB)
+            .env_clear()
+            .current_dir("/")
+            .stdin(device)
+            .stdout(Stdio::from(OwnedFd::from(writer)))
+            .stderr(Stdio::null());
+        if fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid() == 0 {
+            command.uid(IDENTIFY_UID).gid(IDENTIFY_UID);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("{IDENTIFY_VERB}: {e}"))?;
+        // The command keeps its copy of the writer, which would hide EOF.
+        drop(command);
+        // Polled on this thread, so what survives a deadline is at most the one
+        // reaper: a stalled worker, or a descendant holding the socket, pins
+        // nothing else of root's.
+        let started = Instant::now();
+        let mut reply = Vec::new();
+        let mut buffer = [0u8; MAX_IDENTITY as usize + 1];
+        let mut ended = false;
+        let status = loop {
+            if !ended {
+                match reader.read(&mut buffer) {
+                    Ok(0) => ended = true,
+                    Ok(read) => {
+                        reply.extend_from_slice(buffer.get(..read).unwrap_or(&[]));
+                        if reply.len() as u64 > MAX_IDENTITY {
+                            abandon(child);
+                            return Err(format!("{IDENTIFY_VERB} answered too much"));
+                        }
+                        continue;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => {
+                        abandon(child);
+                        return Err(format!("{IDENTIFY_VERB}: {error}"));
+                    }
+                }
+            }
+            if ended {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => {}
+                    Err(error) => {
+                        abandon(child);
+                        return Err(format!("{IDENTIFY_VERB}: {error}"));
+                    }
+                }
+            }
+            if started.elapsed() >= self.identify_deadline {
+                abandon(child);
+                return Err(format!("{IDENTIFY_VERB} did not finish"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if !status.success() {
+            return Err(format!("{IDENTIFY_VERB} failed"));
+        }
+        parse_identity(&String::from_utf8_lossy(&reply))
     }
 
     /// `/run/media` root-owned 0755, and the owner's directory beneath it
@@ -549,15 +748,8 @@ impl Serve {
         if !probe::same(&meta, expected) || meta.ino() != before.ino() {
             return Err(format!("{} changed during open", node.display()));
         }
-        let (sender, receiver) = mpsc::channel();
-        std::thread::Builder::new()
-            .spawn(move || {
-                let _ = sender.send(identify(&device).map_err(|e| e.to_string()));
-            })
-            .map_err(|e| format!("{name}: {e}"))?;
-        let (media, label) = receiver
-            .recv_timeout(IDENTIFY_DEADLINE)
-            .map_err(|_| format!("{name} did not answer its reads"))?
+        let (media, label) = self
+            .identify_confined(device)
             .map_err(|e| format!("{name}: {e}"))?
             .ok_or_else(|| format!("{name} holds no filesystem td mounts"))?;
         let read_only = sysfs_text(&self.sys.join(name).join("ro")).is_ok_and(|ro| ro == "1");
@@ -1090,6 +1282,112 @@ mod tests {
         ));
     }
 
+    /// No test below root reaches the identity change or the worker's refusal,
+    /// so losing both would put parsing back in root's hands with every gate
+    /// green. The contract is pinned where a gate can see it.
+    #[test]
+    fn the_worker_changes_identity_and_refuses_otherwise() {
+        // Comments stripped, so commenting a line out is losing it.
+        let source: String = include_str!("media.rs")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let spawner = source
+            .split_once("pub fn identify_confined(")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        // The same value in both columns, and this test holds which: 65534 is
+        // td-time's worker and a human's uid would pass the worker's own guard.
+        assert_eq!(IDENTIFY_UID, 65532);
+        assert!(spawner.contains(
+            "if fs::metadata(\"/proc/self\").map_err(|e| e.to_string())?.uid() == 0 {\n            \
+             command.uid(IDENTIFY_UID).gid(IDENTIFY_UID);\n        }"
+        ));
+        assert!(spawner.contains(".env_clear()"));
+        assert!(spawner.contains(".stdin(device)"));
+        assert!(!spawner.contains("identify("), "root must not parse");
+        let worker = source
+            .split_once("pub fn identify_stdin(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let guard = worker
+            .find("if !unprivileged(&status) {\n        return Err(")
+            .unwrap();
+        // Split, so this test's own text is not a call it counts.
+        let call = concat!("identify", "(&");
+        let parse = worker.find(call).unwrap();
+        assert!(guard < parse, "the guard must precede every read");
+        assert_eq!(source.matches(call).count(), 1, "one reader of a medium");
+    }
+
+    #[test]
+    fn a_worker_answer_round_trips_and_a_hostile_one_is_refused() {
+        for found in [
+            None,
+            Some((Media::Udf, None)),
+            Some((Media::Vfat, Some("CAMERA".to_string()))),
+        ] {
+            let line = identity_line(&Ok(found.clone()));
+            assert_eq!(parse_identity(&line), Ok(found));
+        }
+        // A label is mapped before it crosses, so it cannot end the line.
+        let line = identity_line(&Ok(Some((Media::Vfat, Some("A\nok udf".into())))));
+        assert_eq!(line, "ok vfat A_ok_udf\n");
+        let refused = identity_line(&Err(io::Error::other("its ext4\nsuperblock")));
+        assert_eq!(parse_identity(&refused), Err("its ext4superblock".into()));
+
+        for hostile in [
+            "",
+            "none",
+            "none\nnone\n",
+            "ok\n",
+            "ok \n",
+            "ok ntfs\n",
+            "ok vfat\nok udf\n",
+            "mounted\n",
+        ] {
+            assert!(
+                parse_identity(hostile).is_err(),
+                "root took {hostile:?} from a worker"
+            );
+        }
+        // Whatever a worker says, its reason reaches a reply as one line of
+        // printable ASCII, and a bounded one.
+        let long = format!("error \u{1b}[2J{}\n", "x".repeat(4096));
+        let why = parse_identity(&long).unwrap_err();
+        assert!(why.len() <= MAX_LABEL * 4 && why.bytes().all(|b| b.is_ascii_graphic()));
+        // A label a worker sent unmapped still meets root's own rule.
+        let (_, label) = parse_identity("ok vfat ../../etc\n").unwrap().unwrap();
+        assert_eq!(label.as_deref().and_then(label_name).unwrap(), "_.._etc");
+    }
+
+    #[test]
+    fn a_worker_with_any_privilege_is_told_apart() {
+        let status = |uid: &str, cap: &str| {
+            format!("Name:\tx\nUid:\t{uid}\nGid:\t65532\t65532\t65532\t65532\nCapInh:\t0000000000000001\nCapPrm:\t{cap}\nCapEff:\t{cap}\nCapAmb:\t{cap}\n")
+        };
+        let none = "0000000000000000";
+        assert!(unprivileged(&status("65532\t65532\t65532\t65532", none)));
+        for uid in ["0\t0\t0\t0", "65532\t0\t65532\t65532", "65532\t65532\t0\t0"] {
+            assert!(!unprivileged(&status(uid, none)), "{uid}");
+        }
+        assert!(!unprivileged(&status(
+            "65532\t65532\t65532\t65532",
+            "0000000000000400"
+        )));
+        // A launch that changed the uid and kept root's group.
+        let kept_gid = status("65532\t65532\t65532\t65532", none)
+            .replace("Gid:\t65532\t65532\t65532\t65532", "Gid:\t0\t0\t0\t0");
+        assert!(!unprivileged(&kept_gid));
+        // What it cannot read is not unprivileged.
+        assert!(!unprivileged(""));
+        assert!(!unprivileged(&status("65532\t65532\t65532", none)));
+        assert!(!unprivileged("Uid:\t1\t1\t1\t1\n"));
+    }
+
     #[test]
     fn the_owner_is_read_from_passwd() {
         let passwd = "root:x:0:0::/root:/bin/sh\ntester:x:1000:100::/home/tester:/bin/sh\n";
@@ -1148,6 +1446,8 @@ mod tests {
             mounts: root.join("mounts"),
             mount: "/nonexistent/mount".into(),
             umount: "/nonexistent/umount".into(),
+            worker: "/nonexistent/td-disks".into(),
+            identify_deadline: IDENTIFY_DEADLINE,
             uid: 1000,
             gid: 100,
             user: "tester".into(),

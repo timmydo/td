@@ -10317,6 +10317,18 @@ mod tests {
                 "group gid {gid} must be unique"
             );
         }
+        // Each is one program's worker, which runs as it precisely because
+        // nothing else does: td-disks's media-identify (td-disks/DESIGN.md).
+        for worker in [65532] {
+            for sys in [&SYSTEM, &SERVER] {
+                assert!(
+                    sys.users.iter().all(|user| user.uid != worker)
+                        && sys.applications.iter().all(|a| a.external_uid != worker),
+                    "uid {worker} is a worker's alone"
+                );
+            }
+            assert!(groups.iter().all(|(_, gid)| *gid != worker));
+        }
         for user in SYSTEM.users {
             assert_eq!(
                 SYSTEM

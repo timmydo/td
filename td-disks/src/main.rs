@@ -65,6 +65,7 @@ fn run() -> Result<(), String> {
             let owner: u32 = owner.parse().map_err(|_| "media-serve OWNER_UID")?;
             media::Serve::system(owner)?.serve()
         }
+        [media::IDENTIFY_VERB] => media::identify_stdin(),
         ["media-watch", control] => media::watch(
             std::path::Path::new("/sys/class/block"),
             std::path::Path::new(control),
