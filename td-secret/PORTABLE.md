@@ -1407,7 +1407,7 @@ on stdin and no other inherited descriptors beyond independent stdout and
 stderr. Startup verifies all UID/GID columns, supplementary groups, absent
 effective capabilities and one thread. The endpoint is a capability handed
 out by the trusted launcher; there is no public notebook listener and no
-UID-only browsing admission. Root-only shadow validation belongs to the launcher before its credential
+UID-only browsing admission. Account validation belongs to the launcher before its credential
 drop; the worker reads only the immutable public registry.
 The paired authority launches the pinned service and td-pass window,
 mediates token operations through secure attention, and destroys both at
@@ -1465,8 +1465,7 @@ and partial-frame disconnect. These are backend tests, not live hardware or
 end-to-end trusted desktop acceptance.
 
 The diskless `qemu-secret --case notebook-service` fixture launches the
-production worker through td-login as UID/GID 989 with a root-only shadow
-file. It checks heartbeat and empty-vault inspection replies, then observes
+production worker through td-login as UID/GID 989. It checks heartbeat and empty-vault inspection replies, then observes
 process exit after closing the authority endpoint. It needs no TPM or token.
 
 ### Root notebook token exchange

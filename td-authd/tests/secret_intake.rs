@@ -196,9 +196,8 @@ fn root_public_client_uses_the_human_identity_and_immutable_descriptor() {
     fs::set_permissions("/etc", fs::Permissions::from_mode(0o755)).unwrap();
     for (name, text, mode) in [
         ("td-principals.tsv", "td-principals-v1\nsession\t1000\t993\t992\t991\napplication\t1000\tmail\t65537\n", 0o444),
-        ("passwd", "tester:x:1000:1000::/home/tester:/bin/false\ntda65537:x:65537:65537::/var/lib/td/applications/65537:/bin/false\n", 0o644),
+        ("passwd", "tester::1000:1000::/home/tester:/bin/false\ntda65537:!td-service:65537:65537::/var/lib/td/applications/65537:/bin/false\n", 0o644),
         ("group", "tester:x:1000:\ntda65537:x:65537:\n", 0o644),
-        ("shadow", "tester::0:0:99999:7:::\ntda65537:!td-service:0:0:99999:7:::\n", 0o600),
     ] {
         let path = format!("/etc/{name}");
         fs::write(&path, text).unwrap();

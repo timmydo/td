@@ -30,7 +30,7 @@ pub const CASES: &[(&str, &str)] = &[
 /// Private notebook service startup, without a TPM or security key.
 pub const NOTEBOOK_CASES: &[(&str, &str)] = &[(
     "notebook-service",
-    "portable::service::tests::qemu_reserved_identity_serves_with_root_only_shadow",
+    "portable::service::tests::qemu_reserved_identity_serves",
 )];
 pub const TPM_CASES: &[(&str, &str)] = &[
     (

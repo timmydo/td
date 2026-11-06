@@ -112,6 +112,12 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     if forced && !status.is_root() {
         return Err("only root may use -f (it starts a session without authenticating)".into());
     }
+    // `-p` carries the caller's environment into a session. Below root that
+    // session could only be the caller's own, so it would grant nothing, but
+    // THREAT-MODEL.md §5 holds every other front end to a clean environment.
+    if opts.preserve && !status.is_root() {
+        return Err("only root may use -p (it keeps the caller's environment)".into());
+    }
     if !forced {
         guard_console(&status);
     }
@@ -329,6 +335,18 @@ mod tests {
 
     fn argv(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Without a root-only file in the way, only this keeps a non-root `login -p`
+    /// from carrying its environment into a session.
+    #[test]
+    fn only_root_may_keep_the_environment() {
+        if Status::read().unwrap().is_root() {
+            println!("SKIPPED: this runner holds root");
+            return;
+        }
+        let error = run(&argv(&["-p", "nobody"])).unwrap_err();
+        assert!(error.contains("only root may use -p"), "{error}");
     }
 
     /// The forms the image actually uses, plus the ones an operator types.

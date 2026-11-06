@@ -380,7 +380,7 @@ pub fn recipe() -> Recipe {
 
 #[cfg(test)]
 mod tests {
-    use super::super::system_x86_64::{ROOTCHECK_ETC_NAME, SHADOW_ETC_NAME};
+    use super::super::system_x86_64::ROOTCHECK_ETC_NAME;
     use super::*;
     use crate::shared::{
         TD_APPLICATION_CONFIG_PATH, TD_APPLICATION_LAUNCHER_TABLE, TD_APPLICATION_REGISTRY,
@@ -632,12 +632,10 @@ mod tests {
                 "fixture source lacks authority sentinel {authority}"
             );
         }
-        for image_name in [ROOTCHECK_ETC_NAME, SHADOW_ETC_NAME] {
-            assert!(
-                fixture_boundary.contains(&format!("        \"/etc/{image_name}\",")),
-                "fixture source lacks image sentinel /etc/{image_name}"
-            );
-        }
+        assert!(
+            fixture_boundary.contains(&format!("        \"/etc/{ROOTCHECK_ETC_NAME}\",")),
+            "fixture source lacks image sentinel /etc/{ROOTCHECK_ETC_NAME}"
+        );
         assert!(fixture_mounts.contains("(\"/etc\", \"configuration\")"));
         assert!(fixture_mounts.contains("for immutable_root in [\"/app\", \"/usr\", \"/etc\"]"));
         for row in [

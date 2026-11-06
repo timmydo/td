@@ -396,7 +396,7 @@ mod confinement {
         );
         assert_eq!(
             fingerprint(include_str!("write_operation.rs")),
-            0x0de90e50f55c5610
+            0x5fe202ee099e5378
         );
         assert_eq!(
             fingerprint(include_str!("enrollment_operation.rs")),

@@ -4,57 +4,43 @@ use super::*;
 
 const TABLE: &str = "td-principals-v1\nsession\t1000\t993\t991\t989\nsession\t1001\t992\t990\t988\napplication\t1000\tfirefox\t65536\napplication\t1000\tmail\t65538\napplication\t1001\tmail\t65537\n";
 
-const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\ntester:x:1000:1000:Tester:/home/tester:/bin/sh\nother:x:1001:1001:Other:/home/other:/bin/sh\n";
+const PASSWD: &str = "root:!:0:0:root:/root:/bin/sh\ntester::1000:1000:Tester:/home/tester:/bin/sh\nother::1001:1001:Other:/home/other:/bin/sh\n";
 const GROUP: &str = "root:x:0:\ntester:x:1000:\nother:x:1001:\nwheel:x:10:tester\n";
-const SHADOW: &str = "root:!:0:0:99999:7:::\ntester::0:0:99999:7:::\nother::0:0:99999:7:::\n";
 
 #[test]
 fn primary_table_rename_preserves_credentials_reservations_and_other_fields() {
     let registry = Registry::parse(TABLE).unwrap();
     let passwd = format!(
-        "{}tdc1000:x:993:993:Compositor:/run/tdc1000:/bin/false\n\
-        tda65536:x:65536:65536:Browser:/var/lib/td/applications/65536:/bin/false\n",
-        PASSWD.replace(":Tester:", ":tester comment:")
+        "{}tdc1000:!td-service:993:993:Compositor:/run/tdc1000:/bin/false\n\
+        tda65536:!td-service:65536:65536:Browser:/var/lib/td/applications/65536:/bin/false\n",
+        PASSWD
+            .replace(":Tester:", ":tester comment:")
+            .replace("tester::", "tester:opaque-tester-hash:")
     );
     let group = format!("{GROUP}tdc1000:x:993:\ntda65536:x:65536:\nteam:x:2000:tester,other\n");
-    let shadow = format!(
-        "{}tdc1000:!td-service:0:0:99999:7:::\n\
-        tda65536:!td-service:0:0:99999:7:::\n",
-        SHADOW.replace("tester::", "tester:opaque-tester-hash:")
-    );
-    let renamed = rename_primary_tables(&registry, &passwd, &group, &shadow, "alice").unwrap();
+    let renamed = rename_primary_tables(&registry, &passwd, &group, "alice").unwrap();
     assert_eq!(
         renamed.passwd,
         passwd.replace(
-            "tester:x:1000:1000:tester comment:/home/tester:",
-            "alice:x:1000:1000:tester comment:/home/alice:"
+            "tester:opaque-tester-hash:1000:1000:tester comment:/home/tester:",
+            "alice:opaque-tester-hash:1000:1000:tester comment:/home/alice:"
         )
     );
     assert_eq!(renamed.group, group.replace("tester", "alice"));
-    assert_eq!(renamed.shadow, shadow.replace("\ntester:", "\nalice:"));
     assert_eq!(
         registry.application_accounts(&renamed.passwd).unwrap(),
         registry.application_accounts(&passwd).unwrap()
     );
-    let again = rename_primary_tables(
-        &registry,
-        &renamed.passwd,
-        &renamed.group,
-        &renamed.shadow,
-        "alice",
-    )
-    .unwrap();
+    let again = rename_primary_tables(&registry, &renamed.passwd, &renamed.group, "alice").unwrap();
     assert_eq!(again.passwd, renamed.passwd);
     assert_eq!(again.group, renamed.group);
-    assert_eq!(again.shadow, renamed.shadow);
     for name in ["root", "other", "wheel", "tdc1000", "tda99999", "../alice"] {
-        assert!(rename_primary_tables(&registry, &passwd, &group, &shadow, name).is_err());
+        assert!(rename_primary_tables(&registry, &passwd, &group, name).is_err());
     }
     let canonical = rename_primary_tables(
         &registry,
         &PASSWD.replace("/home/tester", "/var/home/tester"),
         GROUP,
-        SHADOW,
         "tester",
     )
     .unwrap();
@@ -64,24 +50,31 @@ fn primary_table_rename_preserves_credentials_reservations_and_other_fields() {
 #[test]
 fn primary_table_rename_preserves_near_matches_and_refuses_growth_past_the_bound() {
     let registry = Registry::parse(TABLE).unwrap();
-    let passwd = format!("{PASSWD}tester2:x:2000:2000:Other:/home/tester2:/bin/sh\natester:x:2001:2001:Other:/home/atester:/bin/sh\n");
+    let passwd = format!("{PASSWD}tester2::2000:2000:Other:/home/tester2:/bin/sh\natester::2001:2001:Other:/home/atester:/bin/sh\n");
     let group = format!("{GROUP}team:x:2000:tester2,tester,atester\n");
-    let shadow = format!("{SHADOW}tester2::0:0:99999:7:::\natester::0:0:99999:7:::\n");
-    let renamed = rename_primary_tables(&registry, &passwd, &group, &shadow, "alice").unwrap();
+    let renamed = rename_primary_tables(&registry, &passwd, &group, "alice").unwrap();
     assert!(renamed
         .group
         .ends_with("team:x:2000:tester2,alice,atester\n"));
-    assert!(renamed.passwd.contains("\ntester2:x:2000:"));
-    assert!(renamed.passwd.contains("\natester:x:2001:"));
-    let bounded = SHADOW.replace(
-        "other::",
-        &format!("other:{}:", "x".repeat(MAX_BYTES - SHADOW.len())),
-    );
+    assert!(renamed.passwd.contains("\ntester2::2000:"));
+    assert!(renamed.passwd.contains("\natester::2001:"));
+    // Filler accounts, since the table bound is well above one record's.
+    let mut bounded = PASSWD.to_string();
+    let mut uid = 3000;
+    while bounded.len() < MAX_BYTES {
+        let row = format!("f{uid}::{uid}:{uid}::/:/bin/false\n");
+        let pad = (MAX_BYTES - bounded.len() - row.len()).min(3000);
+        bounded.push_str(&format!(
+            "f{uid}::{uid}:{uid}:{}:/:/bin/false\n",
+            "x".repeat(pad)
+        ));
+        uid += 1;
+    }
     assert_eq!(bounded.len(), MAX_BYTES);
     registry
-        .check_primary_name(PASSWD, GROUP, &bounded, "alexandria")
+        .check_primary_name(&bounded, GROUP, "alexandria")
         .unwrap();
-    let error = rename_primary_tables(&registry, PASSWD, GROUP, &bounded, "alexandria")
+    let error = rename_primary_tables(&registry, &bounded, GROUP, "alexandria")
         .err()
         .unwrap();
     assert!(error.contains("exceeds its bound"), "{error}");
@@ -128,7 +121,6 @@ impl AccountStageFixture {
             (TABLE_NAME, TABLE, 0o444),
             ("passwd", PASSWD, 0o644),
             ("group", GROUP, 0o644),
-            ("shadow", SHADOW, 0o600),
         ] {
             let mut file = OpenOptions::new()
                 .write(true)
@@ -166,7 +158,6 @@ fn primary_staging_creates_consistent_private_output_without_changing_the_source
         (TABLE_NAME, TABLE, 0o444),
         ("passwd", PASSWD, 0o644),
         ("group", GROUP, 0o644),
-        ("shadow", SHADOW, 0o600),
     ] {
         assert_eq!(
             std::fs::read_to_string(fixture.0.join("etc").join(name)).unwrap(),
@@ -232,9 +223,7 @@ fn primary_names_preserve_numeric_reservations_and_reject_identity_collisions() 
         "tda99x",
         &"a".repeat(32),
     ] {
-        registry
-            .check_primary_name(PASSWD, GROUP, SHADOW, name)
-            .unwrap();
+        registry.check_primary_name(PASSWD, GROUP, name).unwrap();
     }
     for name in [
         "root",
@@ -261,9 +250,7 @@ fn primary_names_preserve_numeric_reservations_and_reject_identity_collisions() 
         &"a".repeat(33),
     ] {
         assert!(
-            registry
-                .check_primary_name(PASSWD, GROUP, SHADOW, name)
-                .is_err(),
+            registry.check_primary_name(PASSWD, GROUP, name).is_err(),
             "accepted {name:?}"
         );
     }
@@ -272,7 +259,6 @@ fn primary_names_preserve_numeric_reservations_and_reject_identity_collisions() 
         .check_primary_name(
             &PASSWD.replace("tester", "alice"),
             &GROUP.replace("tester", "alice"),
-            &SHADOW.replace("tester", "alice"),
             "alice",
         )
         .unwrap();
@@ -281,67 +267,39 @@ fn primary_names_preserve_numeric_reservations_and_reject_identity_collisions() 
 #[test]
 fn primary_name_check_refuses_orphan_authority_and_inconsistent_tables() {
     let registry = Registry::parse(TABLE).unwrap();
-    for (passwd, group, shadow) in [
+    for (passwd, group) in [
         (
             PASSWD.to_owned(),
             GROUP.replace("10:tester", "10:tester,alice"),
-            SHADOW.to_owned(),
         ),
         (
             PASSWD.to_owned(),
             GROUP.replace("10:tester", "10:tester,missing"),
-            SHADOW.to_owned(),
         ),
         (
             PASSWD.to_owned(),
             GROUP.replace("10:tester", "10:tester,tester"),
-            SHADOW.to_owned(),
         ),
-        (
-            PASSWD.to_owned(),
-            GROUP.replace("10:tester", "10:tester,"),
-            SHADOW.to_owned(),
-        ),
+        (PASSWD.to_owned(), GROUP.replace("10:tester", "10:tester,")),
         (
             PASSWD.to_owned(),
             GROUP.replace("tester:x:1000:", "alias:x:1000:"),
-            SHADOW.to_owned(),
         ),
-        (
-            PASSWD.to_owned(),
-            GROUP.replace("tester:x:1000:\n", ""),
-            SHADOW.to_owned(),
-        ),
+        (PASSWD.to_owned(), GROUP.replace("tester:x:1000:\n", "")),
         (
             PASSWD.to_owned(),
             GROUP.replace("tester:x:1000:", "tester:x:01000:"),
-            SHADOW.to_owned(),
-        ),
-        (
-            PASSWD.to_owned(),
-            GROUP.to_owned(),
-            SHADOW.replace("tester::0:0:99999:7:::\n", ""),
-        ),
-        (
-            PASSWD.to_owned(),
-            GROUP.to_owned(),
-            format!("{SHADOW}alice:secret-hash:0:0:99999:7:::\n"),
         ),
         (
             PASSWD.replace("/home/tester", "/home/tester/../root"),
             GROUP.to_owned(),
-            SHADOW.to_owned(),
         ),
-        (
-            PASSWD.replace("1000:1000", "1000:0"),
-            GROUP.to_owned(),
-            SHADOW.to_owned(),
-        ),
+        (PASSWD.replace("1000:1000", "1000:0"), GROUP.to_owned()),
     ] {
         let error = registry
-            .check_primary_name(&passwd, &group, &shadow, "alice")
+            .check_primary_name(&passwd, &group, "alice")
             .unwrap_err();
-        assert!(!error.contains("secret-hash"));
+        assert!(!error.is_empty());
     }
 }
 
@@ -349,11 +307,11 @@ fn primary_name_check_refuses_orphan_authority_and_inconsistent_tables() {
 fn active_application_accounts_bind_reserved_uids_to_private_homes() {
     let registry = Registry::parse(TABLE).unwrap();
     assert!(registry.application_accounts(PASSWD).unwrap().is_empty());
-    let row = "tda65536:x:65536:65536:Browser:/var/lib/td/applications/65536:/bin/false\n";
+    let row =
+        "tda65536:!td-service:65536:65536:Browser:/var/lib/td/applications/65536:/bin/false\n";
     let passwd = format!("{PASSWD}{row}");
     let group = format!("{GROUP}tda65536:x:65536:\n");
-    let shadow = format!("{SHADOW}tda65536:!td-service:0:0:99999:7:::\n");
-    registry.verify_accounts(&passwd, &group, &shadow).unwrap();
+    registry.verify_accounts(&passwd, &group).unwrap();
     let active = registry.application_accounts(&passwd).unwrap();
     assert_eq!(
         active,
@@ -373,20 +331,19 @@ fn active_application_accounts_bind_reserved_uids_to_private_homes() {
         passwd.replace("tda65536", "tester-app"),
         format!("{passwd}{row}"),
     ] {
-        assert!(registry.verify_accounts(&bad, &group, &shadow).is_err());
+        assert!(registry.verify_accounts(&bad, &group).is_err());
     }
 }
 
 #[test]
 fn reservations_allow_only_unique_service_accounts_without_supplementary_authority() {
     let registry = Registry::parse(TABLE).unwrap();
-    registry.verify_accounts(PASSWD, GROUP, SHADOW).unwrap();
-    let passwd = format!("{PASSWD}tdc1000:x:993:993:Compositor:/run/tdc1000:/bin/false\n");
+    registry.verify_accounts(PASSWD, GROUP).unwrap();
+    let passwd =
+        format!("{PASSWD}tdc1000:!td-service:993:993:Compositor:/run/tdc1000:/bin/false\n");
     let group = format!("{GROUP}tdc1000:x:993:\n");
-    let shadow = format!("{SHADOW}tdc1000:!td-service:0:0:99999:7:::\n");
-    registry.verify_accounts(&passwd, &group, &shadow).unwrap();
-    assert!(registry.verify_accounts(&passwd, GROUP, &shadow).is_err());
-    assert!(registry.verify_accounts(PASSWD, GROUP, &shadow).is_err());
+    registry.verify_accounts(&passwd, &group).unwrap();
+    assert!(registry.verify_accounts(&passwd, GROUP).is_err());
     for altered in [
         passwd.replace("tdc1000", "alias"),
         passwd.replace("993:993", "993:1000"),
@@ -394,7 +351,7 @@ fn reservations_allow_only_unique_service_accounts_without_supplementary_authori
         format!("{passwd}alias:x:993:993:A:/run/a:/bin/sh\n"),
         format!("{passwd}alias:x:999:993:A:/run/a:/bin/sh\n"),
     ] {
-        assert!(registry.verify_accounts(&altered, &group, &shadow).is_err());
+        assert!(registry.verify_accounts(&altered, &group).is_err());
     }
     for altered in [
         group.replace("tdc1000", "alias"),
@@ -402,17 +359,14 @@ fn reservations_allow_only_unique_service_accounts_without_supplementary_authori
         group.replace("10:tester", "10:tester,tdc1000"),
         format!("{group}alias:x:993:\n"),
     ] {
-        assert!(registry
-            .verify_accounts(&passwd, &altered, &shadow)
-            .is_err());
+        assert!(registry.verify_accounts(&passwd, &altered).is_err());
     }
     for altered in [
-        shadow.replace("!td-service", ""),
-        shadow.replace("!td-service", "!"),
-        SHADOW.to_string(),
-        format!("{shadow}tdc1000::0:0:99999:7:::\n"),
+        passwd.replace("!td-service", ""),
+        passwd.replace("!td-service", "!"),
+        passwd.replace("!td-service", "x"),
     ] {
-        assert!(registry.verify_accounts(&passwd, &group, &altered).is_err());
+        assert!(registry.verify_accounts(&altered, &group).is_err());
     }
 }
 
@@ -422,9 +376,9 @@ fn account_validation_covers_retired_reservations_and_missing_humans() {
     let current = Registry::parse("td-principals-v1\nsession\t1000\t993\t991\t989\n").unwrap();
     let retained = retired.enroll(&current).unwrap();
     let reused = format!("{PASSWD}daemon:x:65537:65537:New:/run/new:/bin/false\n");
-    assert!(retained.verify_accounts(&reused, GROUP, SHADOW).is_err());
+    assert!(retained.verify_accounts(&reused, GROUP).is_err());
     assert!(retained
-        .verify_accounts("root:x:0:0:root:/root:/bin/sh\n", GROUP, SHADOW)
+        .verify_accounts("root:!:0:0:root:/root:/bin/sh\n", GROUP)
         .is_err());
 }
 
@@ -432,12 +386,10 @@ fn account_validation_covers_retired_reservations_and_missing_humans() {
 fn removed_human_accounts_may_disappear_without_freeing_their_reservations() {
     let old = Registry::parse(TABLE).unwrap();
     let active = Registry::parse("td-principals-v1\nsession\t1000\t993\t991\t989\n").unwrap();
-    let passwd = "root:x:0:0:root:/root:/bin/sh\ntester:x:1000:1000:Tester:/home/tester:/bin/sh\n";
-    old.verify_retained_accounts(&active, passwd, GROUP, SHADOW)
+    let passwd = "root:!:0:0:root:/root:/bin/sh\ntester::1000:1000:Tester:/home/tester:/bin/sh\n";
+    old.verify_retained_accounts(&active, passwd, GROUP)
         .unwrap();
-    assert!(old
-        .verify_retained_accounts(&old, passwd, GROUP, SHADOW)
-        .is_err());
+    assert!(old.verify_retained_accounts(&old, passwd, GROUP).is_err());
 }
 
 #[test]
@@ -460,7 +412,6 @@ fn staged_configuration_check_is_read_only_and_refuses_substituted_files() {
         ("td-principals.tsv", TABLE, 0o444),
         ("passwd", PASSWD, 0o644),
         ("group", GROUP, 0o644),
-        ("shadow", SHADOW, 0o600),
     ] {
         let mut file = OpenOptions::new()
             .write(true)
@@ -477,7 +428,6 @@ fn staged_configuration_check_is_read_only_and_refuses_substituted_files() {
     for (name, contents) in [
         ("passwd", PASSWD),
         ("group", GROUP),
-        ("shadow", SHADOW),
         ("td-principals.tsv", TABLE),
     ] {
         assert_eq!(fs::read_to_string(etc.join(name)).unwrap(), contents);
@@ -497,16 +447,13 @@ fn staged_configuration_check_is_read_only_and_refuses_substituted_files() {
     fs::set_permissions(etc.join("group"), Permissions::from_mode(0o600)).unwrap();
     assert!(check_primary_name(&root, "alice").is_err());
     fs::set_permissions(etc.join("group"), Permissions::from_mode(0o644)).unwrap();
-    fs::set_permissions(etc.join("shadow"), Permissions::from_mode(0o644)).unwrap();
-    assert!(check_deployment(&root).is_err());
-    assert!(check_primary_name(&root, "alice").is_err());
 }
 
 #[test]
 fn launch_session_binds_the_human_name_uid_gid_and_compositor() {
     let registry =
         super::Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n").unwrap();
-    let passwd = "root:x:0:0:root:/root:/bin/sh\ntester:x:1000:1000:Test:/home/tester:/bin/sh\n";
+    let passwd = "root:!:0:0:root:/root:/bin/sh\ntester::1000:1000:Test:/home/tester:/bin/sh\n";
     assert!(registry.launch_session("tester", 1000, 993, passwd).is_ok());
     for (user, owner, compositor) in [
         ("root", 1000, 993),
@@ -521,7 +468,7 @@ fn launch_session_binds_the_human_name_uid_gid_and_compositor() {
     for table in [
         passwd.replace("1000:1000", "1000:1001"),
         passwd.replace("1000:1000", "1001:1001"),
-        format!("{passwd}tester:x:1000:1000:Test:/home/tester:/bin/sh\n"),
+        format!("{passwd}tester::1000:1000:Test:/home/tester:/bin/sh\n"),
     ] {
         assert!(registry
             .launch_session("tester", 1000, 993, &table)
@@ -532,15 +479,13 @@ fn launch_session_binds_the_human_name_uid_gid_and_compositor() {
 #[test]
 fn the_full_account_check_rejects_a_second_name_for_the_human_uid() {
     let registry = Registry::parse("td-principals-v1\nsession\t1000\t993\t992\t991\n").unwrap();
-    let passwd = "root:x:0:0:root:/root:/bin/sh\ntester:x:1000:1000:Test:/home/tester:/bin/sh\n";
+    let passwd = "root:!:0:0:root:/root:/bin/sh\ntester::1000:1000:Test:/home/tester:/bin/sh\n";
     let group = "root:x:0:\ntester:x:1000:\n";
-    let shadow = "root:!:1:0:99999:7:::\ntester::1:0:99999:7:::\n";
-    assert!(registry.verify_accounts(passwd, group, shadow).is_ok());
+    assert!(registry.verify_accounts(passwd, group).is_ok());
     assert!(registry
         .verify_accounts(
             &format!("{passwd}alias:x:1000:1000:Alias:/home/alias:/bin/sh\n"),
             group,
-            &format!("{shadow}alias::1:0:99999:7:::\n")
         )
         .is_err());
 }
@@ -570,27 +515,27 @@ fn account_fixtures_do_not_share_a_root_when_clock_values_repeat() {
 fn notebook_account_cannot_log_in_alias_another_role_or_join_groups() {
     let table = TABLE.replacen("application", "notebook\t1000\t987\napplication", 1);
     let registry = Registry::parse(&table).unwrap();
-    let passwd = format!("{PASSWD}tdv1000:x:987:987:Vault:/var/lib/td/notebooks/1000:/bin/false\n");
+    let passwd = format!(
+        "{PASSWD}tdv1000:!td-service:987:987:Vault:/var/lib/td/notebooks/1000:/bin/false\n"
+    );
     let group = format!("{GROUP}tdv1000:x:987:\n");
-    let shadow = format!("{SHADOW}tdv1000:!td-service:0:0:99999:7:::\n");
-    registry.verify_accounts(&passwd, &group, &shadow).unwrap();
+    registry.verify_accounts(&passwd, &group).unwrap();
     for changed in [
         passwd.replace("tdv1000", "other-vault"),
         passwd.replace("/bin/false", "/bin/sh"),
     ] {
-        assert!(registry.verify_accounts(&changed, &group, &shadow).is_err());
+        assert!(registry.verify_accounts(&changed, &group).is_err());
     }
     assert!(registry
-        .verify_accounts(&passwd, &group, &shadow.replace("!td-service", "!"))
+        .verify_accounts(&passwd.replace("!td-service", "!"), &group)
         .is_err());
     assert!(registry
         .verify_accounts(
             &passwd,
             &group.replace("wheel:x:10:tester", "wheel:x:10:tester,tdv1000"),
-            &shadow
         )
         .is_err());
     assert!(registry
-        .check_primary_name(&passwd, &group, &shadow, "tdv9999")
+        .check_primary_name(&passwd, &group, "tdv9999")
         .is_err());
 }

@@ -2514,7 +2514,7 @@ fn require_root_refusal(result: &BootResult, context: &str) -> Result<(), String
         (
             result.evidence.root_ssh_refused,
             ROOT_SSH_REFUSED_MARKER,
-            "root's /etc/shadow field read exactly `!` and the running daemon refused the \
+            "root's /etc/passwd password field read exactly `!` and the running daemon refused the \
              seeded loopback root key (exit 255, `Permission denied (publickey)`)",
         ),
         (

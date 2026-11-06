@@ -43,7 +43,7 @@ file (also pinned by the image shape check), compares identity and metadata
 after opening, and checks the read length against the opened size.
 Configuration publication is trusted root work serialized before sessions;
 this reader does not defend against a privileged concurrent file rewrite.
-It reads no shadow data and grants no authentication authority. The stock
+It grants no authentication authority. The stock
 account remains `tester`; this lookup alone does not enable account rename.
 
 There are no caller-selected paths, IDs, flags or permissions. Startup uses
@@ -281,11 +281,11 @@ image activates these identities together with private state ownership and
 credential/socket admission. The typed launcher consumes that reservation;
 this identity parser grants no token consent.
 
-The live reader pins the root-owned `/etc` directory and opens only the four
-fixed children `td-principals.tsv`, `passwd`, `group`, and `shadow`. Each
+The live reader pins the root-owned `/etc` directory and opens only the three
+fixed children `td-principals.tsv`, `passwd`, and `group`. Each
 directory excludes unprivileged writers. It refuses leaf symlinks, bounds
 reads, and requires single-link root-owned regular files: mode 0444 for the
-principal table, 0600 for shadow, and no group/other write or special mode
+principal table, and no group/other write or special mode
 bits for passwd and group. Nonblocking open prevents malformed FIFOs from
 hanging admission. A broker or portal sharing the human or an app uid would
 remain vulnerable to ptrace and message forgery, so their identities are
@@ -306,7 +306,7 @@ collisions, complete membership and the resulting renamed tables before
 writing a new private `OUT/etc`. It copies the reservation table unchanged
 and preserves credential/lock fields and numeric IDs, changing only the
 primary name, canonical home and matching group/member references. Its
-files have exact passwd/group 0644, shadow 0600 and reservations 0444 modes;
+files have exact passwd/group 0644 and reservations 0444 modes;
 its output root is 0700 and its `etc` directory 0755, independent of umask.
 Both remain outside the live account view. Staging requires a
 consistently owned parent without other writers and refuses an existing
@@ -319,8 +319,8 @@ The caller must verify the source deployment and serialize any eventual
 activation before account consumers start.
 
 Account files have bounded, newline-terminated records: passwd has seven
-colon-separated fields and group four, both with `x` in the password field;
-shadow has nine. Comments, blank records, extra fields, duplicate names or
+colon-separated fields and group four, group with `x` in its password field
+and passwd with td-login's marker in its own. Comments, blank records, extra fields, duplicate names or
 IDs, and noncanonical numeric IDs are refused. These are immutable generated
 account databases, not the unrelated mutable `/etc` identity symlinks. An
 invalid account edit therefore fails image construction and firstboot.
@@ -332,15 +332,14 @@ provisioning applications, it loads the immutable table and reserves its
 identities in `/var/lib/td/principals.tsv`. The image enables this mode
 at sysinit. These are reservations only: it creates no accounts and
 changes no running uid. Every reserved uid/gid is checked against the
-complete current passwd, group, and shadow tables, including retired
+complete current passwd and group tables, including retired
 assignments. A future activated account must use the canonical name
 `tdc<owner>`, `tdb<owner>`, or `tdp<owner>` for compositor, broker, or
 portal, and `tda<uid>` for an application. Its primary gid equals uid,
-shell is `/bin/false`, and shadow field is exactly `!td-service`; it has
+shell is `/bin/false`, and password field is exactly `!td-service`; it has
 no supplementary membership and its primary group exists and admits no
-other members. Orphan shadow records for reserved names are refused.
-Aliases, shared primary gids, missing active human owners, duplicate
-account records, and human-login shadow classes fail enrollment. The
+other members. Aliases, shared primary gids, missing active human owners,
+duplicate account records, and human-login password classes fail enrollment. The
 image generator validates these same tables with the provisioner's
 parser. A registry row alone does not activate a service. The image
 consumes the compositor assignment through its paired root authority;

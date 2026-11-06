@@ -1676,9 +1676,9 @@ principal is enrolled, so later enrollment cannot collide with the installed
 name.
 Rechecking the deployment's current primary name is allowed when it passes
 these checks. It requires regular, consistently owned
-account tables (passwd/group 0644, shadow 0600, principal reservations 0444),
+account tables (passwd/group 0644, principal reservations 0444),
 rejects account/group collisions and reserved service/application names,
-and requires a matching human primary group and complete shadow roster.
+and requires a matching human primary group.
 Its exact public account-table modes match the generated image and shared
 live account reader; the general `check-principals` command instead checks
 reservation integrity and excludes unsafe writers without pinning those
@@ -1695,7 +1695,7 @@ use this preflight as described below.
 `td-firstboot stage-primary-name ROOT NAME OUT` prepares that account
 configuration from the same caller-verified deployment. It validates the
 complete input and renamed tables before creating a new private output
-root. `OUT/etc` contains passwd/group at 0644, shadow at 0600 and the
+root. `OUT/etc` contains passwd/group at 0644 and the
 unchanged principal reservations at 0444. Only the human account name,
 canonical `/home/NAME`, matching primary group name and exact
 supplementary-group member references change. Numeric identities,
@@ -1743,8 +1743,8 @@ optional `var/lib` or `var/lib/td` means no choice, while aliases, bad modes,
 wrong ownership and malformed content refuse without repair.
 
 A selected name is staged through the complete account-table admission above
-in a new private `/run/td-primary`. The provisioner binds its prepared passwd,
-group and shadow files over the corresponding deployment paths and remounts
+in a new private `/run/td-primary`. The provisioner binds its prepared passwd
+and group files over the corresponding deployment paths and remounts
 each read-only, nodev, nosuid and noexec. It checks inode identity and requires
 write-opens to fail specifically with EROFS, then re-admits the complete live
 account set and verifies the selected name. The principal reservation table

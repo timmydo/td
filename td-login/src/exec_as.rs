@@ -105,8 +105,8 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     // FORCED, as `login -f` is. What needs root is a switch that CHANGES
     // something, and `creds::may_switch` refuses that over all four uid
     // columns; `creds::apply` returns early when the credentials already
-    // match, which only root targeting root reaches, since `authorize` reads
-    // the root-only `/etc/shadow` first. THREAT-MODEL.md §3.
+    // match, so an account naming itself just runs the program as itself, and
+    // root targeting root stops at root's lock. THREAT-MODEL.md §3.
     let account = login::authorize(&opts.user, true)?;
     let groups = db::supplementary(&opts.user)?;
     let session = session_for(&account, &groups, opts, &session::inherited());

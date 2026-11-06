@@ -8523,7 +8523,7 @@ It recognizes only `/dev/snd/pcmC<card>D<device>p`, caps the scan at 64
 entries, and assigns those playback nodes mode 0600 to `audio`; capture,
 control and unknown nodes retain their existing ownership. The locked
 account remains refused by `td-login exec-as`. A separate exact
-`exec-service-as` path admits only the service-only shadow marker and is
+`exec-service-as` path admits only the service-only passwd marker and is
 the daemon unit's credential transition, rather than `su`, a passwordless
 account, or a general `User=` directive in td-svc. The unit requires seat
 setup. On every start, `td-seatd exec-audio` repeats the bounded playback
@@ -9299,7 +9299,7 @@ root-only privilege drop, and since L6 there is no `su`. Root-run
 boot-health probes, thirteen `/etc/bootsuccess` legs, the
 `TD-LOGIN-RUN-OK` one among them, and the network self-test drop to the
 primary account through `exec-primary`. Since L7 root has no login at
-all: its shadow field is `!`, which every td-login path refuses, and
+all: its password field is `!`, which every td-login path refuses, and
 neither SSH form admits root (`td-login/TOKEN-LOGIN.md`, "SSH"). Root
 runs only what td-svc and the image start as root.
 
@@ -9349,7 +9349,7 @@ build is left without an administrative path.
    changed, and fails any body using a shell construct it does not
    model, a nested shell among them unless it is handed exactly `-c`
    and a literal script that expands nothing and passes the same scan.
-2. **L7 locks root**; it has landed. Root's shadow field is `!`, which
+2. **L7 locks root**; it has landed. Root's password field is `!`, which
    every td-login path refuses, and neither SSH form admits root
    (`td-login/TOKEN-LOGIN.md`, "SSH"), so the forms differ only by
    `AllowUsers`. td-init's two console shells, the rescue shell PID 1

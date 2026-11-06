@@ -18,7 +18,7 @@ in the same landing.
 
 The release/source administrator (`td-update/ADMIN.md`) is a separate SSH
 principal, UID/GID 986, with a forced fixed-command interface and root-owned
-keys enrolled through one physical settings approval. It remains admitted in both SSH policy forms. Its shadow marker is
+keys enrolled through one physical settings approval. It remains admitted in both SSH policy forms. Its password-field marker is
 `td-admin-key-only`, an unsupported hash to td-login, not an empty password
 or service marker. OpenSSH uses public-key authentication alone; td-login
 cannot authenticate that marker. The build/download account UID/GID 985 uses the
@@ -44,8 +44,8 @@ Adversaries considered:
 - **A1 — an unprivileged local user** with a shell on the image (the
   auto-login user, or an SSH session), trying to gain uid 0 or another
   user's credentials.
-- **A2 — a hostile or corrupted account database**: `/etc/passwd`,
-  `/etc/group`, `/etc/shadow` with duplicate, malformed, or crafted
+- **A2 — a hostile or corrupted account database**: `/etc/passwd` and
+  `/etc/group` with duplicate, malformed, or crafted
   entries. The read-only EROFS deployment supplies the base tables. Before
   starting consumers, firstboot may publish a read-only account projection
   for the validated root-owned saved username; `td-install/INSTALLER.md`
@@ -140,7 +140,7 @@ asset tag names it, whoever set the SSH keys the VM was created with admits one.
 The boot-health login uses a fresh volatile key for the unprivileged UI account,
 but its root-owned authorization line is constrained by OpenSSH `restrict` and
 `from="127.0.0.1"`; possession of that key cannot create a network-reachable
-login. Root has no SSH login, and no other interactive one: its shadow
+login. Root has no SSH login, and no other interactive one: its password
 field is `!` (§3) and td-login is no administrative path (§4). The
 disposable, unenrolled QEMU volume is preseeded with a loopback-restricted
 root public key in the persistent authorization file and a root-only
@@ -285,8 +285,10 @@ td-login **does not verify password hashes** and does not prompt for a
 password. Turning off terminal echo needs `termios`/`ioctl`, which safe
 `std` does not reach and which would widen the `unsafe` surface for a
 capability no shipped td image uses. The policy is therefore fail-closed
-by construction — the shadow field is classified, and only one class
-authenticates:
+by construction — `/etc/passwd`'s password field is classified, and only
+one class authenticates. There is no `/etc/shadow`: td's accounts hold
+markers, never a secret, so nothing about them needs a root-only file, and
+OpenSSH is built `--without-shadow` so its lock check reads the same field:
 
 The `login -f` and `exec-as` columns below are the *forced* paths,
 which skip authentication because the caller has by then already
@@ -297,11 +299,14 @@ needed for is a switch that CHANGES something, and §4's
 `creds::may_switch` is what refuses one, over all four uid columns. A
 switch to the credentials the caller already holds takes `creds::apply`'s
 early return instead and starts a program with no privilege that caller
-lacked. Only root targeting root could reach that case: the forced path
-reads the root-only `/etc/shadow` before any switch, so `exec-as tester`
-or `exec-primary` run as tester fails there, and on a td image root's
-field is `!`, which the forced path refuses too (below). The forced path
-skips a password; it does not hand one out.
+lacked. So `exec-as tester` or `exec-primary` run as tester just runs the
+program as tester, which tester could have done, and non-root `login tester`
+or a service account's `exec-service-as` of itself likewise, while on a td
+image root's field is `!`, which the forced path refuses (below). Such a run
+works only if the caller's groups already match, resets its environment and
+directory as any session does, and tries the session-cgroup join first, which
+is the caller moving itself where the kernel lets it, a warning otherwise.
+The forced path skips a password; it does not hand one out.
 
 Ordinary `exec-as` shares `login -f`'s forced policy, and by construction
 rather than by coincidence: both human-session front ends, `login` and
@@ -311,7 +316,7 @@ holds them to by refusing any module but `db` and `login` to name
 `may_start_session` at all. So a locked or service-only account is refused on
 every one of them. `exec-service-as` reaches the same account lookup and the
 same credential switch, but a disjoint policy decision accepts only the exact
-`!td-service` shadow marker. It rejects an empty field, a hash and an ordinary
+`!td-service` marker. It rejects an empty field, a hash and an ordinary
 lock, so a unit cannot turn the service path into a second way to enter a
 human account.
 
@@ -321,7 +326,7 @@ accepts a name, UID, account-file path or environment override. They resolve
 the primary name through the shared `td-authd/src/primary_account.rs` reader:
 a root-owned, regular mode-0644 `/etc/passwd`, bounded canonical records,
 unique names and UIDs, UID/GID 1000 and its canonical named home. The normal
-front end then independently authorizes that name against shadow, resolves
+front end then independently authorizes that name's password field, resolves
 groups and enters the existing credential switch. Publication must precede
 sessions; concurrent privileged account-file rewriting is outside this model.
 These selectors neither authenticate nor grant authority: `login-primary`
@@ -349,11 +354,11 @@ outside its tests. The predicate adds no credential syscall or policy
 decision; the console refusal below adds a hand-back to root that reuses
 §6's identification and mode write in its own order.
 
-| `/etc/shadow` field | class        | interactive `login` | `login -f` | `exec-as` (forced) | `exec-service-as` |
+| `/etc/passwd` field | class        | interactive `login` | `login -f` | `exec-as` (forced) | `exec-service-as` |
 | ------------------- | ------------ | ------------------- | ---------- | ------------------ | ----------------- |
 | empty               | `NoPassword` | allowed             | allowed    | allowed            | denied            |
 | `!td-service`       | `Service`    | denied              | denied     | denied             | **allowed**       |
-| `!`, `!!`, `*`      | `Locked`     | denied              | **denied** | **denied**         | denied            |
+| `!`, `!!`, `*`, `x` | `Locked`     | denied              | **denied** | **denied**         | denied            |
 | anything else       | `Hashed`     | **denied**          | allowed    | allowed            | denied            |
 | no entry / no file  | —            | denied              | denied     | denied             | denied            |
 
@@ -404,10 +409,10 @@ Consequences worth stating plainly:
   entered through `exec-service-as` on live boots only. None can be entered
   through td-login's human forced modes or an interactive login.
 - **A class is a property of a name; the uid is what the kernel
-  enforces.** `classify` reads one account's shadow field, so
+  enforces.** `classify` reads one account's password field, so
   `!td-service` says that the NAME `audio` is refused by every human
   path. It says nothing about uid 994. A second passwd entry sharing
-  that uid carries its own shadow field and its own `/etc/group`
+  that uid carries its own password field and its own `/etc/group`
   membership. An empty field is `NoPassword`, which is admitted on
   EVERY path in the table above — interactive `login` included, where no
   caller has established anything and none is asked to. So the alias is
@@ -446,7 +451,7 @@ Consequences worth stating plainly:
   `passwordless: true`, so the console is trusted **by image
   configuration**, not by td-login. The interactive behavior is
   unchanged from the busybox chain this replaces, which also accepted
-  the empty shadow field without prompting. Root's field is `!`
+  the empty password field without prompting. Root's field is `!`
   (`APPLICATIONS.md` §L.1, L7): `Locked`, which every column above
   refuses, the forced paths included, and which
   `system_def_is_self_consistent` holds for uid 0. Root needs no session
@@ -499,7 +504,7 @@ any exit would be a reboot or a respawn loop. A signal still ends it:
 Ctrl-C or Ctrl-\ typed on the serial line, `SIGHUP` or `SIGTERM` ends
 td-login with a non-zero status, so the `&&` skips the reboot and td-svc
 respawns the greeter into the same gate. td ships no `su` (§4), root's
-shadow field is `!`, neither SSH form admits root (§1) and td-init
+password field is `!`, neither SSH form admits root (§1) and td-init
 starts no console shell (§3's stock bullet), all before any
 machine can enroll (TOKEN-LOGIN.md, "Enrollment requires §L.1
 elevation"). The
@@ -626,22 +631,22 @@ It follows that:
   column, and the kernel would refuse the syscalls anyway; the check
   exists so the failure is a named diagnostic rather than an `EPERM`
   from somewhere in the middle of a switch.
-- So no td-login front end is an administrative path: each is a
-  root-only privilege drop. td ships no `su`. `APPLICATIONS.md` §L.1's
+- So no td-login front end is an administrative path: each drops
+  privilege, and only root's use of one changes credentials. td ships no
+  `su`. `APPLICATIONS.md` §L.1's
   L6 deleted the applet, whose only callers were root-run boot-health
   probes, and moved them to `exec-primary` (§5, §8); a stale `/bin/su`
   link or `td-login su` reaches usage and exit 2, and the image's shape
   check refuses a packed `/bin/su`.
 - `exec-as`'s program and argument tail, which in a setuid program would
   be an escalation surface (choose the program root runs), are inert:
-  only root can reach the credential switch at all, and root can already
-  exec anything. Its grammar has no options and a mandatory `--`, so no
+  only root can change credentials, and root can already exec anything,
+  as an account naming itself can exec what it runs as itself. Its grammar has no options and a mandatory `--`, so no
   argument word is ever consumed as one.
 - A switch to the credentials already held is a no-op — `apply` returns
   early when the kernel's view already equals the target — so it attempts
-  no privilege change. Only root targeting a root it may enter reaches
-  it: a non-root caller's `exec-as` fails reading the root-only
-  `/etc/shadow` first, and a td image's locked root is refused (§3). The
+  no privilege change. An account naming itself reaches it and runs its
+  program as itself; a td image's locked root is refused (§3). The
   session-cgroup join is independently idempotent: a same-user invocation
   already in the leaf performs no write.
 
@@ -733,7 +738,7 @@ previous user's terminal.
 
 That `chown` is the sharpest edge in the program. A3 chooses what is on
 fd 0; a `login` that blindly chowns "whatever fd 0 is called" hands the
-target user ownership of any file the caller can open — `/etc/shadow`,
+target user ownership of any file the caller can open — `/etc/passwd`,
 a store path, a device node. td-login therefore validates before it
 chowns, and treats a failed validation as "do not chown" rather than
 "do not log in":
@@ -799,7 +804,7 @@ Against A2, the parsers fail closed rather than fail soft:
   before consumers start. Invalid retained state still stops boot and
   requires trusted recovery. Between "nobody logs in" and "the wrong person
   logs in", this program picks the first.
-- A duplicate user name in `/etc/passwd` or `/etc/shadow` is an error.
+- A duplicate user name in `/etc/passwd` is an error.
   Two entries for `root` with different uids is an ambiguity nothing
   downstream can resolve safely, and "first wins" versus "last wins" is
   exactly the kind of ordering assumption this document exists to
@@ -808,12 +813,12 @@ Against A2, the parsers fail closed rather than fail soft:
   absolute path with no `PATH` search, so a relative shell would
   resolve against the current directory.
 - uid and gid must parse as `u32`. No wrapping, no negative-as-huge.
-- A `/etc/shadow` record must carry **all nine** `shadow(5)` fields, not
-  merely the name and password the decision reads. The password field is
-  the *second* of nine and an empty one means `NoPassword`, so a record
+- A `/etc/passwd` record must carry **all seven** fields, not merely the
+  name and password the decision reads. The password field is the
+  *second* of seven and an empty one means `NoPassword`, so a record
   that loses its tail keeps a name and an empty secret: accepting a
   short line is how corruption of a **locked** account turns into an
-  account anybody may log into. `build_shadow` writes nine.
+  account anybody may log into.
 - A `/etc/group` line naming a user is only honoured if the group's gid
   parses; a malformed group file fails the lookup rather than silently
   granting a smaller set.
@@ -833,12 +838,11 @@ assert equality against `/proc/self/status`.
   check all four UID/GID columns, supplementary groups, cleared held
   capabilities, environment replacement and working directories.
   A nonroot forced login, foreign-UID primary exec, locked/service-only
-  shadow records, missing UID 1000 and duplicate UID aliases must refuse.
+  password fields, missing UID 1000 and duplicate UID aliases must refuse.
   Its guest holds an unenrolled root-owned mode-0700 `/var/lib/td/login`,
   so the console gate admits its root `login-primary`.
-  The foreign-UID case temporarily makes the disposable guest's shadow
-  readable to prove the credential gate itself refuses the switch. This
-  fixture is a host diagnostic supplied with the target td-login binary,
+  The foreign-UID case proves the credential gate itself refuses the
+  switch. This fixture is a host diagnostic supplied with the target td-login binary,
   not image content.
 - The boot exercises login's forced-session path through `login-primary`
   and credential health probes through `exec-primary`. Unit tests cover

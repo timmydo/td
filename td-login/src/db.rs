@@ -1,4 +1,6 @@
-//! The account database: `/etc/passwd`, `/etc/group`, `/etc/shadow`.
+//! The account database: `/etc/passwd` and `/etc/group`. There is no
+//! `/etc/shadow`: td keeps no secret in its accounts, only the marker
+//! `classify` reads, so nothing about them needs a root-only file.
 //!
 //! Parsing is fail-closed (THREAT-MODEL.md §7). A malformed line fails the whole
 //! lookup instead of being skipped — skipping is how a crafted entry shadows a
@@ -13,7 +15,6 @@ use std::fs;
 
 pub const PASSWD: &str = "/etc/passwd";
 pub const GROUP: &str = "/etc/group";
-pub const SHADOW: &str = "/etc/shadow";
 
 /// One `/etc/passwd` entry. `gecos` is carried because `login` has no use for it
 /// and dropping it would make the seven-field check look like six.
@@ -27,13 +28,13 @@ pub struct Account {
     pub shell: String,
 }
 
-/// What `/etc/shadow`'s password field says about an account. The classification
+/// What `/etc/passwd`'s password field says about an account. The classification
 /// IS the authentication policy; see `may_start_session`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Secret {
     /// Empty field: no password is required.
     NoPassword,
-    /// `!`, `!!`, `*`, or any `!`-prefixed hash — administratively locked.
+    /// `!`, `!!`, `*`, `x`, or any `!`-prefixed hash — administratively locked.
     Locked,
     /// Exact td image marker: locked for every human session and available
     /// only to the service-specific credential path.
@@ -59,7 +60,7 @@ pub enum Denied {
 
 /// The whole authentication decision, in one place.
 ///
-/// `forced` is `login -f` / a root-invoked `exec-as`: the CALLER has already
+/// `forced` is `login -f` / `exec-as`: the CALLER has already
 /// established the right to start this session, so no secret is consulted —
 /// except that a locked account stays locked (THREAT-MODEL.md §3).
 pub fn may_start_session(secret: Secret, forced: bool) -> Result<(), Denied> {
@@ -94,14 +95,16 @@ pub fn classify(field: &str) -> Secret {
     // `*` and anything `!`-prefixed are the two spellings shadow-utils, busybox
     // and util-linux all agree mean "cannot authenticate". `!` in front of an
     // otherwise valid hash is how `passwd -l` locks an account without losing it.
-    if field == "*" || field.starts_with('!') {
+    // `x` points at a shadow file td does not have, so it says nothing about the
+    // account and is not read as a hash the forced paths would admit.
+    if field == "*" || field == "x" || field.starts_with('!') {
         return Secret::Locked;
     }
     Secret::Hashed
 }
 
 /// Read a database file. A missing file is an error, not an empty database:
-/// "no /etc/shadow" must not read as "no account has a password".
+/// "no /etc/passwd" must not read as "no account has a password".
 fn read(path: &str) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))
 }
@@ -149,7 +152,7 @@ pub fn account_in(text: &str, path: &str, want: &str) -> Result<Account, String>
     // Every OTHER entry's uid, so an alias can be refused below. `Secret` is a
     // property of a NAME; the uid is what the kernel enforces. A second name
     // for one uid is a second account policy for ONE kernel identity — its own
-    // shadow field, its own group list — and whichever name a caller happened
+    // password field, its own group list — and whichever name a caller happened
     // to ask for would decide which policy applied.
     let mut aliases: Vec<(u32, usize, &str)> = Vec::new();
     for (lineno, line) in entries(text) {
@@ -244,12 +247,10 @@ pub fn supplementary(user: &str) -> Result<Vec<u32>, String> {
     supplementary_in(&read(GROUP)?, GROUP, user)
 }
 
-/// `shadow(5)`: name, password, last change, min, max, warn, inactive, expire,
-/// reserved. `build_shadow` writes all nine.
-const SHADOW_FIELDS: usize = 9;
+/// `passwd(5)`: name, password, uid, gid, gecos, home, shell.
+const PASSWD_FIELDS: usize = 7;
 
-/// The shadow entry for one account. A missing entry is an error, so an account
-/// present in `/etc/passwd` but absent from `/etc/shadow` cannot log in.
+/// The password field of one account. A missing entry is an error.
 pub fn secret_in(text: &str, path: &str, user: &str) -> Result<Secret, String> {
     let mut hit: Option<Secret> = None;
     for (lineno, line) in entries(text) {
@@ -257,9 +258,8 @@ pub fn secret_in(text: &str, path: &str, user: &str) -> Result<Secret, String> {
         // Accepting a SHORT line is how corruption becomes authentication: a
         // truncated `root:` has an empty password field, and an empty password
         // field means NoPassword — so losing the tail of a LOCKED account's
-        // entry would turn it into one anybody may log into. td writes exactly
-        // nine fields (shadow(5)); anything else is not this file.
-        let f = fields(line, SHADOW_FIELDS, path, lineno)?;
+        // entry would turn it into one anybody may log into.
+        let f = fields(line, PASSWD_FIELDS, path, lineno)?;
         let (Some(name), Some(field)) = (f.first(), f.get(1)) else {
             return Err(format!("{path}:{lineno}: expected at least name:password"));
         };
@@ -278,7 +278,7 @@ pub fn secret_in(text: &str, path: &str, user: &str) -> Result<Secret, String> {
 }
 
 pub fn secret(user: &str) -> Result<Secret, String> {
-    secret_in(&read(SHADOW)?, SHADOW, user)
+    secret_in(&read(PASSWD)?, PASSWD, user)
 }
 
 #[cfg(test)]
@@ -287,10 +287,9 @@ mod tests {
     use super::*;
 
     /// What `system-x86-64` generates today, verbatim in shape.
-    const PW: &str = "root:x:0:0:root:/root:/bin/sh\n\
-                      tester:x:1000:1000:Test User:/home/tester:/bin/sh\n";
+    const PW: &str = "root:!:0:0:root:/root:/bin/sh\n\
+                      tester::1000:1000:Test User:/home/tester:/bin/sh\n";
     const GR: &str = "root:x:0:\ntester:x:1000:\nwheel:x:10:tester\ntty:x:5:\n";
-    const SH: &str = "root:!:19000:0:99999:7:::\ntester::19000:0:99999:7:::\n";
 
     #[test]
     fn the_shipped_database_resolves() {
@@ -305,26 +304,26 @@ mod tests {
             supplementary_in(GR, GROUP, "root").unwrap(),
             Vec::<u32>::new()
         );
-        assert_eq!(secret_in(SH, SHADOW, "tester").unwrap(), Secret::NoPassword);
-        assert_eq!(secret_in(SH, SHADOW, "root").unwrap(), Secret::Locked);
+        assert_eq!(secret_in(PW, PASSWD, "tester").unwrap(), Secret::NoPassword);
+        assert_eq!(secret_in(PW, PASSWD, "root").unwrap(), Secret::Locked);
     }
 
-    /// A TRUNCATED shadow record must not read as "no password". This is the
-    /// direction corruption runs in: the password field is the SECOND of nine,
+    /// A TRUNCATED record must not read as "no password". This is the
+    /// direction corruption runs in: the password field is the SECOND of seven,
     /// so a line that loses its tail keeps a name and an empty secret — and an
     /// empty secret is the one class interactive `login` lets through. A locked
     /// account whose entry got shortened would become one anybody may log into.
     #[test]
-    fn a_truncated_shadow_record_is_refused_rather_than_read_as_passwordless() {
+    fn a_truncated_record_is_refused_rather_than_read_as_passwordless() {
         for truncated in [
             "tester:",
             "tester::",
-            "tester::19000",
-            "tester::19000:0:99999:7::",
-            "tester:!:19000:0:99999:7::::extra",
+            "tester::1000",
+            "tester::1000:1000:Test User:/home/tester",
+            "tester:!:1000:1000:Test User:/home/tester:/bin/sh:extra",
         ] {
-            let text = format!("root:!:19000:0:99999:7:::\n{truncated}\n");
-            let err = secret_in(&text, SHADOW, "tester").unwrap_err();
+            let text = format!("root:!:0:0:root:/root:/bin/sh\n{truncated}\n");
+            let err = secret_in(&text, PASSWD, "tester").unwrap_err();
             assert!(
                 err.contains("colon-separated fields"),
                 "{truncated:?} must be refused as malformed, got: {err}"
@@ -333,14 +332,14 @@ mod tests {
         // The refusal is for the whole LOOKUP, not just the bad line: a
         // malformed entry anywhere means this is not a file to authenticate
         // against, whoever is being looked up.
-        let text = format!("{SH}broken:\n");
-        assert!(secret_in(&text, SHADOW, "root").is_err());
+        let text = format!("{PW}broken:\n");
+        assert!(secret_in(&text, PASSWD, "root").is_err());
     }
 
     #[test]
     fn an_unknown_user_is_an_error_not_an_empty_account() {
         assert!(account_in(PW, PASSWD, "nobody").is_err());
-        assert!(secret_in(SH, SHADOW, "nobody").is_err());
+        assert!(secret_in(PW, PASSWD, "nobody").is_err());
         // ...but an unknown user simply belongs to no groups.
         assert_eq!(
             supplementary_in(GR, GROUP, "nobody").unwrap(),
@@ -348,7 +347,7 @@ mod tests {
         );
     }
 
-    /// The duplicate-entry refusal, both files. "First wins" and "last wins" are
+    /// The duplicate-entry refusal, both lookups. "First wins" and "last wins" are
     /// each a defensible convention and each one an attacker's choice of which
     /// entry to append.
     #[test]
@@ -356,8 +355,7 @@ mod tests {
         let doubled = format!("{PW}tester:x:0:0::/root:/bin/sh\n");
         let err = account_in(&doubled, PASSWD, "tester").unwrap_err();
         assert!(err.contains("more than once"), "{err}");
-        let doubled = format!("{SH}tester::19000:0:99999:7:::\n");
-        assert!(secret_in(&doubled, SHADOW, "tester").is_err());
+        assert!(secret_in(&doubled, PASSWD, "tester").is_err());
         // A duplicate of a DIFFERENT user is still not this user's problem.
         let other = format!("{PW}root:x:0:0::/root:/bin/sh\n");
         assert!(account_in(&other, PASSWD, "tester").is_ok());
@@ -366,7 +364,7 @@ mod tests {
 
     /// A uid two names can speak for resolves to neither.
     ///
-    /// `Secret` is a property of a NAME — `classify` reads one shadow field —
+    /// `Secret` is a property of a NAME — `classify` reads one password field —
     /// while the uid is what the kernel enforces. So an alias is not a second
     /// way to spell one account; it is a second account policy for one kernel
     /// identity, and the caller picks which one applies by picking a name.
@@ -392,13 +390,13 @@ mod tests {
     /// `!td-service` is refused by `login`, `login -f` and ordinary
     /// `exec-as`, which is what makes `exec-service-as` the only door. But the
     /// class hangs on the NAME `audio`. An alias sharing 994 carries its own
-    /// shadow field, and an empty one is `NoPassword`, which every forced
+    /// password field, and an empty one is `NoPassword`, which every forced
     /// caller may start — so without the refusal above, ordinary `exec-as`
     /// walks straight past the class to the uid it protects.
     #[test]
     fn the_service_class_is_reached_by_a_uid_no_other_name_claims() {
-        let text = "root:x:0:0:root:/root:/bin/sh\n\
-                    audio:x:994:994:System Audio:/run/td-audio:/bin/false\n";
+        let text = "root:!:0:0:root:/root:/bin/sh\n\
+                    audio:!td-service:994:994:System Audio:/run/td-audio:/bin/false\n";
         // The class does its own job: no forced path admits it.
         assert_eq!(
             may_start_session(classify("!td-service"), true),
@@ -407,7 +405,7 @@ mod tests {
         assert!(account_in(text, PASSWD, "audio").is_ok());
 
         // Now alias the uid with an account the class never sees.
-        let aliased = format!("{text}evil:x:994:994:Evil:/run/td-audio:/bin/sh\n");
+        let aliased = format!("{text}evil::994:994:Evil:/run/td-audio:/bin/sh\n");
         assert_eq!(may_start_session(classify(""), true), Ok(()));
         for name in ["audio", "evil"] {
             assert!(
@@ -467,7 +465,7 @@ mod tests {
         assert_eq!(classify("!$6$salt$hash"), Secret::Locked);
         assert_eq!(classify("!td-service"), Secret::Service);
         assert_eq!(classify("$6$salt$hash"), Secret::Hashed);
-        assert_eq!(classify("x"), Secret::Hashed);
+        assert_eq!(classify("x"), Secret::Locked);
     }
 
     /// The policy table of THREAT-MODEL.md §3, asserted as a table. The row that

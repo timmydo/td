@@ -144,8 +144,8 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 // /usr and no /sbin. Generated system config lives under immutable /etc; the other
 // non-store root entries are mountpoints plus /home and /root links into /var.
 
-/// One account materialised into `/etc/passwd`, `/etc/group`, `/etc/shadow`, and a
-/// home directory. `passwordless` writes an EMPTY shadow password — convenient for
+/// One account materialised into `/etc/passwd`, `/etc/group`, and a home
+/// directory. `passwordless` writes an EMPTY password field — convenient for
 /// a throwaway VM (the auto-login path bypasses auth anyway). With both account
 /// class flags false the password is ordinarily locked; `service_only` selects
 /// td-login's distinct non-human service marker instead.
@@ -163,7 +163,7 @@ struct User {
     /// `build_group` first, then it may be named here.
     groups: &'static [&'static str],
     passwordless: bool,
-    /// Mark this account with td-login's exact service-only shadow class.
+    /// Mark this account with td-login's exact service-only class.
     /// Such an account is refused by login, login -f and ordinary exec-as;
     /// only exec-service-as may enter it.
     service_only: bool,
@@ -450,7 +450,7 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
     },
 ];
 
-/// Account names are written into the colon-separated /etc/{passwd,group,shadow}
+/// Account names are written into the colon-separated /etc/{passwd,group}
 /// this recipe generates, where one carrying `:` would silently restructure the
 /// account database. Generated root shell reaches the human account through
 /// `exec-primary` and the quoted `$health_user` it reports, never by a name
@@ -1272,18 +1272,24 @@ fn build_passwd(sys: &SystemDef) -> String {
     let mut s = String::new();
     for u in sys.users {
         s.push_str(&format!(
-            "{}:x:{}:{}:{}:{}:{}\n",
-            u.name, u.uid, u.gid, u.gecos, u.home, u.shell
+            "{}:{}:{}:{}:{}:{}:{}\n",
+            u.name,
+            password_field(u),
+            u.uid,
+            u.gid,
+            u.gecos,
+            u.home,
+            u.shell
         ));
     }
     for application in sys.applications {
         let uid = application.external_uid;
         s.push_str(&format!(
-            "tda{uid}:x:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n"
+            "tda{uid}:!td-service:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n"
         ));
     }
     s.push_str(&format!(
-        "{SSHD_PRIVSEP_USER}:x:{SSHD_PRIVSEP_UID}:{SSHD_PRIVSEP_GID}:OpenSSH privilege separation:{SSHD_PRIVSEP_PATH}:/bin/false\n"
+        "{SSHD_PRIVSEP_USER}:!:{SSHD_PRIVSEP_UID}:{SSHD_PRIVSEP_GID}:OpenSSH privilege separation:{SSHD_PRIVSEP_PATH}:/bin/false\n"
     ));
     s
 }
@@ -1333,7 +1339,7 @@ fn gets_generic_persistent_home_setup(user: &User) -> bool {
 }
 
 /// Root's generated record, which the autotest health leg requires whole.
-const ROOT_SHADOW_LINE: &str = "root:!:19000:0:99999:7:::";
+const ROOT_PASSWD_LINE: &str = "root:!:0:0:root:/root:/bin/sh";
 
 /// td-svc's `SENTINEL_UID`, which the autotest health leg reads back off the
 /// process the kernel's `cad_pid` names (td-svc/DESIGN.md §9).
@@ -1354,31 +1360,20 @@ fn netd_credentials() -> String {
     )
 }
 
-fn build_shadow(sys: &SystemDef) -> String {
-    let mut s = String::new();
-    for u in sys.users {
-        // Empty password field => no password. `!` is an ordinary lock, while
-        // the exact td marker is denied by every human path and admitted only
-        // by exec-service-as. A fixed last-change day keeps this reproducible.
-        let pw = if u.uid == ADMIN_ACCOUNT.uid {
-            "td-admin-key-only"
-        } else if u.service_only {
-            "!td-service"
-        } else if u.passwordless {
-            ""
-        } else {
-            "!"
-        };
-        s.push_str(&format!("{}:{}:19000:0:99999:7:::\n", u.name, pw));
+/// What td-login classifies, and all td keeps for an account: no account has a
+/// secret to protect, so there is no `/etc/shadow`. Empty means no password. `!`
+/// is an ordinary lock, while the exact td marker is denied by every human path
+/// and admitted only by exec-service-as.
+fn password_field(u: &User) -> &'static str {
+    if u.uid == ADMIN_ACCOUNT.uid {
+        "td-admin-key-only"
+    } else if u.service_only {
+        "!td-service"
+    } else if u.passwordless {
+        ""
+    } else {
+        "!"
     }
-    for application in sys.applications {
-        s.push_str(&format!(
-            "tda{}:!td-service:19000:0:99999:7:::\n",
-            application.external_uid
-        ));
-    }
-    s.push_str(&format!("{SSHD_PRIVSEP_USER}:!:19000:0:99999:7:::\n"));
-    s
 }
 
 fn build_inittab() -> String {
@@ -1474,7 +1469,6 @@ const SETUP_MIN_HEIGHT: u16 = 480;
 const TERMINFO_ENTRY: &str = "{root}/real-root{in:td-term-terminfo}/share/terminfo/t/td-term";
 
 pub(super) const ROOTCHECK_ETC_NAME: &str = "rootcheck";
-pub(super) const SHADOW_ETC_NAME: &str = "shadow";
 
 /// `TD_SVC_CONF` as `etc_files` names it: relative to /etc, since that is the directory
 /// it writes into. Derived rather than repeated — see TD_SVC_CONF for what a divergence
@@ -3282,7 +3276,7 @@ fn td_login_probe(sys: &SystemDef) -> String {
 /// `exec-primary`.
 ///
 /// It has to: `exec-as` changes credentials, so a copy running as the unprivileged user
-/// would fail `setgroups(2)` with EPERM and prove nothing about the applet. That is also
+/// would change nothing and prove nothing about the applet. That is also
 /// why it cannot join `td_login_probe` above — the two legs need different privilege.
 ///
 /// What it exercises is the whole path a supervisor unit will take, end to end and on the
@@ -3732,8 +3726,8 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          /bin/chmod 0644 /run/td-ssh-known-hosts || fail\n\
          if [ \"$refusal_fixture\" = 1 ]; then \
          /bin/td-util test -f {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} || fail; \
-         /bin/grep -q -x -F '{ROOT_SHADOW_LINE}' /etc/shadow || \
-         {{ echo \"td-login: root's shadow field is not locked\"; fail; }}; \
+         /bin/grep -q -x -F '{ROOT_PASSWD_LINE}' /etc/passwd || \
+         {{ echo \"td-login: root's password field is not locked\"; fail; }}; \
          rootssh=$(/bin/ssh -F /dev/null -v -i {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} \
          -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
          -o UserKnownHostsFile=/run/td-ssh-known-hosts \
@@ -4418,9 +4412,9 @@ fn build_mutable_state() -> String {
          # and there is deliberately NO /etc overlay: each line below is one reviewed\n\
          # symlink out of it, so the set of mutable files is a fixed, auditable list\n\
          # rather than a whole writable directory.\n\
-         # passwd, group and shadow may instead be read-only account projections\n\
+         # passwd and group may instead be read-only account projections\n\
          # prepared by td-firstboot from signed base tables and the saved username.\n\
-         # Those three file binds preserve numeric identities and authentication fields.\n\
+         # Those two file binds preserve numeric identities and authentication fields.\n\
          # os-release may be a read-only bind that adds an assembled deployment's commit.\n\
          #\n\
          # volatile  = /run tmpfs, rebuilt every boot by td-netd\n\
@@ -4743,7 +4737,6 @@ fn etc_files(sys: &SystemDef) -> Result<Vec<(&'static str, String, bool)>, Strin
             false,
         ),
         ("group", build_group(sys), false),
-        (SHADOW_ETC_NAME, build_shadow(sys), false),
         ("hostname-default", format!("{}\n", sys.hostname), false),
         ("os-release", build_os_release(sys), false),
         (
@@ -4794,7 +4787,6 @@ fn server_etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
             false,
         ),
         ("group", build_group(sys), false),
-        (SHADOW_ETC_NAME, build_shadow(sys), false),
         ("hostname-default", format!("{}\n", sys.hostname), false),
         ("os-release", build_os_release(sys), false),
         ("ssh/ssh_config", build_ssh_config(), false),
@@ -6221,7 +6213,6 @@ fn shape_etc_files(sys: &SystemDef) -> Vec<&'static str> {
         vec![
             "passwd",
             "group",
-            "shadow",
             "hostname-default",
             "os-release",
             application_etc_name(BUS_APPLICATION_POLICY),
@@ -6243,7 +6234,6 @@ fn shape_etc_files(sys: &SystemDef) -> Vec<&'static str> {
         vec![
             "passwd",
             "group",
-            "shadow",
             "hostname-default",
             "os-release",
             "mutable-state",
@@ -6440,8 +6430,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
     });
 
     // 1) Stage the real-root tree in build scratch. WriteFile exposes a fixed
-    //    mode, so set the shadow-file mode explicitly before packing. Every
-    //    staged copy is made writable by its owner, so the td-term terminfo
+    //    mode. Every staged copy is made writable by its owner, so the td-term terminfo
     //    entry goes back to 0444, the mode td-jail's terminal grant admits
     //    the file it binds at; the packer keeps modes as staged.
     let root_steps = match real_root_steps(sys) {
@@ -6464,7 +6453,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 POST_RUST_SH,
                 "-c",
                 &format!(
-                    "chmod 0755 '{{root}}/real-root' && chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}'{read_only_tables}"
+                    "chmod 0755 '{{root}}/real-root' && chmod 0444 '{TERMINFO_ENTRY}'{read_only_tables}"
                 ),
             ],
         )
@@ -7069,16 +7058,17 @@ mod tests {
     /// refuses before any key; only the primary keeps an empty field.
     #[test]
     fn root_is_locked_and_only_the_primary_is_passwordless() {
-        let shadow = build_shadow(&SYSTEM);
-        let root: Vec<&str> = shadow
+        let passwd = build_passwd(&SYSTEM);
+        let root: Vec<&str> = passwd
             .lines()
             .filter(|line| line.starts_with("root:"))
             .collect();
-        assert_eq!(root, [ROOT_SHADOW_LINE]);
-        let empty: Vec<&str> = shadow
+        assert_eq!(root, [ROOT_PASSWD_LINE]);
+        let empty: Vec<&str> = passwd
             .lines()
-            .filter_map(|line| line.strip_suffix(":19000:0:99999:7:::"))
-            .filter_map(|line| line.strip_suffix(':'))
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(_, rest)| rest.starts_with(':'))
+            .map(|(name, _)| name)
             .collect();
         assert_eq!(empty, [SYSTEM.autologin]);
     }
@@ -7095,12 +7085,11 @@ mod tests {
              interactive SystemDef user"
         );
         assert!(build_passwd(&SYSTEM).contains(&format!(
-            "{SSHD_PRIVSEP_USER}:x:{SSHD_PRIVSEP_UID}:{SSHD_PRIVSEP_GID}:OpenSSH privilege separation:{SSHD_PRIVSEP_PATH}:/bin/false\n"
+            "{SSHD_PRIVSEP_USER}:!:{SSHD_PRIVSEP_UID}:{SSHD_PRIVSEP_GID}:OpenSSH privilege separation:{SSHD_PRIVSEP_PATH}:/bin/false\n"
         )));
         assert!(
             build_group(&SYSTEM).contains(&format!("{SSHD_PRIVSEP_USER}:x:{SSHD_PRIVSEP_GID}:\n"))
         );
-        assert!(build_shadow(&SYSTEM).contains(&format!("{SSHD_PRIVSEP_USER}:!:")));
 
         let rootcheck = build_rootcheck(&SYSTEM);
         for required in [
@@ -7141,10 +7130,9 @@ mod tests {
             (AUDIO_UID, AUDIO_GID, false, true)
         );
         assert!(build_passwd(&SYSTEM).contains(&format!(
-            "{AUDIO_USER}:x:{AUDIO_UID}:{AUDIO_GID}:System Audio:{AUDIO_RUNTIME}:/bin/false\n"
+            "{AUDIO_USER}:!td-service:{AUDIO_UID}:{AUDIO_GID}:System Audio:{AUDIO_RUNTIME}:/bin/false\n"
         )));
         assert!(build_group(&SYSTEM).contains(&format!("{AUDIO_USER}:x:{AUDIO_GID}:\n")));
-        assert!(build_shadow(&SYSTEM).contains(&format!("{AUDIO_USER}:!td-service:")));
         let init = build_deployment_init(&SYSTEM);
         let rootcheck = build_rootcheck(&SYSTEM);
         assert!(!init.contains("/sysroot/var/run/td-audio"));
@@ -7205,7 +7193,7 @@ mod tests {
             build_group(&SYSTEM).contains(&format!("profiler-read:x:{PROFILER_READ_GID}:\n")),
             "the reader group must exist without enrolling an interactive account"
         );
-        assert!(build_shadow(&SYSTEM).contains("profiler:!:"));
+        assert!(build_passwd(&SYSTEM).contains("profiler:!:"));
 
         let init = build_deployment_init(&SYSTEM);
         for required in [
@@ -10342,6 +10330,36 @@ mod tests {
         )));
     }
 
+    /// No account table of td's names a shadow file, and the server that would
+    /// read one is built not to.
+    #[test]
+    fn there_is_no_shadow_file_and_openssh_reads_the_same_field() {
+        for sys in [&SYSTEM, &SERVER] {
+            let etc = etc_files(sys).unwrap();
+            assert!(
+                etc.iter().all(|(name, _, _)| *name != "shadow"),
+                "{}",
+                sys.stem
+            );
+            assert!(!shape_etc_files(sys).contains(&"shadow"), "{}", sys.stem);
+            // Every class td-login tells apart, in the field sshd's lock check reads.
+            let passwd = build_passwd(sys);
+            let field = |name: &str| {
+                passwd
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&format!("{name}:")))
+                    .and_then(|rest| rest.split(':').next())
+                    .map(str::to_string)
+            };
+            assert_eq!(field("root").as_deref(), Some("!"));
+            assert_eq!(field(UI_USER).as_deref(), Some(""));
+            assert_eq!(field(SSHD_PRIVSEP_USER).as_deref(), Some("!"));
+            assert_eq!(field("td-netd").as_deref(), Some("!td-service"));
+            assert!(passwd.lines().all(|line| !line.contains(":x:")));
+        }
+        assert!(include_str!("openssh-x86-64.rs").contains("\"--without-shadow\","));
+    }
+
     /// The two workers' uids are their crates' own, and the health leg that
     /// reads the sentinel's back is on both profiles.
     #[test]
@@ -10553,14 +10571,14 @@ mod tests {
         // `-f` skips the account database entirely (td-login/THREAT-MODEL.md section 3). So a
         // `passwordless: false` auto-login user is an image that boots to a getty respawn
         // loop and never reaches a greeter, with the oracle able to report only a timeout.
-        // `build_shadow` writes `!` for such a user, which is exactly what td-login locks on.
+        // `password_field` writes `!` for such a user, which is exactly what td-login locks on.
         assert!(
             SYSTEM
                 .users
                 .iter()
                 .find(|user| user.name == SYSTEM.autologin)
                 .is_some_and(|user| user.passwordless),
-            "autologin user '{}' must be passwordless: build_shadow writes `!` otherwise, and \
+            "autologin user '{}' must be passwordless: password_field writes `!` otherwise, and \
              td-login denies a locked account even under `login -f`",
             SYSTEM.autologin
         );
@@ -10570,11 +10588,11 @@ mod tests {
                 "user '{}' cannot be both passwordless and service-only",
                 u.name
             );
-            // APPLICATIONS.md §L.1, L7: root's shadow field is `!`, which every
+            // APPLICATIONS.md §L.1, L7: root's password field is `!`, which every
             // td-login path and sshd refuse; root login is never re-enabled.
             assert!(
                 !(u.uid == 0 && (u.passwordless || u.service_only)),
-                "uid 0 ('{}') must stay locked: its shadow field is `!`",
+                "uid 0 ('{}') must stay locked: its password field is `!`",
                 u.name
             );
             if u.service_only {
@@ -10597,7 +10615,7 @@ mod tests {
             assert!(
                 valid_account_name(u.name),
                 "user name '{}' must be a plain [A-Za-z0-9._-] name of at most 32 bytes: it \
-                 is written into the colon-separated /etc/{{passwd,group,shadow}} this \
+                 is written into the colon-separated /etc/{{passwd,group}} this \
                  recipe generates",
                 u.name
             );
@@ -12536,8 +12554,8 @@ mod tests {
             "/bin/td-util test -f {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} || fail"
         ));
         let locked = at(&format!(
-            "/bin/grep -q -x -F '{ROOT_SHADOW_LINE}' /etc/shadow || \
-             {{ echo \"td-login: root's shadow field is not locked\"; fail; }}"
+            "/bin/grep -q -x -F '{ROOT_PASSWD_LINE}' /etc/passwd || \
+             {{ echo \"td-login: root's password field is not locked\"; fail; }}"
         ));
         let verbose = at(&format!(
             "/bin/ssh -F /dev/null -v -i {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} "
@@ -17081,11 +17099,8 @@ mod principal_tests {
         let registry = principal_schema::Registry::parse(&build_principals(&SYSTEM)).unwrap();
         let passwd = build_passwd(&SYSTEM);
         let group = build_group(&SYSTEM);
-        let shadow = build_shadow(&SYSTEM);
         for name in [UI_USER, "alice", "user_2"] {
-            registry
-                .check_primary_name(&passwd, &group, &shadow, name)
-                .unwrap();
+            registry.check_primary_name(&passwd, &group, name).unwrap();
         }
         for name in [
             "root",
@@ -17099,9 +17114,7 @@ mod principal_tests {
             "tda65536",
         ] {
             assert!(
-                registry
-                    .check_primary_name(&passwd, &group, &shadow, name)
-                    .is_err(),
+                registry.check_primary_name(&passwd, &group, name).is_err(),
                 "accepted {name}"
             );
         }
@@ -17111,11 +17124,7 @@ mod principal_tests {
     fn deployment_principals_parse_and_cannot_alias_system_credentials() {
         let registry = principal_schema::Registry::parse(&build_principals(&SYSTEM)).unwrap();
         registry
-            .verify_accounts(
-                &build_passwd(&SYSTEM),
-                &build_group(&SYSTEM),
-                &build_shadow(&SYSTEM),
-            )
+            .verify_accounts(&build_passwd(&SYSTEM), &build_group(&SYSTEM))
             .unwrap();
         let session = registry.session(UI_UID).unwrap();
         assert_eq!(
@@ -17125,11 +17134,9 @@ mod principal_tests {
         for (name, uid) in [("firefox", 65536), ("mail", 65537), ("news", 65538)] {
             assert_eq!(registry.application(UI_UID, name).unwrap().uid, uid);
             assert!(build_passwd(&SYSTEM).contains(&format!(
-                "tda{uid}:x:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n"
+                "tda{uid}:!td-service:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n"
             )));
             assert!(build_group(&SYSTEM).contains(&format!("tda{uid}:x:{uid}:\n")));
-            assert!(build_shadow(&SYSTEM)
-                .contains(&format!("tda{uid}:!td-service:19000:0:99999:7:::\n")));
         }
         // Claude Code shipped as 65539 until it left td. An install enrolled
         // then keeps that reservation in its ledger: the union still enrolls
@@ -17145,11 +17152,7 @@ mod principal_tests {
         let retained = prior.enroll(&registry).unwrap();
         assert_eq!(retained.application(UI_UID, "claude").unwrap().uid, 65539);
         retained
-            .verify_accounts(
-                &build_passwd(&SYSTEM),
-                &build_group(&SYSTEM),
-                &build_shadow(&SYSTEM),
-            )
+            .verify_accounts(&build_passwd(&SYSTEM), &build_group(&SYSTEM))
             .unwrap();
         assert!(build_td_svc_conf(&SYSTEM).contains("--application-primary --enroll-principals\n"));
         assert!(etc_files(&SYSTEM)
@@ -17523,11 +17526,7 @@ mod server_tests {
         // notebook row for an account the server does not ship.
         let registry = principal_schema::Registry::parse(&build_principals(&SERVER)).unwrap();
         registry
-            .verify_accounts(
-                &build_passwd(&SERVER),
-                &build_group(&SERVER),
-                &build_shadow(&SERVER),
-            )
+            .verify_accounts(&build_passwd(&SERVER), &build_group(&SERVER))
             .unwrap();
         assert_eq!(registry.notebooks().count(), 0);
         let desktop = principal_schema::Registry::parse(&build_principals(&SYSTEM)).unwrap();
@@ -17542,7 +17541,7 @@ mod server_tests {
             .unwrap();
         assert_eq!(primary.uid, UI_UID);
         assert!(passwd.contains(&format!("{SSHD_PRIVSEP_USER}:")));
-        assert!(build_shadow(&SERVER).contains(ROOT_SHADOW_LINE));
+        assert!(build_passwd(&SERVER).contains(ROOT_PASSWD_LINE));
     }
 
     /// A server's one SSH policy render also admits the provisioned keys;

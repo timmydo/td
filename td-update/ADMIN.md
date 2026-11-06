@@ -51,7 +51,7 @@ and do not change its recorded reboot choice. A lost submission reply is
 resolved with `status`, not an assumed failure.
 
 The dedicated account is UID/GID 986, home `/var/lib/td-admin`, shell
-`/bin/td-admin`. Its non-password shadow marker cannot authenticate through
+`/bin/td-admin`. Its non-password marker in `/etc/passwd` cannot authenticate through
 td-login. OpenSSH accepts only Ed25519 public-key authentication, from the
 root-owned `/var/lib/td-admin/authorized_keys`. Its Match block forces
 `/bin/td-admin ssh`, disables PTYs and inherits disabled forwarding and user

@@ -153,12 +153,12 @@ pub(crate) fn prepare(root: &Path) -> Result<String, String> {
             .map_err(|error| format!("primary account runtime: {error}"))?;
         let staged = root.join("run/td-primary");
         principals::stage_primary_name(root, &name, &staged)?;
-        for leaf in ["passwd", "group", "shadow"] {
+        for leaf in ["passwd", "group"] {
             publish(&staged.join("etc").join(leaf), &root.join("etc").join(leaf))
                 .map_err(|error| format!("publish primary {leaf}: {error}"))?;
         }
     }
-    for leaf in ["passwd", "group", "shadow"] {
+    for leaf in ["passwd", "group"] {
         read_only(&root.join("etc").join(leaf))
             .map_err(|error| format!("primary {leaf}: {error}"))?;
     }

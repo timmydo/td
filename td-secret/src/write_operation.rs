@@ -384,11 +384,10 @@ mod tests {
             ("td-principals.tsv", table, 0o444),
             (
                 "passwd",
-                "tester:x:1000:1000::/home/tester:/bin/false\n",
+                "tester::1000:1000::/home/tester:/bin/false\n",
                 0o644,
             ),
             ("group", "tester:x:1000:\n", 0o644),
-            ("shadow", "tester::0:0:99999:7:::\n", 0o600),
         ] {
             let path = format!("/etc/{name}");
             fs::write(&path, text).unwrap();
@@ -426,20 +425,15 @@ mod tests {
             .open("/etc/passwd")
             .unwrap();
         passwd
-            .write_all(b"tda65537:x:65537:65537::/var/lib/td/applications/65537:/bin/false\n")
+            .write_all(
+                b"tda65537:!td-service:65537:65537::/var/lib/td/applications/65537:/bin/false\n",
+            )
             .unwrap();
         let mut group = fs::OpenOptions::new()
             .append(true)
             .open("/etc/group")
             .unwrap();
         group.write_all(b"tda65537:x:65537:\n").unwrap();
-        let mut shadow = fs::OpenOptions::new()
-            .append(true)
-            .open("/etc/shadow")
-            .unwrap();
-        shadow
-            .write_all(b"tda65537:!td-service:0:0:99999:7:::\n")
-            .unwrap();
         policy.verify_installed_accounts(&policy).unwrap();
         assert!(description(
             &request(Role::Primary).encode(),

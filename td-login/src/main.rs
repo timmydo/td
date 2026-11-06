@@ -83,7 +83,7 @@ const VERIFY: &str = "verify-credentials";
 /// name a person could mistake for a general-purpose "run this as anyone" tool,
 /// which is worth not hanging in `/bin`.
 const EXEC_AS: &str = "exec-as";
-/// A service identity is marked separately in `/etc/shadow`; this exact
+/// A service identity is marked in its `/etc/passwd` password field; this exact
 /// subcommand is the only front end that admits that class.
 const EXEC_SERVICE_AS: &str = "exec-service-as";
 /// Literal execution as the validated primary human; no new applet.
@@ -453,7 +453,7 @@ mod tests {
 
     fn alice() -> Result<primary_account::PrimaryAccount, String> {
         primary_account::parse(
-            "root:x:0:0:Root:/root:/bin/sh\nalice:x:1000:1000:Alice:/home/alice:/bin/sh\n",
+            "root:!:0:0:Root:/root:/bin/sh\nalice::1000:1000:Alice:/home/alice:/bin/sh\n",
         )
         .map_err(|error| error.to_string())
     }

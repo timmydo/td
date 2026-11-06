@@ -996,7 +996,7 @@ pub const GIT_RUNTIME_MARKER: &str = "TD-GIT-RUN-OK";
 pub const SSHD_MARKER: &str = "TD-SSHD-OK";
 
 /// Printed by the root-owned health target, only under the QEMU autotest token, after
-/// root's `/etc/shadow` field reads exactly `!` and the running daemon refuses the
+/// root's `/etc/passwd` password field reads exactly `!` and the running daemon refuses the
 /// loopback root key the disposable test volume seeds into the persistent
 /// authorization file, which the client offered first (td-login/THREAT-MODEL.md §8).
 pub const ROOT_SSH_REFUSED_MARKER: &str = "TD-ROOT-SSH-REFUSED";
@@ -1058,7 +1058,7 @@ pub const TD_INIT_RUNTIME_MARKER: &str = "TD-INIT-RUN-OK";
 /// It gates on the literal `exec-as` as well, and that half needs a leg of its own:
 /// `exec-as` is the front end a SUPERVISOR uses, so it runs as root and drops, where
 /// the readback inside `exec-primary` has already dropped by the time it runs. A copy
-/// inside that shell would fail `setgroups(2)` with EPERM and prove nothing. Both legs
+/// inside that shell would change nothing and prove nothing. Both legs
 /// point at the same readback, so the marker still means one thing — this crate's
 /// credential switch produced the credentials it named — proven through both front
 /// ends the image has rather than one.

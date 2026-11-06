@@ -1023,15 +1023,10 @@ fn root_inspection_observes_file_state_without_publishing_or_repairing() {
         ),
         (
             "/etc/passwd",
-            "root:x:0:0:root:/root:/bin/false\ntester:x:1000:1000:Test:/home/tester:/bin/false\n",
+            "root:!:0:0:root:/root:/bin/false\ntester::1000:1000:Test:/home/tester:/bin/false\n",
             0o644,
         ),
         ("/etc/group", "root:x:0:\ntester:x:1000:\n", 0o644),
-        (
-            "/etc/shadow",
-            "root:!:1:0:99999:7:::\ntester::1:0:99999:7:::\n",
-            0o600,
-        ),
     ] {
         fs::write(path, bytes).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();

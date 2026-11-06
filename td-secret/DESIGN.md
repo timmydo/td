@@ -1745,7 +1745,7 @@ absent account files, tmpfs `/run` and the production binary at
 its account and executes both write roles on real root socketpairs. Each
 must fail at application admission without credential intake or a reply,
 while preserving a seeded runtime key. Adding the canonical application
-account/group/service-shadow entries makes the same description admissible.
+account/group entries with the service marker makes the same description admissible.
 The pre-fix source-built binary fails this oracle at the admission result.
 
 The unchanged `td-authd/src/secret_sys.rs` transport also serves the

@@ -389,20 +389,19 @@ mod tests {
     }
 
     #[test]
-    fn service_admission_never_requires_root_only_shadow_reads() {
+    fn service_admission_is_left_to_the_launcher() {
         let source = include_str!("portable_service.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();
         assert!(!source.contains("verify_installed_accounts"));
-        assert!(!source.contains("/etc/shadow"));
         assert!(!source.contains("Host::open"));
         assert!(source.contains("operation::service_startup(uid)?"));
     }
 
     #[test]
     #[ignore = "requires the disposable notebook-service QEMU guest"]
-    fn qemu_reserved_identity_serves_with_root_only_shadow() {
+    fn qemu_reserved_identity_serves() {
         use std::os::fd::OwnedFd;
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixStream;
@@ -413,9 +412,8 @@ mod tests {
         std::fs::create_dir_all("/etc").unwrap();
         for (path, text, mode) in [
             ("/etc/td-principals.tsv", "td-principals-v1\nsession\t1000\t993\t992\t991\nnotebook\t1000\t989\n", 0o444),
-            ("/etc/passwd", "root:x:0:0:Root:/root:/bin/sh\ntester:x:1000:1000:Tester:/home/tester:/bin/sh\ntdv1000:x:989:989:Vault:/var/lib/td/notebooks/1000:/bin/false\n", 0o644),
+            ("/etc/passwd", "root:!:0:0:Root:/root:/bin/sh\ntester::1000:1000:Tester:/home/tester:/bin/sh\ntdv1000:!td-service:989:989:Vault:/var/lib/td/notebooks/1000:/bin/false\n", 0o644),
             ("/etc/group", "root:x:0:\ntester:x:1000:\ntdv1000:x:989:\n", 0o644),
-            ("/etc/shadow", "root:!:0:0:99999:7:::\ntester::0:0:99999:7:::\ntdv1000:!td-service:0:0:99999:7:::\n", 0o600),
         ] {
             std::fs::write(path, text).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();

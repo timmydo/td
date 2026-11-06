@@ -797,7 +797,6 @@ fn verify_jail_boundary() -> Result<(), String> {
     for path in [
         "/td/store",
         "/etc/rootcheck",
-        "/etc/shadow",
         "/etc/td-app.conf",
         "/etc/td-applications.tsv",
         "/etc/td-launcher.tsv",

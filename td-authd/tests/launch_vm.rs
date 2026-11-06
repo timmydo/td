@@ -260,9 +260,8 @@ fn init() {
     for (path,text,mode) in [
         ("/etc/td-principals.tsv",table,0o444),
         ("/var/lib/td/principals.tsv",table,0o600),
-        ("/etc/passwd","root:x:0:0:root:/root:/bin/false\nalice:x:1000:1000:Test:/home/alice:/bin/false\ntdc1000:x:993:993:Compositor:/run:/bin/false\n",0o644),
+        ("/etc/passwd","root:!:0:0:root:/root:/bin/false\nalice::1000:1000:Test:/home/alice:/bin/false\ntdc1000:!td-service:993:993:Compositor:/run:/bin/false\n",0o644),
         ("/etc/group","root:x:0:\nalice:x:1000:\ntdc1000:x:993:\n",0o644),
-        ("/etc/shadow","root:!:1:0:99999:7:::\nalice::1:0:99999:7:::\ntdc1000:!td-service:1:0:99999:7:::\n",0o600),
     ] { fs::write(path,text).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(mode)).unwrap(); }
     // Unenrolled: td-login's console logins, login-primary among them, refuse
     // and park unless this root-owned 0700 directory lacks the record.
@@ -396,7 +395,6 @@ fn primary_probe(login: bool) {
 
 fn primary_login_checks() {
     let original = fs::read_to_string("/etc/passwd").unwrap();
-    let shadow = fs::read_to_string("/etc/shadow").unwrap();
     let passwd = original.replace("/home/alice:/bin/false", "/home/alice:/pair-probe");
     fs::write("/etc/passwd", &passwd).unwrap();
     let invoke = |args: &[&str]| {
@@ -425,9 +423,6 @@ fn primary_login_checks() {
             "TD-PRIMARY-LOGIN-PROBE-OK\n"
         );
     }
-    // In this disposable guest only, permit shadow reads so the foreign-UID
-    // case reaches the credential gate rather than failing to open the file.
-    fs::set_permissions("/etc/shadow", fs::Permissions::from_mode(0o644)).unwrap();
     let foreign = invoke(&[
         "exec-service-as",
         "tdc1000",
@@ -438,7 +433,6 @@ fn primary_login_checks() {
         "/pair-probe",
         "--primary-exec-probe",
     ]);
-    fs::set_permissions("/etc/shadow", fs::Permissions::from_mode(0o600)).unwrap();
     assert!(!foreign.status.success());
     assert!(foreign.stdout.is_empty());
     let error = String::from_utf8_lossy(&foreign.stderr);
@@ -449,8 +443,8 @@ fn primary_login_checks() {
     assert!(error.contains("[993, 993, 993, 993]"), "{error}");
     for marker in ["!", "!td-service"] {
         fs::write(
-            "/etc/shadow",
-            shadow.replace("alice::", &format!("alice:{marker}:")),
+            "/etc/passwd",
+            passwd.replace("alice::", &format!("alice:{marker}:")),
         )
         .unwrap();
         for command in commands {
@@ -466,7 +460,7 @@ fn primary_login_checks() {
             );
         }
     }
-    fs::write("/etc/shadow", &shadow).unwrap();
+    fs::write("/etc/passwd", &passwd).unwrap();
     for bad in [
         passwd.replace("1000:1000", "1001:1001"),
         format!("{passwd}alias:x:1000:1000:Alias:/home/alias:/pair-probe\n"),

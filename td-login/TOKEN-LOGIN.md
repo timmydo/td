@@ -204,7 +204,7 @@ down boot health and the diagnostics that make the state repairable.
 
 The record's presence is the only enrollment state. Present means enrolled
 and automatic login off; there is no second flag, `/etc/autologin` edit or
-shadow change. Its contents, with exact bytes (below) pinned against
+password-field change. Its contents, with exact bytes (below) pinned against
 independent literal vectors (`td-secret/tests/login_record_vectors.py`),
 are a magic and version, the UID, a random 32-byte record ID fixed at
 first enrollment, and one through eight
@@ -774,7 +774,7 @@ generates both on every boot (`build_bootsuccess` in
 names that file and, only in the ordinary form, `.ssh/authorized_keys`
 (`td-firstboot/src/ssh_policy.rs`). Root has no SSH
 login in either form: both carry `PermitRootLogin no` (`APPLICATIONS.md`
-§L.1, L7), and root's shadow field is `!`. This is that rule's one
+§L.1, L7), and root's password field is `!`. This is that rule's one
 statement; other documents point here.
 
 A server image (`server-x86-64`, td-svc/DESIGN.md §10, "Profiles")
@@ -1217,7 +1217,7 @@ A key and its PIN are required only to unlock and to add or remove keys,
 which is how recovery policy changes. Ordinary elevation is the §L.1
 consent-only mechanism, which an enrolled machine always has
 ("Enrollment requires §L.1 elevation", above, owns that prerequisite).
-As on every td machine, `su` no longer exists and root's shadow field
+As on every td machine, `su` no longer exists and root's password field
 is locked (§L.1's L6 and L7), interactive root login is refused
 (`THREAT-MODEL.md` §3) and root SSH is refused (SSH). Root remains
 reachable only through root-owned services and physical access, and root

@@ -94,7 +94,6 @@ pub(crate) fn check_deployment(root: &Path) -> Result<(), String> {
         &registry,
         &read_root_file(&etc, "passwd", None)?,
         &read_root_file(&etc, "group", None)?,
-        &read_root_file(&etc, "shadow", Some(0o600))?,
     )
 }
 
@@ -106,7 +105,6 @@ pub(crate) fn check_primary_name(root: &Path, name: &str) -> Result<(), String> 
     registry.check_primary_name(
         &read_root_file(&etc, "passwd", Some(0o644))?,
         &read_root_file(&etc, "group", Some(0o644))?,
-        &read_root_file(&etc, "shadow", Some(0o600))?,
         name,
     )
 }
@@ -120,7 +118,6 @@ pub(crate) fn primary_in_root(root: &Path) -> Result<primary_account::PrimaryAcc
     registry.check_primary_name(
         &passwd,
         &read_root_file(&etc, "group", Some(0o644))?,
-        &read_root_file(&etc, "shadow", Some(0o600))?,
         primary.name(),
     )?;
     Ok(primary)
@@ -137,7 +134,6 @@ pub(crate) fn stage_primary_name(root: &Path, name: &str, output: &Path) -> Resu
         &registry,
         &read_root_file(&etc, "passwd", Some(0o644))?,
         &read_root_file(&etc, "group", Some(0o644))?,
-        &read_root_file(&etc, "shadow", Some(0o600))?,
         name,
     )?;
     let leaf = output
@@ -169,7 +165,6 @@ pub(crate) fn stage_primary_name(root: &Path, name: &str, output: &Path) -> Resu
         (TABLE_NAME, table.as_str(), 0o444),
         ("passwd", tables.passwd.as_str(), 0o644),
         ("group", tables.group.as_str(), 0o644),
-        ("shadow", tables.shadow.as_str(), 0o600),
     ] {
         let path = format!("/proc/self/fd/{}/{file_name}", staged.as_raw_fd());
         let mut file = OpenOptions::new()
@@ -194,7 +189,6 @@ pub(crate) fn stage_primary_name(root: &Path, name: &str, output: &Path) -> Resu
 struct PrimaryTables {
     passwd: String,
     group: String,
-    shadow: String,
 }
 
 fn append_account_row(output: &mut String, fields: &[&str]) -> Result<(), String> {
@@ -211,16 +205,14 @@ fn rename_primary_tables(
     registry: &Registry,
     passwd: &str,
     group: &str,
-    shadow: &str,
     name: &str,
 ) -> Result<PrimaryTables, String> {
-    registry.check_primary_name(passwd, group, shadow, name)?;
+    registry.check_primary_name(passwd, group, name)?;
     let primary = primary_account::parse(passwd).map_err(|error| error.to_string())?;
     let home = format!("/home/{name}");
     let mut result = PrimaryTables {
         passwd: String::new(),
         group: String::new(),
-        shadow: String::new(),
     };
     for row in account_rows(passwd)? {
         let [account, password, uid, gid, comment, old_home, shell] = row.as_slice() else {
@@ -258,21 +250,7 @@ fn rename_primary_tables(
             .join(",");
         append_account_row(&mut result.group, &[account, password, gid, &members])?;
     }
-    for row in account_rows(shadow)? {
-        let Some((account, fields)) = row.split_first() else {
-            return Err("missing shadow account name".into());
-        };
-        let account = if *account == primary.name() {
-            name
-        } else {
-            *account
-        };
-        let mut renamed = Vec::with_capacity(row.len());
-        renamed.push(account);
-        renamed.extend_from_slice(fields);
-        append_account_row(&mut result.shadow, &renamed)?;
-    }
-    registry.check_primary_name(&result.passwd, &result.group, &result.shadow, name)?;
+    registry.check_primary_name(&result.passwd, &result.group, name)?;
     Ok(result)
 }
 
@@ -292,12 +270,11 @@ impl Registry {
         &self,
         passwd: &str,
         group: &str,
-        shadow: &str,
         name: &str,
     ) -> Result<(), String> {
         primary_account::validate_name(name).map_err(|error| error.to_string())?;
         let primary = primary_account::parse(passwd).map_err(|error| error.to_string())?;
-        self.verify_retained_accounts(self, passwd, group, shadow)?;
+        self.verify_retained_accounts(self, passwd, group)?;
         if ["tda", "tdb", "tdc", "tdi", "tdp", "tdv"]
             .iter()
             .any(|prefix| {
@@ -351,16 +328,6 @@ impl Registry {
         if !primary_group {
             return Err("human account lacks its named primary group".into());
         }
-        let mut shadow_names = BTreeSet::new();
-        for row in account_rows(shadow)? {
-            let [account, ..] = row.as_slice() else {
-                return Err("missing shadow account name".into());
-            };
-            shadow_names.insert(*account);
-        }
-        if shadow_names != names {
-            return Err("passwd and shadow must name exactly the same accounts".into());
-        }
         Ok(())
     }
 
@@ -373,7 +340,7 @@ impl Registry {
     fn application_accounts(&self, passwd: &str) -> Result<Vec<Application>, String> {
         let mut active = Vec::new();
         for row in account_rows(passwd)? {
-            let [name, "x", uid, gid, _, home, shell] = row.as_slice() else {
+            let [name, _, uid, gid, _, home, shell] = row.as_slice() else {
                 return Err("invalid principal passwd row".into());
             };
             let uid = decimal(uid, 0..=u32::MAX)?;
@@ -427,7 +394,7 @@ impl Registry {
         }
         let mut found = false;
         for row in account_rows(passwd)? {
-            let [name, "x", uid, gid, _, _, _] = row.as_slice() else {
+            let [name, _, uid, gid, _, _, _] = row.as_slice() else {
                 let name: String = row
                     .first()
                     .copied()
@@ -467,7 +434,6 @@ impl Registry {
             active,
             &read_root_file(&etc, "passwd", None)?,
             &read_root_file(&etc, "group", None)?,
-            &read_root_file(&etc, "shadow", Some(0o600))?,
         )
     }
 
@@ -492,13 +458,8 @@ impl Registry {
     }
 
     #[cfg(test)]
-    pub(crate) fn verify_accounts(
-        &self,
-        passwd: &str,
-        group: &str,
-        shadow: &str,
-    ) -> Result<(), String> {
-        self.verify_retained_accounts(self, passwd, group, shadow)
+    pub(crate) fn verify_accounts(&self, passwd: &str, group: &str) -> Result<(), String> {
+        self.verify_retained_accounts(self, passwd, group)
     }
 
     fn verify_retained_accounts(
@@ -506,7 +467,6 @@ impl Registry {
         active: &Self,
         passwd: &str,
         group: &str,
-        shadow: &str,
     ) -> Result<(), String> {
         self.application_accounts(passwd)?;
         let names = self.account_names();
@@ -514,7 +474,7 @@ impl Registry {
         let mut seen_names = BTreeSet::new();
         let mut present = BTreeSet::new();
         for row in account_rows(passwd)? {
-            let [name, "x", uid, gid, _, _, shell] = row.as_slice() else {
+            let [name, password, uid, gid, _, _, shell] = row.as_slice() else {
                 return Err("invalid principal passwd row".into());
             };
             let uid = decimal(uid, 0..=u32::MAX)?;
@@ -525,6 +485,9 @@ impl Registry {
             if let Some(expected) = names.get(&uid) {
                 if expected != name || gid != uid || *shell != "/bin/false" {
                     return Err("reserved principal uid belongs to another account".into());
+                }
+                if *password != "!td-service" {
+                    return Err("principal account permits human login".into());
                 }
                 present.insert(*name);
             } else if names.values().any(|expected| expected == name) || names.contains_key(&gid) {
@@ -566,25 +529,6 @@ impl Registry {
         }
         if present.iter().any(|name| !group_names.contains(name)) {
             return Err("principal account lacks its canonical primary group".into());
-        }
-        let mut shadow_names = BTreeSet::new();
-        for row in account_rows(shadow)? {
-            let [name, password, _, _, _, _, _, _, _] = row.as_slice() else {
-                return Err("invalid principal shadow row".into());
-            };
-            if !shadow_names.insert(*name) {
-                return Err("ambiguous shadow account".into());
-            }
-            if names.values().any(|expected| expected == name)
-                && (!present.contains(name) || *password != "!td-service")
-            {
-                return Err(
-                    "principal shadow entry lacks an account or permits human login".into(),
-                );
-            }
-        }
-        if !present.is_subset(&shadow_names) {
-            return Err("principal account lacks service authorization".into());
         }
         Ok(())
     }

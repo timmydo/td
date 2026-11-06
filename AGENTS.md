@@ -406,7 +406,7 @@ job, builds use a separate unprivileged identity, and no caller-supplied
 command or source is admitted. `td-update/ADMIN.md` owns this policy.
 
 Principle 7 is a target, not a current claim. The stock VM writes an
-empty shadow field for `tester` and auto-logs in. Root is locked (`!`)
+empty password field for `tester` and auto-logs in. Root is locked (`!`)
 and there is no `su`; no console or SSH login reaches root.
 Administration is the session owner's consent operations; without
 consent, recovery is td-boot's automatic rollback or physical access

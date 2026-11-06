@@ -1328,18 +1328,13 @@ fn accounts() {
         ("td-applications.tsv", "", 0o444),
         (
             "passwd",
-            "tester:x:1000:1000::/home/tester:/bin/false\ntdc1000:x:993:993::/run/td-compositor/1000:/bin/false\ntdb1000:x:992:992::/var/empty:/bin/false\ntdp1000:x:991:991::/var/empty:/bin/false\n",
+            "tester::1000:1000::/home/tester:/bin/false\ntdc1000:!td-service:993:993::/run/td-compositor/1000:/bin/false\ntdb1000:!td-service:992:992::/var/empty:/bin/false\ntdp1000:!td-service:991:991::/var/empty:/bin/false\n",
             0o644,
         ),
         (
             "group",
             "tester:x:1000:\ntdc1000:x:993:\ntdb1000:x:992:\ntdp1000:x:991:\n",
             0o644,
-        ),
-        (
-            "shadow",
-            "tester::0:0:99999:7:::\ntdc1000:!td-service:0:0:99999:7:::\ntdb1000:!td-service:0:0:99999:7:::\ntdp1000:!td-service:0:0:99999:7:::\n",
-            0o600,
         ),
     ] {
         let path = Path::new("/etc").join(name);
