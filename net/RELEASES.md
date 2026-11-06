@@ -93,13 +93,26 @@ acquisition budget is one hour, including individual DNS/request deadlines.
 There is no automatic retry loop: rerun the command to resume cached objects.
 Disk I/O and hashing do not acquire asynchronous interruption guarantees.
 
-`fetch URL STATE CACHE OUTPUT` creates a new output directory. `OUTPUT.partial`
+`fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT]` creates a new output directory. `OUTPUT.partial`
 is reserved scratch and reclaimed on retry; its parent must be owned and
 protected, and no other process may write there during acquisition. State
 and cache leases serialize cooperating writers. The caller must provide safe
 ancestors for state, cache, output and repository paths. This does not isolate
-mutually hostile processes sharing a UID. Only one 256 KiB object, bounded
-metadata and the index are needed in memory, rather than an entire image.
+mutually hostile processes sharing a UID. Acquisition keeps one 256 KiB object buffer (plus a 256 KiB read buffer
+while seeding), bounded metadata and the index in memory, rather than an
+entire image.
+With `--seed`, acquisition scans the three local deployment payloads using
+that same CDC algorithm, after authenticating the requested release metadata.
+Only missing objects whose SHA-256 and length match that signed index enter
+the cache. Local bytes grant no publisher trust and require no old signing
+metadata; even a source-built installation can seed an update. The complete
+new payloads still undergo ordinary verification. Already verified cache
+objects avoid reseeding; unrelated local chunks are not retained. Seed files
+must be regular files within the protocol's payload bounds. An unreadable,
+changing or oversized seed fails explicitly. The scan shares the acquisition
+deadline and uses bounded chunk/read buffers. Experimental non-CDC partitions
+may reuse fewer seed chunks and fetch the rest normally.
+
 Cache collection is manual; it is safe to remove it while no acquisition is
 active. There is no automatic cache-size quota.
 

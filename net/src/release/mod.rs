@@ -11,6 +11,7 @@
 
 mod format;
 mod publisher;
+mod seed;
 #[cfg(test)]
 mod tests;
 
@@ -360,6 +361,16 @@ fn assemble(
 }
 
 fn fetch(base: &str, state_path: &Path, cache: &Path, output: &Path) -> Result<()> {
+    fetch_seeded(base, state_path, cache, output, None)
+}
+
+fn fetch_seeded(
+    base: &str,
+    state_path: &Path,
+    cache: &Path,
+    output: &Path,
+    seed: Option<&Path>,
+) -> Result<()> {
     let _state_lock = lock(&sidecar(state_path, ".lock"))?;
     directory(cache)?;
     let _cache_lock = lock(&cache.join("lock"))?;
@@ -402,6 +413,10 @@ fn fetch(base: &str, state_path: &Path, cache: &Path, output: &Path) -> Result<(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.to_string()),
     }
+    if let Some(deployment) = seed {
+        let bytes = seed::cache(&release, cache, deployment, source.deadline)?;
+        eprintln!("release seed: {bytes} verified object bytes from local deployment");
+    }
     io(fs::DirBuilder::new().mode(0o700).create(&stage))?;
     let result = (|| {
         for version in state.root.version.saturating_sub(63).max(1)..=state.root.version {
@@ -440,7 +455,7 @@ fn fetch(base: &str, state_path: &Path, cache: &Path, output: &Path) -> Result<(
     result
 }
 
-const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  fetch URL STATE CACHE OUTPUT\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n";
+const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT]\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n";
 
 fn command(args: &[String]) -> Result<()> {
     let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
@@ -510,6 +525,13 @@ fn command(args: &[String]) -> Result<()> {
         ["fetch", base, state, cache, output] => {
             fetch(base, Path::new(state), Path::new(cache), Path::new(output))
         }
+        ["fetch", base, state, cache, output, "--seed", deployment] => fetch_seeded(
+            base,
+            Path::new(state),
+            Path::new(cache),
+            Path::new(output),
+            Some(Path::new(deployment)),
+        ),
         ["verify", state, bundle] => {
             let (commit, deployment) = verify(Path::new(state), Path::new(bundle))?;
             println!("{commit} {deployment}");

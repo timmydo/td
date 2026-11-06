@@ -570,6 +570,14 @@ fn learn_release(log: &File) -> Result<()> {
 
 fn download_child(endpoint: &str) -> Result<()> {
     join_group(BUILD_GROUP)?;
+    let running = read(Path::new("/run/td-deployment"), 66)?;
+    let running = running
+        .strip_suffix('\n')
+        .ok_or("invalid running deployment")?;
+    if !crate::protocol::valid_digest(running.as_bytes()) {
+        return Err("invalid running deployment".into());
+    }
+
     Err(format!(
         "start download identity: {}",
         fixed("/bin/td-login")
@@ -579,16 +587,24 @@ fn download_child(endpoint: &str) -> Result<()> {
                 "--",
                 "/bin/td-admin",
                 "download-worker",
-                endpoint
+                endpoint,
+                running,
             ])
             .exec()
     ))
 }
 
-fn download_worker(endpoint: &str) -> Result<()> {
+fn download_worker(endpoint: &str, running: &str) -> Result<()> {
     if io(fs::metadata("/proc/self"), "read download identity")?.uid() != BUILD_UID {
         return Err("download worker requires its private identity".into());
     }
+    if !crate::protocol::valid_digest(running.as_bytes()) {
+        return Err("invalid running deployment".into());
+    }
+    let seed = format!(
+        "/run/td-volume/{}/{running}",
+        crate::protocol::DEPLOYMENTS_DIR
+    );
     Err(format!(
         "start release downloader: {}",
         fixed("/bin/td-release")
@@ -597,7 +613,9 @@ fn download_worker(endpoint: &str) -> Result<()> {
                 endpoint,
                 WORKER_STATE,
                 "/var/lib/td-admin-build/release-cache",
-                DOWNLOAD
+                DOWNLOAD,
+                "--seed",
+                &seed,
             ])
             .exec()
     ))
@@ -1196,7 +1214,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         ["build-child", revision] => build_child(revision),
         ["build-worker", revision] => build_worker(revision),
         ["download-child", endpoint] => download_child(endpoint),
-        ["download-worker", endpoint] => download_worker(endpoint),
+        ["download-worker", endpoint, running] => download_worker(endpoint, running),
         ["verify-release-child"] => {
             join_group(OPERATION_GROUP)?;
             Err(format!(

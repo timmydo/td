@@ -105,6 +105,13 @@ The worker retains verified objects in
 `/var/lib/td-admin-build/release-cache`; its completed candidate is always
 `/var/lib/td-admin-build/download`. It cannot write the privileged replay
 state. A failed job may retain verified cache objects for the next request.
+The root download helper reads and validates the root-private deployment ID
+in `/run/td-deployment` before switching identity, and passes that ID to the
+worker. The downloader seeds missing requested chunks from that deployment
+under the read-only volume's `td/deployments` directory.
+This is the running image, independent of selectors changed by an earlier
+`--no-reboot` update. Its bytes are untrusted cache candidates checked against
+the new signed index, never an alternate release authorization.
 
 After draining the worker, including failure or cancellation, root runs the
 installed metadata learner over its fixed `release-state.metadata` evidence.

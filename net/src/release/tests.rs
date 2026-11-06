@@ -737,3 +737,80 @@ fn explicit_partitions_round_trip_through_the_same_signed_downloader() {
         .is_err());
     }
 }
+
+#[test]
+fn local_seed_completes_a_cold_fetch_without_repository_objects() {
+    let f = Fixture::new();
+    fs::remove_dir_all(f.repo.join("objects")).unwrap();
+    assert!(f.fetch("cold").is_err());
+    fetch_seeded(
+        &f.base(),
+        &f.state,
+        &f.cache,
+        &f.dir.join("seeded"),
+        Some(&f.deployment),
+    )
+    .unwrap();
+    verify(&f.state, &f.dir.join("seeded")).unwrap();
+    for (name, _) in format::FILES {
+        assert_eq!(
+            fs::read(f.dir.join("seeded").join(name)).unwrap(),
+            fs::read(f.deployment.join(name)).unwrap()
+        );
+    }
+    // A complete verified cache avoids reopening the seed on a later update.
+    fetch_seeded(
+        &f.base(),
+        &f.state,
+        &f.cache,
+        &f.dir.join("warm"),
+        Some(&f.dir.join("absent")),
+    )
+    .unwrap();
+}
+
+#[test]
+fn local_seed_does_not_authorize_changed_payload_bytes() {
+    let f = Fixture::new();
+    fs::write(f.deployment.join("bzImage"), vec![0u8; 700_000]).unwrap();
+    fs::remove_dir_all(f.repo.join("objects")).unwrap();
+    assert!(fetch_seeded(
+        &f.base(),
+        &f.state,
+        &f.cache,
+        &f.dir.join("bad"),
+        Some(&f.deployment),
+    )
+    .is_err());
+    assert!(!f.dir.join("bad").exists());
+}
+
+#[test]
+fn local_seed_refuses_links_and_oversized_files_before_reading() {
+    let f = Fixture::new();
+    let path = f.deployment.join("bzImage");
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("initramfs.cpio", &path).unwrap();
+    assert!(fetch_seeded(
+        &f.base(),
+        &f.state,
+        &f.cache,
+        &f.dir.join("linked"),
+        Some(&f.deployment),
+    )
+    .is_err());
+    fs::remove_file(&path).unwrap();
+    File::create(&path)
+        .unwrap()
+        .set_len(256 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(fetch_seeded(
+        &f.base(),
+        &f.state,
+        &f.cache,
+        &f.dir.join("large"),
+        Some(&f.deployment),
+    )
+    .unwrap_err()
+    .contains("seed payload size exceeds bound"));
+}

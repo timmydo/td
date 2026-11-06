@@ -96,9 +96,11 @@ fn response(stream: &mut TcpStream, phase: usize, objects: &AtomicUsize) -> Resu
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         bytes.len()
     ))?;
-    let truncate = target.starts_with("/objects/")
-        && objects.fetch_add(1, Ordering::SeqCst) >= 4
-        && phase == 1;
+    let object = target.starts_with("/objects/");
+    if object {
+        objects.fetch_add(1, Ordering::SeqCst);
+    }
+    let truncate = object && phase == 1;
     let body = if truncate {
         bytes.get(..bytes.len() / 2).ok_or("truncation bound")?
     } else {
@@ -306,7 +308,7 @@ pub(super) fn run(phase: &OsStr) -> Result<()> {
         println!("TD-ADMIN-EXPIRED-REFUSED");
         server.select(1);
         job("update --no-reboot", false, &mut previous)?;
-        if server.objects.load(Ordering::SeqCst) < 5 || selectors()? != before {
+        if server.objects.load(Ordering::SeqCst) == 0 || selectors()? != before {
             return Err("truncated transfer did not preserve selectors".into());
         }
         println!("TD-ADMIN-INTERRUPTED");
