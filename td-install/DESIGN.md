@@ -331,10 +331,10 @@ session joined, so the person does not type a passphrase again on the
 installed system. After the settings are admitted and before staging, it
 reads td-netd's `var/lib/td-netd/wifi` under the root it serves: a
 missing directory, a missing file or an empty one carries nothing. Only
-a real regular file (td-fs's `open_real_file`, no symlink followed) of
-mode 0600 or stricter and at most 4096 bytes, in a directory that is
-not a symlink and that no one but its owner writes, both owned by root,
-whose bytes are only td-netd's alphabet (lowercase hex, `open`, spaces
+a real regular file (td-fs's `open_real_file`, no symlink followed) with
+a single name, of mode 0600 or stricter and at most 4096 bytes, in a
+directory that is not a symlink and that no one but its owner writes,
+each owned by td-netd's account or by root, whose bytes are only td-netd's alphabet (lowercase hex, `open`, spaces
 and newlines), is carried. `var` and `var/lib` are resolved as the root
 has them, root's on the live system. The alphabet is a check on bytes,
 not a parse: td-netd parses the copy on the installed system as it
@@ -345,7 +345,9 @@ installed system can configure again; once read, a failure to stage the
 copy fails the installation as staging the settings does. The bytes are
 read into one allocation, held zeroed-on-drop and staged as
 `@var/lib/td-netd/wifi`, mode 0600, in `@var/lib/td-netd` at 0700, both
-root's, modes set because `--rootdir` copies them. A network joined
+root's, modes set because `--rootdir` copies them; td-netd's first root
+start there makes both its account's. The live copy may be either's,
+since that same start may have failed to. A network joined
 after the execution read the file is not carried. The wizard never sees
 the networks and nothing about them crosses the installation protocol;
 the review's details say that networks joined in the session are

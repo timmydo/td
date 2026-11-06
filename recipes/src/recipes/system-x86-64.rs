@@ -482,6 +482,9 @@ fn valid_home(uid: u32, home: &str) -> bool {
     if uid == 985 {
         return home == "/var/lib/td-admin-build";
     }
+    if uid == NETD_UID {
+        return home == NETD_RUNTIME;
+    }
     if uid == AUDIO_UID {
         return home == AUDIO_RUNTIME;
     }
@@ -534,6 +537,23 @@ const PROFILER_ACCOUNT: User = User {
     groups: &[],
     passwordless: false,
     service_only: false,
+};
+
+/// td-netd's own, which it drops to after preparing what only root can
+/// (td-netd/src/privilege.rs). Named by value there and in td-install, and
+/// `netd_account_is_the_one_its_crates_name` holds them together.
+const NETD_UID: u32 = 984;
+const NETD_RUNTIME: &str = "/run/td-netd";
+const NETD_ACCOUNT: User = User {
+    name: "td-netd",
+    uid: NETD_UID,
+    gid: NETD_UID,
+    gecos: "Network Service",
+    home: NETD_RUNTIME,
+    shell: "/bin/false",
+    groups: &[],
+    passwordless: false,
+    service_only: true,
 };
 
 const ADMIN_ACCOUNT: User = User {
@@ -593,6 +613,7 @@ const SYSTEM: SystemDef = SystemDef {
         PROFILER_ACCOUNT,
         ADMIN_ACCOUNT,
         ADMIN_BUILD_ACCOUNT,
+        NETD_ACCOUNT,
         User {
             name: NOTEBOOK_USER,
             uid: NOTEBOOK_RESERVED_UID,
@@ -675,7 +696,12 @@ const SERVER: SystemDef = SystemDef {
     motd: "\n  td server - a source-built, Rust-first Linux.\n  \
            td-svc supervises the system units and OpenSSH; nothing graphical runs.\n  \
            The system is immutable: rebuild the image and replace the machine to change it.\n\n",
-    users: &[ROOT_ACCOUNT, PROFILER_ACCOUNT, PRIMARY_ACCOUNT],
+    users: &[
+        ROOT_ACCOUNT,
+        PROFILER_ACCOUNT,
+        NETD_ACCOUNT,
+        PRIMARY_ACCOUNT,
+    ],
     applications: &[],
     ..SYSTEM
 };
@@ -1312,6 +1338,21 @@ const ROOT_SHADOW_LINE: &str = "root:!:19000:0:99999:7:::";
 /// td-svc's `SENTINEL_UID`, which the autotest health leg reads back off the
 /// process the kernel's `cad_pid` names (td-svc/DESIGN.md §9).
 const CAD_SENTINEL_UID: u32 = 65533;
+
+/// How long the autotest health leg gives `td-netd watch` to be running and
+/// past its credential change. The two legs of boot are not ordered: `network`
+/// and `bootsuccess` both only follow `netup`.
+const NETD_CREDENTIAL_WAIT_SECS: u32 = 30;
+
+/// `/proc/PID/status` for a watcher that holds only the two capabilities,
+/// in the order the health leg's reader meets the rows.
+fn netd_credentials() -> String {
+    let (id, kept, none) = (NETD_UID, "0000000000001400", "0000000000000000");
+    format!(
+        " uid={id},{id},{id},{id} gid={id},{id},{id},{id} groups= \
+         inh={none} prm={kept} eff={kept} amb={none}"
+    )
+}
 
 fn build_shadow(sys: &SystemDef) -> String {
     let mut s = String::new();
@@ -3586,6 +3627,7 @@ fn td_util_probe_command(applet: &str) -> String {
 }
 
 fn build_bootsuccess(sys: &SystemDef) -> String {
+    let netd_credentials = netd_credentials();
     // A failed health transaction reboots a server (healthwatch), so a
     // token-free server boot retries its probes for the full ceiling.
     let retry_default = if sys.desktop() {
@@ -3718,6 +3760,20 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          && [ \"$eff\" = 0000000000000000 ] || \
          {{ echo \"td-svc: the kernel's Ctrl-Alt-Del target $cad holds uid $uid caps $eff\"; \
          fail; }}\n\
+         nw=0; ns=\n\
+         while :; do \
+         set +f; procs=$(/bin/td-util printf '%s\\n' /proc/[0-9]*/comm); set -f; \
+         for f in $procs; do \
+         [ \"$(/bin/td-util cat \"$f\" 2>/dev/null)\" = td-netd ] || continue; \
+         ns=; while read -r k a b c d; do case \"$k\" in \
+         Uid:) ns=\"$ns uid=$a,$b,$c,$d\";; Gid:) ns=\"$ns gid=$a,$b,$c,$d\";; \
+         Groups:) ns=\"$ns groups=$a\";; CapPrm:) ns=\"$ns prm=$a\";; CapEff:) ns=\"$ns eff=$a\";; \
+         CapInh:) ns=\"$ns inh=$a\";; CapAmb:) ns=\"$ns amb=$a\";; esac; done <\"${{f%/comm}}/status\"; \
+         done; \
+         [ \"$ns\" = '{netd_credentials}' ] && break; \
+         nw=$((nw+1)); [ \"$nw\" -lt {NETD_CREDENTIAL_WAIT_SECS} ] || \
+         {{ echo \"td-netd: the watcher holds$ns\"; fail; }}; \
+         /bin/td-util sleep 1; done\n\
          bin=$(/bin/ls -1 -A /bin) || fail\n\
          /bin/td-util printf '%s\\n' \"$bin\" | /bin/grep -q -x -F sh || \
          {{ echo \"td-login: the /bin listing lacks sh\"; fail; }}\n\
@@ -8585,6 +8641,7 @@ mod tests {
             service_accounts,
             [
                 "td-admin-build",
+                "td-netd",
                 NOTEBOOK_USER,
                 PORTAL_USER,
                 BROKER_USER,
@@ -10304,6 +10361,29 @@ mod tests {
                 sys.stem
             );
         }
+    }
+
+    /// One account, one kept set, written in each of the three places that
+    /// has to know them; td-netd's and td-install's crates build apart from
+    /// this one and cannot share a constant.
+    #[test]
+    fn netd_account_is_the_one_its_crates_name() {
+        let privilege = include_str!("../../../td-netd/src/privilege.rs");
+        assert!(privilege.contains(&format!("pub const NETD_UID: u32 = {NETD_UID};")));
+        assert!(privilege.contains(&format!("pub const NETD_GID: u32 = {NETD_UID};")));
+        let install = include_str!("../../../td-install/src/main.rs");
+        assert!(install.contains(&format!("const NETD_UID: u32 = {NETD_UID};")));
+        for sys in [&SYSTEM, &SERVER] {
+            let account = sys.users.iter().find(|user| user.name == "td-netd");
+            let account = account.map(|user| (user.uid, user.gid, user.service_only));
+            assert_eq!(account, Some((NETD_UID, NETD_UID, true)));
+            assert!(build_group(sys).contains(&format!("td-netd:x:{NETD_UID}:\n")));
+            let bootsuccess = build_bootsuccess(sys);
+            assert!(bootsuccess.contains(&netd_credentials()), "{}", sys.stem);
+        }
+        // The value of the two capabilities, CAP_NET_BIND_SERVICE and
+        // CAP_NET_ADMIN, as privilege.rs's own test has them.
+        assert!(netd_credentials().contains("prm=0000000000001400"));
     }
 
     /// The tailorable `SYSTEM` const is hand-edited to shape the distro; guard the

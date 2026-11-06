@@ -11,10 +11,11 @@
 //! drops it when the socket closes, and `watch` restarting reassociates.
 //!
 //! The session owner joins, lists and forgets networks through
-//! `/run/td-netd/wifi`, a socket authenticated by its mode alone (0600, owned
-//! by the account, in a root directory), as td-fetchd's is. Each network's
-//! PMK, never its passphrase, is stored root-only in `/var/lib/td-netd/wifi`,
-//! one line per network, in the order `join` last named them.
+//! `/run/td-netd/control/wifi`, a socket authenticated by its directory alone
+//! (0710, in the account's private group, made by the root start). Each
+//! network's PMK, never its passphrase, is stored for this daemon alone in
+//! `/var/lib/td-netd/wifi`, one line per network, in the order `join` last
+//! named them.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -29,10 +30,10 @@ use crate::genl::{self, Builder, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK, NLM_F_DUMP,
 use crate::sys::{self, GenlSocket};
 use crate::wpa;
 
-const CONFIG_DIR: &str = "/var/lib/td-netd";
-const CONFIG_PATH: &str = "/var/lib/td-netd/wifi";
-const CONTROL_DIR: &str = "/run/td-netd";
-pub const CONTROL_PATH: &str = "/run/td-netd/wifi";
+pub const CONFIG_DIR: &str = "/var/lib/td-netd";
+pub const CONFIG_PATH: &str = "/var/lib/td-netd/wifi";
+pub const CONTROL_DIR: &str = "/run/td-netd/control";
+pub const CONTROL_PATH: &str = "/run/td-netd/control/wifi";
 /// The largest control request: `join`, a 32-byte SSID and a PMK in hex.
 const MAX_REQUEST: u64 = 256;
 /// Datagrams from nl80211 are at most a page or two; a scan dump packs
@@ -410,40 +411,31 @@ fn random_nonce() -> io::Result<[u8; 32]> {
     Ok(nonce)
 }
 
-/// Bind the owner's control socket: a root directory no one else can write
-/// and a socket only the owner (and root) may connect to. The directory is
-/// root's alone (0700) from before the bind until the socket is the
-/// owner's at 0600, so no umask lets anyone else connect in between.
-fn bind_control(owner: u32) -> io::Result<UnixListener> {
-    match fs::symlink_metadata(CONTROL_DIR) {
-        Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
-            return Err(io::Error::other(format!(
-                "{CONTROL_DIR} is not a directory"
-            )));
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::DirBuilder::new().mode(0o700).create(CONTROL_DIR)?
-        }
-        Err(e) => return Err(e),
+/// Bind the owner's control socket in the directory the root start made
+/// (`privilege::shed`): 0710 in the owner's private group, so reaching the
+/// socket is the check, and connecting needs write on its inode, hence 0666.
+/// This daemon cannot give a socket to another account, nor make that
+/// directory, so without it there is no control.
+fn bind_control() -> io::Result<UnixListener> {
+    let meta = fs::symlink_metadata(CONTROL_DIR)?;
+    if !meta.is_dir() {
+        return Err(io::Error::other(format!(
+            "{CONTROL_DIR} is not a directory"
+        )));
     }
-    std::os::unix::fs::chown(CONTROL_DIR, Some(0), Some(0))?;
-    fs::set_permissions(CONTROL_DIR, fs::Permissions::from_mode(0o700))?;
     match fs::remove_file(CONTROL_PATH) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
     let listener = UnixListener::bind(CONTROL_PATH)?;
-    std::os::unix::fs::chown(CONTROL_PATH, Some(owner), None)?;
-    fs::set_permissions(CONTROL_PATH, fs::Permissions::from_mode(0o600))?;
-    fs::set_permissions(CONTROL_DIR, fs::Permissions::from_mode(0o755))?;
+    fs::set_permissions(CONTROL_PATH, fs::Permissions::from_mode(0o666))?;
     listener.set_nonblocking(true)?;
     Ok(listener)
 }
 
 impl Wifi {
     pub fn new(owner: Option<u32>, report: Report<'_>) -> Self {
-        let control = owner.and_then(|uid| match bind_control(uid) {
+        let control = owner.and_then(|_| match bind_control() {
             Ok(listener) => Some(listener),
             Err(e) => {
                 report(&format!("wifi: control socket unavailable: {e}"));

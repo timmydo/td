@@ -187,7 +187,7 @@ one.
 | # | crate | syscalls |
 |---|-------|----------|
 | 1 | `td-kexec` | `kexec_file_load(2)`, `reboot(2)`, `memfd_create(2)` with pinned flags including `MFD_NOEXEC_SEAL`, `fcntl(2)` pinned to `F_ADD_SEALS` and one seal set (plus a test-only `F_SETLEASE` probe) — see [§1](#1-td-kexec--the-guest-kexec-helper) |
-| 2 | `td-netd` | `ioctl(2)` with seven interface-config requests and `TCGETS`/`TCSETS` on standard input, `socket(2)`, `setsockopt(2)`, `sendto(2)`, `recvfrom(2)` and `close(2)` for one owned `NETLINK_GENERIC` socket, `poll(2)` over at most two descriptors — see [§2](#2-td-netd--the-network-bring-up-daemon) |
+| 2 | `td-netd` | `ioctl(2)` with seven interface-config requests and `TCGETS`/`TCSETS` on standard input, `socket(2)`, `setsockopt(2)`, `sendto(2)`, `recvfrom(2)` and `close(2)` for one owned `NETLINK_GENERIC` socket, `poll(2)` over at most two descriptors, and one ordered credential change of `prctl(2)`, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `capset(2)` — see [§2](#2-td-netd--the-network-bring-up-daemon) |
 | 3 | `td-init` | eleven — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has six pinned requests, `poll(2)` at most two lines |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
@@ -339,7 +339,7 @@ tests scan only production code for the four requests above.
 ## 2. `td-netd` — the network bring-up daemon
 
 The `td-netd` network bring-up daemon is confined to one raw entry
-point, `syscall6` in `td-netd/src/sys.rs`, carrying exactly seven
+point, `syscall6` in `td-netd/src/sys.rs`, carrying exactly twelve
 syscalls. Its confinement tests (`src/confinement.rs`, through
 `td-source-scan`) pin each x86_64 number, every call site whole, every
 named value a call site passes, and the asm block register for
@@ -373,6 +373,19 @@ register:
   needs no AF_PACKET socket either.
 - `poll(2)` (7) over a fixed two-entry array: that socket and the
   owner's control listener.
+- The one credential change, `sys::drop_credentials`, called once, from
+  `privilege.rs`, before `up` or `watch` does anything else: `prctl(2)`
+  (157) with PR_SET_KEEPCAPS, `setgroups(2)` (116) to the empty list,
+  `setgid(2)` (106), `setuid(2)` (105), `capset(2)` (126) with version
+  3's header and data words on the stack, and `prctl(2)` with
+  PR_SET_NO_NEW_PRIVS, in that order. These calls change one thread, so
+  `privilege.rs` refuses a process with a second one and the tests hold
+  the crate to starting none, and to executing nothing. It reads
+  `/proc/self/status` after, and refuses unless every uid and gid column
+  is td-netd's, the supplementary groups are empty, the permitted and
+  effective sets are exactly CAP_NET_ADMIN and CAP_NET_BIND_SERVICE, the
+  inheritable and ambient sets are empty and no-new-privs is set. Below
+  root there is nothing to change and none of this runs.
 
 DHCP and DNS still ride `std`'s `UdpSocket`/`TcpStream`: bringing the
 link up and an explicit limited-broadcast host route make the DHCP

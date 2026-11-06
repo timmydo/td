@@ -14,7 +14,8 @@
 //!   no-op (exit 2), so boot can distinguish it from a configured link.
 //! * `td-netd watch [--wifi-owner UID]` — supervise physical Ethernet carrier,
 //!   the Wi-Fi association (`wifi.rs`), DHCP and leases; UID may join, list
-//!   and forget Wi-Fi networks through `/run/td-netd/wifi`.
+//!   and forget Wi-Fi networks through `/run/td-netd/control/wifi`. Started as
+//!   root, `up` and `watch` drop to their own account first (`privilege.rs`).
 //! * `td-netd wifi scan | list | join [--open] [--] NAME | forget [--] NAME |
 //!   forget --all` — the owner's client.
 //! * `td-netd status` — print the latest connection state and address.
@@ -54,6 +55,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod genl;
+mod privilege;
 mod sha1;
 mod sys;
 mod wifi;
@@ -814,7 +816,7 @@ fn prepare_loopback() -> io::Result<UdpSocket> {
 
 fn write_hosts(hostname: &str) -> io::Result<()> {
     let hpath = hosts_path();
-    fs::write(&hpath, render_hosts(hostname))
+    privilege::publish_hosts(&hpath, &render_hosts(hostname))
         .map_err(|e| io::Error::new(e.kind(), format!("write {hpath}: {e}")))
 }
 
@@ -832,11 +834,18 @@ fn cmd_loopback() -> io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `up` and `watch` do this first: all the rest parses what the network sends.
+fn shed_root(wifi_owner: Option<u32>) -> io::Result<()> {
+    let no_servers = render_resolv_conf(&[]);
+    privilege::shed(wifi_owner, &resolv_conf_path(), &no_servers, &hosts_path())
+}
+
 /// Bring a link up and DHCP-configure it. Always writes /etc/hosts and brings
 /// loopback up; a missing external interface is a clean no-op. Exit status keys the
 /// boot glue's UP marker: `SUCCESS` = an external link was configured; `2` = only
 /// loopback (no NIC), so the marker is NOT emitted; any error propagates as failure.
 fn cmd_up(iface_arg: Option<String>) -> io::Result<ExitCode> {
+    shed_root(None)?;
     let _lock = network_lock()?;
     // Loopback and the static hosts table are always established first, so a
     // NIC-less boot still gets a complete localhost path through /run.
@@ -868,7 +877,7 @@ fn network_lock() -> io::Result<fs::File> {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open("/run/td-netd.lock")?;
+        .open(LOCK_PATH)?;
     file.try_lock()
         .map_err(|e| io::Error::other(format!("network manager already running: {e}")))?;
     Ok(file)
@@ -912,7 +921,7 @@ fn apply_lease(fd: RawFd, name: &str, lease: &Lease) -> io::Result<()> {
             }
         }
     }
-    fs::write(resolv_conf_path(), render_resolv_conf(&lease.dns))?;
+    privilege::publish_resolv_conf(&resolv_conf_path(), &render_resolv_conf(&lease.dns))?;
     write_handoff(name, lease)
 }
 
@@ -937,7 +946,12 @@ fn lease_status(name: &str, lease: &Lease) -> String {
     )
 }
 
-const STATUS_PATH: &str = "/run/td-network-status";
+/// What this daemon owns under `/run`, which the root start makes its account's
+/// (`privilege::shed`). Nothing else reads these but its own `status` verb.
+pub const RUN_DIR: &str = "/run/td-netd";
+const LOCK_PATH: &str = "/run/td-netd/lock";
+const STATUS_PATH: &str = "/run/td-netd/status";
+const STATUS_NEW_PATH: &str = "/run/td-netd/status.new";
 
 fn report(message: &str) -> io::Result<()> {
     let mut file = fs::OpenOptions::new()
@@ -945,9 +959,9 @@ fn report(message: &str) -> io::Result<()> {
         .create(true)
         .truncate(true)
         .mode(0o644)
-        .open("/run/td-network-status.new")?;
+        .open(STATUS_NEW_PATH)?;
     writeln!(file, "{message}")?;
-    fs::rename("/run/td-network-status.new", STATUS_PATH)?;
+    fs::rename(STATUS_NEW_PATH, STATUS_PATH)?;
     let _ = writeln!(io::stderr(), "td-netd: {message}");
     Ok(())
 }
@@ -1019,7 +1033,7 @@ fn forget_lease() -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    fs::write(resolv_conf_path(), render_resolv_conf(&[]))
+    privilege::publish_resolv_conf(&resolv_conf_path(), &render_resolv_conf(&[]))
 }
 
 fn renewal_packet(mac: [u8; 6], xid: u32, address: [u8; 4]) -> Vec<u8> {
@@ -1067,7 +1081,8 @@ fn lease_duration(lease: &Lease) -> Duration {
     Duration::from_secs(u64::from(lease.seconds.unwrap_or(300)))
 }
 
-const HANDOFF_PATH: &str = "/run/td-network-lease";
+const HANDOFF_PATH: &str = "/run/td-netd/lease";
+const HANDOFF_NEW_PATH: &str = "/run/td-netd/lease.new";
 
 // /proc uptime includes suspend time, unlike Instant. An address whose lease
 // expired while the laptop slept must not remain configured after resume.
@@ -1152,9 +1167,9 @@ fn write_handoff(name: &str, lease: &Lease) -> io::Result<()> {
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open("/run/td-network-lease.new")?;
+        .open(HANDOFF_NEW_PATH)?;
     file.write_all(encode_handoff(name, lease, live_lease_start(lease, uptime()?)?).as_bytes())?;
-    fs::rename("/run/td-network-lease.new", HANDOFF_PATH)
+    fs::rename(HANDOFF_NEW_PATH, HANDOFF_PATH)
 }
 
 fn read_handoff() -> io::Result<Option<(String, Lease, Duration)>> {
@@ -1193,6 +1208,7 @@ fn note(shared: bool, message: &str) {
 }
 
 fn cmd_watch(wifi_owner: Option<u32>) -> io::Result<ExitCode> {
+    shed_root(wifi_owner)?;
     let _lock = network_lock()?;
     // Read first: a name set after it is seen in the loop, and one set
     // before it was saved to /etc/hostname, which the table renders.

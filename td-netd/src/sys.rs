@@ -18,6 +18,15 @@ const SYS_SOCKET: usize = 41;
 const SYS_SENDTO: usize = 44;
 const SYS_RECVFROM: usize = 45;
 const SYS_SETSOCKOPT: usize = 54;
+const SYS_SETUID: usize = 105;
+const SYS_SETGID: usize = 106;
+const SYS_SETGROUPS: usize = 116;
+const SYS_CAPSET: usize = 126;
+const SYS_PRCTL: usize = 157;
+
+const PR_SET_KEEPCAPS: usize = 8;
+const PR_SET_NO_NEW_PRIVS: usize = 38;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
 /// The single raw-syscall entry point (x86_64 SysV syscall ABI).
 #[inline]
@@ -53,6 +62,35 @@ fn check(ret: isize) -> io::Result<isize> {
     } else {
         Ok(ret)
     }
+}
+
+/// Leave root for `uid`:`gid`, keeping exactly `capabilities`, from one thread.
+/// Keep-caps is what carries the permitted set across `setuid`, which empties
+/// the effective set; `capset` then narrows the permitted set to what is kept,
+/// clears the inheritable set and raises the effective one. Each call's order
+/// is the reason this is one function: `setuid` removes the authority the group
+/// changes need. The caller reads the outcome back from `/proc/self/status`.
+pub fn drop_credentials(uid: u32, gid: u32, capabilities: u32) -> io::Result<()> {
+    check(syscall6(SYS_PRCTL, PR_SET_KEEPCAPS, 1, 0, 0, 0, 0))?;
+    check(syscall6(SYS_SETGROUPS, 0, 0, 0, 0, 0, 0))?;
+    check(syscall6(SYS_SETGID, gid as usize, 0, 0, 0, 0, 0))?;
+    check(syscall6(SYS_SETUID, uid as usize, 0, 0, 0, 0, 0))?;
+    // `struct __user_cap_header_struct`, then two `__user_cap_data_struct`
+    // words of effective, permitted and inheritable. The kernel only reads them
+    // for a version it knows.
+    let header = [LINUX_CAPABILITY_VERSION_3, 0u32];
+    let data = [capabilities, capabilities, 0u32, 0u32, 0u32, 0u32];
+    check(syscall6(
+        SYS_CAPSET,
+        header.as_ptr() as usize,
+        data.as_ptr() as usize,
+        0,
+        0,
+        0,
+        0,
+    ))?;
+    check(syscall6(SYS_PRCTL, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0))?;
+    Ok(())
 }
 
 /// `ioctl(fd, request, argp)` for the interface-config requests

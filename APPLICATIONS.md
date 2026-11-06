@@ -7115,9 +7115,10 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   legacy to preserve. The broker currently returns `UnknownMethod` for
   `Peer.GetMachineId`; §D must make that future reply use this same app value.
 - **`/etc/resolv.conf`** — read-only bind of the direct regular
-  `/run/resolv.conf` (td-netd's product), only with shared network and only
-  after td-netd has produced it. Absent with no network or no lease is correct:
-  DNS should fail like the network it names. **`/etc/hosts`** carries loopback
+  `/run/resolv.conf` (td-netd's product, root's file, written through a
+  descriptor root opened), only with shared network and only after td-netd has
+  produced it. Naming no server with no lease, and absent before td-netd
+  starts, is correct: DNS should fail like the network it names. **`/etc/hosts`** carries loopback
   and the inherited UTS hostname; `/etc/hostname` agrees with the same name.
 - **`/etc/localtime`** — **read-only bind of the runtime's own compiled
   zone**, as required by §O. Application timezone resolution uses

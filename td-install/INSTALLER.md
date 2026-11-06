@@ -2358,14 +2358,16 @@ td-netd wifi forget --all
 
 A `--` before NAME admits a name that begins with `--`. `join` asks for
 the passphrase without echo (8 to 63 characters, or a 64-digit hex key),
-derives the PMK, hands only that to the watcher over `/run/td-netd/wifi`,
-and follows the wireless interface's status until an address arrives or
-the join fails. While Ethernet holds the connection it saves the network
-and returns; Wi-Fi joins when the cable is unplugged. That socket is the
-owner's alone (mode 0600, in a root directory that is root's alone until
-the socket is the owner's), the owner being the account the `network`
-unit names with `--wifi-owner`. The watcher keeps up to 16 networks
-root-only in `/var/lib/td-netd/wifi`, one line each, in the order `join`
+derives the PMK, hands only that to the watcher over
+`/run/td-netd/control/wifi`, and follows the wireless interface's status
+until an address arrives or the join fails. While Ethernet holds the
+connection it saves the network and returns; Wi-Fi joins when the cable is
+unplugged. That socket is the owner's alone by its directory (mode 0710,
+the td-netd account's in the owner's private group, made before the
+watcher leaves root; no such group means no socket), the owner being the
+account the `network` unit names with `--wifi-owner`. The watcher keeps up
+to 16 networks in `/var/lib/td-netd/wifi`, readable only by its own
+account and root, one line each, in the order `join`
 last named them, so a passphrase is typed once per network; joining a
 seventeenth drops the last. An installation from the live medium copies the
 live session's file onto the installed `@var` (DESIGN.md "Carried Wi-Fi

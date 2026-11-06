@@ -43,6 +43,10 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-netd/src/genl.rs"),
     ),
     (
+        "{src}/td-netd/src/privilege.rs",
+        include_str!("../../../td-netd/src/privilege.rs"),
+    ),
+    (
         "{src}/td-netd/src/sha1.rs",
         include_str!("../../../td-netd/src/sha1.rs"),
     ),

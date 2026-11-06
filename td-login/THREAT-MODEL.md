@@ -382,10 +382,14 @@ Consequences worth stating plainly:
   account passwordless to satisfy ordinary `exec-as` would therefore red both
   the image contract and the credential policy.
 
-  The shipped image has seven infrastructure service identities plus four
+  The shipped image has eight infrastructure service identities plus four
   locked application identities. OpenSSH's `sshd`
-  privilege-separation account and `td-profiler`'s `profiler` account are not
-  td-svc `exec-as` targets; each daemon performs its own fixed-purpose drop.
+  privilege-separation account, `td-profiler`'s `profiler` account and
+  `td-netd`'s `td-netd` account are not td-svc `exec-as` targets; each daemon
+  performs its own fixed-purpose drop. td-netd's keeps CAP_NET_ADMIN and
+  CAP_NET_BIND_SERVICE, which this crate's drop could never do by design
+  (UNSAFE.md §2), and has a `/bin/false` shell and a volatile `/run/td-netd`
+  home.
   The `sshd` account has a `/bin/false` shell and an empty root-owned
   `/run/sshd-empty` chroot recreated before the daemon starts. The `audio`
   account has a `/bin/false` shell and a volatile `/run/td-audio` home and is

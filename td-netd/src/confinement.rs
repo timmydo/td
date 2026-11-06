@@ -42,6 +42,7 @@ fn src_holds_exactly_the_scanned_modules() {
             "confinement.rs",
             "genl.rs",
             "main.rs",
+            "privilege.rs",
             "sha1.rs",
             "sys.rs",
             "wifi.rs",
@@ -132,6 +133,11 @@ const AMENDED: &[(&str, &str)] = &[
     ("SYS_SENDTO", "44"),
     ("SYS_RECVFROM", "45"),
     ("SYS_SETSOCKOPT", "54"),
+    ("SYS_SETUID", "105"),
+    ("SYS_SETGID", "106"),
+    ("SYS_SETGROUPS", "116"),
+    ("SYS_CAPSET", "126"),
+    ("SYS_PRCTL", "157"),
 ];
 
 /// Every value a call site passes by name, pinned too.
@@ -146,6 +152,9 @@ const VALUES: &[(&str, &str)] = &[
     ("NETLINK_ADD_MEMBERSHIP", "1"),
     ("RECV_FLAGS", "0x40|0x20"),
     ("SOCKADDR_NL_LEN", "12"),
+    ("PR_SET_KEEPCAPS", "8"),
+    ("PR_SET_NO_NEW_PRIVS", "38"),
+    ("LINUX_CAPABILITY_VERSION_3", "0x2008_0522"),
 ];
 
 #[test]
@@ -211,6 +220,12 @@ fn every_call_site_is_pinned_whole() {
         "(SYS_RECVFROM,self.fdasusize,buf.as_mut_ptr()asusize,buf.len(),RECV_FLAGS,address.as_mut_ptr()asusize,address_len.as_mut_ptr()asusize,)",
         "(SYS_CLOSE,self.fdasusize,0,0,0,0,0)",
         "(SYS_POLL,fds.as_mut_ptr()asusize,2,millis,0,0,0,)",
+        "(SYS_PRCTL,PR_SET_KEEPCAPS,1,0,0,0,0)",
+        "(SYS_SETGROUPS,0,0,0,0,0,0)",
+        "(SYS_SETGID,gidasusize,0,0,0,0,0)",
+        "(SYS_SETUID,uidasusize,0,0,0,0,0)",
+        "(SYS_CAPSET,header.as_ptr()asusize,data.as_ptr()asusize,0,0,0,0,)",
+        "(SYS_PRCTL,PR_SET_NO_NEW_PRIVS,1,0,0,0,0)",
     ];
     let sys = squeeze(&source("sys.rs"));
     for arguments in ARGUMENTS {
@@ -232,8 +247,92 @@ fn every_call_site_is_pinned_whole() {
         "letmutaddress=[0u8;SOCKADDR_NL_LEN];",
         "letmutfds=[0u8;16];",
         "letvalue=group.to_ne_bytes();",
+        "letheader=[LINUX_CAPABILITY_VERSION_3,0u32];",
+        "letdata=[capabilities,capabilities,0u32,0u32,0u32,0u32];",
     ] {
         assert_eq!(sys.matches(buffer).count(), 1, "{buffer}");
+    }
+}
+
+/// The credential change: in the order that works, in one function, called
+/// once, for exactly the account and capabilities `privilege.rs` names, and
+/// believed only from the kernel's readback.
+#[test]
+fn the_credential_change_is_one_ordered_call() {
+    let sys = squeeze(&source("sys.rs"));
+    let body = sys.split_once("pubfndrop_credentials(").unwrap().1;
+    let sites = [
+        "SYS_PRCTL,PR_SET_KEEPCAPS",
+        "SYS_SETGROUPS,",
+        "SYS_SETGID,",
+        "SYS_SETUID,",
+        "SYS_CAPSET,",
+        "SYS_PRCTL,PR_SET_NO_NEW_PRIVS",
+    ];
+    let mut at = 0;
+    for site in sites {
+        let found = body.find(site).unwrap_or_else(|| panic!("{site} is gone"));
+        assert!(found >= at, "{site} is out of order");
+        at = found;
+    }
+    let privilege = squeeze(&source("privilege.rs"));
+    for (name, text) in sources() {
+        let expected = match name.as_str() {
+            "sys.rs" | "privilege.rs" => 1,
+            "confinement.rs" => continue,
+            _ => 0,
+        };
+        let count = squeeze(&text).matches("drop_credentials(").count();
+        assert_eq!(count, expected, "{name}: defined once, called once");
+    }
+    assert_eq!(
+        privilege
+            .matches("sys::drop_credentials(NETD_UID,NETD_GID,KEPT)?;")
+            .count(),
+        1
+    );
+    assert_eq!(
+        privilege.matches("verified(&fs::read_to_string(").count(),
+        1
+    );
+    let change = privilege.find("sys::drop_credentials(").unwrap();
+    let check = privilege.find("verified(&fs::read_to_string(").unwrap();
+    assert!(change < check, "the readback follows the change");
+    // Root's descriptors are open before the change, and the network comes
+    // after it: `up` and `watch` shed before anything else they do.
+    let main = squeeze(&source("main.rs"));
+    for (function, owner) in [("fncmd_up(", "None"), ("fncmd_watch(", "wifi_owner")] {
+        let body = main.split_once(function).unwrap().1;
+        let shed = format!("shed_root({owner})?;");
+        let at = body
+            .find(&shed)
+            .unwrap_or_else(|| panic!("{function} sheds"));
+        assert!(
+            Some(at) < body.find("network_lock()"),
+            "{function} sheds before it does anything else"
+        );
+    }
+}
+
+/// Permitted capabilities survive no exec without ambient ones, but a child
+/// sharing this process's account, or a second thread missing the per-thread
+/// drop, is outside what the drop proves. So there are neither.
+#[test]
+fn the_daemon_starts_no_program_and_no_thread() {
+    for (name, text) in sources() {
+        if name == "confinement.rs" {
+            continue;
+        }
+        let text = squeeze(&text);
+        for construct in [
+            concat!("Com", "mand::"),
+            concat!("std::proc", "ess::Com"),
+            concat!("thread::sp", "awn"),
+            concat!("thread::Bui", "lder"),
+            concat!("thread::sco", "pe"),
+        ] {
+            assert_eq!(text.matches(construct).count(), 0, "{name}: {construct}");
+        }
     }
 }
 

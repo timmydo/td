@@ -1889,7 +1889,7 @@ impl LiveExecution {
         });
         // A convenience, so a file td-netd cannot have written stays behind
         // rather than failing the installation.
-        let wifi = read_wifi_networks(&self.root, 0).unwrap_or_else(|error| {
+        let wifi = read_wifi_networks(&self.root, WIFI_OWNERS).unwrap_or_else(|error| {
             let _ = writeln!(
                 io::stderr(),
                 "td-install serve: saved Wi-Fi networks not carried: {error}"
@@ -3857,10 +3857,17 @@ impl Drop for WifiNetworks {
     }
 }
 
+/// The account td-netd runs as, which owns what it saved (td-netd's
+/// `privilege.rs`; system-x86-64 holds the three together).
+const NETD_UID: u32 = 984;
+/// Who may own a live session's saved networks: td-netd, or root from a
+/// deployment older than its account, whose first boot has not changed them.
+const WIFI_OWNERS: &[u32] = &[NETD_UID, 0];
+
 /// The live session's saved networks, or `None` when it saved none. Only
-/// a private file in a directory no one else writes, both `owner`'s (root
-/// for an execution), is carried: anything else is not td-netd's.
-fn read_wifi_networks(root: &Path, owner: u32) -> io::Result<Option<WifiNetworks>> {
+/// a private file in a directory no one else writes, both one of `owners`',
+/// is carried: anything else is not td-netd's.
+fn read_wifi_networks(root: &Path, owners: &[u32]) -> io::Result<Option<WifiNetworks>> {
     use std::os::unix::fs::MetadataExt;
     let directory = root.join(WIFI_LIVE_DIR);
     let held = match paths::symlink_metadata(&directory) {
@@ -3868,7 +3875,7 @@ fn read_wifi_networks(root: &Path, owner: u32) -> io::Result<Option<WifiNetworks
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if !held.is_dir() || held.uid() != owner || held.mode() & 0o022 != 0 {
+    if !held.is_dir() || !owners.contains(&held.uid()) || held.mode() & 0o022 != 0 {
         return Err(invalid(format!(
             "{} is not a directory only its owner writes",
             directory.display()
@@ -3880,7 +3887,13 @@ fn read_wifi_networks(root: &Path, owner: u32) -> io::Result<Option<WifiNetworks
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if metadata.uid() != owner || metadata.mode() & 0o077 != 0 || metadata.len() > WIFI_LIMIT {
+    // Single-named, as td-netd's own handover requires: a second name is a file
+    // that account linked here, not one it wrote, and this copy would launder it.
+    if !owners.contains(&metadata.uid())
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > WIFI_LIMIT
+    {
         return Err(invalid(format!(
             "{} is not a private file of at most {WIFI_LIMIT} bytes",
             path.display()
@@ -3905,8 +3918,9 @@ fn read_wifi_networks(root: &Path, owner: u32) -> io::Result<Option<WifiNetworks
     Ok((!networks.0.is_empty()).then_some(networks))
 }
 
-/// The saved networks onto `@var`, as td-netd keeps them: root's file at
-/// 0600 in root's 0700 directory, modes set since `--rootdir` copies them.
+/// The saved networks onto `@var`: root's file at 0600 in root's 0700 directory,
+/// modes set since `--rootdir` copies them, which td-netd's first root start
+/// makes its own account's.
 fn seed_wifi(subvol: &Path, networks: &WifiNetworks) -> io::Result<()> {
     let lib = subvol.join("lib");
     paths::create_dir_all(&lib)?;
@@ -6501,14 +6515,14 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         // The test runs unprivileged: its own files stand in for root's.
         let owner = std::fs::metadata(&root).unwrap().uid();
-        assert!(read_wifi_networks(&root, owner).unwrap().is_none());
+        assert!(read_wifi_networks(&root, &[owner]).unwrap().is_none());
         std::fs::create_dir_all(&directory).unwrap();
-        assert!(read_wifi_networks(&root, owner).unwrap().is_none());
+        assert!(read_wifi_networks(&root, &[owner]).unwrap().is_none());
         write(b"", 0o600, 0o700);
-        assert!(read_wifi_networks(&root, owner).unwrap().is_none());
+        assert!(read_wifi_networks(&root, &[owner]).unwrap().is_none());
 
         write(networks.as_bytes(), 0o600, 0o700);
-        let carried = read_wifi_networks(&root, owner).unwrap().unwrap();
+        let carried = read_wifi_networks(&root, &[owner]).unwrap().unwrap();
         assert_eq!(carried.0, networks.as_bytes());
         let scratch = fixture.path().join("scratch");
         std::fs::create_dir(&scratch).unwrap();
@@ -6530,9 +6544,9 @@ mod tests {
 
         // Stricter modes and the full bound are td-netd's too.
         write(networks.as_bytes(), 0o400, 0o755);
-        assert!(read_wifi_networks(&root, owner).unwrap().is_some());
+        assert!(read_wifi_networks(&root, &[owner]).unwrap().is_some());
         write(&vec![b'a'; WIFI_LIMIT as usize], 0o600, 0o700);
-        assert!(read_wifi_networks(&root, owner).unwrap().is_some());
+        assert!(read_wifi_networks(&root, &[owner]).unwrap().is_some());
 
         // Anything td-netd cannot have written stays behind.
         for (body, file_mode, dir_mode) in [
@@ -6544,31 +6558,40 @@ mod tests {
         ] {
             write(&body, file_mode, dir_mode);
             assert!(
-                read_wifi_networks(&root, owner).is_err(),
+                read_wifi_networks(&root, &[owner]).is_err(),
                 "{file_mode:o} {dir_mode:o}"
             );
         }
         write(networks.as_bytes(), 0o600, 0o700);
-        assert!(read_wifi_networks(&root, owner + 1).is_err());
+        assert!(read_wifi_networks(&root, &[owner + 1]).is_err());
+        // Either of the accounts named may hold them.
+        assert!(read_wifi_networks(&root, &[owner + 1, owner]).is_ok());
+        assert!(WIFI_OWNERS.contains(&NETD_UID) && WIFI_OWNERS.contains(&0));
+        // A second name is not something td-netd wrote.
+        let second = directory.join("second");
+        std::fs::hard_link(&file, &second).unwrap();
+        assert!(read_wifi_networks(&root, &[owner]).is_err());
+        std::fs::remove_file(&second).unwrap();
+        assert!(read_wifi_networks(&root, &[owner]).is_ok());
         // A symlink at the file or at its directory, and a FIFO.
         let elsewhere = fixture.path().join("elsewhere");
         std::fs::rename(&file, &elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
-        assert!(read_wifi_networks(&root, owner).is_err());
+        assert!(read_wifi_networks(&root, &[owner]).is_err());
         std::fs::remove_file(&file).unwrap();
         let status = std::process::Command::new("mkfifo")
             .arg(&file)
             .status()
             .unwrap();
         assert!(status.success());
-        assert!(read_wifi_networks(&root, owner).is_err());
+        assert!(read_wifi_networks(&root, &[owner]).is_err());
         std::fs::remove_file(&file).unwrap();
         let real = fixture.path().join("real-td-netd");
         std::fs::rename(&directory, &real).unwrap();
         std::fs::write(real.join(WIFI_FILE), networks.as_bytes()).unwrap();
         set(&real.join(WIFI_FILE), 0o600);
         std::os::unix::fs::symlink(&real, &directory).unwrap();
-        assert!(read_wifi_networks(&root, owner).is_err());
+        assert!(read_wifi_networks(&root, &[owner]).is_err());
     }
 
     #[test]
