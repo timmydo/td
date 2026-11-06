@@ -453,6 +453,54 @@ pub mod ed25519 {
     pub const PUBLIC_LEN: usize = 32;
     pub const SIGNATURE_LEN: usize = 64;
 
+    /// The y of every point of order 1, 2, 4 or 8, each way it can be spelled: 0, 1,
+    /// the two y of order 8, p - 1, and p and p + 1 as the only y at or past p that
+    /// reduce to one of those. The sign bit is left out, so seven stand for fourteen.
+    const SMALL_ORDER_Y: &[[u8; 32]] = &[
+        [0; 32],
+        [
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ],
+        [
+            0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef,
+            0x98, 0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88,
+            0x6d, 0x53, 0xfc, 0x05,
+        ],
+        [
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10,
+            0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77,
+            0x92, 0xac, 0x03, 0x7a,
+        ],
+        [
+            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ],
+        [
+            0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ],
+        [
+            0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ],
+    ];
+
+    /// Whether `public` encodes a point of small order, in any spelling, those `verify`
+    /// refuses anyway included. `verify` itself takes the canonical ones, being handed
+    /// only trusted keys, so a caller holding untrusted key material asks here. A key of
+    /// mixed order is not small and is not caught. The input is public: this may branch.
+    pub fn is_small_order(public: &[u8; PUBLIC_LEN]) -> bool {
+        let mut y = *public;
+        if let Some(high) = y.last_mut() {
+            *high &= 0x7f;
+        }
+        SMALL_ORDER_Y.contains(&y)
+    }
+
     pub struct SigningKey {
         scalar: [u8; 32],
         prefix: [u8; 32],
@@ -656,6 +704,67 @@ mod tests {
             k,
             hex32("684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51")
         );
+    }
+
+    // The torsion subgroup taken from the group law rather than from the list: the
+    // multiples of an order-8 point, eight distinct encodings, each of which [8]P
+    // sends to the identity.
+    #[test]
+    fn the_small_order_list_is_exactly_the_torsion_subgroup() {
+        let generator = hex32("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05");
+        let generator = Point::decode(&generator).unwrap();
+        let mut scalar = [0u8; 32];
+        let mut encodings = std::collections::BTreeSet::new();
+        for multiple in 0..8 {
+            scalar[0] = multiple;
+            let point = generator.multiply(&scalar);
+            let encoded = point.encode();
+            assert!(ed25519::is_small_order(&encoded), "{multiple}");
+            scalar[0] = 8;
+            assert_eq!(point.multiply(&scalar).encode(), Point::IDENTITY.encode());
+            encodings.insert(encoded);
+        }
+        assert_eq!(encodings.len(), 8);
+
+        // Those eight, and the six that decode refuses: the y at or past p, and x = 0
+        // with its sign bit set. Those are the only other ways of spelling a member.
+        let mut non_canonical = Vec::new();
+        for text in [
+            "0100000000000000000000000000000000000000000000000000000000000080",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ] {
+            let encoded = hex32(text);
+            assert!(ed25519::is_small_order(&encoded), "{text}");
+            assert!(Point::decode(&encoded).is_err(), "{text}");
+            non_canonical.push(encoded);
+        }
+
+        // One bit from any of the fourteen is not small, but for the sign bit.
+        for encoded in encodings.iter().chain(&non_canonical) {
+            for bit in 0..255 {
+                let mut changed = *encoded;
+                changed[bit / 8] ^= 1 << (bit % 8);
+                let is_listed = encodings.contains(&changed) || non_canonical.contains(&changed);
+                assert_eq!(ed25519::is_small_order(&changed), is_listed, "{bit}");
+            }
+            let mut other_sign = *encoded;
+            other_sign[31] ^= 0x80;
+            assert!(ed25519::is_small_order(&other_sign));
+        }
+
+        // Nor is the base point, an ordinary key or a key of mixed order.
+        assert!(!ed25519::is_small_order(&BASE));
+        let key = ed25519::SigningKey::from_seed(&[7; 32])
+            .unwrap()
+            .public_key();
+        assert!(!ed25519::is_small_order(&key));
+        let mixed = Point::decode(&key).unwrap().add(generator).encode();
+        assert!(Point::decode(&mixed).is_ok());
+        assert!(!ed25519::is_small_order(&mixed));
     }
 
     #[test]

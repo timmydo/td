@@ -1,20 +1,25 @@
-//! ChaCha20-Poly1305 (RFC 8439). ChaCha20 is additions, XORs and rotations and
-//! Poly1305 adds 64-by-64 products, so its time depends only on the lengths,
-//! given that those products are constant time. Poly1305 is reachable only
-//! through the AEAD: every block it sees is whole, padded by RFC 8439's
-//! construction, which is why it has no short-final-block path. A block takes
-//! four full products and two by the small top limb of h, which stays below 2p
-//! between blocks. Its limbs, reduction and finish are modified from the 64-bit
-//! path of OpenSSL's `crypto/poly1305/poly1305.c`, Apache-2.0 (THIRD-PARTY.md).
+//! ChaCha20-Poly1305 (RFC 8439) and OpenSSH's `chacha20-poly1305@openssh.com`.
+//! ChaCha20 is additions, XORs and rotations and Poly1305 adds 64-by-64 products,
+//! so the time depends only on the lengths, given that those products are constant
+//! time. Poly1305 is reachable only through these two AEADs. RFC 8439's pads every
+//! block whole; OpenSSH's MACs its packet bare, whose short last block takes
+//! Poly1305's own ending. A block takes four full products and two by the small top
+//! limb of h, which stays below 2p between blocks. Its limbs, reduction and finish
+//! are modified from the 64-bit path of OpenSSL's `crypto/poly1305/poly1305.c`,
+//! Apache-2.0 (THIRD-PARTY.md).
 
 use crate::{ct, Refused};
 
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
+pub const OPENSSH_KEY_LEN: usize = 64;
 
 /// RFC 8439 2.8: a 32-bit block counter starting at 1 covers this much.
 const MAX_LEN: u64 = ((1 << 32) - 1) * 64;
+
+/// The bytes before a packet's payload in OpenSSH's construction.
+const LENGTH_LEN: usize = 4;
 
 pub(crate) const SIGMA: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
 
@@ -48,6 +53,106 @@ pub fn open(
     Ok(())
 }
 
+/// `chacha20-poly1305@openssh.com`, OpenSSH's PROTOCOL.chacha20poly1305. Its state is
+/// a 64-bit counter then a 64-bit nonce holding the sequence number big-endian, which
+/// is RFC 8439's layout under a nonce of four zero bytes then that number, as long as
+/// the counter stays below 2^32: past that the two differ, so `seal` and `open` refuse.
+/// A sequence number must never repeat under one key.
+pub struct OpenSshAead {
+    main: [u32; 8],
+    length: [u32; 8],
+}
+
+impl OpenSshAead {
+    /// `key[..32]` is K_2, for the payload and the Poly1305 key; `key[32..]` is K_1,
+    /// for the length.
+    pub fn new(key: &[u8; OPENSSH_KEY_LEN]) -> Self {
+        let (main, length) = key.split_at(KEY_LEN);
+        Self {
+            main: key_words(main),
+            length: key_words(length),
+        }
+    }
+
+    /// The packet length, which the reader needs before it can have the whole packet
+    /// to authenticate. So this one value is released unauthenticated: the protocol
+    /// defines it so, and the caller must bound it before believing it.
+    pub fn decrypt_length(&self, seq: u32, encrypted: &[u8; LENGTH_LEN]) -> [u8; LENGTH_LEN] {
+        let mut pad = block(&self.length, 0, &openssh_nonce(seq));
+        let mut out = *encrypted;
+        for (byte, mask) in out.iter_mut().zip(&pad) {
+            *byte ^= *mask;
+        }
+        ct::zero(&mut pad);
+        out
+    }
+
+    /// `packet` is the 4 length bytes then the payload: encrypt it where it lies and
+    /// return the tag over all of it. Refused, and left alone, when too short to hold
+    /// a length or too long for the counter.
+    pub fn seal(&self, seq: u32, packet: &mut [u8]) -> Result<[u8; TAG_LEN], Refused> {
+        let cipher = self.cipher(seq, packet.len())?;
+        let (length, payload) = packet
+            .split_first_chunk_mut::<LENGTH_LEN>()
+            .ok_or(Refused)?;
+        *length = self.decrypt_length(seq, length);
+        cipher.crypt(payload);
+        Ok(cipher.bare_tag(packet))
+    }
+
+    /// Check the tag over the encrypted length and payload, then decrypt the payload
+    /// where it lies. The 4 length bytes stay as they arrived, `decrypt_length` having
+    /// read them. A refused packet is left untouched: nothing of the payload is
+    /// decrypted before the tag holds.
+    pub fn open(&self, seq: u32, packet: &mut [u8], tag: &[u8; TAG_LEN]) -> Result<(), Refused> {
+        let cipher = self.cipher(seq, packet.len())?;
+        if !ct::eq(&cipher.bare_tag(packet), tag) {
+            return Err(Refused);
+        }
+        let (_, payload) = packet
+            .split_first_chunk_mut::<LENGTH_LEN>()
+            .ok_or(Refused)?;
+        cipher.crypt(payload);
+        Ok(())
+    }
+
+    fn cipher(&self, seq: u32, packet_len: usize) -> Result<Cipher, Refused> {
+        check_len(packet_len.checked_sub(LENGTH_LEN).ok_or(Refused)?)?;
+        Ok(Cipher {
+            key: self.main,
+            nonce: openssh_nonce(seq),
+        })
+    }
+}
+
+impl Drop for OpenSshAead {
+    fn drop(&mut self) {
+        self.main.fill(0);
+        self.length.fill(0);
+        std::hint::black_box((&self.main, &self.length));
+    }
+}
+
+/// The sequence number's big-endian bytes, read as ChaCha20's little-endian word.
+const fn openssh_nonce(seq: u32) -> [u32; 3] {
+    [0, 0, seq.swap_bytes()]
+}
+
+fn key_words(key: &[u8]) -> [u32; 8] {
+    let mut words = [0u32; 8];
+    for (word, bytes) in words.iter_mut().zip(key.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
+    }
+    words
+}
+
+fn check_len(len: usize) -> Result<(), Refused> {
+    if u64::try_from(len).map_err(|_| Refused)? > MAX_LEN {
+        return Err(Refused);
+    }
+    Ok(())
+}
+
 struct Cipher {
     key: [u32; 8],
     nonce: [u32; 3],
@@ -55,13 +160,8 @@ struct Cipher {
 
 impl Cipher {
     fn new(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], len: usize) -> Result<Self, Refused> {
-        if u64::try_from(len).map_err(|_| Refused)? > MAX_LEN {
-            return Err(Refused);
-        }
-        let mut words = [0u32; 8];
-        for (word, bytes) in words.iter_mut().zip(key.as_chunks::<4>().0) {
-            *word = u32::from_le_bytes(*bytes);
-        }
+        check_len(len)?;
+        let words = key_words(key);
         let mut nonce_words = [0u32; 3];
         for (word, bytes) in nonce_words.iter_mut().zip(nonce.as_chunks::<4>().0) {
             *word = u32::from_le_bytes(*bytes);
@@ -92,10 +192,22 @@ impl Cipher {
         }
     }
 
-    fn tag(&self, aad: &[u8], ciphertext: &[u8]) -> [u8; TAG_LEN] {
+    fn mac(&self) -> Poly1305 {
         let mut first = block(&self.key, 0, &self.nonce);
-        let mut mac = Poly1305::new(&first);
+        let mac = Poly1305::new(&first);
         ct::zero(&mut first);
+        mac
+    }
+
+    /// OpenSSH's tag: Poly1305 over the message itself, with nothing around it.
+    fn bare_tag(&self, message: &[u8]) -> [u8; TAG_LEN] {
+        let mut mac = self.mac();
+        mac.bare(message);
+        mac.finish()
+    }
+
+    fn tag(&self, aad: &[u8], ciphertext: &[u8]) -> [u8; TAG_LEN] {
+        let mut mac = self.mac();
         mac.padded(aad);
         mac.padded(ciphertext);
         let mut lengths = [0u8; 16];
@@ -187,9 +299,14 @@ impl Poly1305 {
         }
     }
 
-    /// One whole 16-byte block with its 2^128 bit set: h = (h + block) * r, reduced
-    /// partly. r1 has its low two bits clear, so r1 * 2^128 = r1 * 5 / 4 mod p.
+    /// One whole 16-byte block with its 2^128 bit set.
     fn block(&mut self, block: &[u8; 16]) {
+        self.absorb(block, 1);
+    }
+
+    /// h = (h + block + high * 2^128) * r, reduced partly. r1 has its low two bits
+    /// clear, so r1 * 2^128 = r1 * 5 / 4 mod p.
+    fn absorb(&mut self, block: &[u8; 16], high: u64) {
         let (t0, t1) = two_words(block);
         let [r0, r1] = self.r;
         let s1 = r1 + (r1 >> 2);
@@ -198,7 +315,7 @@ impl Poly1305 {
         let (h0, carry) = h0.overflowing_add(t0);
         let (h1, carry_a) = h1.overflowing_add(t1);
         let (h1, carry_b) = h1.overflowing_add(u64::from(carry));
-        let h2 = h2 + u64::from(carry_a) + u64::from(carry_b) + 1;
+        let h2 = h2 + u64::from(carry_a) + u64::from(carry_b) + high;
 
         let wide = |a: u64, b: u64| u128::from(a) * u128::from(b);
         let d0 = wide(h0, r0) + wide(h1, s1);
@@ -225,6 +342,22 @@ impl Poly1305 {
                 *out = *byte;
             }
             self.block(&last);
+        }
+    }
+
+    /// `data` as Poly1305 itself reads it (RFC 8439 2.5): a short last block ends in
+    /// a 1 byte, which takes the place of its 2^128 bit.
+    fn bare(&mut self, data: &[u8]) {
+        let (blocks, rest) = data.as_chunks::<16>();
+        for block in blocks {
+            self.block(block);
+        }
+        if !rest.is_empty() {
+            let mut last = [0u8; 16];
+            for (out, byte) in last.iter_mut().zip(rest.iter().chain(&[1])) {
+                *out = *byte;
+            }
+            self.absorb(&last, 0);
         }
     }
 
@@ -261,10 +394,12 @@ impl Drop for Poly1305 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
-    use super::{block, open, seal, Cipher, Poly1305, MAX_LEN};
+    #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::panic)]
+    use super::{
+        block, check_len, key_words, open, openssh_nonce, seal, Cipher, Poly1305, MAX_LEN,
+    };
     use crate::sha::{Digest, Sha256};
-    use crate::test_corpus::{expand, long_rows, rows, EDGE_LENGTHS};
+    use crate::test_corpus::{expand, hex as field, long_rows, rows, EDGE_LENGTHS};
 
     /// One way of running the keystream from a given block.
     type Backend = fn(&Cipher, u32, &mut [u8]);
@@ -416,6 +551,70 @@ mod tests {
         assert_eq!(MAX_LEN, ((1u64 << 32) - 1) * 64);
         assert!(Cipher::new(&[0; 32], &[0; 12], MAX_LEN as usize).is_ok());
         assert!(Cipher::new(&[0; 32], &[0; 12], MAX_LEN as usize + 1).is_err());
+        // A packet's payload has the same bound, past its 4 length bytes.
+        let aead = super::OpenSshAead::new(&[0; 64]);
+        assert!(aead.cipher(0, MAX_LEN as usize + 4).is_ok());
+        assert!(aead.cipher(0, MAX_LEN as usize + 5).is_err());
+        assert!(aead.cipher(0, 4).is_ok());
+        assert!(aead.cipher(0, 3).is_err());
+        assert!(check_len(MAX_LEN as usize + 1).is_err());
+    }
+
+    // OpenSSL's Poly1305 at every length around a block, short last blocks included,
+    // and RFC 8439's own vectors: `bare` is reachable from outside only through a
+    // packet, so this is where it is held to Poly1305 by itself.
+    #[test]
+    fn bare_poly1305_agrees_with_openssl() {
+        let mut count = 0;
+        for line in include_str!("../tests/ssh/poly1305.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let [key, message, tag] = fields[..] else {
+                panic!("malformed row: {line}");
+            };
+            let mut block = [0u8; 64];
+            block[..32].copy_from_slice(&field(key));
+            let mut mac = Poly1305::new(&block);
+            mac.bare(&field(message));
+            assert_eq!(mac.finish().to_vec(), field(tag), "{line}");
+            count += 1;
+        }
+        assert_eq!(count, 79);
+    }
+
+    // The framing on each backend: `tests/ssh_vectors.rs` reaches only the CPU's.
+    #[test]
+    fn every_backend_answers_the_openssh_packets() {
+        let mut count = 0;
+        for line in include_str!("../tests/ssh/chachapoly.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let [key, seq, length, sealed, tag] = fields[..] else {
+                panic!("malformed row: {line}");
+            };
+            let key = field(key);
+            let length: usize = length.parse().unwrap();
+            let sealed = field(sealed);
+            let cipher = Cipher {
+                key: key_words(&key[..32]),
+                nonce: openssh_nonce(seq.parse().unwrap()),
+            };
+            assert_eq!(cipher.bare_tag(&sealed).to_vec(), field(tag));
+            let plain: Vec<u8> = (0..length)
+                .map(|i| ((i * 17 + length) & 0xff) as u8)
+                .collect();
+            for backend in backends() {
+                let mut data = plain.clone();
+                backend(&cipher, 1, &mut data);
+                assert_eq!(data, sealed[4..]);
+            }
+            count += 1;
+        }
+        assert_eq!(count, 52);
     }
 
     // RFC 8439 2.3.2.

@@ -1,0 +1,11 @@
+# Generator: OpenSSH_10.3p1 ssh-keygen -t ed25519 -a 2 -Z aes256-ctr.
+# Test fixture, not a real identity. Passphrase: correct horse battery
+# Public: AAAAC3NzaC1lZDI1NTE5AAAAIDXeJPRczLcloou6U8JBkMdrZBasY0TTGIr0Ibdt3c4y
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABCIX/t37I
+ZaBx/2ONwwdVmSAAAAAgAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIDXeJPRczLcloou6
+U8JBkMdrZBasY0TTGIr0Ibdt3c4yAAAAoGB48q79c+RI/2zq2qfIfDERnJJivObtu+EDqo
+ZsBYOgukhiWROGu0r9rWfXc5J2ZvDiQiN6V48jEcaG04zCvAlnSYifNxt7v3Hhz5KzrgMD
+Jb5tgxNVaRYRJs3JTnwxkt3w7e7odZMZlvT/1we95Znozv8A9IYjjB27kElIJkPZJXtEn9
+oFzMxoCAxMUit4xCo4yJvYLtNX4F11KVwxpQc=
+-----END OPENSSH PRIVATE KEY-----

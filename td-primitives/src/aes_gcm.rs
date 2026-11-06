@@ -118,8 +118,9 @@ impl AesGcm {
         Ok(())
     }
 
-    /// `first` is 2 in every use but a test of the counter's wrap.
-    fn ctr(&self, nonce: &[u8; NONCE_LEN], first: u32, data: &mut [u8]) {
+    /// `first` is 2 in GCM, where only a test of the counter's wrap differs.
+    /// `aes256_ctr` runs its 128-bit counter through this one stretch at a time.
+    pub(crate) fn ctr(&self, nonce: &[u8; NONCE_LEN], first: u32, data: &mut [u8]) {
         let round_keys = match &self.engine {
             Engine::Software { round_keys, .. } => round_keys,
             #[cfg(target_arch = "x86_64")]
@@ -635,7 +636,7 @@ fn carryless(x: u64, y: u64) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
     use super::{
         check_len, expand_key, interleave_in, interleave_out, ortho, sbox, software_engine, AesGcm,
@@ -672,7 +673,7 @@ mod tests {
     }
 
     /// Each backend this machine has, which is always the software one.
-    fn engines(key: &[u8]) -> Vec<AesGcm> {
+    pub(crate) fn engines(key: &[u8]) -> Vec<AesGcm> {
         let mut all = vec![software(key)];
         all.extend(hardware(key));
         all

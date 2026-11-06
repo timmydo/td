@@ -1,6 +1,7 @@
 //! SHA-256, SHA-384, SHA-512 (FIPS 180-4) and SHA-1. SHA-1 exists only because
-//! the OpenPGP v4 fingerprint is defined by it: it is one function, not a
-//! `Digest`, so no HMAC or signature can be built on it.
+//! the OpenPGP v4 fingerprint and SSH's hashed `known_hosts` are defined by it: it
+//! is not a `Digest`, so the one HMAC on it is `hmac::hmac_sha1` and no signature
+//! can be built on it.
 //!
 //! All of them run in time that depends only on the input's length.
 
@@ -269,9 +270,15 @@ impl Digest for Sha384 {
 
 /// Legacy: for fingerprints the OpenPGP format fixes, never for a signature.
 pub fn sha1(data: &[u8]) -> [u8; 20] {
+    sha1_of_parts(&[data])
+}
+
+pub(crate) fn sha1_of_parts(parts: &[&[u8]]) -> [u8; 20] {
     let mut h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
     let mut blocks = Blocks::<64>::new();
-    blocks.absorb(data, &mut |block| compress1(&mut h, block));
+    for part in parts {
+        blocks.absorb(part, &mut |block| compress1(&mut h, block));
+    }
     blocks.pad(8, &mut |block| compress1(&mut h, block));
     let mut out = [0; 20];
     for (bytes, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {

@@ -3,9 +3,11 @@
 
 #[cfg(target_arch = "x86_64")]
 mod accel;
+pub mod aes256_ctr;
 pub mod aes_gcm;
 #[cfg(target_arch = "x86_64")]
 mod aes_ni;
+pub mod bcrypt_pbkdf;
 mod bignum;
 pub mod chacha20_poly1305;
 #[cfg(target_arch = "x86_64")]
@@ -15,6 +17,8 @@ pub mod curve25519;
 mod der;
 pub mod ec;
 pub mod hmac;
+pub mod keccak;
+pub mod mlkem768;
 pub mod random;
 pub mod rsa;
 pub mod sha;

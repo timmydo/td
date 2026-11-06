@@ -1,9 +1,9 @@
 //! HMAC (RFC 2104) over any `Digest`. HKDF and TLS 1.2's PRF are not here:
 //! rustls derives both from this through its own `HkdfUsingHmac` and
-//! `PrfUsingHmac`.
+//! `PrfUsingHmac`. SHA-1 is no `Digest`, and `hmac_sha1` is the only HMAC over it.
 
 use crate::ct;
-use crate::sha::Digest;
+use crate::sha::{sha1, sha1_of_parts, Digest};
 
 #[derive(Clone)]
 pub struct Hmac<D: Digest> {
@@ -64,6 +64,34 @@ pub fn mac<D: Digest>(key: &[u8], parts: &[&[u8]]) -> D::Output {
         hmac.update(part);
     }
     hmac.finalize()
+}
+
+/// HMAC-SHA-1 (RFC 2104), for what its format defines by it: a hashed `known_hosts`
+/// entry. Nothing else should take a dependency on this. Compare with `ct::eq`.
+pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
+    let mut pad = [0u8; 64];
+    if key.len() > pad.len() {
+        let mut hashed = sha1(key);
+        for (out, byte) in pad.iter_mut().zip(hashed) {
+            *out = byte;
+        }
+        ct::zero(&mut hashed);
+    } else {
+        for (out, byte) in pad.iter_mut().zip(key) {
+            *out = *byte;
+        }
+    }
+    for byte in &mut pad {
+        *byte ^= 0x36;
+    }
+    let mut inner = sha1_of_parts(&[&pad, data]);
+    for byte in &mut pad {
+        *byte ^= 0x36 ^ 0x5c;
+    }
+    let out = sha1_of_parts(&[&pad, &inner]);
+    ct::zero(&mut pad);
+    ct::zero(&mut inner);
+    out
 }
 
 #[cfg(test)]
