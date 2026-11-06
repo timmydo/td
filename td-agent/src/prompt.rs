@@ -109,19 +109,21 @@ pub fn prefix(created: u64) -> String {
 
 /// `prefix`, for a conversation that works in `place`.
 pub fn prefix_in(created: u64, place: Option<&Place>) -> String {
-    prefix_with(created, place, None, &[])
+    prefix_with(CONVERSATION, created, place, None, &[])
 }
 
 /// `prefix_in`, with the person's skills listed last (DESIGN.md §13),
 /// and `mcp`, its MCP servers' tools' definitions, after its own tools
-/// (§12, MCP servers), the environment saying what they are.
+/// (§12, MCP servers), the environment saying what they are, `conversation`
+/// being the system prompt in force (§13, The person's prompts).
 pub fn prefix_with(
+    conversation: &str,
     created: u64,
     place: Option<&Place>,
     skills: Option<&str>,
     mcp: &[td_json::Json],
 ) -> String {
-    let text = CONVERSATION.replacen(
+    let text = conversation.replacen(
         TOOLS,
         if place.is_some() {
             WORKSPACE
@@ -738,7 +740,7 @@ mod tests {
         assert!(!prefix.contains("- MCP tools:"));
         let mcp =
             td_json::parse(r#"{"type":"function","function":{"name":"mcp__gh__list"}}"#).unwrap();
-        let with = prefix_with(0, Some(&place), None, &[mcp]);
+        let with = prefix_with(CONVERSATION, 0, Some(&place), None, &[mcp]);
         assert!(
             with.contains("- MCP tools: the tools named mcp__SERVER__TOOL"),
             "{with}"

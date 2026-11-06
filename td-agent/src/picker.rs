@@ -188,6 +188,30 @@ impl Picker {
         .map_err(|e| format!("the template chooser: {e}"))
     }
 
+    /// The chooser of a prompt to edit, each row saying whose it is.
+    pub fn prompts(
+        surface: Surface,
+        rect: Rect,
+        rows: &[(String, String)],
+    ) -> Result<Self, String> {
+        let first = rows.first().map(|(name, _)| name.as_str()).unwrap_or("");
+        let (entries, left_out) = entries(
+            rows.iter()
+                .map(|(name, meta)| (name.as_str(), meta.as_str(), true)),
+            "",
+        );
+        Self::over(
+            surface,
+            rect,
+            "Prompts",
+            entries,
+            left_out,
+            first,
+            "what you save holds from each conversation's next request",
+        )
+        .map_err(|e| format!("the prompt chooser: {e}"))
+    }
+
     fn over(
         surface: Surface,
         rect: Rect,

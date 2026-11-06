@@ -367,6 +367,8 @@ pub struct Session {
     /// `ask` whose mode could not be written: sent in `ask` until the
     /// human chooses their mode.
     held: Vec<String>,
+    /// What was last said of prompts that cannot be used, not to say it again.
+    prompt_troubles: Vec<String>,
     /// The conversation open after the last request for a new one was served.
     made: Option<Id>,
     /// What reads folders for the chooser.
@@ -407,6 +409,13 @@ impl Session {
                 Request::NewScratch(unconfined) => self.start_in(None, unconfined),
                 Request::NewIn(folder, unconfined) => self.start_in(Some(folder), unconfined),
                 Request::NewFrom(name) => self.start_from(&name),
+                Request::SetPrompt {
+                    ask,
+                    name,
+                    from,
+                    text,
+                } => self.set_prompt(ask, name, &from, &text),
+                Request::ListPrompts => self.send_prompts(),
                 Request::SaveTemplate {
                     template,
                     replacing,
@@ -686,6 +695,59 @@ impl Session {
             }
         }
         self.supervisor.repolicy(rules, self.mode);
+        self.send_prompts();
+    }
+
+    /// Tells the window the prompts as they are, so its dialog opens on them.
+    fn send_prompts(&mut self) {
+        let entries = crate::prompts::listing(self.state.root());
+        let troubles: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry.trouble.clone())
+            .collect();
+        for why in troubles
+            .iter()
+            .filter(|why| !self.prompt_troubles.contains(why))
+        {
+            let said = format!(
+                "turns stop until File > Prompts\u{2026} replaces a prompt that cannot be used: {why}"
+            );
+            logged!("td-agent: {said}");
+            self.view.note(said);
+        }
+        self.prompt_troubles = troubles;
+        self.view.set_prompts(entries);
+    }
+
+    /// Puts `text` in force as the prompt `name`; each conversation reads it
+    /// from its next request (DESIGN.md §13).
+    fn set_prompt(&mut self, ask: u64, name: crate::prompts::Name, from: &str, text: &str) {
+        // A window told before the file moved on overwrites nothing it did not
+        // show; a save made again after a lost answer finds its own text there.
+        let listed = crate::prompts::listing(self.state.root());
+        let now = listed.iter().find(|entry| entry.name == name);
+        if now.is_some_and(|entry| entry.text != from && entry.text != text) {
+            self.send_prompts();
+            return self.view.prompt_refused(ask, format!(
+                "{} changed since this dialog opened, so it stays as it is: copy what you want to keep, then leave and open it again",
+                name.title()
+            ));
+        }
+        match crate::prompts::save(self.state.root(), name, Some(text)) {
+            Ok(()) => {
+                self.send_prompts();
+                self.view.prompt_saved(
+                    ask,
+                    format!(
+                        "{} saved; it holds from each conversation's next request",
+                        name.title()
+                    ),
+                );
+            }
+            Err(why) => self
+                .view
+                .prompt_refused(ask, format!("{} stays as it was: {why}", name.title())),
+        }
     }
 
     /// What `conversation`'s workspace card shows, read now: its trust
@@ -3254,6 +3316,7 @@ pub fn run(
         made: None,
         folders: crate::chooser::FolderReader::default(),
         held: Vec::new(),
+        prompt_troubles: Vec::new(),
     };
     session.read_tasks(ids.into_iter().map(|(_, id)| id).collect());
     // Before any conversation starts.

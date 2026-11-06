@@ -28,7 +28,7 @@ const USAGE: &str = "\
 usage: td-agent calibrate FIXTURES
 
 Puts each case of FIXTURES, a JSON array of {name, expected, state}, to
-both classifier stages with the configuration and key the window uses,
+both classifier stages with the configuration, key and prompts the window uses,
 and prints what each answered and every stage's false allows and false
 escalations, Jev's at each threshold. `expected` is \"allow\" for an
 action that should run without the person and \"ask\" for one that
@@ -201,9 +201,19 @@ pub fn run(args: &[String]) -> Result<(), String> {
     );
     let config = config::load(config_path.as_deref())?;
     let client = &config.client;
+    // The prompts the window's conversations judge by.
+    let prompts = match crate::store::StateDir::from_env(
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+    ) {
+        Ok(state) => crate::prompts::Prompts::load(state.root())
+            .map_err(|why| format!("your prompts could not be read: {why}"))?,
+        Err(_) => crate::prompts::Prompts::default(),
+    };
+    let prompts = &prompts;
     let jev_url = classifier::jev_url(&client.base_url)
         .ok_or("Jev is asked only when base_url ends in /v1")?;
-    let worst = worst_case(client, &cases)?;
+    let worst = worst_case(client, &cases, prompts)?;
     if let Some(limit) = client.limits.turn {
         if worst > limit {
             return Err(format!(
@@ -226,8 +236,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut answers = Vec::new();
     let mut stopped = None;
     for case in &cases {
-        let head = classifier::reasoning_head(client, &case.state);
-        let body = classifier::jev_body(&client.classifier_fast_model, &case.state);
+        let head = classifier::reasoning_head(client, &case.state, prompts);
+        let body = classifier::jev_body(&client.classifier_fast_model, &case.state, prompts);
         // Refused as a crossing would be, neither stage asked.
         if let Some(why) = unasked(&case.state, &head, &body) {
             let why = format!("not asked: {why}");
@@ -382,7 +392,11 @@ fn read(path: &Path) -> Result<String, String> {
 /// models list: refused, as a conversation refuses it, when a stage's
 /// model is not in the list, or has no price while any cost limit is
 /// set, or the reasoning stage's model takes no `max_tokens`.
-fn worst_case(client: &Client, cases: &[Case]) -> Result<u64, String> {
+fn worst_case(
+    client: &Client,
+    cases: &[Case],
+    prompts: &crate::prompts::Prompts,
+) -> Result<u64, String> {
     let wanted = [
         client.classifier_model.as_str(),
         client.classifier_fast_model.as_str(),
@@ -432,8 +446,8 @@ fn worst_case(client: &Client, cases: &[Case]) -> Result<u64, String> {
     }
     let mut worst = 0u64;
     for case in cases {
-        let head = classifier::reasoning_head(client, &case.state);
-        let jev = classifier::jev_body(&client.classifier_fast_model, &case.state);
+        let head = classifier::reasoning_head(client, &case.state, prompts);
+        let jev = classifier::jev_body(&client.classifier_fast_model, &case.state, prompts);
         let tokens = |bytes: usize| (bytes as u64 + 2).div_ceil(4);
         worst = worst
             .saturating_add(reasoning.map_or(0, |p| {

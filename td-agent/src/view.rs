@@ -40,6 +40,8 @@ pub enum View {
     Replay(Option<Id>, Result<String, String>, Vec<Event>, Pictures),
     GiveBack(String, Vec<Attached>, String),
     Restore(String, String),
+    PromptSaved(u64, String),
+    PromptRefused(u64, String),
     TemplateSaved(String),
     TemplateRefused(String),
     SetTemplates(Vec<(String, bool)>),
@@ -49,6 +51,7 @@ pub enum View {
     SetNetworks(Box<Client>),
     SetModes(Option<Vec<(String, Mode)>>),
     SetAllAllowed(Vec<String>),
+    SetPrompts(Vec<crate::prompts::Entry>),
     SetModels(String, Vec<(String, u64)>),
     SetCredit(Option<String>),
     SetClosing(Id, Option<&'static str>),
@@ -303,6 +306,7 @@ impl Port {
             | View::SetNetworks(_)
             | View::SetModes(_)
             | View::SetAllAllowed(_)
+            | View::SetPrompts(_)
             | View::SetModels(..)
             | View::SetCredit(_)
             | View::SetKeyPath(_)
@@ -569,6 +573,14 @@ impl Port {
         self.say(View::Restore(text.into(), why));
     }
 
+    pub fn prompt_saved(&mut self, ask: u64, said: String) {
+        self.say(View::PromptSaved(ask, said));
+    }
+
+    pub fn prompt_refused(&mut self, ask: u64, why: String) {
+        self.say(View::PromptRefused(ask, why));
+    }
+
     pub fn template_saved(&mut self, said: String) {
         self.say(View::TemplateSaved(said));
     }
@@ -599,6 +611,10 @@ impl Port {
 
     pub fn set_modes(&mut self, modes: Option<Vec<(String, Mode)>>) {
         self.say(View::SetModes(modes));
+    }
+
+    pub fn set_prompts(&mut self, prompts: Vec<crate::prompts::Entry>) {
+        self.say(View::SetPrompts(prompts));
     }
 
     pub fn set_all_allowed(&mut self, all_allowed: Vec<String>) {
@@ -798,6 +814,8 @@ impl App {
             }
             View::GiveBack(text, pictures, why) => self.give_back(&text, pictures, why),
             View::Restore(text, why) => self.restore(&text, why),
+            View::PromptSaved(ask, said) => self.prompt_saved(ask, said),
+            View::PromptRefused(ask, why) => self.prompt_refused(ask, why),
             View::TemplateSaved(said) => self.template_saved(said),
             View::TemplateRefused(why) => self.template_refused(why),
             View::SetTemplates(templates) => self.set_templates(templates),
@@ -807,6 +825,7 @@ impl App {
             View::SetNetworks(client) => self.set_networks(&client),
             View::SetModes(modes) => self.set_modes(modes),
             View::SetAllAllowed(all_allowed) => self.set_all_allowed(all_allowed),
+            View::SetPrompts(prompts) => self.set_prompts(prompts),
             View::SetModels(default, contexts) => self.set_models(&default, contexts),
             View::SetCredit(credit) => self.set_credit(credit),
             View::SetClosing(id, doing) => self.set_closing(&id, doing),

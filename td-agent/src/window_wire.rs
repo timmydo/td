@@ -195,6 +195,11 @@ fn rows_from(value: &Json) -> Result<Vec<(String, String)>, String> {
         .collect()
 }
 
+/// The save an answer about a prompt is to.
+fn ask_number(value: &Json) -> Result<u64, String> {
+    maybe_number(value, "ask")?.ok_or_else(|| "ask is not a number".to_string())
+}
+
 fn maybe_number(value: &Json, name: &str) -> Result<Option<u64>, String> {
     match value.get(name) {
         Some(Json::Null) => Ok(None),
@@ -800,6 +805,14 @@ pub fn encode_view(view: &View) -> Vec<u8> {
             "restore",
             vec![field("text", text(said)), field("why", text(why))],
         ),
+        View::PromptSaved(ask, said) => (
+            "prompt_saved",
+            vec![field("ask", Json::from(*ask)), field("said", text(said))],
+        ),
+        View::PromptRefused(ask, why) => (
+            "prompt_refused",
+            vec![field("ask", Json::from(*ask)), field("why", text(why))],
+        ),
         View::TemplateSaved(said) => ("template_saved", vec![field("said", text(said))]),
         View::TemplateRefused(why) => ("template_refused", vec![field("why", text(why))]),
         View::SetTemplates(templates) => (
@@ -837,6 +850,25 @@ pub fn encode_view(view: &View) -> Vec<u8> {
             vec![field(
                 "client",
                 carried(client.as_ref(), client.to_json(), client_paths),
+            )],
+        ),
+        View::SetPrompts(prompts) => (
+            "set_prompts",
+            vec![field(
+                "prompts",
+                Json::Arr(
+                    prompts
+                        .iter()
+                        .map(|entry| {
+                            Json::Obj(vec![
+                                field("name", text(entry.name.word())),
+                                field("text", text(&entry.text)),
+                                field("custom", Json::Bool(entry.custom)),
+                                field("trouble", optional(&entry.trouble)),
+                            ])
+                        })
+                        .collect(),
+                ),
             )],
         ),
         View::SetAllAllowed(all_allowed) => (
@@ -1095,6 +1127,8 @@ pub fn decode_view(bytes: &[u8]) -> Result<View, String> {
             string(value, "why")?,
         ),
         Some("restore") => View::Restore(string(value, "text")?, string(value, "why")?),
+        Some("prompt_saved") => View::PromptSaved(ask_number(value)?, string(value, "said")?),
+        Some("prompt_refused") => View::PromptRefused(ask_number(value)?, string(value, "why")?),
         Some("template_saved") => View::TemplateSaved(string(value, "said")?),
         Some("template_refused") => View::TemplateRefused(string(value, "why")?),
         Some("set_templates") => {
@@ -1114,6 +1148,14 @@ pub fn decode_view(bytes: &[u8]) -> Result<View, String> {
         Some("set_networks") => View::SetNetworks(Box::new(member(value, "client", |client| {
             carried_from(client, Client::from_json, client_paths)
         })?)),
+        Some("set_prompts") => View::SetPrompts(items(value, "prompts", |one| {
+            Ok(crate::prompts::Entry {
+                name: prompt_name(one)?,
+                text: string(one, "text")?,
+                custom: flag(one, "custom")?,
+                trouble: maybe(one, "trouble")?,
+            })
+        })?),
         Some("set_all_allowed") => View::SetAllAllowed(strings(value, "conversations")?),
         Some("set_modes") => View::SetModes(match value.get("modes") {
             Some(Json::Null) => None,
@@ -1357,6 +1399,21 @@ pub fn encode_request(request: &Request) -> Vec<u8> {
             ],
         ),
         Request::SetDefault(model) => ("set_default", vec![field("model", text(model))]),
+        Request::SetPrompt {
+            ask,
+            name,
+            from,
+            text: said,
+        } => (
+            "set_prompt",
+            vec![
+                field("ask", Json::from(*ask)),
+                field("name", text(name.word())),
+                field("from", text(from)),
+                field("text", text(said)),
+            ],
+        ),
+        Request::ListPrompts => ("list_prompts", Vec::new()),
         Request::SetAllAllowed { conversation, on } => (
             "set_all_allowed",
             vec![
@@ -1565,6 +1622,13 @@ fn request_from(value: &Json) -> Result<Request, String> {
             number: number(value, "number")?,
         },
         Some("set_default") => Request::SetDefault(string(value, "model")?),
+        Some("set_prompt") => Request::SetPrompt {
+            ask: ask_number(value)?,
+            name: prompt_name(value)?,
+            from: string(value, "from")?,
+            text: string(value, "text")?,
+        },
+        Some("list_prompts") => Request::ListPrompts,
         Some("set_all_allowed") => Request::SetAllAllowed {
             conversation: id_from(value, "conversation")?,
             on: flag(value, "on")?,
@@ -1606,6 +1670,12 @@ fn request_from(value: &Json) -> Result<Request, String> {
         },
         _ => return Err("a request of an unknown type".into()),
     })
+}
+
+/// A prompt's name as a message gives it.
+fn prompt_name(value: &Json) -> Result<crate::prompts::Name, String> {
+    let word = string(value, "name")?;
+    crate::prompts::Name::from_word(&word).ok_or_else(|| format!("no prompt is called {word}"))
 }
 
 #[cfg(test)]
@@ -2027,6 +2097,14 @@ mod tests {
             View::GiveBack(AWKWARD.into(), attached(), "why".into()),
             View::GiveBack(String::new(), Vec::new(), String::new()),
             View::Restore(AWKWARD.into(), "why".into()),
+            View::PromptSaved(7, "said".into()),
+            View::PromptRefused(7, "why".into()),
+            View::SetPrompts(vec![crate::prompts::Entry {
+                name: crate::prompts::Name::Classifier,
+                text: "broken".into(),
+                custom: true,
+                trouble: Some("why".into()),
+            }]),
             View::TemplateSaved("said".into()),
             View::TemplateRefused("why".into()),
             View::SetTemplates(vec![("a".into(), true), ("b".into(), false)]),
@@ -2042,6 +2120,8 @@ mod tests {
                 }],
                 "high".into(),
             ),
+            View::SetPrompts(Vec::new()),
+            View::SetPrompts(crate::prompts::Prompts::default().entries()),
             View::SetAllAllowed(Vec::new()),
             View::SetAllAllowed(vec!["id".into()]),
             View::SetModes(None),
@@ -2285,6 +2365,13 @@ mod tests {
                 number: 2,
             },
             Request::SetDefault("a/b".into()),
+            Request::SetPrompt {
+                ask: 7,
+                name: crate::prompts::Name::JevRequest,
+                from: "c".into(),
+                text: "a\nb".into(),
+            },
+            Request::ListPrompts,
             Request::SetAllAllowed {
                 conversation: id(1),
                 on: true,
@@ -2377,6 +2464,8 @@ mod tests {
             View::Replay(..) => "Replay",
             View::GiveBack(..) => "GiveBack",
             View::Restore(..) => "Restore",
+            View::PromptSaved(..) => "PromptSaved",
+            View::PromptRefused(..) => "PromptRefused",
             View::TemplateSaved(..) => "TemplateSaved",
             View::TemplateRefused(..) => "TemplateRefused",
             View::SetTemplates(..) => "SetTemplates",
@@ -2384,6 +2473,7 @@ mod tests {
             View::SetQueued(..) => "SetQueued",
             View::SetOffers(..) => "SetOffers",
             View::SetNetworks(..) => "SetNetworks",
+            View::SetPrompts(..) => "SetPrompts",
             View::SetAllAllowed(..) => "SetAllAllowed",
             View::SetModes(..) => "SetModes",
             View::SetModels(..) => "SetModels",
@@ -2461,6 +2551,8 @@ mod tests {
             Request::Kill { .. } => "Kill",
             Request::Output { .. } => "Output",
             Request::SetDefault(..) => "SetDefault",
+            Request::SetPrompt { .. } => "SetPrompt",
+            Request::ListPrompts => "ListPrompts",
             Request::SetAllAllowed { .. } => "SetAllAllowed",
             Request::SetMode { .. } => "SetMode",
             Request::Trust { .. } => "Trust",

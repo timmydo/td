@@ -44,6 +44,8 @@ pub enum Action {
     SetKey,
     /// Open the dialog that makes a workspace template (DESIGN.md §7).
     NewTemplate,
+    /// Opens the chooser of the prompts the person may replace.
+    Prompts,
     /// Choose a template made in the window, to edit or remove.
     EditTemplate,
     /// Write the diagnostics archive (DESIGN.md §4).
@@ -98,6 +100,7 @@ pub const FILE: &[(&str, &str, Action)] = &[
     ("New template\u{2026}", "", Action::NewTemplate),
     ("Edit template\u{2026}", "", Action::EditTemplate),
     ("Set OpenRouter key\u{2026}", "", Action::SetKey),
+    ("Prompts\u{2026}", "", Action::Prompts),
     ("Export diagnostics", "", Action::Export),
     ("Messages\u{2026}", "C-S-m", Action::Messages),
     ("Quit", "", Action::Quit),

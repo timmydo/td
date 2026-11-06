@@ -4022,8 +4022,11 @@ impl Session {
     fn expected_prefix(&mut self, client: &Client) -> Result<String, String> {
         let skills = self.skills_index();
         let mcp = serving::definitions(&self.mcp_offered);
+        let prompts = crate::prompts::Prompts::load(&self.state)
+            .map_err(|why| format!("your prompts could not be read: {why}"))?;
+        let system = prompts.get(crate::prompts::Name::System);
         self.placed(client, |created, place| {
-            crate::prompt::prefix_with(created, place, skills.as_deref(), &mcp)
+            crate::prompt::prefix_with(system, created, place, skills.as_deref(), &mcp)
         })
     }
 
@@ -7493,6 +7496,14 @@ impl Session {
         else {
             return Ok(refused("no turn is under way".into()));
         };
+        // A policy the person chose and that cannot be read is no reason to
+        // judge by another.
+        let prompts = match crate::prompts::Prompts::load(&self.state) {
+            Ok(prompts) => prompts,
+            Err(why) => {
+                return Ok(refused(format!("your prompts could not be read: {why}")));
+            }
+        };
         // Jev, when it can be asked: its endpoint and price.
         // Auto mode asks it whatever `data_collection` says of a conversation's
         // own requests (DESIGN.md §11).
@@ -7546,7 +7557,7 @@ impl Session {
             return Ok(refused(why));
         }
         let state = self.classifier_state(&pending);
-        let head = classifier::reasoning_head(&client, &state);
+        let head = classifier::reasoning_head(&client, &state, &prompts);
         let bytes = head.len() as u64 + 2;
         let pricing = model.as_ref().and_then(|m| m.pricing);
         let reserved = pricing.map_or(0, |p| {
@@ -7555,7 +7566,7 @@ impl Session {
         // Jev's request: its body, without braces, as a head; billed by
         // its input alone.
         let jev = jev.map(|(url, pricing)| {
-            let body = classifier::jev_body(&client.classifier_fast_model, &state);
+            let body = classifier::jev_body(&client.classifier_fast_model, &state, &prompts);
             let head = body
                 .strip_prefix('{')
                 .and_then(|b| b.strip_suffix('}'))

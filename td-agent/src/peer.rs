@@ -48,7 +48,7 @@ pub const OPTIONS: Options = Options {
     hello: Hello {
         program: "td-agent-window",
         // Raised by hand with the forms of `window_wire`.
-        version: 3,
+        version: 4,
     },
     streams: &[STREAM, BYE],
     max_message: MAX_MESSAGE,

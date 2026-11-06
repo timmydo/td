@@ -33,9 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use td_ui::chrome::ROW;
-use td_ui::editor::{self, Controller as Pane, Event as PaneEvent, Outcome as PaneOutcome};
-use td_ui::editor_clipboard::{Paste, Snapshot};
-use td_ui::editor_model::TabId;
+use td_ui::editor::{Event as PaneEvent, Outcome as PaneOutcome};
 use td_ui::keys::{self, Section};
 use td_ui::messages::{self, Error as MessagesError, Message, Side, Target, Tone};
 use td_ui::raster::{
@@ -49,6 +47,7 @@ use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 use crate::book::Book;
 pub use crate::book::{Row, RowState};
 use crate::chooser::Chooser;
+use crate::composer::Composer;
 use crate::config::{Mode, Network};
 use crate::confirm::{self, Confirm};
 use crate::cost;
@@ -59,6 +58,7 @@ use crate::picker::{Offer, Picker};
 use crate::picture::Reference;
 #[cfg(test)]
 use crate::post::Entry;
+use crate::promptdialog::{PromptDialog, Reply as PromptReply};
 use crate::protocol::{Up, MAX_TEXT};
 use crate::store::{Event, Held, Id, Kind, Purpose, Role, Status, TaskStart, TodoItem};
 use crate::supervisor::Update;
@@ -255,6 +255,8 @@ enum Picking {
     Template,
     /// A template made in the window, to edit or remove.
     Edit,
+    /// A prompt to edit.
+    Prompt,
 }
 
 /// Which dialog asked the clipboard for its text.
@@ -262,6 +264,7 @@ enum Picking {
 enum Asker {
     Key,
     Template,
+    Prompt,
 }
 
 /// How much of a background process's command its row shows.
@@ -421,6 +424,17 @@ pub enum Request {
         or_home: bool,
         from: Option<String>,
     },
+    /// Put `text` in force as the prompt `name` (DESIGN.md §13); the session
+    /// answers `ask` through `prompt_saved` or `prompt_refused`.
+    SetPrompt {
+        ask: u64,
+        name: crate::prompts::Name,
+        /// What it held when the dialog opened: refused if the file has moved on.
+        from: String,
+        text: String,
+    },
+    /// Tell the window the prompts as they are.
+    ListPrompts,
     /// Keep the template from the template dialog, in place of the one
     /// made in the window named `replacing`; the session answers through
     /// `template_saved` or `template_refused`.
@@ -610,154 +624,6 @@ struct Regions {
     rule: Rect,
     composer: Rect,
     status: Rect,
-}
-
-/// The composer: one editable document in td-ui's editor pane. `Return`
-/// sends it, as `C-Return` does from outside a dialog; `S-Return` is the
-/// pane's own newline.
-struct Composer {
-    pane: Pane,
-    tab: Option<TabId>,
-}
-
-impl Composer {
-    fn new() -> Result<Self, String> {
-        let mut composer = Self {
-            pane: Pane::pane().map_err(|e| format!("composer: {e}"))?,
-            tab: None,
-        };
-        composer.fresh();
-        Ok(composer)
-    }
-
-    fn event(&mut self, event: PaneEvent<'_>) -> PaneOutcome {
-        self.pane.dispatch(event).unwrap_or(PaneOutcome::Ignored)
-    }
-
-    fn target(&self) -> Option<(TabId, u64)> {
-        let tab = self.tab?;
-        Some((tab, self.pane.editor().document(tab).ok()?.revision()))
-    }
-
-    /// An empty document in place of the one there was.
-    fn fresh(&mut self) {
-        if let Some(tab) = self.tab.take() {
-            if let Ok((point, _)) = self.pane.editor().save_snapshot(tab) {
-                self.event(PaneEvent::Saved(point));
-            }
-            if let Ok(document) = self.pane.editor().document(tab) {
-                let revision = document.revision();
-                self.event(PaneEvent::Close { tab, revision });
-            }
-        }
-        if let PaneOutcome::Created(tab) = self.event(PaneEvent::New) {
-            self.tab = Some(tab);
-        }
-    }
-
-    fn text(&self) -> &str {
-        self.tab
-            .and_then(|tab| self.pane.editor().document(tab).ok())
-            .map_or("", |document| document.text())
-    }
-
-    fn place(&mut self, rect: Rect, surface: Surface) {
-        if rect.width > 0 && rect.height > 0 {
-            self.event(PaneEvent::Frame { rect, surface });
-        }
-    }
-
-    fn chord(&mut self, chord: &str) -> bool {
-        let Some((tab, revision)) = self.target() else {
-            return false;
-        };
-        matches!(
-            self.event(PaneEvent::Key {
-                tab,
-                revision,
-                chord,
-            }),
-            PaneOutcome::Changed | PaneOutcome::Prefix
-        )
-    }
-
-    fn pointer(&mut self, phase: PointerPhase, x: i64, y: i64, extend: bool) -> bool {
-        let Some((tab, revision)) = self.target() else {
-            return false;
-        };
-        let phase = match phase {
-            PointerPhase::Press => editor::PointerPhase::Press,
-            PointerPhase::Move => editor::PointerPhase::Move,
-            PointerPhase::Release => editor::PointerPhase::Release,
-        };
-        self.event(PaneEvent::Pointer {
-            tab,
-            revision,
-            phase,
-            x,
-            cell_x: x,
-            y,
-            extend,
-        }) == PaneOutcome::Changed
-    }
-
-    /// The selection, or the caret's line, as a copy takes it.
-    fn selection(&self) -> Option<Snapshot> {
-        let (tab, revision) = self.target()?;
-        Snapshot::capture(self.pane.editor(), tab, revision)
-            .ok()
-            .flatten()
-    }
-
-    fn scroll(&mut self, rows: isize, columns: isize) -> bool {
-        let Some((tab, revision)) = self.target() else {
-            return false;
-        };
-        self.event(PaneEvent::Scroll {
-            tab,
-            revision,
-            rows,
-            columns,
-        }) == PaneOutcome::Changed
-    }
-
-    fn insert(&mut self, text: &str) -> Result<bool, String> {
-        let Some((tab, revision)) = self.target() else {
-            return Ok(false);
-        };
-        let paste = Paste::begin(self.pane.editor(), tab, revision)
-            .and_then(|mut paste| {
-                paste.push(text.as_bytes())?;
-                Ok(paste)
-            })
-            .map_err(|e| format!("the paste: {e}"))?;
-        self.pane
-            .dispatch(PaneEvent::Paste(paste))
-            .map(|outcome| outcome == PaneOutcome::Changed)
-            .map_err(|e| format!("the paste: {e}"))
-    }
-
-    /// `text` after everything there is, on lines of its own, leaving
-    /// the draft and its selection as they were; whether it went in.
-    fn append(&mut self, text: &str) -> Result<bool, String> {
-        if self.text().is_empty() {
-            return self.insert(text);
-        }
-        // To the end, which drops the selection rather than replacing it.
-        self.chord("C-End");
-        let tail = if self.text().ends_with('\n') {
-            ""
-        } else {
-            "\n"
-        };
-        self.insert(&format!("{tail}{text}\n"))
-    }
-
-    fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-        if let Ok(scene) = self.pane.scene(&[]) {
-            scene.emit(damage, sink);
-        }
-    }
 }
 
 /// The focused widgets' keys for the key list, as `key` binds them; the
@@ -1031,6 +897,12 @@ pub struct App {
     /// The template dialog, while it is open: modal over the window, as
     /// the key dialog is.
     template: Option<TemplateDialog>,
+    /// The prompt dialog, while it is open.
+    prompt: Option<PromptDialog>,
+    /// The prompts as the broker holds them.
+    prompts: Vec<crate::prompts::Entry>,
+    /// The last save asked for, so that an answer finds its own dialog.
+    prompt_asks: u64,
     /// Where the key file is, as the dialog says it; none when there is
     /// no configuration directory to put it in.
     key_path: Option<String>,
@@ -1193,6 +1065,9 @@ impl App {
             card_trust: None,
             dialog: None,
             template: None,
+            prompt: None,
+            prompts: crate::prompts::Prompts::default().entries(),
+            prompt_asks: 0,
             key_path: None,
             keyed: true,
             press: None,
@@ -1952,6 +1827,7 @@ impl App {
             (Some(_), Picking::Model) => "conversation",
             (Some(_), Picking::Template) => "template",
             (Some(_), Picking::Edit) => "edit-template",
+            (Some(_), Picking::Prompt) => "prompt",
         }
     }
 
@@ -3956,6 +3832,9 @@ impl App {
         if self.composer.event(PaneEvent::Tick(now)) == PaneOutcome::Changed {
             self.touch();
         }
+        if self.prompt.as_mut().is_some_and(|prompt| prompt.tick(now)) {
+            self.touch();
+        }
         if self.restyled.1 && now.saturating_sub(self.restyled.0) >= RESTYLE_MS {
             let request = self.streaming.map(|s| s.request);
             if let (Err(e), Some(request)) = (self.restyle(), request) {
@@ -4126,6 +4005,12 @@ impl App {
                 self.note("the window is now too small for the key dialog, which is closed");
             }
         }
+        if let Some(prompt) = self.prompt.as_mut() {
+            if !prompt.resize(self.surface) {
+                self.close_prompt();
+                self.note("the window is now too small for the prompt dialog, which is closed; nothing was saved");
+            }
+        }
         if let Some(template) = self.template.as_mut() {
             if !template.resize(self.surface) {
                 self.close_template();
@@ -4205,6 +4090,7 @@ impl App {
             self.focused
                 && self.dialog.is_none()
                 && self.template.is_none()
+                && self.prompt.is_none()
                 && self.picker.is_none()
                 && self.notes.is_none()
                 && self.chooser.is_none()
@@ -4218,7 +4104,10 @@ impl App {
         };
         let (list, transcript, composer) = (list_focus, on(Focus::Transcript), on(Focus::Composer));
         let _ = self.list.set_focus(list);
-        let notes_focus = self.focused && self.dialog.is_none() && self.template.is_none();
+        let notes_focus = self.focused
+            && self.dialog.is_none()
+            && self.template.is_none()
+            && self.prompt.is_none();
         if let Some(notes) = self.notes.as_mut() {
             notes.focus(notes_focus);
         }
@@ -4227,6 +4116,10 @@ impl App {
             &mut td_ui::window::NoClipboard,
         );
         self.composer.event(PaneEvent::Focus(composer));
+        let focused = self.focused;
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.focus(focused);
+        }
         self.touch();
     }
 
@@ -4624,6 +4517,9 @@ impl App {
         if self.template.is_some() {
             return self.template_input(input, clipboard);
         }
+        if self.prompt.is_some() {
+            return self.prompt_input(input, clipboard);
+        }
         if self.picker.is_some() {
             return self.picker_input(input);
         }
@@ -4689,6 +4585,18 @@ impl App {
     /// no other paste goes anywhere; otherwise the focused composer
     /// takes it.
     fn pasted(&mut self, text: &str) {
+        if matches!(self.dialog_paste, Some(Asker::Prompt)) && self.prompt.is_some() {
+            self.dialog_paste = None;
+            let live = self.live;
+            if let Some(prompt) = self.prompt.as_mut() {
+                if !live {
+                    prompt.drive();
+                }
+                let reply = prompt.paste(text);
+                self.prompt_reply(reply);
+            }
+            return;
+        }
         // Only to the dialog that asked: a paste the masked key dialog
         // asked for never reaches the template dialog's plain fields.
         match (
@@ -4714,6 +4622,9 @@ impl App {
         }
         if self.dialog.is_some() {
             return self.note("a paste that came while the key dialog was open is dropped");
+        }
+        if self.prompt.is_some() {
+            return self.note("a paste that came while the prompt dialog was open and had not asked for one is dropped");
         }
         if self.template.is_some() {
             return self.note("a paste that came while the template dialog was open is dropped");
@@ -4878,9 +4789,13 @@ impl App {
         self.book.opens(id)
     }
 
-    /// Whether the person is in the middle of something a new `App` would end.
+    /// Whether the person is in the middle of something a new `App` would end;
+    /// the prompt dialog goes across, to save on the link that came back.
     pub fn holding_input(&self) -> bool {
-        self.modal() || self.menu.is_open() || self.capture.is_some() || self.chooser_coming()
+        (self.modal() && self.prompt.is_none())
+            || self.menu.is_open()
+            || self.capture.is_some()
+            || self.chooser_coming()
     }
 
     /// What a window on a connection that failed and came back keeps of the one
@@ -4905,6 +4820,10 @@ impl App {
         }
         std::mem::swap(&mut self.log, &mut old.log);
         self.chooser_start = old.chooser_start.take();
+        self.prompt = old.prompt.take();
+        self.prompt_asks = old.prompt_asks;
+        self.dialog_paste = old.dialog_paste.take();
+        self.apply_focus();
     }
 
     /// The split as the person left it, when the session has it to say.
@@ -5155,6 +5074,7 @@ impl App {
             menu::Action::SetKey => self.open_key_dialog(),
             menu::Action::NewTemplate => self.open_new_template(None),
             menu::Action::EditTemplate => self.open_edit_picker(),
+            menu::Action::Prompts => self.open_prompts(),
             menu::Action::Export => self.export_diagnostics(),
             menu::Action::Quit => self.requests.push(Request::Quit),
             menu::Action::Model => self.open_picker(),
@@ -5759,13 +5679,14 @@ impl App {
     }
 
     /// Whether a modal is open: the picker, the Messages window, the
-    /// chooser, the key or template dialog, or the question.
+    /// chooser, the key, template or prompt dialog, or the question.
     fn modal(&self) -> bool {
         self.picker.is_some()
             || self.notes.is_some()
             || self.chooser.is_some()
             || self.dialog.is_some()
             || self.template.is_some()
+            || self.prompt.is_some()
             || self.confirm.is_some()
     }
 
@@ -6134,6 +6055,7 @@ impl App {
                     crate::config::DIRECTORY_UNCONFINED,
                 ];
                 if picking == Picking::Edit
+                    || picking == Picking::Prompt
                     || (picking == Picking::Template && onward.contains(&name.as_str()))
                 {
                     self.picker = None;
@@ -6184,6 +6106,13 @@ impl App {
                     Picking::Template => {
                         self.requests.push(Request::NewFrom(name));
                         self.touch();
+                    }
+                    // Straight on to the dialog, as an edited template goes.
+                    Picking::Prompt => {
+                        self.open_prompt(&name);
+                        if self.prompt.is_none() {
+                            self.offer();
+                        }
                     }
                     // Straight on to the dialog, as New template… goes.
                     Picking::Edit => {
@@ -6494,7 +6423,7 @@ impl App {
 
     /// Opens the key dialog, modal over the window.
     pub fn open_key_dialog(&mut self) {
-        if self.dialog.is_some() || self.template.is_some() {
+        if self.dialog.is_some() || self.template.is_some() || self.prompt.is_some() {
             return;
         }
         let Some(path) = self.key_path.clone() else {
@@ -6723,6 +6652,203 @@ impl App {
         }
     }
 
+    /// The chooser File → Prompts… opens: each prompt, and whether it is the
+    /// person's own.
+    /// The chooser's rows: each prompt and what it is.
+    fn prompt_rows(&self) -> Vec<(String, String)> {
+        self.prompts
+            .iter()
+            .map(|entry| {
+                let meta = match (&entry.trouble, entry.custom) {
+                    (Some(_), _) => "cannot be used",
+                    (None, true) => "yours",
+                    (None, false) => "shipped",
+                };
+                (entry.name.title().to_string(), meta.to_string())
+            })
+            .collect()
+    }
+
+    fn open_prompts(&mut self) {
+        let rows = self.prompt_rows();
+        let opened = Picker::prompts(self.surface, body(self.surface), &rows);
+        self.show_picker(opened, Picking::Prompt);
+        // A file may have moved on since it was last told.
+        self.requests.push(Request::ListPrompts);
+    }
+
+    /// The dialog on the prompt the chooser calls `title`.
+    fn open_prompt(&mut self, title: &str) {
+        let Some(entry) = self.prompts.iter().find(|e| e.name.title() == title) else {
+            return self.note(format!("no prompt is called {title}"));
+        };
+        match PromptDialog::open(self.surface, entry) {
+            Ok(prompt) => {
+                self.cancel_pointer();
+                self.prompt = Some(prompt);
+                self.apply_focus();
+            }
+            Err(why) => self.note(why),
+        }
+    }
+
+    fn close_prompt(&mut self) {
+        self.prompt = None;
+        // A paste still on its way is this dialog's, no later one's.
+        if matches!(self.dialog_paste, Some(Asker::Prompt)) {
+            self.dialog_paste = None;
+        }
+        self.apply_focus();
+    }
+
+    /// Save `ask` is in force, as `said` says: the dialog waiting for that
+    /// closes, and one opened since is no business of this answer.
+    pub fn prompt_saved(&mut self, ask: u64, said: String) {
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.waiting_for(ask))
+        {
+            self.close_prompt();
+        }
+        self.note(said);
+        self.offer();
+    }
+
+    /// Save `ask` could not be kept: the dialog waiting for that stays with what
+    /// was typed, saying why.
+    pub fn prompt_refused(&mut self, ask: u64, why: String) {
+        match self
+            .prompt
+            .as_mut()
+            .filter(|prompt| prompt.waiting_for(ask))
+        {
+            Some(prompt) => {
+                prompt.refused(why);
+                self.touch();
+            }
+            None => self.note(why),
+        }
+    }
+
+    /// The link ended, so no answer is coming to a dialog that waits for one: it
+    /// takes input again, with what was typed.
+    pub fn prompt_link_lost(&mut self, why: String) {
+        if let Some(prompt) = self.prompt.as_mut().filter(|prompt| prompt.waiting()) {
+            prompt.refused(why);
+            self.touch();
+        }
+    }
+
+    /// The prompts as the broker now holds them.
+    pub fn set_prompts(&mut self, prompts: Vec<crate::prompts::Entry>) {
+        let before = self.prompt_rows();
+        self.prompts = prompts;
+        let rows = self.prompt_rows();
+        // The chooser asked when it opened; a filter being typed or a row moved
+        // to is left alone.
+        let shown = matches!(self.picking, Picking::Prompt)
+            && self.picker.as_ref().is_some_and(|picker| {
+                picker.query().is_empty()
+                    && picker.selected() == before.first().map(|(name, _)| name.as_str())
+            });
+        if shown && rows != before {
+            if let Ok(picker) = Picker::prompts(self.surface, body(self.surface), &rows) {
+                self.picker = Some(picker);
+                self.apply_focus();
+                self.touch();
+            }
+        }
+    }
+
+    fn prompt_reply(&mut self, reply: PromptReply) {
+        match reply {
+            PromptReply::Stay(true) => self.touch(),
+            PromptReply::Stay(false) => {}
+            PromptReply::Closed => {
+                self.close_prompt();
+                self.offer();
+            }
+            PromptReply::Save { name, from, text } => {
+                // What the classifier judges by, so the person's alone: saved by
+                // the window's own keyboard or pointer, from a dialog nothing
+                // else gave input to.
+                if !self.live || self.prompt.as_ref().is_some_and(PromptDialog::driven) {
+                    if let Some(prompt) = self.prompt.as_mut() {
+                        prompt.refused(
+                            "this dialog took input from the control seam, which saves no prompt"
+                                .to_string(),
+                        );
+                    }
+                    return self.touch();
+                }
+                self.prompt_asks += 1;
+                let ask = self.prompt_asks;
+                self.requests.push(Request::SetPrompt {
+                    ask,
+                    name,
+                    from,
+                    text,
+                });
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.wait(ask);
+                }
+                self.touch();
+            }
+        }
+    }
+
+    /// An input while the prompt dialog is open, which is the dialog's: every
+    /// key, the pointer, the wheel and the paste it asked for. A resize and the
+    /// window's focus are the window's too.
+    fn prompt_input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
+        let live = self.live;
+        let Some(prompt) = self.prompt.as_mut() else {
+            return;
+        };
+        if !live {
+            prompt.drive();
+        }
+        let reply = match input {
+            Input::Key { chord, repeat } => {
+                self.press = None;
+                let idle = !clipboard.pasting();
+                let reply = prompt.key(chord, repeat, clipboard);
+                if idle && clipboard.pasting() {
+                    self.dialog_paste = Some(Asker::Prompt);
+                }
+                reply
+            }
+            Input::Pointer {
+                phase,
+                x,
+                y,
+                extend,
+                ..
+            } => prompt.pointer(phase, x, y, extend),
+            Input::Wheel { rows, columns } => PromptReply::Stay(prompt.scroll(rows, columns)),
+            Input::CancelPointer => {
+                prompt.cancel_pointer();
+                PromptReply::Stay(true)
+            }
+            Input::Focus(focused) => {
+                if !focused {
+                    prompt.cancel_pointer();
+                }
+                self.focused = focused;
+                self.apply_focus();
+                PromptReply::Stay(true)
+            }
+            Input::Resize(surface) => return self.resize(surface),
+            Input::Paste(_)
+            | Input::PasteImage { .. }
+            | Input::Hover(_)
+            | Input::Context { .. }
+            | Input::Close => PromptReply::Stay(false),
+        };
+        self.prompt_reply(reply);
+    }
+
     /// An input while the key dialog is open, which is the dialog's: every
     /// key, the pointer, and the paste it asked for. A resize and the
     /// window's focus are the window's too.
@@ -6850,6 +6976,9 @@ impl App {
         }
         if self.template.is_some() {
             return self.template_input(Input::Key { chord, repeat }, clipboard);
+        }
+        if self.prompt.is_some() {
+            return self.prompt_input(Input::Key { chord, repeat }, clipboard);
         }
         if self.picker.is_some() {
             return self.picker_input(Input::Key { chord, repeat });
@@ -7352,6 +7481,9 @@ impl App {
         }
         if let Some(dialog) = &self.dialog {
             dialog.emit(self.focused, damage, sink);
+        }
+        if let Some(prompt) = &self.prompt {
+            prompt.emit(damage, sink);
         }
         if let Some(template) = &self.template {
             template.emit(self.focused, damage, sink);
@@ -11648,6 +11780,229 @@ pub mod tests {
         assert_eq!(app.most_recent(), Some(id(3)));
     }
 
+    /// File → Prompts… lists them, the dialog edits one, and only the window's
+    /// own keyboard saves it (DESIGN.md §13).
+    #[test]
+    fn a_prompt_dialog_goes_across_a_link_that_comes_back() {
+        let mut old = app();
+        old.live = true;
+        old.open_prompt("System prompt");
+        old.dialog_paste = Some(Asker::Prompt);
+        old.pasted("typed ");
+        key(&mut old, "C-s");
+        old.take_requests();
+        let asked = old.prompt_asks;
+        old.prompt_link_lost("the connection ended".into());
+        // It does not keep the window from taking the link back.
+        assert!(!old.holding_input());
+        let mut fresh = app();
+        fresh.take_over_from(&mut old);
+        fresh.live = true;
+        assert!(fresh.modal() && old.prompt.is_none());
+        assert!(fresh.prompt.as_ref().unwrap().text().starts_with("typed "));
+        key(&mut fresh, "C-s");
+        let requests = fresh.take_requests();
+        let [Request::SetPrompt { ask, text, .. }] = requests.as_slice() else {
+            panic!("{requests:?}");
+        };
+        assert_eq!(*ask, asked + 1);
+        assert!(text.starts_with("typed "));
+        // The answer to the save the link took is not the answer to this one.
+        fresh.prompt_saved(asked, "saved".into());
+        assert!(fresh.prompt.as_ref().unwrap().waiting());
+        fresh.prompt_saved(asked + 1, "saved".into());
+        assert!(!fresh.modal());
+        // A paste it asked for follows it.
+        let mut old = app();
+        old.open_prompt("System prompt");
+        old.dialog_paste = Some(Asker::Prompt);
+        let mut fresh = app();
+        fresh.take_over_from(&mut old);
+        fresh.pasted("LATE ");
+        assert!(fresh.prompt.as_ref().unwrap().text().starts_with("LATE "));
+        // Another dialog is still what holds the link off.
+        let mut held = app();
+        held.set_key_path(Some("/nowhere/key".into()));
+        held.open_key_dialog();
+        assert!(held.holding_input());
+    }
+
+    #[test]
+    fn a_chooser_told_new_marks_keeps_the_row_moved_to() {
+        use crate::prompts::Prompts;
+        let mut app = app();
+        app.menu_action(menu::Action::Prompts);
+        key(&mut app, "Down");
+        let chosen = app.picker.as_ref().unwrap().selected().map(str::to_string);
+        assert_eq!(chosen.as_deref(), Some("Classifier policy"));
+        let mut entries = Prompts::default().entries();
+        entries[0].custom = true;
+        app.set_prompts(entries);
+        let now = app.picker.as_ref().unwrap().selected().map(str::to_string);
+        assert_eq!(now, chosen);
+    }
+
+    #[test]
+    fn prompts_are_chosen_edited_and_saved_only_by_the_person() {
+        use crate::prompts::{Entry, Name};
+        let mut app = app();
+        app.live = true;
+        app.menu_action(menu::Action::Prompts);
+        assert_eq!(app.take_requests(), [Request::ListPrompts]);
+        assert_eq!(app.picking(), "prompt");
+        assert!(text(&app).contains("Classifier policy, unconfined"));
+        assert!(text(&app).contains("shipped"));
+        app.input(
+            Input::Key {
+                chord: "Return",
+                repeat: false,
+            },
+            &mut NoClipboard,
+        );
+        assert_eq!(app.picking(), "none");
+        assert!(app.modal());
+        assert!(text(&app).contains("System prompt"));
+        // Chords of the window are the dialog's while it is open.
+        key(&mut app, "C-n");
+        assert_eq!(app.picking(), "none");
+        assert!(app.take_requests().is_empty());
+        // A paste it asked for goes in; it is saved as typed.
+        app.dialog_paste = Some(Asker::Prompt);
+        app.pasted("MINE ");
+        key(&mut app, "C-s");
+        let requests = app.take_requests();
+        let [Request::SetPrompt {
+            name, text: saved, ..
+        }] = requests.as_slice()
+        else {
+            panic!("{requests:?}");
+        };
+        assert_eq!(*name, Name::System);
+        assert!(saved.starts_with("MINE "));
+        // It stays until the session answers: refused, with what was typed.
+        assert!(app.modal());
+        app.prompt_refused(app.prompt_asks, "the disk is full".into());
+        assert!(app.modal());
+        assert!(text(&app).contains("the disk is full"));
+        assert!(app.prompt.as_ref().unwrap().text().starts_with("MINE "));
+        // The key dialog does not open under it.
+        app.set_key_path(Some(PATH.into()));
+        app.open_key_dialog();
+        assert!(app.dialog.is_none());
+        // Kept, it closes.
+        key(&mut app, "C-s");
+        app.take_requests();
+        app.prompt_saved(app.prompt_asks, "saved".into());
+        assert!(!app.modal());
+        assert_eq!(app.notice(), Some("saved"));
+        // An answer to a dialog left closes no later one.
+        app.open_prompt("Classifier policy");
+        key(&mut app, "C-s");
+        app.take_requests();
+        key(&mut app, "Escape");
+        app.open_prompt("System prompt");
+        app.dialog_paste = Some(Asker::Prompt);
+        app.pasted("typed ");
+        let left = app.prompt_asks;
+        app.prompt_saved(left, "Classifier policy saved".into());
+        assert!(app.prompt.as_ref().unwrap().text().starts_with("typed "));
+        app.prompt_refused(left, "Classifier policy stays as it was".into());
+        assert_eq!(app.notice(), Some("Classifier policy stays as it was"));
+        assert!(!app.prompt.as_ref().unwrap().waiting());
+        // Nor one that waits for its own: only its own answer is its.
+        key(&mut app, "C-s");
+        app.take_requests();
+        app.prompt_saved(left, "Classifier policy saved".into());
+        app.prompt_refused(left, "Classifier policy stays as it was".into());
+        assert!(app.prompt.as_ref().unwrap().waiting());
+        // With the link gone no answer is coming, and it takes input again.
+        let unanswered = app.prompt_asks;
+        app.prompt_link_lost("the connection ended".into());
+        assert!(!app.prompt.as_ref().unwrap().waiting());
+        assert!(app.prompt.as_ref().unwrap().text().starts_with("typed "));
+        assert!(text(&app).contains("the connection ended"));
+        app.prompt_saved(unanswered, "saved after all".into());
+        assert!(app.prompt.is_some());
+        // Its Escape asks, having been changed; a second leaves.
+        key(&mut app, "Escape");
+        key(&mut app, "Escape");
+        assert!(!app.modal());
+        // A paste a closed dialog asked for reaches no later one.
+        app.open_prompt("System prompt");
+        let mut clipboard = crate::keydialog::tests::Recorder::default();
+        app.key("C-v", false, &mut clipboard);
+        assert_eq!(clipboard.pastes, 1);
+        assert!(matches!(app.dialog_paste, Some(Asker::Prompt)));
+        app.input(
+            Input::Key {
+                chord: "Escape",
+                repeat: false,
+            },
+            &mut NoClipboard,
+        );
+        assert!(app.prompt.is_none() && app.dialog_paste.is_none());
+        app.open_prompt("System prompt");
+        let shown = app.prompt.as_ref().unwrap().text().to_string();
+        app.pasted("LATE ");
+        assert_eq!(app.prompt.as_ref().unwrap().text(), shown);
+        key(&mut app, "Escape");
+        // Far too small, it closes saying nothing was saved.
+        app.open_prompt("System prompt");
+        let small = Surface::new(320, 120, Scale::default()).unwrap();
+        app.input(Input::Resize(small), &mut NoClipboard);
+        assert!(app.prompt.is_none());
+        let full = Surface::new(1024, 640, Scale::default()).unwrap();
+        app.input(Input::Resize(full), &mut NoClipboard);
+        // Told so, the chooser says it is the person's, and the dialog opens on it.
+        app.set_prompts(vec![Entry {
+            name: Name::System,
+            text: "mine".into(),
+            custom: true,
+            trouble: None,
+        }]);
+        app.menu_action(menu::Action::Prompts);
+        assert!(text(&app).contains("yours"));
+        // The answer to its asking comes while it is open.
+        app.set_prompts(vec![Entry {
+            name: Name::System,
+            text: "mine".into(),
+            custom: true,
+            trouble: Some("why".into()),
+        }]);
+        assert!(text(&app).contains("cannot be used"));
+        key(&mut app, "Escape");
+        app.open_prompt("System prompt");
+        assert_eq!(app.prompt.as_ref().unwrap().text(), "mine");
+        key(&mut app, "Escape");
+        assert!(!app.modal());
+        // A paste from the control seam, then the person's key: nothing is saved.
+        let mut app = super::tests::app();
+        app.open_prompt("System prompt");
+        app.dialog_paste = Some(Asker::Prompt);
+        app.pasted("SEAM ");
+        app.live = true;
+        key(&mut app, "C-s");
+        assert!(app.take_requests().is_empty());
+        // Input from the control seam, then the person's: nothing is saved.
+        let mut app = super::tests::app();
+        app.open_prompt("System prompt");
+        app.live = false;
+        app.input(
+            Input::Key {
+                chord: "x",
+                repeat: false,
+            },
+            &mut NoClipboard,
+        );
+        app.live = true;
+        app.dialog_paste = Some(Asker::Prompt);
+        app.pasted("MINE ");
+        key(&mut app, "C-s");
+        assert!(app.take_requests().is_empty());
+        assert!(app.modal(), "it stays, saying why");
+        assert!(text(&app).contains("control seam"));
+    }
+
     #[test]
     fn f10_or_a_press_on_file_opens_the_menu_and_its_items_act() {
         let mut app = app();
@@ -11668,9 +12023,9 @@ pub mod tests {
         key(&mut app, "C-n");
         assert_eq!(app.picking(), "template");
         key(&mut app, "Escape");
-        // A press on the header opens it; one on the fifth row exports,
-        // and one on the seventh quits.
-        for (row, request) in [(4, Request::Export), (6, Request::Quit)] {
+        // A press on the header opens it; one on the sixth row exports,
+        // and one on the eighth quits.
+        for (row, request) in [(5, Request::Export), (7, Request::Quit)] {
             press(&mut app, CELL_WIDTH as i64 + 4, 4);
             assert!(app.menu_open());
             let panel = app.menu.panel(0).unwrap();

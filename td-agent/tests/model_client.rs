@@ -10629,6 +10629,189 @@ fn the_breaker_leaves_an_unconfined_workspace_in_auto() {
     );
 }
 
+/// The person's prompts are what is asked (DESIGN.md §13): the system prompt,
+/// the reasoning stage's policy and Jev's question, an edit holding from the
+/// next request; one that cannot be taken stops the next turn, not falling back
+/// to the shipped text.
+#[test]
+fn the_persons_prompts_are_what_is_asked() {
+    use td_agent::prompts::{self, Name};
+    let owned = td_fs::TempDir::new("prompts-asked").unwrap();
+    let base = std::fs::canonicalize(owned.path()).unwrap();
+    let work = base.join("work");
+    std::fs::create_dir(&work).unwrap();
+    let command = |text: &str| {
+        access_reply(
+            "shell",
+            td_json::Json::Obj(vec![("command".into(), text.into())]),
+        )
+    };
+    let workspace = work.display().to_string();
+    let mut h = Harness::new_in_as(
+        "prompts-asked",
+        Role::Conversation,
+        Some(&workspace),
+        false,
+        true,
+        vec![
+            command("echo one"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![Reply::ok("classifier-allow.json")],
+    );
+    h.mock
+        .route("typesafe/jev", vec![Reply::ok("jev-matches.json")]);
+    let root = h.state.root().to_path_buf();
+    prompts::save(&root, Name::System, Some("MY SYSTEM {tools}")).unwrap();
+    prompts::save(&root, Name::ClassifierUnconfined, Some("MY POLICY")).unwrap();
+    prompts::save(
+        &root,
+        Name::JevRequestUnconfined,
+        Some("instructions: MY QUESTION\nmatches: m\nexceeds: e\nunrelated: u\n"),
+    )
+    .unwrap();
+    h.setup(Client::default());
+    h.down(&auto_with(""));
+    h.say("Run it.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(
+        approvals(&events)
+            .iter()
+            .any(|a| a.1 == "allow" && a.2 == "classifier"),
+        "{:?}",
+        approvals(&events)
+    );
+    let requests = h.mock.requests();
+    let main = requests
+        .iter()
+        .find(|r| r.text().contains("MY SYSTEM"))
+        .unwrap_or_else(|| panic!("no request had the system prompt"));
+    let shipped = Name::System.shipped().lines().next().unwrap();
+    assert!(!main.text().contains(shipped));
+    let reasoning = requests
+        .iter()
+        .find(|r| r.text().contains("gpt-oss-safeguard"))
+        .unwrap();
+    assert_eq!(flat(&reasoning.text())["messages.0.content"], "MY POLICY");
+    let jev = requests
+        .iter()
+        .find(|r| r.text().contains("typesafe/jev"))
+        .unwrap();
+    let body = flat(&jev.text());
+    assert_eq!(body["questions.request.instructions"], "MY QUESTION");
+    assert_eq!(body["questions.request.criteria.exceeds"], "e");
+    let shipped = prompts::Prompts::default().question(Name::JevDisclosesUnconfined);
+    assert_eq!(
+        body["questions.discloses.instructions"],
+        shipped.instructions
+    );
+    // One past taking stops the next turn and says which.
+    std::fs::write(root.join(prompts::DIR).join("classifier"), "").unwrap();
+    h.say("Again.");
+    let (_, outcome, _) = h.turn();
+    assert!(
+        outcome.contains("your prompts could not be read"),
+        "{outcome}"
+    );
+}
+
+/// A policy that cannot be read when a call is judged is not replaced by the
+/// shipped one: that call goes to the person, and the turn then stops.
+#[test]
+fn a_prompt_gone_bad_mid_turn_leaves_the_call_to_the_person() {
+    let owned = td_fs::TempDir::new("prompts-mid-turn").unwrap();
+    let base = std::fs::canonicalize(owned.path()).unwrap();
+    let work = base.join("work");
+    std::fs::create_dir(&work).unwrap();
+    let proof = base.join("proof");
+    let workspace = work.display().to_string();
+    let mut h = Harness::new_in_as(
+        "prompts-mid-turn",
+        Role::Conversation,
+        Some(&workspace),
+        false,
+        true,
+        Vec::new(),
+    );
+    let dir = h.state.root().join(td_agent::prompts::DIR);
+    std::fs::create_dir(&dir).unwrap();
+    let shell = |text: String| {
+        access_reply(
+            "shell",
+            td_json::Json::Obj(vec![("command".into(), text.into())]),
+        )
+    };
+    // One reply with two calls: the first breaks the policy the second is judged by.
+    let body = |reply: Reply| {
+        let Reply::Stream { body, .. } = reply else {
+            panic!("expected stream");
+        };
+        String::from_utf8(body).unwrap()
+    };
+    let first = body(shell(format!(
+        "printf '' > '{}'",
+        dir.join("classifier").display()
+    )));
+    let second: Vec<String> = body(shell(format!("touch '{}'", proof.display())))
+        .lines()
+        .filter(|line| line.contains("\"tool_calls\":["))
+        .map(|line| {
+            line.replace(
+                "\"tool_calls\":[{\"index\":0",
+                "\"tool_calls\":[{\"index\":1",
+            )
+            .replace("toolu_", "toolu_second_")
+        })
+        .collect();
+    let mut two = String::new();
+    for line in first.lines() {
+        if line.contains("\"finish_reason\":\"tool_calls\"") {
+            for call in &second {
+                two.push_str(call);
+                two.push_str("\n\n");
+            }
+        }
+        two.push_str(line);
+        two.push('\n');
+    }
+    h.mock.route(
+        "gpt-oss-safeguard",
+        vec![Reply::ok("classifier-allow.json")],
+    );
+    h.mock
+        .route("typesafe/jev", vec![Reply::ok("jev-matches.json")]);
+    let mut reply = Reply::sse("stream-tool-network.sse");
+    if let Reply::Stream { body, .. } = &mut reply {
+        *body = two.into_bytes();
+    }
+    h.mock.route("Run both.", vec![reply]);
+    h.setup(Client::default());
+    h.down(&auto_with(""));
+    h.say("Run both.");
+    let (call, _, details) = h.until_ask();
+    assert!(
+        details[0].contains("your prompts could not be read"),
+        "{details:?}"
+    );
+    assert!(!proof.exists());
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert!(
+        outcome.contains("your prompts could not be read"),
+        "{outcome}"
+    );
+}
+
 /// In `auto` mode an unconfined workspace's command is the classifier's
 /// (DESIGN.md §8, §11), an allow rule for it aside: asked with its own
 /// policy, as a `command`, the command whole among what the model wrote;

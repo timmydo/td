@@ -1746,6 +1746,8 @@ painted after the window's frame. File's items are:
   the window); they have no chord;
 - `Set OpenRouter key…`, which opens the key dialog below; it has no
   chord;
+- `Prompts…`, which opens the prompts the person may replace (§13, The
+  person's prompts); it has no chord;
 - `Export diagnostics`, the diagnostics export (below,
   "The diagnostics export"); it has no chord;
 - `Messages…`, shown with `C-S-m`, which does what `C-S-m` does: the
@@ -5339,9 +5341,9 @@ endpoints listing, prices `classifier_fast_model` while a cost limit is
 set, and prices nothing of its output, which its reservation does not
 cover; otherwise it is unavailable, and while `jev_required` the action
 goes to the human with nothing asked. The reasoning stage is a chat
-completion of `classifier_model` with `prompt/classifier.txt` as its
-system message, `prompt/classifier-unconfined.txt` for an unconfined
-workspace's call (§8), and the state as its user message, `max_tokens` 4096,
+completion of `classifier_model` with `prompt/classifier.txt`, or the person's
+own (§13), as its system message, `prompt/classifier-unconfined.txt` for an
+unconfined workspace's call (§8), and the state as its user message, `max_tokens` 4096,
 `provider` as any request's. Both requests are reserved together against
 the day, the turn's and the conversation's limits, logged as `Request`
 events of purpose `classify` with their whole bodies, sent at once,
@@ -5426,7 +5428,7 @@ test holds each of its states to the shape the conversation's state has
 at every level, its `detail` to what td-agent says of the crossing
 (`classifier::described`, which the conversation uses too), and its
 calls to end with the pending call, as a live state's do. With the
-configuration and key the window uses, and only with a `/v1` root, so
+configuration, key and prompts the window uses, and only with a `/v1` root, so
 that Jev can be asked, it refuses as a
 crossing does a stage's model the models list leaves out, a reasoning
 model that takes no `max_tokens` and, while any cost limit is set, a
@@ -6857,6 +6859,38 @@ not written once.
 
 Titles come from a cheap model (`title_model`) after the first exchange,
 reserved like any request; the first line of the task stands until then.
+
+**The person's prompts.** The person may replace the system prompt
+(`prompt/conversation.txt`), the reasoning stage's two policies and Jev's four
+questions (`prompt/jev-*.txt`, each `instructions:` and one line per option,
+which are the keys its answers are read by, so they stay). A replaced one is a
+file under the state directory's `prompts`, named for it, at most 64 KiB; no file
+is the shipped text. Each is read as a request is made, so an edit holds from the
+next: a conversation's next request carries a new prefix (§6), and `td-agent
+calibrate` judges by them too. A file that cannot be taken is never passed over
+for the shipped text, since the person chose what it says: the next turn stops
+and says so, and a call the classifier was about to judge goes to the person.
+They are the person's as the rules are: a jailed call cannot reach the state
+directory, and the unconfined policy counts them among what a command may not
+change unasked. Nothing checks that a replaced policy is sound, and the shipped
+calibration holds only for the shipped text.
+
+File > `Prompts…` lists them, each marked yours, shipped or as one that cannot be
+used, and opens one in a dialog holding td-ui's editor pane: `C-s` or Save saves,
+taking nothing but Escape until the session answers or the link ends, so a failed
+write loses nothing, and refused if the file has moved on since the dialog opened
+to anything but what is being saved, and the dialog goes across a far link that
+ends and comes back; otherwise Escape or Cancel closes, asking once when the text changed; and Shipped text loads what
+td-agent ships to save or not, asking once before it replaces changes, saving it
+taking the file away. A text past its form is refused there, and a system prompt
+without `{tools}`, which leaves out what the model is told of its workspace and
+tools, is saved only when asked twice. A file that cannot be taken is shown on its
+own, with why, as text where the editor can hold it and otherwise the shipped
+text, and saving replaces it; the others show as they are. Only the window's own
+keyboard or pointer saves, from a dialog the control seam gave no input to, as a
+template is (§7). A far window edits the far machine's, where the conversations
+run. Sub-agents' and titles' prompts, and the workspace paragraphs, are not among
+them.
 
 **Prompt texts.** The prompt texts are
 `prompt/conversation.txt` and `prompt/title.txt`, with the workspace

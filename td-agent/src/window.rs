@@ -572,7 +572,11 @@ impl Window {
             self.unconfirmed.sent(&text, &pictures, Instant::now());
         } else if !matches!(
             request,
-            Request::Open(_) | Request::ListFolders { .. } | Request::Redraw | Request::Commands
+            Request::Open(_)
+                | Request::ListFolders { .. }
+                | Request::ListPrompts
+                | Request::Redraw
+                | Request::Commands
         ) {
             self.asked_at = Some(Instant::now());
         }
@@ -595,7 +599,10 @@ impl Window {
                         from,
                         read: Err(why),
                     });
-                } else {
+                } else if let Request::SetPrompt { ask, .. } = request {
+                    self.app
+                        .prompt_refused(ask, format!("{why}, so it was not saved"));
+                } else if !matches!(request, Request::ListPrompts) {
                     self.app.note(format!("{why}, so that was not done"));
                 }
             }
@@ -756,6 +763,9 @@ impl Window {
         self.title = format!("td-agent: {host}: not connected");
         self.app.set_away(Some(format!("not connected to {host}")));
         self.app.note(format!("{host}: {why}"));
+        self.app.prompt_link_lost(format!(
+            "the connection to {host} ended before it answered, so this may or may not be saved: Save again once connected"
+        ));
         let now = Instant::now();
         for (text, pictures) in self.unconfirmed.take(now) {
             self.app.give_back(

@@ -975,7 +975,8 @@ fn ask(peer: &td_agent::peer::Peer, request: &Request) {
 }
 
 /// A window at the far end of `td-agent attach` is told all there is, starts a
-/// conversation, and is refused auto mode; a second takes over from it; and with
+/// conversation, sets a prompt and turns auto mode on; a second takes over from
+/// it; and with
 /// none left and nothing under way the broker ends and takes its sockets.
 #[test]
 fn a_far_window_attaches_and_a_second_takes_over_and_the_broker_ends_with_the_last() {
@@ -1007,6 +1008,84 @@ fn a_far_window_attaches_and_a_second_takes_over_and_the_broker_ends_with_the_la
     assert!(told.iter().any(|view| matches!(view, View::SetShare(_))));
     SHOWN.with(|shown| *shown.borrow_mut() = Some(made.clone()));
 
+    // A prompt is the far machine's, kept there and told back.
+    let shipped = td_agent::prompts::Name::Classifier;
+    ask(
+        &first,
+        &Request::SetPrompt {
+            ask: 1,
+            name: shipped,
+            from: shipped.shipped().into(),
+            text: "MY POLICY".into(),
+        },
+    );
+    told_until(&first, |view| {
+        matches!(view, View::SetPrompts(prompts)
+            if prompts.iter().any(|p| p.name == shipped && p.custom && p.text == "MY POLICY"))
+    });
+    told_until(&first, |view| matches!(view, View::PromptSaved(1, _)));
+    // A text past its form is refused there, what is kept staying.
+    ask(
+        &first,
+        &Request::SetPrompt {
+            ask: 2,
+            name: td_agent::prompts::Name::JevRequest,
+            from: td_agent::prompts::Name::JevRequest.shipped().into(),
+            text: "no form".into(),
+        },
+    );
+    told_until(
+        &first,
+        |view| matches!(view, View::PromptRefused(2, said) if said.contains("stays as it was")),
+    );
+    // A window told before the file moved on overwrites nothing.
+    let file = scratch
+        .0
+        .join("td-agent")
+        .join("prompts")
+        .join("classifier");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "MY POLICY");
+    std::fs::write(&file, "BY HAND").unwrap();
+    ask(
+        &first,
+        &Request::SetPrompt {
+            ask: 3,
+            name: shipped,
+            from: "MY POLICY".into(),
+            text: "STALE".into(),
+        },
+    );
+    told_until(
+        &first,
+        |view| matches!(view, View::PromptRefused(3, said) if said.contains("changed since")),
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "BY HAND");
+    // A save made again after its answer was lost finds its own text.
+    ask(
+        &first,
+        &Request::SetPrompt {
+            ask: 4,
+            name: shipped,
+            from: "MY POLICY".into(),
+            text: "BY HAND".into(),
+        },
+    );
+    told_until(&first, |view| matches!(view, View::PromptSaved(4, _)));
+    // One gone bad is said once, however often the prompts are told.
+    std::fs::write(&file, "").unwrap();
+    ask(&first, &Request::ListPrompts);
+    ask(&first, &Request::ListPrompts);
+    ask(&first, &Request::Export);
+    let told = told_until(
+        &first,
+        |view| matches!(view, View::Note(said) if said.contains("export") || said.contains("diagnostics")),
+    );
+    let said = told
+        .iter()
+        .filter(|view| matches!(view, View::Note(said) if said.contains("cannot be used")))
+        .count();
+    assert_eq!(said, 1, "{told:#?}");
+    std::fs::remove_file(&file).unwrap();
     ask(
         &first,
         &Request::SetMode {

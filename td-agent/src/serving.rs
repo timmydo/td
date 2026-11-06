@@ -349,13 +349,16 @@ impl Session {
         // prefix that cannot be made is the request's to say.
         if let Some((_, client)) = self.setup.clone().filter(|_| !groups.is_empty()) {
             let skills = self.skills_index();
+            // Unread, the turn that follows says so; this only fits.
+            let prompts = crate::prompts::Prompts::load(&self.state).unwrap_or_default();
+            let system = prompts.get(crate::prompts::Name::System);
             let fitted = self.placed(&client, |created, place| {
                 let mut groups = groups.clone();
                 let mut dropped = Vec::new();
                 while !groups.is_empty() {
                     let mcp = definitions(&groups);
                     let prefix =
-                        crate::prompt::prefix_with(created, place, skills.as_deref(), &mcp);
+                        crate::prompt::prefix_with(system, created, place, skills.as_deref(), &mcp);
                     if fits_a_line(prefix) {
                         break;
                     }
