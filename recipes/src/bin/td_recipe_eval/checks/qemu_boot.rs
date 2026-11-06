@@ -3513,6 +3513,7 @@ pub(crate) fn create_release_volume(
 
 enum VolumeLayout {
     Basic,
+    Admin(PathBuf),
     Transactional,
     CorruptCurrent,
     /// `current` a second successful deployment, `previous` the recipe's:
@@ -3576,6 +3577,8 @@ fn create_persistent_volume_layout(
         .map_err(|e| format!("hash deployment manifest {}: {e}", manifest.display()))?;
     let copies: u64 = match layout {
         VolumeLayout::Basic => 1,
+        // Initial/current/previous, repository, verified cache and download.
+        VolumeLayout::Admin(_) => 6,
         VolumeLayout::Transactional => 3,
         VolumeLayout::CorruptCurrent | VolumeLayout::Rollback => 2,
     };
@@ -3627,6 +3630,10 @@ fn create_persistent_volume_layout(
         stage_td_jail_seccomp_probe(&seed, probe)?;
     }
     let alternate_id = match layout {
+        VolumeLayout::Admin(fixture) => {
+            update::admin::stage(&fixture, &seed)?;
+            deployment_id.clone()
+        }
         VolumeLayout::Basic => deployment_id.clone(),
         VolumeLayout::Transactional => {
             let channel = seed.join(td_boot_protocol::VOLUME_CHANNEL_DIR);

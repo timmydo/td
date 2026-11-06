@@ -46,6 +46,11 @@ const STEPS: &[Step] = &[
         proves: "an approved deploy-rollback selects the previous system, and an approved set-hostname names the system, at the next boot",
     },
     Step {
+        name: "qemu-admin-update",
+        argv: &["qemu-admin-update"],
+        proves: "the guest acquires signed releases through restricted SSH administration, refuses expired metadata and root rollback, resumes HTTP transfers, and rolls back failed boots",
+    },
+    Step {
         name: "qemu-boot-live",
         argv: &["qemu-boot-live"],
         proves: "the live medium boots through UEFI firmware",
@@ -342,7 +347,7 @@ mod tests {
         assert_eq!(code, 0);
         assert!(
             line.contains(
-                "of 5 oracle(s), 1 passed (0 from the memo), 1 unprovisioned, 0 failed, 3 not run"
+                "of 6 oracle(s), 1 passed (0 from the memo), 1 unprovisioned, 0 failed, 4 not run"
             ),
             "{line}"
         );
@@ -354,7 +359,7 @@ mod tests {
         let (line, code) = verdict(&warm_gap);
         assert_eq!(code, td_engine::exit::EXIT_UNPROVISIONED);
         assert!(
-            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 5 not run"),
+            line.contains("0 passed (0 from the memo), 0 unprovisioned, 0 failed, 6 not run"),
             "{line}"
         );
         // Every oracle from the memo, warm skipped: a pass that booted nothing,
@@ -363,13 +368,14 @@ mod tests {
             ("qemu-boot-system", Outcome::Memo, s(0)),
             ("qemu-boot-server", Outcome::Memo, s(0)),
             ("qemu-deploy-rollback", Outcome::Memo, s(0)),
+            ("qemu-admin-update", Outcome::Memo, s(0)),
             ("qemu-boot-live", Outcome::Memo, s(0)),
             ("qemu-install-system", Outcome::Memo, s(0)),
         ];
         let (line, code) = verdict(&all_memo);
         assert_eq!(code, 0);
         assert!(
-            line.contains("5 passed (5 from the memo), 0 unprovisioned"),
+            line.contains("6 passed (6 from the memo), 0 unprovisioned"),
             "{line}"
         );
         assert_eq!(Outcome::Memo.word(), "memo");

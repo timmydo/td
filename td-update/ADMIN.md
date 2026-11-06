@@ -210,3 +210,15 @@ short form the startup menu's label shows (`td-install/DESIGN.md`, "Installed
 startup menu"). `--no-reboot` therefore leaves the running system reporting the
 commit it booted from until the next boot. A rollback reports the commit of the
 deployment it restores, or none if that deployment predates this.
+
+## Installed-machine oracle
+
+`td-recipe-eval qemu-admin-update` exercises the installed service, its
+restricted SSH command, unprivileged downloader, root-owned replay state,
+publication and reboot on a disposable desktop VM. The ordinary primary
+account hosts an untrusted loopback repository using a target-built fixture;
+only its ephemeral, separately provisioned admin SSH key grants update
+authority. Expiry, truncated HTTP/resumption, root rotation/rollback refusal and
+failed-boot rollback are required assertions. The test provisions policy
+out of band and does not grant an ordinary account a policy-setting command.
+The fixture executable and keys are absent from distribution images.

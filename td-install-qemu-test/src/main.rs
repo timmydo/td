@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+mod admin;
 mod encrypted;
 mod encrypted_boot;
 #[allow(dead_code, reason = "shared codec; this fixture is its consent end")]
@@ -2028,6 +2029,7 @@ fn main() -> ExitCode {
     if std::process::id() != 1 {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         let result = match args.as_slice() {
+            [verb, phase] if verb == "admin-client" => admin::run(phase),
             [verb, source] if verb == "validate-source" => claim_probe_validator(Path::new(source)),
             _ => Err("invalid source claim probe arguments".into()),
         };

@@ -197,3 +197,17 @@ candidate. The headless profile exercises this without the desktop oracle's
 Firefox readiness/input dependency. This covers signed acquisition through installation and rollback;
 it does not exercise the SSH administration service or HTTP inside the VM.
 The network tests separately cover loopback HTTP and interrupted transfers.
+
+`qemu-admin-update` additionally boots the desktop deployment normally, with
+an oracle-owned public repository and initial publisher/admin-key policy on
+its disposable volume. A target-built test client runs as the primary user,
+serves that repository on guest loopback, and invokes the installed restricted
+SSH admin interface. It requires expired metadata and a truncated response
+to leave selectors unchanged, a retry to reuse cached bytes and install,
+and a rotated root to reject replay of the earlier root epoch. It then requires the
+downloaded deployment to boot healthy, a subsequent default update to reboot,
+and three failed candidate boots to fall back to the retained healthy image.
+The test client and ephemeral private keys never enter a published image.
+This is loopback HTTP and SSH inside the VM; public HTTPS remains a separate
+hosting test. Initial trust is staged as trusted-media provisioning would
+stage it, rather than exercised through the physical enrollment UI.

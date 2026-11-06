@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[path = "../../../../../../td-fs/src/temp_dir.rs"]
 #[allow(dead_code)] // This host-only oracle uses the guard's Drop cleanup.
-mod fixture_temp;
+pub(super) mod fixture_temp;
 
 const COMMIT: &str = "ffffffffffffffffffffffffffffffffffffffff";
 
@@ -65,7 +65,7 @@ impl Delivery {
         Ok(delivery)
     }
 
-    fn path(&self, name: &str) -> Result<String, String> {
+    pub(super) fn path(&self, name: &str) -> Result<String, String> {
         self.work
             .join(name)
             .to_str()
@@ -73,7 +73,7 @@ impl Delivery {
             .ok_or_else(|| "non-UTF-8 release fixture path".into())
     }
 
-    fn command(&self, args: &[&str]) -> Result<String, String> {
+    pub(super) fn command(&self, args: &[&str]) -> Result<String, String> {
         let output = Command::new(&self.program)
             .arg("release")
             .args(args)

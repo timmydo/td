@@ -10,6 +10,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use td_recipe::{shared, td_boot_protocol};
+pub(crate) mod admin;
 
 use crate::atlas::{Slot, Style, PAGE_WIDTH};
 use crate::face::Face;
