@@ -37,6 +37,7 @@ mod feed;
 mod fetch;
 mod fetchd;
 mod flathub;
+mod git_remote;
 mod http;
 mod launch;
 mod openpgp;
@@ -92,6 +93,7 @@ fn main() {
         "td-launch" => launch::run(&args),
         "td-test-https" => test_https::run(&args),
         "td-release" => release::run(&args),
+        "git-remote-http" | "git-remote-https" => git_remote::run(&args),
         // An application's name, linked to this binary: that application,
         // beside this binary, with a fetch service of its own (launch.rs).
         _ if launch::launches(std::ffi::OsStr::new(base)).is_some() => {

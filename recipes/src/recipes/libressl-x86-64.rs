@@ -1,10 +1,10 @@
 use crate::shared::{build_root_static_cc, unpack_into, BUILD_ROOT_PATH, BUILD_ROOT_SH as SH};
 use crate::types::{Recipe, Step, TextEdit};
 
-// LibreSSL 4.4.0 provides the OpenSSL-compatible TLS surface curl and Git will
-// consume. It exports static libssl.a + libcrypto.a and the public headers,
-// and no program: the libraries are absorbed into downstream runtime ELFs,
-// which carry td's debug-companion policy at their own final link boundary.
+// LibreSSL 4.4.0 provides the OpenSSL-compatible TLS surface curl consumes. It
+// exports static libssl.a + libcrypto.a and the public headers, and no program:
+// the libraries are absorbed into downstream runtime ELFs, which carry td's
+// debug-companion policy at their own final link boundary.
 //
 // It compiles in the Debian build root against td glibc
 // (`build_root_static_cc`); the archives' consumers link them.

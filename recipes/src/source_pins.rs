@@ -36,9 +36,9 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "curl-x86-64-source",
         aliases: &[],
-        // curl 8.23.0 supplies Git's source-built HTTP/HTTPS transport. The
-        // recipe keeps only static libcurl and disables every protocol and
-        // optional dependency outside the reviewed HTTP(S) closure.
+        // curl 8.23.0 supplies the curl command. The recipe keeps only a static
+        // build and disables every protocol and optional dependency outside
+        // the reviewed HTTP(S) closure.
         url: "https://curl.se/download/curl-8.23.0.tar.xz",
         sha256: "8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5",
         file: "curl-8.23.0.tar.xz",
@@ -56,9 +56,9 @@ const PINS: &[PinDef] = &[
         key: "git-x86-64-source",
         aliases: &[],
         // Git 2.56.0 is the source-built daily-driver client. Its td configuration
-        // keeps local repositories and HTTP(S) remotes and dispatches SSH remotes
-        // through the separate OpenSSH package, while omitting language runtimes,
-        // WebDAV, and direct OpenSSL use.
+        // keeps local repositories and dispatches SSH remotes through the separate
+        // OpenSSH package and HTTP(S) remotes through td-net's helper, while
+        // omitting language runtimes, libcurl, WebDAV, and direct OpenSSL use.
         url: "https://www.kernel.org/pub/software/scm/git/git-2.56.0.tar.xz",
         sha256: "26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3",
         file: "git-2.56.0.tar.xz",
@@ -153,7 +153,7 @@ const PINS: &[PinDef] = &[
         key: "libressl-x86-64-source",
         aliases: &[],
         // LibreSSL 4.4.0 supplies the OpenSSL-compatible TLS implementation
-        // for curl and Git. The recipe builds only static archives and disables
+        // for curl. The recipe builds only static archives and disables
         // upstream assembly so every eventual shipped instruction remains on
         // td's checked frame-pointer path.
         url: "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.4.0.tar.gz",

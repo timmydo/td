@@ -4,6 +4,11 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // Git's shipped ELFs and scripts, its local and service workflows, and
 // its HTTPS and SSH dispatch. It runs in the Debian build root: the root's
 // bash, coreutils, grep and readelf grade it.
+//
+// A build has no loopback, so here the built Git only reaches td-net's
+// git-remote-https as the image links it and sees it refuse and fail. The full
+// exchange is `net/tests/git_remote.rs` over TCP, and the system oracle's
+// `git ls-remote` against a real server.
 
 // The shipped scripts that start with a shebang, per directory: Git's ten
 // SCRIPT_SH programs, and the fourteen hook samples (upstream's perl
@@ -14,7 +19,7 @@ const SHEBANG_SCRIPTS_HOOKS: usize = 14;
 
 pub fn recipe() -> Recipe {
     let git = "{in:git-x86-64}";
-    let curl_test = "{in:curl-x86-64-test}";
+    let td_net = "{in:td-net}/bin/td-net";
     let openssh = "{in:openssh-x86-64}";
     let openssh_test = "{in:openssh-x86-64-test}";
     let readelf = "/usr/bin/readelf";
@@ -26,24 +31,19 @@ pub fn recipe() -> Recipe {
                 format!("{git}/bin/git-receive-pack"),
                 format!("{git}/bin/git-upload-archive"),
                 format!("{git}/bin/git-upload-pack"),
-                format!("{git}/libexec/git-core/git-remote-http"),
-                format!("{git}/libexec/git-core/git-remote-https"),
                 format!("{git}/libexec/git-core/git-sh-i18n--envsubst"),
                 format!("{openssh}/bin/ssh"),
+                td_net.to_string(),
             ],
             exec: true,
         },
         Step::Require {
-            paths: vec![
-                format!("{curl_test}/result"),
-                format!("{openssh_test}/result"),
-            ],
+            paths: vec![format!("{openssh_test}/result")],
             exec: false,
         },
         Step::Require {
             paths: vec![
                 format!("{git}/lib/debug/bin/git.debug"),
-                format!("{git}/lib/debug/libexec/git-core/git-remote-http.debug"),
                 format!("{git}/lib/debug/libexec/git-core/git-sh-i18n--envsubst.debug"),
             ],
             exec: false,
@@ -54,11 +54,9 @@ pub fn recipe() -> Recipe {
                 SH,
                 "-c",
                 &format!(
-                    "grep -Fq 'PASS: curl 8.23.0 performs verified local-socket HTTPS' '{curl_test}/result' || \
-                         {{ echo 'Git transport prerequisite did not pass its verified TLS oracle' >&2; exit 1; }}; \
-                     grep -Fq 'PASS: OpenSSH Portable 10.6p2 provides the bounded ssh/sshd/ssh-keygen profile' '{openssh_test}/result' || \
+                    "grep -Fq 'PASS: OpenSSH Portable 10.6p2 provides the bounded ssh/sshd/ssh-keygen profile' '{openssh_test}/result' || \
                          {{ echo 'Git SSH prerequisite did not pass the OpenSSH package oracle' >&2; exit 1; }}; \
-                     for binary in '{git}/bin/git' '{git}/libexec/git-core/git-remote-http' '{git}/libexec/git-core/git-sh-i18n--envsubst'; do \
+                     for binary in '{git}/bin/git' '{git}/libexec/git-core/git-sh-i18n--envsubst'; do \
                          header=$('{readelf}' -h \"$binary\") || exit 1; \
                          printf '%s\\n' \"$header\" | grep -Fq 'Class:                             ELF64' || exit 1; \
                          printf '%s\\n' \"$header\" | grep -Fq 'Machine:                           Advanced Micro Devices X86-64' || exit 1; \
@@ -94,6 +92,14 @@ pub fn recipe() -> Recipe {
         .env("PATH", &path),
         Step::MkDir {
             path: "{root}/home".into(),
+        },
+        // As the image's /bin holds it: Git's own exec path has no HTTP helper.
+        Step::MkDir {
+            path: "{root}/http".into(),
+        },
+        Step::Symlink {
+            target: td_net.into(),
+            link: "{root}/http/git-remote-https".into(),
         },
         Step::MkDir {
             path: "{root}/work".into(),
@@ -155,8 +161,13 @@ pub fn recipe() -> Recipe {
                  test -s receive.refs || exit 1; \
                  printf '001aargument --format=tar\\n0012argument HEAD\\n0000' | git-upload-archive repo > remote.archive || exit 1; \
                  test -s remote.archive || exit 1; \
-                 if GIT_TRACE=1 GIT_TERMINAL_PROMPT=0 git ls-remote https://127.0.0.1:9/td-no-service >https-helper.log 2>&1; then exit 1; fi; \
-                 grep -Fq 'git-remote-https' https-helper.log || exit 1; \
+                 mkdir mint || exit 1; \
+                 '{in:td-net}/bin/td-net' test-https mint mint || exit 1; \
+                 if PATH=\"{root}/http:$PATH\" GIT_TRACE=1 GIT_TERMINAL_PROMPT=0 GIT_SSL_CAINFO=mint/ca.pem git ls-remote https://127.0.0.1:9/td-no-service >https-helper.log 2>&1; then echo 'https ls-remote reached a service' >&2; exit 1; fi; \
+                 grep -Fq 'git-remote-https' https-helper.log || { echo 'Git did not dispatch to its HTTPS helper:' >&2; cat https-helper.log >&2; exit 1; }; \
+                 grep -Fq \"unable to access 'https://127.0.0.1:9/td-no-service/'\" https-helper.log || { echo 'td-net did not report the unreachable remote:' >&2; cat https-helper.log >&2; exit 1; }; \
+                 if PATH=\"{root}/http:$PATH\" GIT_SSL_NO_VERIFY=1 GIT_TERMINAL_PROMPT=0 git ls-remote https://127.0.0.1:9/td-no-service >https-refused.log 2>&1; then echo 'https ls-remote ignored GIT_SSL_NO_VERIFY' >&2; exit 1; fi; \
+                 grep -Fq 'GIT_SSL_NO_VERIFY is set' https-refused.log || { echo 'td-net did not refuse an unverified peer:' >&2; cat https-refused.log >&2; exit 1; }; \
                  if GIT_TRACE=1 GIT_TERMINAL_PROMPT=0 GIT_SSH='{root}/ssh-probe' git ls-remote ssh://127.0.0.1:9/td-no-service >ssh-helper.log 2>&1; then echo 'ssh ls-remote reached a service' >&2; exit 1; fi; \
                  grep -Fq '{root}/ssh-probe' ssh-helper.log || { echo 'Git did not dispatch to the ssh probe:' >&2; cat ssh-helper.log >&2; exit 1; }; \
                  test \"$(cat '{root}/ssh-status')\" = '0 255 ' || { echo \"OpenSSH did not check its variant and then fail its connection: statuses $(cat '{root}/ssh-status')\" >&2; cat ssh-helper.log >&2; exit 1; }; \
@@ -164,6 +175,7 @@ pub fn recipe() -> Recipe {
                  build=$(git version --build-options) || exit 1; \
                  printf '%s\\n' \"$build\" | grep -Fq 'git version 2.56.0' || exit 1; \
                  printf '%s\\n' \"$build\" | grep -Fq 'shell-path: /bin/sh' || exit 1; \
+                 if printf '%s\\n' \"$build\" | grep -Fq 'libcurl:'; then echo 'Git was built with libcurl' >&2; exit 1; fi; \
                  test \"$(git --exec-path)\" = '{in:git-x86-64}/libexec/git-core' || exit 1",
             ],
         )
@@ -177,7 +189,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Git 2.56.0 local and service workflows, HTTPS helper dispatch with verified curl TLS, and SSH dispatch through verified OpenSSH; the system boot oracle completes clone/push/reclone over a real loopback sshd\n".into(),
+        content: "PASS: Git 2.56.0 local and service workflows, HTTPS dispatch to td-net's git-remote-https, and SSH dispatch through verified OpenSSH; the system boot oracle completes clone/push/reclone over a real loopback sshd\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -189,7 +201,7 @@ pub fn recipe() -> Recipe {
         .build_root()
         .native_inputs(&[
             "git-x86-64",
-            "curl-x86-64-test",
+            "td-net",
             "openssh-x86-64",
             "openssh-x86-64-test",
             "glibc-x86-64",
@@ -197,7 +209,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check git-x86-64-test: build Git, exercise local service workflows plus HTTPS/OpenSSH dispatch, and require both transport oracles"
+echo ">> recipe-check git-x86-64-test: build Git, exercise local service workflows plus HTTPS/OpenSSH dispatch, and require OpenSSH's transport oracle"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run git-x86-64-test 1
 "#,
@@ -210,13 +222,13 @@ mod tests {
     use super::{recipe, Step};
 
     #[test]
-    fn validation_composes_git_with_both_verified_transport_oracles() {
+    fn validation_composes_git_with_its_two_transports() {
         let recipe = recipe();
         crate::shared::assert_build_root_test(
             &recipe,
             &[
                 "git-x86-64",
-                "curl-x86-64-test",
+                "td-net",
                 "openssh-x86-64",
                 "openssh-x86-64-test",
                 "glibc-x86-64",
@@ -228,7 +240,7 @@ mod tests {
             Some(
                 [
                     "git-x86-64",
-                    "curl-x86-64-test",
+                    "td-net",
                     "openssh-x86-64",
                     "openssh-x86-64-test",
                     "glibc-x86-64",

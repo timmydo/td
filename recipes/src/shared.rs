@@ -983,8 +983,8 @@ pub const RIPGREP_FD_RUNTIME_MARKER: &str = "TD-RG-FD-RUN-OK";
 /// Printed by the root-owned health target only after the unprivileged user can
 /// initialize a bare repository, clone it, commit and push to it, then clone it
 /// again and verify the resulting history. The same leg requires a pinned CA
-/// bundle at the image's conventional path. Verified use of that bundle and Git's
-/// compiled HTTPS helper is the operator-only `GIT_HTTPS_RUNTIME_MARKER` below.
+/// bundle at the image's conventional path. Verified use of that bundle and td-net's
+/// Git HTTPS helper is the operator-only `GIT_HTTPS_RUNTIME_MARKER` below.
 pub const GIT_RUNTIME_MARKER: &str = "TD-GIT-RUN-OK";
 
 /// Printed by the root-owned health target only after the unprivileged OpenSSH client

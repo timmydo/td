@@ -2,23 +2,23 @@ use crate::shared::{
     build_root_dynamic_cc, build_root_link_map_check, unpack_into, LinkedLibc, BUILD_ROOT_PATH,
     BUILD_ROOT_SH as SH,
 };
-use crate::types::{Recipe, Step, TextEdit};
+use crate::types::{Recipe, Step};
 
-// Source-built Git with local repository support and smart HTTP(S) transport.
-// Git delegates SSH transport to the separately source-built OpenSSH client;
-// language runtimes, legacy WebDAV, localization, and direct OpenSSL use remain
-// outside this daily-driver closure.
+// Source-built Git with local repository support. Its remote transports are
+// other programs: SSH is the separately source-built OpenSSH client, and HTTP(S)
+// is td-net's git-remote-https applet, which the image links into /bin, where
+// Git finds it on PATH. Language runtimes, libcurl, legacy WebDAV, localization,
+// and direct OpenSSL use remain outside this daily-driver closure.
 //
 // It compiles in the Debian build root against td glibc
 // (`build_root_dynamic_cc`): each program links td glibc's libc.so.6 with its
-// loader and RUNPATH, gcc-runtime's start files and libgcc, and the curl,
-// LibreSSL and zlib archives, which its link map proves.
+// loader and RUNPATH, gcc-runtime's start files and libgcc, and the zlib
+// archive, which its link map proves.
 
 /// The ELF programs, each linked by its own make.
-const PROGRAMS: &[&str] = &["git", "git-remote-http", "git-sh-i18n--envsubst"];
+const PROGRAMS: &[&str] = &["git", "git-sh-i18n--envsubst"];
 
-/// Shell scripts, generated without a link. The https alias is not made here:
-/// its rule would revisit git-remote-http after that link's map was checked.
+/// Shell scripts, generated without a link.
 const SCRIPTS: &[&str] = &[
     "git-difftool--helper",
     "git-filter-branch",
@@ -39,8 +39,6 @@ const SCRIPTS: &[&str] = &[
 const NO_LINK_MAP: &str = "{root}/no-link.map";
 
 pub fn recipe() -> Recipe {
-    let curl = "{in:curl-x86-64}";
-    let tls = "{in:libressl-x86-64}";
     let zlib = "{in:zlib-x86-64}";
     let path = format!("{{root}}/wb:{BUILD_ROOT_PATH}");
 
@@ -48,26 +46,7 @@ pub fn recipe() -> Recipe {
 
     // SHELL_PATH=/bin/sh is compiled into shipped scripts, and Git's
     // generators run under it too: the root's /bin/sh, as upstream intends.
-    steps.push(Step::substitute_text(
-        "{src}/Makefile",
-        vec![TextEdit::new(
-            "REMOTE_CURL_ALIASES = git-remote-https$X git-remote-ftp$X git-remote-ftps$X",
-            "REMOTE_CURL_ALIASES = git-remote-https$X",
-            1,
-        )],
-    ));
     steps.extend(build_root_dynamic_cc());
-    steps.push(Step::WriteFile {
-        path: "{root}/wb/curl-config".into(),
-        content: format!(
-            "#!{SH}\n\
-             case \"$1\" in\n\
-             --vernum) printf '%s\\n' '081700';;\n\
-             *) exit 1;;\n\
-             esac\n"
-        ),
-        exec: true,
-    });
     steps.push(Step::WriteFile {
         path: "{src}/config.mak".into(),
         content: format!(
@@ -79,16 +58,12 @@ pub fn recipe() -> Recipe {
              SHELL_PATH = /bin/sh\n\
              CC = {{root}}/wb/cc\n\
              AR = /usr/bin/ar\n\
-             CURL_CONFIG = {{root}}/wb/curl-config\n\
-             CURL_LDFLAGS = {curl}/lib/libcurl.a {tls}/lib/libssl.a {tls}/lib/libcrypto.a {zlib}/lib/libz.a -pthread\n\
              # The override drops Git's EXTLIBS additions for this\n\
              # configuration, zlib, pthread and config.mak.uname's -ldl. Name\n\
-             # pthread in CURL_LDFLAGS and zlib here so no implicit -l search\n\
-             # can escape the closure; dlopen is in td glibc's libc.so.6.\n\
+             # zlib here so no implicit -l search can escape the closure;\n\
+             # pthread and dlopen are in td glibc's libc.so.6.\n\
              override EXTLIBS = {zlib}/lib/libz.a\n\
-             CFLAGS = -O2 -I{curl}/include -I{zlib}/include \
-             -ffile-prefix-map={curl}=/td-build/input/curl \
-             -ffile-prefix-map={tls}=/td-build/input/libressl \
+             CFLAGS = -O2 -I{zlib}/include \
              -ffile-prefix-map={zlib}=/td-build/input/zlib\n\
              LDFLAGS = -Wl,--build-id=sha1\n\
              NO_PERL = YesPlease\n\
@@ -99,6 +74,7 @@ pub fn recipe() -> Recipe {
              NO_GETTEXT = YesPlease\n\
              NO_EXPAT = YesPlease\n\
              NO_OPENSSL = YesPlease\n\
+             NO_CURL = YesPlease\n\
              NO_RUST = YesPlease\n\
              NO_BASH_COMPLETION = YesPlease\n\
              SKIP_DASHED_BUILT_INS = YesPlease\n\
@@ -127,12 +103,7 @@ pub fn recipe() -> Recipe {
             "{src}",
             &map,
             program,
-            &[
-                "gcc-runtime",
-                "curl-x86-64",
-                "libressl-x86-64",
-                "zlib-x86-64",
-            ],
+            &["gcc-runtime", "zlib-x86-64"],
             LinkedLibc::Shared,
         ));
     }
@@ -202,15 +173,8 @@ pub fn recipe() -> Recipe {
         });
     }
     steps.push(Step::CopyFiles {
-        files: vec![
-            "{src}/git-remote-http".into(),
-            "{src}/git-sh-i18n--envsubst".into(),
-        ],
+        files: vec!["{src}/git-sh-i18n--envsubst".into()],
         dest: "{out}/libexec/git-core".into(),
-    });
-    steps.push(Step::Symlink {
-        target: "git-remote-http".into(),
-        link: "{out}/libexec/git-core/git-remote-https".into(),
     });
     steps.push(Step::CopyFiles {
         files: SCRIPTS
@@ -233,8 +197,6 @@ pub fn recipe() -> Recipe {
             "{out}/bin/git-receive-pack".into(),
             "{out}/bin/git-upload-archive".into(),
             "{out}/bin/git-upload-pack".into(),
-            "{out}/libexec/git-core/git-remote-http".into(),
-            "{out}/libexec/git-core/git-remote-https".into(),
             "{out}/libexec/git-core/git-sh-i18n--envsubst".into(),
             "{out}/libexec/git-core/git-submodule".into(),
         ],
@@ -253,13 +215,7 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("git-x86-64", "2.56.0")
         .source_input("git-x86-64-source")
         .build_root()
-        .native_inputs(&[
-            "curl-x86-64",
-            "libressl-x86-64",
-            "zlib-x86-64",
-            "glibc-x86-64",
-            "gcc-runtime",
-        ])
+        .native_inputs(&["zlib-x86-64", "glibc-x86-64", "gcc-runtime"])
         .steps(steps)
 }
 
@@ -269,20 +225,14 @@ mod tests {
     use crate::types::Step;
 
     #[test]
-    fn build_uses_the_exact_final_https_toolchain_closure() {
+    fn build_uses_the_exact_toolchain_closure_with_no_http_library() {
         let recipe = recipe();
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(
-                [
-                    "curl-x86-64",
-                    "libressl-x86-64",
-                    "zlib-x86-64",
-                    "glibc-x86-64",
-                    "gcc-runtime",
-                ]
-                .map(str::to_string)
-                .as_slice()
+                ["zlib-x86-64", "glibc-x86-64", "gcc-runtime"]
+                    .map(str::to_string)
+                    .as_slice()
             )
         );
         assert!(recipe.inputs.is_none());
@@ -301,15 +251,15 @@ mod tests {
             "NO_GETTEXT = YesPlease",
             "NO_EXPAT = YesPlease",
             "NO_OPENSSL = YesPlease",
+            "NO_CURL = YesPlease",
             "NO_RUST = YesPlease",
             "SKIP_DASHED_BUILT_INS = YesPlease",
         ] {
             assert!(config.contains(required), "missing Git policy {required}");
         }
-        assert!(config.contains("CURL_LDFLAGS = {in:curl-x86-64}/lib/libcurl.a"));
         assert!(config.contains("override EXTLIBS = {in:zlib-x86-64}/lib/libz.a"));
+        assert!(!config.contains("CURL_"));
         assert!(!config.contains("CURLDIR ="));
-        assert!(!config.contains("CURL_CFLAGS ="));
         assert!(!config.contains("SANE_TOOL_PATH ="));
         assert!(!config.contains("ZLIB_PATH ="));
 
@@ -340,7 +290,7 @@ mod tests {
                     matches!(step, Step::Run { argv, .. }
                         if argv.iter().any(|arg| arg.contains(&format!("m='{map}'"))
                             && arg.contains(&format!("= '{program}'"))
-                            && arg.contains("{in:curl-x86-64}")
+                            && arg.contains("{in:zlib-x86-64}")
                             && arg.contains("$sys/libc.so.6")))
                 })
                 .expect("link-map check");
@@ -357,7 +307,7 @@ mod tests {
             .iter()
             .any(|name| scripts.iter().any(|arg| arg == name)));
         assert!(!makes.iter().any(|argv| argv.iter().any(|arg| arg == "all")));
-        assert!(!scripts.iter().any(|arg| arg == "git-remote-https"));
+        assert!(!PROGRAMS.iter().any(|name| name.starts_with("git-remote")));
         let sentinel = steps.iter().position(|step| {
             matches!(step, Step::Run { argv, .. }
                 if argv.iter().any(|arg| arg.contains("[ -e '{root}/no-link.map' ]")))
@@ -403,8 +353,6 @@ mod tests {
             })
             .expect("Git build configuration");
         for required in [
-            "-ffile-prefix-map={in:curl-x86-64}=/td-build/input/curl",
-            "-ffile-prefix-map={in:libressl-x86-64}=/td-build/input/libressl",
             "-ffile-prefix-map={in:zlib-x86-64}=/td-build/input/zlib",
             "LDFLAGS = -Wl,--build-id=sha1",
         ] {

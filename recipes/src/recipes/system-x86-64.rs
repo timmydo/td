@@ -1564,9 +1564,11 @@ mod svc_timeouts {
     /// built-in evdev nodes.
     pub const SEAT: u32 = 30;
     /// `td-netd up` is DHCP with bounded retries. Under the nettest token it also
-    /// resolves and reaches the upstream, then Git has libcurl's 300-second connect
-    /// bound plus the explicit 10-second low-speed transfer bound. Keep the service
-    /// above twice that reviewed 336-second worst case.
+    /// resolves and reaches the upstream, then each of Git's two requests has its
+    /// helper's 30-second resolve and 60-second connect bounds plus the explicit
+    /// 10-second low-speed bound, on its response head and again on its body. Keep
+    /// the service above twice that reviewed 246-second worst case. A server keeping
+    /// above the limit is not bounded here.
     pub const NETUP: u32 = 700;
     /// Brings up loopback and mints one P-256 test authority and server
     /// identity in the slow VM; ECDSA keys take milliseconds, the rest is
@@ -4215,7 +4217,7 @@ const IMMUTABLE_ETC: &[ImmutableEtc] = &[
     ImmutableEtc {
         etc: "ssl/certs/ca-certificates.crt",
         target: "{in:ca-certificates}/share/ca-certificates/ca-bundle.crt",
-        why: "The static curl transport used by Git needs this CA bundle path, \
+        why: "The Git HTTP transport and the curl command need this CA bundle path, \
               while the pinned Mozilla extract remains immutable store content",
         desktop_only: false,
     },
@@ -5413,6 +5415,9 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         ("rg", "{in:ripgrep}/bin/rg"),
         ("fd", "{in:fd}/bin/fd"),
         ("git", "{in:git-x86-64}/bin/git"),
+        // Git's HTTP(S) transport, which it finds on PATH as a helper.
+        ("git-remote-http", "{in:td-net}/bin/td-net"),
+        ("git-remote-https", "{in:td-net}/bin/td-net"),
         ("curl", "{in:curl-x86-64}/bin/curl"),
         ("git-receive-pack", "{in:git-x86-64}/bin/git-receive-pack"),
         (
@@ -6023,7 +6028,7 @@ fn shape_check(sys: &SystemDef) -> String {
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"{in:git-x86-64}/bin/$a\" ] || { echo \"root tree: /bin/$a is not a symlink to staged Git\" >&2; exit 1; }; \
      done; \
      [ -s \"{root}/real-root{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: the pinned CA bundle is missing or empty' >&2; exit 1; }; \
-     [ \"$(readlink \"$root/etc/ssl/certs/ca-certificates.crt\" 2>/dev/null)\" = \"{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: Git curl CA path does not resolve to the pinned bundle' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/etc/ssl/certs/ca-certificates.crt\" 2>/dev/null)\" = \"{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: the CA path does not resolve to the pinned bundle' >&2; exit 1; }; \
      for rel in bin/ssh bin/ssh-keygen bin/sshd libexec/sshd-session libexec/sshd-auth; do \
          openssh=\"{root}/real-root{in:openssh-x86-64}/$rel\"; \
          { [ -f \"$openssh\" ] && [ -x \"$openssh\" ]; } || { echo \"root tree: OpenSSH $rel is not packed/executable under real-root{in:openssh-x86-64}\" >&2; exit 1; }; \
@@ -6536,8 +6541,9 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
         // uutils: the dynamically-linked `coreutils` multicall packed as the /bin file/text
         //   userland (#547).
         // ripgrep/fd: dynamically linked Rust search tools exposed as /bin/rg and /bin/fd.
-        // Git: the source-built local and HTTP(S) client plus its executable helpers.
-        // ca-certificates: immutable Mozilla trust data at curl's conventional path.
+        // Git: the source-built client plus its executable helpers; its HTTP(S) helpers
+        //   are td-net's.
+        // ca-certificates: immutable Mozilla trust data at the conventional path.
         // tzdata: immutable compiled zones and geographic tables at /etc/zoneinfo.
         // jetbrains-mono-nerd-font: the pinned outline face at
         //   /etc/fonts/jetbrains-mono-nerd.
@@ -8829,9 +8835,9 @@ mod tests {
             ),
             (
                 svc_timeouts::NETUP,
-                336,
-                "DHCP and td-netd resolve/reach, then libcurl's 300s connect and 10s \
-                 low-speed transfer bounds",
+                246,
+                "DHCP and td-netd resolve/reach, then two requests' 30s resolve, 60s connect \
+                 and two 10s low-speed bounds in git-remote-https",
             ),
             (
                 svc_timeouts::BOOTSUCCESS,
@@ -10138,8 +10144,8 @@ mod tests {
                 "/bin/{name} names a C tool the image no longer ships"
             );
         }
-        // curl and Git link LibreSSL's archives statically; the image
-        // carries none of it and no `openssl` command.
+        // curl links LibreSSL's archives statically; the image carries none
+        // of it and no `openssl` command.
         assert!(
             !steps.iter().any(|step| match step {
                 Step::CopyTree { from, .. } => from.contains("libressl"),
@@ -10153,6 +10159,8 @@ mod tests {
             ("rg", "{in:ripgrep}/bin/rg"),
             ("fd", "{in:fd}/bin/fd"),
             ("git", "{in:git-x86-64}/bin/git"),
+            ("git-remote-http", "{in:td-net}/bin/td-net"),
+            ("git-remote-https", "{in:td-net}/bin/td-net"),
             ("curl", "{in:curl-x86-64}/bin/curl"),
             ("git-receive-pack", "{in:git-x86-64}/bin/git-receive-pack"),
             (

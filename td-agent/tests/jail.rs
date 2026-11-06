@@ -390,7 +390,8 @@ fn a_commands_network_goes_through_the_proxy_to_the_relay() {
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .contains("other.test:80 is not on this workspace's allowlist"),);
-    assert!(said.contains("the person refused it"), "{said}");
+    // Only a client that proxies plain http in the clear hears the reason; td's
+    // own Git helper tunnels it with CONNECT, whose refusal has just a status.
     assert!(said.contains("403"), "{said}");
     // The second never reached the relay.
     assert!(heard.recv_timeout(Duration::from_millis(300)).is_err());

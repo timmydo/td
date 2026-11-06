@@ -4,10 +4,10 @@ use crate::shared::{
 };
 use crate::types::{Recipe, Step};
 
-// Static HTTP(S)-only curl CLI and libcurl for Git's transports.
-// Both use the same narrow, reviewed protocol and dependency surface.
-// It compiles in the Debian build root against td glibc
-// (`build_root_static_cc`); Git's link consumes the archive.
+// Static HTTP(S)-only curl CLI, with the narrow, reviewed protocol and
+// dependency surface its libcurl archive also has. Git's transport is td-net's,
+// not this. It compiles in the Debian build root against td glibc
+// (`build_root_static_cc`).
 pub fn recipe() -> Recipe {
     let tls = "{in:libressl-x86-64}";
     let zlib = "{in:zlib-x86-64}";

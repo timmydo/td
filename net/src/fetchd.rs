@@ -1073,7 +1073,7 @@ fn perform_with_pool(
 /// rustls on td-primitives, both TLS 1.2 and 1.3 (ureq's `ALL_VERSIONS`), over the
 /// given roots. Each agent builds its own rustls configuration from this
 /// once, so session resumption is scoped to one agent.
-fn tls(roots: ureq::tls::RootCerts) -> ureq::tls::TlsConfig {
+pub(crate) fn tls(roots: ureq::tls::RootCerts) -> ureq::tls::TlsConfig {
     ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::Rustls)
         .unversioned_rustls_crypto_provider(crate::tls_crypto::shared())

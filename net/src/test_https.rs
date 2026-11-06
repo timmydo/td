@@ -23,6 +23,18 @@
 //       against NAME, GET PATH, and succeed only on a 200 whose body
 //       contains TEXT.
 //
+//   td-test-https serve-git --listen ADDR --cert FILE --key FILE --root DIR
+//                           [--auth USER:PASS] [--elsewhere URL] [--log FILE]
+//       Serve DIR's bare repositories over smart HTTP by running `git
+//       upload-pack` and `git receive-pack` as http-backend would, one
+//       request per connection, and print `listening ADDR` once bound.
+//       Paths starting /moved, /elsewhere or /to-http redirect, /forbidden
+//       and /dumb answer as their names say, /v0 ignores a client's protocol
+//       v2 request, /chunked answers in chunks, and /trickle answers a byte at
+//       a time. `--auth` asks for Basic everywhere but /moved. `--log` records
+//       each request's line and what it carried. git-remote-https's tests run
+//       against this.
+//
 // It is a fixture, not a web server: no keep-alive, no ranges, no
 // directories, and nothing outside DIR's own flat names. Every connection,
 // served or probed, has one deadline for its whole life, handshake included.
@@ -87,12 +99,17 @@ pub fn run(args: &[String]) {
             parse_serve(flags).and_then(|serve| serve.run().map(|never| match never {}))
         }
         Some((verb, flags)) if verb == "probe" => parse_probe(flags).and_then(|p| p.run()),
+        Some((verb, flags)) if verb == "serve-git" => {
+            parse_serve_git(flags).and_then(|serve| serve.run().map(|never| match never {}))
+        }
         _ => {
             eprintln!(
                 "usage: td-test-https mint DIR\n       \
                  td-test-https serve --listen ADDR --cert FILE --key FILE --root DIR\n       \
                  td-test-https probe --connect ADDR --server-name NAME --ca FILE \
-                 --path PATH --expect TEXT"
+                 --path PATH --expect TEXT\n       \
+                 td-test-https serve-git --listen ADDR --cert FILE --key FILE --root DIR \
+                 [--auth USER:PASS] [--elsewhere URL] [--log FILE]"
             );
             std::process::exit(2);
         }
@@ -388,27 +405,9 @@ fn bit_string(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn pem(label: &str, der: &[u8]) -> Vec<u8> {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut text = Vec::new();
-    for chunk in der.chunks(3) {
-        let byte = |i: usize| chunk.get(i).copied().unwrap_or(0);
-        let (b0, b1, b2) = (byte(0), byte(1), byte(2));
-        let sextets = [
-            b0 >> 2,
-            (b0 & 0x03) << 4 | b1 >> 4,
-            (b1 & 0x0f) << 2 | b2 >> 6,
-            b2 & 0x3f,
-        ];
-        for (i, sextet) in sextets.iter().enumerate() {
-            text.push(if i <= chunk.len() {
-                ALPHABET.get(usize::from(*sextet)).copied().unwrap_or(b'=')
-            } else {
-                b'='
-            });
-        }
-    }
+    let text = crate::git_remote::base64(der);
     let mut out = format!("-----BEGIN {label}-----\n").into_bytes();
-    for line in text.chunks(64) {
+    for line in text.as_bytes().chunks(64) {
         out.extend_from_slice(line);
         out.push(b'\n');
     }
@@ -649,6 +648,450 @@ fn file(root: &Path, name: &str) -> Option<(Vec<u8>, &'static str)> {
         "text/plain; charset=utf-8"
     };
     Some((body, kind))
+}
+
+// ---- serve-git --------------------------------------------------------------
+
+/// A push's pack, bounded because the fixture holds it in memory.
+const MAX_GIT_BODY: u64 = 64 * 1024 * 1024;
+/// A clone or push of the test repositories, whole, on a loaded machine.
+const GIT_CONNECTION_BUDGET: Duration = Duration::from_secs(120);
+
+struct ServeGit {
+    listen: SocketAddr,
+    config: Arc<ServerConfig>,
+    site: Arc<GitSite>,
+}
+
+struct GitSite {
+    root: PathBuf,
+    /// The `Authorization` every request must carry, if any must.
+    authorization: Option<String>,
+    elsewhere: Option<String>,
+    log: Option<PathBuf>,
+}
+
+fn parse_serve_git(args: &[String]) -> Result<ServeGit, String> {
+    let mut required = Vec::new();
+    let mut auth = None;
+    let mut elsewhere = None;
+    let mut log = None;
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let slot = match flag.as_str() {
+            "--auth" => &mut auth,
+            "--elsewhere" => &mut elsewhere,
+            "--log" => &mut log,
+            _ => {
+                required.push(flag.clone());
+                required.push(
+                    it.next()
+                        .ok_or_else(|| format!("{flag} needs a value"))?
+                        .clone(),
+                );
+                continue;
+            }
+        };
+        let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        if slot.replace(value.clone()).is_some() {
+            return Err(format!("{flag} given twice"));
+        }
+    }
+    let serve = {
+        let values = flags(&required, &["listen", "cert", "key", "root"])?;
+        let [listen, cert, key, root] = values.as_slice() else {
+            return Err("serve-git takes --listen, --cert, --key and --root".into());
+        };
+        parse_serve(&[
+            "--listen".to_string(),
+            listen.to_string(),
+            "--cert".to_string(),
+            cert.to_string(),
+            "--key".to_string(),
+            key.to_string(),
+            "--root".to_string(),
+            root.to_string(),
+        ])?
+    };
+    Ok(ServeGit {
+        listen: serve.listen,
+        config: serve.config,
+        site: Arc::new(GitSite {
+            root: serve.root,
+            authorization: auth.map(|pair: String| {
+                format!("Basic {}", crate::git_remote::base64(pair.as_bytes()))
+            }),
+            elsewhere,
+            log: log.map(PathBuf::from),
+        }),
+    })
+}
+
+impl ServeGit {
+    fn run(self) -> Result<Never, String> {
+        let listener =
+            TcpListener::bind(self.listen).map_err(|e| format!("listen {}: {e}", self.listen))?;
+        let bound = listener
+            .local_addr()
+            .map_err(|e| format!("listen {}: {e}", self.listen))?;
+        let mut stdout = std::io::stdout();
+        writeln!(stdout, "listening {bound}")
+            .and_then(|()| stdout.flush())
+            .map_err(|e| format!("say where it listens: {e}"))?;
+        let active = Arc::new(AtomicUsize::new(0));
+        loop {
+            let Ok((socket, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            };
+            let start = Instant::now();
+            let Some(slot) = Slot::take(&active) else {
+                continue;
+            };
+            let (config, site) = (self.config.clone(), self.site.clone());
+            let _ = std::thread::Builder::new().spawn(move || {
+                let _slot = slot;
+                let socket = Deadline::new(socket, start, GIT_CONNECTION_BUDGET);
+                // Silent per connection; the client sees the failure.
+                let _ = respond_git(config, &site, socket);
+            });
+        }
+    }
+}
+
+/// One parsed request head, and any body bytes read along with it.
+struct GitRequest {
+    method: String,
+    path: String,
+    query: String,
+    headers: Vec<(String, String)>,
+    leftover: Vec<u8>,
+}
+
+impl GitRequest {
+    fn parse(mut raw: Vec<u8>) -> Result<Self, String> {
+        let end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or("the request head has no end")?;
+        let leftover = raw.split_off(end + 4);
+        let text = std::str::from_utf8(&raw).map_err(|_| "the request head is not UTF-8")?;
+        let mut lines = text.split("\r\n");
+        let mut words = lines.next().ok_or("no request line")?.split(' ');
+        let (method, target) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        Ok(Self {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: query.to_string(),
+            headers,
+            leftover,
+        })
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn chunked(&self) -> bool {
+        self.header("transfer-encoding")
+            .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+    }
+
+    fn body(&mut self, stream: &mut impl Read) -> Result<Vec<u8>, String> {
+        let leftover = std::mem::take(&mut self.leftover);
+        let mut input = std::io::BufReader::new(leftover.as_slice().chain(stream));
+        let mut body = Vec::new();
+        if self.chunked() {
+            read_chunks(&mut input, &mut body)?;
+        } else if let Some(length) = self.header("content-length") {
+            let length: u64 = length.parse().map_err(|_| "a bad Content-Length")?;
+            if length > MAX_GIT_BODY {
+                return Err("the request is too long".into());
+            }
+            input
+                .take(length)
+                .read_to_end(&mut body)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(body)
+    }
+}
+
+fn read_chunks(input: &mut impl std::io::BufRead, body: &mut Vec<u8>) -> Result<(), String> {
+    loop {
+        let mut line = String::new();
+        input.read_line(&mut line).map_err(|e| e.to_string())?;
+        let size = usize::from_str_radix(line.trim(), 16).map_err(|_| "a bad chunk size")?;
+        if size == 0 {
+            return Ok(());
+        }
+        if (body.len() + size) as u64 > MAX_GIT_BODY {
+            return Err("the request is too long".into());
+        }
+        let start = body.len();
+        input
+            .by_ref()
+            .take(size as u64)
+            .read_to_end(body)
+            .map_err(|e| e.to_string())?;
+        if body.len() - start != size {
+            return Err("a chunk was cut short".into());
+        }
+        let mut end = String::new();
+        input.read_line(&mut end).map_err(|e| e.to_string())?;
+    }
+}
+
+struct GitResponse {
+    status: &'static str,
+    headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+    framing: Framing,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Framing {
+    Length,
+    Chunks,
+    Trickle,
+}
+
+impl GitResponse {
+    fn text(status: &'static str, body: &str) -> Self {
+        Self {
+            status,
+            headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
+            body: body.as_bytes().to_vec(),
+            framing: Framing::Length,
+        }
+    }
+
+    fn redirect(location: String) -> Self {
+        Self {
+            status: "302 Found",
+            headers: vec![("Location", location)],
+            body: Vec::new(),
+            framing: Framing::Length,
+        }
+    }
+}
+
+fn respond_git(config: Arc<ServerConfig>, site: &GitSite, socket: Deadline) -> Result<(), String> {
+    let connection = ServerConnection::new(config).map_err(|e| e.to_string())?;
+    let mut stream = StreamOwned::new(connection, socket);
+    let head = read_head(&mut stream)?;
+    let mut request = GitRequest::parse(head)?;
+    let body = request.body(&mut stream)?;
+    site.record(&request, &body);
+    let response = site.answer(&request, body);
+    let mut out = format!("HTTP/1.1 {}\r\nConnection: close\r\n", response.status);
+    if response.framing == Framing::Length {
+        out.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
+    } else {
+        out.push_str("Transfer-Encoding: chunked\r\n");
+    }
+    for (name, value) in &response.headers {
+        out.push_str(&format!("{name}: {value}\r\n"));
+    }
+    out.push_str("\r\n");
+    stream
+        .write_all(out.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|e| e.to_string())?;
+    match response.framing {
+        Framing::Length => stream
+            .write_all(&response.body)
+            .map_err(|e| e.to_string())?,
+        Framing::Chunks => {
+            for chunk in response.body.chunks(1024) {
+                stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .and_then(|()| stream.write_all(chunk))
+                    .and_then(|()| stream.write_all(b"\r\n"))
+                    .map_err(|e| e.to_string())?;
+            }
+            stream.write_all(b"0\r\n\r\n").map_err(|e| e.to_string())?;
+        }
+        // Often enough for any per-read timeout, too little for a rate. It
+        // ends when the client hangs up or the connection's budget does.
+        Framing::Trickle => loop {
+            stream
+                .write_all(b"1\r\n0\r\n")
+                .and_then(|()| stream.flush())
+                .map_err(|e| e.to_string())?;
+            std::thread::sleep(Duration::from_millis(100));
+        },
+    }
+    stream.conn.send_close_notify();
+    stream.flush().map_err(|e| e.to_string())
+}
+
+impl GitSite {
+    fn record(&self, request: &GitRequest, body: &[u8]) {
+        let Some(path) = &self.log else {
+            return;
+        };
+        let line = format!(
+            "{} {}?{} auth={} chunked={} protocol={} agent={} bytes={}\n",
+            request.method,
+            request.path,
+            request.query,
+            request.header("authorization").is_some(),
+            request.chunked(),
+            request.header("git-protocol").unwrap_or("none"),
+            request.header("user-agent").unwrap_or("none"),
+            body.len(),
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    fn answer(&self, request: &GitRequest, body: Vec<u8>) -> GitResponse {
+        let query = if request.query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", request.query)
+        };
+        let path = request.path.as_str();
+        // Before asking who it is, as a server canonicalizing a path does.
+        if let Some(rest) = path.strip_prefix("/moved/") {
+            return GitResponse::redirect(format!("/{rest}{query}"));
+        }
+        if let Some(wanted) = &self.authorization {
+            if request.header("authorization") != Some(wanted) {
+                let mut response = GitResponse::text("401 Unauthorized", "who are you\n");
+                response
+                    .headers
+                    .push(("WWW-Authenticate", "Basic realm=\"td test\"".to_string()));
+                return response;
+            }
+        }
+        if let Some(rest) = path.strip_prefix("/to-http/") {
+            return GitResponse::redirect(format!("http://127.0.0.1:9/{rest}{query}"));
+        }
+        if let (Some(rest), Some(origin)) = (path.strip_prefix("/elsewhere/"), &self.elsewhere) {
+            return GitResponse::redirect(format!("{origin}/{rest}{query}"));
+        }
+        if path.starts_with("/forbidden/") {
+            return GitResponse::text("403 Forbidden", "the fixture forbids this\n");
+        }
+        if path.starts_with("/dumb/") {
+            return GitResponse::text("200 OK", "0123 refs/heads/main\n");
+        }
+        if path.starts_with("/trickle/") {
+            return GitResponse {
+                status: "200 OK",
+                headers: vec![(
+                    "Content-Type",
+                    "application/x-git-upload-pack-advertisement".to_string(),
+                )],
+                body: Vec::new(),
+                framing: Framing::Trickle,
+            };
+        }
+        let (path, framing) = match path.strip_prefix("/chunked") {
+            Some(rest) => (rest, Framing::Chunks),
+            None => (path, Framing::Length),
+        };
+        let (rest, protocol) = match path.strip_prefix("/v0/") {
+            Some(rest) => (rest, None),
+            None => (
+                path.strip_prefix('/').unwrap_or(path),
+                request.header("git-protocol"),
+            ),
+        };
+        let mut response = self
+            .run_git(request, rest, protocol, body)
+            .unwrap_or_else(|| GitResponse::text("404 Not Found", "no such repository\n"));
+        response.framing = framing;
+        response
+    }
+
+    /// `NAME.git/info/refs?service=S` or `NAME.git/S`, for a repository
+    /// directly in the root and one of the two services.
+    fn run_git(
+        &self,
+        request: &GitRequest,
+        rest: &str,
+        protocol: Option<&str>,
+        body: Vec<u8>,
+    ) -> Option<GitResponse> {
+        let (name, action) = rest.split_once('/')?;
+        let flat = !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+        let repository = self.root.join(name);
+        if !flat || !repository.is_dir() {
+            return None;
+        }
+        let (service, advertise) = if action == "info/refs" && request.method == "GET" {
+            (request.query.strip_prefix("service=")?, true)
+        } else if request.method == "POST" {
+            (action, false)
+        } else {
+            return None;
+        };
+        let verb = match service {
+            "git-upload-pack" => "upload-pack",
+            "git-receive-pack" => "receive-pack",
+            _ => return None,
+        };
+        let mode = if advertise {
+            "--http-backend-info-refs"
+        } else {
+            "--stateless-rpc"
+        };
+        let mut child = std::process::Command::new("git")
+            .args([verb, mode])
+            .arg(&repository)
+            .env("GIT_PROTOCOL", protocol.unwrap_or(""))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&body);
+        });
+        let output = child.wait_with_output().ok()?;
+        let _ = writer.join();
+        let mut response = Vec::new();
+        if advertise {
+            if protocol != Some("version=2") || verb == "receive-pack" {
+                let line = format!("# service={service}\n");
+                response.extend_from_slice(format!("{:04x}{line}0000", line.len() + 4).as_bytes());
+            }
+            response.extend_from_slice(&output.stdout);
+        } else {
+            response = output.stdout;
+        }
+        let kind = if advertise {
+            format!("application/x-{service}-advertisement")
+        } else {
+            format!("application/x-{service}-result")
+        };
+        Some(GitResponse {
+            status: "200 OK",
+            headers: vec![("Content-Type", kind)],
+            body: response,
+            framing: Framing::Length,
+        })
+    }
 }
 
 // ---- probe ------------------------------------------------------------------
