@@ -665,8 +665,14 @@ fn complete_issuance_over_verified_local_https() {
                     _ => panic!("write closed"),
                 }
             }
-            while io.flush().unwrap() != FlushProgress::Complete {
-                std::thread::sleep(Duration::from_millis(1));
+            // Flush also reads, and the client may close once it holds the
+            // whole response. Whether it got one is advance's to report.
+            loop {
+                match io.flush() {
+                    Ok(FlushProgress::Pending) => std::thread::sleep(Duration::from_millis(1)),
+                    Ok(FlushProgress::Complete) | Err(td_mta::ports::Error::Tls) => break,
+                    Err(error) => panic!("{error:?}"),
+                }
             }
         }
     });

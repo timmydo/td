@@ -664,7 +664,7 @@ pub(super) fn exercise(
         .arg(&desktop_runtime)
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert!(output.status.success(), "{output:?}");
     super::wait_command(&mut desktop);
     desktop = start("desktop").0;
     enqueue();
