@@ -9,6 +9,7 @@
     clippy::indexing_slicing
 )]
 
+mod inventory;
 #[cfg(test)]
 pub(crate) mod tests;
 mod website;
@@ -141,6 +142,28 @@ fn authorization(
     headers: &BTreeMap<String, String>,
     digest: &str,
 ) -> Result<String> {
+    authorization_query(
+        credentials,
+        method,
+        path,
+        "",
+        region,
+        stamp,
+        headers,
+        digest,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn authorization_query(
+    credentials: &Credentials,
+    method: &str,
+    path: &str,
+    query: &str,
+    region: &str,
+    stamp: &str,
+    headers: &BTreeMap<String, String>,
+    digest: &str,
+) -> Result<String> {
     let date = stamp.get(..8).ok_or("invalid S3 signing date")?;
     let scope = format!("{date}/{region}/s3/aws4_request");
     let canonical_headers: String = headers
@@ -157,7 +180,7 @@ fn authorization(
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(";");
-    let canonical = format!("{method}\n{path}\n\n{canonical_headers}\n{signed}\n{digest}");
+    let canonical = format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed}\n{digest}");
     let to_sign = format!(
         "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
         hash(canonical.as_bytes())
@@ -280,10 +303,29 @@ impl Client {
         key: &str,
         digest: &str,
         extra: &[(&str, &str)],
+        body: Option<(&mut File, u64)>,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
+        self.request_query(method, key, "", digest, extra, body)
+    }
+    fn request_query(
+        &self,
+        method: &str,
+        key: &str,
+        query: &str,
+        digest: &str,
+        extra: &[(&str, &str)],
         mut body: Option<(&mut File, u64)>,
     ) -> Result<ureq::http::Response<ureq::Body>> {
-        let path = key_path(&self.bucket, key)?;
-        let url = format!("{}{path}", self.endpoint);
+        let path = if key.is_empty() && !query.is_empty() {
+            format!("/{}/", self.bucket)
+        } else {
+            key_path(&self.bucket, key)?
+        };
+        let url = if query.is_empty() {
+            format!("{}{path}", self.endpoint)
+        } else {
+            format!("{}{path}?{query}", self.endpoint)
+        };
         for attempt in 0..ATTEMPTS {
             let remaining = self.remaining()?;
             let seconds = SystemTime::now()
@@ -305,15 +347,28 @@ impl Client {
             if let Some((_, size)) = &body {
                 headers.insert("content-length".into(), size.to_string());
             }
-            let auth = authorization(
-                &self.credentials,
-                method,
-                &path,
-                &self.region,
-                &stamp,
-                &headers,
-                digest,
-            )?;
+            let auth = if query.is_empty() {
+                authorization(
+                    &self.credentials,
+                    method,
+                    &path,
+                    &self.region,
+                    &stamp,
+                    &headers,
+                    digest,
+                )?
+            } else {
+                authorization_query(
+                    &self.credentials,
+                    method,
+                    &path,
+                    query,
+                    &self.region,
+                    &stamp,
+                    &headers,
+                    digest,
+                )?
+            };
             // Do not format ureq errors: credentials and signed headers are private.
             let result = if let Some((file, size)) = body.as_mut() {
                 io(file.seek(SeekFrom::Start(0)))?;
@@ -333,6 +388,8 @@ impl Client {
             } else {
                 let mut request = if method == "HEAD" {
                     self.agent.head(&url)
+                } else if method == "DELETE" {
+                    self.agent.delete(&url)
                 } else {
                     self.agent.get(&url)
                 };

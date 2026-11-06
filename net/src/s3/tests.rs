@@ -118,6 +118,7 @@ pub(crate) struct Store {
     pub(crate) fail: Option<(String, u16, usize)>,
     pub(crate) lose_reply: Option<String>,
     pub(crate) race_head: Option<Vec<u8>>,
+    pub(crate) age_on_delete: Option<std::path::PathBuf>,
     race_file: Option<(String, Stored)>,
     fail_put: Option<(String, u16)>,
 }
@@ -183,7 +184,7 @@ fn serve(mut stream: TcpStream, shared: &Mutex<Store>) {
     }
     let words: Vec<_> = first.split_whitespace().collect();
     let method = words[0];
-    let path = words[1];
+    let (path, query) = words[1].split_once('?').unwrap_or((words[1], ""));
     let key = path.strip_prefix("/td-releases/").unwrap().to_string();
     let mut headers = BTreeMap::new();
     loop {
@@ -217,10 +218,11 @@ fn serve(mut stream: TcpStream, shared: &Mutex<Store>) {
         .collect();
     assert_eq!(
         headers["authorization"],
-        authorization(
+        authorization_query(
             &credentials(),
             method,
             path,
+            query,
             "auto",
             &headers["x-amz-date"],
             &canonical,
@@ -237,7 +239,58 @@ fn serve(mut stream: TcpStream, shared: &Mutex<Store>) {
             return;
         }
     }
+    if !query.is_empty() {
+        assert_eq!(method, "GET");
+        assert!(key.is_empty());
+        assert!(query.ends_with("list-type=2&max-keys=1000&prefix=releases%2F"));
+        let keys: Vec<_> = store
+            .files
+            .keys()
+            .filter(|k| k.starts_with("releases/"))
+            .collect();
+        let start: usize = query
+            .strip_prefix("continuation-token=page")
+            .map(|s| s.split('&').next().unwrap().parse().unwrap())
+            .unwrap_or(0);
+        let part: Vec<_> = keys.iter().skip(start).take(1).collect();
+        let more = start + part.len() < keys.len();
+        let mut xml = format!(
+            "<ListBucketResult><KeyCount>{}</KeyCount><IsTruncated>{more}</IsTruncated>",
+            part.len()
+        );
+        for k in part {
+            xml.push_str(&format!("<Contents><Key>{k}</Key></Contents>"));
+        }
+        if more {
+            xml.push_str(&format!(
+                "<NextContinuationToken>page{}</NextContinuationToken>",
+                start + 1
+            ));
+        }
+        xml.push_str("</ListBucketResult>");
+        reply(&mut stream, 200, &[], xml.as_bytes(), method);
+        return;
+    }
     match method {
+        "DELETE" => {
+            if let Some(path) = store.age_on_delete.take() {
+                File::open(path)
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new()
+                            .set_modified(SystemTime::now() - Duration::from_secs(9 * 86400)),
+                    )
+                    .unwrap();
+            }
+            if store.files.get(&key).is_some_and(|f| {
+                headers.get("if-match") != Some(&format!("\"{}\"", hash(&f.bytes)))
+            }) {
+                reply(&mut stream, 412, &[], &[], method);
+                return;
+            }
+            store.files.remove(&key);
+            reply(&mut stream, 204, &[], &[], method);
+        }
         "PUT" => {
             if let Some((target, status)) = &store.fail_put {
                 if target == &key {

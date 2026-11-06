@@ -46,7 +46,7 @@ pub(super) fn immutable(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
-fn prepare(repo: &Path, root_path: &Path) -> Result<(File, Root)> {
+pub(super) fn prepare(repo: &Path, root_path: &Path) -> Result<(File, Root)> {
     directory(repo)?;
     let lock = lock(&repo.join("lock"))?;
     for sub in ["roots", "heads", "releases", "objects"] {
@@ -488,6 +488,26 @@ pub(super) fn promote_next(
 
 pub(super) fn gc(repo: &Path, root_path: &Path, delete: bool) -> Result<()> {
     let (_lock, _) = prepare(repo, root_path)?;
+    let obsolete = garbage(repo)?;
+    for path in obsolete {
+        println!(
+            "{} {}",
+            if delete { "delete" } else { "would-delete" },
+            path.display()
+        );
+        if delete {
+            io(fs::remove_file(path))?;
+        }
+    }
+    if delete {
+        for sub in ["releases", "objects"] {
+            io(File::open(repo.join(sub)).and_then(|f| f.sync_all()))?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn garbage(repo: &Path) -> Result<Vec<PathBuf>> {
     let time = now()?;
     let grace = 7 * DAY;
     let mut selected = BTreeSet::new();
@@ -560,20 +580,5 @@ pub(super) fn gc(repo: &Path, root_path: &Path, delete: bool) -> Result<()> {
             obsolete.push(entry.path());
         }
     }
-    for path in obsolete {
-        println!(
-            "{} {}",
-            if delete { "delete" } else { "would-delete" },
-            path.display()
-        );
-        if delete {
-            io(fs::remove_file(path))?;
-        }
-    }
-    if delete {
-        for sub in ["releases", "objects"] {
-            io(File::open(repo.join(sub)).and_then(|f| f.sync_all()))?;
-        }
-    }
-    Ok(())
+    Ok(obsolete)
 }

@@ -1461,3 +1461,196 @@ fn s3_rotation_keeps_intermediate_roots_and_expired_head_is_not_uploaded() {
     assert!(s3_upload(&args).is_err());
     assert!(mock.store.lock().unwrap().requests.is_empty());
 }
+
+#[test]
+fn s3_cleanup_is_explicit_and_retains_selected_and_recent_content() {
+    let f = Fixture::new();
+    let mock = crate::s3::tests::Mock::new();
+    let cred = f.dir.join("credentials");
+    crate::s3::tests::write_credentials(&cred);
+    s3_upload(&s3_args(&f, &mock, &cred)).unwrap();
+    let time = now().unwrap();
+    let original = text(&f.repo.join("releases").join(&f.release), INDEX_LIMIT).unwrap();
+    let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
+    lines.pop();
+    lines[2] = "2".into();
+    lines[3] = (time - 10 * format::DAY).to_string();
+    lines[4] = (time - 9 * format::DAY).to_string();
+    let expired = format::signed(&(lines.join("\n") + "\n"), &fs::read(&f.key).unwrap()).unwrap();
+    let old_index = f.repo.join("releases").join(hash(expired.as_bytes()));
+    fs::write(&old_index, expired).unwrap();
+    let old = f.repo.join("objects").join(hash(b"old orphan"));
+    let recent = f.repo.join("objects").join(hash(b"recent orphan"));
+    fs::write(&old, b"old orphan").unwrap();
+    fs::write(&recent, b"recent orphan").unwrap();
+    File::open(&old)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(SystemTime::now() - Duration::from_secs(8 * format::DAY)),
+        )
+        .unwrap();
+    let mut client = mock.client(&cred);
+    for path in [&old, &recent, &old_index] {
+        let bytes = fs::read(path).unwrap();
+        let key = path.strip_prefix(&f.repo).unwrap().to_str().unwrap();
+        client
+            .immutable(
+                key,
+                &mut File::open(path).unwrap(),
+                bytes.len() as u64,
+                &hash(&bytes),
+            )
+            .unwrap();
+    }
+    let args: Vec<_> = [
+        f.repo.to_str().unwrap(),
+        f.root.to_str().unwrap(),
+        &mock.endpoint,
+        "auto",
+        "td-releases",
+        cred.to_str().unwrap(),
+        "test",
+    ]
+    .into_iter()
+    .collect();
+    let before = mock.store.lock().unwrap().files.len();
+    maintenance::gc(&args).unwrap();
+    assert_eq!(mock.store.lock().unwrap().files.len(), before);
+    assert!(!mock
+        .store
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .any(|(m, _)| m == "DELETE"));
+    let mut delete = args.clone();
+    delete.push("--delete");
+    assert!(maintenance::gc(&delete).is_err());
+    delete.push("--exclusive-publisher");
+    // Unknown remote history makes a local reachability proof incomplete.
+    let unknown = format!("releases/{}", "a".repeat(64));
+    mock.store.lock().unwrap().files.insert(
+        unknown.clone(),
+        crate::s3::tests::Stored {
+            bytes: b"unknown".to_vec(),
+            headers: Default::default(),
+        },
+    );
+    assert!(maintenance::gc(&delete).is_err());
+    assert_eq!(mock.store.lock().unwrap().files.len(), before + 1);
+    mock.store.lock().unwrap().files.remove(&unknown);
+    // A mismatched head or object also refuses before deletion.
+    let head_key = "heads/system-x86-64";
+    let saved = mock.store.lock().unwrap().files[head_key].clone();
+    mock.store
+        .lock()
+        .unwrap()
+        .files
+        .get_mut(head_key)
+        .unwrap()
+        .bytes = b"changed".to_vec();
+    assert!(maintenance::gc(&delete).is_err());
+    mock.store
+        .lock()
+        .unwrap()
+        .files
+        .insert(head_key.into(), saved);
+    let old_key = old.strip_prefix(&f.repo).unwrap().to_str().unwrap();
+    mock.store
+        .lock()
+        .unwrap()
+        .files
+        .get_mut(old_key)
+        .unwrap()
+        .headers
+        .insert("x-amz-meta-sha256".into(), "wrong".into());
+    assert!(maintenance::gc(&delete).is_err());
+    mock.store
+        .lock()
+        .unwrap()
+        .files
+        .get_mut(old_key)
+        .unwrap()
+        .headers
+        .insert("x-amz-meta-sha256".into(), hash(b"old orphan"));
+    // Eligibility changes while remote deletion runs. Local reclamation must
+    // use the original plan, leaving this now-old object for the next pass.
+    mock.store.lock().unwrap().age_on_delete = Some(recent.clone());
+    maintenance::gc(&delete).unwrap();
+    let store = mock.store.lock().unwrap();
+    assert_eq!(store.files.len(), before - 2);
+    assert!(store.files.contains_key(&format!("releases/{}", f.release)));
+    assert!(store
+        .files
+        .contains_key(recent.strip_prefix(&f.repo).unwrap().to_str().unwrap()));
+    let deletes: Vec<_> = store
+        .requests
+        .iter()
+        .filter(|(m, _)| m == "DELETE")
+        .map(|(_, k)| k.as_str())
+        .collect();
+    assert_eq!(
+        deletes,
+        vec![
+            old_index.strip_prefix(&f.repo).unwrap().to_str().unwrap(),
+            old_key
+        ]
+    );
+    assert!(!old.exists());
+    assert!(!old_index.exists());
+    assert!(recent.exists());
+    drop(store);
+    // A retry can recover after remote deletion succeeded but local unlink did not.
+    fs::write(&old, b"old orphan").unwrap();
+    File::open(&old)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(SystemTime::now() - Duration::from_secs(9 * format::DAY)),
+        )
+        .unwrap();
+    maintenance::gc(&delete).unwrap();
+    assert!(!old.exists());
+    assert!(!recent.exists());
+}
+
+#[test]
+fn s3_renew_upload_keeps_the_selected_image_and_advances_discovery() {
+    let f = Fixture::new();
+    let mock = crate::s3::tests::Mock::new();
+    let cred = f.dir.join("credentials");
+    crate::s3::tests::write_credentials(&cred);
+    s3_upload(&s3_args(&f, &mock, &cred)).unwrap();
+    mock.store.lock().unwrap().requests.clear();
+    maintenance::renew_upload(&[
+        f.repo.to_str().unwrap(),
+        f.root.to_str().unwrap(),
+        f.key.to_str().unwrap(),
+        "system-x86-64",
+        &mock.endpoint,
+        "auto",
+        "td-releases",
+        cred.to_str().unwrap(),
+        "test",
+    ])
+    .unwrap();
+    let store = mock.store.lock().unwrap();
+    let root = Root::parse(&text(&f.root, SMALL).unwrap(), None).unwrap();
+    let head = Head::parse(
+        std::str::from_utf8(&store.files["heads/system-x86-64"].bytes).unwrap(),
+        &root,
+        now().unwrap(),
+        "system-x86-64",
+    )
+    .unwrap();
+    assert_eq!(head.version, 2);
+    assert_eq!(head.release, f.release);
+    let puts: Vec<_> = store
+        .requests
+        .iter()
+        .filter(|(m, _)| m == "PUT")
+        .map(|(_, k)| k.as_str())
+        .collect();
+    assert_eq!(puts, vec!["heads/system-x86-64"]);
+}
