@@ -109,9 +109,13 @@ metadata; even a source-built installation can seed an update. The complete
 new payloads still undergo ordinary verification. A completely verified
 warm cache avoids reseeding. Otherwise the scan records bounded chunk
 locations and retains the opened source descriptors. Assembly reads and
-rehashes a local chunk on demand before using it; unrelated chunks are not
-retained. This keeps local reuse effective even when the cache is smaller
-than the image. Seed files must be regular files within the protocol's
+rehashes a local chunk on demand before using it. Seed chunks are not
+written into the object cache: the installed image already holds those
+bytes. Newly downloaded chunks still enter the cache for interrupted
+transfer recovery, subject to its quota. A later update may rescan its
+running image; cache-only acquisition cannot reuse seed bytes after that
+image is removed. This keeps local reuse effective even when the cache is
+smaller than the image. Seed files must be regular files within the protocol's
 payload bounds. An unreadable, changing or oversized seed fails explicitly.
 The scan shares the acquisition deadline and uses bounded chunk/read
 buffers. Experimental non-CDC partitions may reuse fewer seed chunks and

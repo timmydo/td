@@ -767,7 +767,26 @@ fn local_seed_completes_a_cold_fetch_without_repository_objects() {
             fs::read(f.deployment.join(name)).unwrap()
         );
     }
-    // A complete verified cache avoids reopening the seed on a later update.
+    assert_eq!(
+        fs::read_dir(&f.cache).unwrap().count(),
+        1,
+        "only the cache lease remains"
+    );
+    fetch_seeded(
+        &f.base(),
+        &f.state,
+        &f.cache,
+        &f.dir.join("repeat"),
+        Some(&f.deployment),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_complete_download_cache_avoids_reopening_the_seed() {
+    let f = Fixture::new();
+    f.fetch("initial").unwrap();
+    fs::remove_dir_all(f.repo.join("objects")).unwrap();
     fetch_seeded(
         &f.base(),
         &f.state,
@@ -1085,4 +1104,79 @@ fn next_publication_reclaims_interrupted_index_writes_only() {
     )
     .is_err());
     assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+}
+
+#[test]
+fn direct_seed_reuse_preserves_remote_object_resume() {
+    let f = Fixture::new();
+    let root = Root::parse(&text(&f.root, SMALL).unwrap(), None).unwrap();
+    let release = Release::parse(
+        &text(&f.repo.join("releases").join(&f.release), INDEX_LIMIT).unwrap(),
+        &root,
+        now().unwrap(),
+        "system-x86-64",
+    )
+    .unwrap();
+    directory(&f.cache).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut cache = cache::Cache::open(&f.cache, cache::DEFAULT_LIMIT, deadline).unwrap();
+    let seed = seed::scan(&release, &mut cache, &f.deployment, deadline).unwrap();
+    let first = &release.payloads[0].objects[0];
+    let local = seed.get(&first.digest, first.size).unwrap().unwrap();
+    let remote = vec![17u8; 1024];
+    let interrupted = vec![18u8; 1024];
+    for bytes in [&remote, &interrupted] {
+        assert!(seed
+            .get(&hash(bytes), bytes.len() as u64)
+            .unwrap()
+            .is_none());
+        fs::write(f.repo.join("objects").join(hash(bytes)), bytes).unwrap();
+    }
+    let expected = [local.as_slice(), remote.as_slice(), interrupted.as_slice()].concat();
+    let payload = format::Payload {
+        name: "bzImage",
+        size: expected.len() as u64,
+        digest: hash(&expected),
+        objects: [&local, &remote, &interrupted]
+            .into_iter()
+            .map(|bytes| format::Object {
+                size: bytes.len() as u64,
+                digest: hash(bytes),
+            })
+            .collect(),
+    };
+    let server = Server::start(
+        f.repo.clone(),
+        Some(format!("objects/{}", hash(&interrupted))),
+    );
+    assert!(assemble(
+        &payload,
+        &mut cache,
+        &seed,
+        &mut Source::new(&server.base).unwrap(),
+        &mut Vec::new()
+    )
+    .is_err());
+    drop(server);
+    assert!(!f.cache.join(&first.digest).exists());
+    assert!(f.cache.join(hash(&remote)).exists());
+    assert!(!f.cache.join(hash(&interrupted)).exists());
+    let server = Server::start(f.repo.clone(), None);
+    let mut output = Vec::new();
+    let counts = assemble(
+        &payload,
+        &mut cache,
+        &seed,
+        &mut Source::new(&server.base).unwrap(),
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(output, expected);
+    assert_eq!(counts, (1024, first.size + 1024, first.size));
+    assert_eq!(
+        *server.requests.lock().unwrap(),
+        vec![format!("objects/{}", hash(&interrupted))]
+    );
+    assert!(!f.cache.join(&first.digest).exists());
+    assert!(f.cache.join(hash(&interrupted)).exists());
 }

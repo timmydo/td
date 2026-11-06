@@ -361,7 +361,6 @@ fn assemble(
         } else if let Some(bytes) = seed.get(&object.digest, object.size)? {
             reused += object.size;
             seeded += object.size;
-            cache.put(&object.digest, &bytes)?;
             bytes
         } else {
             let bytes = source.get(&format!("objects/{}", object.digest), object.size)?;
