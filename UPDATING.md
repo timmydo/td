@@ -9,6 +9,12 @@ file restates neither.
 Run the check at least weekly, and at once when an advisory names a pinned
 project. Security releases go first and land on their own.
 
+Before a refresh that reaches the boot path, learn whether main is green:
+`git fetch origin`, then `td-builder main-integration status`, which reads the
+last fetched head. Without a pass, get a verdict first with `td-builder
+main-integration run --once` (`DEVELOPMENT.md`) and read any red, or nothing
+will separate a bump's red from one already there.
+
 # What td pins
 
 | Class | Where it is pinned | How it moves |
@@ -71,8 +77,10 @@ when a watch could not be answered (1 wins over 3). What no edit to that
 lock alone can move is reported but does not count. That is a transitive
 crate whose only newer release is a new major, and anything in
 `recipes/locks/*` except a yank. A yank counts even there, as a reason to
-look at the pinned crate's newer releases. A direct dependency behind a
-major counts until it is ported.
+look at the pinned crate's newer releases. With none, the yank stays and the
+exit stays 3 until upstream releases: the lock is verbatim, so report it
+rather than editing it. A direct dependency behind a major counts until it
+is ported.
 
 Read a `-> NEW` as "upstream has released NEW", then decide:
 
@@ -92,7 +100,11 @@ table.
 Before bumping, read the release notes and advisories between the pin and
 the target: what changed, what it fixes, and whether a fix reaches td's
 build (a recipe that builds a feature out is immune to a bug in it, for
-example). The commit message records the advisories each bump takes.
+example). Claim that only after reading the recipe's configuration and
+grepping for other consumers of the same code or data, and name what was
+read: reviewers refuted more than one "does not reach td" written from the
+release notes alone. The commit message records the advisories each bump
+takes.
 
 # Source pins
 
@@ -154,7 +166,9 @@ and its licences), per commit.
    A source pin re-keys every recipe check. A change to the boot path (the
    kernel, `system-x86-64`, the boot crates `DEVELOPMENT.md` names) also
    deserves the integration tier before pushing:
-   `td-builder check integration`.
+   `td-builder check integration`. A new kernel series can change the order
+   output reaches the console as well as what it prints, and the oracles read
+   that console, so run the tier before pushing one.
 
 6. Run `td-feed outdated pins` again: the pin now reads `current`.
 
@@ -276,8 +290,11 @@ ships, and is a reviewed decision of its own.
 
 Every new crate name a lock gains is an external dependency under
 `AGENTS.md` principle 2: the commit calls it out and carries the owner's
-sign-off. A crate that landed without one gets it in a later commit naming
-the crate and the commit that added it.
+sign-off. That includes `recipes/locks/*`, verbatim as they are, so compare
+each lock's crate names before and after a bump and ask before pushing. A
+crate that landed without one gets it in a later commit naming the crate and
+the commit that added it. `ready` refuses an empty commit under a `docs-only`
+waiver, so that commit has to touch a document.
 
 - td-net: `cargo update --manifest-path net/Cargo.toml` takes the
   semver-compatible releases its dependents allow. Check each new
@@ -300,9 +317,54 @@ the crate and the commit that added it.
   td-crypto/Cargo.toml` (and `td-mta/Cargo.toml`). `td-crypto/DESIGN.md`
   owns the admission rules.
 
+# When a check goes red
+
+A red during a refresh is the bump's until shown otherwise, and a red that
+goes away on a rerun is a bug nobody has explained yet. Rerunning can get a
+branch through `ready`, but report the failure. Do not call it a flake:
+intermittent reds in this procedure have turned out to be a production bug and
+a line another program split.
+
+To tell whose it is, run the failing oracle three times on the new pin and
+three on the old, on the same base and on the same host, the old pin in a
+worktree of its own. `DEVELOPMENT.md` lists the oracles and what a host needs
+to run them.
+
+```text
+cargo build --release --manifest-path builder/Cargo.toml
+cargo build --release --locked --manifest-path recipes/Cargo.toml --bin td-recipe-eval
+target/release/td-recipe-eval warm system-x86-64 --flathub
+target/release/td-recipe-eval ORACLE
+```
+
+The warm line is the tier's own first step. Some oracles warm only from a
+terminal, so without it a run from a script or an agent can fail on what was
+last warmed in that worktree, which says nothing about the pin.
+
+Read the raw console before believing an oracle's "absent". A marker can be
+on the console and refused all the same: look at the line it landed on and
+the line after, since either may hold the rest of another writer's line. A red
+oracle also hides whatever it would have checked later, so fixing one can
+uncover the next, and that next one need not be new.
+
 # Landing
 
 Each bump is one green, self-contained commit with its own review record
 (`DEVELOPMENT.md`). The message gives the old and new versions, the
-advisories taken, the source of each hash, and the checks run. Then
-`td-builder ready` and push, as for any change.
+advisories taken, the source of each hash, and the checks run, naming the tree
+for any that ran before a rebase. Then `td-builder ready` and push, as for any
+change.
+
+A refresh outlives several landings on main, so rebase before the last checks.
+`ready` notes when main has moved since the last fetch. To see whether a
+rebase would conflict, without moving anything:
+
+```text
+git fetch origin
+git merge-tree --write-tree --name-only origin/main HEAD
+```
+
+It merges the tips, so a clean result does not prove each commit replays. Do
+not use `git replay` for this: since git 2.53 it moves refs by default. Read
+what the rebase brought as well as whether it applied, since code new on main
+can repeat what a commit in the stack just fixed everywhere else.
