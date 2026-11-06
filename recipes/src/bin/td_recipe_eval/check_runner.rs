@@ -934,9 +934,11 @@ pub fn qemu_deploy_rollback_cli(args: &[String]) -> Result<(), String> {
 }
 
 pub fn qemu_admin_update_cli(args: &[String]) -> Result<(), String> {
-    if !args.is_empty() {
-        return Err("usage: qemu-admin-update".into());
-    }
+    let public = if args.is_empty() {
+        None
+    } else {
+        Some(crate::checks::qemu_boot::update::admin::public::Public::parse(args)?)
+    };
     oracle_host(false)?;
     let targets = oracle_targets("qemu-admin-update")?;
     ensure_targets_provenance(targets)?;
@@ -947,7 +949,11 @@ pub fn qemu_admin_update_cli(args: &[String]) -> Result<(), String> {
         .with_allowed_builds(oracle_reach(targets)?);
     warm_operator_inputs(&runner, targets);
     let _lock = lock_ladder_for_run(&runner)?;
-    crate::checks::qemu_boot::update::admin::run(&runner)
+    if let Some(public) = public {
+        crate::checks::qemu_boot::update::admin::public::run(&runner, &public)
+    } else {
+        crate::checks::qemu_boot::update::admin::run(&runner)
+    }
 }
 
 /// Install the production system from an ISO inside a disposable QEMU machine.

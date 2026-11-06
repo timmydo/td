@@ -231,3 +231,24 @@ authority. Expiry, truncated HTTP/resumption, root rotation/rollback refusal and
 failed-boot rollback are required assertions. The test provisions policy
 out of band and does not grant an ordinary account a policy-setting command.
 The fixture executable and keys are absent from distribution images.
+
+For an operator-run public-hosting check, use:
+
+```text
+td-recipe-eval qemu-admin-update --public BASE_DEPLOYMENT ROOT HTTPS_URL COMMIT DEPLOYMENT_ID
+```
+
+This boots the supplied older deployment on a disposable volume, provisions
+only the explicitly trusted public root and an ephemeral SSH administrator
+key, and runs the installed downloader against that HTTPS repository. It
+requires the expected signed commit/deployment, nonzero local byte reuse,
+a second update with zero new object bytes, a healthy boot reporting the
+expected BUILD_ID, and explicit rollback to the original deployment. The
+public head must remain on the selected release during the check. The
+ordinary loopback oracle separately exercises hostile responses, key rotation
+and automatic failed-boot rollback; this operator mode does not change public
+metadata, enroll a production machine or exercise destructive failure cases
+against a public repository. It uses the current checkout's selector and host
+harness with the supplied base's userland and payloads. Logs survive under the
+runner's `public-admin-update` directory; the disk and disposable SSH key are
+removed when the run ends.

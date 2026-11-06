@@ -317,3 +317,9 @@ The test client and ephemeral private keys never enter a published image.
 This is loopback HTTP and SSH inside the VM; public HTTPS remains a separate
 hosting test. Initial trust is staged as trusted-media provisioning would
 stage it, rather than exercised through the physical enrollment UI.
+
+The operator-only `qemu-admin-update --public` mode described in
+[ADMIN.md](../td-update/ADMIN.md#installed-machine-oracle) exercises the
+installed downloader against a real HTTPS repository from a supplied older
+deployment. It checks the selected identity, reuse, reboot and explicit
+rollback without changing public repository contents.

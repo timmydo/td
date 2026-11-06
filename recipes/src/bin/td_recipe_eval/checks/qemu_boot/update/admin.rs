@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod public;
+
 const PROFILE: &str = "system-x86-64";
 const CLIENT: &str = "/var/home/tester/.td-admin-oracle/client admin-client";
 const COMMIT: &str = "ffffffffffffffffffffffffffffffffffffffff";
