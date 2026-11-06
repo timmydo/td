@@ -640,6 +640,55 @@ fn time_settings_bind_exact_values_and_cancellation_never_starts_the_helper() {
 }
 
 #[test]
+fn publisher_replacement_needs_its_own_grant_and_exact_presented_approval() {
+    let fixture = Fixture::new("td");
+    let fingerprint = "a".repeat(64);
+    let value = format!("publisher {fingerprint}");
+    assert_eq!(
+        Setting::parse(&value).unwrap().operation(),
+        elevation::Operation::ReplacePublisher
+    );
+    let mut refused_intake = fixture.intake(refused);
+    assert_eq!(
+        fixture.submit(&mut refused_intake, &frame(&value)).1,
+        Some(4)
+    );
+    drop(refused_intake);
+    let (mut intake, _client) = queued(&fixture, &value);
+    let ready = intake.select().unwrap();
+    let mut change = intake.describe(fixture.uid(), ready).unwrap();
+    let request = change.request().clone();
+    assert!(request.awaits_approval());
+    assert_eq!(Request::decode(&request.encode()).unwrap(), request);
+    assert!(request.lines().contains(&fingerprint));
+    assert!(request
+        .lines()
+        .contains(&"TRUSTS FUTURE RELEASES FROM THIS ROOT".into()));
+    assert!(request
+        .lines()
+        .contains(&"RESETS SAVED UPDATE VERSION HISTORY".into()));
+    assert!(change.commit(&request).is_err());
+    change.presented(&request).unwrap();
+    let changed = Request::new(
+        *request.nonce(),
+        fixture.uid(),
+        Operation::ReplacePublisher {
+            requester: fixture.uid(),
+            fingerprint: "b".repeat(64),
+        },
+    )
+    .unwrap();
+    assert!(change.commit(&changed).is_err());
+    assert!(change.helper.is_none());
+    change.cancel().unwrap();
+    assert!(change.commit(&request).is_err());
+    assert!(change.helper.is_none());
+    for bad in ["publisher ", "publisher ../root", "publisher AAAA"] {
+        assert!(Setting::parse(bad).is_err());
+    }
+}
+
+#[test]
 fn time_settings_have_a_distinct_principal_and_refuse_malformed_values() {
     assert_eq!(
         Setting::parse("laptop").unwrap().operation(),

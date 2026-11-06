@@ -3,6 +3,8 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const ADMIN_RS: &str = include_str!("../../../td-update/src/admin.rs");
 const OFFICIAL_ROOT: &str = include_str!("../../../td-update/src/official.root");
+const RECOVERY_RS: &str = include_str!("../../../td-update/src/publisher_recovery.rs");
+const PRIMARY_ACCOUNT_RS: &str = include_str!("../../../td-authd/src/primary_account.rs");
 const APPLY_RS: &str = include_str!("../../../td-update/src/apply.rs");
 const UPSTREAM_RS: &str = include_str!("../../../td-update/src/upstream.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
@@ -32,6 +34,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-update/src/official.root".into(),
             content: OFFICIAL_ROOT.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-update/src/publisher_recovery.rs".into(),
+            content: RECOVERY_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-authd/src/primary_account.rs".into(),
+            content: PRIMARY_ACCOUNT_RS.into(),
             exec: false,
         },
         Step::WriteFile {

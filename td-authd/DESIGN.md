@@ -3874,3 +3874,28 @@ The GUI's local tag-11 lock also revokes the mail intake immediately when
 consumed. Root clears buffered replies and discards a still-pending service
 credential result before queuing the vault lock; it never publishes that
 result while waiting for the lock acknowledgement.
+
+## Explicit update publisher replacement
+
+The settings intake accepts `publisher SHA256`, a 64-character lowercase
+hexadecimal public-root document fingerprint. Its distinct `replace-publisher`
+principal grant is appended to the desktop elevation table. Consent tag 43
+carries requester UID and exactly that fingerprint; the requester must equal
+the owner. H presents the full fingerprint, future-release grant, reset of
+update-version history, unchanged endpoint/profile, and that no image is
+installed. It requires the existing fresh presentation and Enter commitment,
+requester liveness and backoff. Cancellation launches nothing.
+
+Commit consumes approval and clears backoff before invoking only
+`/bin/td-admin accept-publisher SHA256` through Inspection, with its cleared
+environment, fixed cwd and a 30-second deadline. The helper independently binds
+the staged candidate to the approved hash and atomically recovers policy
+publication as specified in `td-update/ADMIN.md`. It can establish a new root
+without the previous key, but cannot change an SSH administrator key or any
+hardware protector. SSH requests cannot reach this operation.
+
+The existing deployment intake also accepts an explicitly selected downloaded
+deployment through `td-update trust-image DIRECTORY SHA256`. Its tag 5,
+principal grant and pinned-source checks are unchanged; neither admission nor
+approval asserts that the requester built the image. The exact manifest digest
+and root helper's payload checks establish which bytes are approved.

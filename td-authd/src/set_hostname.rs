@@ -27,7 +27,11 @@ use std::time::{Duration, Instant};
 pub(crate) struct Setting(String);
 impl Setting {
     fn parse(text: &str) -> Result<Self, String> {
-        if let Some(blob) = text.strip_prefix("admin-key ") {
+        if let Some(fingerprint) = text.strip_prefix("publisher ") {
+            if !crate::consent::deployment_id(fingerprint) {
+                return Err("invalid publisher fingerprint".into());
+            }
+        } else if let Some(blob) = text.strip_prefix("admin-key ") {
             if !crate::consent::admin_key(blob) {
                 return Err("invalid admin public key".into());
             }
@@ -44,7 +48,9 @@ impl Setting {
         &self.0
     }
     fn operation(&self) -> elevation::Operation {
-        if self.0.starts_with("admin-key ") {
+        if self.0.starts_with("publisher ") {
+            elevation::Operation::ReplacePublisher
+        } else if self.0.starts_with("admin-key ") {
             elevation::Operation::EnrollAdminKey
         } else if self.0.starts_with("time ") {
             elevation::Operation::ManageTime
@@ -640,7 +646,12 @@ impl Change {
         let request = Request::new(
             nonce,
             owner,
-            if let Some(blob) = ready.name.name().strip_prefix("admin-key ") {
+            if let Some(fingerprint) = ready.name.name().strip_prefix("publisher ") {
+                Operation::ReplacePublisher {
+                    requester: ready.requester,
+                    fingerprint: fingerprint.into(),
+                }
+            } else if let Some(blob) = ready.name.name().strip_prefix("admin-key ") {
                 Operation::EnrollAdminKey {
                     requester: ready.requester,
                     blob: blob.into(),
@@ -709,6 +720,16 @@ impl Change {
         self.admit(request)?;
         if !self.presented {
             return Err("hostname change was not presented".into());
+        }
+        if let Operation::ReplacePublisher { fingerprint, .. } = self.request.operation() {
+            self.committed = true;
+            self.result = Some(false);
+            self.backoff.approved()?;
+            let mut command = Command::new("/bin/td-admin");
+            command.args(["accept-publisher", fingerprint]);
+            self.helper = Some(Inspection::printing(command, 511, Duration::from_secs(30))?);
+            self.result = None;
+            return Ok(());
         }
         if let Operation::EnrollAdminKey { blob, .. } = self.request.operation() {
             self.committed = true;

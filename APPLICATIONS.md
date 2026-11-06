@@ -9143,6 +9143,7 @@ confirm is in `td-compositor/DESIGN.md`, "Elevation consent".
 | `deploy-rollback` | the attention menu's `B`; there is no requester process | the full current and previous deployment IDs, which root reads from the `boot/current` and `boot/previous` selectors under the read-only `/run/td-volume/td` | `/bin/td-boot on-volume rollback /run/td-update CURRENT PREVIOUS` |
 | `set-hostname` | a typed public intake modelled on the update queue, with a notice; the attention menu's `H` selects it | the new name, a `Hostname` parsed by the shared `td-firstboot/src/hostname.rs`, beside the old name | root writes `/var/lib/td/hostname` canonically |
 | `deploy-publish` | the update queue (request 19), with a notice, and the menu's `I` | the full deployment ID of a locally built system | `/bin/td-update apply-operation ID` |
+| `replace-publisher` | `td-admin trust-publisher` queues a typed settings request; H selects it | the complete public-root SHA-256; future-release authority and version-history reset | `/bin/td-admin accept-publisher SHA256` |
 | `manage-time` | `td-time` queues a typed settings request; the menu's `H` selects it | exact UTC timestamp, timezone identifier, or automatic on/off | `/bin/td-time apply ACTION VALUE` |
 | `manage-volumes` | `td-disks` queues a typed settings request; the menu's `H` selects it | the volume's name, filesystem UUID and kind, and whether its programs may run | `/bin/td-disks apply add\|remove ...` |
 
@@ -9217,7 +9218,7 @@ queued request, to its requester, refuses with a named diagnostic
 (property 4). Its v1 row is "UID 1000 may perform every v1 operation":
 `deploy-rollback` from L3, `set-hostname` from L4 and `deploy-publish`,
 today's update installation, from L5, followed by `manage-time`,
-`enroll-admin-key` and `manage-volumes`. Each authorizes one reviewed
+`enroll-admin-key`, `manage-volumes` and `replace-publisher`. Each authorizes one reviewed
 setting, never arbitrary root execution; `td-time/DESIGN.md` defines
 clock and RTC policy and `td-disks/DESIGN.md` which volumes mount. A machine with other rows builds
 them into its own image; no user's home or setting adds one.

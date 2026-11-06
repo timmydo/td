@@ -434,6 +434,7 @@ impl Elevation {
             Operation::SetHostname { .. }
             | Operation::ManageTime { .. }
             | Operation::ManageVolumes { .. }
+            | Operation::ReplacePublisher { .. }
             | Operation::EnrollAdminKey { .. } => Some(Self::Hostname),
             _ => None,
         }
@@ -2234,6 +2235,11 @@ impl Client {
                             Operation::EnrollAdminKey { .. }
                         ) {
                             crate::attention::Notice::AdminKeySaved
+                        } else if matches!(
+                            pending.request.operation(),
+                            Operation::ReplacePublisher { .. }
+                        ) {
+                            crate::attention::Notice::PublisherSaved
                         } else if matches!(
                             pending.request.operation(),
                             Operation::ManageTime { .. }

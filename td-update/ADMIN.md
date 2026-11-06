@@ -278,3 +278,57 @@ against a public repository. It uses the current checkout's selector and host
 harness with the supplied base's userland and payloads. Logs survive under the
 runner's `public-admin-update` directory; the disk and disposable SSH key are
 removed when the run ends.
+
+## Explicit publisher recovery
+
+Ordinary updates never bypass signature checks, and SSH administrators cannot
+change publisher trust. The primary local account has two separate consent
+paths when the signing chain cannot be continued.
+
+`td-admin trust-publisher ROOT_FILE SHA256` requires the exact SHA-256 of a
+public root document obtained through a separately trusted channel. It stages
+that requester-owned document privately and queues `publisher SHA256` on the
+settings intake. Ctrl+Alt+Escape, H shows the full fingerprint and states that
+approval trusts future releases and resets saved update-version history. The
+`replace-publisher` principal grant is distinct from SSH-key enrollment and
+one-image installation. This does not require the old root key's signature;
+physical approval establishes a new trust anchor. The document must still be
+a valid self-signed root with usable expiry policy. The download endpoint and
+profile stay unchanged. No update is installed or reboot requested.
+
+After approval the fixed root helper reads only the primary account's staged
+candidate, requires its owner and exact hash, and runs the installed
+`td-release reanchor` to create new state preserving the existing profile.
+It serializes with admin jobs and enrollment, retains the complete previous
+policy under `releases-before-NONCE`, and activates the new policy. A durable
+`release-recovery` journal precedes the two directory renames. Startup and
+admin jobs complete an interrupted authorized replacement before using policy;
+they never bootstrap the bundled root in the gap. Before clearing the journal,
+recovery durably removes the downloader's old root archive and metadata
+evidence, so reused version numbers cannot collide with the retired publisher
+and old evidence cannot restore its floors. Verified content chunks stay cached.
+Invalid journal or staging
+refuses, with no default-trust fallback. Uncommitted staging may be discarded
+under the lease. The old history remains for inspection, not as an automatic
+fallback. The helper's 30-second supervision can leave an uncertain outcome;
+startup completes a durable commit, and no client automatically retries.
+
+`td-update trust-image DIRECTORY SHA256` instead requests installation of one
+exact deployment: the expected SHA-256 is its `manifest` digest, which binds
+all payload hashes. Obtain that digest independently, and place the manifest,
+`bzImage`, `initramfs.cpio` and `root.erofs` in a directory owned by the primary
+account. The command checks the manifest hash and uses the existing
+`deploy-publish` intake. Ctrl+Alt+Escape, I presents the complete deployment ID;
+a fresh approval authorizes only that image. The root helper pins the source,
+copies and verifies every payload before publication. No publisher signature
+is needed for this explicitly approved local installation, and saved publisher
+trust and replay floors are not changed by the operation. Restart is explicit.
+As with any installed operating system, approving its bytes authorizes the code
+that will run with system authority after boot.
+
+To acquire a signed image from a replacement publisher without changing system
+trust, an ordinary account may initialize a disposable `td-release` state with
+that public root, fetch into a private directory, then use `trust-image` with
+the independently obtained deployment digest. Those temporary trust decisions
+never enter `/var/lib/td-admin/releases`. Unsigned deployments can be copied
+from trusted media or another transport and use the same exact-image approval.

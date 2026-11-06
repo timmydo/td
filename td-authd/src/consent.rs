@@ -1123,6 +1123,10 @@ pub enum Operation {
         requester: u32,
         setting: String,
     },
+    ReplacePublisher {
+        requester: u32,
+        fingerprint: String,
+    },
     EnrollAdminKey {
         requester: u32,
         blob: String,
@@ -1716,6 +1720,12 @@ impl Request {
             {
                 return Err("invalid consent upgrade".into());
             }
+            Operation::ReplacePublisher {
+                requester,
+                fingerprint,
+            } if *requester != owner || !deployment_id(fingerprint) => {
+                return Err("invalid publisher trust replacement".into());
+            }
             Operation::EnrollAdminKey { requester, blob }
                 if *requester != owner || !admin_key(blob) =>
             {
@@ -1932,6 +1942,7 @@ impl Request {
             | Operation::SetHostname { .. }
             | Operation::ManageTime { .. }
             | Operation::ManageVolumes { .. }
+            | Operation::ReplacePublisher { .. }
             | Operation::EnrollAdminKey { .. }
             | Operation::SelectorUpdate { .. }
             | Operation::UpgradeCancel => true,
@@ -2491,6 +2502,14 @@ impl Request {
                 bytes.extend_from_slice(current.as_bytes());
                 bytes.extend_from_slice(previous.as_bytes());
             }
+            Operation::ReplacePublisher {
+                requester,
+                fingerprint,
+            } => {
+                bytes.push(43);
+                bytes.extend_from_slice(&requester.to_be_bytes());
+                bytes.extend_from_slice(fingerprint.as_bytes());
+            }
             Operation::EnrollAdminKey { requester, blob } => {
                 bytes.push(40);
                 bytes.extend_from_slice(&requester.to_be_bytes());
@@ -2754,6 +2773,10 @@ impl Request {
                     previous: input.deployment()?,
                 }
             }
+            43 => Operation::ReplacePublisher {
+                requester: input.number()?,
+                fingerprint: input.deployment()?,
+            },
             40 => Operation::EnrollAdminKey {
                 requester: input.number()?,
                 blob: input.text()?,
@@ -3069,6 +3092,20 @@ impl Request {
                 lines.push(format!("CURRENT: {current}"));
                 lines.push(format!("PREVIOUS: {previous}"));
                 lines.push("TAKES EFFECT AT THE NEXT RESTART".into());
+                approval_lines(&mut lines);
+            }
+            Operation::ReplacePublisher {
+                requester,
+                fingerprint,
+            } => {
+                lines.push("REPLACE TRUSTED UPDATE PUBLISHER".into());
+                lines.push(format!("REQUESTER UID {requester}"));
+                lines.push("NEW PUBLIC ROOT SHA-256:".into());
+                lines.push(fingerprint.clone());
+                lines.push("TRUSTS FUTURE RELEASES FROM THIS ROOT".into());
+                lines.push("RESETS SAVED UPDATE VERSION HISTORY".into());
+                lines.push("KEEPS THE DOWNLOAD ADDRESS AND PROFILE".into());
+                lines.push("DOES NOT INSTALL AN IMAGE".into());
                 approval_lines(&mut lines);
             }
             Operation::EnrollAdminKey { requester, blob } => {

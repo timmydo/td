@@ -499,7 +499,7 @@ fn fetch_budgeted(
     result
 }
 
-const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION [EXPIRES] ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  publish-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT DEPLOYMENT\n  promote-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH\n  fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT] [--cache-limit BYTES]\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n  gc-s3 REPOSITORY ROOT ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--delete --exclusive-publisher]\n  iso-index CATALOG OUTPUT\n  upload-iso-index-s3 CATALOG OUTPUT ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n  sign-iso ROOT RELEASE_PRIVATE PROFILE COMMIT ISO SIGNATURE_DIRECTORY\n  verify-iso ROOT PROFILE SIGNATURE ISO\n  upload-iso-s3 ROOT PROFILE SIGNATURE ISO ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n  upload-s3 REPOSITORY ROOT PROFILE ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n";
+const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION [EXPIRES] ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  reanchor PREVIOUS_STATE NEW_ROOT NEW_STATE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  publish-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT DEPLOYMENT\n  promote-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH\n  fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT] [--cache-limit BYTES]\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n  gc-s3 REPOSITORY ROOT ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--delete --exclusive-publisher]\n  iso-index CATALOG OUTPUT\n  upload-iso-index-s3 CATALOG OUTPUT ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n  sign-iso ROOT RELEASE_PRIVATE PROFILE COMMIT ISO SIGNATURE_DIRECTORY\n  verify-iso ROOT PROFILE SIGNATURE ISO\n  upload-iso-s3 ROOT PROFILE SIGNATURE ISO ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n  upload-s3 REPOSITORY ROOT PROFILE ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n";
 
 fn command(args: &[String]) -> Result<()> {
     let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
@@ -556,6 +556,18 @@ fn command(args: &[String]) -> Result<()> {
             }
             let value = State::init(&text(Path::new(root), SMALL)?, profile, now()?)?;
             save_state(state, &value)
+        }
+        ["reanchor", previous, root, output] => {
+            let output = Path::new(output);
+            let _lock = lock(&sidecar(output, ".lock"))?;
+            match fs::symlink_metadata(output) {
+                Ok(_) => return Err("replacement release state already exists".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("inspect replacement release state: {error}")),
+            }
+            let previous = State::parse(&text(Path::new(previous), SMALL * 3)?)?;
+            let value = State::init(&text(Path::new(root), SMALL)?, &previous.profile, now()?)?;
+            save_state(output, &value)
         }
         ["publish", repo, root, key, profile, commit, sequence, issued, expires, deployment] => {
             publisher::publish(

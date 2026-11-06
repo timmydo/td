@@ -16,8 +16,8 @@ The operator provisions a root document and profile out of band with
 `td-net release init STATE ROOT PROFILE`. Supported profiles are
 `system-x86-64` and `server-x86-64`; only the desktop ships td-admin.
 Protect client state: copying or deleting it loses replay protection.
-There is no network trust-on-first-use, reset flag, automatic source fallback
-or automatic key recovery.
+There is no network trust-on-first-use, automatic source fallback or automatic
+key recovery. Explicit local recovery is specified in `td-update/ADMIN.md`.
 
 An offline Ed25519 root key authorizes one release key. A root contains its
 positive version, expiry field, root public key and release public key.
@@ -341,3 +341,14 @@ The operator-only `qemu-admin-update --public` mode described in
 installed downloader against a real HTTPS repository from a supplied older
 deployment. It checks the selected identity, reuse, reboot and explicit
 rollback without changing public repository contents.
+
+## Explicit trust reanchoring
+
+`td-net release reanchor PREVIOUS_STATE NEW_ROOT NEW_STATE` validates the saved
+state and a separately trusted self-signed root, preserves only the profile,
+and initializes a new state with fresh version floors. It does not require an
+old-key cross-signature. The output must be absent; the previous state remains
+unchanged. This is an explicit local provisioning primitive, not a fetch
+fallback or authorization mechanism. The installed admin helper uses it only
+after the exact new root fingerprint has received physical consent. Keep the
+old state for audit; replacing publisher trust abandons its replay history.

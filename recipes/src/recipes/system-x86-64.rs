@@ -4668,7 +4668,7 @@ fn build_firefox_tls_ready() -> String {
 /// consults it before any prompt, for `deploy-rollback` from L3.
 fn build_elevation_table() -> String {
     format!(
-        "td-elevation-v1\n{UI_UID}\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\tmanage-volumes\n"
+        "td-elevation-v1\n{UI_UID}\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\tmanage-volumes\treplace-publisher\n"
     )
 }
 
@@ -9951,7 +9951,7 @@ mod tests {
         assert_eq!(ELEVATION_TABLE, "/etc/td-elevation.tsv");
         assert_eq!(
             build_elevation_table(),
-            "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\tmanage-volumes\n"
+            "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\tmanage-volumes\treplace-publisher\n"
         );
         assert!(etc_files(&SYSTEM)
             .unwrap()

@@ -7,6 +7,39 @@
 use super::*;
 use std::path::PathBuf;
 
+#[test]
+fn explicit_reanchor_creates_new_trust_history_without_mutating_the_old_one() {
+    let old = Fixture::new();
+    let new = Fixture::new();
+    let mut previous = State::parse(&text(&old.state, SMALL * 3).unwrap()).unwrap();
+    previous.head_version = 99;
+    previous.sequence = 77;
+    previous.profile = "server-x86-64".into();
+    save_state(&old.state, &previous).unwrap();
+    let before = fs::read(&old.state).unwrap();
+    let root = text(&new.root, SMALL).unwrap();
+    assert!(format::Root::parse(&root, Some(&previous.root)).is_err());
+    let output = old.dir.join("replacement");
+    let args = vec![
+        "release".into(),
+        "reanchor".into(),
+        old.state.to_str().unwrap().into(),
+        new.root.to_str().unwrap().into(),
+        output.to_str().unwrap().into(),
+    ];
+    command(&args).unwrap();
+    let changed = State::parse(&text(&output, SMALL * 3).unwrap()).unwrap();
+    assert_eq!(changed.root.text, root);
+    assert_eq!(changed.profile, "server-x86-64");
+    assert_eq!((changed.head_version, changed.sequence), (0, 0));
+    assert_eq!(fs::read(&old.state).unwrap(), before);
+    assert!(command(&args).is_err());
+    fs::remove_file(&output).unwrap();
+    fs::write(&new.root, "not a signed root\n").unwrap();
+    assert!(command(&args).is_err());
+    assert!(!output.exists());
+}
+
 struct Fixture {
     dir: crate::test_temp::TempDir,
     root: PathBuf,

@@ -178,7 +178,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(!volume_setting.contains("std::fs"));
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xd4421326953755f1,
+        0xbc471d0016e8d79d,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -667,7 +667,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(rename.matches("self.unwritten = None;").count(), 1);
     // A failed write is sticky: `1f` answers 02 while one stands.
     assert!(rename.contains("            _ => vec![0x9f, 2, 0],"));
-    assert_eq!(rename.matches("Command::new(").count(), 3);
+    assert_eq!(rename.matches("Command::new(").count(), 4);
+    assert!(rename.contains("command.args([\"accept-publisher\", fingerprint]);"));
     assert!(rename.contains("Command::new(\"/bin/td-admin\")"));
     assert!(rename.contains("command.args([\"accept-key\", blob]);"));
     assert!(rename.contains("Command::new(\"/bin/td-time\")"));
@@ -1406,8 +1407,8 @@ const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
 const INSTALLATION_FINGERPRINT: u64 = 0xabb4e7cd418585ae;
 const SHARED_LOGIN_TIER_FINGERPRINT: u64 = 0xb0d5ccf021f64f9d;
 const ROLLBACK_FINGERPRINT: u64 = 0xf96a32041165e345;
-const ELEVATION_FINGERPRINT: u64 = 0xed15ae917aaaa734;
-const SET_HOSTNAME_FINGERPRINT: u64 = 0x93106fbc28219f20;
+const ELEVATION_FINGERPRINT: u64 = 0x21e50efe028ca4b6;
+const SET_HOSTNAME_FINGERPRINT: u64 = 0x9c3353d7916f6012;
 const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
 const REVOCATION_FINGERPRINT: u64 = 0x7090a6da9e98d2e9;

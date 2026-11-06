@@ -36,6 +36,7 @@ pub(crate) enum Notice {
     TimeSaved,
     VolumeSaved,
     AdminKeySaved,
+    PublisherSaved,
     /// A committed device-bound disk installation, before its recovery key:
     /// the screen then closes by itself (secret_client).
     Returning,
@@ -691,6 +692,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::TimeSaved => "TIME SETTINGS SAVED",
         Notice::VolumeSaved => "VOLUME CHANGE APPLIED",
         Notice::AdminKeySaved => "REMOTE ADMIN KEY ENROLLED",
+        Notice::PublisherSaved => "UPDATE PUBLISHER TRUST REPLACED",
         Notice::Returning => RETURNING_NOTICE,
         Notice::Stored => "CREDENTIAL STORED",
         Notice::NoWrite => "NO READY CREDENTIAL WRITE - RUN TD-SECRET SET FIRST",
@@ -953,6 +955,10 @@ mod tests {
     #[test]
     fn the_widest_elevation_prompts_fit_an_800_by_600_output() {
         let prompts = [
+            Operation::ReplacePublisher {
+                requester: 65533,
+                fingerprint: "a".repeat(64),
+            },
             Operation::EnrollAdminKey {
                 requester: 65533,
                 blob: "AAAAC3NzaC1lZDI1NTE5AAAAIGmTjqOMdHoPzoqbE+wEE5Q4aNmEGC0tgJbQOkxqdgUi".into(),
@@ -1374,6 +1380,7 @@ mod tests {
         Notice::TimeSaved,
         Notice::VolumeSaved,
         Notice::AdminKeySaved,
+        Notice::PublisherSaved,
         Notice::Returning,
         Notice::Enrolled,
         Notice::Unenrolled,

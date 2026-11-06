@@ -181,6 +181,15 @@ commitment. The installation state
 machine and its uncertain-result policy are normative in
 `td-authd/DESIGN.md`; no automatic retry or reboot follows.
 
+## One exact downloaded image
+
+`td-update trust-image DIRECTORY SHA256` skips building and admits only a
+manifest matching the explicitly supplied deployment digest. It queues the
+same descriptor-pinned, consent-bound installation as a local build. The
+existing helper validates all payloads against that manifest; no downloaded
+code performs verification. This operation does not replace publisher trust.
+`ADMIN.md` distinguishes it from approving a publisher for future updates.
+
 ## Evidence
 
 Pure tests cover absent source, preservation of existing and symlinked

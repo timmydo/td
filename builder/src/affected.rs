@@ -6860,7 +6860,7 @@ mod tests {
                 "td-vm-guest"
             ]
         );
-        // Jail, login and the VM helper share the primary-account reader;
+        // Jail, login, update and the VM helper share the primary-account reader;
         // td-setup spells td-authd's setup intake path, and td-install's
         // storage worker includes its consent codec. The portal names
         // authd's notebook credential intake path.
@@ -6875,6 +6875,7 @@ mod tests {
                 "td-portal",
                 "td-secret",
                 "td-setup",
+                "td-update",
                 "td-vm-guest"
             ]
         );

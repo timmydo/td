@@ -38,7 +38,7 @@ const SOURCE: &str = "/run/td-volume/td/source";
 const O_NOFOLLOW: i32 = 0x20000;
 const O_NONBLOCK: i32 = 0x800;
 const TARGET: &str = "x86_64-unknown-linux-gnu";
-const HELP: &str = "usage: td-update [install | build | init]\n\n  install  Build this checkout and request installation (the default).\n  build    Build without installing.\n  init     Clone the bundled release into ~/src/td if absent.\n\nInstallation requires secure-attention confirmation. Restart afterwards to boot it.\n";
+const HELP: &str = "usage: td-update [install | build | init | trust-image DIRECTORY SHA256]\n\n  install  Build this checkout and request installation (the default).\n  build    Build without installing.\n  init     Clone the bundled release into ~/src/td if absent.\n  trust-image DIRECTORY SHA256  Request one exact image installation; publisher trust is unchanged.\n\nInstallation requires secure-attention confirmation. Restart afterwards to boot it.\n";
 
 fn io<T>(result: std::io::Result<T>, action: &str) -> Result<T> {
     result.map_err(|e| format!("{action}: {e}"))
@@ -494,6 +494,11 @@ fn build_output(mut input: impl BufRead, output: &mut impl Write) -> Result<Path
 
 fn install(root: &Path, home: &Path) -> Result<()> {
     let source = build(root, home)?;
+    let deployment = deployment_digest(&source)?;
+    request_install(root, home, &source, &deployment)
+}
+
+fn deployment_digest(source: &Path) -> Result<String> {
     let manifest = io(
         OpenOptions::new()
             .read(true)
@@ -513,7 +518,10 @@ fn install(root: &Path, home: &Path) -> Result<()> {
     if bytes.len() > 4096 {
         return Err("built manifest grew while reading".into());
     }
-    let deployment = sha256::hex_digest(&bytes);
+    Ok(sha256::hex_digest(&bytes))
+}
+
+fn request_install(root: &Path, home: &Path, source: &Path, deployment: &str) -> Result<()> {
     eprintln!("td-update: requesting installation of {deployment}");
     success(
         command(Path::new("/bin/td-authd"), root, home)
@@ -525,6 +533,19 @@ fn install(root: &Path, home: &Path) -> Result<()> {
 }
 
 fn run(args: &[String]) -> Result<()> {
+    if let [verb, source, expected] = args {
+        if verb == "trust-image" {
+            if !protocol::valid_digest(expected.as_bytes()) {
+                return Err("trust-image requires the exact deployment SHA-256".into());
+            }
+            let source = io(Path::new(source).canonicalize(), "resolve image directory")?;
+            if deployment_digest(&source)? != *expected {
+                return Err("image manifest differs from the explicitly trusted deployment".into());
+            }
+            let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
+            return request_install(Path::new("/"), &home, &source, expected);
+        }
+    }
     if args.first().map(String::as_str) == Some("apply-operation") {
         let [_, expected] = args else {
             return Err("apply-operation requires exactly one approved deployment ID".into());
@@ -830,6 +851,30 @@ fn main() {
         ] {
             assert_eq!(run(&args), Err(HELP.to_string()));
         }
+    }
+
+    #[test]
+    fn one_image_recovery_refuses_a_wrong_digest_before_contacting_authority() {
+        let scratch = temp_dir::TempDir::new("trust-one-image").unwrap();
+        fs::write(scratch.path().join("manifest"), b"exact deployment\n").unwrap();
+        assert_eq!(
+            deployment_digest(scratch.path()).unwrap(),
+            sha256::hex_digest(b"exact deployment\n")
+        );
+        let args = vec![
+            "trust-image".into(),
+            scratch.path().to_str().unwrap().into(),
+            "0".repeat(64),
+        ];
+        assert_eq!(
+            run(&args),
+            Err("image manifest differs from the explicitly trusted deployment".into())
+        );
+        let args = vec!["trust-image".into(), "/absent".into(), "bad".into()];
+        assert_eq!(
+            run(&args),
+            Err("trust-image requires the exact deployment SHA-256".into())
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 /// The image's table: UID 1000 may perform every v1 operation.
 pub(crate) const V1: &str =
-    "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\tmanage-volumes\n";
+    "td-elevation-v1\n1000\tdeploy-rollback\tset-hostname\tdeploy-publish\tmanage-time\tenroll-admin-key\tmanage-volumes\treplace-publisher\n";
 
 /// A table granting `uid` every v1 operation, outside the grammar's UID
 /// range when a test runs as such a UID.

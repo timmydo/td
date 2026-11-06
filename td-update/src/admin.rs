@@ -11,6 +11,9 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "publisher_recovery.rs"]
+mod recovery;
+
 pub(crate) const ADMIN_UID: u32 = 986;
 pub(crate) const BUILD_UID: u32 = 985;
 const STATE: &str = "/var/lib/td-admin";
@@ -27,7 +30,7 @@ const RELEASE_EVIDENCE: &str = "/var/lib/td-admin-build/release-state.metadata";
 const UPSTREAM: &str = "https://github.com/timmydo/td.git";
 const OFFICIAL_ENDPOINT: &str = "https://releases.tdlinux.org";
 const OFFICIAL_ROOT: &str = include_str!("official.root");
-const HELP: &str = "td-admin update [--no-reboot] | update-from-source [--no-reboot] | rollback [--no-reboot] | status [JOB] | logs [JOB] | cancel | reboot\nSSH: ssh td-admin@HOST update [--no-reboot]\nUpdates download a valid signed release and reboot by default. Jobs survive disconnects.\nUse update-from-source explicitly to build trusted upstream main.\nInitial setup: td-admin enroll-key PUBLIC_KEY_FILE, then approve H on secure attention.\n";
+const HELP: &str = "td-admin update [--no-reboot] | update-from-source [--no-reboot] | rollback [--no-reboot] | status [JOB] | logs [JOB] | cancel | reboot\nSSH: ssh td-admin@HOST update [--no-reboot]\nUpdates download a valid signed release and reboot by default. Jobs survive disconnects.\nUse update-from-source explicitly to build trusted upstream main.\nInitial setup: td-admin enroll-key PUBLIC_KEY_FILE, then approve H on secure attention.\nKey recovery: td-admin trust-publisher ROOT_FILE SHA256, then approve H; trusts future releases.\nOne image only: td-update trust-image DIRECTORY SHA256, then approve I.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Request {
@@ -518,6 +521,7 @@ fn initialize_release_with(
 fn initialize_official_release() -> Result<()> {
     let state = Path::new(STATE);
     let _lease = enrollment_lease(state)?;
+    recovery::finish(state)?;
     if !crate::present(Path::new(RELEASE_POLICY))? {
         initialize_release(state, OFFICIAL_ENDPOINT, OFFICIAL_ROOT, "system-x86-64")?;
         eprintln!("td-admin: initialized bundled publisher policy for {OFFICIAL_ENDPOINT}");
@@ -801,6 +805,7 @@ fn request(shared: &Shared, request: Request) -> Result<String> {
         }
         Request::Reboot if job.active => return Err("an update is active; use status".into()),
         Request::Reboot => {
+            let _lease = enrollment_lease(Path::new(STATE))?;
             operation(&["reboot-child"])?;
             return Ok("Reboot requested.\n".into());
         }
@@ -835,13 +840,17 @@ fn request(shared: &Shared, request: Request) -> Result<String> {
     if let Err(error) = std::thread::Builder::new()
         .name("admin-update".into())
         .spawn(move || {
-            let result = if operation == "update" {
-                update(&worker, reboot, &log)
-            } else if operation == "source-update" {
-                update_source(&worker, reboot, &log)
-            } else {
-                rollback(&worker, reboot)
-            };
+            let result = (|| {
+                let _lease = enrollment_lease(Path::new(STATE))?;
+                recovery::finish(Path::new(STATE))?;
+                if operation == "update" {
+                    update(&worker, reboot, &log)
+                } else if operation == "source-update" {
+                    update_source(&worker, reboot, &log)
+                } else {
+                    rollback(&worker, reboot)
+                }
+            })();
             if let Err(error) = result {
                 let prior = worker
                     .lock()
@@ -1289,6 +1298,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         ["configure-release", endpoint, trust, profile] => {
             configure_release(endpoint, Path::new(trust), profile)
         }
+        ["trust-publisher", source, digest] => recovery::request(Path::new(source), digest),
+        ["accept-publisher", digest] => recovery::accept(digest),
         ["--help" | "-h"] | [] => io(
             std::io::stdout().write_all(HELP.as_bytes()),
             "write admin help",
@@ -1420,6 +1431,8 @@ mod tests {
             vec!["update;reboot"],
             vec!["sh"],
             vec!["serve"],
+            vec!["trust-publisher", "root", "hash"],
+            vec!["accept-publisher", "hash"],
             vec!["update", "--no-reboot", "--no-reboot"],
             vec!["update-from-source", "--repo", "/tmp/repo"],
             vec![

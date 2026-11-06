@@ -8123,3 +8123,13 @@ the log root wrote its reason to (td-authd/DESIGN.md, "Notebook token
 descriptions"); the notice is fixed text, never the process's. Each exchange requires its own physical
 approval; each PIN remains bound to the exact acknowledged description.
 Notebook completion never unlocks the login screen.
+
+### Update publisher recovery
+
+H also selects tag 43, an explicit replacement of update publisher trust. The
+shared description shows the complete public-root SHA-256 and warns that
+future releases are trusted and saved update-version history is reset. It uses
+the ordinary fresh presented Enter approval; success says UPDATE PUBLISHER
+TRUST REPLACED. This does not install an image. I separately selects one exact
+deployment for `td-update trust-image`; its installation approval changes no
+publisher policy. `td-update/ADMIN.md` owns both recovery operations.
