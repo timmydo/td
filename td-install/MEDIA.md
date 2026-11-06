@@ -153,9 +153,10 @@ staged image and the error names it. The directory is synced after
 publication.
 
 Firmware boots the selector, which takes the "Live boot" path below. The
-medium holds no volume identity and no operator data. Nothing on it is
-signed: a medium anyone can write boots whatever they wrote
-(DESIGN.md §6).
+medium holds no volume identity and no operator data. Firmware does not authenticate its contents: a medium anyone can write
+boots whatever they wrote
+(DESIGN.md §6). Optional [detached download signatures](../net/ISO.md)
+authenticate the whole ISO before writing it, not at boot.
 
 ## Live boot diagnostics
 
@@ -428,7 +429,7 @@ lines in `@var/lib/td/authorized-keys`, as an image's volume carries
 them, mode 0644 in directories of mode 0755 and, being formatted by PID
 1's initramfs, owned by root. A provision that fails any check stages
 nothing and stops the live boot, as any `live-seed` refusal does. Like
-the deployment beside it, it is unsigned: whoever can write the medium
+the deployment beside it, it is not authenticated at boot: whoever can write the medium
 chooses the account it admits.
 `mkfs.btrfs` formats `/dev/ram0` from that tree with the handed-off
 UUID, the `td-system` label and a writable `@var` subvolume, as

@@ -27,7 +27,7 @@ use td_primitives::{
 type Result<T> = std::result::Result<T, String>;
 pub(crate) const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 pub(crate) const NO_STORE: &str = "no-store";
-const MAX_FILE: u64 = 4 * 1024 * 1024 * 1024;
+pub(crate) const MAX_FILE: u64 = 4 * 1024 * 1024 * 1024;
 const ATTEMPTS: usize = 3;
 
 fn io<T>(value: std::io::Result<T>) -> Result<T> {
@@ -264,6 +264,9 @@ impl Client {
             reused: 0,
         })
     }
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
     pub(crate) fn remaining(&self) -> Result<Duration> {
         self.deadline
             .checked_duration_since(Instant::now())
@@ -495,15 +498,21 @@ fn header<'a>(
 }
 
 pub(crate) fn file_hash(file: &mut File, size: u64, client: &Client) -> Result<String> {
+    file_hash_until(file, size, client.deadline())
+}
+
+pub(crate) fn file_hash_until(file: &mut File, size: u64, deadline: Instant) -> Result<String> {
     if size > MAX_FILE {
-        return Err("td S3 upload limit is 4 GiB; multipart upload is not implemented".into());
+        return Err("file exceeds the four-GiB hashing/upload bound".into());
     }
     io(file.seek(SeekFrom::Start(0)))?;
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 65536];
     let mut total = 0;
     loop {
-        client.remaining()?;
+        if Instant::now() >= deadline {
+            return Err("file hashing exceeded its deadline".into());
+        }
         let count = io(file.read(&mut buffer))?;
         if count == 0 {
             break;

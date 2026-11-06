@@ -87,7 +87,7 @@ pub fn signed(body: &str, key: &[u8]) -> Result<String> {
     ))
 }
 
-fn verified<'a>(text: &'a str, key: &[u8]) -> Result<&'a str> {
+pub(super) fn verified<'a>(text: &'a str, key: &[u8]) -> Result<&'a str> {
     let (body, signature) = envelope(text)?;
     if !sig::verify_msg(key, body.as_bytes(), &signature) {
         return Err("invalid release signature".into());

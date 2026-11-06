@@ -11,6 +11,7 @@
 
 mod cache;
 mod format;
+mod iso;
 mod publisher;
 mod seed;
 #[cfg(test)]
@@ -497,11 +498,27 @@ fn fetch_budgeted(
     result
 }
 
-const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  publish-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT DEPLOYMENT\n  promote-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH\n  renew REPOSITORY ROOT RELEASE_PRIVATE PROFILE\n  fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT] [--cache-limit BYTES]\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n  upload-s3 REPOSITORY ROOT PROFILE ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n";
+const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  publish-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT DEPLOYMENT\n  promote-next REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH\n  renew REPOSITORY ROOT RELEASE_PRIVATE PROFILE\n  fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT] [--cache-limit BYTES]\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n  sign-iso ROOT RELEASE_PRIVATE PROFILE COMMIT ISO SIGNATURE_DIRECTORY\n  verify-iso ROOT PROFILE SIGNATURE ISO\n  upload-iso-s3 ROOT PROFILE SIGNATURE ISO ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n  upload-s3 REPOSITORY ROOT PROFILE ENDPOINT REGION BUCKET CREDENTIALS CREDENTIAL_PROFILE [--dry-run]\n";
 
 fn command(args: &[String]) -> Result<()> {
     let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
     match words.as_slice() {
+        ["sign-iso", root, key, profile, commit, image, output] => iso::sign(
+            Path::new(root),
+            Path::new(key),
+            profile,
+            commit,
+            Path::new(image),
+            Path::new(output),
+        )
+        .map(|path| println!("{}", path.display())),
+        ["verify-iso", root, profile, signature, image] => iso::verify_command(
+            Path::new(root),
+            profile,
+            Path::new(signature),
+            Path::new(image),
+        ),
+        ["upload-iso-s3", rest @ ..] => iso::upload(rest),
         ["upload-s3", rest @ ..] => upload::command(rest),
         ["keygen", private, public] => {
             let (secret, key) = sig::keygen()?;
