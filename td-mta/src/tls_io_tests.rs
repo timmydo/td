@@ -503,6 +503,82 @@ fn public_tls_round_trip_with_tiny_pipes_and_independent_close() {
     assert_eq!(client.evidence(), None);
 }
 
+#[test]
+fn a_peer_closing_after_it_holds_everything_does_not_fail_flush() {
+    let clock = TestClock::new();
+    let (client, server) = configs(&clock);
+    let (left, right, link) = peers();
+    let mut a = [0; TLS_WIRE_BYTES];
+    let mut b = [0; TLS_WIRE_BYTES];
+    let mut c = [0; TLS_WIRE_BYTES];
+    let mut d = [0; TLS_WIRE_BYTES];
+    let mut client = TlsIo::new(
+        left,
+        TlsSession::client(client, "localhost").unwrap(),
+        clock.clone(),
+        deadline(),
+        deadline(),
+        &mut a,
+        &mut b,
+    )
+    .unwrap();
+    let mut server = TlsIo::new(
+        right,
+        TlsSession::server(server).unwrap(),
+        clock,
+        deadline(),
+        deadline(),
+        &mut c,
+        &mut d,
+    )
+    .unwrap();
+    handshakes(&mut client, &mut server);
+    assert_eq!(server.write(b"hello").unwrap(), IoProgress::Bytes(5));
+    let mut output = [0; 5];
+    let mut used = 0;
+    for _ in 0..100_000 {
+        server.flush().unwrap();
+        if let IoProgress::Bytes(count) = client.read(&mut output[used..]).unwrap() {
+            used += count;
+        }
+        if used == output.len() {
+            break;
+        }
+    }
+    assert_eq!(&output, b"hello");
+    // The client goes without close_notify, as td-mta's own outbound client does.
+    link.lock().unwrap().closed[0] = true;
+    assert_eq!(server.flush(), Ok(FlushProgress::Complete));
+    assert_eq!(server.flush(), Ok(FlushProgress::Complete));
+    // That close is still a truncation to anyone reading for more.
+    assert_eq!(server.read(&mut [0]), Err(Error::Tls));
+    assert!(link.lock().unwrap().aborted[1]);
+}
+
+#[test]
+fn a_peer_closing_before_it_holds_everything_fails_flush() {
+    with_pair(|client, server, _| {
+        handshakes(client, server);
+        // More than the 7-byte pipe holds while nobody reads it.
+        let mut sent = 0;
+        while sent < 64 {
+            match server.write(&[0; 64][sent..]).unwrap() {
+                IoProgress::Bytes(count) => sent += count,
+                _ => break,
+            }
+        }
+        client.transport.link.lock().unwrap().closed[0] = true;
+        let mut outcome = Ok(FlushProgress::Pending);
+        for _ in 0..1000 {
+            outcome = server.flush();
+            if outcome != Ok(FlushProgress::Pending) {
+                break;
+            }
+        }
+        assert_eq!(outcome, Err(Error::Tls));
+    });
+}
+
 fn with_pair(
     work: impl FnOnce(
         &mut TlsIo<Peer, &mut [u8; TLS_WIRE_BYTES]>,
@@ -753,14 +829,14 @@ fn established_sessions_outlive_handshake_deadline_and_preserve_backpressure() {
         assert_eq!(client.write(b"not consumed").unwrap(), IoProgress::Pending);
         for _ in 0..100_000 {
             client.flush().unwrap();
-            server.flush().unwrap();
+            server.step().unwrap();
             if server.session.status().plaintext_pending != 0 {
                 break;
             }
         }
         assert_eq!(server.session.status().plaintext_pending, 5);
         let reads = server.transport.link.lock().unwrap().reads[1];
-        server.flush().unwrap();
+        server.step().unwrap();
         assert_eq!(server.transport.link.lock().unwrap().reads[1], reads);
         let mut received = [0; 5];
         assert_eq!(

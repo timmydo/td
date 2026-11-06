@@ -483,12 +483,15 @@ impl<T: Transport, B: TlsWireStorage> Transport for TlsIo<T, B> {
 
     fn flush(&mut self) -> Result<FlushProgress, Error> {
         self.run(|connection| {
-            connection.step()?;
-            Ok(if connection.flushed()? {
-                FlushProgress::Complete
-            } else {
-                FlushProgress::Pending
-            })
+            connection.send_record()?;
+            // A peer holding everything may close at once, and that is no
+            // failure of this output. Reading is for output still held: it
+            // keeps a peer that is itself blocked writing moving.
+            if connection.flushed()? {
+                return Ok(FlushProgress::Complete);
+            }
+            connection.receive_record()?;
+            Ok(FlushProgress::Pending)
         })
     }
 
