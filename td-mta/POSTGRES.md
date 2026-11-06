@@ -120,8 +120,9 @@ secret versions must validate before a generation becomes active. Disabled
 or unsupported roles cannot become active merely because a row names them.
 A failed candidate leaves the previous generation intact. Instances observe
 generations by bounded polling; notifications may accelerate observation but
-are never the sole correctness mechanism. Restart-only changes report that
-status rather than pretending the new listeners or pool sizes are active.
+are never the sole correctness mechanism. A serving instance applies a newly
+selected generation by draining and reloading; SCHEMA.md §10's restart-only
+refusal is not implemented.
 
 Device verifiers and revocations live in the database. Authorization-sensitive
 writes lock/check the current account policy, device and identity versions

@@ -1,5 +1,9 @@
 //! PostgreSQL foreground receiving and mailbox access.
-use super::{adapter, config_failure, control::Endpoint, lock_root, scope, ConfigFailure};
+use super::{
+    adapter, config_failure,
+    control::{await_workers, Endpoint},
+    lock_root, scope, ConfigFailure,
+};
 use std::{
     io::{self, Write},
     os::unix::fs::MetadataExt,
@@ -56,9 +60,13 @@ pub(super) fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> O
 }
 
 pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
+    // Bound once and kept across reloads: a request arriving between two
+    // generations waits for the next one, and the socket's absence means that
+    // no process holds it.
+    let mut endpoint = None;
     loop {
         let reload = AtomicBool::new(false);
-        run_once(&options, &reload)?;
+        run_once(&options, &reload, &mut endpoint)?;
         if !reload.load(Ordering::Acquire)
             || super::signal_sys::requested().map_err(|_| config_failure("signals", "io"))?
         {
@@ -67,7 +75,11 @@ pub(super) fn run(options: Options) -> Result<(), ConfigFailure> {
     }
 }
 
-fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure> {
+fn run_once(
+    options: &Options,
+    reload: &AtomicBool,
+    endpoint: &mut Option<Endpoint>,
+) -> Result<(), ConfigFailure> {
     let mode = if options.read_only {
         td_mta::postgres_probe::Mode::ReplicaRead
     } else {
@@ -428,7 +440,12 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                 clock: clock.clone(),
             });
             super::signal_sys::block().map_err(|_| config_failure("signals", "io"))?;
-            let endpoint = Endpoint::bind(runtime, runtime_path)?;
+            if endpoint.is_none() {
+                *endpoint = Some(Endpoint::bind(runtime, runtime_path)?);
+            }
+            let endpoint = endpoint
+                .as_ref()
+                .ok_or_else(|| config_failure("control", "invariant"))?;
             let (logging, log_writer) = td_mta::application_log::Producer::new(
                 clock.clone(),
                 binding.selection().generation,
@@ -619,14 +636,12 @@ fn run_once(options: &Options, reload: &AtomicBool) -> Result<(), ConfigFailure>
                 };
                 let ready = || {
                     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while (mailbox_access && !https_ready.load(Ordering::Acquire))
-                        || (relay && !relay_ready.load(Ordering::Acquire))
-                    {
-                        if control.stop_requested() || std::time::Instant::now() >= until {
-                            control.stop();
-                            return Err(ports::Error::WriterStopped);
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    let workers = || {
+                        (!mailbox_access || https_ready.load(Ordering::Acquire))
+                            && (!relay || relay_ready.load(Ordering::Acquire))
+                    };
+                    if !await_workers(&control, reload, workers, until)? {
+                        return Ok(());
                     }
                     if !listeners.is_empty() {
                         control.log(
@@ -706,7 +721,7 @@ fn announce(listeners: usize, mailbox_access: bool, relay: bool) -> Result<(), p
     } else {
         "smtp-only"
     };
-    writeln!(output, "{{\"schema\":1,\"command\":\"serve\",\"status\":\"ready\",\"profile\":\"{profile}\",\"smtp_listeners\":{listeners},\"https\":{mailbox_access},\"outbound\":{relay},\"reload\":false,\"signal_drain\":true}}")?;
+    writeln!(output, "{{\"schema\":1,\"command\":\"serve\",\"status\":\"ready\",\"profile\":\"{profile}\",\"smtp_listeners\":{listeners},\"https\":{mailbox_access},\"outbound\":{relay},\"reload\":true,\"signal_drain\":true}}")?;
     output.flush()?;
     Ok(())
 }

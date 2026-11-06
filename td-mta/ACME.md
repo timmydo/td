@@ -115,7 +115,7 @@ A change causes orderly drain, release of the old listeners and internal reload
 of the selected database profile. This first implementation has a brief listener
 gap; it does not claim uninterrupted hot swapping. An explicit stop wins over a
 reload. Existing external service supervision still handles actual process
-failures. General operator configuration changes continue to require restart.
+failures. A newly selected general configuration takes the same drain and reload.
 
 ## Qualification
 

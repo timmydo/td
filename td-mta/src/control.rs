@@ -19,6 +19,8 @@ use td_mta::{
 const NAME: &str = "smtp-control.sock";
 const TURN: Duration = Duration::from_millis(100);
 const EXCHANGE: Duration = Duration::from_secs(2);
+/// `stop` outlasts a reload's gap, in which nothing serves the socket yet.
+const STOP_REPLY: Duration = Duration::from_secs(30);
 
 pub(super) struct Endpoint {
     listener: td_mta::unix_listener::PrivateListener,
@@ -73,6 +75,31 @@ impl Endpoint {
         Ok(())
     }
 }
+/// Wait for a generation's workers before it announces readiness. `Ok(false)`
+/// is a stop that an operator or a reload asked for, an orderly end announcing
+/// nothing; any other stop, and running out of time, is a failed start.
+pub(super) fn await_workers(
+    control: &Control,
+    reload: &AtomicBool,
+    workers: impl Fn() -> bool,
+    until: Instant,
+) -> Result<bool, td_mta::ports::Error> {
+    while !workers() {
+        // Both orderly causes are stored before the stop flag, so seeing it
+        // first means they are visible.
+        let stopping = control.stop_requested();
+        if stopping && (control.user_stopped() || reload.load(Ordering::Acquire)) {
+            return Ok(false);
+        }
+        if stopping || Instant::now() >= until {
+            control.stop();
+            return Err(td_mta::ports::Error::WriterStopped);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(true)
+}
+
 pub(super) fn check_runtime_path(path: &str) -> Result<(), ConfigFailure> {
     if path
         .len()
@@ -238,18 +265,21 @@ pub(super) fn request(
     stop: bool,
 ) -> Result<(&'static str, &'static str), ConfigFailure> {
     let (_root, mut stream) = connect(runtime)?;
+    request_over(&mut stream, stop)
+}
+
+fn request_over(
+    stream: &mut UnixStream,
+    stop: bool,
+) -> Result<(&'static str, &'static str), ConfigFailure> {
     let start = Instant::now();
-    send(
-        &mut stream,
-        start,
-        if stop { b"STOP\n" } else { b"STATUS\n" },
-    )
-    .map_err(io_failure)?;
+    send(stream, start, if stop { b"STOP\n" } else { b"STATUS\n" }).map_err(io_failure)?;
     stream
         .shutdown(std::net::Shutdown::Write)
         .map_err(io_failure)?;
     let mut bytes = [0; 16];
-    let response = line(&mut stream, start, &mut bytes, false).map_err(io_failure)?;
+    let limit = if stop { STOP_REPLY } else { EXCHANGE };
+    let response = line_with_limit(stream, start, &mut bytes, false, limit).map_err(io_failure)?;
     let (response, profile) = match response.strip_prefix(b"HTTPS ") {
         Some(response) => (response, "mailbox-access"),
         None => (response, "smtp-only"),
@@ -412,6 +442,64 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn a_stop_before_readiness_is_orderly_only_for_an_operator_or_a_reload() {
+        let later = Instant::now() + Duration::from_secs(60);
+        let (no_reload, reloading) = (AtomicBool::new(false), AtomicBool::new(true));
+        let waiting = || false;
+        let control = Control::default();
+        assert_eq!(
+            await_workers(&control, &no_reload, || true, later),
+            Ok(true)
+        );
+        // An operator's stop.
+        control.user_stop();
+        assert_eq!(
+            await_workers(&control, &no_reload, waiting, later),
+            Ok(false)
+        );
+        // A reload's stop.
+        let control = Control::default();
+        control.stop();
+        assert_eq!(
+            await_workers(&control, &reloading, waiting, later),
+            Ok(false)
+        );
+        // Any other stop.
+        assert_eq!(
+            await_workers(&control, &no_reload, waiting, later),
+            Err(td_mta::ports::Error::WriterStopped)
+        );
+        // Workers that never come up, which also stops the others.
+        let control = Control::default();
+        assert_eq!(
+            await_workers(&control, &no_reload, waiting, Instant::now()),
+            Err(td_mta::ports::Error::WriterStopped)
+        );
+        assert!(control.stop_requested());
+        // Workers that came up win over a stop arriving with them.
+        control.stop();
+        assert_eq!(
+            await_workers(&control, &no_reload, || true, later),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn stop_outlasts_a_gap_in_serving() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let control = Control::default();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(move || request_over(&mut client, true).ok());
+            // Longer than any other exchange waits, with nothing serving it.
+            std::thread::sleep(EXCHANGE + Duration::from_millis(500));
+            assert!(!waiting.is_finished());
+            exchange(&mut server, &control, false).unwrap();
+            assert_eq!(waiting.join().unwrap(), Some(("requested", "smtp-only")));
+        });
+        assert!(control.user_stopped());
     }
 
     #[test]

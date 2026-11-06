@@ -620,6 +620,13 @@ pub(super) fn exercise(
         .unwrap();
     assert!(output.status.success());
     super::wait_command(&mut cloud);
+    let desktop_generations = || {
+        fs::read_to_string(local.join("desktop-output"))
+            .unwrap()
+            .matches("\"status\":\"ready\"")
+            .count()
+    };
+    let desktop_before = desktop_generations();
     let version = td_mta::postgres_configuration_store::Version::from_bytes([240; 16]);
     td_mta::postgres_configuration_store::publish(
         &request,
@@ -637,6 +644,33 @@ pub(super) fn exercise(
             .unwrap(),
     )
     .unwrap();
+    // The running desktop notices the selection itself, within its watcher's
+    // 30 seconds, and reloads in process. Its control socket outlives that, and
+    // a stop sent as soon as the reload shows ends the process cleanly.
+    let end = std::time::Instant::now() + Duration::from_secs(90);
+    while desktop_generations() == desktop_before {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["status", "--json", "--runtime"])
+            .arg(&desktop_runtime)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&output.stdout);
+        assert!(!status.contains("not-running"), "{output:?}");
+        if !status.contains("\"state\":\"ready\"") {
+            eprintln!("stopping the desktop during its reload: {status}");
+            break;
+        }
+        assert!(std::time::Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        .args(["stop", "--runtime"])
+        .arg(&desktop_runtime)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    super::wait_command(&mut desktop);
+    desktop = start("desktop").0;
     cloud = start("cloud").0;
     assert_eq!(
         sql(

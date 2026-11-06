@@ -66,8 +66,8 @@ fn pause(control: &Control, duration: Duration) {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
-/// The database address remains pinned for this process. Restart to select a
-/// different primary, which also starts a new five-minute retry clock guard.
+/// The database address remains pinned for this generation. A reload or restart
+/// selects a different primary, and starts a new five-minute retry clock guard.
 #[derive(Default)]
 pub struct QueueControl {
     confirm: AtomicBool,

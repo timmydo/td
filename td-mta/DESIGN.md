@@ -1596,14 +1596,21 @@ password. POSTGRES.md owns their retention and partial-completion contract.
 POSTGRES.md specifies arguments and the remaining database commands. The
 private Unix control socket carries status and stop only; database changes
 use authenticated PostgreSQL connections. Its directory permissions establish
-local control authority. There is no public administration HTTP API.
+local control authority. It stays bound across an internal reload, so
+`not-running` means no process holds it. A request in that gap stays queued for
+the next generation: `stop` waits 30 seconds for its reply and other requests 2,
+and may report `io` across a longer gap. A client that gives up has an unknown
+outcome, since the next generation still serves what it sent. An operator's or
+a reload's stop before readiness is an orderly end that announces nothing; any
+other is a failed start. There is no public administration HTTP API.
 Physical backup and recovery use PostgreSQL tooling. Readiness does not
 contact Migadu or a CA. Configuration errors do not echo supplied secrets.
 
-Listener address changes, data-root changes, and pool sizing require restart.
-Account, alias and sending identity configuration changes require restart. Device
-revocations are observed from PostgreSQL; managed certificates trigger bounded
-drain and reload. Revocation
+Command-line paths, the runtime and scratch directories, require restart. A
+newly selected configuration, with its listeners, pool sizing, accounts, aliases
+and sending identities, takes the same bounded drain and reload as a managed
+certificate.
+Device revocations are observed from PostgreSQL. Revocation
 is rechecked before a mutation commits; a connection is not permanent authority.
 Reload has bounded coexistence memory and records the effective generation.
 

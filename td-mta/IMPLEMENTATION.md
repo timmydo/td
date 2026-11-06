@@ -2950,9 +2950,9 @@ current readiness, orderly-stop and forced-termination limits. The
 PostgreSQL service has since activated HTTPS/JMAP, relay delivery,
 database service logging (OBSERVABILITY.md) and ACME through the separate
 `td-mta acme` worker; serving drains and reloads when its managed
-certificate generation changes (ACME.md). It still refuses a gateway SMTP
-listener at startup, and other configuration changes still require a
-process restart (CONFIG.md).
+certificate generation changes (ACME.md), and a newly selected
+configuration takes the same drain and reload (CONFIG.md). It still refuses
+a gateway SMTP listener at startup.
 
 Prepared Core Session metadata now covers configured-origin URL templates,
 the single account and username, resource-limit projection and a deterministic

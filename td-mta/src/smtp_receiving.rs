@@ -314,7 +314,8 @@ impl<'cfg, B: Storage> Slot<'_, 'cfg, B> {
 }
 
 /// Run with one immutable routing/TLS snapshot and a shared monotonic clock.
-/// Startup storage checks precede readiness; no gateway or reload is enabled.
+/// Startup storage checks precede readiness; no gateway is enabled, and a reload
+/// replaces the whole snapshot with a new generation.
 pub struct Receiving<'s, 'cfg, B: Storage> {
     pub storage: &'s B,
     pub routes: &'cfg Routing<'cfg>,

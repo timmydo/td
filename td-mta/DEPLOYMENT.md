@@ -7,7 +7,9 @@ conversion is supported; migration from an external mail server is described
 in [MIGRATION.md](MIGRATION.md).
 [POSTGRES.md](POSTGRES.md) owns database preparation and current support;
 [CONFIG.md](CONFIG.md#foreground-postgresql-service) owns foreground serving.
-Relay scheduling is active; configuration reload requires process restart.
+Relay scheduling is active. A serving process checks about every 30 seconds
+for a newly selected configuration or a managed certificate change, then drains
+and reloads itself.
 
 The live Azure host serving `mx.timmydouglas.com`, `mx.timmyd.info` and
 `mx.882015.xyz` has a separate [production runbook](PRODUCTION.md), including
@@ -426,8 +428,9 @@ The private control socket also provides the relay controls below. Administer cr
 through `postgres device-create`, `postgres device-list` and `postgres
 device-revoke`, using the explicit database/account arguments in POSTGRES.md.
 
-General configuration changes require validated database versions, selection
-and process restart. Native managed certificate renewal is supervised
+General configuration changes require validated database versions and
+selection; serving processes then drain and reload, and a restart applies them
+sooner. Native managed certificate renewal is supervised
 separately; serving processes drain and reload when their managed certificate
 generation changes, as [ACME.md](ACME.md) specifies. The native executable fixture qualifies separate
 receive/JMAP processes, durable SMTP delivery, verified HTTPS credential

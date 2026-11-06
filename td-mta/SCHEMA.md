@@ -753,6 +753,10 @@ configuration or certificate slot.
 
 ## 10. Restart and reload boundary
 
+This is the specified boundary, not current behaviour: a serving process today
+drains and reloads any newly selected generation, listeners included, rather
+than returning a restart-required result (CONFIG.md).
+
 The field classification is:
 
 | Requires restart | May reload as one complete generation |

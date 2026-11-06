@@ -1832,15 +1832,17 @@ Receive and JMAP roles use the PostgreSQL SMTP, authentication, read and
 mutation adapters. A JMAP-only instance needs no SMTP listener and advertises
 Submission; it can queue mail for a separate relay instance. A relay role
 starts one route worker, including in a listener-free profile. Concurrent
-instances wait for the database route lease. Configuration reload is not yet
-active: a changed selection fences old operations and requires restart.
+instances wait for the database route lease. A changed selection fences old
+operations, and a serving process notices within about 30 seconds and drains
+and reloads itself, with a brief listener gap. If it cannot serve the new
+configuration, or the database is unreachable just then, the process exits.
 
 `queue-clock-status --runtime PATH` reports `held` or `confirmed` for relay
 expiry. `queue-clock-confirm --runtime PATH` requests clock confirmation on
 that process through its private control socket. The acknowledgment is
 `requested`, not completion: check status afterward. Confirmation before
 five minutes of stable database UTC/monotonic progress is refused; submit
-again afterward. A restart or clock discontinuity restores the hold. This
+again afterward. A restart, reload or clock discontinuity restores the hold. This
 operation permits bounded overdue expiry under QUEUE.md; it does not move
 retry deadlines earlier.
 
