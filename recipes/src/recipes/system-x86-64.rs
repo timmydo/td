@@ -1309,6 +1309,10 @@ fn gets_generic_persistent_home_setup(user: &User) -> bool {
 /// Root's generated record, which the autotest health leg requires whole.
 const ROOT_SHADOW_LINE: &str = "root:!:19000:0:99999:7:::";
 
+/// td-svc's `SENTINEL_UID`, which the autotest health leg reads back off the
+/// process the kernel's `cad_pid` names (td-svc/DESIGN.md §9).
+const CAD_SENTINEL_UID: u32 = 65533;
+
 fn build_shadow(sys: &SystemDef) -> String {
     let mut s = String::new();
     for u in sys.users {
@@ -3706,6 +3710,14 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          *) echo \"OpenSSH: the root key was not offered and then refused: $rootssh\"; \
          fail;; esac\n\
          echo {ROOT_SSH_REFUSED_MARKER}\n\
+         cad=$(/bin/td-util cat /proc/sys/kernel/cad_pid) || fail\n\
+         uid=; eff=\n\
+         while read -r k a b c d; do case \"$k\" in Uid:) uid=\"$a $b $c $d\";; \
+         CapEff:) eff=$a;; esac; done </proc/$cad/status\n\
+         [ \"$uid\" = '{CAD_SENTINEL_UID} {CAD_SENTINEL_UID} {CAD_SENTINEL_UID} {CAD_SENTINEL_UID}' ] \
+         && [ \"$eff\" = 0000000000000000 ] || \
+         {{ echo \"td-svc: the kernel's Ctrl-Alt-Del target $cad holds uid $uid caps $eff\"; \
+         fail; }}\n\
          bin=$(/bin/ls -1 -A /bin) || fail\n\
          /bin/td-util printf '%s\\n' \"$bin\" | /bin/grep -q -x -F sh || \
          {{ echo \"td-login: the /bin listing lacks sh\"; fail; }}\n\
@@ -10273,6 +10285,27 @@ mod tests {
         )));
     }
 
+    /// The two workers' uids are their crates' own, and the health leg that
+    /// reads the sentinel's back is on both profiles.
+    #[test]
+    fn worker_uids_are_the_ones_their_crates_name() {
+        let cad = include_str!("../../../td-svc/src/cad.rs");
+        assert!(cad.contains(&format!("const SENTINEL_UID: u32 = {CAD_SENTINEL_UID};")));
+        let media = include_str!("../../../td-disks/src/media.rs");
+        assert!(media.contains("const IDENTIFY_UID: u32 = 65532;"));
+        for sys in [&SYSTEM, &SERVER] {
+            let health = build_bootsuccess(sys);
+            assert!(health.contains("/proc/sys/kernel/cad_pid"), "{}", sys.stem);
+            assert!(
+                health.contains(&format!(
+                    "'{CAD_SENTINEL_UID} {CAD_SENTINEL_UID} {CAD_SENTINEL_UID} {CAD_SENTINEL_UID}'"
+                )),
+                "{}",
+                sys.stem
+            );
+        }
+    }
+
     /// The tailorable `SYSTEM` const is hand-edited to shape the distro; guard the
     /// invariants a bad edit would otherwise surface only as a silent boot failure —
     /// a getty respawn-looping on `login-primary` with no primary account, a
@@ -10318,8 +10351,9 @@ mod tests {
             );
         }
         // Each is one program's worker, which runs as it precisely because
-        // nothing else does: td-disks's media-identify (td-disks/DESIGN.md).
-        for worker in [65532] {
+        // nothing else does: td-disks's media-identify (td-disks/DESIGN.md)
+        // and td-svc's Ctrl-Alt-Del sentinel (td-svc/DESIGN.md §9).
+        for worker in [65532, CAD_SENTINEL_UID] {
             for sys in [&SYSTEM, &SERVER] {
                 assert!(
                     sys.users.iter().all(|user| user.uid != worker)

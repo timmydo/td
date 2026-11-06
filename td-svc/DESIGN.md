@@ -1377,7 +1377,11 @@ needs to **die, observably**. td-svc:
 1. writes `0` to `ctrl-alt-del` **first**, reading it back. Arming in the
    other order leaves a window in which a press still hard-resets;
 2. spawns `td-svc cad-sentinel` with a pipe on its stdin, **retaining the
-   write end**, so the sentinel's `read` blocks rather than seeing EOF;
+   write end**, so the sentinel's `read` blocks rather than seeing EOF. A
+   root supervisor starts it, through `Command`'s safe setters, with an empty
+   environment at `/` as UID/GID 65533, which no account names and nothing
+   else runs as. It only waits, and the kernel's `kill_cad_pid(SIGINT, 1)` is
+   privileged whoever its target is, so root buys it nothing;
 3. writes the sentinel's pid to `cad_pid`, reading it back. A failed *write*
    of ESRCH means the sentinel died between spawn and here, and is reported
    as such rather than retried in place: the answer is a whole fresh arming,
@@ -1440,12 +1444,13 @@ would not start, which reaps it in place; the child is passed to the watcher
 through a slot rather than moved into the closure, because `Builder::spawn`
 consumes the closure whether or not the thread starts.
 
-**Two honest limits.** The trigger is not authenticated: any root process
-can `kill -INT` the sentinel, so the console should say "shutdown requested
-via CAD sentinel", not "Ctrl-Alt-Del pressed". And on td's current
-`allnoconfig` kernel there is no `CONFIG_VT` and no input stack, so
-`ctrl_alt_del()` has no caller at all — the mechanism is testable and
-correct, but a real key press needs a separate kernel-config increment.
+**Two honest limits.** The trigger is not authenticated: any root process,
+or a process holding the sentinel's own UID if one ever existed, can
+`kill -INT` the sentinel, so the console should say "shutdown requested
+via CAD sentinel", not "Ctrl-Alt-Del pressed". And no test presses the
+key: td's kernel has `CONFIG_VT` and an AT keyboard driver, so a press on
+that keyboard should reach `ctrl_alt_del()`, but nothing here shows it,
+and a USB keyboard's path is whatever the VT's keyboard handler sees.
 
 Testing separates what is proven from what is not, and the split is
 deliberate rather than a gap someone forgot to close:
@@ -1484,9 +1489,14 @@ deliberate rather than a gap someone forgot to close:
   (ESRCH), and against an invalid signal number (EINVAL, the one refusal that
   does not depend on whether the suite runs as root).
 - **The kernel path joining them is not covered.** `ctrl_alt_del()` delivering
-  SIGINT to `cad_pid` is taken on the kernel's word; only a VT-enabled
-  `sendkey` test would close it, and on td's `allnoconfig` kernel there is no
-  caller to test.
+  SIGINT to `cad_pid` is taken on the kernel's word; only a `sendkey` test
+  would close it, and none exists yet.
+- **The sentinel's identity is proven only on a booted image.** Every suite
+  here runs below root, so none reaches the change of identity. A source pin
+  holds the code, and boot health under the autotest token reads the process
+  `cad_pid` names and requires UID 65533 and no effective capability. A
+  supervisor that is uid 0 without that uid mapped, as under `unshare -r`,
+  fails to arm and retries; td runs td-svc in no such place.
 
 Because the sysctl paths are `Runtime` fields rather than the constants used
 directly, the tests cannot reach the real ones — a suite that did would disarm

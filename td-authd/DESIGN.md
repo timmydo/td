@@ -260,7 +260,10 @@ Session rows precede application rows. Each group is sorted by numeric human
 uid, then application name for application rows. Human uids are 1000 through
 65533, dedicated service uids are 1 through 999, and application uids are
 65536 through 2147483647; gid equals uid for each dedicated identity. Zero
-and the usual overflow ids are excluded. The producer must also reject any
+and the usual overflow ids are excluded. These parsers admit 65532 and 65533,
+which a human account must never take: they are td-disks's identify worker and
+td-svc's Ctrl-Alt-Del sentinel, whose uids nothing else may hold. Only uid 1000
+is provisioned today. The producer must also reject any
 assigned uid/gid already occupied by another system account. The parser
 independently rejects duplicate service/application assignments, unknown
 session owners, noncanonical decimal spelling, duplicate or unsorted rows,

@@ -2566,9 +2566,8 @@ impl Runtime {
     ///
     /// Never fatal. A machine that supervises its services but hard-resets on a
     /// key press is worse than one that does neither, but it is much better than
-    /// one that refuses to boot — and on td's current `allnoconfig` kernel there
-    /// is no CONFIG_VT and no input stack, so `ctrl_alt_del()` has no caller at
-    /// all and a missing sysctl is the ORDINARY case, not a fault.
+    /// one that refuses to boot — and a kernel without these sysctls has nothing
+    /// to arm, so a missing one is not a fault.
     fn arm_cad(&mut self) {
         // Retire any previous sentinel first. Closing the write end is how it
         // learns to exit — an explicit `drop`, because the whole mechanism
@@ -2588,10 +2587,9 @@ impl Runtime {
             drop(previous.keepalive);
         }
         if let Err(why) = crate::cad::disable_hard_reset(&self.cad_enabled_path) {
-            // A sysctl that is not THERE is the ordinary case on td's current
-            // `allnoconfig` kernel — no CONFIG_VT, so `ctrl_alt_del()` has no
-            // caller — and it will not appear later. Retrying that forever is a
-            // timer that can only fail, so it is said ONCE, ungated, and left.
+            // A sysctl that is not THERE will not appear later. Retrying that
+            // forever is a timer that can only fail, so it is said ONCE,
+            // ungated, and left.
             // Anything else is a fault, and the hard reset is still on, so
             // another attempt is worth making and the reason is throttled with
             // every other repeated one.
@@ -3136,9 +3134,9 @@ impl Runtime {
             self.cad_failures = 0;
         }
         if signal == Some(crate::sys::SIGINT) {
-            // NOT "Ctrl-Alt-Del pressed": `cad_pid` is 0600 but any root process
-            // can send SIGINT to the sentinel, so this names what was OBSERVED,
-            // not a key nobody saw.
+            // NOT "Ctrl-Alt-Del pressed": `cad_pid` is 0600 but any root process,
+            // or one holding the sentinel's uid, can send SIGINT to the sentinel,
+            // so this names what was OBSERVED, not a key nobody saw.
             log("shutdown requested via the ctrl-alt-del sentinel");
             let reply = self.begin_shutdown(Power::Reboot);
             if let Some(why) = reply.strip_prefix("error: ") {
@@ -6595,10 +6593,8 @@ mod tests {
 
     /// A sysctl that does not exist is not a fault, and not retried forever.
     ///
-    /// On td's current `allnoconfig` kernel there is no CONFIG_VT, so
-    /// `ctrl_alt_del()` has no caller and the sysctl is simply absent. Retrying
-    /// that on a timer until the machine is switched off would be a scheduled
-    /// failure; a write that fails for any OTHER reason is worth retrying,
+    /// Retrying an absent sysctl on a timer until the machine is switched off
+    /// would be a scheduled failure; a write that fails for any OTHER reason is worth retrying,
     /// because the file is there and something transient stopped it.
     #[test]
     fn an_absent_sysctl_is_not_retried_but_a_failing_one_is() {

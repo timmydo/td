@@ -23,7 +23,14 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
+
+/// What the sentinel runs as. A SIGINT from anything holding this uid reads as
+/// a press, so no account names it and nothing else runs as it: td-time's
+/// network worker is 65534.
+const SENTINEL_UID: u32 = 65533;
 
 /// 0 = send SIGINT to `cad_pid`; 1 = immediate `kernel_restart`.
 pub const CAD_ENABLED: &str = "/proc/sys/kernel/ctrl-alt-del";
@@ -73,18 +80,41 @@ pub fn disable_hard_reset(path: &str) -> Result<(), String> {
     }
 }
 
+/// The sentinel's argv, stdio, environment and working directory.
+fn sentinel_command(exe: &std::path::Path) -> Command {
+    let mut command = Command::new(exe);
+    command
+        .arg(SENTINEL_VERB)
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
 /// Spawn the sentinel, returning it and the pipe end that keeps it alive.
 ///
 /// `current_exe` rather than a hardcoded `/bin/td-svc`: the sentinel must be
 /// THIS binary, and on the image that path is a symlink into the store that a
 /// half-applied update could be repointing.
+///
+/// A root supervisor gives up root for it: the sentinel only waits, and the
+/// kernel's SIGINT is sent with `kill_cad_pid(SIGINT, 1)`, privileged whoever
+/// the target is. Below root there is no identity to change to. A root that
+/// cannot say who it is, or cannot become that uid, fails the arming, which
+/// retries with the hard reset's state said aloud, rather than leaving a root
+/// sentinel running in silence.
 pub fn spawn_sentinel() -> Result<(Child, ChildStdin), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate td-svc: {e}"))?;
-    let mut child = Command::new(&exe)
-        .arg(SENTINEL_VERB)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    let mut command = sentinel_command(&exe);
+    let euid = fs::metadata("/proc/self")
+        .map_err(|e| format!("cannot read this process's identity: {e}"))?
+        .uid();
+    if euid == 0 {
+        command.uid(SENTINEL_UID).gid(SENTINEL_UID);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("cannot spawn the {SENTINEL_VERB}: {e}"))?;
     match child.stdin.take() {
@@ -256,5 +286,48 @@ mod tests {
     #[test]
     fn the_sentinel_verb_is_one_string() {
         assert_eq!(SENTINEL_VERB, "cad-sentinel");
+    }
+
+    /// A UID another process also holds could fake a press with a SIGINT,
+    /// which is why this is neither root's nor td-time's worker's. No suite
+    /// here runs as root and std offers no getter for what a `Command` will
+    /// clear or become, so the source is what a gate can see. Boot health
+    /// proves the outcome (DESIGN.md §9), and a recipes test ties that value
+    /// to this one.
+    #[test]
+    fn the_sentinel_runs_as_a_uid_of_its_own_with_an_empty_environment() {
+        // Comments stripped, so commenting a line out is losing it.
+        let source: String = include_str!("cad.rs")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let spawner = source
+            .split_once("pub fn spawn_sentinel(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert!(spawner.contains(".uid();\n    if euid == 0 {\n        command.uid(SENTINEL_UID).gid(SENTINEL_UID);\n    }"));
+        let builder = source
+            .split_once("fn sentinel_command(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert!(builder.contains(".env_clear()"));
+        assert_eq!(SENTINEL_UID, 65533);
+    }
+
+    /// What can be read back of a sentinel's start.
+    #[test]
+    fn the_sentinel_starts_at_the_root_with_its_verb_alone() {
+        let command = sentinel_command(std::path::Path::new("/bin/td-svc"));
+        assert_eq!(command.get_program(), "/bin/td-svc");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, [SENTINEL_VERB]);
+        assert_eq!(
+            command.get_current_dir(),
+            Some(std::path::Path::new("/")),
+            "a sentinel must not pin the supervisor's directory"
+        );
     }
 }
