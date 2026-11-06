@@ -417,11 +417,10 @@ fn replacing_the_path_cannot_redirect_a_locked_mutation() {
     let disk = Disk::with_second_key("replace-locked");
     let replacement = disk.root.join("replacement.img");
     fs::copy(&disk.device, &replacement).unwrap();
-    let held = File::open(&disk.device).unwrap();
-    held.lock().unwrap();
-    let other = File::open(&replacement).unwrap();
-    other.lock().unwrap();
-    let before = fs::read(&replacement).unwrap();
+    // The child opens the device only after standard input ends, so it parks
+    // here. Spawn returns before exec closes the child's copies of descriptors
+    // this test holds, so `held` opens after it: what the scan below finds can
+    // then only be the child's own open.
     let mut child = Command::new(env!("CARGO_BIN_EXE_td-luks"))
         .args(["token-import", disk.arg()])
         .stdin(Stdio::piped())
@@ -429,9 +428,14 @@ fn replacing_the_path_cannot_redirect_a_locked_mutation() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let held = File::open(&disk.device).unwrap();
+    held.lock().unwrap();
+    let other = File::open(&replacement).unwrap();
+    other.lock().unwrap();
+    let before = fs::read(&replacement).unwrap();
     child.stdin.take().unwrap().write_all(TOKEN).unwrap();
-    // Observe its open descriptor before replacing the path, so this
-    // exercises an actual waiter rather than racing process startup.
+    // Observe it holding the original inode open before replacing the path,
+    // so this exercises the operation in flight rather than process startup.
     let inode = held.metadata().unwrap().ino();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let observed = loop {
