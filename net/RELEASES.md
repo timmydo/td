@@ -185,10 +185,10 @@ CDC for boot payloads. The default remains CDC.
 ## Publishing and retention
 
 Commands use positional arguments; invoking `td-net release` prints syntax.
-Times are Unix seconds and keys use ring's Ed25519 PKCS#8 private form and
-lowercase hexadecimal public form. `keygen PRIVATE PUBLIC` exclusively
-creates a private mode-0600 file and its public companion. Never put a
-private key inside the served repository.
+Times are Unix seconds and keys use the Ed25519 PKCS#8 v2 private form, the
+seed then its public half and nothing else, and lowercase hexadecimal public
+form. `keygen PRIVATE PUBLIC` exclusively creates a private mode-0600 file and
+its public companion. Never put a private key inside the served repository.
 
 `root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUT`
 creates a root document. For version 1, use ROOT_PRIVATE in both private-key
