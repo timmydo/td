@@ -668,9 +668,9 @@ fn install(
     Ok(())
 }
 
-fn selector(slot: &str) -> Result<String> {
+fn selector(volume: &Path, slot: &str) -> Result<String> {
     let target = io(
-        fs::read_link(Path::new("/run/td-volume/boot").join(slot)),
+        fs::read_link(volume.join(crate::protocol::BOOT_DIR).join(slot)),
         "read deployment selector",
     )?;
     let id = target
@@ -682,8 +682,9 @@ fn selector(slot: &str) -> Result<String> {
 }
 
 fn rollback(shared: &Shared, reboot: bool) -> Result<()> {
-    let current = selector("current")?;
-    let previous = selector("previous")?;
+    let volume = Path::new("/run/td-volume");
+    let current = selector(volume, "current")?;
+    let previous = selector(volume, "previous")?;
     if current == previous {
         return Err("no previous deployment to roll back to".into());
     }
@@ -1253,6 +1254,23 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn rollback_reads_the_boot_protocol_volume_layout() {
+        let scratch = crate::temp_dir::TempDir::new("admin-rollback-selectors").unwrap();
+        let volume = scratch.path();
+        let boot = volume.join(crate::protocol::BOOT_DIR);
+        fs::create_dir_all(&boot).unwrap();
+        let current = "a".repeat(64);
+        let previous = "b".repeat(64);
+        for (slot, id) in [("current", &current), ("previous", &previous)] {
+            std::os::unix::fs::symlink(format!("../deployments/{id}"), boot.join(slot)).unwrap();
+            assert_eq!(selector(volume, slot).unwrap(), *id);
+        }
+        fs::remove_file(boot.join("previous")).unwrap();
+        assert!(selector(volume, "previous").is_err());
+        std::os::unix::fs::symlink("/outside", boot.join("previous")).unwrap();
+        assert!(selector(volume, "previous").is_err());
+    }
     #[test]
     fn update_reboots_by_default_and_only_accepts_the_fixed_interface() {
         assert_eq!(parse(&["update"]), Ok(Request::Update { reboot: true }));
