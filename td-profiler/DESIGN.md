@@ -202,7 +202,7 @@ the normal closure checks remain the wider reproducibility backstop.
 Git's shipped companions no longer contain DWARF against which to check
 source-path remapping. Its recipe still supplies the canonical compiler
 remaps, but its package check does not prove the pre-strip line program's
-paths. Static-archive `DW_AT_comp_dir` checks for zlib, curl and LibreSSL remain, as does the td-boot double-build oracle above; neither
+paths. Static-archive `DW_AT_comp_dir` checks for zlib remain, as does the td-boot double-build oracle above; neither
 is a Git-specific pre-strip DWARF proof.
 
 ## 3. Collection boundary

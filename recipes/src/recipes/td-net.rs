@@ -3,11 +3,13 @@ use crate::types::Recipe;
 /// td-net, the control-plane network multicall, built as a TARGET recipe from
 /// the checkout's own trees (APPLICATIONS.md §W.8): the first control-plane
 /// program rebuilt on the target toolchain, as AGENTS.md foresees, and the
-/// target's one network client, for the `td-fetchd` applet the jailed
-/// applications reach over a socket. `net/` is the crate; `engine/` is its
-/// path dependency. The engine also shares td-civil calendar conversion and
-/// td-fs helpers, and td-primitives is its TLS and signature cryptography; all are staged
-/// beside it and the crate's manifest names the main tree. The lock is the crate's own committed one,
+/// target's one network client (APPLICATIONS.md §B.6): among others the
+/// `td-fetchd` applet the jailed applications reach over a socket, Git's HTTP(S)
+/// helpers and `td-curl`. `net/` is the crate; `engine/` is its path
+/// dependency. The engine also shares td-civil calendar conversion and
+/// td-fs helpers, and td-primitives is its TLS and signature cryptography; all
+/// are staged beside it and the crate's manifest names the main tree. The lock
+/// is the crate's own committed one,
 /// and the closure is the tier's reviewed vendored set; nothing else enters.
 /// Static, as every td-owned program on the image, so the system tree's
 /// `/bin/td-fetchd` link needs no loader.

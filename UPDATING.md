@@ -76,8 +76,6 @@ major counts until it is ported.
 
 Read a `-> NEW` as "upstream has released NEW", then decide:
 
-- LibreSSL's directory carries development releases beside stable ones. Take
-  the release libressl.org names as the latest stable.
 - A Git-tag watch (zlib, Nerd Fonts, the ripgrep
   seed) can see a tag before its release tarball exists. Fetch the tarball
   before trusting the tag.
@@ -93,7 +91,7 @@ table.
 
 Before bumping, read the release notes and advisories between the pin and
 the target: what changed, what it fixes, and whether a fix reaches td's
-build (curl's `--without-nghttp2` build is immune to an HTTP/2 bug, for
+build (a recipe that builds a feature out is immune to a bug in it, for
 example). The commit message records the advisories each bump takes.
 
 # Source pins
@@ -113,14 +111,13 @@ and its licences), per commit.
    | --- | --- |
    | kernel.org (Linux, Git) | `sha256sums.asc` in the release directory |
    | curl's CA extract | `cacert-DATE.pem.sha256` beside the file |
-   | LibreSSL | the `SHA256` file in its directory |
    | OpenSSH | the release notes, `txt/release-X.Y`, in base64 |
    | zlib | zlib.net's release line, and the GitHub release asset's digest |
    | crates.io | the version's `cksum` in the sparse index |
    | Rust | `xz_hash` in that date's `channel-rust-stable.toml` |
    | GitHub release assets (Nerd Fonts, the ripgrep seed) | the asset's digest |
 
-   Where upstream publishes only a signature (curl tarballs, tzdata), verify
+   Where upstream publishes only a signature (tzdata), verify
    it with the maintainer's key, then hash the verified bytes. Where it
    publishes neither (json-c's S3 tarball, LVM2's sha512 list, popt), hash
    the download and cross-check it against a second upstream copy or digest.
@@ -134,10 +131,10 @@ and its licences), per commit.
    ```
 
    Recipes name their version
-   (`Recipe::mesboot("curl-x86-64", "NEW-VERSION")`), and their tests,
+   (`Recipe::mesboot("git-x86-64", "NEW-VERSION")`), and their tests,
    design documents and other crates' fixtures often repeat it. Hits that
    only happen to match stay unchanged (td-mta's `421 4.3.2` SMTP replies
-   are enhanced status codes, not a LibreSSL version).
+   are enhanced status codes, not a version).
 
 4. Fetch and verify the new source and regenerate the seed digest table,
    as `DEVELOPMENT.md` gives it (rebuild the evaluator, warm the cache, then

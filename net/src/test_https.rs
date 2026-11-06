@@ -1,7 +1,7 @@
 // td-test-https — a test HTTPS origin and its verifying client, on the
 // rustls and td-primitives this crate already links.
 // The system image's autotest-only Firefox proof uses it in place of
-// LibreSSL's `openssl req`/`x509`/`s_server`/`s_client`
+// `openssl req`/`x509`/`s_server`/`s_client`
 // (APPLICATIONS.md §B.8 item 6):
 //
 //   td-test-https mint DIR
@@ -30,10 +30,13 @@
 //       request per connection, and print `listening ADDR` once bound.
 //       Paths starting /moved, /elsewhere or /to-http redirect, /forbidden
 //       and /dumb answer as their names say, /v0 ignores a client's protocol
-//       v2 request, /chunked answers in chunks, and /trickle answers a byte at
-//       a time. `--auth` asks for Basic everywhere but /moved. `--log` records
-//       each request's line and what it carried. git-remote-https's tests run
-//       against this.
+//       v2 request, /chunked answers in chunks, /trickle answers a byte at a
+//       time, /short ends before its Content-Length, /short-chunks before its
+//       last chunk, /unframed gives no length, /odd-encoding has a coding that
+//       only looks chunked, and /bad-location redirects to a name that is not
+//       ASCII. `--auth` asks for Basic everywhere but /moved. `--log` records each
+//       request's line and what it carried. git-remote-https's and td-curl's
+//       tests run against this.
 //
 // It is a fixture, not a web server: no keep-alive, no ranges, no
 // directories, and nothing outside DIR's own flat names. Every connection,
@@ -862,6 +865,10 @@ enum Framing {
     Length,
     Chunks,
     Trickle,
+    Short,
+    ShortChunks,
+    Unframed,
+    OddEncoding,
 }
 
 impl GitResponse {
@@ -893,10 +900,17 @@ fn respond_git(config: Arc<ServerConfig>, site: &GitSite, socket: Deadline) -> R
     site.record(&request, &body);
     let response = site.answer(&request, body);
     let mut out = format!("HTTP/1.1 {}\r\nConnection: close\r\n", response.status);
-    if response.framing == Framing::Length {
-        out.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
-    } else {
-        out.push_str("Transfer-Encoding: chunked\r\n");
+    match response.framing {
+        Framing::Length => out.push_str(&format!("Content-Length: {}\r\n", response.body.len())),
+        Framing::Short => out.push_str(&format!(
+            "Content-Length: {}\r\n",
+            response.body.len() + 100
+        )),
+        Framing::Chunks | Framing::Trickle | Framing::ShortChunks => {
+            out.push_str("Transfer-Encoding: chunked\r\n")
+        }
+        Framing::Unframed => {}
+        Framing::OddEncoding => out.push_str("Transfer-Encoding: gzip, xchunked\r\n"),
     }
     for (name, value) in &response.headers {
         out.push_str(&format!("{name}: {value}\r\n"));
@@ -907,7 +921,7 @@ fn respond_git(config: Arc<ServerConfig>, site: &GitSite, socket: Deadline) -> R
         .and_then(|()| stream.flush())
         .map_err(|e| e.to_string())?;
     match response.framing {
-        Framing::Length => stream
+        Framing::Length | Framing::Short | Framing::Unframed | Framing::OddEncoding => stream
             .write_all(&response.body)
             .map_err(|e| e.to_string())?,
         Framing::Chunks => {
@@ -920,6 +934,11 @@ fn respond_git(config: Arc<ServerConfig>, site: &GitSite, socket: Deadline) -> R
             }
             stream.write_all(b"0\r\n\r\n").map_err(|e| e.to_string())?;
         }
+        Framing::ShortChunks => stream
+            .write_all(format!("{:x}\r\n", response.body.len()).as_bytes())
+            .and_then(|()| stream.write_all(&response.body))
+            .and_then(|()| stream.write_all(b"\r\n"))
+            .map_err(|e| e.to_string())?,
         // Often enough for any per-read timeout, too little for a rate. It
         // ends when the client hangs up or the connection's budget does.
         Framing::Trickle => loop {
@@ -940,7 +959,7 @@ impl GitSite {
             return;
         };
         let line = format!(
-            "{} {}?{} auth={} chunked={} protocol={} agent={} bytes={}\n",
+            "{} {}?{} auth={} chunked={} protocol={} agent={} accept={} bytes={}\n",
             request.method,
             request.path,
             request.query,
@@ -948,6 +967,13 @@ impl GitSite {
             request.chunked(),
             request.header("git-protocol").unwrap_or("none"),
             request.header("user-agent").unwrap_or("none"),
+            request
+                .headers
+                .iter()
+                .filter(|(key, _)| key == "accept")
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+                .join("|"),
             body.len(),
         );
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -990,6 +1016,21 @@ impl GitSite {
         }
         if path.starts_with("/dumb/") {
             return GitResponse::text("200 OK", "0123 refs/heads/main\n");
+        }
+        for (start, framing) in [
+            ("/short/", Framing::Short),
+            ("/short-chunks/", Framing::ShortChunks),
+            ("/unframed/", Framing::Unframed),
+            ("/odd-encoding/", Framing::OddEncoding),
+        ] {
+            if path.starts_with(start) {
+                let mut response = GitResponse::text("200 OK", "not all of it\n");
+                response.framing = framing;
+                return response;
+            }
+        }
+        if path.starts_with("/bad-location/") {
+            return GitResponse::redirect("/caf\u{e9}".to_string());
         }
         if path.starts_with("/trickle/") {
             return GitResponse {

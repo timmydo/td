@@ -34,17 +34,6 @@ const PINS: &[PinDef] = &[
         version: "2026-11-05",
     },
     PinDef {
-        key: "curl-x86-64-source",
-        aliases: &[],
-        // curl 8.23.0 supplies the curl command. The recipe keeps only a static
-        // build and disables every protocol and optional dependency outside
-        // the reviewed HTTP(S) closure.
-        url: "https://curl.se/download/curl-8.23.0.tar.xz",
-        sha256: "8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5",
-        file: "curl-8.23.0.tar.xz",
-        version: "8.23.0",
-    },
-    PinDef {
         key: "fd-source",
         aliases: &[],
         url: "https://static.crates.io/crates/fd-find/fd-find-10.5.1.crate",
@@ -148,18 +137,6 @@ const PINS: &[PinDef] = &[
         sha256: "69cdedc8a4f57a30d68e4f045af8b9cce0ec3b1a6e7eec1ad41737c894f26790",
         file: "nerd-fonts-3.5.1-weather-icons-OFL.txt",
         version: "3.5.1",
-    },
-    PinDef {
-        key: "libressl-x86-64-source",
-        aliases: &[],
-        // LibreSSL 4.4.0 supplies the OpenSSL-compatible TLS implementation
-        // for curl. The recipe builds only static archives and disables
-        // upstream assembly so every eventual shipped instruction remains on
-        // td's checked frame-pointer path.
-        url: "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.4.0.tar.gz",
-        sha256: "7d02522ad5070b9adb32eb253ecabce181184a3750cf65abac0675ee908687c1",
-        file: "libressl-4.4.0.tar.gz",
-        version: "4.4.0",
     },
     PinDef {
         key: "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
@@ -661,7 +638,7 @@ mod tests {
 
     #[test]
     fn catalog_carries_all_legacy_source_locks() {
-        assert_eq!(all().len(), 55);
+        assert_eq!(all().len(), 53);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

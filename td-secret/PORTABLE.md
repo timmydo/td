@@ -395,8 +395,8 @@ surface when its backend exists; do not expose raw key-taking methods to
 td-pass to stand in for authentication. Current application credentials do
 not acquire portable-vault access by sharing code or an unlocked session.
 
-The production credential layer remains dependency-free. Neither LibreSSL,
-libfido2 nor a host crypto library may supply the missing P-256 key agreement,
+The production credential layer remains dependency-free. Neither a C TLS
+library, libfido2 nor a host crypto library may supply the missing P-256 key agreement,
 PIN protocol AES or TPM-independent signature verification. Native linking,
 dynamic loading, subprocess crypto and vendoring external implementations
 do not evade this requirement. Host reference implementations may generate

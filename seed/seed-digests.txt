@@ -11,11 +11,9 @@
 # is self-defeating: the runner
 # re-derives from the pins every run and reds on disagreement.
 ca-certificates-source 4m4dzx6xlpf0zph86c0z1xq0frx6pzvf-ca-certificates-source
-curl-x86-64-source s38hackr0p194d351xs9pc71gjknclls-curl-x86-64-source
 fd-source ky623w2y3nfb1ddjv8yrnv7bp70dw5c7-fd-source
 git-x86-64-source dsg8dzp8rizb8x2jfjzs50wqmlq29x44-git-x86-64-source
 jetbrains-mono-nerd-font-source 632myin1d84lnr23d9ma4f4iwgs13bk2-jetbrains-mono-nerd-font-source
-libressl-x86-64-source iad2rcbcs4301jyahxbd8cxv41y1r97h-libressl-x86-64-source
 linux-firmware-amdgpu-dcn-3-1-4-dmcub-source 639m8ngg6xa7zy4g29q6r54zx4n6y3dl-linux-firmware-amdgpu-dcn-3-1-4-dmcub-source
 linux-firmware-amdgpu-gc-11-0-1-imu-source msiwa2192ss51pk94nvanddcgbhky40s-linux-firmware-amdgpu-gc-11-0-1-imu-source
 linux-firmware-amdgpu-gc-11-0-1-me-source ws3ykq42ikpzihdgwxmkacim9cfkxw1w-linux-firmware-amdgpu-gc-11-0-1-me-source

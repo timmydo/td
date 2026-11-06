@@ -8425,20 +8425,17 @@ mod tests {
         assert!(answer.pins.is_empty());
         // Members built in or imported from Debian: the kernel, glibc and
         // libgcc, the upstream toolchain's runtime,
-        // zlib, OpenSSH, Git with curl and
-        // LibreSSL, and every Rust recipe: td-link, whose throwaway first
+        // zlib, OpenSSH, Git and every Rust recipe: td-link, whose throwaway first
         // stage the root's GCC links, each Cargo recipe, whose build
         // scripts' C the root's GCC compiles, and each direct-rustc
         // recipe, whose companions the root's objcopy splits.
         assert_eq!(
             answer.build_root_members,
             [
-                "curl-x86-64",
                 "fd",
                 "gcc-runtime",
                 "git-x86-64",
                 "glibc-x86-64",
-                "libressl-x86-64",
                 "linux-x86-64",
                 "openssh-x86-64",
                 "ripgrep",
@@ -8874,8 +8871,8 @@ chmod 755 '{}'
         let _ = fs::remove_dir_all(&lw);
     }
 
-    // The cross-worktree failure this guards happened while adding LibreSSL and
-    // then again while adding the CA bundle. A's new source was cold, so the old
+    // The cross-worktree failure this guards happened while adding a TLS library
+    // and then again while adding the CA bundle. A's new source was cold, so the old
     // path interned it into the db keyed by the ancestor table and only THEN
     // called `seed_digests::require`. B still used that ancestor table; its next
     // build authenticated the whole shared db and rejected A's unpinned row.
@@ -10863,8 +10860,8 @@ chmod 755 '{}'
                 "{stem}: reads td-compositor in its closure {expected}, selected {why:?}"
             );
         }
-        assert!(!toolkit.contains_key("curl-x86-64-test"), "{toolkit:?}");
-        assert!(!reached.contains_key("curl-x86-64-test"), "{reached:?}");
+        assert!(!toolkit.contains_key("td-netd-test"), "{toolkit:?}");
+        assert!(!reached.contains_key("td-netd-test"), "{reached:?}");
         // What the shared modules compile in reaches every check, by its
         // file, by the directory holding it, or by a directory inside it.
         let every: BTreeSet<String> = all

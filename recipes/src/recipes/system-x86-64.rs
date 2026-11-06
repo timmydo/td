@@ -1566,9 +1566,9 @@ mod svc_timeouts {
     /// `td-netd up` is DHCP with bounded retries. Under the nettest token it also
     /// resolves and reaches the upstream, then each of Git's two requests has its
     /// helper's 30-second resolve and 60-second connect bounds plus the explicit
-    /// 10-second low-speed bound, on its response head and again on its body. Keep
-    /// the service above twice that reviewed 246-second worst case. A server keeping
-    /// above the limit is not bounded here.
+    /// 10-second low-speed bound, on its response head and again on its body, then
+    /// td-curl's 60-second download. Keep the service above twice that reviewed
+    /// 306-second worst case. A server keeping above the limit is not bounded here.
     pub const NETUP: u32 = 700;
     /// Brings up loopback and mints one P-256 test authority and server
     /// identity in the slow VM; ECDSA keys take milliseconds, the rest is
@@ -4105,7 +4105,8 @@ fn build_netup() -> String {
          /bin/rm -rf \"$HOME\" \"$XDG_CONFIG_HOME\" && \
          /bin/mkdir -p \"$HOME\" \"$XDG_CONFIG_HOME\" || exit 1; \
          r=$(/bin/git ls-remote {GIT_HTTPS_TEST_URL} HEAD) && \
-         set -- $r && [ \"$#\" = 2 ] && [ \"${{#1}}\" = 40 ] && [ \"$2\" = HEAD ]' && \
+         set -- $r && [ \"$#\" = 2 ] && [ \"${{#1}}\" = 40 ] && [ \"$2\" = HEAD ] && \
+         /bin/curl -fsSL --proto =https -m 60 -o /dev/null \"{GIT_HTTPS_TEST_URL}/info/refs?service=git-upload-pack\"' && \
          echo {GIT_HTTPS_RUNTIME_MARKER}; \
          fi\n"
     )
@@ -4217,7 +4218,7 @@ const IMMUTABLE_ETC: &[ImmutableEtc] = &[
     ImmutableEtc {
         etc: "ssl/certs/ca-certificates.crt",
         target: "{in:ca-certificates}/share/ca-certificates/ca-bundle.crt",
-        why: "The Git HTTP transport and the curl command need this CA bundle path, \
+        why: "The Git HTTP transport and td-curl need this CA bundle path, \
               while the pinned Mozilla extract remains immutable store content",
         desktop_only: false,
     },
@@ -5364,7 +5365,6 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         "{in:fd}".into(),
         "{in:openssh-x86-64}".into(),
         "{in:git-x86-64}".into(),
-        "{in:curl-x86-64}".into(),
         "{in:gcc-runtime}".into(),
         "{in:zlib-x86-64}".into(),
         "{in:td-link-runtime}".into(),
@@ -5418,7 +5418,9 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         // Git's HTTP(S) transport, which it finds on PATH as a helper.
         ("git-remote-http", "{in:td-net}/bin/td-net"),
         ("git-remote-https", "{in:td-net}/bin/td-net"),
-        ("curl", "{in:curl-x86-64}/bin/curl"),
+        // A small download client that says it is not curl (net/src/td_curl.rs).
+        ("td-curl", "{in:td-net}/bin/td-net"),
+        ("curl", "{in:td-net}/bin/td-net"),
         ("git-receive-pack", "{in:git-x86-64}/bin/git-receive-pack"),
         (
             "git-upload-archive",
@@ -6598,7 +6600,6 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "ripgrep",
                 "fd",
                 "git-x86-64",
-                "curl-x86-64",
                 "ca-certificates",
                 "tzdata",
                 "jetbrains-mono-nerd-font",
@@ -8835,9 +8836,9 @@ mod tests {
             ),
             (
                 svc_timeouts::NETUP,
-                246,
+                306,
                 "DHCP and td-netd resolve/reach, then two requests' 30s resolve, 60s connect \
-                 and two 10s low-speed bounds in git-remote-https",
+                 and two 10s low-speed bounds in git-remote-https, then td-curl's 60s -m",
             ),
             (
                 svc_timeouts::BOOTSUCCESS,
@@ -10103,7 +10104,6 @@ mod tests {
             "{in:fd}".to_string(),
             "{in:openssh-x86-64}".to_string(),
             "{in:git-x86-64}".to_string(),
-            "{in:curl-x86-64}".to_string(),
             "{in:gcc-runtime}".to_string(),
             "{in:zlib-x86-64}".to_string(),
             "{in:td-link-runtime}".to_string(),
@@ -10144,16 +10144,13 @@ mod tests {
                 "/bin/{name} names a C tool the image no longer ships"
             );
         }
-        // curl links LibreSSL's archives statically; the image carries none
-        // of it and no `openssl` command.
+        // TLS is td-net's rustls; no `openssl` command ships.
         assert!(
-            !steps.iter().any(|step| match step {
-                Step::CopyTree { from, .. } => from.contains("libressl"),
-                Step::Symlink { target, link } =>
-                    target.contains("libressl") || link.ends_with("/bin/openssl"),
-                _ => false,
-            }),
-            "LibreSSL entered the image"
+            !steps.iter().any(|step| matches!(
+                step,
+                Step::Symlink { link, .. } if link.ends_with("/bin/openssl")
+            )),
+            "an openssl command entered the image"
         );
         for (name, target) in [
             ("rg", "{in:ripgrep}/bin/rg"),
@@ -10161,7 +10158,8 @@ mod tests {
             ("git", "{in:git-x86-64}/bin/git"),
             ("git-remote-http", "{in:td-net}/bin/td-net"),
             ("git-remote-https", "{in:td-net}/bin/td-net"),
-            ("curl", "{in:curl-x86-64}/bin/curl"),
+            ("td-curl", "{in:td-net}/bin/td-net"),
+            ("curl", "{in:td-net}/bin/td-net"),
             ("git-receive-pack", "{in:git-x86-64}/bin/git-receive-pack"),
             (
                 "git-upload-archive",
@@ -10227,12 +10225,7 @@ mod tests {
                 "shipped input {required} must be declared"
             );
         }
-        for forbidden in [
-            "libressl-x86-64",
-            "gcc-runtime-stage1",
-            "rust-toolchain",
-            "td-link",
-        ] {
+        for forbidden in ["gcc-runtime-stage1", "rust-toolchain", "td-link"] {
             assert!(
                 !native_inputs.iter().any(|input| input == forbidden),
                 "build-only input {forbidden} must not be a direct system input"
@@ -14593,6 +14586,9 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 && !netup.contains("GIT_SSL_NO_VERIFY")
                 && netup.contains("GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt")
                 && netup.contains(&format!("/bin/git ls-remote {GIT_HTTPS_TEST_URL} HEAD"))
+                && netup.contains(&format!(
+                    "/bin/curl -fsSL --proto =https -m 60 -o /dev/null \"{GIT_HTTPS_TEST_URL}/info/refs?service=git-upload-pack\""
+                ))
                 && netup.contains(&format!("echo {GIT_HTTPS_RUNTIME_MARKER}")),
             "the Git HTTPS marker must follow an isolated, noninteractive, verified upstream query"
         );
@@ -17210,7 +17206,6 @@ mod server_tests {
             sorted,
             [
                 "ca-certificates",
-                "curl-x86-64",
                 "fd",
                 "gcc-runtime",
                 "git-x86-64",

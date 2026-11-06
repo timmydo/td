@@ -41,12 +41,14 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustls::pki_types::{pem::PemObject, CertificateDer};
 use ureq::config::AutoHeaderValue;
-use ureq::{Agent, Proxy, ProxyProtocol, SendBody};
+use ureq::{Agent, SendBody};
 
-const DEFAULT_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
-const MAX_CA_BUNDLE: u64 = 16 * 1024 * 1024;
+use crate::client::{
+    self, load_tls, printable, select_proxy, usable_proxy, CONNECT_TIMEOUT, DEFAULT_CA_BUNDLE,
+    RESOLVE_TIMEOUT, STALL_TIMEOUT,
+};
+
 /// A repository with millions of refs advertises hundreds of megabytes.
 const MAX_ADVERTISEMENT: u64 = 1024 * 1024 * 1024;
 /// A v2 advertisement is capabilities, not refs: this is far past any real one.
@@ -56,12 +58,6 @@ const MAX_ERROR_BODY: u64 = 64 * 1024;
 const POST_BUFFER: usize = 1024 * 1024;
 const MAX_PACKET: usize = 65520;
 const MAX_REDIRECTS: u32 = 5;
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Shared geometrically among a host's addresses, TLS handshake included.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long a connection may send nothing. A server preparing a pack sends
-/// keepalives, so this is a dead peer, not a slow one.
-const STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Environment that asks for something this transport does not do.
 const REFUSED_ENVIRONMENT: &[&str] = &[
@@ -117,7 +113,8 @@ pub fn run(args: &[String]) {
     if let Err(error) = result {
         // Empty when Git has already been told, as a rejected push's status.
         if !error.is_empty() {
-            eprintln!("fatal: {error}");
+            // A certificate's name can reach a message.
+            eprintln!("fatal: {}", printable(error.as_bytes()));
         }
         std::process::exit(128);
     }
@@ -307,20 +304,15 @@ impl Target {
         self.base.get(..end).unwrap_or(&self.base)
     }
 
-    /// `origin`, with what writes one host's name two ways made the same.
     fn origin_key(&self) -> String {
-        let origin = self.origin().to_ascii_lowercase();
-        let default = if self.https { ":443" } else { ":80" };
-        match origin.strip_suffix(default) {
-            Some(bare) => bare.to_string(),
-            None => origin,
-        }
+        client::origin_key(self.origin(), self.https)
     }
 
     /// The target a redirect of `requested` to `location` moves to, whose
     /// `info/refs` request must end in the `tail` that was asked for.
     fn redirected(&self, requested: &str, location: &str, tail: &str) -> Result<Self, String> {
-        let absolute = absolute_location(self, requested, location)?;
+        let absolute = client::absolute_location(self.origin(), self.https, requested, location)
+            .map_err(|reason| format!("'{}' {reason}", self.base))?;
         let base = absolute.strip_suffix(tail).ok_or_else(|| {
             format!(
                 "'{}' redirected somewhere that is not a Git repository",
@@ -347,44 +339,6 @@ impl Target {
         }
         Ok(next)
     }
-}
-
-/// A redirect's `Location` as an absolute URL. A relative one holding a dot
-/// segment is refused rather than resolved.
-fn absolute_location(target: &Target, requested: &str, location: &str) -> Result<String, String> {
-    let lower = location.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        return Ok(location.to_string());
-    }
-    if location.contains("://") {
-        return Err(format!(
-            "'{}' redirected to a scheme this transport does not speak",
-            target.base
-        ));
-    }
-    let path = location.split('?').next().unwrap_or(location);
-    if path
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
-    {
-        return Err(format!(
-            "'{}' redirected with a dot segment, which is refused",
-            target.base
-        ));
-    }
-    if let Some(rest) = location.strip_prefix("//") {
-        let scheme = if target.https { "https" } else { "http" };
-        return Ok(format!("{scheme}://{rest}"));
-    }
-    if location.starts_with('/') {
-        return Ok(format!("{}{location}", target.origin()));
-    }
-    let directory = requested.split('?').next().unwrap_or(requested);
-    let directory = directory
-        .rfind('/')
-        .and_then(|at| directory.get(..=at))
-        .unwrap_or(directory);
-    Ok(format!("{directory}{location}"))
 }
 
 fn percent_decode(text: &str) -> Result<String, String> {
@@ -569,6 +523,13 @@ impl Settings {
         if let Some(value) = lookup("GIT_HTTP_USER_AGENT") {
             user_agent = Some(value);
         }
+        // ureq unwraps this into a header value, and CONNECT would carry it raw.
+        if user_agent
+            .as_deref()
+            .is_some_and(|text| text.bytes().any(|b| b.is_ascii_control() && b != b'\t'))
+        {
+            return Err("the HTTP user agent may not hold a control character".to_string());
+        }
         let low_speed = (low_speed_limit > 0 && low_speed_time > 0).then(|| LowSpeed {
             limit: low_speed_limit,
             time: Duration::from_secs(low_speed_time),
@@ -576,7 +537,7 @@ impl Settings {
         Ok(Self {
             ca_bundle: ca_bundle.unwrap_or_else(|| DEFAULT_CA_BUNDLE.to_string()),
             follow_redirects,
-            proxy: select_proxy(target, configured_proxy.clone(), lookup),
+            proxy: select_proxy(target.https, &target.host, configured_proxy.clone(), lookup),
             configured_proxy,
             low_speed,
             post_buffer,
@@ -683,102 +644,6 @@ impl<R: Read> Read for Paced<R> {
         }
         Ok(read)
     }
-}
-
-/// As Git and curl choose: `remote.*.proxy` or `http.proxy`, where an empty
-/// value means none, then the scheme's variable and `all_proxy`. Plain HTTP
-/// reads only the lower-case `http_proxy`, which a CGI request cannot set.
-/// `no_proxy` wins over all of them.
-fn select_proxy(
-    target: &Target,
-    configured: Option<String>,
-    lookup: &dyn Fn(&str) -> Option<String>,
-) -> Option<String> {
-    let names: &[&str] = if target.https {
-        &["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]
-    } else {
-        &["http_proxy", "all_proxy", "ALL_PROXY"]
-    };
-    let chosen = match configured {
-        Some(value) => value,
-        None => names
-            .iter()
-            .find_map(|name| lookup(name).filter(|value| !value.is_empty()))?,
-    };
-    if chosen.is_empty() {
-        return None;
-    }
-    let bypass = lookup("no_proxy").or_else(|| lookup("NO_PROXY"));
-    if bypass.is_some_and(|list| no_proxy_matches(&list, &target.host)) {
-        return None;
-    }
-    Some(chosen)
-}
-
-/// A host matches an entry it equals or is a subdomain of; `*` matches all.
-fn no_proxy_matches(list: &str, host: &str) -> bool {
-    let host = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_ascii_lowercase();
-    list.split(',').any(|entry| {
-        let entry = entry
-            .trim()
-            .trim_start_matches('.')
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_ascii_lowercase();
-        !entry.is_empty()
-            && (entry == "*"
-                || host == entry
-                || host
-                    .strip_suffix(entry.as_str())
-                    .is_some_and(|prefix| prefix.ends_with('.')))
-    })
-}
-
-fn load_tls(bundle: &str, required: bool) -> Result<ureq::tls::TlsConfig, String> {
-    let bytes = match read_bundle(bundle) {
-        Ok(bytes) => bytes,
-        // A plain http remote has no use for the store. A redirect to https is
-        // another origin, so it comes back here as required.
-        Err(_) if !required => {
-            return Ok(crate::fetchd::tls(
-                ureq::tls::RootCerts::new_with_certs(&[]),
-            ))
-        }
-        Err(error) => return Err(error),
-    };
-    let mut roots = Vec::new();
-    let mut check = rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_slice_iter(&bytes) {
-        let cert = cert.map_err(|e| format!("CA bundle {bundle}: {e}"))?;
-        // One root rustls cannot parse is one root not trusted; the rest of a
-        // pinned store stands, and an all-unusable one fails below.
-        let der = ureq::tls::Certificate::from_der(cert.as_ref()).to_owned();
-        if check.add(cert).is_ok() {
-            roots.push(der);
-        }
-    }
-    if roots.is_empty() {
-        return Err(format!("CA bundle {bundle} holds no usable certificate"));
-    }
-    Ok(crate::fetchd::tls(ureq::tls::RootCerts::new_with_certs(
-        &roots,
-    )))
-}
-
-fn read_bundle(path: &str) -> Result<Vec<u8>, String> {
-    // /etc/ssl's bundle is a symlink into the store, so a link is expected.
-    let file = std::fs::File::open(path).map_err(|e| format!("CA bundle {path}: {e}"))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_CA_BUNDLE + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("CA bundle {path}: {e}"))?;
-    if bytes.len() as u64 > MAX_CA_BUNDLE {
-        return Err(format!("CA bundle {path} is too large"));
-    }
-    Ok(bytes)
 }
 
 // ---- options ---------------------------------------------------------------
@@ -978,20 +843,6 @@ fn chomp(line: &[u8]) -> &[u8] {
 fn server_error(line: &[u8]) -> Option<String> {
     line.strip_prefix(b"ERR ")
         .map(|message| format!("remote error: {}", printable(chomp(message))))
-}
-
-/// A server's text with its control characters made visible.
-fn printable(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .chars()
-        .map(|ch| {
-            if ch.is_control() && ch != '\t' {
-                '?'
-            } else {
-                ch
-            }
-        })
-        .collect()
 }
 
 #[derive(Debug)]
@@ -1634,8 +1485,12 @@ impl Client {
                         // with the old one's and a no_proxy host could carry a
                         // request past the proxy meant for the new one.
                         let lookup = |name: &str| std::env::var(name).ok();
-                        self.settings.proxy =
-                            select_proxy(&next, self.settings.configured_proxy.clone(), &lookup);
+                        self.settings.proxy = select_proxy(
+                            next.https,
+                            &next.host,
+                            self.settings.configured_proxy.clone(),
+                            &lookup,
+                        );
                         self.agent = None;
                     }
                     if verbosity > 0 {
@@ -1915,21 +1770,6 @@ impl Client {
     }
 }
 
-/// A proxy this client can use, or why not. The value may hold a password, so
-/// no error says what it was.
-fn usable_proxy(value: &str) -> Result<Proxy, String> {
-    let proxy = Proxy::new(value)
-        .map_err(|_| "the configured HTTP proxy is not a valid proxy URL".to_string())?;
-    if !matches!(proxy.protocol(), ProxyProtocol::Http | ProxyProtocol::Https) {
-        return Err("td's HTTP transport does not support a SOCKS proxy".to_string());
-    }
-    // Curl and this client's defaults differ, so saying one is the only safe way.
-    if proxy.uri().port_u16().is_none() {
-        return Err("the configured HTTP proxy names no port".to_string());
-    }
-    Ok(proxy)
-}
-
 fn send_pack_arguments(options: &Options, base: &str) -> Vec<String> {
     let mut args = vec![
         "send-pack".to_string(),
@@ -2171,6 +2011,7 @@ mod tests {
             settings(&[("http.sslcainfo", Some(""))]).unwrap().ca_bundle,
             DEFAULT_CA_BUNDLE
         );
+        assert!(settings(&[("http.useragent", Some("a\nb"))]).is_err());
         // A bare key is a boolean's true: it asks.
         assert!(settings(&[("http.emptyauth", None)]).is_err());
 
@@ -2311,34 +2152,49 @@ mod tests {
             "ALL_PROXY" => Some("http://all".to_string()),
             _ => None,
         };
-        assert_eq!(select_proxy(&https, None, &env).unwrap(), "http://secure");
+        assert_eq!(
+            select_proxy(https.https, &https.host, None, &env).unwrap(),
+            "http://secure"
+        );
         // HTTP_PROXY is never read: a CGI request's Proxy header sets it.
-        assert_eq!(select_proxy(&http, None, &env).unwrap(), "http://all");
+        assert_eq!(
+            select_proxy(http.https, &http.host, None, &env).unwrap(),
+            "http://all"
+        );
         // Configuration beats the environment, and empty means none.
         assert_eq!(
-            select_proxy(&https, Some("http://set".to_string()), &env).unwrap(),
+            select_proxy(
+                https.https,
+                &https.host,
+                Some("http://set".to_string()),
+                &env
+            )
+            .unwrap(),
             "http://set"
         );
-        assert_eq!(select_proxy(&https, Some(String::new()), &env), None);
+        assert_eq!(
+            select_proxy(https.https, &https.host, Some(String::new()), &env),
+            None
+        );
         let bypass = |name: &str| match name {
             "https_proxy" => Some("http://secure".to_string()),
             "no_proxy" => Some("other.test, .a.test".to_string()),
             _ => None,
         };
-        assert_eq!(select_proxy(&https, None, &bypass), None);
+        assert_eq!(select_proxy(https.https, &https.host, None, &bypass), None);
     }
 
     #[test]
     fn no_proxy_matches_a_domain_not_a_suffix() {
-        assert!(no_proxy_matches("a.test", "a.test"));
-        assert!(no_proxy_matches("a.test", "sub.a.test"));
-        assert!(no_proxy_matches(".a.test", "sub.a.test"));
-        assert!(no_proxy_matches("*", "anything"));
-        assert!(no_proxy_matches("localhost,127.0.0.1,::1", "[::1]"));
-        assert!(no_proxy_matches("[::1]", "[::1]"));
-        assert!(!no_proxy_matches("a.test", "bad-a.test"));
-        assert!(!no_proxy_matches("", "a.test"));
-        assert!(!no_proxy_matches(",,", "a.test"));
+        assert!(client::no_proxy_matches("a.test", "a.test"));
+        assert!(client::no_proxy_matches("a.test", "sub.a.test"));
+        assert!(client::no_proxy_matches(".a.test", "sub.a.test"));
+        assert!(client::no_proxy_matches("*", "anything"));
+        assert!(client::no_proxy_matches("localhost,127.0.0.1,::1", "[::1]"));
+        assert!(client::no_proxy_matches("[::1]", "[::1]"));
+        assert!(!client::no_proxy_matches("a.test", "bad-a.test"));
+        assert!(!client::no_proxy_matches("", "a.test"));
+        assert!(!client::no_proxy_matches(",,", "a.test"));
     }
 
     #[test]

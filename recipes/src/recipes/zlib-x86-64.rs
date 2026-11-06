@@ -6,7 +6,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // zlib 1.4 for x86_64: the shared libz.so.1 the upstream Rust toolchain's
 // libLLVM and rust-lld need at run time (rust-toolchain links it into its
-// lib/), and the static libz.a curl, Git and td-util-test's
+// lib/), and the static libz.a Git and td-util-test's
 // minigzip link. Built in the Debian build root: Debian's gcc compiles
 // zlib's sources against a sysroot of td glibc under the shipped target
 // profile (`build_root_glibc_cc`), and Debian's ld links the library from td

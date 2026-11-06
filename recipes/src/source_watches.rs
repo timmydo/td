@@ -53,13 +53,6 @@ const WATCHES: &[(&str, Watch)] = &[
         },
     ),
     (
-        "curl-x86-64-source",
-        Watch::Index {
-            index: "https://curl.se/download/",
-            pattern: "curl-{}.tar.xz",
-        },
-    ),
-    (
         "fd-source",
         Watch::Index {
             index: "https://index.crates.io/fd/-f/fd-find",
@@ -83,13 +76,6 @@ const WATCHES: &[(&str, Watch)] = &[
     ("nerd-fonts-powerline-extra-license-source", NERD_FONTS),
     ("nerd-fonts-powerline-symbols-license-source", NERD_FONTS),
     ("nerd-fonts-weather-icons-license-source", NERD_FONTS),
-    (
-        "libressl-x86-64-source",
-        Watch::Index {
-            index: "https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/",
-            pattern: "libressl-{}.tar.gz",
-        },
-    ),
     (
         "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
         LINUX_FIRMWARE,

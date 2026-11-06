@@ -32,6 +32,7 @@
 // `td-net subst`. Invoking a bare
 // `td-net` with no applet selector is a usage error (exit 2) by design.
 mod app;
+mod client;
 mod egress;
 mod feed;
 mod fetch;
@@ -52,6 +53,7 @@ use td_engine::elf;
 mod rust_toolchain;
 mod sig;
 mod subst;
+mod td_curl;
 mod test_https;
 #[cfg(test)]
 #[path = "../../td-fs/src/temp_dir.rs"]
@@ -73,7 +75,20 @@ fn main() {
     // takes the process default, and with no built-in provider panics without
     // one. This is before any applet, so no path can reach TLS without it.
     let _ = tls_crypto::provider().install_default();
-    let args: Vec<String> = std::env::args().collect();
+    let Ok(args) = std::env::args_os()
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<Vec<String>, _>>()
+    else {
+        let arg0 = std::env::args_os().next().unwrap_or_default();
+        let base = std::path::Path::new(&arg0).file_name().unwrap_or_default();
+        let name = if base == "curl" || base == "td-curl" {
+            td_curl::NAME
+        } else {
+            "td-net"
+        };
+        eprintln!("{name}: an argument is not UTF-8");
+        std::process::exit(2);
+    };
     let arg0 = args.first().map(String::as_str).unwrap_or("td-net");
     let base = std::path::Path::new(arg0)
         .file_name()
@@ -94,6 +109,7 @@ fn main() {
         "td-test-https" => test_https::run(&args),
         "td-release" => release::run(&args),
         "git-remote-http" | "git-remote-https" => git_remote::run(&args),
+        "curl" | "td-curl" => td_curl::run(&args),
         // An application's name, linked to this binary: that application,
         // beside this binary, with a fetch service of its own (launch.rs).
         _ if launch::launches(std::ffi::OsStr::new(base)).is_some() => {

@@ -101,6 +101,15 @@ pub fn recipe() -> Recipe {
             target: td_net.into(),
             link: "{root}/http/git-remote-https".into(),
         },
+        // Both names the image ships for its download client.
+        Step::Symlink {
+            target: td_net.into(),
+            link: "{root}/http/curl".into(),
+        },
+        Step::Symlink {
+            target: td_net.into(),
+            link: "{root}/http/td-curl".into(),
+        },
         Step::MkDir {
             path: "{root}/work".into(),
         },
@@ -171,6 +180,17 @@ pub fn recipe() -> Recipe {
                  if GIT_TRACE=1 GIT_TERMINAL_PROMPT=0 GIT_SSH='{root}/ssh-probe' git ls-remote ssh://127.0.0.1:9/td-no-service >ssh-helper.log 2>&1; then echo 'ssh ls-remote reached a service' >&2; exit 1; fi; \
                  grep -Fq '{root}/ssh-probe' ssh-helper.log || { echo 'Git did not dispatch to the ssh probe:' >&2; cat ssh-helper.log >&2; exit 1; }; \
                  test \"$(cat '{root}/ssh-status')\" = '0 255 ' || { echo \"OpenSSH did not check its variant and then fail its connection: statuses $(cat '{root}/ssh-status')\" >&2; cat ssh-helper.log >&2; exit 1; }; \
+                 for name in curl td-curl; do \
+                     said=$('{root}/http/'$name --version) || { echo \"$name --version failed\" >&2; exit 1; }; \
+                     printf '%s\\n' \"$said\" | grep -Fq 'td-curl' || { echo \"$name does not say it is td-curl\" >&2; exit 1; }; \
+                     printf '%s\\n' \"$said\" | grep -Fq 'not curl' || { echo \"$name does not say it is not curl\" >&2; exit 1; }; \
+                     '{root}/http/'$name -k https://127.0.0.1:9/ >curl-refused.log 2>&1; \
+                     test $? = 2 || { echo \"$name took an option it does not list\" >&2; cat curl-refused.log >&2; exit 1; }; \
+                     grep -Fq 'td-curl (not curl): option -k is not supported' curl-refused.log || { cat curl-refused.log >&2; exit 1; }; \
+                     SSL_CERT_FILE=mint/ca.pem '{root}/http/'$name -fsS https://127.0.0.1:9/ >curl-down.log 2>&1; \
+                     test $? = 1 || { echo \"$name did not fail on the unreachable server\" >&2; cat curl-down.log >&2; exit 1; }; \
+                     grep -Fq 'td-curl (not curl): (1) io:' curl-down.log || { echo \"$name did not reach the network layer:\" >&2; cat curl-down.log >&2; exit 1; }; \
+                 done; \
                  cd repo || exit 1; \
                  build=$(git version --build-options) || exit 1; \
                  printf '%s\\n' \"$build\" | grep -Fq 'git version 2.56.0' || exit 1; \
@@ -189,7 +209,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Git 2.56.0 local and service workflows, HTTPS dispatch to td-net's git-remote-https, and SSH dispatch through verified OpenSSH; the system boot oracle completes clone/push/reclone over a real loopback sshd\n".into(),
+        content: "PASS: Git 2.56.0 local and service workflows, HTTPS dispatch to td-net's git-remote-https, td-curl's refusals, and SSH dispatch through verified OpenSSH; the system boot oracle completes clone/push/reclone over a real loopback sshd\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
