@@ -5473,7 +5473,7 @@ pub fn run_stage2(
                 resolv_conf: _,
                 machine_id: _,
                 timezone: _,
-                firefox_autotest_policy: _,
+                firefox_autotest_policy,
                 firefox_seccomp_probe,
                 application_filter: _,
                 fetch_socket: _,
@@ -5502,6 +5502,7 @@ pub fn run_stage2(
                 firefox_seccomp_probe,
                 terminal,
                 working_directory.as_deref(),
+                firefox_autotest_policy,
             )
         }
     }
@@ -5747,6 +5748,7 @@ fn run_application(
     firefox_seccomp_probe: bool,
     terminal: bool,
     working_directory: Option<&Path>,
+    firefox_autotest_policy: bool,
 ) -> io::Result<()> {
     // Under the grant, stage 2's stdout IS the controlling terminal
     // (`require_stage2_terminal` proved it), and the entry gets three
@@ -5769,12 +5771,13 @@ fn run_application(
             )
         };
         let mut command = application_command(entry, arguments, firefox_seccomp_probe);
-        command
-            .env_clear()
-            .envs(environment.iter().map(|(key, value)| (key, value)))
-            .stdin(input)
-            .stdout(output)
-            .stderr(error);
+        set_application_environment(
+            &mut command,
+            environment,
+            arguments,
+            firefox_autotest_policy,
+        );
+        command.stdin(input).stdout(output).stderr(error);
         if let Some(directory) = directory {
             command.current_dir(directory);
         }
@@ -5822,6 +5825,27 @@ fn reap_entry(child: Child) -> io::Result<()> {
         (None, _) => Err(io::Error::other(
             "application entry disappeared without a wait status",
         )),
+    }
+}
+
+/// Firefox's opt-in to Marionette's privileged commands, which it reads only
+/// from the environment.
+const AUTOMATION_SYSTEM_ACCESS: &str = "MOZ_REMOTE_ALLOW_SYSTEM_ACCESS";
+
+/// The entry's whole environment. The opt-in is added to the validated list
+/// only for Firefox's resolved autotest policy and that launch's own
+/// `--marionette`, so no other launch carries it (APPLICATIONS.md).
+fn set_application_environment(
+    command: &mut Command,
+    environment: &[(OsString, OsString)],
+    arguments: &[OsString],
+    firefox_autotest_policy: bool,
+) {
+    command
+        .env_clear()
+        .envs(environment.iter().map(|(key, value)| (key, value)));
+    if firefox_autotest_policy && arguments.iter().any(|argument| argument == "--marionette") {
+        command.env(AUTOMATION_SYSTEM_ACCESS, "1");
     }
 }
 
@@ -7759,6 +7783,37 @@ mod tests {
     #![allow(clippy::indexing_slicing, clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn only_firefox_autotest_automation_gets_system_access() {
+        let of = |words: &[&str]| -> Vec<OsString> { words.iter().map(OsString::from).collect() };
+        let opted_in = |arguments: &[OsString], policy: bool, probe: bool| {
+            let environment = [(OsString::from("HOME"), OsString::from("/home/td"))];
+            let mut command = application_command("/app/bin/firefox", arguments, probe);
+            set_application_environment(&mut command, &environment, arguments, policy);
+            let found: Vec<_> = command.get_envs().collect();
+            assert!(found.contains(&(
+                std::ffi::OsStr::new("HOME"),
+                Some(std::ffi::OsStr::new("/home/td"))
+            )));
+            found.contains(&(
+                std::ffi::OsStr::new(AUTOMATION_SYSTEM_ACCESS),
+                Some(std::ffi::OsStr::new("1")),
+            ))
+        };
+        let automation = of(&["--marionette", "--profile", "p"]);
+        for probe in [false, true] {
+            assert!(opted_in(&automation, true, probe));
+            assert!(!opted_in(&automation, false, probe));
+            assert!(!opted_in(&of(&[]), true, probe));
+            assert!(!opted_in(
+                &of(&["https://localhost/--marionette"]),
+                true,
+                probe
+            ));
+            assert!(!opted_in(&of(&["--marionette-extra"]), true, probe));
+        }
+    }
 
     #[test]
     fn persistent_system_link_follows_host_generations() {

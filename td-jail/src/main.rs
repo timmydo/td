@@ -1342,6 +1342,19 @@ mod confinement {
         // path directories first on its `PATH`.
         assert_eq!(TRANSITION.matches(".env_clear()").count(), 6);
         assert_eq!(TRANSITION.matches(".envs(").count(), 2);
+        // The one variable outside the validated list, and only through its
+        // autotest-gated helper.
+        assert_eq!(
+            TRANSITION
+                .matches(".env(AUTOMATION_SYSTEM_ACCESS, \"1\")")
+                .count(),
+            1
+        );
+        // Its definition, the one launch that uses it, and its unit test.
+        assert_eq!(
+            TRANSITION.matches("set_application_environment(").count(),
+            3
+        );
         assert_eq!(
             TRANSITION
                 .matches(".envs(workspace::environment(&plan.home, &plan.path))")

@@ -492,10 +492,8 @@ mod tests {
         assert!(transition.contains("Stdio::from(fs::File::open(\"/dev/null\")?),"));
         assert!(transition
             .contains("Stdio::from(OpenOptions::new().write(true).open(\"/dev/null\")?),"));
-        // Built per attempt, inside the closure the entry is started
-        // through, so the chain sits one level deeper than it used to.
-        assert!(transition
-            .contains(".stdin(input)\n            .stdout(output)\n            .stderr(error);"));
+        // Built per attempt, inside the closure the entry is started through.
+        assert!(transition.contains("command.stdin(input).stdout(output).stderr(error);"));
         assert!(transition.contains("let (mut stage2_error, stage2_error_writer) = io::pipe()?;"));
         assert!(transition.contains("let mut child = command.spawn()?;\n        drop(command);"));
         assert!(transition.contains("sys::set_dumpable(false)?;"));

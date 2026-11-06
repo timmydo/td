@@ -1711,14 +1711,20 @@ kernel token, and disappears on reboot. An ordinary boot launches Firefox
 with its default profile and first-run flow, and the content readiness and
 evidence probes become successful no-ops rather than failing or delaying the
 service while the browser waits for the human's decision.
-The exact autotest launch additionally enables Firefox's Marionette server and
-the Firefox 138-and-later system-access opt-in. Marionette's own pinned server
-implementation binds loopback only with a backlog of one, and the td probe
+The exact autotest launch additionally enables Firefox's Marionette server.
+Firefox's system-access opt-in is the environment variable
+`MOZ_REMOTE_ALLOW_SYSTEM_ACCESS=1`, which td-jail adds only to a launch holding
+both the resolved Firefox autotest policy and the `--marionette` argument.
+Firefox takes the argument after a flag it does not recognize as that flag's,
+so no unrecognized flag may precede the fixed document's URL. Marionette's own
+pinned server implementation binds loopback only with a backlog of one, and the
+td probe
 accepts protocol version 3 with one active session and bounded frames. Ordinary
 support/input probes have one 60-second end-to-end deadline; item 10's single
 continuity session has a separate 360-second backstop around its 300-second
 schedule. This unauthenticated privileged channel is test
-machinery, not a product interface: neither flag reaches an ordinary boot,
+machinery, not a product interface: neither `--marionette` nor the opt-in
+reaches an ordinary boot,
 the profile is volatile, and `td.autotest=1` remains supported only in the
 NIC-less or inbound-unreachable QEMU plans described below.
 The compositor considers only toplevels that asserted the exact

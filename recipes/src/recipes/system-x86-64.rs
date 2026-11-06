@@ -2346,7 +2346,7 @@ fn build_desktop_td_svc_conf() -> String {
          type=daemon\n\
          cgroup=session\n\
          unless-exists={applications_on_demand}\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct -- --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct --;; esac'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct -- --marionette --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct --;; esac'\n\
          after=audio,busd,portal,wayland,firefox-files,firefox-handoff,firefox-autotest,firefox-tls-origin,placement-evidence,firefox-fetch,software-evidence\n\
          requires=wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
@@ -7620,7 +7620,7 @@ mod tests {
             firefox,
             format!(
                 "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in \
-                 *\" {AUTOTEST_CMDLINE_TOKEN} \"*) exec /bin/td-authd application-start {UI_UID} {FIREFOX_NAME} direct -- --marionette --remote-allow-system-access \
+                 *\" {AUTOTEST_CMDLINE_TOKEN} \"*) exec /bin/td-authd application-start {UI_UID} {FIREFOX_NAME} direct -- --marionette \
                  --profile {FIREFOX_AUTOTEST_PROFILE} \
                  {FIREFOX_TLS_URL};; *) exec \
                  /bin/td-authd application-start {UI_UID} {FIREFOX_NAME} direct --;; esac'")

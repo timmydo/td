@@ -3032,11 +3032,12 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
     if !result.evidence.firefox_network {
         return Err(format!(
-            "Git HTTPS succeeded but the jailed Firefox did not load and validate the public \
-             document ({FIREFOX_NETWORK_RUNTIME_MARKER:?} absent) — Firefox could not resolve \
-             the host through the jailed libc configuration, connect through shared networking, \
-             verify the public certificate with NSS, complete navigation, or inspect the loaded \
-             content context. Last serial output:\n{}",
+            "Git HTTPS succeeded but Firefox's evidence unit did not emit \
+             {FIREFOX_NETWORK_RUNTIME_MARKER:?} ({}). It prints that marker near its end, after \
+             the local HTTPS document's paint, the content-process and resource checks, the \
+             support probe, the public-network probe and publishing its evidence, so a failure \
+             in any of them looks alike here. Last serial output:\n{}",
+            result.reason,
             tail(&result.console, 80)
         ));
     }
