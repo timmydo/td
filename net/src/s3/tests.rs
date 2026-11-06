@@ -245,7 +245,7 @@ fn serve(mut stream: TcpStream, shared: &Mutex<Store>) {
                     return;
                 }
             }
-            if key.starts_with("heads/") {
+            if key.starts_with("heads/") || key == "index.html" {
                 if let Some(bytes) = store.race_head.take() {
                     store.files.insert(
                         key.clone(),

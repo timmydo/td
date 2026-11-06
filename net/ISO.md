@@ -71,3 +71,48 @@ Numbers are canonical decimal; commit, hash and signature are lowercase hex
 of 20, 32 and 64 bytes respectively. The marker separates this assertion from
 other release messages. Existing release lifetime rules reject future-issued records; both root
 and record must be fresh before and after hashing.
+
+## Download listing
+
+`iso-index` generates a standalone `index.html`, styled like `www/`, from an
+explicit UTF-8 catalog. It does not scan a bucket or infer releases from file
+names. The catalog begins with `td-iso-catalog-v1`; every following line has
+four tab-separated fields: public root path, profile, signature path, ISO
+path. Paths are relative to the catalog's directory unless absolute. No blank
+rows, comments or control characters are allowed. The maximum is 128 entries
+and one MiB of catalog text. A header-only catalog produces an empty listing.
+
+```text
+td-net release iso-index CATALOG index.html
+td-net release upload-iso-index-s3 CATALOG index.html ENDPOINT auto td-releases CREDENTIALS PROFILE --dry-run
+```
+
+Both commands verify the complete local ISO bytes, signatures and freshness.
+Any invalid, expired or missing entry refuses the entire operation, preserving
+the old output. Remove expired entries explicitly or renew their signatures.
+For one ISO/profile select one signature; duplicate entries and conflicting
+roots for one epoch refuse. Multiple root epochs and profiles are supported.
+Keep the complete catalog: uploading it replaces the listing, it does not
+merge it with the previous page. Entries sort by profile, filename and digest.
+
+The upload command writes the local preview even in dry-run but makes no
+network requests in that mode. Without dry-run it uploads/reuses every listed
+ISO, root and signature before publishing `index.html` last, with
+`Content-Type: text/html; charset=utf-8` and `Cache-Control: no-store`.
+Publication uses the original page's ETag (or absence) as a write condition;
+a concurrent change refuses unless exact readback equals the intended page.
+A failed operation may leave reusable immutable files, but does not publish
+an incomplete listing. No remote files are deleted. No signing key is needed.
+Local inputs and output directories must remain stable during the command.
+
+Configure the public serving layer to rewrite `/` to `/index.html`, preserve
+all other paths, and honor the cache header. Links are root-relative. The
+page embeds its stylesheet and uses no JavaScript or external assets. Its
+colors, typography and layout follow `www/style.css`; its assets live under
+`net/` so the networking recipe remains self-contained.
+
+The page is unsigned navigation, not a release trust anchor or latest-release
+proof. It displays signature expiry in UTC, but cannot remove entries as time
+passes. Regenerate and publish after catalog changes; clients still verify
+against an independently trusted root and current time. This command does
+not publish system-update heads or change their trust rules.

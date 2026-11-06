@@ -448,6 +448,39 @@ impl Client {
         bytes: &[u8],
         previous: Option<&Remote>,
     ) -> Result<()> {
+        self.mutable(
+            key,
+            file,
+            bytes,
+            previous,
+            "application/octet-stream",
+            16384,
+        )
+    }
+    pub(crate) fn html_index(
+        &self,
+        file: &mut File,
+        bytes: &[u8],
+        previous: Option<&Remote>,
+    ) -> Result<()> {
+        self.mutable(
+            "index.html",
+            file,
+            bytes,
+            previous,
+            "text/html; charset=utf-8",
+            1024 * 1024,
+        )
+    }
+    fn mutable(
+        &self,
+        key: &str,
+        file: &mut File,
+        bytes: &[u8],
+        previous: Option<&Remote>,
+        content_type: &str,
+        limit: u64,
+    ) -> Result<()> {
         let condition = previous
             .map(|r| ("if-match", r.etag.as_str()))
             .unwrap_or(("if-none-match", "*"));
@@ -458,15 +491,15 @@ impl Client {
             &[
                 condition,
                 ("cache-control", NO_STORE),
-                ("content-type", "application/octet-stream"),
+                ("content-type", content_type),
             ],
             Some((file, bytes.len() as u64)),
         )?;
         match response.status().as_u16() {
             200 => Ok(()),
-            409 | 412 if self.get(key, 16384)?.is_some_and(|r| r.bytes == bytes) => Ok(()),
+            409 | 412 if self.get(key, limit)?.is_some_and(|r| r.bytes == bytes) => Ok(()),
             code => Err(format!(
-                "S3 head publication refused (HTTP {code}); rerun after checking the remote head"
+                "S3 publication of {key} refused (HTTP {code}); rerun after checking the remote object"
             )),
         }
     }

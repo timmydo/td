@@ -2,6 +2,8 @@
 use super::*;
 use crate::s3;
 
+pub(super) mod index;
+
 struct Record {
     name: String,
     size: u64,
@@ -239,6 +241,20 @@ pub(super) fn upload(words: &[&str]) -> Result<()> {
     if dry {
         return Ok(());
     }
+    publish(&mut client, &mut verified, profile)?;
+    println!(
+        "ISO S3 complete: {} files uploaded, {} reused",
+        client.uploaded, client.reused
+    );
+    Ok(())
+}
+
+fn publish(client: &mut s3::Client, verified: &mut Verified, profile: &str) -> Result<()> {
+    let image_key = verified.record.image_key();
+    let signature_digest = hash(verified.signature.as_bytes());
+    let signature_key = format!("iso/signatures/{signature_digest}.sig");
+    let root_key = format!("roots/{}", verified.root.version);
+    Record::parse(&verified.signature, &verified.root, profile, now()?)?;
     client.immutable(
         &image_key,
         &mut verified.image,
@@ -258,10 +274,6 @@ pub(super) fn upload(words: &[&str]) -> Result<()> {
         verified.signature.len() as u64,
         &signature_digest,
     )?;
-    println!(
-        "ISO S3 complete: {} files uploaded, {} reused",
-        client.uploaded, client.reused
-    );
     Ok(())
 }
 
@@ -453,5 +465,206 @@ mod tests {
         mock.store.lock().unwrap().fail = Some((format!("iso/{digest}/td.iso"), 403, 1));
         assert!(f.upload(&mock, false).is_err());
         assert!(mock.store.lock().unwrap().files.is_empty());
+    }
+    fn catalog(f: &Fixture) -> PathBuf {
+        let path = f.dir.join("catalog");
+        fs::write(
+            &path,
+            format!(
+                "td-iso-catalog-v1\n{}\tsystem-x86-64\t{}\t{}\n",
+                f.root.display(),
+                f.signature.display(),
+                f.image.display()
+            ),
+        )
+        .unwrap();
+        path
+    }
+    fn upload_catalog(
+        f: &Fixture,
+        mock: &s3::tests::Mock,
+        catalog: &Path,
+        dry: bool,
+    ) -> Result<()> {
+        let credentials = f.dir.join("credentials");
+        s3::tests::write_credentials(&credentials);
+        let output = f.dir.join("index.html");
+        let mut args = vec![
+            catalog.to_str().unwrap(),
+            output.to_str().unwrap(),
+            &mock.endpoint,
+            "auto",
+            "td-releases",
+            credentials.to_str().unwrap(),
+            "test",
+        ];
+        if dry {
+            args.push("--dry-run");
+        }
+        index::upload(&args)
+    }
+    #[test]
+    fn catalog_verifies_inputs_and_never_replaces_them() {
+        let f = Fixture::new();
+        let path = catalog(&f);
+        let output = f.dir.join("index.html");
+        index::generate(&path, &output).unwrap();
+        let page = fs::read_to_string(&output).unwrap();
+        assert!(page.contains("Timmy’s Distro"));
+        assert!(page.contains(&format!(
+            "href=\"/iso/{}/td.iso\"",
+            hash(b"whole ISO bytes")
+        )));
+        assert!(page.contains("15 bytes"));
+        assert!(page.contains("Signature expires (UTC)"));
+        assert!(page.contains("#f7f6f2"));
+        for input in [&path, &f.root, &f.signature, &f.image] {
+            assert!(index::generate(&path, input).is_err());
+        }
+        let alias = f.dir.join("alias");
+        fs::hard_link(&f.root, &alias).unwrap();
+        assert!(index::generate(&path, &alias).is_err());
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            format!("{}{}\n", original, original.lines().nth(1).unwrap()),
+        )
+        .unwrap();
+        assert!(index::generate(&path, &output).is_err());
+        fs::write(&path, &original).unwrap();
+        fs::write(&f.image, b"corrupt").unwrap();
+        assert!(index::generate(&path, &output).is_err());
+        assert_eq!(fs::read_to_string(&output).unwrap(), page);
+    }
+    #[test]
+    fn catalog_uploads_page_last_with_html_type_and_conditional_updates() {
+        let f = Fixture::new();
+        let path = catalog(&f);
+        let mock = s3::tests::Mock::new();
+        upload_catalog(&f, &mock, &path, true).unwrap();
+        assert!(mock.store.lock().unwrap().requests.is_empty());
+        upload_catalog(&f, &mock, &path, false).unwrap();
+        {
+            let store = mock.store.lock().unwrap();
+            let puts: Vec<_> = store.requests.iter().filter(|(m, _)| m == "PUT").collect();
+            assert_eq!(puts.len(), 4);
+            assert_eq!(puts.last().unwrap().1, "index.html");
+            assert_eq!(
+                store.files["index.html"].headers["content-type"],
+                "text/html; charset=utf-8"
+            );
+            assert_eq!(
+                store.files["index.html"].headers["cache-control"],
+                s3::NO_STORE
+            );
+        }
+        // A changed catalog replaces the page; it never deletes remote images.
+        fs::write(&path, "td-iso-catalog-v1\n").unwrap();
+        mock.store.lock().unwrap().lose_reply = Some("index.html".into());
+        upload_catalog(&f, &mock, &path, false).unwrap();
+        {
+            let store = mock.store.lock().unwrap();
+            assert!(String::from_utf8_lossy(&store.files["index.html"].bytes)
+                .contains("No installer images"));
+            assert_eq!(store.files.len(), 4);
+            assert!(store.files["index.html"].headers.contains_key("if-match"));
+        }
+        mock.store.lock().unwrap().race_head = Some(b"concurrent publisher".to_vec());
+        assert!(upload_catalog(&f, &mock, &path, false).is_err());
+        assert_eq!(
+            mock.store.lock().unwrap().files["index.html"].bytes,
+            b"concurrent publisher"
+        );
+    }
+    #[test]
+    fn failed_catalog_upload_preserves_the_previous_page() {
+        let f = Fixture::new();
+        let path = catalog(&f);
+        let mock = s3::tests::Mock::new();
+        let signature_key = format!(
+            "iso/signatures/{}.sig",
+            hash(&fs::read(&f.signature).unwrap())
+        );
+        mock.store.lock().unwrap().files.insert(
+            "index.html".into(),
+            s3::tests::Stored {
+                bytes: b"previous page".to_vec(),
+                headers: Default::default(),
+            },
+        );
+        mock.store.lock().unwrap().fail = Some((signature_key, 403, 1));
+        assert!(upload_catalog(&f, &mock, &path, false).is_err());
+        assert_eq!(
+            mock.store.lock().unwrap().files["index.html"].bytes,
+            b"previous page"
+        );
+        assert!(!mock
+            .store
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|(method, key)| method == "PUT" && key == "index.html"));
+    }
+    #[test]
+    fn catalog_lists_multiple_entries_and_refuses_expired_or_malformed_records() {
+        let f = Fixture::new();
+        let path = catalog(&f);
+        let original = fs::read_to_string(&path).unwrap();
+        let second = f.dir.join("second.iso");
+        fs::write(&second, b"second image").unwrap();
+        let signature = sign(
+            &f.root,
+            &f.key,
+            "server-x86-64",
+            &"b".repeat(40),
+            &second,
+            &f.dir.join("signatures"),
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{original}{}\tserver-x86-64\t{}\t{}\n",
+                f.root.display(),
+                signature.display(),
+                second.display()
+            ),
+        )
+        .unwrap();
+        let output = f.dir.join("index.html");
+        index::generate(&path, &output).unwrap();
+        let html = fs::read_to_string(&output).unwrap();
+        assert_eq!(html.matches("<article ").count(), 2);
+        assert!(html.contains("Server · x86-64"));
+        assert!(html.contains("Desktop · x86-64"));
+        for bad in [
+            "wrong header\n".to_string(),
+            "td-iso-catalog-v1\n\n".into(),
+            format!(
+                "td-iso-catalog-v1\n{}",
+                format!("{}\n", original.lines().nth(1).unwrap()).repeat(129)
+            ),
+        ] {
+            fs::write(&path, bad).unwrap();
+            assert!(index::generate(&path, &output).is_err());
+        }
+        fs::write(&path, original).unwrap();
+        let mut lines: Vec<_> = fs::read_to_string(&f.signature)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let time = now().unwrap();
+        lines[2] = (time - 100).to_string();
+        lines[3] = (time - 1).to_string();
+        lines.pop();
+        fs::write(
+            &f.signature,
+            format::signed(&(lines.join("\n") + "\n"), &fs::read(&f.key).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(index::generate(&path, &output).is_err());
+        assert_eq!(fs::read_to_string(output).unwrap(), html);
     }
 }
