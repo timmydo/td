@@ -104,7 +104,9 @@ of its trusted state, and runs the installed downloader under that identity.
 The worker retains verified objects in
 `/var/lib/td-admin-build/release-cache`; its completed candidate is always
 `/var/lib/td-admin-build/download`. It cannot write the privileged replay
-state. A failed job may retain verified cache objects for the next request.
+state. A failed job may retain verified cache objects for the next request. The
+cache retains at most two GiB of object payload bytes, evicting least recently
+used objects under its lease; metadata and installation staging are separate.
 The root download helper reads and validates the root-private deployment ID
 in `/run/td-deployment` before switching identity, and passes that ID to the
 worker. The downloader seeds missing requested chunks from that deployment

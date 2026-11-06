@@ -433,7 +433,15 @@ fn output_space_failure_is_reported_and_verified_cache_survives() {
     .unwrap();
     directory(&f.cache).unwrap();
     let mut source = Source::new(&f.base()).unwrap();
-    let error = assemble(&release.payloads[0], &f.cache, &mut source, &mut Full).unwrap_err();
+    let mut cache = cache::Cache::open(&f.cache, cache::DEFAULT_LIMIT, source.deadline).unwrap();
+    let error = assemble(
+        &release.payloads[0],
+        &mut cache,
+        &seed::Seed::default(),
+        &mut source,
+        &mut Full,
+    )
+    .unwrap_err();
     assert!(error.contains("space"), "{error}");
     assert!(f
         .cache
@@ -638,6 +646,7 @@ fn learning_expired_signed_evidence_preserves_floors_but_cannot_install_it() {
     learn(&f.state, &evidence).unwrap();
     let mut state = State::parse(&text(&f.state, SMALL * 3).unwrap()).unwrap();
     assert_eq!((state.head_version, state.sequence), (2, 2));
+    let time = now().unwrap();
     assert!(metadata(&mut state, &head, &release, time).is_err());
     let old = text(&f.repo.join("heads/system-x86-64"), SMALL).unwrap();
     assert!(metadata(&mut state, &old, &original, time)
@@ -813,4 +822,103 @@ fn local_seed_refuses_links_and_oversized_files_before_reading() {
     )
     .unwrap_err()
     .contains("seed payload size exceeds bound"));
+}
+
+#[test]
+fn cache_budget_smaller_than_image_still_reuses_the_local_seed() {
+    for limit in [td_engine::image_chunks::MAX as u64, 0] {
+        let f = Fixture::new();
+        f.fetch("initial").unwrap();
+        fs::remove_dir_all(f.repo.join("objects")).unwrap();
+        fetch_budgeted(
+            &f.base(),
+            &f.state,
+            &f.cache,
+            &f.dir.join("limited"),
+            Some(&f.deployment),
+            limit,
+        )
+        .unwrap();
+        verify(&f.state, &f.dir.join("limited")).unwrap();
+        let bytes: u64 = fs::read_dir(&f.cache)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name() != "lock")
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert!(bytes <= limit, "{bytes} > {limit}");
+    }
+}
+
+#[test]
+fn cache_evicts_the_least_recently_used_object() {
+    let owned = crate::test_temp::TempDir::new("release-cache-lru").unwrap();
+    let path = owned.join("cache");
+    directory(&path).unwrap();
+    let a = vec![1; 100];
+    let b = vec![2; 100];
+    let c = vec![3; 100];
+    for (bytes, age) in [(&a, 1), (&b, 2)] {
+        let entry = path.join(hash(bytes));
+        fs::write(&entry, bytes).unwrap();
+        File::open(&entry)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(age)))
+            .unwrap();
+    }
+    let mut cache =
+        cache::Cache::open(&path, 200, Instant::now() + Duration::from_secs(10)).unwrap();
+    assert_eq!(cache.get(&hash(&a), 100).unwrap(), Some(a.clone()));
+    cache.put(&hash(&c), &c).unwrap();
+    assert!(path.join(hash(&a)).exists());
+    assert!(!path.join(hash(&b)).exists());
+    assert!(path.join(hash(&c)).exists());
+}
+
+#[test]
+fn cache_reclaims_only_its_owned_names_and_never_follows_links() {
+    let owned = crate::test_temp::TempDir::new("release-cache-cleanup").unwrap();
+    let path = owned.join("cache");
+    directory(&path).unwrap();
+    let outside = owned.join("outside");
+    fs::write(&outside, b"preserve").unwrap();
+    let digest = "a".repeat(64);
+    std::os::unix::fs::symlink(&outside, path.join(&digest)).unwrap();
+    fs::write(path.join(format!(".{digest}.12.0.tmp")), b"partial").unwrap();
+    cache::Cache::open(&path, 0, Instant::now() + Duration::from_secs(10)).unwrap();
+    assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+    assert_eq!(fs::read(&outside).unwrap(), b"preserve");
+    fs::write(path.join("unrelated"), b"preserve too").unwrap();
+    assert!(cache::Cache::open(&path, 0, Instant::now() + Duration::from_secs(10)).is_err());
+    assert_eq!(fs::read(path.join("unrelated")).unwrap(), b"preserve too");
+}
+
+#[test]
+fn seed_bytes_are_reverified_after_the_scan() {
+    use std::os::unix::fs::FileExt;
+    let f = Fixture::new();
+    directory(&f.cache).unwrap();
+    let root = Root::parse(&text(&f.root, SMALL).unwrap(), None).unwrap();
+    let release = Release::parse(
+        &text(&f.repo.join("releases").join(&f.release), INDEX_LIMIT).unwrap(),
+        &root,
+        now().unwrap(),
+        "system-x86-64",
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut cache = cache::Cache::open(&f.cache, 0, deadline).unwrap();
+    let seed = seed::scan(&release, &mut cache, &f.deployment, deadline).unwrap();
+    let object = &release.payloads[0].objects[0];
+    let bytes = seed.get(&object.digest, object.size).unwrap().unwrap();
+    OpenOptions::new()
+        .write(true)
+        .open(f.deployment.join("bzImage"))
+        .unwrap()
+        .write_all_at(&[bytes[0] ^ 0xff], 0)
+        .unwrap();
+    assert!(seed
+        .get(&object.digest, object.size)
+        .unwrap_err()
+        .contains("changed after scanning"));
 }

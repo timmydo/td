@@ -93,28 +93,49 @@ acquisition budget is one hour, including individual DNS/request deadlines.
 There is no automatic retry loop: rerun the command to resume cached objects.
 Disk I/O and hashing do not acquire asynchronous interruption guarantees.
 
-`fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT]` creates a new output directory. `OUTPUT.partial`
+`fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT] [--cache-limit BYTES]` creates a new output directory. `OUTPUT.partial`
 is reserved scratch and reclaimed on retry; its parent must be owned and
 protected, and no other process may write there during acquisition. State
 and cache leases serialize cooperating writers. The caller must provide safe
-ancestors for state, cache, output and repository paths. This does not isolate
-mutually hostile processes sharing a UID. Acquisition keeps one 256 KiB object buffer (plus a 256 KiB read buffer
-while seeding), bounded metadata and the index in memory, rather than an
-entire image.
-With `--seed`, acquisition scans the three local deployment payloads using
-that same CDC algorithm, after authenticating the requested release metadata.
-Only missing objects whose SHA-256 and length match that signed index enter
-the cache. Local bytes grant no publisher trust and require no old signing
+ancestors for state, cache, output and repository paths. This does not
+isolate mutually hostile processes sharing a UID. Acquisition keeps one 256
+KiB object buffer (plus a 256 KiB read buffer while seeding), bounded
+metadata and the index in memory, rather than an entire image. With
+`--seed`, acquisition scans the three local deployment payloads using that
+same CDC algorithm, after authenticating the requested release metadata.
+Only objects whose SHA-256 and length match that signed index can be
+reused. Local bytes grant no publisher trust and require no old signing
 metadata; even a source-built installation can seed an update. The complete
-new payloads still undergo ordinary verification. Already verified cache
-objects avoid reseeding; unrelated local chunks are not retained. Seed files
-must be regular files within the protocol's payload bounds. An unreadable,
-changing or oversized seed fails explicitly. The scan shares the acquisition
-deadline and uses bounded chunk/read buffers. Experimental non-CDC partitions
-may reuse fewer seed chunks and fetch the rest normally.
+new payloads still undergo ordinary verification. A completely verified
+warm cache avoids reseeding. Otherwise the scan records bounded chunk
+locations and retains the opened source descriptors. Assembly reads and
+rehashes a local chunk on demand before using it; unrelated chunks are not
+retained. This keeps local reuse effective even when the cache is smaller
+than the image. Seed files must be regular files within the protocol's
+payload bounds. An unreadable, changing or oversized seed fails explicitly.
+The scan shares the acquisition deadline and uses bounded chunk/read
+buffers. Experimental non-CDC partitions may reuse fewer seed chunks and
+fetch the rest normally.
 
-Cache collection is manual; it is safe to remove it while no acquisition is
-active. There is no automatic cache-size quota.
+The object cache defaults to two GiB of logical payload bytes and at most
+200,000 objects. `--cache-limit BYTES` overrides the byte limit; zero disables
+object retention. Under the cache lease, startup and writes evict the least
+recently used objects until the bounds hold. A successful verified cache read
+updates its modification time. Objects larger than the configured limit are
+used without retaining them. This bounds payload bytes, not filesystem block
+allocation, directory entries or the separately bounded signed metadata.
+Interrupted atomic-write temporaries matching the cache's exact naming
+scheme are reclaimed at startup. Links are unlinked without following them;
+unknown names or non-file object entries refuse rather than risking unrelated
+data. Startup scans at most one million entries within the acquisition
+deadline. No active acquired output or installed deployment is evicted.
+The cache is disposable and may also be removed while no acquisition runs.
+
+Acquisition reports the exact reconstructed payload byte total and cache
+budget before assembly. Output metadata and the installer's separate staging
+copy require additional space. These are capacity figures, not a filesystem
+free-space reservation; ENOSPC still refuses without publishing a partial
+output or changing boot selectors.
 
 The output contains the manifest and three reconstructed payloads plus
 `head`, `release`, and up to 64 recently learned root documents. Verified roots are archived

@@ -9,6 +9,7 @@
     clippy::indexing_slicing
 )]
 
+mod cache;
 mod format;
 mod publisher;
 mod seed;
@@ -324,30 +325,33 @@ fn verify(state_path: &Path, bundle: &Path) -> Result<(String, String)> {
 
 fn assemble(
     payload: &format::Payload,
-    cache: &Path,
+    cache: &mut cache::Cache,
+    seed: &seed::Seed,
     source: &mut Source,
     writer: &mut impl Write,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, u64)> {
     let mut hasher = sha256::Sha256::new();
     let mut downloaded = 0;
     let mut reused = 0;
+    let mut seeded = 0;
     for object in &payload.objects {
         if Instant::now() >= source.deadline {
             return Err("release download exceeded one hour".into());
         }
-        let path = cache.join(&object.digest);
-        let cached = read(&path, object.size)
-            .ok()
-            .filter(|bytes| bytes.len() as u64 == object.size && hash(bytes) == object.digest);
-        let bytes = if let Some(bytes) = cached {
+        let bytes = if let Some(bytes) = cache.get(&object.digest, object.size)? {
             reused += object.size;
+            bytes
+        } else if let Some(bytes) = seed.get(&object.digest, object.size)? {
+            reused += object.size;
+            seeded += object.size;
+            cache.put(&object.digest, &bytes)?;
             bytes
         } else {
             let bytes = source.get(&format!("objects/{}", object.digest), object.size)?;
             if bytes.len() as u64 != object.size || hash(&bytes) != object.digest {
                 return Err("downloaded object hash or length mismatch".into());
             }
-            replace(&path, &bytes)?;
+            cache.put(&object.digest, &bytes)?;
             downloaded += object.size;
             bytes
         };
@@ -357,7 +361,7 @@ fn assemble(
     if sig::to_hex(&hasher.finalize()) != payload.digest {
         return Err("reconstructed payload hash mismatch".into());
     }
-    Ok((downloaded, reused))
+    Ok((downloaded, reused, seeded))
 }
 
 fn fetch(base: &str, state_path: &Path, cache: &Path, output: &Path) -> Result<()> {
@@ -370,6 +374,17 @@ fn fetch_seeded(
     cache: &Path,
     output: &Path,
     seed: Option<&Path>,
+) -> Result<()> {
+    fetch_budgeted(base, state_path, cache, output, seed, cache::DEFAULT_LIMIT)
+}
+
+fn fetch_budgeted(
+    base: &str,
+    state_path: &Path,
+    cache: &Path,
+    output: &Path,
+    seed: Option<&Path>,
+    limit: u64,
 ) -> Result<()> {
     let _state_lock = lock(&sidecar(state_path, ".lock"))?;
     directory(cache)?;
@@ -413,10 +428,17 @@ fn fetch_seeded(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.to_string()),
     }
-    if let Some(deployment) = seed {
-        let bytes = seed::cache(&release, cache, deployment, source.deadline)?;
-        eprintln!("release seed: {bytes} verified object bytes from local deployment");
-    }
+    let output_bytes = release.payloads.iter().try_fold(0u64, |total, payload| {
+        total
+            .checked_add(payload.size)
+            .ok_or("output size overflow")
+    })?;
+    eprintln!("release disk: {output_bytes} payload output bytes, {limit} maximum cached object bytes; metadata and installer staging are additional");
+    let mut cache = cache::Cache::open(cache, limit, source.deadline)?;
+    let seed = seed
+        .map(|deployment| seed::scan(&release, &mut cache, deployment, source.deadline))
+        .transpose()?
+        .unwrap_or_default();
     io(fs::DirBuilder::new().mode(0o700).create(&stage))?;
     let result = (|| {
         for version in state.root.version.saturating_sub(63).max(1)..=state.root.version {
@@ -431,13 +453,15 @@ fn fetch_seeded(
         replace(&stage.join("manifest"), release.manifest.as_bytes())?;
         let mut reused = 0u64;
         let mut downloaded = 0u64;
+        let mut seeded = 0u64;
         for payload in &release.payloads {
             let mut file = io(OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .mode(0o600)
                 .open(stage.join(payload.name)))?;
-            let (new, old) = assemble(payload, cache, &mut source, &mut file)?;
+            let (new, old, local) = assemble(payload, &mut cache, &seed, &mut source, &mut file)?;
+            seeded += local;
             downloaded += new;
             reused += old;
             io(file.sync_all())?;
@@ -446,6 +470,7 @@ fn fetch_seeded(
         io(File::open(&stage).and_then(|f| f.sync_all()))?;
         io(fs::rename(&stage, output))?;
         io(File::open(parent).and_then(|f| f.sync_all()))?;
+        eprintln!("release seed: {seeded} verified object bytes from local deployment");
         eprintln!("release transfer: {} requests, {} response body bytes, {downloaded} new object bytes, {reused} reused output bytes", source.requests, source.bytes);
         Ok(())
     })();
@@ -455,7 +480,7 @@ fn fetch_seeded(
     result
 }
 
-const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT]\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n";
+const HELP: &str = "td-net release keygen PRIVATE PUBLIC\n  root VERSION EXPIRES ROOT_PRIVATE RELEASE_PUBLIC PREVIOUS_ROOT_PRIVATE OUTPUT\n  init STATE ROOT PROFILE\n  publish REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT\n  publish-partitioned REPOSITORY ROOT RELEASE_PRIVATE PROFILE COMMIT SEQUENCE ISSUED EXPIRES DEPLOYMENT PARTITIONS\n  promote REPOSITORY ROOT RELEASE_PRIVATE PROFILE RELEASE_HASH VERSION ISSUED EXPIRES\n  fetch URL STATE CACHE OUTPUT [--seed DEPLOYMENT] [--cache-limit BYTES]\n  verify STATE BUNDLE\n  learn STATE EVIDENCE\n  gc REPOSITORY ROOT [--delete]\n";
 
 fn command(args: &[String]) -> Result<()> {
     let words: Vec<_> = args.iter().skip(1).map(String::as_str).collect();
@@ -532,6 +557,24 @@ fn command(args: &[String]) -> Result<()> {
             Path::new(output),
             Some(Path::new(deployment)),
         ),
+        ["fetch", base, state, cache, output, "--cache-limit", limit] => fetch_budgeted(
+            base,
+            Path::new(state),
+            Path::new(cache),
+            Path::new(output),
+            None,
+            format::number(limit)?,
+        ),
+        ["fetch", base, state, cache, output, "--seed", deployment, "--cache-limit", limit] => {
+            fetch_budgeted(
+                base,
+                Path::new(state),
+                Path::new(cache),
+                Path::new(output),
+                Some(Path::new(deployment)),
+                format::number(limit)?,
+            )
+        }
         ["verify", state, bundle] => {
             let (commit, deployment) = verify(Path::new(state), Path::new(bundle))?;
             println!("{commit} {deployment}");
