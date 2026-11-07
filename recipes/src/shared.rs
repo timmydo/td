@@ -1176,7 +1176,7 @@ pub const TD_POINTER_ABSOLUTE_MARKER: &str = "TD-POINTER-ABSOLUTE";
 /// uts and net namespaces, each with a non-zero ucount ceiling; seccomp with BPF
 /// filtering; inotify; and cgroup v2 with the pids controller enabled.
 ///
-/// Not `CONFIG_MEMCG`, which is pinned and guarded in the recipe but has no runtime
+/// Not `CONFIG_MEMCG`, which is pinned and locked in the recipe but has no runtime
 /// witness until something mounts cgroup2: memcg registers its v1 interface only
 /// under `CONFIG_MEMCG_V1`, so `proc_cgroupstats_show` filters `memory` out of
 /// `/proc/cgroups` entirely. `cgroup.controllers` answers it, and that arrives with
@@ -1184,7 +1184,7 @@ pub const TD_POINTER_ABSOLUTE_MARKER: &str = "TD-POINTER-ABSOLUTE";
 /// which is not the same as "every symbol pinned" — stated because the difference is
 /// exactly one controller and reading it as the stronger claim is the mistake.
 ///
-/// The build already greps the resolved `.config`, so this is not that check
+/// The build already compares the resolved config with its lock, so this is not that check
 /// repeated. What it adds is that the kernel the image BOOTS is the kernel that
 /// config described: a pin only constrains the producer, and the image's kernel
 /// could be replaced, rebuilt from a stale tree, or selected from a deployment

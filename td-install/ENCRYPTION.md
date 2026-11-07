@@ -750,13 +750,13 @@ The kernel carries the firmware framebuffer: `CONFIG_SYSFB_SIMPLEFB`
 presents a UEFI GOP framebuffer whose pixel format simple-framebuffer can
 describe as a `simple-framebuffer` device, and `CONFIG_DRM_SIMPLEDRM`
 drives it with DRM's fbdev emulation, so fbcon draws the VT on any such
-display before, or without, a native driver. Both are pinned and guarded
-over the resolved configuration as the other console and display symbols
+display before, or without, a native driver. Both are pinned and held by
+the resolved configuration's lock as the other console and display symbols
 are (the linux-x86-64 recipe); Linux 7.3.1's `DRM_EFIDRM` and
 `DRM_VESADRM` require `SYSFB_SIMPLEFB` off, so neither is built, and
 the legacy `FB_EFI` and `FB_VESA`, which would take a mode
-simple-framebuffer cannot describe, stay off; the recipe refuses any of
-the four set. A native
+simple-framebuffer cannot describe, stay off; the lock and its tests refuse
+any of the four set. A native
 driver takes the display over. In Linux 7.3.1 `sysfb_init` is a device
 initcall in `drivers/firmware`, linked after the GPU drivers, and
 virtio-gpu (as virtio-vga) and i915 remove a conflicting firmware

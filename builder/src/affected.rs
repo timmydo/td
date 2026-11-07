@@ -2033,6 +2033,7 @@ const BOOT_CRATES: &[&str] = &[
 /// own code, and the tier's runner. A name ending `/` is a directory.
 const BOOT_FILES: &[&str] = &[
     "recipes/src/recipes/linux-x86-64.rs",
+    "recipes/src/recipes/linux-x86-64.config",
     "recipes/src/recipes/system-x86-64.rs",
     "recipes/src/recipes/server-x86-64.rs",
     "recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs",
@@ -5425,7 +5426,9 @@ fn may_read_recipe_definitions(text: &str) -> bool {
             if saw_recipe && component == ".." {
                 return true;
             }
-            if previous == "recipes" && component.ends_with(".rs") {
+            if previous == "recipes"
+                && (component.ends_with(".rs") || component.ends_with(".config"))
+            {
                 return true;
             }
             previous = component;
@@ -5730,10 +5733,10 @@ fn evaluator_source(p: &str) -> bool {
 }
 
 fn recipe_definition(p: &str) -> bool {
-    let Some(stem) = p
-        .strip_prefix("recipes/src/recipes/")
-        .and_then(|file| file.strip_suffix(".rs"))
-    else {
+    let Some(stem) = p.strip_prefix("recipes/src/recipes/").and_then(|file| {
+        file.strip_suffix(".rs")
+            .or_else(|| file.strip_suffix(".config"))
+    }) else {
         return false;
     };
     stem.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
@@ -6978,6 +6981,7 @@ mod tests {
             "recipes/src/recipes/td-init.rs",
             "recipes/src/recipes/td-install-qemu-test.rs",
             "recipes/src/recipes/linux-x86-64.rs",
+            "recipes/src/recipes/linux-x86-64.config",
             "recipes/src/recipes/system-x86-64.rs",
             "recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs",
             "recipes/src/bin/td_recipe_eval/checks/qemu_boot/live.rs",
@@ -9893,6 +9897,7 @@ mod tests {
             return;
         }
         let definitions = vec![
+            "recipes/src/recipes/linux-x86-64.config".to_string(),
             "recipes/src/recipes/td-boot.rs".to_string(),
             "recipes/src/recipes/td-install.rs".to_string(),
         ];
@@ -10072,6 +10077,16 @@ mod tests {
                 all,
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn a_crate_naming_the_config_lock_reads_recipe_definitions() {
+        for text in [
+            "include_str!(\"../../recipes/src/recipes/linux-x86-64.config\")",
+            "const LOCK: &str = \"recipes/linux-x86-64.config\";",
+        ] {
+            assert!(may_read_recipe_definitions(text), "{text}");
         }
     }
 

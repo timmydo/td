@@ -2258,7 +2258,7 @@ fn validate_system_boot(
              (`kernel: … (CONFIG_… off) — …`). Nothing else on the image notices: every \
              the later td-jail transition and filter markers cannot print on a kernel with no \
              user namespaces or seccomp. \
-             The producer's own `.config` guard should have caught this first, so a \
+             The producer's resolved config lock should have caught this first, so a \
              failure HERE and not there means the two disagree — an image built against a \
              different kernel, a deployment selected from an older bookkeeping entry, or a \
              `cgroup_disable=`/`user.max_user_namespaces=0` on the command line, which no \

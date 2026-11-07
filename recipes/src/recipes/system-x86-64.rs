@@ -15560,6 +15560,22 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// pins they exist to observe. These are two different files that must agree, and
     /// nothing but a test can make them.
     const LINUX_RECIPE: &str = include_str!("linux-x86-64.rs");
+    const LINUX_LOCK: &str = include_str!("linux-x86-64.config");
+
+    /// The kernel recipe's `CONFIG` decisions, without its test tables.
+    fn config_table() -> &'static str {
+        LINUX_RECIPE
+            .split("const CONFIG: &[&str] = &[")
+            .nth(1)
+            .and_then(|rest| rest.split("];").next())
+            .filter(|table| !table.trim().is_empty())
+            .expect("the kernel recipe declares its CONFIG table")
+    }
+
+    /// The kernel's resolved config lock names this exact line.
+    fn linux_locked(line: &str) -> bool {
+        LINUX_LOCK.lines().any(|held| held == line)
+    }
 
     /// Every kernel symbol APPLICATIONS.md §0 turns on for the application tier, plus
     /// the one it deliberately does NOT turn on by hand.
@@ -15567,7 +15583,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// Listed here rather than derived from the probe tables so the two can disagree:
     /// a symbol that gains a pin but no probe, or a probe naming a symbol nothing pins,
     /// fails below. What this roster cannot catch is a pin added to the kernel recipe
-    /// and to nothing else — the recipe's own `.config` guard is what covers that, and
+    /// and to nothing else — the recipe's resolved-config lock is what covers that, and
     /// it fails the producer build rather than this test.
     const SANDBOX_SYMBOLS: &[&str] = &[
         "CONFIG_USER_NS",
@@ -15618,8 +15634,8 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                  exception list with a reason — never neither, and never both"
             );
             assert!(
-                LINUX_RECIPE.contains(&format!("grep -q '^{symbol}=y' .config")),
-                "the kernel recipe does not guard {symbol} over the RESOLVED config"
+                linux_locked(&format!("{symbol}=y")),
+                "the kernel's resolved config lock does not hold {symbol}"
             );
         }
         let mut probed: Vec<&str> = SANDBOX_KERNEL_NODES
@@ -15646,11 +15662,11 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             );
         }
         assert!(
-            LINUX_RECIPE.contains("# CONFIG_RT_GROUP_SCHED is not set"),
+            config_table().contains("\"# CONFIG_RT_GROUP_SCHED is not set\""),
             "the kernel must keep real-time group scheduling outside the delegated CPU contract"
         );
         assert!(
-            LINUX_RECIPE.contains("grep -q '^CONFIG_RT_GROUP_SCHED=y' .config"),
+            !linux_locked("CONFIG_RT_GROUP_SCHED=y"),
             "the resolved kernel config must reject real-time group scheduling"
         );
     }
@@ -15733,16 +15749,16 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     #[test]
     fn seccomp_filter_is_guarded_but_never_pinned() {
         assert!(
-            LINUX_RECIPE.contains("'CONFIG_SECCOMP=y'"),
+            config_table().contains("\"CONFIG_SECCOMP=y\""),
             "SECCOMP is prompted, so it must be pinned or allnoconfig answers it n"
         );
         assert!(
-            !LINUX_RECIPE.contains("'CONFIG_SECCOMP_FILTER=y'"),
+            !config_table().contains("\"CONFIG_SECCOMP_FILTER=y\""),
             "SECCOMP_FILTER must not appear in the pin list: it is unprompted, so the \
              line would be dropped by olddefconfig while looking like a pin that took"
         );
         assert!(
-            LINUX_RECIPE.contains("grep -q '^CONFIG_SECCOMP_FILTER=y' .config"),
+            linux_locked("CONFIG_SECCOMP_FILTER=y"),
             "a derived symbol can only be observed after resolution, so it must be guarded"
         );
     }
@@ -15755,12 +15771,12 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     #[test]
     fn ipc_ns_stays_refused_until_someone_argues_for_it() {
         assert!(
-            LINUX_RECIPE.contains("if grep -q '^CONFIG_IPC_NS=y' .config; then"),
-            "IPC_NS must be guarded OFF, not just left out of the pin list"
+            !linux_locked("CONFIG_IPC_NS=y"),
+            "IPC_NS must stay off in the resolved lock, not just out of the pin list"
         );
         for symbol in ["CONFIG_IPC_NS", "CONFIG_SYSVIPC", "CONFIG_FUSE_FS"] {
             assert!(
-                !LINUX_RECIPE.contains(&format!("'{symbol}=y'")),
+                !config_table().contains(&format!("\"{symbol}=y\"")),
                 "{symbol} is deferred by APPLICATIONS.md §0 and must not be pinned on"
             );
         }

@@ -122,16 +122,18 @@ the pin block.
 
 `recipes/src/recipes/linux-x86-64.rs` resolves the kernel config in
 **three** steps, and reading only the first is how an earlier draft of
-this table got an answer wrong:
+this table got an answer wrong. The result must then equal the committed
+`linux-x86-64.config` lock, line for line (`UPDATING.md`, "Kernel config
+lock"):
 
-1. **`allnoconfig`** (`linux-x86-64.rs:154`) answers `n` to every
+1. **`allnoconfig`** answers `n` to every
    *prompted* symbol regardless of its `default`. A symbol whose prompt
    is guarded `if EXPERT` keeps its default instead, because
    `allnoconfig` turns `EXPERT` off and an invisible prompt cannot be
    answered.
-2. **An explicit pin list** (`:530-606`, 77 lines since this rung added
-   nine) forces symbols on or off by name.
-3. **`olddefconfig`** (`:614`) then "takes defaults for newly-visible
+2. **An explicit pin list** (the recipe's `CONFIG` table) forces symbols
+   on or off by name.
+3. **`olddefconfig`** then "takes defaults for newly-visible
    symbols" — the recipe's own words. This is the step that matters: a
    symbol invisible at step 1 because its dependency was off becomes
    visible once step 2 pins that dependency, and **olddefconfig takes its
@@ -304,8 +306,8 @@ diagnostic; it never silently selects a weaker sandbox.
 
 **LANDED, in staged halves, and the split is worth reading before relying on
 it.** The pins above are in
-`linux-x86-64.rs`, each guarded against the RESOLVED `.config` rather
-than against the pin list; and the greeter carries a kernel-capability
+`linux-x86-64.rs`, each held by the RESOLVED config's lock rather
+than by the pin list; and the greeter carries a kernel-capability
 farm that prints `TD-SANDBOX-KERNEL-OK` once the RUNNING kernel has been
 observed to have every one that can be witnessed from `/proc` — all of
 them but `MEMCG`, for the reason below. What did NOT land in the kernel

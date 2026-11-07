@@ -163,6 +163,10 @@ and its licences), per commit.
    td-builder affected-checks --run
    ```
 
+   A kernel or Debian build root pin can move the kernel's resolved config:
+   if it does, the build stops at "Kernel config lock" below until that is
+   reviewed.
+
    A source pin re-keys every recipe check. A change to the boot path (the
    kernel, `system-x86-64`, the boot crates `DEVELOPMENT.md` names) also
    deserves the integration tier before pushing:
@@ -171,6 +175,35 @@ and its licences), per commit.
    that console, so run the tier before pushing one.
 
 6. Run `td-feed outdated pins` again: the pin now reads `current`.
+
+## Kernel config lock
+
+`recipes/src/recipes/linux-x86-64.config` is the kernel's resolved config:
+the sorted `CONFIG_` lines `olddefconfig` makes of the recipe's `CONFIG`
+table over `allnoconfig`, on the build root's compiler. The recipe compares
+the two before it builds anything, so a kernel or build-root bump, or a
+symbol someone added, cannot move a default unseen. A difference fails the
+build and prints a unified diff. Read each line of it: a new `=y` is new
+kernel code, and a lost one may be a driver a machine needed. Then apply it
+and commit it with the change that caused it. The failure repeats the log's
+tail after the message, which `patch` would read as a second copy, so stop
+at the message:
+
+```text
+cargo build --release --locked --manifest-path recipes/Cargo.toml --bin td-recipe-eval
+mkdir -p .td-build-cache/agent-scratch
+log=.td-build-cache/agent-scratch/kernel-config.log
+target/release/td-recipe-eval build-run linux-x86-64 2>&1 | tee "$log"
+sed '/^resolved kernel config differs/q' "$log" | patch recipes/src/recipes/linux-x86-64.config
+```
+
+The recipe's table and lock are compiled into the evaluator, so rebuild it
+after editing either. A gate's failure shows only the last lines of the diff;
+this route shows all of it, unless `TD_RECIPE_QUIET` is set. The `HELD` and
+`HELD_OFF` tables in the recipe's tests name what must survive and why. Adding
+a driver needs no entry there, only its `CONFIG` line and the lock's diff; a
+test refuses an `=` line the lock did not take, so a symbol under a parent
+that is off, or one this kernel renamed, fails.
 
 ## Crate pins
 

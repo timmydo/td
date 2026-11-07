@@ -119,6 +119,324 @@ pub const FIRMWARE: &[(&str, &str)] = &[
     ),
 ];
 
+/// Every kernel config symbol the recipe decides, in `.config` syntax. It is
+/// appended over allnoconfig before olddefconfig resolves the rest; the
+/// lock below then holds the result, and a test holds that every line here took
+/// effect. Adding a driver is a line here and the lock's diff. The reasoning is
+/// in the notes at step 2 of `recipe()`, whose "guarded" means named in the
+/// `HELD` tests over the lock.
+const CONFIG: &[&str] = &[
+    "CONFIG_SYSCALL_USER_DISPATCH=y",
+    "# CONFIG_SERIAL_8250_MOXA_PCIE is not set",
+    "CONFIG_UNWINDER_FRAME_POINTER=y",
+    "# CONFIG_UNWINDER_ORC is not set",
+    "# CONFIG_MODULES is not set",
+    "# CONFIG_MODULE_SIG is not set",
+    "# CONFIG_SYSTEM_TRUSTED_KEYRING is not set",
+    "# CONFIG_DEBUG_INFO_BTF is not set",
+    "# CONFIG_FTRACE is not set",
+    "# CONFIG_GCC_PLUGINS is not set",
+    "# CONFIG_IKHEADERS is not set",
+    "CONFIG_KERNEL_GZIP=y",
+    "CONFIG_BINFMT_ELF=y",
+    "CONFIG_BINFMT_SCRIPT=y",
+    "CONFIG_BLK_DEV_INITRD=y",
+    "CONFIG_SERIAL_8250=y",
+    "CONFIG_SERIAL_8250_CONSOLE=y",
+    "CONFIG_INITRAMFS_SOURCE=\"\"",
+    "CONFIG_PROC_FS=y",
+    "CONFIG_SYSFS=y",
+    "CONFIG_DEVTMPFS=y",
+    "CONFIG_UNIX98_PTYS=y",
+    "CONFIG_TMPFS=y",
+    "CONFIG_BLOCK=y",
+    "CONFIG_BLK_DEV=y",
+    "CONFIG_PCI=y",
+    "CONFIG_PCI_MSI=y",
+    "CONFIG_VIRTIO=y",
+    "CONFIG_VIRTIO_MENU=y",
+    "CONFIG_VIRTIO_PCI=y",
+    "CONFIG_VIRTIO_CONSOLE=y",
+    "CONFIG_VIRTIO_BLK=y",
+    "CONFIG_MISC_FILESYSTEMS=y",
+    "CONFIG_EROFS_FS=y",
+    "CONFIG_EROFS_FS_ZIP=y",
+    "CONFIG_EROFS_FS_ZIP_ZSTD=y",
+    "# CONFIG_KEXEC is not set",
+    "CONFIG_KEXEC_FILE=y",
+    "# CONFIG_KEXEC_SIG is not set",
+    "# CONFIG_KEXEC_SIG_FORCE is not set",
+    "CONFIG_RELOCATABLE=y",
+    "# CONFIG_RANDOMIZE_BASE is not set",
+    "CONFIG_BLK_DEV_LOOP=y",
+    "CONFIG_BLK_DEV_RAM=y",
+    "CONFIG_BLK_DEV_RAM_COUNT=1",
+    "CONFIG_BTRFS_FS=y",
+    "CONFIG_SCSI=y",
+    "CONFIG_BLK_DEV_SD=y",
+    "CONFIG_BLK_DEV_SR=y",
+    "CONFIG_ATA=y",
+    "CONFIG_SATA_AHCI=y",
+    "CONFIG_BLK_DEV_NVME=y",
+    "CONFIG_NVME_CORE=y",
+    "# CONFIG_NVME_MULTIPATH is not set",
+    "CONFIG_USB_STORAGE=y",
+    "CONFIG_ISO9660_FS=y",
+    "CONFIG_MD=y",
+    "CONFIG_BLK_DEV_DM=y",
+    "CONFIG_DM_CRYPT=y",
+    "CONFIG_CRYPTO_AES=y",
+    "CONFIG_CRYPTO_XTS=y",
+    "CONFIG_CRYPTO_AES_NI_INTEL=y",
+    "CONFIG_CRYPTO_HMAC=y",
+    "CONFIG_CRYPTO_SHA256=y",
+    "# CONFIG_CRYPTO_USER_API_HASH is not set",
+    "# CONFIG_CRYPTO_USER_API_SKCIPHER is not set",
+    "# CONFIG_CRYPTO_USER_API_RNG is not set",
+    "# CONFIG_CRYPTO_USER_API_AEAD is not set",
+    "CONFIG_NET=y",
+    "CONFIG_PACKET=y",
+    "CONFIG_UNIX=y",
+    "CONFIG_INET=y",
+    "CONFIG_NETDEVICES=y",
+    "CONFIG_VIRTIO_NET=y",
+    "CONFIG_ETHERNET=y",
+    "CONFIG_NET_VENDOR_INTEL=y",
+    "CONFIG_E1000=y",
+    "CONFIG_HYPERVISOR_GUEST=y",
+    "CONFIG_PARAVIRT=y",
+    "CONFIG_KVM_GUEST=y",
+    "CONFIG_HYPERV=y",
+    "CONFIG_HYPERV_VMBUS=y",
+    "CONFIG_SCSI_LOWLEVEL=y",
+    "CONFIG_HYPERV_STORAGE=y",
+    "CONFIG_HYPERV_NET=y",
+    "CONFIG_PCI_HYPERV=y",
+    "CONFIG_NET_VENDOR_AMAZON=y",
+    "CONFIG_ENA_ETHERNET=y",
+    "CONFIG_SCSI_VIRTIO=y",
+    "CONFIG_NET_VENDOR_GOOGLE=y",
+    "CONFIG_GVE=y",
+    "CONFIG_DMIID=y",
+    "CONFIG_INPUT=y",
+    "CONFIG_INPUT_EVDEV=y",
+    "CONFIG_INPUT_KEYBOARD=y",
+    "CONFIG_KEYBOARD_ATKBD=y",
+    "CONFIG_INPUT_MOUSE=y",
+    "CONFIG_MOUSE_PS2=y",
+    "CONFIG_VIRTIO_INPUT=y",
+    "CONFIG_SERIO=y",
+    "CONFIG_SERIO_I8042=y",
+    "CONFIG_VT=y",
+    "CONFIG_VT_CONSOLE=y",
+    "CONFIG_VT_HW_CONSOLE_BINDING=y",
+    "CONFIG_FB=y",
+    "CONFIG_FRAMEBUFFER_CONSOLE=y",
+    "CONFIG_DRM=y",
+    "CONFIG_DRM_VIRTIO_GPU=y",
+    "CONFIG_DRM_VIRTIO_GPU_KMS=y",
+    "CONFIG_DRM_FBDEV_EMULATION=y",
+    "CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y",
+    "CONFIG_SYSFB_SIMPLEFB=y",
+    "CONFIG_DRM_SIMPLEDRM=y",
+    "# CONFIG_SECURITY_DMESG_RESTRICT is not set",
+    "CONFIG_ACPI=y",
+    "CONFIG_EFI=y",
+    "CONFIG_EFI_STUB=y",
+    "CONFIG_CMDLINE_BOOL=y",
+    "CONFIG_CMDLINE=@EFI_CMDLINE@",
+    "# CONFIG_CMDLINE_OVERRIDE is not set",
+    "# CONFIG_EFI_HANDOVER_PROTOCOL is not set",
+    "# CONFIG_EFI_MIXED is not set",
+    "# CONFIG_EFIVAR_FS is not set",
+    "CONFIG_PNP=y",
+    "CONFIG_PNPACPI=y",
+    "CONFIG_USB_SUPPORT=y",
+    "CONFIG_USB=y",
+    "CONFIG_USB_PCI=y",
+    "CONFIG_USB_XHCI_HCD=y",
+    "CONFIG_HID_SUPPORT=y",
+    "CONFIG_HID=y",
+    "CONFIG_HID_GENERIC=y",
+    "CONFIG_UHID=y",
+    "CONFIG_HIDRAW=y",
+    "CONFIG_USB_HID=y",
+    "CONFIG_TCG_TPM=y",
+    "CONFIG_SECURITYFS=y",
+    "CONFIG_SECURITY=y",
+    "CONFIG_LSM=\"\"",
+    "# CONFIG_SECURITY_NETWORK is not set",
+    "# CONFIG_SECURITY_PATH is not set",
+    "# CONFIG_SECURITY_SELINUX is not set",
+    "# CONFIG_SECURITY_SMACK is not set",
+    "# CONFIG_SECURITY_TOMOYO is not set",
+    "# CONFIG_SECURITY_APPARMOR is not set",
+    "# CONFIG_SECURITY_LOADPIN is not set",
+    "# CONFIG_SECURITY_YAMA is not set",
+    "# CONFIG_SECURITY_SAFESETID is not set",
+    "# CONFIG_SECURITY_LOCKDOWN_LSM is not set",
+    "# CONFIG_SECURITY_LANDLOCK is not set",
+    "# CONFIG_SECURITY_IPE is not set",
+    "# CONFIG_BPF_LSM is not set",
+    "# CONFIG_INTEGRITY is not set",
+    "CONFIG_TCG_TIS=y",
+    "CONFIG_TCG_CRB=y",
+    "# CONFIG_TCG_TPM2_HMAC is not set",
+    "# CONFIG_HW_RANDOM_TPM is not set",
+    "CONFIG_PERF_EVENTS=y",
+    "CONFIG_SMP=y",
+    "CONFIG_NR_CPUS=256",
+    "CONFIG_HOTPLUG_CPU=y",
+    "CONFIG_USER_NS=y",
+    "CONFIG_PID_NS=y",
+    "CONFIG_UTS_NS=y",
+    "CONFIG_NET_NS=y",
+    "CONFIG_AUDIT=y",
+    "CONFIG_COMPAT_32BIT_TIME=y",
+    "CONFIG_IA32_EMULATION=y",
+    "# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set",
+    "# CONFIG_X86_X32_ABI is not set",
+    "CONFIG_SECCOMP=y",
+    "CONFIG_INOTIFY_USER=y",
+    "CONFIG_CGROUPS=y",
+    "CONFIG_CGROUP_SCHED=y",
+    "CONFIG_FAIR_GROUP_SCHED=y",
+    "CONFIG_CFS_BANDWIDTH=y",
+    "# CONFIG_RT_GROUP_SCHED is not set",
+    "CONFIG_MEMCG=y",
+    "CONFIG_CGROUP_PIDS=y",
+    "CONFIG_SOUND=y",
+    "CONFIG_SND=y",
+    "CONFIG_SND_PCM=y",
+    "# CONFIG_SND_PCM_OSS is not set",
+    "CONFIG_SND_PCI=y",
+    "CONFIG_SND_HDA_INTEL=y",
+    "CONFIG_SND_HDA_GENERIC=y",
+    "CONFIG_SND_ALOOP=y",
+    "CONFIG_DRM_I915=y",
+    "CONFIG_E1000E=y",
+    "CONFIG_X86_PLATFORM_DEVICES=y",
+    "CONFIG_ACPI_EC=y",
+    "CONFIG_I2C=y",
+    "CONFIG_THINKPAD_ACPI=y",
+    "CONFIG_ACPI_AC=y",
+    "CONFIG_ACPI_BATTERY=y",
+    "CONFIG_ACPI_BUTTON=y",
+    "CONFIG_ACPI_THERMAL=y",
+    "CONFIG_ACPI_FAN=y",
+    "CONFIG_ACPI_VIDEO=y",
+    "CONFIG_BACKLIGHT_CLASS_DEVICE=y",
+    "CONFIG_CPU_FREQ=y",
+    "CONFIG_X86_INTEL_PSTATE=y",
+    "CONFIG_CPU_IDLE=y",
+    "CONFIG_INTEL_IDLE=y",
+    "CONFIG_SUSPEND=y",
+    "CONFIG_USB_EHCI_HCD=y",
+    "CONFIG_MMC=y",
+    "CONFIG_MMC_BLOCK=y",
+    "CONFIG_MMC_SDHCI=y",
+    "CONFIG_MMC_SDHCI_PCI=y",
+    "CONFIG_MMC_RICOH_MMC=y",
+    "CONFIG_SND_HDA_CODEC_CONEXANT=y",
+    "CONFIG_SND_HDA_CODEC_HDMI=y",
+    "CONFIG_DRM_AMDGPU=y",
+    "CONFIG_DRM_AMD_DC=y",
+    "CONFIG_RTC_CLASS=y",
+    "CONFIG_RTC_DRV_CMOS=y",
+    "CONFIG_PCIEPORTBUS=y",
+    "CONFIG_PCIEASPM=y",
+    "CONFIG_PCIEASPM_DEFAULT=y",
+    "CONFIG_AMD_PMC=y",
+    "CONFIG_X86_AMD_PSTATE=y",
+    "CONFIG_X86_AMD_PLATFORM_DEVICE=y",
+    "CONFIG_PINCTRL_AMD=y",
+    "CONFIG_I2C_DESIGNWARE_CORE=y",
+    "CONFIG_I2C_DESIGNWARE_PLATFORM=y",
+    "CONFIG_I2C_HID=y",
+    "CONFIG_I2C_HID_ACPI=y",
+    "CONFIG_HID_MULTITOUCH=y",
+    "CONFIG_SND_HDA_CODEC_REALTEK=y",
+    "CONFIG_IOMMU_SUPPORT=y",
+    "CONFIG_AMD_IOMMU=y",
+    "CONFIG_IRQ_REMAP=y",
+    "CONFIG_X86_X2APIC=y",
+    "CONFIG_WIRELESS=y",
+    "CONFIG_CFG80211=y",
+    "CONFIG_MAC80211=y",
+    "CONFIG_WLAN=y",
+    "CONFIG_WLAN_VENDOR_ATH=y",
+    "CONFIG_ATH11K=y",
+    "CONFIG_ATH11K_PCI=y",
+    "CONFIG_CPU_MITIGATIONS=y",
+    "CONFIG_IGC=y",
+    "CONFIG_ETHTOOL_NETLINK=y",
+    "CONFIG_RTC_INTF_DEV=y",
+    "CONFIG_RTC_HCTOSYS=y",
+    "CONFIG_VIRTUALIZATION=y",
+    "CONFIG_KVM=y",
+    "CONFIG_KVM_AMD=y",
+    "CONFIG_KVM_INTEL=y",
+    "CONFIG_EXT4_FS=y",
+    "CONFIG_EXT4_USE_FOR_EXT2=y",
+    "CONFIG_VFAT_FS=y",
+    "CONFIG_FAT_DEFAULT_UTF8=y",
+    "CONFIG_EXFAT_FS=y",
+    "CONFIG_NLS=y",
+    "CONFIG_NLS_CODEPAGE_437=y",
+    "CONFIG_NLS_ISO8859_1=y",
+    "CONFIG_NLS_UTF8=y",
+    "CONFIG_IGB=y",
+    "CONFIG_NET_VENDOR_REALTEK=y",
+    "CONFIG_R8169=y",
+    "CONFIG_USB_NET_DRIVERS=y",
+    "CONFIG_USB_USBNET=y",
+    "CONFIG_USB_NET_CDCETHER=y",
+    "CONFIG_USB_NET_CDC_NCM=y",
+    "CONFIG_USB_RTL8152=y",
+    "CONFIG_USB_NET_AX88179_178A=y",
+    "CONFIG_USB_UAS=y",
+    "CONFIG_SND_USB=y",
+    "CONFIG_SND_USB_AUDIO=y",
+    "CONFIG_UDF_FS=y",
+    "# CONFIG_USB_NET_NET1080 is not set",
+    "# CONFIG_USB_NET_CDC_SUBSET is not set",
+    "# CONFIG_USB_NET_ZAURUS is not set",
+    "CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin amdgpu/green_sardine_asd.bin amdgpu/green_sardine_ce.bin amdgpu/green_sardine_dmcub.bin amdgpu/green_sardine_me.bin amdgpu/green_sardine_mec.bin amdgpu/green_sardine_pfp.bin amdgpu/green_sardine_rlc.bin amdgpu/green_sardine_sdma.bin amdgpu/green_sardine_ta.bin amdgpu/green_sardine_vcn.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"",
+    "CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"",
+    "# CONFIG_KERNEL_BZIP2 is not set",
+    "# CONFIG_KERNEL_LZMA is not set",
+    "# CONFIG_KERNEL_XZ is not set",
+    "# CONFIG_KERNEL_LZO is not set",
+    "# CONFIG_KERNEL_LZ4 is not set",
+    "# CONFIG_KERNEL_ZSTD is not set",
+];
+
+/// The resolved `.config`'s `CONFIG_` lines, sorted: what olddefconfig made
+/// of `CONFIG`. An absent symbol is off. UPDATING.md, "Kernel config lock".
+const CONFIG_LOCK: &str = include_str!("linux-x86-64.config");
+
+/// The symbol a `CONFIG` line names.
+fn config_symbol(line: &str) -> Option<&str> {
+    let line = line.strip_prefix("# ").unwrap_or(line);
+    line.split([' ', '='])
+        .next()
+        .filter(|s| s.starts_with("CONFIG_"))
+}
+
+/// Drops what allnoconfig wrote for each `CONFIG` symbol and appends `CONFIG`.
+fn config_script() -> String {
+    let deletes: String = CONFIG
+        .iter()
+        .filter_map(|line| config_symbol(line))
+        .map(|symbol| format!("/^#? *{symbol}[ =]/d; "))
+        .collect();
+    let writes: String = CONFIG.iter().map(|line| format!(" '{line}'")).collect();
+    format!("sed -i -r '{deletes}' .config && printf '%s\\n'{writes} >> .config").replace(
+        "@EFI_CMDLINE@",
+        &format!("{:?}", crate::shared::efi_default_cmdline()),
+    )
+}
+
 // linux-x86-64 (Linux 7.3.1): the latest STABLE mainline kernel (not a
 // longterm/LTS line), built in the Debian build root (AGENTS.md "Debian build
 // root"): Debian's gcc 14.2 as CC and HOSTCC, its binutils, make, flex, bison,
@@ -179,7 +497,7 @@ pub const FIRMWARE: &[(&str, &str)] = &[
 // `-device e1000`) sits under `menuconfig ETHERNET` → `config NET_VENDOR_INTEL`.
 // All three parents (NETDEVICES, ETHERNET, NET_VENDOR_INTEL) are forced off by
 // allnoconfig and would drop their leaves under olddefconfig, so they are pinned
-// =y EXPLICITLY alongside the drivers, and the grep-verify guard re-checks the
+// =y EXPLICITLY alongside the drivers, and the resolved lock re-checks the
 // leaves. The behavioural proof is the host-side `qemu-boot-net` oracle (QEMU
 // user-net; td-netd brings the link up, then resolve + reach a host).
 //
@@ -321,7 +639,7 @@ pub fn recipe() -> Recipe {
     //    e.g. SHMEM behind TMPFS, which has no prompt and keeps its `default y`). The
     //    parents must therefore be set EXPLICITLY: CONFIG_VIRTIO_MENU (gates
     //    VIRTIO_PCI), CONFIG_BLK_DEV (gates VIRTIO_BLK), CONFIG_MISC_FILESYSTEMS
-    //    (gates EROFS_FS). Do not drop them as "redundant" — the grep-verify guard on
+    //    (gates EROFS_FS). Do not drop them as "redundant" — the resolved lock on
     //    the leaves (step 4) reds the whole producer build if a parent goes missing.
     //    (PCI / BLOCK are directly selectable, with no menuconfig parent.)
     //
@@ -353,7 +671,7 @@ pub fn recipe() -> Recipe {
     //    dependency set (CRC32, CRYPTO_LIB_SHA256/BLAKE2B, ZLIB/LZO/ZSTD, RAID6_PQ,
     //    XOR_BLOCKS, XXHASH, FS_IOMAP — verified against fs/btrfs/Kconfig), so do NOT
     //    pin those individually; note CONFIG_LIBCRC32C does NOT exist in 7.3.1 (btrfs
-    //    uses the CRC32 lib, not CRYPTO_CRC32C) — a guard on it would red the build
+    //    uses the CRC32 lib, not CRYPTO_CRC32C) — a test holding it would red
     //    permanently. BTRFS_FS sits under `if BLOCK` (BLOCK already =y) and
     //    BLK_DEV_LOOP under `menuconfig BLK_DEV` (already =y), so no new menuconfig
     //    parent is required.
@@ -421,8 +739,8 @@ pub fn recipe() -> Recipe {
     //    can answer it and a pin is what turns it back on. SECCOMP_FILTER (:681) has
     //    NO prompt at all — it is `def_bool y` on `HAVE_ARCH_SECCOMP_FILTER && SECCOMP
     //    && NET`, so kconfig computes it and a line naming it in this list would be
-    //    dropped by olddefconfig rather than honoured. It is guarded below instead:
-    //    the guard is over the RESOLVED config, which is where a derived symbol can be
+    //    dropped by olddefconfig rather than honoured. It is held by the lock instead:
+    //    the lock is the RESOLVED config, which is where a derived symbol can be
     //    observed at all. NET is already =y above, so the dependency is satisfied —
     //    stated rather than left to be discovered, since seccomp silently depending on
     //    the network stack is not a thing anyone guesses.
@@ -697,7 +1015,7 @@ pub fn recipe() -> Recipe {
     //    TD_UTIL_APPLETS breaks for ordinary users. Its `menu "Security options"`
     //    parent has no config symbol, so unlike the erofs-root leaves above no
     //    parent pin is needed. A `default` flip is absorbed by the pin; only a
-    //    `select` that defeats it reaches the guard, which names the symbol here
+    //    `select` that defeats it reaches the lock's diff, which names the symbol here
     //    rather than letting it surface as a broken applet in the boot oracle.
     //
     //    CPU VULNERABILITY MITIGATIONS: x86 prompts for CPU_MITIGATIONS as a
@@ -723,883 +1041,29 @@ pub fn recipe() -> Recipe {
     //    x86 then selects ARCH_HAS_CPU_ATTACK_VECTORS, the attack-vector
     //    controls of `mitigations=`; ADDRESS_MASKING (LAM, unpinned)
     //    becomes unavailable.
-    steps.push(
-        Step::run(
-            "{src}",
-            &[
-                SH,
-                "-c",
-                &"sed -i -r \
-                 '/^#? *CONFIG_UNWINDER_ORC[ =]/d; \
-                  /^#? *CONFIG_UNWINDER_FRAME_POINTER[ =]/d; \
-                  /^#? *CONFIG_MODULES[ =]/d; \
-                  /^#? *CONFIG_MODULE_SIG[ =]/d; \
-                  /^#? *CONFIG_SYSTEM_TRUSTED_KEYRING[ =]/d; \
-                  /^#? *CONFIG_SYSTEM_TRUSTED_KEYS[ =]/d; \
-                  /^#? *CONFIG_DEBUG_INFO_BTF[ =]/d; \
-                  /^#? *CONFIG_FTRACE[ =]/d; \
-                  /^#? *CONFIG_GCC_PLUGINS[ =]/d; \
-                  /^#? *CONFIG_IKHEADERS[ =]/d; \
-                  /^#? *CONFIG_KERNEL_GZIP[ =]/d; \
-                  /^#? *CONFIG_KERNEL_BZIP2[ =]/d; \
-                  /^#? *CONFIG_KERNEL_LZMA[ =]/d; \
-                  /^#? *CONFIG_KERNEL_XZ[ =]/d; \
-                  /^#? *CONFIG_KERNEL_LZO[ =]/d; \
-                  /^#? *CONFIG_KERNEL_LZ4[ =]/d; \
-                  /^#? *CONFIG_KERNEL_ZSTD[ =]/d; \
-                  /^#? *CONFIG_BINFMT_ELF[ =]/d; \
-                  /^#? *CONFIG_BINFMT_SCRIPT[ =]/d; \
-                  /^#? *CONFIG_BLK_DEV_INITRD[ =]/d; \
-                  /^#? *CONFIG_SERIAL_8250[ =]/d; \
-                  /^#? *CONFIG_SERIAL_8250_CONSOLE[ =]/d; \
-                  /^#? *CONFIG_INITRAMFS_SOURCE[ =]/d; \
-                  /^#? *CONFIG_PROC_FS[ =]/d; \
-                  /^#? *CONFIG_SYSFS[ =]/d; \
-                  /^#? *CONFIG_DEVTMPFS[ =]/d; \
-                  /^#? *CONFIG_UNIX98_PTYS[ =]/d; \
-                  /^#? *CONFIG_TMPFS[ =]/d; \
-                  /^#? *CONFIG_BLOCK[ =]/d; \
-                  /^#? *CONFIG_BLK_DEV[ =]/d; \
-                  /^#? *CONFIG_PCI[ =]/d; \
-                  /^#? *CONFIG_PCI_MSI[ =]/d; \
-                  /^#? *CONFIG_VIRTIO[ =]/d; \
-                  /^#? *CONFIG_VIRTIO_MENU[ =]/d; \
-                  /^#? *CONFIG_VIRTIO_PCI[ =]/d; \
-                  /^#? *CONFIG_VIRTIO_CONSOLE[ =]/d; \
-                  /^#? *CONFIG_VIRTIO_BLK[ =]/d; \
-                  /^#? *CONFIG_MISC_FILESYSTEMS[ =]/d; \
-                  /^#? *CONFIG_EROFS_FS[ =]/d; \
-                  /^#? *CONFIG_EROFS_FS_ZIP[ =]/d; \
-                  /^#? *CONFIG_EROFS_FS_ZIP_ZSTD[ =]/d; \
-                  /^#? *CONFIG_KEXEC[ =]/d; \
-                  /^#? *CONFIG_KEXEC_FILE[ =]/d; \
-                  /^#? *CONFIG_KEXEC_SIG[ =]/d; \
-                  /^#? *CONFIG_KEXEC_SIG_FORCE[ =]/d; \
-                  /^#? *CONFIG_RELOCATABLE[ =]/d; \
-                  /^#? *CONFIG_RANDOMIZE_BASE[ =]/d; \
-                  /^#? *CONFIG_BLK_DEV_LOOP[ =]/d; \
-                  /^#? *CONFIG_BLK_DEV_RAM[ =]/d; \
-                  /^#? *CONFIG_BLK_DEV_RAM_COUNT[ =]/d; \
-                  /^#? *CONFIG_BTRFS_FS[ =]/d; \
-                  /^#? *CONFIG_SCSI[ =]/d; \
-                  /^#? *CONFIG_BLK_DEV_SD[ =]/d; \
-                  /^#? *CONFIG_BLK_DEV_SR[ =]/d; \
-                  /^#? *CONFIG_ATA[ =]/d; \
-                  /^#? *CONFIG_SATA_AHCI[ =]/d; \
-                  /^#? *CONFIG_BLK_DEV_NVME[ =]/d; \
-                  /^#? *CONFIG_NVME_CORE[ =]/d; \
-                  /^#? *CONFIG_NVME_MULTIPATH[ =]/d; \
-                  /^#? *CONFIG_USB_STORAGE[ =]/d; \
-                  /^#? *CONFIG_ISO9660_FS[ =]/d; \
-                  /^#? *CONFIG_MD[ =]/d; \
-                  /^#? *CONFIG_BLK_DEV_DM[ =]/d; \
-                  /^#? *CONFIG_DM_CRYPT[ =]/d; \
-                  /^#? *CONFIG_CRYPTO_AES[ =]/d; \
-                  /^#? *CONFIG_CRYPTO_XTS[ =]/d; \
-                  /^#? *CONFIG_CRYPTO_AES_NI_INTEL[ =]/d; \
-                  /^#? *CONFIG_CRYPTO_HMAC[ =]/d; \
-                  /^#? *CONFIG_CRYPTO_SHA256[ =]/d; \
-                  /^#? *CONFIG_CRYPTO_USER_API[_A-Z]*[ =]/d; \
-                  /^#? *CONFIG_NET[ =]/d; \
-                  /^#? *CONFIG_PACKET[ =]/d; \
-                  /^#? *CONFIG_UNIX[ =]/d; \
-                  /^#? *CONFIG_INET[ =]/d; \
-                  /^#? *CONFIG_NETDEVICES[ =]/d; \
-                  /^#? *CONFIG_VIRTIO_NET[ =]/d; \
-                  /^#? *CONFIG_ETHERNET[ =]/d; \
-                  /^#? *CONFIG_NET_VENDOR_INTEL[ =]/d; \
-                  /^#? *CONFIG_E1000[ =]/d; \
-                  /^#? *CONFIG_HYPERVISOR_GUEST[ =]/d; \
-                  /^#? *CONFIG_PARAVIRT[ =]/d; \
-                  /^#? *CONFIG_KVM_GUEST[ =]/d; \
-                  /^#? *CONFIG_HYPERV[ =]/d; \
-                  /^#? *CONFIG_HYPERV_VMBUS[ =]/d; \
-                  /^#? *CONFIG_SCSI_LOWLEVEL[ =]/d; \
-                  /^#? *CONFIG_HYPERV_STORAGE[ =]/d; \
-                  /^#? *CONFIG_HYPERV_NET[ =]/d; \
-                  /^#? *CONFIG_PCI_HYPERV[ =]/d; \
-                  /^#? *CONFIG_NET_VENDOR_AMAZON[ =]/d; \
-                  /^#? *CONFIG_ENA_ETHERNET[ =]/d; \
-                  /^#? *CONFIG_SCSI_VIRTIO[ =]/d; \
-                  /^#? *CONFIG_NET_VENDOR_GOOGLE[ =]/d; \
-                  /^#? *CONFIG_GVE[ =]/d; \
-                  /^#? *CONFIG_DMIID[ =]/d; \
-                  /^#? *CONFIG_INPUT[ =]/d; \
-                  /^#? *CONFIG_INPUT_EVDEV[ =]/d; \
-                  /^#? *CONFIG_INPUT_KEYBOARD[ =]/d; \
-                  /^#? *CONFIG_KEYBOARD_ATKBD[ =]/d; \
-                  /^#? *CONFIG_INPUT_MOUSE[ =]/d; \
-                  /^#? *CONFIG_MOUSE_PS2[ =]/d; \
-                  /^#? *CONFIG_VIRTIO_INPUT[ =]/d; \
-                  /^#? *CONFIG_SERIO[ =]/d; \
-                  /^#? *CONFIG_SERIO_I8042[ =]/d; \
-                  /^#? *CONFIG_VT[ =]/d; \
-                  /^#? *CONFIG_VT_CONSOLE[ =]/d; \
-                  /^#? *CONFIG_HW_CONSOLE_BINDING[ =]/d; \
-                  /^#? *CONFIG_FB[ =]/d; \
-                  /^#? *CONFIG_FRAMEBUFFER_CONSOLE[ =]/d; \
-                  /^#? *CONFIG_DRM[ =]/d; \
-                  /^#? *CONFIG_DRM_VIRTIO_GPU[ =]/d; \
-                  /^#? *CONFIG_DRM_VIRTIO_GPU_KMS[ =]/d; \
-                  /^#? *CONFIG_DRM_FBDEV_EMULATION[ =]/d; \
-                  /^#? *CONFIG_DRM_CLIENT_DEFAULT_FBDEV[ =]/d; \
-                  /^#? *CONFIG_SYSFB_SIMPLEFB[ =]/d; \
-                  /^#? *CONFIG_DRM_SIMPLEDRM[ =]/d; \
-                  /^#? *CONFIG_SECURITY_DMESG_RESTRICT[ =]/d; \
-                  /^#? *CONFIG_ACPI[ =]/d; \
-                  /^#? *CONFIG_CMDLINE_BOOL[ =]/d; \
-                  /^#? *CONFIG_CMDLINE[ =]/d; \
-                  /^#? *CONFIG_CMDLINE_OVERRIDE[ =]/d; \
-                  /^#? *CONFIG_EFI[ =]/d; \
-                  /^#? *CONFIG_EFI_STUB[ =]/d; \
-                  /^#? *CONFIG_EFI_HANDOVER_PROTOCOL[ =]/d; \
-                  /^#? *CONFIG_EFI_MIXED[ =]/d; \
-                  /^#? *CONFIG_EFIVAR_FS[ =]/d; \
-                  /^#? *CONFIG_PNP[ =]/d; \
-                  /^#? *CONFIG_PNPACPI[ =]/d; \
-                  /^#? *CONFIG_USB_SUPPORT[ =]/d; \
-                  /^#? *CONFIG_USB[ =]/d; \
-                  /^#? *CONFIG_USB_PCI[ =]/d; \
-                  /^#? *CONFIG_USB_XHCI_HCD[ =]/d; \
-                  /^#? *CONFIG_HID_SUPPORT[ =]/d; \
-                  /^#? *CONFIG_HID[ =]/d; \
-                  /^#? *CONFIG_HID_GENERIC[ =]/d; \
-                  /^#? *CONFIG_UHID[ =]/d; \
-                  /^#? *CONFIG_HIDRAW[ =]/d; \
-                  /^#? *CONFIG_USB_HID[ =]/d; \
-                  /^#? *CONFIG_TCG_TPM[ =]/d; \
-                  /^#? *CONFIG_SECURITYFS[ =]/d; \
-                  /^#? *CONFIG_SECURITY[ =]/d; \
-                  /^#? *CONFIG_LSM[ =]/d; \
-                  /^#? *CONFIG_SECURITY_NETWORK[ =]/d; \
-                  /^#? *CONFIG_SECURITY_PATH[ =]/d; \
-                  /^#? *CONFIG_SECURITY_SELINUX[ =]/d; \
-                  /^#? *CONFIG_SECURITY_SMACK[ =]/d; \
-                  /^#? *CONFIG_SECURITY_TOMOYO[ =]/d; \
-                  /^#? *CONFIG_SECURITY_APPARMOR[ =]/d; \
-                  /^#? *CONFIG_SECURITY_LOADPIN[ =]/d; \
-                  /^#? *CONFIG_SECURITY_YAMA[ =]/d; \
-                  /^#? *CONFIG_SECURITY_SAFESETID[ =]/d; \
-                  /^#? *CONFIG_SECURITY_LOCKDOWN_LSM[ =]/d; \
-                  /^#? *CONFIG_SECURITY_LANDLOCK[ =]/d; \
-                  /^#? *CONFIG_SECURITY_IPE[ =]/d; \
-                  /^#? *CONFIG_BPF_LSM[ =]/d; \
-                  /^#? *CONFIG_INTEGRITY[ =]/d; \
-                  /^#? *CONFIG_TCG_TIS[ =]/d; \
-                  /^#? *CONFIG_TCG_CRB[ =]/d; \
-                  /^#? *CONFIG_TCG_TPM2_HMAC[ =]/d; \
-                  /^#? *CONFIG_HW_RANDOM_TPM[ =]/d; \
-                  /^#? *CONFIG_PERF_EVENTS[ =]/d; \
-                  /^#? *CONFIG_HOTPLUG_CPU[ =]/d; \
-                  /^#? *CONFIG_SMP[ =]/d; \
-                  /^#? *CONFIG_NR_CPUS[ =]/d; \
-                  /^#? *CONFIG_USER_NS[ =]/d; \
-                  /^#? *CONFIG_PID_NS[ =]/d; \
-                  /^#? *CONFIG_UTS_NS[ =]/d; \
-                  /^#? *CONFIG_NET_NS[ =]/d; \
-                  /^#? *CONFIG_AUDIT[ =]/d; \
-                  /^#? *CONFIG_COMPAT_32BIT_TIME[ =]/d; \
-                  /^#? *CONFIG_IA32_EMULATION[ =]/d; \
-                  /^#? *CONFIG_IA32_EMULATION_DEFAULT_DISABLED[ =]/d; \
-                  /^#? *CONFIG_X86_X32_ABI[ =]/d; \
-                  /^#? *CONFIG_SECCOMP[ =]/d; \
-                  /^#? *CONFIG_INOTIFY_USER[ =]/d; \
-                  /^#? *CONFIG_CGROUPS[ =]/d; \
-                  /^#? *CONFIG_CGROUP_SCHED[ =]/d; \
-                  /^#? *CONFIG_FAIR_GROUP_SCHED[ =]/d; \
-                  /^#? *CONFIG_CFS_BANDWIDTH[ =]/d; \
-                  /^#? *CONFIG_RT_GROUP_SCHED[ =]/d; \
-                  /^#? *CONFIG_MEMCG[ =]/d; \
-                  /^#? *CONFIG_CGROUP_PIDS[ =]/d; \
-                  /^#? *CONFIG_SOUND[ =]/d; \
-                  /^#? *CONFIG_SND[ =]/d; \
-                  /^#? *CONFIG_SND_PCM[ =]/d; \
-                  /^#? *CONFIG_SND_PCM_OSS[ =]/d; \
-                  /^#? *CONFIG_SND_PCI[ =]/d; \
-                  /^#? *CONFIG_SND_HDA_INTEL[ =]/d; \
-                  /^#? *CONFIG_SND_HDA_GENERIC[ =]/d; \
-                  /^#? *CONFIG_DRM_I915[ =]/d; \
-                  /^#? *CONFIG_E1000E[ =]/d; \
-                  /^#? *CONFIG_X86_PLATFORM_DEVICES[ =]/d; \
-                  /^#? *CONFIG_ACPI_EC[ =]/d; \
-                  /^#? *CONFIG_I2C[ =]/d; \
-                  /^#? *CONFIG_THINKPAD_ACPI[ =]/d; \
-                  /^#? *CONFIG_ACPI_AC[ =]/d; \
-                  /^#? *CONFIG_ACPI_BATTERY[ =]/d; \
-                  /^#? *CONFIG_ACPI_BUTTON[ =]/d; \
-                  /^#? *CONFIG_ACPI_THERMAL[ =]/d; \
-                  /^#? *CONFIG_ACPI_FAN[ =]/d; \
-                  /^#? *CONFIG_ACPI_VIDEO[ =]/d; \
-                  /^#? *CONFIG_BACKLIGHT_CLASS_DEVICE[ =]/d; \
-                  /^#? *CONFIG_CPU_FREQ[ =]/d; \
-                  /^#? *CONFIG_X86_INTEL_PSTATE[ =]/d; \
-                  /^#? *CONFIG_CPU_IDLE[ =]/d; \
-                  /^#? *CONFIG_INTEL_IDLE[ =]/d; \
-                  /^#? *CONFIG_SUSPEND[ =]/d; \
-                  /^#? *CONFIG_USB_EHCI_HCD[ =]/d; \
-                  /^#? *CONFIG_MMC[ =]/d; \
-                  /^#? *CONFIG_MMC_BLOCK[ =]/d; \
-                  /^#? *CONFIG_MMC_SDHCI[ =]/d; \
-                  /^#? *CONFIG_MMC_SDHCI_PCI[ =]/d; \
-                  /^#? *CONFIG_MMC_RICOH_MMC[ =]/d; \
-                  /^#? *CONFIG_SND_HDA_CODEC_CONEXANT[ =]/d; \
-                  /^#? *CONFIG_SND_HDA_CODEC_HDMI[ =]/d; \
-                  /^#? *CONFIG_DRM_AMDGPU[ =]/d; \
-                  /^#? *CONFIG_DRM_AMD_DC[ =]/d; \
-                  /^#? *CONFIG_RTC_CLASS[ =]/d; \
-                  /^#? *CONFIG_RTC_DRV_CMOS[ =]/d; \
-                  /^#? *CONFIG_PCIEPORTBUS[ =]/d; \
-                  /^#? *CONFIG_PCIEASPM[ =]/d; \
-                  /^#? *CONFIG_PCIEASPM_DEFAULT[ =]/d; \
-                  /^#? *CONFIG_AMD_PMC[ =]/d; \
-                  /^#? *CONFIG_X86_AMD_PSTATE[ =]/d; \
-                  /^#? *CONFIG_X86_AMD_PLATFORM_DEVICE[ =]/d; \
-                  /^#? *CONFIG_PINCTRL_AMD[ =]/d; \
-                  /^#? *CONFIG_I2C_DESIGNWARE_CORE[ =]/d; \
-                  /^#? *CONFIG_I2C_DESIGNWARE_PLATFORM[ =]/d; \
-                  /^#? *CONFIG_I2C_HID[ =]/d; \
-                  /^#? *CONFIG_I2C_HID_ACPI[ =]/d; \
-                  /^#? *CONFIG_HID_MULTITOUCH[ =]/d; \
-                  /^#? *CONFIG_SND_HDA_CODEC_REALTEK[ =]/d; \
-                  /^#? *CONFIG_IOMMU_SUPPORT[ =]/d; \
-                  /^#? *CONFIG_AMD_IOMMU[ =]/d; \
-                  /^#? *CONFIG_IRQ_REMAP[ =]/d; \
-                  /^#? *CONFIG_X86_X2APIC[ =]/d; \
-                  /^#? *CONFIG_WIRELESS[ =]/d; \
-                  /^#? *CONFIG_CFG80211[ =]/d; \
-                  /^#? *CONFIG_MAC80211[ =]/d; \
-                  /^#? *CONFIG_WLAN[ =]/d; \
-                  /^#? *CONFIG_WLAN_VENDOR_ATH[ =]/d; \
-                  /^#? *CONFIG_ATH11K[ =]/d; \
-                  /^#? *CONFIG_ATH11K_PCI[ =]/d; \
-                  /^#? *CONFIG_EXTRA_FIRMWARE[ =]/d; \
-                  /^#? *CONFIG_EXTRA_FIRMWARE_DIR[ =]/d; \
-                  /^#? *CONFIG_CPU_MITIGATIONS[ =]/d; \
-                  /^#? *CONFIG_IGC[ =]/d; \
-                  /^#? *CONFIG_ETHTOOL_NETLINK[ =]/d; \
-                  /^#? *CONFIG_RTC_INTF_DEV[ =]/d; \
-                  /^#? *CONFIG_RTC_HCTOSYS[ =]/d; \
-                  /^#? *CONFIG_VIRTUALIZATION[ =]/d; \
-                  /^#? *CONFIG_KVM[ =]/d; \
-                  /^#? *CONFIG_KVM_AMD[ =]/d; \
-                  /^#? *CONFIG_KVM_INTEL[ =]/d; \
-                  /^#? *CONFIG_EXT4_FS[ =]/d; \
-                  /^#? *CONFIG_EXT4_USE_FOR_EXT2[ =]/d; \
-                  /^#? *CONFIG_VFAT_FS[ =]/d; \
-                  /^#? *CONFIG_FAT_DEFAULT_UTF8[ =]/d; \
-                  /^#? *CONFIG_EXFAT_FS[ =]/d; \
-                  /^#? *CONFIG_NLS[ =]/d; \
-                  /^#? *CONFIG_NLS_CODEPAGE_437[ =]/d; \
-                  /^#? *CONFIG_NLS_ISO8859_1[ =]/d; \
-                  /^#? *CONFIG_NLS_UTF8[ =]/d; \
-                  /^#? *CONFIG_IGB[ =]/d; \
-                  /^#? *CONFIG_NET_VENDOR_REALTEK[ =]/d; \
-                  /^#? *CONFIG_R8169[ =]/d; \
-                  /^#? *CONFIG_USB_NET_DRIVERS[ =]/d; \
-                  /^#? *CONFIG_USB_USBNET[ =]/d; \
-                  /^#? *CONFIG_USB_NET_CDCETHER[ =]/d; \
-                  /^#? *CONFIG_USB_NET_CDC_NCM[ =]/d; \
-                  /^#? *CONFIG_USB_RTL8152[ =]/d; \
-                  /^#? *CONFIG_USB_NET_AX88179_178A[ =]/d; \
-                  /^#? *CONFIG_USB_UAS[ =]/d; \
-                  /^#? *CONFIG_SND_USB[ =]/d; \
-                  /^#? *CONFIG_SND_USB_AUDIO[ =]/d; \
-                  /^#? *CONFIG_UDF_FS[ =]/d; \
-                  /^#? *CONFIG_USB_NET_NET1080[ =]/d; \
-                  /^#? *CONFIG_USB_NET_CDC_SUBSET[ =]/d; \
-                  /^#? *CONFIG_USB_NET_ZAURUS[ =]/d; \
-                  /^#? *CONFIG_SYSCALL_USER_DISPATCH[ =]/d; \
-                  /^#? *CONFIG_SERIAL_8250_MOXA_PCIE[ =]/d; \
-                  /^#? *CONFIG_SND_ALOOP[ =]/d' .config && \
-                 printf '%s\\n' \
-                   'CONFIG_SYSCALL_USER_DISPATCH=y' \
-                   '# CONFIG_SERIAL_8250_MOXA_PCIE is not set' \
-                   'CONFIG_UNWINDER_FRAME_POINTER=y' \
-                   '# CONFIG_UNWINDER_ORC is not set' \
-                   '# CONFIG_MODULES is not set' \
-                   '# CONFIG_MODULE_SIG is not set' \
-                   '# CONFIG_SYSTEM_TRUSTED_KEYRING is not set' \
-                   'CONFIG_SYSTEM_TRUSTED_KEYS=\"\"' \
-                   '# CONFIG_DEBUG_INFO_BTF is not set' \
-                   '# CONFIG_FTRACE is not set' \
-                   '# CONFIG_GCC_PLUGINS is not set' \
-                   '# CONFIG_IKHEADERS is not set' \
-                   'CONFIG_KERNEL_GZIP=y' \
-                   'CONFIG_BINFMT_ELF=y' \
-                   'CONFIG_BINFMT_SCRIPT=y' \
-                   'CONFIG_BLK_DEV_INITRD=y' \
-                   'CONFIG_SERIAL_8250=y' \
-                   'CONFIG_SERIAL_8250_CONSOLE=y' \
-                   'CONFIG_INITRAMFS_SOURCE=\"\"' \
-                   'CONFIG_PROC_FS=y' \
-                   'CONFIG_SYSFS=y' \
-                   'CONFIG_DEVTMPFS=y' \
-                   'CONFIG_UNIX98_PTYS=y' \
-                   'CONFIG_TMPFS=y' \
-                   'CONFIG_BLOCK=y' \
-                   'CONFIG_BLK_DEV=y' \
-                   'CONFIG_PCI=y' \
-                   'CONFIG_PCI_MSI=y' \
-                   'CONFIG_VIRTIO=y' \
-                   'CONFIG_VIRTIO_MENU=y' \
-                   'CONFIG_VIRTIO_PCI=y' \
-                   'CONFIG_VIRTIO_CONSOLE=y' \
-                   'CONFIG_VIRTIO_BLK=y' \
-                   'CONFIG_MISC_FILESYSTEMS=y' \
-                   'CONFIG_EROFS_FS=y' \
-                   'CONFIG_EROFS_FS_ZIP=y' \
-                   'CONFIG_EROFS_FS_ZIP_ZSTD=y' \
-                   '# CONFIG_KEXEC is not set' \
-                   'CONFIG_KEXEC_FILE=y' \
-                   '# CONFIG_KEXEC_SIG is not set' \
-                   '# CONFIG_KEXEC_SIG_FORCE is not set' \
-                   'CONFIG_RELOCATABLE=y' \
-                   '# CONFIG_RANDOMIZE_BASE is not set' \
-                   'CONFIG_BLK_DEV_LOOP=y' \
-                   'CONFIG_BLK_DEV_RAM=y' \
-                   'CONFIG_BLK_DEV_RAM_COUNT=1' \
-                   'CONFIG_BTRFS_FS=y' \
-                   'CONFIG_SCSI=y' \
-                   'CONFIG_BLK_DEV_SD=y' \
-                   'CONFIG_BLK_DEV_SR=y' \
-                   'CONFIG_ATA=y' \
-                   'CONFIG_SATA_AHCI=y' \
-                   'CONFIG_BLK_DEV_NVME=y' \
-                   'CONFIG_NVME_CORE=y' \
-                   '# CONFIG_NVME_MULTIPATH is not set' \
-                   'CONFIG_USB_STORAGE=y' \
-                   'CONFIG_ISO9660_FS=y' \
-                   'CONFIG_MD=y' \
-                   'CONFIG_BLK_DEV_DM=y' \
-                   'CONFIG_DM_CRYPT=y' \
-                   'CONFIG_CRYPTO_AES=y' \
-                   'CONFIG_CRYPTO_XTS=y' \
-                   'CONFIG_CRYPTO_AES_NI_INTEL=y' \
-                   'CONFIG_CRYPTO_HMAC=y' \
-                   'CONFIG_CRYPTO_SHA256=y' \
-                   '# CONFIG_CRYPTO_USER_API_HASH is not set' \
-                   '# CONFIG_CRYPTO_USER_API_SKCIPHER is not set' \
-                   '# CONFIG_CRYPTO_USER_API_RNG is not set' \
-                   '# CONFIG_CRYPTO_USER_API_AEAD is not set' \
-                   'CONFIG_NET=y' \
-                   'CONFIG_PACKET=y' \
-                   'CONFIG_UNIX=y' \
-                   'CONFIG_INET=y' \
-                   'CONFIG_NETDEVICES=y' \
-                   'CONFIG_VIRTIO_NET=y' \
-                   'CONFIG_ETHERNET=y' \
-                   'CONFIG_NET_VENDOR_INTEL=y' \
-                   'CONFIG_E1000=y' \
-                   'CONFIG_HYPERVISOR_GUEST=y' \
-                   'CONFIG_PARAVIRT=y' \
-                   'CONFIG_KVM_GUEST=y' \
-                   'CONFIG_HYPERV=y' \
-                   'CONFIG_HYPERV_VMBUS=y' \
-                   'CONFIG_SCSI_LOWLEVEL=y' \
-                   'CONFIG_HYPERV_STORAGE=y' \
-                   'CONFIG_HYPERV_NET=y' \
-                   'CONFIG_PCI_HYPERV=y' \
-                   'CONFIG_NET_VENDOR_AMAZON=y' \
-                   'CONFIG_ENA_ETHERNET=y' \
-                   'CONFIG_SCSI_VIRTIO=y' \
-                   'CONFIG_NET_VENDOR_GOOGLE=y' \
-                   'CONFIG_GVE=y' \
-                   'CONFIG_DMIID=y' \
-                   'CONFIG_INPUT=y' \
-                   'CONFIG_INPUT_EVDEV=y' \
-                   'CONFIG_INPUT_KEYBOARD=y' \
-                   'CONFIG_KEYBOARD_ATKBD=y' \
-                   'CONFIG_INPUT_MOUSE=y' \
-                   'CONFIG_MOUSE_PS2=y' \
-                   'CONFIG_VIRTIO_INPUT=y' \
-                   'CONFIG_SERIO=y' \
-                   'CONFIG_SERIO_I8042=y' \
-                   'CONFIG_VT=y' \
-                   'CONFIG_VT_CONSOLE=y' \
-                   'CONFIG_HW_CONSOLE_BINDING=y' \
-                   'CONFIG_FB=y' \
-                   'CONFIG_FRAMEBUFFER_CONSOLE=y' \
-                   'CONFIG_DRM=y' \
-                   'CONFIG_DRM_VIRTIO_GPU=y' \
-                   'CONFIG_DRM_VIRTIO_GPU_KMS=y' \
-                   'CONFIG_DRM_FBDEV_EMULATION=y' \
-                   'CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y' \
-                   'CONFIG_SYSFB_SIMPLEFB=y' \
-                   'CONFIG_DRM_SIMPLEDRM=y' \
-                   '# CONFIG_SECURITY_DMESG_RESTRICT is not set' \
-                   'CONFIG_ACPI=y' \
-                   'CONFIG_EFI=y' \
-                   'CONFIG_EFI_STUB=y' \
-                   'CONFIG_CMDLINE_BOOL=y' \
-                   'CONFIG_CMDLINE=@EFI_CMDLINE@' \
-                   '# CONFIG_CMDLINE_OVERRIDE is not set' \
-                   '# CONFIG_EFI_HANDOVER_PROTOCOL is not set' \
-                   '# CONFIG_EFI_MIXED is not set' \
-                   '# CONFIG_EFIVAR_FS is not set' \
-                   'CONFIG_PNP=y' \
-                   'CONFIG_PNPACPI=y' \
-                   'CONFIG_USB_SUPPORT=y' \
-                   'CONFIG_USB=y' \
-                   'CONFIG_USB_PCI=y' \
-                   'CONFIG_USB_XHCI_HCD=y' \
-                   'CONFIG_HID_SUPPORT=y' \
-                   'CONFIG_HID=y' \
-                   'CONFIG_HID_GENERIC=y' \
-                   'CONFIG_UHID=y' \
-                   'CONFIG_HIDRAW=y' \
-                   'CONFIG_USB_HID=y' \
-                   'CONFIG_TCG_TPM=y' \
-                   'CONFIG_SECURITYFS=y' \
-                   'CONFIG_SECURITY=y' \
-                   'CONFIG_LSM=\"\"' \
-                   '# CONFIG_SECURITY_NETWORK is not set' \
-                   '# CONFIG_SECURITY_PATH is not set' \
-                   '# CONFIG_SECURITY_SELINUX is not set' \
-                   '# CONFIG_SECURITY_SMACK is not set' \
-                   '# CONFIG_SECURITY_TOMOYO is not set' \
-                   '# CONFIG_SECURITY_APPARMOR is not set' \
-                   '# CONFIG_SECURITY_LOADPIN is not set' \
-                   '# CONFIG_SECURITY_YAMA is not set' \
-                   '# CONFIG_SECURITY_SAFESETID is not set' \
-                   '# CONFIG_SECURITY_LOCKDOWN_LSM is not set' \
-                   '# CONFIG_SECURITY_LANDLOCK is not set' \
-                   '# CONFIG_SECURITY_IPE is not set' \
-                   '# CONFIG_BPF_LSM is not set' \
-                   '# CONFIG_INTEGRITY is not set' \
-                   'CONFIG_TCG_TIS=y' \
-                   'CONFIG_TCG_CRB=y' \
-                   '# CONFIG_TCG_TPM2_HMAC is not set' \
-                   '# CONFIG_HW_RANDOM_TPM is not set' \
-                   'CONFIG_PERF_EVENTS=y' \
-                   'CONFIG_SMP=y' \
-                   'CONFIG_NR_CPUS=256' \
-                   'CONFIG_HOTPLUG_CPU=y' \
-                   'CONFIG_USER_NS=y' \
-                   'CONFIG_PID_NS=y' \
-                   'CONFIG_UTS_NS=y' \
-                   'CONFIG_NET_NS=y' \
-                   'CONFIG_AUDIT=y' \
-                   'CONFIG_COMPAT_32BIT_TIME=y' \
-                   'CONFIG_IA32_EMULATION=y' \
-                   '# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set' \
-                   '# CONFIG_X86_X32_ABI is not set' \
-                   'CONFIG_SECCOMP=y' \
-                   'CONFIG_INOTIFY_USER=y' \
-                   'CONFIG_CGROUPS=y' \
-                   'CONFIG_CGROUP_SCHED=y' \
-                   'CONFIG_FAIR_GROUP_SCHED=y' \
-                   'CONFIG_CFS_BANDWIDTH=y' \
-                   '# CONFIG_RT_GROUP_SCHED is not set' \
-                   'CONFIG_MEMCG=y' \
-                   'CONFIG_CGROUP_PIDS=y' \
-                   'CONFIG_SOUND=y' \
-                   'CONFIG_SND=y' \
-                   'CONFIG_SND_PCM=y' \
-                   '# CONFIG_SND_PCM_OSS is not set' \
-                   'CONFIG_SND_PCI=y' \
-                   'CONFIG_SND_HDA_INTEL=y' \
-                   'CONFIG_SND_HDA_GENERIC=y' \
-                   'CONFIG_SND_ALOOP=y' \
-                   'CONFIG_DRM_I915=y' \
-                   'CONFIG_E1000E=y' \
-                   'CONFIG_X86_PLATFORM_DEVICES=y' \
-                   'CONFIG_ACPI_EC=y' \
-                   'CONFIG_I2C=y' \
-                   'CONFIG_THINKPAD_ACPI=y' \
-                   'CONFIG_ACPI_AC=y' \
-                   'CONFIG_ACPI_BATTERY=y' \
-                   'CONFIG_ACPI_BUTTON=y' \
-                   'CONFIG_ACPI_THERMAL=y' \
-                   'CONFIG_ACPI_FAN=y' \
-                   'CONFIG_ACPI_VIDEO=y' \
-                   'CONFIG_BACKLIGHT_CLASS_DEVICE=y' \
-                   'CONFIG_CPU_FREQ=y' \
-                   'CONFIG_X86_INTEL_PSTATE=y' \
-                   'CONFIG_CPU_IDLE=y' \
-                   'CONFIG_INTEL_IDLE=y' \
-                   'CONFIG_SUSPEND=y' \
-                   'CONFIG_USB_EHCI_HCD=y' \
-                   'CONFIG_MMC=y' \
-                   'CONFIG_MMC_BLOCK=y' \
-                   'CONFIG_MMC_SDHCI=y' \
-                   'CONFIG_MMC_SDHCI_PCI=y' \
-                   'CONFIG_MMC_RICOH_MMC=y' \
-                   'CONFIG_SND_HDA_CODEC_CONEXANT=y' \
-                   'CONFIG_SND_HDA_CODEC_HDMI=y' \
-                   'CONFIG_DRM_AMDGPU=y' \
-                   'CONFIG_DRM_AMD_DC=y' \
-                   'CONFIG_RTC_CLASS=y' \
-                   'CONFIG_RTC_DRV_CMOS=y' \
-                   'CONFIG_PCIEPORTBUS=y' \
-                   'CONFIG_PCIEASPM=y' \
-                   'CONFIG_PCIEASPM_DEFAULT=y' \
-                   'CONFIG_AMD_PMC=y' \
-                   'CONFIG_X86_AMD_PSTATE=y' \
-                   'CONFIG_X86_AMD_PLATFORM_DEVICE=y' \
-                   'CONFIG_PINCTRL_AMD=y' \
-                   'CONFIG_I2C_DESIGNWARE_CORE=y' \
-                   'CONFIG_I2C_DESIGNWARE_PLATFORM=y' \
-                   'CONFIG_I2C_HID=y' \
-                   'CONFIG_I2C_HID_ACPI=y' \
-                   'CONFIG_HID_MULTITOUCH=y' \
-                   'CONFIG_SND_HDA_CODEC_REALTEK=y' \
-                   'CONFIG_IOMMU_SUPPORT=y' \
-                   'CONFIG_AMD_IOMMU=y' \
-                   'CONFIG_IRQ_REMAP=y' \
-                   'CONFIG_X86_X2APIC=y' \
-                   'CONFIG_WIRELESS=y' \
-                   'CONFIG_CFG80211=y' \
-                   'CONFIG_MAC80211=y' \
-                   'CONFIG_WLAN=y' \
-                   'CONFIG_WLAN_VENDOR_ATH=y' \
-                   'CONFIG_ATH11K=y' \
-                   'CONFIG_ATH11K_PCI=y' \
-                   'CONFIG_CPU_MITIGATIONS=y' \
-                   'CONFIG_IGC=y' \
-                   'CONFIG_ETHTOOL_NETLINK=y' \
-                   'CONFIG_RTC_INTF_DEV=y' \
-                   'CONFIG_RTC_HCTOSYS=y' \
-                   'CONFIG_VIRTUALIZATION=y' \
-                   'CONFIG_KVM=y' \
-                   'CONFIG_KVM_AMD=y' \
-                   'CONFIG_KVM_INTEL=y' \
-                   'CONFIG_EXT4_FS=y' \
-                   'CONFIG_EXT4_USE_FOR_EXT2=y' \
-                   'CONFIG_VFAT_FS=y' \
-                   'CONFIG_FAT_DEFAULT_UTF8=y' \
-                   'CONFIG_EXFAT_FS=y' \
-                   'CONFIG_NLS=y' \
-                   'CONFIG_NLS_CODEPAGE_437=y' \
-                   'CONFIG_NLS_ISO8859_1=y' \
-                   'CONFIG_NLS_UTF8=y' \
-                   'CONFIG_IGB=y' \
-                   'CONFIG_NET_VENDOR_REALTEK=y' \
-                   'CONFIG_R8169=y' \
-                   'CONFIG_USB_NET_DRIVERS=y' \
-                   'CONFIG_USB_USBNET=y' \
-                   'CONFIG_USB_NET_CDCETHER=y' \
-                   'CONFIG_USB_NET_CDC_NCM=y' \
-                   'CONFIG_USB_RTL8152=y' \
-                   'CONFIG_USB_NET_AX88179_178A=y' \
-                   'CONFIG_USB_UAS=y' \
-                   'CONFIG_SND_USB=y' \
-                   'CONFIG_SND_USB_AUDIO=y' \
-                   'CONFIG_UDF_FS=y' \
-                   '# CONFIG_USB_NET_NET1080 is not set' \
-                   '# CONFIG_USB_NET_CDC_SUBSET is not set' \
-                   '# CONFIG_USB_NET_ZAURUS is not set' \
-                   'CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin amdgpu/green_sardine_asd.bin amdgpu/green_sardine_ce.bin amdgpu/green_sardine_dmcub.bin amdgpu/green_sardine_me.bin amdgpu/green_sardine_mec.bin amdgpu/green_sardine_pfp.bin amdgpu/green_sardine_rlc.bin amdgpu/green_sardine_sdma.bin amdgpu/green_sardine_ta.bin amdgpu/green_sardine_vcn.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' \
-                   'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' >> .config"
-                    .replace(
-                        "@EFI_CMDLINE@",
-                        &format!("{:?}", crate::shared::efi_default_cmdline()),
-                    ),
-            ],
-        )
-        .env("PATH", PATH),
-    );
+    steps.push(Step::run("{src}", &[SH, "-c", &config_script()]).env("PATH", PATH));
 
     // 3) olddefconfig normalises the choice (takes defaults for newly-visible
     //    symbols, non-interactive).
     steps.push(mk(&["olddefconfig"]));
 
-    // 4) Guard: the minimal invariant must hold before the full build. Fail HERE,
-    //    with a named symbol, if the unwinder flip or the no-modules pin did not
-    //    take. (objtool IS expected on x86_64 7.x — not asserted absent.)
+    // 4) The resolved config is exactly the committed lock, so every default
+    //    olddefconfig takes and every symbol a kernel or toolchain bump moves
+    //    is a reviewed line. Fail here, before the full build, with the diff.
+    steps.push(Step::WriteFile {
+        path: "{root}/kernel-config.lock".into(),
+        content: CONFIG_LOCK.into(),
+        exec: false,
+    });
     steps.push(
         Step::run(
             "{src}",
             &[
                 SH,
                 "-c",
-                &"grep -q '^CONFIG_UNWINDER_FRAME_POINTER=y' .config || { echo 'frame-pointer unwinder not selected' >&2; exit 1; }; \
-                 grep -q '^CONFIG_KERNEL_GZIP=y' .config || { echo 'gzip kernel compression not selected (bzImage would need another compressor)' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BINFMT_ELF=y' .config || { echo 'BINFMT_ELF off — the kernel could not exec the initramfs userland' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BINFMT_SCRIPT=y' .config || { echo 'BINFMT_SCRIPT off — the kernel could not exec the #! /init script' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BLK_DEV_INITRD=y' .config || { echo 'BLK_DEV_INITRD off — the kernel could not load the initramfs' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SERIAL_8250_CONSOLE=y' .config || { echo '8250 serial console off — no ttyS0 boot output for the qemu check' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DEVTMPFS=y' .config || { echo 'DEVTMPFS off - init cannot mount /dev, so the userland has no ttyS0/console devices' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off - a usable userland (ps/mount/init) needs /proc' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SYSFS=y' .config || { echo 'SYSFS off - a usable userland needs /sys' >&2; exit 1; }; \
-                 grep -q '^CONFIG_TMPFS=y' .config || { echo 'TMPFS off - a usable userland needs writable /var,/tmp,/run mounts' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BLOCK=y' .config || { echo 'BLOCK off - no block layer for the virtio-blk erofs disk' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PCI=y' .config || { echo 'PCI off - virtio-blk-pci (the -M pc transport) needs the PCI bus' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PCI_MSI=y' .config || { echo 'PCI_MSI off - target PCI profile selects MSI/MSI-X support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_VIRTIO_PCI=y' .config || { echo 'VIRTIO_PCI off - no virtio transport on the -M pc PCI bus' >&2; exit 1; }; \
-                 grep -q '^CONFIG_VIRTIO_CONSOLE=y' .config || { echo 'VIRTIO_CONSOLE off - no td VM bridge' >&2; exit 1; }; \
-                 grep -q '^CONFIG_VIRTIO_BLK=y' .config || { echo 'VIRTIO_BLK off - the erofs disk (/dev/vda) would not appear' >&2; exit 1; }; \
-                 grep -q '^CONFIG_EROFS_FS_ZIP=y' .config || exit 1; \
-                 grep -q '^CONFIG_EROFS_FS_ZIP_ZSTD=y' .config || exit 1; \
-                 grep -q '^CONFIG_EROFS_FS=y' .config || { echo 'EROFS_FS off - the read-only erofs root could not be mounted' >&2; exit 1; }; \
-                 if grep -q '^CONFIG_OVERLAY_FS=y' .config; then echo 'OVERLAY_FS on - /etc is immutable and writable state uses direct mounts; no overlay user remains' >&2; exit 1; fi; \
-                 grep -q '^CONFIG_PRINTK=y' .config || { echo 'PRINTK off — no kernel console output' >&2; exit 1; }; \
-                 grep -q '^CONFIG_TTY=y' .config || { echo 'TTY off — the serial console needs the tty layer' >&2; exit 1; }; \
-                 grep -q '^CONFIG_UNIX98_PTYS=y' .config || { echo 'UNIX98_PTYS off — /dev/ptmx would not exist, so td-term could not allocate a pty and the graphical session would come up with no terminal' >&2; exit 1; }; \
-                 grep -q '^CONFIG_KEXEC_FILE=y' .config || { echo 'KEXEC_FILE off — the shim boots the selected deployment via kexec_file_load(2)' >&2; exit 1; }; \
-                 grep -q '^CONFIG_RELOCATABLE=y' .config || { echo 'RELOCATABLE off — a non-relocatable bzImage is rejected by the x86 kexec_file_load loader (boots via -kernel, fails via kexec)' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BTRFS_FS=y' .config || { echo 'BTRFS_FS off — the persistent volume is one btrfs filesystem (@var plus the loop-mounted EROFS root blobs)' >&2; exit 1; }; \
-                 grep -q '^CONFIG_MD=y' .config || { echo 'MD off — device mapper needs its prompted parent enabled' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BLK_DEV_DM=y' .config || { echo 'BLK_DEV_DM off — encrypted volumes need built-in device mapper' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DM_CRYPT=y' .config || { echo 'DM_CRYPT off — encrypted volumes need the built-in crypt target' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CRYPTO_AES=y' .config || { echo 'CRYPTO_AES off — disk encryption needs a generic AES fallback' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CRYPTO_XTS=y' .config || { echo 'CRYPTO_XTS off — disk encryption needs the generic XTS mode' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CRYPTO_AES_NI_INTEL=y' .config || { echo 'CRYPTO_AES_NI_INTEL off — disk encryption needs the x86 accelerated AES-XTS implementation' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CRYPTO_HMAC=y' .config || { echo 'CRYPTO_HMAC off — kernel consumers need HMAC' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CRYPTO_SHA256=y' .config || { echo 'CRYPTO_SHA256 off — kernel consumers need SHA-256' >&2; exit 1; }; \
-                 ! grep -qE '^CONFIG_CRYPTO_USER_API[^=]*=[ym]' .config || { echo 'deprecated AF_ALG user interface enabled' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BLK_DEV_LOOP=y' .config || { echo 'BLK_DEV_LOOP off — the immutable EROFS root is a file inside btrfs, loop-mounted read-only' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BLK_DEV_RAM=y' .config || { echo 'BLK_DEV_RAM off - a live boot keeps its volatile volume on /dev/ram0' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BLK_DEV_RAM_COUNT=1$' .config || { echo 'BLK_DEV_RAM_COUNT is not 1 - the live profile uses exactly /dev/ram0' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SCSI=y' .config || { echo 'SCSI off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BLK_DEV_SD=y' .config || { echo 'BLK_DEV_SD off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BLK_DEV_SR=y' .config || { echo 'BLK_DEV_SR off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ATA=y' .config || { echo 'ATA off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SATA_AHCI=y' .config || { echo 'SATA_AHCI off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BLK_DEV_NVME=y' .config || { echo 'BLK_DEV_NVME off - NVMe installation requires its built-in PCI driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NVME_CORE=y' .config || { echo 'NVME_CORE off - NVMe installation requires built-in namespace support' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_NVME_MULTIPATH is not set' .config || { echo 'NVME_MULTIPATH on - installation fixture requires direct controller namespaces' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_STORAGE=y' .config || { echo 'USB_STORAGE off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ISO9660_FS=y' .config || { echo 'ISO9660_FS off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NET=y' .config || { echo 'NET off — no networking stack for td-netd link-up/DHCP' >&2; exit 1; }; \
-                 grep -q '^CONFIG_INET=y' .config || { echo 'INET off — no IPv4/TCP/UDP for DHCP or resolve/reach' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PACKET=y' .config || { echo 'PACKET off — AF_PACKET raw-socket family unavailable' >&2; exit 1; }; \
-                 grep -q '^CONFIG_UNIX=y' .config || { echo 'UNIX off — AF_UNIX local-socket family unavailable' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NETDEVICES=y' .config || { echo 'NETDEVICES off (menuconfig parent dropped) — no NIC drivers are visible' >&2; exit 1; }; \
-                 grep -q '^CONFIG_VIRTIO_NET=y' .config || { echo 'VIRTIO_NET off — the qemu user-net virtio NIC would not appear' >&2; exit 1; }; \
-                 grep -q '^CONFIG_E1000=y' .config || { echo 'E1000 off (ETHERNET/NET_VENDOR_INTEL menuconfig parents likely dropped) — no real Intel NIC driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_INPUT_EVDEV=y' .config || { echo 'INPUT_EVDEV off — td-compositor cannot read /dev/input/eventN' >&2; exit 1; }; \
-                 grep -q '^CONFIG_KEYBOARD_ATKBD=y' .config || { echo 'KEYBOARD_ATKBD off — the qemu PS/2 keyboard would not appear' >&2; exit 1; }; \
-                 grep -q '^CONFIG_MOUSE_PS2=y' .config || { echo 'MOUSE_PS2 off — the qemu PS/2 pointer would not appear' >&2; exit 1; }; \
-                 grep -q '^CONFIG_VIRTIO_INPUT=y' .config || { echo 'VIRTIO_INPUT off — the qemu virtio tablet would not appear, so the pointer could not reach the far edges of the screen' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SERIO_I8042=y' .config || { echo 'SERIO_I8042 off — qemu PS/2 input has no controller' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SYSCALL_USER_DISPATCH=y' .config || { echo 'SYSCALL_USER_DISPATCH off — allnoconfig answers n to the prompt Linux 7.3 gave it, removing a prctl applications could use on 7.2' >&2; exit 1; }; \
-                 if grep -q '^CONFIG_SERIAL_8250_MOXA_PCIE=' .config; then echo 'SERIAL_8250_MOXA_PCIE set — it defaults to SERIAL_8250 since Linux 7.3, and td supports no such card' >&2; exit 1; fi; \
-                 grep -q '^CONFIG_VT_CONSOLE=y' .config || { echo 'VT_CONSOLE off — the framebuffer recovery console is unavailable' >&2; exit 1; }; \
-                 grep -q '^CONFIG_FRAMEBUFFER_CONSOLE=y' .config || { echo 'FRAMEBUFFER_CONSOLE off — virtio fbdev cannot host the recovery console' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DRM_VIRTIO_GPU=y' .config || { echo 'DRM_VIRTIO_GPU off — qemu virtio-vga cannot expose /dev/fb0' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DRM_VIRTIO_GPU_KMS=y' .config || { echo 'DRM_VIRTIO_GPU_KMS off — virtio-gpu has no scanout' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DRM_FBDEV_EMULATION=y' .config || { echo 'DRM_FBDEV_EMULATION off — td-compositor has no /dev/fb0 software scanout' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y' .config || { echo 'DRM_CLIENT_DEFAULT_FBDEV off — the selected virtio DRM client will not create fb0' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SYSFB_SIMPLEFB=y' .config || { echo 'SYSFB_SIMPLEFB off — a UEFI GOP framebuffer is not offered as a simple-framebuffer device, so the selector has no keyboard console on a display td has no driver for' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DRM_SIMPLEDRM=y' .config || { echo 'DRM_SIMPLEDRM off — nothing drives the firmware framebuffer, so fbcon has no display before or without a native driver' >&2; exit 1; }; \
-                 if grep -q '^CONFIG_DRM_EFIDRM=' .config; then echo 'DRM_EFIDRM set — it requires SYSFB_SIMPLEFB off; simpledrm is the one firmware framebuffer driver' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_DRM_VESADRM=' .config; then echo 'DRM_VESADRM set — it requires SYSFB_SIMPLEFB off; simpledrm is the one firmware framebuffer driver' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_FB_EFI=' .config; then echo 'FB_EFI set — legacy efifb would take a GOP mode simple-framebuffer cannot describe; simpledrm is the one firmware framebuffer driver' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_FB_VESA=' .config; then echo 'FB_VESA set — legacy vesafb would take a VBE mode simple-framebuffer cannot describe; simpledrm is the one firmware framebuffer driver' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_KEXEC=y' .config; then echo 'KEXEC (legacy segment-based kexec_load) on — only KEXEC_FILE is used; the legacy syscall is kept off to not widen the surface' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_KEXEC_SIG=y' .config; then echo 'KEXEC_SIG on — would demand a trusted-keyring signature policy td does not ship' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_RANDOMIZE_BASE=y' .config; then echo 'RANDOMIZE_BASE (KASLR) on — pinned off for a deterministic kexec boot' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then echo 'BTF on (would need pahole)' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_DMESG_RESTRICT=y' .config; then echo 'SECURITY_DMESG_RESTRICT on — unprivileged /dev/kmsg reads become EPERM, so the shipped /bin/dmesg breaks for ordinary users' >&2; exit 1; fi; \
-                 grep -q '^CONFIG_ACPI=y' .config || { echo 'ACPI off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_EFI=y$' .config || { echo 'EFI off - firmware entry requires EFI runtime support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CMDLINE_BOOL=y$' .config || { echo 'EFI built-in command line missing' >&2; exit 1; }; \
-                 grep -Fxq 'CONFIG_CMDLINE=@EFI_CMDLINE@' .config || { echo 'EFI initrd command line mismatch' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_CMDLINE_OVERRIDE is not set$' .config || { echo 'firmware command line must remain usable' >&2; exit 1; }; \
-                 grep -q '^CONFIG_EFI_STUB=y$' .config || { echo 'EFI_STUB off - bzImage cannot be loaded by UEFI' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_EFI_HANDOVER_PROTOCOL is not set$' .config || { echo 'deprecated EFI handover disabled policy missing' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_EFI_MIXED is not set$' .config || { echo '32-bit EFI firmware disabled policy missing' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_EFIVAR_FS is not set$' .config || { echo 'EFI variable filesystem disabled policy missing' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PNP=y' .config || { echo 'PNP off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PNPACPI=y' .config || { echo 'PNPACPI off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_SUPPORT=y' .config || { echo 'USB_SUPPORT off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB=y' .config || { echo 'USB off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_PCI=y' .config || { echo 'USB_PCI off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_XHCI_HCD=y' .config || { echo 'USB_XHCI_HCD off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HID_SUPPORT=y' .config || { echo 'HID_SUPPORT off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HID=y' .config || { echo 'HID off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HID_GENERIC=y' .config || { echo 'HID_GENERIC off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
-                 grep -q '^CONFIG_UHID=y' .config || { echo 'UHID off - secret VM fixture requires kernel HID transport' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HIDRAW=y' .config || { echo 'HIDRAW off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_HID=y' .config || { echo 'USB_HID off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_XHCI_PCI=y' .config || { echo 'USB_XHCI_PCI off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
-                 grep -q '^CONFIG_TCG_TPM=y' .config || { echo 'TCG_TPM off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SECURITYFS=y$' .config || { echo 'SECURITYFS off - the selector reads the TPM event log through securityfs' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SECURITY=y$' .config || { echo 'SECURITY off - Linux 7.2 registers securityfs only from the LSM framework' >&2; exit 1; }; \
-                 grep -Fxq 'CONFIG_LSM=\"\"' .config || { echo 'CONFIG_LSM not empty - no security module may be ordered' >&2; exit 1; }; \
-                 if grep -q '^CONFIG_SECURITY_NETWORK=' .config; then echo 'SECURITY_NETWORK on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_PATH=' .config; then echo 'SECURITY_PATH on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_SELINUX=' .config; then echo 'SECURITY_SELINUX on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_SMACK=' .config; then echo 'SECURITY_SMACK on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_TOMOYO=' .config; then echo 'SECURITY_TOMOYO on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_APPARMOR=' .config; then echo 'SECURITY_APPARMOR on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_LOADPIN=' .config; then echo 'SECURITY_LOADPIN on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_YAMA=' .config; then echo 'SECURITY_YAMA on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_SAFESETID=' .config; then echo 'SECURITY_SAFESETID on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_LOCKDOWN_LSM=' .config; then echo 'SECURITY_LOCKDOWN_LSM on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_LANDLOCK=' .config; then echo 'SECURITY_LANDLOCK on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SECURITY_IPE=' .config; then echo 'SECURITY_IPE on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_BPF_LSM=' .config; then echo 'BPF_LSM on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_INTEGRITY=' .config; then echo 'INTEGRITY on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
-                 grep -q '^CONFIG_TCG_TIS=y' .config || { echo 'TCG_TIS off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_TCG_CRB=y' .config || { echo 'TCG_CRB off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PERF_EVENTS=y' .config || { echo 'PERF_EVENTS off — td-profiler cannot open its per-CPU software sampling events' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SMP=y$' .config || { echo 'SMP missing' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NR_CPUS=256$' .config || { echo 'NR_CPUS does not match the VM allocation ceiling' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HOTPLUG_CPU=y$' .config || { echo 'HOTPLUG_CPU missing' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USER_NS=y' .config || { echo 'USER_NS off — unshare(CLONE_NEWUSER) returns EINVAL, so td-jail cannot build a sandbox at all' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PID_NS=y' .config || { echo 'PID_NS off — a jailed app would see (and could signal) every process on the machine' >&2; exit 1; }; \
-                 grep -q '^CONFIG_UTS_NS=y' .config || { echo 'UTS_NS off — a jail could not present its own hostname' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NET_NS=y' .config || { echo 'NET_NS off — a jail without shared=network could not be cut off from the network stack' >&2; exit 1; }; \
-                 grep -q '^CONFIG_AUDIT=y' .config || { echo 'AUDIT off — the physical Firefox proof cannot account for outer seccomp denials' >&2; exit 1; }; \
-                 grep -q '^CONFIG_AUDITSYSCALL=y' .config || { echo 'AUDITSYSCALL off — x86 seccomp audit records cannot carry syscall identity' >&2; exit 1; }; \
-                 grep -q '^CONFIG_COMPAT_32BIT_TIME=y$' .config || { echo 'COMPAT_32BIT_TIME off — i386 code under the td-jail development policy would lack its futex and clock syscalls' >&2; exit 1; }; \
-                 grep -q '^CONFIG_IA32_EMULATION=y$' .config || { echo 'IA32_EMULATION off — the td-jail probe cannot prove confinement kills i386 syscalls' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set$' .config || { echo 'IA32 emulation disabled at boot — the td-jail probe needs compatibility execution' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_X86_X32_ABI is not set$' .config || { echo 'X86_X32_ABI on — x32 calls could reach an unmodelled compatibility ABI instead of the deliberate kill probe' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SECCOMP=y' .config || { echo 'SECCOMP off — seccomp(2) returns ENOSYS, so td-jail ships namespaces with no syscall filter' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SECCOMP_FILTER=y' .config || { echo 'SECCOMP_FILTER off — no BPF syscall filtering. It is unprompted (def_bool y on HAVE_ARCH_SECCOMP_FILTER && SECCOMP && NET), so it cannot be pinned: something took SECCOMP or NET away' >&2; exit 1; }; \
-                 grep -q '^CONFIG_INOTIFY_USER=y' .config || { echo 'INOTIFY_USER off — GLib file monitoring in a jailed app degrades to polling' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CGROUPS=y' .config || { echo 'CGROUPS off — no cgroup v2, so an application has no aggregate CPU, memory, or pid cap' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CGROUP_SCHED=y' .config || { echo 'CGROUP_SCHED off — the cgroup v2 cpu controller does not exist' >&2; exit 1; }; \
-                 grep -q '^CONFIG_FAIR_GROUP_SCHED=y' .config || { echo 'FAIR_GROUP_SCHED off — fair-scheduler cgroup accounting does not exist' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CFS_BANDWIDTH=y' .config || { echo 'CFS_BANDWIDTH off — cpu.max cannot throttle a jailed application' >&2; exit 1; }; \
-                 if grep -q '^CONFIG_RT_GROUP_SCHED=y' .config; then echo 'RT_GROUP_SCHED on — real-time tasks in the populated root can block enabling the cpu controller, and td does not delegate real-time bandwidth' >&2; exit 1; fi; \
-                 grep -q '^CONFIG_MEMCG=y' .config || { echo 'MEMCG off — memory.max/memory.high do not exist, so a multi-process app is bounded only per process' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CGROUP_PIDS=y' .config || { echo 'CGROUP_PIDS off — pids.max does not exist, so nothing bounds a fork bomb inside a jail' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_PCM=y' .config || { echo 'SND_PCM off — /dev/snd/pcmC*D*p would not exist, so td-audio has no device to open (APPLICATIONS.md K.4)' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_HDA_INTEL=y' .config || { echo 'SND_HDA_INTEL off — QEMU -device intel-hda and ordinary desktop codecs both go through it, so /proc/asound/pcm would be empty' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_HDA_GENERIC=y' .config || { echo 'SND_HDA_GENERIC off — the HDA controller would bind no codec, so the card would enumerate with no playback device' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_ALOOP=y' .config || { echo 'SND_ALOOP off — nothing can capture what was played, so the tone fixture has no in-image oracle' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off — td-audio discovers devices through /proc/asound/pcm' >&2; exit 1; }; \
-                 if grep -q '^CONFIG_SND_PCM_OSS=y' .config; then echo 'SND_PCM_OSS on — APPLICATIONS.md K.4 refuses the deprecated OSS emulation layer on the merits, and olddefconfig must not bring it back as a default' >&2; exit 1; fi; \
-                 grep -q '^CONFIG_DRM_I915=y' .config || { echo 'DRM_I915 off — the T430s Ivy Bridge GPU has no KMS driver, so td-compositor has no /dev/fb0 there' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ETHERNET=y' .config || { echo 'ETHERNET off — NIC vendor menus stay hidden, so the e1000e driver cannot be chosen' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NET_VENDOR_INTEL=y' .config || { echo 'NET_VENDOR_INTEL off — the Intel NIC drivers stay hidden' >&2; exit 1; }; \
-                 grep -q '^CONFIG_E1000E=y' .config || { echo 'E1000E off — the T430s Intel 82579LM wired NIC has no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_MOUSE_PS2_SYNAPTICS=y' .config || { echo 'MOUSE_PS2_SYNAPTICS off — the T430s touchpad is driven as a bare PS/2 mouse' >&2; exit 1; }; \
-                 grep -q '^CONFIG_MOUSE_PS2_TRACKPOINT=y' .config || { echo 'MOUSE_PS2_TRACKPOINT off — the TrackPoint loses its own protocol and settings' >&2; exit 1; }; \
-                 grep -q '^CONFIG_X86_PLATFORM_DEVICES=y' .config || { echo 'X86_PLATFORM_DEVICES off — laptop platform drivers stay hidden, thinkpad_acpi among them' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ACPI_EC=y' .config || { echo 'ACPI_EC off — the embedded controller behind battery, lid and hotkeys is unreachable' >&2; exit 1; }; \
-                 grep -q '^CONFIG_I2C=y' .config || { echo 'I2C off — thinkpad_acpi and i915 depend on the I2C core' >&2; exit 1; }; \
-                 grep -q '^CONFIG_THINKPAD_ACPI=y' .config || { echo 'THINKPAD_ACPI off — ThinkPad hotkeys, fan, LEDs and thermal readings have no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ACPI_AC=y' .config || { echo 'ACPI_AC off — the AC adapter state is unknown' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ACPI_BATTERY=y' .config || { echo 'ACPI_BATTERY off — the laptop battery is not reported' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ACPI_BUTTON=y' .config || { echo 'ACPI_BUTTON off — the power button and lid switch produce no events' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ACPI_THERMAL=y' .config || { echo 'ACPI_THERMAL off — ACPI thermal zones are not monitored' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ACPI_FAN=y' .config || { echo 'ACPI_FAN off — ACPI fan devices are not driven' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ACPI_VIDEO=y' .config || { echo 'ACPI_VIDEO off — the panel backlight has no ACPI control' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BACKLIGHT_CLASS_DEVICE=y' .config || { echo 'BACKLIGHT_CLASS_DEVICE off — the panel backlight cannot be set' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CPU_FREQ=y' .config || { echo 'CPU_FREQ off — the CPU runs at one frequency, on battery as on AC' >&2; exit 1; }; \
-                 grep -q '^CONFIG_X86_INTEL_PSTATE=y' .config || { echo 'X86_INTEL_PSTATE off — Intel CPUs get no P-state scaling driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CPU_IDLE=y' .config || { echo 'CPU_IDLE off — idle CPUs enter no deep C-states' >&2; exit 1; }; \
-                 grep -q '^CONFIG_INTEL_IDLE=y' .config || { echo 'INTEL_IDLE off — Intel CPUs get no native idle driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SUSPEND=y' .config || { echo 'SUSPEND off — the machine cannot suspend to RAM' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_EHCI_HCD=y' .config || { echo 'USB_EHCI_HCD off — a stick in a USB 2.0 port is invisible (the T430s has one EHCI-only port)' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_EHCI_PCI=y' .config || { echo 'USB_EHCI_PCI off — PCI EHCI controllers bind no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_MMC=y' .config || { echo 'MMC off — the SD card reader has no MMC core' >&2; exit 1; }; \
-                 grep -q '^CONFIG_MMC_BLOCK=y' .config || { echo 'MMC_BLOCK off — SD cards appear as no block device' >&2; exit 1; }; \
-                 grep -q '^CONFIG_MMC_SDHCI=y' .config || { echo 'MMC_SDHCI off — the SDHCI card reader has no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_MMC_SDHCI_PCI=y' .config || { echo 'MMC_SDHCI_PCI off — the PCI SDHCI card reader binds no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_MMC_RICOH_MMC=y' .config || { echo 'MMC_RICOH_MMC off — the Ricoh reader keeps its separate MMC function, so MMC cards are not seen through SDHCI' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_HDA_CODEC_CONEXANT=y' .config || { echo 'SND_HDA_CODEC_CONEXANT off — the T430s Conexant codec falls back to the generic parser' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_HDA_CODEC_HDMI=y' .config || { echo 'SND_HDA_CODEC_HDMI off — HDMI and DisplayPort audio codecs stay hidden' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_HDA_CODEC_HDMI_INTEL=y' .config || { echo 'SND_HDA_CODEC_HDMI_INTEL off — Intel HDMI and DisplayPort audio has no codec driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DRM_AMDGPU=y' .config || { echo 'DRM_AMDGPU off - T14s suspend requires it' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DRM_AMD_DC=y' .config || { echo 'DRM_AMD_DC off - T14s suspend requires it' >&2; exit 1; }; \
-                 grep -q '^CONFIG_RTC_CLASS=y' .config || { echo 'RTC_CLASS off - T14s suspend requires it' >&2; exit 1; }; \
-                 grep -q '^CONFIG_RTC_DRV_CMOS=y' .config || { echo 'RTC_DRV_CMOS off - T14s suspend requires it' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PCIEPORTBUS=y' .config || { echo 'PCIEPORTBUS off - PCIe devices cannot follow firmware power policy' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PCIEASPM=y' .config || { echo 'PCIEASPM off - PCIe devices cannot follow firmware power policy' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PCIEASPM_DEFAULT=y' .config || { echo 'PCIEASPM_DEFAULT off - PCIe devices cannot follow firmware power policy' >&2; exit 1; }; \
-                 grep -q '^CONFIG_AMD_PMC=y' .config || { echo 'AMD_PMC off - T14s suspend requires it' >&2; exit 1; }; \
-                 grep -q '^CONFIG_X86_AMD_PSTATE=y' .config || { echo 'X86_AMD_PSTATE off — AMD CPUs get no P-state scaling driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ACPI_PROCESSOR=y' .config || { echo 'ACPI_PROCESSOR off — AMD CPUs get no ACPI idle states and amd-pstate has no CPPC' >&2; exit 1; }; \
-                 grep -q '^CONFIG_X86_AMD_PLATFORM_DEVICE=y' .config || { echo 'X86_AMD_PLATFORM_DEVICE off — the AMD I2C and GPIO controllers are never created from ACPI' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PINCTRL_AMD=y' .config || { echo 'PINCTRL_AMD off — the T14s touchpad interrupt line has no GPIO controller' >&2; exit 1; }; \
-                 grep -q '^CONFIG_I2C_DESIGNWARE_CORE=y' .config || { echo 'I2C_DESIGNWARE_CORE off — the AMD I2C controller behind the T14s touchpad has no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_I2C_DESIGNWARE_PLATFORM=y' .config || { echo 'I2C_DESIGNWARE_PLATFORM off — the ACPI-enumerated DesignWare I2C controller binds no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_I2C_HID=y' .config || { echo 'I2C_HID off — the HID-over-I2C menu stays hidden, so the T14s touchpad has no transport' >&2; exit 1; }; \
-                 grep -q '^CONFIG_I2C_HID_ACPI=y' .config || { echo 'I2C_HID_ACPI off — the ACPI-enumerated I2C touchpad binds no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_I2C_HID_CORE=y' .config || { echo 'I2C_HID_CORE off — HID over I2C has no core' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HID_MULTITOUCH=y' .config || { echo 'HID_MULTITOUCH off — the T14s precision touchpad stays a relative mouse with no finger tool' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_HDA_CODEC_REALTEK=y' .config || { echo 'SND_HDA_CODEC_REALTEK off — the T14s Realtek codec falls back to the generic parser' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_HDA_CODEC_ALC269=y' .config || { echo 'SND_HDA_CODEC_ALC269 off — the ALC257 family on the T14s has no Realtek fixups' >&2; exit 1; }; \
-                 grep -q '^CONFIG_GPIO_ACPI=y' .config || { echo 'GPIO_ACPI off — the I2C touchpad gets no interrupt and GPIO-signalled ACPI events (_AEI) are lost' >&2; exit 1; }; \
-                 grep -q '^CONFIG_IOMMU_SUPPORT=y' .config || { echo 'IOMMU_SUPPORT off — IRQ_REMAP and the IOMMU drivers stay hidden, so X86_X2APIC cannot be built' >&2; exit 1; }; \
-                 grep -q '^CONFIG_AMD_IOMMU=y' .config || { echo 'AMD_IOMMU off — the AMD IOMMU goes unused: no interrupt remapping (an x2APIC handover falls back to xAPIC) and no DMA isolation' >&2; exit 1; }; \
-                 grep -q '^CONFIG_IRQ_REMAP=y' .config || { echo 'IRQ_REMAP off — X86_X2APIC depends on it' >&2; exit 1; }; \
-                 grep -q '^CONFIG_X86_X2APIC=y' .config || { echo 'X86_X2APIC off — firmware that hands over in x2APIC mode leaves the kernel with its APIC disabled' >&2; exit 1; }; \
-                 grep -q '^CONFIG_WIRELESS=y' .config || { echo 'WIRELESS off — no wireless stack' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CFG80211=y' .config || { echo 'CFG80211 off — no nl80211, so td-netd cannot drive a radio' >&2; exit 1; }; \
-                 grep -q '^CONFIG_MAC80211=y' .config || { echo 'MAC80211 off — ath11k needs the soft-MAC stack' >&2; exit 1; }; \
-                 grep -q '^CONFIG_WLAN=y' .config || { echo 'WLAN off — the wireless driver menu hides ath11k' >&2; exit 1; }; \
-                 grep -q '^CONFIG_WLAN_VENDOR_ATH=y' .config || { echo 'WLAN_VENDOR_ATH off — the Atheros/Qualcomm menu hides ath11k' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ATH11K=y' .config || { echo 'ATH11K off — the T14s WCN6855 Wi-Fi has no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ATH11K_PCI=y' .config || { echo 'ATH11K_PCI off — the WCN6855 is a PCI device' >&2; exit 1; }; \
-                 grep -q '^CONFIG_FW_LOADER=y' .config || { echo 'FW_LOADER off — no firmware reaches ath11k' >&2; exit 1; }; \
-                 grep -q '^CONFIG_MHI_BUS=y' .config || { echo 'MHI_BUS off — ath11k_pci boots the WCN6855 over MHI' >&2; exit 1; }; \
-                 grep -q '^CONFIG_QRTR=y' .config || { echo 'QRTR off — ath11k talks QMI to the WCN6855 over QRTR' >&2; exit 1; }; \
-                 grep -q '^CONFIG_QRTR_MHI=y' .config || { echo 'QRTR_MHI off — QRTR has no transport to the WCN6855' >&2; exit 1; }; \
-                 grep -q '^CONFIG_QCOM_QMI_HELPERS=y' .config || { echo 'QCOM_QMI_HELPERS off — ath11k has no QMI client' >&2; exit 1; }; \
-                 grep -qx 'CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin amdgpu/green_sardine_asd.bin amdgpu/green_sardine_ce.bin amdgpu/green_sardine_dmcub.bin amdgpu/green_sardine_me.bin amdgpu/green_sardine_mec.bin amdgpu/green_sardine_pfp.bin amdgpu/green_sardine_rlc.bin amdgpu/green_sardine_sdma.bin amdgpu/green_sardine_ta.bin amdgpu/green_sardine_vcn.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"' .config || { echo 'EXTRA_FIRMWARE is not the Phoenix, Cezanne and WCN6855 set — amdgpu and ath11k probe before any root is mounted, with no firmware to load' >&2; exit 1; }; \
-                 grep -qx 'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"' .config || { echo 'EXTRA_FIRMWARE_DIR is not the build-tree firmware directory' >&2; exit 1; }; \
-                 if grep -q '^CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y' .config; then echo 'CFG80211_REQUIRE_SIGNED_REGDB on — it selects the trusted keyring and its openssl-linked certs/ tool' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_SYSTEM_TRUSTED_KEYRING=y' .config; then echo 'SYSTEM_TRUSTED_KEYRING on — a select overrode its pin, and certs/ would need openssl' >&2; exit 1; fi; \
-                 grep -q '^CONFIG_HYPERVISOR_GUEST=y' .config || { echo 'HYPERVISOR_GUEST off — guest support stays hidden, so no hypervisor drivers can be chosen' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PARAVIRT=y' .config || { echo 'PARAVIRT off — Hyper-V and KVM guest support need the paravirt layer' >&2; exit 1; }; \
-                 grep -q '^CONFIG_KVM_GUEST=y' .config || { echo 'KVM_GUEST off — a KVM cloud guest (EC2 Nitro, GCE) has no kvmclock or paravirt EOI' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HYPERV=y' .config || { echo 'HYPERV off — Hyper-V (Azure) guest support is off' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HYPERV_VMBUS=y' .config || { echo 'HYPERV_VMBUS off — the synthetic devices of Azure are on VMBus, so neither its disk nor its NIC appears' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SCSI_LOWLEVEL=y' .config || { echo 'SCSI_LOWLEVEL off — SCSI host drivers stay hidden, so storvsc and virtio-scsi cannot be chosen' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HYPERV_STORAGE=y' .config || { echo 'HYPERV_STORAGE off — the OS disk of an Azure VM (storvsc) is invisible' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HYPERV_NET=y' .config || { echo 'HYPERV_NET off — the synthetic NIC of an Azure VM (netvsc) has no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_PCI_HYPERV=y' .config || { echo 'PCI_HYPERV off — an Azure size with an NVMe disk controller presents it over Hyper-V vPCI, so its OS disk is invisible' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NET_VENDOR_AMAZON=y' .config || { echo 'NET_VENDOR_AMAZON off — the Amazon NIC drivers stay hidden' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ENA_ETHERNET=y' .config || { echo 'ENA_ETHERNET off — the ENA NIC of an EC2 Nitro instance has no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SCSI_VIRTIO=y' .config || { echo 'SCSI_VIRTIO off — a GCE persistent disk on virtio-scsi is invisible' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NET_VENDOR_GOOGLE=y' .config || { echo 'NET_VENDOR_GOOGLE off — the Google NIC drivers stay hidden' >&2; exit 1; }; \
-                 grep -q '^CONFIG_GVE=y' .config || { echo 'GVE off — a GCE machine series that requires gVNIC has no network' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DMI=y' .config || { echo 'DMI off — the firmware tables that name a cloud are not scanned' >&2; exit 1; }; \
-                 grep -q '^CONFIG_DMIID=y' .config || { echo 'DMIID off — /sys/class/dmi/id is missing, so a server cannot tell which cloud it runs on' >&2; exit 1; }; \
-                 grep -q '^CONFIG_HYPERV_TIMER=y' .config || { echo 'HYPERV_TIMER off — an Azure VM has no Hyper-V clocksource. It is unprompted (def_bool HYPERV && X86), so something took HYPERV away' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CPU_MITIGATIONS=y' .config || { echo 'CPU_MITIGATIONS off — every CPU vulnerability mitigation is compiled out and mitigations= cannot restore one' >&2; exit 1; }; \
-                 grep -q '^CONFIG_RTC_INTF_DEV=y' .config || { echo 'RTC_INTF_DEV off — /dev/rtc0 is missing, so td-time cannot persist a correction to the RTC' >&2; exit 1; }; \
-                 grep -q '^CONFIG_RTC_HCTOSYS=y' .config || { echo 'RTC_HCTOSYS off — the RTC class does not re-seed the system clock at boot or resume' >&2; exit 1; }; \
-                 grep -q '^CONFIG_IGC=y' .config || { echo 'IGC off — the Intel I225/I226 wired NIC of the Ryzen desktop has no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_ETHTOOL_NETLINK=y' .config || { echo 'ETHTOOL_NETLINK off — IGC depends on it' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CPU_SUP_AMD=y' .config || { echo 'CPU_SUP_AMD off — AMD processors lose their detection and quirks, and KVM_AMD cannot be built' >&2; exit 1; }; \
-                 grep -q '^CONFIG_CPU_SUP_INTEL=y' .config || { echo 'CPU_SUP_INTEL off — Intel processors lose their detection, quirks and mitigations' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_HDA_CODEC_ALC882=y' .config || { echo 'SND_HDA_CODEC_ALC882 off — the desktop ALC1220 has no Realtek fixups' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_HDA_CODEC_HDMI_ATI=y' .config || { echo 'SND_HDA_CODEC_HDMI_ATI off — AMD HDMI and DisplayPort audio has no codec driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_VIRTUALIZATION=y' .config || { echo 'VIRTUALIZATION off — the KVM menu stays hidden' >&2; exit 1; }; \
-                 grep -q '^CONFIG_KVM=y' .config || { echo 'KVM off — /dev/kvm is missing, so QEMU guests run only under emulation' >&2; exit 1; }; \
-                 grep -q '^CONFIG_KVM_X86=y' .config || { echo 'KVM_X86 off — no vendor KVM module survived resolution' >&2; exit 1; }; \
-                 grep -q '^CONFIG_KVM_AMD=y' .config || { echo 'KVM_AMD off — AMD-V hosts cannot run KVM guests' >&2; exit 1; }; \
-                 grep -q '^CONFIG_KVM_INTEL=y' .config || { echo 'KVM_INTEL off — VT-x hosts cannot run KVM guests' >&2; exit 1; }; \
-                 grep -q '^CONFIG_EXT4_FS=y' .config || { echo 'EXT4_FS off — ext4 disks formatted by other systems cannot be mounted' >&2; exit 1; }; \
-                 grep -q '^CONFIG_JBD2=y' .config || { echo 'JBD2 off — ext4 has no journal layer' >&2; exit 1; }; \
-                 grep -q '^CONFIG_EXT4_USE_FOR_EXT2=y' .config || { echo 'EXT4_USE_FOR_EXT2 off — ext2 and ext3 volumes do not mount through ext4' >&2; exit 1; }; \
-                 grep -q '^CONFIG_FAT_FS=y' .config || { echo 'FAT_FS off — VFAT has no FAT core' >&2; exit 1; }; \
-                 grep -q '^CONFIG_VFAT_FS=y' .config || { echo 'VFAT_FS off — USB sticks and SD cards formatted FAT cannot be mounted' >&2; exit 1; }; \
-                 grep -q '^CONFIG_FAT_DEFAULT_UTF8=y' .config || { echo 'FAT_DEFAULT_UTF8 off — FAT long names are not UTF-8 by default' >&2; exit 1; }; \
-                 grep -qx 'CONFIG_FAT_DEFAULT_CODEPAGE=437' .config || { echo 'FAT_DEFAULT_CODEPAGE is not 437 — the built-in codepage would not be the one FAT mounts with' >&2; exit 1; }; \
-                 grep -qx 'CONFIG_FAT_DEFAULT_IOCHARSET=\"iso8859-1\"' .config || { echo 'FAT_DEFAULT_IOCHARSET is not iso8859-1 — the built-in iocharset would not be the one FAT mounts with' >&2; exit 1; }; \
-                 grep -q '^CONFIG_EXFAT_FS=y' .config || { echo 'EXFAT_FS off — SDXC cards and large sticks formatted exFAT cannot be mounted' >&2; exit 1; }; \
-                 grep -qx 'CONFIG_EXFAT_DEFAULT_IOCHARSET=\"utf8\"' .config || { echo 'EXFAT_DEFAULT_IOCHARSET is not utf8 — exFAT names would need an NLS table' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NLS=y' .config || { echo 'NLS off — FAT and exFAT have no character sets' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NLS_CODEPAGE_437=y' .config || { echo 'NLS_CODEPAGE_437 off — FAT refuses to mount without its default codepage' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NLS_ISO8859_1=y' .config || { echo 'NLS_ISO8859_1 off — VFAT refuses to mount without its default iocharset' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NLS_UTF8=y' .config || { echo 'NLS_UTF8 off — a mount asking iocharset=utf8 fails' >&2; exit 1; }; \
-                 grep -q '^CONFIG_IGB=y' .config || { echo 'IGB off — the Intel 82575/82576/I210/I211/I350 wired NICs many desktop and server boards carry have no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_NET_VENDOR_REALTEK=y' .config || { echo 'NET_VENDOR_REALTEK off — R8169 is hidden behind it' >&2; exit 1; }; \
-                 grep -q '^CONFIG_R8169=y' .config || { echo 'R8169 off — the Realtek 8111/8168/8125 wired NICs most consumer boards carry have no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_NET_DRIVERS=y' .config || { echo 'USB_NET_DRIVERS off — every USB Ethernet driver is hidden behind it' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_USBNET=y' .config || { echo 'USB_USBNET off — the CDC, NCM and AX88179 adapters are drivers on it' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_NET_CDCETHER=y' .config || { echo 'USB_NET_CDCETHER off — class-compliant USB Ethernet adapters and phone tethering have no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_NET_CDC_NCM=y' .config || { echo 'USB_NET_CDC_NCM off — USB-C docks and NCM tethering have no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_RTL8152=y' .config || { echo 'USB_RTL8152 off — Realtek RTL8152/8153/8156 USB and dock Ethernet has no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_NET_AX88179_178A=y' .config || { echo 'USB_NET_AX88179_178A off — ASIX AX88179 USB 3 gigabit adapters have no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_USB_UAS=y' .config || { echo 'USB_UAS off — USB SSDs and enclosures fall back to slow bulk-only transport' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_USB=y' .config || { echo 'SND_USB off — USB audio is hidden behind it' >&2; exit 1; }; \
-                 grep -q '^CONFIG_SND_USB_AUDIO=y' .config || { echo 'SND_USB_AUDIO off — USB headsets and DACs have no driver' >&2; exit 1; }; \
-                 grep -q '^CONFIG_UDF_FS=y' .config || { echo 'UDF_FS off — Blu-ray discs, packet-written DVDs and UDF-formatted media cannot be mounted' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_USB_NET_NET1080 is not set' .config || { echo 'USB_NET_NET1080 on — NetChip host-to-host cables are USB drivers nothing asked for' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_USB_NET_CDC_SUBSET is not set' .config || { echo 'USB_NET_CDC_SUBSET on — Belkin and ARM Linux host-to-host links are USB drivers nothing asked for' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_USB_NET_ZAURUS is not set' .config || { echo 'USB_NET_ZAURUS on — Sharp Zaurus links are USB drivers nothing asked for' >&2; exit 1; }; \
-                 for m in PAGE_TABLE_ISOLATION RETPOLINE RETHUNK UNRET_ENTRY CALL_DEPTH_TRACKING IBPB_ENTRY IBRS_ENTRY SRSO GDS RFDS SPECTRE_BHI MDS TAA MMIO_STALE_DATA L1TF RETBLEED SPECTRE_V1 SPECTRE_V2 SRBDS SSB ITS TSA VMSCAPE; do grep -q \"^CONFIG_MITIGATION_$m=y\" .config || { echo \"MITIGATION_$m off or absent — its upstream default did not survive resolution, or this kernel renamed it\" >&2; exit 1; }; done; \
-                 if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::shared::efi_default_cmdline())),
+                "grep '^CONFIG_' .config | LC_ALL=C sort > {root}/kernel-config.resolved; \
+                 diff -u {root}/kernel-config.lock {root}/kernel-config.resolved >&2 || \
+                 { echo 'resolved kernel config differs from recipes/src/recipes/linux-x86-64.config: review this diff and apply it (UPDATING.md, \"Kernel config lock\")' >&2; exit 1; }",
             ],
         )
         .env("PATH", PATH),
@@ -1826,6 +1290,399 @@ fn firmware_pins() -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    /// What must hold in the resolved lock, and why it matters if not.
+    const HELD: &[(&str, &str)] = &[
+        ("CONFIG_UNWINDER_FRAME_POINTER=y", "frame-pointer unwinder not selected"),
+        ("CONFIG_KERNEL_GZIP=y", "gzip kernel compression not selected (bzImage would need another compressor)"),
+        ("CONFIG_BINFMT_ELF=y", "BINFMT_ELF off — the kernel could not exec the initramfs userland"),
+        ("CONFIG_BINFMT_SCRIPT=y", "BINFMT_SCRIPT off — the kernel could not exec the #! /init script"),
+        ("CONFIG_BLK_DEV_INITRD=y", "BLK_DEV_INITRD off — the kernel could not load the initramfs"),
+        ("CONFIG_SERIAL_8250_CONSOLE=y", "8250 serial console off — no ttyS0 boot output for the qemu check"),
+        ("CONFIG_DEVTMPFS=y", "DEVTMPFS off - init cannot mount /dev, so the userland has no ttyS0/console devices"),
+        ("CONFIG_PROC_FS=y", "PROC_FS off - a usable userland (ps/mount/init) needs /proc"),
+        ("CONFIG_SYSFS=y", "SYSFS off - a usable userland needs /sys"),
+        ("CONFIG_TMPFS=y", "TMPFS off - a usable userland needs writable /var,/tmp,/run mounts"),
+        ("CONFIG_BLOCK=y", "BLOCK off - no block layer for the virtio-blk erofs disk"),
+        ("CONFIG_PCI=y", "PCI off - virtio-blk-pci (the -M pc transport) needs the PCI bus"),
+        ("CONFIG_PCI_MSI=y", "PCI_MSI off - target PCI profile selects MSI/MSI-X support"),
+        ("CONFIG_VIRTIO_PCI=y", "VIRTIO_PCI off - no virtio transport on the -M pc PCI bus"),
+        ("CONFIG_VIRTIO_CONSOLE=y", "VIRTIO_CONSOLE off - no td VM bridge"),
+        ("CONFIG_VIRTIO_BLK=y", "VIRTIO_BLK off - the erofs disk (/dev/vda) would not appear"),
+        ("CONFIG_EROFS_FS_ZIP=y", ""),
+        ("CONFIG_EROFS_FS_ZIP_ZSTD=y", ""),
+        ("CONFIG_EROFS_FS=y", "EROFS_FS off - the read-only erofs root could not be mounted"),
+        ("CONFIG_PRINTK=y", "PRINTK off — no kernel console output"),
+        ("CONFIG_TTY=y", "TTY off — the serial console needs the tty layer"),
+        ("CONFIG_UNIX98_PTYS=y", "UNIX98_PTYS off — /dev/ptmx would not exist, so td-term could not allocate a pty and the graphical session would come up with no terminal"),
+        ("CONFIG_KEXEC_FILE=y", "KEXEC_FILE off — the shim boots the selected deployment via kexec_file_load(2)"),
+        ("CONFIG_RELOCATABLE=y", "RELOCATABLE off — a non-relocatable bzImage is rejected by the x86 kexec_file_load loader (boots via -kernel, fails via kexec)"),
+        ("CONFIG_BTRFS_FS=y", "BTRFS_FS off — the persistent volume is one btrfs filesystem (@var plus the loop-mounted EROFS root blobs)"),
+        ("CONFIG_MD=y", "MD off — device mapper needs its prompted parent enabled"),
+        ("CONFIG_BLK_DEV_DM=y", "BLK_DEV_DM off — encrypted volumes need built-in device mapper"),
+        ("CONFIG_DM_CRYPT=y", "DM_CRYPT off — encrypted volumes need the built-in crypt target"),
+        ("CONFIG_CRYPTO_AES=y", "CRYPTO_AES off — disk encryption needs a generic AES fallback"),
+        ("CONFIG_CRYPTO_XTS=y", "CRYPTO_XTS off — disk encryption needs the generic XTS mode"),
+        ("CONFIG_CRYPTO_AES_NI_INTEL=y", "CRYPTO_AES_NI_INTEL off — disk encryption needs the x86 accelerated AES-XTS implementation"),
+        ("CONFIG_CRYPTO_HMAC=y", "CRYPTO_HMAC off — kernel consumers need HMAC"),
+        ("CONFIG_CRYPTO_SHA256=y", "CRYPTO_SHA256 off — kernel consumers need SHA-256"),
+        ("CONFIG_BLK_DEV_LOOP=y", "BLK_DEV_LOOP off — the immutable EROFS root is a file inside btrfs, loop-mounted read-only"),
+        ("CONFIG_BLK_DEV_RAM=y", "BLK_DEV_RAM off - a live boot keeps its volatile volume on /dev/ram0"),
+        ("CONFIG_BLK_DEV_RAM_COUNT=1", "BLK_DEV_RAM_COUNT is not 1 - the live profile uses exactly /dev/ram0"),
+        ("CONFIG_SCSI=y", "SCSI off - offline optical/USB installation requires built-in media support"),
+        ("CONFIG_BLK_DEV_SD=y", "BLK_DEV_SD off - offline optical/USB installation requires built-in media support"),
+        ("CONFIG_BLK_DEV_SR=y", "BLK_DEV_SR off - offline optical/USB installation requires built-in media support"),
+        ("CONFIG_ATA=y", "ATA off - offline optical/USB installation requires built-in media support"),
+        ("CONFIG_SATA_AHCI=y", "SATA_AHCI off - offline optical/USB installation requires built-in media support"),
+        ("CONFIG_BLK_DEV_NVME=y", "BLK_DEV_NVME off - NVMe installation requires its built-in PCI driver"),
+        ("CONFIG_NVME_CORE=y", "NVME_CORE off - NVMe installation requires built-in namespace support"),
+        ("CONFIG_USB_STORAGE=y", "USB_STORAGE off - offline optical/USB installation requires built-in media support"),
+        ("CONFIG_ISO9660_FS=y", "ISO9660_FS off - offline optical/USB installation requires built-in media support"),
+        ("CONFIG_NET=y", "NET off — no networking stack for td-netd link-up/DHCP"),
+        ("CONFIG_INET=y", "INET off — no IPv4/TCP/UDP for DHCP or resolve/reach"),
+        ("CONFIG_PACKET=y", "PACKET off — AF_PACKET raw-socket family unavailable"),
+        ("CONFIG_UNIX=y", "UNIX off — AF_UNIX local-socket family unavailable"),
+        ("CONFIG_NETDEVICES=y", "NETDEVICES off (menuconfig parent dropped) — no NIC drivers are visible"),
+        ("CONFIG_VIRTIO_NET=y", "VIRTIO_NET off — the qemu user-net virtio NIC would not appear"),
+        ("CONFIG_E1000=y", "E1000 off (ETHERNET/NET_VENDOR_INTEL menuconfig parents likely dropped) — no real Intel NIC driver"),
+        ("CONFIG_INPUT_EVDEV=y", "INPUT_EVDEV off — td-compositor cannot read /dev/input/eventN"),
+        ("CONFIG_KEYBOARD_ATKBD=y", "KEYBOARD_ATKBD off — the qemu PS/2 keyboard would not appear"),
+        ("CONFIG_MOUSE_PS2=y", "MOUSE_PS2 off — the qemu PS/2 pointer would not appear"),
+        ("CONFIG_VIRTIO_INPUT=y", "VIRTIO_INPUT off — the qemu virtio tablet would not appear, so the pointer could not reach the far edges of the screen"),
+        ("CONFIG_SERIO_I8042=y", "SERIO_I8042 off — qemu PS/2 input has no controller"),
+        ("CONFIG_SYSCALL_USER_DISPATCH=y", "SYSCALL_USER_DISPATCH off — allnoconfig answers n to the prompt Linux 7.3 gave it, removing a prctl applications could use on 7.2"),
+        ("CONFIG_VT_CONSOLE=y", "VT_CONSOLE off — the framebuffer recovery console is unavailable"),
+        ("CONFIG_FRAMEBUFFER_CONSOLE=y", "FRAMEBUFFER_CONSOLE off — virtio fbdev cannot host the recovery console"),
+        ("CONFIG_DRM_VIRTIO_GPU=y", "DRM_VIRTIO_GPU off — qemu virtio-vga cannot expose /dev/fb0"),
+        ("CONFIG_DRM_VIRTIO_GPU_KMS=y", "DRM_VIRTIO_GPU_KMS off — virtio-gpu has no scanout"),
+        ("CONFIG_DRM_FBDEV_EMULATION=y", "DRM_FBDEV_EMULATION off — td-compositor has no /dev/fb0 software scanout"),
+        ("CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y", "DRM_CLIENT_DEFAULT_FBDEV off — the selected virtio DRM client will not create fb0"),
+        ("CONFIG_SYSFB_SIMPLEFB=y", "SYSFB_SIMPLEFB off — a UEFI GOP framebuffer is not offered as a simple-framebuffer device, so the selector has no keyboard console on a display td has no driver for"),
+        ("CONFIG_DRM_SIMPLEDRM=y", "DRM_SIMPLEDRM off — nothing drives the firmware framebuffer, so fbcon has no display before or without a native driver"),
+        ("CONFIG_ACPI=y", "ACPI off - TPM enrollment requires ACPI discovery and TPM2 device support"),
+        ("CONFIG_EFI=y", "EFI off - firmware entry requires EFI runtime support"),
+        ("CONFIG_CMDLINE_BOOL=y", "EFI built-in command line missing"),
+        ("CONFIG_CMDLINE=@EFI_CMDLINE@", "EFI initrd command line mismatch"),
+        ("CONFIG_EFI_STUB=y", "EFI_STUB off - bzImage cannot be loaded by UEFI"),
+        ("CONFIG_PNP=y", "PNP off - TPM enrollment requires ACPI discovery and TPM2 device support"),
+        ("CONFIG_PNPACPI=y", "PNPACPI off - TPM enrollment requires ACPI discovery and TPM2 device support"),
+        ("CONFIG_USB_SUPPORT=y", "USB_SUPPORT off - FIDO USB transport requires built-in xHCI and hidraw"),
+        ("CONFIG_USB=y", "USB off - FIDO USB transport requires built-in xHCI and hidraw"),
+        ("CONFIG_USB_PCI=y", "USB_PCI off - FIDO USB transport requires built-in xHCI and hidraw"),
+        ("CONFIG_USB_XHCI_HCD=y", "USB_XHCI_HCD off - FIDO USB transport requires built-in xHCI and hidraw"),
+        ("CONFIG_HID_SUPPORT=y", "HID_SUPPORT off - FIDO USB transport requires built-in xHCI and hidraw"),
+        ("CONFIG_HID=y", "HID off - FIDO USB transport requires built-in xHCI and hidraw"),
+        ("CONFIG_HID_GENERIC=y", "HID_GENERIC off - FIDO USB transport requires built-in xHCI and hidraw"),
+        ("CONFIG_UHID=y", "UHID off - secret VM fixture requires kernel HID transport"),
+        ("CONFIG_HIDRAW=y", "HIDRAW off - FIDO USB transport requires built-in xHCI and hidraw"),
+        ("CONFIG_USB_HID=y", "USB_HID off - FIDO USB transport requires built-in xHCI and hidraw"),
+        ("CONFIG_USB_XHCI_PCI=y", "USB_XHCI_PCI off - FIDO USB transport requires built-in xHCI and hidraw"),
+        ("CONFIG_TCG_TPM=y", "TCG_TPM off - TPM enrollment requires ACPI discovery and TPM2 device support"),
+        ("CONFIG_SECURITYFS=y", "SECURITYFS off - the selector reads the TPM event log through securityfs"),
+        ("CONFIG_SECURITY=y", "SECURITY off - Linux 7.2 registers securityfs only from the LSM framework"),
+        ("CONFIG_LSM=\"\"", "CONFIG_LSM not empty - no security module may be ordered"),
+        ("CONFIG_TCG_TIS=y", "TCG_TIS off - TPM enrollment requires ACPI discovery and TPM2 device support"),
+        ("CONFIG_TCG_CRB=y", "TCG_CRB off - TPM enrollment requires ACPI discovery and TPM2 device support"),
+        ("CONFIG_PERF_EVENTS=y", "PERF_EVENTS off — td-profiler cannot open its per-CPU software sampling events"),
+        ("CONFIG_SMP=y", "SMP missing"),
+        ("CONFIG_NR_CPUS=256", "NR_CPUS does not match the VM allocation ceiling"),
+        ("CONFIG_HOTPLUG_CPU=y", "HOTPLUG_CPU missing"),
+        ("CONFIG_USER_NS=y", "USER_NS off — unshare(CLONE_NEWUSER) returns EINVAL, so td-jail cannot build a sandbox at all"),
+        ("CONFIG_PID_NS=y", "PID_NS off — a jailed app would see (and could signal) every process on the machine"),
+        ("CONFIG_UTS_NS=y", "UTS_NS off — a jail could not present its own hostname"),
+        ("CONFIG_NET_NS=y", "NET_NS off — a jail without shared=network could not be cut off from the network stack"),
+        ("CONFIG_AUDIT=y", "AUDIT off — the physical Firefox proof cannot account for outer seccomp denials"),
+        ("CONFIG_AUDITSYSCALL=y", "AUDITSYSCALL off — x86 seccomp audit records cannot carry syscall identity"),
+        ("CONFIG_COMPAT_32BIT_TIME=y", "COMPAT_32BIT_TIME off — i386 code under the td-jail development policy would lack its futex and clock syscalls"),
+        ("CONFIG_IA32_EMULATION=y", "IA32_EMULATION off — the td-jail probe cannot prove confinement kills i386 syscalls"),
+        ("CONFIG_SECCOMP=y", "SECCOMP off — seccomp(2) returns ENOSYS, so td-jail ships namespaces with no syscall filter"),
+        ("CONFIG_SECCOMP_FILTER=y", "SECCOMP_FILTER off — no BPF syscall filtering. It is unprompted (def_bool y on HAVE_ARCH_SECCOMP_FILTER && SECCOMP && NET), so it cannot be pinned: something took SECCOMP or NET away"),
+        ("CONFIG_INOTIFY_USER=y", "INOTIFY_USER off — GLib file monitoring in a jailed app degrades to polling"),
+        ("CONFIG_CGROUPS=y", "CGROUPS off — no cgroup v2, so an application has no aggregate CPU, memory, or pid cap"),
+        ("CONFIG_CGROUP_SCHED=y", "CGROUP_SCHED off — the cgroup v2 cpu controller does not exist"),
+        ("CONFIG_FAIR_GROUP_SCHED=y", "FAIR_GROUP_SCHED off — fair-scheduler cgroup accounting does not exist"),
+        ("CONFIG_CFS_BANDWIDTH=y", "CFS_BANDWIDTH off — cpu.max cannot throttle a jailed application"),
+        ("CONFIG_MEMCG=y", "MEMCG off — memory.max/memory.high do not exist, so a multi-process app is bounded only per process"),
+        ("CONFIG_CGROUP_PIDS=y", "CGROUP_PIDS off — pids.max does not exist, so nothing bounds a fork bomb inside a jail"),
+        ("CONFIG_SND_PCM=y", "SND_PCM off — /dev/snd/pcmC*D*p would not exist, so td-audio has no device to open (APPLICATIONS.md K.4)"),
+        ("CONFIG_SND_HDA_INTEL=y", "SND_HDA_INTEL off — QEMU -device intel-hda and ordinary desktop codecs both go through it, so /proc/asound/pcm would be empty"),
+        ("CONFIG_SND_HDA_GENERIC=y", "SND_HDA_GENERIC off — the HDA controller would bind no codec, so the card would enumerate with no playback device"),
+        ("CONFIG_SND_ALOOP=y", "SND_ALOOP off — nothing can capture what was played, so the tone fixture has no in-image oracle"),
+        ("CONFIG_PROC_FS=y", "PROC_FS off — td-audio discovers devices through /proc/asound/pcm"),
+        ("CONFIG_DRM_I915=y", "DRM_I915 off — the T430s Ivy Bridge GPU has no KMS driver, so td-compositor has no /dev/fb0 there"),
+        ("CONFIG_ETHERNET=y", "ETHERNET off — NIC vendor menus stay hidden, so the e1000e driver cannot be chosen"),
+        ("CONFIG_NET_VENDOR_INTEL=y", "NET_VENDOR_INTEL off — the Intel NIC drivers stay hidden"),
+        ("CONFIG_E1000E=y", "E1000E off — the T430s Intel 82579LM wired NIC has no driver"),
+        ("CONFIG_MOUSE_PS2_SYNAPTICS=y", "MOUSE_PS2_SYNAPTICS off — the T430s touchpad is driven as a bare PS/2 mouse"),
+        ("CONFIG_MOUSE_PS2_TRACKPOINT=y", "MOUSE_PS2_TRACKPOINT off — the TrackPoint loses its own protocol and settings"),
+        ("CONFIG_X86_PLATFORM_DEVICES=y", "X86_PLATFORM_DEVICES off — laptop platform drivers stay hidden, thinkpad_acpi among them"),
+        ("CONFIG_ACPI_EC=y", "ACPI_EC off — the embedded controller behind battery, lid and hotkeys is unreachable"),
+        ("CONFIG_I2C=y", "I2C off — thinkpad_acpi and i915 depend on the I2C core"),
+        ("CONFIG_THINKPAD_ACPI=y", "THINKPAD_ACPI off — ThinkPad hotkeys, fan, LEDs and thermal readings have no driver"),
+        ("CONFIG_ACPI_AC=y", "ACPI_AC off — the AC adapter state is unknown"),
+        ("CONFIG_ACPI_BATTERY=y", "ACPI_BATTERY off — the laptop battery is not reported"),
+        ("CONFIG_ACPI_BUTTON=y", "ACPI_BUTTON off — the power button and lid switch produce no events"),
+        ("CONFIG_ACPI_THERMAL=y", "ACPI_THERMAL off — ACPI thermal zones are not monitored"),
+        ("CONFIG_ACPI_FAN=y", "ACPI_FAN off — ACPI fan devices are not driven"),
+        ("CONFIG_ACPI_VIDEO=y", "ACPI_VIDEO off — the panel backlight has no ACPI control"),
+        ("CONFIG_BACKLIGHT_CLASS_DEVICE=y", "BACKLIGHT_CLASS_DEVICE off — the panel backlight cannot be set"),
+        ("CONFIG_CPU_FREQ=y", "CPU_FREQ off — the CPU runs at one frequency, on battery as on AC"),
+        ("CONFIG_X86_INTEL_PSTATE=y", "X86_INTEL_PSTATE off — Intel CPUs get no P-state scaling driver"),
+        ("CONFIG_CPU_IDLE=y", "CPU_IDLE off — idle CPUs enter no deep C-states"),
+        ("CONFIG_INTEL_IDLE=y", "INTEL_IDLE off — Intel CPUs get no native idle driver"),
+        ("CONFIG_SUSPEND=y", "SUSPEND off — the machine cannot suspend to RAM"),
+        ("CONFIG_USB_EHCI_HCD=y", "USB_EHCI_HCD off — a stick in a USB 2.0 port is invisible (the T430s has one EHCI-only port)"),
+        ("CONFIG_USB_EHCI_PCI=y", "USB_EHCI_PCI off — PCI EHCI controllers bind no driver"),
+        ("CONFIG_MMC=y", "MMC off — the SD card reader has no MMC core"),
+        ("CONFIG_MMC_BLOCK=y", "MMC_BLOCK off — SD cards appear as no block device"),
+        ("CONFIG_MMC_SDHCI=y", "MMC_SDHCI off — the SDHCI card reader has no driver"),
+        ("CONFIG_MMC_SDHCI_PCI=y", "MMC_SDHCI_PCI off — the PCI SDHCI card reader binds no driver"),
+        ("CONFIG_MMC_RICOH_MMC=y", "MMC_RICOH_MMC off — the Ricoh reader keeps its separate MMC function, so MMC cards are not seen through SDHCI"),
+        ("CONFIG_SND_HDA_CODEC_CONEXANT=y", "SND_HDA_CODEC_CONEXANT off — the T430s Conexant codec falls back to the generic parser"),
+        ("CONFIG_SND_HDA_CODEC_HDMI=y", "SND_HDA_CODEC_HDMI off — HDMI and DisplayPort audio codecs stay hidden"),
+        ("CONFIG_SND_HDA_CODEC_HDMI_INTEL=y", "SND_HDA_CODEC_HDMI_INTEL off — Intel HDMI and DisplayPort audio has no codec driver"),
+        ("CONFIG_DRM_AMDGPU=y", "DRM_AMDGPU off - T14s suspend requires it"),
+        ("CONFIG_DRM_AMD_DC=y", "DRM_AMD_DC off - T14s suspend requires it"),
+        ("CONFIG_RTC_CLASS=y", "RTC_CLASS off - T14s suspend requires it"),
+        ("CONFIG_RTC_DRV_CMOS=y", "RTC_DRV_CMOS off - T14s suspend requires it"),
+        ("CONFIG_PCIEPORTBUS=y", "PCIEPORTBUS off - PCIe devices cannot follow firmware power policy"),
+        ("CONFIG_PCIEASPM=y", "PCIEASPM off - PCIe devices cannot follow firmware power policy"),
+        ("CONFIG_PCIEASPM_DEFAULT=y", "PCIEASPM_DEFAULT off - PCIe devices cannot follow firmware power policy"),
+        ("CONFIG_AMD_PMC=y", "AMD_PMC off - T14s suspend requires it"),
+        ("CONFIG_X86_AMD_PSTATE=y", "X86_AMD_PSTATE off — AMD CPUs get no P-state scaling driver"),
+        ("CONFIG_ACPI_PROCESSOR=y", "ACPI_PROCESSOR off — AMD CPUs get no ACPI idle states and amd-pstate has no CPPC"),
+        ("CONFIG_X86_AMD_PLATFORM_DEVICE=y", "X86_AMD_PLATFORM_DEVICE off — the AMD I2C and GPIO controllers are never created from ACPI"),
+        ("CONFIG_PINCTRL_AMD=y", "PINCTRL_AMD off — the T14s touchpad interrupt line has no GPIO controller"),
+        ("CONFIG_I2C_DESIGNWARE_CORE=y", "I2C_DESIGNWARE_CORE off — the AMD I2C controller behind the T14s touchpad has no driver"),
+        ("CONFIG_I2C_DESIGNWARE_PLATFORM=y", "I2C_DESIGNWARE_PLATFORM off — the ACPI-enumerated DesignWare I2C controller binds no driver"),
+        ("CONFIG_I2C_HID=y", "I2C_HID off — the HID-over-I2C menu stays hidden, so the T14s touchpad has no transport"),
+        ("CONFIG_I2C_HID_ACPI=y", "I2C_HID_ACPI off — the ACPI-enumerated I2C touchpad binds no driver"),
+        ("CONFIG_I2C_HID_CORE=y", "I2C_HID_CORE off — HID over I2C has no core"),
+        ("CONFIG_HID_MULTITOUCH=y", "HID_MULTITOUCH off — the T14s precision touchpad stays a relative mouse with no finger tool"),
+        ("CONFIG_SND_HDA_CODEC_REALTEK=y", "SND_HDA_CODEC_REALTEK off — the T14s Realtek codec falls back to the generic parser"),
+        ("CONFIG_SND_HDA_CODEC_ALC269=y", "SND_HDA_CODEC_ALC269 off — the ALC257 family on the T14s has no Realtek fixups"),
+        ("CONFIG_GPIO_ACPI=y", "GPIO_ACPI off — the I2C touchpad gets no interrupt and GPIO-signalled ACPI events (_AEI) are lost"),
+        ("CONFIG_IOMMU_SUPPORT=y", "IOMMU_SUPPORT off — IRQ_REMAP and the IOMMU drivers stay hidden, so X86_X2APIC cannot be built"),
+        ("CONFIG_AMD_IOMMU=y", "AMD_IOMMU off — the AMD IOMMU goes unused: no interrupt remapping (an x2APIC handover falls back to xAPIC) and no DMA isolation"),
+        ("CONFIG_IRQ_REMAP=y", "IRQ_REMAP off — X86_X2APIC depends on it"),
+        ("CONFIG_X86_X2APIC=y", "X86_X2APIC off — firmware that hands over in x2APIC mode leaves the kernel with its APIC disabled"),
+        ("CONFIG_WIRELESS=y", "WIRELESS off — no wireless stack"),
+        ("CONFIG_CFG80211=y", "CFG80211 off — no nl80211, so td-netd cannot drive a radio"),
+        ("CONFIG_MAC80211=y", "MAC80211 off — ath11k needs the soft-MAC stack"),
+        ("CONFIG_WLAN=y", "WLAN off — the wireless driver menu hides ath11k"),
+        ("CONFIG_WLAN_VENDOR_ATH=y", "WLAN_VENDOR_ATH off — the Atheros/Qualcomm menu hides ath11k"),
+        ("CONFIG_ATH11K=y", "ATH11K off — the T14s WCN6855 Wi-Fi has no driver"),
+        ("CONFIG_ATH11K_PCI=y", "ATH11K_PCI off — the WCN6855 is a PCI device"),
+        ("CONFIG_FW_LOADER=y", "FW_LOADER off — no firmware reaches ath11k"),
+        ("CONFIG_MHI_BUS=y", "MHI_BUS off — ath11k_pci boots the WCN6855 over MHI"),
+        ("CONFIG_QRTR=y", "QRTR off — ath11k talks QMI to the WCN6855 over QRTR"),
+        ("CONFIG_QRTR_MHI=y", "QRTR_MHI off — QRTR has no transport to the WCN6855"),
+        ("CONFIG_QCOM_QMI_HELPERS=y", "QCOM_QMI_HELPERS off — ath11k has no QMI client"),
+        ("CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin amdgpu/green_sardine_asd.bin amdgpu/green_sardine_ce.bin amdgpu/green_sardine_dmcub.bin amdgpu/green_sardine_me.bin amdgpu/green_sardine_mec.bin amdgpu/green_sardine_pfp.bin amdgpu/green_sardine_rlc.bin amdgpu/green_sardine_sdma.bin amdgpu/green_sardine_ta.bin amdgpu/green_sardine_vcn.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"", "EXTRA_FIRMWARE is not the Phoenix, Cezanne and WCN6855 set — amdgpu and ath11k probe before any root is mounted, with no firmware to load"),
+        ("CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"", "EXTRA_FIRMWARE_DIR is not the build-tree firmware directory"),
+        ("CONFIG_HYPERVISOR_GUEST=y", "HYPERVISOR_GUEST off — guest support stays hidden, so no hypervisor drivers can be chosen"),
+        ("CONFIG_PARAVIRT=y", "PARAVIRT off — Hyper-V and KVM guest support need the paravirt layer"),
+        ("CONFIG_KVM_GUEST=y", "KVM_GUEST off — a KVM cloud guest (EC2 Nitro, GCE) has no kvmclock or paravirt EOI"),
+        ("CONFIG_HYPERV=y", "HYPERV off — Hyper-V (Azure) guest support is off"),
+        ("CONFIG_HYPERV_VMBUS=y", "HYPERV_VMBUS off — the synthetic devices of Azure are on VMBus, so neither its disk nor its NIC appears"),
+        ("CONFIG_SCSI_LOWLEVEL=y", "SCSI_LOWLEVEL off — SCSI host drivers stay hidden, so storvsc and virtio-scsi cannot be chosen"),
+        ("CONFIG_HYPERV_STORAGE=y", "HYPERV_STORAGE off — the OS disk of an Azure VM (storvsc) is invisible"),
+        ("CONFIG_HYPERV_NET=y", "HYPERV_NET off — the synthetic NIC of an Azure VM (netvsc) has no driver"),
+        ("CONFIG_PCI_HYPERV=y", "PCI_HYPERV off — an Azure size with an NVMe disk controller presents it over Hyper-V vPCI, so its OS disk is invisible"),
+        ("CONFIG_NET_VENDOR_AMAZON=y", "NET_VENDOR_AMAZON off — the Amazon NIC drivers stay hidden"),
+        ("CONFIG_ENA_ETHERNET=y", "ENA_ETHERNET off — the ENA NIC of an EC2 Nitro instance has no driver"),
+        ("CONFIG_SCSI_VIRTIO=y", "SCSI_VIRTIO off — a GCE persistent disk on virtio-scsi is invisible"),
+        ("CONFIG_NET_VENDOR_GOOGLE=y", "NET_VENDOR_GOOGLE off — the Google NIC drivers stay hidden"),
+        ("CONFIG_GVE=y", "GVE off — a GCE machine series that requires gVNIC has no network"),
+        ("CONFIG_DMI=y", "DMI off — the firmware tables that name a cloud are not scanned"),
+        ("CONFIG_DMIID=y", "DMIID off — /sys/class/dmi/id is missing, so a server cannot tell which cloud it runs on"),
+        ("CONFIG_HYPERV_TIMER=y", "HYPERV_TIMER off — an Azure VM has no Hyper-V clocksource. It is unprompted (def_bool HYPERV && X86), so something took HYPERV away"),
+        ("CONFIG_CPU_MITIGATIONS=y", "CPU_MITIGATIONS off — every CPU vulnerability mitigation is compiled out and mitigations= cannot restore one"),
+        ("CONFIG_RTC_INTF_DEV=y", "RTC_INTF_DEV off — /dev/rtc0 is missing, so td-time cannot persist a correction to the RTC"),
+        ("CONFIG_RTC_HCTOSYS=y", "RTC_HCTOSYS off — the RTC class does not re-seed the system clock at boot or resume"),
+        ("CONFIG_IGC=y", "IGC off — the Intel I225/I226 wired NIC of the Ryzen desktop has no driver"),
+        ("CONFIG_ETHTOOL_NETLINK=y", "ETHTOOL_NETLINK off — IGC depends on it"),
+        ("CONFIG_CPU_SUP_AMD=y", "CPU_SUP_AMD off — AMD processors lose their detection and quirks, and KVM_AMD cannot be built"),
+        ("CONFIG_CPU_SUP_INTEL=y", "CPU_SUP_INTEL off — Intel processors lose their detection, quirks and mitigations"),
+        ("CONFIG_SND_HDA_CODEC_ALC882=y", "SND_HDA_CODEC_ALC882 off — the desktop ALC1220 has no Realtek fixups"),
+        ("CONFIG_SND_HDA_CODEC_HDMI_ATI=y", "SND_HDA_CODEC_HDMI_ATI off — AMD HDMI and DisplayPort audio has no codec driver"),
+        ("CONFIG_VIRTUALIZATION=y", "VIRTUALIZATION off — the KVM menu stays hidden"),
+        ("CONFIG_KVM=y", "KVM off — /dev/kvm is missing, so QEMU guests run only under emulation"),
+        ("CONFIG_KVM_X86=y", "KVM_X86 off — no vendor KVM module survived resolution"),
+        ("CONFIG_KVM_AMD=y", "KVM_AMD off — AMD-V hosts cannot run KVM guests"),
+        ("CONFIG_KVM_INTEL=y", "KVM_INTEL off — VT-x hosts cannot run KVM guests"),
+        ("CONFIG_EXT4_FS=y", "EXT4_FS off — ext4 disks formatted by other systems cannot be mounted"),
+        ("CONFIG_JBD2=y", "JBD2 off — ext4 has no journal layer"),
+        ("CONFIG_EXT4_USE_FOR_EXT2=y", "EXT4_USE_FOR_EXT2 off — ext2 and ext3 volumes do not mount through ext4"),
+        ("CONFIG_FAT_FS=y", "FAT_FS off — VFAT has no FAT core"),
+        ("CONFIG_VFAT_FS=y", "VFAT_FS off — USB sticks and SD cards formatted FAT cannot be mounted"),
+        ("CONFIG_FAT_DEFAULT_UTF8=y", "FAT_DEFAULT_UTF8 off — FAT long names are not UTF-8 by default"),
+        ("CONFIG_FAT_DEFAULT_CODEPAGE=437", "FAT_DEFAULT_CODEPAGE is not 437 — the built-in codepage would not be the one FAT mounts with"),
+        ("CONFIG_FAT_DEFAULT_IOCHARSET=\"iso8859-1\"", "FAT_DEFAULT_IOCHARSET is not iso8859-1 — the built-in iocharset would not be the one FAT mounts with"),
+        ("CONFIG_EXFAT_FS=y", "EXFAT_FS off — SDXC cards and large sticks formatted exFAT cannot be mounted"),
+        ("CONFIG_EXFAT_DEFAULT_IOCHARSET=\"utf8\"", "EXFAT_DEFAULT_IOCHARSET is not utf8 — exFAT names would need an NLS table"),
+        ("CONFIG_NLS=y", "NLS off — FAT and exFAT have no character sets"),
+        ("CONFIG_NLS_CODEPAGE_437=y", "NLS_CODEPAGE_437 off — FAT refuses to mount without its default codepage"),
+        ("CONFIG_NLS_ISO8859_1=y", "NLS_ISO8859_1 off — VFAT refuses to mount without its default iocharset"),
+        ("CONFIG_NLS_UTF8=y", "NLS_UTF8 off — a mount asking iocharset=utf8 fails"),
+        ("CONFIG_IGB=y", "IGB off — the Intel 82575/82576/I210/I211/I350 wired NICs many desktop and server boards carry have no driver"),
+        ("CONFIG_NET_VENDOR_REALTEK=y", "NET_VENDOR_REALTEK off — R8169 is hidden behind it"),
+        ("CONFIG_R8169=y", "R8169 off — the Realtek 8111/8168/8125 wired NICs most consumer boards carry have no driver"),
+        ("CONFIG_USB_NET_DRIVERS=y", "USB_NET_DRIVERS off — every USB Ethernet driver is hidden behind it"),
+        ("CONFIG_USB_USBNET=y", "USB_USBNET off — the CDC, NCM and AX88179 adapters are drivers on it"),
+        ("CONFIG_USB_NET_CDCETHER=y", "USB_NET_CDCETHER off — class-compliant USB Ethernet adapters and phone tethering have no driver"),
+        ("CONFIG_USB_NET_CDC_NCM=y", "USB_NET_CDC_NCM off — USB-C docks and NCM tethering have no driver"),
+        ("CONFIG_USB_RTL8152=y", "USB_RTL8152 off — Realtek RTL8152/8153/8156 USB and dock Ethernet has no driver"),
+        ("CONFIG_USB_NET_AX88179_178A=y", "USB_NET_AX88179_178A off — ASIX AX88179 USB 3 gigabit adapters have no driver"),
+        ("CONFIG_USB_UAS=y", "USB_UAS off — USB SSDs and enclosures fall back to slow bulk-only transport"),
+        ("CONFIG_SND_USB=y", "SND_USB off — USB audio is hidden behind it"),
+        ("CONFIG_SND_USB_AUDIO=y", "SND_USB_AUDIO off — USB headsets and DACs have no driver"),
+        ("CONFIG_UDF_FS=y", "UDF_FS off — Blu-ray discs, packet-written DVDs and UDF-formatted media cannot be mounted"),
+        ("CONFIG_MITIGATION_PAGE_TABLE_ISOLATION=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_RETPOLINE=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_RETHUNK=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_UNRET_ENTRY=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_CALL_DEPTH_TRACKING=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_IBPB_ENTRY=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_IBRS_ENTRY=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_SRSO=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_GDS=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_RFDS=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_SPECTRE_BHI=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_MDS=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_TAA=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_MMIO_STALE_DATA=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_L1TF=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_RETBLEED=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_SPECTRE_V1=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_SPECTRE_V2=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_SRBDS=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_SSB=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_ITS=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_TSA=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+        ("CONFIG_MITIGATION_VMSCAPE=y", "its upstream default did not survive resolution, or this kernel renamed it"),
+    ];
+
+    /// What the resolved lock must not turn on, and why.
+    const HELD_OFF: &[(&str, &str)] = &[
+        ("CONFIG_OVERLAY_FS", "OVERLAY_FS on - /etc is immutable and writable state uses direct mounts; no overlay user remains"),
+        ("CONFIG_NVME_MULTIPATH", "NVME_MULTIPATH on - installation fixture requires direct controller namespaces"),
+        ("CONFIG_SERIAL_8250_MOXA_PCIE", "SERIAL_8250_MOXA_PCIE set — it defaults to SERIAL_8250 since Linux 7.3, and td supports no such card"),
+        ("CONFIG_DRM_EFIDRM", "DRM_EFIDRM set — it requires SYSFB_SIMPLEFB off; simpledrm is the one firmware framebuffer driver"),
+        ("CONFIG_DRM_VESADRM", "DRM_VESADRM set — it requires SYSFB_SIMPLEFB off; simpledrm is the one firmware framebuffer driver"),
+        ("CONFIG_FB_EFI", "FB_EFI set — legacy efifb would take a GOP mode simple-framebuffer cannot describe; simpledrm is the one firmware framebuffer driver"),
+        ("CONFIG_FB_VESA", "FB_VESA set — legacy vesafb would take a VBE mode simple-framebuffer cannot describe; simpledrm is the one firmware framebuffer driver"),
+        ("CONFIG_KEXEC", "KEXEC (legacy segment-based kexec_load) on — only KEXEC_FILE is used; the legacy syscall is kept off to not widen the surface"),
+        ("CONFIG_KEXEC_SIG", "KEXEC_SIG on — would demand a trusted-keyring signature policy td does not ship"),
+        ("CONFIG_RANDOMIZE_BASE", "RANDOMIZE_BASE (KASLR) on — pinned off for a deterministic kexec boot"),
+        ("CONFIG_MODULES", "MODULES on (would need module tooling)"),
+        ("CONFIG_DEBUG_INFO_BTF", "BTF on (would need pahole)"),
+        ("CONFIG_SECURITY_DMESG_RESTRICT", "SECURITY_DMESG_RESTRICT on — unprivileged /dev/kmsg reads become EPERM, so the shipped /bin/dmesg breaks for ordinary users"),
+        ("CONFIG_CMDLINE_OVERRIDE", "firmware command line must remain usable"),
+        ("CONFIG_EFI_HANDOVER_PROTOCOL", "deprecated EFI handover disabled policy missing"),
+        ("CONFIG_EFI_MIXED", "32-bit EFI firmware disabled policy missing"),
+        ("CONFIG_EFIVAR_FS", "EFI variable filesystem disabled policy missing"),
+        ("CONFIG_SECURITY_NETWORK", "SECURITY_NETWORK on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_SECURITY_PATH", "SECURITY_PATH on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_SECURITY_SELINUX", "SECURITY_SELINUX on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_SECURITY_SMACK", "SECURITY_SMACK on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_SECURITY_TOMOYO", "SECURITY_TOMOYO on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_SECURITY_APPARMOR", "SECURITY_APPARMOR on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_SECURITY_LOADPIN", "SECURITY_LOADPIN on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_SECURITY_YAMA", "SECURITY_YAMA on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_SECURITY_SAFESETID", "SECURITY_SAFESETID on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_SECURITY_LOCKDOWN_LSM", "SECURITY_LOCKDOWN_LSM on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_SECURITY_LANDLOCK", "SECURITY_LANDLOCK on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_SECURITY_IPE", "SECURITY_IPE on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_BPF_LSM", "BPF_LSM on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_INTEGRITY", "INTEGRITY on - the LSM framework is built for securityfs alone, with no security module"),
+        ("CONFIG_IA32_EMULATION_DEFAULT_DISABLED", "IA32 emulation disabled at boot — the td-jail probe needs compatibility execution"),
+        ("CONFIG_X86_X32_ABI", "X86_X32_ABI on — x32 calls could reach an unmodelled compatibility ABI instead of the deliberate kill probe"),
+        ("CONFIG_RT_GROUP_SCHED", "RT_GROUP_SCHED on — real-time tasks in the populated root can block enabling the cpu controller, and td does not delegate real-time bandwidth"),
+        ("CONFIG_SND_PCM_OSS", "SND_PCM_OSS on — APPLICATIONS.md K.4 refuses the deprecated OSS emulation layer on the merits, and olddefconfig must not bring it back as a default"),
+        ("CONFIG_CFG80211_REQUIRE_SIGNED_REGDB", "CFG80211_REQUIRE_SIGNED_REGDB on — it selects the trusted keyring and its openssl-linked certs/ tool"),
+        ("CONFIG_SYSTEM_TRUSTED_KEYRING", "SYSTEM_TRUSTED_KEYRING on — a select overrode its pin, and certs/ would need openssl"),
+        ("CONFIG_USB_NET_NET1080", "USB_NET_NET1080 on — NetChip host-to-host cables are USB drivers nothing asked for"),
+        ("CONFIG_USB_NET_CDC_SUBSET", "USB_NET_CDC_SUBSET on — Belkin and ARM Linux host-to-host links are USB drivers nothing asked for"),
+        ("CONFIG_USB_NET_ZAURUS", "USB_NET_ZAURUS on — Sharp Zaurus links are USB drivers nothing asked for"),
+        ("CONFIG_IPC_NS", "IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately"),
+    ];
+
+    /// The lock names this exact `CONFIG_X=value` line.
+    fn locked(line: &str) -> bool {
+        CONFIG_LOCK.lines().any(|held| held == line)
+    }
+
+    /// The lock turns this `CONFIG_X` on, at any value.
+    fn set(symbol: &str) -> bool {
+        let prefix = format!("{symbol}=");
+        CONFIG_LOCK.lines().any(|held| held.starts_with(&prefix))
+    }
+
+    #[test]
+    fn the_lock_holds_what_the_kernel_needs() {
+        for (line, why) in HELD {
+            let line = line.replace(
+                "@EFI_CMDLINE@",
+                &format!("{:?}", crate::shared::efi_default_cmdline()),
+            );
+            assert!(locked(&line), "{line}: {why}");
+        }
+        for (symbol, why) in HELD_OFF {
+            assert!(!set(symbol), "{symbol} on: {why}");
+        }
+        assert!(
+            !CONFIG_LOCK
+                .lines()
+                .any(|line| line.starts_with("CONFIG_CRYPTO_USER_API")),
+            "deprecated AF_ALG user interface enabled"
+        );
+    }
+
+    #[test]
+    fn the_lock_is_sorted_config_lines() {
+        let lines: Vec<&str> = CONFIG_LOCK.lines().collect();
+        assert!(lines.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(lines.iter().all(|line| line.starts_with("CONFIG_")));
+    }
+
+    #[test]
+    fn config_decides_each_symbol_once() {
+        let mut symbols: Vec<&str> = CONFIG
+            .iter()
+            .filter_map(|line| config_symbol(line))
+            .collect();
+        assert_eq!(symbols.len(), CONFIG.len());
+        symbols.sort_unstable();
+        symbols.dedup();
+        assert_eq!(symbols.len(), CONFIG.len());
+        // Each line is one single-quoted shell word in `config_script`.
+        assert!(CONFIG.iter().all(|line| !line.contains('\'')));
+    }
+
+    /// A pin olddefconfig drops, under a parent that is off or a symbol this
+    /// kernel renamed, leaves the lock's diff empty and the driver absent.
+    #[test]
+    fn every_config_decision_took_effect() {
+        let cmdline = format!("{:?}", crate::shared::efi_default_cmdline());
+        for line in CONFIG {
+            let line = line.replace("@EFI_CMDLINE@", &cmdline);
+            match line.strip_prefix("# ") {
+                Some(off) => {
+                    let symbol = off.trim_end_matches(" is not set");
+                    assert!(!set(symbol), "{symbol} is decided off but the lock has it");
+                }
+                None => assert!(locked(&line), "{line} is decided but the lock lacks it"),
+            }
+        }
+    }
+
+    /// `WriteFile` content passes through the placeholder expander, so a brace
+    /// would be rewritten before the comparison.
+    #[test]
+    fn the_lock_holds_no_placeholder() {
+        assert!(!CONFIG_LOCK.contains(['{', '}']));
+    }
+
     /// The ThinkPad T430s's hardware is built in and survives config
     /// resolution: display, wired network, pointing devices, platform and
     /// power, USB 2.0, the SD reader and audio codecs.
@@ -1875,10 +1732,7 @@ mod tests {
             let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
             assert_eq!(text.matches(&stale).count(), 1, "{symbol}");
             assert_eq!(text.matches(&pin).count(), 1, "{symbol}");
-            assert!(
-                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
-                "{symbol}"
-            );
+            assert!(locked(&format!("CONFIG_{symbol}=y")), "{symbol}");
         }
         // No prompt here, so a written line would read as a pin without
         // being one: guarded only.
@@ -1893,10 +1747,7 @@ mod tests {
                 "{symbol}"
             );
             assert!(!text.contains(&format!("'CONFIG_{symbol}=y'")), "{symbol}");
-            assert!(
-                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
-                "{symbol}"
-            );
+            assert!(locked(&format!("CONFIG_{symbol}=y")), "{symbol}");
         }
     }
 
@@ -1942,10 +1793,7 @@ mod tests {
             let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
             assert_eq!(text.matches(&stale).count(), 1, "{symbol}");
             assert_eq!(text.matches(&pin).count(), 1, "{symbol}");
-            assert!(
-                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
-                "{symbol}"
-            );
+            assert!(locked(&format!("CONFIG_{symbol}=y")), "{symbol}");
         }
         // Selected by a pinned symbol, or without a visible prompt: guarded
         // only.
@@ -1960,10 +1808,7 @@ mod tests {
                 "{symbol}"
             );
             assert!(!text.contains(&format!("'CONFIG_{symbol}=y'")), "{symbol}");
-            assert!(
-                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
-                "{symbol}"
-            );
+            assert!(locked(&format!("CONFIG_{symbol}=y")), "{symbol}");
         }
     }
 
@@ -2025,12 +1870,7 @@ mod tests {
             let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
             assert_eq!(text.matches(&stale).count(), 1, "{symbol}");
             assert_eq!(text.matches(&pin).count(), 1, "{symbol}");
-            assert_eq!(
-                text.matches(&format!("grep -q '^CONFIG_{symbol}=y' .config"))
-                    .count(),
-                1,
-                "{symbol}"
-            );
+            assert!(locked(&format!("CONFIG_{symbol}=y")), "{symbol}");
         }
         for symbol in ["USB_NET_NET1080", "USB_NET_CDC_SUBSET", "USB_NET_ZAURUS"] {
             let off = format!("# CONFIG_{symbol} is not set");
@@ -2041,11 +1881,7 @@ mod tests {
                 "{symbol}"
             );
             assert_eq!(text.matches(&format!("'{off}'")).count(), 1, "{symbol}");
-            assert_eq!(
-                text.matches(&format!("grep -q '^{off}' .config")).count(),
-                1,
-                "{symbol}"
-            );
+            assert!(!set(&format!("CONFIG_{symbol}")), "{symbol}");
         }
         // Unprompted, selected, or prompting only under EXPERT: guarded only.
         for symbol in [
@@ -2062,10 +1898,7 @@ mod tests {
                 "{symbol}"
             );
             assert!(!text.contains(&format!("'CONFIG_{symbol}=y'")), "{symbol}");
-            assert!(
-                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
-                "{symbol}"
-            );
+            assert!(locked(&format!("CONFIG_{symbol}=y")), "{symbol}");
         }
         // The defaults the built-in tables serve are checked, not written.
         for line in [
@@ -2074,10 +1907,7 @@ mod tests {
             "CONFIG_EXFAT_DEFAULT_IOCHARSET=\"utf8\"",
         ] {
             assert!(!config.contains(&format!("'{line}'")), "{line}");
-            assert!(
-                text.contains(&format!("grep -qx '{line}' .config")),
-                "{line}"
-            );
+            assert!(locked(line), "{line}");
         }
         // Modules stay off: every driver above is built in.
         assert!(config.contains("'# CONFIG_MODULES is not set'"));
@@ -2103,14 +1933,7 @@ mod tests {
             1
         );
         assert_eq!(text.matches("'CONFIG_CPU_MITIGATIONS=y'").count(), 1);
-        assert!(text.contains("grep -q '^CONFIG_CPU_MITIGATIONS=y' .config"));
-        let looped = text
-            .split("for m in ")
-            .nth(1)
-            .and_then(|rest| rest.split("; do").next())
-            .unwrap_or_default()
-            .split(' ')
-            .collect::<Vec<_>>();
+        assert!(locked("CONFIG_CPU_MITIGATIONS=y"));
         for name in [
             "PAGE_TABLE_ISOLATION",
             "RETPOLINE",
@@ -2136,11 +1959,10 @@ mod tests {
             "TSA",
             "VMSCAPE",
         ] {
-            assert!(looped.contains(&name), "{name}");
+            assert!(locked(&format!("CONFIG_MITIGATION_{name}=y")), "{name}");
         }
-        assert!(text.contains("grep -q \"^CONFIG_MITIGATION_$m=y\" .config"));
         assert!(!text.contains("'CONFIG_MITIGATION_"));
-        assert!(!text.contains("CONFIG_MITIGATION_SLS"));
+        assert!(!set("CONFIG_MITIGATION_SLS"));
     }
 
     /// The T14s's Wi-Fi: ath11k built in, with linux-firmware's files
@@ -2186,12 +2008,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let extra = format!("'CONFIG_EXTRA_FIRMWARE=\"{names}\"'");
-        assert_eq!(text.matches(&extra).count(), 2, "pinned and guarded");
+        assert_eq!(text.matches(&extra).count(), 1, "pinned");
+        assert!(locked(&format!("CONFIG_EXTRA_FIRMWARE=\"{names}\"")));
         assert_eq!(
             text.matches("'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"'")
                 .count(),
-            2
+            1
         );
+        assert!(locked("CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\""));
         for symbol in [
             "WIRELESS",
             "CFG80211",
@@ -2204,9 +2028,9 @@ mod tests {
             let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
             assert_eq!(text.matches(&stale).count(), 1, "{symbol}");
             assert_eq!(text.matches(&format!("'CONFIG_{symbol}=y'")).count(), 1);
-            assert!(text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")));
+            assert!(locked(&format!("CONFIG_{symbol}=y")));
         }
-        assert!(text.contains("if grep -q '^CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y' .config; then"));
+        assert!(!set("CONFIG_CFG80211_REQUIRE_SIGNED_REGDB"));
         // Neither source patch fails the build when absent: hw2.1 silicon
         // would ask for files nothing embeds, and the keyring would return.
         // A linux-firmware tag bump must re-check that WHENCE still links
@@ -2234,7 +2058,7 @@ mod tests {
                 "{file}"
             );
         }
-        assert!(text.contains("if grep -q '^CONFIG_SYSTEM_TRUSTED_KEYRING=y' .config; then"));
+        assert!(!set("CONFIG_SYSTEM_TRUSTED_KEYRING"));
         for symbol in [
             "FW_LOADER",
             "MHI_BUS",
@@ -2243,7 +2067,7 @@ mod tests {
             "QCOM_QMI_HELPERS",
         ] {
             assert!(!text.contains(&format!("'CONFIG_{symbol}=y'")), "{symbol}");
-            assert!(text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")));
+            assert!(locked(&format!("CONFIG_{symbol}=y")));
         }
     }
 
@@ -2315,32 +2139,17 @@ mod tests {
             let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
             assert_eq!(text.matches(&stale).count(), 1, "{symbol}");
             assert_eq!(text.matches(&pin).count(), 1, "{symbol}");
-            assert!(
-                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
-                "{symbol}"
-            );
+            assert!(locked(&format!("CONFIG_{symbol}=y")), "{symbol}");
         }
         // No prompt: guarded only.
         assert!(!text.contains("CONFIG_HYPERV_TIMER[ =]/d"));
         assert!(!text.contains("'CONFIG_HYPERV_TIMER=y'"));
-        assert!(text.contains("grep -q '^CONFIG_HYPERV_TIMER=y' .config"));
+        assert!(locked("CONFIG_HYPERV_TIMER=y"));
         assert!(!text.contains("'CONFIG_DMI=y'"));
-        assert!(text.contains("grep -q '^CONFIG_DMI=y' .config"));
+        assert!(locked("CONFIG_DMI=y"));
         // EC2 presents EBS as NVMe; x2APIC is pinned for the T14s.
         assert!(text.contains("'CONFIG_BLK_DEV_NVME=y'"));
-        assert!(text.contains("grep -q '^CONFIG_X86_X2APIC=y' .config"));
-        // Each guard message is a single-quoted shell word. The guard script
-        // is one line, so every message in it is split out.
-        let messages = text
-            .split("{ echo '")
-            .skip(1)
-            .chain(text.split("then echo '").skip(1))
-            .collect::<Vec<_>>();
-        assert!(messages.len() > 100);
-        for rest in messages {
-            let message = rest.split("' >&2").next().unwrap_or_default();
-            assert!(!message.contains('\''), "{message}");
-        }
+        assert!(locked("CONFIG_X86_X2APIC=y"));
     }
 
     #[test]
@@ -2368,10 +2177,10 @@ mod tests {
             "PCI_MSI",
         ] {
             assert!(text.contains(&format!("'CONFIG_{symbol}=y'")));
-            assert!(text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")));
+            assert!(locked(&format!("CONFIG_{symbol}=y")));
         }
         assert!(text.contains("'# CONFIG_NVME_MULTIPATH is not set'"));
-        assert!(text.contains("grep -q '^# CONFIG_NVME_MULTIPATH is not set' .config"));
+        assert!(!set("CONFIG_NVME_MULTIPATH"));
     }
 
     /// ENCRYPTION.md "Keyboard console": simpledrm over sysfb's
@@ -2397,26 +2206,18 @@ mod tests {
                 1,
                 "{symbol}"
             );
-            assert!(
-                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config ||")),
-                "{symbol}"
-            );
+            assert!(locked(&format!("CONFIG_{symbol}=y")), "{symbol}");
         }
         // Unavailable beside SYSFB_SIMPLEFB (EFIDRM, VESADRM) or off by
         // allnoconfig (efifb, vesafb): never written, refused if set.
         for symbol in ["DRM_EFIDRM", "DRM_VESADRM", "FB_EFI", "FB_VESA"] {
             assert!(!text.contains(&format!("'CONFIG_{symbol}=")), "{symbol}");
-            assert!(
-                text.contains(&format!(
-                    "if grep -q '^CONFIG_{symbol}=' .config; then echo '{symbol} set"
-                )),
-                "{symbol}"
-            );
+            assert!(!set(&format!("CONFIG_{symbol}")), "{symbol}");
         }
         let cmdline = format!("{:?}", crate::shared::efi_default_cmdline());
         assert!(cmdline.contains("console=tty0 console=ttyS0,115200"));
         assert!(text.contains(&format!("'CONFIG_CMDLINE={cmdline}'")));
-        assert!(text.contains(&format!("grep -Fxq 'CONFIG_CMDLINE={cmdline}' .config")));
+        assert!(locked(&format!("CONFIG_CMDLINE={cmdline}")));
     }
 
     #[test]
@@ -2437,9 +2238,9 @@ mod tests {
         for stale in ["CONFIG_BLK_DEV_RAM[ =]/d", "CONFIG_BLK_DEV_RAM_COUNT[ =]/d"] {
             assert!(text.contains(stale), "{stale} missing");
         }
-        assert!(text.contains("grep -q '^CONFIG_BLK_DEV_RAM=y' .config"));
+        assert!(locked("CONFIG_BLK_DEV_RAM=y"));
         // Anchored, so a resolved count of 10 or 16 cannot satisfy it.
-        assert!(text.contains("grep -q '^CONFIG_BLK_DEV_RAM_COUNT=1$' .config"));
+        assert!(locked("CONFIG_BLK_DEV_RAM_COUNT=1"));
     }
 
     #[test]
@@ -2460,7 +2261,7 @@ mod tests {
                 "{symbol} missing pin"
             );
             assert!(
-                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
+                locked(&format!("CONFIG_{symbol}=y")),
                 "{symbol} missing resolved guard"
             );
         }
@@ -2483,13 +2284,10 @@ mod tests {
                 text.contains(&format!("'CONFIG_{symbol}=y'")),
                 "{symbol} pin"
             );
-            assert!(
-                text.contains(&format!("grep -q '^CONFIG_{symbol}=y$' .config")),
-                "{symbol} guard"
-            );
+            assert!(locked(&format!("CONFIG_{symbol}=y")), "{symbol} lock");
         }
         assert!(text.contains("'CONFIG_LSM=\"\"'"));
-        assert!(text.contains("grep -Fxq 'CONFIG_LSM=\"\"' .config"));
+        assert!(locked("CONFIG_LSM=\"\""));
         for symbol in [
             "SECURITY_NETWORK",
             "SECURITY_PATH",
@@ -2510,10 +2308,7 @@ mod tests {
                 text.contains(&format!("'# CONFIG_{symbol} is not set'")),
                 "{symbol} pin"
             );
-            assert!(
-                text.contains(&format!("if grep -q '^CONFIG_{symbol}=' .config")),
-                "{symbol} guard"
-            );
+            assert!(!set(&format!("CONFIG_{symbol}")), "{symbol} lock");
         }
     }
 
@@ -2534,13 +2329,9 @@ mod tests {
             "CONFIG_SMP=y",
             "CONFIG_NR_CPUS=256",
             "CONFIG_HOTPLUG_CPU=y",
-            "grep -q '^CONFIG_PERF_EVENTS=y' .config",
-            "grep -q '^CONFIG_SMP=y$' .config",
-            "grep -q '^CONFIG_NR_CPUS=256$' .config",
-            "grep -q '^CONFIG_HOTPLUG_CPU=y$' .config",
         ] {
             assert!(
-                command_text.contains(required),
+                command_text.contains(required) && locked(required),
                 "kernel profiler contract omitted {required}"
             );
         }
@@ -2561,26 +2352,30 @@ mod tests {
         for required in [
             "/^#? *CONFIG_AUDIT[ =]/d",
             "CONFIG_AUDIT=y",
-            "grep -q '^CONFIG_AUDIT=y' .config",
-            "grep -q '^CONFIG_AUDITSYSCALL=y' .config",
             "/^#? *CONFIG_COMPAT_32BIT_TIME[ =]/d",
             "CONFIG_COMPAT_32BIT_TIME=y",
-            "grep -q '^CONFIG_COMPAT_32BIT_TIME=y$' .config",
             "/^#? *CONFIG_IA32_EMULATION[ =]/d",
             "CONFIG_IA32_EMULATION=y",
-            "grep -q '^CONFIG_IA32_EMULATION=y$' .config",
             "/^#? *CONFIG_IA32_EMULATION_DEFAULT_DISABLED[ =]/d",
             "# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set",
-            "grep -q '^# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set$' .config",
             "/^#? *CONFIG_X86_X32_ABI[ =]/d",
             "# CONFIG_X86_X32_ABI is not set",
-            "grep -q '^# CONFIG_X86_X32_ABI is not set$' .config",
         ] {
             assert!(
                 command_text.contains(required),
                 "kernel Firefox audit contract omitted {required}"
             );
         }
+        for line in [
+            "CONFIG_AUDIT=y",
+            "CONFIG_AUDITSYSCALL=y",
+            "CONFIG_COMPAT_32BIT_TIME=y",
+            "CONFIG_IA32_EMULATION=y",
+        ] {
+            assert!(locked(line), "{line}");
+        }
+        assert!(!set("CONFIG_IA32_EMULATION_DEFAULT_DISABLED"));
+        assert!(!set("CONFIG_X86_X32_ABI"));
         assert_eq!(command_text.matches("'CONFIG_AUDITSYSCALL=y'").count(), 0);
     }
 
@@ -2601,13 +2396,13 @@ mod tests {
             "CONFIG_FAIR_GROUP_SCHED=y",
             "CONFIG_CFS_BANDWIDTH=y",
             "# CONFIG_RT_GROUP_SCHED is not set",
-            "grep -q '^CONFIG_CFS_BANDWIDTH=y' .config",
-            "grep -q '^CONFIG_RT_GROUP_SCHED=y' .config",
         ] {
             assert!(
                 command_text.contains(required),
                 "kernel CPU bandwidth contract omitted {required}"
             );
         }
+        assert!(locked("CONFIG_CFS_BANDWIDTH=y"));
+        assert!(!set("CONFIG_RT_GROUP_SCHED"));
     }
 }

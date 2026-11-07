@@ -533,7 +533,8 @@ recipe-check scope are unchanged. Paths the mapping ignores, including
 documentation, do not broaden a mixed code diff. Thus a private SSH-policy
 edit in firstboot does not run consumers of its shared hostname parser.
 
-A flat recipe definition at `recipes/src/recipes/<stem>.rs` also runs
+A flat recipe definition at `recipes/src/recipes/<stem>.rs`, or the
+resolved config lock `<stem>.config` beside it, also runs
 the builder/recipes/engine workspace legs and repository formatting,
 without unchanged standalone crate legs. Its stem starts with a lowercase
 ASCII letter and contains only lowercase ASCII letters, digits and `-`;
