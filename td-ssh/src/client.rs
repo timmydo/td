@@ -2,7 +2,7 @@
 //! session channel.
 
 use crate::client_config::{
-    caller_uid, expand_path, Family, LogLevel, MatchContext, Options, Origin, RequestTty, Strict,
+    caller_uid, expand_path, parse_port, LogLevel, Options, Origin, RequestTty, Strict,
 };
 use crate::conn::{
     self, Conn, Credit, Event, EventReceiver, LocalWindow, WhenBroken, CHANNEL_MAX_PACKET,
@@ -13,7 +13,7 @@ use crate::error::{
 };
 use crate::kex::{
     self, ed25519_signature_blob, parse_ed25519_public, Kex, KexEnvironment, RandomSource, Role,
-    CIPHER, DEFAULT_KEX, HOST_KEY_ALGORITHM, MAC_PLACEHOLDER,
+    CIPHER, DEFAULT_KEX, HOST_KEY_ALGORITHM,
 };
 use crate::keyfile::{fingerprint_of_blob, PrivateKey, PrivateKeyFile};
 use crate::known_hosts::{self, Lookup};
@@ -61,6 +61,8 @@ const DEFAULT_ESCAPE: u8 = b'~';
 /// Wrong answers to the host-key question before the connection is refused,
 /// whichever source is answering.
 const HOST_KEY_TRIES: u32 = 3;
+/// Wrong passphrases for one identity before the next is tried.
+const PASSPHRASE_TRIES: u32 = 3;
 
 /// Everything the command line settled.
 #[derive(Default)]
@@ -78,40 +80,16 @@ pub struct Invocation {
     pub dump_config: bool,
     pub verbosity: u8,
     pub quiet: bool,
+    /// `-4` is `Some(false)` and `-6` `Some(true)`, the last one given deciding, as
+    /// Git passes for `git fetch -4`.
+    pub ipv6: Option<bool>,
 }
 
-const REMOVED_FLAGS: &[(char, &str)] = &[
-    ('A', "agent forwarding"),
-    ('B', "binding to an interface"),
-    ('D', "dynamic forwarding"),
-    ('E', "a log file"),
-    ('I', "PKCS#11 tokens"),
-    ('J', "jump hosts"),
-    ('L', "local forwarding"),
-    ('M', "connection sharing"),
-    ('O', "connection sharing"),
-    ('R', "remote forwarding"),
-    ('S', "connection sharing"),
-    ('W', "stdio forwarding"),
-    ('X', "X11 forwarding"),
-    ('Y', "X11 forwarding"),
-    ('b', "binding to an address"),
-    ('c', "cipher selection"),
-    ('f', "backgrounding"),
-    ('g', "gateway ports"),
-    ('m', "MAC selection"),
-    ('s', "subsystems"),
-    ('w', "tunnels"),
-    ('y', "syslog"),
-    ('C', "compression"),
-    ('K', "GSSAPI"),
-    ('e', "changing the escape character"),
-];
-
 /// Flags that take an argument, for parsing `-pPORT` and `-p PORT` alike.
-const TAKES_VALUE: &[char] = &['F', 'i', 'l', 'o', 'p', 'Q'];
-/// Flags that only disable what td-ssh never does.
-const NO_OP_FLAGS: &[char] = &['a', 'k', 'x'];
+const TAKES_VALUE: &[char] = &['F', 'i', 'l', 'o', 'p'];
+/// `td-remote` passes it for a stock `ssh`'s sake: it disables X11, which td-ssh never
+/// does. Its `-a` is `ForwardAgent no`, so a person's `ForwardAgent yes` reads.
+const NO_OP_FLAGS: &[char] = &['x'];
 
 pub enum Parsed {
     Run(Box<Invocation>),
@@ -163,14 +141,13 @@ pub fn parse_args(args: &[OsString]) -> Result<Parsed> {
                 } else {
                     attached
                 };
-                if let Some(answer) = apply_value_flag(flag, value, &mut invocation)? {
-                    return Ok(Parsed::PrintAndExit(answer));
-                }
+                apply_value_flag(flag, value, &mut invocation)?;
                 break;
             }
             match flag {
-                '4' => invocation.options.family = Some(Family::Inet),
-                '6' => invocation.options.family = Some(Family::Inet6),
+                '4' => invocation.ipv6 = Some(false),
+                '6' => invocation.ipv6 = Some(true),
+                'a' => invocation.options.apply_option("ForwardAgent=no")?,
                 'G' => invocation.dump_config = true,
                 'n' => invocation.stdin_null = true,
                 'N' => invocation.no_session = true,
@@ -180,23 +157,12 @@ pub fn parse_args(args: &[OsString]) -> Result<Parsed> {
                 'v' => invocation.verbosity = invocation.verbosity.saturating_add(1),
                 'V' => return Ok(Parsed::PrintAndExit(format!("{IDENTIFICATION}\n"))),
                 other if NO_OP_FLAGS.contains(&other) => {}
-                other => {
-                    let reason = REMOVED_FLAGS
-                        .iter()
-                        .find(|(name, _)| *name == other)
-                        .map(|(_, reason)| *reason);
-                    return Err(Error::refused(match reason {
-                        Some(reason) => {
-                            format!("-{other}: td-ssh does not support {reason}")
-                        }
-                        None => format!("unknown option -- {other}"),
-                    }));
-                }
+                other => return Err(Error::refused(format!("unknown option -- {other}"))),
             }
         }
     }
     invocation.destination = destination.ok_or_else(|| {
-        Error::refused("usage: ssh [-46GNnqTtVv] [-F file] [-i identity] [-l user] [-o option] [-p port] [-Q query] destination [command...]")
+        Error::refused("usage: ssh [-46aGNnqTtVvx] [-F file] [-i identity] [-l user] [-o option] [-p port] destination [command...]")
     })?;
     if !command.is_empty() {
         invocation.command = Some(command.join(&b' '));
@@ -225,11 +191,7 @@ fn place_positional<'a>(
     Ok(())
 }
 
-fn apply_value_flag(
-    flag: char,
-    value: &str,
-    invocation: &mut Invocation,
-) -> Result<Option<String>> {
+fn apply_value_flag(flag: char, value: &str, invocation: &mut Invocation) -> Result<()> {
     match flag {
         'F' => invocation.config_file = Some(PathBuf::from(value)),
         'i' => invocation.identity_args.push(value.to_string()),
@@ -245,32 +207,14 @@ fn apply_value_flag(
         'p' => {
             if invocation.options.port.is_none() {
                 invocation.options.port = Some(
-                    value
-                        .parse()
-                        .map_err(|_| Error::refused(format!("Bad port '{value}'")))?,
+                    parse_port(value)
+                        .ok_or_else(|| Error::refused(format!("Bad port '{value}'")))?,
                 );
             }
         }
-        'Q' => return query(value).map(Some),
         _ => return Err(Error::refused(format!("unknown option -- {flag}"))),
     }
-    Ok(None)
-}
-
-/// `-Q`: truthfully, from what this build compiles.
-fn query(what: &str) -> Result<String> {
-    let lines: &[&str] = match what {
-        "kex" => DEFAULT_KEX,
-        "cipher" | "cipher-auth" => &[CIPHER],
-        "key" | "key-plain" | "sig" | "HostKeyAlgorithms" | "PubkeyAcceptedAlgorithms" => {
-            &[HOST_KEY_ALGORITHM]
-        }
-        "mac" => &[MAC_PLACEHOLDER],
-        other => return Err(Error::refused(format!("Unsupported query \"{other}\""))),
-    };
-    let mut out = lines.join("\n");
-    out.push('\n');
-    Ok(out)
+    Ok(())
 }
 
 /// `ssh://[user@]host[:port]`, `user@host`, or `host`.
@@ -280,10 +224,9 @@ fn parse_destination(destination: &str) -> Result<(Option<String>, String, Optio
         let (user, host_port) = split_user(rest);
         let (host, port) = match host_port.rsplit_once(':') {
             Some((host, port)) if !host.contains(':') || host.ends_with(']') => {
-                let port = port
-                    .parse()
-                    .map_err(|_| Error::refused(format!("Bad port '{port}'")))?;
-                (host, Some(port))
+                let parsed =
+                    parse_port(port).ok_or_else(|| Error::refused(format!("Bad port '{port}'")))?;
+                (host, Some(parsed))
             }
             _ => (host_port, None),
         };
@@ -678,20 +621,17 @@ fn verification_failed() -> Error {
     Error::refused("Host key verification failed.")
 }
 
-fn connect(host: &str, port: u16, family: Family, timeout: Option<Duration>) -> Result<TcpStream> {
+fn connect(
+    host: &str,
+    port: u16,
+    ipv6: Option<bool>,
+    timeout: Option<Duration>,
+) -> Result<TcpStream> {
     let mut last = None;
     let addresses = (host, port).to_socket_addrs().map_err(|error| {
         Error::refused(format!("ssh: Could not resolve hostname {host}: {error}"))
     })?;
-    for address in addresses {
-        let wanted = match family {
-            Family::Any => true,
-            Family::Inet => address.is_ipv4(),
-            Family::Inet6 => address.is_ipv6(),
-        };
-        if !wanted {
-            continue;
-        }
+    for address in addresses.filter(|address| ipv6.is_none_or(|six| address.is_ipv6() == six)) {
         let attempt = match timeout {
             Some(limit) => TcpStream::connect_timeout(&address, limit),
             None => TcpStream::connect(address),
@@ -704,7 +644,7 @@ fn connect(host: &str, port: u16, family: Family, timeout: Option<Duration>) -> 
     Err(Error::refused(format!(
         "ssh: connect to host {host} port {port}: {}",
         last.map_or_else(
-            || "no address of the requested family".to_string(),
+            || "no address of the family asked for".to_string(),
             |error| error.to_string()
         )
     )))
@@ -1293,7 +1233,7 @@ struct Session {
     guard: Option<TerminalGuard>,
     max_packet: u32,
     start_stdin: Option<StdinStarter>,
-    /// `-n` and `StdinNull`: stdin is never read, so nothing else signals EOF.
+    /// `-n`: stdin is never read, so nothing else signals EOF.
     stdin_null: bool,
     command: Option<Vec<u8>>,
     env: Vec<(String, Vec<u8>)>,
@@ -1696,19 +1636,20 @@ fn local_identity(
 fn read_configuration(
     options: &mut Options,
     config_file: Option<&Path>,
-    context: &MatchContext<'_>,
+    host: &str,
+    home: &Path,
 ) -> Result<()> {
     match config_file {
         Some(path) if path.as_os_str() == "none" => Ok(()),
-        Some(path) => options.read_file(path, context, Origin::Explicit),
+        Some(path) => options.read_file(path, host, Origin::Given),
         None => {
-            let user_config = context.home.join(".ssh/config");
+            let user_config = home.join(".ssh/config");
             if user_config.exists() {
-                options.read_file(&user_config, context, Origin::User)?;
+                options.read_file(&user_config, host, Origin::User)?;
             }
             let system = Path::new("/etc/ssh/ssh_config");
             if system.exists() {
-                options.read_file(system, context, Origin::System)?;
+                options.read_file(system, host, Origin::Given)?;
             }
             Ok(())
         }
@@ -1806,12 +1747,12 @@ pub fn run(mut invocation: Invocation) -> Result<i32> {
     };
     let local_name = local_user.as_deref().unwrap_or_default().to_string();
     let mut options = std::mem::take(&mut invocation.options);
-    let context = MatchContext {
-        original_host: &original_host,
-        local_user: &local_name,
-        home: &home,
-    };
-    read_configuration(&mut options, invocation.config_file.as_deref(), &context)?;
+    read_configuration(
+        &mut options,
+        invocation.config_file.as_deref(),
+        &original_host,
+        &home,
+    )?;
     options.validate()?;
 
     // Whatever a `HostName` supplied is recorded as much as a destination is.
@@ -1833,9 +1774,6 @@ pub fn run(mut invocation: Invocation) -> Result<i32> {
         options.log_level.unwrap_or(LogLevel::Info)
     };
     let logger = Logger { level };
-    for note in &options.notes {
-        logger.debug(note);
-    }
 
     let batch = options.batch_mode.unwrap_or(false);
     let expand = |value: &str| {
@@ -1893,21 +1831,7 @@ pub fn run(mut invocation: Invocation) -> Result<i32> {
         .connect_timeout
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs);
-    let attempts = options.connection_attempts.unwrap_or(1).max(1);
-    let family = options.family.unwrap_or(Family::Any);
-    let mut stream = None;
-    let mut last_error = None;
-    for _ in 0..attempts {
-        match connect(&host, port, family, timeout) {
-            Ok(connected) => {
-                stream = Some(connected);
-                break;
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    let stream = stream
-        .ok_or_else(|| last_error.unwrap_or_else(|| Error::refused("ssh: connection failed")))?;
+    let stream = connect(&host, port, invocation.ipv6, timeout)?;
     let _ = stream.set_nodelay(true);
     apply_socket_limits(&stream, &options)?;
     // Socket options, not a descriptor's: this handle reaches the live socket
@@ -1940,7 +1864,7 @@ pub fn run(mut invocation: Invocation) -> Result<i32> {
     let login = Login {
         user: &user,
         identities: &identities,
-        prompts: options.password_prompts.unwrap_or(3),
+        prompts: PASSPHRASE_TRIES,
         batch,
         logger: &logger,
     };
@@ -2039,15 +1963,14 @@ fn session_loop(
         conn.limit_rekey_bytes(limit);
     }
 
-    let stdin_null = invocation.stdin_null || options.stdin_null == Some(true);
-    let no_session = invocation.no_session || options.session_none == Some(true);
+    let stdin_null = invocation.stdin_null;
+    let no_session = invocation.no_session;
     let stdin_is_tty = !stdin_null && sys::is_terminal(io::stdin());
     let tty = decide_tty(invocation, options, stdin_is_tty);
     let want_tty = !no_session && tty.request;
     if !no_session && tty.no_terminal {
         logger.info("Pseudo-terminal will not be allocated because stdin is not a terminal.");
     }
-    let escape = options.escape_char.unwrap_or(Some(DEFAULT_ESCAPE));
     let size = sys::window_size(io::stdin()).unwrap_or(sys::Winsize {
         rows: 24,
         columns: 80,
@@ -2068,15 +1991,15 @@ fn session_loop(
             if cooked.is_some() {
                 spawn_window_watcher(events.clone(), size, window_stop);
             }
-            match escape.zip(cooked) {
-                Some((escape, cooked)) => {
+            match cooked {
+                Some(cooked) => {
                     let exit = EscapeExit {
                         events: events.clone(),
                         escaped,
                         control,
                         cooked,
                     };
-                    let input = EscapingStdin::spawn(EscapeFilter::new(escape), exit);
+                    let input = EscapingStdin::spawn(EscapeFilter::new(DEFAULT_ESCAPE), exit);
                     conn::spawn_source(input, SESSION_CHANNEL, false, max_packet, credit, events);
                 }
                 None => {
@@ -2356,8 +2279,9 @@ struct TtyChoice {
     no_terminal: bool,
 }
 
-/// `RequestTTY`, then `-t`/`-T`, against what stdin is, as OpenSSH decides. Only
-/// `-tt` and `RequestTTY force` ask without a terminal behind them.
+/// `-t`/`-T`, then `RequestTTY`, against what stdin is, as OpenSSH decides. Only
+/// `-tt` and `force` ask without a terminal behind it. `options` are the merged ones:
+/// `run` has taken the invocation's own by then.
 fn decide_tty(invocation: &Invocation, options: &Options, stdin_is_tty: bool) -> TtyChoice {
     let wanted = TtyChoice {
         request: stdin_is_tty,
@@ -2464,7 +2388,6 @@ mod tests {
             "SendEnv=GIT_PROTOCOL",
             "-p",
             "2222",
-            "-4",
             "git@example",
             "git-upload-pack 'x.git'",
         ]);
@@ -2511,25 +2434,11 @@ mod tests {
         assert!(parse_args(&["-p".into(), "bad".into(), "h".into()]).is_err());
     }
 
-    /// The exceptions, as stock: the last `-F`, and the last of `-4` and `-6`.
+    /// The exception, as stock: the last `-F`.
     #[test]
-    fn the_last_config_file_and_address_family_win() {
+    fn the_last_config_file_wins() {
         let invocation = parsed(&["-F", "one", "-F", "two", "h"]);
         assert_eq!(invocation.config_file, Some(PathBuf::from("two")));
-        assert_eq!(
-            parsed(&["-4", "-6", "h"]).options.family,
-            Some(Family::Inet6)
-        );
-        assert_eq!(
-            parsed(&["-6", "-4", "h"]).options.family,
-            Some(Family::Inet)
-        );
-        assert_eq!(
-            parsed(&["-o", "AddressFamily=inet", "-6", "h"])
-                .options
-                .family,
-            Some(Family::Inet6)
-        );
     }
 
     #[test]
@@ -2578,35 +2487,56 @@ mod tests {
     }
 
     #[test]
-    fn removed_features_exit_naming_the_feature() {
-        for (flag, word) in [
-            ("-L", "forwarding"),
-            ("-R", "forwarding"),
-            ("-D", "forwarding"),
-            ("-A", "agent"),
-            ("-J", "jump"),
-            ("-X", "X11"),
-            ("-C", "compression"),
+    fn a_flag_td_ssh_does_not_have_is_refused() {
+        for flag in [
+            "-L", "-R", "-D", "-A", "-J", "-W", "-X", "-Y", "-C", "-Q", "-k", "-e", "-Z",
         ] {
-            let error = parse_args(&strings(&[flag, "1:h:1", "h"]))
+            let error = parse_args(&strings(&[flag, "h"]))
                 .err()
                 .unwrap()
                 .to_string();
-            assert!(error.contains(word), "{flag}: {error}");
+            assert!(error.contains("unknown option"), "{flag}: {error}");
         }
-        assert!(parse_args(&strings(&["-Z", "h"])).is_err());
     }
 
     #[test]
-    fn queries_are_truthful() {
-        let answer = |what: &str| match parse_args(&strings(&["-Q", what])).unwrap() {
-            Parsed::PrintAndExit(text) => text,
-            Parsed::Run(_) => panic!("expected output"),
+    fn the_last_address_family_wins_and_a_is_forward_agent_no() {
+        assert_eq!(parsed(&["h"]).ipv6, None);
+        assert_eq!(parsed(&["-4", "-6", "h"]).ipv6, Some(true));
+        assert_eq!(parsed(&["-6", "-4", "h"]).ipv6, Some(false));
+        let mut invocation = parsed(&["-a", "h"]);
+        invocation
+            .options
+            .read_text("ForwardAgent yes\n", "h", "test")
+            .unwrap();
+        assert!(Options::default()
+            .read_text("ForwardAgent yes\n", "h", "test")
+            .is_err());
+    }
+
+    #[test]
+    fn t_and_big_t_override_request_tty() {
+        let with = |args: &[&str], request: &str| {
+            let mut invocation = parsed(args);
+            invocation
+                .options
+                .read_text(&format!("RequestTTY {request}\n"), "h", "test")
+                .unwrap();
+            decide_tty(&invocation, &invocation.options, false).request
         };
-        assert_eq!(answer("kex"), "mlkem768x25519-sha256\ncurve25519-sha256\n");
-        assert_eq!(answer("cipher"), "chacha20-poly1305@openssh.com\n");
-        assert_eq!(answer("key-plain"), "ssh-ed25519\n");
-        assert!(parse_args(&strings(&["-Q", "nonsense"])).is_err());
+        assert!(with(&["h"], "force"));
+        assert!(!with(&["-T", "h"], "force"));
+        assert!(!with(&["h"], "no"));
+        assert!(with(&["-tt", "h"], "no"));
+    }
+
+    #[test]
+    fn no_port_is_zero_on_the_command_line_or_in_a_url() {
+        for args in [&["-p", "0", "h"][..], &["-p0", "h"], &["-o", "Port=0", "h"]] {
+            assert!(parse_args(&strings(args)).is_err(), "{args:?}");
+        }
+        assert!(parse_destination("ssh://h:0").is_err());
+        assert_eq!(parse_destination("ssh://h:1").unwrap().2, Some(1));
     }
 
     #[test]
@@ -2714,9 +2644,6 @@ mod tests {
         assert_eq!(choice(&["h"], true), granted());
         assert_eq!(choice(&["h"], false), none());
         assert_eq!(choice(&["h", "cmd"], true), none());
-        assert_eq!(choice(&["-oRequestTTY=yes", "h"], false), spoken());
-        assert_eq!(choice(&["-oRequestTTY=force", "h"], false), granted());
-        assert_eq!(choice(&["-oRequestTTY=no", "h"], true), none());
     }
 
     #[test]
@@ -2982,10 +2909,7 @@ mod tests {
     fn a_key_file_loads_only_when_private() {
         let dir = td_fs::TempDir::new("td-ssh-identity").unwrap();
         let path = dir.path().join("k");
-        let text = PrivateKey::from_seed(&[3; 32], "")
-            .unwrap()
-            .to_file(None, &[0; 16], 1)
-            .unwrap();
+        let text = PrivateKey::from_seed(&[3; 32], "").unwrap().to_file(1);
         fs::write(&path, text).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(load_identity(&path, &quiet()).is_none());
@@ -2996,28 +2920,24 @@ mod tests {
     #[test]
     fn dash_f_none_reads_nothing_and_the_default_user_file_is_checked() {
         let dir = td_fs::TempDir::new("td-ssh-config").unwrap();
-        let context = MatchContext {
-            original_host: "h",
-            local_user: "l",
-            home: dir.path(),
-        };
+        let home = dir.path();
         let mut options = Options::default();
-        read_configuration(&mut options, Some(Path::new("none")), &context).unwrap();
-        assert!(read_configuration(&mut options, Some(Path::new("absent")), &context).is_err());
+        read_configuration(&mut options, Some(Path::new("none")), "h", home).unwrap();
+        assert!(read_configuration(&mut options, Some(Path::new("absent")), "h", home).is_err());
         let config = dir.path().join(".ssh/config");
         fs::create_dir(dir.path().join(".ssh")).unwrap();
         fs::write(&config, "Port 7\n").unwrap();
         fs::set_permissions(&config, fs::Permissions::from_mode(0o666)).unwrap();
         // `-F none` leaves the same file unread.
-        read_configuration(&mut options, Some(Path::new("none")), &context).unwrap();
+        read_configuration(&mut options, Some(Path::new("none")), "h", home).unwrap();
         assert_eq!(options.port, None);
-        let error = read_configuration(&mut options, None, &context)
+        let error = read_configuration(&mut options, None, "h", home)
             .err()
             .unwrap()
             .to_string();
         assert!(error.contains("Bad owner or permissions on"), "{error}");
         // The same file named by `-F` is the caller's own choice.
-        read_configuration(&mut options, Some(&config), &context).unwrap();
+        read_configuration(&mut options, Some(&config), "h", home).unwrap();
         assert_eq!(options.port, Some(7));
     }
 
@@ -4033,10 +3953,7 @@ mod tests {
     }
 
     fn test_identity() -> Vec<Identity> {
-        let text = PrivateKey::from_seed(&[5; 32], "")
-            .unwrap()
-            .to_file(None, &[0; 16], 1)
-            .unwrap();
+        let text = PrivateKey::from_seed(&[5; 32], "").unwrap().to_file(1);
         vec![Identity {
             path: PathBuf::from("/test/key"),
             file: PrivateKeyFile::parse(&text).unwrap(),

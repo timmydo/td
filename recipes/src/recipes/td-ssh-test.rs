@@ -22,7 +22,6 @@ pub fn recipe() -> Recipe {
                 exec: true,
             },
             Step::assert_static(&[TD_SSH, TD_SSHD, TD_KEYGEN]),
-            Step::run("{root}", &[TD_SSH, "-Q", "kex"]),
             Step::run("{root}", &[TD_SSH, "-V"]),
             Step::MkDir {
                 path: "{out}".into(),

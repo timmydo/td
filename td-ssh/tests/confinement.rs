@@ -9,6 +9,8 @@
     clippy::panic
 )]
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use td_source_scan::{
@@ -406,7 +408,7 @@ fn dev_full() -> std::fs::File {
         .unwrap()
 }
 
-/// `-Q kex > /dev/full` used to exit 101.
+/// `-V > /dev/full` must not exit 101.
 #[test]
 fn a_full_stdout_is_an_ordinary_failure_status() {
     let run = |program: &str, args: &[&str]| {
@@ -417,7 +419,7 @@ fn a_full_stdout_is_an_ordinary_failure_status() {
             .output()
             .unwrap()
     };
-    for args in [&["-Q", "kex"][..], &["-V"], &["-F", "none", "-G", "h"]] {
+    for args in [&["-V"][..], &["-F", "none", "-G", "h"]] {
         let output = run(env!("CARGO_BIN_EXE_td-ssh"), args);
         assert_eq!(output.status.code(), Some(255), "{args:?}: {output:?}");
         let text = String::from_utf8_lossy(&output.stderr);
@@ -441,11 +443,116 @@ fn a_full_stdout_is_an_ordinary_failure_status() {
     }
 }
 
+/// Each line a td program runs `/bin/ssh-keygen` with, as it runs it: td-firstboot's
+/// host key on every boot, td-vm-guest's git key and its proof, td-update's
+/// fingerprint, and the generation bootsuccess, td-secret and td-vm-guest's
+/// workspace use. Their own tests drive a stub or the host's OpenSSH, so this is the
+/// only place the real tool meets them. A protected key under `-y -P ''` fails at
+/// once, with no prompt on the closed stdin.
+#[test]
+fn every_line_a_td_program_runs_keygen_with_still_works() {
+    let dir = td_fs::TempDir::new("td-ssh-callers").unwrap();
+    let keygen = env!("CARGO_BIN_EXE_td-ssh-keygen");
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+    let (host, guest, plain) = (path("host"), path("guest"), path("plain"));
+    let run = |args: &[&str], input: Option<&str>| {
+        let mut command = Command::new(keygen);
+        command.env_clear().current_dir("/").args(args);
+        match input {
+            Some(file) => command.stdin(fs::File::open(file).unwrap()),
+            None => command.stdin(Stdio::null()),
+        };
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        output.stdout
+    };
+    let message = path("challenge");
+    fs::write(&message, b"challenge\n").unwrap();
+    run(
+        &[
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "td-ssh-host-key",
+            "-f",
+            &host,
+        ],
+        None,
+    );
+    let public = run(&["-y", "-P", "", "-f", &host], None);
+    assert!(public.starts_with(b"ssh-ed25519 "), "{public:?}");
+    run(&["-l", "-E", "sha256", "-f", &format!("{host}.pub")], None);
+    run(&["-l", "-f", &format!("{host}.pub")], None);
+    run(
+        &["-q", "-t", "ed25519", "-N", "", "-C", "td-vm", "-f", &guest],
+        None,
+    );
+    let public = String::from_utf8(run(&["-y", "-P", "", "-f", &guest], None)).unwrap();
+    run(&["-q", "-t", "ed25519", "-N", "", "-f", &plain], None);
+    run(
+        &[
+            "-q",
+            "-Y",
+            "sign",
+            "-n",
+            "td-vm-key",
+            "-f",
+            &guest,
+            &message,
+        ],
+        None,
+    );
+    let allowed = path("allowed");
+    fs::write(&allowed, format!("td-vm {public}")).unwrap();
+    run(
+        &[
+            "-q",
+            "-Y",
+            "verify",
+            "-n",
+            "td-vm-key",
+            "-I",
+            "td-vm",
+            "-f",
+            &allowed,
+            "-s",
+            &format!("{message}.sig"),
+        ],
+        Some(&message),
+    );
+
+    let protected = path("protected");
+    fs::write(&protected, include_str!("fixtures/protected_ed25519")).unwrap();
+    fs::set_permissions(&protected, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = Command::new(keygen)
+        .env_clear()
+        .args(["-y", "-P", "", "-f", &protected])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("Enter passphrase"),
+        "{output:?}"
+    );
+    let output = Command::new(keygen)
+        .env_clear()
+        .args(["-y", "-P", "hunter2", "-f", &protected])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
 /// The one print point filters, whatever reached it and from wherever.
 #[test]
 fn an_error_reaches_the_terminal_without_control_characters() {
     let output = Command::new(env!("CARGO_BIN_EXE_td-ssh"))
-        .args(["-Q", "x\x1b]0;PWNED\x07"])
+        .args(["-p", "x\x1b]0;PWNED\x07", "h"])
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -458,7 +565,7 @@ fn an_error_reaches_the_terminal_without_control_characters() {
 #[test]
 fn a_full_stderr_loses_the_message_and_keeps_the_status() {
     let status = Command::new(env!("CARGO_BIN_EXE_td-ssh"))
-        .args(["-Q", "nonsense"])
+        .args(["-p", "nonsense", "h"])
         .stdin(Stdio::null())
         .stderr(dev_full())
         .status()

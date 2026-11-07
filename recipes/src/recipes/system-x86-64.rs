@@ -3795,7 +3795,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          -o KexAlgorithms={SSH_KEX_ALGORITHMS} \
          -o HostKeyAlgorithms={SSH_KEY_ALGORITHMS} \
          -o PubkeyAcceptedAlgorithms={SSH_KEY_ALGORITHMS} \
-         -o Ciphers={SSH_CIPHERS} -o Compression=no \
+         -o Ciphers={SSH_CIPHERS} \
          root@127.0.0.1 /bin/echo TD-ROOT-SSH-ADMITTED 2>&1); rootssh_status=$?\n\
          [ \"$rootssh_status\" = 255 ] || \
          {{ echo \"td-ssh: root login was not refused: $rootssh\"; fail; }}\n\
@@ -3941,7 +3941,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          -o KexAlgorithms={SSH_KEX_ALGORITHMS} \
          -o HostKeyAlgorithms={SSH_KEY_ALGORITHMS} \
          -o PubkeyAcceptedAlgorithms={SSH_KEY_ALGORITHMS} \
-         -o Ciphers={SSH_CIPHERS} -o Compression=no\"; export GIT_SSH_COMMAND; \
+         -o Ciphers={SSH_CIPHERS}\"; export GIT_SSH_COMMAND; \
          /bin/rm -rf /tmp/td-git-probe || \
          {{ echo \"git: could not clear the health-probe directory\"; exit 1; }}; \
          /bin/mkdir -p \"$HOME\" \"$XDG_CONFIG_HOME\" || \
@@ -3988,7 +3988,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          -o KexAlgorithms={SSH_KEX_ALGORITHMS} \
          -o HostKeyAlgorithms={SSH_KEY_ALGORITHMS} \
          -o PubkeyAcceptedAlgorithms={SSH_KEY_ALGORITHMS} \
-         -o Ciphers={SSH_CIPHERS} -o Compression=no \
+         -o Ciphers={SSH_CIPHERS} \
          \"$USER@127.0.0.1\" /bin/echo TD-SSH-ROUNDTRIP 2>&1) || \
          {{ echo \"td-ssh: loopback command failed: $o\"; exit 1; }}; \
          [ \"$o\" = TD-SSH-ROUNDTRIP ] || \

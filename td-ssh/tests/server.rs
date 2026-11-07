@@ -741,7 +741,7 @@ fn single_user_is_refused_as_root() {
     assert!(stderr(&refused).contains("refused as root"));
 }
 
-/// Every removed client feature is refused, naming the feature.
+/// Every removed client feature is refused.
 #[test]
 fn removed_client_features_exit_255() {
     for flag in ["-A", "-X", "-Y", "-f", "-M", "-C"] {
@@ -1155,6 +1155,33 @@ fn a_stalled_reader_on_a_pty_loses_nothing_after_the_child_exits() {
         stderr(&output),
         server.log()
     );
+}
+
+/// `RequestTTY` from `-o` or a file reaches the session, through the real client:
+/// read where options are merged, not only where they are parsed.
+#[test]
+fn request_tty_decides_a_terminal_unless_t_or_big_t_says_otherwise() {
+    let server = start("");
+    let config = server.root.join("tty-config");
+    fs::write(&config, "Host *\n  RequestTTY force\n").unwrap();
+    let probe = "test -t 0 && echo terminal || echo none";
+    let run = |args: &[&str]| {
+        let output = server
+            .ssh("client")
+            .args(args)
+            .arg(format!("{USER}@127.0.0.1"))
+            .arg(probe)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        stdout(&output).trim_end().to_string()
+    };
+    assert_eq!(run(&[]), "none");
+    assert_eq!(run(&["-o", "RequestTTY=force"]), "terminal");
+    assert_eq!(run(&["-F", config.to_str().unwrap()]), "terminal");
+    assert_eq!(run(&["-T", "-o", "RequestTTY=force"]), "none");
+    assert_eq!(run(&["-tt", "-o", "RequestTTY=no"]), "terminal");
 }
 
 /// The file SFTP and a command each make with no mode of their own.

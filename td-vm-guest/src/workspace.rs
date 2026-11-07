@@ -173,6 +173,9 @@ fn sync_tree(path: &Path, remaining: &mut usize, depth: usize) -> Result<()> {
     )
 }
 
+/// A VM's state keeps this text and `configuration` refuses one that differs, so td-ssh must
+/// read it for as long as that VM lives: td-ssh's `a_vm_s_generated_file_still_reads`
+/// holds a copy. Change both, and keep the old text readable.
 fn ssh_config(plan: &Plan, state: &Path) -> String {
     format!("Host td-host\n  HostName {}\n  User {}\n  Port {}\n  HostKeyAlias td-host\n  IdentityFile {}/git/id_ed25519\n  IdentitiesOnly yes\n  IdentityAgent none\n  BatchMode yes\n  PreferredAuthentications publickey\n  StrictHostKeyChecking yes\n  UserKnownHostsFile {}/ssh/known_hosts\n  GlobalKnownHostsFile /dev/null\n  CheckHostIP no\n  UpdateHostKeys no\n  ForwardAgent no\n  ClearAllForwardings yes\n  PermitLocalCommand no\n  CanonicalizeHostname no\n  ProxyCommand none\n  ProxyJump none\n  ConnectTimeout 10\n  ServerAliveInterval 15\n  ServerAliveCountMax 3\n",
         plan.address, plan.user, plan.port, state.display(), state.display())

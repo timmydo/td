@@ -18,13 +18,10 @@ const CIPHER_NONE: &str = "none";
 const CIPHER_AES: &str = "aes256-ctr";
 const KDF_NONE: &str = "none";
 const KDF_BCRYPT: &str = "bcrypt";
-const SALT_LEN: usize = 16;
 const AES_KEY_LEN: usize = 32;
 const AES_IV_LEN: usize = 16;
 const AES_BLOCK: usize = 16;
 const NONE_BLOCK: usize = 8;
-/// OpenSSH's default for a passphrase it was given.
-const WRITE_ROUNDS: u32 = 24;
 /// A work factor beyond this is treated as hostile: it would pin a CPU for
 /// hours decoding a file someone else handed over.
 const MAX_ROUNDS: u32 = 1024;
@@ -352,8 +349,8 @@ impl PrivateKey {
 
     /// The part that holds the seed, written once into room for all of it, so that
     /// no earlier and shorter copy is left behind on the heap.
-    fn secret_section(&self, public: &[u8; 32], check: u32, block: usize) -> Writer {
-        let mut secret = Writer::with_capacity(secret_section_size(self.comment.len(), block));
+    fn secret_section(&self, public: &[u8; 32], check: u32) -> Writer {
+        let mut secret = Writer::with_capacity(secret_section_size(self.comment.len(), NONE_BLOCK));
         secret.u32(check).u32(check);
         secret.str(HOST_KEY_ALGORITHM).string(public);
         let mut combined = [0u8; 64];
@@ -364,52 +361,26 @@ impl PrivateKey {
         td_primitives::ct::zero(&mut combined);
         secret.str(&self.comment);
         let mut pad = 1u8;
-        while !secret.as_slice().len().is_multiple_of(block) {
+        while !secret.as_slice().len().is_multiple_of(NONE_BLOCK) {
             secret.u8(pad);
             pad = pad.wrapping_add(1);
         }
         secret
     }
 
-    /// Writes `openssh-key-v1`, encrypted when a nonempty passphrase is given.
-    /// `salt` and `check` come from the caller's entropy.
-    pub fn to_file(
-        &self,
-        passphrase: Option<&[u8]>,
-        salt: &[u8; SALT_LEN],
-        check: u32,
-    ) -> Result<String> {
+    /// Writes `openssh-key-v1` in the clear, as every form of this text is the key.
+    /// `check` comes from the caller's entropy.
+    pub fn to_file(&self, check: u32) -> String {
         let public = self.signing.public_key();
-        let passphrase = passphrase.filter(|p| !p.is_empty());
-        let block = if passphrase.is_some() {
-            AES_BLOCK
-        } else {
-            NONE_BLOCK
-        };
-        let mut section = Wiped(self.secret_section(&public, check, block).into_vec());
+        let section = Wiped(self.secret_section(&public, check).into_vec());
 
-        // Without a passphrase this too is the key in the clear.
         let mut writer = Writer::with_capacity(section.0.len().saturating_add(OUTER_ROOM));
         writer.raw(MAGIC);
-        match passphrase {
-            Some(passphrase) => {
-                let mut options = Writer::new();
-                options.string(salt).u32(WRITE_ROUNDS);
-                writer
-                    .str(CIPHER_AES)
-                    .str(KDF_BCRYPT)
-                    .string(options.as_slice());
-                apply_key_cipher(passphrase, salt, WRITE_ROUNDS, &mut section.0)?;
-            }
-            None => {
-                writer.str(CIPHER_NONE).str(KDF_NONE).string(&[]);
-            }
-        }
+        writer.str(CIPHER_NONE).str(KDF_NONE).string(&[]);
         writer.u32(1).string(&ed25519_public_blob(&public));
         writer.string(&section.0);
         drop(section);
 
-        // Without a passphrase, each form of this text is the key in the clear.
         let structure = Wiped(writer.into_vec());
         let encoded = Wiped(base64(&structure.0).into_bytes());
         let mut out = String::with_capacity(encoded.0.len() + encoded.0.len() / 70 + 128);
@@ -421,7 +392,7 @@ impl PrivateKey {
         }
         out.push_str(END);
         out.push('\n');
-        Ok(out)
+        out
     }
 }
 
@@ -429,6 +400,10 @@ impl PrivateKey {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// A real OpenSSH_10.3p1 `ssh-keygen -a 2 -Z aes256-ctr` file, comment `td-ssh fixture`
+    /// and passphrase `hunter2`: a test fixture, not a real identity.
+    const ENCRYPTED_FIXTURE: &str = include_str!("../tests/fixtures/protected_ed25519");
 
     /// Growing would leave a shorter copy of the seed on the heap, unwiped.
     #[test]
@@ -440,12 +415,10 @@ mod tests {
         ] {
             let key = PrivateKey::from_seed(&[5; 32], comment).unwrap();
             let public = key.signing.public_key();
-            for block in [NONE_BLOCK, AES_BLOCK] {
-                let section = key.secret_section(&public, 7, block);
-                let size = secret_section_size(comment.len(), block);
-                assert_eq!(section.capacity(), size, "grew past its room");
-                assert!(section.as_slice().len() <= size);
-            }
+            let section = key.secret_section(&public, 7);
+            let size = secret_section_size(comment.len(), NONE_BLOCK);
+            assert_eq!(section.capacity(), size, "grew past its room");
+            assert!(section.as_slice().len() <= size);
         }
     }
 
@@ -473,13 +446,9 @@ mod tests {
 
     #[test]
     fn a_parsed_key_file_wipes_its_secret_section() {
-        let mut parsed = PrivateKeyFile::parse(
-            &PrivateKey::from_seed(&[4; 32], "")
-                .unwrap()
-                .to_file(None, &[0; 16], 1)
-                .unwrap(),
-        )
-        .unwrap();
+        let mut parsed =
+            PrivateKeyFile::parse(&PrivateKey::from_seed(&[4; 32], "").unwrap().to_file(1))
+                .unwrap();
         assert!(parsed.secret_section.iter().any(|byte| *byte != 0));
         parsed.wipe();
         assert!(parsed.secret_section.iter().all(|byte| *byte == 0));
@@ -488,7 +457,7 @@ mod tests {
     #[test]
     fn unencrypted_files_round_trip() {
         let key = PrivateKey::from_seed(&[5; 32], "alice@host").unwrap();
-        let file = key.to_file(None, &[0; 16], 0x1234_5678).unwrap();
+        let file = key.to_file(0x1234_5678);
         let parsed = PrivateKeyFile::parse(&file).unwrap();
         assert!(!parsed.is_encrypted());
         assert_eq!(parsed.public(), key.signing.public_key());
@@ -498,13 +467,12 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_files_round_trip_and_refuse_a_wrong_passphrase() {
-        let key = PrivateKey::from_seed(&[6; 32], "").unwrap();
-        let file = key.to_file(Some(b"hunter2"), &[9; 16], 77).unwrap();
-        let parsed = PrivateKeyFile::parse(&file).unwrap();
+    fn a_stock_encrypted_file_decrypts_and_refuses_a_wrong_passphrase() {
+        let parsed = PrivateKeyFile::parse(ENCRYPTED_FIXTURE).unwrap();
         assert!(parsed.is_encrypted());
+        let key = parsed.decrypt(Some(b"hunter2")).unwrap();
         assert_eq!(parsed.public(), key.signing.public_key());
-        assert_eq!(parsed.decrypt(Some(b"hunter2")).unwrap().seed(), [6; 32]);
+        assert_eq!(key.comment, "td-ssh fixture");
         for wrong in [Some(&b"wrong"[..]), Some(&b""[..]), None] {
             let error = parsed.decrypt(wrong).err().unwrap().to_string();
             assert!(error.contains("incorrect passphrase"), "{error}");
@@ -532,10 +500,7 @@ mod tests {
         assert!(PrivateKeyFile::parse("hello\n").is_err());
         assert!(PrivateKeyFile::parse(&format!("{BEGIN}\nZm9v\n")).is_err());
         assert!(PrivateKeyFile::parse(&format!("{BEGIN}\nZm9v\n{END}\n")).is_err());
-        let good = PrivateKey::from_seed(&[8; 32], "c")
-            .unwrap()
-            .to_file(None, &[0; 16], 1)
-            .unwrap();
+        let good = PrivateKey::from_seed(&[8; 32], "c").unwrap().to_file(1);
         let body: String = good
             .lines()
             .filter(|line| !line.starts_with("-----"))

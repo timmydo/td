@@ -22,12 +22,14 @@ const SIG_HASH: &str = "sha512";
 const SIG_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
 const SIG_END: &str = "-----END SSH SIGNATURE-----";
 const MAX_FILE: u64 = 64 * 1024;
-const USAGE: &str = "usage: ssh-keygen [-q] -t ed25519 [-N pass] [-C comment] [-f file]\n       ssh-keygen -y [-P pass] -f file\n       ssh-keygen -l [-E sha256] -f file\n       ssh-keygen -Y sign -n namespace -f key [file]\n       ssh-keygen -Y verify -n namespace -I identity -f allowed -s signature";
+const USAGE: &str = "usage: ssh-keygen [-q] -t ed25519 -N '' [-C comment] [-f file]\n       ssh-keygen -y [-P pass] -f file\n       ssh-keygen -l [-E sha256] -f file\n       ssh-keygen -Y sign -n namespace -f key [file]\n       ssh-keygen -Y verify -n namespace -I identity -f allowed -s signature";
 
 #[derive(Default, Debug)]
 struct Arguments {
     generate_type: Option<String>,
     new_passphrase: Option<String>,
+    /// `-P`, for `-y` alone: td-firstboot and td-vm-guest pass `-P ''` so that
+    /// a protected key fails rather than prompting on a closed stdin.
     old_passphrase: Option<String>,
     comment: Option<String>,
     file: Option<PathBuf>,
@@ -157,6 +159,13 @@ fn write_pair(path: &Path, private: &str, public_path: &Path, public: &str) -> R
 /// Refuses before any secret is made, with both targets checked first, so a
 /// failure leaves no partial pair.
 fn generate(arguments: &Arguments) -> Result<i32> {
+    // Stock would prompt without `-N`. Here that would be a promise of protection
+    // this tool cannot keep, so an unprotected key is asked for by name.
+    if arguments.new_passphrase.as_deref() != Some("") {
+        return Err(Error::refused(
+            "td-ssh-keygen writes only unprotected keys: say so with -N ''",
+        ));
+    }
     let key_type = arguments.generate_type.as_deref().unwrap_or("ed25519");
     if key_type != "ed25519" {
         return Err(Error::refused(format!(
@@ -185,42 +194,15 @@ fn generate(arguments: &Arguments) -> Result<i32> {
             )));
         }
     }
-    let mut passphrase = match &arguments.new_passphrase {
-        Some(passphrase) => passphrase.clone().into_bytes(),
-        None => {
-            let prompter = Prompter::new(false);
-            let mut first = prompter.secret("Enter passphrase (empty for no passphrase): ")?;
-            let mut second = match prompter.secret("Enter same passphrase again: ") {
-                Ok(second) => second,
-                Err(error) => {
-                    td_primitives::ct::zero(&mut first);
-                    return Err(error);
-                }
-            };
-            let same = first == second;
-            td_primitives::ct::zero(&mut second);
-            if !same {
-                td_primitives::ct::zero(&mut first);
-                return Err(Error::refused("Passphrases do not match."));
-            }
-            first
-        }
-    };
     let mut seed = [0u8; 32];
     random(&mut seed)?;
-    let mut salt = [0u8; 16];
-    random(&mut salt)?;
     let mut check = [0u8; 4];
     random(&mut check)?;
     let comment = arguments.comment.clone().unwrap_or_else(default_comment);
     let key = PrivateKey::from_seed(&seed, &comment);
     td_primitives::ct::zero(&mut seed);
-    let written_key = key.and_then(|key| {
-        let text = key.to_file(Some(&passphrase), &salt, u32::from_be_bytes(check))?;
-        Ok((key, text))
-    });
-    td_primitives::ct::zero(&mut passphrase);
-    let (key, text) = written_key?;
+    let key = key?;
+    let text = key.to_file(u32::from_be_bytes(check));
     let public = key.public();
     let written = write_pair(&path, &text, &public_path, &public.to_line());
     wipe_text(text);
@@ -280,16 +262,14 @@ fn load_private(path: &Path, passphrase: Option<&str>, batch_prompt: bool) -> Re
     if !file.is_encrypted() {
         return file.decrypt(None);
     }
-    match passphrase {
-        Some(passphrase) => file.decrypt(Some(passphrase.as_bytes())),
-        None => {
-            let mut answer = Prompter::new(batch_prompt)
-                .secret(&format!("Enter passphrase for \"{}\": ", path.display()))?;
-            let key = file.decrypt(Some(&answer));
-            td_primitives::ct::zero(&mut answer);
-            key
-        }
+    if let Some(passphrase) = passphrase {
+        return file.decrypt(Some(passphrase.as_bytes()));
     }
+    let mut answer = Prompter::new(batch_prompt)
+        .secret(&format!("Enter passphrase for \"{}\": ", path.display()))?;
+    let key = file.decrypt(Some(&answer));
+    td_primitives::ct::zero(&mut answer);
+    key
 }
 
 fn print_public(arguments: &Arguments) -> Result<i32> {
@@ -531,6 +511,13 @@ fn verify_command(arguments: &Arguments) -> Result<i32> {
 
 pub fn run(args: &[OsString]) -> Result<i32> {
     let arguments = parse(args)?;
+    let reading_public = arguments.print_public
+        && arguments.sign_action.is_none()
+        && !arguments.fingerprint
+        && arguments.generate_type.is_none();
+    if arguments.old_passphrase.is_some() && !reading_public {
+        return Err(Error::refused("-P is only for -y"));
+    }
     if let Some(action) = arguments.sign_action.as_deref() {
         return match action {
             "sign" => sign_command(&arguments),
@@ -666,6 +653,37 @@ mod tests {
         assert_eq!(run(&generate_args(&path)).unwrap(), 0);
         assert!(PrivateKeyFile::parse(&fs::read_to_string(&path).unwrap()).is_ok());
         assert!(fs::symlink_metadata(public_path_of(&path)).is_ok());
+    }
+
+    /// Asked for a protected key, or not saying which, leaves nothing behind.
+    #[test]
+    fn only_an_unprotected_key_is_written_and_only_when_asked_for_by_name() {
+        let dir = td_fs::TempDir::new("td-ssh-keygen").unwrap();
+        let path = dir.path().join("k");
+        let path_arg = path.clone().into_os_string();
+        for flags in [
+            &["-q", "-t", "ed25519", "-N", "x", "-f"][..],
+            &["-q", "-t", "ed25519", "-f"],
+        ] {
+            let mut args = os_args(flags);
+            args.push(path_arg.clone());
+            let error = run(&args).err().unwrap().to_string();
+            assert!(error.contains("only unprotected keys"), "{error}");
+            assert!(fs::symlink_metadata(&path).is_err());
+        }
+        let mut args = os_args(&["-q", "-t", "ed25519", "-N", "", "-P", "", "-f"]);
+        args.push(path_arg);
+        let error = run(&args).err().unwrap().to_string();
+        assert!(error.contains("only for -y"), "{error}");
+        assert!(fs::symlink_metadata(&path).is_err());
+        for flags in [
+            &["-q", "-Y", "sign", "-P", "x", "-n", "n", "-f", "k"][..],
+            &["-l", "-P", "x", "-f", "k"],
+            &["-y", "-Y", "sign", "-P", "x", "-n", "n", "-f", "k"],
+        ] {
+            let error = run(&os_args(flags)).err().unwrap().to_string();
+            assert!(error.contains("only for -y"), "{flags:?}: {error}");
+        }
     }
 
     #[test]

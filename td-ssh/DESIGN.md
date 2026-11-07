@@ -19,7 +19,7 @@ speaks to current standard peers. Anything not named here is absent.
 remove forwarding, agents, multiplexing, compression, password, keyboard
 interactive, host-based and certificate code by never writing it; keep the
 client's command line and configuration familiar enough that `git`, muscle
-memory and `~/.ssh/config` work.
+memory and a plain `~/.ssh/config` work.
 
 **The trade, stated plainly.** td previously chose externally maintained
 OpenSSH over a td-owned daemon (`fb96f5260`). This reverses that for surface
@@ -451,12 +451,12 @@ slot until the connection ends. That is accepted: it costs the account only its 
 slots, and the connection is its own to end.
 
 **`ssh` command line.** `ssh [options] [user@]host [command...]` and
-`ssh://[user@]host[:port]`. Options: `-4 -6 -F -G -i -l -n -N -o -p -q -Q -t -T
--v -V`. `-Q` answers `kex`, `cipher`, `key`, `key-plain`, `mac`, `sig`
-truthfully from §2. Options naming removed features (`-A -D -J -L -R -W -X -Y -f
--M -S -O -c -m -b -B -E -I -w -C -a -e -g -k -K -s -x -y`) exit 255 with a
-diagnostic naming the removed feature, except that no-op disablers `-a -k -x` are
-accepted. A host, given or by `HostName`, is held to OpenSSH's `valid_hostname`, and
+`ssh://[user@]host[:port]`. Options: `-F -G -i -l -n -N -o -p -q -t -T -v -V`; `-4` and
+`-6`, which Git passes for `git fetch -4` and which keep only that family's addresses, the
+last given deciding; and `-a -x`, which `td-remote` passes for a stock `ssh`'s sake: `-a`
+is `ForwardAgent no`, first obtained like any option, so a person's `ForwardAgent yes`
+after it reads, and `-x` disables X11, which td-ssh has none of. Anything else exits 255
+as an unknown option. A port is 1 to 65535, by `-p`, `Port` or a URL. A host, given or by `HostName`, is held to OpenSSH's `valid_hostname`, and
 further refuses `*` and `?`: a leading `-`, whitespace, controls, and any of
 `` '`"$\;&<>|(){},*? ``, so `a,b` cannot record as a pin for two hosts. Git's `-o SendEnv=GIT_PROTOCOL` and `-G` probe both work. The remote
 command is carried as bytes; options and the destination must be UTF-8 and are
@@ -465,11 +465,11 @@ otherwise refused. A remote command is one `exec` request and so one packet: at 
 naming that limit. The limit is §2's and is not raised. Of `-l`, `-p`, `-o User`,
 `-o Port` and the destination's own, the first given wins, in command-line order and
 ahead of any configuration, as in OpenSSH, and a later `-p` is not even parsed. As there,
-the last `-F` and the last of `-4` and `-6` win. Over `USER` and `LOGNAME`, both
+the last `-F` wins. Over `USER` and `LOGNAME`, both
 unset, the remote user is the name `/etc/passwd` gives the real uid, and `HOME` likewise;
 no such entry and no `-l` or `User` refuses by uid. The destination host is lowercased once, before configuration,
 lookup and recording, as OpenSSH does, so a hashed pin cannot be missed by case; a
-`HostName` is lowercased likewise. `-n` and `StdinNull` leave stdin unread and send
+`HostName` is lowercased likewise. `-n` leaves stdin unread and sends
 `CHANNEL_EOF` as soon as the session starts.
 
 Exit status is the remote status, or 255 for a local or protocol failure, and 255
@@ -547,12 +547,12 @@ farewell's second, and then shuts the socket down, the one thing that ends a wri
 core is blocked in. A drain of output already under way, for a stalled local consumer,
 lasts no more than a second from the key. A core that has still not ended 3 s later is
 printing into a stderr nobody reads, out of any socket's reach, so the keys' thread puts
-the terminal back and ends the process with 255 itself. `EscapeChar` changes the character
-(one character, `^X` or `none`). `RequestTTY` follows OpenSSH's
-default of a PTY for no command when stdin is a terminal. A PTY is requested only
-when stdin is a terminal, `-n` counting as none, or `-tt` or `RequestTTY force`
-insists; `-t` or `RequestTTY yes` without one says OpenSSH's `Pseudo-terminal will not
-be allocated because stdin is not a terminal.`
+the terminal back and ends the process with 255 itself. The character is always `~`.
+A PTY follows OpenSSH's default, for no command when stdin is a terminal, and
+`RequestTTY`, which `-t` and `-T` override, as `td-remote`'s `-T` needs. It is requested
+only when stdin is a terminal, `-n` counting as none, or `-tt` or `RequestTTY force`
+insists; `-t` without one
+says OpenSSH's `Pseudo-terminal will not be allocated because stdin is not a terminal.`
 
 An unechoed prompt takes the same route with no guard to lose: for its duration it
 clears `ECHO`, `ICANON` and `ISIG` and reads byte by byte, itself handling line end,
@@ -560,60 +560,59 @@ erase, `^W`, `^U`, `^D` and `^C`, so Ctrl-C reaches it as a key, and aborts, and
 
 **`ssh_config`.** `-F FILE` alone, else `~/.ssh/config` then `/etc/ssh/ssh_config`;
 first obtained value wins. `-F /dev/null`, which most td callers pass, therefore
-reads nothing, and `-F none` reads no file at all. As OpenSSH, `~/.ssh/config` and what
-it includes must be owned by the caller or root and not group or other writable, else
-`Bad owner or permissions on PATH`; `-F FILE` and the system file are not checked. A
-relative `Include` resolves under `~/.ssh`, or under `/etc/ssh` for what the system
-file includes. `Host` patterns with `*`, `?`, `!`, ignoring case; `Match` with `all`,
-`host`, `originalhost`, `user`, `localuser`; `Include` with `~` and `*`;
-`IgnoreUnknown`. `Match exec` is a hard error, since td-ssh runs no local command.
-Keywords fall into these classes:
+reads nothing, and `-F none` reads no file at all. As OpenSSH, `~/.ssh/config` must be
+owned by the caller or root and not group or other writable, else
+`Bad owner or permissions on PATH`; `-F FILE` and the system file are not checked.
+`Host` patterns with `*`, `?`, `!`, ignoring case. `Match` and `Include` refuse the file
+wherever they stand, inactive blocks and `IgnoreUnknown` included, since skipping one
+would apply what followed to the wrong host or lose what it held.
 
-- *Honoured:* `HostName`, `User`, `Port`, `IdentityFile`, `IdentitiesOnly`,
-  `BatchMode`, `StrictHostKeyChecking`, `UserKnownHostsFile`,
-  `GlobalKnownHostsFile`, `HostKeyAlias`, `HashKnownHosts`, `ConnectTimeout`,
-  `ConnectionAttempts`, `ServerAliveInterval`, `ServerAliveCountMax`, `SendEnv`
-  (patterns, against the local environment, sending valid names only; OpenSSH's
+A keyword is here because a td caller passes it or a person at a terminal needs it, and
+no other is read: a copied configuration may need editing.
+
+- *Honoured:* `HostName`, `User`, `Port`, `IdentityFile`, `IdentitiesOnly` (accepted, and
+  how td-ssh behaves anyway, with no agent to prefer), `BatchMode`,
+  `StrictHostKeyChecking`, `UserKnownHostsFile`, `GlobalKnownHostsFile`, `HostKeyAlias`,
+  `HashKnownHosts`, `ConnectTimeout`, `ServerAliveInterval`, `ServerAliveCountMax`,
+  `SendEnv` (patterns, against the local environment, sending valid names only; OpenSSH's
   `-PATTERN` clearing is not implemented, so such a word clears nothing and, being no
-  valid name, sends nothing), `AddressFamily`, `LogLevel`, `RequestTTY`, `StdinNull`,
-  `EscapeChar`, `SessionType` (`none` as `-N`, `default`; `subsystem` refused as `-s` is),
-  `PreferredAuthentications` (must include `publickey`), `PubkeyAuthentication` (`no`
-  refuses), `NumberOfPasswordPrompts`,
-  `ClearAllForwardings` (a `yes` admits the forwarding keywords below by discarding
-  them, as OpenSSH's does), and `RekeyLimit` in bytes, which can only lower the
-  compiled limit and refuses a time. `IdentitiesOnly` is accepted and is how td-ssh
-  behaves anyway, with no agent to prefer.
-- *Algorithm lists* (`KexAlgorithms`, `HostKeyAlgorithms`,
-  `PubkeyAcceptedAlgorithms`, `PubkeyAcceptedKeyTypes`, `Ciphers`, `MACs`): `+`
-  and `^` forms keep the compiled set; `-` subtracts; a plain list intersects.
-  An empty result is a hard error. Unknown names are not errors, so a
-  `+ssh-rsa` line is harmless.
-- *Connection-changing, refused unless set to their disabled value:*
-  `ProxyCommand`, `ProxyJump`, `RemoteCommand`, `PermitLocalCommand`, `ForwardX11`,
-  `LocalForward`, `RemoteForward`, `DynamicForward`, `Tunnel`,
-  `CanonicalizeHostname`, `BindAddress`, `BindInterface`.
-  Connecting anyway would silently go somewhere else, or leak. `td-remote` passes
-  `RemoteCommand=none` and `td-vm-guest`'s generated file `PermitLocalCommand no`,
-  and those are accepted.
-- *Convenience, ignored with a `-v` note:* `AddKeysToAgent`,
-  `ChallengeResponseAuthentication`, `CheckHostIP`, `Compression`, `ControlMaster`,
-  `ControlPath`, `ControlPersist`, `EnableEscapeCommandline`, `ExitOnForwardFailure`,
-  `FingerprintHash`, `ForwardAgent`, `ForwardX11Timeout`, `GatewayPorts`,
-  `GSSAPIAuthentication`, `GSSAPIDelegateCredentials`, `HostbasedAuthentication`,
-  `IdentityAgent`, `IPQoS`, `KbdInteractiveAuthentication`, `KbdInteractiveDevices`,
-  `LogVerbose`, `NoHostAuthenticationForLocalhost`, `ObscureKeystrokeTiming`,
-  `PasswordAuthentication`, `RequiredRSASize`, `SecurityKeyProvider`, `SyslogFacility`,
-  `TCPKeepAlive`, `UpdateHostKeys`, `VerifyHostKeyDNS`, `VisualHostKey`,
-  `WarnWeakCrypto`, and `Protocol 2`, there being no other, any other value of which
-  refuses. So are `LocalCommand` and `ForwardX11Trusted`, which do nothing without a
-  parent refused above, `PermitLocalCommand` and `ForwardX11`, and `CanonicalDomains`,
-  `CanonicalizeFallbackLocal`, `CanonicalizeMaxDots` and `CanonicalizePermittedCNAMEs`,
-  which do nothing without `CanonicalizeHostname`.
-- *Refused rather than ignored,* because a caller relying on one would silently lose
-  it: `SetEnv`, `KnownHostsCommand`, `PKCS11Provider`, `ForkAfterAuthentication`,
-  `StdinForward`, `CertificateFile`.
+  valid name, sends nothing), `LogLevel`, `RequestTTY`, `PreferredAuthentications` (must include
+  `publickey`), and `RekeyLimit` in bytes, which can only lower the compiled limit and
+  refuses a time.
+- *Algorithm lists* (`KexAlgorithms`, `HostKeyAlgorithms`, `PubkeyAcceptedAlgorithms`,
+  `Ciphers`), which the boot probes and tests pin: `+` and `^` forms keep the compiled
+  set; `-` subtracts; a plain list intersects. An empty result is a hard error. Unknown
+  names are not errors, so a `+ssh-rsa` line is harmless.
+- *Stated, each only at the one value saying what td-ssh already does:*
+  `ClearAllForwardings yes`, `RemoteCommand none`, `ControlPath none`, which `td-remote`
+  passes because it also runs over a stock `ssh` on a host, with a person's configuration
+  behind it; and `IdentityAgent none`, `CheckHostIP no`, `UpdateHostKeys no`,
+  `ForwardAgent no`, `PermitLocalCommand no`, `CanonicalizeHostname no`, `ProxyCommand
+  none`, `ProxyJump none`, which stand in the file `td-vm-guest` wrote into a VM's state.
+  It compares that file byte for byte on every start and refuses a difference, so an
+  existing VM's must keep reading. OpenSSH's other spellings of that value (`true`,
+  `false`, quoted) count as it; `on` and `off` do not, since OpenSSH would read
+  `ForwardAgent off` as an agent socket named `off`. Another value is refused when it is the first obtained,
+  and `IgnoreUnknown` does not waive it: for `ProxyCommand`, `ProxyJump`,
+  `RemoteCommand`, `ForwardAgent` and `ClearAllForwardings` connecting anyway would
+  silently go somewhere else, run something else, or leak, and for the rest td-ssh does
+  not do what the other value asks. After the stated value, as after any first value, a
+  later one is not looked at, so `td-remote`'s stated keywords override the same ones in
+  a person's file. A person's file is otherwise held to these rules behind `td-remote`
+  too: a `ControlMaster`, a `Compression` or a `ForwardX11` in it refuses that link.
+- *Discarded:* `LocalForward`, `RemoteForward` and `DynamicForward`, only where
+  `ClearAllForwardings yes` is in force, on whatever line, as in OpenSSH; without it the
+  connection refuses, there being no forwarding to give.
 
-Anything else is an error unless `IgnoreUnknown` covers it, as in OpenSSH.
+Anything else, X11 and passwords included, is `Bad configuration option` unless an
+earlier `IgnoreUnknown` names it, in a `Host` block that applies: an inactive block's
+keywords are not looked at, as in OpenSSH. `IgnoreUnknown` takes one comma-separated list
+of keywords and refuses a pattern, as stock does not, so that no `IgnoreUnknown *` can hide everything. It does not waive a
+keyword whose absence would trust another key, leave from another address or run something
+other than asked: `AddressFamily`, `BindAddress`, `BindInterface`, `CertificateFile`,
+`ForkAfterAuthentication`, `KnownHostsCommand`, `PKCS11Provider`, `RevokedHostKeys`,
+`SecurityKeyProvider`, `SessionType`, `SetEnv`, `StdinNull`, `Tunnel` and
+`TunnelDevice`.
 
 **No agent.** `SSH_AUTH_SOCK` is ignored. A key held only in an agent elsewhere
 does not authenticate through td-ssh.
@@ -621,7 +620,7 @@ does not authenticate through td-ssh.
 **Identities.** `-i` and `IdentityFile`, else `~/.ssh/id_ed25519`. A private key
 file must be owned by the caller and not group or other accessible. That is stricter
 than OpenSSH, which checks the mode only of a key the caller owns.
-Encrypted `openssh-key-v1` with `bcrypt` and `aes256-ctr` is read (§7), with the
+Encrypted `openssh-key-v1` with `bcrypt` and `aes256-ctr` is read, never written (§7), with the
 passphrase obtained from `SSH_ASKPASS` when `SSH_ASKPASS_REQUIRE=force` or there
 is no terminal, else `/dev/tty` with echo disabled; `BatchMode` prompts for
 nothing. Three wrong attempts move to the next identity, and Ctrl-C at the prompt
@@ -647,16 +646,19 @@ exchange has verified, so a key a peer merely sent cannot be pinned. If hashing 
 get its salt nothing is recorded: a line in the clear is what `HashKnownHosts` refuses.
 
 **`td-ssh-keygen`.** Only what callers use: `-t ed25519` (and no other type) with
-`-q -N -C -f`, refusing before it makes a secret if either file of the pair exists,
+`-q -N '' -C -f`, refusing before it makes a secret if either file of the pair exists,
 writing private then public and removing the private half if the public cannot be
-written, with `~/.ssh` made 0700 for the default path, as OpenSSH does; prompting
-without `-N`; `-y [-P] -f`; `-l [-E sha256] -f`, printing
+written, with `~/.ssh` made 0700 for the default path, as OpenSSH does; `-y [-P pass] -f`,
+asking for the passphrase of a protected key without `-P`, which td-firstboot (every boot)
+and td-vm-guest pass as `-P ''`, so a protected key fails rather than prompting on a
+closed stdin, and which nothing else takes; `-l [-E sha256] -f`, printing
 exactly one line `256 SHA256:B64 COMMENT (ED25519)`, its comment through the filter
 above; `-q -Y sign -n -f`; `-q -Y
 verify -n -I -f -s`. SSHSIG uses SHA-512 with allowed-signers files of plain
-`principal[,principal] ssh-ed25519 KEY` lines, with no options. Writing a
-passphrase-protected key uses `aes256-ctr` and 24 `bcrypt_pbkdf` rounds, OpenSSH's
-defaults. Existing `openssh-key-v1` files, host keys above all, remain valid; a
+`principal[,principal] ssh-ed25519 KEY` lines, with no options. It writes no protected
+key: every td caller makes an unprotected one, so any other `-N`, or none, refuses, rather
+than a tool that prompts handing back a key in the clear. A protected key made elsewhere
+is read (§7). Existing `openssh-key-v1` files, host keys above all, remain valid; a
 td-ssh update changes no machine's host identity.
 
 ## 7. Cryptography (`td-primitives`)
@@ -750,8 +752,8 @@ reach the jail.
   sending 8 MiB each at once over one connection, by digest. `td-ssh` with a stdout that
   closes early, against stock `sshd` and `td-sshd`; stock `ssh` has no such leg, not
   sending `eow@openssh.com` to td-sshd (§4). A refused terminal: stock `ssh -tt` with
-  `no-pty` on its key, and `td-ssh -tt` against `PermitTTY no`. Keys from each generator read by the other, plain and encrypted,
-  with one fingerprint; `-Y sign`/`verify` crossed. Stock `sftp` and modern `scp`
+  `no-pty` on its key, and `td-ssh -tt` against `PermitTTY no`. Plain keys from each generator read by the other, and a stock encrypted one by td's,
+  with one fingerprint, and td's refusal to write a protected one; `-Y sign`/`verify` crossed. Stock `sftp` and modern `scp`
   against `td-sshd`: a batch of mkdir, put, rename, `ls`, get, rm and rmdir, and `scp`
   both ways with absolute, home-relative and `~/` paths, 4 MiB by digest on the far
   side too; `mkdir` and `scp -r` with their modes. `scp -r` makes a directory then chmods

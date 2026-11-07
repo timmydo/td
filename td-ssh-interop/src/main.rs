@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 const MARKER: &str = "TD-SSH-INTEROP-OK";
 const KEX: &[&str] = &["mlkem768x25519-sha256", "curve25519-sha256"];
 const PASSPHRASE: &str = "correct horse";
+const ASKPASS: &str = "askpass";
 const FALLBACK_USER: &str = "tester";
 const WATCHDOG: Duration = Duration::from_secs(300);
 const START_DEADLINE: Duration = Duration::from_secs(20);
@@ -267,8 +268,9 @@ fn account(home: &Path, shell: &Path) -> Result<String, String> {
     Ok(FALLBACK_USER.to_string())
 }
 
-/// `[stock keygen]` and `[td keygen]` produce keys the other reads, plain and
-/// encrypted, with the same fingerprint, and each verifies the other's SSHSIG.
+/// `[stock keygen]` and `[td keygen]` produce keys the other reads, with the same
+/// fingerprint, and each verifies the other's SSHSIG. td reads a stock encrypted key
+/// too, and writes none.
 fn crossed_key_tools(
     tools: &Tools,
     work: &Path,
@@ -277,7 +279,6 @@ fn crossed_key_tools(
     let stock_key = work.join("stock_key");
     let stock_encrypted = work.join("stock_encrypted");
     let td_key = work.join("td_key");
-    let td_encrypted = work.join("td_encrypted");
     for (generator, path, passphrase) in [
         // Plain, so each client can load and sign with it: a refusal then says the
         // server looked at the key, not that the client could not use it.
@@ -285,7 +286,6 @@ fn crossed_key_tools(
         (&tools.ssh_keygen, &stock_key, ""),
         (&tools.ssh_keygen, &stock_encrypted, PASSPHRASE),
         (&tools.td_keygen, &td_key, ""),
-        (&tools.td_keygen, &td_encrypted, PASSPHRASE),
     ] {
         must(
             "generate a key",
@@ -307,25 +307,22 @@ fn crossed_key_tools(
             .collect::<Vec<_>>()
             .join(" ")
     };
-    for (name, reader, path, passphrase) in [
-        ("td reads a stock key", &tools.td_keygen, &stock_key, ""),
+    let askpass = write_askpass(tools, work)?;
+    for (name, reader, path) in [
+        ("td reads a stock key", &tools.td_keygen, &stock_key),
         (
             "td reads a stock encrypted key",
             &tools.td_keygen,
             &stock_encrypted,
-            PASSPHRASE,
         ),
-        ("stock reads a td key", &tools.ssh_keygen, &td_key, ""),
-        (
-            "stock reads a td encrypted key",
-            &tools.ssh_keygen,
-            &td_encrypted,
-            PASSPHRASE,
-        ),
+        ("stock reads a td key", &tools.ssh_keygen, &td_key),
     ] {
         let output = run(Command::new(reader)
-            .args(["-y", "-P", passphrase, "-f"])
-            .arg(path))?;
+            .args(["-y", "-f"])
+            .arg(path)
+            .env("SSH_ASKPASS", &askpass)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .stdin(Stdio::null()))?;
         let wanted = first_two(&public(path)?);
         report.check(
             name,
@@ -340,6 +337,17 @@ fn crossed_key_tools(
         )?;
         Ok(first_two(&text(&output.stdout)))
     };
+    let protected = work.join("td_protected");
+    let output = run(Command::new(&tools.td_keygen)
+        .args(["-q", "-t", "ed25519", "-N", PASSPHRASE, "-f"])
+        .arg(&protected))?;
+    report.check(
+        "td keygen refuses to write a protected key",
+        !output.status.success()
+            && saying(&output, "only unprotected keys")
+            && fs::symlink_metadata(&protected).is_err(),
+        || describe(&output),
+    );
     let stock_print = fingerprint(&tools.ssh_keygen, &td_key)?;
     let td_print = fingerprint(&tools.td_keygen, &td_key)?;
     report.check(
@@ -554,6 +562,19 @@ fn start_stock_sshd(
         std::thread::sleep(Duration::from_millis(10));
     }
     Ok(Daemon { child, port })
+}
+
+/// A program answering a key's passphrase, in `work`.
+fn write_askpass(tools: &Tools, work: &Path) -> Result<PathBuf, String> {
+    let askpass = work.join(ASKPASS);
+    fs::write(
+        &askpass,
+        format!("#!{}\necho {PASSPHRASE}\n", tools.shell.display()),
+    )
+    .map_err(|error| error.to_string())?;
+    fs::set_permissions(&askpass, fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+    Ok(askpass)
 }
 
 /// One client binary pointed at one daemon.
@@ -1015,14 +1036,7 @@ fn td_client_against_stock_sshd(
     another_key_refused("td-ssh to sshd", client, stranger, report)?;
 
     // A passphrase through askpass, against a key stock ssh-keygen wrote.
-    let askpass = work.join("askpass");
-    fs::write(
-        &askpass,
-        format!("#!{}\necho {PASSPHRASE}\n", tools.shell.display()),
-    )
-    .map_err(|error| error.to_string())?;
-    fs::set_permissions(&askpass, fs::Permissions::from_mode(0o700))
-        .map_err(|error| error.to_string())?;
+    let askpass = work.join(ASKPASS);
     let mut command = Command::new(client.program);
     command
         .args(["-F", "/dev/null", "-p"])

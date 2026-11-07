@@ -47,6 +47,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// A real `ssh-keygen -Z aes256-ctr` file, passphrase `hunter2`: a test fixture,
+    /// not a real identity.
+    const ENCRYPTED_KEY: &str = include_str!("../../tests/fixtures/protected_ed25519");
+
     fn single(uid: u32) -> SingleUser {
         SingleUser {
             name: "t".into(),
@@ -63,14 +67,14 @@ mod tests {
         let path = dir.path().join("key");
         let uid = fs::metadata("/proc/self").unwrap().uid();
         let key = PrivateKey::from_seed(&[1; 32], "").unwrap();
-        fs::write(&path, key.to_file(None, &[0; 16], 1).unwrap()).unwrap();
+        fs::write(&path, key.to_file(1)).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(load_host_key(&path, Some(&single(uid))).is_ok());
         assert!(load_host_key(&path, Some(&single(uid.wrapping_add(1)))).is_err());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         assert!(load_host_key(&path, Some(&single(uid))).is_err());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(&path, key.to_file(Some(b"x"), &[0; 16], 1).unwrap()).unwrap();
+        fs::write(&path, ENCRYPTED_KEY).unwrap();
         assert!(load_host_key(&path, Some(&single(uid))).is_err());
         fs::write(&path, "not a key").unwrap();
         assert!(load_host_key(&path, Some(&single(uid))).is_err());

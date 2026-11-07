@@ -912,7 +912,7 @@ fn primary_output_waits_for_room_on_a_nonblocking_stream() {
 
 #[test]
 fn a_diagnostic_waits_for_room_on_a_nonblocking_stream() {
-    let (code, text) = output_through_a_full_nonblocking_socket(&["-Q", "nonsense"]);
+    let (code, text) = output_through_a_full_nonblocking_socket(&["-p", "nonsense", "h"]);
     assert_eq!(code, Some(255), "{text}");
     assert!(text.contains("nonsense"), "{text}");
 }
