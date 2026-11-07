@@ -8,6 +8,8 @@ license = "MIT"
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
 [package.metadata.td-gate]
 clippy-all-targets = true
+# Strict modes read ancestor ownership, which the check host's identity map hides.
+trusted-test-root = true
 
 [lib]
 path = "src/lib.rs"
@@ -19,6 +21,10 @@ path = "src/bin/td-ssh.rs"
 [[bin]]
 name = "td-ssh-keygen"
 path = "src/bin/td-ssh-keygen.rs"
+
+[[bin]]
+name = "td-sshd"
+path = "src/bin/td-sshd.rs"
 
 [dependencies]
 td-encoding = { path = "../td-encoding" }

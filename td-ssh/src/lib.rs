@@ -13,5 +13,6 @@ pub mod msg;
 pub mod packet;
 pub mod pattern;
 pub mod prompt;
+pub mod server;
 pub mod sys;
 pub mod wire;

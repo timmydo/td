@@ -72,7 +72,8 @@ to one function-scoped ioctl instruction in its binary. The twenty-fifth,
 instruction in its binary. The twenty-sixth, `td-primitives`, makes no syscall
 of its own: its six function-scoped allowances call cryptographic instructions
 that a runtime check found on the CPU. The twenty-seventh, `td-ssh`, has one
-function-scoped instruction for three value-pinned terminal requests.
+function-scoped instruction for eight syscalls, among them seven value-pinned
+terminal requests, and one pre-exec hook for an account child's session.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -213,7 +214,7 @@ one.
 | 24 | `td-luks` | device-mapper ioctl requests; see §24 |
 | 25 | `td-time` | CLOCK_REALTIME clock_settime and RTC_SET_TIME ioctl; see §25 |
 | 26 | `td-primitives` | none: six calls into AES-NI, PCLMULQDQ, AVX2 and SHA code behind a runtime CPU check, touching no pointer; see §26 |
-| 27 | `td-ssh` | `ioctl(2)` with three value-pinned terminal requests; see §27 |
+| 27 | `td-ssh` | `setgroups(2)`, `setgid(2)`, `setuid(2)`, `prctl(2)` pinned to `PR_SET_NO_NEW_PRIVS` and `PR_SET_DUMPABLE`, `seccomp(2)` with one operation, `ioctl(2)` with seven value-pinned terminal requests, `setsid(2)`, `umask(2)` pinned to one floor operation; plus one scoped pre-exec hook — see [§27](#27-td-ssh--a-reduced-ssh-client-and-server) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -3811,21 +3812,48 @@ round it visible in review; it is not proof against a hostile author, who could
 edit the test. Any additional instruction family, call or allowance amends this
 section and `td-primitives/DESIGN.md` in the same landing.
 
-## 27. `td-ssh` — terminal attributes
+## 27. `td-ssh` — a reduced SSH client and server
 
-The `td-ssh` library and its binaries deny unsafe code,
-with one function-scoped allowance around one private syscall instruction in
-`src/sys.rs`. It reaches `ioctl(16)` with `TCGETS`, `TCSETS` and `TIOCGWINSZ` only,
-for raw mode, a password prompt without echo, and the window size. Each wrapper
-borrows a live descriptor and passes a live object of the kernel's layout (a size
-test holds both), so there is no caller-selected request, pointer or raw descriptor,
-no mapping, adoption or FFI. The instruction zeroes the argument registers it does
-not use and accounts for rcx and r11.
+The primitives are `td-primitives`, whose `unsafe` is section 26's and for CPU
+instructions alone. The `td-ssh` library and its binaries deny it, with two
+function-scoped allowances in `src/sys.rs`: one around one private syscall
+instruction, one around one `pre_exec` hook.
 
-`td-ssh/tests/confinement.rs` pins that this file alone holds `unsafe`, the counts
-of blocks, allowances and instructions, the syscall number and request values, every
-ioctl call site's request, and the deny in each crate root. Any additional syscall,
-request or allowance amends this section and `td-ssh/DESIGN.md` in the same landing.
+The instruction reaches:
+
+| Syscall | Pinned to | Used by |
+|---|---|---|
+| `ioctl(16)` | `TCGETS`, `TCSETS`, `TIOCGWINSZ` on a borrowed descriptor | the client's raw mode, an unechoed prompt, the window size |
+| | `TIOCSWINSZ`, `TIOCSPTLCK`, `TIOCGPTN` on a borrowed PTY | the session's terminal |
+| | `TIOCSCTTY` on stdin, in the hook only | an account child's controlling terminal |
+| `setsid(112)` | no arguments, in the hook only | an account child's session |
+| `setgroups(116)`, `setgid(106)`, `setuid(105)` | one call site each, reached only from `server/credentials.rs`, in that order, followed by a readback of `/proc/self/status` | the switch to the `sshd` account or the logged-in account, in the jail, the session and the key reader |
+| `prctl(157)` | `PR_SET_NO_NEW_PRIVS` with 1, `PR_SET_DUMPABLE` with 0 | the jail; the session and the key reader |
+| `seccomp(317)` | `SECCOMP_SET_MODE_FILTER`, no flags, a program built in `server/jail.rs` | the jail |
+| `umask(95)` | `0o077` to read the inherited mask, then that mask with `0o022` added, so it can only tighten | the listener at its start, which every stage and account process inherits |
+
+Each wrapper takes a borrowed descriptor and passes a live object of the
+kernel's layout (a size test holds the terminal structures), so a caller selects
+no request, pointer or raw descriptor, and there is no mapping, adoption or FFI.
+The instruction zeroes the argument registers it does not use, which `prctl`
+requires, and accounts for rcx and r11. The hook runs in the forked child before
+exec and makes only raw syscalls: no allocation, lock or shared state. Between
+the server's stages there is no hook and no descriptor passing: each is a fresh
+exec of `/proc/self/exe` with `Command` stdio. `chroot` is safe std.
+
+`td-ssh/tests/confinement.rs` pins that this file alone holds `unsafe`; the
+counts of blocks, allowances, instructions and hooks; each syscall number and
+request value; every ioctl and prctl call site; each fixed call's exact
+arguments and its count, `PR_SET_DUMPABLE`'s 0 and `seccomp`'s flags among them;
+that `setsid` and `TIOCSCTTY` occur only inside the hook; the caller inventory
+of every server wrapper, as identifiers, so an import cannot hide one; that no
+server stage calls `Command`'s `uid`, `gid` or `groups`; the credential switch's
+order and readback, and the key reader's; the jail's order; the seccomp
+allowlist as its literal numbers; that the stages use no hook and no descriptor
+passing; and that the pre-auth worker names no key or socket type.
+`td-ssh/tests/server.rs` reads a running worker's and signer's `/proc` status to
+see the filter really installed. Any additional syscall, request, caller or
+allowance amends this section and `td-ssh/DESIGN.md` in the same landing.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 
