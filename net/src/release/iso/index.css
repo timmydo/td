@@ -3,7 +3,7 @@
 body { margin: 0; font-size: 17px; line-height: 1.65; }
 a { color: inherit; text-underline-offset: .23em; }
 a:hover { color: var(--accent); }
-a:focus-visible { outline: 3px solid var(--accent); outline-offset: 5px; }
+a:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 5px; }
 .wrap { width: min(100% - 64px, 1040px); margin-inline: auto; }
 .skip-link { position: absolute; left: 16px; top: -100px; padding: 12px; background: var(--paper); }
 .skip-link:focus { top: 12px; z-index: 1; }
@@ -35,3 +35,13 @@ code { font: 13px/1.6 ui-monospace, monospace; }
 .site-footer strong { font-size: 19px; letter-spacing: -.05em; color: var(--ink); margin-right: 12px; }
 .empty { text-align: center; padding-bottom: 40px; }
 @media (max-width: 700px) { .wrap { width: calc(100% - 40px); } .site-header { padding-block: 20px; } nav { gap: 20px; font-size: 13px; } .hero { padding: 56px 0 42px; } .release { grid-template-columns: 1fr; gap: 28px; } .site-footer { flex-wrap: wrap; gap: 12px; } }
+
+.latest { border-top: 3px solid var(--accent); }
+.latest h2 { font-size: 32px; margin-bottom: 12px; }
+.filename { overflow-wrap: anywhere; margin-bottom: 8px; font-family: ui-monospace, monospace; font-size: 14px; }
+.published { color: var(--muted); font-size: 14px; margin-bottom: 12px; }
+.archive { border-top: 1px solid var(--line); padding-block: 24px; }
+.archive summary { cursor: pointer; color: var(--accent); text-decoration: underline; text-underline-offset: .23em; width: fit-content; }
+.archive-note { color: var(--muted); margin: 20px 0 0; }
+.previous .button { color: var(--accent); background: transparent; }
+.previous .button:hover { color: #fff; background: var(--accent); }

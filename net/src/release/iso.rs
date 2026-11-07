@@ -10,6 +10,7 @@ struct Record {
     digest: String,
     commit: String,
     expires: u64,
+    issued: u64,
 }
 impl Record {
     fn parse(text: &str, root: &Root, profile: &str, time: u64) -> Result<Self> {
@@ -47,6 +48,7 @@ impl Record {
             digest,
             commit,
             expires,
+            issued,
         })
     }
     fn image_key(&self) -> String {
@@ -604,6 +606,62 @@ mod tests {
             .any(|(method, key)| method == "PUT" && key == "index.html"));
     }
     #[test]
+    fn catalog_features_newest_signed_issue_not_filename_or_row_order() {
+        let f = Fixture::new();
+        let path = catalog(&f);
+        let original = fs::read_to_string(&path).unwrap();
+        let signed = fs::read_to_string(&f.signature).unwrap();
+        let mut lines: Vec<_> = signed.lines().map(str::to_string).collect();
+        lines[2] = (now().unwrap() - 60).to_string();
+        lines[3] = (lines[3].parse::<u64>().unwrap() - 60).to_string();
+        lines.pop();
+        fs::write(
+            &f.signature,
+            format::signed(&(lines.join("\n") + "\n"), &fs::read(&f.key).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let newer = f.dir.join("zzz-newer.iso");
+        fs::write(&newer, b"newer image").unwrap();
+        let signature = sign(
+            &f.root,
+            &f.key,
+            "system-x86-64",
+            &"b".repeat(40),
+            &newer,
+            &f.dir.join("signatures"),
+        )
+        .unwrap();
+        let row = format!(
+            "{}\tsystem-x86-64\t{}\t{}\n",
+            f.root.display(),
+            signature.display(),
+            newer.display()
+        );
+        fs::write(&path, format!("{original}{row}")).unwrap();
+        let output = f.dir.join("index.html");
+        index::generate(&path, &output).unwrap();
+        let html = fs::read_to_string(&output).unwrap();
+        let (latest, previous) = html
+            .split_once("<details class=\"archive\" id=\"previous-versions\">")
+            .unwrap();
+        assert!(latest.contains("zzz-newer.iso"));
+        assert!(!latest.contains(">td.iso<"));
+        assert!(previous.contains(">td.iso<"));
+        assert!(previous.contains("<summary>Previous versions</summary>"));
+        assert_eq!(html.matches("<h2>Latest release</h2>").count(), 1);
+        assert!(html.contains("Published <time"));
+        fs::write(
+            &path,
+            format!(
+                "td-iso-catalog-v1\n{row}{}\n",
+                original.lines().nth(1).unwrap()
+            ),
+        )
+        .unwrap();
+        index::generate(&path, &output).unwrap();
+        assert_eq!(fs::read_to_string(output).unwrap(), html);
+    }
+    #[test]
     fn catalog_lists_multiple_entries_and_refuses_expired_or_malformed_records() {
         let f = Fixture::new();
         let path = catalog(&f);
@@ -633,6 +691,8 @@ mod tests {
         index::generate(&path, &output).unwrap();
         let html = fs::read_to_string(&output).unwrap();
         assert_eq!(html.matches("<article ").count(), 2);
+        assert_eq!(html.matches("<h2>Latest release</h2>").count(), 2);
+        assert!(!html.contains("<details"));
         assert!(html.contains("Server · x86-64"));
         assert!(html.contains("Desktop · x86-64"));
         for bad in [

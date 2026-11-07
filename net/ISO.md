@@ -96,7 +96,12 @@ explicitly in the catalog; no recurring signature renewal is needed.
 For one ISO/profile select one signature; duplicate entries and conflicting
 roots for one epoch refuse. Multiple root epochs and profiles are supported.
 Keep the complete catalog: uploading it replaces the listing, it does not
-merge it with the previous page. Entries sort by profile, filename and digest.
+merge it with the previous page. Entries sort by profile, then descending signed
+issue time, with filename and digest breaking ties deterministically. The first
+entry per profile is featured as the latest listed release; remaining entries
+appear under a collapsed, keyboard-accessible Previous versions disclosure.
+Each entry shows its signed publication time. This ordering describes the
+catalog, not freshness beyond it or source ancestry.
 
 The upload command writes the local preview even in dry-run but makes no
 network requests in that mode. Without dry-run it uploads/reuses every listed
