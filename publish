@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+case "$0" in
+    */*) start_dir=${0%/*} ;;
+    *) start_dir=. ;;
+esac
+# Preserve a caller-relative configuration path across the checkout cd.
+caller=$(pwd -P)
+count=$#
+config_next=
+for arg do
+    if [ -n "$config_next" ]; then
+        case "$arg" in /*) ;; *) arg="$caller/$arg" ;; esac
+        config_next=
+    fi
+    [ "$arg" = --config ] && config_next=1
+    set -- "$@" "$arg"
+done
+shift "$count"
+cd "$start_dir"
+. ./host-preflight.sh
+exec cargo run --release --locked --manifest-path recipes/Cargo.toml --bin td-recipe-eval -- publish "$@"

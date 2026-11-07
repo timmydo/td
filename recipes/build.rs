@@ -420,6 +420,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// `TD_EVALUATOR_HOST_SOURCE_FINGERPRINT` and not every recipe check's. A
 /// trailing `/` names a directory.
 const HOST_CHECK_SOURCES: &[&str] = &[
+    "recipes/src/bin/td_recipe_eval/publish.rs",
     "recipes/src/bin/td_recipe_eval/checks/accel.rs",
     "recipes/src/bin/td_recipe_eval/checks/bundle.rs",
     "recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs",

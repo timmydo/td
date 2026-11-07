@@ -1021,7 +1021,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 
     // The repository-root entry points and the preflight fragment they
     // source, plus the test that drives them. `build-qcow`, `build-iso`,
-    // `build-server-image`, `test-iso` and `host-preflight.sh` route here
+    // `build-server-image`, `test-iso`, `publish` and `host-preflight.sh` route here
     // rather than to the generic shell arm because `start-bootstrap` is what
     // actually proves them: bash -n would accept a `build-qcow` that had
     // quietly stopped running the preflight.
@@ -1030,6 +1030,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         || p == "build-iso"
         || p == "build-server-image"
         || p == "test-iso"
+        || p == "publish"
         || p == "host-preflight.sh"
         || p == "tests/start.sh"
     {
@@ -1749,7 +1750,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 /// The shell scripts' syntax check, one `bash -n` per script: given several
 /// names at once, bash checks the first and hands the rest to it as its
 /// arguments.
-const SHELL_SYNTAX: &str = "for f in start build-qcow build-iso build-server-image test-iso host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh; do bash -n \"$f\" || exit 1; done";
+const SHELL_SYNTAX: &str = "for f in start build-qcow build-iso build-server-image test-iso publish host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh; do bash -n \"$f\" || exit 1; done";
 
 /// The repository-wide format check, as the preflights spell it: this binary's
 /// `gate-crates fmt --all` (`check_format`).
@@ -2965,6 +2966,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("build-server-image", "start-bootstrap");
     assert_preflight!("test-iso", "shell-syntax");
     assert_preflight!("test-iso", "start-bootstrap");
+    assert_preflight!("publish", "shell-syntax");
+    assert_preflight!("publish", "start-bootstrap");
     assert_preflight!("host-preflight.sh", "shell-syntax");
     assert_preflight!("host-preflight.sh", "start-bootstrap");
     assert_preflight!("install-fonts", "shell-syntax");
@@ -12836,7 +12839,7 @@ mod tests {
                 "  check.sh",
                 "",
                 "Selected checks:",
-                "  for f in start build-qcow build-iso build-server-image test-iso host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh; do bash -n \"$f\" || exit 1; done",
+                "  for f in start build-qcow build-iso build-server-image test-iso publish host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh; do bash -n \"$f\" || exit 1; done",
                 &full_cargo,
                 "  td-builder check check",
                 defers,

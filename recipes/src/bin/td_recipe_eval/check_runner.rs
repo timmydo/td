@@ -1342,7 +1342,7 @@ pub fn bundle_cli(args: &[String]) -> Result<(), String> {
 
 /// `build-iso`: the signed system deployment on a bootable installation ISO
 /// (td-install/MEDIA.md "Live boot").
-pub fn build_iso_cli(args: &[String]) -> Result<(), String> {
+pub fn build_iso_cli(args: &[String], retain: Option<&Path>) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
     let options = crate::checks::qemu_boot::build_iso::parse_args(args)?;
     ensure_targets_provenance(&[STEM])?;
@@ -1356,9 +1356,24 @@ pub fn build_iso_cli(args: &[String]) -> Result<(), String> {
     crate::checks::bundle::check_outside_ladder(&options.out, runner.ladder_work_dir())?;
     let admitted = crate::checks::qemu_boot::build_iso::check_out(&options)?;
     crate::checks::bundle::check_outside_ladder(&options.out, runner.ladder_work_dir())?;
+    if let Some(path) = retain {
+        crate::checks::bundle::check_outside_ladder(path, runner.ladder_work_dir())?;
+        if path.try_exists().map_err(|e| e.to_string())? {
+            return Err("retained deployment already exists".into());
+        }
+    }
     crate::warm::preflight(&runner, &[STEM])?;
     let lock = lock_ladder_for_run(&runner)?;
-    crate::checks::qemu_boot::build_iso::run(&runner, lock, &options, admitted)
+    match retain {
+        Some(path) => crate::checks::qemu_boot::build_iso::run_retaining(
+            &runner,
+            lock,
+            &options,
+            admitted,
+            Some(path),
+        ),
+        None => crate::checks::qemu_boot::build_iso::run(&runner, lock, &options, admitted),
+    }
 }
 
 /// `server-image`: the server deployment on a UEFI disk image that admits
@@ -11490,6 +11505,7 @@ chmod 755 '{}'
             "accel",
             "bundle",
             "provisioned_account",
+            "publish",
             "qemu_boot",
             "release_source",
             "run",
@@ -11637,6 +11653,9 @@ chmod 755 '{}'
         let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
         let eval = bin.join("td_recipe_eval");
         let harness_file = |rel: &str| {
+            if rel == "td_recipe_eval/publish.rs" {
+                return true;
+            }
             let rel = rel.strip_prefix("td_recipe_eval/checks/").unwrap_or("");
             HARNESSES
                 .iter()
@@ -11676,20 +11695,21 @@ chmod 755 '{}'
         assert!(seen >= 5, "the runner modules were not found ({seen})");
 
         // The evaluator's own dispatch reaches the harnesses only for the
-        // three host commands it routes to them directly, one of them the
-        // mock metadata service the host's QEMU runs.
+        // four host commands it routes to them directly, including the
+        // publisher and the mock metadata service the host's QEMU runs.
         let main = fs::read_to_string(bin.join("td-recipe-eval.rs")).unwrap();
         let routed: Vec<String> = named_lines(&main)
             .into_iter()
             .filter(|(_, found)| !found.is_empty())
             .map(|(l, _)| l.trim().to_string())
             .collect();
-        assert_eq!(routed.len(), 3, "{routed:?}");
+        assert_eq!(routed.len(), 4, "{routed:?}");
         assert!(routed
             .iter()
             .all(|l| l.contains("checks::qemu_boot::test_iso::cli")
                 || l.contains("checks::qemu_boot::update::run_cli")
-                || l.contains("checks::qemu_boot::cloud_mock::serve_cli")));
+                || l.contains("checks::qemu_boot::cloud_mock::serve_cli")
+                || l.contains("publish::cli")));
 
         let src = fs::read_to_string(eval.join("check_runner.rs")).unwrap();
         let (production, _) = src

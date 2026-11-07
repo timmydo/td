@@ -100,7 +100,9 @@ still runs it. `ready` remains required for documentation updates.
 The repository-root entry scripts are `./start`, `./build-qcow`,
 `./build-iso` and `./build-server-image`, which build the system through
 the Cargo runner, `./test-iso`,
-which boots a retained ISO with a private QEMU disk, `./install-fonts`,
+which boots a retained ISO with a private QEMU disk, `./publish`, which
+publishes the current clean checkout with optional tests (net/OPERATIONS.md),
+and `./install-fonts`,
 which installs the pinned outline face for td programs run on this host
 (`td-builder install-fonts`), and `./install-apps`, which builds the desktop
 programs in release mode and installs them for this host's user (`td-builder

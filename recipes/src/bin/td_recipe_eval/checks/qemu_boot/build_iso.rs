@@ -237,6 +237,16 @@ pub(crate) fn run(
     options: &BuildIsoOptions,
     admitted: Admitted,
 ) -> Result<(), String> {
+    run_retaining(runner, lock, options, admitted, None)
+}
+
+pub(crate) fn run_retaining(
+    runner: &RecipeCheckRunner,
+    lock: fs::File,
+    options: &BuildIsoOptions,
+    admitted: Admitted,
+    retain: Option<&Path>,
+) -> Result<(), String> {
     println!(
         "   [build-iso] building the td distro (system-x86-64). An unchanged tree is\n            \
          reused whole; a cold tree builds every recipe.\n"
@@ -268,6 +278,12 @@ pub(crate) fn run(
         let _ = fs::remove_file(&staged);
         return Err(error);
     }
+    if let Some(retain) = retain {
+        if let Err(error) = retain_deployment(&deployment, retain) {
+            let _ = fs::remove_file(&staged);
+            return Err(error);
+        }
+    }
     drop(lock);
     publish(&staged, &options.out, admitted)?;
     println!(
@@ -276,6 +292,24 @@ pub(crate) fn run(
         options.out.display(),
         options.out.display()
     );
+    Ok(())
+}
+
+fn retain_deployment(deployment: &Path, retain: &Path) -> Result<(), String> {
+    fs::create_dir(retain).map_err(|e| format!("create retained deployment: {e}"))?;
+    for (_, name) in MEDIA_DEPLOYMENT_FILES {
+        let mut input = fs::File::open(deployment.join(name)).map_err(|e| e.to_string())?;
+        let mut output = fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(retain.join(name))
+            .map_err(|e| e.to_string())?;
+        std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
+        output.sync_all().map_err(|e| e.to_string())?;
+    }
+    fs::File::open(retain)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -323,6 +357,31 @@ pub(super) fn staged_path(out: &Path) -> Result<PathBuf, String> {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_deployment_is_an_independent_exact_copy_and_never_overwrites() {
+        let owned = crate::test_temp::TempDir::new("td-publish-retain").unwrap();
+        let source = owned.path().join("source");
+        let retained = owned.path().join("retained");
+        fs::create_dir(&source).unwrap();
+        for (_, name) in MEDIA_DEPLOYMENT_FILES {
+            fs::write(source.join(name), name.as_bytes()).unwrap();
+        }
+        retain_deployment(&source, &retained).unwrap();
+        for (_, name) in MEDIA_DEPLOYMENT_FILES {
+            assert_eq!(fs::read(retained.join(name)).unwrap(), name.as_bytes());
+        }
+        fs::write(source.join("root.erofs"), b"changed source").unwrap();
+        assert_eq!(
+            fs::read(retained.join("root.erofs")).unwrap(),
+            b"root.erofs"
+        );
+        assert!(retain_deployment(&source, &retained).is_err());
+        assert_eq!(
+            fs::read(retained.join("root.erofs")).unwrap(),
+            b"root.erofs"
+        );
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

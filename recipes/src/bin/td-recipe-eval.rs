@@ -37,6 +37,7 @@
 //!                         stream built inputs into a retained hybrid ISO;
 //!                         no build, signing, device access or live-profile creation
 //!   test-iso ISO [--usb]  interactively boot an ISO and disposable install disk
+//!   publish [--test] [--config FILE]  build, sign and upload a release
 //!   build-iso [--out FILE] [--force]  write a bootable td installation ISO
 //!   server-image [--out FILE] [--user NAME] [--authorized-keys FILE]... [--size GIB] [--vhd | --iso]
 //!                         write server-x86-64 to a UEFI disk image, or with
@@ -104,6 +105,8 @@ mod gc_roots;
 mod iso_image;
 #[path = "td_recipe_eval/local_source_roster.rs"]
 mod local_source_roster;
+#[path = "td_recipe_eval/publish.rs"]
+mod publish;
 #[path = "td_recipe_eval/seed_digests.rs"]
 mod seed_digests;
 #[path = "td_recipe_eval/warm.rs"]
@@ -398,8 +401,13 @@ fn main() {
                 die(&error);
             }
         }
+        Some("publish") => {
+            if let Err(error) = publish::cli(args.get(2..).unwrap_or(&[])) {
+                die(&error);
+            }
+        }
         Some("build-iso") => {
-            if let Err(error) = check_runner::build_iso_cli(args.get(2..).unwrap_or(&[])) {
+            if let Err(error) = check_runner::build_iso_cli(args.get(2..).unwrap_or(&[]), None) {
                 die_runner(&error);
             }
         }

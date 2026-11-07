@@ -56,6 +56,7 @@ make_fixture() {
     cp "$root/start" "$1/start"
     cp "$root/build-qcow" "$1/build-qcow"
     cp "$root/build-iso" "$1/build-iso"
+    cp "$root/publish" "$1/publish"
     cp "$root/build-server-image" "$1/build-server-image"
     cp "$root/test-iso" "$1/test-iso"
     cp "$root/host-preflight.sh" "$1/host-preflight.sh"
@@ -107,7 +108,7 @@ assert_isolated_runner_build() {
 # runner bootstrap and before Cargo starts building the system — from EITHER
 # entry point. `build-qcow` runs a far longer build than `start`, so an
 # unenforced floor there is the more expensive one to discover.
-for script in start build-qcow build-iso build-server-image test-iso; do
+for script in start build-qcow build-iso build-server-image test-iso publish; do
     old_rust=$work/old-rust-$script
     make_fixture "$old_rust"
     old_rust_log=$work/old-rust-$script.log
@@ -141,7 +142,7 @@ done
 
 # A successful Cargo exit without the promised artifact must not reach the
 # system build through an old or dangling runner.
-for script in start build-qcow build-iso build-server-image test-iso; do
+for script in start build-qcow build-iso build-server-image test-iso publish; do
     missing=$work/missing-$script
     make_fixture "$missing"
     missing_log=$work/missing-$script.log
@@ -308,3 +309,14 @@ test -x "$fixture/$runner_path" || {
 }
 
 echo "PASS: start, build-qcow, build-iso, build-server-image and test-iso require Rust 1.95 and bootstrap their Cargo runner"
+
+# Publishing preserves the caller's config path and makes tests an explicit flag.
+publish_log=$work/publish.log
+(
+    cd "$work"
+    run_entry_point "$fixture" "$publish_log" publish --test --config config/publish.json
+)
+assert_isolated_runner_build "$(sed -n '1p' "$publish_log")" "$fixture" publish
+test "$(sed -n '2p' "$publish_log")" = "$ambient_target|wrong-target|$ambient_home|$fixture|run --release --locked --manifest-path recipes/Cargo.toml --bin td-recipe-eval -- publish --test --config $work/config/publish.json"
+test -z "$(sed -n '3p' "$publish_log")"
+echo "PASS: publish bootstraps from another checkout and preserves --config and --test"
