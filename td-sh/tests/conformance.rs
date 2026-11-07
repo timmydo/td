@@ -2943,6 +2943,51 @@ fn the_shell_seeds_the_names_ash_seeds() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Exercise the OS argument boundary, including argv[0], in the real binary.
+#[test]
+fn non_utf8_arguments_are_usage_errors() -> Result<(), Box<dyn std::error::Error>> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+
+    let invalid = OsStr::from_bytes(b"bad\xff");
+    let cases: &[(&OsStr, &[&OsStr])] = &[
+        (invalid, &[OsStr::new("-c"), OsStr::new("echo ran")]),
+        (OsStr::new("td-sh"), &[OsStr::new("-c"), invalid]),
+        (OsStr::new("td-sh"), &[invalid]),
+        (
+            OsStr::new("td-sh"),
+            &[OsStr::new("-c"), OsStr::new("echo ran"), invalid],
+        ),
+        (
+            OsStr::new("td-sh"),
+            &[
+                OsStr::new("-c"),
+                OsStr::new("echo ran"),
+                OsStr::new("name"),
+                invalid,
+            ],
+        ),
+    ];
+    for (arg0, args) in cases {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_td-sh"))
+            .arg0(arg0)
+            .args(*args)
+            .output()?;
+        assert_eq!(out.status.code(), Some(2), "{arg0:?} {args:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "a rejected invocation ran: {out:?}");
+        assert_eq!(out.stderr, b"td-sh: arguments must be valid UTF-8\n");
+    }
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_td-sh"))
+        .args(["-c", "printf '%s:%s' \"$0\" \"$1\"", "名前", "café"])
+        .output()?;
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, "名前:café".as_bytes());
+    assert!(out.stderr.is_empty(), "{out:?}");
+    Ok(())
+}
+
 /// An environment entry that is not valid UTF-8 used to ABORT the shell before it
 /// ran a line, because `std::env::vars` unwraps. Only a real child can carry one
 /// in, so this cannot be a unit test.

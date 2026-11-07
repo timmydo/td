@@ -63,7 +63,15 @@ fn main() -> ExitCode {
     // mask means briefly clearing it, so the one place that is safe to do is
     // here, while this thread is the only one.
     process::prime_umask();
-    let args: Vec<String> = std::env::args().collect();
+    // Reject undecodable input before execution: lossy conversion could run a
+    // different command or open a different script than the caller supplied.
+    let args: Vec<String> = match std::env::args_os().map(|arg| arg.into_string()).collect() {
+        Ok(args) => args,
+        Err(_) => {
+            let _ = writeln!(std::io::stderr(), "td-sh: arguments must be valid UTF-8");
+            return ExitCode::from(2);
+        }
+    };
     // On a stack this crate chose rather than the one the process was launched
     // with, so `ulimit -s` cannot put the depth guards above where the stack
     // ends. Spawned AFTER the umask priming above, which needs to be alone.
