@@ -1,338 +1,84 @@
 # td
 
-An immutable, Rust-first Linux distribution — built from pinned sources all
-the way up to the running image.
+td is an immutable, Rust-first Linux distribution with its own system tools,
+Wayland desktop and applications. The system is defined by Rust recipes in
+this repository, from pinned build inputs to the bootable image.
 
-td boots onto a **read-only, content-addressed root**. Every package lives
-at its own `/td/store/<hash>-name` path, and the system you run is exactly
-the artifact graph that was built. No host compiler or host library enters a
-build, and nothing in the root is mutable.
+## Design philosophy
 
-## Highlights
+- **Make the system inspectable.** Recipes declare their inputs and build
+  in isolation. The target build uses a pinned Debian build root and upstream
+  Rust toolchain. Debian glibc and libgcc are imported; ambient host tools
+  and libraries stay outside the target build.
+- **Keep the system separate from your data.** The root filesystem is
+  read-only. Updates replace complete deployments and retain the previous
+  version for rollback, while user files and writable state persist.
+- **Build with Rust and keep dependencies small.** td develops its own
+  system tools, UI toolkit and desktop applications alongside Rust uutils.
+  Shared code lives in local crates; external dependencies are reviewed
+  explicitly.
+- **Keep local builds possible.** The recipe graph travels in Git, so you
+  can build and customize the system yourself. Signed image updates are
+  also supported with a configured publisher policy.
 
-- **Immutable** — the root filesystem is a read-only erofs image. `/bin`
-  is a pure symlink farm into `/td/store`; there is no `/usr` or `/sbin`.
-  `/var` is persistent Btrfs state; `/run` and `/tmp` are volatile tmpfs.
-- **Pinned build inputs** — the kernel and application libraries compile
-  from pinned sources in a pinned Debian build root. glibc and libgcc are
-  imported from that root without compilation; Rust is
-  upstream's pinned 1.99.1 release, retargeted onto td's glibc. Host
-  `/bin`, `/usr`, and ambient `PATH` never enter a build. (Those two
-  downloaded trust roots, the Rust release and the Debian build root, are
-  pinned by SHA-256.)
-- **Rust-first userland** — the core file and text tools are Rust uutils, and
-  the boot/login/shell path is td's own static Rust multicalls. No
-  prebuilt multicall is shipped: every multicall in the image, uutils
-  included, is one td built from source.
-- **Content-addressed** — store paths, offline builds, and fixed-output
-  sources verified by SHA-256. Deployment updates are verified into a hidden
-  directory, flushed, atomically published by manifest hash, and activated
-  with a retained verified previous deployment. Once a fallback exists, new
-  deployments receive three durable boot attempts; the first deployment is
-  trusted because it has nowhere to roll back. A healthy target acknowledges
-  its exact deployment, while an exhausted candidate automatically rolls back.
-  A corrupt current selector is durably repaired to its verified previous
-  deployment, and an explicit `td-boot rollback` of a named current and
-  previous pair remains available, which the session owner reaches through
-  secure attention's `B` (`deploy-rollback`). Update
-  transactions and boot selection are serialized per block device through
-  unmount; verified read-only recovery remains available when a writable
-  bookkeeping transaction is unavailable and confirms health without attempting
-  to mutate that state.
-  Invalid bookkeeping ownership or modes are not repaired automatically:
-  verified recovery remains bootable, but a root operator must inspect and
-  repair the state before normal update acknowledgement resumes.
+The [repository principles](AGENTS.md#principles) and
+[build and trust model](AGENTS.md#build-and-trust-model) describe these choices
+in detail.
 
-## Requirements
+## Get started
 
-- A Linux **x86-64** host with unprivileged user namespaces enabled — the
-  build sandbox is rootless, so no `sudo` and no host `/td` directory is
-  needed (the store is assembled inside the sandbox).
-- Rust 1.95 or newer (`cargo` and `rustc`) to build td's control-plane tools.
-- QEMU (`qemu-system-x86_64`) to boot the image.
+### Install td
 
-## Try it
+Download a prebuilt installation ISO from [tdlinux.org](https://www.tdlinux.org/).
 
-The examples use `td-recipe-eval`, shorthand for `cargo run --release
---manifest-path recipes/Cargo.toml --bin td-recipe-eval --`.
+The installation ISO boots into a graphical installer and installs the
+system offline onto a chosen disk. Installation erases that disk.
+The installer is validated on x86-64 UEFI under QEMU; real-hardware
+validation is still in progress.
 
-Build the system and boot it under QEMU:
+To clone and build the ISO yourself, use an x86-64 Linux host with
+unprivileged user namespaces enabled, Rust 1.95 or newer (`cargo` and
+`rustc`), a C compiler and network access:
 
 ```sh
-./start
+git clone https://github.com/timmydo/td.git
+cd td
+./build-iso
 ```
 
-`./start` is the repository-root convenience wrapper for
-`td-recipe-eval run system-x86-64`.
-It boots a selector initramfs, verifies the current deployment on a persistent
-Btrfs volume, kexecs that deployment, loop-mounts its read-only EROFS root,
-starts the software Wayland compositor and visible td-native demo, and
-auto-logs you in as `tester` on the serial console. Type `exit` (or Ctrl-D) to
-power off; Ctrl-A X force-quits QEMU. The private test volume lasts for this
-interactive session and is discarded when QEMU exits; the headless
-`qemu-boot-system` check first proves a pending deployment can acknowledge and
-remain attempt-free, then recreates the volume, fails a candidate before the
-health target for three boots, preserves `/var` through that reused-volume
-sequence, and proves automatic rollback on the next boot. An explicitly
-read-only disk pass exercises selector-side bookkeeping recovery; a separate
-fixture proves corrupted-current fallback.
+The image is written to `dist/td-install-x86-64.iso`. A first system build
+can take hours. With QEMU installed, `./start` builds and boots a disposable
+VM session. See the [installer documentation](td-install/INSTALLER.md)
+for installation details.
 
-### Run td's applications outside td
+### Try the applications on another distro
 
-td's desktop programs are ordinary Wayland clients, so you can use them
-on the Linux desktop you already run, without building or booting the
-distribution. You need cargo and rustc (Rust 1.95 or newer) and a C
-compiler on `PATH` (or `TD_CC_HOME`), nothing else of the toolchain, and
-the network the first time, for td-net's crates and the font's pinned
-upstream release:
+You can run td's editor, terminal, mail client and other desktop programs
+on an existing Linux Wayland desktop. You need Rust 1.95 or newer
+(`cargo` and `rustc`), a C compiler and network access for the initial
+build and font download.
 
 ```sh
+git clone https://github.com/timmydo/td.git
+cd td
 ./install-fonts
 ./install-apps
 ```
 
-`./install-apps` builds td-agent, td-dua, td-editor, td-mail, td-news,
-td-pass, td-photo, td-pinentry, td-review, td-taskmgr and td-term in
-release mode with the host's cargo and installs them for you, every
-program built before any is installed (`td-builder install-apps`). Each
-runs by name from `~/.local/bin`, and it tells you to add that to `PATH`
-when it is missing. td-news, td-mail and td-agent there are links to an
-installed td-net that serves their fetch service for each run, with the
-programs themselves in `~/.local/lib/td`. td-jail and td-txt go there
-too, linked nowhere: td-net names them to td-agent, whose tools run in
-td-jail's workspace jail, which needs unprivileged user namespaces.
-These are development builds run as you, not the static artifacts the
-image carries, and apart from td-agent's tools, unjailed. Run
-`./install-apps` again after a `git pull` to update them.
+Applications are installed into `~/.local/bin`; add it to your `PATH` if
+needed, then run `td-editor`, `td-term` or another installed program.
+Run `./install-apps` again after pulling updates. These host builds run
+as your user; td-agent's tools additionally require unprivileged user
+namespaces. See [applications and confinement](APPLICATIONS.md) for
+runtime details.
 
-`./install-fonts` installs the pinned JetBrains Mono Nerd Font that
-td-ui and td-term draw with in `~/.local/share/fonts/jetbrains-mono-nerd`
-(under `$XDG_DATA_HOME` when that is set), so td programs run on this
-host draw with it rather than Unifont (`td-builder install-fonts`).
+## Explore further
 
-### Hand it to somebody who has not built td
-
-```sh
-./build-qcow
-```
-
-`./build-qcow` is the wrapper for `td-recipe-eval bundle`. It builds the same
-system `./start` boots and writes `dist/td-vm-x86-64/`: the kernel, the
-selector initramfs, a qcow2 Btrfs volume holding the deployment, a
-`SHA256SUMS`, a README, and a POSIX-sh `start` launcher rendered from the very
-QEMU profile `./start` uses. Someone with QEMU and no checkout unpacks it and
-runs `./start`, and the guest writes go to a throwaway overlay so the image
-keeps matching its checksum.
-
-The bundle is a convenience for people evaluating td, not a distribution
-channel: nothing in the recipe graph names it and no build fetches it.
-Source updates remain available through `git pull` and a rebuild. Signed
-image updates require a separately provisioned publisher policy below.
-
-Published bundles also carry the checkout's committed Git history on the disk,
-at `/run/td-volume/td/source/repository.bundle` inside the guest. The adjacent
-`revision` file names the exported commit. `./build-qcow` requires a clean,
-complete Git checkout and checks that its commit remains unchanged through
-publication. First boot clones this source offline into `~/src/td` as the
-login user. New checkouts track `main` at `https://github.com/timmydo/td.git`;
-`--source-origin` and `--source-branch` select other upstream settings when
-building a bundle. Existing checkouts retain their edits and Git settings.
-
-### Keep a VM and update it from within td
-
-Create a private installation in a new directory whose parent exists:
-
-```sh
-./build-qcow --installation --out "$HOME/td-installation"
-TD_VM_MEMORY=12288 "$HOME/td-installation/start"
-```
-
-This gives the guest 12 GiB, matching the native update regression's memory
-allocation. The launcher's default 2 GiB is for booting and exploring the
-system. A first build builds the whole recipe graph and can take
-hours; subsequent updates reuse the retained build cache.
-
-This launcher keeps guest writes in the installation disk across boots.
-Keep the installation directory private: copying its disk copies the
-machine, its host identity and its users' files.
-
-Once first boot has initialized the checkout, run inside td:
-
-```sh
-cd ~/src/td
-git pull --ff-only
-./update
-```
-
-The updater builds the recipe graph with the installed toolchain and the
-pinned Debian build root. The first build fetches declared sources and
-builds the graph locally; later builds reuse local outputs. When
-installation is requested, press Ctrl+Alt+Escape, then I. Review the
-deployment ID and press Enter to approve, or Escape to cancel; any other
-key pressed first also cancels. A request left unapproved makes
-the next wait, longer each time. The authorized operation verifies and
-installs the successor. Restart explicitly to boot it; the previous
-deployment remains available for recovery. Use `./update build` to stop
-after building without requesting installation.
-
-The checkout, build cache and other user state persist across updates and
-rollback. The source bundle is companion data outside the deployment;
-it does not authorize installation. See [td-update/DESIGN.md](td-update/DESIGN.md)
-for the source, build and installation contract and native VM regression.
-
-### Download signed system updates
-
-A provisioned desktop administrator can use `td-admin update` to acquire a signed
-system image from a configured static repository. It reuses verified cached
-chunks, checks signatures, expiry and replay protection, and passes the
-complete verified deployment through the existing installer and rollback
-mechanism. It reboots by default; `--no-reboot` defers that step.
-
-There is no default public service or publisher key. Initial local root
-setup selects the repository, trusted public root document and machine
-profile using `td-admin configure-release`. Keep private signing keys on the
-publisher side. A local filesystem repository and loopback HTTP are supported
-for testing; HTTPS is supported for subsequent hosting.
-
-If no valid release is available, `update` fails clearly. Use
-`td-admin update-from-source` explicitly to build trusted upstream main;
-there is no automatic build fallback. The stock server profile does not ship
-this administrator service and retains its replacement workflow.
-The interactive `./update` source-build
-workflow above remains available. See [remote administration](td-update/ADMIN.md)
-for enrollment/setup and [signed releases](net/RELEASES.md) for publication,
-key rotation and expiry/collection. [Controlled measurements](td-image-transfer/CONTROLLED-RESULTS.md)
-record bandwidth, request counts and the limits of reuse.
-
-## Filesystem layout
-
-```
-/td/store/<hash>-<name>/   every package, content-addressed and read-only
-/bin                       symlink farm → /td/store (td multicalls + uutils)
-/etc                       generated, deployment-owned, immutable
-/var                       persistent writable Btrfs @var subvolume
-/run /tmp                  volatile writable tmpfs
-/home /root                symlinks into /var
-```
-
-## Defining the system
-
-A whole distribution is one Rust recipe. `recipes/src/recipes/system-x86-64.rs`
-composes the kernel, td's own multicalls, and uutils into a boot selector plus a deployment
-bundle containing `{bzImage, initramfs.cpio, root.erofs, manifest}`. Edit its
-`SYSTEM` constant to tailor the hostname, users, auto-login, login shell, and
-applet set, then `td-recipe-eval run` again.
-
-Individual packages are recipes too — declarative Rust, no shell:
-
-```rust
-pub fn recipe() -> Recipe {
-    Recipe::rust("fd", "10.5.1")
-        .source_pin(SourcePin::new(
-            "fd-source",
-            "https://static.crates.io/crates/fd-find/fd-find-10.5.1.crate",
-            "d3d01f6d39c2cc05c28551a22ae66f82ef1526176ca9ad52073323528a7609f7",
-            "fd-find-10.5.1.crate",
-        ))
-        .bins(&["fd"])
-        .no_default_features()
-        .features(&["completions"])
-}
-```
-
-## Building
-
-```sh
-td-recipe-eval list                  # list every recipe
-td-recipe-eval build-run <name>      # build one recipe into /td/store
-td-recipe-eval qemu-boot-session     # one offline graphical session (pass/fail)
-td-recipe-eval qemu-boot-system      # install/update/recovery boot sequence
-td-recipe-eval qemu-boot-server      # headless server image: health, unattended rollback
-td-recipe-eval qemu-install          # disposable offline ISO installation test
-td-recipe-eval qemu-boot-live        # live wizard installs a disk, which then boots through firmware
-```
-
-`td-builder check integration` runs the system-level oracles —
-`qemu-boot-system`, `qemu-boot-server`, `qemu-deploy-rollback`,
-`qemu-boot-live` and `qemu-install-system` — on the host;
-`td-builder main-integration run` runs it on main after landings, after
-every recipe check, and a branch's `ready` never does (`DEVELOPMENT.md`).
-
-To build a bootable live ISO of the system:
-
-```sh
-./build-iso                          # writes dist/td-install-x86-64.iso
-./build-iso --out /tmp/td.iso --force
-```
-
-It boots from optical media or a USB stick and runs the system from the
-medium, with all writes in RAM; see "Live boot" in [the media
-contract](td-install/MEDIA.md). It opens the graphical installer alone,
-which erases one chosen whole disk and installs td onto it, offline. Storage is
-encrypted to the machine where it has a usable TPM 2.0 and a screen and
-keyboard the startup recovery prompt can use and the person does not
-choose unencrypted storage on the review, and unencrypted otherwise
-([the encryption contract](td-install/ENCRYPTION.md) "Activation"); either
-way the installed account logs in automatically, and root is locked,
-with no console or SSH login ([AGENTS.md](AGENTS.md) principle 7).
-Version 1 is validated on x86-64 UEFI under QEMU only;
-real hardware is the next milestone. [The installer
-contract](td-install/INSTALLER.md) says what version 1 does and what of it
-remains.
-
-To build the headless server (`server-x86-64`) as a disk image that UEFI
-firmware boots, reachable over SSH as one account:
-
-```sh
-./build-server-image                 # writes dist/td-server-x86-64.img as $USER,
-                                     # admitting each ~/.ssh/*.pub of ssh-ed25519 keys
-./build-server-image --vhd --user ada --authorized-keys ada.pub --size 16
-                                     # a fixed VHD, the disk format Azure and AWS take
-./build-server-image --iso           # a live medium: the same server, state in RAM
-```
-
-The image runs system services under td-svc and starts nothing
-graphical. Its account has no password and no console login; the serial
-console shows boot and health only. Logged in, the account can run
-`td-svc status` and read the services' logs in `/var/log/svc`, but not
-start or stop anything ([td-svc design](td-svc/DESIGN.md) §8,
-"Observation"). The image carries the account name and the public keys
-with their comments. It is immutable: to update, replace the machine
-with a newer image ([td-svc design](td-svc/DESIGN.md) §10, "Profiles").
-Its kernel carries Azure's, EC2 Nitro's and GCE's disk and NIC drivers;
-"Cloud images" there says how each cloud imports it and what does not
-work yet. No cloud boot is tested. An attached NoCloud seed
-(`cloud-localds`'s `cidata` ISO) can name the host and add Ed25519 keys
-for the account, and on EC2 and Azure the instance's metadata service
-does the same from its key pair or SSH keys, and an Azure VM reports
-ready; nothing else is read ("Instance metadata", "Cloud metadata").
-
-To compose a retained optical/USB ISO from other prepared boot files and
-payloads, use `td-recipe-eval compose-iso OUTPUT KERNEL INITRAMFS
-[ISO-NAME=FILE ...]`. See the media contract for its input and publication
-rules.
-
-To boot a retained ISO interactively with a disposable destination disk:
-
-```sh
-./test-iso path/to/installer.iso
-./test-iso path/to/installer.iso --usb
-```
-
-The first command attaches the ISO as optical media; `--usb` tests the same
-image as USB mass storage. QEMU opens the ISO read-only and creates a private
-16 GiB sparse destination. Both VMs get an outbound-only QEMU user-mode
-network with DHCP; its gateway, 10.0.2.2, reaches services on this host's
-loopback. After the first VM exits, type `boot` to start the
-destination alone with fresh UEFI variables, or press Enter to stop. Inspect both
-sessions manually; QEMU exit status alone does not prove installation worked.
-The disk is removed when the command exits normally. Scratch files default to
-`target/`; set `TMPDIR` to choose another host filesystem with room for the
-disk's written contents. After Ctrl-C, remove any leftover `target/td-test-iso-*`
-directory from that run.
-Set `TD_QEMU_ACCEL=tcg` to force software emulation when KVM is available.
+- [Applications and confinement](APPLICATIONS.md)
+- [Desktop compositor](td-compositor/README.md) and [UI toolkit](td-ui/DESIGN.md)
+- [Development and contribution workflow](DEVELOPMENT.md)
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Third-party material in the tree keeps
-its own license; [THIRD-PARTY.md](THIRD-PARTY.md) lists it.
+MIT. See [LICENSE](LICENSE). Third-party material keeps its own license;
+[THIRD-PARTY.md](THIRD-PARTY.md) lists it.
