@@ -55,7 +55,7 @@ const DRM_IOCTL_VERSION: usize = 0xc040_6400;
 /// `drm_master_open` in `drivers/gpu/drm/drm_auth.c` makes the first opener of
 /// a PRIMARY node the DRM master whenever `dev->master` is NULL, and an
 /// in-kernel client — fbcon, fbdev emulation — never sets it. So merely opening
-/// `/dev/dri/card0` on a td image takes mastership, `SET_MASTER` or no
+/// the selected card on a td image takes mastership, `SET_MASTER` or no
 /// `SET_MASTER`.
 ///
 /// What that costs is narrower than an earlier revision of this comment said,

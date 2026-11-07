@@ -11,9 +11,15 @@ use std::process::{self, Command};
 use std::time::{Duration, Instant};
 
 const FRAMEBUFFER: &str = "/dev/fb0";
-/// The DRM card behind the framebuffer. Optional: a machine whose only
-/// display is a legacy firmware framebuffer has none.
-const CARD: &str = "/dev/dri/card0";
+/// Where the DRM cards are. Optional: a machine whose only display is a legacy
+/// firmware framebuffer has none.
+const DRI_DIR: &str = "/dev/dri";
+/// What the kernel says of each card's connectors.
+const DRM_CLASS: &str = "/sys/class/drm";
+/// The root-owned link naming the card the compositor is to drive.
+const CARD_LINK: &str = "/run/td-seat-card";
+/// Cards a walk considers. The DRM core numbers primary nodes below 64.
+const MAX_CARDS: usize = 64;
 const INPUT_DIR: &str = "/dev/input";
 const SOUND_DIR: &str = "/dev/snd";
 const MAX_PLAYBACK_DEVICES: usize = 64;
@@ -726,6 +732,91 @@ fn present(path: &Path) -> Result<bool, String> {
     }
 }
 
+/// Each `cardN` node under `dri`, in number order.
+fn card_nodes(dri: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = match fs::read_dir(dri) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", dri.display())),
+    };
+    let mut cards: Vec<(u32, PathBuf)> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read {}: {e}", dri.display()))?;
+        let number = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix("card"))
+            .filter(|digits| {
+                digits.bytes().all(|byte| byte.is_ascii_digit())
+                    && (*digits == "0" || !digits.starts_with('0'))
+            })
+            .and_then(|digits| digits.parse().ok());
+        if let Some(number) = number {
+            cards.push((number, entry.path()));
+        }
+    }
+    cards.sort();
+    cards.truncate(MAX_CARDS);
+    Ok(cards.into_iter().map(|(_, path)| path).collect())
+}
+
+/// Whether any of a card's connectors reports a display.
+fn has_connected_output(class: &Path, card: &str) -> bool {
+    let prefix = format!("{card}-");
+    let Ok(entries) = fs::read_dir(class) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_name().to_string_lossy().starts_with(&prefix)
+            && fs::read_to_string(entry.path().join("status"))
+                .is_ok_and(|status| status.trim_end() == "connected")
+    })
+}
+
+/// The card to drive: the lowest-numbered one with a display on it, else the
+/// lowest-numbered one. A machine's first card need not have the panel: a
+/// discrete GPU can probe first, and simpledrm can leave a native driver's card
+/// above a number it no longer holds.
+fn select_card(dri: &Path, class: &Path) -> Result<Option<PathBuf>, String> {
+    let cards = card_nodes(dri)?;
+    let named = |card: &&PathBuf| {
+        card.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| has_connected_output(class, name))
+    };
+    Ok(cards.iter().find(named).or(cards.first()).cloned())
+}
+
+/// Name the selected card at `link`, or leave nothing there for a machine with
+/// none, which is what sends the compositor to the framebuffer. The rename means
+/// the link is never briefly absent, which would read as having no card.
+fn publish_card(link: &Path, card: Option<&Path>) -> Result<(), String> {
+    let Some(card) = card else {
+        return match fs::remove_file(link) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("remove {}: {e}", link.display())),
+        };
+    };
+    let building = link.with_extension("new");
+    match fs::remove_file(&building) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("remove {}: {e}", building.display())),
+    }
+    unix_fs::symlink(card, &building).map_err(|e| format!("link {}: {e}", building.display()))?;
+    fs::rename(&building, link).map_err(|e| format!("rename to {}: {e}", link.display()))
+}
+
+/// The card `assign` published, which is the one it granted.
+fn published_card(link: &Path) -> Result<Option<PathBuf>, String> {
+    match fs::read_link(link) {
+        Ok(card) => Ok(Some(card)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read {}: {e}", link.display())),
+    }
+}
+
 fn assign(
     display: Display<'_>,
     input_dir: &Path,
@@ -908,8 +999,8 @@ fn probe_access(assignment: Assignment) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     require_human_process(&status, assignment.seat)?;
     denied_device_read(Path::new(FRAMEBUFFER))?;
-    if present(Path::new(CARD))? {
-        denied_device_read(Path::new(CARD))?;
+    for card in card_nodes(Path::new(DRI_DIR))? {
+        denied_device_read(&card)?;
     }
     for path in input_paths(Path::new(INPUT_DIR))? {
         denied_device_read(&path)?;
@@ -995,11 +1086,21 @@ fn run(args: &[String]) -> Result<(), String> {
         return watch(assignment);
     }
     let runtime = PathBuf::from(RUNTIME_BASE).join(assignment.seat.uid.to_string());
+    // Selection is `assign`'s, once a boot. A later card or display does not move
+    // it, and `probe` checks what was granted rather than choosing again.
+    let selected = if command == "assign" {
+        select_card(Path::new(DRI_DIR), Path::new(DRM_CLASS))?
+    } else {
+        published_card(Path::new(CARD_LINK))?
+    };
+    // With none, a path that is absent for that very reason, so `assign` and
+    // `probe` read no card even if one has registered since.
+    let card = selected.clone().unwrap_or_else(|| PathBuf::from(CARD_LINK));
     let counts = match command.as_str() {
         "assign" => assign(
             Display {
                 framebuffer: Path::new(FRAMEBUFFER),
-                card: Path::new(CARD),
+                card: &card,
             },
             Path::new(INPUT_DIR),
             Path::new(SOUND_DIR),
@@ -1011,7 +1112,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "probe" => probe(
             Display {
                 framebuffer: Path::new(FRAMEBUFFER),
-                card: Path::new(CARD),
+                card: &card,
             },
             Path::new(INPUT_DIR),
             Path::new(SOUND_DIR),
@@ -1023,6 +1124,7 @@ fn run(args: &[String]) -> Result<(), String> {
         _ => return Err(usage()),
     };
     if command == "assign" {
+        publish_card(Path::new(CARD_LINK), selected.as_deref())?;
         assign_vm_port(&compositor_runtime(&runtime)?, assignment.compositor)?;
     }
     if let Err(error) = backlight_access(command, assignment.compositor) {
@@ -1046,7 +1148,11 @@ fn run(args: &[String]) -> Result<(), String> {
         assignment.audio.uid,
         assignment.audio.gid,
         counts.playback,
-        if counts.card { CARD } else { "none" },
+        if counts.card {
+            card.to_string_lossy()
+        } else {
+            "none".into()
+        },
     );
     Ok(())
 }
@@ -1143,12 +1249,100 @@ mod tests {
         assert!(body.contains("require_human_process(&status, assignment.seat)?"));
         assert!(body.contains("denied_device_read(Path::new(FRAMEBUFFER))?"));
         assert!(body.contains(
-            "if present(Path::new(CARD))? {\n        denied_device_read(Path::new(CARD))?;\n    }"
+            "for card in card_nodes(Path::new(DRI_DIR))? {\n        denied_device_read(&card)?;\n    }"
         ));
         assert!(body.contains("input_paths(Path::new(INPUT_DIR))?"));
         assert!(body.contains("denied_device_read(&path)?"));
         assert!(!body.contains("probe("));
         assert!(!body.contains("verify_owner_mode"));
+    }
+
+    fn drm_fixture(cards: &[&str], connected: &[&str]) -> td_fs::TempDir {
+        let root = td_fs::TempDir::new("td-seatd-cards").unwrap();
+        let dri = root.path().join("dri");
+        let class = root.path().join("class");
+        fs::create_dir_all(&dri).unwrap();
+        fs::create_dir_all(&class).unwrap();
+        fs::write(dri.join("renderD128"), b"").unwrap();
+        for card in cards {
+            fs::write(dri.join(card), b"").unwrap();
+            let output = class.join(format!("{card}-eDP-1"));
+            fs::create_dir_all(&output).unwrap();
+            let status = if connected.contains(card) {
+                "connected\n"
+            } else {
+                "disconnected\n"
+            };
+            fs::write(output.join("status"), status).unwrap();
+        }
+        root
+    }
+
+    fn selected(root: &td_fs::TempDir) -> Option<String> {
+        select_card(&root.path().join("dri"), &root.path().join("class"))
+            .unwrap()
+            .map(|card| card.file_name().unwrap().to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn the_card_with_a_display_is_the_one_driven() {
+        let hybrid = drm_fixture(&["card0", "card1"], &["card1"]);
+        assert_eq!(selected(&hybrid).as_deref(), Some("card1"));
+        let both = drm_fixture(&["card0", "card1"], &["card0", "card1"]);
+        assert_eq!(selected(&both).as_deref(), Some("card0"));
+        // Number order, not name order: card10 sorts before card2 by name.
+        let ordered = drm_fixture(&["card10", "card2"], &["card10", "card2"]);
+        assert_eq!(selected(&ordered).as_deref(), Some("card2"));
+    }
+
+    #[test]
+    fn a_card_with_nothing_connected_is_still_a_card() {
+        let dark = drm_fixture(&["card1", "card0"], &[]);
+        assert_eq!(selected(&dark).as_deref(), Some("card0"));
+        let none = drm_fixture(&[], &[]);
+        assert_eq!(selected(&none), None);
+        let root = td_fs::TempDir::new("td-seatd-no-dri").unwrap();
+        assert_eq!(
+            select_card(&root.path().join("absent"), &root.path().join("absent")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_connector_of_another_card_says_nothing_of_this_one() {
+        // card1's connector is not card10's.
+        let root = drm_fixture(&["card1", "card10"], &["card10"]);
+        assert_eq!(selected(&root).as_deref(), Some("card10"));
+    }
+
+    #[test]
+    fn the_link_follows_the_selection_and_is_absent_without_a_card() {
+        let root = td_fs::TempDir::new("td-seatd-link").unwrap();
+        let link = root.path().join("card");
+        let (one, two) = (Path::new("/dev/dri/card1"), Path::new("/dev/dri/card0"));
+        publish_card(&link, None).unwrap();
+        assert_eq!(published_card(&link).unwrap(), None);
+        publish_card(&link, Some(one)).unwrap();
+        assert_eq!(published_card(&link).unwrap().as_deref(), Some(one));
+        publish_card(&link, Some(two)).unwrap();
+        assert_eq!(published_card(&link).unwrap().as_deref(), Some(two));
+        assert!(fs::symlink_metadata(link.with_extension("new")).is_err());
+        publish_card(&link, None).unwrap();
+        assert_eq!(published_card(&link).unwrap(), None);
+    }
+
+    #[test]
+    fn only_a_cards_own_name_is_a_card() {
+        let root = drm_fixture(&["card0", "card1"], &[]);
+        for other in ["card+1", "card007", "card", "card1-eDP-1", "cardx"] {
+            fs::write(root.path().join("dri").join(other), b"").unwrap();
+        }
+        let names: Vec<String> = card_nodes(&root.path().join("dri"))
+            .unwrap()
+            .iter()
+            .map(|card| card.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["card0", "card1"]);
     }
 
     fn own_account(path: &Path) -> Account {

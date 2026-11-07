@@ -8684,7 +8684,7 @@ middle.
 | component | uid | why |
 |---|---|---|
 | `td-svc` | root | the supervisor |
-| `td-seatd` | root, oneshot, and the `[seat-watch]` daemon (`td-seatd watch`) | assigns `/dev/fb0`, `/dev/dri/card0` when present, and `/dev/input/event*`, at boot and, through `watch`, each event node that appears later; makes human `/run/user/1000`, compositor `/run/td-compositor/1000`, and audio `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
+| `td-seatd` | root, oneshot, and the `[seat-watch]` daemon (`td-seatd watch`) | assigns `/dev/fb0`, the DRM card it selects when present, and `/dev/input/event*`, at boot and, through `watch`, each event node that appears later; makes human `/run/user/1000`, compositor `/run/td-compositor/1000`, and audio `/run/td-audio`; assigns only `/dev/snd/pcmC*D*p` playback nodes to `audio` |
 | `td-compositor` | 993 (`tdc1000`) | owns display/input devices and the private root authority endpoint |
 | `td-busd` | 992 (`tdb1000`) | protected runtime and explicit kernel-UID admission |
 | `td-portal` | 991 (`tdp1000`) | owns the credential store and reads a fixed read-only Downloads view |
@@ -8930,7 +8930,7 @@ This enables ordinary terminal launches, with no consent path.
 #### Device ownership and secure-path prerequisites
 
 1. **Device access belongs to the compositor.** `td-seatd` assigns mode-0600
-   `/dev/fb0`, `/dev/dri/card0` when the machine has one, and
+   `/dev/fb0`, the DRM card it selects when the machine has one, and
    `/dev/input/event*` to UID/GID 993, and its `watch` daemon gives each
    event node that appears later the same assignment
    (td-compositor/DESIGN.md, "Input hotplug"); a late node is root-owned
@@ -9672,7 +9672,7 @@ callback that waits for a completion that waits for a repaint that waits for
 the client. The card descriptor has to join the event loop, and it has: the
 KMS backend reads completions on a thread of its own, as row 3 records.
 
-The image runs the KMS backend on `/dev/dri/card0`, with the fbdev backend as
+The image runs the KMS backend on td-seatd's selected card, with the fbdev backend as
 its fallback only on a machine without a card. Driving the card takes the
 screen from the fbdev console, and the mechanism is the modeset, not the
 mastership: once the compositor's framebuffer is on the primary plane, the

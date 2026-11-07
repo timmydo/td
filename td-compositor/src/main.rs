@@ -251,6 +251,22 @@ fn select_backend(
     }
 }
 
+/// Whether the card exists. td-seatd's link being there with nothing behind it is
+/// a card that went away, not a machine with none: only the fallback's `NotFound`
+/// means that, so this must not answer it.
+fn inspect_card(card: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(card) {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(card).is_ok() =>
+        {
+            Err(std::io::Error::other("the card it names is gone"))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 struct RunOptions {
     output: OutputDevice,
     input: PathBuf,
@@ -488,7 +504,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         launcher::LaunchBackend::Direct(_) => (None, None),
     };
     let task_launcher = launches.task_launcher();
-    let backend = select_backend(&options.output, |card| std::fs::metadata(card).map(|_| ()))?;
+    let backend = select_backend(&options.output, inspect_card)?;
     if let (OutputDevice::Card { card, .. }, Backend::Framebuffer(path)) =
         (&options.output, &backend)
     {
@@ -2608,6 +2624,30 @@ pub struct MappedRegion {
     /// exists is driven, and one that cannot even be inspected is an error
     /// rather than a quiet switch to fbdev. The existence check is asked only
     /// when there is somewhere to fall back to.
+    #[test]
+    fn a_link_to_a_vanished_card_is_not_a_machine_without_one() {
+        use super::inspect_card;
+        use std::io::ErrorKind;
+
+        let root = crate::temp_dir::TempDir::new("td-compositor-card").unwrap();
+        let absent = root.path().join("absent");
+        assert_eq!(
+            inspect_card(&absent).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        let dangling = root.path().join("dangling");
+        std::os::unix::fs::symlink(root.path().join("gone"), &dangling).unwrap();
+        assert_ne!(
+            inspect_card(&dangling).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        let card = root.path().join("card");
+        std::fs::write(&card, b"").unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&card, &link).unwrap();
+        inspect_card(&link).unwrap();
+    }
+
     #[test]
     fn the_framebuffer_is_driven_only_when_the_card_is_missing() {
         use super::{select_backend, Backend, OutputDevice};

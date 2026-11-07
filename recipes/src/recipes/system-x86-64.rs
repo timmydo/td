@@ -2152,7 +2152,7 @@ fn build_desktop_td_svc_conf() -> String {
          type=daemon\n\
          cgroup=service\n\
          exec=/bin/td-authd terminal-serve --primary --peer-uid {compositor_uid}\n\
-         pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --card /dev/dri/card0 --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
+         pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --card /run/td-seat-card --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
          after=seat,sandbox-default\n\
          requires=seat\n\
          ready=/bin/td-login exec-primary -- /bin/td-compositor probe {wayland_socket}\n\
@@ -8840,7 +8840,7 @@ mod tests {
         // paths, with no shell interpreting authority arguments.
         let expected = format!(
             "/bin/td-login exec-service-as {COMPOSITOR_USER} -- /bin/td-compositor run \
-             --card /dev/dri/card0 --framebuffer /dev/fb0 --input /dev/input \
+             --card /run/td-seat-card --framebuffer /dev/fb0 --input /dev/input \
              --socket {WAYLAND_SOCKET} \
              --portal-socket {PORTAL_WAYLAND_SOCKET} \
              --control-socket {CONTROL_SOCKET} \

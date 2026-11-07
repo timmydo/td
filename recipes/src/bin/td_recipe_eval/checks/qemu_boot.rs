@@ -2350,7 +2350,7 @@ fn validate_system_boot(
         return Err(format!(
             "the serial boot and userland health checks passed, but the graphical runtime \
              marker ({TD_WAYLAND_RUNTIME_MARKER:?}) was absent — td-seatd did not assign \
-             /dev/dri/card0 and the evdev seat to uid 993, the unprivileged compositor could \
+             the DRM card and the evdev seat to uid 993, the unprivileged compositor could \
              not paint its first frame through the virtio-gpu card, or its peer-admitted \
              Wayland socket never began listening. The serial greeter remains the recovery path. Last serial output:\n{}",
             tail(&result.console, 80)
@@ -2583,7 +2583,7 @@ fn validate_compositor_boot(result: &BootResult) -> Result<(), String> {
             "td-compositor's KMS marker ({TD_COMPOSITOR_KMS_MARKER:?}) was absent. The kernel \
              pins CONFIG_DRM, CONFIG_DRM_VIRTIO_GPU and CONFIG_DRM_VIRTIO_GPU_KMS and QEMU \
              attaches a virtio-vga, so /dev/dri/card0 exists on every boot of this image and \
-             the compositor is started with `--card /dev/dri/card0`. An absent marker is one \
+             the compositor is started with td-seatd's selected card. An absent marker is one \
              of: the node was missing and the compositor fell back to /dev/fb0, td-seatd did \
              not grant the card to the compositor account, DRM mastership was refused, no \
              connector offered a driveable mode, or the swap chain's ADDFB2, SETCRTC or \
@@ -2628,7 +2628,7 @@ fn validate_compositor_boot(result: &BootResult) -> Result<(), String> {
         Some((width, height)) if width > 0 && height > 0 => width,
         _ => {
             return Err(format!(
-                "td-compositor drives /dev/dri/card0 but reported no usable output size \
+                "td-compositor drives its card but reported no usable output size \
                  ({output:?}). A mode with a zero axis is refused where it is read, so this is \
                  the connector offering nothing a frame could be allocated against. \
                  Report was: {report}"

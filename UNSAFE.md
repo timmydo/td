@@ -862,7 +862,7 @@ authority this process is handed without asking for it. `drm_master_open` in
 `drivers/gpu/drm/drm_auth.c` makes the first opener of a PRIMARY node the DRM
 master whenever `dev->master` is NULL, and an in-kernel client — fbcon, fbdev
 emulation — never sets it, so on a td image the plain `open` of
-`/dev/dri/card0` IS the acquisition. What holding it costs was stated too
+the selected card IS the acquisition. What holding it costs was stated too
 strongly here for two landings and is now stated exactly: the framebuffer
 console keeps painting, because `drm_fb_helper_fb_dirty` commits the damage
 whatever its vblank wait does: it waits only on a CRTC showing the fbdev

@@ -20,12 +20,19 @@ Linux devtmpfs + sysfs + fbdev + evdev
 in its `watch` mode the root daemon `[seat-watch]`, which gives each evdev
 node that appears later the same assignment. It creates the private human
 runtime `/run/user/1000` and the compositor's `/run/td-compositor/1000`
-below root-owned parents. It validates the framebuffer, the DRM card
-`/dev/dri/card0` and the evdev nodes as character devices, the evdev nodes
+below root-owned parents. It selects one DRM card: the lowest-numbered
+`/dev/dri/cardN` with a connector reporting `connected`, else the
+lowest-numbered, and names it at the root-owned link `/run/td-seat-card`,
+which the compositor opens. It selects once, at boot: a display turned on later
+does not move the choice, and a card that registers later stays root's until the
+next boot. A link whose card has gone is an error rather than the framebuffer
+fallback. It validates the framebuffer, that card and the
+evdev nodes as character devices, the evdev nodes
 of input major 13, assigns them to compositor UID/GID 993 with mode 0600,
-and verifies the result. The human cannot open those devices. The card is
-optional: a framebuffer with no card boots with `card=none` on the ready
-line. The kernel builds in simpledrm (td-install/ENCRYPTION.md "Keyboard
+and verifies the result. Any other card stays root's. The human cannot open
+those devices. The card is
+optional: a framebuffer with no card has no link and boots with `card=none`
+on the ready line. The kernel builds in simpledrm (td-install/ENCRYPTION.md "Keyboard
 console"), so a UEFI GOP display is itself a card, simpledrm's `card0`, and
 a machine has none only when its display has neither a UEFI GOP framebuffer
 simple-framebuffer can describe nor a td driver, or when it has no display
@@ -83,7 +90,7 @@ second unsafe exception for the client half of wl_shm.
 
 ## 2. Hardware profile
 
-The image drives QEMU's virtio-gpu card, `/dev/dri/card0`, through the KMS
+The image drives the card td-seatd selects, on QEMU its virtio-gpu card, through the KMS
 backend of section 4, and falls back to the fbdev backend only on a machine
 with no card. The kernel builds in the firmware framebuffer
 (td-install/ENCRYPTION.md "Keyboard console"): a UEFI GOP display td has
@@ -95,7 +102,7 @@ the display it stays their `card0`, and the QEMU profile is unchanged. A
 native driver whose probe is deferred until after simpledrm bound
 replaces it, but its card may then not be `card0` (DRM takes the lowest
 free minor, and simpledrm's is freed only once nothing holds it open),
-and the image's `--card /dev/dri/card0` would not find it.
+which td-seatd's selection allows for.
 The fbdev backend drives `/dev/fb0`, exposed by the kernel's
 DRM fbdev emulation. Width, height, and stride come
 from `/sys/class/graphics/fb0`; the compositor refuses any format other than
@@ -4495,7 +4502,7 @@ longer holds it to the screen's rate the way a synchronous one did:
 - The epoch is read after the transaction's lock is released, so a paint
   queued in between can lengthen the wait by a frame, never shorten it.
 
-The image runs `run --card /dev/dri/card0 --framebuffer /dev/fb0`: the KMS
+The image runs `run --card /run/td-seat-card --framebuffer /dev/fb0`: the KMS
 backend, with fbdev only for a machine that has no card. Its boot evidence is
 two stdout lines the compositor prints itself, each flushed and pinned
 byte-for-byte by a unit test. `TD-COMPOSITOR-KMS-READY` follows `open_kms`'s
@@ -4575,8 +4582,8 @@ tested against `size_of` of the struct it carries, and `DrmModeInfo` is pinned
 at 68 bytes separately because it is not an argument but the ELEMENT of the
 array `modes_ptr` points at, making its size the kernel's copy stride.
 
-devtmpfs creates `/dev/dri/card0` root-owned at mode 0600, and td runs no
-udev. `td-seatd` therefore assigns the card to the compositor account beside
+devtmpfs creates each `/dev/dri/cardN` root-owned at mode 0600, and td runs no
+udev. `td-seatd` therefore assigns the selected card to the compositor account beside
 `/dev/fb0`. The compositor opens it as that account, so its
 `TD-COMPOSITOR-KMS-READY` marker proves the grant: without it, the open fails
 with `EACCES`, which is an error rather than a fallback. The non-root
