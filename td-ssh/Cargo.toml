@@ -1,0 +1,45 @@
+[package]
+name = "td-ssh"
+version = "0.1.0"
+edition = "2021"
+description = "td's reduced SSH client, server and key tool"
+license = "MIT"
+
+# How builder/src/affected.rs gates this crate; absent keys take the defaults.
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "td-ssh"
+path = "src/bin/td-ssh.rs"
+
+[[bin]]
+name = "td-ssh-keygen"
+path = "src/bin/td-ssh-keygen.rs"
+
+[dependencies]
+td-encoding = { path = "../td-encoding" }
+td-primitives = { path = "../td-primitives" }
+
+[dev-dependencies]
+td-fs = { path = "../td-fs" }
+td-source-scan = { path = "../td-source-scan" }
+
+[workspace]
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+strip = true

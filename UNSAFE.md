@@ -13,8 +13,8 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 `sandbox.rs`. Those three files carry `#![allow(unsafe_code)]` so builder
 can stay `libc`-free. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-SIX
-numbered target-side exceptions, TWENTY-FOUR of them live, each a standalone
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-SEVEN
+numbered target-side exceptions, TWENTY-FIVE of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
 `#[allow]` around its recorded raw Linux boundary, or in the twenty-sixth's case
 its CPU instructions (the crate itself
@@ -52,7 +52,7 @@ value-pinned requests, and `poll(2)` — recorded twice because the
 one-package locks the gate required of a root crate when the two were
 imported left no shared crate to put it in; both now draw in a td-ui
 window and forbid `unsafe` crate-wide, so §17 and §18 are retired and the
-roster counts twenty-four live surfaces in twenty-six numbered entries. The
+roster counts twenty-five live surfaces in twenty-seven numbered entries. The
 twentieth, `td-taskmgr`, has one function-scoped instruction for
 process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
@@ -71,7 +71,8 @@ to one function-scoped ioctl instruction in its binary. The twenty-fifth,
 `td-time`, confines system and RTC clock writes to one function-scoped
 instruction in its binary. The twenty-sixth, `td-primitives`, makes no syscall
 of its own: its six function-scoped allowances call cryptographic instructions
-that a runtime check found on the CPU.
+that a runtime check found on the CPU. The twenty-seventh, `td-ssh`, has one
+function-scoped instruction for three value-pinned terminal requests.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -212,6 +213,7 @@ one.
 | 24 | `td-luks` | device-mapper ioctl requests; see §24 |
 | 25 | `td-time` | CLOCK_REALTIME clock_settime and RTC_SET_TIME ioctl; see §25 |
 | 26 | `td-primitives` | none: six calls into AES-NI, PCLMULQDQ, AVX2 and SHA code behind a runtime CPU check, touching no pointer; see §26 |
+| 27 | `td-ssh` | `ioctl(2)` with three value-pinned terminal requests; see §27 |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -3808,6 +3810,22 @@ compares each `detect` with `/proc/cpuinfo`. This stops mistakes and makes a way
 round it visible in review; it is not proof against a hostile author, who could
 edit the test. Any additional instruction family, call or allowance amends this
 section and `td-primitives/DESIGN.md` in the same landing.
+
+## 27. `td-ssh` — terminal attributes
+
+The `td-ssh` library and its binaries deny unsafe code,
+with one function-scoped allowance around one private syscall instruction in
+`src/sys.rs`. It reaches `ioctl(16)` with `TCGETS`, `TCSETS` and `TIOCGWINSZ` only,
+for raw mode, a password prompt without echo, and the window size. Each wrapper
+borrows a live descriptor and passes a live object of the kernel's layout (a size
+test holds both), so there is no caller-selected request, pointer or raw descriptor,
+no mapping, adoption or FFI. The instruction zeroes the argument registers it does
+not use and accounts for rcx and r11.
+
+`td-ssh/tests/confinement.rs` pins that this file alone holds `unsafe`, the counts
+of blocks, allowances and instructions, the syscall number and request values, every
+ioctl call site's request, and the deny in each crate root. Any additional syscall,
+request or allowance amends this section and `td-ssh/DESIGN.md` in the same landing.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 
