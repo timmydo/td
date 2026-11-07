@@ -11,8 +11,10 @@ pub const DIR: &str = "lib/firmware";
 /// Where the notices sit in the output.
 pub const NOTICES_DIR: &str = "share/licenses/linux-firmware";
 
-/// The Phoenix and Cezanne GPU and WCN6855 files requested at probe, each by
-/// its pin and the name the driver asks for.
+/// What the drivers built into the kernel request at probe, each by its pin and
+/// the name the driver asks for: the Phoenix and Cezanne GPUs, then Wi-Fi. For
+/// iwlwifi, the highest API the kernel accepts for each family; the files are
+/// the driver's names, linked in linux-firmware from `intel/iwlwifi/`.
 pub const FIRMWARE: &[(&str, &str)] = &[
     (
         "linux-firmware-amdgpu-gc-11-0-1-imu-source",
@@ -118,6 +120,218 @@ pub const FIRMWARE: &[(&str, &str)] = &[
         "linux-firmware-ath11k-wcn6855-regdb-source",
         "ath11k/WCN6855/hw2.0/regdb.bin",
     ),
+    (
+        "linux-firmware-iwlwifi-6000g2a-source",
+        "iwlwifi-6000g2a-6.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-7260-source",
+        "iwlwifi-7260-17.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-7265-source",
+        "iwlwifi-7265-17.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-7265d-source",
+        "iwlwifi-7265D-29.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-3160-source",
+        "iwlwifi-3160-17.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-3168-source",
+        "iwlwifi-3168-29.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-8000c-source",
+        "iwlwifi-8000C-36.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-8265-source",
+        "iwlwifi-8265-36.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-9000-pu-b0-jf-b0-source",
+        "iwlwifi-9000-pu-b0-jf-b0-46.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-9260-th-b0-jf-b0-source",
+        "iwlwifi-9260-th-b0-jf-b0-46.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-cc-a0-source",
+        "iwlwifi-cc-a0-77.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-qu-b0-hr-b0-source",
+        "iwlwifi-Qu-b0-hr-b0-77.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-qu-c0-hr-b0-source",
+        "iwlwifi-Qu-c0-hr-b0-77.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-quz-a0-hr-b0-source",
+        "iwlwifi-QuZ-a0-hr-b0-77.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-qu-b0-jf-b0-source",
+        "iwlwifi-Qu-b0-jf-b0-77.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-qu-c0-jf-b0-source",
+        "iwlwifi-Qu-c0-jf-b0-77.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-quz-a0-jf-b0-source",
+        "iwlwifi-QuZ-a0-jf-b0-77.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-ty-a0-gf-a0-source",
+        "iwlwifi-ty-a0-gf-a0-89.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-so-a0-gf-a0-source",
+        "iwlwifi-so-a0-gf-a0-89.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-so-a0-hr-b0-source",
+        "iwlwifi-so-a0-hr-b0-89.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-ma-b0-gf-a0-source",
+        "iwlwifi-ma-b0-gf-a0-89.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-ma-b0-gf4-a0-source",
+        "iwlwifi-ma-b0-gf4-a0-89.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-ma-b0-hr-b0-source",
+        "iwlwifi-ma-b0-hr-b0-89.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-gl-c0-fm-c0-source",
+        "iwlwifi-gl-c0-fm-c0-c107.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-bz-b0-fm-c0-source",
+        "iwlwifi-bz-b0-fm-c0-c107.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-sc-a0-fm-c0-source",
+        "iwlwifi-sc-a0-fm-c0-c107.ucode",
+    ),
+    (
+        "linux-firmware-iwlwifi-ty-a0-gf-a0-pnvm-source",
+        "iwlwifi-ty-a0-gf-a0.pnvm",
+    ),
+    (
+        "linux-firmware-iwlwifi-so-a0-gf-a0-pnvm-source",
+        "iwlwifi-so-a0-gf-a0.pnvm",
+    ),
+    (
+        "linux-firmware-iwlwifi-ma-b0-gf-a0-pnvm-source",
+        "iwlwifi-ma-b0-gf-a0.pnvm",
+    ),
+    (
+        "linux-firmware-iwlwifi-ma-b0-gf4-a0-pnvm-source",
+        "iwlwifi-ma-b0-gf4-a0.pnvm",
+    ),
+    (
+        "linux-firmware-mt76-mt7921-wm-source",
+        "mediatek/WIFI_RAM_CODE_MT7961_1.bin",
+    ),
+    (
+        "linux-firmware-mt76-mt7921-rom-patch-source",
+        "mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin",
+    ),
+    (
+        "linux-firmware-mt76-mt7922-wm-source",
+        "mediatek/WIFI_RAM_CODE_MT7922_1.bin",
+    ),
+    (
+        "linux-firmware-mt76-mt7922-rom-patch-source",
+        "mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin",
+    ),
+    (
+        "linux-firmware-mt76-mt7925-wm-source",
+        "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin",
+    ),
+    (
+        "linux-firmware-mt76-mt7925-rom-patch-source",
+        "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin",
+    ),
+    (
+        "linux-firmware-mt76-mt7920-wm-source",
+        "mediatek/WIFI_RAM_CODE_MT7961_1a.bin",
+    ),
+    (
+        "linux-firmware-mt76-mt7920-rom-patch-source",
+        "mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin",
+    ),
+    (
+        "linux-firmware-mt76-mt7902-wm-source",
+        "mediatek/WIFI_RAM_CODE_MT7902_1.bin",
+    ),
+    (
+        "linux-firmware-mt76-mt7902-rom-patch-source",
+        "mediatek/WIFI_MT7902_patch_mcu_1_1_hdr.bin",
+    ),
+    (
+        "linux-firmware-rtw88-rtw8822c-source",
+        "rtw88/rtw8822c_fw.bin",
+    ),
+    (
+        "linux-firmware-rtw88-rtw8822c-wow-source",
+        "rtw88/rtw8822c_wow_fw.bin",
+    ),
+    (
+        "linux-firmware-rtw88-rtw8821c-source",
+        "rtw88/rtw8821c_fw.bin",
+    ),
+    (
+        "linux-firmware-rtw88-rtw8822b-source",
+        "rtw88/rtw8822b_fw.bin",
+    ),
+    (
+        "linux-firmware-rtw89-rtw8852a-source",
+        "rtw89/rtw8852a_fw-1.bin",
+    ),
+    (
+        "linux-firmware-rtw89-rtw8852b-source",
+        "rtw89/rtw8852b_fw-2.bin",
+    ),
+    (
+        "linux-firmware-rtw89-rtw8852c-source",
+        "rtw89/rtw8852c_fw-2.bin",
+    ),
+    (
+        "linux-firmware-ath10k-qca6174-firmware-6-source",
+        "ath10k/QCA6174/hw3.0/firmware-6.bin",
+    ),
+    (
+        "linux-firmware-ath10k-qca6174-board-2-source",
+        "ath10k/QCA6174/hw3.0/board-2.bin",
+    ),
+    (
+        "linux-firmware-ath10k-qca6174-board-source",
+        "ath10k/QCA6174/hw3.0/board.bin",
+    ),
+    (
+        "linux-firmware-ath12k-wcn7850-amss-source",
+        "ath12k/WCN7850/hw2.0/amss.bin",
+    ),
+    (
+        "linux-firmware-ath12k-wcn7850-m3-source",
+        "ath12k/WCN7850/hw2.0/m3.bin",
+    ),
+    (
+        "linux-firmware-ath12k-wcn7850-board-2-source",
+        "ath12k/WCN7850/hw2.0/board-2.bin",
+    ),
 ];
 
 /// Each notice's pin and its path under `NOTICES_DIR`, as linux-firmware lays
@@ -131,6 +345,23 @@ pub const NOTICES: &[(&str, &str)] = &[
     (
         "linux-firmware-qualcomm-atheros-license-source",
         "LICENSE.QualcommAtheros_ath10k",
+    ),
+    (
+        "linux-firmware-iwlwifi-license-source",
+        "LICENCE.iwlwifi_firmware",
+    ),
+    ("linux-firmware-mt76-license-source", "LICENCE.mediatek"),
+    (
+        "linux-firmware-rtw-license-source",
+        "LICENCE.rtlwifi_firmware.txt",
+    ),
+    (
+        "linux-firmware-ath10k-qca6174-notice-source",
+        "ath10k/QCA6174/hw3.0/notice_ath10k_firmware-6.txt",
+    ),
+    (
+        "linux-firmware-ath12k-wcn7850-notice-source",
+        "ath12k/WCN7850/hw2.0/Notice.txt",
     ),
 ];
 
@@ -154,9 +385,17 @@ pub fn recipe() -> Recipe {
         .iter()
         .map(|dir| Step::MkDir { path: file(dir) })
         .collect();
-    steps.push(Step::MkDir {
-        path: notice("ath11k/WCN6855/hw2.0"),
-    });
+    let mut notice_dirs: Vec<&str> = NOTICES
+        .iter()
+        .filter_map(|(_, path)| path.rsplit_once('/').map(|(dir, _)| dir))
+        .collect();
+    notice_dirs.sort_unstable();
+    notice_dirs.dedup();
+    steps.extend(
+        notice_dirs
+            .iter()
+            .map(|dir| Step::MkDir { path: notice(dir) }),
+    );
     let copy = |pin: &str, to: String| Step::CopyFile {
         file: format!("{{in:{pin}}}"),
         to,

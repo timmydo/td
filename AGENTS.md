@@ -190,8 +190,9 @@ code belongs to no class here and needs an amendment to this file.
 ## Device firmware
 
 Some hardware runs code td cannot build: the ThinkPad T14s Gen 4 AMD's
-Qualcomm WCN6855 Wi-Fi and Phoenix Radeon GPU, and the Ryzen 5700G
-desktop's Cezanne Radeon GPU, load their firmware from the host when
+Qualcomm WCN6855 Wi-Fi and Phoenix Radeon GPU, the Ryzen 5700G
+desktop's Cezanne Radeon GPU, and the Intel, MediaTek, Realtek and Qualcomm
+Wi-Fi chips the roster lists, load their firmware from the host when
 their drivers probe. td takes such firmware as upstream bytes from linux-firmware's
 tagged tree, each file a pin with a reviewed URL and SHA-256, listed in
 `DEVICE_FIRMWARE` (`recipes/src/source_pins.rs`). Only the peripheral
@@ -202,7 +203,7 @@ store, links it at `/lib/firmware`, and copies the files into its
 deployment initramfs, so a driver built into the kernel finds them when
 it probes and again after `switch_root`, which empties the initramfs only
 once the root has replaced it. The selector's initramfs holds none, so the
-same drivers' probes fail there: no such device runs before the handover,
+same drivers get none there: no such device runs before the handover,
 and the display stays on the firmware framebuffer. The kernel's firmware
 loader hands them to the device's driver; no recipe
 step executes, links or loads them as host code. Some are ELF images
@@ -215,8 +216,8 @@ they are also named: one `device-firmware` line per pin, beside the
 trust roots, for every closure holding that recipe.
 What td does not establish is anything about that code: a device with
 firmware can reach host memory by DMA, which an IOMMU, where the kernel
-drives one, bounds (with lazy unmapping), and the WCN6855 answers QMI
-over the QRTR socket family, which td-jail's filter keeps from
+drives one, bounds (with lazy unmapping), and the WCN6855 and WCN7850
+answer QMI over the QRTR socket family, which td-jail's filter keeps from
 applications (not from unjailed session processes). Adding firmware
 for a device is a reviewed pin in that roster; code the host CPU
 executes belongs to no class here but the next.

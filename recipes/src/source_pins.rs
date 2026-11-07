@@ -440,6 +440,528 @@ const PINS: &[PinDef] = &[
         version: "20261019",
     },
     PinDef {
+        key: "linux-firmware-iwlwifi-6000g2a-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-6000g2a-6.ucode",
+        sha256: "9c435c7f413ff2ff1320604c68beb6e8239bb93522dc4b7c02c8cc94a393d88a",
+        file: "linux-firmware-20261019-iwlwifi-6000g2a-6.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-7260-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-7260-17.ucode",
+        sha256: "5d81a6003df0228a497ad27f916ba2c979614b4c439b0f45a5f2873dc0607fe8",
+        file: "linux-firmware-20261019-iwlwifi-7260-17.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-7265-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-7265-17.ucode",
+        sha256: "91f699308f102a9ed90217d813bfdb355464ece958a4f8ac96bba5e9d77fe870",
+        file: "linux-firmware-20261019-iwlwifi-7265-17.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-7265d-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-7265D-29.ucode",
+        sha256: "c52bcaa0595f64d5fb32b7db3dd4b832ea7bf78f1037bcafc19d9c0f5c5c617e",
+        file: "linux-firmware-20261019-iwlwifi-7265D-29.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-3160-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-3160-17.ucode",
+        sha256: "0e893c1ed74c3186047508e93442b2d71a07dd5fac00d9dbdb68f34407d7be14",
+        file: "linux-firmware-20261019-iwlwifi-3160-17.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-3168-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-3168-29.ucode",
+        sha256: "3afae7bf4bb5fbb83a895ec7ad097b9fd20b7d8794f405c2823cbea5284e65c3",
+        file: "linux-firmware-20261019-iwlwifi-3168-29.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-8000c-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-8000C-36.ucode",
+        sha256: "479931721f5e168d69d67c297c11738acd75da390adb94f96030a1055f4cf57a",
+        file: "linux-firmware-20261019-iwlwifi-8000C-36.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-8265-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-8265-36.ucode",
+        sha256: "1336afcd028ed094d1fe33893c84c273bb5711be52970040344a75a12f276d56",
+        file: "linux-firmware-20261019-iwlwifi-8265-36.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-9000-pu-b0-jf-b0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-9000-pu-b0-jf-b0-46.ucode",
+        sha256: "9a0c5d938646942f9798e6212579c25771e4bb44301cd409b82abe361ca2c3e0",
+        file: "linux-firmware-20261019-iwlwifi-9000-pu-b0-jf-b0-46.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-9260-th-b0-jf-b0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-9260-th-b0-jf-b0-46.ucode",
+        sha256: "05f4c12514fddfd56fea660b3d2eb6b6e6f4a87a324d5d40464050312ddca911",
+        file: "linux-firmware-20261019-iwlwifi-9260-th-b0-jf-b0-46.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-cc-a0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-cc-a0-77.ucode",
+        sha256: "1866a58a1daee56b120362122d5f7548b443b53d33f2558a7e4407d58fd27dab",
+        file: "linux-firmware-20261019-iwlwifi-cc-a0-77.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-qu-b0-hr-b0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-Qu-b0-hr-b0-77.ucode",
+        sha256: "df005896aafdf5eb9c427033781890a58c7ab97a8dc1e1ea6b8df4eefc033a9d",
+        file: "linux-firmware-20261019-iwlwifi-Qu-b0-hr-b0-77.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-qu-c0-hr-b0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-Qu-c0-hr-b0-77.ucode",
+        sha256: "a250e179666288396e19ff15c307edfe8f089341c8713a22b457b7304fc1a6fe",
+        file: "linux-firmware-20261019-iwlwifi-Qu-c0-hr-b0-77.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-quz-a0-hr-b0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-QuZ-a0-hr-b0-77.ucode",
+        sha256: "39d79587dd035bc84172b6bcf6de81217560088b0ceb06304d5121ba56db8d83",
+        file: "linux-firmware-20261019-iwlwifi-QuZ-a0-hr-b0-77.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-qu-b0-jf-b0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-Qu-b0-jf-b0-77.ucode",
+        sha256: "b66c0551a5c6c3db23d32d05914ee5450ed1af98e4c4723d04906db443cc9c5e",
+        file: "linux-firmware-20261019-iwlwifi-Qu-b0-jf-b0-77.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-qu-c0-jf-b0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-Qu-c0-jf-b0-77.ucode",
+        sha256: "d54ea577cc799b2e53b55fc320f6d9b6742d6582af7359fed21c89495d315077",
+        file: "linux-firmware-20261019-iwlwifi-Qu-c0-jf-b0-77.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-quz-a0-jf-b0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-QuZ-a0-jf-b0-77.ucode",
+        sha256: "5a9aef304c60d92b26878bf0c7e0c138776b71e5ce772de2f0fb7455d5340478",
+        file: "linux-firmware-20261019-iwlwifi-QuZ-a0-jf-b0-77.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-ty-a0-gf-a0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-ty-a0-gf-a0-89.ucode",
+        sha256: "792478ef7752595525379a5068e2d47e310a2c344636b7df866c54746ced1dc0",
+        file: "linux-firmware-20261019-iwlwifi-ty-a0-gf-a0-89.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-so-a0-gf-a0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-so-a0-gf-a0-89.ucode",
+        sha256: "fae8230ebd1426dfb7d5b5594fdd89e346af5144080659d010b8d2a2fd2f7d4a",
+        file: "linux-firmware-20261019-iwlwifi-so-a0-gf-a0-89.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-so-a0-hr-b0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-so-a0-hr-b0-89.ucode",
+        sha256: "6c4a1b2b4720865ee954a055b5aac19377187b142e1b7c5567524c61445bde20",
+        file: "linux-firmware-20261019-iwlwifi-so-a0-hr-b0-89.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-ma-b0-gf-a0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-ma-b0-gf-a0-89.ucode",
+        sha256: "83c358a33c66bd41f753ee8e0e4fff5c9741694a397ac13a61e851e6bcf5dd6b",
+        file: "linux-firmware-20261019-iwlwifi-ma-b0-gf-a0-89.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-ma-b0-gf4-a0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-ma-b0-gf4-a0-89.ucode",
+        sha256: "2469b6bdd91a42fe9a57f5004a3e63838718147b5f604652a505d2db0cb28d48",
+        file: "linux-firmware-20261019-iwlwifi-ma-b0-gf4-a0-89.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-ma-b0-hr-b0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-ma-b0-hr-b0-89.ucode",
+        sha256: "3cdc5ae5fcbf3c4638758bef28b7695c010bd14d57d46357235923f2569b0ad7",
+        file: "linux-firmware-20261019-iwlwifi-ma-b0-hr-b0-89.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-gl-c0-fm-c0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-gl-c0-fm-c0-c107.ucode",
+        sha256: "cb33a383c65f3bc3bb19db319f50eedcae07c2ea2e53bfb4c88173d0b51144ed",
+        file: "linux-firmware-20261019-iwlwifi-gl-c0-fm-c0-c107.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-bz-b0-fm-c0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-bz-b0-fm-c0-c107.ucode",
+        sha256: "b271756a357b6f9a901d2f0c8a56a5c1046dae12905728dd9163729e3b5ceabc",
+        file: "linux-firmware-20261019-iwlwifi-bz-b0-fm-c0-c107.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-sc-a0-fm-c0-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-sc-a0-fm-c0-c107.ucode",
+        sha256: "57ba546820b2ebb7f9ab2e6949855b42fddad9ae002bed38192c6651de1013a6",
+        file: "linux-firmware-20261019-iwlwifi-sc-a0-fm-c0-c107.ucode",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-ty-a0-gf-a0-pnvm-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-ty-a0-gf-a0.pnvm",
+        sha256: "9697e327f8171454b3c19b1ec9449753d5b934d4e91722f469616818a6d477b0",
+        file: "linux-firmware-20261019-iwlwifi-ty-a0-gf-a0.pnvm",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-so-a0-gf-a0-pnvm-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-so-a0-gf-a0.pnvm",
+        sha256: "78abe08cf33bc209b96a887c7e3db8855a1d9650edacf849c4fa0d4596bcfac5",
+        file: "linux-firmware-20261019-iwlwifi-so-a0-gf-a0.pnvm",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-ma-b0-gf-a0-pnvm-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-ma-b0-gf-a0.pnvm",
+        sha256: "65ccc7ed05c0ecb3ea0374b607ecacfdc693df4e5cbf825a4c91f71ce8fa9b7b",
+        file: "linux-firmware-20261019-iwlwifi-ma-b0-gf-a0.pnvm",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-ma-b0-gf4-a0-pnvm-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/intel/iwlwifi/iwlwifi-ma-b0-gf4-a0.pnvm",
+        sha256: "ed9f78deb780a6c50aa0ac594558f3d3324cc57f38a31302c9d71ea853719fda",
+        file: "linux-firmware-20261019-iwlwifi-ma-b0-gf4-a0.pnvm",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-mt76-mt7921-wm-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/mediatek/WIFI_RAM_CODE_MT7961_1.bin",
+        sha256: "b94217a951518a9c14095765f367bc5dd7698f2dc033941d6f18fc2ebd6a2ab9",
+        file: "linux-firmware-20261019-mediatek-WIFI_RAM_CODE_MT7961_1.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-mt76-mt7921-rom-patch-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin",
+        sha256: "a276c06c2b772adb50b86639d33c82824ff4c21d617feb78caea74c040b873f6",
+        file: "linux-firmware-20261019-mediatek-WIFI_MT7961_patch_mcu_1_2_hdr.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-mt76-mt7922-wm-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/mediatek/WIFI_RAM_CODE_MT7922_1.bin",
+        sha256: "d100e5e04c324fc8da6302112d1e0b4fac952286447d2419eabcd8fb0a1f5b93",
+        file: "linux-firmware-20261019-mediatek-WIFI_RAM_CODE_MT7922_1.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-mt76-mt7922-rom-patch-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin",
+        sha256: "7fc9075d6d54b31e0539734614ca971fa52caf41b642a3000c8a4501591a4d98",
+        file: "linux-firmware-20261019-mediatek-WIFI_MT7922_patch_mcu_1_1_hdr.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-mt76-mt7925-wm-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin",
+        sha256: "23ff53b4bb639b30481e2e06bb1688569ad1ba971b897936db539882abfbd120",
+        file: "linux-firmware-20261019-mediatek-mt7925-WIFI_RAM_CODE_MT7925_1_1.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-mt76-mt7925-rom-patch-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin",
+        sha256: "8eb46014d2a6b4124472eee7476d995008a6f40b1daffef87eb42f30d98699e1",
+        file: "linux-firmware-20261019-mediatek-mt7925-WIFI_MT7925_PATCH_MCU_1_1_hdr.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-mt76-mt7920-wm-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/mediatek/WIFI_RAM_CODE_MT7961_1a.bin",
+        sha256: "3edec74ffe341b917e7fa4ddb2b68851411f2416555f10619a5900fa4b141e6c",
+        file: "linux-firmware-20261019-mediatek-WIFI_RAM_CODE_MT7961_1a.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-mt76-mt7920-rom-patch-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin",
+        sha256: "a766c4e39815e554c80ce5b1596095ff283a60db93356679fecd6494f71cee23",
+        file: "linux-firmware-20261019-mediatek-WIFI_MT7961_patch_mcu_1a_2_hdr.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-mt76-mt7902-wm-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/mediatek/WIFI_RAM_CODE_MT7902_1.bin",
+        sha256: "b5958ac72c71fb8405e080f52d378d02b484812b9f1010c8843727056bbfc998",
+        file: "linux-firmware-20261019-mediatek-WIFI_RAM_CODE_MT7902_1.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-mt76-mt7902-rom-patch-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/mediatek/WIFI_MT7902_patch_mcu_1_1_hdr.bin",
+        sha256: "d73ba9e982f781221a2b9f10c42031f20a9dce046929fc0d55c791a417efe30a",
+        file: "linux-firmware-20261019-mediatek-WIFI_MT7902_patch_mcu_1_1_hdr.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-rtw88-rtw8822c-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/rtw88/rtw8822c_fw.bin",
+        sha256: "3deecb31210986d98cdbfb000391e08d602a6eee4ffc883969faa2b907ab03ba",
+        file: "linux-firmware-20261019-rtw88-rtw8822c_fw.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-rtw88-rtw8822c-wow-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/rtw88/rtw8822c_wow_fw.bin",
+        sha256: "6717fc6ff426a74571ac4f04cd9698fb2f356012c05c58aa64cf21ceb6b958a2",
+        file: "linux-firmware-20261019-rtw88-rtw8822c_wow_fw.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-rtw88-rtw8821c-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/rtw88/rtw8821c_fw.bin",
+        sha256: "2ef409bc418549fcf294061dd0cae1fc22fd9da79b60524950b25de18732f3f0",
+        file: "linux-firmware-20261019-rtw88-rtw8821c_fw.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-rtw88-rtw8822b-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/rtw88/rtw8822b_fw.bin",
+        sha256: "a72da690597bfa99d8eb6fc2ab090d18d8ad92ac2befd35db1c9e3662d8d8418",
+        file: "linux-firmware-20261019-rtw88-rtw8822b_fw.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-rtw89-rtw8852a-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/rtw89/rtw8852a_fw-1.bin",
+        sha256: "fdb5513cf7372440d7980a61aa4b753b192b056734a978458ae4a4ef7f4b2c1e",
+        file: "linux-firmware-20261019-rtw89-rtw8852a_fw-1.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-rtw89-rtw8852b-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/rtw89/rtw8852b_fw-2.bin",
+        sha256: "6ff6aeb56bb5b85cba333b755f8cc1dbfe9ff6e5b16e39f6ba01ce7f1eaa7714",
+        file: "linux-firmware-20261019-rtw89-rtw8852b_fw-2.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-rtw89-rtw8852c-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/rtw89/rtw8852c_fw-2.bin",
+        sha256: "916e87d1470bce5400712f53d419ae68a0f44d858670c57e118d4f0b1d89c5b4",
+        file: "linux-firmware-20261019-rtw89-rtw8852c_fw-2.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-ath10k-qca6174-firmware-6-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath10k/QCA6174/hw3.0/firmware-6.bin",
+        sha256: "04d3bad5efa3f9fbe3ba53fd3e25fa9b0585ed227eea8111303b4e08861f979d",
+        file: "linux-firmware-20261019-ath10k-QCA6174-hw3.0-firmware-6.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-ath10k-qca6174-board-2-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath10k/QCA6174/hw3.0/board-2.bin",
+        sha256: "66e83dde1c9af535df1fcd17c72971a96a263357300e921b358d35a353227d60",
+        file: "linux-firmware-20261019-ath10k-QCA6174-hw3.0-board-2.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-ath10k-qca6174-board-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath10k/QCA6174/hw3.0/board.bin",
+        sha256: "1a8d225818b46986fc4f615594fbe448fa820618590d6902c8f844bb37cda667",
+        file: "linux-firmware-20261019-ath10k-QCA6174-hw3.0-board.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-ath12k-wcn7850-amss-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath12k/WCN7850/hw2.0/amss.bin",
+        sha256: "43aadfd3df887f27de74020273aee484bac6a31dd53068f91baf2a9b094d6a68",
+        file: "linux-firmware-20261019-ath12k-WCN7850-hw2.0-amss.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-ath12k-wcn7850-m3-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath12k/WCN7850/hw2.0/m3.bin",
+        sha256: "0e72f44df7defc269fe92dcea25d4d409046c04b77d41c510c52879b3dfc1055",
+        file: "linux-firmware-20261019-ath12k-WCN7850-hw2.0-m3.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-ath12k-wcn7850-board-2-source",
+        aliases: &[],
+        // Device firmware (AGENTS.md "Device firmware"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath12k/WCN7850/hw2.0/board-2.bin",
+        sha256: "6a98237c743d864773a547e81e23f0c6dc721dcd7331926bee7381e2152e00fd",
+        file: "linux-firmware-20261019-ath12k-WCN7850-hw2.0-board-2.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-iwlwifi-license-source",
+        aliases: &[],
+        // A notice linux-firmware's WHENCE names for Wi-Fi firmware.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/LICENSES/LICENCE.iwlwifi_firmware",
+        sha256: "16d5040c7cf851fc693b7542e20870935b99802533ea1bfd231c377a2305e5c5",
+        file: "linux-firmware-20261019-LICENCE.iwlwifi_firmware",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-mt76-license-source",
+        aliases: &[],
+        // A notice linux-firmware's WHENCE names for Wi-Fi firmware.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/LICENSES/LICENCE.mediatek",
+        sha256: "a90d3f66704d85889945fec5525ea77622549da83aced1aac99828383f8f1805",
+        file: "linux-firmware-20261019-LICENCE.mediatek",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-rtw-license-source",
+        aliases: &[],
+        // A notice linux-firmware's WHENCE names for Wi-Fi firmware.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/LICENSES/LICENCE.rtlwifi_firmware.txt",
+        sha256: "a61351665b4f264f6c631364f85b907d8f8f41f8b369533ef4021765f9f3b62e",
+        file: "linux-firmware-20261019-LICENCE.rtlwifi_firmware.txt",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-ath10k-qca6174-notice-source",
+        aliases: &[],
+        // A notice linux-firmware's WHENCE names for Wi-Fi firmware.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath10k/QCA6174/hw3.0/notice_ath10k_firmware-6.txt",
+        sha256: "8ce5c6ea0542bf4aac31fc3ae16a39792ad22d0eae4543063fac56fb3380f021",
+        file: "linux-firmware-20261019-ath10k-QCA6174-hw3.0-notice_ath10k_firmware-6.txt",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-ath12k-wcn7850-notice-source",
+        aliases: &[],
+        // A notice linux-firmware's WHENCE names for Wi-Fi firmware.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath12k/WCN7850/hw2.0/Notice.txt",
+        sha256: "515bf4c9d620a87458e4447fe01a0e9bc384d1c3e0037cc4c3d2037b1ff25525",
+        file: "linux-firmware-20261019-ath12k-WCN7850-hw2.0-Notice.txt",
+        version: "20261019",
+    },
+    PinDef {
         key: "linux-firmware-qualcomm-atheros-license-source",
         aliases: &[],
         // The licence WHENCE names for those files, which the image ships
@@ -585,6 +1107,59 @@ pub const CPU_MICROCODE: &[&str] = &[
 /// names each. Adding an entry is a reviewed pin; firmware the host CPU runs
 /// is `CPU_MICROCODE`, and any other belongs to no class.
 pub const DEVICE_FIRMWARE: &[&str] = &[
+    "linux-firmware-iwlwifi-6000g2a-source",
+    "linux-firmware-iwlwifi-7260-source",
+    "linux-firmware-iwlwifi-7265-source",
+    "linux-firmware-iwlwifi-7265d-source",
+    "linux-firmware-iwlwifi-3160-source",
+    "linux-firmware-iwlwifi-3168-source",
+    "linux-firmware-iwlwifi-8000c-source",
+    "linux-firmware-iwlwifi-8265-source",
+    "linux-firmware-iwlwifi-9000-pu-b0-jf-b0-source",
+    "linux-firmware-iwlwifi-9260-th-b0-jf-b0-source",
+    "linux-firmware-iwlwifi-cc-a0-source",
+    "linux-firmware-iwlwifi-qu-b0-hr-b0-source",
+    "linux-firmware-iwlwifi-qu-c0-hr-b0-source",
+    "linux-firmware-iwlwifi-quz-a0-hr-b0-source",
+    "linux-firmware-iwlwifi-qu-b0-jf-b0-source",
+    "linux-firmware-iwlwifi-qu-c0-jf-b0-source",
+    "linux-firmware-iwlwifi-quz-a0-jf-b0-source",
+    "linux-firmware-iwlwifi-ty-a0-gf-a0-source",
+    "linux-firmware-iwlwifi-so-a0-gf-a0-source",
+    "linux-firmware-iwlwifi-so-a0-hr-b0-source",
+    "linux-firmware-iwlwifi-ma-b0-gf-a0-source",
+    "linux-firmware-iwlwifi-ma-b0-gf4-a0-source",
+    "linux-firmware-iwlwifi-ma-b0-hr-b0-source",
+    "linux-firmware-iwlwifi-gl-c0-fm-c0-source",
+    "linux-firmware-iwlwifi-bz-b0-fm-c0-source",
+    "linux-firmware-iwlwifi-sc-a0-fm-c0-source",
+    "linux-firmware-iwlwifi-ty-a0-gf-a0-pnvm-source",
+    "linux-firmware-iwlwifi-so-a0-gf-a0-pnvm-source",
+    "linux-firmware-iwlwifi-ma-b0-gf-a0-pnvm-source",
+    "linux-firmware-iwlwifi-ma-b0-gf4-a0-pnvm-source",
+    "linux-firmware-mt76-mt7921-wm-source",
+    "linux-firmware-mt76-mt7921-rom-patch-source",
+    "linux-firmware-mt76-mt7922-wm-source",
+    "linux-firmware-mt76-mt7922-rom-patch-source",
+    "linux-firmware-mt76-mt7925-wm-source",
+    "linux-firmware-mt76-mt7925-rom-patch-source",
+    "linux-firmware-mt76-mt7920-wm-source",
+    "linux-firmware-mt76-mt7920-rom-patch-source",
+    "linux-firmware-mt76-mt7902-wm-source",
+    "linux-firmware-mt76-mt7902-rom-patch-source",
+    "linux-firmware-rtw88-rtw8822c-source",
+    "linux-firmware-rtw88-rtw8822c-wow-source",
+    "linux-firmware-rtw88-rtw8821c-source",
+    "linux-firmware-rtw88-rtw8822b-source",
+    "linux-firmware-rtw89-rtw8852a-source",
+    "linux-firmware-rtw89-rtw8852b-source",
+    "linux-firmware-rtw89-rtw8852c-source",
+    "linux-firmware-ath10k-qca6174-firmware-6-source",
+    "linux-firmware-ath10k-qca6174-board-2-source",
+    "linux-firmware-ath10k-qca6174-board-source",
+    "linux-firmware-ath12k-wcn7850-amss-source",
+    "linux-firmware-ath12k-wcn7850-m3-source",
+    "linux-firmware-ath12k-wcn7850-board-2-source",
     "linux-firmware-amdgpu-gc-11-0-1-mes-2-source",
     "linux-firmware-amdgpu-gc-11-0-1-mes1-source",
     "linux-firmware-amdgpu-gc-11-0-1-imu-source",
@@ -725,7 +1300,7 @@ mod tests {
 
     #[test]
     fn catalog_carries_all_legacy_source_locks() {
-        assert_eq!(all().len(), 61);
+        assert_eq!(all().len(), 119);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

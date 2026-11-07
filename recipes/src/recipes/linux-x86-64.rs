@@ -8,6 +8,13 @@ use crate::types::{Recipe, Step, TextEdit};
 const ATH11K_MHI_FAILED: &str =
     "\t\tath11k_err(ab, \"failed to start mhi: %d\\n\", ret);\n\t\treturn ret;";
 const ATH11K_MHI_FAILED_RESTORES_ASPM: &str = "\t\tath11k_err(ab, \"failed to start mhi: %d\\n\", ret);\n\t\tath11k_pci_aspm_restore(ab_pci);\n\t\treturn ret;";
+/// ath10k's power-down, which is empty: only a started firmware puts its link back.
+const ATH10K_POWER_DOWN: &str = "so there's no point in resetting here.\n\t */\n}";
+const ATH10K_POWER_DOWN_RESTORES_ASPM: &str = "so there's no point in resetting here.\n\t */\n\tpcie_capability_clear_and_set_word(ath10k_pci_priv(ar)->pdev, PCI_EXP_LNKCTL,\n\t\t\t\t\t   PCI_EXP_LNKCTL_ASPMC,\n\t\t\t\t\t   ath10k_pci_priv(ar)->link_ctl & PCI_EXP_LNKCTL_ASPMC);\n}";
+/// The same in ath12k, which copied ath11k's function.
+const ATH12K_MHI_FAILED: &str =
+    "\t\tath12k_err(ab, \"failed to start mhi: %d\\n\", ret);\n\t\treturn ret;";
+const ATH12K_MHI_FAILED_RESTORES_ASPM: &str = "\t\tath12k_err(ab, \"failed to start mhi: %d\\n\", ret);\n\t\tath12k_pci_aspm_restore(ab_pci);\n\t\treturn ret;";
 
 /// Every kernel config symbol the recipe decides, in `.config` syntax. It is
 /// appended over allnoconfig before olddefconfig resolves the rest; the
@@ -385,6 +392,32 @@ const CONFIG: &[&str] = &[
     "CONFIG_SND_HDA_CODEC_CIRRUS=y",
     "CONFIG_SND_HDA_CODEC_CS420X=y",
     "CONFIG_SND_HDA_CODEC_CS8409=y",
+    // Wi-Fi beyond the T14s's WCN6855, each with the firmware device-firmware pins
+    // for it. Intel from 6000-series up, since DVM, MVM and MLD each drive a range
+    // of them; MediaTek's MT7921/22 and MT7925; Realtek's 88 and 89; Qualcomm's
+    // QCA6174 and WCN7850. RFKILL stays off: none needs it. They select
+    // DEV_COREDUMP, whose root-only dumps of a crashed device last five minutes
+    // and which nothing here reads; amdgpu writes them too once it is on.
+    "CONFIG_WLAN_VENDOR_INTEL=y",
+    "CONFIG_IWLWIFI=y",
+    "CONFIG_IWLDVM=y",
+    "CONFIG_IWLMVM=y",
+    "CONFIG_IWLMLD=y",
+    "CONFIG_WLAN_VENDOR_MEDIATEK=y",
+    "CONFIG_MT7921E=y",
+    "CONFIG_MT7925E=y",
+    "CONFIG_WLAN_VENDOR_REALTEK=y",
+    "CONFIG_RTW88=y",
+    "CONFIG_RTW88_8822CE=y",
+    "CONFIG_RTW88_8821CE=y",
+    "CONFIG_RTW88_8822BE=y",
+    "CONFIG_RTW89=y",
+    "CONFIG_RTW89_8852AE=y",
+    "CONFIG_RTW89_8852BE=y",
+    "CONFIG_RTW89_8852CE=y",
+    "CONFIG_ATH10K=y",
+    "CONFIG_ATH10K_PCI=y",
+    "CONFIG_ATH12K=y",
 ];
 
 /// The resolved `.config`'s `CONFIG_` lines, sorted: what olddefconfig made
@@ -549,6 +582,22 @@ pub fn recipe() -> Recipe {
         vec![TextEdit::new(
             ATH11K_MHI_FAILED,
             ATH11K_MHI_FAILED_RESTORES_ASPM,
+            1,
+        )],
+    ));
+    steps.push(Step::substitute_text(
+        "{src}/drivers/net/wireless/ath/ath10k/pci.c",
+        vec![TextEdit::new(
+            ATH10K_POWER_DOWN,
+            ATH10K_POWER_DOWN_RESTORES_ASPM,
+            1,
+        )],
+    ));
+    steps.push(Step::substitute_text(
+        "{src}/drivers/net/wireless/ath/ath12k/pci.c",
+        vec![TextEdit::new(
+            ATH12K_MHI_FAILED,
+            ATH12K_MHI_FAILED_RESTORES_ASPM,
             1,
         )],
     ));
@@ -2016,8 +2065,9 @@ mod tests {
             assert!(locked(&format!("CONFIG_{symbol}=y")));
         }
         assert!(!set("CONFIG_CFG80211_REQUIRE_SIGNED_REGDB"));
-        // Neither source patch fails the build when absent: hw2.1 silicon
-        // would ask for files nothing carries, and the keyring would return.
+        // None of the source patches fails the build when absent: hw2.1 silicon
+        // would ask for files nothing carries, the keyring would return, and a
+        // failed selector probe would keep Wi-Fi's link out of L1 in the deployment.
         // A linux-firmware tag bump must re-check that WHENCE still links
         // hw2.1's files to hw2.0's.
         for (file, from, to) in [
@@ -2025,6 +2075,16 @@ mod tests {
                 "{src}/drivers/net/wireless/ath/ath11k/pci.c",
                 ATH11K_MHI_FAILED,
                 ATH11K_MHI_FAILED_RESTORES_ASPM,
+            ),
+            (
+                "{src}/drivers/net/wireless/ath/ath10k/pci.c",
+                ATH10K_POWER_DOWN,
+                ATH10K_POWER_DOWN_RESTORES_ASPM,
+            ),
+            (
+                "{src}/drivers/net/wireless/ath/ath12k/pci.c",
+                ATH12K_MHI_FAILED,
+                ATH12K_MHI_FAILED_RESTORES_ASPM,
             ),
             (
                 "{src}/drivers/net/wireless/ath/ath11k/core.c",

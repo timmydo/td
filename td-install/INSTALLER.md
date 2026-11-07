@@ -36,9 +36,9 @@ T430s itself can show those work. A card in the built-in reader is readable
 but never an installation target. The compositor recognizes the touchpad
 from its sysfs properties and moves the pointer by one finger's travel, as
 a mouse does; its button presses click, and tapping and scrolling are not
-yet read. The TrackPoint moves it relatively. Its Intel Wi-Fi needs
-firmware no reviewed pin carries yet (AGENTS.md, "Device firmware"), so
-the wired port is its network.
+yet read. The TrackPoint moves it relatively. Its wired port is its
+network: an Intel 6205 card asks iwlwifi for a pinned file, and that has
+not been tried on the machine.
 
 The ThinkPad T14s Gen 4 AMD is a second hardware target on the same terms:
 its drivers are built in and checked after config resolution ahead of
@@ -68,6 +68,32 @@ by the card's PCI subsystem ID from `board-2.bin`, which holds Lenovo's
 17aa:9309 and has no generic fallback; a card it lacks logs "failed to
 fetch board data" and brings up no interface. This has not yet been
 tried on the hardware.
+
+Beyond those machines a desktop image carries Wi-Fi for general hardware,
+none of it yet run on real silicon. These have a driver and their firmware:
+Intel's 6005 and 6205, and its cards from the 7000 series through the BE200;
+MediaTek's MT7921, MT7922, MT7925, MT7920 and MT7902; Realtek's 8822CE, 8821CE,
+8822BE and 8852A, B and C; and Qualcomm's QCA6174 hw3 and WCN7850. Each driver
+is built in with linux-firmware's pinned files in the deployment initramfs
+(AGENTS.md, "Device firmware"), which adds 63 MB to every desktop's initramfs
+for a card most machines do not have, until switch_root frees it.
+
+A card outside that list misses in one of two ways. Where the driver binds and
+no file is pinned, it logs a firmware failure and brings up no interface:
+Intel's 6000, 6050 and 6000g2b, and its so-a0 with a gf4 or jf radio and bz and
+sc with a wh, gf or hr one; MediaTek's MT7927 and MT7928; ath10k's QCA9377,
+QCA6164, QCA988X and QCA6174 hw2.1; and ath11k's QCA6390. `hwcheck` lists the
+file it asked for, except that ath10k asks quietly, so such a card shows as bound
+with nothing missing and only its driver's "Failed to find firmware" line tells.
+Where no driver is built, `hwcheck` says `NO DRIVER`: Realtek's 8851B, 8852BT and
+8922A, and rtw88's other PCI parts, such as the 8723DE. The first kind wants
+pins; the second, config lines and the lock's diff as well. linux-firmware has no
+file for some silicon the kernel names, such as gl-b0 or bz-a0.
+
+What each driver does without firmware in the selector was read and not run.
+None is expected to hold up the PIN prompt for long, but WCN7850's MHI reset can
+wait up to 90 s, and WCN6855's 20 s, if the device does not clear it, and mt76's
+retries and iwlwifi's walk down its API range log to the console that prompt is on.
 
 A Ryzen 7 5700G desktop on an AMD 500-series board is a third target on
 the same terms. It shares the T14s's AMD platform set; beside it, its
