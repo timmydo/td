@@ -860,6 +860,10 @@ fn the_power_check_reads_each_supply() {
     };
     assert!(on_mains(&entries));
     assert!(on_mains(&class.join("absent")));
+    // A desktop with a wireless mouse has no battery of its own.
+    supply("hidpp_battery_0", Some("Battery"), None);
+    fs::write(devices.join("hidpp_battery_0/scope"), "Device\n").unwrap();
+    assert!(on_mains(&entries));
     supply("BAT0", Some("Battery"), None);
     assert!(!on_mains(&entries));
     supply("AC", Some("Mains"), Some("0"));

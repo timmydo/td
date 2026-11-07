@@ -1544,10 +1544,11 @@ and the recovery prompt is offered on both consoles; an installer that
 encrypts only where the live system shows a keyboard console
 ("Activation") remains increment 7's target. What stays deferred is a
 display with neither a UEFI GOP framebuffer nor a td driver, a keyboard
-td's kernel has no driver for (USB keyboards on ports served by OHCI or
-UHCI controllers, companions included, and I2C-HID and Bluetooth
-keyboards), keymaps other than US on the VT, and a console policy for the running system's own text greeter, which stays
-on `ttyS0`, so a machine without a serial port has none.
+td's kernel has no driver for (Bluetooth and SPI keyboards, and I2C-HID
+ones on a controller, or an interrupt's GPIO controller, it does not
+drive), keymaps other than US on the VT, and a console policy for the
+running system's own text greeter, which stays on `ttyS0`, so a machine
+without a serial port has none.
 Each kernel entry prepends the built-in prefix; selector-to-deployment
 kexec therefore adds a second copy. The current short profile arguments
 fit, but this consumes part of both td-boot's 2048-byte command-line bound

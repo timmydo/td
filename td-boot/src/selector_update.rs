@@ -566,7 +566,8 @@ pub(crate) fn resilience(partition: &volume::Pinned) -> Resilience {
 /// Whether the machine is on mains power for the upgrade's start: each
 /// `class` entry's `type`, and `online` reading `1`, through
 /// `upgrade::on_mains`. An entry whose `type` cannot be read is no supply;
-/// a supply whose `online` cannot be read is offline.
+/// a supply whose `online` cannot be read is offline. A `Device`-scoped entry
+/// powers a peripheral, such as a wireless mouse, and not this machine.
 pub(crate) fn on_mains(class: &Path) -> bool {
     let mut supplies: Vec<(String, bool)> = Vec::new();
     if let Ok(entries) = fs::read_dir(class) {
@@ -577,6 +578,9 @@ pub(crate) fn on_mains(class: &Path) -> bool {
             let Ok(kind) = sysfs(&dir.join("type")) else {
                 continue;
             };
+            if sysfs(&dir.join("scope")).is_ok_and(|text| text.trim_end() == "Device") {
+                continue;
+            }
             let online = sysfs(&dir.join("online")).is_ok_and(|text| text.trim_end() == "1");
             supplies.push((kind.trim_end().to_owned(), online));
         }

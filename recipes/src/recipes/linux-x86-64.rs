@@ -409,6 +409,94 @@ const CONFIG: &[&str] = &[
     "# CONFIG_KERNEL_LZO is not set",
     "# CONFIG_KERNEL_LZ4 is not set",
     "# CONFIG_KERNEL_ZSTD is not set",
+    // Intel platforms: VT-d, the VMD controller RST mode hides NVMe behind, and
+    // the LPSS I2C and pinctrl a touchpad sits on. VT-d stays in legacy mode
+    // until an Intel machine has booted the less exercised scalable one.
+    "CONFIG_INTEL_IOMMU=y",
+    "# CONFIG_INTEL_IOMMU_SCALABLE_MODE_DEFAULT_ON is not set",
+    "# CONFIG_INTEL_IOMMU_PERF_EVENTS is not set",
+    "CONFIG_VMD=y",
+    "CONFIG_X86_INTEL_LPSS=y",
+    "CONFIG_MFD_INTEL_LPSS_PCI=y",
+    "CONFIG_MFD_INTEL_LPSS_ACPI=y",
+    "CONFIG_I2C_DESIGNWARE_PCI=y",
+    "CONFIG_I2C_DESIGNWARE_BAYTRAIL=y",
+    "CONFIG_PINCTRL_LYNXPOINT=y",
+    "CONFIG_PINCTRL_BAYTRAIL=y",
+    "CONFIG_PINCTRL_CHERRYVIEW=y",
+    "CONFIG_PINCTRL_BROXTON=y",
+    "CONFIG_PINCTRL_GEMINILAKE=y",
+    "CONFIG_PINCTRL_SUNRISEPOINT=y",
+    "CONFIG_PINCTRL_CANNONLAKE=y",
+    "CONFIG_PINCTRL_ICELAKE=y",
+    "CONFIG_PINCTRL_LAKEFIELD=y",
+    "CONFIG_PINCTRL_JASPERLAKE=y",
+    "CONFIG_PINCTRL_ELKHARTLAKE=y",
+    "CONFIG_PINCTRL_TIGERLAKE=y",
+    "CONFIG_PINCTRL_ALDERLAKE=y",
+    "CONFIG_PINCTRL_METEORLAKE=y",
+    "CONFIG_PINCTRL_METEORPOINT=y",
+    "CONFIG_PINCTRL_INTEL_PLATFORM=y",
+    "CONFIG_I2C_I801=y",
+    "CONFIG_I2C_PIIX4=y",
+    // Storage controllers.
+    "CONFIG_MMC_SDHCI_ACPI=y",
+    "CONFIG_MISC_RTSX_PCI=y",
+    "CONFIG_MMC_REALTEK_PCI=y",
+    "CONFIG_SCSI_UFSHCD=y",
+    "CONFIG_SCSI_UFSHCD_PCI=y",
+    "CONFIG_ATA_SFF=y",
+    "CONFIG_ATA_BMDMA=y",
+    "CONFIG_ATA_PIIX=y",
+    "CONFIG_MEGARAID_SAS=y",
+    "CONFIG_SCSI_MPT3SAS=y",
+    "CONFIG_VMWARE_PVSCSI=y",
+    // Wired NICs.
+    "CONFIG_NET_VENDOR_BROADCOM=y",
+    "CONFIG_TIGON3=y",
+    "CONFIG_BNXT=y",
+    "CONFIG_NET_VENDOR_ATHEROS=y",
+    "CONFIG_ATL1C=y",
+    "CONFIG_ALX=y",
+    "CONFIG_NET_VENDOR_AQUANTIA=y",
+    "CONFIG_AQTION=y",
+    "CONFIG_NET_VENDOR_MARVELL=y",
+    "CONFIG_SKY2=y",
+    "CONFIG_IXGBE=y",
+    "CONFIG_I40E=y",
+    "CONFIG_VMXNET3=y",
+    // USB 1.1 hosts, and companions of older USB 2.0 ones.
+    "CONFIG_USB_OHCI_HCD=y",
+    "CONFIG_USB_OHCI_HCD_PCI=y",
+    "CONFIG_USB_UHCI_HCD=y",
+    // Touchpads and common keyboards and receivers.
+    "CONFIG_MOUSE_PS2_ELANTECH=y",
+    "CONFIG_MOUSE_PS2_ELANTECH_SMBUS=y",
+    "CONFIG_MOUSE_PS2_SYNAPTICS_SMBUS=y",
+    "CONFIG_MOUSE_ELAN_I2C=y",
+    "CONFIG_MOUSE_ELAN_I2C_I2C=y",
+    "CONFIG_MOUSE_ELAN_I2C_SMBUS=y",
+    "CONFIG_RMI4_CORE=y",
+    "CONFIG_RMI4_SMB=y",
+    "CONFIG_RMI4_F03=y",
+    "CONFIG_RMI4_F11=y",
+    "CONFIG_RMI4_F12=y",
+    "CONFIG_RMI4_F30=y",
+    "CONFIG_HID_RMI=y",
+    "CONFIG_LEDS_CLASS_MULTICOLOR=y",
+    "CONFIG_HID_LOGITECH=y",
+    "CONFIG_HID_LOGITECH_DJ=y",
+    "CONFIG_HID_LOGITECH_HIDPP=y",
+    "CONFIG_HID_APPLE=y",
+    "CONFIG_HID_LENOVO=y",
+    "CONFIG_HID_MICROSOFT=y",
+    // HDA codecs beyond Realtek and Conexant.
+    "CONFIG_SND_HDA_CODEC_ANALOG=y",
+    "CONFIG_SND_HDA_CODEC_SIGMATEL=y",
+    "CONFIG_SND_HDA_CODEC_VIA=y",
+    "CONFIG_SND_HDA_CODEC_CIRRUS=y",
+    "CONFIG_SND_HDA_CODEC_CS420X=y",
+    "CONFIG_SND_HDA_CODEC_CS8409=y",
 ];
 
 /// The resolved `.config`'s `CONFIG_` lines, sorted: what olddefconfig made
@@ -948,6 +1036,28 @@ pub fn recipe() -> Recipe {
     //    CRYPTO_LIB_SHA256; AX88179's PHYLIB; UDF's CRC_ITU_T, BUFFER_HEAD
     //    and LEGACY_DIRECT_IO; USB audio's SND_HWDEP, SND_RAWMIDI and
     //    BITREVERSE.
+    //
+    //    GENERAL HARDWARE: the families at the end of `CONFIG`, for machines td
+    //    has not met, each needing no firmware or running without its optional
+    //    firmware. Intel laptops: VMD, or VMD-based RST's NVMe disks are invisible
+    //    to the installer (AHCI-remapped RST stays a firmware setting to turn
+    //    off); the LPSS I2C controllers, I2C_DESIGNWARE_PCI and each client
+    //    platform's pinctrl, since a touchpad's interrupt is a GPIO and without
+    //    its controller the I2C_HID the T14s brought defers forever. VT-d, so a
+    //    machine whose firmware has a DMAR table gets lazy DMA isolation as AMD
+    //    ones do and x2APIC survives a handover. It is on where firmware has it
+    //    on, so the T430s's i915, e1000e and card reader run translated there.
+    //    SMBus controllers carry RMI4 touchpads. UHCI and OHCI serve USB 1.1
+    //    keyboards and the companion ports of older USB 2.0 hosts. HID++ reports
+    //    a wireless device's battery as a power supply of Device scope, which
+    //    the mains check and td-agent's report leave out. Left out, and why:
+    //    other vendors' laptop drivers, whose keys nothing reads and which bring
+    //    RFKILL, and Intel's HID and virtual-button events, whose keys nothing
+    //    reads either; USB4 and Thunderbolt,
+    //    whose PCIe tunnels are a DMA path that wants its own decision; SOF audio,
+    //    Wi-Fi and Bluetooth, which need firmware; touch behind Intel THC;
+    //    native drivers for displays simpledrm already serves; and filesystems
+    //    nothing mounts.
     //
     //    CLOUD GUESTS (td-svc/DESIGN.md §10, "Cloud images"): the drivers a
     //    server image needs to find its disk and network on Azure, EC2 Nitro
@@ -1584,6 +1694,14 @@ mod tests {
 
     /// What the resolved lock must not turn on, and why.
     const HELD_OFF: &[(&str, &str)] = &[
+        (
+            "CONFIG_INTEL_IOMMU_SCALABLE_MODE_DEFAULT_ON",
+            "VT-d scalable mode on - no Intel machine has booted it",
+        ),
+        (
+            "CONFIG_INTEL_IOMMU_PERF_EVENTS",
+            "VT-d PMU on - nothing here asked for it",
+        ),
         ("CONFIG_OVERLAY_FS", "OVERLAY_FS on - /etc is immutable and writable state uses direct mounts; no overlay user remains"),
         ("CONFIG_NVME_MULTIPATH", "NVME_MULTIPATH on - installation fixture requires direct controller namespaces"),
         ("CONFIG_SERIAL_8250_MOXA_PCIE", "SERIAL_8250_MOXA_PCIE set — it defaults to SERIAL_8250 since Linux 7.3, and td supports no such card"),

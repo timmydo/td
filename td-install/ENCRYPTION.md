@@ -1033,15 +1033,16 @@ reads advertised keys, not a keyboard a person types on: a HID device
 that advertises a keyboard's keys without being one, such as a security
 token's one-time-password interface, a wireless receiver with no
 keyboard paired or a barcode scanner, passes it, and the disclosed
-limit then applies.
+limit then applies. A Logitech receiver's keyboard comes up just after
+its receiver does, and is not seen if that is after the probe.
 
 Automatic login remains and stays disclosed, and td-authd passes no
 storage operand: there is none. What remains deferred is hardware the
 probe refuses and so installs unencrypted: a display with neither a UEFI
 GOP framebuffer simple-framebuffer can describe nor a td driver, and a
-keyboard td's kernel has no driver for (USB keyboards on ports served by
-OHCI or UHCI controllers, companions included, and I2C-HID and Bluetooth
-keyboards); and a keymap
+keyboard td's kernel has no driver for (Bluetooth and SPI keyboards, and
+I2C-HID ones on a controller, or an interrupt's GPIO controller, it does
+not drive); and a keymap
 other than US. Activation leaves the selectors as they are: the
 installed selector on an unencrypted volume makes no TPM contact, and
 the live selector caps as MEDIA.md says.
@@ -2257,7 +2258,8 @@ operations' wire, steps and screens.
    first requires mains power: a `/sys/class/power_supply` entry of type
    `Mains` online, or no `Battery` entry, among the supplies the kernel
    has registered by then, so a battery whose driver registers later
-   counts as none. Without it the console says the upgrade waits for
+   counts as none. An entry of `Device` scope powers a peripheral, such as
+   a wireless mouse, and is not among them. Without it the console says the upgrade waits for
    mains power, and the boot runs the device-bound release order with
    nothing upgraded. Before U5 the first prompt is the recovery key's,
    asked before anything else is gathered and tested only after the cap.

@@ -5370,8 +5370,8 @@ fn boot_source(
             }
         }
     }
-    // A direct boot's PC machine has PIIX IDE, which the kernel does not
-    // drive; q35's AHCI takes the seed as its first free port.
+    // q35's AHCI takes the seed as its first free port. Only a firmware boot
+    // is given one.
     if let Some(seed) = plan.seed {
         if !matches!(source, BootSource::Firmware { .. }) {
             return Err("a NoCloud seed needs a firmware boot's q35 AHCI".into());

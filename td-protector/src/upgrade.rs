@@ -73,7 +73,8 @@ impl State {
 
 /// Whether a machine's power supplies let the upgrade start: a `Mains`
 /// supply online, or no `Battery` one. Each is a `/sys/class/power_supply`
-/// entry's `type` and whether its `online` reads `1`.
+/// entry's `type` and whether its `online` reads `1`, leaving out an entry of
+/// `Device` scope, which powers a peripheral.
 pub fn on_mains(supplies: &[(&str, bool)]) -> bool {
     supplies
         .iter()

@@ -494,7 +494,9 @@ fn overview(roots: &Roots, before: &Sample, after: &Sample, seconds: f64, out: &
         out.push_str(&format!("Temperatures: {}\n", temperatures.join(", ")));
     }
     for supply in sensors(&roots.sys.join("class/power_supply"), "") {
-        if read(&supply.join("type")).as_deref().map(str::trim) != Some("Battery") {
+        if read(&supply.join("type")).as_deref().map(str::trim) != Some("Battery")
+            || read(&supply.join("scope")).as_deref().map(str::trim) == Some("Device")
+        {
             continue;
         }
         let name = supply
@@ -746,6 +748,8 @@ mod tests {
         f.sys("class/power_supply/BAT0/capacity", "87\n");
         f.sys("class/power_supply/BAT0/status", "Discharging\n");
         f.sys("class/power_supply/AC/type", "Mains\n");
+        f.sys("class/power_supply/hidpp_battery_0/type", "Battery\n");
+        f.sys("class/power_supply/hidpp_battery_0/scope", "Device\n");
         f.write("stat", "cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 1\ncpu1 1\n");
         f.process(10, "busy (worker) x", 1000, 2048, "/usr/bin/busy\0--fast\0");
         f.process(20, "kthreadd", 50, 0, "");
@@ -779,6 +783,7 @@ mod tests {
             assert!(text.contains(want), "{want:?} in:\n{text}");
         }
         assert!(!text.contains("Battery AC"), "{text}");
+        assert!(!text.contains("hidpp"), "{text}");
         let rows: Vec<&str> = text
             .lines()
             .skip_while(|l| !l.contains("PID"))

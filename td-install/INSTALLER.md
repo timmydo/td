@@ -86,6 +86,28 @@ volumes mount at boot, and removable media mount for the owner while
 the session is unlocked (td-disks/DESIGN.md). None of this has been
 tried on the machine.
 
+For machines td has not met, the kernel also builds in families that need no
+firmware, or run without their optional firmware: Intel platforms' VT-d, VMD
+(NVMe disks in VMD-based RST mode; AHCI-remapped RST must still be turned off in
+the firmware), and LPSS I2C and pinctrl on client platforms from Haswell and Bay
+Trail through Panther Lake, which touchpads sit on; UFS, ACPI SD hosts, Realtek
+PCIe card readers, PIIX and ICH IDE and MegaRAID and MPT SAS controllers;
+Broadcom Tigon3 and NetXtreme-C, Atheros, Aquantia, Marvell and Intel 10 and 40
+GbE NICs, and VMware's NIC and SCSI; UHCI and OHCI USB; Elan and Synaptics RMI4
+touchpads; Logitech, Apple, Lenovo and Microsoft HID; and Analog, Sigmatel, VIA
+and Cirrus HDA codecs. A display it has no driver for keeps the firmware's mode
+through simpledrm. None of these has been tried on such a machine. Thunderbolt
+and USB4 tunnels, whose PCIe is a DMA path, touch behind Intel THC and other
+vendors' laptop hotkey drivers are not built. The kernel drives eMMC but the
+installer offers no `mmcblk` disk, so a machine with only eMMC has nowhere to
+install, and a 32-bit UEFI tablet cannot start this 64-bit kernel.
+
+VT-d translates wherever the firmware leaves it on, in legacy rather than
+scalable mode. On a T430s with VT-d enabled in its setup, i915, e1000e and the
+card reader run translated, which that machine's validation has to cover, as
+has a selector-to-deployment kexec on the Intel graphics whose remapping unit
+the kernel leaves on (`quirk_igfx_skip_te_disable`, Ice Lake through Meteor Lake).
+
 A machine needs the kernel's drivers and firmware before anything else can
 work. `hwcheck` reports that much: on a booted td system it lists each PCI and
 USB device with its driver, or `NO DRIVER`, counting and not listing unbound
