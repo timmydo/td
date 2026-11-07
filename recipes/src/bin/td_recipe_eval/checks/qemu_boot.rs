@@ -6959,7 +6959,7 @@ fn latch_console_evidence_from(
         buf,
         TD_FIRSTBOOT_HOST_KEY_PREFIX.as_bytes(),
     );
-    latch_token(
+    latch_os_release_build(
         &mut evidence.os_release_build,
         buf,
         OS_RELEASE_BUILD_PREFIX.as_bytes(),
@@ -7918,46 +7918,24 @@ fn latch_terminal_clipboard_target(
     }
 }
 
-/// Longest token `latch_token` will accept. An ed25519 SHA-256 fingerprint is
-/// `SHA256:` plus 43 base64 characters; the ceiling is generous enough for another
-/// hash without letting a console line of `x`s become an unbounded String.
+/// Longest token `terminated_token` or `quoted_token` will accept, quotes counted.
+/// An ed25519 SHA-256 fingerprint is `SHA256:` plus 43 base64 characters; the
+/// ceiling is generous enough for another hash without letting a console line of
+/// `x`s become an unbounded String.
 const HOST_KEY_MAX: usize = 64;
 /// What `/etc/rootcheck` prints before an assembled deployment's `BUILD_ID`
 /// value. Spelled here and in the recipe rather than in `td_recipe::shared`,
 /// which every recipe check is keyed on; `qemu-boot-live` reds if they part.
 const OS_RELEASE_BUILD_PREFIX: &str = "TD-OS-RELEASE BUILD_ID=";
 
-/// Latch the graphic-character token that follows `prefix` — for a variable-length
-/// value, rather than the fixed-width hex deployment ids `latch_selection_id` reads.
-///
-/// Requires the token to be TERMINATED within the window: the console is drained
-/// incrementally, so a token still being written would otherwise latch truncated
-/// and then compare unequal against the same key on the next boot. The scan window
-/// carries `evidence_marker_max_len` bytes of overlap (which counts this prefix plus
-/// `HOST_KEY_MAX`), so a line skipped for that reason is re-examined intact.
-fn latch_token(found: &mut Option<String>, haystack: &[u8], prefix: &[u8]) {
-    if found.is_some() {
-        return;
-    }
-    for start in 0..haystack.len() {
-        let Some(after_prefix) = start.checked_add(prefix.len()) else {
-            return;
-        };
-        if haystack.get(start..after_prefix) != Some(prefix) {
-            continue;
-        }
-        if let Some(token) = haystack.get(after_prefix..).and_then(terminated_token) {
-            *found = Some(token.to_string());
-            return;
-        }
-    }
-}
-
-/// The token `rest` opens with, if it ends its line within the ceiling. Anything else
-/// is still being written (its newline has not arrived), longer than the ceiling, or
-/// carrying a kernel record whose first word would run on from the token — and
-/// latching other than the whole value would compare unequal against the same key
-/// next boot, reporting a rotation that did not happen.
+/// The graphic-character token `rest` opens with, if it ends its line within the
+/// ceiling: for a variable-length value, rather than the fixed-width hex deployment ids
+/// `latch_selection_id` reads. Anything else is still being written (its newline has not
+/// arrived), longer than the ceiling, or carrying a kernel record whose first word would
+/// run on from the token — and latching other than the whole value would compare unequal
+/// against the same key next boot, reporting a rotation that did not happen. The scan
+/// window carries `evidence_marker_max_len` bytes of overlap (which counts the prefix
+/// plus `HOST_KEY_MAX`), so a line skipped for that reason is re-examined intact.
 fn terminated_token(rest: &[u8]) -> Option<&str> {
     let graphic = rest
         .iter()
@@ -7990,8 +7968,46 @@ fn sha256_fingerprint(rest: &[u8]) -> Option<&str> {
 /// boot, or pass `HOST_KEY_MAX` and not latch. A SHA-256 fingerprint has one width,
 /// so it is read by that width, whatever follows it, a longer base64 run included.
 /// A line that does not fill that width, which no shipped key prints, keeps
-/// `latch_token`'s rule. The first line either rule can read wins.
+/// `terminated_token`'s rule. The first line either rule can read wins.
 fn latch_host_key(found: &mut Option<String>, haystack: &[u8], prefix: &[u8]) {
+    latch_first_read(found, haystack, prefix, |rest| {
+        sha256_fingerprint(rest).or_else(|| terminated_token(rest))
+    });
+}
+
+/// The double-quoted value `rest` opens with, quotes included, however its line goes on.
+fn quoted_token(rest: &[u8]) -> Option<&str> {
+    let graphic = rest
+        .iter()
+        .take(HOST_KEY_MAX)
+        .take_while(|byte| byte.is_ascii_graphic())
+        .count();
+    let run = rest.get(..graphic)?;
+    let inner = run.strip_prefix(b"\"")?;
+    let close = inner.iter().position(|byte| *byte == b'"')?;
+    std::str::from_utf8(rest.get(..close.checked_add(2)?)?).ok()
+}
+
+/// `BUILD_ID`'s value is quoted, so its closing quote ends it, whatever kernel record
+/// ran on from there (see `is_kernel_record`). A quote that never closes is no value,
+/// even if its line ends. An unquoted line, which no shipped `os-release` holds, keeps
+/// `terminated_token`'s rule.
+fn latch_os_release_build(found: &mut Option<String>, haystack: &[u8], prefix: &[u8]) {
+    latch_first_read(found, haystack, prefix, |rest| {
+        if rest.first() == Some(&b'"') {
+            quoted_token(rest)
+        } else {
+            terminated_token(rest)
+        }
+    });
+}
+
+fn latch_first_read(
+    found: &mut Option<String>,
+    haystack: &[u8],
+    prefix: &[u8],
+    read: fn(&[u8]) -> Option<&str>,
+) {
     if found.is_some() {
         return;
     }
@@ -7999,7 +8015,7 @@ fn latch_host_key(found: &mut Option<String>, haystack: &[u8], prefix: &[u8]) {
         let Some(rest) = haystack.get(start..).and_then(|at| at.strip_prefix(prefix)) else {
             continue;
         };
-        if let Some(token) = sha256_fingerprint(rest).or_else(|| terminated_token(rest)) {
+        if let Some(token) = read(rest) {
             *found = Some(token.to_string());
             return;
         }
@@ -13435,7 +13451,7 @@ mod tests {
         }
         // Still being written: nothing latches until a byte follows the digest.
         assert_eq!(latched(format!("{prefix}{fingerprint}")), None);
-        // A digest cut short is no fingerprint of this width, and stays `latch_token`'s.
+        // A digest cut short is no fingerprint of this width, and stays `terminated_token`'s.
         let short = "SHA256:aGVsbG8gd29ybGQ";
         assert_eq!(
             latched(format!("{prefix}{short}\n")).as_deref(),
@@ -13454,7 +13470,7 @@ mod tests {
     /// The overlap the incremental drain carries must admit the LONGEST thing
     /// latched, or a fingerprint line straddling two reads is never seen at all.
     /// The budget is `evidence_marker_max_len(marker) - 1` (see `drain_console`),
-    /// and `latch_token` needs the prefix, up to HOST_KEY_MAX token bytes, AND the
+    /// and `terminated_token` needs the prefix, up to HOST_KEY_MAX token bytes, AND the
     /// terminator inside the window — hence the +2.
     #[test]
     fn the_scan_overlap_covers_a_full_fingerprint_line() {
@@ -13483,6 +13499,43 @@ mod tests {
             Some(format!("\"{commit}\"")),
             "{line}"
         );
+    }
+
+    #[test]
+    fn a_kernel_record_on_the_build_id_line_is_no_part_of_the_value() {
+        let commit = "0".repeat(40);
+        let quoted = format!("\"{commit}\"");
+        let prefix = OS_RELEASE_BUILD_PREFIX;
+        let latch = |text: &str| {
+            let mut evidence = ConsoleEvidence::default();
+            latch_console_evidence(&mut evidence, text.as_bytes(), b"target");
+            evidence.os_release_build
+        };
+
+        for record in [
+            "[   41.210000] input: ImExPS/2 Generic Explorer Mouse\r\n",
+            "input: ImExPS/2 Generic Explorer Mouse\r\n",
+        ] {
+            assert_eq!(
+                latch(&format!("{prefix}{quoted}{record}")).as_deref(),
+                Some(quoted.as_str()),
+                "{record}"
+            );
+        }
+        assert_eq!(
+            latch(&format!("{prefix}{quoted}\n")).as_deref(),
+            Some(quoted.as_str())
+        );
+        // The value is not whole yet, or never was: a later line may still give it.
+        assert_eq!(latch(&format!("{prefix}\"{commit}")), None);
+        assert_eq!(latch(&format!("{prefix}\"{commit} tail\"\n")), None);
+        assert_eq!(latch(&format!("{prefix}\"")), None);
+        assert_eq!(latch(&format!("{prefix}\"\"\n")).as_deref(), Some("\"\""));
+        // A shape no shipped os-release has keeps the whole-line rule.
+        assert_eq!(latch(&format!("{prefix}{commit}\n")), Some(commit.clone()));
+        assert_eq!(latch(&format!("{prefix}{commit}[ 1.0] x\n")), None);
+        let later = format!("{prefix}\"{commit}\r\n{prefix}{quoted}\n");
+        assert_eq!(latch(&later).as_deref(), Some(quoted.as_str()));
     }
 
     #[test]
