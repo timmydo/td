@@ -4769,6 +4769,7 @@ impl RecipeCheckRunner {
                         Some(CheckRunner::BuildOnly) => b"build-only".as_slice(),
                         Some(CheckRunner::RustToolchain) => b"rust-toolchain".as_slice(),
                         Some(CheckRunner::Tzdata) => b"tzdata".as_slice(),
+                        Some(CheckRunner::SshInterop) => b"ssh-interop".as_slice(),
                         None => b"none".as_slice(),
                     },
                 );

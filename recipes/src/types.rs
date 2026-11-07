@@ -1041,6 +1041,7 @@ pub enum CheckRunner {
     BuildOnly,
     RustToolchain,
     Tzdata,
+    SshInterop,
 }
 
 impl CheckRunner {
@@ -1057,7 +1058,7 @@ impl CheckRunner {
             CheckRunner::RustToolchain => {
                 &["ripgrep", "fd", "uutils", "td-sh", "td-util", "td-txt"]
             }
-            CheckRunner::BuildOnly | CheckRunner::Tzdata => &[],
+            CheckRunner::BuildOnly | CheckRunner::Tzdata | CheckRunner::SshInterop => &[],
         }
     }
 }

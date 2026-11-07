@@ -134,6 +134,8 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-setup",
     "td-sh",
     "td-software",
+    "td-ssh",
+    "td-ssh-interop",
     "td-svc",
     "td-taskmgr",
     "td-term",

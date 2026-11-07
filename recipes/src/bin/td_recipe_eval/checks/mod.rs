@@ -17,6 +17,7 @@ pub(crate) mod release_source;
 pub(crate) mod qemu_boot;
 pub(crate) mod run;
 mod rust_toolchain;
+mod ssh_interop;
 mod tzdata;
 pub(crate) mod vm_profile;
 
@@ -29,5 +30,6 @@ pub(crate) fn run(
         CheckRunner::BuildOnly => basic::run_build_only(runner, stem),
         CheckRunner::RustToolchain => rust_toolchain::run(runner),
         CheckRunner::Tzdata => tzdata::run(runner),
+        CheckRunner::SshInterop => ssh_interop::run(runner),
     }
 }

@@ -3,10 +3,12 @@
 //! reading their own `src/` off disk, since the compiler cannot say "only
 //! `sys.rs` holds an unsafe block" or "no module is reached by `#[path]`".
 //!
-//! It is a dev-dependency only (AGENTS.md principle 2): no recipe stages it and
-//! no shipped binary links it, because the recipes build those crates without
-//! `--test`. A change to how it reads comments, literals, or the tokens after
-//! `unsafe` is a change to every consumer's confinement, and is reviewed as one.
+//! It is a dev-dependency only (AGENTS.md principle 2): no shipped binary links it,
+//! because the recipes build those crates without `--test`. Only td-ssh's recipe
+//! stages it, since its `cargo` reads a dev-dependency to resolve the lock, and it
+//! compiles none of it. A change to how it reads comments, literals, or the tokens
+//! after `unsafe` is a change to every consumer's confinement, and is reviewed as
+//! one.
 
 #![forbid(unsafe_code)]
 

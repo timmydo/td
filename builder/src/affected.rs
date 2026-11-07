@@ -135,10 +135,12 @@ fn local_source_crate(p: &str) -> Option<&'static str> {
     if p.contains("..") {
         return None;
     }
-    ["td-install-qemu-test"].into_iter().find(|name| {
-        p.strip_prefix(name)
-            .is_some_and(|rest| rest.starts_with('/'))
-    })
+    ["td-install-qemu-test", "td-ssh-interop"]
+        .into_iter()
+        .find(|name| {
+            p.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1457,15 +1459,18 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     }
 
     // td-source-scan is the confinement tests' shared source reader and only
-    // ever a dev-dependency: no recipe stages, embeds or names it, and the
-    // recipes compile its consumers' src/ with a direct rustc and no
-    // `--test` (td-svc's `--test` build is tests/pair.rs, its own crate
-    // root), so no target artifact can change. The cargo-test preflight is
-    // everything that reads it: its own suite and lints, and through the
-    // reader closure every consumer's confinement tests.
-    // `source_scan_reaches_no_recipe` holds the premise.
+    // ever a dev-dependency: no target artifact compiles it, as the recipes
+    // compile its consumers' src/ with a direct rustc and no `--test` (td-svc's
+    // `--test` build is tests/pair.rs, its own crate root). The cargo-test
+    // preflight is everything that reads it: its own suite and lints, and through
+    // the reader closure every consumer's confinement tests. td-ssh's cargo recipe
+    // alone stages it, to resolve its lock, so an edit changes that source input
+    // and takes the target gates with it, as td-test-compositor's does.
+    // `source_scan_reaches_only_the_td_ssh_recipe` holds the premise.
     if p.starts_with("td-source-scan/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -1530,6 +1535,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // The notebook the same way: td-pass-test runs the static binary's
     // entry, and its window's cases run under the native harness.
     if p.starts_with("td-pass/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
+    // SSH the same way: td-ssh-test logs in between its static binaries and
+    // stock OpenSSH.
+    if p.starts_with("td-ssh/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");
@@ -2943,6 +2957,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-pass/src/app/mod.rs", "recipe-checks");
     assert_preflight!("td-pass/src/backend.rs", "cargo-test");
     assert_target!("td-pass/Cargo.lock", "recipe-checks");
+    // SSH as well: td-ssh-test's real logins.
+    assert_target!("td-ssh/src/conn.rs", "check");
+    assert_target!("td-ssh/src/server/monitor.rs", "recipe-checks");
+    assert_preflight!("td-ssh/src/client.rs", "cargo-test");
+    assert_target!("td-ssh/Cargo.lock", "recipe-checks");
+    assert_target!("td-ssh-interop/src/main.rs", "recipe-checks");
+    assert_preflight!("td-ssh-interop/src/main.rs", "cargo-test");
     // The application manager as well: td-software-test runs its text
     // modes.
     assert_preflight!("td-software/src/app.rs", "cargo-test");
@@ -6918,6 +6939,7 @@ mod tests {
                 "td-netd",
                 "td-primitives",
                 "td-sh",
+                "td-ssh",
                 "td-svc",
                 "td-util"
             ]
@@ -9700,6 +9722,8 @@ mod tests {
                 "td-secret",
                 "td-setup",
                 "td-software",
+                "td-ssh",
+                "td-ssh-interop",
                 "td-taskmgr",
                 "td-term",
                 "td-ui",
@@ -9720,9 +9744,10 @@ mod tests {
         // reading td-install's codecs, adds two, and td-init, whose
         // secret-line PTY test opens its terminal through td-ui, adds two;
         // td-boot, which includes td-init's console identity by `#[path]`,
-        // and td-kexec and td-update, which read td-boot, add two each.
+        // and td-kexec and td-update, which read td-boot, add two each, as do
+        // td-ssh, which mounts td-login's sources, and td-ssh-interop, its driver.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 78, "{comp:?}");
+        assert_eq!(comp.len(), 82, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -9757,6 +9782,8 @@ mod tests {
                 "td-secret",
                 "td-setup",
                 "td-software",
+                "td-ssh",
+                "td-ssh-interop",
                 "td-taskmgr",
                 "td-term",
                 "td-ui",
@@ -9798,6 +9825,8 @@ mod tests {
                 "td-secret",
                 "td-setup",
                 "td-software",
+                "td-ssh",
+                "td-ssh-interop",
                 "td-taskmgr",
                 "td-term",
                 "td-ui",
@@ -10462,9 +10491,10 @@ mod tests {
     }
 
     /// A td-source-scan change selects the cargo-test preflight over the crate
-    /// and every consumer's confinement tests, and no target gate.
+    /// and every consumer's confinement tests, and the target gates, since it
+    /// is a source input of td-ssh's recipe.
     #[test]
-    fn source_scan_changes_run_consumer_tests_without_distro_checks() {
+    fn source_scan_changes_run_consumer_tests_and_the_target_gates() {
         let root = repo_root();
         let Ok(roster) = discover_gate_crates(&root) else {
             eprintln!("SKIP: no roster crates (builder-only sandbox)");
@@ -10487,6 +10517,7 @@ mod tests {
                 "td-jail",
                 "td-login",
                 "td-sh",
+                "td-ssh",
                 "td-svc",
                 "td-util",
             ] {
@@ -10495,8 +10526,8 @@ mod tests {
                     "{path} selects no preflight over {krate}: {output}"
                 );
             }
-            assert!(!output.contains("td-builder check"), "{path}: {output}");
-            assert!(!output.contains("recipe-checks scope"), "{path}: {output}");
+            assert!(output.contains("td-builder check"), "{path}: {output}");
+            assert!(output.contains("recipe-checks scope"), "{path}: {output}");
         }
         for path in [
             "td-source-scan-x/src/lib.rs",
@@ -10509,12 +10540,13 @@ mod tests {
         }
     }
 
-    /// The premise of td-source-scan's cargo-test-only arm: it is a
-    /// dev-dependency of every crate that names it and a dependency of none,
-    /// and no recipe or staged tree names it, so no target artifact compiles
-    /// it. A recipe that built a consumer's tests would void the arm.
+    /// The premise of td-source-scan's arm: it is a dev-dependency of every crate
+    /// that names it and a dependency of none, so no target artifact compiles it,
+    /// and the one recipe naming it is td-ssh's, whose `cargo` reads it to resolve
+    /// the lock. Another recipe staging it, or one building a consumer's tests,
+    /// would need that arm revisited.
     #[test]
-    fn source_scan_reaches_no_recipe() {
+    fn source_scan_reaches_only_the_td_ssh_recipe() {
         let root = repo_root();
         let Ok(roster) = discover_gate_crates(&root) else {
             eprintln!("SKIP: no roster crates (builder-only sandbox)");
@@ -10535,8 +10567,13 @@ mod tests {
         let mut recipes = Vec::new();
         collect_rs_recursive(&root.join("recipes/src"), &mut recipes);
         assert!(!recipes.is_empty());
-        for path in recipes {
-            let text = std::fs::read_to_string(&path).unwrap();
+        // `catalog.rs`'s test names every staged tree.
+        let allowed = [
+            root.join("recipes/src/recipes/td-ssh.rs"),
+            root.join("recipes/src/catalog.rs"),
+        ];
+        for path in recipes.iter().filter(|path| !allowed.contains(path)) {
+            let text = std::fs::read_to_string(path).unwrap();
             for spelling in spellings {
                 assert!(
                     !text.contains(spelling),
@@ -10545,8 +10582,14 @@ mod tests {
                 );
             }
         }
+        for path in &allowed {
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(!text.contains("td_source_scan"), "{}", path.display());
+        }
         let staged = std::fs::read_to_string(root.join("seed/local-source-roster.txt")).unwrap();
-        assert!(!staged.contains(name), "{name} now enters a recipe closure");
+        let lines: Vec<&str> = staged.lines().filter(|l| l.contains(name)).collect();
+        assert_eq!(lines.len(), 1, "{name} enters another recipe: {lines:?}");
+        assert!(lines[0].starts_with("td-ssh-source "), "{lines:?}");
     }
 
     /// td-pinentry's arm selects the cargo-test preflight alone because no

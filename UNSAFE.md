@@ -179,8 +179,9 @@ tokens after each `unsafe`, the allow and block counts, module coverage,
 and the constructs that would decouple the scanned text from the compiled
 crate; and `td-primitives` also the tokens after each `unsafe` and the
 allow and block counts. It is a
-dev-dependency only, absent from every recipe and shipped binary, and
-forbids `unsafe` itself. A change to how it reads comments, literals or
+dev-dependency only, absent from every shipped binary and from every recipe
+but `td-ssh`'s, whose `cargo` must read it to resolve the lock and compiles
+none of it, and forbids `unsafe` itself. A change to how it reads comments, literals or
 tokens is a change to each consumer's confinement and is reviewed as
 one.
 

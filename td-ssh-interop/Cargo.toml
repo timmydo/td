@@ -1,0 +1,23 @@
+[package]
+name = "td-ssh-interop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Drives real logins between td-ssh and stock OpenSSH for td-ssh-test"
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

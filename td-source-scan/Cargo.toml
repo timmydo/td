@@ -9,8 +9,9 @@ license = "MIT"
 # a worktree nested under it (see the root Cargo.toml). A consumer names this
 # crate under a bare [dev-dependencies] as
 # `td-source-scan = { path = "../td-source-scan" }`, the one sibling spelling
-# the lock guard admits (AGENTS.md 'Rust code'); no recipe stages it and no
-# shipped binary links it. It depends on nothing but `std`.
+# the lock guard admits (AGENTS.md 'Rust code'); no shipped binary links it, and
+# only td-ssh's recipe stages it, for cargo to resolve that lock. It depends on
+# nothing but `std`.
 [workspace]
 
 [lib]

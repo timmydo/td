@@ -518,6 +518,8 @@ mod tests {
                 "td-sandbox",
                 "td-setup",
                 "td-software",
+                "td-ssh",
+                "td-ssh-interop",
                 "td-taskmgr",
                 "td-term",
                 "td-time",
@@ -651,6 +653,7 @@ mod tests {
                 "td-jpeg",
                 "td-json",
                 "td-kv",
+                "td-login",
                 "td-luks",
                 "td-mail",
                 "td-markdown",
@@ -669,6 +672,8 @@ mod tests {
                 "td-secret",
                 "td-setup",
                 "td-software",
+                "td-source-scan",
+                "td-ssh",
                 "td-taskmgr",
                 "td-term",
                 "td-test-compositor",
@@ -683,7 +688,7 @@ mod tests {
         lone.dedup();
         assert_eq!(
             lone,
-            ["td-install-qemu-test"],
+            ["td-install-qemu-test", "td-ssh-interop"],
             "a lone local-source crate joined; add it to builder/src/affected.rs local_source_crate"
         );
     }
