@@ -565,18 +565,21 @@ containing public `td-build-info`. The reader accepts only the exact
 canonical archive, from the already hash-verified initramfs descriptor.
 No inode timestamp or current checkout supplies an old system's label.
 
-The booted system names the same commit in `/etc/os-release`, as
+The booted system uses the UTC source commit date (`YYYY-MM-DD`) as
+`VERSION` and `VERSION_ID` in `/etc/os-release`, with `PRETTY_NAME="td DATE"`.
+The build date never substitutes for the commit date. It names the same commit as
 `BUILD_ID="COMMIT"`, or `BUILD_ID="COMMIT+dirty"` for an uncommitted
 checkout. The kernel unpacks the appendix into the deployment initramfs's
 rootfs, and `td-boot os-release /sysroot` decodes that member strictly, stages
-the image's os-release plus that one line as `/run/td-os-release`, and binds it
+the image's os-release with its version/display fields replaced and `BUILD_ID`
+added as `/run/td-os-release`, and binds it
 read-only over `/etc/os-release` before the switch to the real root. It stays a
 regular file, so td-jail's host `/etc` entries keep carrying it, which a
 `MUTABLE_ETC` link into `/run` would not. Because the commit comes from the
 booted deployment rather than from `/var`, a rollback reports the previous
 deployment's own commit, if that deployment's init has this step.
 A deployment no one assembled, such as a raw recipe output or `./build-qcow`'s,
-keeps the image's file and names no build; a failed step does the same, a bind
+keeps the unversioned image file and names no build; a failed step does the same, a bind
 left writable by a failed remount being unmounted again, and costs only its
 console line. `/etc/rootcheck` fails a boot whose `/etc/os-release` accepts a
 write and prints the line it found, which `qemu-boot-live` requires from a live

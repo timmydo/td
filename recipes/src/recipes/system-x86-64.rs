@@ -208,7 +208,6 @@ struct SystemDef {
     profile: Profile,
     hostname: &'static str,
     os_name: &'static str,
-    os_version: &'static str,
     /// Welcome banner printed by the login shell (via `/etc/profile`).
     motd: &'static str,
     /// The user getty auto-logs-in on ttyS0, through `/etc/autologin` running
@@ -597,7 +596,6 @@ const SYSTEM: SystemDef = SystemDef {
     profile: Profile::Desktop,
     hostname: "td",
     os_name: "td",
-    os_version: "0.1",
     // NOTE: td-builder's config reader now decodes JSON as UTF-8 (the shared
     // engine/src/json.rs, same codec td-recipe-eval emits with), so a multi-byte
     // char here round-trips intact. Keeping /etc strings ASCII is still the safe
@@ -4176,11 +4174,8 @@ fn build_netup() -> String {
 
 fn build_os_release(sys: &SystemDef) -> String {
     format!(
-        "NAME=\"{name}\"\nID={id}\nVERSION=\"{ver}\"\nVERSION_ID={ver}\n\
-         PRETTY_NAME=\"{name} {ver}\"\n",
-        name = sys.os_name,
-        id = sys.os_name,
-        ver = sys.os_version
+        "NAME=\"{name}\"\nID={name}\nPRETTY_NAME=\"{name}\"\n",
+        name = sys.os_name
     )
 }
 
@@ -10962,7 +10957,6 @@ mod tests {
             profile: SYSTEM.profile,
             hostname: SYSTEM.hostname,
             os_name: SYSTEM.os_name,
-            os_version: SYSTEM.os_version,
             motd: SYSTEM.motd,
             autologin: SYSTEM.autologin,
             users: SYSTEM.users,
@@ -11629,7 +11623,6 @@ mod tests {
             profile: sys.profile,
             hostname: sys.hostname,
             os_name: sys.os_name,
-            os_version: sys.os_version,
             motd: sys.motd,
             autologin: sys.autologin,
             users: sys.users,
@@ -11672,7 +11665,6 @@ mod tests {
             profile: SYSTEM.profile,
             hostname: SYSTEM.hostname,
             os_name: SYSTEM.os_name,
-            os_version: SYSTEM.os_version,
             motd: SYSTEM.motd,
             autologin: SYSTEM.autologin,
             users: SYSTEM.users,
@@ -12487,6 +12479,7 @@ mod tests {
         assert!(rootcheck.contains("echo \"TD-OS-RELEASE $b\""));
         // The image's own file keeps naming no build.
         assert!(!build_os_release(&SYSTEM).contains("BUILD_ID"));
+        assert!(!build_os_release(&SYSTEM).contains("VERSION"));
     }
 
     #[test]

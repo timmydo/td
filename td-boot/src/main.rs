@@ -3900,7 +3900,7 @@ fn run_admit(run: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The image's os-release with the build's source appended. `dirty` marks
+/// The image's os-release with the deployment's source date and identity. `dirty` marks
 /// a commit that does not identify every byte, as the startup menu's label does.
 fn os_release_with_build(base: &[u8], info: &boot_info::Info) -> io::Result<Vec<u8>> {
     if !base.ends_with(b"\n")
@@ -3913,7 +3913,22 @@ fn os_release_with_build(base: &[u8], info: &boot_info::Info) -> io::Result<Vec<
         ));
     }
     let state = if info.dirty { "+dirty" } else { "" };
-    let mut text = base.to_vec();
+    let mut text = Vec::with_capacity(base.len() + 192);
+    for line in base.split_inclusive(|b| *b == b'\n') {
+        if ![b"VERSION=".as_slice(), b"VERSION_ID=", b"PRETTY_NAME="]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        {
+            text.extend_from_slice(line);
+        }
+    }
+    text.extend_from_slice(
+        format!(
+            "VERSION=\"{date}\"\nVERSION_ID=\"{date}\"\nPRETTY_NAME=\"td {date}\"\n",
+            date = info.commit_date
+        )
+        .as_bytes(),
+    );
     text.extend_from_slice(format!("BUILD_ID=\"{}{state}\"\n", info.commit).as_bytes());
     Ok(text)
 }
@@ -4421,12 +4436,12 @@ mod tests {
     }
 
     #[test]
-    fn os_release_appends_the_commit_after_the_images_own_lines() {
-        let base = b"NAME=\"td\"\nID=td\n";
+    fn os_release_uses_commit_date_and_preserves_exact_build_identity() {
+        let base = b"NAME=\"td\"\nID=td\nVERSION=\"0.1\"\nVERSION_ID=0.1\nPRETTY_NAME=\"td 0.1\"\n";
         let clean = os_release_with_build(base, &os_release_info(false)).unwrap();
         assert_eq!(
             String::from_utf8(clean).unwrap(),
-            format!("NAME=\"td\"\nID=td\nBUILD_ID=\"{}\"\n", "c".repeat(40))
+            format!("NAME=\"td\"\nID=td\nVERSION=\"2026-11-03\"\nVERSION_ID=\"2026-11-03\"\nPRETTY_NAME=\"td 2026-11-03\"\nBUILD_ID=\"{}\"\n", "c".repeat(40))
         );
         let dirty = os_release_with_build(base, &os_release_info(true)).unwrap();
         assert!(String::from_utf8(dirty)
@@ -4466,7 +4481,7 @@ mod tests {
         assert_eq!(view, root.join(OS_RELEASE_VIEW));
         assert_eq!(
             fs::read_to_string(&view).unwrap(),
-            format!("ID=td\nBUILD_ID=\"{}\"\n", "c".repeat(40))
+            format!("ID=td\nVERSION=\"2026-11-03\"\nVERSION_ID=\"2026-11-03\"\nPRETTY_NAME=\"td 2026-11-03\"\nBUILD_ID=\"{}\"\n", "c".repeat(40))
         );
         assert_eq!(fs::metadata(&view).unwrap().permissions().mode() & 0o222, 0);
         // The image's file is left as it is: the view binds over it.
