@@ -115,6 +115,11 @@ the kernel leaves on (`quirk_igfx_skip_te_disable`, Ice Lake through Meteor Lake
 Each deployment's initramfs offers the CPU its vendor's current microcode, which
 the kernel log shows it taking or not (AGENTS.md, "CPU microcode").
 
+td starts only through UEFI, and with Secure Boot off. Nothing signs td's selector,
+so firmware enforcing Secure Boot refuses it and the medium does not start until
+Secure Boot is turned off in that machine's setup. Chaining to the platform's keys
+is a separate design (DESIGN.md).
+
 A machine needs the kernel's drivers and firmware before anything else can
 work. `hwcheck` reports that much: on a booted td system it lists each PCI and
 USB device with its driver, or `NO DRIVER`, counting and not listing unbound
