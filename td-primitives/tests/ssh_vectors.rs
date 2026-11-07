@@ -647,11 +647,11 @@ fn decrypts(text: &'static str, comment: &[u8]) {
 fn openssh_key_files_decrypt_through_bcrypt_and_aes() {
     decrypts(
         include_str!("ssh/openssh_ed25519_a2.txt"),
-        b"td-ssh-crypto rounds 2",
+        b"td-primitives rounds 2",
     );
     decrypts(
         include_str!("ssh/openssh_ed25519_a16.txt"),
-        b"td-ssh-crypto rounds 16 with a longer comment than usual",
+        b"td-primitives rounds 16 with a longer comment than usual",
     );
 }
 
@@ -691,7 +691,7 @@ fn an_openssh_chacha_key_file_decrypts_in_full() {
     assert!(aead.open(1, &mut sealed, &tag).is_err());
 }
 
-const CHACHA_FILE_COMMENT: &[u8] = b"td-ssh-crypto chachapoly";
+const CHACHA_FILE_COMMENT: &[u8] = b"td-primitives chachapoly";
 
 /// A random key almost never passes the modulus check, so it stops there. The largest
 /// valid coefficients are what reach the arithmetic with the most to carry.
