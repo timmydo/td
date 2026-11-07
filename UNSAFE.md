@@ -1254,8 +1254,8 @@ out-of-bounds kernel write from code the compiler reads as safe; and
 check that would catch a constructed termios can only fire against a real
 terminal, which the gate has none of.
 
-Every other applet td-util serves is safe `std`: `/proc` and `/dev/kmsg`
-read as ordinary files, and the build-tool applets (`find`, `xargs`,
+Every other applet td-util serves is safe `std`: `/proc`, `/sys` and
+`/dev/kmsg` read as ordinary files, and the build-tool applets (`find`, `xargs`,
 `cmp`, `diff`, `od`, `uname`, `gzip`, `tar`, `cpio`, `gen_init_cpio`) walk,
 read, write and spawn through `std::fs` and `std::process`. That is what
 keeps the surface at one syscall.

@@ -62,7 +62,7 @@ pub fn render(text: &str, show_time: bool, raw: bool) -> String {
     out
 }
 
-fn read_kmsg(path: &str) -> Result<String, String> {
+pub fn read_kmsg(path: &str) -> Result<String, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .read(true)

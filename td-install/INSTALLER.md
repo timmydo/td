@@ -86,6 +86,19 @@ volumes mount at boot, and removable media mount for the owner while
 the session is unlocked (td-disks/DESIGN.md). None of this has been
 tried on the machine.
 
+A machine needs the kernel's drivers and firmware before anything else can
+work. `hwcheck` reports that much: on a booted td system it lists each PCI and
+USB device with its driver, or `NO DRIVER`, counting and not listing unbound
+bridge and chipset functions, and each firmware file the loader logged as not
+found, saying so if the log no longer reaches back to boot. A driver can ask for
+a file quietly or be able to do without it, so that list neither clears nor
+condemns a device. On any Linux system, a td checkout's
+`td-util hwcheck --builtin FILE` compares that machine's devices with the
+`modules.builtin.modinfo` a built `linux-x86-64` recipe output holds beside its
+`bzImage`; the image does not carry it. Both read PCI and USB only, not a device
+on an ACPI, I2C or platform bus, and a driver's presence does not establish that
+the device works.
+
 Legacy BIOS, resizing, dual boot and RAID are outside v1. Preserving an
 existing td installation is limited to the explicit reinstall mode below.
 For a new installation, one selected whole disk is reformatted, not

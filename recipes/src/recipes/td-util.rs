@@ -10,7 +10,7 @@ use crate::types::{Recipe, Step};
 // `recipes/src/recipes/*.rs` catalog glob, so it is not itself a recipe module.
 //
 // SCOPE: the applets that must run where uutils' coreutils cannot. Two kinds.
-// `clear`, `which`, `free`, `ps`, `dmesg` and `less` are names uutils does not
+// `clear`, `which`, `free`, `ps`, `dmesg`, `hwcheck` and `less` are names uutils does not
 // provide at all, and get `/bin` symlinks — `less` not quite: uutils has a pager
 // behind a feature flag that compiles a crossterm stack in, which is a dependency
 // this image does not take, so busybox was being carried for `more` alone.
@@ -40,9 +40,9 @@ use crate::types::{Recipe, Step};
 // syscall this roster does not have, which is a further reviewed amendment.
 //
 // system-x86-64 packs td-util into the real root AND both initramfs cpios, routes
-// /bin/{clear,which,free,ps,dmesg,less} here, and calls the others as
+// /bin/{clear,which,free,ps,dmesg,hwcheck,less} here, and calls the others as
 // `td-util <applet>` where it used to call `busybox <applet>`. The greeter runs each
-// by its /bin path and emits TD_UTIL_RUNTIME_MARKER only if all six exit 0, so
+// by its /bin path and emits TD_UTIL_RUNTIME_MARKER only if all of them exit 0, so
 // `td-recipe-eval qemu-boot-system` re-proves the whole
 // farm on every boot — including the /proc and /dev/kmsg applets whose legs below
 // are skipped when the build sandbox lacks /proc. That oracle is operator-run (qemu
@@ -93,6 +93,7 @@ const MODULES: &[(&str, &str)] = &[
     ),
     ("glob", include_str!("../../../td-util/src/glob.rs")),
     ("gz", include_str!("../../../td-util/src/gz.rs")),
+    ("hwcheck", include_str!("../../../td-util/src/hwcheck.rs")),
     ("less", include_str!("../../../td-util/src/less.rs")),
     ("od", include_str!("../../../td-util/src/od.rs")),
     ("printf", include_str!("../../../td-util/src/printf.rs")),

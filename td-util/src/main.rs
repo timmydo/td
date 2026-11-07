@@ -3,7 +3,7 @@
 //! PRE-PIVOT userland: the applets that must run where uutils' coreutils cannot,
 //! and that need no syscall surface beyond what safe `std` already exposes.
 //!
-//! Two kinds of caller, one reason. `clear`/`which`/`free`/`ps`/`dmesg`/`less` are
+//! Two kinds of caller, one reason. `clear`/`which`/`free`/`ps`/`dmesg`/`hwcheck`/`less` are
 //! names uutils does not provide at all — `less` not quite: uutils has a pager
 //! behind a feature flag that compiles a crossterm stack in, which is a dependency
 //! this image does not take, so busybox was being carried for `more` alone.
@@ -85,6 +85,7 @@ mod gz;
     )
 )]
 mod gzip;
+mod hwcheck;
 mod less;
 mod od;
 mod printf;
@@ -124,6 +125,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("gen_init_cpio", gen_init_cpio::run),
     ("gunzip", gz::gunzip),
     ("gzip", gz::gzip),
+    ("hwcheck", hwcheck::run),
     ("less", less::run),
     ("ln", fileops::ln),
     ("mkdir", fileops::mkdir),
@@ -410,8 +412,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            26,
-            "expected twenty-six modules in src/ beside the crate root"
+            27,
+            "expected twenty-seven modules in src/ beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -453,6 +455,7 @@ mod confinement {
                 "gen_init_cpio.rs",
                 "glob.rs",
                 "gz.rs",
+                "hwcheck.rs",
                 "less.rs",
                 "main.rs",
                 "od.rs",

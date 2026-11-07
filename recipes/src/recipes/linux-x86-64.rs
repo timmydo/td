@@ -1190,6 +1190,9 @@ pub fn recipe() -> Recipe {
         files: vec![
             "{src}/vmlinux".into(),
             "{src}/System.map".into(),
+            // What each built-in driver binds: `hwcheck --builtin` reads it to
+            // say, from any Linux system, whether this kernel fits that machine.
+            "{src}/modules.builtin.modinfo".into(),
             "{src}/arch/x86/boot/bzImage".into(),
             "{root}/initramfs.cpio".into(),
         ],
@@ -1199,10 +1202,27 @@ pub fn recipe() -> Recipe {
         paths: vec![
             "{out}/vmlinux".into(),
             "{out}/bzImage".into(),
+            "{out}/modules.builtin.modinfo".into(),
             "{out}/initramfs.cpio".into(),
         ],
         exec: false,
     });
+    // A kernel without modules holds drivers' device tables here only because
+    // modpost writes them for vmlinux too, so a later kbuild could leave a
+    // table of a few explicit aliases that reads as no drivers at all.
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                SH,
+                "-c",
+                "for a in nvme.alias=pci: xhci_pci.alias=pci: usbhid.alias=usb:; do \
+                 grep -aqF \"$a\" '{out}/modules.builtin.modinfo' || \
+                 { echo \"modules.builtin.modinfo lacks $a: hwcheck --builtin would read as no drivers\" >&2; exit 1; }; done",
+            ],
+        )
+        .env("PATH", PATH),
+    );
     // [native-arch] vmlinux must be an ELF64 x86-64 linked executable (EXEC, not a
     // stray relocatable .o) — caught at the producer rung.
     steps.push(
