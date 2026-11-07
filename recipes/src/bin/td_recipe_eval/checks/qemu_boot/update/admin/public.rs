@@ -43,7 +43,7 @@ impl Public {
     }
 }
 const SSH: &str = "ssh -F /dev/null -T -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile=/var/home/tester/.td-admin-oracle/known_hosts -o ConnectTimeout=10 -i /var/home/tester/.td-admin-oracle/key td-admin@127.0.0.1";
-fn ssh(guest: &mut Guest, command: &str) -> Result<Vec<String>> {
+pub(super) fn ssh(guest: &mut Guest, command: &str) -> Result<Vec<String>> {
     guest.command(&format!("{SSH} '{command}'"))
 }
 fn job(guest: &mut Guest, verb: &str, previous: &mut u64) -> Result<(String, String)> {

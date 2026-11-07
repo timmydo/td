@@ -316,6 +316,13 @@ pub(crate) fn run(runner: &crate::check_runner::RecipeCheckRunner) -> Result<()>
             }
             println!("{marker}");
         }
+        // The operator-only public mode's own line, so its client and its stdin, the
+        // guest's console rather than the fixture's /dev/null, are proved on every run.
+        let status = public::ssh(&mut guest, "status")?;
+        if !status.iter().any(|line| line.starts_with("job ")) {
+            return Err(format!("public mode's SSH line got no job: {status:?}"));
+        }
+        println!("TD-ADMIN-PUBLIC-LINE");
         guest.send(&format!("{CLIENT} reboot"))?;
         shutdown(guest)?;
         let mut guest = Guest::healthy(&options, 2, deadline, &disk, |_| Ok(()))?;
