@@ -603,7 +603,7 @@ mod tests {
             return;
         }
         let uid = fs::metadata("/proc/self").unwrap().uid();
-        // OpenSSH StrictModes deliberately rejects /tmp even for private children.
+        // The host OpenSSH's StrictModes deliberately rejects /tmp even for private children.
         // Concurrent hosted checks run in their own PID namespaces over the one
         // HOME, so the pid alone can repeat: take the first name this creates.
         let home = PathBuf::from(std::env::var_os("HOME").expect("host HOME"));

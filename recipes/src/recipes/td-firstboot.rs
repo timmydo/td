@@ -10,7 +10,7 @@ use crate::types::{Recipe, Step};
 // on a machine's first boot. Per-file symlinks rather than an /etc overlay: the
 // overlay would retire SYSTEM_ETC_RO_MARKER for the whole directory.
 //
-// SCOPE: the /var side only. OpenSSH `ssh-keygen` mints the Ed25519 key;
+// SCOPE: the /var side only. td-ssh's `ssh-keygen` mints the Ed25519 key;
 // td-secret supplies the shared credential store. The crate is safe std (its entropy is
 // /dev/random read as an ordinary file), which keeps it `#![forbid(unsafe_code)]`
 // and adds NO target-side unsafe exception to UNSAFE.md.

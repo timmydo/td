@@ -38,7 +38,7 @@ const STEPS: &[Step] = &[
     Step {
         name: "qemu-boot-server",
         argv: &["qemu-boot-server"],
-        proves: "the headless server image boots to its system units and OpenSSH with nothing graphical, and a candidate that fails health reboots itself until it rolls back",
+        proves: "the headless server image boots to its system units and td-sshd with nothing graphical, and a candidate that fails health reboots itself until it rolls back",
     },
     Step {
         name: "qemu-deploy-rollback",

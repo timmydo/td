@@ -20,11 +20,11 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // fingerprint — the same before/after shape the qemu oracle checks across a reboot,
 // but decided here in seconds and without a VM.
 //
-// `--keygen` is pointed at a STUB rather than the real OpenSSH package: what needs
+// `--keygen` is pointed at a STUB rather than the real td-ssh package: what needs
 // proving here is td-firstboot's end of the standard `ssh-keygen` contract (the
 // generation and fingerprint argv, and the files it then insists on). The real
 // pairing is exercised by `qemu-boot-system`, which boots the image with the actual
-// `/bin/ssh-keygen` and `/bin/sshd`. The stub is deliberately
+// `/bin/ssh-keygen` and `/bin/td-sshd`. The stub is deliberately
 // also driven into its failure modes — a keygen that exits non-zero, and one that
 // claims success without writing a key — because those are the paths where a
 // machine ends up believing it has an identity it does not have.
@@ -80,7 +80,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", PATH),
     );
 
-    // The keygen stub: the three standard OpenSSH operations td-firstboot uses, in
+    // The keygen stub: the three standard `ssh-keygen` operations td-firstboot uses, in
     // the smallest form that can hold them. Generation writes a fixed pair,
     // derivation parses the private fixture and emits its public half, and
     // fingerprinting reports a fixed 256-bit Ed25519 SHA-256 line.
@@ -105,7 +105,7 @@ pub fn recipe() -> Recipe {
              if [ \"$mode\" = derive ]; then\n\
                key=$(cat \"$file\") || exit 1\n\
                case \"$key\" in\n\
-                 'STUB PRIVATE KEY') echo 'ssh-ed25519 STUB td-openssh-host-key' ;;\n\
+                 'STUB PRIVATE KEY') echo 'ssh-ed25519 STUB td-ssh-host-key' ;;\n\
                  'STUB RSA PRIVATE KEY') echo 'ssh-rsa RSASTUB wrong-type' ;;\n\
                  *) echo 'stub: malformed private key' >&2; exit 1 ;;\n\
                esac\n\
@@ -113,11 +113,11 @@ pub fn recipe() -> Recipe {
              fi\n\
              if [ \"$mode\" = fingerprint ]; then\n\
                [ -f \"$file\" ] || exit 1\n\
-               echo '256 SHA256:stubfingerprint td-openssh-host-key (ED25519)'\n\
+               echo '256 SHA256:stubfingerprint td-ssh-host-key (ED25519)'\n\
                exit 0\n\
              fi\n\
              printf 'STUB PRIVATE KEY\\n' > \"$file\"\n\
-             printf 'ssh-ed25519 STUB td-openssh-host-key\\n' > \"$file.pub\"\n"
+             printf 'ssh-ed25519 STUB td-ssh-host-key\\n' > \"$file.pub\"\n"
         ),
         exec: true,
     });
@@ -148,10 +148,10 @@ pub fn recipe() -> Recipe {
                esac\n\
              done\n\
              case \"$mode\" in\n\
-               derive) echo 'ssh-ed25519 STUB td-openssh-host-key' ;;\n\
+               derive) echo 'ssh-ed25519 STUB td-ssh-host-key' ;;\n\
                fingerprint) echo 'not a SHA-256 Ed25519 fingerprint' ;;\n\
                generate) printf 'STUB PRIVATE KEY\\n' > \"$file\"; \
-                 printf 'ssh-ed25519 STUB td-openssh-host-key\\n' > \"$file.pub\" ;;\n\
+                 printf 'ssh-ed25519 STUB td-ssh-host-key\\n' > \"$file.pub\" ;;\n\
              esac\n"
         ),
         exec: true,

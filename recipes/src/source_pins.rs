@@ -46,7 +46,7 @@ const PINS: &[PinDef] = &[
         aliases: &[],
         // Git 2.56.0 is the source-built daily-driver client. Its td configuration
         // keeps local repositories and dispatches SSH remotes through the separate
-        // OpenSSH package and HTTP(S) remotes through td-net's helper, while
+        // td-ssh package and HTTP(S) remotes through td-net's helper, while
         // omitting language runtimes, libcurl, WebDAV, and direct OpenSSL use.
         url: "https://www.kernel.org/pub/software/scm/git/git-2.56.0.tar.xz",
         sha256: "26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3",
@@ -387,9 +387,9 @@ const PINS: &[PinDef] = &[
     PinDef {
         key: "openssh-x86-64-source",
         aliases: &[],
-        // OpenSSH Portable 10.6p2 supplies both halves of td's minimal SSH
-        // surface. The recipe builds only ssh, ssh-keygen, sshd and the two
-        // mandatory privilege-separation helpers, without libcrypto or zlib.
+        // OpenSSH Portable 10.6p2, td-ssh-test's peer and in no image. The recipe
+        // builds only what that check drives (ssh, ssh-keygen, sshd and its two
+        // helpers, scp, sftp), without libcrypto or zlib.
         url: "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.6p2.tar.gz",
         sha256: "9ae44872090cf2f06b3cf9ff147e7f16f309671340763ed2f99248398ae29d5b",
         file: "openssh-10.6p2.tar.gz",

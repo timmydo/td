@@ -1,6 +1,11 @@
 //! Real logins between td-ssh and stock OpenSSH (td-ssh/DESIGN.md section 9). It
 //! runs as one process because each `store-ns` is its own network namespace: both
 //! ends of a connection must start from here. A wrong KEX or AEAD cannot pass this.
+//! It also hands the real td-sshd every form of the image's rendered policy, since
+//! that daemon refuses a whole file for one keyword it does not know.
+
+#[path = "../../td-firstboot/src/ssh_policy.rs"]
+mod ssh_policy;
 
 use std::collections::HashMap;
 use std::fs;
@@ -42,6 +47,8 @@ const DOWNLOAD_REKEY_LIMIT: &str = "RekeyLimit=128K";
 const KEX_LINE: &str = "kex: algorithm: ";
 const TD_REKEYED: &str = "rekeyed ";
 const STOCK_NEW_KEYS: &str = "SSH2_MSG_NEWKEYS sent";
+/// The primary account the image's policy is rendered for.
+const POLICY_PRIMARY: &str = "alice";
 
 /// Bytes that are not their own neighbours, so a dropped or repeated block shows.
 fn pattern(length: usize) -> Vec<u8> {
@@ -95,6 +102,8 @@ struct Tools {
     ssh: PathBuf,
     sshd: PathBuf,
     ssh_keygen: PathBuf,
+    scp: PathBuf,
+    sftp: PathBuf,
     sshd_session: PathBuf,
     sshd_auth: PathBuf,
     td_ssh: PathBuf,
@@ -1072,6 +1081,387 @@ fn td_client_against_stock_sshd(
     still_answering("td-ssh to sshd", client, report)
 }
 
+fn file_digest(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    Ok(digest_line(&bytes))
+}
+
+/// Stock `sftp` and modern `scp`, which speak SFTP to the subsystem through the
+/// stock `ssh` under test, each byte held by digest on the far side too.
+fn file_transfer_against_td_sshd(
+    tools: &Tools,
+    work: &Path,
+    home: &Path,
+    client: &Client<'_>,
+    report: &mut Report,
+) -> Result<(), String> {
+    let payload = pattern(TRANSFER_BYTES);
+    let wanted = digest_line(&payload);
+    let local = work.join("transfer_local");
+    fs::write(&local, &payload).map_err(|error| error.to_string())?;
+    let known_hosts = format!("UserKnownHostsFile={}", client.known_hosts.display());
+    let options = |command: &mut Command| {
+        command
+            .args(["-F", "/dev/null", "-i"])
+            .arg(client.key)
+            .arg("-S")
+            .arg(client.program)
+            .args(["-o", "StrictHostKeyChecking=accept-new", "-o"])
+            .arg(&known_hosts)
+            .args(["-o", "GlobalKnownHostsFile=/dev/null", "-P"])
+            .arg(client.port.to_string());
+    };
+    let batch = |name: &str, script: String| -> Result<Output, String> {
+        let file = work.join(name);
+        fs::write(&file, script).map_err(|error| error.to_string())?;
+        let mut command = Command::new(&tools.sftp);
+        options(&mut command);
+        run(command.arg("-b").arg(&file).arg(&client.target))
+    };
+
+    let back = work.join("sftp_back");
+    let output = batch(
+        "sftp_batch",
+        format!(
+            "mkdir incoming\nput {} incoming/first\nrename incoming/first incoming/moved\nls -l incoming\nget incoming/moved {}\n",
+            local.display(),
+            back.display()
+        ),
+    )?;
+    let listing = text(&output.stdout);
+    report.check(
+        "sftp to td-sshd: a batch of mkdir, put, rename, ls and get",
+        output.status.success(),
+        || describe(&output),
+    );
+    let incoming = fs::metadata(home.join("incoming")).map_err(|error| error.to_string())?;
+    report.check(
+        "sftp to td-sshd: mkdir is under the umask floor",
+        incoming.mode() & 0o022 == 0,
+        || format!("{:o}", incoming.mode()),
+    );
+    let moved = home.join("incoming/moved");
+    let far = file_digest(&moved).unwrap_or_else(|error| error);
+    report.check("sftp to td-sshd: put, by digest", far == wanted, || {
+        format!("wanted {wanted}, the far side holds {far}")
+    });
+    let near = file_digest(&back).unwrap_or_else(|error| error);
+    report.check("sftp to td-sshd: get, by digest", near == wanted, || {
+        format!("wanted {wanted}, got {near}")
+    });
+    report.check(
+        "sftp to td-sshd: rename took the old name, ls shows the new",
+        !home.join("incoming/first").exists() && listing.contains("incoming/moved"),
+        || listing.clone(),
+    );
+    let output = batch(
+        "sftp_cleanup",
+        "rm incoming/moved\nrmdir incoming\n".to_string(),
+    )?;
+    report.check(
+        "sftp to td-sshd: rm and rmdir",
+        output.status.success() && !home.join("incoming").exists(),
+        || describe(&output),
+    );
+
+    let scp = |source: &std::ffi::OsStr, destination: &std::ffi::OsStr| -> Result<Output, String> {
+        let mut command = Command::new(&tools.scp);
+        options(&mut command);
+        run(command.arg("-q").arg(source).arg(destination))
+    };
+    let remote = |path: &str| std::ffi::OsString::from(format!("{}:{path}", client.target));
+    let absolute = work.join("scp_absolute");
+    for (name, path, landed) in [
+        (
+            "scp to td-sshd: upload to an absolute path",
+            absolute.display().to_string(),
+            absolute.clone(),
+        ),
+        (
+            "scp to td-sshd: upload to a home-relative path",
+            "scp_relative".to_string(),
+            home.join("scp_relative"),
+        ),
+        (
+            "scp to td-sshd: upload to a tilde path",
+            "~/scp_tilde".to_string(),
+            home.join("scp_tilde"),
+        ),
+    ] {
+        let output = scp(local.as_os_str(), &remote(&path))?;
+        let far = file_digest(&landed).unwrap_or_else(|error| error);
+        report.check(name, output.status.success() && far == wanted, || {
+            format!(
+                "wanted {wanted}, the far side holds {far}: {}",
+                describe(&output)
+            )
+        });
+    }
+    // scp -r makes each directory, then chmods it to the local one's mode: a request
+    // for that exact mode, which td-sshd honours as sftp-server does. So a 0777 tree
+    // arrives 0777 from either, and it is `MKDIR` that the floor is for, above. What
+    // this holds is the ordinary tree arriving as it was.
+    let tree = work.join("scp_tree");
+    let inner = tree.join("inner");
+    fs::create_dir_all(&inner).map_err(|error| error.to_string())?;
+    fs::write(inner.join("file"), b"in a tree\n").map_err(|error| error.to_string())?;
+    for directory in [&tree, &inner] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+    }
+    let mut command = Command::new(&tools.scp);
+    options(&mut command);
+    let output = run(command
+        .args(["-q", "-r"])
+        .arg(&tree)
+        .arg(remote("scp_tree")))?;
+    let modes: Vec<u32> = [home.join("scp_tree"), home.join("scp_tree/inner")]
+        .iter()
+        .map(|directory| fs::metadata(directory).map_or(u32::MAX, |found| found.mode()))
+        .collect();
+    report.check(
+        "scp -r to td-sshd: directories under the umask floor",
+        output.status.success()
+            && modes
+                .iter()
+                .all(|mode| *mode != u32::MAX && mode & 0o777 == 0o755),
+        || format!("{modes:?}: {}", describe(&output)),
+    );
+    let download = work.join("scp_back");
+    let output = scp(&remote("scp_relative"), download.as_os_str())?;
+    let near = file_digest(&download).unwrap_or_else(|error| error);
+    report.check(
+        "scp to td-sshd: download from a home-relative path",
+        output.status.success() && near == wanted,
+        || format!("wanted {wanted}, got {near}: {}", describe(&output)),
+    );
+    Ok(())
+}
+
+/// What `-T` must say of `user` under one form of the image's policy.
+fn wanted_policy_lines(
+    form: ssh_policy::Form,
+    provisioned: ssh_policy::Provisioned,
+    user: &str,
+) -> Vec<String> {
+    use ssh_policy::{Form, Provisioned};
+    let desktop = provisioned == Provisioned::No;
+    let keys = if user == POLICY_PRIMARY {
+        let mut keys = ssh_policy::SSHD_SELFTEST_AUTHORIZED_KEYS.to_string();
+        if !desktop {
+            keys.push_str(&format!(
+                " {} {}",
+                ssh_policy::SSHD_PROVISIONED_AUTHORIZED_KEYS,
+                ssh_policy::SSHD_METADATA_AUTHORIZED_KEYS
+            ));
+        }
+        if form == Form::Ordinary {
+            keys.push_str(&format!(" {}", ssh_policy::SSHD_USER_AUTHORIZED_KEYS));
+        }
+        keys
+    } else if user == "td-admin" && desktop {
+        "/var/lib/td-admin/authorized_keys".to_string()
+    } else {
+        ssh_policy::SSHD_AUTHORIZED_KEYS.to_string()
+    };
+    let mut lines = vec![
+        format!("hostkey {}", ssh_policy::SSHD_HOST_KEY),
+        "permitrootlogin no".to_string(),
+        format!("authorizedkeysfile {keys}"),
+        "subsystem sftp internal-sftp".to_string(),
+    ];
+    match (form, desktop) {
+        (Form::Ordinary, _) => lines.push("allowusers none".to_string()),
+        (Form::Enforced, true) => {
+            lines.push(format!("allowusers {POLICY_PRIMARY}"));
+            lines.push("allowusers td-admin".to_string());
+        }
+        (Form::Enforced, false) => lines.push(format!("allowusers {POLICY_PRIMARY}")),
+    }
+    if user == "td-admin" && desktop {
+        lines.push("forcecommand /bin/td-admin ssh".to_string());
+        lines.push("permittty no".to_string());
+        lines.push("maxsessions 1".to_string());
+    }
+    lines
+}
+
+/// Every form of the policy the image renders, in the real daemon: `-T` parses the
+/// file as it is and says what a `Match` for each name selects, not whether that
+/// account would be admitted, which it never decides, and `-t` reads it with the
+/// test's host key standing for the machine's, which is all that differs.
+fn image_policy_in_td_sshd(
+    tools: &Tools,
+    work: &Path,
+    user: &str,
+    report: &mut Report,
+) -> Result<(), String> {
+    use ssh_policy::{Form, Provisioned};
+    let host_key = work.join("td_sshd_host");
+    for (name, form, provisioned) in [
+        ("desktop ordinary", Form::Ordinary, Provisioned::No),
+        ("desktop enforced", Form::Enforced, Provisioned::No),
+        ("server ordinary", Form::Ordinary, Provisioned::Server),
+        ("server enforced", Form::Enforced, Provisioned::Server),
+    ] {
+        let policy = ssh_policy::config(POLICY_PRIMARY, form, provisioned);
+        let file = work.join("image_policy");
+        fs::write(&file, &policy).map_err(|error| error.to_string())?;
+        for account in [POLICY_PRIMARY, "tester", "root", "td-admin"] {
+            let output = run(Command::new(&tools.td_sshd)
+                .arg("-T")
+                .arg("-f")
+                .arg(&file)
+                .arg("-C")
+                .arg(format!("user={account},host=localhost,addr=127.0.0.1")))?;
+            let said = text(&output.stdout);
+            let wanted = wanted_policy_lines(form, provisioned, account);
+            let missing: Vec<&String> = wanted
+                .iter()
+                .filter(|line| !said.lines().any(|said| said == line.as_str()))
+                .collect();
+            let admitted = said
+                .lines()
+                .filter(|line| line.starts_with("allowusers "))
+                .count();
+            let allowed = wanted
+                .iter()
+                .filter(|line| line.starts_with("allowusers "))
+                .count();
+            report.check(
+                &format!("the image's {name} policy selected for {account}, by td-sshd -T"),
+                output.status.success() && missing.is_empty() && admitted == allowed,
+                || format!("missing {missing:?}: {}", describe(&output)),
+            );
+        }
+        let with_key = policy.replace(
+            &format!("HostKey {}\n", ssh_policy::SSHD_HOST_KEY),
+            &format!("HostKey {}\n", host_key.display()),
+        );
+        fs::write(&file, with_key).map_err(|error| error.to_string())?;
+        let output = run(Command::new(&tools.td_sshd)
+            .arg("-t")
+            .arg("-f")
+            .arg(&file)
+            .args(["--single-user", user]))?;
+        report.check(
+            &format!("the image's {name} policy, by td-sshd -t"),
+            output.status.success(),
+            || describe(&output),
+        );
+    }
+    Ok(())
+}
+
+/// The enforced form's whole point, by real logins: it withdraws the account's own
+/// `~/.ssh/authorized_keys`, which the ordinary form reads. The root-owned self-test
+/// file both forms name is the test's, for the login that shows this daemon is up.
+fn enforced_form_logins(
+    tools: &Tools,
+    work: &Path,
+    user: &str,
+    in_the_account: &Path,
+    self_test: &Path,
+    report: &mut Report,
+) -> Result<(), String> {
+    use ssh_policy::{Form, Provisioned};
+    let public_of = |path: &Path| -> Result<String, String> {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".pub");
+        fs::read_to_string(name).map_err(|error| error.to_string())
+    };
+    let home = work.join("policy_home");
+    let dot_ssh = home.join(".ssh");
+    fs::create_dir_all(&dot_ssh).map_err(|error| error.to_string())?;
+    let own = dot_ssh.join("authorized_keys");
+    fs::write(&own, public_of(in_the_account)?).map_err(|error| error.to_string())?;
+    fs::set_permissions(&own, fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    let listed = work.join("policy_self_test_keys");
+    fs::write(&listed, public_of(self_test)?).map_err(|error| error.to_string())?;
+    fs::set_permissions(&listed, fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    let render = |form: Form| {
+        ssh_policy::config(user, form, Provisioned::No)
+            .replace(
+                "Port 22\nListenAddress 0.0.0.0\n",
+                "Port 0\nListenAddress 127.0.0.1\n",
+            )
+            .replace(
+                &format!("HostKey {}\n", ssh_policy::SSHD_HOST_KEY),
+                &format!("HostKey {}\n", work.join("td_sshd_host").display()),
+            )
+            .replace(
+                ssh_policy::SSHD_SELFTEST_AUTHORIZED_KEYS,
+                &listed.display().to_string(),
+            )
+    };
+    let target = format!("{user}@127.0.0.1");
+    let login = |port: u16, key: &Path, program: &Path, hosts: &str| -> Result<Output, String> {
+        Client {
+            program,
+            port,
+            key,
+            known_hosts: work.join(hosts),
+            target: target.clone(),
+        }
+        .exec(&["-o", "IdentitiesOnly=yes"], "echo in")
+    };
+
+    let enforced = spawn_td_sshd(
+        tools,
+        work,
+        "td_sshd_enforced",
+        &render(Form::Enforced),
+        &home,
+        user,
+    )?;
+    let output = login(
+        enforced.port,
+        in_the_account,
+        &tools.ssh,
+        "known_hosts_enforced",
+    )?;
+    report.check(
+        "the enforced form: a key only in the account's own file is refused",
+        output.status.code() == Some(255) && saying(&output, "Permission denied (publickey)"),
+        || describe(&output),
+    );
+    let output = login(
+        enforced.port,
+        self_test,
+        &tools.td_ssh,
+        "known_hosts_enforced_td",
+    )?;
+    report.check(
+        "the enforced form: a key in the file it names logs in",
+        output.status.success() && output.stdout == b"in\n",
+        || describe(&output),
+    );
+    drop(enforced);
+
+    let ordinary = spawn_td_sshd(
+        tools,
+        work,
+        "td_sshd_ordinary",
+        &render(Form::Ordinary),
+        &home,
+        user,
+    )?;
+    let output = login(
+        ordinary.port,
+        in_the_account,
+        &tools.ssh,
+        "known_hosts_ordinary",
+    )?;
+    report.check(
+        "the ordinary form: the same key logs in",
+        output.status.success() && output.stdout == b"in\n",
+        || describe(&output),
+    );
+    Ok(())
+}
+
 fn parse_arguments() -> Result<HashMap<String, String>, String> {
     let mut parsed = HashMap::new();
     let mut args = std::env::args().skip(1);
@@ -1095,6 +1485,8 @@ fn tools(arguments: &HashMap<String, String>) -> Result<Tools, String> {
         ssh: openssh.join("bin/ssh"),
         sshd: openssh.join("bin/sshd"),
         ssh_keygen: openssh.join("bin/ssh-keygen"),
+        scp: openssh.join("bin/scp"),
+        sftp: openssh.join("bin/sftp"),
         sshd_session: openssh.join("libexec/sshd-session"),
         sshd_auth: openssh.join("libexec/sshd-auth"),
         td_ssh: td_ssh.join("bin/td-ssh"),
@@ -1138,6 +1530,7 @@ fn exercise(tools: &Tools, work: &Path, report: &mut Report) -> Result<(), Strin
 
     // Each side authenticates with the key the other's tool wrote.
     let td_sshd = start_td_sshd(tools, work, &home, &user, &public_of(&stock_key)?)?;
+    image_policy_in_td_sshd(tools, work, &user, report)?;
     let stock_client = Client {
         program: &tools.ssh,
         port: td_sshd.port,
@@ -1147,6 +1540,9 @@ fn exercise(tools: &Tools, work: &Path, report: &mut Report) -> Result<(), Strin
     };
     let stranger = work.join(STRANGER_KEY);
     stock_client_against_td_sshd(tools, work, &home, &stock_client, &stranger, report)?;
+    file_transfer_against_td_sshd(tools, work, &home, &stock_client, report)?;
+    drop(td_sshd);
+    enforced_form_logins(tools, work, &user, &stock_key, &td_key, report)?;
 
     let authorized = format!(
         "{}{}",

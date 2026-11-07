@@ -52,10 +52,10 @@ resolved with `status`, not an assumed failure.
 
 The dedicated account is UID/GID 986, home `/var/lib/td-admin`, shell
 `/bin/td-admin`. Its non-password marker in `/etc/passwd` cannot authenticate through
-td-login. OpenSSH accepts only Ed25519 public-key authentication, from the
+td-login. td-sshd accepts only Ed25519 public-key authentication, from the
 root-owned `/var/lib/td-admin/authorized_keys`. Its Match block forces
-`/bin/td-admin ssh`, disables PTYs and inherits disabled forwarding and user
-startup files. The shell accepts that exact `-c` invocation and parses
+`/bin/td-admin ssh` and disables PTYs; td-sshd has no forwarding or user
+startup files to disable. The shell accepts that exact `-c` invocation and parses
 `SSH_ORIGINAL_COMMAND` as the fixed command vocabulary; it never evaluates
 shell syntax. SFTP, another executable and extra arguments cannot bypass it.
 This explicitly remains available in both login-key policy forms. Root SSH

@@ -120,6 +120,10 @@ const SSHD_MARKER: &str = td_recipe::shared::SSHD_MARKER;
 /// key's SSH login is refused (APPLICATIONS.md §L.1, L7).
 const ROOT_SSH_REFUSED_MARKER: &str = td_recipe::shared::ROOT_SSH_REFUSED_MARKER;
 
+/// Printed under the autotest token from the running daemon's `/proc`: a live pre-auth
+/// worker holds the `sshd` uid, `Seccomp: 2` and `NoNewPrivs: 1`.
+const SSHD_JAIL_MARKER: &str = td_recipe::shared::SSHD_JAIL_MARKER;
+
 /// Printed beside it once a listing of `/bin` holds `sh` and no `su`.
 const SU_ABSENT_MARKER: &str = td_recipe::shared::SU_ABSENT_MARKER;
 
@@ -568,6 +572,7 @@ struct ConsoleEvidence {
     git_runtime: bool,
     sshd: bool,
     root_ssh_refused: bool,
+    sshd_jail: bool,
     su_absent: bool,
     td_util_runtime: bool,
     td_txt_runtime: bool,
@@ -1404,9 +1409,10 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
          ({UUTILS_RUNTIME_MARKER}), ripgrep+fd ({RIPGREP_FD_RUNTIME_MARKER}), Git plus its \
-         installed CA bundle ({GIT_RUNTIME_MARKER}), OpenSSH through the restricted tester \
-         path ({SSHD_MARKER}) while root's field read `!` and the daemon refused the \
-         preseeded root key ({ROOT_SSH_REFUSED_MARKER}) on a root with no /bin/su \
+         installed CA bundle ({GIT_RUNTIME_MARKER}), td-ssh through the restricted tester \
+         path ({SSHD_MARKER}) while root's field read `!`, the daemon refused the \
+         preseeded root key ({ROOT_SSH_REFUSED_MARKER}) and a live pre-auth worker read \
+         as jailed ({SSHD_JAIL_MARKER}) on a root with no /bin/su \
          ({SU_ABSENT_MARKER}), td-util \
          ({TD_UTIL_RUNTIME_MARKER}), td-txt's grep+sed answering correctly over the live \
          /proc ({TD_TXT_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
@@ -2103,12 +2109,12 @@ fn validate_system_boot(
     }
     if !result.evidence.sshd {
         return Err(format!(
-            "the greeter was reached and root/userland checks passed, but the OpenSSH runtime \
+            "the greeter was reached and root/userland checks passed, but the td-ssh runtime \
              marker ({SSHD_MARKER:?}) was absent — the installed unprivileged client did not \
              authenticate to the running daemon on loopback with the ephemeral Ed25519 key and \
-             execute the expected command under the exact modern-only algorithm policy. Either \
-             loopback/listener setup regressed, public-key auth or a split daemon helper failed, \
-             or the libcrypto-free dynamic closure does not resolve on the erofs root. Last \
+             execute the expected command under td-ssh's one suite. Either loopback/listener \
+             setup regressed, or public-key auth, the jail, the credential switch or a session \
+             failed: td-sshd's own log is on the console. Last \
              serial output:\n{}",
             tail(&result.console, 80)
         ));
@@ -2516,6 +2522,12 @@ fn require_root_refusal(result: &BootResult, context: &str) -> Result<(), String
             ROOT_SSH_REFUSED_MARKER,
             "root's /etc/passwd password field read exactly `!` and the running daemon refused the \
              seeded loopback root key (exit 255, `Permission denied (publickey)`)",
+        ),
+        (
+            result.evidence.sshd_jail,
+            SSHD_JAIL_MARKER,
+            "the running daemon's /proc showed a live pre-auth worker under the sshd uid with \
+             `Seccomp: 2` and `NoNewPrivs: 1`",
         ),
         (
             result.evidence.su_absent,
@@ -6681,6 +6693,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         GIT_RUNTIME_MARKER.len(),
         SSHD_MARKER.len(),
         ROOT_SSH_REFUSED_MARKER.len(),
+        SSHD_JAIL_MARKER.len(),
         SU_ABSENT_MARKER.len(),
         TD_UTIL_RUNTIME_MARKER.len(),
         TD_TXT_RUNTIME_MARKER.len(),
@@ -6969,6 +6982,7 @@ fn latch_console_evidence_from(
         buf,
         ROOT_SSH_REFUSED_MARKER.as_bytes(),
     );
+    latch_marker(&mut evidence.sshd_jail, buf, SSHD_JAIL_MARKER.as_bytes());
     latch_marker(&mut evidence.su_absent, buf, SU_ABSENT_MARKER.as_bytes());
     latch_marker(
         &mut evidence.td_util_runtime,
@@ -11048,7 +11062,7 @@ mod tests {
     }
 
     #[test]
-    fn openssh_root_refusal_key_is_a_root_only_disposable_volume_fixture() {
+    fn root_refusal_key_is_a_root_only_disposable_volume_fixture() {
         let seq = AtomicU64::new(2250);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _guard = Scratch { dir: dir.clone() };
@@ -11326,6 +11340,7 @@ mod tests {
             FIREFOX_NETWORK_RUNTIME_MARKER,
             SSHD_MARKER,
             ROOT_SSH_REFUSED_MARKER,
+            SSHD_JAIL_MARKER,
             SU_ABSENT_MARKER,
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
@@ -11718,6 +11733,7 @@ mod tests {
         evidence.selected_current = true;
         evidence.sshd = true;
         evidence.root_ssh_refused = true;
+        evidence.sshd_jail = true;
         evidence.su_absent = true;
         evidence.state_owner = true;
         evidence.state_writable = true;
@@ -11882,11 +11898,12 @@ mod tests {
         let mut result = healthy;
         result.evidence.shutdown = true;
         assert_eq!(validate(&result), Ok(()));
-        let rows: [(fn(&mut ConsoleEvidence), &str); 2] = [
+        let rows: [(fn(&mut ConsoleEvidence), &str); 3] = [
             (
                 |evidence| evidence.root_ssh_refused = false,
                 ROOT_SSH_REFUSED_MARKER,
             ),
+            (|evidence| evidence.sshd_jail = false, SSHD_JAIL_MARKER),
             (|evidence| evidence.su_absent = false, SU_ABSENT_MARKER),
         ];
         for (clear, marker) in rows {
@@ -13083,6 +13100,7 @@ mod tests {
             GIT_RUNTIME_MARKER,
             SSHD_MARKER,
             ROOT_SSH_REFUSED_MARKER,
+            SSHD_JAIL_MARKER,
             SU_ABSENT_MARKER,
             TD_UTIL_RUNTIME_MARKER,
             TD_TXT_RUNTIME_MARKER,
@@ -13154,6 +13172,7 @@ mod tests {
         assert!(evidence.git_runtime);
         assert!(evidence.sshd);
         assert!(evidence.root_ssh_refused);
+        assert!(evidence.sshd_jail);
         assert!(evidence.su_absent);
         assert!(evidence.td_util_runtime);
         assert!(evidence.td_txt_runtime);

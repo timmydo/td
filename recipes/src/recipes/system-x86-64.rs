@@ -1,9 +1,10 @@
 #[path = "../../../td-firstboot/src/ssh_policy.rs"]
-pub(super) mod ssh_policy;
-use ssh_policy::{
-    OPENSSH_CIPHERS, OPENSSH_KEX_ALGORITHMS, OPENSSH_KEY_ALGORITHMS, SSHD_HOST_KEY,
-    SSHD_SELFTEST_AUTHORIZED_KEYS,
-};
+#[allow(
+    dead_code,
+    reason = "the image names the policy's paths; td-firstboot renders it, for these tests too"
+)]
+mod ssh_policy;
+use ssh_policy::{SSHD_HOST_KEY, SSHD_SELFTEST_AUTHORIZED_KEYS};
 
 #[cfg(test)]
 use ssh_policy::SSHD_AUTHORIZED_KEYS;
@@ -18,19 +19,19 @@ use crate::shared::{
     NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
     PERSIST_WRITE_CMDLINE_TOKEN, POST_RUST_SH, RIPGREP_FD_RUNTIME_MARKER,
     ROOT_SSH_REFUSAL_KEY_FINGERPRINT, ROOT_SSH_REFUSED_MARKER, SERVER_HEALTH_REBOOT_MARKER,
-    SERVER_HEALTH_STEADY_MARKER, SETUP_INPUT_CMDLINE_TOKEN, SSHD_MARKER, SU_ABSENT_MARKER,
-    SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER,
-    SYSTEM_ETC_MUTABLE_MARKER, SYSTEM_ETC_RO_MARKER, SYSTEM_LOGIN_DIRECTORY_MARKER,
-    SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
-    SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
-    SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER, TD_FETCH_BOOT_MARKER,
-    TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER, TD_FIREFOX_INPUT_FAILED_MARKER,
-    TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_JAIL_APPLICATION_FILTER_PROBE_MARKER, TD_JAIL_KILL_REAPS_MARKER,
-    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
-    TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY,
-    TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+    SERVER_HEALTH_STEADY_MARKER, SETUP_INPUT_CMDLINE_TOKEN, SSHD_JAIL_MARKER, SSHD_MARKER,
+    SU_ABSENT_MARKER, SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER,
+    SYSTEM_DEPLOY_ROLLBACK_MARKER, SYSTEM_ETC_MUTABLE_MARKER, SYSTEM_ETC_RO_MARKER,
+    SYSTEM_LOGIN_DIRECTORY_MARKER, SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER,
+    SYSTEM_NET_UP_MARKER, SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER,
+    SYSTEM_ROOT_RO_MARKER, SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER,
+    SYSTEM_STATE_WRITABLE_MARKER, TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER,
+    TD_FETCH_BOOT_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
+    TD_FIREFOX_INPUT_FAILED_MARKER, TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
+    TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_APPLICATION_FILTER_PROBE_MARKER,
+    TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER,
+    TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER,
+    TD_NEWS_ENTRY, TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
     TD_SOFTWARE_INSTALL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
     UUTILS_RUNTIME_MARKER,
@@ -195,7 +196,7 @@ enum Profile {
     /// bus, portal, the shipped applications and the serial-console greeter.
     Desktop,
     /// The headless system (td-svc/DESIGN.md §10, "Profiles"): td-svc runs the
-    /// boot-glue units and OpenSSH, and nothing graphical is packed. No console
+    /// boot-glue units and td-sshd, and nothing graphical is packed. No console
     /// logs anyone in, and no elevation operation is granted.
     Server,
 }
@@ -256,6 +257,14 @@ const SSHD_PRIVSEP_USER: &str = "sshd";
 const SSHD_PRIVSEP_UID: u32 = 995;
 const SSHD_PRIVSEP_GID: u32 = 995;
 const SSHD_PRIVSEP_PATH: &str = "/run/sshd-empty";
+/// The /bin names of td-ssh's binaries, the root tree's check spelling them too.
+const SSH_BIN_LINKS: &[(&str, &str)] = &[
+    ("ssh", "td-ssh"),
+    ("ssh-keygen", "td-ssh-keygen"),
+    ("td-ssh", "td-ssh"),
+    ("td-ssh-keygen", "td-ssh-keygen"),
+    ("td-sshd", "td-sshd"),
+];
 /// The observer group: its members read td-svc's status socket and
 /// `/var/log/svc` (td-svc/DESIGN.md §8, "Observation"). Only the primary
 /// account is one, on every image. Reserved: no principal may take 988 as its id.
@@ -692,7 +701,7 @@ const SERVER: SystemDef = SystemDef {
     profile: Profile::Server,
     hostname: "td-server",
     motd: "\n  td server - a source-built, Rust-first Linux.\n  \
-           td-svc supervises the system units and OpenSSH; nothing graphical runs.\n  \
+           td-svc supervises the system units and td-sshd; nothing graphical runs.\n  \
            The system is immutable: rebuild the image and replace the machine to change it.\n\n",
     users: &[
         ROOT_ACCOUNT,
@@ -739,7 +748,7 @@ const TD_PORTAL_SETTINGS: &str = include_str!("../../../td-portal/default-settin
 /// nothing packs it, `/bin/busybox` is not a symlink any more, and
 /// `nothing_on_the_image_is_busybox` is what keeps it that way. Every /bin entry now
 /// resolves into a binary td built from source — the four static multicalls, uutils,
-/// ripgrep, fd and sshd.
+/// ripgrep, fd and the SSH daemon.
 ///
 /// What that cost, recorded because it is a real loss rather than a clean win: `find`
 /// and `xargs` are not on the image at all. They were never `/bin` symlinks (the
@@ -1287,7 +1296,7 @@ fn build_passwd(sys: &SystemDef) -> String {
         ));
     }
     s.push_str(&format!(
-        "{SSHD_PRIVSEP_USER}:!:{SSHD_PRIVSEP_UID}:{SSHD_PRIVSEP_GID}:OpenSSH privilege separation:{SSHD_PRIVSEP_PATH}:/bin/false\n"
+        "{SSHD_PRIVSEP_USER}:!:{SSHD_PRIVSEP_UID}:{SSHD_PRIVSEP_GID}:td-sshd privilege separation:{SSHD_PRIVSEP_PATH}:/bin/false\n"
     ));
     s
 }
@@ -1680,7 +1689,7 @@ fn firefox_input_give_up() -> String {
 ///     initialization of their shared state directory.
 ///   td-firstboot mints the per-machine identity, so it precedes everything that reads
 ///     or checks it — rootcheck (asserts it is READABLE through the MUTABLE_ETC
-///     symlinks on a still-read-only /etc), and OpenSSH (whose generated config
+///     symlinks on a still-read-only /etc), and td-sshd (whose generated config
 ///     names those mutable paths). It also provisions the applications'
 ///     first configuration into the login user's home, which stage-1 init created
 ///     and handed to that user before sysinit began.
@@ -1706,7 +1715,7 @@ fn build_td_svc_conf(sys: &SystemDef) -> String {
     }
 }
 
-/// The server's table: the desktop's boot-glue, profiler, network and OpenSSH
+/// The server's table: the desktop's boot-glue, profiler, network and td-sshd
 /// units, stanza for stanza (`server_units_are_the_desktops_stanzas` holds
 /// that), and a health target that requires what a server is for.
 ///
@@ -1816,7 +1825,7 @@ fn build_server_td_svc_conf() -> String {
          \n\
          [sshd]\n\
          type=daemon\n\
-         exec=/bin/sshd -D -e -f {SSHD_CONFIG}\n\
+         exec=/bin/td-sshd -f {SSHD_CONFIG}\n\
          after={sysinit}\n\
          ready=/bin/td-netd reach 127.0.0.1 22\n\
          restart=always\n\
@@ -2506,9 +2515,9 @@ fn build_desktop_td_svc_conf() -> String {
          after={sysinit}\n\
          timeout={bootfail}\n\
          \n\
-         # OpenSSH binds all interfaces on port 22 as root, then puts the\n\
+         # td-sshd binds all interfaces on port 22 as root, then puts the\n\
          # network-facing pre-auth process behind its dedicated locked uid,\n\
-         # chroot, and seccomp filter. The immutable config names only the\n\
+         # chroot, and seccomp filter. The rendered config names only the\n\
          # per-machine Ed25519 host key, so a missing identity is fail-closed.\n\
          [td-admin]\n\
          type=daemon\n\
@@ -2520,7 +2529,7 @@ fn build_desktop_td_svc_conf() -> String {
          \n\
          [sshd]\n\
          type=daemon\n\
-         exec=/bin/sshd -D -e -f {SSHD_CONFIG}\n\
+         exec=/bin/td-sshd -f {SSHD_CONFIG}\n\
          after={sysinit}\n\
          ready=/bin/td-netd reach 127.0.0.1 22\n\
          restart=always\n\
@@ -2535,7 +2544,7 @@ fn build_desktop_td_svc_conf() -> String {
          # text that gets printed when sshd is why the boot failed.\n\
          console=yes\n\
          # A stop, restart or shutdown kills its whole leaf and waits for it to\n\
-         # empty, so OpenSSH sessions, which start sessions of their own and so\n\
+         # empty, so td-sshd's sessions, which start sessions of their own and so\n\
          # leave sshd's process group, end with it. A listener crash restarts in\n\
          # place and keeps them (td-svc/DESIGN.md §4, `stop=leaf`).\n\
          stop=leaf\n\
@@ -2995,7 +3004,7 @@ fn build_autologin(sys: &SystemDef) -> Result<String, String> {
 fn build_rootcheck(sys: &SystemDef) -> String {
     let mut s = String::new();
     s.push_str("#!/bin/sh\nok=1\n");
-    // OpenSSH chroots its network-facing pre-auth process here after switching
+    // td-sshd chroots its network-facing pre-auth process here before switching
     // to the dedicated locked account. Recreate the volatile directory on every
     // boot so it is empty, root-owned, and settled before the sshd unit starts.
     s.push_str(&format!(
@@ -3683,8 +3692,10 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     // The human may read its private self-test key but must not own the public
     // AuthorizedKeysFile that grants it access. Under the QEMU autotest token, a
     // separately preseeded root-only fixture authorizes a loopback root key in the
-    // persistent default path, which the boot reads without changing: root's locked
-    // field and `PermitRootLogin no` must refuse it (APPLICATIONS.md §L.1, L7).
+    // persistent default path, which the boot reads without changing: td-sshd must
+    // refuse it, by its check on uid 0 before root's locked field or `PermitRootLogin
+    // no` are looked at (APPLICATIONS.md §L.1, L7).
+    let jail_evidence = sshd_jail_evidence();
     format!(
         "#!/bin/sh\n\
          set -f\n\
@@ -3731,19 +3742,20 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          -o UserKnownHostsFile=/run/td-ssh-known-hosts \
          -o GlobalKnownHostsFile=/dev/null \
          -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
-         -o KexAlgorithms={OPENSSH_KEX_ALGORITHMS} \
-         -o HostKeyAlgorithms={OPENSSH_KEY_ALGORITHMS} \
-         -o PubkeyAcceptedAlgorithms={OPENSSH_KEY_ALGORITHMS} \
-         -o Ciphers={OPENSSH_CIPHERS} -o Compression=no \
+         -o KexAlgorithms={SSH_KEX_ALGORITHMS} \
+         -o HostKeyAlgorithms={SSH_KEY_ALGORITHMS} \
+         -o PubkeyAcceptedAlgorithms={SSH_KEY_ALGORITHMS} \
+         -o Ciphers={SSH_CIPHERS} -o Compression=no \
          root@127.0.0.1 /bin/echo TD-ROOT-SSH-ADMITTED 2>&1); rootssh_status=$?\n\
          [ \"$rootssh_status\" = 255 ] || \
-         {{ echo \"OpenSSH: root login was not refused: $rootssh\"; fail; }}\n\
+         {{ echo \"td-ssh: root login was not refused: $rootssh\"; fail; }}\n\
          case \"$rootssh\" in \
          *'Offering public key: {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} ED25519 \
          {ROOT_SSH_REFUSAL_KEY_FINGERPRINT}'*'Permission denied (publickey)'*) ;; \
-         *) echo \"OpenSSH: the root key was not offered and then refused: $rootssh\"; \
+         *) echo \"td-ssh: the root key was not offered and then refused: $rootssh\"; \
          fail;; esac\n\
          echo {ROOT_SSH_REFUSED_MARKER}\n\
+         {jail_evidence}\
          cad=$(/bin/td-util cat /proc/sys/kernel/cad_pid) || fail\n\
          uid=; eff=\n\
          while read -r k a b c d; do case \"$k\" in Uid:) uid=\"$a $b $c $d\";; \
@@ -3876,10 +3888,10 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
          -o UserKnownHostsFile=/run/td-ssh-known-hosts \
          -o GlobalKnownHostsFile=/dev/null \
-         -o KexAlgorithms={OPENSSH_KEX_ALGORITHMS} \
-         -o HostKeyAlgorithms={OPENSSH_KEY_ALGORITHMS} \
-         -o PubkeyAcceptedAlgorithms={OPENSSH_KEY_ALGORITHMS} \
-         -o Ciphers={OPENSSH_CIPHERS} -o Compression=no\"; export GIT_SSH_COMMAND; \
+         -o KexAlgorithms={SSH_KEX_ALGORITHMS} \
+         -o HostKeyAlgorithms={SSH_KEY_ALGORITHMS} \
+         -o PubkeyAcceptedAlgorithms={SSH_KEY_ALGORITHMS} \
+         -o Ciphers={SSH_CIPHERS} -o Compression=no\"; export GIT_SSH_COMMAND; \
          /bin/rm -rf /tmp/td-git-probe || \
          {{ echo \"git: could not clear the health-probe directory\"; exit 1; }}; \
          /bin/mkdir -p \"$HOME\" \"$XDG_CONFIG_HOME\" || \
@@ -3923,14 +3935,14 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
          -o UserKnownHostsFile=/run/td-ssh-known-hosts \
          -o GlobalKnownHostsFile=/dev/null \
-         -o KexAlgorithms={OPENSSH_KEX_ALGORITHMS} \
-         -o HostKeyAlgorithms={OPENSSH_KEY_ALGORITHMS} \
-         -o PubkeyAcceptedAlgorithms={OPENSSH_KEY_ALGORITHMS} \
-         -o Ciphers={OPENSSH_CIPHERS} -o Compression=no \
-         \"$USER@127.0.0.1\" /bin/echo TD-OPENSSH-ROUNDTRIP 2>&1) || \
-         {{ echo \"OpenSSH: loopback command failed: $o\"; exit 1; }}; \
-         [ \"$o\" = TD-OPENSSH-ROUNDTRIP ] || \
-         {{ echo \"OpenSSH: unexpected loopback output: $o\"; exit 1; }}'; then \
+         -o KexAlgorithms={SSH_KEX_ALGORITHMS} \
+         -o HostKeyAlgorithms={SSH_KEY_ALGORITHMS} \
+         -o PubkeyAcceptedAlgorithms={SSH_KEY_ALGORITHMS} \
+         -o Ciphers={SSH_CIPHERS} -o Compression=no \
+         \"$USER@127.0.0.1\" /bin/echo TD-SSH-ROUNDTRIP 2>&1) || \
+         {{ echo \"td-ssh: loopback command failed: $o\"; exit 1; }}; \
+         [ \"$o\" = TD-SSH-ROUNDTRIP ] || \
+         {{ echo \"td-ssh: unexpected loopback output: $o\"; exit 1; }}'; then \
          [ \"$ms\" = 1 ] || {{ echo {SSHD_MARKER}; ms=1; }}; else healthy=0; fi; \
          if {PRIMARY_PROBE_LAUNCHER} /bin/sh -c \
          'u=1; /bin/td-util --list >/dev/null 2>&1 || \
@@ -4032,7 +4044,7 @@ fn build_profile(sys: &SystemDef) -> String {
     // (every /bin entry resolves into /td/store), so keep PATH honest and minimal.
     s.push_str("export PATH=/bin\n");
     if !sys.desktop() {
-        // A server's login shells are OpenSSH sessions: no compositor
+        // A server's login shells are td-sshd's sessions: no compositor
         // runtime to name, no greeter to report and no session to park.
         s.push_str("export PS1='\\u@\\h:\\w\\$ '\n");
         s.push_str("cat <<'__TD_MOTD__'\n");
@@ -4356,17 +4368,74 @@ const SSHD_CONFIG: &str = "/run/td-sshd.conf";
 const SSHD_AUTHORIZED_KEYS_STATE: &str = "/var/lib/td/ssh/authorized_keys";
 const QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY: &str = "/var/lib/td-test/root-ssh-refusal-key";
 
+/// td-ssh's one suite (td-ssh/DESIGN.md §2), which the health probes' client
+/// names so that nothing else can pass; td-sshd has no keyword for it.
+const SSH_KEX_ALGORITHMS: &str = "mlkem768x25519-sha256,curve25519-sha256";
+const SSH_KEY_ALGORITHMS: &str = "ssh-ed25519";
+const SSH_CIPHERS: &str = "chacha20-poly1305@openssh.com";
+
+/// The suite and every disabled feature are compiled into td-ssh, so the system
+/// file holds the one choice that remains.
 fn build_ssh_config() -> String {
+    "HashKnownHosts yes\n".to_string()
+}
+
+/// What the jail evidence's client runs as its `SSH_ASKPASS`, and where the
+/// verdict goes: its stdout is the answer to the host key question.
+const SSHD_JAIL_PROBE: &str = "/run/td-sshd-jail-probe";
+const SSHD_JAIL_VERDICT: &str = "/run/td-sshd-jail-verdict";
+/// A second apart, within what the client's question waits: the transient a concurrent
+/// connection shows lasts far less, and one that stays is a jail that did not close.
+const SSHD_JAIL_RESCANS: u32 = 4;
+
+/// td-ssh/DESIGN.md §9's marker. A client that does not yet trust the host asks
+/// about its key after the exchange and before authentication, so while the
+/// question is open the connection's pre-auth worker is alive, jailed and
+/// waiting. The probe, as that question's askpass, reads every process's status,
+/// a process that has gone costing only its own line, and answers no. A concurrent
+/// connection's stage between the switch and the filter shows what a real hole would,
+/// and this port is open to anyone, so a bad reading has to stay bad across rescans
+/// before it can roll a boot back.
+fn sshd_jail_evidence() -> String {
+    let probe = format!(
+        "scan() {{ set +f; procs=$(/bin/td-util printf \"%s\\n\" /proc/[0-9]*/status); set -f; \
+         workers=0; bad=; \
+         for f in $procs; do \
+         st=$(/bin/td-util cat \"$f\" 2>/dev/null) || continue; \
+         case \"$st\" in *\"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\"*) ;; *) continue;; esac; \
+         workers=$((workers+1)); \
+         case \"$st\" in *\"Seccomp:\t2\"*) ;; *) bad=\"$bad $f:seccomp\";; esac; \
+         case \"$st\" in *\"NoNewPrivs:\t1\"*) ;; *) bad=\"$bad $f:no_new_privs\";; esac; \
+         case \"$st\" in *\"Gid:\t{gid}\t{gid}\t{gid}\t{gid}\"*) ;; *) bad=\"$bad $f:gid\";; esac; \
+         case \"$st\" in *\"Groups:\t{gid} \n\"*) ;; *) bad=\"$bad $f:groups\";; esac; \
+         root=$(/bin/td-util readlink \"${{f%/status}}/root\" 2>/dev/null); \
+         [ \"$root\" = {SSHD_PRIVSEP_PATH} ] || bad=\"$bad $f:root\"; \
+         done; }}; \
+         scan; tries=0; \
+         while [ -n \"$bad\" ] && [ \"$tries\" -lt {SSHD_JAIL_RESCANS} ]; do \
+         /bin/td-util sleep 1; scan; tries=$((tries+1)); done; \
+         /bin/td-util printf \"workers=%s bad=%s\\n\" \"$workers\" \"$bad\" > {SSHD_JAIL_VERDICT}; \
+         echo no",
+        uid = SSHD_PRIVSEP_UID,
+        gid = SSHD_PRIVSEP_GID,
+    );
     format!(
-        "Host *\n\
-         \tKexAlgorithms {OPENSSH_KEX_ALGORITHMS}\n\
-         \tHostKeyAlgorithms {OPENSSH_KEY_ALGORITHMS}\n\
-         \tPubkeyAcceptedAlgorithms {OPENSSH_KEY_ALGORITHMS}\n\
-         \tCiphers {OPENSSH_CIPHERS}\n\
-         \tCompression no\n\
-         \tForwardAgent no\n\
-         \tHashKnownHosts yes\n\
-         \tVerifyHostKeyDNS no\n"
+        "/bin/rm -f {SSHD_JAIL_PROBE} {SSHD_JAIL_VERDICT}\n\
+         /bin/td-util printf '%s\\n' '#!/bin/sh' '{probe}' > {SSHD_JAIL_PROBE} || fail\n\
+         /bin/chmod 0700 {SSHD_JAIL_PROBE} || fail\n\
+         SSH_ASKPASS={SSHD_JAIL_PROBE} SSH_ASKPASS_REQUIRE=force /bin/ssh -F /dev/null \
+         -i {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} -o IdentitiesOnly=yes \
+         -o StrictHostKeyChecking=ask -o UserKnownHostsFile=/dev/null \
+         -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+         -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+         root@127.0.0.1 /bin/true </dev/null >/dev/null 2>&1\n\
+         jail=$(/bin/td-util cat {SSHD_JAIL_VERDICT} 2>/dev/null)\n\
+         /bin/rm -f {SSHD_JAIL_PROBE} {SSHD_JAIL_VERDICT}\n\
+         case \"$jail\" in \
+         'workers=0 '*|'') echo \"td-sshd: no pre-auth worker to read: $jail\"; fail;; \
+         *'bad=') ;; \
+         *) echo \"td-sshd: a pre-auth worker is not jailed: $jail\"; fail;; esac\n\
+         echo {SSHD_JAIL_MARKER}\n"
     )
 }
 
@@ -5082,6 +5151,12 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         from: "{in:td-firstboot}".into(),
         dest: "{root}/real-root{in:td-firstboot}".into(),
     });
+    // td-ssh is static like td-netd: copied directly, since scanning it as a
+    // runtime root would mistake build-provenance strings for edges.
+    steps.push(Step::CopyTree {
+        from: "{in:td-ssh}".into(),
+        dest: "{root}/real-root{in:td-ssh}".into(),
+    });
     // The session and elevation authority: a server has no session to serve
     // and grants no elevation.
     if sys.desktop() {
@@ -5411,14 +5486,13 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         link: format!("{{root}}/real-root/bin/{}", td_boot_protocol::TD_LUKS),
     });
     // Stage the dynamically linked userland and every transitively referenced store item
-    // at its canonical absolute path. uutils, ripgrep, fd and OpenSSH pull their
+    // at its canonical absolute path. uutils, ripgrep, fd and Git pull their
     // td glibc closures. The engine admits only direct recipe inputs, so a Rust bootstrap
     // or other build-only reference fails closed rather than entering the EROFS image.
     let mut runtime_roots = vec![
         "{in:uutils}".into(),
         "{in:ripgrep}".into(),
         "{in:fd}".into(),
-        "{in:openssh-x86-64}".into(),
         "{in:git-x86-64}".into(),
         "{in:gcc-runtime}".into(),
         "{in:zlib-x86-64}".into(),
@@ -5727,12 +5801,11 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             link: format!("{{root}}/real-root/etc/{}", entry.etc),
         });
     }
-    // The bounded OpenSSH profile exposes the client, host-key tool, and daemon
-    // through /bin. sshd's mandatory split helpers stay at their compiled
-    // content-addressed libexec paths and are reached only by the daemon.
-    for name in ["ssh", "ssh-keygen", "sshd"] {
+    // td-ssh's client, key tool and daemon, each stage of which re-executes its
+    // own file: nothing else of an SSH implementation is in the image.
+    for (name, binary) in SSH_BIN_LINKS {
         steps.push(Step::Symlink {
-            target: format!("{{in:openssh-x86-64}}/bin/{name}"),
+            target: format!("{{in:td-ssh}}/bin/{binary}"),
             link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
@@ -6086,15 +6159,17 @@ fn shape_check(sys: &SystemDef) -> String {
      done; \
      [ -s \"{root}/real-root{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: the pinned CA bundle is missing or empty' >&2; exit 1; }; \
      [ \"$(readlink \"$root/etc/ssl/certs/ca-certificates.crt\" 2>/dev/null)\" = \"{in:ca-certificates}/share/ca-certificates/ca-bundle.crt\" ] || { echo 'root tree: the CA path does not resolve to the pinned bundle' >&2; exit 1; }; \
-     for rel in bin/ssh bin/ssh-keygen bin/sshd libexec/sshd-session libexec/sshd-auth; do \
-         openssh=\"{root}/real-root{in:openssh-x86-64}/$rel\"; \
-         { [ -f \"$openssh\" ] && [ -x \"$openssh\" ]; } || { echo \"root tree: OpenSSH $rel is not packed/executable under real-root{in:openssh-x86-64}\" >&2; exit 1; }; \
+     for pair in ssh:td-ssh ssh-keygen:td-ssh-keygen td-ssh:td-ssh td-ssh-keygen:td-ssh-keygen td-sshd:td-sshd; do \
+         name=${pair%:*}; binary=${pair#*:}; \
+         [ \"$(readlink \"$root/bin/$name\" 2>/dev/null)\" = \"{in:td-ssh}/bin/$binary\" ] && [ -f \"$root{in:td-ssh}/bin/$binary\" ] && [ -x \"$root{in:td-ssh}/bin/$binary\" ] || { echo \"root tree: /bin/$name must be a symlink to the packed td-ssh $binary\" >&2; exit 1; }; \
+         [ -f \"$root{in:td-ssh}/lib/debug/bin/$binary.debug\" ] || { echo \"root tree: td-ssh $binary lacks its debug companion\" >&2; exit 1; }; \
      done; \
-     for a in ssh ssh-keygen sshd; do \
-         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"{in:openssh-x86-64}/bin/$a\" ] || { echo \"root tree: /bin/$a is not a symlink to staged OpenSSH\" >&2; exit 1; }; \
+     store=\"$root{in:td-ssh}\"; store=${store%/*}; \
+     for absent in \"$root\"/bin/sshd \"$root\"/bin/scp \"$root\"/bin/sftp \"$root\"/bin/sftp-server \"$root\"/bin/ssh-add \"$root\"/bin/ssh-agent \"$root\"/bin/ssh-keyscan \"$root\"/bin/ssh-keysign \"$root\"/libexec/sshd-session \"$root\"/libexec/sshd-auth \"$root\"/libexec/sftp-server \"$root\"/libexec/ssh-keysign \"$store\"/*openssh* \"$store\"/*/bin/sshd \"$store\"/*/bin/scp \"$store\"/*/bin/sftp \"$store\"/*/bin/sftp-server \"$store\"/*/bin/ssh-add \"$store\"/*/bin/ssh-agent \"$store\"/*/bin/ssh-keyscan \"$store\"/*/bin/ssh-keysign \"$store\"/*/libexec/sftp-server \"$store\"/*/libexec/ssh-keysign \"$store\"/*/libexec/ssh-pkcs11-helper \"$store\"/*/libexec/ssh-sk-helper \"$store\"/*/libexec/sshd-session \"$store\"/*/libexec/sshd-auth; do \
+         [ ! -e \"$absent\" ] && [ ! -L \"$absent\" ] || { echo \"root tree: OpenSSH leftover $absent is in the image\" >&2; exit 1; }; \
      done; \
      tdf=\"{root}/real-root{in:td-firstboot}/bin/td-firstboot\"; tdftgt=\"{in:td-firstboot}/bin/td-firstboot\"; \
-     { [ -f \"$tdf\" ] && [ -x \"$tdf\" ]; } || { echo 'root tree: the td-firstboot binary is not packed/executable at real-root{in:td-firstboot}/bin/td-firstboot - the sysinit job would fail and the machine would have no identity, so OpenSSH would refuse to start' >&2; exit 1; }; \
+     { [ -f \"$tdf\" ] && [ -x \"$tdf\" ]; } || { echo 'root tree: the td-firstboot binary is not packed/executable at real-root{in:td-firstboot}/bin/td-firstboot - the sysinit job would fail and the machine would have no identity, so td-sshd would refuse to start' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-firstboot\" 2>/dev/null)\" = \"$tdftgt\" ] || { echo 'root tree: /bin/td-firstboot is not a symlink to the staged identity provisioner' >&2; exit 1; }; \
      \"$tdf\" --help >/dev/null 2>&1 || { echo 'the packed td-firstboot does not run (it is static with an empty closure, so it must)' >&2; exit 1; }; \
      \"$tdf\" --nonesuch >/dev/null 2>&1; [ $? -eq 2 ] || { echo 'td-firstboot must exit 2 on an unknown argument (usage error) rather than provisioning something unasked' >&2; exit 1; }; \
@@ -6603,9 +6678,8 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
         //   /etc/fonts/jetbrains-mono-nerd.
         // linux-firmware-notices: the embedded Wi-Fi firmware's notice and
         //   licence, in the store beside the face.
-        // OpenSSH: the source-built client, key generator, daemon, and mandatory split
-        //   helpers. Its deliberately libcrypto-free closure is reached by
-        //   StageRuntimeClosure.
+        // td-ssh: the static client, key tool and daemon (empty runtime closure,
+        //   CopyTree'd), behind SSH_BIN_LINKS.
         // glibc-x86-64: the dynamic Rust userland's declared runtime input.
         //   StageRuntimeClosure reaches it from embedded store references and copies the whole
         //   content-addressed item.
@@ -6657,7 +6731,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "jetbrains-mono-nerd-font",
                 "linux-firmware-notices",
                 "glibc-x86-64",
-                "openssh-x86-64",
+                "td-ssh",
                 "td-netd",
                 "td-boot",
                 "td-kexec",
@@ -7007,7 +7081,7 @@ mod tests {
     ///
     /// Every collision reachable from today's inputs is already refused, and
     /// this does not pretend otherwise: `system_def_is_self_consistent` and
-    /// `openssh_privilege_separation_identity_is_locked_and_prepared` both
+    /// `sshd_privilege_separation_identity_is_locked_and_prepared` both
     /// red for a declared duplicate and for a privsep collision, the latter
     /// reading `build_passwd`'s output as well. What they check is the set of
     /// DECLARED uids. This parses the generated string instead, so it also
@@ -7069,18 +7143,25 @@ mod tests {
     }
 
     #[test]
-    fn openssh_privilege_separation_identity_is_locked_and_prepared() {
+    fn sshd_privilege_separation_identity_is_locked_and_prepared() {
+        // The account td-sshd's jail compiles in is the one the image declares.
+        let jail = include_str!("../../../td-ssh/src/server/jail.rs");
+        assert!(jail.contains(&format!(
+            "pub const PRIVSEP_PATH: &str = \"{SSHD_PRIVSEP_PATH}\";"
+        )));
+        assert!(jail.contains(&format!("pub const PRIVSEP_UID: u32 = {SSHD_PRIVSEP_UID};")));
+        assert!(jail.contains(&format!("pub const PRIVSEP_GID: u32 = {SSHD_PRIVSEP_GID};")));
         assert!(
             SYSTEM.users.iter().all(|user| {
                 user.name != SSHD_PRIVSEP_USER
                     && user.uid != SSHD_PRIVSEP_UID
                     && user.gid != SSHD_PRIVSEP_GID
             }),
-            "the fixed OpenSSH account name, uid, and gid must not collide with an \
+            "the fixed td-sshd account name, uid, and gid must not collide with an \
              interactive SystemDef user"
         );
         assert!(build_passwd(&SYSTEM).contains(&format!(
-            "{SSHD_PRIVSEP_USER}:!:{SSHD_PRIVSEP_UID}:{SSHD_PRIVSEP_GID}:OpenSSH privilege separation:{SSHD_PRIVSEP_PATH}:/bin/false\n"
+            "{SSHD_PRIVSEP_USER}:!:{SSHD_PRIVSEP_UID}:{SSHD_PRIVSEP_GID}:td-sshd privilege separation:{SSHD_PRIVSEP_PATH}:/bin/false\n"
         )));
         assert!(
             build_group(&SYSTEM).contains(&format!("{SSHD_PRIVSEP_USER}:x:{SSHD_PRIVSEP_GID}:\n"))
@@ -7095,16 +7176,16 @@ mod tests {
         ] {
             assert!(
                 rootcheck.lines().any(|line| line == required),
-                "rootcheck does not prepare the OpenSSH privsep chroot with {required:?}"
+                "rootcheck does not prepare td-sshd's privsep chroot with {required:?}"
             );
         }
         assert!(
             ordered_before("rootcheck", "sshd"),
-            "OpenSSH may not start before its empty root-owned privsep chroot exists"
+            "td-sshd may not start before its empty root-owned privsep chroot exists"
         );
         assert!(
             ordered_before("sshd", "bootsuccess"),
-            "deployment health must wait for the running OpenSSH listener"
+            "deployment health must wait for the running td-sshd listener"
         );
     }
 
@@ -7375,7 +7456,7 @@ mod tests {
             "/bin/td-term run",
             "/etc/bootsuccess",
             "/etc/bootfail",
-            "/bin/sshd -D -e -f /run/td-sshd.conf",
+            "/bin/td-sshd -f /run/td-sshd.conf",
             "/etc/tty-session",
         ] {
             assert!(
@@ -8742,7 +8823,7 @@ mod tests {
     }
 
     /// sshd stops its whole service leaf, so a stop, restart or shutdown ends
-    /// the OpenSSH sessions that left its process group
+    /// td-sshd's sessions that left its process group
     /// (td-login/TOKEN-LOGIN.md, increment 5's A1). The key needs the leaf
     /// sshd already owns: the default `cgroup=service` and no terminal.
     #[test]
@@ -10154,7 +10235,6 @@ mod tests {
             "{in:uutils}".to_string(),
             "{in:ripgrep}".to_string(),
             "{in:fd}".to_string(),
-            "{in:openssh-x86-64}".to_string(),
             "{in:git-x86-64}".to_string(),
             "{in:gcc-runtime}".to_string(),
             "{in:zlib-x86-64}".to_string(),
@@ -10325,10 +10405,10 @@ mod tests {
         )));
     }
 
-    /// No account table of td's names a shadow file, and the server that would
-    /// read one is built not to.
+    /// No account table of td's names a shadow file: td-sshd admits by this one
+    /// field, through td-login's own classifier.
     #[test]
-    fn there_is_no_shadow_file_and_openssh_reads_the_same_field() {
+    fn there_is_no_shadow_file_and_td_sshd_reads_the_same_field() {
         for sys in [&SYSTEM, &SERVER] {
             let etc = etc_files(sys).unwrap();
             assert!(
@@ -10337,7 +10417,7 @@ mod tests {
                 sys.stem
             );
             assert!(!shape_etc_files(sys).contains(&"shadow"), "{}", sys.stem);
-            // Every class td-login tells apart, in the field sshd's lock check reads.
+            // Every class td-login tells apart, in the field td-sshd's admission reads.
             let passwd = build_passwd(sys);
             let field = |name: &str| {
                 passwd
@@ -10352,7 +10432,7 @@ mod tests {
             assert_eq!(field("td-netd").as_deref(), Some("!td-service"));
             assert!(passwd.lines().all(|line| !line.contains(":x:")));
         }
-        assert!(include_str!("openssh-x86-64.rs").contains("\"--without-shadow\","));
+        assert!(include_str!("../../../td-ssh/src/server/account.rs").contains("db::secret(name)"));
     }
 
     /// The two workers' uids are their crates' own, and the health leg that
@@ -10599,12 +10679,12 @@ mod tests {
             }
             assert_ne!(
                 u.uid, SSHD_PRIVSEP_UID,
-                "user '{}' collides with the reserved OpenSSH privilege-separation uid {}",
+                "user '{}' collides with the reserved td-sshd privilege-separation uid {}",
                 u.name, SSHD_PRIVSEP_UID
             );
             assert_ne!(
                 u.gid, SSHD_PRIVSEP_GID,
-                "user '{}' collides with the reserved OpenSSH privilege-separation gid {}",
+                "user '{}' collides with the reserved td-sshd privilege-separation gid {}",
                 u.name, SSHD_PRIVSEP_GID
             );
             assert!(
@@ -12349,12 +12429,14 @@ mod tests {
             );
         }
         assert_eq!(
-            exec, "/bin/sshd -D -e -f /run/td-sshd.conf",
-            "the service must run the foreground OpenSSH daemon against the reviewed config"
+            exec, "/bin/td-sshd -f /run/td-sshd.conf",
+            "the service must run td-sshd, which stays in the foreground, against the rendered \
+             config"
         );
         // TOKEN-LOGIN.md, "SSH": the login state selects the form; both keep
-        // every reviewed line and refuse root (APPLICATIONS.md §L.1, L7), and
-        // the enforced one admits only the primary.
+        // every line and refuse root (APPLICATIONS.md §L.1, L7), and the enforced
+        // one admits only the primary. Authentication, forwarding and the suite
+        // have no keyword: td-sshd refuses a file naming one (td-ssh/DESIGN.md §5).
         for (form, admission) in [
             (
                 ssh_policy::Form::Ordinary,
@@ -12378,20 +12460,14 @@ mod tests {
             for required in [
                 format!("HostKey {SSHD_HOST_KEY}"),
                 format!("AuthorizedKeysFile {SSHD_AUTHORIZED_KEYS}"),
-                "AuthenticationMethods publickey".into(),
-                "PasswordAuthentication no".into(),
-                "KbdInteractiveAuthentication no".into(),
-                "HostbasedAuthentication no".into(),
-                format!("KexAlgorithms {OPENSSH_KEX_ALGORITHMS}"),
-                format!("HostKeyAlgorithms {OPENSSH_KEY_ALGORITHMS}"),
-                format!("PubkeyAcceptedAlgorithms {OPENSSH_KEY_ALGORITHMS}"),
-                format!("Ciphers {OPENSSH_CIPHERS}"),
-                "Compression no".into(),
-                "DisableForwarding yes".into(),
+                "PermitRootLogin no".into(),
+                "LoginGraceTime 30".into(),
+                "MaxAuthTries 3".into(),
+                "MaxSessions 4".into(),
             ] {
                 assert!(
                     config.lines().any(|line| line == required),
-                    "the reviewed OpenSSH server policy lost {required:?}"
+                    "the rendered td-sshd policy lost {required:?}"
                 );
             }
             let admitted: Vec<&str> = config
@@ -12514,7 +12590,7 @@ mod tests {
         assert!(!init.contains("td-login-cutover"), "{init}");
         assert_eq!(
             unit_key("sshd", "exec"),
-            Some(format!("/bin/sshd -D -e -f {SSHD_CONFIG}"))
+            Some(format!("/bin/td-sshd -f {SSHD_CONFIG}"))
         );
     }
 
@@ -12528,6 +12604,141 @@ mod tests {
         assert!(
             !bootsuccess.contains("td-compositor probe-"),
             "{bootsuccess}"
+        );
+    }
+
+    /// td-ssh/DESIGN.md §9: every profile's root tree holds td-ssh's three names,
+    /// each packed with its companion, and nothing left of OpenSSH: no program of
+    /// its in /bin or under any store item, whatever that item is called, and no
+    /// OpenSSH store item at all.
+    #[test]
+    fn the_root_tree_holds_td_ssh_and_no_openssh() {
+        for sys in [&SYSTEM, &SERVER] {
+            let check = shape_check(sys);
+            assert_eq!(
+                check
+                    .matches("for pair in ssh:td-ssh ssh-keygen:td-ssh-keygen td-ssh:td-ssh td-ssh-keygen:td-ssh-keygen td-sshd:td-sshd; do")
+                    .count(),
+                1
+            );
+            for (name, binary) in SSH_BIN_LINKS {
+                assert!(
+                    check.contains(&format!("{name}:{binary}")),
+                    "{name} -> {binary} is not checked"
+                );
+            }
+            for absent in [
+                "\"$root\"/bin/sshd ",
+                "\"$root\"/bin/scp ",
+                "\"$root\"/bin/sftp ",
+                "\"$root\"/bin/sftp-server ",
+                "\"$root\"/bin/ssh-add ",
+                "\"$root\"/bin/ssh-agent ",
+                "\"$root\"/bin/ssh-keyscan ",
+                "\"$root\"/bin/ssh-keysign ",
+                "\"$root\"/libexec/sshd-session ",
+                "\"$root\"/libexec/sshd-auth ",
+                "\"$root\"/libexec/sftp-server ",
+                "\"$root\"/libexec/ssh-keysign ",
+                "\"$store\"/*openssh* ",
+                "\"$store\"/*/bin/sshd ",
+                "\"$store\"/*/bin/scp ",
+                "\"$store\"/*/bin/sftp ",
+                "\"$store\"/*/bin/sftp-server ",
+                "\"$store\"/*/bin/ssh-add ",
+                "\"$store\"/*/bin/ssh-agent ",
+                "\"$store\"/*/bin/ssh-keyscan ",
+                "\"$store\"/*/bin/ssh-keysign ",
+                "\"$store\"/*/libexec/sftp-server ",
+                "\"$store\"/*/libexec/ssh-keysign ",
+                "\"$store\"/*/libexec/ssh-pkcs11-helper ",
+                "\"$store\"/*/libexec/ssh-sk-helper ",
+                "\"$store\"/*/libexec/sshd-session ",
+                "\"$store\"/*/libexec/sshd-auth;",
+            ] {
+                assert!(check.contains(absent), "{absent} is not held absent");
+            }
+            assert!(!check.contains("{in:openssh-x86-64}"));
+            assert_eq!(
+                check
+                    .matches("{in:td-ssh}/lib/debug/bin/$binary.debug")
+                    .count(),
+                1
+            );
+        }
+        let steps = recipe().steps.unwrap_or_default();
+        for (name, binary) in SSH_BIN_LINKS {
+            let target = format!("{{in:td-ssh}}/bin/{binary}");
+            let link = format!("{{root}}/real-root/bin/{name}");
+            assert!(steps.iter().any(|step| matches!(step,
+                Step::Symlink { target: t, link: l } if *t == target && *l == link)));
+        }
+        assert!(steps.iter().any(|step| matches!(step,
+            Step::CopyTree { from, dest }
+                if from == "{in:td-ssh}" && dest == "{root}/real-root{in:td-ssh}")));
+    }
+
+    /// The system ssh_config holds the one setting td-ssh does not compile in.
+    #[test]
+    fn the_system_ssh_config_is_hashed_known_hosts_alone() {
+        assert_eq!(build_ssh_config(), "HashKnownHosts yes\n");
+    }
+
+    /// td-ssh/DESIGN.md §9: the marker's evidence comes from the running daemon's
+    /// /proc, read while a real connection holds a pre-auth worker open, and no
+    /// worker at all, or one outside the jail, fails boot health.
+    #[test]
+    fn boot_health_reads_a_live_pre_auth_workers_jail() {
+        let bootsuccess = build_bootsuccess(&SYSTEM);
+        let at = |needle: &str| {
+            bootsuccess
+                .find(needle)
+                .unwrap_or_else(|| panic!("boot health lacks {needle:?}"))
+        };
+        assert_eq!(bootsuccess.matches(SSHD_JAIL_MARKER).count(), 1);
+        assert!(!SSHD_JAIL_MARKER.contains(SSHD_MARKER));
+        let refused = at(&format!("echo {ROOT_SSH_REFUSED_MARKER}\n"));
+        let asked = at(&format!(
+            "SSH_ASKPASS={SSHD_JAIL_PROBE} SSH_ASKPASS_REQUIRE=force /bin/ssh -F /dev/null "
+        ));
+        let unknown = at("-o StrictHostKeyChecking=ask -o UserKnownHostsFile=/dev/null ");
+        let read = at(&format!(
+            "jail=$(/bin/td-util cat {SSHD_JAIL_VERDICT} 2>/dev/null)"
+        ));
+        let none =
+            at("'workers=0 '*|'') echo \"td-sshd: no pre-auth worker to read: $jail\"; fail;;");
+        let clean = at(
+            "*'bad=') ;; *) echo \"td-sshd: a pre-auth worker is not jailed: $jail\"; fail;; esac",
+        );
+        let marker = at(&format!("echo {SSHD_JAIL_MARKER}\n"));
+        assert!(refused < asked && asked < unknown && unknown < read);
+        assert!(read < none && none < clean && clean < marker);
+        for pinned in [
+            format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}", uid = SSHD_PRIVSEP_UID),
+            "Seccomp:\t2".to_string(),
+            "NoNewPrivs:\t1".to_string(),
+            format!("Gid:\t{gid}\t{gid}\t{gid}\t{gid}", gid = SSHD_PRIVSEP_GID),
+            format!("Groups:\t{gid} \n", gid = SSHD_PRIVSEP_GID),
+            format!("[ \"$root\" = {SSHD_PRIVSEP_PATH} ] || bad="),
+            "/bin/td-util readlink \"${f%/status}/root\"".to_string(),
+        ] {
+            assert!(bootsuccess.contains(&pinned), "{pinned:?}");
+        }
+        // Worker and signer alike take this jail: it is every uid-995 process, and the
+        // chroot's path is the daemon's own.
+        let jail = include_str!("../../../td-ssh/src/server/jail.rs");
+        assert!(jail.contains(&format!(
+            "pub const PRIVSEP_PATH: &str = \"{SSHD_PRIVSEP_PATH}\";"
+        )));
+        // Only a reading that stays bad is a failure; none at all fails at once.
+        let rescan = at(&format!(
+            "while [ -n \"$bad\" ] && [ \"$tries\" -lt {SSHD_JAIL_RESCANS} ]; do"
+        ));
+        assert!(rescan < asked);
+        assert!(bootsuccess[rescan..asked].contains("/bin/td-util sleep 1; scan;"));
+        assert!(
+            bootsuccess.contains(&format!("/bin/chmod 0700 {SSHD_JAIL_PROBE} || fail")),
+            "the probe is root's alone: root runs it"
         );
     }
 
@@ -12560,11 +12771,11 @@ mod tests {
         // client could not load is never offered.
         let refused = at(&format!(
             "[ \"$rootssh_status\" = 255 ] || \
-             {{ echo \"OpenSSH: root login was not refused: $rootssh\"; fail; }}\n\
+             {{ echo \"td-ssh: root login was not refused: $rootssh\"; fail; }}\n\
              case \"$rootssh\" in \
              *'Offering public key: {QEMU_ROOT_SSH_REFUSAL_PRIVATE_KEY} ED25519 \
              {ROOT_SSH_REFUSAL_KEY_FINGERPRINT}'*'Permission denied (publickey)'*) ;; \
-             *) echo \"OpenSSH: the root key was not offered and then refused: $rootssh\"; \
+             *) echo \"td-ssh: the root key was not offered and then refused: $rootssh\"; \
              fail;; esac\n\
              echo {ROOT_SSH_REFUSED_MARKER}\n"
         ));
@@ -12598,7 +12809,7 @@ mod tests {
             "boot health must never read, append, replace, or remove live authorization state"
         );
         assert!(
-            bootsuccess.contains("\"$USER@127.0.0.1\" /bin/echo TD-OPENSSH-ROUNDTRIP"),
+            bootsuccess.contains("\"$USER@127.0.0.1\" /bin/echo TD-SSH-ROUNDTRIP"),
             "the volatile primary-account Match override also needs a successful login"
         );
         assert!(
@@ -12612,7 +12823,7 @@ mod tests {
                 && bootsuccess
                     .contains(&format!("/bin/chmod 0644 {SSHD_SELFTEST_AUTHORIZED_KEYS}")),
             "the tester authorization must stay root-owned but be readable after \
-             sshd drops privilege"
+             td-sshd reads it"
         );
     }
 
@@ -14225,10 +14436,10 @@ mod tests {
                 && bootsuccess.contains("/bin/ssh-keygen -q -t ed25519 -N ''")
                 && bootsuccess.contains("GIT_SSH_COMMAND=\"/bin/ssh -F /dev/null")
                 && bootsuccess.contains(&format!(
-                    "-o KexAlgorithms={OPENSSH_KEX_ALGORITHMS}"
+                    "-o KexAlgorithms={SSH_KEX_ALGORITHMS}"
                 ))
                 && bootsuccess.contains(&format!(
-                    "-o Ciphers={OPENSSH_CIPHERS}"
+                    "-o Ciphers={SSH_CIPHERS}"
                 ))
                 && bootsuccess.contains("/bin/git init --bare -b main origin")
                 && bootsuccess
@@ -14245,7 +14456,7 @@ mod tests {
                 && bootsuccess.contains("git: receive-pack push failed")
                 && bootsuccess.contains("/etc/ssl/certs/ca-certificates.crt")
                 && bootsuccess.contains(GIT_RUNTIME_MARKER)
-                && bootsuccess.contains("TD-OPENSSH-ROUNDTRIP")
+                && bootsuccess.contains("TD-SSH-ROUNDTRIP")
                 && bootsuccess.contains(SSHD_MARKER)
                 && bootsuccess.contains("/bin/td-util --list")
                 && bootsuccess.contains(TD_UTIL_RUNTIME_MARKER)
@@ -14402,7 +14613,7 @@ mod tests {
                     < bootsuccess
                         .find("&& /bin/td-boot on-volume success")
                         .unwrap()
-                && bootsuccess.find("TD-OPENSSH-ROUNDTRIP").unwrap()
+                && bootsuccess.find("TD-SSH-ROUNDTRIP").unwrap()
                     < bootsuccess
                         .find("&& /bin/td-boot on-volume success")
                         .unwrap()
@@ -17323,13 +17534,7 @@ mod server_tests {
         assert_eq!(server.name, "server-x86-64");
         assert!(server.payload_inputs.is_none());
         assert!(!canonical.contains("{payload:"));
-        for kept in [
-            "openssh-x86-64",
-            "td-svc",
-            "td-netd",
-            "td-jail",
-            "td-term-terminfo",
-        ] {
+        for kept in ["td-ssh", "td-svc", "td-netd", "td-jail", "td-term-terminfo"] {
             assert!(server_inputs.iter().any(|name| name == kept), "{kept}");
         }
         assert_eq!(
@@ -17350,7 +17555,6 @@ mod server_tests {
                 "glibc-x86-64",
                 "linux-firmware-notices",
                 "linux-x86-64",
-                "openssh-x86-64",
                 "ripgrep",
                 "td-boot",
                 "td-btrfs",
@@ -17366,6 +17570,7 @@ mod server_tests {
                 "td-profiler",
                 "td-secret",
                 "td-sh",
+                "td-ssh",
                 "td-svc",
                 "td-term-terminfo",
                 "td-txt",

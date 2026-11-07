@@ -135,12 +135,10 @@ fn local_source_crate(p: &str) -> Option<&'static str> {
     if p.contains("..") {
         return None;
     }
-    ["td-install-qemu-test", "td-ssh-interop"]
-        .into_iter()
-        .find(|name| {
-            p.strip_prefix(name)
-                .is_some_and(|rest| rest.starts_with('/'))
-        })
+    ["td-install-qemu-test"].into_iter().find(|name| {
+        p.strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1542,8 +1540,8 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     }
 
     // SSH the same way: td-ssh-test logs in between its static binaries and
-    // stock OpenSSH.
-    if p.starts_with("td-ssh/") && !p.contains("..") {
+    // stock OpenSSH, its driver staging td-firstboot's policy beside it.
+    if (p.starts_with("td-ssh/") || p.starts_with("td-ssh-interop/")) && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");
@@ -9525,16 +9523,21 @@ mod tests {
             eprintln!("SKIP: no roster crates (builder-only sandbox)");
             return;
         }
-        for changed in [
-            vec!["td-firstboot/src/ssh_policy.rs"],
-            vec!["td-firstboot/src/main.rs"],
-            vec![
-                "td-firstboot/src/ssh_policy.rs",
-                "td-firstboot/src/main.rs",
-                "td-login/TOKEN-LOGIN.md",
-                "recipes/src/recipes/system-x86-64.rs",
-                "recipes/src/recipes/openssh-x86-64-test.rs",
-            ],
+        // td-ssh-interop mounts the policy to hold it against the real td-sshd.
+        const WITH_DRIVER: &[&str] = &["td-firstboot", "td-ssh-interop"];
+        for (changed, wanted) in [
+            (vec!["td-firstboot/src/ssh_policy.rs"], WITH_DRIVER),
+            (vec!["td-firstboot/src/main.rs"], &["td-firstboot"][..]),
+            (
+                vec![
+                    "td-firstboot/src/ssh_policy.rs",
+                    "td-firstboot/src/main.rs",
+                    "td-login/TOKEN-LOGIN.md",
+                    "recipes/src/recipes/system-x86-64.rs",
+                    "recipes/src/recipes/td-ssh-test.rs",
+                ],
+                WITH_DRIVER,
+            ),
         ] {
             let paths: Vec<String> = changed.iter().map(|p| p.to_string()).collect();
             let cmds = cargo_test_cmds(&root, &paths).unwrap();
@@ -9542,7 +9545,7 @@ mod tests {
                 cmds.iter().filter_map(|c| cmd_manifest_crate(c)).collect();
             selected.sort_unstable();
             selected.dedup();
-            assert_eq!(selected, ["td-firstboot"], "{paths:?}");
+            assert_eq!(selected, wanted, "{paths:?}");
             assert!(cmds.iter().any(|c| c.contains("--workspace")));
         }
         let shared = cargo_test_cmds(&root, &["td-firstboot/src/hostname.rs".into()]).unwrap();

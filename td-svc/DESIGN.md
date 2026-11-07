@@ -293,7 +293,7 @@ timeout=60
 
 [sshd]
 type=daemon
-exec=/bin/sshd -D -e -f /run/td-sshd.conf
+exec=/bin/td-sshd -f /run/td-sshd.conf
 after=netup,td-firstboot
 ready=/bin/td-netd reach 127.0.0.1 22
 ready-timeout=30
@@ -578,7 +578,7 @@ requested stop or restart TERMs the group as usual, opens the leaf's
 leaf whose leader restarted in place is not empty), and TERMs every pid
 `cgroup.procs` lists, bounded at 64 KiB of it, other than the leader and
 the rest of its process group, which the group's TERM reached, so sessions
-that left the group, such as OpenSSH sessions that start their own
+that left the group, such as td-sshd's sessions that start their own
 sessions, get the grace too. That TERM is best effort, with one log line
 for what it missed: an entry that is not a pid is skipped, a member that
 exits between the read and its signal may have its pid reused, and td-svc
@@ -1670,7 +1670,7 @@ The system recipe generates the table for one of two profiles. The
 desktop (`system-x86-64`) is everything above. The server
 (`server-x86-64`) runs the same supervisor, inittab and boot path. Its
 accounts are the desktop's root, primary (UID 1000), profiler and
-OpenSSH privilege-separation accounts, without the td-admin,
+td-sshd privilege-separation accounts, without the td-admin,
 td-admin-build, compositor, broker, portal, audio, installer or notebook
 accounts. Its principal table still
 reserves the primary session's identities, which the account preflight

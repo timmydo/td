@@ -674,6 +674,7 @@ mod tests {
                 "td-software",
                 "td-source-scan",
                 "td-ssh",
+                "td-ssh-interop",
                 "td-taskmgr",
                 "td-term",
                 "td-test-compositor",
@@ -688,9 +689,62 @@ mod tests {
         lone.dedup();
         assert_eq!(
             lone,
-            ["td-install-qemu-test", "td-ssh-interop"],
+            ["td-install-qemu-test"],
             "a lone local-source crate joined; add it to builder/src/affected.rs local_source_crate"
         );
+    }
+
+    /// td-ssh/DESIGN.md §9: stock OpenSSH is td-ssh-test's peer. No other recipe
+    /// names it, so no image can hold it, and no image's closure reaches the one
+    /// recipe that does.
+    #[test]
+    fn only_td_ssh_test_names_the_openssh_peer() {
+        const PEER: &str = "openssh-x86-64";
+        let recipes = all();
+        let naming: Vec<&str> = recipes
+            .iter()
+            .filter(|(stem, recipe)| {
+                *stem != PEER && recipe.to_json().to_canonical().contains(PEER)
+            })
+            .map(|(stem, _)| *stem)
+            .collect();
+        assert_eq!(naming, ["td-ssh-test"]);
+        let mut reached: Vec<&str> = Vec::new();
+        let mut pending = vec!["system-x86-64", "server-x86-64"];
+        while let Some(stem) = pending.pop() {
+            if reached.contains(&stem) {
+                continue;
+            }
+            reached.push(stem);
+            let (_, recipe) = recipes
+                .iter()
+                .find(|(name, _)| *name == stem)
+                .unwrap_or_else(|| panic!("{stem} is not in the catalog"));
+            for names in [
+                &recipe.inputs,
+                &recipe.native_inputs,
+                &recipe.payload_inputs,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for name in names {
+                    // A pin names no recipe. Anything else this walk cannot follow is
+                    // an unseen part of the closure.
+                    match recipes.iter().find(|(stem, _)| stem == name) {
+                        Some((known, _)) => pending.push(known),
+                        None => assert!(
+                            crate::source_pins::by_key(name).is_some(),
+                            "{stem}'s input {name} is neither a recipe nor a source pin"
+                        ),
+                    }
+                }
+            }
+        }
+        assert!(reached.contains(&"td-ssh"));
+        for held_out in [PEER, "td-ssh-test", "td-ssh-interop"] {
+            assert!(!reached.contains(&held_out), "an image reaches {held_out}");
+        }
     }
 
     /// The post-Rust tool farm links no awk, so a recipe built on it runs

@@ -4177,7 +4177,7 @@ mod tests {
     #[test]
     fn building_a_leaf_unit_goes_through_its_start_gate() {
         let rt = runtime(
-            "[sshd]\ntype=daemon\nexec=/bin/sshd -D '' 'two words'\nstop=leaf\n\
+            "[sshd]\ntype=daemon\nexec=/bin/td-sshd '' 'two words'\nstop=leaf\n\
              [plain]\ntype=daemon\nexec=/bin/x\n",
         );
         let unit = &rt.lookup("sshd").unwrap().unit;

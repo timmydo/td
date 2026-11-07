@@ -4,12 +4,12 @@ use crate::shared::{
 };
 use crate::types::{Recipe, Step};
 
-// OpenSSH Portable supplies td's SSH client and daemon from one pinned source.
-// This is deliberately the no-libcrypto profile: the negotiated surface is
-// restricted by the image configuration to the internal post-quantum hybrid
-// KEXs, Ed25519 keys, and ChaCha20-Poly1305. zlib, PAM, Kerberos, PKCS#11,
-// FIDO, libedit, login accounting, and the unshipped client/server tools never
-// enter the closure.
+// Stock OpenSSH Portable, TEST-ONLY: td-ssh-test's peer and nothing else's
+// (td-ssh/DESIGN.md §9). No image holds it, which a catalog test and the image's
+// root-tree check both hold, so `scp` and `sftp` can be built for that peer
+// without any image ever carrying them. It stays the no-libcrypto profile, so a
+// peer with internal crypto only. zlib, PAM, Kerberos, PKCS#11, FIDO, libedit and
+// login accounting never enter the closure.
 //
 // It compiles in the Debian build root against td glibc under the shipped
 // target profile (`build_root_dynamic_cc`; the seccomp sandbox's linux/
@@ -23,9 +23,7 @@ use crate::types::{Recipe, Step};
 // Portable OpenSSH has no build switch that removes password verification, and
 // its fallback verifier requires crypt(3) even when PasswordAuthentication is
 // disabled at runtime. Replace that one translation unit with a fail-closed
-// implementation. This both keeps libcrypt out and makes the image's
-// public-key-only authentication policy true in the linked server, not just in
-// sshd_config.
+// implementation, which keeps libcrypt out.
 const AUTH_PASSWORD_DISABLED_C: &str = r#"#include "includes.h"
 #include <sys/types.h>
 #include "hostfile.h"
@@ -40,9 +38,22 @@ auth_password(struct ssh *ssh, const char *password)
 }
 "#;
 
-/// The shipped programs, each built by its own make.
-const PROGRAMS: &[&str] = &["ssh", "sshd", "sshd-session", "sshd-auth", "ssh-keygen"];
+/// The programs td-ssh-test drives or the daemon needs, each built by its own make.
+const PROGRAMS: &[&str] = &[
+    "ssh",
+    "sshd",
+    "sshd-session",
+    "sshd-auth",
+    "ssh-keygen",
+    "scp",
+    "sftp",
+];
 
+/// What stands in `{out}/bin`.
+const BIN_PROGRAMS: &[&str] = &["ssh", "sshd", "ssh-keygen", "scp", "sftp"];
+
+/// Stock OpenSSH as td-ssh-test's peer. Test-only: no shipped image and no other
+/// recipe may name it (catalog.rs).
 pub fn recipe() -> Recipe {
     let path = format!("{{root}}/wb:{BUILD_ROOT_PATH}");
 
@@ -104,8 +115,7 @@ pub fn recipe() -> Recipe {
         .env("NM", "/usr/bin/nm")
         .env("OBJCOPY", "/usr/bin/objcopy")
         .env("CFLAGS", "-O2")
-        // configure added this itself until 10.6; openssh-x86-64-test
-        // requires the fortified imports it produces.
+        // configure added this itself until 10.6.
         .env("CPPFLAGS", "-D_FORTIFY_SOURCE=2")
         .env("LDFLAGS", "-Wl,--build-id=sha1")
         // td glibc has no crypt(3); the probe would find the root's libcrypt.
@@ -156,7 +166,7 @@ pub fn recipe() -> Recipe {
         steps.push(Step::MkDir { path: dir.into() });
     }
     steps.push(Step::CopyFiles {
-        files: ["ssh", "sshd", "ssh-keygen"]
+        files: BIN_PROGRAMS
             .iter()
             .map(|name| format!("{{root}}/build/{name}"))
             .collect(),
@@ -174,6 +184,8 @@ pub fn recipe() -> Recipe {
             "{out}/bin/ssh".into(),
             "{out}/bin/sshd".into(),
             "{out}/bin/ssh-keygen".into(),
+            "{out}/bin/scp".into(),
+            "{out}/bin/sftp".into(),
             "{out}/libexec/sshd-session".into(),
             "{out}/libexec/sshd-auth".into(),
         ],
@@ -194,7 +206,7 @@ mod tests {
     use crate::types::Step;
 
     #[test]
-    fn build_is_the_bounded_no_libcrypto_client_server_profile() {
+    fn build_is_the_test_peers_no_libcrypto_profile() {
         let recipe = recipe();
         assert_eq!(
             recipe.native_inputs.as_deref(),
@@ -287,7 +299,15 @@ mod tests {
             })
             .collect();
         assert_eq!(builds.len(), PROGRAMS.len(), "one make per program");
-        for target in ["ssh", "sshd", "sshd-session", "sshd-auth", "ssh-keygen"] {
+        for target in [
+            "ssh",
+            "sshd",
+            "sshd-session",
+            "sshd-auth",
+            "ssh-keygen",
+            "scp",
+            "sftp",
+        ] {
             let map = format!("{{root}}/{target}.map");
             let (link, _) = steps
                 .iter()
@@ -309,7 +329,7 @@ mod tests {
                 .expect("link-map check");
             assert!(link < checked, "{target}'s map is checked after its link");
         }
-        for omitted in ["scp", "sftp", "sftp-server", "ssh-agent", "ssh-add"] {
+        for omitted in ["sftp-server", "ssh-agent", "ssh-add"] {
             assert!(
                 !builds
                     .iter()

@@ -5,14 +5,14 @@
 //! Both verbs publish through `cutover::publish`, which td-authd shares
 //! for its own record write: a fixed-name temporary beside the target,
 //! created exclusively without following a link, written, synced and
-//! renamed into place, so `sshd` never reads a partial policy and td-authd
+//! renamed into place, so td-sshd never reads a partial policy and td-authd
 //! never reads a partial record.
 
 use crate::cutover::{self, BootId, Reduced};
 use crate::{login_state, principals, ssh_policy};
 use std::path::Path;
 
-/// The policy `sshd` requires (`-f`), relative to the root rendered under.
+/// The policy td-sshd requires (`-f`), relative to the root rendered under.
 pub(crate) const POLICY: &str = "run/td-sshd.conf";
 
 /// The reduced login state a form serves, which the record and
@@ -75,7 +75,7 @@ const PROVISIONED_KEYS_LIMIT: u64 = 64 * 1024;
 /// The server's provisioned keys are `owner`'s alone to write: absent, or
 /// one regular, singly linked, mode-0644 file of bounded size that `owner`
 /// owns, under directories `owner` owns that no group or other may write.
-/// StrictModes would also accept a file the account owned, which would let
+/// td-sshd's strict modes would also accept a file the account owned, which would let
 /// the account rewrite the keys only the volume's builder may set.
 fn check_provisioned_keys(root: &Path, owner: login_state::Owner) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

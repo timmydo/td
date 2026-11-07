@@ -11,9 +11,9 @@
 //!
 //! Nothing here ever silently REPLACES an identity: a file that is present but
 //! malformed is a hard error, because minting a new one over a bad read cannot be
-//! noticed from outside. The Ed25519 key comes from OpenSSH `ssh-keygen`, the one
-//! program in the image that already has the required key implementation, so this crate
-//! stays dependency-free `std`; credential encryption shares td-secret's implementation.
+//! noticed from outside. The Ed25519 key comes from `/bin/ssh-keygen` (td-ssh's key tool),
+//! the one program in the image that already has the required key implementation, so this
+//! crate stays dependency-free `std`; credential encryption shares td-secret's implementation.
 
 #[path = "../../td-busd/src/app_policy.rs"]
 #[allow(dead_code, reason = "shared immutable application assignments")]
@@ -111,7 +111,7 @@ const PROVISIONED_KEYS_FLAG: &str = "--provisioned-keys";
 /// literal back out of this file to prove the two agree.
 const DEFAULT_STATE_DIR: &str = "/var/lib/td";
 
-/// The OpenSSH key utility used for generation and fingerprinting.
+/// td-ssh's key tool, used for generation and fingerprinting.
 const DEFAULT_KEYGEN: &str = "/bin/ssh-keygen";
 
 /// Paths relative to the state dir. Each is one entry in the recipe's table.
@@ -191,7 +191,7 @@ url = \"https://blog.rust-lang.org/feed.xml\"
 /// on every connection) while authorizing nobody. On a td image it serves no
 /// account at all (td-login/TOKEN-LOGIN.md, "SSH").
 const AUTHORIZED_KEYS_HEADER: &str = "\
-# td OpenSSH authorized_keys - one public key per line.\n\
+# td authorized_keys - one public key per line.\n\
 # This file is per-machine state under /var, reached through the\n\
 # /etc/ssh/authorized_keys symlink. On a td image it admits no account: sshd\n\
 # refuses root, every other account but the primary is locked, and the\n\
@@ -1285,7 +1285,7 @@ fn provision_machine_id(path: &Path) -> Result<Outcome, Failure> {
     }
 }
 
-/// Delegate Ed25519 generation and fingerprinting to OpenSSH. A complete existing
+/// Delegate Ed25519 generation and fingerprinting to `ssh-keygen`. A complete existing
 /// pair is preserved; an incomplete pair is a hard error rather than an invitation
 /// to overwrite or silently repair the machine's identity.
 fn provision_host_key(config: &Config, plan: &Plan) -> Result<(Outcome, String), Failure> {
@@ -1301,7 +1301,7 @@ fn provision_host_key(config: &Config, plan: &Plan) -> Result<(Outcome, String),
                 .arg("-N")
                 .arg("")
                 .arg("-C")
-                .arg("td-openssh-host-key")
+                .arg("td-ssh-host-key")
                 .arg("-f")
                 .arg(&plan.host_key)
                 .output()
@@ -2322,38 +2322,17 @@ mod ssh_forms {
         )
     }
 
-    /// The policy as rendered before the login-key tier and APPLICATIONS.md
-    /// §L.1's L7, plus the SFTP subsystem, for `alice`, written out
-    /// independently of the formatter.
+    /// The policy's fixed lines for `alice`, written out independently of the
+    /// formatter, in td-ssh/DESIGN.md §5's keywords alone.
     const BEFORE: &str = "Port 22\n\
         ListenAddress 0.0.0.0\n\
         HostKey /etc/ssh/ssh_host_ed25519_key\n\
         AuthorizedKeysFile /etc/ssh/authorized_keys\n\
-        AuthenticationMethods publickey\n\
-        PubkeyAuthentication yes\n\
-        PasswordAuthentication no\n\
-        KbdInteractiveAuthentication no\n\
-        ChallengeResponseAuthentication no\n\
-        HostbasedAuthentication no\n\
-        PermitEmptyPasswords no\n\
-        PermitRootLogin prohibit-password\n\
-        StrictModes yes\n\
-        KexAlgorithms mlkem768x25519-sha256,sntrup761x25519-sha512,curve25519-sha256\n\
-        HostKeyAlgorithms ssh-ed25519\n\
-        PubkeyAcceptedAlgorithms ssh-ed25519\n\
-        Ciphers chacha20-poly1305@openssh.com\n\
-        Compression no\n\
-        DisableForwarding yes\n\
-        PermitTTY yes\n\
-        PermitUserEnvironment no\n\
-        PermitUserRC no\n\
-        UseDNS no\n\
-        PrintMotd no\n\
+        PermitRootLogin no\n\
         LoginGraceTime 30\n\
         MaxAuthTries 3\n\
         MaxSessions 4\n\
         Subsystem sftp internal-sftp\n\
-        PidFile /run/sshd.pid\n\
         Match User alice\n\
         \tAuthorizedKeysFile /run/td-ssh-selftest-authorized_keys\n";
 
@@ -2365,13 +2344,10 @@ mod ssh_forms {
         "abcdefghijklmnopqrstuvwxyz012345",
     ];
 
-    /// L7's only change: root, which `BEFORE` admitted with a key, is refused.
-    const ROOT_BEFORE_L7: &str = "PermitRootLogin prohibit-password\n";
     const ROOT_REFUSED: &str = "PermitRootLogin no\n";
 
     fn ordinary(name: &str) -> String {
         BEFORE
-            .replace(ROOT_BEFORE_L7, ROOT_REFUSED)
             .replace("Match User alice\n", &format!("Match User td-admin\n\tAuthorizedKeysFile /var/lib/td-admin/authorized_keys\n\tForceCommand /bin/td-admin ssh\n\tPermitTTY no\n\tMaxSessions 1\nMatch User {name}\n"))
             .replace(
                 "/run/td-ssh-selftest-authorized_keys\n",
@@ -2383,7 +2359,7 @@ mod ssh_forms {
     fn enforced(name: &str) -> String {
         BEFORE
             .replace(
-                ROOT_BEFORE_L7,
+                ROOT_REFUSED,
                 &format!("PermitRootLogin no\nAllowUsers {name} td-admin\n"),
             )
             .replace("Match User alice\n", &format!("Match User td-admin\n\tAuthorizedKeysFile /var/lib/td-admin/authorized_keys\n\tForceCommand /bin/td-admin ssh\n\tPermitTTY no\n\tMaxSessions 1\nMatch User {name}\n"))
@@ -2486,7 +2462,6 @@ mod ssh_forms {
     /// Ordinary boot admits the primary's remote keys but never root.
     #[test]
     fn the_ordinary_form_refuses_root_and_consults_primary_remote_keys() {
-        assert_eq!(BEFORE.matches(ROOT_BEFORE_L7).count(), 1);
         let ordinary_alice = ordinary("alice");
         assert_eq!(ordinary_alice.matches(ROOT_REFUSED).count(), 1);
         assert!(!ordinary_alice.contains("prohibit-password"));
@@ -2670,7 +2645,7 @@ mod ssh_forms {
     }
 
     /// The name both forms admit is the one the shared account validation
-    /// admits, which carries none of OpenSSH's pattern characters, so
+    /// admits, which carries none of `ssh_config`'s pattern characters, so
     /// `AllowUsers` and `Match User` name exactly that account.
     #[test]
     fn the_admitted_primary_is_the_validated_account() {

@@ -232,7 +232,7 @@ a gap. These are requirements for development readiness, not prerequisites
 for the initial stock-desktop lifecycle increment. The image producer owns:
 
 - td's Rust toolchain and Cargo, linker/compiler tools, td control-plane tools,
-  Git, the source-built OpenSSH client and key generator, required build/test
+  Git, td-ssh's client and key tool, required build/test
   utilities, CA certificates, and declared offline dependency sources.
   A clean checkout must build its builder and run the
   repository's actual checks with no host executables entering the target.
@@ -1239,7 +1239,7 @@ registrar's eventual owned-process tracking must cover that cleanup.
 
 ### Guest clone and task worktree
 
-The development image uses ordinary Git and its source-built OpenSSH client.
+The development image uses ordinary Git and td-ssh's client.
 After key enrollment and host-key provisioning, the selected origin is ready
 for an ordinary SSH clone. No custom Git remote helper is required.
 

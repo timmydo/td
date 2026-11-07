@@ -13,10 +13,6 @@ pub const SSHD_PROVISIONED_AUTHORIZED_KEYS: &str = "/var/lib/td/authorized-keys"
 /// `td-firstboot metadata` or `cloud-metadata` writes after this policy is
 /// rendered.
 pub const SSHD_METADATA_AUTHORIZED_KEYS: &str = "/run/td-metadata-authorized-keys";
-pub const OPENSSH_KEX_ALGORITHMS: &str =
-    "mlkem768x25519-sha256,sntrup761x25519-sha512,curve25519-sha256";
-pub const OPENSSH_KEY_ALGORITHMS: &str = "ssh-ed25519";
-pub const OPENSSH_CIPHERS: &str = "chacha20-poly1305@openssh.com";
 
 /// td-login/TOKEN-LOGIN.md, "SSH": the login state selects the form. Both
 /// refuse root (APPLICATIONS.md §L.1, L7); only the ordinary form also reads
@@ -42,7 +38,10 @@ pub enum Provisioned {
     Server,
 }
 
-/// The caller supplies the already admitted primary account name, never raw input.
+/// `td-sshd -f`'s file, in exactly td-ssh/DESIGN.md §5's subset: td-sshd refuses
+/// a whole file for one keyword outside it, and the rest of the policy is
+/// compiled behaviour. The caller supplies the already admitted primary account
+/// name, never raw input.
 pub fn config(primary_name: &str, form: Form, provisioned: Provisioned) -> String {
     let provisioned_keys = match provisioned {
         Provisioned::No => String::new(),
@@ -70,32 +69,12 @@ pub fn config(primary_name: &str, form: Form, provisioned: Provisioned) -> Strin
          ListenAddress 0.0.0.0\n\
          HostKey {SSHD_HOST_KEY}\n\
          AuthorizedKeysFile {SSHD_AUTHORIZED_KEYS}\n\
-         AuthenticationMethods publickey\n\
-         PubkeyAuthentication yes\n\
-         PasswordAuthentication no\n\
-         KbdInteractiveAuthentication no\n\
-         ChallengeResponseAuthentication no\n\
-         HostbasedAuthentication no\n\
-         PermitEmptyPasswords no\n\
          PermitRootLogin no\n\
          {allow}\
-         StrictModes yes\n\
-         KexAlgorithms {OPENSSH_KEX_ALGORITHMS}\n\
-         HostKeyAlgorithms {OPENSSH_KEY_ALGORITHMS}\n\
-         PubkeyAcceptedAlgorithms {OPENSSH_KEY_ALGORITHMS}\n\
-         Ciphers {OPENSSH_CIPHERS}\n\
-         Compression no\n\
-         DisableForwarding yes\n\
-         PermitTTY yes\n\
-         PermitUserEnvironment no\n\
-         PermitUserRC no\n\
-         UseDNS no\n\
-         PrintMotd no\n\
          LoginGraceTime 30\n\
          MaxAuthTries 3\n\
          MaxSessions 4\n\
          Subsystem sftp internal-sftp\n\
-         PidFile /run/sshd.pid\n\
          {admin}\
          Match User {primary_name}\n\
          \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}{provisioned_keys}{remote_keys}\n"

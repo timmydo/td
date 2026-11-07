@@ -2,7 +2,7 @@
 //! §10, "Profiles"). The `server-x86-64` deployment boots through the same
 //! selector, verified kexec, loop-mounted EROFS and persistent `@var` as the
 //! desktop, with no display attached, and its health transaction
-//! completes with the network, OpenSSH and the confinement probes up and
+//! completes with the network, td-sshd and the confinement probes up and
 //! nothing graphical started.
 //!
 //! Two transactional sequences, as `qemu-boot-system` runs them. In the
@@ -44,8 +44,8 @@ use super::{
     validate_primary_selection, BootDisk, BootPlan, BootResult, BootSource, Devices,
     FirmwareAttachment, RunVolume, VolumeLayout, VolumePurpose, AUTOTEST_CMDLINE_TOKEN,
     BOOT_FAIL_TARGET_CMDLINE_TOKEN, DEPLOY_INSTALL_CMDLINE_TOKEN, GIT_RUNTIME_MARKER,
-    GREETER_MARKER, RIPGREP_FD_RUNTIME_MARKER, ROOT_SSH_REFUSED_MARKER, SSHD_MARKER,
-    SU_ABSENT_MARKER, SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER,
+    GREETER_MARKER, RIPGREP_FD_RUNTIME_MARKER, ROOT_SSH_REFUSED_MARKER, SSHD_JAIL_MARKER,
+    SSHD_MARKER, SU_ABSENT_MARKER, SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER,
     SYSTEM_DEPLOY_ROLLBACK_MARKER, SYSTEM_ETC_MUTABLE_MARKER, SYSTEM_ETC_RO_MARKER,
     SYSTEM_GUEST_MEMORY_MIB, SYSTEM_LOGIN_DIRECTORY_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
@@ -248,7 +248,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         return Err("transaction fixture candidate did not change the deployment id".into());
     }
     println!(
-        "   [qemu-boot-server] {qemu} boots the headless deployment with no display: selector -> verified kexec -> loop-mounted root.erofs + persistent @var -> td-svc system units, OpenSSH and the health transaction\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}\n              initial:       {}\n              candidate:     {}",
+        "   [qemu-boot-server] {qemu} boots the headless deployment with no display: selector -> verified kexec -> loop-mounted root.erofs + persistent @var -> td-svc system units, td-sshd and the health transaction\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}\n              initial:       {}\n              candidate:     {}",
         bzimage.display(),
         initramfs.display(),
         volume.display(),
@@ -454,8 +454,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          composes, each for its own account ({IMAGE_ACCOUNT:?}, {ISO_ACCOUNT:?}), cold-boot \
          under UEFI firmware to the same steady state and logins, the disk image named and \
          keyed by its NoCloud seed. Every healthy boot reports the read-only root and \
-         /etc, writable state, OpenSSH loopback ({SSHD_MARKER}) and root's refusal \
-         ({ROOT_SSH_REFUSED_MARKER}), the userland and confinement probes, and no greeter, \
+         /etc, writable state, td-sshd loopback ({SSHD_MARKER}), root's refusal \
+         ({ROOT_SSH_REFUSED_MARKER}) and a live pre-auth worker's jail ({SSHD_JAIL_MARKER}), \
+         the userland and confinement probes, and no greeter, \
          compositor, session bus or application"
     );
     Ok(())
@@ -644,7 +645,7 @@ fn image_boot(
         || evidence.host_key.is_none()
     {
         return Err(format!(
-            "the {label} did not mint a new identity, start OpenSSH, record health \
+            "the {label} did not mint a new identity, start td-sshd, record health \
              {SYSTEM_BOOT_SUCCESS_MARKER:?} and reach {HEALTH_STEADY_MARKER:?} - {}. \
              Last serial output:\n{}",
             result.reason,
@@ -802,6 +803,7 @@ fn validate_health(result: &BootResult, identity: Identity, label: &str) -> Resu
         (evidence.git_runtime, GIT_RUNTIME_MARKER),
         (evidence.sshd, SSHD_MARKER),
         (evidence.root_ssh_refused, ROOT_SSH_REFUSED_MARKER),
+        (evidence.sshd_jail, SSHD_JAIL_MARKER),
         (evidence.su_absent, SU_ABSENT_MARKER),
         (evidence.td_util_runtime, TD_UTIL_RUNTIME_MARKER),
         (evidence.td_txt_runtime, TD_TXT_RUNTIME_MARKER),

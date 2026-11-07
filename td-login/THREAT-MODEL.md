@@ -20,7 +20,7 @@ The release/source administrator (`td-update/ADMIN.md`) is a separate SSH
 principal, UID/GID 986, with a forced fixed-command interface and root-owned
 keys enrolled through one physical settings approval. It remains admitted in both SSH policy forms. Its password-field marker is
 `td-admin-key-only`, an unsupported hash to td-login, not an empty password
-or service marker. OpenSSH uses public-key authentication alone; td-login
+or service marker. td-sshd uses public-key authentication alone; td-login
 cannot authenticate that marker. The build/download account UID/GID 985 uses the
 existing `!td-service` path and cannot log in. Neither account belongs to
 another account's supplementary groups. The existing credential-switching
@@ -66,15 +66,17 @@ Adversaries considered:
 Explicitly **not** in the model: an attacker who already has uid 0
 (nothing here can constrain them), physical DMA, and the kernel itself.
 
-OpenSSH is a separate, deliberately narrow credential-changing boundary.
-The externally maintained `sshd` starts as root, switches its pre-auth process
+td-sshd is a separate, deliberately narrow credential-changing boundary
+(`td-ssh/DESIGN.md`). It starts as root, switches its pre-auth worker
 to the locked `sshd` privilege-separation identity, and switches authenticated
-sessions to their target account without going through td-login. Its fixed
-configuration policy permits only Ed25519 public-key authentication and disables
-password, interactive, host-based, and forwarding paths. This document does
-not extend td-login's syscall or post-condition claims to OpenSSH; the image
-recipe instead pins its source, configuration, locked account, empty volatile
-chroot, split helpers, seccomp sandbox, and a real unprivileged loopback login.
+sessions to their target account without going through td-login, through a
+credential switch of its own that `td-ssh/DESIGN.md` §4 states. It has only
+Ed25519 public-key authentication: password, interactive, host-based and
+forwarding paths are code it does not have, not settings. This document does
+not extend td-login's syscall or post-condition claims to td-sshd; the image
+recipe instead pins its configuration, locked account, empty volatile chroot,
+and a real unprivileged loopback login, and boot health reads a live pre-auth
+worker's uid, seccomp filter and `no_new_privs` from `/proc`.
 Before entering the verified deployment, firstboot validates its complete
 root-owned account tables and publishes the server policy itself as root:root
 mode-0600 `/run/td-sshd.conf`, renaming into place a temporary it created
@@ -83,7 +85,7 @@ record naming the form it rendered (`td-authd/DESIGN.md` amendment 7).
 Only the admitted UID/GID-1000 account name selects its SSH Match
 block and, in the enforced form below, the one `AllowUsers` entry. The
 policy's remaining bytes are compiled from the shared source used by the
-realized OpenSSH recipe test. The daemon requires this configuration file
+realized `td-ssh-test`. The daemon requires this configuration file
 explicitly; there is no optional include or fallback configuration. A
 failed validation, boot ID read, or either write stops boot before user
 processes. Within a boot, `td-firstboot render-ssh-policy`, which td-authd
@@ -114,7 +116,7 @@ The ordinary form also consults `.ssh/authorized_keys` in that account's
 passwd home. The owner may authorize remote Ed25519 keys there; private-key
 possession grants that account's session authority, including access to its
 files, but grants no elevation or hardware-backed credential release.
-OpenSSH's default StrictModes checks apply to the home and authorization
+td-sshd's strict modes (`td-ssh/DESIGN.md` §5) apply to the home and authorization
 file. A process already running as that owner may add keys; same-UID
 isolation is not claimed. Enforced and unavailable login states never consult
 this file, and enrollment's SSH leaf teardown revokes existing sessions.
@@ -138,7 +140,7 @@ firmware's DMI names EC2 takes them from the instance metadata service instead
 key pair, fixed for the instance's life. On Azure, whose firmware's chassis
 asset tag names it, whoever set the SSH keys the VM was created with admits one.
 The boot-health login uses a fresh volatile key for the unprivileged UI account,
-but its root-owned authorization line is constrained by OpenSSH `restrict` and
+but its root-owned authorization line is constrained by `restrict` and
 `from="127.0.0.1"`; possession of that key cannot create a network-reachable
 login. Root has no SSH login, and no other interactive one: its password
 field is `!` (§3) and td-login is no administrative path (§4). The
@@ -288,7 +290,8 @@ capability no shipped td image uses. The policy is therefore fail-closed
 by construction — `/etc/passwd`'s password field is classified, and only
 one class authenticates. There is no `/etc/shadow`: td's accounts hold
 markers, never a secret, so nothing about them needs a root-only file, and
-OpenSSH is built `--without-shadow` so its lock check reads the same field:
+td-sshd's admission reads the same field through this crate's `db.rs`
+(`td-ssh/DESIGN.md` §5):
 
 The `login -f` and `exec-as` columns below are the *forced* paths,
 which skip authentication because the caller has by then already
@@ -388,7 +391,7 @@ Consequences worth stating plainly:
   the image contract and the credential policy.
 
   The shipped image has eight infrastructure service identities plus four
-  locked application identities. OpenSSH's `sshd`
+  locked application identities. td-sshd's `sshd`
   privilege-separation account, `td-profiler`'s `profiler` account and
   `td-netd`'s `td-netd` account are not td-svc `exec-as` targets; each daemon
   performs its own fixed-purpose drop. td-netd's keeps CAP_NET_ADMIN and

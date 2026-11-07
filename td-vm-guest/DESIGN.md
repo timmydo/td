@@ -28,10 +28,11 @@ instance ID, `id_ed25519` and `id_ed25519.pub`. It creates these in private
 staging using the image's fixed `/bin/ssh-keygen`, an empty environment,
 bounded output and execution time. Generation and public-key extraction use
 closed stdin. Before publication it also signs a fixed local challenge and
-verifies the signature against the public key using OpenSSH. Verification
+verifies the signature against the public key using that tool. Verification
 receives only that challenge on stdin; private proof staging is removed after
-the check. Extracting the embedded public key alone cannot detect damaged
-Ed25519 secret bytes. Private
+the check. Extracting the embedded public key alone is not relied on to detect
+damaged Ed25519 secret bytes: td-ssh's tool refuses them there, the host
+OpenSSH's used by the key tests does not. Private
 files are never returned or logged. File and directory syncs precede atomic
 publication; interrupted staging may be removed under the lock. Published
 state is never regenerated to repair corruption or to bind another identity.
@@ -67,10 +68,12 @@ cloning below has its own typed request and completion; terminal launch and
 provider authentication remain separate.
 
 
-Real OpenSSH key tests run in the host preflight with `--include-ignored`.
+Key tests against the host's `ssh-keygen`, whose formats td-ssh's tool shares,
+run in the host preflight with `--include-ignored`.
 The compiler-only sandbox runs the pure wire/identity tests; it does not
-supply OpenSSH. The target recipe checks its realized static helper's startup
-interface, and boot evidence must exercise the standard image's OpenSSH tool.
+supply one. The target recipe checks its realized static helper's startup
+interface, and boot evidence must exercise the standard image's `/bin/ssh-keygen`,
+td-ssh's.
 Tool stderr is discarded deliberately; failure diagnostics expose only the
 fixed operation and exit status, without private material or tool output.
 The fixed human/compositor UIDs are the standard image contract.
@@ -172,8 +175,8 @@ cause an unrequested retry. Status echoes the full plan and is only a record
 of that completed attempt. The service clears status on startup and before a
 new attempt; the compositor refuses a mismatched plan or malformed status.
 
-The host preflight includes a real disposable SSH server under the test user's
-private home, preserving OpenSSH StrictModes. It proves a moved origin main,
+The host preflight includes a real disposable SSH server, the host's OpenSSH,
+under the test user's private home, preserving its StrictModes. It proves a moved origin main,
 explicit retained-ref fetch, atomic relative worktree publication, same-plan
 retry preserving edits and new commits, and an ordinary SSH push. Killing the
 owned provisioning helper while Git's server is held verifies that surviving
@@ -182,7 +185,7 @@ staging. A separate regression lets the Git parent fail while a descendant
 keeps stderr and redirects stdout; the same helper must wait for it. A changed retention ref refuses publication and can be repaired for
 a same-plan retry. A wrong host-key probe is refused. These fixtures use
 host-only fixed Rust test adapters; the standard-image proof exercises the
-actual human-only `td-vm-ssh` alias and source-built Git/OpenSSH.
+actual human-only `td-vm-ssh` alias, source-built Git and td-ssh.
 
 The combined service-loop regression retains both requests across a damaged
 key's signature self-test failure. Each job attempts once, then remains idle

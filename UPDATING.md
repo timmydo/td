@@ -123,7 +123,7 @@ and its licences), per commit.
    | --- | --- |
    | kernel.org (Linux, Git) | `sha256sums.asc` in the release directory |
    | curl's CA extract | `cacert-DATE.pem.sha256` beside the file |
-   | OpenSSH | the release notes, `txt/release-X.Y`, in base64 |
+   | OpenSSH (test-only: td-ssh-test's peer, in no image) | the release notes, `txt/release-X.Y`, in base64 |
    | zlib | zlib.net's release line, and the GitHub release asset's digest |
    | crates.io | the version's `cksum` in the sparse index |
    | Rust | `xz_hash` in that date's `channel-rust-stable.toml` |

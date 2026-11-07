@@ -1130,7 +1130,7 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
 
 /// `td-recipe-eval qemu-boot-server [server-x86-64]` — the headless profile's
 /// boot proof: one persistent volume, booted through the selector to the
-/// deployment's health acknowledgement, with OpenSSH up and nothing graphical
+/// deployment's health acknowledgement, with td-sshd up and nothing graphical
 /// started. Host-side, like every qemu oracle.
 pub fn qemu_boot_server_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = crate::checks::qemu_boot::server::STEM;
@@ -8468,7 +8468,7 @@ mod tests {
         assert!(answer.pins.is_empty());
         // Members built in or imported from Debian: the kernel, glibc and
         // libgcc, the upstream toolchain's runtime,
-        // zlib, OpenSSH, Git and every Rust recipe: td-link, whose throwaway first
+        // zlib, Git and every Rust recipe: td-link, whose throwaway first
         // stage the root's GCC links, each Cargo recipe, whose build
         // scripts' C the root's GCC compiles, and each direct-rustc
         // recipe, whose companions the root's objcopy splits.
@@ -8480,7 +8480,6 @@ mod tests {
                 "git-x86-64",
                 "glibc-x86-64",
                 "linux-x86-64",
-                "openssh-x86-64",
                 "ripgrep",
                 "td-agent",
                 "td-audio",
@@ -8517,6 +8516,7 @@ mod tests {
                 "td-setup",
                 "td-sh",
                 "td-software",
+                "td-ssh",
                 "td-svc",
                 "td-taskmgr",
                 "td-term",
@@ -10794,12 +10794,9 @@ chmod 755 '{}'
             );
             assert!(reach["rust-toolchain"].contains(scope), "{reach:?}");
         }
-        // td-jail-test names firefox's module; so does system-x86-64,
-        // whose module openssh-x86-64-test names in turn.
+        // td-jail-test names firefox's module.
         let firefox = checks_reaching(&["recipes/src/recipes/firefox.rs"]).unwrap();
         assert!(firefox.contains_key("td-jail-test"), "{firefox:?}");
-        let why = &firefox["openssh-x86-64-test"];
-        assert!(why.contains("system-x86-64's module"), "{why}");
         assert!(
             !firefox.contains_key("build-root-hello-test"),
             "{firefox:?}"

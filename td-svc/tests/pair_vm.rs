@@ -113,7 +113,7 @@ fn leaf_result(text: &str) -> ! {
 /// One leader generation of the `stop=leaf` unit. The first starts a session
 /// child at once, before anything else, as a daemon that forks before td-svc
 /// could place it would; the child leaves the leader's process group and
-/// session as an OpenSSH session does, and the leader then crashes. The
+/// session as a td-sshd session does, and the leader then crashes. The
 /// start gate must have put both in the leaf. The second, restarted in place,
 /// must find that session alive in its own leaf and asks for a restart. The
 /// third, started only once the leaf is empty, must find it gone.

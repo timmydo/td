@@ -20,10 +20,9 @@ const SHEBANG_SCRIPTS_HOOKS: usize = 14;
 pub fn recipe() -> Recipe {
     let git = "{in:git-x86-64}";
     let td_net = "{in:td-net}/bin/td-net";
-    let openssh = "{in:openssh-x86-64}";
-    let openssh_test = "{in:openssh-x86-64-test}";
+    let ssh = "{in:td-ssh}/bin/td-ssh";
     let readelf = "/usr/bin/readelf";
-    let path = format!("{git}/bin:{git}/libexec/git-core:{openssh}/bin:{BUILD_ROOT_PATH}");
+    let path = format!("{git}/bin:{git}/libexec/git-core:{BUILD_ROOT_PATH}");
     let mut steps = vec![
         Step::Require {
             paths: vec![
@@ -32,14 +31,10 @@ pub fn recipe() -> Recipe {
                 format!("{git}/bin/git-upload-archive"),
                 format!("{git}/bin/git-upload-pack"),
                 format!("{git}/libexec/git-core/git-sh-i18n--envsubst"),
-                format!("{openssh}/bin/ssh"),
+                ssh.to_string(),
                 td_net.to_string(),
             ],
             exec: true,
-        },
-        Step::Require {
-            paths: vec![format!("{openssh_test}/result")],
-            exec: false,
         },
         Step::Require {
             paths: vec![
@@ -54,9 +49,7 @@ pub fn recipe() -> Recipe {
                 SH,
                 "-c",
                 &format!(
-                    "grep -Fq 'PASS: OpenSSH Portable 10.6p2 provides the bounded ssh/sshd/ssh-keygen profile' '{openssh_test}/result' || \
-                         {{ echo 'Git SSH prerequisite did not pass the OpenSSH package oracle' >&2; exit 1; }}; \
-                     for binary in '{git}/bin/git' '{git}/libexec/git-core/git-sh-i18n--envsubst'; do \
+                    "for binary in '{git}/bin/git' '{git}/libexec/git-core/git-sh-i18n--envsubst'; do \
                          header=$('{readelf}' -h \"$binary\") || exit 1; \
                          printf '%s\\n' \"$header\" | grep -Fq 'Class:                             ELF64' || exit 1; \
                          printf '%s\\n' \"$header\" | grep -Fq 'Machine:                           Advanced Micro Devices X86-64' || exit 1; \
@@ -122,7 +115,7 @@ pub fn recipe() -> Recipe {
             path: "{root}/ssh-probe".into(),
             content: format!(
                 "#!{SH}\n\
-                 '{openssh}/bin/ssh' -F /dev/null -o BatchMode=yes \"$@\"\n\
+                 '{ssh}' -F /dev/null -o BatchMode=yes \"$@\"\n\
                  s=$?\n\
                  printf '%s ' \"$s\" >> '{{root}}/ssh-status'\n\
                  exit \"$s\"\n"
@@ -179,7 +172,7 @@ pub fn recipe() -> Recipe {
                  grep -Fq 'GIT_SSL_NO_VERIFY is set' https-refused.log || { echo 'td-net did not refuse an unverified peer:' >&2; cat https-refused.log >&2; exit 1; }; \
                  if GIT_TRACE=1 GIT_TERMINAL_PROMPT=0 GIT_SSH='{root}/ssh-probe' git ls-remote ssh://127.0.0.1:9/td-no-service >ssh-helper.log 2>&1; then echo 'ssh ls-remote reached a service' >&2; exit 1; fi; \
                  grep -Fq '{root}/ssh-probe' ssh-helper.log || { echo 'Git did not dispatch to the ssh probe:' >&2; cat ssh-helper.log >&2; exit 1; }; \
-                 test \"$(cat '{root}/ssh-status')\" = '0 255 ' || { echo \"OpenSSH did not check its variant and then fail its connection: statuses $(cat '{root}/ssh-status')\" >&2; cat ssh-helper.log >&2; exit 1; }; \
+                 test \"$(cat '{root}/ssh-status')\" = '0 255 ' || { echo \"td-ssh did not check its variant and then fail its connection: statuses $(cat '{root}/ssh-status')\" >&2; cat ssh-helper.log >&2; exit 1; }; \
                  for name in curl td-curl; do \
                      said=$('{root}/http/'$name --version) || { echo \"$name --version failed\" >&2; exit 1; }; \
                      printf '%s\\n' \"$said\" | grep -Fq 'td-curl' || { echo \"$name does not say it is td-curl\" >&2; exit 1; }; \
@@ -209,7 +202,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Git 2.56.0 local and service workflows, HTTPS dispatch to td-net's git-remote-https, td-curl's refusals, and SSH dispatch through verified OpenSSH; the system boot oracle completes clone/push/reclone over a real loopback sshd\n".into(),
+        content: "PASS: Git 2.56.0 local and service workflows, HTTPS dispatch to td-net's git-remote-https, td-curl's refusals, and SSH dispatch through td-ssh; the system boot oracle completes clone/push/reclone over a real loopback td-sshd\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -222,14 +215,13 @@ pub fn recipe() -> Recipe {
         .native_inputs(&[
             "git-x86-64",
             "td-net",
-            "openssh-x86-64",
-            "openssh-x86-64-test",
+            "td-ssh",
             "glibc-x86-64",
         ])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check git-x86-64-test: build Git, exercise local service workflows plus HTTPS/OpenSSH dispatch, and require OpenSSH's transport oracle"
+echo ">> recipe-check git-x86-64-test: build Git, exercise local service workflows plus HTTPS and td-ssh dispatch"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run git-x86-64-test 1
 "#,
@@ -246,27 +238,15 @@ mod tests {
         let recipe = recipe();
         crate::shared::assert_build_root_test(
             &recipe,
-            &[
-                "git-x86-64",
-                "td-net",
-                "openssh-x86-64",
-                "openssh-x86-64-test",
-                "glibc-x86-64",
-            ],
+            &["git-x86-64", "td-net", "td-ssh", "glibc-x86-64"],
             &[],
         );
         assert_eq!(
             recipe.native_inputs.as_deref(),
             Some(
-                [
-                    "git-x86-64",
-                    "td-net",
-                    "openssh-x86-64",
-                    "openssh-x86-64-test",
-                    "glibc-x86-64",
-                ]
-                .map(str::to_string)
-                .as_slice()
+                ["git-x86-64", "td-net", "td-ssh", "glibc-x86-64"]
+                    .map(str::to_string)
+                    .as_slice()
             )
         );
         assert!(recipe.inputs.is_none());

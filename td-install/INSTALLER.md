@@ -1836,11 +1836,14 @@ stops boot.
 The supervised server explicitly requires that path. There is no optional
 include and no immutable config with a stale human name. Only root can
 modify its file or parent. The complete policy formatter is shared with
-the source-built OpenSSH test, which checks effective authorization for
-a renamed human, the stock name and root, and that each form's effective
-configuration for each of them carries exactly that form's
-`PermitRootLogin` and `AllowUsers` lines. It reads `sshd -T`'s report and
-attempts no login, so the refusals themselves are `qemu-login-system`'s
+`td-ssh-test`, which reads `td-sshd -T`'s report for a renamed human, the
+stock name and root under each form: that each form's file parses, what its
+`Match` blocks select for each name, and that form's `allowusers` lines. `-T`
+prints compiled constants, `permitrootlogin` among them, and runs no
+admission, so it says nothing of who would be refused. The check's logins,
+under the enforced and ordinary forms with the file's root-owned paths
+redirected to test files, hold that only the ordinary form reads the
+account's own keys. Refusing other accounts is `qemu-login-system`'s
 (td-login/TOKEN-LOGIN.md, C11) and, for root, the autotest boot health's
 `TD-ROOT-SSH-REFUSED` (td-login/THREAT-MODEL.md §8). The
 generated policy contains no secrets

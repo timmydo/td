@@ -43,7 +43,7 @@ pub(crate) struct ProvisionedAccount {
 
 impl ProvisionedAccount {
     /// The primary account of the system recipe `stem`, renamed `name`.
-    /// `public_keys` holds OpenSSH public key lines; blank and `#` lines are
+    /// `public_keys` holds `authorized_keys` public key lines; blank and `#` lines are
     /// skipped and a repeated key is kept once. At least one key is required:
     /// a server's only login is SSH.
     pub(crate) fn new(stem: &str, name: &str, public_keys: &str) -> Result<Self, String> {
@@ -199,8 +199,8 @@ fn parse_key(line: &str) -> Result<String, String> {
     let kind = fields.next().unwrap_or_default();
     if kind != KEY_TYPE {
         return Err(format!(
-            "only {KEY_TYPE} keys are admitted (td's OpenSSH is built without \
-             libcrypto), and a line may carry no options; found {:?}",
+            "only {KEY_TYPE} keys are admitted (td-sshd knows no other), and a \
+             line may carry no options; found {:?}",
             kind.chars().take(32).collect::<String>()
         ));
     }

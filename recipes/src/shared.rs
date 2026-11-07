@@ -987,13 +987,24 @@ pub const RIPGREP_FD_RUNTIME_MARKER: &str = "TD-RG-FD-RUN-OK";
 /// Git HTTPS helper is the operator-only `GIT_HTTPS_RUNTIME_MARKER` below.
 pub const GIT_RUNTIME_MARKER: &str = "TD-GIT-RUN-OK";
 
-/// Printed by the root-owned health target only after the unprivileged OpenSSH client
-/// authenticates to the running OpenSSH daemon on loopback with an ephemeral Ed25519 key
-/// and executes a command using the image's exact modern-only algorithm policy. The Git
-/// leg independently clones, pushes, and reclones over that same SSH transport. Together
-/// they prove the kernel loopback path, client/server protocol, split daemon helpers,
-/// public-key authentication, remote exec, and the libcrypto-free runtime closure.
+/// Printed by the root-owned health target only after the unprivileged td-ssh client
+/// authenticates to the running td-sshd on loopback with an ephemeral Ed25519 key and
+/// executes a command under td-ssh's one suite. The Git leg independently clones, pushes,
+/// and reclones over that same SSH transport. Together they prove the kernel loopback
+/// path, the client/server protocol, the pre-auth worker's jail, the credential switch
+/// and session of an exec, public-key authentication by a key in the first root-owned
+/// file, and remote exec. Not the rest of the daemon: the child that reads an account's
+/// own keys (this key's file comes first, and the search stops there), the signer's
+/// jail (no rekey), PTY or SFTP. `qemu-boot-server`'s host logins run those, each failing
+/// by name, and no other boot leg does.
 pub const SSHD_MARKER: &str = "TD-SSHD-OK";
+
+/// Printed by the root-owned health target, only under the QEMU autotest token, after it
+/// reads the running daemon's `/proc` while a real connection holds a pre-auth worker
+/// open: at least one process of the `sshd` account's uid, the worker among them, every
+/// one with `Seccomp: 2`, `NoNewPrivs: 1`, the jail's group alone, and a root that reads
+/// `/run/sshd-empty` (td-ssh/DESIGN.md section 9).
+pub const SSHD_JAIL_MARKER: &str = "TD-SSHD-JAIL-OK";
 
 /// Printed by the root-owned health target, only under the QEMU autotest token, after
 /// root's `/etc/passwd` password field reads exactly `!` and the running daemon refuses the
@@ -1001,7 +1012,7 @@ pub const SSHD_MARKER: &str = "TD-SSHD-OK";
 /// authorization file, which the client offered first (td-login/THREAT-MODEL.md §8).
 pub const ROOT_SSH_REFUSED_MARKER: &str = "TD-ROOT-SSH-REFUSED";
 
-/// The OpenSSH fingerprint of that seeded root key. Health requires the client to log
+/// The `SHA256:` fingerprint of that seeded root key. Health requires the client to log
 /// offering exactly this key before the refusal counts, so a key that never reached
 /// the daemon is not evidence; a host test derives it from the fixture's public blob.
 pub const ROOT_SSH_REFUSAL_KEY_FINGERPRINT: &str =

@@ -745,20 +745,20 @@ explicit exception to the primary-only account rule in this section.
 `AllowUsers` in the enforced form also names `td-admin`, whose root-owned
 key file and forced fixed-command interface authorize configured signed-release and explicit trusted-main updates,
 rollback and reboot. This key does not unlock the primary session or access
-its credential store. Stopping sshd during a login-key cutover closes its
+its credential store. Stopping `sshd` during a login-key cutover closes its
 connections too; admitted admin jobs belong to their separate supervised
 service and continue. A login-key change does not revoke the independent
 administrator grant. Root SSH remains refused in both forms.
 
 Both policy forms enable `Subsystem sftp internal-sftp` before any
-`Match` block. Incoming SFTP and modern `scp` transfers run in OpenSSH
+`Match` block. Incoming SFTP and modern `scp` transfers run in td-sshd
 as the authenticated account, with its ordinary filesystem permissions.
 No separate SFTP server executable is needed; the image still ships no
 `scp` or `sftp` client. Subsystem requests use the same key admission
 and enrollment cutover as shell sessions.
 
 On a verifiably unenrolled machine, the primary account can authorize
-remote Ed25519 keys in its own `~/.ssh/authorized_keys`. OpenSSH resolves
+remote Ed25519 keys in its own `~/.ssh/authorized_keys`. td-sshd resolves
 that relative path against the account database home, not an environment
 variable. The home and key file must not be writable by other users; use
 mode 0700 for `~/.ssh` and 0600 for `authorized_keys`. Add public keys
@@ -789,7 +789,7 @@ only by the medium the person chose to boot. With
 render refuses to publish any policy unless the file is absent or is
 one root-owned, singly linked, mode-0644 regular file of at most 64
 KiB under root-owned directories that no group or other may write.
-StrictModes alone would also accept a file the account owned. The
+td-sshd's strict modes alone would also accept a file the account owned. The
 account therefore cannot change the file, and withdrawing
 owner-managed keys on enrollment does not reach it. The second file
 does not exist when the policy is rendered. The server's first unit,
@@ -799,9 +799,9 @@ from instance metadata alone (td-svc/DESIGN.md §10, "Instance
 metadata" and "Cloud metadata"). It lives in volatile
 `/run`, so a key in it admits the account only on a boot whose
 metadata offers it. A server ships no login-key enrollment, so it
-stays in the ordinary form unless its login state is unavailable. The
-realized OpenSSH recipe test checks the server's two forms with `sshd
--T` as well.
+stays in the ordinary form unless its login state is unavailable.
+`td-ssh-test` checks the server's two forms with the built `td-sshd -T`
+and `-t` as well.
 
 The persistent root-owned `/etc/ssh/authorized_keys`, empty on a fresh
 install, admits no account on a td image: root is refused, every
@@ -834,16 +834,20 @@ The enforced form omits `.ssh/authorized_keys` and adds the line
 `AllowUsers NAME td-admin` (`AllowUsers NAME` alone on a provisioned
 server, which has no `td-admin`) right after `PermitRootLogin no`, still
 in the global section before the primary's `Match User NAME` block, NAME
-being the admitted primary account; every other byte is the same. The
-shared account validation admits only a lowercase letter
-followed by lowercase letters, digits, `_` and `-`, so NAME carries none
-of OpenSSH's pattern characters and `AllowUsers` names only those accounts.
+being the admitted primary account. Those two changes are all that separates
+the forms of one profile: every other byte is the same, and a server's policy
+has no `td-admin` `Match` block in either form. Both hold only
+`td-ssh/DESIGN.md` §5's keywords, the file td-sshd refuses whole otherwise;
+what the policy once spelled out (publickey only, no forwarding, the one
+algorithm suite) is compiled in. The shared account validation admits only a
+lowercase letter followed by lowercase letters, digits, `_` and `-`, so NAME
+carries no pattern character and `AllowUsers` names only those accounts.
 Firstboot reads the accounts first, whose failure still stops boot, then
 the state under the same root it renders under, for UID 1000's record
 with root:root as the owner. The predicate answers every failure to read
 as unavailable, never as unenrolled, so a read that fails renders the
 enforced form and nothing falls back to the ordinary one. The realized
-OpenSSH recipe test checks both forms with the built `sshd -T`, and the
+`td-ssh-test` checks both forms with the built `td-sshd -T` and `-t`, and the
 stock image's boot health proves root's seeded key refused
 (`TD-ROOT-SSH-REFUSED`, `THREAT-MODEL.md` §8).
 
@@ -885,9 +889,10 @@ until the restarted greeter's refusal takes it for root. Revocation
 therefore returns the line to root:root with the pinned mode before it
 restarts the greeter (`td-authd/DESIGN.md`, amendment 7), which narrows
 that window to the time between the state change and the revocation;
-the refusal's hand-back alone does not close it. `sshd`'s unit
-stops its whole service leaf (`stop=leaf`, `td-svc/DESIGN.md`), so
-OpenSSH sessions in their own process groups end too.
+the refusal's hand-back alone does not close it. `sshd`'s unit, which runs
+`/bin/td-sshd`, stops its whole service leaf (`stop=leaf`,
+`td-svc/DESIGN.md`), so td-sshd's sessions in their own process groups end
+too: they stay in that leaf (`td-ssh/DESIGN.md` §4).
 
 Removing the last key reverses the cutover, so console login and the
 ordinary SSH policy return at once. The graphical session that performed
@@ -1634,7 +1639,7 @@ and the oracle that shows it.
      it, a relative root) and unreadable (an unsearchable parent); the
      admitted name is the one the shared account validation admits; and
      the recipe tests keep the single render right after the directory
-     step and check both forms with the built `sshd -T`. The enforced
+     step and check both forms with the built `td-sshd -T`. The enforced
      form on a full system is `qemu-login-system`'s (C11). It changes
      the boot path's td-firstboot, so its landing runs `check
      integration` by hand.
@@ -1892,7 +1897,7 @@ and the oracle that shows it.
      - a leader crash, which restarts the leader in place;
      - the shipped `sshd` unit, which sets it.
 
-     Stopping `sshd` now ends the OpenSSH sessions in its leaf, as
+     Stopping `sshd` now ends the td-sshd sessions in its leaf, as
      shutdown already did by killing everything. A machine where
      `sshd`'s placement fails does not start it, as for a pair. The
      evidence is table and supervisor fixtures, host tests of the

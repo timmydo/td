@@ -205,7 +205,7 @@ fn serial_members() -> Vec<Member> {
 }
 
 /// The members of the cgroup leaf `pid` runs in: for `sshd`'s leader its
-/// unit's whole service leaf, every OpenSSH session in it.
+/// unit's whole service leaf, every td-sshd session in it.
 fn leaf_members(pid: u32) -> Vec<Member> {
     let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
     let path = cgroup

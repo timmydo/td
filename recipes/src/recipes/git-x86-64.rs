@@ -5,7 +5,7 @@ use crate::shared::{
 use crate::types::{Recipe, Step};
 
 // Source-built Git with local repository support. Its remote transports are
-// other programs: SSH is the separately source-built OpenSSH client, and HTTP(S)
+// other programs: SSH is td-ssh's client, and HTTP(S)
 // is td-net's git-remote-https applet, which the image links into /bin, where
 // Git finds it on PATH. Language runtimes, libcurl, legacy WebDAV, localization,
 // and direct OpenSSL use remain outside this daily-driver closure.
