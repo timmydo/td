@@ -6941,7 +6941,7 @@ fn latch_console_evidence_from(
         buf,
         TD_FIRSTBOOT_STABLE_MARKER.as_bytes(),
     );
-    latch_token(
+    latch_host_key(
         &mut evidence.host_key,
         buf,
         TD_FIRSTBOOT_HOST_KEY_PREFIX.as_bytes(),
@@ -7909,9 +7909,8 @@ const HOST_KEY_MAX: usize = 64;
 /// which every recipe check is keyed on; `qemu-boot-live` reds if they part.
 const OS_RELEASE_BUILD_PREFIX: &str = "TD-OS-RELEASE BUILD_ID=";
 
-/// Latch the graphic-character token that follows `prefix` — used for the SSH
-/// host-key fingerprint, which is variable-length base64 rather than the
-/// fixed-width hex deployment ids `latch_selection_id` reads.
+/// Latch the graphic-character token that follows `prefix` — for a variable-length
+/// value, rather than the fixed-width hex deployment ids `latch_selection_id` reads.
 ///
 /// Requires the token to be TERMINATED within the window: the console is drained
 /// incrementally, so a token still being written would otherwise latch truncated
@@ -7929,25 +7928,60 @@ fn latch_token(found: &mut Option<String>, haystack: &[u8], prefix: &[u8]) {
         if haystack.get(start..after_prefix) != Some(prefix) {
             continue;
         }
-        let mut end = after_prefix;
-        while let Some(byte) = haystack.get(end) {
-            if !byte.is_ascii_graphic() || end.saturating_sub(after_prefix) >= HOST_KEY_MAX {
-                break;
-            }
-            let Some(next) = end.checked_add(1) else {
-                return;
-            };
-            end = next;
+        if let Some(token) = haystack.get(after_prefix..).and_then(terminated_token) {
+            *found = Some(token.to_string());
+            return;
         }
-        // Only a token that ends its line counts. Anything else is still being
-        // written (its newline has not arrived), longer than the ceiling, or
-        // carrying a kernel record whose first word would run on from the token —
-        // and latching other than the whole fingerprint would compare unequal
-        // against the same key next boot, reporting a rotation that did not happen.
-        if end == after_prefix || !matches!(haystack.get(end), Some(b'\r' | b'\n')) {
+    }
+}
+
+/// The token `rest` opens with, if it ends its line within the ceiling. Anything else
+/// is still being written (its newline has not arrived), longer than the ceiling, or
+/// carrying a kernel record whose first word would run on from the token — and
+/// latching other than the whole value would compare unequal against the same key
+/// next boot, reporting a rotation that did not happen.
+fn terminated_token(rest: &[u8]) -> Option<&str> {
+    let graphic = rest
+        .iter()
+        .take(HOST_KEY_MAX)
+        .take_while(|byte| byte.is_ascii_graphic())
+        .count();
+    if graphic == 0 || !matches!(rest.get(graphic), Some(b'\r' | b'\n')) {
+        return None;
+    }
+    std::str::from_utf8(rest.get(..graphic)?).ok()
+}
+
+/// `SHA256:` and the 43 base64 characters of an unpadded digest.
+const SHA256_FINGERPRINT_LEN: usize = 50;
+
+/// The fingerprint `rest` opens with, read by its width once a byte follows it.
+fn sha256_fingerprint(rest: &[u8]) -> Option<&str> {
+    rest.get(SHA256_FINGERPRINT_LEN)?;
+    let fingerprint = rest.get(..SHA256_FINGERPRINT_LEN)?;
+    let digest = fingerprint.strip_prefix(b"SHA256:")?;
+    digest
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+        .then(|| std::str::from_utf8(fingerprint).ok())?
+}
+
+/// A kernel record can land between the fingerprint and its newline (see
+/// `is_kernel_record`), and its first word then runs on from the last base64
+/// character, so a whole token would compare unequal against the same key next
+/// boot, or pass `HOST_KEY_MAX` and not latch. A SHA-256 fingerprint has one width,
+/// so it is read by that width, whatever follows it, a longer base64 run included.
+/// A line that does not fill that width, which no shipped key prints, keeps
+/// `latch_token`'s rule. The first line either rule can read wins.
+fn latch_host_key(found: &mut Option<String>, haystack: &[u8], prefix: &[u8]) {
+    if found.is_some() {
+        return;
+    }
+    for start in 0..haystack.len() {
+        let Some(rest) = haystack.get(start..).and_then(|at| at.strip_prefix(prefix)) else {
             continue;
-        }
-        if let Some(Ok(token)) = haystack.get(after_prefix..end).map(std::str::from_utf8) {
+        };
+        if let Some(token) = sha256_fingerprint(rest).or_else(|| terminated_token(rest)) {
             *found = Some(token.to_string());
             return;
         }
@@ -13295,11 +13329,19 @@ mod tests {
         );
         assert_eq!(crlf.host_key.as_deref(), Some(fingerprint));
 
-        // A kernel record on the line: refused, not latched with its first word.
+        // A kernel record on the line: the fingerprint, without its first word.
         let mut spliced = ConsoleEvidence::default();
         latch_console_evidence(
             &mut spliced,
             format!("{prefix}{fingerprint}random: crng init done\n").as_bytes(),
+            b"target",
+        );
+        assert_eq!(spliced.host_key.as_deref(), Some(fingerprint));
+        // Not a value of that width, with something on its line: refused.
+        let mut spliced = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut spliced,
+            format!("{prefix}SHA256:shortrandom: crng init done\n").as_bytes(),
             b"target",
         );
         assert_eq!(spliced.host_key, None);
@@ -13327,6 +13369,48 @@ mod tests {
             b"target",
         );
         assert_eq!(first.host_key.as_deref(), Some(fingerprint));
+    }
+
+    /// A boot's serial console, verbatim but for the digest: the same key across a
+    /// reboot was reported as a rotation, because the record ran on from the digest.
+    #[test]
+    fn a_kernel_record_on_the_fingerprint_line_is_no_part_of_the_fingerprint() {
+        let prefix = TD_FIRSTBOOT_HOST_KEY_PREFIX;
+        let fingerprint = "SHA256:1oG10sZJ5tIgnoWacdEt2k4eKqrcKAMvHh+4flXlML0";
+        let latched = |console: String| {
+            let mut evidence = ConsoleEvidence::default();
+            latch_console_evidence(&mut evidence, console.as_bytes(), b"target");
+            evidence.host_key
+        };
+        for line in [
+            "input: ImExPS/2 Generic Explorer Mouse as /devices/platform/i8042/serio1/input/input4",
+            "random: crng init done",
+            // Past HOST_KEY_MAX on its own, which would have latched nothing at all.
+            "a_kernel_subsystem_with_a_long_name: probe deferred",
+            "",
+        ] {
+            assert_eq!(
+                latched(format!("{prefix}{fingerprint}{line}\n")).as_deref(),
+                Some(fingerprint),
+                "{line}"
+            );
+        }
+        // Still being written: nothing latches until a byte follows the digest.
+        assert_eq!(latched(format!("{prefix}{fingerprint}")), None);
+        // A digest cut short is no fingerprint of this width, and stays `latch_token`'s.
+        let short = "SHA256:aGVsbG8gd29ybGQ";
+        assert_eq!(
+            latched(format!("{prefix}{short}\n")).as_deref(),
+            Some(short)
+        );
+        // Not base64 where the digest stands, so not read by the width.
+        let spaced = "SHA256:1oG10sZJ5tIgnoWacdEt2k4eKqrcKAM vHh+4flXlML0";
+        assert_eq!(latched(format!("{prefix}{spaced}\n")), None);
+        // The first line either rule can read wins, whichever read holds the two.
+        assert_eq!(
+            latched(format!("{prefix}{short}\n{prefix}{fingerprint}\n")).as_deref(),
+            Some(short)
+        );
     }
 
     /// The overlap the incremental drain carries must admit the LONGEST thing
