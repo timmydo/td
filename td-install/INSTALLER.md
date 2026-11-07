@@ -112,6 +112,9 @@ card reader run translated, which that machine's validation has to cover, as
 has a selector-to-deployment kexec on the Intel graphics whose remapping unit
 the kernel leaves on (`quirk_igfx_skip_te_disable`, Ice Lake through Meteor Lake).
 
+Each deployment's initramfs offers the CPU its vendor's current microcode, which
+the kernel log shows it taking or not (AGENTS.md, "CPU microcode").
+
 A machine needs the kernel's drivers and firmware before anything else can
 work. `hwcheck` reports that much: on a booted td system it lists each PCI and
 USB device with its driver, or `NO DRIVER`, counting and not listing unbound

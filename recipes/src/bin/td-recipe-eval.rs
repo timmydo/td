@@ -696,7 +696,7 @@ mod tests {
         let pins = td_recipe::source_pins::all();
         // source_pins::tests::catalog_carries_all_legacy_source_locks names
         // each of them.
-        assert_eq!(pins.len(), 53);
+        assert_eq!(pins.len(), 61);
         assert!(pins.iter().all(|pin| pin.key != "stage0-source"));
         // The build root lists through `build-root-pins` alone.
         assert!(pins.iter().all(|pin| !pin.key.starts_with("debian-root-")));

@@ -367,6 +367,79 @@ const PINS: &[PinDef] = &[
         version: "20261019",
     },
     PinDef {
+        key: "intel-microcode-source",
+        aliases: &[],
+        // CPU microcode (AGENTS.md "CPU microcode"): Intel's release tree at its
+        // tag. Only the licence and intel-ucode/ are read, not with-caveats/.
+        url: "https://github.com/intel/Intel-Linux-Processor-Microcode-Data-Files/archive/refs/tags/microcode-20260925.tar.gz",
+        sha256: "0ec19023dad1e6dd0c5909174b8dff2555b91cf01671e36271a1ef36655c0cfc",
+        file: "intel-microcode-20260925.tar.gz",
+        version: "20260925",
+    },
+    PinDef {
+        key: "linux-firmware-amd-ucode-source",
+        aliases: &[],
+        // CPU microcode (AGENTS.md "CPU microcode"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amd-ucode/microcode_amd.bin",
+        sha256: "8a9d9e8b788e31e61cddc03cb1eeab5db99e0f667128943ff0780e6437d2e43e",
+        file: "linux-firmware-20261019-amd-ucode-microcode_amd.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-amd-ucode-fam15h-source",
+        aliases: &[],
+        // CPU microcode (AGENTS.md "CPU microcode"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amd-ucode/microcode_amd_fam15h.bin",
+        sha256: "9d4a668410e72a4bdb86dc23e4261eca04daa83456ada02504115223f356981a",
+        file: "linux-firmware-20261019-amd-ucode-microcode_amd_fam15h.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-amd-ucode-fam16h-source",
+        aliases: &[],
+        // CPU microcode (AGENTS.md "CPU microcode"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amd-ucode/microcode_amd_fam16h.bin",
+        sha256: "e02ad653b39c975d6c52674b50f23727bb6706bab7b4e5b391a4ce229e7ff121",
+        file: "linux-firmware-20261019-amd-ucode-microcode_amd_fam16h.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-amd-ucode-fam17h-source",
+        aliases: &[],
+        // CPU microcode (AGENTS.md "CPU microcode"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amd-ucode/microcode_amd_fam17h.bin",
+        sha256: "966e4b796ec689c618868d08f8a37f347b0e7bfce4ae9df793e08471d363b7d0",
+        file: "linux-firmware-20261019-amd-ucode-microcode_amd_fam17h.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-amd-ucode-fam19h-source",
+        aliases: &[],
+        // CPU microcode (AGENTS.md "CPU microcode"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amd-ucode/microcode_amd_fam19h.bin",
+        sha256: "c614d6db8056c5c67a9189b225124127d56990a190305bcb3927d50e132de7dd",
+        file: "linux-firmware-20261019-amd-ucode-microcode_amd_fam19h.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-amd-ucode-fam1ah-source",
+        aliases: &[],
+        // CPU microcode (AGENTS.md "CPU microcode"), at linux-firmware's tag.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/amd-ucode/microcode_amd_fam1ah.bin",
+        sha256: "a6b22566f5aac770bdeae5610d417ee35ffd4af13eeaa624a2995f57e2d5b274",
+        file: "linux-firmware-20261019-amd-ucode-microcode_amd_fam1ah.bin",
+        version: "20261019",
+    },
+    PinDef {
+        key: "linux-firmware-amd-ucode-license-source",
+        aliases: &[],
+        // The licence WHENCE names for AMD's microcode.
+        url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/LICENSES/LICENSE.amd-ucode",
+        sha256: "2103bd999f77522c5ab5fd35df0579ed00e2a6b885f6f8ebd444e97ffa482991",
+        file: "linux-firmware-20261019-LICENSE.amd-ucode",
+        version: "20261019",
+    },
+    PinDef {
         key: "linux-firmware-qualcomm-atheros-license-source",
         aliases: &[],
         // The licence WHENCE names for those files, which the image ships
@@ -493,11 +566,24 @@ const PINS: &[PinDef] = &[
 /// AGENTS.md amendment.
 const FOREIGN: &[&str] = &["ripgrep-seed-source"];
 
+/// The pins AGENTS.md "CPU microcode" admits: the code a host CPU itself loads,
+/// signed by its vendor. Unmarked, as device firmware is; the closure query names
+/// each. Adding an entry is a reviewed pin.
+pub const CPU_MICROCODE: &[&str] = &[
+    "intel-microcode-source",
+    "linux-firmware-amd-ucode-source",
+    "linux-firmware-amd-ucode-fam15h-source",
+    "linux-firmware-amd-ucode-fam16h-source",
+    "linux-firmware-amd-ucode-fam17h-source",
+    "linux-firmware-amd-ucode-fam19h-source",
+    "linux-firmware-amd-ucode-fam1ah-source",
+];
+
 /// The pins AGENTS.md "Device firmware" admits: linux-firmware files a
 /// peripheral runs or reads, which `device-firmware` carries unmodified and
 /// the host never executes. Unmarked, so no channel refuses them; the closure query
 /// names each. Adding an entry is a reviewed pin; firmware the host CPU runs
-/// belongs to no class.
+/// is `CPU_MICROCODE`, and any other belongs to no class.
 pub const DEVICE_FIRMWARE: &[&str] = &[
     "linux-firmware-amdgpu-gc-11-0-1-mes-2-source",
     "linux-firmware-amdgpu-gc-11-0-1-mes1-source",
@@ -639,7 +725,7 @@ mod tests {
 
     #[test]
     fn catalog_carries_all_legacy_source_locks() {
-        assert_eq!(all().len(), 53);
+        assert_eq!(all().len(), 61);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice
@@ -675,6 +761,16 @@ mod tests {
                 "{key}"
             );
             assert!(PINS.iter().all(|def| !def.aliases.contains(key)));
+        }
+    }
+
+    #[test]
+    fn cpu_microcode_is_unmarked_and_not_device_firmware() {
+        assert!(unresolved(CPU_MICROCODE, PINS).is_empty());
+        for key in CPU_MICROCODE {
+            let pin = by_key(key).unwrap_or_else(|| unreachable!("{key}"));
+            assert!(!pin.foreign(), "{key} is marked");
+            assert!(!DEVICE_FIRMWARE.contains(key), "{key}");
         }
     }
 

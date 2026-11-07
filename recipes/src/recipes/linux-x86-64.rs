@@ -1031,8 +1031,9 @@ pub fn recipe() -> Recipe {
     //    upstream's default, off. VMSCAPE, which depends on KVM, is
     //    guarded with the rest. Those that need CPU microcode (IBPB, IBRS, STIBP, VERW
     //    buffer clearing, SRBDS, GDS, SRSO's IBPB forms) take effect only
-    //    where platform firmware supplied it: td loads no microcode
-    //    (AGENTS.md "Device firmware").
+    //    where the microcode has them: td's deployment initramfs offers the
+    //    vendors' current set (AGENTS.md "CPU microcode"), and a selector runs
+    //    on what platform firmware supplied.
     //    Unasked: RETPOLINE selects OBJTOOL, already built for x86_64;
     //    CALL_DEPTH_TRACKING selects CALL_THUNKS, whose call padding brings
     //    16-byte function alignment, and HAVE_DYNAMIC_FTRACE_NO_PATCHABLE,

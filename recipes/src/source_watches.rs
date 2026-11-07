@@ -34,10 +34,16 @@ const GIT_NERD_FONTS: &str =
 const GIT_RIPGREP: &str =
     "https://github.com/BurntSushi/ripgrep.git/info/refs?service=git-upload-pack";
 const GIT_ZLIB: &str = "https://github.com/madler/zlib.git/info/refs?service=git-upload-pack";
+const GIT_INTEL_MICROCODE: &str =
+    "https://github.com/intel/Intel-Linux-Processor-Microcode-Data-Files.git/info/refs?service=git-upload-pack";
 const RUST_STABLE: &str = "https://static.rust-lang.org/dist/channel-rust-stable.toml";
 const LINUX_FIRMWARE: Watch = Watch::Index {
     index: GIT_LINUX_FIRMWARE,
     pattern: "refs/tags/{}",
+};
+const INTEL_MICROCODE: Watch = Watch::Index {
+    index: GIT_INTEL_MICROCODE,
+    pattern: "refs/tags/microcode-{}",
 };
 const NERD_FONTS: Watch = Watch::Index {
     index: GIT_NERD_FONTS,
@@ -76,6 +82,14 @@ const WATCHES: &[(&str, Watch)] = &[
     ("nerd-fonts-powerline-extra-license-source", NERD_FONTS),
     ("nerd-fonts-powerline-symbols-license-source", NERD_FONTS),
     ("nerd-fonts-weather-icons-license-source", NERD_FONTS),
+    ("intel-microcode-source", INTEL_MICROCODE),
+    ("linux-firmware-amd-ucode-source", LINUX_FIRMWARE),
+    ("linux-firmware-amd-ucode-fam15h-source", LINUX_FIRMWARE),
+    ("linux-firmware-amd-ucode-fam16h-source", LINUX_FIRMWARE),
+    ("linux-firmware-amd-ucode-fam17h-source", LINUX_FIRMWARE),
+    ("linux-firmware-amd-ucode-fam19h-source", LINUX_FIRMWARE),
+    ("linux-firmware-amd-ucode-fam1ah-source", LINUX_FIRMWARE),
+    ("linux-firmware-amd-ucode-license-source", LINUX_FIRMWARE),
     (
         "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
         LINUX_FIRMWARE,

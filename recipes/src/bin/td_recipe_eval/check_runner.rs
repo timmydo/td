@@ -6024,6 +6024,8 @@ pub(crate) struct PayloadClosure {
     /// sorted: unmarked and counted among the seeds, but code a peripheral
     /// runs, so named.
     pub(crate) device_firmware: Vec<String>,
+    /// CPU_MICROCODE pins a closure's recipes name (AGENTS.md "CPU microcode").
+    pub(crate) cpu_microcode: Vec<String>,
 }
 
 impl PayloadClosure {
@@ -6077,7 +6079,15 @@ impl PayloadClosure {
             .device_firmware
             .iter()
             .map(|key| format!("device-firmware\tlinux-firmware\t{key}\n"));
-        root.chain(rust).chain(runtime).chain(firmware).collect()
+        let microcode = self
+            .cpu_microcode
+            .iter()
+            .map(|key| format!("cpu-microcode\tvendor\t{key}\n"));
+        root.chain(rust)
+            .chain(runtime)
+            .chain(firmware)
+            .chain(microcode)
+            .collect()
     }
 }
 
@@ -6341,10 +6351,14 @@ fn contains_payloads(
     let mut upstream_rust_members = Vec::new();
     let mut debian_runtime_members = Vec::new();
     let mut device_firmware = Vec::new();
+    let mut cpu_microcode = Vec::new();
     for node in nodes {
         for key in node.recipe.inputs.iter().flatten() {
             if td_recipe::source_pins::DEVICE_FIRMWARE.contains(&key.as_str()) {
                 device_firmware.push(key.clone());
+            }
+            if td_recipe::source_pins::CPU_MICROCODE.contains(&key.as_str()) {
+                cpu_microcode.push(key.clone());
             }
         }
         if node
@@ -6395,6 +6409,8 @@ fn contains_payloads(
     upstream_rust_members.dedup();
     device_firmware.sort();
     device_firmware.dedup();
+    cpu_microcode.sort();
+    cpu_microcode.dedup();
     PayloadClosure {
         // The DISTINCT stems rather than `nodes.len()`: a repeated node would
         // otherwise inflate the number the claim divides while the sets it is
@@ -6408,6 +6424,7 @@ fn contains_payloads(
         upstream_rust_members,
         debian_runtime_members,
         device_firmware,
+        cpu_microcode,
     }
 }
 
@@ -8475,6 +8492,7 @@ mod tests {
         assert_eq!(
             answer.build_root_members,
             [
+                "cpu-microcode",
                 "fd",
                 "gcc-runtime",
                 "git-x86-64",
@@ -8592,7 +8610,14 @@ mod tests {
              device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-amss-source\n\
              device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-board-2-source\n\
              device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-m3-source\n\
-             device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-regdb-source\n"
+             device-firmware\tlinux-firmware\tlinux-firmware-ath11k-wcn6855-regdb-source\n\
+             cpu-microcode\tvendor\tintel-microcode-source\n\
+             cpu-microcode\tvendor\tlinux-firmware-amd-ucode-fam15h-source\n\
+             cpu-microcode\tvendor\tlinux-firmware-amd-ucode-fam16h-source\n\
+             cpu-microcode\tvendor\tlinux-firmware-amd-ucode-fam17h-source\n\
+             cpu-microcode\tvendor\tlinux-firmware-amd-ucode-fam19h-source\n\
+             cpu-microcode\tvendor\tlinux-firmware-amd-ucode-fam1ah-source\n\
+             cpu-microcode\tvendor\tlinux-firmware-amd-ucode-source\n"
         ));
     }
 

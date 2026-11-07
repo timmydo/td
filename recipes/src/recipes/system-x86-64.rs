@@ -2669,11 +2669,40 @@ fn build_desktop_td_svc_conf() -> String {
     )
 }
 
+/// The vendors' microcode, at the head of the deployment initramfs. The kernel's
+/// early loader reads these from the uncompressed archive before unpacking it,
+/// and hands the CPU a pointer into it, which Intel's SDM asks be 16-byte aligned
+/// and newc aligns only to 4. Being first fixes the offset, whatever size td's
+/// binaries are: `/lib` is here for its length as well as its use, and a test
+/// holds the sum.
+fn microcode_spec() -> String {
+    let dir = super::cpu_microcode::DIR;
+    let mut spec = format!(
+        "dir /lib 0755 0 0\ndir /kernel 0755 0 0\ndir /kernel/x86 0755 0 0\ndir /{dir} 0755 0 0\n"
+    );
+    for file in super::cpu_microcode::FILES {
+        spec.push_str(&format!(
+            "file /{dir}/{file} {{in:cpu-microcode}}/{dir}/{file} 0444 0 0\n"
+        ));
+    }
+    spec
+}
+
+/// The deployment initramfs: microcode first, device firmware on a desktop.
+fn deployment_spec(sys: &SystemDef) -> String {
+    let mut spec = microcode_spec();
+    spec.push_str(&build_initramfs_spec("deployment-init", Phase::Deployment));
+    if sys.desktop() {
+        spec.push_str(&device_firmware_spec());
+    }
+    spec
+}
+
 /// Device firmware for the deployment initramfs, where the loader finds it when
 /// a driver built into the kernel probes. The selector's initramfs has none, so
 /// a selector never starts the GPU or Wi-Fi it hands over to its deployment.
 fn device_firmware_spec() -> String {
-    let mut spec = String::from("dir /lib 0755 0 0\ndir /lib/firmware 0755 0 0\n");
+    let mut spec = String::from("dir /lib/firmware 0755 0 0\n");
     for dir in super::device_firmware::directories() {
         spec.push_str(&format!("dir /lib/firmware/{dir} 0755 0 0\n"));
     }
@@ -5458,6 +5487,14 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             link: "{root}/real-root/lib/firmware".into(),
         });
     }
+    // Microcode's licences, in every profile. Its files are only in the initramfs.
+    steps.push(Step::MkDir {
+        path: "{root}/real-root{in:cpu-microcode}".into(),
+    });
+    steps.push(Step::CopyTree {
+        from: "{in:cpu-microcode}/share".into(),
+        dest: "{root}/real-root{in:cpu-microcode}/share".into(),
+    });
     // Timezone data is an immutable package with no ELF runtime closure.
     steps.push(Step::CopyTree {
         from: "{in:tzdata}".into(),
@@ -5935,6 +5972,7 @@ fn shape_check(sys: &SystemDef) -> String {
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-boot$' || { echo 'deployment initramfs: td-boot store member missing' >&2; exit 1; }; \
      printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-kexec$' || { echo 'selector initramfs: td-kexec store member missing' >&2; exit 1; }; \
      if printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-kexec$'; then echo 'deployment initramfs: td-kexec store member must be selector-only' >&2; exit 1; fi; \
+     for m in kernel/x86/microcode/GenuineIntel.bin kernel/x86/microcode/AuthenticAMD.bin; do printf '%s\\n' \"$init_list\" | grep -q -x -F \"$m\" || { echo \"deployment initramfs: microcode member $m missing\" >&2; exit 1; }; done; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/td-firstboot || { echo 'deployment initramfs: primary home provisioner missing' >&2; exit 1; }; \
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-firstboot$' || { echo 'deployment initramfs: provisioner store member missing' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/td-firstboot; then echo 'selector initramfs: home provisioner must be deployment-only' >&2; exit 1; fi; \
@@ -6611,11 +6649,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{root}/deployment.spec".into(),
-        content: if sys.desktop() {
-            build_initramfs_spec("deployment-init", Phase::Deployment) + &device_firmware_spec()
-        } else {
-            build_initramfs_spec("deployment-init", Phase::Deployment)
-        },
+        content: deployment_spec(sys),
         exec: false,
     });
     steps.push(
@@ -6718,6 +6752,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
         // tzdata: immutable compiled zones and geographic tables at /etc/zoneinfo.
         // jetbrains-mono-nerd-font: the pinned outline face at
         //   /etc/fonts/jetbrains-mono-nerd.
+        // cpu-microcode: both vendors' microcode for the deployment initramfs.
         // device-firmware: the files drivers ask the kernel's loader for, with
         //   their notices and licences, in a desktop's store and initramfs.
         // td-ssh: the static client, key tool and daemon (empty runtime closure,
@@ -6772,6 +6807,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "tzdata",
                 "jetbrains-mono-nerd-font",
                 "device-firmware",
+                "cpu-microcode",
                 "glibc-x86-64",
                 "td-ssh",
                 "td-netd",
@@ -17557,8 +17593,47 @@ mod server_tests {
         }
     }
 
-    /// The server declares and stages none of the desktop's packages, and
-    /// `DESKTOP_INPUTS` names only packages the desktop really declares.
+    #[test]
+    fn only_a_deployment_carries_microcode_at_the_early_loaders_names() {
+        for sys in [&SYSTEM, &SERVER] {
+            let deployment = deployment_spec(sys);
+            for file in ["GenuineIntel.bin", "AuthenticAMD.bin"] {
+                assert_eq!(
+                    deployment
+                        .matches(&format!(
+                            "file /kernel/x86/microcode/{file} \
+                             {{in:cpu-microcode}}/kernel/x86/microcode/{file} 0444 0 0\n"
+                        ))
+                        .count(),
+                    1,
+                    "{file}"
+                );
+            }
+        }
+        assert!(!build_initramfs_spec("init", Phase::Selector).contains("microcode"));
+    }
+
+    /// newc: a 110-byte header and the NUL-terminated name, padded to 4, then the
+    /// data. td-util's gen_init_cpio drops a name's leading slash.
+    #[test]
+    fn intels_microcode_is_sixteen_byte_aligned_in_the_archive() {
+        let mut offset = 0usize;
+        let mut data = None;
+        for line in deployment_spec(&SYSTEM).lines() {
+            let mut fields = line.split(' ');
+            let kind = fields.next().unwrap();
+            let name = fields.next().unwrap().trim_start_matches('/');
+            offset = (offset + 110 + name.len() + 1 + 3) & !3;
+            if name == "kernel/x86/microcode/GenuineIntel.bin" {
+                data = Some(offset);
+                break;
+            }
+            assert_eq!(kind, "dir", "only directories may come first: {line}");
+        }
+        assert_eq!(data, Some(640));
+        assert_eq!(data.unwrap() % 16, 0);
+    }
+
     #[test]
     fn only_a_desktop_deployment_carries_device_firmware() {
         let spec = |sys: &SystemDef| -> String {
@@ -17593,6 +17668,8 @@ mod server_tests {
         }
     }
 
+    /// The server declares and stages none of the desktop's packages, and
+    /// `DESKTOP_INPUTS` names only packages the desktop really declares.
     #[test]
     fn the_server_packs_nothing_graphical() {
         let server = server_recipe();
@@ -17623,6 +17700,7 @@ mod server_tests {
             sorted,
             [
                 "ca-certificates",
+                "cpu-microcode",
                 "fd",
                 "gcc-runtime",
                 "git-x86-64",

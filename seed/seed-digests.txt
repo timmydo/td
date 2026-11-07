@@ -13,7 +13,15 @@
 ca-certificates-source 4m4dzx6xlpf0zph86c0z1xq0frx6pzvf-ca-certificates-source
 fd-source ky623w2y3nfb1ddjv8yrnv7bp70dw5c7-fd-source
 git-x86-64-source dsg8dzp8rizb8x2jfjzs50wqmlq29x44-git-x86-64-source
+intel-microcode-source 7lzlq8r3lh7dkjm9jak7vmgr7v48i21l-intel-microcode-source
 jetbrains-mono-nerd-font-source 632myin1d84lnr23d9ma4f4iwgs13bk2-jetbrains-mono-nerd-font-source
+linux-firmware-amd-ucode-fam15h-source x7yrphyin5iyzmn1hss6wkiiwn4prfk2-linux-firmware-amd-ucode-fam15h-source
+linux-firmware-amd-ucode-fam16h-source 738r8872wn5dlzxxc4sqy0j6b3md4y0s-linux-firmware-amd-ucode-fam16h-source
+linux-firmware-amd-ucode-fam17h-source mhiaf5zs45s5g7w8d9v9q1y54ir1s20a-linux-firmware-amd-ucode-fam17h-source
+linux-firmware-amd-ucode-fam19h-source 1q52rbnwahs3vr4frffnhw3w8svp2pdx-linux-firmware-amd-ucode-fam19h-source
+linux-firmware-amd-ucode-fam1ah-source kzhlwlr9r53r48mbd6y9ky5c7hmrg6x6-linux-firmware-amd-ucode-fam1ah-source
+linux-firmware-amd-ucode-license-source z4c0pamb4f6809fhk32aalj2vsffxycq-linux-firmware-amd-ucode-license-source
+linux-firmware-amd-ucode-source f2l9b3v9rn6xyajrp8il7f24mfqx0c6w-linux-firmware-amd-ucode-source
 linux-firmware-amdgpu-dcn-3-1-4-dmcub-source 639m8ngg6xa7zy4g29q6r54zx4n6y3dl-linux-firmware-amdgpu-dcn-3-1-4-dmcub-source
 linux-firmware-amdgpu-gc-11-0-1-imu-source msiwa2192ss51pk94nvanddcgbhky40s-linux-firmware-amdgpu-gc-11-0-1-imu-source
 linux-firmware-amdgpu-gc-11-0-1-me-source ws3ykq42ikpzihdgwxmkacim9cfkxw1w-linux-firmware-amdgpu-gc-11-0-1-me-source

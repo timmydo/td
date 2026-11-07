@@ -135,7 +135,7 @@ dependency.
 td's target graph contains no foreign binary other than the Debian build
 root's tools and reviewed runtime exports, the upstream Rust toolchain,
 the non-executable pinned upstream data below and the device firmware
-after it. A third-party application is a marked foreign prebuilt
+and CPU microcode after it. A third-party application is a marked foreign prebuilt
 payload in `/td/store`, not a build-tool trust root. The mark is load-bearing:
 
 - ordinary input channels refuse it; only `payload_inputs` may carry it as
@@ -219,8 +219,32 @@ drives one, bounds (with lazy unmapping), and the WCN6855 answers QMI
 over the QRTR socket family, which td-jail's filter keeps from
 applications (not from unjailed session processes). Adding firmware
 for a device is a reviewed pin in that roster; code the host CPU
-executes, CPU microcode included, belongs to no class here and needs
-its own amendment.
+executes belongs to no class here but the next.
+
+## CPU microcode
+
+A CPU loads its vendor's microcode, which td cannot build and which
+vulnerability mitigations depend on. td takes it as upstream bytes:
+Intel's release tree at its tag and AMD's containers at linux-firmware's,
+each a pin with a reviewed URL and SHA-256, listed in `CPU_MICROCODE`
+(`recipes/src/source_pins.rs`). Only the `cpu-microcode` recipe names
+them, which a catalog test holds; it concatenates each vendor's set
+unmodified into the one file the kernel's early loader asks for, and
+every profile's deployment initramfs carries the two files at its head,
+with their licences as data in the root. The kernel hands the patch
+matching this CPU to the CPU, which checks the vendor's signature; on
+AMD's Zen CPUs the kernel first refuses a patch missing from its own
+digest table, so a firmware tag can outrun a kernel (`UPDATING.md`). No
+recipe step executes them, and nothing in zone one links or runs them.
+They stay unmarked, and the closure query names each: one `cpu-microcode`
+line per pin. td establishes no property of that code, and offering it is
+not proof a CPU took it, which only that machine's kernel log says. A
+hypervisor's guest does not load any. The selector's initramfs carries
+none: the selector takes the PIN, the TPM release and the volume key on
+whatever microcode platform firmware supplied, running no untrusted code,
+and the deployment's kernel applies the update after it hands over. Adding
+a pin to the roster is a review; any other code the host CPU executes
+belongs to no class here.
 
 ## Debian build root
 

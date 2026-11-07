@@ -279,6 +279,15 @@ a comment beside the edits and in the commit message. A release that
 contains the fix no longer matches, so the bump past it fails until the
 edits are deleted: they cannot outlive their need.
 
+## linux-firmware's AMD microcode
+
+Linux refuses a Zen patch missing from `amd_shas.c`
+(`arch/x86/kernel/cpu/microcode/`) on a CPU at or below its cutoff revision:
+it logs "No sha256 digest for patch ID" and the CPU keeps what it has. So a tag
+of linux-firmware can outrun the pinned kernel. Before moving the tag, compare
+its Zen patch IDs with that table for the machines td names, and say in the
+commit which IDs the kernel would still refuse.
+
 ## Adding a pin
 
 A new `PinDef` names its `version`. Give it exactly one row in

@@ -2369,11 +2369,13 @@ upstream Rust toolchain, but are not source-built. Static consumers inherit
 their prebuilt code; a closure's runtime lines make that dependency visible.
 
 Device firmware (AGENTS.md, "Device firmware") a member stages is named
-last, one `device-firmware\tlinux-firmware\t<pin>` line per pin; only
+next, one `device-firmware\tlinux-firmware\t<pin>` line per pin; only
 the `device-firmware` recipe may stage it. It is
 unmarked and counted among the audited seeds, like pinned data, but it
 is code a peripheral runs, so the answer says so rather than leaving it
-inside the count.
+inside the count. CPU microcode (AGENTS.md, "CPU microcode") follows it,
+one `cpu-microcode\tvendor\t<pin>` line per pin, staged only by the
+`cpu-microcode` recipe, on the same terms for code the host CPU runs.
 
 A marked pin is reported BESIDE the output built from it rather than
 instead of it: the archive's bytes are a store path of their own, so the

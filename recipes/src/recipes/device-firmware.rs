@@ -253,8 +253,10 @@ mod tests {
             if pin.url.contains("/kernel-firmware/linux-firmware/") {
                 assert!(
                     crate::source_pins::DEVICE_FIRMWARE.contains(&pin.key.as_str())
+                        || crate::source_pins::CPU_MICROCODE.contains(&pin.key.as_str())
+                        || pin.key == "linux-firmware-amd-ucode-license-source"
                         || NOTICES.iter().any(|(key, _)| *key == pin.key),
-                    "{} is neither firmware nor a shipped notice",
+                    "{} is neither firmware, microcode nor a shipped notice",
                     pin.key
                 );
             }
