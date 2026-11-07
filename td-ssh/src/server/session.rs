@@ -5,7 +5,6 @@
 use super::credentials::{self, Credentials};
 use super::ipc::{self, SessionGrant, TransportState};
 use super::log;
-use super::sftp;
 use crate::conn::{self, Conn, Credit, Event, EventSender, LocalWindow, WhenBroken};
 use crate::conn::{CHANNEL_MAX_PACKET, CHANNEL_WINDOW};
 use crate::error::{Error, Result};
@@ -186,7 +185,7 @@ struct Channel {
     credit: Arc<Credit>,
     window: LocalWindow,
     max_packet: u32,
-    /// Where inbound data goes: a child's stdin, a PTY master or the SFTP thread.
+    /// Where inbound data goes: a child's stdin or a PTY master.
     input: Option<Sender<Vec<u8>>>,
     pty: Option<PtyRequest>,
     master: Option<File>,
@@ -196,7 +195,6 @@ struct Channel {
     stderr_open: bool,
     child_status: Option<Result<ExitStatus>>,
     child_running: bool,
-    subsystem_running: bool,
     /// Our `CHANNEL_CLOSE` has been sent: nothing more goes to the peer for this.
     closing: bool,
     /// The peer's `CHANNEL_CLOSE` arrived. A channel in this state exists only to
@@ -441,15 +439,6 @@ impl Channels {
                 self.drain_ptys(now, conn)?;
                 self.after_program(channel, conn)?;
             }
-            Event::SubsystemEnded { channel } => {
-                if let Some(state) = self.channels.get_mut(&channel) {
-                    state.subsystem_running = false;
-                    state.stdout_open = false;
-                    state.stderr_open = false;
-                    state.child_status = Some(Ok(ExitStatus::from_raw(0)));
-                }
-                self.after_program(channel, conn)?;
-            }
             Event::Tick => self.on_tick(Instant::now(), conn)?,
             Event::SinkBroken { .. } | Event::WindowChanged { .. } | Event::EscapeDisconnect => {}
         }
@@ -586,7 +575,7 @@ impl Channels {
         let peer = state.peer;
         let close_owed = !state.closing;
         state.closing = true;
-        if !state.child_running && !state.subsystem_running {
+        if !state.child_running {
             self.channels.remove(&id);
         }
         if close_owed {
@@ -638,7 +627,6 @@ impl Channels {
                 stderr_open: false,
                 child_status: None,
                 child_running: false,
-                subsystem_running: false,
                 closing: false,
                 peer_closed: false,
                 kill: None,
@@ -687,17 +675,13 @@ impl Channels {
                 }
                 true
             }
-            "shell" => self.start(id, None, None),
+            "shell" => self.start(id, None),
             "exec" => {
                 // Bytes, as a file name in a Git path may well be.
                 let command = OsString::from_vec(reader.string()?.to_vec());
-                self.start(id, Some(command), None)
+                self.start(id, Some(command))
             }
-            "subsystem" => {
-                let name = reader.str()?.to_string();
-                self.start(id, None, Some(name))
-            }
-            // env, signal, x11-req, auth-agent-req and anything else.
+            // subsystem, env, signal, x11-req, auth-agent-req and anything else.
             _ => false,
         };
         if want_reply {
@@ -729,26 +713,17 @@ impl Channels {
         Ok(true)
     }
 
-    /// Starts the channel's one program, or SFTP. A forced command wins over
-    /// everything the client asked for, including the subsystem.
-    fn start(&mut self, id: u32, command: Option<OsString>, subsystem: Option<String>) -> bool {
+    /// Starts the channel's one program. A forced command wins over what the client
+    /// asked for.
+    fn start(&mut self, id: u32, command: Option<OsString>) -> bool {
         match self.channels.get(&id) {
             Some(state) if !state.started => {}
             _ => return false,
         }
         let forced = self.grant.force_command.clone();
-        if forced.is_none() {
-            if let Some(name) = &subsystem {
-                if name != "sftp" || !self.grant.sftp {
-                    return false;
-                }
-                return self.start_sftp(id);
-            }
-        }
-        let original = command.or_else(|| subsystem.map(OsString::from));
         let (program_command, original_env) = match forced {
-            Some(forced) => (Some(OsString::from(forced)), original),
-            None => (original, None),
+            Some(forced) => (Some(OsString::from(forced)), command),
+            None => (command, None),
         };
         match self.spawn_child(id, program_command, original_env) {
             Ok(()) => true,
@@ -757,36 +732,6 @@ impl Channels {
                 false
             }
         }
-    }
-
-    fn start_sftp(&mut self, id: u32) -> bool {
-        let events = self.events.clone();
-        let Some(state) = self.channels.get_mut(&id) else {
-            return false;
-        };
-        let (input, output) = (
-            mpsc::channel::<Vec<u8>>(),
-            sftp::ChannelWriter::new(
-                id,
-                state.max_packet as usize,
-                state.credit.clone(),
-                events.clone(),
-            ),
-        );
-        let home = self.grant.home.clone();
-        let reader = sftp::ChannelReader::new(id, input.1, events.clone());
-        let started = thread::Builder::new().spawn(move || {
-            sftp::serve(reader, output, &home);
-            let _ = events.send(Event::SubsystemEnded { channel: id });
-        });
-        if let Err(error) = started {
-            log::line(format_args!("td-sshd: {}: {error}", self.grant.user));
-            return false;
-        }
-        state.started = true;
-        state.subsystem_running = true;
-        state.input = Some(input.0);
-        true
     }
 
     fn spawn_child(
@@ -930,12 +875,7 @@ impl Channels {
         let Some(state) = self.channels.get_mut(&id) else {
             return Ok(());
         };
-        if state.closing
-            || state.child_running
-            || state.subsystem_running
-            || state.stdout_open
-            || state.stderr_open
-        {
+        if state.closing || state.child_running || state.stdout_open || state.stderr_open {
             return Ok(());
         }
         let Some(status) = state.child_status.take() else {
@@ -1170,7 +1110,6 @@ mod tests {
             force_command: None,
             permit_tty: true,
             max_sessions,
-            sftp: true,
             peer_address: "127.0.0.1".into(),
             peer_port: 1,
             local_address: "127.0.0.1".into(),

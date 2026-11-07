@@ -34,6 +34,8 @@ const TRANSFER_BYTES: usize = 4 * 1024 * 1024;
 const DIGEST_FLAG: &str = "--digest";
 const EMIT_FLAG: &str = "--emit";
 const FOREVER_FLAG: &str = "--forever";
+/// `cat`, which this sandbox's login has none of: the booted image's own is `host_login`'s.
+const COPY_FLAG: &str = "--copy";
 /// What each multiplexed session sends, and how many there are: together more
 /// outstanding than a rekey may hold back, on a connection that keeps rekeying.
 const MUX_BYTES: usize = 8 * 1024 * 1024;
@@ -93,6 +95,11 @@ fn far_end(mode: &str, argument: Option<&str>) -> Result<(), String> {
             .write_all(&pattern(length))
             .map_err(|error| error.to_string());
     }
+    if mode == COPY_FLAG {
+        return std::io::copy(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
+            .map(drop)
+            .map_err(|error| error.to_string());
+    }
     let mut bytes = Vec::new();
     std::io::stdin()
         .read_to_end(&mut bytes)
@@ -105,8 +112,6 @@ struct Tools {
     ssh: PathBuf,
     sshd: PathBuf,
     ssh_keygen: PathBuf,
-    scp: PathBuf,
-    sftp: PathBuf,
     sshd_session: PathBuf,
     sshd_auth: PathBuf,
     td_ssh: PathBuf,
@@ -456,7 +461,7 @@ fn start_td_sshd(
             .arg(&host_key))?,
     )?;
     let config = format!(
-        "Port 0\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile .ssh/authorized_keys\nSubsystem sftp internal-sftp\nPermitRootLogin no\nLoginGraceTime 30\nMaxAuthTries 3\nMaxSessions {}\n",
+        "Port 0\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile .ssh/authorized_keys\nPermitRootLogin no\nLoginGraceTime 30\nMaxAuthTries 3\nMaxSessions {}\n",
         host_key.display(),
         MUX_SESSIONS + 2,
     );
@@ -1057,6 +1062,18 @@ fn stock_client_against_td_sshd(
     another_key_refused("ssh to td-sshd", client, stranger, report)?;
     no_password_login(client, report)?;
     a_command_that_is_not_text("ssh to td-sshd", client, report)?;
+    let output = run(client
+        .command()
+        .arg("-s")
+        .arg(&client.target)
+        .arg("sftp")
+        .stdin(Stdio::null()))?;
+    report.check(
+        "ssh to td-sshd: the sftp subsystem is refused",
+        output.status.code() == Some(255) && saying(&output, "subsystem request failed"),
+        || describe(&output),
+    );
+    file_copy_over_exec("ssh to td-sshd", home, client, report)?;
     // A cipher every OpenSSH has: this peer builds without OpenSSL, and one it
     // does not know ends on the command line, before td-sshd is ever asked.
     let output = client.exec(&["-o", "Ciphers=aes256-ctr"], "true")?;
@@ -1074,6 +1091,7 @@ fn stock_client_against_td_sshd(
     };
     another_key_refused("td-ssh to td-sshd", &td_client, stranger, report)?;
     a_command_that_is_not_text("td-ssh to td-sshd", &td_client, report)?;
+    file_copy_over_exec("td-ssh to td-sshd", home, &td_client, report)?;
     stdout_closing_early("td-ssh to td-sshd", &td_client, report)?;
     multiplexed_sessions_across_rekeys(tools, work, client, report)?;
     no_pty_key_against_td_sshd(home, client, report)?;
@@ -1156,154 +1174,48 @@ fn file_digest(path: &Path) -> Result<String, String> {
     Ok(digest_line(&bytes))
 }
 
-/// Stock `sftp` and modern `scp`, which speak SFTP to the subsystem through the
-/// stock `ssh` under test, each byte held by digest on the far side too.
-fn file_transfer_against_td_sshd(
-    tools: &Tools,
-    work: &Path,
+/// How a file moves, there being no SFTP: through a command's stdin and stdout. The
+/// far side's file held by digest too, and a failure read from the status.
+fn file_copy_over_exec(
+    label: &str,
     home: &Path,
     client: &Client<'_>,
     report: &mut Report,
 ) -> Result<(), String> {
+    let helper = std::env::current_exe().map_err(|error| error.to_string())?;
+    let copy = format!("{} {COPY_FLAG}", helper.display());
     let payload = pattern(TRANSFER_BYTES);
     let wanted = digest_line(&payload);
-    let local = work.join("transfer_local");
-    fs::write(&local, &payload).map_err(|error| error.to_string())?;
-    let known_hosts = format!("UserKnownHostsFile={}", client.known_hosts.display());
-    let options = |command: &mut Command| {
-        command
-            .args(["-F", "/dev/null", "-i"])
-            .arg(client.key)
-            .arg("-S")
-            .arg(client.program)
-            .args(["-o", "StrictHostKeyChecking=accept-new", "-o"])
-            .arg(&known_hosts)
-            .args(["-o", "GlobalKnownHostsFile=/dev/null", "-P"])
-            .arg(client.port.to_string());
-    };
-    let batch = |name: &str, script: String| -> Result<Output, String> {
-        let file = work.join(name);
-        fs::write(&file, script).map_err(|error| error.to_string())?;
-        let mut command = Command::new(&tools.sftp);
-        options(&mut command);
-        run(command.arg("-b").arg(&file).arg(&client.target))
-    };
-
-    let back = work.join("sftp_back");
-    let output = batch(
-        "sftp_batch",
-        format!(
-            "mkdir incoming\nput {} incoming/first\nrename incoming/first incoming/moved\nls -l incoming\nget incoming/moved {}\n",
-            local.display(),
-            back.display()
-        ),
+    let output = run_with_input(
+        client
+            .command()
+            .arg(&client.target)
+            .arg(format!("{copy} > copied")),
+        &payload,
     )?;
-    let listing = text(&output.stdout);
+    let far = file_digest(&home.join("copied")).unwrap_or_else(|error| error);
     report.check(
-        "sftp to td-sshd: a batch of mkdir, put, rename, ls and get",
-        output.status.success(),
-        || describe(&output),
-    );
-    let incoming = fs::metadata(home.join("incoming")).map_err(|error| error.to_string())?;
-    report.check(
-        "sftp to td-sshd: mkdir is under the umask floor",
-        incoming.mode() & 0o022 == 0,
-        || format!("{:o}", incoming.mode()),
-    );
-    let moved = home.join("incoming/moved");
-    let far = file_digest(&moved).unwrap_or_else(|error| error);
-    report.check("sftp to td-sshd: put, by digest", far == wanted, || {
-        format!("wanted {wanted}, the far side holds {far}")
-    });
-    let near = file_digest(&back).unwrap_or_else(|error| error);
-    report.check("sftp to td-sshd: get, by digest", near == wanted, || {
-        format!("wanted {wanted}, got {near}")
-    });
-    report.check(
-        "sftp to td-sshd: rename took the old name, ls shows the new",
-        !home.join("incoming/first").exists() && listing.contains("incoming/moved"),
-        || listing.clone(),
-    );
-    let output = batch(
-        "sftp_cleanup",
-        "rm incoming/moved\nrmdir incoming\n".to_string(),
-    )?;
-    report.check(
-        "sftp to td-sshd: rm and rmdir",
-        output.status.success() && !home.join("incoming").exists(),
-        || describe(&output),
-    );
-
-    let scp = |source: &std::ffi::OsStr, destination: &std::ffi::OsStr| -> Result<Output, String> {
-        let mut command = Command::new(&tools.scp);
-        options(&mut command);
-        run(command.arg("-q").arg(source).arg(destination))
-    };
-    let remote = |path: &str| std::ffi::OsString::from(format!("{}:{path}", client.target));
-    let absolute = work.join("scp_absolute");
-    for (name, path, landed) in [
-        (
-            "scp to td-sshd: upload to an absolute path",
-            absolute.display().to_string(),
-            absolute.clone(),
-        ),
-        (
-            "scp to td-sshd: upload to a home-relative path",
-            "scp_relative".to_string(),
-            home.join("scp_relative"),
-        ),
-        (
-            "scp to td-sshd: upload to a tilde path",
-            "~/scp_tilde".to_string(),
-            home.join("scp_tilde"),
-        ),
-    ] {
-        let output = scp(local.as_os_str(), &remote(&path))?;
-        let far = file_digest(&landed).unwrap_or_else(|error| error);
-        report.check(name, output.status.success() && far == wanted, || {
+        &format!("{label}: a file copied up, by digest"),
+        output.status.success() && far == wanted,
+        || {
             format!(
                 "wanted {wanted}, the far side holds {far}: {}",
                 describe(&output)
             )
-        });
-    }
-    // scp -r makes each directory, then chmods it to the local one's mode: a request
-    // for that exact mode, which td-sshd honours as sftp-server does. So a 0777 tree
-    // arrives 0777 from either, and it is `MKDIR` that the floor is for, above. What
-    // this holds is the ordinary tree arriving as it was.
-    let tree = work.join("scp_tree");
-    let inner = tree.join("inner");
-    fs::create_dir_all(&inner).map_err(|error| error.to_string())?;
-    fs::write(inner.join("file"), b"in a tree\n").map_err(|error| error.to_string())?;
-    for directory in [&tree, &inner] {
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o755))
-            .map_err(|error| error.to_string())?;
-    }
-    let mut command = Command::new(&tools.scp);
-    options(&mut command);
-    let output = run(command
-        .args(["-q", "-r"])
-        .arg(&tree)
-        .arg(remote("scp_tree")))?;
-    let modes: Vec<u32> = [home.join("scp_tree"), home.join("scp_tree/inner")]
-        .iter()
-        .map(|directory| fs::metadata(directory).map_or(u32::MAX, |found| found.mode()))
-        .collect();
-    report.check(
-        "scp -r to td-sshd: directories under the umask floor",
-        output.status.success()
-            && modes
-                .iter()
-                .all(|mode| *mode != u32::MAX && mode & 0o777 == 0o755),
-        || format!("{modes:?}: {}", describe(&output)),
+        },
     );
-    let download = work.join("scp_back");
-    let output = scp(&remote("scp_relative"), download.as_os_str())?;
-    let near = file_digest(&download).unwrap_or_else(|error| error);
+    let output = client.exec(&[], &format!("{copy} < copied"))?;
     report.check(
-        "scp to td-sshd: download from a home-relative path",
-        output.status.success() && near == wanted,
-        || format!("wanted {wanted}, got {near}: {}", describe(&output)),
+        &format!("{label}: a file copied down, by digest"),
+        output.status.success() && digest_line(&output.stdout) == wanted,
+        || format!("{:?}, {}", output.status.code(), text(&output.stderr)),
+    );
+    fs::remove_file(home.join("copied")).map_err(|error| error.to_string())?;
+    let output = client.exec(&[], &format!("{copy} > /nonexistent/directory/copied"))?;
+    report.check(
+        &format!("{label}: a copy that cannot be written says so in its status"),
+        !matches!(output.status.code(), Some(0) | Some(255) | None),
+        || describe(&output),
     );
     Ok(())
 }
@@ -1338,7 +1250,6 @@ fn wanted_policy_lines(
         format!("hostkey {}", ssh_policy::SSHD_HOST_KEY),
         "permitrootlogin no".to_string(),
         format!("authorizedkeysfile {keys}"),
-        "subsystem sftp internal-sftp".to_string(),
     ];
     match (form, desktop) {
         (Form::Ordinary, _) => lines.push("allowusers none".to_string()),
@@ -1555,8 +1466,6 @@ fn tools(arguments: &HashMap<String, String>) -> Result<Tools, String> {
         ssh: openssh.join("bin/ssh"),
         sshd: openssh.join("bin/sshd"),
         ssh_keygen: openssh.join("bin/ssh-keygen"),
-        scp: openssh.join("bin/scp"),
-        sftp: openssh.join("bin/sftp"),
         sshd_session: openssh.join("libexec/sshd-session"),
         sshd_auth: openssh.join("libexec/sshd-auth"),
         td_ssh: td_ssh.join("bin/td-ssh"),
@@ -1610,7 +1519,6 @@ fn exercise(tools: &Tools, work: &Path, report: &mut Report) -> Result<(), Strin
     };
     let stranger = work.join(STRANGER_KEY);
     stock_client_against_td_sshd(tools, work, &home, &stock_client, &stranger, report)?;
-    file_transfer_against_td_sshd(tools, work, &home, &stock_client, report)?;
     drop(td_sshd);
     enforced_form_logins(tools, work, &user, &stock_key, &td_key, report)?;
 
@@ -1661,7 +1569,7 @@ fn main() {
     let first = arguments.next();
     if let Some(mode) = first
         .as_deref()
-        .filter(|mode| [DIGEST_FLAG, EMIT_FLAG, FOREVER_FLAG].contains(mode))
+        .filter(|mode| [DIGEST_FLAG, EMIT_FLAG, FOREVER_FLAG, COPY_FLAG].contains(mode))
     {
         if let Err(error) = far_end(mode, arguments.next().as_deref()) {
             eprintln!("td-ssh-interop: {error}");

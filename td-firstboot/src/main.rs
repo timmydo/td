@@ -2332,7 +2332,6 @@ mod ssh_forms {
         LoginGraceTime 30\n\
         MaxAuthTries 3\n\
         MaxSessions 4\n\
-        Subsystem sftp internal-sftp\n\
         Match User alice\n\
         \tAuthorizedKeysFile /run/td-ssh-selftest-authorized_keys\n";
 

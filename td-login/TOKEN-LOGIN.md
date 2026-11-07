@@ -750,12 +750,10 @@ connections too; admitted admin jobs belong to their separate supervised
 service and continue. A login-key change does not revoke the independent
 administrator grant. Root SSH remains refused in both forms.
 
-Both policy forms enable `Subsystem sftp internal-sftp` before any
-`Match` block. Incoming SFTP and modern `scp` transfers run in td-sshd
-as the authenticated account, with its ordinary filesystem permissions.
-No separate SFTP server executable is needed; the image still ships no
-`scp` or `sftp` client. Subsystem requests use the same key admission
-and enrollment cutover as shell sessions.
+td-sshd has no subsystem, so no SFTP and no modern `scp`. A file moves
+through a command's stdin or stdout (`td-ssh/DESIGN.md` §6), as the
+authenticated account with its ordinary filesystem permissions, under the
+same key admission and enrollment cutover as a shell session.
 
 On a verifiably unenrolled machine, the primary account can authorize
 remote Ed25519 keys in its own `~/.ssh/authorized_keys`. td-sshd resolves

@@ -164,7 +164,6 @@ fn run(args: &MonitorArgs<'_>) -> Result<()> {
             .or(grant.grant.command.clone()),
         permit_tty: effective.permit_tty && !grant.grant.no_pty,
         max_sessions: effective.max_sessions,
-        sftp: config.sftp,
         peer_address: peer.ip().to_string(),
         peer_port: peer.port(),
         local_address: local.ip().to_string(),

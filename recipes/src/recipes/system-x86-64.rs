@@ -12554,13 +12554,9 @@ mod tests {
                 })
                 .collect();
             assert_eq!(admitted, admission, "{form:?}");
-            assert_eq!(
-                config
-                    .lines()
-                    .filter(|line| line.starts_with("Subsystem "))
-                    .collect::<Vec<_>>(),
-                ["Subsystem sftp internal-sftp"],
-                "incoming file transfers use the built-in SFTP handler"
+            assert!(
+                !config.lines().any(|line| line.starts_with("Subsystem ")),
+                "td-sshd has no subsystem, and would refuse the whole file"
             );
             let remote = match form {
                 ssh_policy::Form::Ordinary => " .ssh/authorized_keys",

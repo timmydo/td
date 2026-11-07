@@ -57,7 +57,8 @@ root-owned `/var/lib/td-admin/authorized_keys`. Its Match block forces
 `/bin/td-admin ssh` and disables PTYs; td-sshd has no forwarding or user
 startup files to disable. The shell accepts that exact `-c` invocation and parses
 `SSH_ORIGINAL_COMMAND` as the fixed command vocabulary; it never evaluates
-shell syntax. SFTP, another executable and extra arguments cannot bypass it.
+shell syntax. Another executable and extra arguments cannot bypass it, and
+td-sshd refuses a subsystem request from every account.
 This explicitly remains available in both login-key policy forms. Root SSH
 stays disabled and the primary account's ordinary keys confer no admin grant.
 

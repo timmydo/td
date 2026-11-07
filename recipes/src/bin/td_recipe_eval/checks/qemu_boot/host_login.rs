@@ -7,7 +7,7 @@
 //! NoCloud seed or a mock EC2 IMDS, must be admitted as that account on
 //! the boot that metadata reaches alone. Then the daemon's stages no other
 //! leg reaches as root: the reader of the account's own keys, the signer's
-//! jail at a rekey, a PTY and SFTP.
+//! jail at a rekey, a PTY and a file copied each way.
 
 use std::cell::{Cell, RefCell};
 use std::fs::{self, File};
@@ -26,14 +26,15 @@ const METADATA_KEY: &str = "metadata";
 const STRANGER_KEY: &str = "stranger";
 /// Only ever in the account's own `~/.ssh/authorized_keys`.
 const ACCOUNT_KEY: &str = "account";
-/// The bytes the rekeyed session and SFTP carry, as a file beside the keys.
+/// The bytes the rekeyed session and the copy carry, as a file beside the keys.
 const PAYLOAD: &str = "payload";
 const PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 /// Far enough under the payload that each direction forces a signature, which the
 /// signer gives at most once a second.
 const REKEY_LIMIT: &str = "RekeyLimit=1M";
-const SFTP_BATCH: &str = "sftp-batch";
-const SFTP_BACK: &str = "sftp-back";
+/// How a file reaches a td machine and comes back, there being no SFTP.
+const COPY_UP: &str = "/bin/cat > copied-payload";
+const COPY_DOWN: &str = "/bin/cat copied-payload && /bin/rm copied-payload";
 const PTY_DEVICES: &str = "/dev/pts/";
 
 /// What the observe login runs: status through the status socket, a
@@ -66,8 +67,10 @@ enum Attempt {
     RekeyedSession,
     /// `-tt`, whose program finds a terminal on its stdin.
     Pty,
-    /// `sftp`: a put and a get through the subsystem.
-    Sftp,
+    /// The payload written to a file on the far side through a command's stdin.
+    CopyUp,
+    /// That file read back through a command's stdout, by digest.
+    CopyDown,
 }
 
 const ATTEMPTS: &[Attempt] = &[
@@ -80,7 +83,8 @@ const ATTEMPTS: &[Attempt] = &[
     Attempt::AccountKey,
     Attempt::RekeyedSession,
     Attempt::Pty,
-    Attempt::Sftp,
+    Attempt::CopyUp,
+    Attempt::CopyDown,
 ];
 
 impl Attempt {
@@ -92,7 +96,8 @@ impl Attempt {
             | Attempt::WriteAccountKey
             | Attempt::RekeyedSession
             | Attempt::Pty
-            | Attempt::Sftp => PROVISIONED_KEY,
+            | Attempt::CopyUp
+            | Attempt::CopyDown => PROVISIONED_KEY,
             Attempt::Metadata => METADATA_KEY,
             Attempt::Stranger => STRANGER_KEY,
             Attempt::AccountKey => ACCOUNT_KEY,
@@ -108,7 +113,8 @@ impl Attempt {
             | Attempt::AccountKey
             | Attempt::RekeyedSession
             | Attempt::Pty
-            | Attempt::Sftp => true,
+            | Attempt::CopyUp
+            | Attempt::CopyDown => true,
             Attempt::Metadata => seeded,
             Attempt::Stranger | Attempt::Root => false,
         }
@@ -126,7 +132,8 @@ impl Attempt {
             Attempt::AccountKey => "account-key-login",
             Attempt::RekeyedSession => "rekeyed-session",
             Attempt::Pty => "pty-session",
-            Attempt::Sftp => "sftp-session",
+            Attempt::CopyUp => "copy-up",
+            Attempt::CopyDown => "copy-down",
         }
     }
 
@@ -145,7 +152,8 @@ impl Attempt {
                 | Attempt::AccountKey
                 | Attempt::RekeyedSession
                 | Attempt::Pty
-                | Attempt::Sftp
+                | Attempt::CopyUp
+                | Attempt::CopyDown
         )
     }
 }
@@ -318,37 +326,6 @@ impl HostLogin {
         }
     }
 
-    /// Stock `sftp` under its own name, with no `ssh -s` to fall back on: a host whose
-    /// `ssh` is td-ssh has neither, and this stage then fails saying so.
-    fn sftp_command(&self) -> Result<Command, String> {
-        let batch = self.home.join(SFTP_BATCH);
-        let payload = self.home.join(PAYLOAD);
-        let back = self.home.join(SFTP_BACK);
-        fs::write(
-            &batch,
-            format!(
-                "put {} sftp-payload\nget sftp-payload {}\nrm sftp-payload\n",
-                payload.display(),
-                back.display()
-            ),
-        )
-        .map_err(|error| format!("write {}: {error}", batch.display()))?;
-        let mut command = Command::new(host_tool("sftp")?);
-        command
-            .env_clear()
-            .env("HOME", &self.home)
-            .args(["-F", "/dev/null", "-b"])
-            .arg(&batch)
-            .arg("-S")
-            .arg(&self.ssh)
-            .args(client_options(&self.home, "ERROR"))
-            .arg("-i")
-            .arg(self.home.join(Attempt::Sftp.key()))
-            .args(["-P", &self.port()?.to_string()])
-            .arg(format!("{}@127.0.0.1", self.account.name()));
-        Ok(command)
-    }
-
     /// The line the account's own file ends up holding, written by the account.
     fn write_account_key(&self) -> Result<String, String> {
         let path = self.home.join(format!("{ACCOUNT_KEY}.pub"));
@@ -367,44 +344,41 @@ impl HostLogin {
             let path = self.home.join(format!("{}.{stream}", attempt.label()));
             File::create(&path).map_err(|error| format!("create {}: {error}", path.display()))
         };
-        let mut command = if attempt == Attempt::Sftp {
-            self.sftp_command()?
-        } else {
-            let mut command = Command::new(&self.ssh);
-            let level = match attempt {
-                Attempt::RekeyedSession => "DEBUG1",
-                _ => "ERROR",
-            };
-            command
-                .env_clear()
-                .env("HOME", &self.home)
-                .args(["-F", "/dev/null"])
-                .arg(if attempt == Attempt::Pty { "-tt" } else { "-T" })
-                .args(client_options(&self.home, level));
-            if attempt == Attempt::RekeyedSession {
-                command.args(["-o", REKEY_LIMIT]);
-            }
-            let write_key = match attempt {
-                Attempt::WriteAccountKey => self.write_account_key()?,
-                _ => String::new(),
-            };
-            let remote: &[&str] = match attempt {
-                Attempt::Observe => &[OBSERVE],
-                Attempt::WriteAccountKey => &[write_key.as_str()],
-                Attempt::RekeyedSession => &["/bin/cat"],
-                Attempt::Pty => &["/bin/td-util", "readlink", "/proc/self/fd/0"],
-                _ => &["id", "-un"],
-            };
-            command
-                .arg("-i")
-                .arg(self.home.join(attempt.key()))
-                .args(["-p", &self.port()?.to_string()])
-                .args(["-l", attempt.user(self.account.name())])
-                .args(["127.0.0.1", "--"])
-                .args(remote);
-            command
+        let mut command = Command::new(&self.ssh);
+        let level = match attempt {
+            Attempt::RekeyedSession => "DEBUG1",
+            _ => "ERROR",
         };
+        command
+            .env_clear()
+            .env("HOME", &self.home)
+            .args(["-F", "/dev/null"])
+            .arg(if attempt == Attempt::Pty { "-tt" } else { "-T" })
+            .args(client_options(&self.home, level));
         if attempt == Attempt::RekeyedSession {
+            command.args(["-o", REKEY_LIMIT]);
+        }
+        let write_key = match attempt {
+            Attempt::WriteAccountKey => self.write_account_key()?,
+            _ => String::new(),
+        };
+        let remote: &[&str] = match attempt {
+            Attempt::Observe => &[OBSERVE],
+            Attempt::WriteAccountKey => &[write_key.as_str()],
+            Attempt::RekeyedSession => &["/bin/cat"],
+            Attempt::Pty => &["/bin/td-util", "readlink", "/proc/self/fd/0"],
+            Attempt::CopyUp => &[COPY_UP],
+            Attempt::CopyDown => &[COPY_DOWN],
+            _ => &["id", "-un"],
+        };
+        command
+            .arg("-i")
+            .arg(self.home.join(attempt.key()))
+            .args(["-p", &self.port()?.to_string()])
+            .args(["-l", attempt.user(self.account.name())])
+            .args(["127.0.0.1", "--"])
+            .args(remote);
+        if matches!(attempt, Attempt::RekeyedSession | Attempt::CopyUp) {
             let path = self.home.join(PAYLOAD);
             command.stdin(
                 File::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?,
@@ -424,17 +398,15 @@ impl HostLogin {
             fs::read_to_string(path).unwrap_or_default()
         };
         if attempt.is_stage() {
-            let carried = match attempt {
-                Attempt::RekeyedSession => self.home.join(format!("{}.stdout", attempt.label())),
-                _ => self.home.join(SFTP_BACK),
-            };
+            let carried = self.home.join(format!("{}.stdout", attempt.label()));
             let same = fs::read(&carried).is_ok_and(|bytes| digest(&bytes) == digest(&payload()));
+            let carries = matches!(attempt, Attempt::RekeyedSession | Attempt::CopyDown);
             return judge_stage(
                 attempt,
                 self.account.name(),
                 code,
                 // A payload is no text to quote back.
-                &if attempt == Attempt::RekeyedSession {
+                &if carries {
                     String::new()
                 } else {
                     read("stdout")
@@ -526,7 +498,11 @@ fn judge_stage(
             "a session on a PTY",
             stdout.trim_end().starts_with(PTY_DEVICES),
         ),
-        Attempt::Sftp => ("an sftp put and get, by digest", same),
+        Attempt::CopyUp => (
+            "a file written through a command's stdin",
+            stdout.is_empty(),
+        ),
+        Attempt::CopyDown => ("that file read back, by digest", same),
         _ => ("a stage", false),
     };
     if code == Some(0) && passed {
@@ -778,11 +754,15 @@ mod tests {
         assert!(judged(Attempt::Pty, Some(0), "/dev/null\r\n", "", false).is_err());
         assert!(judged(Attempt::Pty, Some(0), "", "", false).is_err());
 
-        assert!(judged(Attempt::Sftp, Some(0), "", "", true).is_ok());
-        assert!(judged(Attempt::Sftp, Some(0), "", "", false)
+        assert!(judged(Attempt::CopyUp, Some(0), "", "", false).is_ok());
+        assert!(judged(Attempt::CopyUp, Some(1), "", "", false)
             .unwrap_err()
-            .contains("sftp"));
-        assert!(judged(Attempt::Sftp, Some(1), "", "", true).is_err());
+            .contains("stdin"));
+        assert!(judged(Attempt::CopyDown, Some(0), "", "", true).is_ok());
+        assert!(judged(Attempt::CopyDown, Some(0), "", "", false)
+            .unwrap_err()
+            .contains("digest"));
+        assert!(judged(Attempt::CopyDown, Some(1), "", "", true).is_err());
 
         for attempt in ATTEMPTS.iter().filter(|attempt| attempt.is_stage()) {
             assert!(attempt.admitted(false), "{attempt:?}");

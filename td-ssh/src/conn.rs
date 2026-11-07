@@ -68,10 +68,6 @@ pub enum Event {
         channel: u32,
         status: Result<ExitStatus>,
     },
-    /// Everything an SFTP subsystem had to say has been said.
-    SubsystemEnded {
-        channel: u32,
-    },
     Tick,
     WindowChanged {
         columns: u32,
@@ -589,13 +585,8 @@ impl Credit {
         }
     }
 
-    /// Waits for at least one byte of credit, taking at most `max`. None once
-    /// the channel closed.
-    pub fn take(&self, max: usize) -> Option<usize> {
-        self.take_unless(max, &AtomicBool::new(false))
-    }
-
-    /// `take`, for a source that can be told to stop.
+    /// Waits for at least one byte of credit, taking at most `max`: None once the
+    /// channel closed, or once `stop` is set.
     fn take_unless(&self, max: usize, stop: &AtomicBool) -> Option<usize> {
         let mut state = self.flow.state.lock().ok()?;
         loop {
@@ -760,6 +751,13 @@ mod tests {
     use crate::kex::Role;
     use std::io::Cursor;
     use std::time::Duration;
+
+    impl Credit {
+        /// `take_unless` with nothing to stop it, which no production source is.
+        fn take(&self, max: usize) -> Option<usize> {
+            self.take_unless(max, &AtomicBool::new(false))
+        }
+    }
 
     struct NoEnv;
 

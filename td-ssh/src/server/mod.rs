@@ -12,7 +12,6 @@ pub mod log;
 pub mod monitor;
 pub mod preauth;
 pub mod session;
-pub mod sftp;
 pub mod signer;
 
 // td-login's account tables and status reader, so both programs parse these

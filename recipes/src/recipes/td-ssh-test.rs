@@ -8,8 +8,8 @@ const TD_KEYGEN: &str = "{in:td-ssh}/bin/td-ssh-keygen";
 /// itself proves only the binaries' static shape and that each entry runs; the
 /// check's runner then drives real logins between these binaries and stock
 /// OpenSSH on the check sandbox's loopback (checks/ssh_interop.rs), which is the
-/// proof a wrong KEX or AEAD cannot pass, stock `sftp` and modern `scp` against
-/// td-sshd among them, and hands the real td-sshd every form of the image's policy.
+/// proof a wrong KEX or AEAD cannot pass, and hands the real td-sshd every form of the
+/// image's policy.
 /// `openssh-x86-64` is an input only so that it can be that peer, and this is the one
 /// recipe that may name it (catalog.rs); `td-sh` is there so that a logged-in account
 /// has a shell, and `td-ssh-interop` is the driver.

@@ -29,7 +29,6 @@ pub struct ServerConfig {
     pub host_key: PathBuf,
     pub authorized_keys: Vec<String>,
     pub allow_users: Option<Vec<String>>,
-    pub sftp: bool,
     pub login_grace_seconds: u64,
     pub max_auth_tries: u32,
     pub max_sessions: u32,
@@ -112,7 +111,6 @@ impl ServerConfig {
         let mut host_key = None;
         let mut authorized_keys = None;
         let mut allow_users: Option<Vec<String>> = None;
-        let mut sftp = None;
         let mut permit_root_login = None;
         let mut login_grace_seconds = None;
         let mut max_auth_tries = None;
@@ -203,17 +201,6 @@ impl ServerConfig {
                     }
                     allow_users = Some(names);
                 }
-                "subsystem" => {
-                    once(&sftp, "Subsystem").map_err(located)?;
-                    if value.split_ascii_whitespace().collect::<Vec<_>>()
-                        != ["sftp", "internal-sftp"]
-                    {
-                        return Err(located(format!(
-                            "Subsystem {value}: only sftp internal-sftp"
-                        )));
-                    }
-                    sftp = Some(true);
-                }
                 "permitrootlogin" => {
                     once(&permit_root_login, "PermitRootLogin").map_err(located)?;
                     permit_root_login = Some(());
@@ -250,7 +237,6 @@ impl ServerConfig {
             host_key: host_key.ok_or("HostKey is required")?,
             authorized_keys: authorized_keys.ok_or("AuthorizedKeysFile is required")?,
             allow_users,
-            sftp: sftp.unwrap_or(false),
             login_grace_seconds: login_grace_seconds.unwrap_or(DEFAULT_LOGIN_GRACE),
             max_auth_tries: max_auth_tries.unwrap_or(DEFAULT_AUTH_TRIES),
             max_sessions: max_sessions.unwrap_or(DEFAULT_SESSIONS),
@@ -338,9 +324,6 @@ impl ServerConfig {
         if let Some(command) = &effective.force_command {
             out.push_str(&format!("forcecommand {command}\n"));
         }
-        if self.sftp {
-            out.push_str("subsystem sftp internal-sftp\n");
-        }
         out
     }
 }
@@ -368,7 +351,6 @@ mod tests {
         }
         for twice in [
             "AllowUsers a\nAllowUsers b\n",
-            "Subsystem sftp internal-sftp\nSubsystem sftp internal-sftp\n",
             "PermitRootLogin no\nPermitRootLogin no\n",
             "LoginGraceTime 3\nLoginGraceTime 4\n",
             "MaxAuthTries 1\nMaxAuthTries 2\n",
@@ -403,11 +385,10 @@ mod tests {
     #[test]
     fn a_full_policy_parses() {
         let text = format!(
-            "{BASE}PermitRootLogin no\nAllowUsers alice td-admin\nSubsystem sftp internal-sftp\nLoginGraceTime 30\nMaxAuthTries 3\nMaxSessions 4\nMatch User td-admin\n\tAuthorizedKeysFile /var/lib/td-admin/authorized_keys\n\tForceCommand /bin/td-admin ssh\n\tPermitTTY no\n\tMaxSessions 1\nMatch User alice\n\tAuthorizedKeysFile /run/a /run/b .ssh/authorized_keys\n"
+            "{BASE}PermitRootLogin no\nAllowUsers alice td-admin\nLoginGraceTime 30\nMaxAuthTries 3\nMaxSessions 4\nMatch User td-admin\n\tAuthorizedKeysFile /var/lib/td-admin/authorized_keys\n\tForceCommand /bin/td-admin ssh\n\tPermitTTY no\n\tMaxSessions 1\nMatch User alice\n\tAuthorizedKeysFile /run/a /run/b .ssh/authorized_keys\n"
         );
         let config = ServerConfig::parse(&text, false).unwrap();
         assert_eq!(config.port, 22);
-        assert!(config.sftp);
         assert!(config.admits_name("alice"));
         assert!(!config.admits_name("mallory"));
         let admin = config.effective("td-admin");
@@ -447,6 +428,7 @@ mod tests {
             "PasswordAuthentication yes",
             "PermitRootLogin yes",
             "PermitRootLogin prohibit-password",
+            "Subsystem sftp internal-sftp",
             "Subsystem sftp /usr/lib/sftp-server",
             "Match Address 10.0.0.1",
             "Match User alice Host x",

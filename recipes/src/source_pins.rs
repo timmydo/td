@@ -985,7 +985,7 @@ const PINS: &[PinDef] = &[
         aliases: &[],
         // OpenSSH Portable 10.6p2, td-ssh-test's peer and in no image. The recipe
         // builds only what that check drives (ssh, ssh-keygen, sshd and its two
-        // helpers, scp, sftp), without libcrypto or zlib.
+        // helpers), without libcrypto or zlib.
         url: "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.6p2.tar.gz",
         sha256: "9ae44872090cf2f06b3cf9ff147e7f16f309671340763ed2f99248398ae29d5b",
         file: "openssh-10.6p2.tar.gz",

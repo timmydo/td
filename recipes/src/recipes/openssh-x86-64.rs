@@ -6,8 +6,7 @@ use crate::types::{Recipe, Step};
 
 // Stock OpenSSH Portable, TEST-ONLY: td-ssh-test's peer and nothing else's
 // (td-ssh/DESIGN.md §9). No image holds it, which a catalog test and the image's
-// root-tree check both hold, so `scp` and `sftp` can be built for that peer
-// without any image ever carrying them. It stays the no-libcrypto profile, so a
+// root-tree check both hold. It stays the no-libcrypto profile, so a
 // peer with internal crypto only. zlib, PAM, Kerberos, PKCS#11, FIDO, libedit and
 // login accounting never enter the closure.
 //
@@ -39,18 +38,10 @@ auth_password(struct ssh *ssh, const char *password)
 "#;
 
 /// The programs td-ssh-test drives or the daemon needs, each built by its own make.
-const PROGRAMS: &[&str] = &[
-    "ssh",
-    "sshd",
-    "sshd-session",
-    "sshd-auth",
-    "ssh-keygen",
-    "scp",
-    "sftp",
-];
+const PROGRAMS: &[&str] = &["ssh", "sshd", "sshd-session", "sshd-auth", "ssh-keygen"];
 
 /// What stands in `{out}/bin`.
-const BIN_PROGRAMS: &[&str] = &["ssh", "sshd", "ssh-keygen", "scp", "sftp"];
+const BIN_PROGRAMS: &[&str] = &["ssh", "sshd", "ssh-keygen"];
 
 /// Stock OpenSSH as td-ssh-test's peer. Test-only: no shipped image and no other
 /// recipe may name it (catalog.rs).
@@ -184,8 +175,6 @@ pub fn recipe() -> Recipe {
             "{out}/bin/ssh".into(),
             "{out}/bin/sshd".into(),
             "{out}/bin/ssh-keygen".into(),
-            "{out}/bin/scp".into(),
-            "{out}/bin/sftp".into(),
             "{out}/libexec/sshd-session".into(),
             "{out}/libexec/sshd-auth".into(),
         ],
@@ -299,15 +288,7 @@ mod tests {
             })
             .collect();
         assert_eq!(builds.len(), PROGRAMS.len(), "one make per program");
-        for target in [
-            "ssh",
-            "sshd",
-            "sshd-session",
-            "sshd-auth",
-            "ssh-keygen",
-            "scp",
-            "sftp",
-        ] {
+        for target in PROGRAMS.iter().copied() {
             let map = format!("{{root}}/{target}.map");
             let (link, _) = steps
                 .iter()
@@ -329,7 +310,7 @@ mod tests {
                 .expect("link-map check");
             assert!(link < checked, "{target}'s map is checked after its link");
         }
-        for omitted in ["sftp-server", "ssh-agent", "ssh-add"] {
+        for omitted in ["scp", "sftp", "sftp-server", "ssh-agent", "ssh-add"] {
             assert!(
                 !builds
                     .iter()

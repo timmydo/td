@@ -97,8 +97,8 @@ need it to list methods), then a query, then a signed request.
 RFC 4252 specifies.
 
 **Connection layer.** Channel types: `session` only. Requests admitted by the
-server: `pty-req`, `window-change`, `shell`, `exec`, `subsystem` (only `sftp`).
-`eow@openssh.com` is honoured (§4). Everything else (`env`, `signal`, `x11-req`,
+server: `pty-req`, `window-change`, `shell`, `exec`.
+`eow@openssh.com` is honoured (§4). Everything else (`subsystem`, `env`, `signal`, `x11-req`,
 `auth-agent-req@openssh.com`, `break`, `direct-tcpip`, `forwarded-tcpip`,
 `tcpip-forward`) is refused. The
 client additionally sends `env` for `SendEnv`-listed variables (GitHub honours
@@ -196,7 +196,7 @@ one counting as IPv4, or one IPv6 /64; excess are closed before any byte is writ
 A connection counts until its monitor writes to a status pipe on authenticating or
 exits, which its worker's exit causes at once. It raises the umask it inherited to
 at least `022`, as OpenSSH does, since `td-svc` passes on PID 1's and nothing sets
-that: a file made with no mode of its own, by a command or SFTP, is not group or
+that: a file made with no mode of its own, by a command, is not group or
 other writable. The cap is on unauthenticated connections alone: authenticated ones
 are not capped, here or by OpenSSH, and each is its account's to spend. No stage
 handles a reload:
@@ -329,8 +329,7 @@ real logins; `Port 0` is accepted only in this mode, and prints the bound port.
 keyword, value or `Match` condition refuses the whole file. Keywords:
 
 `Port`, `ListenAddress`, `HostKey`, `AuthorizedKeysFile`, `AllowUsers`,
-`Subsystem sftp internal-sftp` (the sole value), `PermitRootLogin no` (the sole
-value), `LoginGraceTime`, `MaxAuthTries`, `MaxSessions`, and `Match User NAME` containing only
+`PermitRootLogin no` (the sole value), `LoginGraceTime`, `MaxAuthTries`, `MaxSessions`, and `Match User NAME` containing only
 `AuthorizedKeysFile`, `ForceCommand`, `PermitTTY`, `MaxSessions`.
 `AuthorizedKeysFile` takes several space-separated files; a `Match` value replaces
 the global one. OpenSSH's `none` and `%` tokens there and `ForceCommand none` are
@@ -401,10 +400,10 @@ canonical form, and the whole line is unusable otherwise, a negated pattern abov
 match the one form an address prints in does the same: a `/`, a hostname, any character
 outside digits, `.`, `*`, `?` and, with a `:`, hex digits; a mapped or non-canonical
 literal; or an impossible octet. `restrict` also disables PTY. `ForceCommand` overrides `command=`, and both apply
-to `shell`, `exec` and `subsystem`, setting `SSH_ORIGINAL_COMMAND`: a forced
-account reaches SFTP or another command only through that command.
+to `shell` and `exec`, setting `SSH_ORIGINAL_COMMAND`: a forced account reaches another
+command only through that command.
 
-## 6. Session, SFTP, client and keygen
+## 6. Session, client and keygen
 
 **Children.** Run as `SHELL -c COMMAND`, or for `shell` as the login shell with a
 leading-dash `argv[0]`, in the home directory, in a new session; on a PTY, that
@@ -438,17 +437,18 @@ is left, a peer flooding requests during a rekey, and it fails the connection ra
 than grow. A peer that never answers a rekey is caught by keepalive on the server, there
 being no separate timer, and by the client's `ServerAlive` or a person's `~.`.
 
-**SFTP v3**, in-process on its own thread as the account: `INIT`, `OPEN`,
-`CLOSE`, `READ`, `WRITE`, `LSTAT`, `FSTAT`, `SETSTAT`, `FSETSTAT`, `OPENDIR`,
-`READDIR`, `REMOVE`, `MKDIR`, `RMDIR`, `REALPATH`, `STAT`, `RENAME`, `READLINK`,
-`SYMLINK`, and the extensions `posix-rename@openssh.com`, `fsync@openssh.com`,
-`limits@openssh.com`, `expand-path@openssh.com`. Reads and writes at most 256 KiB,
-at most 64 open handles. Paths are not jailed: it has the account's ordinary
-filesystem permissions, as `internal-sftp` has today. The image still ships no
-`scp` or `sftp` client. `FX_OPEN` or `SETSTAT` on a FIFO with no peer blocks that SFTP
-channel, whose thread does its filesystem calls in turn, and holds its `MaxSessions`
-slot until the connection ends. That is accepted: it costs the account only its own
-slots, and the connection is its own to end.
+**Moving files.** There is no SFTP and so no modern `scp`: no td program used either,
+the image ships neither client, and it was the largest parser of an authenticated peer's
+input. A file moves through a command, with its status the answer: `ssh h 'cat > f' < f`
+and `ssh h cat f > f`, one file at a time, bounded by nothing but the disk. Only the near
+side's status says the bytes all arrived: a link that drops gives the far `cat` an end of
+input and status 0. So a tree goes up as an archive made on the sending side, copied as
+one step and unpacked as a second once the first said 0, `ssh h 'cat > a.tar'` then
+`ssh h tar -xf a.tar`, within `td-util tar`'s limits. A tree comes down awkwardly or as
+`git` carries one: `/bin/tar` only extracts, and the one archiver, `td-util
+gen_init_cpio`, packs newc from a spec list written by hand. That gap is known. Git over
+`ssh` is the same `exec`. A stock `scp`, `sftp` or `rsync` from another machine fails,
+by a refused subsystem or a program not found.
 
 **`ssh` command line.** `ssh [options] [user@]host [command...]` and
 `ssh://[user@]host[:port]`. Options: `-F -G -i -l -n -N -o -p -q -t -T -v -V`; `-4` and
@@ -722,8 +722,6 @@ reach the jail.
 - Host integration, unprivileged: `td-ssh` against `td-sshd --single-user` on
   loopback, covering exec, PTY, large transfer across forced rekeys, the live
   stages' seccomp state, the listener's caps, and refusal of every removed feature.
-  `td-ssh` has no subsystem option, so SFTP's operations are unit-tested and its
-  channel runs against stock `sftp` and `scp` in the recipe test.
 - Host integration, a hostile peer (`tests/client_peer.rs`): the real `td-ssh`, with a
   real terminal for its stdin, against a server built on the crate's key exchange and
   packet layers that stops reading, holds its window shut, leaves a rekey hanging or
@@ -756,12 +754,10 @@ reach the jail.
   closes early, against stock `sshd` and `td-sshd`; stock `ssh` has no such leg, not
   sending `eow@openssh.com` to td-sshd (§4). A refused terminal: stock `ssh -tt` with
   `no-pty` on its key, and `td-ssh -tt` against `PermitTTY no`. Plain keys from each generator read by the other, and a stock encrypted one by td's,
-  with one fingerprint, and td's refusal to write a protected one; `-Y sign`/`verify` crossed. Stock `sftp` and modern `scp`
-  against `td-sshd`: a batch of mkdir, put, rename, `ls`, get, rm and rmdir, and `scp`
-  both ways with absolute, home-relative and `~/` paths, 4 MiB by digest on the far
-  side too; `mkdir` and `scp -r` with their modes. `scp -r` makes a directory then chmods
-  it to the local mode, as an explicit request that the floor does not touch, as
-  `sftp-server`'s does not. `openssh-x86-64` builds those two clients only because no image holds it:
+  with one fingerprint, and td's refusal to write a protected one; `-Y sign`/`verify` crossed. A file copied up and down through a
+  command for each client against `td-sshd`, by digest on the far side too, a copy that
+  cannot be written, read from its status, and `ssh -s sftp` refused. `openssh-x86-64` is
+  built for this alone, without `scp` or `sftp`:
   a catalog test holds that no shipped image and no other recipe names it, and the
   image's root-tree check holds `/bin/sshd`, OpenSSH's helpers and any OpenSSH store
   item absent. Every form of the image's rendered policy (`td-firstboot`'s
@@ -794,9 +790,9 @@ reach the jail.
   image's and the live medium's, the host's client also runs these, each failing by
   name: a key the account writes to its own `~/.ssh/authorized_keys`, then a login by
   it; a session through `cat` under `RekeyLimit=1M`, 2 MiB by digest, with the client's
-  log saying a rekey happened; `ssh -tt`, whose program finds `/dev/pts/`; and `sftp`
-  put and get, by digest. That last needs a stock `sftp` on the host, as this tier
-  needs QEMU, and fails saying so where it has none. The account's key needs the
+  log saying a rekey happened; `ssh -tt`, whose program finds `/dev/pts/`; and the payload
+  written to a file through a command's stdin and read back through another's stdout, by
+  digest. The account's key needs the
   ordinary form of the policy, so a boot whose login directory is invalid fails that
   login by name. No other boot leg runs these. These boot legs are the first time the
   root paths run for real: `--single-user` exercises no `chroot`, credential switch or
@@ -807,7 +803,7 @@ reach the jail.
 Principle 4 applied at the final increment, which cut every image over and removed
 OpenSSH from them in one landing. Prior increments added code no image shipped. In
 order, each independently green: this document; the new primitives in
-`td-primitives`; client and keygen; server and SFTP with `UNSAFE.md` §27; recipes and
+`td-primitives`; client and keygen; server with `UNSAFE.md` §27; recipes and
 interop test; cutover.
 
 The cutover: `/bin/ssh`, `/bin/ssh-keygen`, `/bin/td-ssh`, `/bin/td-ssh-keygen` and `/bin/td-sshd` come from the `td-ssh`

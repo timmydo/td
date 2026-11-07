@@ -151,7 +151,7 @@ fn start_with(options: &Options<'_>) -> Server {
     fs::write(
         &config,
         format!(
-            "Port 0\nListenAddress {}\nHostKey {}\nAuthorizedKeysFile .ssh/authorized_keys\nSubsystem sftp internal-sftp\nPermitRootLogin no\nLoginGraceTime {}\nMaxAuthTries 3\nMaxSessions 4\n{}",
+            "Port 0\nListenAddress {}\nHostKey {}\nAuthorizedKeysFile .ssh/authorized_keys\nPermitRootLogin no\nLoginGraceTime {}\nMaxAuthTries 3\nMaxSessions 4\n{}",
             options.listen,
             root.join("host").display(),
             options.login_grace,
@@ -694,11 +694,7 @@ fn the_config_test_and_print_modes() {
         .output()
         .unwrap();
     let text = stdout(&printed);
-    for line in [
-        "permitrootlogin no",
-        "passwordauthentication no",
-        "subsystem sftp internal-sftp",
-    ] {
+    for line in ["permitrootlogin no", "passwordauthentication no"] {
         assert!(text.lines().any(|seen| seen == line), "{line}: {text}");
     }
     fs::write(&config, "Port 22\nNotAKeyword x\n").unwrap();
@@ -876,42 +872,6 @@ impl RawClient {
             .string(&kex::ed25519_signature_blob(&signature));
         self.send(&request);
         assert_eq!(self.receive()[0], msg::USERAUTH_SUCCESS);
-    }
-
-    /// A session channel running SFTP; the server's channel number.
-    fn start_sftp(&mut self) -> u32 {
-        let mut open = Writer::message(msg::CHANNEL_OPEN);
-        open.str("session").u32(0).u32(1 << 21).u32(1 << 15);
-        self.send(&open);
-        let confirmation = self.receive_skipping_window();
-        assert_eq!(confirmation[0], msg::CHANNEL_OPEN_CONFIRMATION);
-        let mut reader = Reader::new(&confirmation[1..]);
-        reader.u32().unwrap();
-        let channel = reader.u32().unwrap();
-        let mut request = Writer::message(msg::CHANNEL_REQUEST);
-        request.u32(channel).str("subsystem").bool(true).str("sftp");
-        self.send(&request);
-        assert_eq!(self.receive_skipping_window()[0], msg::CHANNEL_SUCCESS);
-        channel
-    }
-
-    /// One SFTP request and the first byte of its reply, which is the reply's type.
-    fn sftp_call(&mut self, channel: u32, body: &Writer) -> u8 {
-        let mut framed = Writer::new();
-        framed.string(body.as_slice());
-        let mut data = Writer::message(msg::CHANNEL_DATA);
-        data.u32(channel).string(framed.as_slice());
-        self.send(&data);
-        // The length and the body arrive as separate channel data.
-        let mut received = Vec::new();
-        while received.len() < 5 {
-            let reply = self.receive_skipping_window();
-            assert_eq!(reply[0], msg::CHANNEL_DATA);
-            let mut reader = Reader::new(&reply[1..]);
-            reader.u32().unwrap();
-            received.extend_from_slice(reader.string().unwrap());
-        }
-        received[4]
     }
 }
 
@@ -1184,7 +1144,7 @@ fn request_tty_decides_a_terminal_unless_t_or_big_t_says_otherwise() {
     assert_eq!(run(&["-tt", "-o", "RequestTTY=no"]), "terminal");
 }
 
-/// The file SFTP and a command each make with no mode of their own.
+/// The file a command makes with no mode of its own.
 #[test]
 fn nothing_created_is_group_or_other_writable_under_an_inherited_umask_of_zero() {
     let server = start_with(&Options {
@@ -1203,51 +1163,28 @@ fn nothing_created_is_group_or_other_writable_under_an_inherited_umask_of_zero()
         .unwrap()
         .mode();
     assert_eq!(mode & 0o022, 0, "{mode:o}");
+}
 
-    let mut client = RawClient::connect(server.port);
-    client.login(&load_key(&server.root.join("client")));
-    let channel = client.start_sftp();
-    let mut init = Writer::message(1);
-    init.u32(3);
-    assert_eq!(client.sftp_call(channel, &init), 2);
-    // FX_OPEN, PF_WRITE | PF_CREAT, an ATTRS with no flags: FX_HANDLE back.
-    let mut open = Writer::message(3);
-    open.u32(1).str("from-sftp").u32(2 | 8).u32(0);
-    assert_eq!(client.sftp_call(channel, &open), 102);
-    let mode = fs::metadata(server.home.join("from-sftp")).unwrap().mode();
-    assert_eq!(mode & 0o022, 0, "{mode:o}");
-    // A mode that asks for all of it gets what the floor leaves, by the one way the
-    // floor is asked: FX_OPEN and FX_MKDIR with SSH_FILEXFER_ATTR_PERMISSIONS.
-    const ATTR_PERMISSIONS: u32 = 4;
-    let mut open = Writer::message(3);
-    open.u32(2)
-        .str("wide-open-sftp")
-        .u32(2 | 8)
-        .u32(ATTR_PERMISSIONS)
-        .u32(0o777);
-    assert_eq!(client.sftp_call(channel, &open), 102);
-    let mode = fs::metadata(server.home.join("wide-open-sftp"))
-        .unwrap()
-        .mode();
-    assert_eq!(mode & 0o777, 0o755, "{mode:o}");
-    let mut mkdir = Writer::message(14);
-    mkdir
-        .u32(3)
-        .str("wide-open-dir")
-        .u32(ATTR_PERMISSIONS)
-        .u32(0o777);
-    // FX_STATUS, whose code the file's being there shows.
-    assert_eq!(client.sftp_call(channel, &mkdir), 101);
-    let mode = fs::metadata(server.home.join("wide-open-dir"))
-        .unwrap()
-        .mode();
-    assert_eq!(mode & 0o777, 0o755, "{mode:o}");
-    // With no attributes the same.
-    let mut mkdir = Writer::message(14);
-    mkdir.u32(4).str("plain-dir").u32(0);
-    assert_eq!(client.sftp_call(channel, &mkdir), 101);
-    let mode = fs::metadata(server.home.join("plain-dir")).unwrap().mode();
-    assert_eq!(mode & 0o777, 0o755, "{mode:o}");
+/// No subsystem exists to ask for, by any name, and a forced command does not change
+/// that by running in its place.
+#[test]
+fn a_subsystem_is_refused() {
+    for extra in ["", "Match User tester\n\tForceCommand echo admin\n"] {
+        let server = start(extra);
+        let mut client = RawClient::connect(server.port);
+        client.login(&load_key(&server.root.join("client")));
+        for name in ["sftp", "other"] {
+            let channel = client.open_session(1 << 21);
+            let mut request = Writer::message(msg::CHANNEL_REQUEST);
+            request.u32(channel).str("subsystem").bool(true).str(name);
+            client.send(&request);
+            assert_eq!(
+                client.receive_skipping_window()[0],
+                msg::CHANNEL_FAILURE,
+                "{extra}{name}"
+            );
+        }
+    }
 }
 
 /// Enough, at a program writing as fast as a shell can, to pass what a rekey used

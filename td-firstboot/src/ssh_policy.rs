@@ -74,7 +74,6 @@ pub fn config(primary_name: &str, form: Form, provisioned: Provisioned) -> Strin
          LoginGraceTime 30\n\
          MaxAuthTries 3\n\
          MaxSessions 4\n\
-         Subsystem sftp internal-sftp\n\
          {admin}\
          Match User {primary_name}\n\
          \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}{provisioned_keys}{remote_keys}\n"

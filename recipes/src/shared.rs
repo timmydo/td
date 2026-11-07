@@ -995,7 +995,7 @@ pub const GIT_RUNTIME_MARKER: &str = "TD-GIT-RUN-OK";
 /// and session of an exec, public-key authentication by a key in the first root-owned
 /// file, and remote exec. Not the rest of the daemon: the child that reads an account's
 /// own keys (this key's file comes first, and the search stops there), the signer's
-/// jail (no rekey), PTY or SFTP. `qemu-boot-server`'s host logins run those, each failing
+/// jail (no rekey), PTY or a file copied. `qemu-boot-server`'s host logins run those, each failing
 /// by name, and no other boot leg does.
 pub const SSHD_MARKER: &str = "TD-SSHD-OK";
 

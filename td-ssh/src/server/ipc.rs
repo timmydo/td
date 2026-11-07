@@ -143,7 +143,6 @@ pub struct SessionGrant {
     pub force_command: Option<String>,
     pub permit_tty: bool,
     pub max_sessions: u32,
-    pub sftp: bool,
     pub peer_address: String,
     pub peer_port: u16,
     pub local_address: String,
@@ -160,10 +159,7 @@ impl SessionGrant {
         writer.str(&self.home).str(&self.shell);
         writer.bool(self.force_command.is_some());
         writer.str(self.force_command.as_deref().unwrap_or(""));
-        writer
-            .bool(self.permit_tty)
-            .u32(self.max_sessions)
-            .bool(self.sftp);
+        writer.bool(self.permit_tty).u32(self.max_sessions);
         writer
             .str(&self.peer_address)
             .u32(u32::from(self.peer_port))
@@ -199,7 +195,6 @@ impl SessionGrant {
             force_command: has_force.then_some(force),
             permit_tty: reader.bool()?,
             max_sessions: reader.u32()?,
-            sftp: reader.bool()?,
             peer_address: reader.str()?.to_string(),
             peer_port: port(reader.u32()?)?,
             local_address: reader.str()?.to_string(),
@@ -298,7 +293,6 @@ mod tests {
             force_command: Some("cmd".into()),
             permit_tty: false,
             max_sessions: 1,
-            sftp: true,
             peer_address: "10.0.0.1".into(),
             peer_port: 1234,
             local_address: "10.0.0.2".into(),

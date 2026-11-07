@@ -2157,7 +2157,7 @@ fn session_loop(
                 }
             }
             Event::EscapeDisconnect => break Ok(Ending::Escaped),
-            Event::ChildExited { .. } | Event::SubsystemEnded { .. } => {}
+            Event::ChildExited { .. } => {}
         }
     };
     window_stop.store(true, Ordering::Relaxed);
