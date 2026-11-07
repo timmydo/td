@@ -1395,11 +1395,12 @@ fn build_inittab() -> String {
     // /etc/td-svc.conf — see build_td_svc_conf for why, and td-svc/DESIGN.md §1 for the
     // three things a signal-free PID 1 cannot express.
     //
-    // The mounts stay HERE, not in the table, because td-svc reads /proc: its own
-    // process group and session come from /proc/self/stat, and every containment query
-    // and liveness check is a /proc read. A td-svc started before /proc exists comes up
-    // degraded and cannot signal a group at all (it fails closed). sysinit jobs run to
-    // completion before any respawn line starts, so this ordering IS that guarantee.
+    // The mounts stay HERE, not in the table, because td-svc needs them. It reads /proc:
+    // its own process group and session come from /proc/self/stat, and every containment
+    // query and liveness check is a /proc read. A td-svc started before /proc exists comes
+    // up degraded and cannot signal a group at all (it fails closed). /proc itself is
+    // already here, carried across by switch_root, which needs it to free the initramfs.
+    // sysinit jobs run to completion before any respawn line starts.
     // Mounting over a read-only dir is a VFS overlay, no write to the erofs. It does NOT
     // mount /var, /tmp, or /run: stage-1 already mounted persistent @var and the
     // volatile tmpfs filesystems, and switch_root preserves the mounts.
@@ -1413,7 +1414,6 @@ fn build_inittab() -> String {
     // it cannot honour. Ctrl-Alt-Del is td-svc's to own precisely because PID 1 cannot.
     format!(
         "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
-         ::sysinit:/bin/mount -t proc proc /proc\n\
          ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
          ::sysinit:/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup\n\
          ::sysinit:/bin/devpts\n\
@@ -2669,6 +2669,23 @@ fn build_desktop_td_svc_conf() -> String {
     )
 }
 
+/// Device firmware for the deployment initramfs, where the loader finds it when
+/// a driver built into the kernel probes. The selector's initramfs has none, so
+/// a selector never starts the GPU or Wi-Fi it hands over to its deployment.
+fn device_firmware_spec() -> String {
+    let mut spec = String::from("dir /lib 0755 0 0\ndir /lib/firmware 0755 0 0\n");
+    for dir in super::device_firmware::directories() {
+        spec.push_str(&format!("dir /lib/firmware/{dir} 0755 0 0\n"));
+    }
+    for (_, name) in super::device_firmware::FIRMWARE {
+        spec.push_str(&format!(
+            "file /lib/firmware/{name} {{in:device-firmware}}/{dir}/{name} 0444 0 0\n",
+            dir = super::device_firmware::DIR
+        ));
+    }
+    spec
+}
+
 /// The firmware/direct-boot initramfs always selects through td-boot and kexecs
 /// the verified deployment. It has no selected-deployment branch, so an external
 /// kernel command line cannot bypass current/previous selection.
@@ -2852,8 +2869,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
     init.push_str(&format!(
         "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1\n\
          {LOGIN_DIRECTORY_STEP}\n\
-         {}\n\
-         /bin/umount /proc\n",
+         {}\n",
         sshd_render_step(sys)
     ));
     if sys.desktop() {
@@ -2895,6 +2911,9 @@ fn build_deployment_init(sys: &SystemDef) -> String {
         }
     }
     // Child Stdio::null and shell redirections still need the real /dev/null.
+    // /proc stays: switch_root reads its mount table to know the old root may be
+    // freed, moves it across and reaches the old root through it. Without it the
+    // whole initramfs stays in memory until the machine stops.
     init.push_str("/bin/umount /dev\nexec /bin/switch_root /sysroot /init\n");
     init
 }
@@ -5423,12 +5442,22 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
             dest: "{root}/real-root{in:jetbrains-mono-nerd-font}".into(),
         });
     }
-    // So are the notices of the firmware the kernel embeds, which its
-    // licence asks a distribution to carry; every profile boots that kernel.
-    steps.push(Step::CopyTree {
-        from: "{in:linux-firmware-notices}".into(),
-        dest: "{root}/real-root{in:linux-firmware-notices}".into(),
-    });
+    // Device firmware for the drivers in the kernel, after switch_root: ath11k
+    // asks again to recover a crashed device. Its ELFs run on the device's own
+    // processor, so the profiler index below leaves this store item out.
+    if sys.desktop() {
+        steps.push(Step::CopyTree {
+            from: "{in:device-firmware}".into(),
+            dest: "{root}/real-root{in:device-firmware}".into(),
+        });
+        steps.push(Step::MkDir {
+            path: "{root}/real-root/lib".into(),
+        });
+        steps.push(Step::Symlink {
+            target: format!("{{in:device-firmware}}/{}", super::device_firmware::DIR),
+            link: "{root}/real-root/lib/firmware".into(),
+        });
+    }
     // Timezone data is an immutable package with no ELF runtime closure.
     steps.push(Step::CopyTree {
         from: "{in:tzdata}".into(),
@@ -5829,22 +5858,25 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     // metadata to the catalog-derived package/runtime provenance table. Application
     // manifest provenance describes containment and is deliberately not transferred
     // to either root.
-    steps.push(Step::run(
-        "{root}",
-        &[
-            "{in:td-profiler}/bin/td-profiler",
-            "index",
-            "{root}/real-root",
-            "{root}/real-root/etc/td-profiler-objects.tsv",
-            "--exclude-store-item",
-            "{in:glibc-x86-64}",
-            "--exclude-store-item",
-            "{in:gcc-runtime}",
-            "--exclude-registry",
-            "{root}/real-root/etc/td-applications.tsv",
-            "{root}/real-root/etc/td-profiler-application-roots.tsv",
-        ],
-    ));
+    let mut index = vec![
+        "{in:td-profiler}/bin/td-profiler",
+        "index",
+        "{root}/real-root",
+        "{root}/real-root/etc/td-profiler-objects.tsv",
+        "--exclude-store-item",
+        "{in:glibc-x86-64}",
+        "--exclude-store-item",
+        "{in:gcc-runtime}",
+    ];
+    if sys.desktop() {
+        index.extend(["--exclude-store-item", "{in:device-firmware}"]);
+    }
+    index.extend([
+        "--exclude-registry",
+        "{root}/real-root/etc/td-applications.tsv",
+        "{root}/real-root/etc/td-profiler-application-roots.tsv",
+    ]);
+    steps.push(Step::run("{root}", &index));
     Ok(steps)
 }
 
@@ -6056,6 +6088,9 @@ fn shape_check(sys: &SystemDef) -> String {
      [ \"$(readlink \"$root/bin/td-jail\" 2>/dev/null)\" = \"{in:td-jail}/bin/td-jail\" ] || { echo 'root tree: /bin/td-jail is not a symlink to the staged confinement boundary' >&2; exit 1; }; \
      tdj=\"{root}/real-root{in:td-jail}/bin/td-jail\"; { [ -f \"$tdj\" ] && [ -x \"$tdj\" ]; } || { echo 'root tree: td-jail is not packed and executable, so the running-kernel transition oracle cannot run' >&2; exit 1; }; \
      @DESKTOP{@\
+     printf '%s\\n' \"$init_list\" | grep -q -x -F lib/firmware/ath11k/WCN6855/hw2.0/amss.bin || { echo 'deployment initramfs: the device firmware is missing' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/lib/firmware\" 2>/dev/null)\" = \"{in:device-firmware}/lib/firmware\" ] || { echo 'root tree: /lib/firmware does not name the device firmware' >&2; exit 1; }; \
+     [ -f \"{root}/real-root{in:device-firmware}/lib/firmware/ath11k/WCN6855/hw2.0/amss.bin\" ] || { echo 'root tree: the device firmware is not packed' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-seatd\" 2>/dev/null)\" = \"{in:td-seatd}/bin/td-seatd\" ] || { echo 'root tree: /bin/td-seatd is not a symlink to the staged single-user seat assigner' >&2; exit 1; }; \
      seat=\"{root}/real-root{in:td-seatd}/bin/td-seatd\"; { [ -f \"$seat\" ] && [ -x \"$seat\" ]; } || { echo 'root tree: td-seatd is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-audio\" 2>/dev/null)\" = \"{in:td-audio}/bin/td-audio\" ] || { echo 'root tree: /bin/td-audio is not a symlink to the staged audio daemon' >&2; exit 1; }; \
@@ -6426,6 +6461,7 @@ pub(super) fn server_recipe() -> Recipe {
 /// programs, in-guest update and installation, the development VM bridge,
 /// the session authority and the outline face.
 const DESKTOP_INPUTS: &[&str] = &[
+    "device-firmware",
     "jetbrains-mono-nerd-font",
     "td-authd",
     "td-taskmgr",
@@ -6575,7 +6611,11 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{root}/deployment.spec".into(),
-        content: build_initramfs_spec("deployment-init", Phase::Deployment),
+        content: if sys.desktop() {
+            build_initramfs_spec("deployment-init", Phase::Deployment) + &device_firmware_spec()
+        } else {
+            build_initramfs_spec("deployment-init", Phase::Deployment)
+        },
         exec: false,
     });
     steps.push(
@@ -6678,8 +6718,8 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
         // tzdata: immutable compiled zones and geographic tables at /etc/zoneinfo.
         // jetbrains-mono-nerd-font: the pinned outline face at
         //   /etc/fonts/jetbrains-mono-nerd.
-        // linux-firmware-notices: the embedded Wi-Fi firmware's notice and
-        //   licence, in the store beside the face.
+        // device-firmware: the files drivers ask the kernel's loader for, with
+        //   their notices and licences, in a desktop's store and initramfs.
         // td-ssh: the static client, key tool and daemon (empty runtime closure,
         //   CopyTree'd), behind SSH_BIN_LINKS.
         // glibc-x86-64: the dynamic Rust userland's declared runtime input.
@@ -6731,7 +6771,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "ca-certificates",
                 "tzdata",
                 "jetbrains-mono-nerd-font",
-                "linux-firmware-notices",
+                "device-firmware",
                 "glibc-x86-64",
                 "td-ssh",
                 "td-netd",
@@ -7386,6 +7426,8 @@ mod tests {
                     "{in:glibc-x86-64}",
                     "--exclude-store-item",
                     "{in:gcc-runtime}",
+                    "--exclude-store-item",
+                    "{in:device-firmware}",
                     "--exclude-registry",
                     "{root}/real-root/etc/td-applications.tsv",
                     "{root}/real-root/etc/td-profiler-application-roots.tsv",
@@ -7416,7 +7458,6 @@ mod tests {
             lines,
             vec![
                 "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev",
-                "::sysinit:/bin/mount -t proc proc /proc",
                 "::sysinit:/bin/mount -t sysfs sysfs /sys",
                 "::sysinit:/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup",
                 "::sysinit:/bin/devpts",
@@ -7426,18 +7467,14 @@ mod tests {
              — a service that reappears here is one td-svc cannot order, restart, or stop"
         );
 
-        let proc = lines
-            .iter()
-            .position(|l| l.contains("proc /proc"))
-            .unwrap_or_else(|| unreachable!("no /proc mount"));
-        let svc = lines
-            .iter()
-            .position(|l| l.contains("/bin/td-svc"))
-            .unwrap_or_else(|| unreachable!("no td-svc line"));
         assert!(
-            proc < svc,
-            "/proc must be mounted before td-svc starts: it reads /proc/self/stat for its \
-             own group and session, and fails closed without them"
+            !lines.iter().any(|l| l.contains("proc /proc")),
+            "switch_root carries /proc across, and a second mount would stack on it"
+        );
+        assert!(
+            !build_deployment_init(&SYSTEM).contains("/bin/umount /proc"),
+            "td-svc reads /proc/self/stat and fails closed without it, and switch_root \
+             needs it to free the initramfs"
         );
     }
 
@@ -12587,7 +12624,7 @@ mod tests {
                 .expect("API filesystem entry")
                 < at
         );
-        assert!(at < init.find("/bin/umount /proc").expect("proc cleanup"));
+        assert!(at < init.find("exec /bin/switch_root").expect("switch"));
         assert!(!init.contains(SSHD_CONFIG), "{init}");
         assert!(!init.contains("td-login-cutover"), "{init}");
         assert_eq!(
@@ -13326,7 +13363,7 @@ mod tests {
             init.contains("mount -o move /volume /sysroot/run/td-volume")
                 && init.contains("printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment")
                 && init.contains("chmod 0600 /sysroot/run/td-deployment")
-                && init.contains("/bin/umount /proc")
+                && !init.contains("/bin/umount /proc")
                 && init.contains("/bin/umount /dev"),
             "the selected id must be handed to the real root before the verified backing volume moves below it"
         );
@@ -13578,11 +13615,11 @@ mod tests {
             .count();
         let closed = before.iter().filter(|line| **line == "fi").count();
         assert_eq!(opened, closed);
-        let proc_unmounted = lines
+        let switched = lines
             .iter()
-            .position(|line| *line == "/bin/umount /proc")
-            .expect("proc cleanup");
-        assert!(at < proc_unmounted);
+            .position(|line| *line == "exec /bin/switch_root /sysroot /init")
+            .expect("switch");
+        assert!(at < switched);
     }
 
     /// Rootcheck reports the directory on its own marker and never lowers
@@ -13619,7 +13656,6 @@ mod tests {
                 < init.find(prepare).unwrap()
         );
         assert!(init.find(prepare).unwrap() < init.find("render-primary-sshd /sysroot").unwrap());
-        assert!(init.find(prepare).unwrap() < init.find("/bin/umount /proc").unwrap());
         assert_eq!(init.matches("/bin/umount /dev").count(), 1);
         assert!(init.find(prepare).unwrap() < init.find("/bin/umount /dev").unwrap());
         assert!(init.find("/bin/umount /dev").unwrap() < init.find("/bin/switch_root").unwrap());
@@ -15534,15 +15570,17 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(init.starts_with("#!/bin/td-boot initramfs\n"));
         let mknod = init.find("/bin/mknod ").unwrap();
         assert!(mknod < init.find("/bin/td-boot root-loop").unwrap());
-        // ...and released before the pivot, with /proc and /dev. switch_root MOVES
-        // whatever of the API mounts it finds, so leaving this one behind stacks a
-        // second sysfs under the one sysinit mounts on the real root.
+        // ...and released before the pivot, with /dev. switch_root MOVES whatever of
+        // the API mounts it finds, so leaving this one behind stacks a second sysfs
+        // under the one sysinit mounts on the real root. /proc is the one it is meant
+        // to find: it frees the initramfs through it, and sysinit does not mount it.
         let released = |m: &str| {
             init.match_indices(&format!("/bin/umount {m}"))
                 .next()
                 .map(|(at, _)| at)
         };
-        for api in ["/proc", "/dev", "/sys"] {
+        assert_eq!(released("/proc"), None);
+        for api in ["/dev", "/sys"] {
             let at = released(api);
             assert!(
                 at.is_some() && at < init.match_indices("switch_root").next().map(|(p, _)| p),
@@ -17522,6 +17560,40 @@ mod server_tests {
     /// The server declares and stages none of the desktop's packages, and
     /// `DESKTOP_INPUTS` names only packages the desktop really declares.
     #[test]
+    fn only_a_desktop_deployment_carries_device_firmware() {
+        let spec = |sys: &SystemDef| -> String {
+            system_recipe(sys)
+                .steps
+                .unwrap_or_default()
+                .into_iter()
+                .find_map(|step| match step {
+                    Step::WriteFile { path, content, .. } if path == "{root}/deployment.spec" => {
+                        Some(content)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| unreachable!("no deployment spec"))
+        };
+        let desktop = spec(&SYSTEM);
+        for (_, name) in super::super::device_firmware::FIRMWARE {
+            assert_eq!(
+                desktop
+                    .matches(&format!(
+                        "file /lib/firmware/{name} {{in:device-firmware}}/lib/firmware/{name} 0444 0 0\n"
+                    ))
+                    .count(),
+                1,
+                "{name}"
+            );
+        }
+        assert!(desktop.contains("dir /lib/firmware/ath11k/WCN6855/hw2.0 0755 0 0\n"));
+        assert!(!spec(&SERVER).contains("device-firmware"));
+        for phase in [Phase::Selector, Phase::Deployment] {
+            assert!(!build_initramfs_spec("init", phase).contains("firmware"));
+        }
+    }
+
+    #[test]
     fn the_server_packs_nothing_graphical() {
         let server = server_recipe();
         let desktop = recipe();
@@ -17555,7 +17627,6 @@ mod server_tests {
                 "gcc-runtime",
                 "git-x86-64",
                 "glibc-x86-64",
-                "linux-firmware-notices",
                 "linux-x86-64",
                 "ripgrep",
                 "td-boot",

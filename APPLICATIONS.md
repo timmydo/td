@@ -2370,7 +2370,7 @@ their prebuilt code; a closure's runtime lines make that dependency visible.
 
 Device firmware (AGENTS.md, "Device firmware") a member stages is named
 last, one `device-firmware\tlinux-firmware\t<pin>` line per pin; only
-the kernel, which embeds it, may stage it. It is
+the `device-firmware` recipe may stage it. It is
 unmarked and counted among the audited seeds, like pinned data, but it
 is code a peripheral runs, so the answer says so rather than leaving it
 inside the count.

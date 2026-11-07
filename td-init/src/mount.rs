@@ -532,7 +532,9 @@ fn table_flags(table: &[Entry], path: &[u8]) -> Option<usize> {
 /// For `-a`: every mount point, in REVERSE TABLE ORDER — which is what busybox
 /// does. Not a depth sort, and worth not claiming to be one: it is child-before-
 /// parent only because the kernel lists a mount after whatever it was mounted
-/// on, which holds for td's own sequence but not for an arbitrary namespace.
+/// on, which holds for td's own sequence but not for an arbitrary namespace, nor
+/// for what crossed switch_root, such as `/proc`, which goes after `/` and costs
+/// nothing since the table is already read.
 /// Table order would reach each parent while a child still held it. The whole
 /// table is read before the first unmount, because `/proc` is one of the
 /// filesystems `-a` is about to take away.

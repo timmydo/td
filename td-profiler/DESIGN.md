@@ -410,8 +410,9 @@ deployment root, after every source-built closure and application table
 exists, and that walk is the deployment's companion coverage check. The
 selector and deployment initramfs cpios are not walked. Their ELFs are
 copies of store runtimes the root carries, except the selector-only
-td-kexec, which no walk checks. The walk excludes only the `glibc-x86-64`
-and `gcc-runtime` store items (§2) and the package and runtime roots the
+td-kexec, which no walk checks, and the device firmware's, run by a device. The walk excludes only the `glibc-x86-64`
+and `gcc-runtime` store items (§2), the `device-firmware` store item, whose
+ELFs run on a device's own processor, and the package and runtime roots the
 application registry's catalog policy marks foreign and none marks
 source. Symlinks are not followed, and a `lib/debug` tree holds
 companions: only a file named `*.debug` there is read, as a companion.

@@ -1541,8 +1541,10 @@ name format, file validation and default-preservation contract.
 The mounts stay with PID 1 deliberately: td-svc reads `/proc` for its own
 group and session and for every containment and liveness query, and one
 started before `/proc` exists comes up unable to signal a group at all.
-`sysinit` runs to completion before any `respawn` line, so that ordering is
-the guarantee.
+`/proc` itself crosses from the deployment initramfs with `switch_root`, which
+needs it to free that initramfs, so it is there before PID 1 reads its table;
+`sysinit` runs the rest to completion before any `respawn` line, and that
+ordering is the guarantee for them.
 
 Landing 3 added the control socket and the stop path: `/run/td-svc/control`
 with `status`, `start`, `stop` and `restart`; `td-svc <verb> [NAME]` as the

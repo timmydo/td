@@ -4,120 +4,10 @@ use crate::shared::{
 };
 use crate::types::{Recipe, Step, TextEdit};
 
-/// The build-tree directory EXTRA_FIRMWARE_DIR names, relative to the
-/// kernel source tree, so the image names no store path.
-const FIRMWARE_DIR: &str = "td-firmware";
-/// The build root's cp, which may write into the build tree.
-const CP: &str = "/usr/bin/cp";
-
-/// Phoenix and Cezanne GPU and WCN6855 files requested at probe (AGENTS.md
-/// "Device firmware"), each by its pin and the name the driver asks for.
-pub const FIRMWARE: &[(&str, &str)] = &[
-    (
-        "linux-firmware-amdgpu-gc-11-0-1-imu-source",
-        "amdgpu/gc_11_0_1_imu.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-gc-11-0-1-mes1-source",
-        "amdgpu/gc_11_0_1_mes1.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-gc-11-0-1-mes-2-source",
-        "amdgpu/gc_11_0_1_mes_2.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
-        "amdgpu/dcn_3_1_4_dmcub.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-gc-11-0-1-me-source",
-        "amdgpu/gc_11_0_1_me.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-gc-11-0-1-mec-source",
-        "amdgpu/gc_11_0_1_mec.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-gc-11-0-1-pfp-source",
-        "amdgpu/gc_11_0_1_pfp.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-gc-11-0-1-rlc-source",
-        "amdgpu/gc_11_0_1_rlc.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-psp-13-0-4-ta-source",
-        "amdgpu/psp_13_0_4_ta.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-psp-13-0-4-toc-source",
-        "amdgpu/psp_13_0_4_toc.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-sdma-6-0-1-source",
-        "amdgpu/sdma_6_0_1.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-vcn-4-0-2-source",
-        "amdgpu/vcn_4_0_2.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-green-sardine-asd-source",
-        "amdgpu/green_sardine_asd.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-green-sardine-ce-source",
-        "amdgpu/green_sardine_ce.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-green-sardine-dmcub-source",
-        "amdgpu/green_sardine_dmcub.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-green-sardine-me-source",
-        "amdgpu/green_sardine_me.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-green-sardine-mec-source",
-        "amdgpu/green_sardine_mec.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-green-sardine-pfp-source",
-        "amdgpu/green_sardine_pfp.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-green-sardine-rlc-source",
-        "amdgpu/green_sardine_rlc.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-green-sardine-sdma-source",
-        "amdgpu/green_sardine_sdma.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-green-sardine-ta-source",
-        "amdgpu/green_sardine_ta.bin",
-    ),
-    (
-        "linux-firmware-amdgpu-green-sardine-vcn-source",
-        "amdgpu/green_sardine_vcn.bin",
-    ),
-    (
-        "linux-firmware-ath11k-wcn6855-amss-source",
-        "ath11k/WCN6855/hw2.0/amss.bin",
-    ),
-    (
-        "linux-firmware-ath11k-wcn6855-m3-source",
-        "ath11k/WCN6855/hw2.0/m3.bin",
-    ),
-    (
-        "linux-firmware-ath11k-wcn6855-board-2-source",
-        "ath11k/WCN6855/hw2.0/board-2.bin",
-    ),
-    (
-        "linux-firmware-ath11k-wcn6855-regdb-source",
-        "ath11k/WCN6855/hw2.0/regdb.bin",
-    ),
-];
+/// ath11k_pci_power_up's failed start, and the same with the link put back.
+const ATH11K_MHI_FAILED: &str =
+    "\t\tath11k_err(ab, \"failed to start mhi: %d\\n\", ret);\n\t\treturn ret;";
+const ATH11K_MHI_FAILED_RESTORES_ASPM: &str = "\t\tath11k_err(ab, \"failed to start mhi: %d\\n\", ret);\n\t\tath11k_pci_aspm_restore(ab_pci);\n\t\treturn ret;";
 
 /// Every kernel config symbol the recipe decides, in `.config` syntax. It is
 /// appended over allnoconfig before olddefconfig resolves the rest; the
@@ -401,8 +291,6 @@ const CONFIG: &[&str] = &[
     "# CONFIG_USB_NET_NET1080 is not set",
     "# CONFIG_USB_NET_CDC_SUBSET is not set",
     "# CONFIG_USB_NET_ZAURUS is not set",
-    "CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin amdgpu/green_sardine_asd.bin amdgpu/green_sardine_ce.bin amdgpu/green_sardine_dmcub.bin amdgpu/green_sardine_me.bin amdgpu/green_sardine_mec.bin amdgpu/green_sardine_pfp.bin amdgpu/green_sardine_rlc.bin amdgpu/green_sardine_sdma.bin amdgpu/green_sardine_ta.bin amdgpu/green_sardine_vcn.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"",
-    "CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"",
     "# CONFIG_KERNEL_BZIP2 is not set",
     "# CONFIG_KERNEL_LZMA is not set",
     "# CONFIG_KERNEL_XZ is not set",
@@ -642,27 +530,25 @@ pub fn recipe() -> Recipe {
         )],
     ));
 
-    // Device firmware, unmodified, where EXTRA_FIRMWARE_DIR finds it. The
-    // engine's copyFile writes only into the output, so the build root's cp
-    // places it in the build tree.
-    steps.push(Step::MkDir {
-        path: format!("{{src}}/{FIRMWARE_DIR}/ath11k/WCN6855/hw2.0"),
-    });
-    steps.push(Step::MkDir {
-        path: format!("{{src}}/{FIRMWARE_DIR}/amdgpu"),
-    });
-    for (pin, name) in FIRMWARE {
-        let from = format!("{{in:{pin}}}");
-        let to = format!("{{src}}/{FIRMWARE_DIR}/{name}");
-        steps.push(Step::run("{src}", &[CP, "--", &from, &to]));
-    }
     // The chip's hw2.1 revision requests linux-firmware's hw2.1 names, which
-    // are links to hw2.0's files; reading hw2.0's embeds each file once.
+    // are links to hw2.0's files; reading hw2.0's carries each file once.
     steps.push(Step::substitute_text(
         "{src}/drivers/net/wireless/ath/ath11k/core.c",
         vec![TextEdit::new(
             "\t\t\t.dir = \"WCN6855/hw2.1\",",
             "\t\t\t.dir = \"WCN6855/hw2.0\",",
+            1,
+        )],
+    ));
+    // Power-up turns the endpoint's ASPM off for the download, and only power-down
+    // or a booted firmware turns it back on. A selector has no firmware to start,
+    // its probe unwinds without either, and kexec resets no link, so the
+    // deployment would inherit the link out of L1 and never restore it.
+    steps.push(Step::substitute_text(
+        "{src}/drivers/net/wireless/ath/ath11k/pci.c",
+        vec![TextEdit::new(
+            ATH11K_MHI_FAILED,
+            ATH11K_MHI_FAILED_RESTORES_ASPM,
             1,
         )],
     ));
@@ -923,8 +809,8 @@ pub fn recipe() -> Recipe {
     //    SERIAL_MCTRL_GPIO; the Realtek menu defaults in every Realtek codec
     //    family, whose library selects the side-codec component; AMD_IOMMU
     //    selects the IOMMU API, IOVA, SVA, page fault and PCI ATS/PRI/PASID
-    //    support. AMDGPU and DC drive Phoenix with its pinned firmware
-    //    embedded before probe, including DMCUB for display power management.
+    //    support. AMDGPU and DC drive Phoenix with its pinned firmware,
+    //    including DMCUB for display power management.
     //    AMD_PMC and the CMOS RTC support s2idle entry and wake accounting.
     //    PCIe ASPM follows the firmware policy, without forcing unsupported states.
     //    Its internal microphones sit on
@@ -936,10 +822,10 @@ pub fn recipe() -> Recipe {
     //    selects MHI_BUS, QRTR and QRTR_MHI, ATH11K selects
     //    QCOM_QMI_HELPERS, and FW_LOADER prompts only under EXPERT, so those
     //    are guarded. Built in, ath11k probes before any root is mounted,
-    //    so linux-firmware's files are embedded with EXTRA_FIRMWARE from a
-    //    build-tree directory (AGENTS.md "Device firmware"), and the chip's
-    //    hw2.1 revision is pointed at hw2.0's files, which linux-firmware
-    //    links it to, so each is embedded once. RFKILL stays off. No
+    //    so linux-firmware's files come from the device-firmware recipe
+    //    (AGENTS.md "Device firmware"), and the chip's hw2.1 revision is pointed
+    //    at hw2.0's files, which linux-firmware links it to, so each is carried
+    //    once. RFKILL stays off. No
     //    regulatory.db is carried: cfg80211 starts from the world domain
     //    and ath11k applies the regulatory domain its firmware reports.
     //    CFG80211_REQUIRE_SIGNED_REGDB's default is flipped off in its
@@ -959,14 +845,17 @@ pub fn recipe() -> Recipe {
     //    and SND_HDA_CODEC_HDMI_ATI prompt only under EXPERT, so they are
     //    guarded, not written. Its Cezanne GPU (Renoir family, which
     //    amdgpu names green_sardine) is driven by AMDGPU and DC with the
-    //    ten files amdgpu requests for it embedded beside Phoenix's: PSP
+    //    ten files amdgpu requests for it beside Phoenix's: PSP
     //    ASD and TA, the gfx CE/PFP/ME/MEC/RLC microcode, SDMA, VCN and the
     //    DCN 2.1 DMCUB. MODULE_FIRMWARE also declares green_sardine_mec2,
     //    but gfx v9 skips that request on GC 9.3.0 and reuses MEC, and
     //    Renoir loads no gpu_info file. Every one of these blocks requests
     //    its file in early init, before amdgpu takes the display from the
     //    GOP framebuffer, so a missing file leaves simpledrm driving it
-    //    rather than a dark panel.
+    //    rather than a dark panel. That is every selector boot: only the
+    //    deployment initramfs holds these files, and the loader finds them
+    //    there because it waits for the initramfs to unpack. ath11k's probe
+    //    fails there too, after a bounded wait, with its link put back.
     //    DisplayPort audio follows amdgpu's audio endpoint.
     //
     //    CLOCK (td-time/DESIGN.md): td-time writes the RTC through
@@ -1395,7 +1284,6 @@ pub fn recipe() -> Recipe {
         .source_input("linux-kernel-source")
         .build_root()
         .native_inputs(&["td-sh", "td-init", "td-util"])
-        .inputs(&firmware_pins())
         .steps(steps)
     // No behavioural boot check is registered here: a qemu boot needs HOST qemu,
     // which the gate's host-free `pivot_root` sandbox deliberately hides (the
@@ -1408,12 +1296,6 @@ pub fn recipe() -> Recipe {
     // operator or developer. Automated in-sandbox coverage is the shape checks
     // above (producer rung) and the linux-x86-64-test BuildOnly check, which
     // build the bzImage + initramfs and assert they are well-formed.
-}
-
-/// Every pin the kernel stages: the firmware it embeds. Its notices ship
-/// in the image from `linux-firmware-notices`.
-fn firmware_pins() -> Vec<&'static str> {
-    FIRMWARE.iter().map(|(pin, _)| *pin).collect()
 }
 
 #[cfg(test)]
@@ -1607,8 +1489,6 @@ mod tests {
         ("CONFIG_QRTR=y", "QRTR off — ath11k talks QMI to the WCN6855 over QRTR"),
         ("CONFIG_QRTR_MHI=y", "QRTR_MHI off — QRTR has no transport to the WCN6855"),
         ("CONFIG_QCOM_QMI_HELPERS=y", "QCOM_QMI_HELPERS off — ath11k has no QMI client"),
-        ("CONFIG_EXTRA_FIRMWARE=\"amdgpu/gc_11_0_1_imu.bin amdgpu/gc_11_0_1_mes1.bin amdgpu/gc_11_0_1_mes_2.bin amdgpu/dcn_3_1_4_dmcub.bin amdgpu/gc_11_0_1_me.bin amdgpu/gc_11_0_1_mec.bin amdgpu/gc_11_0_1_pfp.bin amdgpu/gc_11_0_1_rlc.bin amdgpu/psp_13_0_4_ta.bin amdgpu/psp_13_0_4_toc.bin amdgpu/sdma_6_0_1.bin amdgpu/vcn_4_0_2.bin amdgpu/green_sardine_asd.bin amdgpu/green_sardine_ce.bin amdgpu/green_sardine_dmcub.bin amdgpu/green_sardine_me.bin amdgpu/green_sardine_mec.bin amdgpu/green_sardine_pfp.bin amdgpu/green_sardine_rlc.bin amdgpu/green_sardine_sdma.bin amdgpu/green_sardine_ta.bin amdgpu/green_sardine_vcn.bin ath11k/WCN6855/hw2.0/amss.bin ath11k/WCN6855/hw2.0/m3.bin ath11k/WCN6855/hw2.0/board-2.bin ath11k/WCN6855/hw2.0/regdb.bin\"", "EXTRA_FIRMWARE is not the Phoenix, Cezanne and WCN6855 set — amdgpu and ath11k probe before any root is mounted, with no firmware to load"),
-        ("CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"", "EXTRA_FIRMWARE_DIR is not the build-tree firmware directory"),
         ("CONFIG_HYPERVISOR_GUEST=y", "HYPERVISOR_GUEST off — guest support stays hidden, so no hypervisor drivers can be chosen"),
         ("CONFIG_PARAVIRT=y", "PARAVIRT off — Hyper-V and KVM guest support need the paravirt layer"),
         ("CONFIG_KVM_GUEST=y", "KVM_GUEST off — a KVM cloud guest (EC2 Nitro, GCE) has no kvmclock or paravirt EOI"),
@@ -2104,34 +1984,12 @@ mod tests {
     }
 
     /// The T14s's Wi-Fi: ath11k built in, with linux-firmware's files
-    /// staged from their pins and named by EXTRA_FIRMWARE.
+    /// carried by the device-firmware recipe.
     #[test]
-    fn wcn6855_wifi_is_builtin_with_its_firmware_embedded() {
+    fn wcn6855_wifi_is_builtin_with_its_firmware_outside_the_kernel() {
         let recipe = recipe();
-        let pins: Vec<String> = firmware_pins().into_iter().map(String::from).collect();
-        assert_eq!(recipe.inputs, Some(pins));
-        let firmware: Vec<&str> = FIRMWARE.iter().map(|(pin, _)| *pin).collect();
-        let mut roster = crate::source_pins::DEVICE_FIRMWARE.to_vec();
-        let mut staged = firmware.clone();
-        roster.sort_unstable();
-        staged.sort_unstable();
-        assert_eq!(
-            staged, roster,
-            "the kernel stages exactly the firmware roster"
-        );
+        assert_eq!(recipe.inputs, None, "the kernel names no firmware");
         let steps = recipe.steps.unwrap_or_default();
-        for (pin, name) in FIRMWARE {
-            assert!(steps.iter().any(|step| matches!(
-                step,
-                Step::Run { argv, .. }
-                    if *argv == [
-                        CP.to_string(),
-                        "--".into(),
-                        format!("{{in:{pin}}}"),
-                        format!("{{src}}/td-firmware/{name}"),
-                    ]
-            )));
-        }
         let text = steps
             .iter()
             .filter_map(|step| match step {
@@ -2140,20 +1998,8 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let names = FIRMWARE
-            .iter()
-            .map(|(_, name)| *name)
-            .collect::<Vec<_>>()
-            .join(" ");
-        let extra = format!("'CONFIG_EXTRA_FIRMWARE=\"{names}\"'");
-        assert_eq!(text.matches(&extra).count(), 1, "pinned");
-        assert!(locked(&format!("CONFIG_EXTRA_FIRMWARE=\"{names}\"")));
-        assert_eq!(
-            text.matches("'CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\"'")
-                .count(),
-            1
-        );
-        assert!(locked("CONFIG_EXTRA_FIRMWARE_DIR=\"td-firmware\""));
+        assert!(!text.contains("EXTRA_FIRMWARE"));
+        assert!(locked("CONFIG_EXTRA_FIRMWARE=\"\""));
         for symbol in [
             "WIRELESS",
             "CFG80211",
@@ -2170,10 +2016,15 @@ mod tests {
         }
         assert!(!set("CONFIG_CFG80211_REQUIRE_SIGNED_REGDB"));
         // Neither source patch fails the build when absent: hw2.1 silicon
-        // would ask for files nothing embeds, and the keyring would return.
+        // would ask for files nothing carries, and the keyring would return.
         // A linux-firmware tag bump must re-check that WHENCE still links
         // hw2.1's files to hw2.0's.
         for (file, from, to) in [
+            (
+                "{src}/drivers/net/wireless/ath/ath11k/pci.c",
+                ATH11K_MHI_FAILED,
+                ATH11K_MHI_FAILED_RESTORES_ASPM,
+            ),
             (
                 "{src}/drivers/net/wireless/ath/ath11k/core.c",
                 "\t\t\t.dir = \"WCN6855/hw2.1\",",
@@ -2206,39 +2057,6 @@ mod tests {
         ] {
             assert!(!text.contains(&format!("'CONFIG_{symbol}=y'")), "{symbol}");
             assert!(locked(&format!("CONFIG_{symbol}=y")));
-        }
-    }
-
-    /// The roster reaches the graph only through the kernel, on any input
-    /// channel, so the closure query's `device-firmware` lines, which read
-    /// the kernel's inputs, cannot miss a copy; and every linux-firmware
-    /// pin is the roster or a notice the image ships.
-    #[test]
-    fn only_the_kernel_names_device_firmware() {
-        for (stem, recipe) in crate::catalog::all() {
-            let named = recipe
-                .inputs
-                .iter()
-                .chain(recipe.native_inputs.iter())
-                .chain(recipe.payload_inputs.iter())
-                .flatten()
-                .chain(recipe.source_input.iter());
-            for key in named {
-                if crate::source_pins::DEVICE_FIRMWARE.contains(&key.as_str()) {
-                    assert_eq!(stem, "linux-x86-64", "{stem} names {key}");
-                }
-            }
-        }
-        let notices = super::super::linux_firmware_notices::NOTICES;
-        for pin in crate::source_pins::all() {
-            if pin.url.contains("/kernel-firmware/linux-firmware/") {
-                assert!(
-                    crate::source_pins::DEVICE_FIRMWARE.contains(&pin.key.as_str())
-                        || notices.iter().any(|(key, _)| *key == pin.key),
-                    "{} is neither firmware nor a shipped notice",
-                    pin.key
-                );
-            }
         }
     }
 

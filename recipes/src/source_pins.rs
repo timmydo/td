@@ -327,7 +327,8 @@ const PINS: &[PinDef] = &[
         aliases: &[],
         // Device firmware (AGENTS.md "Device firmware"): linux-firmware's
         // files for the Qualcomm WCN6855 Wi-Fi at its 20261019 tag, which the
-        // kernel embeds unmodified for ath11k to hand to the device.
+        // device-firmware recipe carries unmodified for ath11k to hand to the
+        // device.
         url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/ath11k/WCN6855/hw2.0/amss.bin",
         sha256: "e12b23ddc4b8d2d2a10a651a5d6fdcd00f60fcae884d2cf5dad17627211fcdfd",
         file: "linux-firmware-20261019-ath11k-WCN6855-hw2.0-amss.bin",
@@ -369,7 +370,7 @@ const PINS: &[PinDef] = &[
         key: "linux-firmware-qualcomm-atheros-license-source",
         aliases: &[],
         // The licence WHENCE names for those files, which the image ships
-        // through `linux-firmware-notices`.
+        // through `device-firmware`.
         url: "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20261019/LICENSES/LICENSE.QualcommAtheros_ath10k",
         sha256: "337a55102138d7baa143ee4a4c6c91693e0113fece35d380b2a12109e8c23b3f",
         file: "linux-firmware-20261019-LICENSE.QualcommAtheros_ath10k",
@@ -493,8 +494,8 @@ const PINS: &[PinDef] = &[
 const FOREIGN: &[&str] = &["ripgrep-seed-source"];
 
 /// The pins AGENTS.md "Device firmware" admits: linux-firmware files a
-/// peripheral runs or reads, which the kernel embeds unmodified and the host
-/// never executes. Unmarked, so no channel refuses them; the closure query
+/// peripheral runs or reads, which `device-firmware` carries unmodified and
+/// the host never executes. Unmarked, so no channel refuses them; the closure query
 /// names each. Adding an entry is a reviewed pin; firmware the host CPU runs
 /// belongs to no class.
 pub const DEVICE_FIRMWARE: &[&str] = &[

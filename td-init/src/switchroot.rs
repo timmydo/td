@@ -12,8 +12,10 @@
 //! panics, td's `panic=-1` reboots, and a pending deployment's attempt is
 //! spent. No shell is offered (APPLICATIONS.md §L.1, L7). One window remains, as it does in
 //! util-linux: the API mounts move before the root does, so a failed root move
-//! strands them under NEWROOT. The old rootfs is freed in that same window —
-//! busybox's order. Everything that can be checked has been by then.
+//! strands them under NEWROOT. Everything that can be checked has been by then.
+//! The old rootfs is freed last, after the chroot, through a handle and the
+//! `/proc` carried across, so a failed move leaves it whole and a driver's
+//! firmware request that starts after the chroot never meets it.
 
 use crate::sys;
 use std::collections::VecDeque;
@@ -498,35 +500,69 @@ fn empty_filesystem(dir: &Path, dev: u64) {
     }
 }
 
-/// Free the initramfs before moving the new root over it.
+/// Decide whether the initramfs is to be freed, and keep a handle on it: the
+/// walk runs after the chroot, because a driver's firmware request reads through
+/// PID 1's root, and until that moves `/lib/firmware` must still hold its files.
+/// A Wi-Fi driver asks from a workqueue with nothing ordering it against this.
 ///
 /// The initramfs rootfs CANNOT be unmounted — the kernel documents this — so
 /// its extracted contents stay resident for the life of the machine unless they
 /// are deleted here. util-linux and busybox both delete them; a switch_root
 /// that does not is a permanent memory leak the size of the initramfs.
 ///
-/// It deletes files on the live root, so it is guarded twice, exactly as
-/// busybox guards it: the root must be a disposable filesystem type, and the
+/// It deletes a whole filesystem, so it is guarded twice, exactly as busybox
+/// guards it: the root must be a disposable filesystem type, and the
 /// walk never crosses a device boundary. Either guard failing costs the memory
 /// and nothing else — the boot carries on.
-fn free_old_root(mounts: Option<&str>) {
+fn old_root_to_free(mounts: Option<&str>) -> Option<(std::fs::File, u64)> {
     let fstype = match mounts.and_then(root_fstype) {
         Some(t) => t,
         None => {
-            crate::emit_err("switch_root: no mount table; leaving the old root's memory in use\n");
-            return;
+            crate::emit_err("switch_root: no mount table; leaving the old root's memory\n");
+            return None;
         }
     };
     if !DISPOSABLE_ROOT.contains(&fstype.as_str()) {
         crate::emit_err(&format!(
             "switch_root: / is {fstype}, not an initramfs; leaving it intact\n"
         ));
-        return;
+        return None;
     }
-    let Ok(meta) = std::fs::metadata("/") else {
+    let opened = std::fs::File::open("/").and_then(|root| {
+        let dev = std::os::unix::fs::MetadataExt::dev(&root.metadata()?);
+        Ok((root, dev))
+    });
+    match opened {
+        Ok(old) => Some(old),
+        Err(e) => {
+            crate::emit_err(&format!(
+                "switch_root: opening /: {e}; leaving the old root's memory\n"
+            ));
+            None
+        }
+    }
+}
+
+const FREED: &str = "switch_root: freed the initramfs\n";
+
+/// Empty the old root through its handle, once it is out of every path. The new
+/// root's `/proc`, moved beside it, is what still reaches it.
+fn free_old_root(old: Option<(std::fs::File, u64)>) {
+    let Some((root, dev)) = old else {
         return;
     };
-    empty_filesystem(Path::new("/"), std::os::unix::fs::MetadataExt::dev(&meta));
+    let through = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&root));
+    if std::fs::read_dir(&through).is_err() {
+        crate::emit_err("switch_root: no /proc to reach the old root; leaving its memory\n");
+        return;
+    }
+    empty_filesystem(Path::new(&through), dev);
+    // Said either way: this costs no boot when it fails, so the console line is
+    // all a test can hold.
+    match std::fs::read_dir(&through).map(|mut left| left.next().is_none()) {
+        Ok(true) => crate::emit_err(FREED),
+        _ => crate::emit_err("switch_root: entries remain in the old root; leaving their memory\n"),
+    }
 }
 
 pub fn run(args: &[String]) -> Result<u8, String> {
@@ -602,9 +638,7 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     }
 
     std::env::set_current_dir(root).map_err(|e| format!("chdir {newroot}: {e}"))?;
-    // Last use of the old root. From here the cwd is the only handle on the new
-    // one, which is why the chdir comes first.
-    free_old_root(mounts.as_deref());
+    let old_root = old_root_to_free(mounts.as_deref());
     // "." rather than NEWROOT: the chdir above has already resolved it, so this
     // is correct whether the caller passed an absolute or a relative path.
     let dot = cpath(".")?;
@@ -612,6 +646,7 @@ pub fn run(args: &[String]) -> Result<u8, String> {
         .map_err(|e| format!("moving {newroot} to /: {e}"))?;
     sys::chroot(&dot).map_err(|e| format!("chroot: {e}"))?;
     std::env::set_current_dir("/").map_err(|e| format!("chdir /: {e}"))?;
+    free_old_root(old_root);
 
     // The path is the VERIFIED one as it reads after the chroot, not the
     // operand: `Command::new("init")` has no slash, so execvp would PATH-search
@@ -1073,6 +1108,15 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
         empty_filesystem(&base, dev.wrapping_add(1));
         assert!(base.join("sub/nested").exists());
         assert!(base.join("file").exists());
+
+        // Through a handle, as after the chroot: the handle is what still reaches
+        // a root no path names any more.
+        build();
+        let handle = std::fs::File::open(&base).unwrap();
+        let through = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&handle));
+        empty_filesystem(Path::new(&through), dev);
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+        drop(handle);
 
         // The tree's own device: emptied, but the directory handed in survives —
         // it is the mount point itself, which the caller still needs.

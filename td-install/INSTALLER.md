@@ -50,9 +50,8 @@ through hid-multitouch, the Realtek codec, x2APIC, which firmware that hands
 over in x2APIC mode needs, and the AMD IOMMU, for interrupt remapping and
 DMA isolation.
 Its Phoenix Radeon is driven by AMDGPU and DC with twelve reviewed
-linux-firmware files embedded in the kernel, including DMCUB for display
-power management. AMD PMC, the CMOS RTC and PCIe ASPM following firmware
-policy supply the s2idle platform support. Physical secure attention offers
+linux-firmware files, including DMCUB for display power management. AMD PMC,
+the CMOS RTC and PCIe ASPM following firmware policy supply the s2idle platform support. Physical secure attention offers
 `Z: SLEEP`, then Enter, with a presented lock before sleep for enrolled
 sessions. The compositor retains its single-output KMS profile; this is not
 external-display or hotplug support. Its internal microphones are on the ACP,
@@ -61,8 +60,8 @@ target, not yet an acceptance claim: test repeated short and long sleeps on
 AC and battery, panel recovery, keyboard/TrackPoint/touchpad, Wi-Fi, token
 unlock and the kernel's hardware sleep statistics on the machine. It has
 no wired port. Its Qualcomm WCN6855 Wi-Fi is its network: ath11k is
-built in with linux-firmware's pinned files embedded in the kernel
-(AGENTS.md, "Device firmware"), and `td-netd wifi join` names the network
+built in with linux-firmware's pinned files (AGENTS.md, "Device firmware"),
+and `td-netd wifi join` names the network
 ("Installed Ethernet and remote access"). Only WCN6855 silicon is carried
 (QCA2066 and QCA6698AQ share its PCI ID), and its board data is chosen
 by the card's PCI subsystem ID from `board-2.bin`, which holds Lenovo's
@@ -74,9 +73,8 @@ A Ryzen 7 5700G desktop on an AMD 500-series board is a third target on
 the same terms. It shares the T14s's AMD platform set; beside it, its
 Intel I225-V wired port is driven by igc and its ALC1220 by the Realtek
 ALC882 family. Its Cezanne Radeon is driven by AMDGPU and DC with the
-ten reviewed linux-firmware files amdgpu requests for it embedded in the
-kernel beside Phoenix's (AGENTS.md, "Device firmware"); its DisplayPort
-audio is the AMD HDMI codec on AMDGPU's audio endpoint. The same kernel can
+ten reviewed linux-firmware files amdgpu requests for it (AGENTS.md, "Device
+firmware"); its DisplayPort audio is the AMD HDMI codec on AMDGPU's audio endpoint. The same kernel can
 host KVM guests and mount ext4, FAT, exFAT and UDF, and builds in the
 common Intel IGB and Realtek wired NICs, USB Ethernet (CDC, NCM, ASIX
 and Realtek, the chips most USB-C docks' ports use), USB Attached SCSI
@@ -101,6 +99,12 @@ and USB4 tunnels, whose PCIe is a DMA path, touch behind Intel THC and other
 vendors' laptop hotkey drivers are not built. The kernel drives eMMC but the
 installer offers no `mmcblk` disk, so a machine with only eMMC has nowhere to
 install, and a 32-bit UEFI tablet cannot start this 64-bit kernel.
+
+A selector carries no device firmware, so on a machine whose GPU needs some, its
+driver gives up and the PIN prompt and boot menu stay on the firmware's display
+mode: a monitor connected after that does not appear until the deployment, and
+validation on the T14s and the 5700G has to show the prompt staying visible, and
+the WCN6855 coming up after a selector whose ath11k could not start it.
 
 VT-d translates wherever the firmware leaves it on, in legacy rather than
 scalable mode. On a T430s with VT-d enabled in its setup, i915, e1000e and the

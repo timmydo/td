@@ -638,6 +638,7 @@ fn image_boot(
     if evidence.kernel_panic
         || !evidence.boot_success
         || !evidence.target
+        || !evidence.initramfs_freed
         || !result.marker_killed
         || rebooted
         || !evidence.firstboot_new
@@ -645,7 +646,8 @@ fn image_boot(
         || evidence.host_key.is_none()
     {
         return Err(format!(
-            "the {label} did not mint a new identity, start td-sshd, record health \
+            "the {label} did not free its initramfs, mint a new identity, start td-sshd, record \
+             health \
              {SYSTEM_BOOT_SUCCESS_MARKER:?} and reach {HEALTH_STEADY_MARKER:?} - {}. \
              Last serial output:\n{}",
             result.reason,

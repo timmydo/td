@@ -195,17 +195,24 @@ desktop's Cezanne Radeon GPU, load their firmware from the host when
 their drivers probe. td takes such firmware as upstream bytes from linux-firmware's
 tagged tree, each file a pin with a reviewed URL and SHA-256, listed in
 `DEVICE_FIRMWARE` (`recipes/src/source_pins.rs`). Only the peripheral
-it is written for runs it. The kernel recipe copies the pinned files
-unmodified into its build tree and embeds them with
-`CONFIG_EXTRA_FIRMWARE`; the kernel's firmware loader hands them to the
-device's driver; no recipe step executes, links or loads them as host
-code, and the image carries them only inside the kernel, with their
-notices as data beside it. Only the kernel recipe names a roster pin,
+it is written for runs it. The `device-firmware` recipe copies the
+pinned files unmodified into `lib/firmware` in its output, with their
+notices as data beside them. A desktop image holds that output in its
+store, links it at `/lib/firmware`, and copies the files into its
+deployment initramfs, so a driver built into the kernel finds them when
+it probes and again after `switch_root`, which empties the initramfs only
+once the root has replaced it. The selector's initramfs holds none, so the
+same drivers' probes fail there: no such device runs before the handover,
+and the display stays on the firmware framebuffer. The kernel's firmware
+loader hands them to the device's driver; no recipe
+step executes, links or loads them as host code. Some are ELF images
+for the device's own processor, which is why the profiler's object
+index leaves that store item out. Only that recipe names a roster pin,
 which a catalog test holds. They stay
 unmarked, like the data above, because nothing in zone one runs them,
 and the closure query counts them among the audited seeds. Being code,
 they are also named: one `device-firmware` line per pin, beside the
-trust roots, for every closure holding the kernel that embeds them.
+trust roots, for every closure holding that recipe.
 What td does not establish is anything about that code: a device with
 firmware can reach host memory by DMA, which an IOMMU, where the kernel
 drives one, bounds (with lazy unmapping), and the WCN6855 answers QMI
@@ -341,8 +348,8 @@ The first `td-profiler/DESIGN.md` implementation increment enforces the
 producer side in compiler flags, per-output runtime/debug pair checks, size
 ceilings, and reproducibility oracles. The image-integration increment adds
 the whole-deployment coverage walk: the image build indexes each runtime ELF
-in the deployment root, apart from the glibc and gcc-runtime outputs and the
-marked foreign application roots it excludes, and fails on one without a
+in the deployment root, apart from the glibc, gcc-runtime and device-firmware
+outputs and the marked foreign application roots it excludes, and fails on one without a
 build-ID-matched companion (`td-profiler/DESIGN.md` §4).
 
 # Principles

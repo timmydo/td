@@ -278,6 +278,9 @@ const ROOT_SSH_REFUSAL_AUTHORIZATION: &str = "restrict,from=\"127.0.0.1\" ssh-ed
 AAAAC3NzaC1lZDI1NTE5AAAAIK0uXleFgR7j5hIDzeLfwwdu8isqRbVRkCjqczyhQ+p3 \
 td-qemu-root-refusal\n";
 
+/// Printed by switch_root once the old root has been emptied. Its failure costs
+/// no boot, so nothing else notices: td-init's FREED.
+const INITRAMFS_FREED_MARKER: &str = "switch_root: freed the initramfs";
 /// Printed after the unprivileged software compositor paints and listens.
 const TD_WAYLAND_RUNTIME_MARKER: &str = td_recipe::shared::TD_WAYLAND_RUNTIME_MARKER;
 
@@ -640,6 +643,7 @@ struct ConsoleEvidence {
     td_firefox_file_chooser: bool,
     td_application_cursor: bool,
     td_profiler_attribution: bool,
+    initramfs_freed: bool,
     td_wayland_runtime: bool,
     td_pointer_absolute: bool,
     td_term_runtime: bool,
@@ -2331,6 +2335,14 @@ fn validate_system_boot(
              symbol with source-line resolution explicitly unavailable. Last serial \
              output:\n{}",
             td_recipe::td_profiler_contract::ATTRIBUTION_FUNCTION_FRAGMENT,
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.initramfs_freed {
+        return Err(format!(
+            "the boot carried on, but switch_root never printed {INITRAMFS_FREED_MARKER:?}: the \
+             initramfs, device firmware and microcode included, stays in memory until the \
+             machine stops. Its console line says why. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -6753,6 +6765,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX
             .len()
             .saturating_add(exact_line_window(TD_PROFILER_ATTRIBUTION_MARKER)),
+        INITRAMFS_FREED_MARKER.len(),
         TD_WAYLAND_RUNTIME_MARKER.len(),
         TD_POINTER_ABSOLUTE_MARKER.len(),
         TD_TERM_RUNTIME_MARKER.len(),
@@ -7286,6 +7299,11 @@ fn latch_console_evidence_from(
         TD_PROFILER_EVIDENCE_CONSOLE_PREFIX.as_bytes(),
         TD_PROFILER_ATTRIBUTION_MARKER.as_bytes(),
         starts_at_stream_boundary,
+    );
+    latch_marker(
+        &mut evidence.initramfs_freed,
+        buf,
+        INITRAMFS_FREED_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.td_wayland_runtime,
@@ -11423,6 +11441,7 @@ mod tests {
             TD_FIREFOX_SOAK_MARKER,
             TD_FIREFOX_SECCOMP_AUDIT_MARKER,
             TD_PROFILER_ATTRIBUTION_MARKER,
+            INITRAMFS_FREED_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
             TD_POINTER_ABSOLUTE_MARKER,
             TD_TERM_RUNTIME_MARKER,
@@ -11798,6 +11817,7 @@ mod tests {
         evidence.td_applications_placed = true;
         evidence.td_txt_runtime = true;
         evidence.td_util_runtime = true;
+        evidence.initramfs_freed = true;
         evidence.td_wayland_runtime = true;
         evidence.uutils_runtime = true;
         evidence
@@ -11909,6 +11929,24 @@ mod tests {
     }
 
     /// APPLICATIONS.md §L.1, L7: each refusal marker has its own row.
+    #[test]
+    fn a_boot_that_kept_its_initramfs_is_refused() {
+        let mut result = BootResult {
+            evidence: healthy_evidence(),
+            exited_clean: true,
+            marker_killed: false,
+            reason: String::new(),
+            console: "TD-PRIMARY-PROFILE-READY tester\n".into(),
+            elapsed: Duration::from_secs(1),
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        result.evidence.shutdown = true;
+        assert_eq!(validate_session_boot(&result), Ok(()));
+        result.evidence.initramfs_freed = false;
+        let refused = validate_session_boot(&result).unwrap_err();
+        assert!(refused.contains(INITRAMFS_FREED_MARKER), "{refused}");
+    }
+
     #[test]
     fn root_refusal_markers_are_required_for_every_healthy_boot() {
         let healthy = BootResult {
