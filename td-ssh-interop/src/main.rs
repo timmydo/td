@@ -8,9 +8,11 @@
 mod ssh_policy;
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -577,6 +579,57 @@ fn write_askpass(tools: &Tools, work: &Path) -> Result<PathBuf, String> {
     Ok(askpass)
 }
 
+/// Stock `ssh` asking td-sshd for each way of logging in that takes a secret: the
+/// server names `publickey` alone, and nothing is asked for.
+fn no_password_login(client: &Client<'_>, report: &mut Report) -> Result<(), String> {
+    for method in ["password", "keyboard-interactive"] {
+        let output = run(Command::new(client.program)
+            .args(["-F", "/dev/null", "-v", "-p"])
+            .arg(client.port.to_string())
+            .args(["-o", "BatchMode=no", "-o", "PubkeyAuthentication=no", "-o"])
+            .arg(format!("PreferredAuthentications={method}"))
+            .args(["-o", "StrictHostKeyChecking=accept-new", "-o"])
+            .arg(format!(
+                "UserKnownHostsFile={}",
+                client.known_hosts.display()
+            ))
+            .args(["-o", "GlobalKnownHostsFile=/dev/null"])
+            .env("SSH_ASKPASS", "/nonexistent")
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .stdin(Stdio::null())
+            .arg(&client.target)
+            .arg("true"))?;
+        report.check(
+            &format!("ssh to td-sshd: {method} is not offered"),
+            output.status.code() == Some(255)
+                && saying(&output, "Authentications that can continue: publickey\r\n")
+                && saying(&output, "Permission denied (publickey)")
+                && !saying(&output, "Next authentication method: "),
+            || describe(&output),
+        );
+    }
+    Ok(())
+}
+
+/// A command is bytes all the way to the account's shell, which refuses what it
+/// cannot read as text with its own status, not a panic and not a lossy guess.
+fn a_command_that_is_not_text(
+    label: &str,
+    client: &Client<'_>,
+    report: &mut Report,
+) -> Result<(), String> {
+    let output = run(client
+        .command()
+        .arg(&client.target)
+        .arg(OsStr::from_bytes(b"echo \xff")))?;
+    report.check(
+        &format!("{label}: a command that is not UTF-8 reaches the shell"),
+        output.status.code() == Some(2) && output.stdout.is_empty() && !saying(&output, "panicked"),
+        || describe(&output),
+    );
+    Ok(())
+}
+
 /// One client binary pointed at one daemon.
 struct Client<'a> {
     program: &'a Path,
@@ -1002,6 +1055,8 @@ fn stock_client_against_td_sshd(
     }
 
     another_key_refused("ssh to td-sshd", client, stranger, report)?;
+    no_password_login(client, report)?;
+    a_command_that_is_not_text("ssh to td-sshd", client, report)?;
     // A cipher every OpenSSH has: this peer builds without OpenSSL, and one it
     // does not know ends on the command line, before td-sshd is ever asked.
     let output = client.exec(&["-o", "Ciphers=aes256-ctr"], "true")?;
@@ -1018,6 +1073,7 @@ fn stock_client_against_td_sshd(
         target: client.target.clone(),
     };
     another_key_refused("td-ssh to td-sshd", &td_client, stranger, report)?;
+    a_command_that_is_not_text("td-ssh to td-sshd", &td_client, report)?;
     stdout_closing_early("td-ssh to td-sshd", &td_client, report)?;
     multiplexed_sessions_across_rekeys(tools, work, client, report)?;
     no_pty_key_against_td_sshd(home, client, report)?;

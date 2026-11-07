@@ -9,7 +9,7 @@ const STEM: &str = "td-ssh-test";
 const MARKER: &str = "TD-SSH-INTEROP-OK ";
 /// Every check the driver has. A leg that stopped running would pass by its exit
 /// status alone, so the count is held to the number it should be.
-const CHECKS: u32 = 80;
+const CHECKS: u32 = 84;
 
 pub(super) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     runner.prepare_recipe_target(STEM)?;

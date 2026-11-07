@@ -743,8 +743,11 @@ reach the jail.
   EOF; 4 MiB each way across forced rekeys, by digest, with `-v` saying a rekey
   happened; refused forwards and an algorithm outside the profile, each by the words
   of the refusal, since a dead daemon gives 255 too and a server that permits a forward
-  gives its own; a plain key nothing authorizes, for each client against each server,
-  since a key the client cannot load shows nothing of the server; a changed host key;
+  gives its own; stock `ssh` asking for a password and for keyboard-interactive, shown
+  only `publickey`; a command that is not UTF-8, which the shell refuses with its own
+  status, for each client against td-sshd; a plain key nothing authorizes, for each
+  client against each server, since a key the client cannot load shows nothing of the
+  server; a changed host key;
   and an encrypted stock key through askpass. `td-ssh` against a stock `sshd` allowing
   only each KEX in turn, and against one with `RekeyLimit` that starts the rekeys itself.
   Each daemon ends the phase with a login, to show its refusals were its own. td-sshd

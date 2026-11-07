@@ -908,6 +908,22 @@ mod tests {
     }
 
     #[test]
+    fn a_preference_without_publickey_refuses() {
+        for text in [
+            "PreferredAuthentications password",
+            "PreferredAuthentications keyboard-interactive,password",
+        ] {
+            let error = read(text, "h").unwrap().validate().err().unwrap();
+            assert!(
+                error.to_string().contains("only with public keys"),
+                "{text}"
+            );
+        }
+        let both = read("PreferredAuthentications password,publickey", "h").unwrap();
+        both.validate().unwrap();
+    }
+
+    #[test]
     fn ignore_unknown_rescues_a_named_keyword_and_no_pattern() {
         assert!(read("IgnoreUnknown UseKeychain\nUseKeychain yes\n", "h").is_ok());
         assert!(read("IgnoreUnknown a,UseKeychain\nUseKeychain yes\n", "h").is_ok());

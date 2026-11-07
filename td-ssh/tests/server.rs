@@ -1532,6 +1532,46 @@ fn a_small_order_key_in_authorized_keys_admits_no_one() {
     assert_eq!(client.receive()[0], msg::USERAUTH_FAILURE);
 }
 
+/// Sent as a hostile client would, not through one that reads the method list first:
+/// each is answered with `publickey` alone, costs no try, and a key still works after.
+#[test]
+fn no_other_authentication_method_exists() {
+    let server = start("");
+    let key = load_key(&server.root.join("client"));
+    let mut client = RawClient::connect(server.port);
+    client.start_auth();
+    for _ in 0..4 {
+        for (method, body) in [
+            ("none", &[][..]),
+            // Each body as RFC 4252 lays it out, so a server that read one would
+            // still be judging the method, not a malformed packet.
+            ("password", &[b"\0\0\0\0\x01x".as_slice()][..]),
+            (
+                "keyboard-interactive",
+                &[b"\0\0\0\0\0\0\0\0".as_slice()][..],
+            ),
+            (
+                "hostbased",
+                &[b"\0\0\0\x0bssh-ed25519\0\0\0\0\0\0\0\x01h\0\0\0\x01u\0\0\0\0".as_slice()][..],
+            ),
+            ("gssapi-with-mic", &[b"\0\0\0\0".as_slice()][..]),
+        ] {
+            let mut request = Writer::message(msg::USERAUTH_REQUEST);
+            request.str(USER).str("ssh-connection").str(method);
+            for part in body {
+                request.raw(part);
+            }
+            client.send(&request);
+            let reply = client.receive();
+            assert_eq!(reply[0], msg::USERAUTH_FAILURE, "{method}");
+            let mut reader = Reader::new(&reply[1..]);
+            assert_eq!(reader.str().unwrap(), "publickey", "{method}");
+            assert!(!reader.bool().unwrap(), "{method}");
+        }
+    }
+    assert_eq!(client.offer(&key)[0], msg::USERAUTH_PK_OK);
+}
+
 #[test]
 fn an_argument_that_is_not_utf8_is_refused_with_status_one() {
     let not_text = OsStr::from_bytes(b"\xff");
