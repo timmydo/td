@@ -126,13 +126,16 @@ by who chose them:
   and later a stylesheet or a frame. It is always sent `public`, so a
   page on the internet cannot make td-web touch a device on the local
   network. td-web makes no request the person did not cause by
-  navigating; a `<meta http-equiv=refresh>` is shown as a link, not
-  followed.
+  navigating. A `<meta http-equiv=refresh>` is not followed; td-html
+  drops `<meta>`, so neither is it shown.
 
-**Bounds.** A document's body is taken up to `MAX_DOCUMENT` (16 MiB),
-an image's up to `MAX_IMAGE` (16 MiB); a larger body is refused by the
-service and shown as an error. Markup past `MAX_RENDERED` (4 MiB) is
-not rendered, and the page says so. Requests carry
+**Bounds.** A body is taken up to `MAX_DOCUMENT` (16 MiB), a picture's
+too; a larger body is refused by the service and shown as an error. A
+picture is shown within td-ui's bounds (8192 pixels an axis, 16 Mi
+pixels): a larger JPEG is decoded at the largest of td-jpeg's scales
+that fits, a larger PNG is refused. Markup past `MAX_MARKUP` (2 MiB)
+and text past `MAX_TEXT` (4 MiB) are not rendered, and the page says
+so (§5). Requests carry
 `accept: text/html, application/xhtml+xml, text/plain;q=0.9,
 image/png;q=0.8, image/jpeg;q=0.8, */*;q=0.1` and td-web's
 `user-agent`; the service sends `accept-encoding: identity` itself.
@@ -146,17 +149,30 @@ sniff of its first bytes for `<!doctype html` or `<html`:
   (`to_rich`) at the page pane's width in cells, and rendered again when
   the width changes. Links, emphasis, code and preformatted text keep
   their looks; colours named by the document are not applied, so text
-  is always the theme's ink on the theme's ground. An image's place
-  shows its `alt` text, or its file name, as a link to the image.
+  is always the theme's ink on the theme's ground. An image with `alt`
+  text shows that text as a link to the image; td-html drops one
+  without. td-html keeps no element ids, so a link's `#fragment` is
+  kept in the address but not scrolled to.
 - `text/*` is shown as it is, wrapped at the pane's width.
 - `image/png` and `image/jpeg` reached by navigation are decoded and
   shown fitted to the pane, never enlarged.
 - Anything else is not shown: the page names the type and size and
   says that Firefox opens it. Downloads are a later increment (§10).
 
-Text is decoded as UTF-8, invalid sequences replaced; other charsets are
-a later increment. A status other than `2xx` with a body is shown with
-its status in the status row; one without a body is an error page.
+Text is decoded as UTF-8, invalid sequences replaced and a byte order
+mark dropped; other charsets are a later increment. Markup past
+`MAX_MARKUP` (2 MiB) and text past `MAX_TEXT` (4 MiB) are not rendered,
+a rendering keeps at most `MAX_LINES` (100,000) lines, and the status
+row says when either cut the page short. td-html builds a rendering
+whole before td-web cuts it, so the markup bound is what bounds that
+work: a hostile page of empty paragraphs at the bound costs about a
+second and some 270 MB at each width (§10). A status other than `2xx` with a body is shown with its
+status in the status row; one without a body is an error page.
+
+Each character takes one cell: td-html's own stroke marks are dropped
+from struck text, which td-web strikes itself, but a wide character or
+a combining mark still takes one cell of its own, and a preformatted
+line wider than the page is cut at its edge (§10).
 
 The rendered page is td-web's own model, a list of lines of styled runs
 with link targets, independent of how it was produced: the first
@@ -184,9 +200,12 @@ of handler, is a later decision and an amendment to td-portal's design.
 ## 8. Window and keys
 
 One td-ui window: an address row on top, the page below, a status row
-at the bottom (the URL a focused or hovered link goes to, the response
-status, or what is loading). Its app id is `td-web`; its title is the
-document's `<title>`, else its URL.
+at the bottom. The status row says, first that applies: what the last
+input made happen (a link not followed, a refusal, a copy), until the
+next key, click, wheel turn or paste; what is loading; where the link under the pointer, else the
+focused link, goes; the response's status, the place in the page and
+any cut. Its app id is `td-web`; its title is the document's `<title>`,
+else its URL, then ` - td-web`.
 
 | Key | Does |
 |---|---|
@@ -197,19 +216,25 @@ document's `<title>`, else its URL.
 | `Enter` (page) | follow the focused link |
 | `Alt+Left`, `Alt+Right` | back, forward |
 | `Ctrl+R`, `F5` | reload |
-| `Ctrl+F`, `/` | find in page; `Enter`/`Shift+Enter` next/previous |
+| `Ctrl+F`, `/` | find in page; `Enter`/`Shift+Enter`, then `n`/`N`, next/previous |
 | `Up`, `Down`, `PageUp`, `PageDown`, `Space`, `Home`, `End` | scroll |
-| `Ctrl+C` | copy the selection, else the focused link's URL |
+| `Ctrl+C` | copy the address or find row's selection while it has focus, else the focused link's URL, else the page's |
 | `Ctrl+Q`, `Ctrl+W` | close |
-| `?`, `F1` | the key list |
+| `?`, `F1` | the key list (`F1` is the window's own) |
 
-A click on a link follows it; the wheel scrolls. A fetch runs off the
-window's thread, so the window stays responsive while a page loads, and
-`Escape` on the page stops a load in progress.
-
-td-web offers td-ui's driving layer (td-ui/DESIGN.md, the control
-socket), so a test or an agent can operate it through the same verbs
-as td-ui's other programs.
+A click on a link follows it, the pointer over one says where it goes,
+and the wheel scrolls. A navigation's fetch and its decoding, a
+picture's included, run on a thread of its own, so the window stays
+responsive while a page loads, and `Escape` on the page stops waiting
+for it; rendering at the page's width, again on a resize, is the
+window's. A stopped fetch runs on until the service answers or times
+out, so td-web keeps at most `MAX_WORKERS` (4) fetches out, stopped
+ones included, and asks the person to wait past that; a navigation
+overtaken by another is stopped. The history keeps at most 100 pages
+each way, and moves only when a page arrives: a step back or forward
+that is stopped, refused or overtaken leaves it as it was. A resize
+keeps the focused link and what find marked. There is no text selection
+in the page yet.
 
 ## 9. Increments
 
@@ -222,7 +247,7 @@ as td-ui's other programs.
 3. **The `td-web` crate**: §4-§8 over td-html's rich output, runnable on
    a host through `./install-apps` with a private fetch service
    (`td-net launch`), tested without a network through an injected
-   fetcher.
+   fetcher. Inline pictures, which are subresources, wait for §10.
 4. **Packaging**: the `td-web` and `web` recipes, the `web`
    `ShippedApplication` at 65540, its fetch service and application
    units, its launcher card and its permissions (§3).
@@ -251,6 +276,16 @@ order; each is its own design amendment when it starts:
   progressive JPEG in td-jpeg; GIF; then WebP and an SVG subset.
 - **Downloads** to `~/Downloads` through the portal, which today admits
   Firefox alone.
+- **Driving.** td-ui's control socket (td-ui/DESIGN.md), so a test or an
+  agent can operate td-web through the verbs td-ui's other programs
+  take, and an oracle can boot it in the image.
+- **Text selection** in the page, and copying it.
+- **Bounded rendering**: a line limit inside td-html's rich output, and
+  rendering off the window's thread, so a hostile page costs neither
+  the memory nor the pause §5 states.
+- **Wide text**: horizontal scrolling for preformatted lines, and cells
+  by character width (td-html already counts wide characters as two and
+  combining marks as none).
 - **Toward replacing Firefox.** Script (an interpreter, §2),
   bidirectional text and shaping, a per-site process model (which td-jail
   does not offer today: one jail, no nested namespaces), and becoming a

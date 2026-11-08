@@ -1578,6 +1578,14 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // td-web (td-web/DESIGN.md) is, until its packaging increment, a host
+    // program `./install-apps` builds: no recipe builds it yet, so the
+    // cargo-test preflight is every tier that reads it.
+    if p.starts_with("td-web/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // Toolkit edits affect its standalone consumers and their target recipes;
     // locally derived source identities and realized-output checks apply.
     if p.starts_with("td-ui/") && !p.contains("..") {
@@ -3102,6 +3110,17 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-pinentry/tests/control_process.rs",
         "td-pinentry/Cargo.toml",
         "td-pinentry/Cargo.lock",
+    ] {
+        assert_preflight!(path, "cargo-test");
+        assert_no_target!(path, "recipe-checks");
+        assert_no_target!(path, "check");
+    }
+    // td-web is a host program no recipe builds yet, routed as td-pinentry is.
+    for path in [
+        "td-web/src/main.rs",
+        "td-web/src/app.rs",
+        "td-web/Cargo.toml",
+        "td-web/Cargo.lock",
     ] {
         assert_preflight!(path, "cargo-test");
         assert_no_target!(path, "recipe-checks");
@@ -9756,13 +9775,14 @@ mod tests {
                 "td-ui",
                 "td-update",
                 "td-vm",
-                "td-vm-guest"
+                "td-vm-guest",
+                "td-web"
             ]
         );
         // td-agent's, td-photo's, td-mail's, td-pass's and td-pinentry's
         // native cases make their commands three, as td-setup's are; td-dua,
-        // td-news, td-review, td-sandbox, td-software and td-term, toolkit consumers
-        // with no native case, add two each.
+        // td-news, td-review, td-sandbox, td-software, td-term and td-web, toolkit
+        // consumers with no native case, add two each.
         // td-crypto's test-only P-256 oracle is td-fido's, which reads no
         // compositor source, so td-crypto is not a reader here. The native mail read
         // fixture makes td-mta a reader through td-mail.
@@ -9774,7 +9794,7 @@ mod tests {
         // and td-kexec and td-update, which read td-boot, add two each, as do
         // td-ssh, which mounts td-login's sources, and td-ssh-interop, its driver.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 82, "{comp:?}");
+        assert_eq!(comp.len(), 84, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -9816,7 +9836,8 @@ mod tests {
                 "td-ui",
                 "td-update",
                 "td-vm",
-                "td-vm-guest"
+                "td-vm-guest",
+                "td-web"
             ]
         );
         // td-install's readers include td-authd, so td-boot's protocol
@@ -9859,7 +9880,8 @@ mod tests {
                 "td-ui",
                 "td-update",
                 "td-vm",
-                "td-vm-guest"
+                "td-vm-guest",
+                "td-web"
             ]
         );
         // The order holds within a narrowed list: the format check, then every
@@ -10663,6 +10685,36 @@ mod tests {
         let lines: Vec<&str> = staged.lines().filter(|l| l.contains(name)).collect();
         assert_eq!(lines.len(), 1, "{name} enters another recipe: {lines:?}");
         assert!(lines[0].starts_with("td-ssh-source "), "{lines:?}");
+    }
+
+    /// td-web's arm selects the cargo-test preflight alone because no
+    /// recipe builds it yet; the packaging increment that adds one moves
+    /// it to recipe-checks, which this test then says.
+    #[test]
+    fn web_reaches_no_recipe_yet() {
+        let root = repo_root();
+        if discover_gate_crates(&root).is_err() {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        }
+        let mut recipes = Vec::new();
+        collect_rs_recursive(&root.join("recipes/src"), &mut recipes);
+        assert!(!recipes.is_empty());
+        for path in recipes {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for spelling in ["\"td-web\"", "td_web"] {
+                assert!(
+                    !text.contains(spelling),
+                    "{} names {spelling}; revisit td-web's affected-check mapping",
+                    path.display()
+                );
+            }
+        }
+        let staged = std::fs::read_to_string(root.join("seed/local-source-roster.txt")).unwrap();
+        assert!(
+            !staged.contains("td-web"),
+            "td-web now enters a recipe closure"
+        );
     }
 
     /// td-pinentry's arm selects the cargo-test preflight alone because no

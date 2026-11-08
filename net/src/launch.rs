@@ -1,7 +1,8 @@
 // td-launch — run one application with a fetch service of its own, for a
 // host that has no session fetch service (APPLICATIONS.md §X.7). td-news,
-// td-mail and td-agent hold no network client: on td the jail binds
-// td-fetchd's socket into the first two, and td-agent, a program of td's
+// td-mail, td-web and td-agent hold no network client: on td the jail binds
+// td-fetchd's socket into the first two (td-web's once it is packaged),
+// and td-agent, a program of td's
 // account there, finds it under the account's runtime directory. Run elsewhere,
 // this applet serves one for the launch:
 //
@@ -23,7 +24,7 @@
 // directory named for a pid no longer running, which the next launch
 // sweeps, judging by its own pid namespace.
 //
-// Invoked by an application's name (`td-news`, `td-mail`, `td-agent`)
+// Invoked by an application's name (`td-news`, `td-mail`, `td-web`, `td-agent`)
 // through a link to this binary, it launches the program of that name
 // beside the binary the link resolves to, refusing one that is this binary.
 // For td-agent it also names the td-jail and td-txt beside it, when
@@ -47,7 +48,7 @@ use std::time::{Duration, Instant};
 
 /// The applications a link to this binary may name: those that fetch
 /// through the service.
-pub(crate) const LAUNCHED: &[&str] = &["td-agent", "td-mail", "td-news"];
+pub(crate) const LAUNCHED: &[&str] = &["td-agent", "td-mail", "td-news", "td-web"];
 
 /// The programs an application runs beside it, each found beside this
 /// binary and named to the application in an environment variable:

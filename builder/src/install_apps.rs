@@ -4,7 +4,7 @@
 //!
 //! td-dua, td-editor, td-pass, td-photo, td-pinentry, td-review,
 //! td-taskmgr and td-term are installed in `~/.local/bin`. td-news,
-//! td-mail and td-agent fetch only through td's fetch service, which a host
+//! td-mail, td-web and td-agent fetch only through td's fetch service, which a host
 //! session does not run, so they are installed with td-net in
 //! `~/.local/lib/td`, and their names in `~/.local/bin` are links to
 //! td-net, whose `launch` applet serves a fetch service of their own and
@@ -43,6 +43,7 @@ const APPS: &[&str] = &[
     "td-sandbox",
     "td-taskmgr",
     "td-term",
+    "td-web",
 ];
 /// The fetch service and launcher, the checkout's `net` crate.
 const TD_NET: &str = "td-net";

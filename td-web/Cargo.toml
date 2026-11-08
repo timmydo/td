@@ -1,0 +1,39 @@
+[package]
+name = "td-web"
+version = "0.1.0"
+edition = "2021"
+description = "td's own document browser: HTML, text, PNG and JPEG through td's fetch service in a td-ui window"
+license = "MIT"
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[[bin]]
+name = "td-web"
+path = "src/main.rs"
+
+# td-web is a TARGET-built application (td-web/DESIGN.md), standalone like
+# td-news: its own workspace root, so cargo behaves the same from any
+# checkout, with a lock that names itself and the td siblings it draws
+# through.
+[workspace]
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+# td's own crates, by the one sibling-dependency spelling the lock guard
+# admits (AGENTS.md 'Rust code'): the fetch service's client, HTML
+# rendering, the PNG and JPEG decoders, the shared UI toolkit and URLs.
+[dependencies]
+td-fetch-client = { path = "../td-fetch-client" }
+td-html = { path = "../td-html" }
+td-jpeg = { path = "../td-jpeg" }
+td-png = { path = "../td-png" }
+td-ui = { path = "../td-ui" }
+td-url = { path = "../td-url" }
