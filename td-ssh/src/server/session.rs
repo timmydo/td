@@ -121,7 +121,7 @@ fn run(single_user: bool) -> Result<()> {
     // A home that cannot be entered is reported by the shell it would have run.
     let _ = std::env::set_current_dir(&grant.home);
 
-    let random = RandomSource(File::open("/dev/urandom")?);
+    let random = RandomSource(File::open("/dev/random")?);
     socket.set_write_timeout(Some(STALL_LIMIT))?;
     let writer_half = socket.try_clone()?;
     let ending = socket.try_clone()?;

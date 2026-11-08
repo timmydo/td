@@ -120,8 +120,10 @@ fn required_file(arguments: &Arguments) -> Result<&Path> {
         .ok_or_else(|| Error::refused(USAGE))
 }
 
+/// `/dev/random`: early in boot, a host key waits for the kernel's CRNG to be
+/// seeded, and after that never.
 fn random(out: &mut [u8]) -> Result<()> {
-    File::open("/dev/urandom")
+    File::open("/dev/random")
         .and_then(|mut file| file.read_exact(out))
         .map_err(|error| Error::refused(format!("reading entropy: {error}")))
 }

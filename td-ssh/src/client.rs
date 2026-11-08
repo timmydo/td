@@ -514,7 +514,7 @@ impl HostCheck {
             return;
         };
         let random = |salt: &mut [u8; 20]| -> io::Result<()> {
-            File::open("/dev/urandom").and_then(|mut file| file.read_exact(salt))
+            File::open("/dev/random").and_then(|mut file| file.read_exact(salt))
         };
         let line = match line_to_record(&self.name, key_b64, self.hash, random) {
             Ok(line) => line,
@@ -1858,7 +1858,7 @@ pub fn run(mut invocation: Invocation) -> Result<i32> {
         clock: clock.clone(),
     };
     let env = ClientEnv {
-        random: RandomSource(File::open("/dev/urandom")?),
+        random: RandomSource(File::open("/dev/random")?),
         check,
         pinned: None,
     };

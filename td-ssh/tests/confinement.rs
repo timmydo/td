@@ -492,7 +492,35 @@ fn randomness_comes_only_through_a_caller_held_descriptor() {
         for reads_the_device in ["random::fill", "generate_secret", "generate_seed"] {
             assert!(!shipped.contains(reads_the_device), "{name}");
         }
+        // `/dev/random`, which waits for the CRNG to be seeded (DESIGN.md section 7).
+        assert!(!shipped.contains("urandom"), "{name}");
     }
+    // And it is read at exactly these places, each a source of randomness.
+    let tree = tree();
+    let opens = |name: &str| {
+        squeeze(production(&strip_comments(&source(&tree.rs, name))))
+            .matches("File::open(\"/dev/random\")")
+            .count()
+    };
+    for (name, count) in [
+        ("keygen.rs", 1),
+        ("client.rs", 2),
+        ("server/preauth.rs", 1),
+        ("server/session.rs", 1),
+    ] {
+        assert_eq!(opens(name), count, "{name}");
+    }
+    // And nowhere else, by that or any other way of naming the device.
+    let named: usize = tree
+        .rs
+        .iter()
+        .map(|(_, text)| {
+            squeeze(production(&strip_comments(text)))
+                .matches("/dev/random")
+                .count()
+        })
+        .sum();
+    assert_eq!(named, 5);
 }
 
 fn dev_full() -> std::fs::File {

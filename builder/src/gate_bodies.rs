@@ -4308,8 +4308,12 @@ fn dev_probe() -> ExitCode {
         println!("  no writable /dev/null");
         return ExitCode::from(11);
     }
-    if !Path::new("/dev/zero").exists() || !Path::new("/dev/urandom").exists() {
-        println!("  missing /dev/zero|urandom");
+    // `/dev/random` too: td-ssh and td-firstboot read it, to wait for the CRNG.
+    if ["/dev/zero", "/dev/urandom", "/dev/random"]
+        .iter()
+        .any(|device| !Path::new(device).exists())
+    {
+        println!("  missing /dev/zero|urandom|random");
         return ExitCode::from(12);
     }
     for leak in [

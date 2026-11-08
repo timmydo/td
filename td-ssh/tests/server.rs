@@ -574,7 +574,7 @@ fn the_pre_auth_worker_runs_under_seccomp_and_no_new_privs() {
     assert_eq!(field(&status, "Seccomp"), Some("2"), "{status}");
     assert_eq!(field(&status, "NoNewPrivs"), Some("1"), "{status}");
     assert_eq!(field(&status, "Threads"), Some("1"), "{status}");
-    // Standard three, the socket's two clones, the monitor's clone, urandom.
+    // Standard three, the socket's two clones, the monitor's clone, /dev/random.
     let fds = fs::read_dir(format!("/proc/{}/fd", worker[0]))
         .unwrap()
         .count();

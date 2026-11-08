@@ -77,7 +77,7 @@ fn setup_and_run(drop_identity: bool) -> Result<()> {
     let socket = ManuallyDrop::new(duplicate(std::io::stdin())?);
     let socket_writer = ManuallyDrop::new(socket.try_clone()?);
     let monitor = ManuallyDrop::new(duplicate(std::io::stdout())?);
-    let random = ManuallyDrop::new(File::open("/dev/urandom")?);
+    let random = ManuallyDrop::new(File::open("/dev/random")?);
     let status = credentials::open_status()?;
     jail::enter(status, drop_identity).map_err(Error::refused)?;
 

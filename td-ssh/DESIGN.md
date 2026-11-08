@@ -240,7 +240,7 @@ worker can refuse service, and can spend its single signature (§3), but cannot
 authenticate without a client's valid signature over this session, which means the
 session ID it named itself (§3).
 
-**Pre-auth worker.** Starts as root; opens `/dev/urandom` and the status
+**Pre-auth worker.** Starts as root; opens `/dev/random` and the status
 descriptor; checks that `/run/sshd-empty` is a directory, root-owned and not group
 or other writable, failing the connection otherwise; `chroot`s to it and
 `chdir("/")`s; switches to `sshd` (uid and gid 995, with a group list of exactly that
@@ -698,9 +698,16 @@ shared with TLS and td's other consumers. It added these, for itself: `OpenSshAe
 that crate is `openssh-key-v1`, the wire encodings, and the following.
 
 **Randomness** comes through `KexEnvironment::random`, and so as arguments to
-everything in the exchange, from a caller-held `/dev/urandom` descriptor, since the
+everything in the exchange, from a caller-held `/dev/random` descriptor, since the
 worker's chroot has no device nodes. td-ssh never calls `td-primitives`' `random`, or
-`generate_secret` or `generate_seed`, which read the device themselves.
+`generate_secret` or `generate_seed`, which read the device themselves. Every read,
+the client's, the server's, a host or user key's and a hashed `known_hosts` salt's, is
+of `/dev/random`, which since Linux 5.6 waits until the kernel's CRNG is seeded and
+never after; `/dev/urandom` does not wait, so a key made or an exchange run early in a
+boot could otherwise draw on a pool not yet seeded. td ships a later kernel; on one
+before 5.6, `/dev/random` would block on an entropy estimate again and again, and
+td-ssh does not support it. The wait is short where the kernel can make jitter
+entropy, and a connection that arrives before it ends meets LoginGraceTime.
 
 **The seed.** `SigningKey` cannot give its seed back, and the signer hand-off and key
 writing need it, so `keyfile::PrivateKey` keeps a copy beside the signing key, wiped
