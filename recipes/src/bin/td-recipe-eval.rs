@@ -401,6 +401,11 @@ fn main() {
                 die(&error);
             }
         }
+        Some("publish-build") => {
+            if let Err(error) = publish::build_cli(args.get(2..).unwrap_or(&[])) {
+                die(&error);
+            }
+        }
         Some("publish") => {
             if let Err(error) = publish::cli(args.get(2..).unwrap_or(&[])) {
                 die(&error);

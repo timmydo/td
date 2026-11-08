@@ -756,6 +756,27 @@ it from `git log`; an untracked plan file cannot be the handoff.
 Never use `git stash` in this repository. `refs/stash` is repository-global,
 not worktree-local.
 
+# Publisher build parallelism
+
+`./publish` runs its image-build child through `td-builder
+build-with-budget ABSOLUTE-PROGRAM [ARGUMENT...]`. The wrapper joins the
+per-user check host and claims available memory tokens before starting
+the child, hence before the evaluator takes its build-cache lock. It
+requests up to two GiB per available CPU, bounded by the pool's capacity
+after its base grant, and accepts a smaller grant when peers hold tokens,
+with two GiB as the minimum. It prints the compiler job count and grant.
+The grant is held until the child exits; client loss cancels the hosted
+process tree. Waiting requests share the existing admission and
+memory-pressure checks. The wrapper is recorded for `td-builder stop` in
+its checkout.
+
+Kernel `make -j{jobs}` and recipe Cargo jobs use that grant, which the
+evaluator passes through its cleared environment. A nested wrapper reuses an inherited grant.
+Lower-level build-plan commands acquire no further memory while holding cache locks. The publisher
+releases its build grant before optional checks, signing or uploads.
+This allocation is per user, like the check host; it does not coordinate
+separate accounts' concurrent builds.
+
 # Stopping a run
 
 To abandon a long check run, ask for it:

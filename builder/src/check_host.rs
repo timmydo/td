@@ -410,7 +410,15 @@ fn write_patiently(
     Ok(())
 }
 
+pub fn inherited_build_grant(args: &[String]) -> bool {
+    args.first().is_some_and(|arg| arg == "build-with-budget")
+        && check_memory::request_job_budget().is_some()
+}
+
 pub fn should_forward(args: &[String]) -> bool {
+    if inherited_build_grant(args) {
+        return false;
+    }
     should_forward_with_host_state(
         args,
         std::env::var_os(check_memory::HOST_CHILD_ENV).is_some(),
@@ -445,6 +453,7 @@ pub(crate) fn should_forward_with_host_state(args: &[String], already_hosted: bo
                 "-h" | "--help" | "--list" | "list-gates" | "gate-timing-report"
             )
         }),
+        Some("build-with-budget") => args.len() >= 2,
         Some("daemon-request") => {
             args.len() == 3 && args.get(2).is_some_and(|request| request != "SHUTDOWN")
         }
@@ -453,10 +462,61 @@ pub(crate) fn should_forward_with_host_state(args: &[String], already_hosted: bo
 }
 
 pub fn forward(args: &[String]) -> ExitCode {
-    match forward_inner(args) {
+    let mut request = args.to_vec();
+    if let Some(verb) = request.first_mut() {
+        if verb == "build-with-budget" {
+            *verb = "build-with-budget-hosted".into();
+        }
+    }
+    match forward_inner(&request) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("td-builder: check host: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Acquire memory before the child can take a build-cache lock. The host's
+/// PID namespace owns the child and permit through exit or cancellation.
+pub fn build_with_budget(args: &[String], acquire: bool) -> ExitCode {
+    let result = (|| -> Result<ExitCode, String> {
+        let program = args
+            .first()
+            .ok_or("build-with-budget needs an absolute executable path")?;
+        if !Path::new(program).is_absolute() {
+            return Err("build-with-budget needs an absolute executable path".into());
+        }
+        let permit = acquire
+            .then(|| check_memory::plan_permit(&|| false))
+            .transpose()?;
+        let bytes = permit
+            .as_ref()
+            .map(check_memory::MemoryPermit::bytes)
+            .or_else(check_memory::request_job_budget)
+            .ok_or("missing inherited compiler memory grant")?;
+        let jobs = check_memory::jobs_for_budget(bytes, check_memory::nproc());
+        eprintln!(
+            "td-builder: build-with-budget: {jobs} compiler job(s), {} MiB memory grant",
+            bytes / (1024 * 1024)
+        );
+        let status = Command::new(program)
+            .args(args.get(1..).ok_or("missing build arguments")?)
+            .env(check_memory::JOB_BUDGET_ENV, bytes.to_string())
+            .env("CARGO_BUILD_JOBS", jobs.to_string())
+            .status()
+            .map_err(|e| format!("run admitted build: {e}"))?;
+        Ok(ExitCode::from(
+            status
+                .code()
+                .and_then(|n| u8::try_from(n).ok())
+                .unwrap_or(1),
+        ))
+    })();
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("td-builder: build-with-budget: {e}");
             ExitCode::FAILURE
         }
     }
@@ -3935,6 +3995,22 @@ mod tests {
         assert!(!forwards(&["ready", "--record-only"]));
         assert!(!forwards(&["affected-checks"]));
         assert!(!forwards(&["build", "x"]));
+        assert!(forwards(&["build-with-budget", "/bin/program"]));
+        assert!(!forwards(&["build-with-budget"]));
+        assert!(!should_forward_with_host_state(
+            &words(&["build-with-budget", "/bin/program"]),
+            true
+        ));
+        assert!(!forwards(&[
+            "build-plan",
+            "--auto",
+            "kernel",
+            "recipes",
+            "map",
+            "store",
+            "db",
+            "scratch"
+        ]));
         assert!(!should_forward_with_host_state(
             &words(&["check", "check-engine"]),
             true

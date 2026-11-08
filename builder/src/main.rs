@@ -9008,6 +9008,12 @@ fn main() -> ExitCode {
         // one; the run writes a record in its own worktree and this reads it.
         // See builder/src/run_record.rs.
         Some("stop") => run_record::stop_cli(args.get(2..).unwrap_or(&[])),
+        Some("build-with-budget") => {
+            check_host::build_with_budget(args.get(2..).unwrap_or(&[]), false)
+        }
+        Some("build-with-budget-hosted") => {
+            check_host::build_with_budget(args.get(2..).unwrap_or(&[]), true)
+        }
         Some("check-host-serve") => check_host::serve_cli(args.get(2..).unwrap_or(&[])),
         Some("check-host-stop") if args.len() == 2 => check_host::stop_cli(),
         // main-integration run|status — the qemu oracles on main after

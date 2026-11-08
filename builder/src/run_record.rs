@@ -316,6 +316,9 @@ impl Guard {
 /// `should_record` for which process records, and `long_run_verb` for which
 /// invocations count.
 pub fn record_if_long_run(args: &[String]) -> Option<Guard> {
+    if crate::check_host::inherited_build_grant(args) {
+        return None;
+    }
     let hosted = std::env::var_os(crate::check_memory::HOST_CHILD_ENV).is_some();
     let verb = should_record(args, hosted)?;
     let root = crate::repo::resolve_root();
@@ -1579,6 +1582,7 @@ mod tests {
             verbs,
             [
                 "affected-checks",
+                "build-with-budget",
                 "check",
                 "daemon-request",
                 "gate-run",

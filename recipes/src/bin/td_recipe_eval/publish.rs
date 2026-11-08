@@ -332,6 +332,30 @@ fn append_catalog(text: &str, row: &str, base: &Path) -> Result<String, String> 
     Ok(output)
 }
 
+/// Internal child entry point: only the image build holds a compiler grant.
+pub(crate) fn build_cli(args: &[String]) -> Result<(), String> {
+    let [iso, deployment] = args else {
+        return Err("usage: publish-build ISO DEPLOYMENT-DIRECTORY".into());
+    };
+    crate::check_runner::build_iso_cli(&["--out".into(), iso.clone()], Some(Path::new(deployment)))
+}
+
+fn build_image(builder: &Path, iso: &Path, deployment: &Path) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let executable =
+        fs::canonicalize(executable).map_err(|e| format!("resolve build evaluator: {e}"))?;
+    run(
+        builder,
+        &[
+            "build-with-budget".into(),
+            path_text(&executable),
+            "publish-build".into(),
+            path_text(iso),
+            path_text(deployment),
+        ],
+    )
+}
+
 pub(crate) fn cli(args: &[String]) -> Result<(), String> {
     if args == ["--help"] || args == ["-h"] {
         println!("{HELP}");
@@ -475,7 +499,7 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
             ));
         }
         crate::check_runner::warm_cli(&[PROFILE.into()])?;
-        crate::check_runner::build_iso_cli(&["--out".into(), path_text(&iso)], Some(&deployment))?;
+        build_image(&repo.join("target/release/td-builder"), &iso, &deployment)?;
         boot_info_source::finish(&repo, &source)?;
         atomic(&built, &fingerprint(&dir, &iso)?)?;
     }

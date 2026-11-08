@@ -212,7 +212,17 @@ impl TokenPool {
         leave_free: usize,
         aborted: &dyn Fn() -> bool,
     ) -> Result<MemoryPermit, String> {
-        if tokens == 0 || tokens.saturating_add(leave_free) > self.count {
+        self.acquire_range(tokens, tokens, leave_free, aborted)
+    }
+
+    fn acquire_range(
+        &self,
+        minimum: usize,
+        tokens: usize,
+        leave_free: usize,
+        aborted: &dyn Fn() -> bool,
+    ) -> Result<MemoryPermit, String> {
+        if minimum == 0 || minimum > tokens || tokens.saturating_add(leave_free) > self.count {
             return Err(format!(
                 "memory grant asks for {tokens} token(s) plus {leave_free} reserved from a {}-token pool",
                 self.count
@@ -258,17 +268,16 @@ impl TokenPool {
                     Err(e) => return Err(format!("lock memory token {}: {e}", path.display())),
                 }
             }
-            let remaining = self.count.saturating_sub(locked_elsewhere + held.len());
-            let requested_bytes = u64::try_from(tokens)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(TOKEN_BYTES);
-            let memory_ok = memory_admission_bytes(self.reserve_bytes)
-                .map(|bytes| bytes >= requested_bytes)
-                .unwrap_or(false);
+            let available = self.count.saturating_sub(locked_elsewhere + leave_free);
+            let memory_tokens = memory_admission_bytes(self.reserve_bytes)
+                .map(|bytes| usize::try_from(bytes / TOKEN_BYTES).unwrap_or(usize::MAX))
+                .unwrap_or(0);
+            held.truncate(available.min(memory_tokens));
+            let requested_bytes = (held.len() as u64).saturating_mul(TOKEN_BYTES);
             let pressure_ok = memory_psi_some_avg10()
                 .map(|pressure| pressure < MEMORY_PSI_LIMIT)
                 .unwrap_or(true);
-            if held.len() == tokens && remaining >= leave_free && memory_ok && pressure_ok {
+            if held.len() >= minimum && pressure_ok {
                 drop(admission);
                 return Ok(MemoryPermit {
                     _files: held,
@@ -300,6 +309,20 @@ pub fn gate_permit(aborted: &dyn Fn() -> bool) -> Result<MemoryPermit, String> {
 
 pub fn build_permit(aborted: &dyn Fn() -> bool) -> Result<MemoryPermit, String> {
     gate_permit(aborted)
+}
+
+/// A standalone plan holds the host's base permit while compiling. Claim
+/// spare tokens atomically, accepting a smaller grant when peers are busy.
+pub fn plan_permit(aborted: &dyn Fn() -> bool) -> Result<MemoryPermit, String> {
+    let pool = TokenPool::from_env()?;
+    let maximum = plan_grant_tokens(pool.count, parse_env_usize(BASE_TOKENS_ENV)?, nproc());
+    pool.acquire_range(2, maximum, 0, aborted)
+}
+
+fn plan_grant_tokens(count: usize, base: usize, cpus: usize) -> usize {
+    cpus.max(1)
+        .saturating_mul(2)
+        .min(count.saturating_sub(base))
 }
 
 /// Borrow `tokens` beyond a running gate's grant from tokens nothing holds,
@@ -799,6 +822,35 @@ mod tests {
         assert!(v1_memory_cgroup_ancestors_from(cgroups, "")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn standalone_plan_jobs_follow_cpu_and_pool_capacity() {
+        assert_eq!(plan_grant_tokens(32, 4, 16), 28);
+        assert_eq!(plan_grant_tokens(32, 4, 4), 8);
+        assert_eq!(plan_grant_tokens(8, 2, 16), 6);
+        assert_eq!(plan_grant_tokens(3, 1, 16), 2);
+    }
+
+    #[test]
+    fn variable_grants_shrink_for_peers_and_release_their_locks() {
+        let temp = crate::test_temp::TempDir::new("td-plan-memory").unwrap();
+        let budget = HostBudget {
+            work_bytes: 3 * TOKEN_BYTES,
+            reserve_bytes: 0,
+            token_count: 3,
+            base_tokens: 1,
+            gate_tokens: 2,
+        };
+        let pool = TokenPool::create(&temp, &budget).unwrap();
+        let peer = pool.acquire(1, 0, &|| false).unwrap();
+        let plan = pool.acquire_range(2, 3, 0, &|| true).unwrap();
+        assert_eq!(plan.bytes(), 2 * TOKEN_BYTES);
+        assert!(pool.acquire(1, 0, &|| true).is_err());
+        drop(plan);
+        drop(peer);
+        let wide = pool.acquire_range(2, 3, 0, &|| true).unwrap();
+        assert_eq!(wide.bytes(), 3 * TOKEN_BYTES);
     }
 
     #[test]
