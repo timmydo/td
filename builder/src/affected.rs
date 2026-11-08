@@ -1603,6 +1603,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         "td-remote/",
         "td-test-compositor/",
         "td-toml/",
+        "td-url/",
     ];
     if SHARED_LIBRARIES.iter().any(|dir| p.starts_with(dir)) && !p.contains("..") {
         sel.add_preflight("cargo-test");
@@ -2753,6 +2754,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-remote/src/lib.rs",
         "td-test-compositor/src/lib.rs",
         "td-toml/src/lib.rs",
+        "td-url/src/lib.rs",
         "td-json/Cargo.toml",
         "td-toml/Cargo.toml",
         "td-kv/Cargo.lock",

@@ -64,6 +64,7 @@ td-png = { path = "../td-png" }
 td-remote = { path = "../td-remote" }
 td-toml = { path = "../td-toml" }
 td-ui = { path = "../td-ui" }
+td-url = { path = "../td-url" }
 
 [dev-dependencies]
 td-test-compositor = { path = "../td-test-compositor" }

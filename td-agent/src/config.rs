@@ -11,6 +11,8 @@ use crate::workspace::{Shared, Workspace};
 use td_json::Json;
 use td_toml::Toml;
 
+pub use td_url::Destination;
+
 /// Where models are asked for (DESIGN.md §5).
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// The model a conversation uses by default.
@@ -174,88 +176,6 @@ pub const DEFAULT_ALLOWLIST: &[&str] = &[
     "proxy.golang.org",
     "sum.golang.org",
 ];
-
-/// A destination on an allowlist: a host, a DNS name in lower case or
-/// an IP address, and a port.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Destination {
-    pub host: String,
-    pub port: u16,
-}
-
-impl Destination {
-    /// `host`, `host:port`, `[v6]` or `[v6]:port`; 443 when no port is
-    /// named.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let wrong = || format!("{text:?} is not a host with an optional port");
-        let (host, port) = if let Some(rest) = text.strip_prefix('[') {
-            let (inner, after) = rest.split_once(']').ok_or_else(wrong)?;
-            let v6 = inner.parse::<std::net::Ipv6Addr>().map_err(|_| wrong())?;
-            let port = match after {
-                "" => None,
-                after => Some(after.strip_prefix(':').ok_or_else(wrong)?),
-            };
-            (format!("[{v6}]"), port)
-        } else {
-            let (host, port) = match text.rsplit_once(':') {
-                Some((host, port)) => (host, Some(port)),
-                None => (text, None),
-            };
-            (dns_or_v4(host).ok_or_else(wrong)?, port)
-        };
-        let port = match port {
-            None => 443,
-            Some(port) => Some(port)
-                .filter(|port| (1..=5).contains(&port.len()))
-                .filter(|port| port.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|port| port.parse::<u16>().ok())
-                .filter(|port| *port != 0)
-                .ok_or_else(wrong)?,
-        };
-        Ok(Self { host, port })
-    }
-
-    /// As configuration writes it: the port left off when it is 443.
-    pub fn text(&self) -> String {
-        if self.port == 443 {
-            self.host.clone()
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
-    }
-}
-
-/// `host` as a destination names it: an IPv4 address, or a DNS name of
-/// letters, digits and hyphens, in lower case, a trailing dot dropped,
-/// whose last label is not a number, decimal or `0x` hexadecimal, since
-/// the resolver reads such a name (`10.1`, `0x7f.1`, `2130706433`) as an
-/// address. The egress relay's `parse_host` (net/src/egress.rs) holds
-/// the same rule.
-pub fn dns_or_v4(host: &str) -> Option<String> {
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        return Some(host.to_string());
-    }
-    let name = host.strip_suffix('.').unwrap_or(host);
-    let label_ok = |label: &str| {
-        !label.is_empty()
-            && label.len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    };
-    let numeric = name.rsplit('.').next().is_some_and(|last| {
-        let hex = last
-            .get(..2)
-            .filter(|prefix| prefix.eq_ignore_ascii_case("0x"))
-            .and_then(|_| last.get(2..));
-        last.bytes().all(|b| b.is_ascii_digit())
-            || hex.is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
-    });
-    (!name.is_empty() && name.len() <= 253 && name.split('.').all(label_ok) && !numeric)
-        .then(|| name.to_ascii_lowercase())
-}
 
 /// `network_allowlist`'s list, each a destination, at most
 /// `MAX_ALLOWLIST`, each once.

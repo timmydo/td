@@ -311,8 +311,8 @@ fn parse_host(text: &str) -> Result<Host, String> {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
     };
     // A last label that is a number, decimal or `0x` hexadecimal, makes
-    // the resolver read the name as an address (`10.1`, `0x7f.1`); td-agent's
-    // `config::dns_or_v4` holds the same rule.
+    // the resolver read the name as an address (`10.1`, `0x7f.1`); td-url's
+    // `dns_or_v4` holds the same rule.
     let numeric = name.rsplit('.').next().is_some_and(|last| {
         let hex = last
             .get(..2)

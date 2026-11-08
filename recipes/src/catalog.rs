@@ -683,6 +683,7 @@ mod tests {
                 "td-toml",
                 "td-tpm",
                 "td-ui",
+                "td-url",
                 "td-util",
             ]
         );

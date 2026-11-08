@@ -118,8 +118,10 @@ by who chose them:
   ordinary request, so it may reach a host on the local network (a
   router's page, a printer's).
 - A **redirect hop** keeps its navigation's reach only when it stays on
-  the same scheme-and-host as the URL that redirected; a hop to another
-  host is sent `public`.
+  the same host as the URL that redirected, whatever its scheme or port
+  (`td_url::Url::same_host`): a device's `http` page sending the browser
+  to its own `https` is still that device. A hop to another host is
+  sent `public`, and so is every hop after it.
 - A **subresource** is a request the document chose: an inline image,
   and later a stylesheet or a frame. It is always sent `public`, so a
   page on the internet cannot make td-web touch a device on the local

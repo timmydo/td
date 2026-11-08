@@ -19,6 +19,7 @@ dependencies = [
  "td-test-compositor",
  "td-toml",
  "td-ui",
+ "td-url",
 ]
 
 [[package]]
@@ -74,4 +75,8 @@ version = "0.1.0"
 
 [[package]]
 name = "td-ui"
+version = "0.1.0"
+
+[[package]]
+name = "td-url"
 version = "0.1.0"
