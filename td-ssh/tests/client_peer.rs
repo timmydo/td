@@ -602,6 +602,83 @@ fn a_closed_stdout_tells_the_server_and_the_client_ends_with_it() {
     );
 }
 
+/// The process's resident memory, in KiB.
+fn resident_kib(child: &Child) -> u64 {
+    let status = fs::read_to_string(format!("/proc/{}/status", child.id())).unwrap();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kib| kib.parse().ok())
+        .unwrap()
+}
+
+/// A server sending to a stdout nobody reads, a byte a message to a sixteenth of the
+/// window and then as many empty messages, which the window does not count. Before,
+/// each was an allocation of its own, about 55 bytes: some 14 MiB here, against
+/// under 1 MiB now. What waits for that stdout is the window's bytes, not one
+/// allocation a message, and the core still answers: its reply to a request sent
+/// last comes after all of them.
+#[test]
+fn tiny_and_empty_data_to_an_unread_stdout_costs_only_its_bytes() {
+    const TINY: usize = 128 * 1024;
+    const EMPTY: usize = 128 * 1024;
+    let scene = Scene::new();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let child = scene
+        .ssh(&[])
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .spawn()
+        .unwrap();
+    let child = Killed(child);
+    let mut peer = scene.accept();
+    peer.open(1 << 20);
+    assert_eq!(peer.request(true), "exec");
+    peer.answer(true);
+    let channel = peer.client_channel;
+    // An unoptimized client takes a while over a quarter of a million packets.
+    peer.control
+        .set_read_timeout(Some(Duration::from_secs(300)))
+        .unwrap();
+    let (arriving, mut writer, _) = peer.read_in_background();
+    let before = resident_kib(&child.0);
+    let mut tiny = Writer::message(msg::CHANNEL_DATA);
+    tiny.u32(channel).string(b"x");
+    for _ in 0..TINY {
+        writer.write_packet(tiny.as_slice()).unwrap();
+    }
+    let mut empty = Writer::message(msg::CHANNEL_DATA);
+    empty.u32(channel).string(b"");
+    for _ in 0..EMPTY {
+        writer.write_packet(empty.as_slice()).unwrap();
+    }
+    let mut asking = Writer::message(msg::GLOBAL_REQUEST);
+    asking.str("keepalive@example").bool(true);
+    writer.write_packet(asking.as_slice()).unwrap();
+    let answer = loop {
+        let packet = arriving
+            .recv_timeout(Duration::from_secs(300))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the core stopped answering ({error:?}, client state {:?}): {}",
+                    fs::read_to_string(format!("/proc/{}/stat", child.0.id())),
+                    scene.stderr()
+                )
+            });
+        // Its stdin's end and any grant come too; the answer is what is waited for.
+        if ![msg::CHANNEL_WINDOW_ADJUST, msg::CHANNEL_EOF].contains(&packet[0]) {
+            break packet[0];
+        }
+    };
+    assert_eq!(answer, msg::REQUEST_FAILURE, "{}", scene.stderr());
+    let grown = resident_kib(&child.0).saturating_sub(before);
+    assert!(
+        grown < 4 * 1024,
+        "{grown} KiB more resident for {TINY} bytes of data"
+    );
+    drop(ours);
+}
+
 /// A server that takes no notice of eow finishes what it had past the whole window,
 /// then says how the command ended. The window for dead output was once not granted,
 /// and it hung for good with stderr behind the same window.

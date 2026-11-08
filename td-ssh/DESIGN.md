@@ -428,6 +428,15 @@ other's reader. Nothing else charges against it, so ticks and exits always get t
 This cannot deadlock with a blocked write: that write has its limit (§4 and below), and
 the core's end releases every waiter.
 
+Inbound data goes the other way, from the core to a local stream (a child's stdin, the
+client's stdout or stderr), each with a thread that writes it. What waits for that thread
+is one buffer the core appends to, not a message queue: the window bounds its bytes, held
+in at most twice that between the buffer and what the thread has taken, and nothing else is
+kept a message, so a peer sending empty `CHANNEL_DATA`, which the window does not count, or
+one byte at a time adds nothing a message of its own would cost. An empty message is dropped
+where it arrives. The thread writes a packet's worth at a time and the window reopens as
+each lands.
+
 Rekeying does not disconnect a healthy peer. Sources, the client's stdin among them,
 stop taking credit from the first KEXINIT, either side's, until `NEWKEYS` has gone both
 ways and what was held has gone out. Only what they had already taken and control

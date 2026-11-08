@@ -5,7 +5,7 @@ use crate::client_config::{
     caller_uid, expand_path, parse_port, LogLevel, Options, Origin, RequestTty, Strict,
 };
 use crate::conn::{
-    self, Conn, Credit, Event, EventReceiver, LocalWindow, WhenBroken, CHANNEL_MAX_PACKET,
+    self, Conn, Credit, Event, EventReceiver, LocalWindow, Sink, WhenBroken, CHANNEL_MAX_PACKET,
     CHANNEL_WINDOW,
 };
 use crate::error::{
@@ -33,7 +33,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1223,8 +1223,8 @@ struct Session {
     peer_channel: Option<u32>,
     credit: Option<Arc<Credit>>,
     window: LocalWindow,
-    stdout: Option<Sender<Vec<u8>>>,
-    stderr: Option<Sender<Vec<u8>>>,
+    stdout: Option<Sink>,
+    stderr: Option<Sink>,
     handles: Vec<JoinHandle<()>>,
     exit_code: Option<i32>,
     want_tty: bool,
@@ -1247,8 +1247,8 @@ struct Session {
 
 /// Hands data to its sink, whose write will credit the window. False when there
 /// is no such write coming, and the caller has to credit it.
-fn forward(sink: Option<&Sender<Vec<u8>>>, data: &[u8]) -> bool {
-    sink.is_some_and(|sink| sink.send(data.to_vec()).is_ok())
+fn forward(sink: Option<&Sink>, data: &[u8]) -> bool {
+    sink.is_some_and(|sink| sink.send(data))
 }
 
 impl Session {
@@ -1548,11 +1548,12 @@ fn finish_output(
     drain_while_joining(handles, receiver, escape, observe);
 }
 
-/// A sink sends an event per message and this is the only thread draining them,
-/// so a plain join would deadlock on a full queue, and dropping the receiver
-/// would make the sinks return with output unwritten. Only the sinks ending ends
-/// this: a peer still sending would keep the queue itself alive for ever. So the
-/// look at what they left behind is bounded too. `observe` sees every event taken.
+/// A sink sends an event per packet it writes and this is the only thread
+/// draining them, so a plain join would deadlock on a full queue, and dropping
+/// the receiver would make the sinks return with output unwritten. Only the sinks
+/// ending ends this: a peer still sending would keep the queue itself alive for
+/// ever. So the look at what they left behind is bounded too. `observe` sees every
+/// event taken.
 fn drain_while_joining(
     handles: Vec<JoinHandle<()>>,
     receiver: &EventReceiver,
@@ -3163,7 +3164,20 @@ mod tests {
     fn stderr_data_of_an_unknown_type_never_reaches_stderr() {
         let (mut conn, _shared) = test_conn();
         let mut session = test_session();
-        let (sink, drained) = mpsc::channel();
+        #[derive(Clone, Default)]
+        struct Shared(Arc<Mutex<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let drained = Shared::default();
+        let (events, _receiver) = conn::event_channel();
+        let (sink, handle) = conn::spawn_sink(drained.clone(), 2, WhenBroken::Discard, events);
         session.stderr = Some(sink);
         session
             .on_message(
@@ -3183,8 +3197,9 @@ mod tests {
                 &mut conn,
             )
             .unwrap();
-        assert_eq!(drained.try_recv().unwrap(), b"y");
-        assert!(drained.try_recv().is_err());
+        session.stderr = None;
+        handle.unwrap().join().unwrap();
+        assert_eq!(*drained.0.lock().unwrap(), b"y");
     }
 
     #[test]
@@ -3245,8 +3260,9 @@ mod tests {
         seen: Arc<Mutex<Vec<u8>>>,
     }
 
-    /// More queued messages than the event queue holds, behind a stalled consumer
-    /// that `release` lets go, and the sink's sender already dropped.
+    /// More credits than the event queue holds waiting to be read, behind a stalled
+    /// consumer that `release` lets go, and the sink already dropped. Data sent to a
+    /// sink is one buffer, so filling the queue takes one write per message.
     fn stalled_sink() -> StalledSink {
         let (events, receiver) = conn::event_channel();
         let (release, gate) = mpsc::channel();
@@ -3257,8 +3273,17 @@ mod tests {
         };
         let (sink, handle) =
             conn::spawn_sink(writer, SESSION_CHANNEL, WhenBroken::Discard, events.clone());
-        for _ in 0..QUEUED {
-            sink.send(vec![1u8; 100]).unwrap();
+        for written in 1..=conn::EVENT_QUEUE {
+            assert!(sink.send(&[1u8; 100]));
+            release.send(()).unwrap();
+            let deadline = Instant::now() + LIMIT;
+            while seen.lock().unwrap().len() < written * 100 {
+                assert!(Instant::now() < deadline, "the consumer never wrote");
+                thread::yield_now();
+            }
+        }
+        for _ in conn::EVENT_QUEUE..QUEUED {
+            assert!(sink.send(&[1u8; 100]));
         }
         StalledSink {
             events,

@@ -5,7 +5,7 @@
 use super::credentials::{self, Credentials};
 use super::ipc::{self, SessionGrant, TransportState};
 use super::log;
-use crate::conn::{self, Conn, Credit, Event, EventSender, LocalWindow, WhenBroken};
+use crate::conn::{self, Conn, Credit, Event, EventSender, LocalWindow, Sink, WhenBroken};
 use crate::conn::{CHANNEL_MAX_PACKET, CHANNEL_WINDOW};
 use crate::error::{Error, Result};
 use crate::kex::{Kex, KexEnvironment, RandomSource, Role};
@@ -186,7 +186,7 @@ struct Channel {
     window: LocalWindow,
     max_packet: u32,
     /// Where inbound data goes: a child's stdin or a PTY master.
-    input: Option<Sender<Vec<u8>>>,
+    input: Option<Sink>,
     pty: Option<PtyRequest>,
     master: Option<File>,
     started: bool,
@@ -500,11 +500,9 @@ impl Channels {
                 if let Some(state) = self.open_mut(id) {
                     state.window.charge(data.len())?;
                     match &state.input {
-                        Some(input) => {
-                            let _ = input.send(data.to_vec());
-                        }
+                        Some(input) if input.send(data) => {}
                         // Nothing will ever read it: grant the window straight back.
-                        None => {
+                        _ => {
                             let bytes = u32::try_from(data.len()).unwrap_or(u32::MAX);
                             if let Some(grant) = state.window.consumed(bytes) {
                                 let mut message = Writer::message(msg::CHANNEL_WINDOW_ADJUST);
@@ -532,7 +530,7 @@ impl Channels {
             msg::CHANNEL_EOF => {
                 let id = reader.u32()?;
                 if let Some(state) = self.open_mut(id) {
-                    // Dropping the sender ends the sink, which closes the child's
+                    // Dropping the `Sink` ends it, which closes the child's
                     // stdin. A PTY has no such edge: its slave stays open.
                     state.input = None;
                 }

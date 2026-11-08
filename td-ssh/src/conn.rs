@@ -12,9 +12,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{
-    sync_channel, Receiver, RecvError, RecvTimeoutError, SendError, Sender, SyncSender,
-};
+use std::sync::mpsc::{sync_channel, Receiver, RecvError, RecvTimeoutError, SendError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -669,33 +667,124 @@ pub enum WhenBroken {
     Report,
 }
 
+/// The core's end of a sink: bytes it has charged to the channel's window, for
+/// the sink's thread to write. They are appended to one buffer, not queued one
+/// message at a time, so what waits is the window's bytes, held in at most twice
+/// that between the buffer and what the thread has taken: a peer sending empty or
+/// one-byte messages adds nothing a message of its own would cost. Dropping it is
+/// the end of the stream, once what it holds is written.
+pub struct Sink {
+    shared: Arc<SinkShared>,
+}
+
+struct SinkShared {
+    state: Mutex<SinkState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct SinkState {
+    pending: Vec<u8>,
+    /// The `Sink` was dropped: nothing more will come.
+    closed: bool,
+    /// The thread has ended, or never started, so nothing will write what came.
+    gone: bool,
+}
+
+impl Sink {
+    /// Hands bytes on. False when no write is coming for them and the caller has to
+    /// credit the window itself. Empty data is dropped here, being nothing to write.
+    pub fn send(&self, data: &[u8]) -> bool {
+        let Ok(mut state) = self.shared.state.lock() else {
+            return false;
+        };
+        if state.gone {
+            return false;
+        }
+        if !data.is_empty() {
+            state.pending.extend_from_slice(data);
+            self.shared.ready.notify_one();
+        }
+        true
+    }
+}
+
+impl Drop for Sink {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.closed = true;
+        }
+        self.shared.ready.notify_one();
+    }
+}
+
+/// Marks the sink gone however its thread ends, or if it never ran.
+struct SinkThread(Arc<SinkShared>);
+
+impl Drop for SinkThread {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.gone = true;
+            state.pending = Vec::new();
+        }
+    }
+}
+
+impl SinkThread {
+    /// Everything appended since the last call, or None at the end of the stream.
+    fn next(&self) -> Option<Vec<u8>> {
+        let mut state = self.0.state.lock().ok()?;
+        loop {
+            if !state.pending.is_empty() {
+                return Some(std::mem::take(&mut state.pending));
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.0.ready.wait(state).ok()?;
+        }
+    }
+}
+
 /// Drains a channel's inbound data to a local stream on its own thread, so a
 /// slow consumer never stalls the core. The window is only reopened as bytes
-/// actually land, which is what bounds the queue.
+/// actually land, which is what bounds what waits.
 pub fn spawn_sink<W: Write + Send + 'static>(
     mut output: W,
     channel: u32,
     when_broken: WhenBroken,
     events: EventSender,
-) -> (Sender<Vec<u8>>, Option<thread::JoinHandle<()>>) {
-    let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+) -> (Sink, Option<thread::JoinHandle<()>>) {
+    let shared = Arc::new(SinkShared {
+        state: Mutex::new(SinkState::default()),
+        ready: Condvar::new(),
+    });
+    let sink = Sink {
+        shared: shared.clone(),
+    };
     let starter = events.clone();
+    let worker = SinkThread(shared);
     let handle = start_thread(&starter, move || {
         let mut broken = false;
-        while let Ok(data) = receiver.recv() {
-            if !broken && (output.write_all(&data).is_err() || output.flush().is_err()) {
-                broken = true;
-                if when_broken == WhenBroken::Report {
-                    let _ = events.send(Event::SinkBroken { channel });
+        while let Some(data) = worker.next() {
+            // A packet's worth at a time, each credited as it lands, so a slow
+            // consumer reopens the window as it goes, as when each message was
+            // written on its own, and not only once all that waited is through.
+            for piece in data.chunks(CHANNEL_MAX_PACKET as usize) {
+                if !broken && (output.write_all(piece).is_err() || output.flush().is_err()) {
+                    broken = true;
+                    if when_broken == WhenBroken::Report {
+                        let _ = events.send(Event::SinkBroken { channel });
+                    }
                 }
-            }
-            let bytes = u32::try_from(data.len()).unwrap_or(u32::MAX);
-            if events.send(Event::Consumed { channel, bytes }).is_err() {
-                return;
+                let bytes = u32::try_from(piece.len()).unwrap_or(u32::MAX);
+                if events.send(Event::Consumed { channel, bytes }).is_err() {
+                    return;
+                }
             }
         }
     });
-    (sender, handle)
+    (sink, handle)
 }
 
 /// Consumed bytes that bring a grant. A slow link drains the window no faster than
@@ -1120,7 +1209,7 @@ mod tests {
         let (sink, handle) = spawn_sink(Gone, 5, WhenBroken::Report, events.clone());
         drop(events);
         for _ in 0..3 {
-            sink.send(vec![1; 100]).unwrap();
+            assert!(sink.send(&[1; 100]));
         }
         drop(sink);
         handle.unwrap().join().unwrap();
@@ -1128,23 +1217,22 @@ mod tests {
         while let Ok(event) = receiver.recv_timeout(Duration::from_millis(50)) {
             seen.push(event);
         }
-        assert_eq!(seen.len(), 4);
         assert!(matches!(seen[0], Event::SinkBroken { channel: 5 }));
-        for event in &seen[1..] {
-            assert!(matches!(
-                event,
-                Event::Consumed {
-                    channel: 5,
-                    bytes: 100
-                }
-            ));
-        }
+        let credits: Vec<u32> = seen[1..]
+            .iter()
+            .filter_map(|event| match event {
+                Event::Consumed { channel: 5, bytes } => Some(*bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(credits.len(), seen.len() - 1, "only credits follow");
+        assert_eq!(credits.iter().sum::<u32>(), 300);
 
         // The other kind keeps the window moving, as a child's stdin needs.
         let (events, receiver) = event_channel();
         let (sink, handle) = spawn_sink(Gone, 5, WhenBroken::Discard, events.clone());
         drop(events);
-        sink.send(vec![1; 100]).unwrap();
+        assert!(sink.send(&[1; 100]));
         drop(sink);
         handle.unwrap().join().unwrap();
         assert!(matches!(
@@ -1154,6 +1242,116 @@ mod tests {
                 bytes: 100
             })
         ));
+    }
+
+    /// A consumer that has stopped, a window spent on it, and then a flood of empty
+    /// and one-byte messages: what waits is the window's bytes, held in one buffer,
+    /// and the empty ones add nothing at all. Before, each was a queued message.
+    #[test]
+    fn a_flood_of_empty_or_tiny_data_holds_no_more_than_its_bytes() {
+        struct Blocked(Receiver<()>);
+        impl Write for Blocked {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (events, receiver) = event_channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let (sink, handle) = spawn_sink(Blocked(gate), 5, WhenBroken::Discard, events.clone());
+        assert!(sink.send(&[1; 100]));
+        // The thread has taken that and is blocked writing it.
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while !sink.shared.state.lock().unwrap().pending.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the sink never wrote");
+            thread::yield_now();
+        }
+        for _ in 0..1_000_000 {
+            assert!(sink.send(&[]));
+        }
+        let mut window = LocalWindow::default();
+        window.charge(100).unwrap();
+        for _ in 0..CHANNEL_WINDOW - 100 {
+            window.charge(1).unwrap();
+            assert!(sink.send(&[2]));
+        }
+        assert!(window.charge(1).is_err(), "the window is spent");
+        let state = sink.shared.state.lock().unwrap();
+        assert_eq!(state.pending.len(), (CHANNEL_WINDOW - 100) as usize);
+        assert!(state.pending.capacity() <= 2 * CHANNEL_WINDOW as usize);
+        drop(state);
+        drop(sink);
+        drop(events);
+        // One write for the first message and one for each packet of the rest.
+        for _ in 0..=CHANNEL_WINDOW / CHANNEL_MAX_PACKET {
+            release.send(()).unwrap();
+        }
+        handle.unwrap().join().unwrap();
+        let mut credited = 0;
+        while let Ok(Event::Consumed { bytes, .. }) =
+            receiver.recv_timeout(Duration::from_millis(50))
+        {
+            credited += bytes;
+        }
+        assert_eq!(credited, CHANNEL_WINDOW);
+    }
+
+    /// What waited is credited a packet at a time as it lands, not once all of it
+    /// is through, so a slow consumer keeps the window moving.
+    #[test]
+    fn a_large_wait_is_credited_as_each_packet_lands() {
+        struct Gated(Receiver<()>);
+        impl Write for Gated {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (events, receiver) = event_channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let (sink, handle) = spawn_sink(Gated(gate), 5, WhenBroken::Discard, events.clone());
+        let packet = CHANNEL_MAX_PACKET as usize;
+        assert!(sink.send(&vec![1; 4 * packet]));
+        release.send(()).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(PATIENCE),
+            Ok(Event::Consumed { channel: 5, bytes }) if bytes == CHANNEL_MAX_PACKET
+        ));
+        // Three packets are still to be written, so nothing more is credited yet.
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(sink);
+        drop(events);
+        for _ in 0..3 {
+            release.send(()).unwrap();
+        }
+        handle.unwrap().join().unwrap();
+        let mut credited = CHANNEL_MAX_PACKET;
+        while let Ok(Event::Consumed { bytes, .. }) =
+            receiver.recv_timeout(Duration::from_millis(50))
+        {
+            credited += bytes;
+        }
+        assert_eq!(credited, 4 * CHANNEL_MAX_PACKET);
+    }
+
+    /// A sink whose thread could not start, or has ended, says so, so the caller
+    /// credits the window rather than wait on a write that will not come.
+    #[test]
+    fn a_sink_with_no_thread_left_refuses_and_holds_nothing() {
+        let (events, receiver) = event_channel();
+        drop(receiver);
+        let (sink, handle) = spawn_sink(Vec::new(), 5, WhenBroken::Discard, events);
+        assert!(sink.send(&[1; 10]));
+        // Its Consumed cannot be delivered, so the thread ends.
+        handle.unwrap().join().unwrap();
+        assert!(!sink.send(&[1; 10]));
+        assert!(sink.shared.state.lock().unwrap().pending.is_empty());
     }
 
     /// A core blocked in a write is told by the socket, and its queue holds the rest.
