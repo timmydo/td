@@ -12,6 +12,15 @@ td-html, td-json, td-mime and td-nfc. They add no registry source or private bac
 manifests, locks and source staging are admitted alongside td-crypto and
 td-mta.
 
+td-tls-provider's lock holds Rustls 0.23.46 with no backend feature (custom
+provider, std, TLS 1.2) and local std-only td-primitives. Its selected graph
+is a subset of the crypto graph's packages under other features: once_cell,
+rustls, rustls-pki-types, rustls-webpki, subtle, untrusted and zeroize. ring
+and its build tools are locked through rustls-webpki's weak feature edge but
+never selected. Every locked package is also in the mail lock at the same
+version and checksum, so the common offline vendor serves it; a
+policy test holds that.
+
 Direct inputs are Rustls 0.23.46 (std, TLS 1.2, AWS-LC), aws-lc-rs 1.19.0
 (alloc, non-FIPS), and webpki-roots 1.0.11 (compiled Mozilla root data).
 Rustls owns TLS, webpki validates certificates, pki-types represents their

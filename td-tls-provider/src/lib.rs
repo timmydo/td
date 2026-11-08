@@ -1,20 +1,11 @@
 //! td-primitives behind rustls's `CryptoProvider`: everything rustls asks of a
 //! crypto library, with nothing chosen here that rustls could not already
 //! refuse. The engine stays rustls's, HKDF and the TLS 1.2 PRF included, which it
-//! derives from the HMAC below (td-primitives/DESIGN.md).
+//! derives from the HMAC below (td-primitives/DESIGN.md). td-tls-provider/DESIGN.md
+//! is the contract: what is here, and that each consumer builds its own policy.
 //!
 //! Record layouts follow rustls's own providers. Each wrong-shape case refuses:
 //! a key of the wrong length makes a cipher that seals and opens nothing.
-
-#![deny(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)]
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -51,7 +42,7 @@ use td_primitives::{chacha20_poly1305, ct, random, rsa, Refused};
 
 /// ChaCha20-Poly1305 leads: without AES instructions it is the faster and has
 /// no bitsliced key schedule to hold.
-pub(crate) fn provider() -> CryptoProvider {
+pub fn provider() -> CryptoProvider {
     CryptoProvider {
         cipher_suites: vec![
             TLS13_CHACHA20_POLY1305_SHA256,
@@ -72,7 +63,7 @@ pub(crate) fn provider() -> CryptoProvider {
 }
 
 /// The provider, shared: a process builds configurations from one.
-pub(crate) fn shared() -> Arc<CryptoProvider> {
+pub fn shared() -> Arc<CryptoProvider> {
     Arc::new(provider())
 }
 
@@ -921,8 +912,8 @@ impl SecureRandom for SystemEntropy {
     }
 }
 
-/// td-test-https's identities are the only keys td-net serves with, so nothing
-/// but a P-256 PKCS#8 loads.
+/// Only a P-256 PKCS#8 key, in the shape `p256_from_pkcs8` reads, loads, and
+/// it signs only ECDSA-P256-SHA256.
 #[derive(Debug)]
 struct P256Keys;
 
@@ -961,7 +952,7 @@ pub(crate) fn p256_from_pkcs8(pkcs8: &[u8]) -> Option<p256::SecretKey> {
 }
 
 /// The PKCS#8 `p256_from_pkcs8` reads.
-pub(crate) fn p256_to_pkcs8(secret: &[u8; p256::SECRET_LEN], public: &[u8]) -> Vec<u8> {
+pub fn p256_to_pkcs8(secret: &[u8; p256::SECRET_LEN], public: &[u8]) -> Vec<u8> {
     let mut der = Vec::with_capacity(P256_PKCS8_HEAD.len() + 32 + 5 + public.len());
     der.extend_from_slice(P256_PKCS8_HEAD);
     der.extend_from_slice(secret);
@@ -1034,6 +1025,17 @@ mod tests {
     const CA: &[u8] = include_bytes!("../tests/fixtures/account-ca/ca.pem");
     const CERT: &[u8] = include_bytes!("../tests/fixtures/account-ca/server.pem");
     const KEY: &[u8] = include_bytes!("../tests/fixtures/account-ca/server.key");
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn from_hex(text: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16))
+            .collect()
+    }
 
     fn narrowed(
         suite: SupportedCipherSuite,
@@ -1408,11 +1410,11 @@ mod tests {
                 .unwrap()
                 .encode();
             assert_eq!(
-                crate::sig::to_hex(&written),
+                to_hex(&written),
                 *wire,
                 "{family} at {seq}: the nonce, the AAD or the layout moved"
             );
-            let wire = crate::sig::from_hex(wire).unwrap();
+            let wire = from_hex(wire).unwrap();
             let mut body = wire[5..].to_vec();
             let mut again = body.clone();
             let opened = open.decrypt(inbound(&mut body), *seq).unwrap();
@@ -1441,7 +1443,7 @@ mod tests {
                     .encrypt(outbound(b"hello", version), *seq)
                     .unwrap()
                     .encode();
-                assert_eq!(crate::sig::to_hex(&written), *wire, "RSA {family}");
+                assert_eq!(to_hex(&written), *wire, "RSA {family}");
             }
         }
     }
@@ -1476,7 +1478,7 @@ mod tests {
     #[test]
     fn each_group_agrees_on_the_secret_its_rfc_gives() {
         fn bytes(text: &str) -> Vec<u8> {
-            crate::sig::from_hex(text).unwrap()
+            from_hex(text).unwrap()
         }
 
         let secret: [u8; 32] =
@@ -1488,7 +1490,7 @@ mod tests {
             secret,
         });
         assert_eq!(
-            crate::sig::to_hex(exchange.pub_key()),
+            to_hex(exchange.pub_key()),
             "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
         );
         let shared = exchange
@@ -1497,7 +1499,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            crate::sig::to_hex(shared.secret_bytes()),
+            to_hex(shared.secret_bytes()),
             "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
         );
 
@@ -1511,7 +1513,7 @@ mod tests {
             secret,
         });
         assert_eq!(
-            crate::sig::to_hex(exchange.pub_key()),
+            to_hex(exchange.pub_key()),
             "04dad0b65394221cf9b051e1feca5787d098dfe637fc90b9ef945d0c3772581180\
              5271a0461cdb8252d61f1c456fa3e59ab1f45b33accf5f58389e0577b8990bb3"
         );
@@ -1522,7 +1524,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            crate::sig::to_hex(shared.secret_bytes()),
+            to_hex(shared.secret_bytes()),
             "d6840f6b42f6edafd13116e0e12565202fef8e9ece7dce03812464d04b9442de"
         );
 
@@ -1538,7 +1540,7 @@ mod tests {
             secret,
         });
         assert_eq!(
-            crate::sig::to_hex(exchange.pub_key()),
+            to_hex(exchange.pub_key()),
             "04667842d7d180ac2cde6f74f37551f55755c7645c20ef73e31634fe72b4c55ee6\
              de3ac808acb4bdb4c88732aee95f41aa\
              9482ed1fc0eeb9cafc4984625ccfc23f65032149e0e144ada024181535a0f38e\
@@ -1553,7 +1555,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            crate::sig::to_hex(shared.secret_bytes()),
+            to_hex(shared.secret_bytes()),
             "11187331c279962d93d604243fd592cb9d0a926f422e47187521287e7156c5c4\
              d603135569b9e9d09cf5d4a270f59746"
         );
@@ -1679,7 +1681,7 @@ mod tests {
                     } else {
                         HKDF_SHA256
                     };
-                    assert_eq!(crate::sig::to_hex(block.as_ref()), answer, "{name:?}");
+                    assert_eq!(to_hex(block.as_ref()), answer, "{name:?}");
                 }
                 SupportedCipherSuite::Tls12(suite) => {
                     assert_eq!(suite.common.hash_provider.algorithm(), *hash, "{name:?}");
@@ -1705,7 +1707,7 @@ mod tests {
                     } else {
                         PRF_SHA256
                     };
-                    assert_eq!(crate::sig::to_hex(&output), answer, "{name:?}");
+                    assert_eq!(to_hex(&output), answer, "{name:?}");
                 }
             }
         }
@@ -1733,7 +1735,7 @@ mod tests {
             let [name, public, message, signature] = fields[..] else {
                 panic!("malformed row: {line}");
             };
-            let unhex = |text| crate::sig::from_hex(text).unwrap();
+            let unhex = |text| from_hex(text).unwrap();
             let (public, message, signature) = (unhex(public), unhex(message), unhex(signature));
             for verifier in all {
                 let verifier_name = format!("{verifier:?}");
@@ -1996,7 +1998,7 @@ mod tests {
         let joined = key.sign(&[b"The quick brown fox ", b"jumps over the lazy dog"]);
         // RFC-independent: Python's hmac module.
         assert_eq!(
-            crate::sig::to_hex(joined.as_ref()),
+            to_hex(joined.as_ref()),
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
         );
         let mut running = HASH_SHA256.start();
@@ -2004,12 +2006,12 @@ mod tests {
         let forked = running.fork_finish();
         running.update(b"bc");
         assert_eq!(
-            crate::sig::to_hex(running.finish().as_ref()),
-            crate::sig::to_hex(HASH_SHA256.hash(b"abc").as_ref())
+            to_hex(running.finish().as_ref()),
+            to_hex(HASH_SHA256.hash(b"abc").as_ref())
         );
         assert_eq!(
-            crate::sig::to_hex(forked.as_ref()),
-            crate::sig::to_hex(HASH_SHA256.hash(b"a").as_ref())
+            to_hex(forked.as_ref()),
+            to_hex(HASH_SHA256.hash(b"a").as_ref())
         );
     }
 }

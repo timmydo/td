@@ -1,4 +1,5 @@
-//! Named dependency admission for the mail cryptography boundary.
+//! Named dependency admission for the crypto boundary: the mail crates and
+//! td-tls-provider, the shared rustls provider.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -14,6 +15,8 @@ pub(crate) const LOCAL_SOURCES: &[&str] = &[
     "td-mime",
     "td-mta",
     "td-nfc",
+    "td-primitives",
+    "td-tls-provider",
 ];
 
 pub(crate) const DEPENDENCIES: &[&str] = &[
@@ -23,7 +26,7 @@ pub(crate) const DEPENDENCIES: &[&str] = &[
 ];
 
 pub(crate) fn admitted(name: &str) -> bool {
-    matches!(name, "td-crypto" | "td-mta")
+    matches!(name, "td-crypto" | "td-mta" | "td-tls-provider")
 }
 
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
@@ -37,6 +40,8 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
         "td-json" => "2793cd9cd8ffc7bac436069324b42b503f7f3114418fc95f558fb0831060e8b3",
         "td-nfc" => "39d752d381e239345e4ba213ea2ce2fb4efb723a4ea9f16f1d8aa1f1173359cf",
         "td-mime" => "3f14e32d7ee4f4b11e57845153df490fc4d0480f282477ecebf2349d5347b1d4",
+        "td-primitives" => "056b2c47072b8e101730f86e33fbe79a00917aaa91a12aa17a7a801070bd4b85",
+        "td-tls-provider" => "b6c4742d6c92c053f6d1595dbb29ff11a8396775e23e30e0317bb6ee72f10298",
         _ => {
             return Err(format!(
                 "{name} has no external crypto dependency admission"
@@ -57,6 +62,8 @@ pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
         "td-json" => "679f89cdafa0f8457884ba0d0f0c197814d2b13e4f6ece4557575c9bdfe3848c",
         "td-nfc" => "6b447fb42d5b4e2aa2a02da0817647db6f178d445f8dc3861c7c9a011cce4695",
         "td-mime" => "72893a76d9ecfaad70a4bcf8447386fa5a0d2127ec5c4c770c9ac14438c0a7ed",
+        "td-primitives" => "388616b0ea8bc440730c90424f57a66dd8921b6c6b08ab2518d51d6da561fd13",
+        "td-tls-provider" => "46e710a0aaab04b17090c56ce3c7dcb46de35c18b4016ef2091f9969328cb389",
         _ => {
             return Err(format!(
                 "{name} has no external crypto dependency admission"
@@ -220,12 +227,24 @@ unicode-properties v0.1.5|default,emoji,general-category
 whoami v2.1.3|default,std,wasi-wasite,wasm-web
 ";
 
-/// Vendored directory names (`name-version`) of the packages the mail graph
-/// compiles. Locked-only packages contribute no code to an artifact.
+/// td-tls-provider's selected graph: rustls with no built-in backend, its
+/// cryptography all td-primitives, which is std only.
+const TLS_PROVIDER_ACTIVE: &str = "once_cell v1.21.4|alloc,race,std
+rustls v0.23.46|custom-provider,std,tls12
+rustls-pki-types v1.15.1|alloc,default,std
+rustls-webpki v0.103.16|alloc,std
+subtle v2.6.1|
+untrusted v0.9.0|
+zeroize v1.9.1|alloc,default
+";
+
+/// Vendored directory names (`name-version`) of the packages the admitted
+/// graphs compile. Locked-only packages contribute no code to an artifact.
 pub(crate) fn active_vendor_dirs() -> BTreeSet<String> {
     ACTIVE
         .lines()
         .chain(POSTGRES_ACTIVE.lines())
+        .chain(TLS_PROVIDER_ACTIVE.lines())
         .filter_map(|line| {
             let (name, rest) = line.split_once(" v")?;
             let version = rest.split(['|', ' ']).next()?;
@@ -240,8 +259,17 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
             "{name} has no external crypto dependency admission"
         ));
     }
-    let mut expected: BTreeSet<String> = ACTIVE.lines().map(str::to_owned).collect();
-    let mut local = vec!["td-crypto"];
+    let (mut expected, mut local): (BTreeSet<String>, _) = if name == "td-tls-provider" {
+        (
+            TLS_PROVIDER_ACTIVE.lines().map(str::to_owned).collect(),
+            vec!["td-primitives", "td-tls-provider"],
+        )
+    } else {
+        (
+            ACTIVE.lines().map(str::to_owned).collect(),
+            vec!["td-crypto"],
+        )
+    };
     if name == "td-mta" {
         expected.extend(POSTGRES_ACTIVE.lines().map(str::to_owned));
         local.extend([
@@ -277,6 +305,12 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
 pub(crate) const POSTGRES_DEPENDENCIES: &[&str] = &[
     "tokio-postgres = { version = \"=0.7.18\", default-features = false }",
     "tokio = { version = \"=1.54.1\", default-features = false, features = [\"io-util\"] }",
+];
+
+/// td-tls-provider's one external line: rustls's engine and nothing else, its
+/// built-in backends off.
+pub(crate) const TLS_PROVIDER_DEPENDENCIES: &[&str] = &[
+    "rustls = { version = \"=0.23.46\", default-features = false, features = [\"custom-provider\", \"std\", \"tls12\"] }",
 ];
 
 #[cfg(test)]
@@ -401,6 +435,7 @@ mod tests {
             "td-json",
             "td-mime",
             "td-nfc",
+            "td-primitives",
         ] {
             if !root.join(name).join("Cargo.toml").exists() {
                 continue;
@@ -452,15 +487,44 @@ mod tests {
             assert!(manifest_pin("td-other", &manifest).is_err());
             assert!(lock_pin("td-other", &lock).is_err());
         }
+        let manifest = std::fs::read_to_string(root.join("td-tls-provider/Cargo.toml")).unwrap();
+        let lock = std::fs::read_to_string(root.join("td-tls-provider/Cargo.lock")).unwrap();
+        assert!(manifest_pin("td-tls-provider", &manifest).is_ok());
+        assert!(lock_pin("td-tls-provider", &lock).is_ok());
+        for line in TLS_PROVIDER_DEPENDENCIES {
+            assert!(manifest.lines().any(|candidate| candidate == *line));
+        }
+        // The hash pins are what refuse these: any byte changed reds, a
+        // backend feature or extra dependency among them.
+        for bad in [
+            format!("{manifest}\n[build-dependencies]\ncc = \"1\"\n"),
+            manifest.replace("\"custom-provider\", ", ""),
+            manifest.replace("\"tls12\"]", "\"tls12\", \"ring\"]"),
+            manifest.replace("[dependencies]", "[dependencies]\nlog = \"0.4\""),
+        ] {
+            assert!(manifest_pin("td-tls-provider", &bad).is_err());
+        }
+        for bad in [
+            lock.replace("version = \"0.23.46\"", "version = \"0.23.45\""),
+            lock.replace("checksum = \"", "checksum = \"0"),
+            format!("{lock}\n[[package]]\nname = \"unapproved\"\nversion = \"1.0.0\"\n"),
+        ] {
+            assert!(lock_pin("td-tls-provider", &bad).is_err());
+        }
     }
 
     #[test]
     fn active_vendor_dirs_name_every_active_package_and_no_locked_only_one() {
         let dirs = active_vendor_dirs();
-        assert_eq!(
-            dirs.len(),
-            ACTIVE.lines().count() + POSTGRES_ACTIVE.lines().count()
-        );
+        // The graphs share packages: td-tls-provider's rustls closure is the
+        // crypto graph's under other features.
+        let packages: BTreeSet<&str> = ACTIVE
+            .lines()
+            .chain(POSTGRES_ACTIVE.lines())
+            .chain(TLS_PROVIDER_ACTIVE.lines())
+            .filter_map(|line| line.split_once('|').map(|(package, _)| package))
+            .collect();
+        assert_eq!(dirs.len(), packages.len());
         assert!(dirs.contains("aws-lc-rs-1.19.0"));
         assert!(dirs.contains("async-trait-0.1.92"));
         assert!(dirs.contains("whoami-2.1.3"));
@@ -480,6 +544,48 @@ mod tests {
         }
         let missing: Vec<_> = dirs.difference(&locked).collect();
         assert!(missing.is_empty(), "not in td-mta/Cargo.lock: {missing:?}");
+    }
+
+    /// Every registry package (name, version, checksum) of a lock.
+    fn registry_packages(lock: &str) -> BTreeSet<(String, String, String)> {
+        lock.split("[[package]]")
+            .filter_map(|entry| {
+                let field = |key: &str| {
+                    entry.lines().find_map(|line| {
+                        line.strip_prefix(key)
+                            .map(|value| value.trim_matches('"').to_string())
+                    })
+                };
+                Some((
+                    field("name = ")?,
+                    field("version = ")?,
+                    field("checksum = ")?,
+                ))
+            })
+            .collect()
+    }
+
+    /// The wrapper builds td-tls-provider from the common offline vendor,
+    /// which is td-mta's lock extracted: a package the provider's lock
+    /// holds and the mail lock does not would red only in the leg.
+    #[test]
+    fn tls_provider_lock_is_served_by_the_mail_vendor() {
+        let root = root();
+        let Ok(provider) = std::fs::read_to_string(root.join("td-tls-provider/Cargo.lock")) else {
+            eprintln!("SKIP: builder-only source tree has no td-tls-provider lock");
+            return;
+        };
+        let mail = std::fs::read_to_string(root.join("td-mta/Cargo.lock")).unwrap();
+        let provider = registry_packages(&provider);
+        let mail = registry_packages(&mail);
+        assert!(provider.iter().any(|(name, ..)| name == "rustls"));
+        let missing: Vec<_> = provider.difference(&mail).collect();
+        assert!(missing.is_empty(), "not in td-mta/Cargo.lock: {missing:?}");
+        let mut drifted = provider.clone();
+        if let Some((name, version, checksum)) = drifted.pop_first() {
+            drifted.insert((name, version, format!("0{checksum}")));
+        }
+        assert!(!drifted.is_subset(&mail));
     }
 
     #[test]
@@ -595,5 +701,37 @@ mod tests {
             assert!(active_graph(&root, "td-mta", &bad).is_err());
         }
         assert!(active_graph(&root, "td-mta", &graph).is_err());
+
+        let provider = root.join("td-tls-provider").canonicalize().unwrap();
+        let primitives = root.join("td-primitives").canonicalize().unwrap();
+        let tls = format!(
+            "{TLS_PROVIDER_ACTIVE}td-tls-provider v0.1.0 ({})|\ntd-primitives v0.1.0 ({})|\n",
+            provider.display(),
+            primitives.display()
+        );
+        assert!(active_graph(&root, "td-tls-provider", &tls).is_ok());
+        assert!(active_graph(&root, "td-crypto", &tls).is_err());
+        assert!(active_graph(&root, "td-tls-provider", &graph).is_err());
+        for bad in [
+            format!("{tls}ring v0.17.14|alloc\n"),
+            format!("{tls}aws-lc-rs v1.19.0|alloc,aws-lc-sys,non-fips,prebuilt-nasm\n"),
+            format!("{tls}log v0.4.35|\n"),
+            tls.replace(
+                "rustls v0.23.46|custom-provider,std,tls12",
+                "rustls v0.23.46|custom-provider,logging,std,tls12",
+            ),
+            tls.replace(
+                "rustls-webpki v0.103.16|alloc,std",
+                "rustls-webpki v0.103.16|alloc,ring,std",
+            ),
+            tls.replace(
+                &format!("td-primitives v0.1.0 ({})|\n", primitives.display()),
+                "",
+            ),
+            tls.replace(&primitives.display().to_string(), "/wrong/primitives"),
+            format!("{tls}td-crypto v0.1.0 ({})|\n", crypto.display()),
+        ] {
+            assert!(active_graph(&root, "td-tls-provider", &bad).is_err());
+        }
     }
 }

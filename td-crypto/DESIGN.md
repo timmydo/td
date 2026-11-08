@@ -71,10 +71,14 @@ checkout's root `.cargo/config.toml` is required. Ancestor
 `.cargo/config.toml` files are accepted only when each matches that same
 compiled pin, allowing nested worktrees to use their own runner. Legacy
 `.cargo/config` files remain refused at every level. Automatic build.rs
-files are refused for all nine local source packages: td-civil,
-td-crypto, td-fs, td-header, td-html, td-json, td-mime, td-nfc and td-mta. Their exact manifests and locks are
-pinned; td-civil, td-fs, td-header, td-html, td-json, td-mime and td-nfc remain std-only roster
-crates. The Cargo config pin contains only target runner settings, for
+files are refused for all eleven local source packages: td-civil,
+td-crypto, td-fs, td-header, td-html, td-json, td-mime, td-nfc, td-mta,
+td-primitives and td-tls-provider. Their exact manifests and locks are
+pinned; td-civil, td-fs, td-header, td-html, td-json, td-mime, td-nfc and
+td-primitives remain std-only roster crates. td-primitives' dev-dependency
+td-source-scan is compiled into no admitted graph and is not pinned.
+td-tls-provider (its DESIGN.md) is admitted with its own pinned Rustls line
+and active graph, which select no backend. The Cargo config pin contains only target runner settings, for
 which Cargo selects the deepest definition. Any future pin change must
 recheck ancestor merging and relative path behavior; identical files with
 other settings need not have identical effective behavior. A nested
@@ -91,7 +95,7 @@ entering its networkless sandbox, respecting disabled gates. Preparation there
 is best-effort: a provisioned Cargo gate enforces presence, while a missing
 toolchain retains the existing Unprovisioned result. The host preflight fails
 if its required source preparation cannot complete. Both command lists use `td-builder gate-crates crypto-cargo` for
-these two crates. This wrapper verifies private archive copies, reconstructs
+td-crypto, td-mta and td-tls-provider. This wrapper verifies private archive copies, reconstructs
 and rehashes extracted sources before cache reuse, uses a fresh Cargo home,
 forces offline/frozen source replacement, and checks Cargo's selected graph.
 A missing, stale or tampered vendor fails; Cargo never fetches a substitute.
@@ -1083,8 +1087,10 @@ static ELF architecture
 and API confinement but reports runtime untested; successful compilation
 is not x86-64 runtime or resource qualification.
 Reuse compatible reviewed pins without inheriting td-net's dependency set.
-Rustls and aws-lc-rs are direct dependencies only of td-crypto, resolving one
-AWS-LC version pair for bulk digests, entropy, comparison, P-256 signing and TLS.
+aws-lc-rs is a direct dependency only of td-crypto, resolving one AWS-LC
+version pair for bulk digests, entropy, comparison, P-256 signing and TLS.
+Rustls is a direct dependency of td-crypto and of td-tls-provider, at the
+same pinned version.
 The owned SHA-256 implementation serves allocation-free streaming digests.
 Disable unused
 features and all undeclared build fallbacks.
@@ -1167,8 +1173,12 @@ were audited/exercised. Do not claim arbitrary provider panic/OOM survival.
 
 Future td-owned primitives replace the private backend behind this same facade;
 their implementation lives in `td-primitives` (AGENTS.md principle 2), and they
-do not introduce another public mail dependency. The Rustls provider bridge
-also stays private here. Replacing AWS-LC still retains the Rustls TLS engine;
+do not introduce another public mail dependency. The Rustls provider bridge is
+the shared `td-tls-provider` crate, td-net's provider and admitted by the same
+policy, since code two crates need lives in one crate (principle 2). td-crypto
+does not use it yet; when it does, it assembles this document's and TLS.md's
+policy from it inside private fields and never re-exports it, so the bridge
+stays private to the facade. Replacing AWS-LC still retains the Rustls TLS engine;
 it does not make the entire crate std-only. This crate owns the inventory of
 existing engine SHA/Ed25519 and td-fido P-256 implementations and their audit
 evidence before reusing any code. Reuse confers no unproven side-channel claim

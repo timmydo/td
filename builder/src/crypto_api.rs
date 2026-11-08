@@ -922,7 +922,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("repository");
-        for name in ["td-crypto", "td-mta"] {
+        for name in ["td-crypto", "td-mta", "td-tls-provider"] {
             let original =
                 fs::read_to_string(root.join(name).join("Cargo.toml")).expect("manifest");
             crate::crypto_policy::manifest_pin(name, &original).expect("admitted manifest");

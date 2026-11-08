@@ -296,8 +296,8 @@ The ordinary Cargo preflight still qualifies the host build; it does not
 silently claim to have run this separately provisioned portable command.
 
 The driver stages manifests, locks, `src/` and optional `tests/` for
-td-civil, td-crypto, td-header, td-html, td-json, td-mime, td-nfc and
-td-mta, plus the three test-only
+every pinned local source package (DESIGN.md names the eleven), plus the
+three test-only
 oracle files listed below. It refuses symlinks and special files. It
 rechecks staged manifest/lock pins, reconstructs the verified vendor tree,
 and mounts these inputs read-only. It uses the existing

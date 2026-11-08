@@ -544,7 +544,7 @@ mod tests {
     // the MPI on the wire has dropped the leading zero.
     #[test]
     fn a_signature_whose_mpi_lost_a_leading_zero_verifies() {
-        let answers = include_str!("../tests/signature_answers.txt");
+        let answers = include_str!("../../td-tls-provider/tests/signature_answers.txt");
         let row = answers
             .lines()
             .find(|line| line.starts_with("PGP_SHORT_MPI "))

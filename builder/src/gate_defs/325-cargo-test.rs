@@ -39,10 +39,10 @@
 //! reds here; that it is a reviewed change is enforced by review, and by
 //! `the_workspace_lock_count_follows_the_members_list`. The `source = ` half
 //! went the other way: the old script applied it to the root lock alone, and
-//! it now runs over every lock in the roster. Every
-//! roster crate, except the named td-crypto/td-mta admission, keeps a lock
-//! listing only itself and the sibling roster
-//! crates its manifest depends on by path, checked over the derived list by
+//! it now runs over every lock in the roster. Every roster crate, except the
+//! named td-crypto/td-mta/td-tls-provider admission, keeps a lock listing only
+//! itself and the sibling roster crates its manifest depends on by path,
+//! checked over the derived list by
 //! `gate-crates locks`. Most are TARGET-built programs — the
 //! shipped userland, from the boot shim and installer up to the compositor and
 //! session broker; `td-builder gate-crates names` prints the current set, and
@@ -90,9 +90,9 @@
 //! clippy-driver, the cargo bin dir carries cargo, and the cc bin dir (gcc-toolchain, rust's
 //! default linker driver) is prepended to PATH — all resolved guix-free by `provision-{rust,cc}`
 //! (a PROVIDED TD_RUST_HOME/TD_CC_HOME, or rustup/system cc). `cargo clippy/test --frozen`
-//! (= --locked --offline) touches no network. td-crypto and td-mta use the
-//! shared crypto-cargo wrapper with checksum-verified sources prepared before
-//! entering the sandbox; no Cargo registry fetch is available here.
+//! (= --locked --offline) touches no network. td-crypto, td-mta and td-tls-provider
+//! use the shared crypto-cargo wrapper with checksum-verified sources prepared
+//! before entering the sandbox; no Cargo registry fetch is available here.
 //! Scratch CARGO_HOME/CARGO_TARGET_DIR live in .cargo-test-scratch/ at the repo ROOT — OUTSIDE
 //! the crate dirs, so they cannot perturb the td-builder/td-recipe package source hashes.
 //! Each command's status is checked before the next runs, so copying its output into the log

@@ -55,11 +55,12 @@ compressed points anywhere but `uncompressed`, P-384 signing, P-521 signing and
 exchange, and any other curve are absent on purpose. Private `bignum` and `der`
 serve the modules above and are not an API. td-net is the consumer the TLS
 algorithms exist for, in place of `ring`:
-`net/src/tls_crypto.rs` puts them behind rustls's `CryptoProvider`, whose suites are
+`td-tls-provider` puts them behind rustls's `CryptoProvider`, whose suites are
 ChaCha20-Poly1305 and AES-GCM in TLS 1.3 and with ECDHE in TLS 1.2, over X25519, P-256
 and P-384. td-ssh, the SSH client and server, adds the consumer rows above, and takes
-SHA-2, HMAC, X25519, Ed25519 and `ct` as they stand. Key-file formats, td-subst's and
-td-test-https's PKCS#8 and td-ssh's `openssh-key-v1`, belong to those consumers.
+SHA-2, HMAC, X25519, Ed25519 and `ct` as they stand. Key-file formats belong to their
+consumers: td-subst's Ed25519 PKCS#8, td-tls-provider's P-256 PKCS#8, which td-net's
+td-test-https writes through it, and td-ssh's `openssh-key-v1`.
 
 `random` is the one place the crate reads a file. What td-ssh needs random bytes for
 takes them as arguments, as `mlkem768`'s functions do, because its worker runs in a
@@ -354,10 +355,13 @@ that run is a record in the landing commit, not a test to repeat.
 
 ## Relation to other crates
 
+- `td-tls-provider` is the rustls `CryptoProvider` over this crate, td-net's
+  today. It is crypto-admitted for its rustls dependency; this crate stays std
+  only, and its manifest and lock are pinned with that admission.
 - `td-crypto` is a separate private Rustls/AWS-LC closure for mail serving. It
   does not use this crate yet: td-mta/IMPLEMENTATION.md F04 moves it here
-  behind a private provider bridge in td-crypto, and P-521 and `uncompressed`
-  are here for the policy that bridge must keep.
+  through `td-tls-provider`, kept private behind td-crypto's facade, and P-521
+  and `uncompressed` are here for the policy that td-crypto must keep.
 - `td-fido` keeps its own AES, P-256 and HMAC-SHA256 for the disk and login
   path, `td-netd` its SHA-1, and the engine its SHA-256. Moving them here is
   possible now that this crate exists, and is a separate change because each

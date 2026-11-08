@@ -170,7 +170,7 @@ impl Key {
         let public = secret
             .public_key()
             .map_err(|_| "derive a P-256 public key".to_string())?;
-        let pkcs8 = crate::tls_crypto::p256_to_pkcs8(&bytes, &public);
+        let pkcs8 = td_tls_provider::p256_to_pkcs8(&bytes, &public);
         td_primitives::ct::zero(&mut bytes);
         Ok(Self {
             pkcs8,
@@ -515,7 +515,7 @@ fn parse_serve(args: &[String]) -> Result<Serve, String> {
         return Err(format!("{cert} holds no certificate"));
     }
     let key = PrivateKeyDer::from_pem_slice(&read_pem(key)?).map_err(|e| format!("{key}: {e}"))?;
-    let config = ServerConfig::builder_with_provider(crate::tls_crypto::shared())
+    let config = ServerConfig::builder_with_provider(td_tls_provider::shared())
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("server versions: {e}"))?
         .with_no_client_auth()
@@ -1147,7 +1147,7 @@ fn parse_probe(args: &[String]) -> Result<Probe, String> {
     if roots.is_empty() {
         return Err(format!("{ca} holds no certificate"));
     }
-    let config = ClientConfig::builder_with_provider(crate::tls_crypto::shared())
+    let config = ClientConfig::builder_with_provider(td_tls_provider::shared())
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("client versions: {e}"))?
         .with_root_certificates(roots)

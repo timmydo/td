@@ -2907,8 +2907,12 @@ Mail code and its direct dependency do not change with backend selection.
    with pinned/approved known-answer, adversarial and differential inputs.
    Require independent cryptographic and exact-artifact side-channel review,
    repeated when compiler/flags/target change. Tests alone are insufficient.
-3. Implement its private Rustls CryptoProvider bridge as well as the direct
-   operations, except the separately qualified direct SHA-256 cutover. Other
+3. Take its Rustls CryptoProvider from `td-tls-provider`, the provider td-net
+   also uses, so that both consumers share one implementation (the
+   repository user's decision, under AGENTS.md principle 2), extending it
+   with what TLS.md's policy needs and keeping it private behind the facade,
+   and implement the direct operations, except the separately qualified
+   direct SHA-256 cutover. Other
    candidate paths stay test-only until cutover; there is no public
    feature/configuration selector or new mail dependency. The reviewed test
    closure may contain both implementations for qualification.

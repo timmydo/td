@@ -344,19 +344,25 @@ waiver, so that commit has to touch a document.
   editing `net/Cargo.toml` and adapting the code. The host preparation
   warms the vendored closure from the committed lock, and `net-test` runs
   td-net's suite.
-- td-crypto and td-mta pin their direct dependencies exactly (`=1.19.0`)
-  in their manifests and in `crypto_policy::DEPENDENCIES` (td-crypto's)
-  and `POSTGRES_DEPENDENCIES` (td-mta's), so `cargo update` alone moves
-  only what those exact pins leave free. Edit each manifest and its list
-  together, then update the lock. After that,
+- td-crypto, td-mta and td-tls-provider pin their direct dependencies
+  exactly (`=1.19.0`) in their manifests and in
+  `crypto_policy::DEPENDENCIES` (td-crypto's), `POSTGRES_DEPENDENCIES`
+  (td-mta's) and `TLS_PROVIDER_DEPENDENCIES` (td-tls-provider's), so
+  `cargo update` alone moves only what those exact pins leave free. Edit
+  each manifest and its list together, then update the lock. td-net's
+  caret `rustls` line in `net/Cargo.toml` unifies with td-tls-provider's
+  exact one into a single rustls in `net/Cargo.lock`, so bump the two
+  alongside and update td-net's lock with them. After that,
   update what `builder/src/crypto_policy.rs` pins: the manifest and lock
-  digests, and the active-graph strings (`ACTIVE`, `POSTGRES_ACTIVE`).
+  digests, and the active-graph strings (`ACTIVE`, `POSTGRES_ACTIVE`,
+  `TLS_PROVIDER_ACTIVE`).
   Also update the inventory tables in `td-crypto/DEPENDENCIES.md`. A
   tokio-postgres bump also amends the normative documents that name its
   version: `AGENTS.md`, `td-crypto/DESIGN.md`, `td-mta/DESIGN.md`,
   `td-mta/POSTGRES.md` and `UNSAFE.md`. Check each crate with
   `td-builder gate-crates crypto-cargo test --manifest-path
-  td-crypto/Cargo.toml` (and `td-mta/Cargo.toml`). `td-crypto/DESIGN.md`
+  td-crypto/Cargo.toml` (and `td-mta/Cargo.toml`,
+  `td-tls-provider/Cargo.toml`). `td-crypto/DESIGN.md`
   owns the admission rules.
 
 # When a check goes red

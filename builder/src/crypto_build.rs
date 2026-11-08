@@ -101,6 +101,7 @@ fn run_inner(root: &Path, action: &str, manifest: &str) -> Result<Option<Release
     let name = match manifest {
         "td-crypto/Cargo.toml" => "td-crypto",
         "td-mta/Cargo.toml" => "td-mta",
+        "td-tls-provider/Cargo.toml" => "td-tls-provider",
         _ => return Err("manifest has no crypto admission".into()),
     };
     if action == "perf" && name != "td-mta" {
@@ -490,6 +491,18 @@ mod tests {
                 .err()
                 .as_deref(),
             Some("crypto-cargo perf measures only td-mta")
+        );
+        assert_eq!(
+            run_inner(root, "perf", "td-tls-provider/Cargo.toml")
+                .err()
+                .as_deref(),
+            Some("crypto-cargo perf measures only td-mta")
+        );
+        assert_eq!(
+            run_inner(root, "test", "td-primitives/Cargo.toml")
+                .err()
+                .as_deref(),
+            Some("manifest has no crypto admission")
         );
         assert_eq!(
             run_inner(root, "bench", "td-mta/Cargo.toml")

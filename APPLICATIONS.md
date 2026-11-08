@@ -10845,7 +10845,7 @@ webpki-roots, and no decoder. So:
    what is left of the exchange's deadline, on a reused connection as on
    a new one, so the deadline needs no wrapper. Public roots are ureq's
    webpki-roots configuration, from the package td-net pins exactly,
-   over rustls with td's own provider, `net/src/tls_crypto.rs`, and TLS
+   over rustls with td's own provider, `td-tls-provider`, and TLS
    1.2/1.3; each agent builds
    its rustls configuration once, so session resumption is scoped to one
    agent. Custom roots replace public roots, each first held to rustls's

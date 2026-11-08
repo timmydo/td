@@ -60,7 +60,6 @@ mod test_https;
 #[cfg(test)]
 #[path = "../../td-fs/src/temp_dir.rs"]
 mod test_temp;
-mod tls_crypto;
 
 // The rule for reading a file that must be a real, bounded regular file:
 // td-fs's, shared rather than mirrored.
@@ -76,7 +75,7 @@ fn main() {
     // Every ureq agent that names no TLS configuration, http.rs's among them,
     // takes the process default, and with no built-in provider panics without
     // one. This is before any applet, so no path can reach TLS without it.
-    let _ = tls_crypto::provider().install_default();
+    let _ = td_tls_provider::provider().install_default();
     let Ok(args) = std::env::args_os()
         .map(std::ffi::OsString::into_string)
         .collect::<Result<Vec<String>, _>>()

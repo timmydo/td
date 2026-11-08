@@ -1,9 +1,10 @@
-"""Signatures td-net's tests check against, made here by textbook big-integer
-arithmetic, so that its tables meet answers they did not compute.
+"""Signatures td-tls-provider's and td-net's tests check against, made here by
+textbook big-integer arithmetic, so that their tables meet answers they did not
+compute.
 
     python3 -I signature_answers.py > signature_answers.txt
 
-One row for each distinct check in net/src/tls_crypto.rs, as `VERIFIER public-key
+One row for each distinct check in td-tls-provider/src/lib.rs, as `VERIFIER public-key
 message signature` in hex, the key as a TLS peer presents it: an EC point, a raw
 Ed25519 key or a DER RSAPublicKey.
 

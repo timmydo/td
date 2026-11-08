@@ -1076,7 +1076,7 @@ fn perform_with_pool(
 pub(crate) fn tls(roots: ureq::tls::RootCerts) -> ureq::tls::TlsConfig {
     ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::Rustls)
-        .unversioned_rustls_crypto_provider(crate::tls_crypto::shared())
+        .unversioned_rustls_crypto_provider(td_tls_provider::shared())
         .root_certs(roots)
         .build()
 }
@@ -2164,7 +2164,8 @@ mod tests {
         assert!(fetch_pool::can_reuse(&reusable));
     }
 
-    const ACCOUNT_CA: &[u8] = include_bytes!("../tests/fixtures/account-ca/ca.pem");
+    const ACCOUNT_CA: &[u8] =
+        include_bytes!("../../td-tls-provider/tests/fixtures/account-ca/ca.pem");
 
     #[test]
     fn account_ca_framing_is_bounded_and_unambiguous() {
@@ -2215,17 +2216,17 @@ mod tests {
             ServerConfig, ServerConnection, StreamOwned,
         };
         let cert = if expired {
-            include_bytes!("../tests/fixtures/account-ca/expired.pem").as_slice()
+            include_bytes!("../../td-tls-provider/tests/fixtures/account-ca/expired.pem").as_slice()
         } else {
-            include_bytes!("../tests/fixtures/account-ca/server.pem").as_slice()
+            include_bytes!("../../td-tls-provider/tests/fixtures/account-ca/server.pem").as_slice()
         };
         let cert = CertificateDer::from_pem_slice(cert).unwrap();
         let key = PrivateKeyDer::from_pem_slice(include_bytes!(
-            "../tests/fixtures/account-ca/server.key"
+            "../../td-tls-provider/tests/fixtures/account-ca/server.key"
         ))
         .unwrap();
         let config = Arc::new(
-            ServerConfig::builder_with_provider(crate::tls_crypto::shared())
+            ServerConfig::builder_with_provider(td_tls_provider::shared())
                 .with_safe_default_protocol_versions()
                 .unwrap()
                 .with_no_client_auth()

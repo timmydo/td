@@ -1108,6 +1108,18 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // td-net's rustls provider over td-primitives, and the fixtures td-net's
+    // fetch and OpenPGP tests share with it: as for td-primitives, td-net's
+    // own suite and the chain targets that build it.
+    if p.starts_with("td-tls-provider/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        sel.add_preflight("net-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        add_chain_targets(sel);
+        return;
+    }
+
     // The target guest crates compile offline in the cargo-test preflight. Their
     // sources are embedded into target-static recipes, whose link/behavior tests
     // live in the recipe-owned checks.
@@ -1439,7 +1451,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     }
 
     // These recipe-free shared crates route through their mail reader. Std crates
-    // use ordinary Cargo; only td-crypto and td-mta use `crypto-cargo`, which
+    // use ordinary Cargo; only the admitted crates use `crypto-cargo`, which
     // enforces pinned manifests, locks, Cargo config and backend features.
     // The full check added only gate 325's in-sandbox, networkless copy of
     // those same legs (the host legs are offline too: frozen, with verified
@@ -3012,6 +3024,14 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-primitives/src/ec.rs", "net-test");
     assert_preflight!("td-primitives/src/ec.rs", "cargo-test");
     assert_target!("td-primitives/src/ec.rs", "recipe-checks");
+    assert_preflight!("td-tls-provider/src/lib.rs", "net-test");
+    assert_preflight!("td-tls-provider/src/lib.rs", "cargo-test");
+    assert_target!("td-tls-provider/src/lib.rs", "recipe-checks");
+    assert_preflight!(
+        "td-tls-provider/tests/fixtures/account-ca/server.pem",
+        "net-test"
+    );
+    assert_no_preflight!("td-tls-provider/src/lib.rs", "local-source-roster");
     assert_target!("td-boot/Cargo.toml", "check");
     assert_target!("td-boot/Cargo.toml", "recipe-checks");
     // protocol.rs is the deployment contract the recipes and td-install
@@ -4709,7 +4729,9 @@ fn manifest_path_dependencies(
         if !is_dev
             && ((name == "td-crypto" && crate::crypto_policy::DEPENDENCIES.contains(&line))
                 || (name == "td-mta"
-                    && crate::crypto_policy::POSTGRES_DEPENDENCIES.contains(&line)))
+                    && crate::crypto_policy::POSTGRES_DEPENDENCIES.contains(&line))
+                || (name == "td-tls-provider"
+                    && crate::crypto_policy::TLS_PROVIDER_DEPENDENCIES.contains(&line)))
         {
             continue;
         }
@@ -9497,7 +9519,7 @@ mod tests {
             cargo_test_cmds_all(&root).unwrap(),
             gate_cargo_cmds(&root).unwrap(),
         ] {
-            for name in ["td-crypto", "td-mta"] {
+            for name in ["td-crypto", "td-mta", "td-tls-provider"] {
                 for action in ["test", "clippy"] {
                     let selected: Vec<_> = commands
                         .iter()
@@ -10485,12 +10507,58 @@ mod tests {
         }
         let docs = path_output(&root, "td-crypto/TLS.md");
         assert!(docs.contains("Selected checks: none"), "{docs}");
+        // The shared provider is crypto-admitted but not mail: its change
+        // takes no mail leg.
+        let provider = cargo_test_cmds(&root, &["td-tls-provider/src/lib.rs".to_string()]).unwrap();
+        for krate in ["td-crypto", "td-mta"] {
+            assert!(
+                !provider
+                    .iter()
+                    .any(|c| cmd_manifest_crate(c) == Some(krate)),
+                "{krate}"
+            );
+        }
         for path in ["td-crypto-x/src/lib.rs", "td-crypto/../td-sh/src/main.rs"] {
             assert!(
                 path_output(&root, path).contains("td-builder check"),
                 "{path}"
             );
         }
+    }
+
+    /// A td-tls-provider change, and a change to the td-primitives it reads,
+    /// selects the provider's legs through `crypto-cargo`, td-net's suite and
+    /// the target gates that build td-net; its design document selects
+    /// nothing.
+    #[test]
+    fn tls_provider_changes_run_its_wrapped_legs_and_td_net() {
+        let root = repo_root();
+        let Ok(roster) = discover_gate_crates(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        if !roster.iter().any(|c| c.name == "td-tls-provider") {
+            eprintln!("SKIP: td-tls-provider is not in the gate roster");
+            return;
+        }
+        for path in [
+            "td-tls-provider/src/lib.rs",
+            "td-tls-provider/Cargo.toml",
+            "td-tls-provider/Cargo.lock",
+            "td-primitives/src/ec.rs",
+        ] {
+            let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
+            for action in ["test", "clippy"] {
+                let leg = format!(
+                    " gate-crates crypto-cargo {action} --manifest-path td-tls-provider/Cargo.toml"
+                );
+                assert!(commands.iter().any(|c| c.contains(&leg)), "{path}: {leg}");
+            }
+            let output = path_output(&root, path);
+            assert!(output.contains("td-builder check"), "{path}: {output}");
+        }
+        let docs = path_output(&root, "td-tls-provider/DESIGN.md");
+        assert!(docs.contains("Selected checks: none"), "{docs}");
     }
 
     /// A td-source-scan change selects the cargo-test preflight over the crate
@@ -12153,18 +12221,31 @@ mod tests {
             "[workspace]\nmembers = [\"builder\"]\n",
         )
         .unwrap();
-        for name in crate::crypto_policy::LOCAL_SOURCES {
-            std::fs::create_dir(temp.join(name)).unwrap();
-            std::fs::copy(
-                source.join(name).join("Cargo.toml"),
-                temp.join(name).join("Cargo.toml"),
-            )
-            .unwrap();
+        // The admitted sources and every sibling their manifests name, dev
+        // ones included (td-primitives' td-source-scan), which the roster
+        // check requires to exist though no admitted graph compiles them.
+        let mut pending: Vec<String> = crate::crypto_policy::LOCAL_SOURCES
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let mut copied: Vec<String> = Vec::new();
+        while let Some(name) = pending.pop() {
+            if copied.contains(&name) {
+                continue;
+            }
+            let manifest = std::fs::read_to_string(source.join(&name).join("Cargo.toml")).unwrap();
+            let (deps, dev) = manifest_path_dependencies(&name, &manifest).unwrap();
+            pending.extend(deps.into_iter().chain(dev));
+            std::fs::create_dir(temp.join(&name)).unwrap();
+            std::fs::write(temp.join(&name).join("Cargo.toml"), manifest).unwrap();
+            copied.push(name);
         }
+        assert!(copied.iter().any(|name| name == "td-source-scan"));
         assert!(dependency_free_locks(&temp).is_ok());
         for (name, dep) in [
             ("td-reader", "td-crypto"),
             ("td-reader", "td-mta"),
+            ("td-reader", "td-tls-provider"),
             ("td-indirect", "td-reader"),
         ] {
             std::fs::create_dir_all(temp.join(name)).unwrap();
@@ -12440,6 +12521,29 @@ mod tests {
                 &line.replace("default-features = false", "default-features = true"),
             );
             assert!(manifest_path_dependencies("td-mta", &changed).is_err());
+        }
+    }
+
+    #[test]
+    fn tls_provider_rustls_is_its_own_private_production_pin() {
+        let admitted = include_str!("../../td-tls-provider/Cargo.toml");
+        let (paths, dev_paths) = manifest_path_dependencies("td-tls-provider", admitted).unwrap();
+        assert_eq!(paths, ["td-primitives"]);
+        assert!(dev_paths.is_empty());
+        for line in crate::crypto_policy::TLS_PROVIDER_DEPENDENCIES {
+            assert!(admitted.lines().any(|candidate| candidate == *line));
+            // Only this case reaches the grammar: the line is no sibling path
+            // for any other crate. The two below change td-tls-provider's
+            // manifest, which its hash pin refuses before any line is read.
+            let manifest = format!("[package]\nname = \"td-aa\"\n[dependencies]\n{line}\n");
+            assert!(manifest_path_dependencies("td-aa", &manifest).is_err());
+            let dev = format!(
+                "{}\n[dev-dependencies]\n{line}\n",
+                admitted.replace(line, "")
+            );
+            assert!(manifest_path_dependencies("td-tls-provider", &dev).is_err());
+            let changed = admitted.replace(line, &line.replace("\"custom-provider\", ", ""));
+            assert!(manifest_path_dependencies("td-tls-provider", &changed).is_err());
         }
     }
 

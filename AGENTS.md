@@ -24,7 +24,8 @@ needs them:
 - For shared MIME parsing or decoding, read `td-mime/DESIGN.md`.
 - For shared HTML rendering or text extraction, read `td-html/DESIGN.md`.
 - For td-crypto or its consumer boundary, read `td-crypto/DESIGN.md`.
-- For td's own cryptographic primitives, read `td-primitives/DESIGN.md`.
+- For td's own cryptographic primitives, read `td-primitives/DESIGN.md`;
+  for the rustls provider built on them, read `td-tls-provider/DESIGN.md`.
 - For the FIDO2 client, or the SHA-256, HMAC and HKDF the boot and login
   crates share, read `td-fido/DESIGN.md`.
 - For shared header lexical syntax, read `td-header/DESIGN.md`.
@@ -599,11 +600,14 @@ message.
   PostgreSQL is the sole mail backend described in `td-mta/POSTGRES.md`.
   Its exact manifest, lock and active features are pinned in the same policy.
   The std-only `td-fs` owns bounded private socket dialing and test scratch.
-  All nine
-  local manifests and locks are pinned. No other roster crate may depend
-  on `td-crypto` or `td-mta`, directly or transitively; `td-header`,
-  `td-civil`, `td-html`, `td-json`, `td-mime` and `td-nfc` remain
-  ordinary std-only shared crates.
+  `td-tls-provider`, td-primitives behind rustls's `CryptoProvider`, depends
+  on rustls 0.23.46 with no built-in backend and on local `td-primitives`;
+  its exact manifest, lock and active features are pinned in the same policy.
+  All eleven local manifests and locks are pinned, `td-primitives` among
+  them. No roster crate outside the admission may depend on `td-crypto`,
+  `td-mta` or `td-tls-provider`, directly or transitively; `td-header`,
+  `td-civil`, `td-html`, `td-json`, `td-mime`, `td-nfc` and
+  `td-primitives` remain ordinary std-only shared crates.
   `td-crypto/DESIGN.md` owns offline preparation and crypto confinement;
   `td-mta/STORAGE.md` owns local scratch and the storage boundary. No other
   roster crate may consume the PostgreSQL closure, directly or transitively.

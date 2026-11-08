@@ -7,8 +7,9 @@ use crate::types::Recipe;
 /// `td-fetchd` applet the jailed applications reach over a socket, Git's HTTP(S)
 /// helpers and `td-curl`. `net/` is the crate; `engine/` is its path
 /// dependency. The engine also shares td-civil calendar conversion and
-/// td-fs helpers, and td-primitives is its TLS and signature cryptography; all
-/// are staged beside it and the crate's manifest names the main tree. The lock
+/// td-fs helpers, td-primitives is its TLS and signature cryptography, and
+/// td-tls-provider puts that behind rustls; all are staged beside it and the
+/// crate's manifest names the main tree. The lock
 /// is the crate's own committed one,
 /// and the closure is the tier's reviewed vendored set; nothing else enters.
 /// Static, as every td-owned program on the image, so the system tree's
@@ -16,7 +17,13 @@ use crate::types::Recipe;
 pub fn recipe() -> Recipe {
     Recipe::rust("td-net", "0.1.0")
         .local_source("net")
-        .local_source_trees(&["engine", "td-fs", "td-civil", "td-primitives"])
+        .local_source_trees(&[
+            "engine",
+            "td-fs",
+            "td-civil",
+            "td-primitives",
+            "td-tls-provider",
+        ])
         .build_root()
         .native_inputs(&["rust-toolchain", "td-link", "glibc-x86-64"])
         .cargo_subdir("net")
@@ -40,7 +47,8 @@ mod tests {
                 "engine".to_string(),
                 "td-fs".to_string(),
                 "td-civil".to_string(),
-                "td-primitives".to_string()
+                "td-primitives".to_string(),
+                "td-tls-provider".to_string()
             ])
         );
         assert_eq!(recipe.cargo_subdir.as_deref(), Some("net"));

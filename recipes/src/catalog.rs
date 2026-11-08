@@ -679,6 +679,7 @@ mod tests {
                 "td-term",
                 "td-test-compositor",
                 "td-time",
+                "td-tls-provider",
                 "td-toml",
                 "td-tpm",
                 "td-ui",

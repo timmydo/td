@@ -1,0 +1,29 @@
+[package]
+name = "td-tls-provider"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "td-primitives behind rustls's CryptoProvider, shared by td's TLS consumers"
+
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+# rustls is the TLS engine; `custom-provider` keeps it from falling back on a
+# built-in backend. Everything it asks of a crypto library is td-primitives.
+[dependencies]
+rustls = { version = "=0.23.46", default-features = false, features = ["custom-provider", "std", "tls12"] }
+td-primitives = { path = "../td-primitives" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
