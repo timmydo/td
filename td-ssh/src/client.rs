@@ -801,16 +801,16 @@ impl<R: Read, W: Write, E: KexEnvironment> AuthLink<'_, R, W, E> {
             let payload = self.reader.read_packet()?;
             let number = payload.first().copied().unwrap_or(0);
             match number {
-                msg::IGNORE | msg::DEBUG | msg::EXT_INFO | msg::UNIMPLEMENTED => {}
                 msg::DISCONNECT => return Err(conn::disconnected(&payload)),
                 number if msg::is_kex(number) => {
                     conn::kex_step(self.reader, self.writer, self.kex, self.env, &payload)?;
                 }
-                number if self.kex.peer_committed() => {
+                number if self.kex.peer_committed() && !msg::is_generic_transport(number) => {
                     return Err(Error::protocol(format!(
                         "message {number} after the peer's KEXINIT"
                     )));
                 }
+                msg::IGNORE | msg::DEBUG | msg::EXT_INFO | msg::UNIMPLEMENTED => {}
                 msg::GLOBAL_REQUEST => {
                     let mut request = Reader::new(payload.get(1..).unwrap_or_default());
                     let _name = request.string()?;
@@ -3428,8 +3428,16 @@ mod tests {
         /// Starts a rekey, and returns once it finished, with whatever
         /// application messages the client had sent before it saw the KEXINIT.
         fn rekey(&mut self) -> Vec<Vec<u8>> {
+            self.rekey_sending(&[])
+        }
+
+        /// A rekey that sends `between` right after its KEXINIT.
+        fn rekey_sending(&mut self, between: &[&[u8]]) -> Vec<Vec<u8>> {
             let init = self.kex.start(&mut self.env).unwrap();
             self.send(&init);
+            for payload in between {
+                self.send(payload);
+            }
             let mut in_flight = Vec::new();
             loop {
                 let payload = self.reader.read_packet().unwrap();
@@ -4028,6 +4036,77 @@ mod tests {
         let established =
             establish(stream, client_env(), DEFAULT_KEX.to_vec(), &login, limits).unwrap();
         assert_eq!(server.join().unwrap(), established.kex.session_id());
+    }
+
+    /// During authentication too, a server's exchange admits RFC 4253 section 7.1's
+    /// transport-generic messages and refuses `EXT_INFO`.
+    #[test]
+    fn a_rekey_during_authentication_admits_only_generic_transport_messages() {
+        for refused in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let mut server = FakeServer::accept(&listener);
+                server.expect(msg::SERVICE_REQUEST);
+                if refused {
+                    let init = server.kex.start(&mut server.env).unwrap();
+                    server.send(&init);
+                    let mut ext_info = Writer::message(msg::EXT_INFO);
+                    ext_info.u32(0);
+                    server.send(ext_info.as_slice());
+                    // The client ends here; what it sent first is its business.
+                    while server.reader.read_packet().is_ok() {}
+                    return;
+                }
+                let mut debug = Writer::message(msg::DEBUG);
+                debug.bool(false).str("mid-exchange").str("");
+                let mut unimplemented = Writer::message(msg::UNIMPLEMENTED);
+                unimplemented.u32(7);
+                server.rekey_sending(&[
+                    &[msg::IGNORE, 0, 0, 0, 0],
+                    debug.as_slice(),
+                    unimplemented.as_slice(),
+                ]);
+                let mut accept = Writer::message(msg::SERVICE_ACCEPT);
+                accept.str("ssh-userauth");
+                server.send(accept.as_slice());
+                server.expect(msg::USERAUTH_REQUEST);
+                let mut failure = Writer::message(msg::USERAUTH_FAILURE);
+                failure.str("publickey").bool(false);
+                server.send(failure.as_slice());
+                server.expect(msg::USERAUTH_REQUEST);
+                let mut ok = Writer::message(msg::USERAUTH_PK_OK);
+                ok.str(HOST_KEY_ALGORITHM).string(&[0]);
+                server.send(ok.as_slice());
+                server.expect(msg::USERAUTH_REQUEST);
+                server.send(&[msg::USERAUTH_SUCCESS]);
+            });
+            let stream = TcpStream::connect(address).unwrap();
+            stream.set_read_timeout(Some(LIMIT)).unwrap();
+            let identities = test_identity();
+            let logger = quiet();
+            let login = Login {
+                user: "u",
+                identities: &identities,
+                prompts: 3,
+                batch: true,
+                logger: &logger,
+            };
+            let limits = SetupLimits {
+                clock: SetupClock::default(),
+                auth_read: Some(LIMIT),
+            };
+            let result = establish(stream, client_env(), DEFAULT_KEX.to_vec(), &login, limits);
+            server.join().unwrap();
+            match result {
+                Ok(_) => assert!(!refused, "EXT_INFO mid-exchange was taken"),
+                Err(error) => {
+                    let error = error.to_string();
+                    assert!(refused, "{error}");
+                    assert!(error.contains("after the peer's KEXINIT"), "{error}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -80,8 +80,19 @@ GiB; refusing would break large Git transfers. Either side starts a rekey after
 KEX packets, and its sources stop taking window credit until that exchange's `NEWKEYS`
 (§6). It still
 accepts application packets until the peer's KEXINIT arrives (RFC 4253 §7.1: an
-in-flight `CHANNEL_DATA` is legitimate), and only KEX packets from then to
-`NEWKEYS`. The client requires a rekey's host key to equal the connection's first.
+in-flight `CHANNEL_DATA` is legitimate), and from then to `NEWKEYS` only KEX packets
+and the transport-generic `IGNORE`, `DEBUG` and `UNIMPLEMENTED` §7.1 allows, which
+OpenSSH sends then too; `EXT_INFO` and anything else ends the connection. The client's
+authentication phase holds the same rule. In the connection core every packet counts
+toward the limits, an ignored one too, so a peer sending nothing else still gets a
+rekey; the authentication phases start none, bounded instead by LoginGraceTime on the
+server and, where set, the client's connect and keepalive limits. The sequence number,
+which is the cipher's nonce, never wraps under one key: a packet numbered 2^32-1, sent
+or received, ends the connection, one short of a wrap. Only a peer keeping a connection
+on one key reaches that: by never finishing a rekey, whether never answering ours or
+stalling in its own with only the messages an exchange admits, or by holding a client
+in authentication, where with no limits set this is the last bound. The client
+requires a rekey's host key to equal the connection's first.
 
 **Ignored without error:** `SSH_MSG_IGNORE`, `DEBUG`, `UNIMPLEMENTED` and
 `EXT_INFO` after the first `NEWKEYS`. Unknown global requests with `want_reply`

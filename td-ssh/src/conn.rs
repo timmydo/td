@@ -481,26 +481,30 @@ impl<W: Write, E: KexEnvironment> Conn<W, E> {
         self.rx_bytes = self.rx_bytes.saturating_add(payload.len() as u64);
         self.rx_packets = self.rx_packets.saturating_add(1);
         let number = payload.first().copied().unwrap_or(0);
-        match number {
-            msg::DISCONNECT => Err(disconnected(&payload)),
-            msg::IGNORE | msg::DEBUG | msg::UNIMPLEMENTED | msg::EXT_INFO => Ok(None),
-            number if msg::is_kex(number) => {
-                let output = self.kex.on_message(&payload, &mut self.env)?;
-                // Open again only once what was held has gone out, or a source
-                // would overtake it.
-                self.flow.set_transport_open(false);
-                self.apply(output)?;
-                self.flow.set_transport_open(!self.kex.in_progress());
-                Ok(None)
-            }
-            _ if self.kex.peer_committed() => Err(Error::protocol(format!(
+        if number == msg::DISCONNECT {
+            return Err(disconnected(&payload));
+        }
+        if msg::is_kex(number) {
+            let output = self.kex.on_message(&payload, &mut self.env)?;
+            // Open again only once what was held has gone out, or a source
+            // would overtake it.
+            self.flow.set_transport_open(false);
+            self.apply(output)?;
+            self.flow.set_transport_open(!self.kex.in_progress());
+            return Ok(None);
+        }
+        // Before any ignoring, so that nothing a peer sends gets past either.
+        if self.kex.peer_committed() && !msg::is_generic_transport(number) {
+            return Err(Error::protocol(format!(
                 "message {number} after the peer's KEXINIT"
-            ))),
-            _ => {
-                // A receive-only connection sends too rarely to notice otherwise.
-                self.maybe_rekey()?;
-                Ok(Some(payload))
-            }
+            )));
+        }
+        // Every packet counts: a receive-only connection, or one fed nothing but
+        // IGNORE, sends too rarely to notice otherwise.
+        self.maybe_rekey()?;
+        match number {
+            msg::IGNORE | msg::DEBUG | msg::UNIMPLEMENTED | msg::EXT_INFO => Ok(None),
+            _ => Ok(Some(payload)),
         }
     }
 
@@ -890,6 +894,58 @@ mod tests {
             NoEnv,
             Flow::new(),
         )
+    }
+
+    /// A core part way into a rekey the peer started.
+    fn mid_peer_exchange() -> Conn<Vec<u8>, NoEnv> {
+        let (rx_keys, _unused) = sync_channel(1);
+        let mut conn = Conn::new(
+            PacketWriter::new(Vec::new()),
+            rx_keys,
+            Kex::resume(Role::Client, "SSH-2.0-a", "SSH-2.0-b", [9; 32]),
+            NoEnv,
+            Flow::new(),
+        );
+        let mut peer = Kex::resume(Role::Server, "SSH-2.0-a", "SSH-2.0-b", [9; 32]);
+        let init = peer.start(&mut NoEnv).unwrap();
+        assert_eq!(conn.on_packet(init).unwrap(), None);
+        assert!(conn.kex.peer_committed());
+        conn
+    }
+
+    /// From the peer's KEXINIT to `NEWKEYS` only KEX and RFC 4253 section 7.1's
+    /// transport-generic messages pass: not `EXT_INFO`, and nothing of the
+    /// connection, however it would otherwise be ignored.
+    #[test]
+    fn during_the_peer_s_exchange_only_generic_transport_messages_pass() {
+        for number in [msg::IGNORE, msg::DEBUG, msg::UNIMPLEMENTED] {
+            let mut conn = mid_peer_exchange();
+            assert_eq!(conn.on_packet(vec![number]).unwrap(), None, "{number}");
+        }
+        for number in [msg::EXT_INFO, msg::CHANNEL_DATA, msg::GLOBAL_REQUEST, 200] {
+            let mut conn = mid_peer_exchange();
+            let error = conn.on_packet(vec![number]).err().unwrap().to_string();
+            assert!(
+                error.contains("after the peer's KEXINIT"),
+                "{number}: {error}"
+            );
+        }
+    }
+
+    /// What is ignored still counts toward a rekey, so a peer sending nothing else
+    /// cannot keep a connection on one key past the limit.
+    #[test]
+    fn ignored_messages_count_toward_a_rekey() {
+        for number in [msg::IGNORE, msg::DEBUG, msg::UNIMPLEMENTED, msg::EXT_INFO] {
+            let mut conn = test_conn();
+            conn.rx_packets = REKEY_PACKETS - 1;
+            assert_eq!(conn.on_packet(vec![number]).unwrap(), None);
+            assert!(conn.kex.in_progress(), "{number}");
+            let mut conn = test_conn();
+            conn.limit_rekey_bytes(1024);
+            assert_eq!(conn.on_packet(vec![number; 2048]).unwrap(), None);
+            assert!(conn.kex.in_progress(), "{number} by bytes");
+        }
     }
 
     #[test]

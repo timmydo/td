@@ -42,6 +42,13 @@ pub const OPEN_RESOURCE_SHORTAGE: u32 = 4;
 
 pub const EXTENDED_DATA_STDERR: u32 = 1;
 
+/// What may arrive in the middle of a peer's key exchange besides its own
+/// messages: RFC 4253 section 7.1's transport-generic ones, which OpenSSH also
+/// sends then. Not `EXT_INFO`, which RFC 8308 places only after a `NEWKEYS`.
+pub fn is_generic_transport(number: u8) -> bool {
+    matches!(number, IGNORE | UNIMPLEMENTED | DEBUG)
+}
+
 /// Message numbers strict KEX admits before the first `NEWKEYS` completes.
 pub fn is_kex(number: u8) -> bool {
     matches!(number, KEXINIT | NEWKEYS | KEX_ECDH_INIT | KEX_ECDH_REPLY)

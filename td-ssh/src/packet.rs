@@ -83,6 +83,15 @@ impl Counters {
     }
 }
 
+/// The sequence number after `seq`. It is the AEAD's nonce, and strict KEX resets
+/// it at every `NEWKEYS`, so only a peer that keeps a connection on one key comes
+/// near a wrap: one never finishing a rekey, or never ending authentication, which
+/// rekeys nothing. The connection ends instead.
+fn next_seq(seq: u32) -> Result<u32> {
+    seq.checked_add(1)
+        .ok_or_else(|| Error::protocol("sequence number exhausted without a rekey"))
+}
+
 pub struct PacketReader<R> {
     inner: R,
     aead: Option<OpenSshAead>,
@@ -184,7 +193,7 @@ impl<R: Read> PacketReader<R> {
             .get(5..4 + length - padding)
             .ok_or_else(|| Error::protocol("bad padding"))?
             .to_vec();
-        self.counters.seq = seq.wrapping_add(1);
+        self.counters.seq = next_seq(seq)?;
         self.counters.packets = self.counters.packets.saturating_add(1);
         self.counters.bytes = self.counters.bytes.saturating_add(length as u64 + 4);
         Ok(payload)
@@ -260,6 +269,7 @@ impl<W: Write> PacketWriter<W> {
             return Err(Error::protocol("outgoing packet is too long"));
         }
         let seq = self.counters.seq;
+        let next = next_seq(seq)?;
         self.buffer.clear();
         self.buffer
             .extend_from_slice(&u32::try_from(length).unwrap_or(u32::MAX).to_be_bytes());
@@ -274,7 +284,7 @@ impl<W: Write> PacketWriter<W> {
         }
         self.inner.write_all(&self.buffer)?;
         self.inner.flush()?;
-        self.counters.seq = seq.wrapping_add(1);
+        self.counters.seq = next;
         self.counters.packets = self.counters.packets.saturating_add(1);
         self.counters.bytes = self.counters.bytes.saturating_add(length as u64 + 4);
         Ok(())
@@ -373,6 +383,38 @@ mod tests {
         reader.aead = Some(OpenSshAead::new(&key));
         assert_eq!(reader.read_packet().unwrap(), b"one");
         assert!(reader.read_packet().is_err());
+    }
+
+    /// Under one key the nonce never repeats: the packet that would wrap the
+    /// sequence number is refused, whichever way it goes.
+    #[test]
+    fn the_sequence_number_never_wraps() {
+        let key = [3u8; 64];
+        let mut writer = PacketWriter::new(Vec::new());
+        writer.aead = Some(OpenSshAead::new(&key));
+        writer.counters.seq = u32::MAX - 1;
+        writer.write_packet(b"last").unwrap();
+        let sent = writer.inner.len();
+        let error = writer.write_packet(b"wraps").err().unwrap().to_string();
+        assert!(error.contains("sequence number"), "{error}");
+        assert_eq!(writer.inner.len(), sent, "nothing went out");
+
+        // A peer's packet sealed at the last number, which is good in itself:
+        // only the number after it is refused.
+        let mut wire = writer.inner.clone();
+        let mut packet = vec![0, 0, 0, 16, 10];
+        packet.extend_from_slice(b"wraps");
+        packet.resize(4 + 16, 0);
+        let tag = OpenSshAead::new(&key).seal(u32::MAX, &mut packet).unwrap();
+        wire.extend_from_slice(&packet);
+        wire.extend_from_slice(&tag);
+        let mut reader = PacketReader::new(Cursor::new(wire));
+        reader.aead = Some(OpenSshAead::new(&key));
+        reader.counters.seq = u32::MAX - 1;
+        assert_eq!(reader.read_packet().unwrap(), b"last");
+        assert_eq!(reader.counters.seq, u32::MAX);
+        let error = reader.read_packet().err().unwrap().to_string();
+        assert!(error.contains("sequence number"), "{error}");
     }
 
     #[test]
