@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use td_primitives::aes_gcm::AesGcm;
 use td_primitives::chacha20_poly1305;
 use td_primitives::curve25519::{ed25519, x25519};
-use td_primitives::ec::{p256, p384};
+use td_primitives::ec::{p256, p384, p521};
 use td_primitives::hmac::mac;
 use td_primitives::rsa;
 use td_primitives::sha::{sha1, Digest, Sha256, Sha384, Sha512};
@@ -394,18 +394,87 @@ fn ecdsa_agrees_with_wycheproof() {
             let digest: Vec<u8> = match key[1] {
                 "sha256" => Sha256::digest(message).to_vec(),
                 "sha384" => Sha384::digest(message).to_vec(),
-                // Longer than either order: these rows pin truncation.
+                // Longer than P-256's and P-384's orders: those rows pin truncation.
                 "sha512" => Sha512::digest(message).to_vec(),
                 other => panic!("unknown hash {other}"),
             };
             match key[0] {
                 "p256" => p256::verify(&public, &digest, signature).is_ok(),
                 "p384" => p384::verify(&public, &digest, signature).is_ok(),
+                "p521" => p521::verify(&public, &digest, signature).is_ok(),
                 other => panic!("unknown curve {other}"),
             }
         },
     );
     assert_eq!(tally.counts(), ECDSA_COUNTS, "{tally:?}");
+}
+
+fn uncompressed_on(curve: &str, encoded: &[u8]) -> Result<Vec<u8>, Refused> {
+    match curve {
+        "p256" => p256::uncompressed(encoded).map(|point| point.to_vec()),
+        "p384" => p384::uncompressed(encoded).map(|point| point.to_vec()),
+        "p521" => p521::uncompressed(encoded).map(|point| point.to_vec()),
+        other => panic!("unknown curve {other}"),
+    }
+}
+
+#[test]
+fn points_decode_in_either_form_as_wycheproof_states() {
+    let mut counts = std::collections::BTreeMap::new();
+    for line in include_str!("wycheproof/ec_points.txt").lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let [curve, encoded, result, verdict] = fields[..] else {
+            panic!("malformed row: {line}");
+        };
+        let outcome = uncompressed_on(curve, &hex(encoded));
+        match verdict {
+            "valid" => assert_eq!(outcome, Ok(hex(result)), "{line}"),
+            "invalid" => assert_eq!(outcome, Err(Refused), "{line}"),
+            other => panic!("unknown verdict {other}"),
+        }
+        *counts.entry((curve, verdict)).or_insert(0usize) += 1;
+    }
+    assert_eq!(
+        counts.into_iter().collect::<Vec<_>>(),
+        EC_POINT_COUNTS,
+        "rows per curve and verdict"
+    );
+}
+
+// The one compressed key each ECDH point file takes, which states no
+// uncompressed form, checked by the secret it agrees on instead.
+#[test]
+fn a_decompressed_ecdh_key_agrees_on_wycheproofs_secret() {
+    for (text, curve) in [
+        (include_str!("wycheproof/ecdh_p256.txt"), "p256"),
+        (include_str!("wycheproof/ecdh_p384.txt"), "p384"),
+    ] {
+        let mut seen = 0;
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let [private, public, shared, "acceptable"] = fields[..] else {
+                continue;
+            };
+            assert!(
+                public.starts_with("02") || public.starts_with("03"),
+                "{line}"
+            );
+            let point = uncompressed_on(curve, &hex(public)).unwrap();
+            let secret = match curve {
+                "p256" => p256::SecretKey::from_bytes(&padded_scalar(private))
+                    .unwrap()
+                    .agree(&point)
+                    .map(|s| s.to_vec()),
+                _ => p384::SecretKey::from_bytes(&padded_scalar(private))
+                    .unwrap()
+                    .agree(&point)
+                    .map(|s| s.to_vec()),
+            };
+            assert_eq!(secret, Ok(hex(shared)), "{line}");
+            seen += 1;
+        }
+        assert_eq!(seen, 1, "{curve}");
+    }
 }
 
 fn der_length(length: usize) -> Vec<u8> {
@@ -697,6 +766,87 @@ fn p256_verifies_a_truncated_sha384_digest() {
     );
 }
 
+// The range check again, on the coordinate a compressed point carries alone, and
+// on P-521, whose 66-byte coordinates leave room above p.
+#[test]
+fn a_coordinate_of_p_or_more_is_refused_in_either_form() {
+    for curve in ["p256", "p384", "p521"] {
+        let row = edge_row(&format!("{curve}-small-x"));
+        let (x, y, x_plus_p) = (hex(row[0]), hex(row[1]), hex(row[2]));
+        let point = uncompressed(&x, &y);
+        assert_eq!(uncompressed_on(curve, &point), Ok(point.clone()), "{curve}");
+        assert!(uncompressed_on(curve, &uncompressed(&x_plus_p, &y)).is_err());
+        let odd = y[y.len() - 1] & 1;
+        let tagged = |tag: u8, x: &[u8]| [&[tag][..], x].concat();
+        assert_eq!(
+            uncompressed_on(curve, &tagged(2 | odd, &x)),
+            Ok(point.clone()),
+            "{curve} compressed"
+        );
+        for tag in [2, 3] {
+            assert!(uncompressed_on(curve, &tagged(tag, &x_plus_p)).is_err());
+        }
+        let row = edge_row(&format!("{curve}-small-y"));
+        let (x, y, y_plus_p) = (hex(row[0]), hex(row[1]), hex(row[2]));
+        let point = uncompressed(&x, &y);
+        assert_eq!(uncompressed_on(curve, &point), Ok(point.clone()), "{curve}");
+        assert!(uncompressed_on(curve, &uncompressed(&x, &y_plus_p)).is_err());
+    }
+}
+
+// Pairings td-crypto's certificate policy admits and Wycheproof holds only with
+// SHA-512; each digest is shorter than the order, so the whole of it is signed.
+#[test]
+fn p521_verifies_sha256_and_sha384_digests() {
+    let row = edge_row("p521-sha256");
+    let (public, message, signature) = (hex(row[0]), hex(row[1]), hex(row[2]));
+    let digest = Sha256::digest(&message);
+    assert_eq!(p521::verify(&public, &digest, &signature), Ok(()));
+    let mut other = digest;
+    other[31] ^= 1;
+    assert!(p521::verify(&public, &other, &signature).is_err(), "sha256");
+    let row = edge_row("p521-sha384");
+    let (public, message, signature) = (hex(row[0]), hex(row[1]), hex(row[2]));
+    let digest = Sha384::digest(&message);
+    assert_eq!(p521::verify(&public, &digest, &signature), Ok(()));
+    let mut other = digest;
+    other[47] ^= 1;
+    assert!(p521::verify(&public, &other, &signature).is_err(), "sha384");
+    // The key compressed is refused here: verification takes one form.
+    let compressed = [&[2 | (public[132] & 1)][..], &public[1..67]].concat();
+    assert_eq!(
+        p521::uncompressed(&compressed),
+        Ok(public.clone().try_into().unwrap())
+    );
+    assert!(p521::verify(&compressed, &digest, &signature).is_err());
+}
+
+// 66 bytes are 528 bits: only the leftmost 521 were signed.
+#[test]
+fn p521_keeps_the_leftmost_521_bits_of_a_long_digest() {
+    let row = edge_row("p521-digest66");
+    let (public, digest, signature) = (hex(row[0]), hex(row[1]), hex(row[2]));
+    assert_eq!(digest.len(), 66);
+    assert_eq!(p521::verify(&public, &digest, &signature), Ok(()));
+    let mut beyond = digest.clone();
+    beyond[65] ^= 0x7f;
+    assert_eq!(
+        p521::verify(&public, &beyond, &signature),
+        Ok(()),
+        "the low seven bits"
+    );
+    let mut last = digest.clone();
+    last[65] ^= 0x80;
+    assert!(p521::verify(&public, &last, &signature).is_err(), "bit 521");
+    // A digest one byte longer still keeps the same 521.
+    let longer = [&digest[..], &[0xff]].concat();
+    assert_eq!(
+        p521::verify(&public, &longer, &signature),
+        Ok(()),
+        "67 bytes"
+    );
+}
+
 // The width where PSS's encoded message is a byte shorter than the modulus.
 #[test]
 fn a_2049_bit_pss_signature_needs_a_zero_leading_byte() {
@@ -807,6 +957,14 @@ const X25519_COUNTS: [usize; 4] = [264, 0, 223, 31];
 const P256_ECDH_COUNTS: [usize; 4] = [330, 24, 0, 1];
 const P384_ECDH_COUNTS: [usize; 4] = [771, 18, 0, 1];
 const ED25519_COUNTS: [usize; 4] = [117, 64, 29, 0];
-const ECDSA_COUNTS: [usize; 4] = [1004, 1552, 0, 0];
+const ECDSA_COUNTS: [usize; 4] = [1236, 1862, 0, 0];
+const EC_POINT_COUNTS: &[((&str, &str), usize)] = &[
+    (("p256", "invalid"), 24),
+    (("p256", "valid"), 735),
+    (("p384", "invalid"), 18),
+    (("p384", "valid"), 1333),
+    (("p521", "invalid"), 28),
+    (("p521", "valid"), 824),
+];
 const RSA_PKCS1_COUNTS: [usize; 4] = [39, 1250, 0, 5];
 const RSA_PSS_COUNTS: [usize; 4] = [353, 183, 0, 0];

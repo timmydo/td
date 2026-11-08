@@ -44,15 +44,17 @@ check found.
 | `aes_gcm` | AES-128-GCM and AES-256-GCM (SP 800-38D), 96-bit nonce, 128-bit tag | TLS records, where a server may offer nothing else |
 | `curve25519` | X25519 (RFC 7748); Ed25519 (RFC 8032), with `ed25519::is_small_order` | TLS key exchange; TLS and certificate signatures; td-subst's signing keys; td-ssh's exchange, host and user keys. The check is for td-ssh, which reads keys it does not yet trust |
 | `ec` | P-256: ECDH, ECDSA signing (RFC 6979 nonces), verification. P-384: ECDH and verification | TLS key exchange and signatures; td-test-https's identities. A TLS 1.2 server holding a P-384 certificate refuses a client that does not list that group, whichever it then negotiates |
+| `ec` | P-521: ECDSA verification. On all three curves, `uncompressed`: a SEC 1 point in either form, validated and uncompressed | td-crypto's certificate and handshake policy, which admits P-521 signatures and compressed certificate keys and which td-mta/IMPLEMENTATION.md F04 moves onto this crate |
 | `rsa` | RSASSA-PKCS1-v1_5 and RSASSA-PSS verification, 2048 to 8192 bits. PSS salt the length of the hash | TLS and certificate signatures; OpenPGP v4 signatures on Flathub commits |
 | `random` | The system's random bytes, from `/dev/random` | Keys, nonces and TLS randoms |
 | `ct` | Equality reading every byte; best-effort erasure | Tag and secret comparison |
 
 AES-192, other GCM nonce and tag sizes, a standalone Poly1305, a standalone
 AES block API, a standalone Blowfish, other ML-KEM sizes, RSA signing and decryption,
-compressed points, P-384 signing and any other curve, P-521 included, are absent on
-purpose. Private `bignum` and `der` serve the modules above and are not an API. td-net
-is the consumer the TLS algorithms exist for, in place of `ring`:
+compressed points anywhere but `uncompressed`, P-384 signing, P-521 signing and
+exchange, and any other curve are absent on purpose. Private `bignum` and `der`
+serve the modules above and are not an API. td-net is the consumer the TLS
+algorithms exist for, in place of `ring`:
 `net/src/tls_crypto.rs` puts them behind rustls's `CryptoProvider`, whose suites are
 ChaCha20-Poly1305 and AES-GCM in TLS 1.3 and with ECDHE in TLS 1.2, over X25519, P-256
 and P-384. td-ssh, the SSH client and server, adds the consumer rows above, and takes
@@ -134,9 +136,10 @@ finite-field premaster with its zeros stripped; td negotiates no such group.
   with Fermat inversion and word-by-word Montgomery multiplication whose final
   subtraction is masked. The table holds multiples of a public point. ECDSA
   nonces are RFC 6979's, so a bad random source cannot leak the key.
-- Verification, of every kind, and all of RSA take only public inputs and
-  may branch on them. ECDSA verification and secret scalars share one windowed
-  routine rather than have a faster public one beside it. `bignum` is shared, so RSA
+- Verification, of every kind, all of RSA, and decompression take only public
+  inputs and may branch on them. P-521 has no secret operation. ECDSA
+  verification and secret scalars share one windowed routine rather than have a
+  faster public one beside it. `bignum` is shared, so RSA
   pays for the masks it does not need rather than keeping a second multiplier.
 
 What is **not** claimed:
@@ -175,7 +178,12 @@ a change to any of these reds:
   TLS, and takes the rest, twist and non-canonical keys included, as RFC 7748 says.
 - ECDH and ECDSA keys are uncompressed points with coordinates below p, on the
   curve; the curves have prime order, so that is the whole check. A compressed
-  point is refused (one Wycheproof row on each ECDH curve).
+  point is refused (one Wycheproof row on each ECDH curve): TLS sends only the
+  uncompressed form. `uncompressed` alone takes a compressed point, for a key a
+  certificate holds, which SEC 1 lets it hold either way, and refuses an x below
+  p whose y would need a root that does not exist. It takes no other tag: SEC 1's
+  hybrid form (6, 7) and the point at infinity are refused. Its output is the
+  form the rest take.
 - Ed25519 refuses S of L or more, a non-canonical key and a key of x = 0 with its
   sign bit set. It is cofactorless and takes small-order and mixed-order keys: a
   key is trusted before it is used here, and a trusted key is neither.
@@ -184,7 +192,10 @@ a change to any of these reds:
   small-order encodings: the eight torsion points and the six spellings of them
   `verify` refuses anyway. It says nothing of mixed-order keys.
 - ECDSA takes strict DER only, with r and s in 1 to n - 1, and a digest of at
-  least 32 bytes: at e = 0 anyone can forge for any key.
+  least 32 bytes: at e = 0 anyone can forge for any key. A digest longer than
+  the order keeps as many leftmost bits as the order has, as FIPS 186-5 says;
+  on P-521 that cuts inside a byte, though only a digest of 66 bytes or more,
+  which no hash here makes, is long enough to be cut.
 - PKCS#1 builds the one encoding the hash allows and compares it, which is what
   defeats the 2006 forgery; so it refuses a DigestInfo missing its NULL.
 - PSS takes only a salt the length of the hash, as TLS requires.
@@ -228,6 +239,8 @@ on the same machine, measured before td-net left it:
 | P-256 sign | 208 |
 | P-256 verify | 249 |
 | P-384 ECDH | 500 |
+| P-521 verify | 1830 |
+| P-521 decompression | 65 |
 | Ed25519 sign | 91 |
 | Ed25519 verify | 164 |
 | RSA-2048-size PSS verify | 37 |
@@ -267,7 +280,7 @@ inventory and the vendor's instruction documentation.
 | `tests/wycheproof/` | Wycheproof at the commit `THIRD-PARTY.md` names | `python3 -I wycheproof_import.py DIR`, from `tests/`, over the downloaded JSON |
 | `tests/digest_vectors.txt` | Python's `hashlib` and `hmac` | `python3 -I digest_vectors.py > digest_vectors.txt`, from `tests/` |
 | `tests/aead_long.txt` | A naive reference in `aead_long.py`, written for this purpose and sharing no code with the crate: table AES, bit-at-a-time GHASH, big-integer Poly1305. Its rows were also checked against OpenSSL in review. Wycheproof's longest message is 513 bytes, and these reach TLS records and pass 2^16 counter blocks | `python3 -I aead_long.py > aead_long.txt`, from `tests/` |
-| `tests/edge_vectors.txt` | Python big integers in `edge_vectors.py`: P-256 and P-384 points with a coordinate that fits again after adding p, a P-256 signature over SHA-384, a 2049-bit RSA key for PSS's short encoded message and an 8192-bit key at the top of the range, signatures made here | `python3 -I edge_vectors.py > edge_vectors.txt`, from `tests/` |
+| `tests/edge_vectors.txt` | Python big integers in `edge_vectors.py`: P-256, P-384 and P-521 points with a coordinate that fits again after adding p, a P-256 signature over SHA-384, P-521 signatures over SHA-256, SHA-384 and a 66-byte digest, a 2049-bit RSA key for PSS's short encoded message and an 8192-bit key at the top of the range, signatures made here | `python3 -I edge_vectors.py > edge_vectors.txt`, from `tests/` |
 | `tests/ssh/keccak.txt`, `hmac_sha1.txt` | Python's `hashlib` and `hmac` over OpenSSL 3.5.7, at every sponge and block boundary, 260 and 110 rows | `python3 -I ssh_vectors.py keccak > ssh/keccak.txt`, likewise `hmac_sha1`, from `tests/` |
 | `tests/ssh/aes256ctr.txt` | OpenSSL 3.5.7's `enc -aes-256-ctr` over zeros, 60 rows, carrying past 32, 64 and 128 bits. The table AES in `ssh_vectors.py` reproduces it byte for byte | `python3 -I ssh_vectors.py aes256ctr > ssh/aes256ctr.txt`, from `tests/` |
 | `tests/ssh/chachapoly.txt` | `chacha20-poly1305@openssh.com` composed from OpenSSL 3.5.7's ChaCha20 and Poly1305, framing checked against OpenSSH's `cipher-chachapoly.c`, 52 rows. The textbook ChaCha20 and big-integer Poly1305 in `ssh_vectors.py` reproduce it byte for byte | `python3 -I ssh_vectors.py chachapoly > ssh/chachapoly.txt`, from `tests/` |
@@ -299,7 +312,15 @@ The importer drops what the API cannot express and prints the counts: of
 Wycheproof's AES-GCM rows 133 are kept and 183 dropped (other nonce, tag and key
 sizes), and of ChaCha20-Poly1305's 316 and 9. Wycheproof has no P-256 with
 SHA-384 file, so `edge_vectors.txt` holds a signature for that pairing, and the
-P-256 with SHA-512 rows pin the same truncation. The S-box is also checked against FIPS 197's algebraic
+P-256 with SHA-512 rows pin the same truncation. P-521 has only a SHA-512 file, so
+the edge rows add SHA-256 and SHA-384. `wycheproof/ec_points.txt` is built from the
+same files: every distinct ECDSA key under both encodings, the compressed one tagged
+by the parity of Wycheproof's y and answered by its uncompressed form, and from the
+ECDH point files the valid keys and every invalid point: off the curve, out of range,
+empty, or an x with no root, as the files' compressed points of the twist are. It
+drops 3 rows, the one compressed key each file takes without stating its other form;
+on P-256 and P-384 a test checks that key by the secret it agrees on instead, and
+P-521, with no exchange, has only `ec_points.txt`'s other keys. The S-box is also checked against FIPS 197's algebraic
 definition, for all 256 values in every lane.
 
 `ssh/` holds what td-ssh takes from this crate, and leaves out what Wycheproof
@@ -334,8 +355,9 @@ that run is a record in the landing commit, not a test to repeat.
 ## Relation to other crates
 
 - `td-crypto` is a separate private Rustls/AWS-LC closure for mail serving. It
-  does not use this crate today; its design names this crate as where owned
-  primitives would go.
+  does not use this crate yet: td-mta/IMPLEMENTATION.md F04 moves it here
+  behind a private provider bridge in td-crypto, and P-521 and `uncompressed`
+  are here for the policy that bridge must keep.
 - `td-fido` keeps its own AES, P-256 and HMAC-SHA256 for the disk and login
   path, `td-netd` its SHA-1, and the engine its SHA-256. Moving them here is
   possible now that this crate exists, and is a separate change because each

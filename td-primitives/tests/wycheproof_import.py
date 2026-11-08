@@ -90,6 +90,63 @@ def rsa_key(group):
     return group["publicKey"]["modulus"] + " " + group["publicKey"]["publicExponent"]
 
 
+def compressed(uncompressed):
+    """SEC 1's compressed form of an uncompressed point: x, tagged by y's parity."""
+    width = (len(uncompressed) - 2) // 4
+    x, y = uncompressed[2 : 2 + 2 * width], uncompressed[2 + 2 * width :]
+    return ("03" if int(y[-1], 16) & 1 else "02") + x
+
+
+def points(directory, curves):
+    """Rows of curve, encoded point, its validated uncompressed form or "-", verdict.
+
+    Every distinct ECDSA key goes in under both encodings, its uncompressed form
+    being Wycheproof's. From the ECDH point files come the valid uncompressed keys
+    and every invalid point: off the curve, out of range, empty, or an x with no
+    square root, which the wrong-curve compressed rows are too, being points on
+    the twist. The one compressed key each file takes is dropped, as the file
+    does not state its uncompressed form.
+    """
+    rows, seen, dropped = [], set(), 0
+
+    def add(curve, encoded, result, verdict):
+        if (curve, encoded) not in seen:
+            seen.add((curve, encoded))
+            rows.append(f"{curve} {field(encoded)} {result} {verdict}")
+
+    for curve, bits, ecdsa_names in curves:
+        for name in ecdsa_names:
+            for group in load(directory, name)["testGroups"]:
+                key = group["publicKey"]["uncompressed"]
+                add(curve, key, key, "valid")
+                add(curve, compressed(key), key, "valid")
+        for group in load(directory, f"ecdh_secp{bits}r1_ecpoint")["testGroups"]:
+            for test in group["tests"]:
+                public = test["public"]
+                if test["result"] == "valid" and public.startswith("04"):
+                    add(curve, public, public, "valid")
+                elif test["result"] == "invalid":
+                    add(curve, public, "-", "invalid")
+                else:
+                    dropped += 1
+    return rows, dropped
+
+
+def ec_points(directory, _name):
+    return points(
+        directory,
+        [
+            ("p256", 256, ["ecdsa_secp256r1_sha256", "ecdsa_secp256r1_sha512"]),
+            (
+                "p384",
+                384,
+                ["ecdsa_secp384r1_sha256", "ecdsa_secp384r1_sha384", "ecdsa_secp384r1_sha512"],
+            ),
+            ("p521", 521, ["ecdsa_secp521r1_sha512"]),
+        ],
+    )
+
+
 def main():
     directory = sys.argv[1]
     os.makedirs("wycheproof", exist_ok=True)
@@ -108,8 +165,10 @@ def main():
                 ("ecdsa_secp384r1_sha384", signature, (ecdsa_key, "p384 sha384")),
                 ("ecdsa_secp256r1_sha512", signature, (ecdsa_key, "p256 sha512")),
                 ("ecdsa_secp384r1_sha512", signature, (ecdsa_key, "p384 sha512")),
+                ("ecdsa_secp521r1_sha512", signature, (ecdsa_key, "p521 sha512")),
             ],
         ),
+        ("wycheproof/ec_points.txt", [(None, ec_points, ())]),
         (
             "wycheproof/rsa_pkcs1.txt",
             [

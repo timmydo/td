@@ -233,8 +233,7 @@ impl<const N: usize> Modulus<N> {
         self.mul(a, &unit)
     }
 
-    /// base^(m-2) in Montgomery form: the inverse, for a prime `m`. The
-    /// exponent is public, so branching on its bits leaks nothing of `base`.
+    /// base^(m-2) in Montgomery form: the inverse, for a prime `m`.
     pub(crate) fn invert(&self, base: &[u64; N]) -> [u64; N] {
         let mut exponent = self.m;
         let mut two = [0u64; N];
@@ -242,6 +241,12 @@ impl<const N: usize> Modulus<N> {
             *low = 2;
         }
         subtract_in_place(&mut exponent, &two, u64::MAX);
+        self.pow(base, &exponent)
+    }
+
+    /// base^exponent in Montgomery form. The exponent is public, so branching
+    /// on its bits leaks nothing of `base`.
+    pub(crate) fn pow(&self, base: &[u64; N], exponent: &[u64; N]) -> [u64; N] {
         let mut result = self.one;
         for word in exponent.iter().rev() {
             for bit in (0..64).rev() {

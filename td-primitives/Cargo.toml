@@ -3,7 +3,7 @@ name = "td-primitives"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "td's own std-only cryptographic primitives: SHA-1/2/3, SHAKE, HMAC, ChaCha20-Poly1305 and OpenSSH's form of it, AES-GCM, AES-256-CTR, bcrypt_pbkdf, X25519, Ed25519, ML-KEM-768, P-256, P-384 and RSA verification"
+description = "td's own std-only cryptographic primitives: SHA-1/2/3, SHAKE, HMAC, ChaCha20-Poly1305 and OpenSSH's form of it, AES-GCM, AES-256-CTR, bcrypt_pbkdf, X25519, Ed25519, ML-KEM-768, P-256, P-384, P-521 and RSA verification"
 
 [package.metadata.td-gate]
 clippy-all-targets = true

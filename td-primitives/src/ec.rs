@@ -1,11 +1,12 @@
-//! P-256 and P-384 over one generic implementation: Renes, Costello and
+//! P-256, P-384 and P-521 over one generic implementation: Renes, Costello and
 //! Batina's complete addition for a = -3 (eprint 2015/1060, algorithm 4), which
 //! has no exceptional case, so it also doubles and there is no second formula.
 //! Scalar multiplication takes fixed four-bit windows, reading every table entry
 //! and selecting with masks, whether or not its scalars are secret: one routine
 //! is less to audit than a fast public path beside a careful secret one. P-256
 //! holds long-lived keys and signs; P-384 verifies certificate chains and holds
-//! only ephemeral ECDH keys.
+//! only ephemeral ECDH keys; P-521 only verifies. Each prime is 3 mod 4, so a
+//! compressed point's y is one exponentiation away.
 
 use std::sync::OnceLock;
 
@@ -85,6 +86,62 @@ const P384_GY: [u64; 6] = [
     0x3617de4a96262c6f,
 ];
 
+const P521_P: [u64; 9] = [
+    0xffffffffffffffff,
+    0xffffffffffffffff,
+    0xffffffffffffffff,
+    0xffffffffffffffff,
+    0xffffffffffffffff,
+    0xffffffffffffffff,
+    0xffffffffffffffff,
+    0xffffffffffffffff,
+    0x00000000000001ff,
+];
+const P521_N: [u64; 9] = [
+    0xbb6fb71e91386409,
+    0x3bb5c9b8899c47ae,
+    0x7fcc0148f709a5d0,
+    0x51868783bf2f966b,
+    0xfffffffffffffffa,
+    0xffffffffffffffff,
+    0xffffffffffffffff,
+    0xffffffffffffffff,
+    0x00000000000001ff,
+];
+const P521_B: [u64; 9] = [
+    0xef451fd46b503f00,
+    0x3573df883d2c34f1,
+    0x1652c0bd3bb1bf07,
+    0x56193951ec7e937b,
+    0xb8b489918ef109e1,
+    0xa2da725b99b315f3,
+    0x929a21a0b68540ee,
+    0x953eb9618e1c9a1f,
+    0x0000000000000051,
+];
+const P521_GX: [u64; 9] = [
+    0xf97e7e31c2e5bd66,
+    0x3348b3c1856a429b,
+    0xfe1dc127a2ffa8de,
+    0xa14b5e77efe75928,
+    0xf828af606b4d3dba,
+    0x9c648139053fb521,
+    0x9e3ecb662395b442,
+    0x858e06b70404e9cd,
+    0x00000000000000c6,
+];
+const P521_GY: [u64; 9] = [
+    0x88be94769fd16650,
+    0x353c7086a272c240,
+    0xc550b9013fad0761,
+    0x97ee72995ef42640,
+    0x17afbd17273e662c,
+    0x98f54449579b4468,
+    0x5c8a5fb42c7d1bd9,
+    0x39296a789a3bc004,
+    0x0000000000000118,
+];
+
 #[derive(Clone, Copy)]
 struct Point<const N: usize> {
     x: [u64; N],
@@ -97,10 +154,40 @@ struct Curve<const N: usize> {
     n: Modulus<N>,
     b: [u64; N],
     g: Point<N>,
+    /// Bytes in an encoded coordinate: 8 N, but 66 for P-521's 9 limbs.
+    width: usize,
+    /// Bits in the order, which bounds a digest's contribution.
+    order_bits: usize,
+    /// (p + 1) / 4, the exponent of a square root mod p.
+    root: [u64; N],
+}
+
+/// The position of the highest set bit, plus one, of a public value.
+fn bit_length(words: &[u64]) -> usize {
+    words
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, word)| **word != 0)
+        .map_or(0, |(at, word)| 64 * at + 64 - word.leading_zeros() as usize)
 }
 
 impl<const N: usize> Curve<N> {
     fn new(p: [u64; N], n: [u64; N], b: [u64; N], gx: [u64; N], gy: [u64; N]) -> Self {
+        // p = 3 mod 4, so (p + 1) / 4 = (p >> 2) + 1.
+        let mut root = [0u64; N];
+        let above = p.iter().skip(1).chain(std::iter::once(&0));
+        for ((word, low), high) in root.iter_mut().zip(&p).zip(above) {
+            *word = (low >> 2) | (high << 62);
+        }
+        let mut carry = 1u64;
+        for word in &mut root {
+            let (sum, over) = word.overflowing_add(carry);
+            *word = sum;
+            carry = u64::from(over);
+        }
+        let width = bit_length(&p).div_ceil(8);
+        let order_bits = bit_length(&n);
         let p = Modulus::new(p);
         let g = Point {
             x: p.enter(&gx),
@@ -112,6 +199,9 @@ impl<const N: usize> Curve<N> {
             n: Modulus::new(n),
             p,
             g,
+            width,
+            order_bits,
+            root,
         }
     }
 
@@ -232,31 +322,44 @@ impl<const N: usize> Curve<N> {
         ))
     }
 
+    /// A coordinate's `width` big-endian bytes, which must be below p.
+    fn coordinate(&self, bytes: &[u8]) -> Result<[u64; N], Refused> {
+        if bytes.len() != self.width {
+            return Err(Refused);
+        }
+        // On the stack: every TLS key exchange and signature check comes here.
+        let mut buffer = [0u8; 8 * MAX_LIMBS];
+        let padded = buffer.get_mut(..8 * N).ok_or(Refused)?;
+        let room = (8 * N).checked_sub(self.width).ok_or(Refused)?;
+        padded
+            .get_mut(room..)
+            .ok_or(Refused)?
+            .copy_from_slice(bytes);
+        let value: [u64; N] = from_be(padded).ok_or(Refused)?;
+        if less_mask(&value, &self.p.m) == 0 {
+            return Err(Refused);
+        }
+        Ok(value)
+    }
+
+    /// x^3 - 3x + b, for x in Montgomery form, in Montgomery form.
+    fn right_side(&self, x: &[u64; N]) -> [u64; N] {
+        let f = &self.p;
+        let minus_three = f.sub(&f.sub(&f.sub(&[0; N], &f.one), &f.one), &f.one);
+        f.add(&f.mul(&f.add(&f.mul(x, x), &minus_three), x), &self.b)
+    }
+
     /// An uncompressed SEC 1 point: canonical coordinates on the curve. The
     /// cofactor is 1, so that is the whole of validation.
     fn decode_point(&self, encoded: &[u8]) -> Result<Point<N>, Refused> {
         let (&tag, coordinates) = encoded.split_first().ok_or(Refused)?;
-        if tag != 4 || coordinates.len() != 16 * N {
+        if tag != 4 {
             return Err(Refused);
         }
-        let (x_bytes, y_bytes) = coordinates.split_at(8 * N);
-        let x: [u64; N] = from_be(x_bytes).ok_or(Refused)?;
-        let y: [u64; N] = from_be(y_bytes).ok_or(Refused)?;
-        if less_mask(&x, &self.p.m) == 0 || less_mask(&y, &self.p.m) == 0 {
-            return Err(Refused);
-        }
-        let x = self.p.enter(&x);
-        let y = self.p.enter(&y);
-        // y^2 = x^3 - 3x + b
-        let xx = self.p.mul(&x, &x);
-        let minus_three = self.p.sub(
-            &self.p.sub(&self.p.sub(&[0; N], &self.p.one), &self.p.one),
-            &self.p.one,
-        );
-        let right = self
-            .p
-            .add(&self.p.mul(&self.p.add(&xx, &minus_three), &x), &self.b);
-        if self.p.mul(&y, &y) != right {
+        let (x_bytes, y_bytes) = coordinates.split_at_checked(self.width).ok_or(Refused)?;
+        let x = self.p.enter(&self.coordinate(x_bytes)?);
+        let y = self.p.enter(&self.coordinate(y_bytes)?);
+        if self.p.mul(&y, &y) != self.right_side(&x) {
             return Err(Refused);
         }
         Ok(Point {
@@ -266,15 +369,67 @@ impl<const N: usize> Curve<N> {
         })
     }
 
-    /// bits2int of a digest, reduced: its leading N words' worth of bytes,
-    /// which for these byte-aligned orders is exactly the leftmost bits.
+    /// A compressed SEC 1 point: x, with y's parity in the tag. An x whose
+    /// right side has no square root is not on the curve. Points are public.
+    fn decompress(&self, encoded: &[u8]) -> Result<Point<N>, Refused> {
+        let (&tag, x_bytes) = encoded.split_first().ok_or(Refused)?;
+        let odd = match tag {
+            2 => 0,
+            3 => 1,
+            _ => return Err(Refused),
+        };
+        let x = self.p.enter(&self.coordinate(x_bytes)?);
+        let right = self.right_side(&x);
+        let mut y = self.p.pow(&right, &self.root);
+        if self.p.mul(&y, &y) != right {
+            return Err(Refused);
+        }
+        let parity = |value: &[u64; N]| self.p.leave(value).first().copied().unwrap_or(0) & 1;
+        if parity(&y) != odd {
+            y = self.p.sub(&[0; N], &y);
+        }
+        // Only y = 0 keeps its parity when negated, and no point of a curve of
+        // prime order has it.
+        if parity(&y) != odd {
+            return Err(Refused);
+        }
+        Ok(Point {
+            x,
+            y,
+            z: self.p.one,
+        })
+    }
+
+    /// A point in either SEC 1 form, validated, as 1 + 2 width uncompressed bytes.
+    fn uncompressed(&self, encoded: &[u8], out: &mut [u8]) -> Result<(), Refused> {
+        let point = match encoded.first() {
+            Some(4) => self.decode_point(encoded)?,
+            _ => self.decompress(encoded)?,
+        };
+        self.encode_affine(&self.p.leave(&point.x), &self.p.leave(&point.y), out)
+    }
+
+    /// bits2int of a digest, reduced (FIPS 186-5 6.4.1): as many of its leftmost
+    /// bits as the order has. Only P-521's order is not whole bytes, and only a
+    /// digest of 66 bytes or more reaches past it.
     fn digest_scalar(&self, digest: &[u8]) -> Result<[u64; N], Refused> {
         let mut bytes = vec![0u8; 8 * N];
-        let take = digest.len().min(8 * N);
+        let take = digest.len().min(self.width);
         let head = digest.get(..take).ok_or(Refused)?;
         let room = bytes.get_mut(8 * N - take..).ok_or(Refused)?;
         room.copy_from_slice(head);
-        let limbs: [u64; N] = from_be(&bytes).ok_or(Refused)?;
+        let mut limbs: [u64; N] = from_be(&bytes).ok_or(Refused)?;
+        // Fewer than 8: `width` rounds p's bits up to a byte, and each order
+        // here has its prime's bit length, as a unit test holds.
+        let excess = (8 * take).saturating_sub(self.order_bits);
+        if excess > 0 {
+            let mut carry = 0u64;
+            for word in limbs.iter_mut().rev() {
+                let low = *word << (64 - excess);
+                *word = (*word >> excess) | carry;
+                carry = low;
+            }
+        }
         Ok(self.n.leave(&self.n.enter(&limbs)))
     }
 
@@ -346,14 +501,24 @@ impl<const N: usize> Curve<N> {
         Err(Refused)
     }
 
-    /// The uncompressed public point of `scalar`, into 1 + 16 N bytes.
+    /// The uncompressed public point of `scalar`, into 1 + 2 width bytes.
     fn encode_public(&self, scalar: &[u64; N], out: &mut [u8]) -> Result<(), Refused> {
         let (x, y) = self.affine(&self.multiply(scalar, &self.g))?;
+        self.encode_affine(&x, &y, out)
+    }
+
+    /// Affine x and y in plain limbs as an uncompressed point of 1 + 2 width bytes.
+    fn encode_affine(&self, x: &[u64; N], y: &[u64; N], out: &mut [u8]) -> Result<(), Refused> {
+        if out.len() != 1 + 2 * self.width {
+            return Err(Refused);
+        }
         let (tag, coordinates) = out.split_first_mut().ok_or(Refused)?;
         *tag = 4;
-        let (left, right) = coordinates.split_at_mut_checked(8 * N).ok_or(Refused)?;
-        Self::encode_coordinate(&x, left);
-        Self::encode_coordinate(&y, right);
+        let (left, right) = coordinates
+            .split_at_mut_checked(self.width)
+            .ok_or(Refused)?;
+        Self::encode_coordinate(x, left);
+        Self::encode_coordinate(y, right);
         Ok(())
     }
 
@@ -367,6 +532,8 @@ impl<const N: usize> Curve<N> {
 }
 
 const MIN_DIGEST_LEN: usize = 32;
+/// P-521's, the most limbs of any curve here.
+const MAX_LIMBS: usize = 9;
 const WINDOW_BITS: usize = 4;
 const WINDOW_ENTRIES: usize = 1 << WINDOW_BITS;
 
@@ -381,6 +548,11 @@ fn p384_curve() -> &'static Curve<6> {
     CURVE.get_or_init(|| Curve::new(P384_P, P384_N, P384_B, P384_GX, P384_GY))
 }
 
+fn p521_curve() -> &'static Curve<9> {
+    static CURVE: OnceLock<Curve<9>> = OnceLock::new();
+    CURVE.get_or_init(|| Curve::new(P521_P, P521_N, P521_B, P521_GX, P521_GY))
+}
+
 pub mod p256 {
     use super::{
         ct, der, from_be, less_mask, p256_curve, zero_mask, Curve, Digest, Hmac, Refused, Sha256,
@@ -393,6 +565,15 @@ pub mod p256 {
     /// the caller's, and a longer one is truncated as FIPS 186-5 requires.
     pub fn verify(public: &[u8], digest: &[u8], der_signature: &[u8]) -> Result<(), Refused> {
         p256_curve().verify(public, digest, der_signature)
+    }
+
+    /// A SEC 1 point, compressed or not, validated and uncompressed: the one
+    /// form `verify` and `agree` take, which is all TLS sends, from a key a
+    /// certificate may hold in either.
+    pub fn uncompressed(encoded: &[u8]) -> Result<[u8; PUBLIC_LEN], Refused> {
+        let mut out = [0u8; PUBLIC_LEN];
+        p256_curve().uncompressed(encoded, &mut out)?;
+        Ok(out)
     }
 
     pub struct SecretKey {
@@ -559,6 +740,14 @@ pub mod p384 {
         p384_curve().verify(public, digest, der_signature)
     }
 
+    /// A SEC 1 point, compressed or not, validated and uncompressed, as
+    /// `p256::uncompressed`.
+    pub fn uncompressed(encoded: &[u8]) -> Result<[u8; PUBLIC_LEN], Refused> {
+        let mut out = [0u8; PUBLIC_LEN];
+        p384_curve().uncompressed(encoded, &mut out)?;
+        Ok(out)
+    }
+
     pub struct SecretKey {
         scalar: [u64; 6],
     }
@@ -598,10 +787,33 @@ pub mod p384 {
     }
 }
 
+/// P-521 verifies signatures and reads the keys they are checked against:
+/// td-crypto's certificate and handshake policy admits them, and td holds no
+/// P-521 key and offers no P-521 exchange.
+pub mod p521 {
+    use super::{p521_curve, Refused};
+
+    pub const PUBLIC_LEN: usize = 133;
+
+    /// `der_signature` by an uncompressed `public` over a digest. A digest of
+    /// 66 bytes or more keeps its leftmost 521 bits; none here is that long.
+    pub fn verify(public: &[u8], digest: &[u8], der_signature: &[u8]) -> Result<(), Refused> {
+        p521_curve().verify(public, digest, der_signature)
+    }
+
+    /// A SEC 1 point, compressed or not, validated and uncompressed, as
+    /// `p256::uncompressed`.
+    pub fn uncompressed(encoded: &[u8]) -> Result<[u8; PUBLIC_LEN], Refused> {
+        let mut out = [0u8; PUBLIC_LEN];
+        p521_curve().uncompressed(encoded, &mut out)?;
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
-    use super::{p256, p256_curve, p384, p384_curve, Curve, Digest, Sha256};
+    use super::{p256, p256_curve, p384, p384_curve, p521_curve, Curve, Digest, Sha256};
     use crate::bignum::zero_mask;
 
     fn hex(text: &str) -> Vec<u8> {
@@ -675,6 +887,7 @@ mod tests {
     fn fixed_windows_agree_with_one_bit_at_a_time() {
         windows_agree_with_bits(p256_curve());
         windows_agree_with_bits(p384_curve());
+        windows_agree_with_bits(p521_curve());
     }
 
     fn order_times_base_is_the_identity<const N: usize>(curve: &Curve<N>) {
@@ -687,6 +900,72 @@ mod tests {
     fn the_order_annihilates_the_base_point() {
         order_times_base_is_the_identity(p256_curve());
         order_times_base_is_the_identity(p384_curve());
+        order_times_base_is_the_identity(p521_curve());
+    }
+
+    /// The generator, compressed under either tag, is G or -G, which share x.
+    fn generator_decompresses<const N: usize>(curve: &Curve<N>, width: usize, order_bits: usize) {
+        assert_eq!((curve.width, curve.order_bits), (width, order_bits));
+        assert_eq!(curve.p.m[0] & 3, 3, "p = 3 mod 4");
+        // 4 root = p + 1.
+        let mut times_four = [0u64; N];
+        let mut carry = 0u64;
+        for (out, word) in times_four.iter_mut().zip(&curve.root) {
+            *out = (word << 2) | carry;
+            carry = word >> 62;
+        }
+        let mut plus_one = curve.p.m;
+        let mut carry = 1u64;
+        for word in &mut plus_one {
+            let (sum, over) = word.overflowing_add(carry);
+            *word = sum;
+            carry = u64::from(over);
+        }
+        assert_eq!(times_four, plus_one);
+
+        let mut encoded = vec![0u8; 1 + 2 * width];
+        let (x, y) = curve.affine(&curve.g).unwrap();
+        curve.encode_affine(&x, &y, &mut encoded).unwrap();
+        let odd = encoded[2 * width] & 1;
+        let mut out = vec![0u8; encoded.len()];
+        for tag in [2u8, 3] {
+            let mut compressed = encoded[..=width].to_vec();
+            compressed[0] = tag;
+            curve.uncompressed(&compressed, &mut out).unwrap();
+            assert_eq!(out[..=width], encoded[..=width]);
+            let negated = curve.p.leave(&curve.p.sub(&[0; N], &curve.g.y));
+            let mut want = vec![0u8; width];
+            Curve::<N>::encode_coordinate(if tag & 1 == odd { &y } else { &negated }, &mut want);
+            assert_eq!(out[1 + width..], want[..], "tag {tag}");
+        }
+        curve.uncompressed(&encoded, &mut out).unwrap();
+        assert_eq!(out, encoded);
+        assert!(
+            curve.uncompressed(&encoded[..=width], &mut out).is_err(),
+            "tag 4, x only"
+        );
+        assert!(
+            curve.uncompressed(&encoded, &mut out[1..]).is_err(),
+            "short output"
+        );
+        // Infinity, hybrid (6, 7) and unassigned tags, over a real x and over
+        // a real x and y, are refused at both lengths.
+        for tag in [0u8, 1, 5, 6, 7] {
+            let mut whole = encoded.clone();
+            whole[0] = tag;
+            assert!(curve.uncompressed(&whole, &mut out).is_err(), "tag {tag}");
+            assert!(
+                curve.uncompressed(&whole[..=width], &mut out).is_err(),
+                "tag {tag}, x only"
+            );
+        }
+    }
+
+    #[test]
+    fn each_curve_has_its_widths_and_a_square_root_exponent() {
+        generator_decompresses(p256_curve(), 32, 256);
+        generator_decompresses(p384_curve(), 48, 384);
+        generator_decompresses(p521_curve(), 66, 521);
     }
 
     fn addition_handles_every_case<const N: usize>(curve: &Curve<N>) {
@@ -736,6 +1015,7 @@ mod tests {
     fn complete_addition_handles_doubling_and_the_identity() {
         addition_handles_every_case(p256_curve());
         addition_handles_every_case(p384_curve());
+        addition_handles_every_case(p521_curve());
     }
 
     // RFC 6979 A.2.5: P-256, SHA-256, message "sample".
