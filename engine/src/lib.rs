@@ -58,6 +58,7 @@ pub mod crc32;
 pub mod elf_edit;
 pub mod rust_dist;
 pub mod tar;
+pub mod tar_write;
 // `debian_root` parses recipes/src/debian-root.lock: td-recipe-eval lists
 // its pins, td-builder assembles and admits the root against it.
 pub mod debian_root;

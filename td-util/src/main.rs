@@ -28,7 +28,8 @@
 //! refuses the rest rather than guessing at it. `gzip` decodes with the engine's
 //! inflater and CRC, included below, so one decoder serves source preparation
 //! and this. `tar` extracts plain or gzip archives with the engine's shared
-//! parser; its `--help` states the supported flags and resource limits.
+//! parser and creates them with its ustar writer; its `--help` states the
+//! supported flags and resource limits.
 //!
 //! Almost everything here is safe `std`: `/proc` and `/dev/kmsg` are ordinary
 //! files, and the build tools walk, read and spawn through `std`. `less` is
@@ -97,6 +98,8 @@ mod tar;
 #[path = "../../engine/src/tar_extract.rs"]
 #[allow(dead_code)]
 mod tar_extract;
+#[path = "../../engine/src/tar_write.rs"]
+mod tar_write;
 mod term;
 mod test;
 mod uname;
@@ -374,6 +377,10 @@ mod confinement {
         (
             "gzip.rs",
             concat!("#[", "path=\"../../engine/src/gzip.rs\"]"),
+        ),
+        (
+            "tar_write.rs",
+            concat!("#[", "path=\"../../engine/src/tar_write.rs\"]"),
         ),
     ];
 

@@ -213,8 +213,15 @@ pub fn recipe() -> Recipe {
     // argv, so this text names them nowhere — the count of 30 above pins
     // that they are served.
     // The build root creates an independent ustar fixture; the realized target
-    // binary extracts both its plain and gzip forms.
-    for dir in ["tar-source", "tar-plain", "tar-gzip"] {
+    // binary extracts both its plain and gzip forms. Then the other way: the
+    // target binary archives the source, and the build root's GNU tar extracts it.
+    for dir in [
+        "tar-source",
+        "tar-plain",
+        "tar-gzip",
+        "tar-made",
+        "tar-made-gzip",
+    ] {
         steps.push(Step::MkDir {
             path: format!("{{root}}/{dir}"),
         });
@@ -257,7 +264,22 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", PATH),
     );
-    for dir in ["tar-plain", "tar-gzip"] {
+    for (flags, archive, extract, dir) in [
+        ("-cf", "made.tar", "-xf", "tar-made"),
+        ("-czf", "made.tar.gz", "-xzf", "tar-made-gzip"),
+    ] {
+        steps.push(
+            Step::run(
+                "{root}",
+                &[bin, "tar", flags, archive, "-C", "tar-source", "."],
+            )
+            .env("PATH", PATH),
+        );
+        steps.push(
+            Step::run("{root}", &["/usr/bin/tar", extract, archive, "-C", dir]).env("PATH", PATH),
+        );
+    }
+    for dir in ["tar-plain", "tar-gzip", "tar-made", "tar-made-gzip"] {
         steps.push(
             Step::run(
                 "{root}",

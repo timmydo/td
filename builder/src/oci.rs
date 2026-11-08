@@ -38,8 +38,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use td_engine::tar_write;
 
-const BLOCK: usize = 512;
 /// SOURCE_DATE_EPOCH=1 — the same mtime guix normalizes image entries to.
 const NORMAL_MTIME: u64 = 1;
 
@@ -58,93 +58,26 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     h.finalize()
 }
 
-// ---- deterministic ustar writer -------------------------------------------------
+// ---- deterministic ustar entries -----------------------------------------------
 
-/// Write VALUE into the ustar numeric field `buf`. Small values use the classic
-/// zero-padded, NUL-terminated octal form (`buf.len()-1` digits then NUL). A value too
-/// large for octal (a `layer.tar` or rootfs file >= 8 GiB in the 12-byte size field —
-/// real OS closures hit this) uses the GNU **base-256** encoding: the field holds the
-/// number big-endian across all bytes with the high bit of byte 0 set as the marker
-/// (Go's `archive/tar` and GNU tar both read it). This is what makes large images
-/// correct instead of silently truncated — the earlier octal-only version dropped the
-/// high digits and desynced the tar stream.
-fn numeric_field(buf: &mut [u8], value: u64) {
-    let w = buf.len();
-    // Octal fits when value < 8^(w-1) (w-1 digits + a NUL). w is 8 or 12 here.
-    let octal_fits = (w - 1) >= 22 || (value as u128) < (1u128 << (3 * (w - 1)));
-    if octal_fits {
-        let s = format!("{value:0width$o}", width = w - 1);
-        buf[..w - 1].copy_from_slice(s.as_bytes());
-        buf[w - 1] = 0;
-    } else {
-        buf.fill(0);
-        let mut v = value;
-        for slot in buf.iter_mut().rev() {
-            *slot = (v & 0xff) as u8;
-            v >>= 8;
-        }
-        buf[0] |= 0x80; // base-256 marker
-    }
-}
-
-fn pad_to_block(out: &mut Vec<u8>) {
-    let rem = out.len() % BLOCK;
-    if rem != 0 {
-        out.resize(out.len() + (BLOCK - rem), 0);
-    }
-}
-
-/// Emit one ustar header block for NAME (already <=100 bytes) into `out`.
-fn write_header(out: &mut Vec<u8>, name: &str, typeflag: u8, mode: u32, size: u64, link: &str) {
-    let mut h = [0u8; BLOCK];
-    let nb = name.as_bytes();
-    let nlen = nb.len().min(100);
-    h[..nlen].copy_from_slice(&nb[..nlen]);
-    numeric_field(&mut h[100..108], (mode & 0o7777) as u64);
-    numeric_field(&mut h[108..116], 0); // uid
-    numeric_field(&mut h[116..124], 0); // gid
-    numeric_field(&mut h[124..136], size);
-    numeric_field(&mut h[136..148], NORMAL_MTIME);
-    h[156] = typeflag;
-    let lb = link.as_bytes();
-    let llen = lb.len().min(100);
-    h[157..157 + llen].copy_from_slice(&lb[..llen]);
-    h[257..263].copy_from_slice(b"ustar\0");
-    h[263..265].copy_from_slice(b"00");
-    // Checksum: sum of all header bytes with the checksum field taken as spaces.
-    h[148..156].fill(b' ');
-    let sum: u32 = h.iter().map(|&b| b as u32).sum();
-    let cs = format!("{sum:06o}");
-    h[148..148 + cs.len()].copy_from_slice(cs.as_bytes());
-    h[154] = 0;
-    h[155] = b' ';
-    out.extend_from_slice(&h);
-}
-
-/// Append one tar entry (header + body, each block-padded), emitting GNU '@LongLink'
-/// pseudo-entries first when the NAME (>100 bytes — store paths) or the symlink LINK
-/// target (>100 bytes — absolute store-path targets) exceed the 100-byte ustar fields.
-/// Without the 'K' entry a long symlink target is silently truncated to a wrong path.
+/// Append one entry, header and body, with normalized owner and time. The writer
+/// (`td_engine::tar_write`) emits a GNU `@LongLink` record first for a NAME or LINK
+/// past the 100-byte ustar fields: store paths and their absolute targets.
 fn tar_entry(out: &mut Vec<u8>, name: &str, typeflag: u8, mode: u32, body: &[u8], link: &str) {
-    if link.len() > 100 {
-        let mut lbytes = link.as_bytes().to_vec();
-        lbytes.push(0);
-        write_header(out, "././@LongLink", b'K', 0o644, lbytes.len() as u64, "");
-        out.extend_from_slice(&lbytes);
-        pad_to_block(out);
-    }
-    if name.len() > 100 {
-        let mut nbytes = name.as_bytes().to_vec();
-        nbytes.push(0);
-        write_header(out, "././@LongLink", b'L', 0o644, nbytes.len() as u64, "");
-        out.extend_from_slice(&nbytes);
-        pad_to_block(out);
-    }
-    write_header(out, name, typeflag, mode, body.len() as u64, link);
-    if !body.is_empty() {
-        out.extend_from_slice(body);
-        pad_to_block(out);
-    }
+    let header = tar_write::Header {
+        name: name.as_bytes(),
+        typeflag,
+        mode,
+        uid: 0,
+        gid: 0,
+        size: body.len() as u64,
+        mtime: NORMAL_MTIME,
+        link: link.as_bytes(),
+    };
+    // A Vec takes every write.
+    let _ = tar_write::write_header(out, &header);
+    out.extend_from_slice(body);
+    let _ = tar_write::pad(out, body.len() as u64);
 }
 
 /// Append SRC's tree to OUT as deterministic tar entries, each named PREFIX joined with
@@ -213,7 +146,7 @@ fn append_subtree(out: &mut Vec<u8>, src: &Path, prefix: &str) -> io::Result<()>
 pub fn build_layer_tar(root: &Path) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     append_subtree(&mut out, root, "")?;
-    out.resize(out.len() + BLOCK * 2, 0);
+    let _ = tar_write::finish(&mut out);
     Ok(out)
 }
 
@@ -270,7 +203,7 @@ pub fn build_layer_tar_from_closure(
             })?;
         append_subtree(&mut out, Path::new(on_disk), &format!("{store_rel}/{base}"))?;
     }
-    out.resize(out.len() + BLOCK * 2, 0);
+    let _ = tar_write::finish(&mut out);
     Ok(out)
 }
 
@@ -395,7 +328,7 @@ fn assemble_archive(out: &mut impl Write, layer: &[u8], cfg: &ImageConfig) -> io
         repositories.as_bytes(),
         "",
     );
-    buf.resize(buf.len() + BLOCK * 2, 0);
+    let _ = tar_write::finish(&mut buf);
     out.write_all(&buf)
 }
 
@@ -444,6 +377,7 @@ pub fn write_docker_archive_from_closure(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use td_engine::tar_write::BLOCK;
 
     struct Entry {
         name: String,
@@ -670,26 +604,6 @@ mod tests {
     }
 
     // ---- coverage for the review fixes -----------------------------------------
-
-    #[test]
-    fn numeric_field_octal_and_base256() {
-        // Small values: classic octal, NUL-terminated.
-        let mut f = [0u8; 12];
-        numeric_field(&mut f, 1);
-        assert_eq!(&f[..12], b"00000000001\0");
-        numeric_field(&mut f, 0o777);
-        assert_eq!(&f[..12], b"00000000777\0");
-        // >= 8 GiB overflows 11 octal digits → GNU base-256 (high bit of byte 0 set),
-        // big-endian value. The earlier octal-only code silently truncated this.
-        let big: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
-        numeric_field(&mut f, big);
-        assert_eq!(f[0] & 0x80, 0x80, "base-256 marker not set for {big}");
-        let mut v: u128 = (f[0] & 0x7f) as u128;
-        for &b in &f[1..] {
-            v = (v << 8) | b as u128;
-        }
-        assert_eq!(v as u64, big, "base-256 round-trip wrong");
-    }
 
     #[test]
     fn long_symlink_target_roundtrips_via_k() {

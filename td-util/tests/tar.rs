@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use std::fs;
-use std::os::unix::fs::{symlink, MetadataExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Output};
 use td_fs::TempDir;
@@ -191,4 +191,233 @@ fn truncated_private_files_remain_private() {
         fs::metadata(d.join("out/secret")).unwrap().mode() & 0o077,
         0
     );
+}
+
+/// A tree holding each kind `tar -c` stores, and the names past 100 bytes that
+/// take long-name records.
+fn tree(root: &Path) -> String {
+    let long = "d".repeat(120);
+    fs::create_dir_all(root.join("src/nested").join(&long)).unwrap();
+    fs::create_dir(root.join("src/empty")).unwrap();
+    fs::write(root.join("src/plain"), b"plain bytes").unwrap();
+    fs::write(root.join("src/tool"), vec![7u8; 70_000]).unwrap();
+    fs::set_permissions(root.join("src/tool"), fs::Permissions::from_mode(0o750)).unwrap();
+    fs::write(root.join("src/na\u{ef}ve"), b"").unwrap();
+    // Its 100th byte splits a character.
+    let split = format!("{}\u{e9}", "s".repeat(99));
+    fs::write(root.join("src").join(&split), b"split").unwrap();
+    fs::write(root.join("src/nested").join(&long).join("inner"), b"deep").unwrap();
+    symlink("plain", root.join("src/near")).unwrap();
+    let far = format!("nested/{long}/inner");
+    symlink(&far, root.join("src/far")).unwrap();
+    fs::hard_link(root.join("src/plain"), root.join("src/again")).unwrap();
+    long
+}
+
+/// The named file in two trees is the same: kind, bytes, target and mode.
+fn same(a: &Path, b: &Path, name: &str) {
+    let (left, right) = (a.join(name), b.join(name));
+    let (lm, rm) = (
+        fs::symlink_metadata(&left).unwrap(),
+        fs::symlink_metadata(&right).unwrap(),
+    );
+    assert_eq!(lm.file_type(), rm.file_type(), "{name}");
+    if lm.file_type().is_symlink() {
+        assert_eq!(
+            fs::read_link(&left).unwrap(),
+            fs::read_link(&right).unwrap()
+        );
+        return;
+    }
+    assert_eq!(lm.mode() & 0o777, rm.mode() & 0o777, "{name}");
+    if lm.is_file() {
+        assert_eq!(
+            fs::read(&left).unwrap(),
+            fs::read(&right).unwrap(),
+            "{name}"
+        );
+        assert_eq!(lm.mtime(), rm.mtime(), "{name}");
+    }
+}
+
+#[test]
+fn creates_archives_its_own_extraction_restores() {
+    let d = TempDir::new("td-util-tar-create").unwrap();
+    let long = tree(&d);
+    let members = [
+        "plain".to_string(),
+        "tool".to_string(),
+        "na\u{ef}ve".to_string(),
+        "near".to_string(),
+        "far".to_string(),
+        "again".to_string(),
+        "empty".to_string(),
+        format!("nested/{long}/inner"),
+        format!("{}\u{e9}", "s".repeat(99)),
+    ];
+    for (flags, archive) in [("-cf", "out.tar"), ("-czf", "out.tar.gz")] {
+        let result = run(&d, &["tar", flags, archive, "-C", "src", "."]);
+        assert!(result.status.success(), "{result:?}");
+        let into = format!("into-{archive}");
+        fs::create_dir(d.join(&into)).unwrap();
+        let extract = if archive.ends_with(".gz") {
+            "-xzf"
+        } else {
+            "-xf"
+        };
+        let result = run(&d, &["tar", extract, archive, "-C", &into]);
+        assert!(result.status.success(), "{result:?}");
+        for name in &members {
+            same(&d.join("src"), &d.join(&into), name);
+        }
+        // A hard link is another copy.
+        assert_ne!(
+            fs::metadata(d.join(&into).join("again")).unwrap().ino(),
+            fs::metadata(d.join(&into).join("plain")).unwrap().ino()
+        );
+    }
+}
+
+/// Names, kinds and owners in an archive with no long names.
+fn members(archive: &[u8]) -> Vec<(String, u8, u64)> {
+    let octal = |field: &[u8]| {
+        let digits = std::str::from_utf8(field.split(|b| *b == 0).next().unwrap()).unwrap();
+        u64::from_str_radix(digits, 8).unwrap()
+    };
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at + 512 <= archive.len() && archive[at] != 0 {
+        let h = &archive[at..at + 512];
+        let name = h[..100].split(|b| *b == 0).next().unwrap();
+        let size = octal(&h[124..136]);
+        found.push((
+            String::from_utf8(name.to_vec()).unwrap(),
+            h[156],
+            octal(&h[108..116]),
+        ));
+        at += 512 + size.div_ceil(512) as usize * 512;
+    }
+    assert_eq!(&archive[at..], &[0; 1024][..], "two zero blocks end it");
+    found
+}
+
+#[test]
+fn writes_to_standard_output_in_byte_order_the_same_each_time() {
+    let d = TempDir::new("td-util-tar-stdout").unwrap();
+    fs::create_dir_all(d.join("t/b/inner")).unwrap();
+    fs::write(d.join("t/b/inner/x"), b"x").unwrap();
+    fs::write(d.join("t/a"), b"a").unwrap();
+    fs::write(d.join("t/B"), b"B").unwrap();
+    symlink("a", d.join("t/c")).unwrap();
+    let first = run(&d, &["tar", "-cf", "-", "t", "./t/a"]);
+    assert!(first.status.success(), "{first:?}");
+    let second = run(&d, &["tar", "-c", "-f-", "--", "t", "./t/a"]);
+    assert_eq!(first.stdout, second.stdout);
+    let uid = fs::metadata(d.join("t/a")).unwrap().uid();
+    let found = members(&first.stdout);
+    let names: Vec<(&str, u8)> = found.iter().map(|(n, k, _)| (n.as_str(), *k)).collect();
+    assert_eq!(
+        names,
+        [
+            ("t/", b'5'),
+            ("t/B", b'0'),
+            ("t/a", b'0'),
+            ("t/b/", b'5'),
+            ("t/b/inner/", b'5'),
+            ("t/b/inner/x", b'0'),
+            ("t/c", b'2'),
+            ("t/a", b'0'),
+        ]
+    );
+    assert!(found.iter().all(|(_, _, owner)| *owner == u64::from(uid)));
+}
+
+#[test]
+fn leaves_out_the_archive_itself_and_sockets() {
+    let d = TempDir::new("td-util-tar-self").unwrap();
+    fs::create_dir(d.join("t")).unwrap();
+    fs::write(d.join("t/kept"), b"kept").unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(d.join("t/socket")).unwrap();
+    let result = run(&d, &["tar", "-cf", "t/self.tar", "-C", "t", "."]);
+    assert!(result.status.success(), "{result:?}");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("the archive itself is not stored"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("a socket is not stored"), "{stderr}");
+    let found = members(&fs::read(d.join("t/self.tar")).unwrap());
+    let names: Vec<&str> = found.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert_eq!(names, ["kept"]);
+}
+
+#[test]
+fn leaves_out_the_archive_on_standard_output_and_follows_a_linked_directory() {
+    let d = TempDir::new("td-util-tar-stdout-self").unwrap();
+    fs::create_dir(d.join("real")).unwrap();
+    fs::write(d.join("real/kept"), b"kept").unwrap();
+    symlink("real", d.join("current")).unwrap();
+    let out = fs::File::create(d.join("real/out.tar")).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_td-util"))
+        .current_dir(&d)
+        .args(["tar", "-cf", "-", "-C", "current", "."])
+        .stdout(out)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let found = members(&fs::read(d.join("real/out.tar")).unwrap());
+    let names: Vec<&str> = found.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert_eq!(names, ["kept"]);
+}
+
+#[test]
+fn refuses_paths_outside_the_directory_and_empty_archives() {
+    let d = TempDir::new("td-util-tar-create-args").unwrap();
+    fs::create_dir(d.join("t")).unwrap();
+    for args in [
+        vec!["tar", "-cf", "a.tar"],
+        vec!["tar", "-c", "t"],
+        vec!["tar", "-cf", "a.tar", "/etc"],
+        vec!["tar", "-cf", "a.tar", "t/../t"],
+        vec!["tar", "-cf", "a.tar", ""],
+        vec!["tar", "-cf", "a.tar", "missing"],
+        vec!["tar", "-cxf", "a.tar", "t"],
+        vec!["tar", "-cf", "a.tar", "-C", "missing", "."],
+        vec!["tar", "-xf", "a.tar", "t"],
+    ] {
+        assert!(!run(&d, &args).status.success(), "{args:?}");
+    }
+    for (args, reason) in [
+        (vec!["tar", "-cf", "a.tar", "/etc"], "relative"),
+        (vec!["tar", "-cf", "a.tar", "t/../t"], "relative"),
+        (
+            vec!["tar", "-cf", "a.tar", "t", "-C", "t"],
+            "before the PATHs",
+        ),
+        (vec!["tar", "-cf", "a.tar"], "empty archive"),
+    ] {
+        let result = run(&d, &args);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(reason), "{args:?}: {stderr}");
+    }
+    // An error is 2, which a changed file's 1 is not.
+    assert_eq!(
+        run(&d, &["tar", "-cf", "a.tar", "missing"]).status.code(),
+        Some(2)
+    );
+    // A PATH through a symlink, which tar -x would refuse.
+    symlink("t", d.join("lt")).unwrap();
+    fs::write(d.join("t/a"), b"a").unwrap();
+    let result = run(&d, &["tar", "-cf", "a.tar", "lt", "lt/a"]);
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("through this symlink"),
+        "{result:?}"
+    );
+    fs::remove_file(d.join("t/a")).unwrap();
+    // A name tar -x would refuse is refused here.
+    use std::os::unix::ffi::OsStrExt;
+    fs::write(d.join("t").join(std::ffi::OsStr::from_bytes(b"\xff")), b"").unwrap();
+    let result = run(&d, &["tar", "-cf", "a.tar", "t"]);
+    assert!(!result.status.success(), "{result:?}");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("not UTF-8"));
 }

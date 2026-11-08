@@ -481,9 +481,13 @@ and `ssh h cat f > f`, one file at a time, bounded by nothing but the disk. Only
 side's status says the bytes all arrived: a link that drops gives the far `cat` an end of
 input and status 0. So a tree goes up as an archive made on the sending side, copied as
 one step and unpacked as a second once the first said 0, `ssh h 'cat > a.tar'` then
-`ssh h tar -xf a.tar`, within `td-util tar`'s limits. A tree comes down awkwardly or as
-`git` carries one: `/bin/tar` only extracts, and the one archiver, `td-util
-gen_init_cpio`, packs newc from a spec list written by hand. That gap is known. Git over
+`ssh h tar -xf a.tar`, within `td-util tar`'s limits. A tree comes down as one step,
+`ssh h tar -cf - -C dir . > a.tar`, whole only once `ssh` said 0, since the far `tar`'s
+status is its own and a dropped link is the near side's failure, and then only if the
+near side could write `a.tar`: a full disk there leaves the status the far side's, as
+OpenSSH's does. `tar -xf a.tar` then refuses an archive without its end, so extracting
+with td's `tar` checks that too.
+`tar -c` stores files, directories and symlinks, and `tar --help` says what else. Git over
 `ssh` is the same `exec`. A stock `scp`, `sftp` or `rsync` from another machine fails,
 by a refused subsystem or a program not found.
 

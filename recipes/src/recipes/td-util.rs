@@ -110,7 +110,8 @@ const MODULES: &[(&str, &str)] = &[
 ];
 
 // The engine files main.rs reaches by `#[path = "../../engine/src/NAME.rs"]`:
-// its CRC and inflater, the ones source preparation trusts. Staged at the
+// its CRC and inflater, the ones source preparation trusts, and the tar reader
+// and writer. Staged at the
 // checkout's own layout so the relative path resolves.
 // Each with its staged path spelled out: builder/src/affected.rs reads this
 // text for the destination of every `#[path]` include it routes here.
@@ -129,6 +130,11 @@ const ENGINE: &[(&str, &str, &str)] = &[
         "gzip",
         "{src}/engine/src/gzip.rs",
         include_str!("../../../engine/src/gzip.rs"),
+    ),
+    (
+        "tar_write",
+        "{src}/engine/src/tar_write.rs",
+        include_str!("../../../engine/src/tar_write.rs"),
     ),
 ];
 
