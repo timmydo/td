@@ -176,11 +176,13 @@ fn run(args: &MonitorArgs<'_>) -> Result<()> {
     single_user_args(&mut session_command, args.single_user.as_ref());
     spawn_stage(session_command, OwnedFd::from(socket), session_end)?;
 
-    let mut frame = Writer::new();
+    let mut frame = ipc::frame_writer();
     state.encode(&mut frame);
+    // Wiped here, not left to the exec that ends this process's memory.
+    drop(state);
     session_grant.encode(&mut frame);
     frame.string(&host_blob);
-    ipc::write_frame(&mut session_stream, frame.as_slice())?;
+    ipc::write_frame(&mut session_stream, &frame.into_wiped())?;
 
     become_signer(&host_key, session_stream, args.single_user.as_ref())
 }
@@ -544,7 +546,7 @@ mod tests {
 
     fn ask(worker: &mut UnixStream, request: &Writer) -> Result<Vec<u8>> {
         ipc::write_frame(worker, request.as_slice())?;
-        ipc::read_frame(worker)
+        Ok(ipc::read_frame(worker)?.to_vec())
     }
 
     fn query(user: &str, key: &[u8; 32]) -> Writer {

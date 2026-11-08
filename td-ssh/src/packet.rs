@@ -92,10 +92,61 @@ fn next_seq(seq: u32) -> Result<u32> {
         .ok_or_else(|| Error::protocol("sequence number exhausted without a rekey"))
 }
 
+/// A transport key, boxed so that moving it copies only a pointer, and wiped when
+/// dropped: through the exchange's output, the reader thread's channel and the
+/// session's handoff these bytes stay in one place. The cipher built from it holds
+/// its own expanded copy inline, which moves with its owner like any value
+/// (DESIGN.md section 7).
+pub struct TransportKey(Box<[u8; 64]>);
+
+impl TransportKey {
+    /// For filling in place.
+    pub fn zeroed() -> Self {
+        Self(Box::new([0; 64]))
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let mut key = Self::zeroed();
+        if bytes.len() != key.0.len() {
+            return Err(Error::protocol("a transport key is 64 bytes"));
+        }
+        key.0.copy_from_slice(bytes);
+        Ok(key)
+    }
+
+    pub fn bytes(&self) -> &[u8; 64] {
+        &self.0
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8; 64] {
+        &mut self.0
+    }
+}
+
+impl Drop for TransportKey {
+    fn drop(&mut self) {
+        td_primitives::ct::zero(self.0.as_mut_slice());
+    }
+}
+
+impl PartialEq for TransportKey {
+    fn eq(&self, other: &Self) -> bool {
+        td_primitives::ct::eq(self.0.as_slice(), other.0.as_slice())
+    }
+}
+
+impl Eq for TransportKey {}
+
+impl std::fmt::Debug for TransportKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TransportKey(..)")
+    }
+}
+
 pub struct PacketReader<R> {
     inner: R,
     aead: Option<OpenSshAead>,
-    key: Option<[u8; 64]>,
+    key: Option<TransportKey>,
     counters: Counters,
     buffer: Vec<u8>,
 }
@@ -112,10 +163,10 @@ impl<R: Read> PacketReader<R> {
     }
 
     /// Resumes a connection whose keys another process negotiated.
-    pub fn resume(inner: R, key: &[u8; 64], counters: Counters) -> Self {
+    pub fn resume(inner: R, key: TransportKey, counters: Counters) -> Self {
         let mut reader = Self::new(inner);
-        reader.aead = Some(OpenSshAead::new(key));
-        reader.key = Some(*key);
+        reader.aead = Some(OpenSshAead::new(key.bytes()));
+        reader.key = Some(key);
         reader.counters = counters;
         reader
     }
@@ -125,13 +176,14 @@ impl<R: Read> PacketReader<R> {
     }
 
     /// The key in use, for handing transport state to another process.
-    pub fn key(&self) -> Option<[u8; 64]> {
-        self.key
+    /// For a handoff: the key leaves, and the cipher built from it stays.
+    pub fn take_key(&mut self) -> Option<TransportKey> {
+        self.key.take()
     }
 
-    pub fn install_key(&mut self, key: &[u8; 64]) {
-        self.aead = Some(OpenSshAead::new(key));
-        self.key = Some(*key);
+    pub fn install_key(&mut self, key: TransportKey) {
+        self.aead = Some(OpenSshAead::new(key.bytes()));
+        self.key = Some(key);
         self.counters.on_new_keys();
     }
 
@@ -211,7 +263,7 @@ impl<R: Read> PacketReader<R> {
 pub struct PacketWriter<W> {
     inner: W,
     aead: Option<OpenSshAead>,
-    key: Option<[u8; 64]>,
+    key: Option<TransportKey>,
     counters: Counters,
     buffer: Vec<u8>,
 }
@@ -227,10 +279,10 @@ impl<W: Write> PacketWriter<W> {
         }
     }
 
-    pub fn resume(inner: W, key: &[u8; 64], counters: Counters) -> Self {
+    pub fn resume(inner: W, key: TransportKey, counters: Counters) -> Self {
         let mut writer = Self::new(inner);
-        writer.aead = Some(OpenSshAead::new(key));
-        writer.key = Some(*key);
+        writer.aead = Some(OpenSshAead::new(key.bytes()));
+        writer.key = Some(key);
         writer.counters = counters;
         writer
     }
@@ -240,13 +292,14 @@ impl<W: Write> PacketWriter<W> {
     }
 
     /// The key in use, for handing transport state to another process.
-    pub fn key(&self) -> Option<[u8; 64]> {
-        self.key
+    /// For a handoff: the key leaves, and the cipher built from it stays.
+    pub fn take_key(&mut self) -> Option<TransportKey> {
+        self.key.take()
     }
 
-    pub fn install_key(&mut self, key: &[u8; 64]) {
-        self.aead = Some(OpenSshAead::new(key));
-        self.key = Some(*key);
+    pub fn install_key(&mut self, key: TransportKey) {
+        self.aead = Some(OpenSshAead::new(key.bytes()));
+        self.key = Some(key);
         self.counters.on_new_keys();
     }
 

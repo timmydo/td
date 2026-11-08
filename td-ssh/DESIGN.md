@@ -711,10 +711,26 @@ neither. `bcrypt_pbkdf` has no round limit, and the key-file reader sets one.
 Writing a key file builds what holds the seed in room made for all of it up front, so
 that no shorter copy is left behind by growing.
 
+**The exchange's secrets.** `K` is encoded once, into room made for it, and goes into
+the exchange hash and the key derivation directly, never into a buffer with the rest
+of what is hashed. A transport key is a `TransportKey` from its derivation to its last
+use: boxed, so that moving it through the exchange's output, the reader thread's
+channel and the session's handoff copies a pointer, and wiped when dropped, as the
+derivation's intermediate digests are; the worker moves its keys into the handoff
+rather than copying them. The frames between the server's processes, which carry the
+keys from the worker through the monitor to the session, are written into room for any
+frame and wiped once sent, and the session wipes its frame as soon as it is decoded,
+not at the session's end. The cipher built from a key, `OpenSshAead`, holds its own
+expanded copy inline and moves with the reader or writer that owns it, leaving the
+stack copies below.
+
 **Not claimed.** Hashing a secret leaves `Sha256` and `Sha512` state unwiped, in
 `td-primitives` and so here: `sha` has no `Drop`. So the KEX's intermediate hash states,
 and the seed's expansion inside `SigningKey`, stay on the stack until overwritten. td-ssh
-wipes the keys and secrets it keeps, not every stack copy on the way to them. The
+wipes the keys and secrets it keeps, not every stack copy on the way to them, nor
+what is still alive when a process execs or exits, such as a reader thread blocked in
+a read, which the kernel reclaims instead. Bytes a key crosses a socket in pass through
+the kernel's buffers. The
 primitives have had no external audit. Bugs in them are security bugs in td, and td is their maintainer.
 
 **Evidence.** The vectors `td-primitives/DESIGN.md` lists, which it runs in its own

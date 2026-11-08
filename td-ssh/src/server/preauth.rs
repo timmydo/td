@@ -115,17 +115,18 @@ fn setup_and_run(drop_identity: bool) -> Result<()> {
         client_version,
         session_id,
         tx_key: packet_writer
-            .key()
+            .take_key()
             .ok_or_else(|| Error::protocol("no transmit key"))?,
         rx_key: packet_reader
-            .key()
+            .take_key()
             .ok_or_else(|| Error::protocol("no receive key"))?,
         tx: packet_writer.counters(),
         rx: packet_reader.counters(),
     };
-    let mut frame = Writer::message(ipc::WORKER_AUTHENTICATED);
+    let mut frame = ipc::frame_writer();
+    frame.u8(ipc::WORKER_AUTHENTICATED);
     state.encode(&mut frame);
-    ipc::write_frame(&mut monitor_reader, frame.as_slice())?;
+    ipc::write_frame(&mut monitor_reader, &frame.into_wiped())?;
     Ok(())
 }
 

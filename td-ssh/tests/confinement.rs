@@ -51,6 +51,12 @@ fn has_token(text: &str, token: &str) -> bool {
     })
 }
 
+/// A squeezed function's body, to the next function.
+fn body<'a>(squeezed: &'a str, name: &str) -> &'a str {
+    let start = squeezed.split(&format!("fn{name}(")).nth(1).unwrap();
+    &start[..start.find("fn").unwrap_or(start.len())]
+}
+
 /// The part of a file that ships: an inline test module may use what code may not.
 fn production(text: &str) -> &str {
     text.split("#[cfg(test)]").next().unwrap_or_default()
@@ -347,22 +353,110 @@ fn the_session_terminal_is_stdin_and_only_the_prompt_opens_dev_tty() {
 fn secrets_are_wiped_and_identities_dropped_after_authentication() {
     let tree = tree();
     let kex = strip_comments(&source(&tree.rs, "kex.rs"));
-    for owner in [
-        "Ephemeral",
-        "Secret32",
-        "SharedSecret",
-        "DerivedKeys",
-        "KexOutput",
-    ] {
+    for owner in ["Ephemeral", "Secret32", "SharedSecret"] {
         assert!(kex.contains(&format!("impl Drop for {owner}")), "{owner}");
     }
     let keyfile = strip_comments(&source(&tree.rs, "keyfile.rs"));
-    for owner in ["Wiped", "PrivateKeyFile"] {
-        assert!(
-            keyfile.contains(&format!("impl Drop for {owner}")),
-            "{owner}"
-        );
+    assert!(keyfile.contains("impl Drop for PrivateKeyFile"));
+    let wire = strip_comments(&source(&tree.rs, "wire.rs"));
+    assert!(wire.contains("impl Drop for Wiped"));
+    let packet = strip_comments(&source(&tree.rs, "packet.rs"));
+    assert!(packet.contains("pub struct TransportKey(Box<[u8; 64]>);"));
+    assert!(packet.contains("impl Drop for TransportKey"));
+    // A transport key is a `TransportKey` wherever it goes, from its derivation to
+    // the session's handoff: never a bare array on the stack or in a channel slot.
+    for name in [
+        "kex.rs",
+        "conn.rs",
+        "packet.rs",
+        "client.rs",
+        "server/ipc.rs",
+        "server/preauth.rs",
+        "server/monitor.rs",
+        "server/session.rs",
+    ] {
+        let text = squeeze(production(&strip_comments(&source(&tree.rs, name))));
+        // Any 64-byte array, typed or a literal.
+        let arrays = text.matches(";64]").count();
+        // The box, its two views and its zeroed fill, and the signature an
+        // Ed25519 blob carries.
+        let allowed = match name {
+            "packet.rs" => 4,
+            "kex.rs" => 2,
+            _ => 0,
+        };
+        assert_eq!(arrays, allowed, "{name}");
     }
+    let kex = squeeze(production(&kex));
+    // `K` goes into the exchange hash directly, never a buffer with the rest.
+    let hash = body(&kex, "exchange_hash");
+    assert_eq!(hash.matches("encoded").count(), 1, "{hash}");
+    assert!(hash.contains("hash.update(&secret.encoded);"), "{hash}");
+    for buffer in ["Writer", "Vec", "extend", "push"] {
+        assert!(!hash.contains(buffer), "{buffer}: {hash}");
+    }
+    // Its encodings are written into room for their longest forms.
+    for encoding in ["curve_secret", "hybrid_secret"] {
+        let text = body(&kex, encoding);
+        assert!(text.contains("Writer::with_capacity("), "{encoding}");
+        assert!(!text.contains("Writer::new()"), "{encoding}");
+    }
+    // The derivation's digests are wiped, and the key is filled in its box.
+    let derive = body(&kex, "derive");
+    for step in [
+        "Secret32(first.finalize())",
+        "Secret32(second.finalize())",
+        "TransportKey::zeroed()",
+    ] {
+        assert!(derive.contains(step), "{step}");
+    }
+    assert!(!derive.contains("TransportKey::from_slice"));
+    // Every frame between the server's processes is wiped: read, and at each of
+    // the two places that writes one carrying the keys.
+    let ipc = squeeze(production(&strip_comments(&source(
+        &tree.rs,
+        "server/ipc.rs",
+    ))));
+    assert!(ipc.contains("->Result<Wiped>{"));
+    assert!(ipc.contains("fnframe_writer()->Writer{Writer::with_capacity(MAX_FRAME)}"));
+    let write = body(&ipc, "write_frame<W:Write>");
+    assert!(write.contains("stream.write_all(payload)?;"), "{write}");
+    let read = body(&ipc, "read_frame<R:Read>");
+    for frame in [write, read] {
+        for copy in ["Writer", "extend", "clone", "to_vec", "Vec::"] {
+            assert!(!frame.contains(copy), "{copy}: {frame}");
+        }
+    }
+    // And the owners' drops do wipe.
+    let packet = squeeze(&packet);
+    assert!(packet.contains(
+        "implDropforTransportKey{fndrop(&mutself){td_primitives::ct::zero(self.0.as_mut_slice());}}"
+    ));
+    assert!(squeeze(&wire)
+        .contains("implDropforWiped{fndrop(&mutself){td_primitives::ct::zero(&mutself.0);}}"));
+    for name in ["server/preauth.rs", "server/monitor.rs"] {
+        let text = squeeze(production(&strip_comments(&source(&tree.rs, name))));
+        let encoded = text.split("state.encode(&mutframe);").count() - 1;
+        assert_eq!(encoded, 1, "{name}");
+        assert_eq!(
+            text.matches("letmutframe=ipc::frame_writer();").count(),
+            1,
+            "{name}"
+        );
+        assert_eq!(text.matches("&frame.into_wiped())").count(), 1, "{name}");
+    }
+    // And the session's, as soon as it is decoded.
+    let session = squeeze(production(&strip_comments(&source(
+        &tree.rs,
+        "server/session.rs",
+    ))));
+    assert!(session.contains("reader.finish()?;drop(frame);"));
+    // The monitor's decoded copy is dropped before it becomes the signer.
+    let monitor = squeeze(production(&strip_comments(&source(
+        &tree.rs,
+        "server/monitor.rs",
+    ))));
+    assert!(monitor.contains("state.encode(&mutframe);drop(state);"));
     let client = squeeze(&strip_comments(&source(&tree.rs, "client.rs")));
     let run = client.split("pubfnrun(").nth(1).unwrap();
     let order = [

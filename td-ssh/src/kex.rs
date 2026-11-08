@@ -5,6 +5,7 @@
 
 use crate::error::{peer_text, Error, Result};
 use crate::msg;
+use crate::packet::TransportKey;
 use crate::wire::{Reader, Writer};
 use std::io::Read;
 use td_primitives::curve25519::{ed25519, x25519};
@@ -64,18 +65,10 @@ impl<R: Read> RandomSource<R> {
 pub struct KexOutput {
     /// In order. A `NEWKEYS` is always last, so install `tx_key` after sending.
     pub send: Vec<Vec<u8>>,
-    pub tx_key: Option<[u8; 64]>,
-    pub rx_key: Option<[u8; 64]>,
+    pub tx_key: Option<TransportKey>,
+    pub rx_key: Option<TransportKey>,
     /// The exchange finished: traffic that was held back may flow.
     pub finished: bool,
-}
-
-impl Drop for KexOutput {
-    fn drop(&mut self) {
-        for key in [&mut self.tx_key, &mut self.rx_key].into_iter().flatten() {
-            td_primitives::ct::zero(key);
-        }
-    }
 }
 
 /// A 32-byte secret, wiped however its scope ends.
@@ -134,7 +127,7 @@ enum State {
         algorithm: &'static str,
     },
     AwaitNewKeys {
-        rx_key: [u8; 64],
+        rx_key: TransportKey,
     },
 }
 
@@ -430,12 +423,12 @@ impl Kex {
     }
 
     fn on_newkeys(&mut self) -> Result<KexOutput> {
-        let State::AwaitNewKeys { rx_key: held } = &mut self.state else {
+        if !matches!(self.state, State::AwaitNewKeys { .. }) {
+            return Err(Error::protocol("NEWKEYS out of order"));
+        }
+        let State::AwaitNewKeys { rx_key } = std::mem::replace(&mut self.state, State::Idle) else {
             return Err(Error::protocol("NEWKEYS out of order"));
         };
-        let rx_key = *held;
-        td_primitives::ct::zero(held);
-        self.state = State::Idle;
         self.peer_init_seen = false;
         self.skip_next = false;
         self.local_init.clear();
@@ -459,17 +452,22 @@ impl Kex {
             Role::Client => (&self.local_init, &self.peer_init),
             Role::Server => (&self.peer_init, &self.local_init),
         };
-        let mut writer = Writer::new();
-        writer
-            .string(&self.client_version)
-            .string(&self.server_version)
-            .string(client_init)
-            .string(server_init)
-            .string(host_key)
-            .string(client_public)
-            .string(server_public);
-        writer.raw(&secret.encoded);
-        Sha256::digest(writer.as_slice())
+        let mut hash = Sha256::new();
+        for field in [
+            self.client_version.as_slice(),
+            &self.server_version,
+            client_init,
+            server_init,
+            host_key,
+            client_public,
+            server_public,
+        ] {
+            hash.update(&u32::try_from(field.len()).unwrap_or(u32::MAX).to_be_bytes());
+            hash.update(field);
+        }
+        // `K` straight into the hash, where no buffer keeps a copy of it.
+        hash.update(&secret.encoded);
+        hash.finalize()
     }
 }
 
@@ -528,8 +526,9 @@ impl Drop for SharedSecret {
     }
 }
 
+/// Each written into room for its longest form, so that growing leaves no copy.
 fn curve_secret(raw: &Secret32) -> SharedSecret {
-    let mut writer = Writer::new();
+    let mut writer = Writer::with_capacity(4 + 1 + 32);
     writer.mpint(&raw.0);
     SharedSecret {
         encoded: writer.into_vec(),
@@ -541,7 +540,7 @@ fn hybrid_secret(kem: &Secret32, curve: &Secret32) -> SharedSecret {
     hasher.update(&kem.0);
     hasher.update(&curve.0);
     let digest = Secret32(hasher.finalize());
-    let mut writer = Writer::new();
+    let mut writer = Writer::with_capacity(4 + 32);
     writer.string(&digest.0);
     SharedSecret {
         encoded: writer.into_vec(),
@@ -639,15 +638,8 @@ fn curve_shared(secret: &[u8; 32], public: &[u8]) -> Result<Secret32> {
 }
 
 struct DerivedKeys {
-    client_to_server: [u8; 64],
-    server_to_client: [u8; 64],
-}
-
-impl Drop for DerivedKeys {
-    fn drop(&mut self) {
-        td_primitives::ct::zero(&mut self.client_to_server);
-        td_primitives::ct::zero(&mut self.server_to_client);
-    }
+    client_to_server: TransportKey,
+    server_to_client: TransportKey,
 }
 
 fn derive_keys(secret: &SharedSecret, hash: &[u8; 32], session_id: &[u8; 32]) -> DerivedKeys {
@@ -658,22 +650,27 @@ fn derive_keys(secret: &SharedSecret, hash: &[u8; 32], session_id: &[u8; 32]) ->
 }
 
 /// RFC 4253 section 7.2, extended by one block for the AEAD's 64 bytes.
-fn derive(secret: &SharedSecret, hash: &[u8; 32], letter: u8, session_id: &[u8; 32]) -> [u8; 64] {
+fn derive(
+    secret: &SharedSecret,
+    hash: &[u8; 32],
+    letter: u8,
+    session_id: &[u8; 32],
+) -> TransportKey {
     let mut first = Sha256::new();
     first.update(&secret.encoded);
     first.update(hash);
     first.update(&[letter]);
     first.update(session_id);
-    let first = first.finalize();
+    let first = Secret32(first.finalize());
     let mut second = Sha256::new();
     second.update(&secret.encoded);
     second.update(hash);
-    second.update(&first);
-    let second = second.finalize();
-    let mut key = [0u8; 64];
-    let (head, tail) = key.split_at_mut(32);
-    head.copy_from_slice(&first);
-    tail.copy_from_slice(&second);
+    second.update(&first.0);
+    let second = Secret32(second.finalize());
+    let mut key = TransportKey::zeroed();
+    let (head, tail) = key.bytes_mut().split_at_mut(32);
+    head.copy_from_slice(&first.0);
+    tail.copy_from_slice(&second.0);
     key
 }
 
@@ -1014,10 +1011,10 @@ mod tests {
         assert!(client_rx.finished && server_rx.finished);
         assert_eq!(client.session_id(), server.session_id());
         (
-            client_tx.tx_key.unwrap(),
-            client_rx.rx_key.unwrap(),
-            reply.tx_key.unwrap(),
-            server_rx.rx_key.unwrap(),
+            *client_tx.tx_key.unwrap().bytes(),
+            *client_rx.rx_key.unwrap().bytes(),
+            *reply.tx_key.unwrap().bytes(),
+            *server_rx.rx_key.unwrap().bytes(),
             client.session_id().unwrap(),
         )
     }
@@ -1176,7 +1173,7 @@ mod tests {
         server.on_message(&tx.send[0], &mut server_env).unwrap();
         assert_eq!(client.session_id(), Some(session_id));
         assert_eq!(server.session_id(), Some(session_id));
-        assert_ne!(tx.tx_key.unwrap(), client_tx);
+        assert_ne!(*tx.tx_key.unwrap().bytes(), client_tx);
         assert_eq!(reply.tx_key.unwrap(), rx.rx_key.unwrap());
         assert!(!client.in_progress() && !server.in_progress());
     }

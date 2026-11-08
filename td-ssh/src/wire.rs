@@ -174,8 +174,38 @@ impl Writer {
         self.buf
     }
 
+    /// The bytes, to be wiped however their scope ends.
+    pub fn into_wiped(self) -> Wiped {
+        Wiped(self.buf)
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         &self.buf
+    }
+}
+
+/// Secret bytes on the heap, wiped however their scope ends. Only what the vector
+/// holds now: a copy it left behind by growing is not, so what fills one is sized
+/// first (`Writer::with_capacity`).
+pub struct Wiped(pub(crate) Vec<u8>);
+
+impl Drop for Wiped {
+    fn drop(&mut self) {
+        td_primitives::ct::zero(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for Wiped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Wiped({} bytes)", self.0.len())
+    }
+}
+
+impl std::ops::Deref for Wiped {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
     }
 }
 

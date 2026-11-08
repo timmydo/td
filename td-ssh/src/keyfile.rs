@@ -4,7 +4,7 @@
 use crate::error::{Error, Result};
 use crate::kex::Secret32;
 use crate::kex::{ed25519_public_blob, parse_ed25519_public, HOST_KEY_ALGORITHM};
-use crate::wire::{Reader, Writer};
+use crate::wire::{Reader, Wiped, Writer};
 use td_encoding::{base64, from_base64};
 use td_primitives::aes256_ctr::Aes256Ctr;
 use td_primitives::bcrypt_pbkdf::bcrypt_pbkdf;
@@ -27,15 +27,6 @@ const NONE_BLOCK: usize = 8;
 const MAX_ROUNDS: u32 = 1024;
 /// Far above any Ed25519 key file; refuses absurd input before decoding it.
 pub const MAX_PRIVATE_KEY_FILE: usize = 16 * 1024;
-
-/// Key material on the heap, wiped however its scope ends.
-struct Wiped(Vec<u8>);
-
-impl Drop for Wiped {
-    fn drop(&mut self) {
-        td_primitives::ct::zero(&mut self.0);
-    }
-}
 
 /// Overwrites key-file text, which for an unencrypted key is the key.
 /// The secret section without its comment and padding: two check words, then the

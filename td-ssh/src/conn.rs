@@ -6,7 +6,7 @@
 use crate::error::{peer_text, Error, Result};
 use crate::kex::{Kex, KexEnvironment, KexOutput};
 use crate::msg;
-use crate::packet::{Counters, PacketReader, PacketWriter};
+use crate::packet::{Counters, PacketReader, PacketWriter, TransportKey};
 use crate::wire::{Reader, Writer};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -291,9 +291,9 @@ pub fn kex_step<R: Read, W: Write, E: KexEnvironment>(
     env: &mut E,
     payload: &[u8],
 ) -> Result<bool> {
-    let output = kex.on_message(payload, env)?;
-    apply_output(writer, &output)?;
-    if let Some(key) = &output.rx_key {
+    let mut output = kex.on_message(payload, env)?;
+    apply_output(writer, &mut output)?;
+    if let Some(key) = output.rx_key {
         reader.install_key(key);
     }
     Ok(output.finished)
@@ -306,11 +306,11 @@ pub fn disconnected(payload: &[u8]) -> Error {
     Error::Disconnected(peer_text(reader.string().unwrap_or_default()))
 }
 
-fn apply_output<W: Write>(writer: &mut PacketWriter<W>, output: &KexOutput) -> Result<()> {
+fn apply_output<W: Write>(writer: &mut PacketWriter<W>, output: &mut KexOutput) -> Result<()> {
     for packet in &output.send {
         writer.write_packet(packet)?;
     }
-    if let Some(key) = &output.tx_key {
+    if let Some(key) = output.tx_key.take() {
         writer.install_key(key);
     }
     Ok(())
@@ -340,8 +340,8 @@ pub fn spawn_reader<R: Read + Send + 'static>(
     mut reader: PacketReader<R>,
     events: EventSender,
     at_end: impl FnOnce() + Send + 'static,
-) -> SyncSender<[u8; 64]> {
-    let (key_sender, key_receiver) = sync_channel::<[u8; 64]>(1);
+) -> SyncSender<TransportKey> {
+    let (key_sender, key_receiver) = sync_channel::<TransportKey>(1);
     let starter = events.clone();
     start_thread(&starter, move || loop {
         let payload = match reader.read_packet() {
@@ -363,7 +363,7 @@ pub fn spawn_reader<R: Read + Send + 'static>(
         }
         if is_new_keys {
             match key_receiver.recv() {
-                Ok(key) => reader.install_key(&key),
+                Ok(key) => reader.install_key(key),
                 Err(_) => return,
             }
         }
@@ -375,7 +375,7 @@ pub fn spawn_reader<R: Read + Send + 'static>(
 /// holds traffic back, rekey decisions, and transport-level messages.
 pub struct Conn<W, E> {
     writer: PacketWriter<W>,
-    rx_keys: SyncSender<[u8; 64]>,
+    rx_keys: SyncSender<TransportKey>,
     kex: Kex,
     env: E,
     held: VecDeque<Vec<u8>>,
@@ -393,7 +393,7 @@ const REKEY_PACKETS: u64 = 1 << 28;
 impl<W: Write, E: KexEnvironment> Conn<W, E> {
     pub fn new(
         writer: PacketWriter<W>,
-        rx_keys: SyncSender<[u8; 64]>,
+        rx_keys: SyncSender<TransportKey>,
         kex: Kex,
         env: E,
         flow: Arc<Flow>,
@@ -508,8 +508,8 @@ impl<W: Write, E: KexEnvironment> Conn<W, E> {
         }
     }
 
-    fn apply(&mut self, output: KexOutput) -> Result<()> {
-        apply_output(&mut self.writer, &output)?;
+    fn apply(&mut self, mut output: KexOutput) -> Result<()> {
+        apply_output(&mut self.writer, &mut output)?;
         if let Some(key) = output.rx_key {
             self.rx_keys
                 .send(key)

@@ -105,6 +105,8 @@ fn run(single_user: bool) -> Result<()> {
     let grant = SessionGrant::decode(&mut reader)?;
     let host_blob = reader.string()?.to_vec();
     reader.finish()?;
+    // It holds the first keys, which a rekey would otherwise leave behind here.
+    drop(frame);
     refuse_root_grant(grant.uid)?;
 
     if !single_user {
@@ -124,8 +126,8 @@ fn run(single_user: bool) -> Result<()> {
     let writer_half = socket.try_clone()?;
     let ending = socket.try_clone()?;
     let reader_half = socket;
-    let packet_reader = PacketReader::resume(reader_half, &state.rx_key, state.rx);
-    let packet_writer = PacketWriter::resume(writer_half, &state.tx_key, state.tx);
+    let packet_reader = PacketReader::resume(reader_half, state.rx_key, state.rx);
+    let packet_writer = PacketWriter::resume(writer_half, state.tx_key, state.tx);
     let kex_engine = Kex::resume(
         Role::Server,
         &state.client_version,
@@ -1020,6 +1022,7 @@ fn arm_drain_timer(after: Duration, events: EventSender) -> std::io::Result<()> 
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
+    use crate::packet::TransportKey;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use td_fs::TempDir;
@@ -1075,7 +1078,7 @@ mod tests {
         wire: Wire,
         read: usize,
         start: Instant,
-        _keys: Receiver<[u8; 64]>,
+        _keys: Receiver<TransportKey>,
         dir: TempDir,
     }
 

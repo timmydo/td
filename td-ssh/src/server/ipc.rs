@@ -3,8 +3,8 @@
 //! are bounded and every message is parsed as hostile.
 
 use crate::error::{Error, Result};
-use crate::packet::Counters;
-use crate::wire::{Reader, Writer};
+use crate::packet::{Counters, TransportKey};
+use crate::wire::{Reader, Wiped, Writer};
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
@@ -53,23 +53,29 @@ pub fn write_frame<W: Write>(stream: &mut W, payload: &[u8]) -> Result<()> {
     let length = u32::try_from(payload.len())
         .map_err(|_| Error::protocol("frame is too long"))?
         .to_be_bytes();
-    let mut message = Vec::with_capacity(4 + payload.len());
-    message.extend_from_slice(&length);
-    message.extend_from_slice(payload);
-    stream.write_all(&message)?;
+    // Two writes, so as not to copy a payload that may carry the transport keys.
+    stream.write_all(&length)?;
+    stream.write_all(payload)?;
     stream.flush()?;
     Ok(())
 }
 
-pub fn read_frame<R: Read>(stream: &mut R) -> Result<Vec<u8>> {
+/// Room for any frame `write_frame` sends, so filling it never grows it and leaves
+/// no copy of what it holds behind. One that outgrows this is refused there.
+pub fn frame_writer() -> Writer {
+    Writer::with_capacity(MAX_FRAME)
+}
+
+/// Wiped when dropped: a frame may carry the transport keys.
+pub fn read_frame<R: Read>(stream: &mut R) -> Result<Wiped> {
     let mut length = [0u8; 4];
     stream.read_exact(&mut length)?;
     let length = u32::from_be_bytes(length) as usize;
     if length > MAX_FRAME {
         return Err(Error::protocol("frame is too long"));
     }
-    let mut payload = vec![0u8; length];
-    stream.read_exact(&mut payload)?;
+    let mut payload = Wiped(vec![0u8; length]);
+    stream.read_exact(&mut payload.0)?;
     Ok(payload)
 }
 
@@ -84,12 +90,12 @@ pub const MONITOR_ANSWER: u8 = 13;
 pub const MONITOR_TOO_MANY: u8 = 14;
 
 /// What moves from the worker to the session once authentication succeeded.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TransportState {
     pub client_version: String,
     pub session_id: [u8; 32],
-    pub tx_key: [u8; 64],
-    pub rx_key: [u8; 64],
+    pub tx_key: TransportKey,
+    pub rx_key: TransportKey,
     pub tx: Counters,
     pub rx: Counters,
 }
@@ -113,8 +119,8 @@ impl TransportState {
     pub fn encode(&self, writer: &mut Writer) {
         writer.str(&self.client_version);
         writer.string(&self.session_id);
-        writer.string(&self.tx_key);
-        writer.string(&self.rx_key);
+        writer.string(self.tx_key.bytes());
+        writer.string(self.rx_key.bytes());
         put_counters(writer, self.tx);
         put_counters(writer, self.rx);
     }
@@ -123,8 +129,8 @@ impl TransportState {
         Ok(Self {
             client_version: reader.str()?.to_string(),
             session_id: reader.array()?,
-            tx_key: reader.array()?,
-            rx_key: reader.array()?,
+            tx_key: TransportKey::from_slice(reader.string()?)?,
+            rx_key: TransportKey::from_slice(reader.string()?)?,
             tx: get_counters(reader)?,
             rx: get_counters(reader)?,
         })
@@ -251,14 +257,14 @@ mod tests {
             Err(Error::Io(io)) if is_timeout(&io)
         ));
         let mut adapter = UntilDeadline::new(&reader, Instant::now() + Duration::from_secs(5));
-        assert_eq!(read_frame(&mut adapter).unwrap(), b"hello");
+        assert_eq!(&*read_frame(&mut adapter).unwrap(), b"hello");
     }
 
     #[test]
     fn frames_round_trip_and_oversize_is_refused_before_allocating() {
         let mut wire = Vec::new();
         write_frame(&mut wire, b"hello").unwrap();
-        assert_eq!(read_frame(&mut Cursor::new(&wire)).unwrap(), b"hello");
+        assert_eq!(&*read_frame(&mut Cursor::new(&wire)).unwrap(), b"hello");
         assert!(write_frame(&mut wire, &vec![0; MAX_FRAME + 1]).is_err());
         let hostile = (u32::MAX).to_be_bytes().to_vec();
         assert!(read_frame(&mut Cursor::new(hostile)).is_err());
@@ -270,8 +276,8 @@ mod tests {
         let state = TransportState {
             client_version: "SSH-2.0-x".into(),
             session_id: [1; 32],
-            tx_key: [2; 64],
-            rx_key: [3; 64],
+            tx_key: TransportKey::from_slice(&[2; 64]).unwrap(),
+            rx_key: TransportKey::from_slice(&[3; 64]).unwrap(),
             tx: Counters {
                 seq: 4,
                 bytes: 5,
