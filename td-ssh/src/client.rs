@@ -32,7 +32,7 @@ use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -1153,18 +1153,70 @@ impl EscapeExit {
 /// waits for window and for a rekey's end, which a server can make for ever, and
 /// `~.` has to be read all the same. So it is, until `ESCAPE_BACKLOG` chunks are
 /// waiting for a window that does not open, as OpenSSH also stops reading.
+///
+/// What the window has room for now, while the source holds nothing of its own,
+/// goes from the reading thread straight to the core: a keystroke then wakes one
+/// thread fewer, which on a busy machine is one wait for a CPU fewer. It goes only
+/// if the core's queue has room now, so the reading thread waits on nothing but
+/// the backlog, and `~.` is read behind a core blocked in a write.
 struct EscapingStdin {
     chunks: Receiver<Vec<u8>>,
     pending: Vec<u8>,
+    order: Arc<SourceOrder>,
+}
+
+/// What lets a chunk pass the source and stay in order: none queued for it, and
+/// the source waiting for the next, so all it was given has been sent.
+#[derive(Default)]
+struct SourceOrder {
+    queued: AtomicUsize,
+    idle: AtomicBool,
+}
+
+/// The way past the source, and what it may carry.
+struct Direct {
+    credit: Arc<Credit>,
+    max_packet: usize,
+}
+
+impl Direct {
+    /// Sends `data` to the core now if that keeps its order and waits for
+    /// nothing; otherwise the data back, with any credit taken for it returned.
+    fn pass(
+        &self,
+        data: Vec<u8>,
+        order: &SourceOrder,
+        events: &conn::EventSender,
+    ) -> Option<Vec<u8>> {
+        let len = data.len();
+        // Only the reading thread queues, so with none queued and the source idle
+        // nothing it was given is still to be sent.
+        if order.queued.load(Ordering::SeqCst) != 0
+            || !order.idle.load(Ordering::SeqCst)
+            || len > conn::source_chunk(self.max_packet)
+            || !self.credit.take_now(len)
+        {
+            return Some(data);
+        }
+        let data = events.send_output_now(SESSION_CHANNEL, false, data).err()?;
+        self.credit.add(u32::try_from(len).unwrap_or(u32::MAX));
+        Some(data)
+    }
 }
 
 impl EscapingStdin {
-    fn spawn(mut filter: EscapeFilter, exit: EscapeExit) -> Self {
+    fn spawn<R: Read + Send + 'static>(
+        mut input: R,
+        mut filter: EscapeFilter,
+        exit: EscapeExit,
+        direct: Direct,
+    ) -> Self {
         let (sender, chunks) = mpsc::sync_channel(ESCAPE_BACKLOG);
         let starter = exit.events.clone();
+        let order = Arc::new(SourceOrder::default());
+        let ours = order.clone();
         conn::start_thread(&starter, move || {
             let mut raw = [0u8; 4096];
-            let mut input = Patient(io::stdin());
             loop {
                 let got = match input.read(&mut raw) {
                     Ok(0) => return,
@@ -1177,7 +1229,14 @@ impl EscapingStdin {
                     exit.disconnect();
                     return;
                 }
-                if !out.is_empty() && sender.send(out).is_err() {
+                if out.is_empty() {
+                    continue;
+                }
+                let Some(out) = direct.pass(out, &ours, &exit.events) else {
+                    continue;
+                };
+                ours.queued.fetch_add(1, Ordering::SeqCst);
+                if sender.send(out).is_err() {
                     return;
                 }
             }
@@ -1185,6 +1244,7 @@ impl EscapingStdin {
         Self {
             chunks,
             pending: Vec::new(),
+            order,
         }
     }
 }
@@ -1199,9 +1259,14 @@ impl Read for EscapingStdin {
                 self.pending.drain(..count);
                 return Ok(count);
             }
-            let Ok(chunk) = self.chunks.recv() else {
+            self.order.idle.store(true, Ordering::SeqCst);
+            let received = self.chunks.recv();
+            // Busy before the count drops, so a chunk read meanwhile queues.
+            self.order.idle.store(false, Ordering::SeqCst);
+            let Ok(chunk) = received else {
                 return Ok(0);
             };
+            self.order.queued.fetch_sub(1, Ordering::SeqCst);
             self.pending = chunk;
         }
     }
@@ -2000,7 +2065,16 @@ fn session_loop(
                         control,
                         cooked,
                     };
-                    let input = EscapingStdin::spawn(EscapeFilter::new(DEFAULT_ESCAPE), exit);
+                    let direct = Direct {
+                        credit: credit.clone(),
+                        max_packet,
+                    };
+                    let input = EscapingStdin::spawn(
+                        Patient(io::stdin()),
+                        EscapeFilter::new(DEFAULT_ESCAPE),
+                        exit,
+                        direct,
+                    );
                     conn::spawn_source(input, SESSION_CHANNEL, false, max_packet, credit, events);
                 }
                 None => {
@@ -3219,13 +3293,13 @@ mod tests {
     /// A sink's far end that holds every write until released: a stalled consumer.
     struct Stalled {
         release: mpsc::Receiver<()>,
-        seen: Arc<Mutex<Vec<u8>>>,
+        seen: Arc<Mutex<usize>>,
     }
 
     impl Write for Stalled {
         fn write(&mut self, data: &[u8]) -> io::Result<usize> {
             let _ = self.release.recv();
-            self.seen.lock().unwrap().extend_from_slice(data);
+            *self.seen.lock().unwrap() += data.len();
             Ok(data.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -3242,7 +3316,9 @@ mod tests {
         finished.recv_timeout(LIMIT).expect("it hung")
     }
 
-    const QUEUED: usize = 6000;
+    /// Past the queue by enough writes that one is still to send its credit.
+    const QUEUED: usize = conn::EVENT_QUEUE + 16;
+    const PIECE: usize = conn::CHANNEL_MAX_PACKET as usize;
 
     fn no_escape() -> EscapeWait<'static> {
         static NEVER: AtomicBool = AtomicBool::new(false);
@@ -3252,38 +3328,198 @@ mod tests {
         }
     }
 
+    /// Keys a test types, a chunk a read, each read counted as it is taken.
+    struct Typed {
+        keys: mpsc::Receiver<Vec<u8>>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl Read for Typed {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Ok(chunk) = self.keys.recv() else {
+                return Ok(0);
+            };
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            buffer[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    /// A session's stdin as the client wires it: the reading thread, the source
+    /// behind it, and the queue they both send to.
+    struct Typing {
+        keys: mpsc::Sender<Vec<u8>>,
+        reads: Arc<AtomicUsize>,
+        order: Arc<SourceOrder>,
+        credit: Arc<Credit>,
+        events: conn::EventSender,
+        receiver: EventReceiver,
+        _listener: TcpListener,
+    }
+
+    fn typing(window: u32) -> Typing {
+        let (events, receiver) = conn::event_channel();
+        let credit = Credit::new(window, events.flow().clone());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let control = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let exit = EscapeExit {
+            events: events.clone(),
+            escaped: Arc::new(AtomicBool::new(false)),
+            control,
+            cooked: sys::Termios::default(),
+        };
+        let (keys, typed) = mpsc::channel();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let max_packet = CHANNEL_MAX_PACKET as usize;
+        let direct = Direct {
+            credit: credit.clone(),
+            max_packet,
+        };
+        let input = EscapingStdin::spawn(
+            Typed {
+                keys: typed,
+                reads: reads.clone(),
+            },
+            EscapeFilter::new(DEFAULT_ESCAPE),
+            exit,
+            direct,
+        );
+        let order = input.order.clone();
+        conn::spawn_source(
+            input,
+            SESSION_CHANNEL,
+            false,
+            max_packet,
+            credit.clone(),
+            events.clone(),
+        );
+        Typing {
+            keys,
+            reads,
+            order,
+            credit,
+            events,
+            receiver,
+            _listener: listener,
+        }
+    }
+
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + LIMIT;
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            thread::yield_now();
+        }
+    }
+
+    fn typed_data(receiver: &EventReceiver) -> Vec<u8> {
+        match receiver.recv_timeout(LIMIT) {
+            Ok(Event::Output {
+                channel: SESSION_CHANNEL,
+                stderr: false,
+                data,
+            }) => data,
+            Ok(_) => panic!("not typed data"),
+            Err(error) => panic!("no typed data: {error:?}"),
+        }
+    }
+
+    /// Keys reach the core in the order typed, whichever way each went: past the
+    /// source while the window has room, through it while the window is shut.
+    #[test]
+    fn keys_keep_their_order_past_the_source_and_through_it() {
+        let t = typing(16);
+        let mut typed = Vec::new();
+        for i in 0..2000 {
+            let key = format!("{i},").into_bytes();
+            typed.extend_from_slice(&key);
+            t.keys.send(key).unwrap();
+        }
+        let mut seen = Vec::new();
+        while seen.len() < typed.len() {
+            let data = typed_data(&t.receiver);
+            // The peer's grant for what arrived, as a window adjust gives it.
+            t.credit.add(u32::try_from(data.len()).unwrap());
+            seen.extend_from_slice(&data);
+        }
+        assert_eq!(seen, typed);
+    }
+
+    /// A key the window has room for does not wait on a core whose queue is over
+    /// its budget, as one blocked in a write leaves it: the reading thread goes
+    /// on reading, the key goes through the source, and its credit is taken once.
+    #[test]
+    fn keys_wait_on_no_full_queue_and_are_charged_once() {
+        let window = 1 << 20;
+        let t = typing(window);
+        t.keys.send(b"a".to_vec()).unwrap();
+        assert_eq!(typed_data(&t.receiver), b"a");
+        until("the source never went idle", || {
+            t.order.idle.load(Ordering::SeqCst) && t.order.queued.load(Ordering::SeqCst) == 0
+        });
+        // Over the budget for every source until the core takes it.
+        let stuffed = Event::Output {
+            channel: SESSION_CHANNEL + 1,
+            stderr: false,
+            data: vec![0; conn::EVENT_BUDGET + 1],
+        };
+        t.events.send(stuffed).unwrap();
+        for key in [b"b", b"c", b"d"] {
+            t.keys.send(key.to_vec()).unwrap();
+        }
+        until("a key waited on the core", || {
+            t.reads.load(Ordering::SeqCst) == 4
+        });
+        assert!(matches!(
+            t.receiver.recv_timeout(LIMIT),
+            Ok(Event::Output { channel, .. }) if channel == SESSION_CHANNEL + 1
+        ));
+        let mut seen = Vec::new();
+        while seen.len() < 3 {
+            seen.extend_from_slice(&typed_data(&t.receiver));
+        }
+        assert_eq!(seen, b"bcd");
+        assert!(
+            t.credit.take_now(window as usize - 4),
+            "credit charged twice"
+        );
+        assert!(!t.credit.take_now(1), "credit not charged");
+    }
+
     struct StalledSink {
         events: conn::EventSender,
         receiver: EventReceiver,
         handle: JoinHandle<()>,
         release: mpsc::Sender<()>,
-        seen: Arc<Mutex<Vec<u8>>>,
+        seen: Arc<Mutex<usize>>,
     }
 
     /// More credits than the event queue holds waiting to be read, behind a stalled
     /// consumer that `release` lets go, and the sink already dropped. Data sent to a
-    /// sink is one buffer, so filling the queue takes one write per message.
+    /// sink is one buffer and credit is reported a packet's worth at a time, so
+    /// filling the queue takes one packet-sized write per credit.
     fn stalled_sink() -> StalledSink {
         let (events, receiver) = conn::event_channel();
         let (release, gate) = mpsc::channel();
-        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(0));
         let writer = Stalled {
             release: gate,
             seen: seen.clone(),
         };
         let (sink, handle) =
             conn::spawn_sink(writer, SESSION_CHANNEL, WhenBroken::Discard, events.clone());
+        let piece = vec![1u8; PIECE];
         for written in 1..=conn::EVENT_QUEUE {
-            assert!(sink.send(&[1u8; 100]));
+            assert!(sink.send(&piece));
             release.send(()).unwrap();
             let deadline = Instant::now() + LIMIT;
-            while seen.lock().unwrap().len() < written * 100 {
+            while *seen.lock().unwrap() < written * PIECE {
                 assert!(Instant::now() < deadline, "the consumer never wrote");
                 thread::yield_now();
             }
         }
         for _ in conn::EVENT_QUEUE..QUEUED {
-            assert!(sink.send(&[1u8; 100]));
+            assert!(sink.send(&piece));
         }
         StalledSink {
             events,
@@ -3305,7 +3541,7 @@ mod tests {
         within_limit(move || {
             drain_while_joining(vec![handle], &receiver, &no_escape(), &mut |_| {});
         });
-        assert_eq!(sink.seen.lock().unwrap().len(), QUEUED * 100);
+        assert_eq!(*sink.seen.lock().unwrap(), QUEUED * PIECE);
     }
 
     #[test]
@@ -3327,7 +3563,7 @@ mod tests {
                 &mut |_| {},
             )
         });
-        assert_eq!(sink.seen.lock().unwrap().len(), QUEUED * 100);
+        assert_eq!(*sink.seen.lock().unwrap(), QUEUED * PIECE);
     }
 
     #[test]
@@ -3353,7 +3589,7 @@ mod tests {
             // What ends such a reader.
             drop(receiver);
         });
-        assert_eq!(sink.seen.lock().unwrap().len(), QUEUED * 100);
+        assert_eq!(*sink.seen.lock().unwrap(), QUEUED * PIECE);
         flood.join().unwrap();
     }
 

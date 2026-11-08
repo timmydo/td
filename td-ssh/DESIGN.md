@@ -288,9 +288,10 @@ rekey stops moving, and never before 600 s, its session, signer and any PTY shel
 that same 900 s is the write timeout on the session's socket, so a stalled write ends
 it too, the one thing a client that still sends but no longer reads can be held to. A laptop asleep for less than ten minutes keeps its session. On a link
 slow enough that a probe waits behind the output in its buffers, what arrives is the
-client's window grants. `td-ssh` sends one per 256 KiB it has consumed, so it is safe at
-above 256 KiB in 600 s, about 440 B/s; under that its answers cannot be relied on to come
-in time, and a link that slow can be cut. Stock OpenSSH and
+client's window grants. `td-ssh` sends one per 256 KiB it has consumed, which its sinks
+report a packet's worth at a time (§6), so one is sent by 352 KiB written at most, and it is
+safe at above that in 600 s, about 600 B/s; under that its answers cannot be relied on to
+come in time, and a link that slow can be cut. Stock OpenSSH and
 `td-ssh` both answer, by the unknown-request failure of §2. No TCP keepalive and no
 new syscall are involved.
 
@@ -446,12 +447,28 @@ in at most twice that between the buffer and what the thread has taken, and noth
 kept a message, so a peer sending empty `CHANNEL_DATA`, which the window does not count, or
 one byte at a time adds nothing a message of its own would cost. An empty message is dropped
 where it arrives. The thread writes a packet's worth at a time and the window reopens as
-each lands.
+each lands. It reports that credit to the core once a packet's worth is owed, not at each
+write, and what is owed when its stream ends: a keystroke written to a terminal or a
+child's stdin wakes no core for its byte, and what waits unreported, under a packet a sink
+(the client's stdout and stderr share a window), is far inside the window.
+
+**Latency.** Threads cost what a poll loop does not: each hand-off is a wake, and a woken
+thread waits for a CPU wherever the machine is busy. A keystroke's echo crosses about five
+hand-offs where OpenSSH's single loop crosses none, so with every CPU of a host busy its
+slowest few per cent take about twice as long, some milliseconds; an idle host shows no
+difference, about 0.3 ms either way over loopback, and on a 40 ms round trip each takes
+one round trip. Two hand-offs are saved: the coalesced credit above, and the client's
+keys, which the thread reading them sends to the core itself while the window has room,
+the source holds nothing of its own, keeping their order, and the core's queue has room
+now: that thread waits on nothing but its own backlog, so `~.` is read behind a core
+blocked in a write, and otherwise its keys go through the source as before. Closing the
+rest is a poll loop's work, which this design declined (above).
 
 Rekeying does not disconnect a healthy peer. Sources, the client's stdin among them,
 stop taking credit from the first KEXINIT, either side's, until `NEWKEYS` has gone both
 ways and what was held has gone out. Only what they had already taken and control
-messages are then held back: at most the queue, a packet in hand per source and whatever
+messages are then held back: at most the queue, a packet in hand per source (the
+client's key-reading thread counting as one) and whatever
 replies a peer asks for meanwhile. So the 8 MiB bound on what is held remains for what
 is left, a peer flooding requests during a rekey, and it fails the connection rather
 than grow. A peer that never answers a rekey is caught by keepalive on the server, there
@@ -561,7 +578,9 @@ Window changes come from a thread polling `TIOCGWINSZ` every 250
 ms, so no signal handler is needed. The `~.` escape disconnects, after a newline,
 and `~~` sends a tilde; nothing else is an escape. Keys are read and looked at on a
 thread of their own, so `~.` is seen while the window is shut or a rekey is stuck, up to
-256 chunks of typing waiting behind them, past which reading stops as OpenSSH's does. It
+256 chunks of typing waiting behind them, past which reading stops as OpenSSH's does.
+That thread sends keys on to the core itself when nothing waits behind the window and
+the core's queue has room, never waiting for either (Latency, above). It
 works on a session whose server stopped reading: it tells the core, gives it the
 farewell's second, and then shuts the socket down, the one thing that ends a write the
 core is blocked in. A drain of output already under way, for a stalled local consumer,

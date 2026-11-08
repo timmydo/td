@@ -12,7 +12,9 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvError, RecvTimeoutError, SendError, SyncSender};
+use std::sync::mpsc::{
+    sync_channel, Receiver, RecvError, RecvTimeoutError, SendError, SyncSender, TrySendError,
+};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -153,6 +155,18 @@ impl Flow {
         }
     }
 
+    /// Room up to `limit` now, or none, as `reserve` would grant it.
+    fn try_reserve(&self, cost: usize, limit: usize) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.receiver_gone || (state.queued > 0 && state.queued.saturating_add(cost) > limit) {
+            return false;
+        }
+        state.queued = state.queued.saturating_add(cost);
+        true
+    }
+
     fn release(&self, cost: usize) {
         if let Ok(mut state) = self.state.lock() {
             state.queued = state.queued.saturating_sub(cost);
@@ -201,6 +215,36 @@ impl EventSender {
     /// Without waiting. Only for what costs nothing against the budget.
     pub fn try_send(&self, event: Event) -> bool {
         self.sender.try_send(event).is_ok()
+    }
+
+    /// Channel data without waiting for budget or a slot in the queue, for a
+    /// thread that must not block: the data back if either is short.
+    pub fn send_output_now(
+        &self,
+        channel: u32,
+        stderr: bool,
+        data: Vec<u8>,
+    ) -> std::result::Result<(), Vec<u8>> {
+        let cost = data.len().saturating_add(MESSAGE_OVERHEAD);
+        if !self.flow.try_reserve(cost, EVENT_BUDGET) {
+            return Err(data);
+        }
+        let event = Event::Output {
+            channel,
+            stderr,
+            data,
+        };
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(event) | TrySendError::Disconnected(event)) => {
+                self.flow.release(cost);
+                // Only the event built above comes back.
+                match event {
+                    Event::Output { data, .. } => Err(data),
+                    _ => Err(Vec::new()),
+                }
+            }
+        }
     }
 
     pub fn flow(&self) -> &Arc<Flow> {
@@ -587,6 +631,26 @@ impl Credit {
         }
     }
 
+    /// Exactly `bytes` of credit if the window and the transport have room for it
+    /// now, without waiting: for a path that has somewhere else to go if not.
+    pub fn take_now(&self, bytes: usize) -> bool {
+        let Ok(state) = self.flow.state.lock() else {
+            return false;
+        };
+        let have = self.bytes.load(Ordering::Relaxed);
+        let wanted = bytes as u64;
+        if self.closed.load(Ordering::Relaxed)
+            || state.receiver_gone
+            || !state.transport_open
+            || wanted == 0
+            || have < wanted
+        {
+            return false;
+        }
+        self.bytes.store(have - wanted, Ordering::Relaxed);
+        true
+    }
+
     /// Waits for at least one byte of credit, taking at most `max`: None once the
     /// channel closed, or once `stop` is set.
     fn take_unless(&self, max: usize, stop: &AtomicBool) -> Option<usize> {
@@ -609,6 +673,11 @@ impl Credit {
     }
 }
 
+/// The most a source sends in one message: the peer's limit, within ours.
+pub fn source_chunk(max_packet: usize) -> usize {
+    max_packet.clamp(1, CHANNEL_MAX_PACKET as usize)
+}
+
 /// Pumps a local stream to a channel, one window-credited piece at a time.
 /// Returns what stops it: `Credit::stop_source` makes it close the stream, once
 /// its wait for credit or its next read has returned, and report the end. A read
@@ -621,7 +690,7 @@ pub fn spawn_source<R: Read + Send + 'static>(
     credit: Arc<Credit>,
     events: EventSender,
 ) -> Arc<AtomicBool> {
-    let chunk = max_packet.clamp(1, CHANNEL_MAX_PACKET as usize);
+    let chunk = source_chunk(max_packet);
     let starter = events.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let told = stop.clone();
@@ -770,10 +839,15 @@ pub fn spawn_sink<W: Write + Send + 'static>(
     let worker = SinkThread(shared);
     let handle = start_thread(&starter, move || {
         let mut broken = false;
+        // Credit is reported once a packet's worth is owed, not at every write: a
+        // keystroke's byte would otherwise wake the core for nothing, which on a
+        // busy machine is a wait for a CPU. What is still owed is far inside the
+        // window, and is reported when the stream ends.
+        let mut owed = 0u32;
         while let Some(data) = worker.next() {
             // A packet's worth at a time, each credited as it lands, so a slow
-            // consumer reopens the window as it goes, as when each message was
-            // written on its own, and not only once all that waited is through.
+            // consumer reopens the window as it goes, and not only once all that
+            // waited is through.
             for piece in data.chunks(CHANNEL_MAX_PACKET as usize) {
                 if !broken && (output.write_all(piece).is_err() || output.flush().is_err()) {
                     broken = true;
@@ -781,11 +855,26 @@ pub fn spawn_sink<W: Write + Send + 'static>(
                         let _ = events.send(Event::SinkBroken { channel });
                     }
                 }
-                let bytes = u32::try_from(piece.len()).unwrap_or(u32::MAX);
-                if events.send(Event::Consumed { channel, bytes }).is_err() {
-                    return;
+                owed = owed.saturating_add(u32::try_from(piece.len()).unwrap_or(u32::MAX));
+                if owed >= CHANNEL_MAX_PACKET {
+                    if events
+                        .send(Event::Consumed {
+                            channel,
+                            bytes: owed,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    owed = 0;
                 }
             }
+        }
+        if owed > 0 {
+            let _ = events.send(Event::Consumed {
+                channel,
+                bytes: owed,
+            });
         }
     });
     (sink, handle)
@@ -1300,6 +1389,52 @@ mod tests {
         ));
     }
 
+    /// Sent now or handed back, with nothing left charged: over the budget, past
+    /// a full queue, and once the core is gone.
+    #[test]
+    fn output_sent_now_waits_for_nothing_and_hands_back_what_it_cannot_send() {
+        let (events, receiver) = event_channel();
+        assert_eq!(events.send_output_now(1, false, b"a".to_vec()), Ok(()));
+        // Past the budget behind what is queued.
+        let large = vec![0; EVENT_BUDGET];
+        assert_eq!(events.send_output_now(1, false, large.clone()), Err(large));
+        assert!(matches!(receiver.recv(), Ok(Event::Output { data, .. }) if data == b"a"));
+        // A full queue, of what costs nothing.
+        for _ in 0..EVENT_QUEUE {
+            assert!(events.try_send(Event::Tick));
+        }
+        assert_eq!(
+            events.send_output_now(1, true, b"b".to_vec()),
+            Err(b"b".to_vec())
+        );
+        assert_eq!(events.flow().state.lock().unwrap().queued, 0, "charged");
+        drop(receiver);
+        assert_eq!(
+            events.send_output_now(1, false, b"c".to_vec()),
+            Err(b"c".to_vec())
+        );
+    }
+
+    /// Credit taken now is all of it or none, and never while a rekey holds the
+    /// transport or once the channel has closed.
+    #[test]
+    fn credit_is_taken_now_whole_or_not_at_all() {
+        let flow = Flow::new();
+        let credit = Credit::new(10, flow.clone());
+        assert!(!credit.take_now(11));
+        assert!(!credit.take_now(0));
+        assert!(credit.take_now(4));
+        assert!(credit.take_now(6));
+        assert!(!credit.take_now(1), "spent");
+        credit.add(5);
+        flow.set_transport_open(false);
+        assert!(!credit.take_now(1), "held by a rekey");
+        flow.set_transport_open(true);
+        assert!(credit.take_now(1));
+        credit.close();
+        assert!(!credit.take_now(1), "closed");
+    }
+
     /// A consumer that has stopped, a window spent on it, and then a flood of empty
     /// and one-byte messages: what waits is the window's bytes, held in one buffer,
     /// and the empty ones add nothing at all. Before, each was a queued message.
@@ -1355,6 +1490,63 @@ mod tests {
         assert_eq!(credited, CHANNEL_WINDOW);
     }
 
+    /// A keystroke's write reports no credit of its own, which would wake the core
+    /// for each, and a packet's worth does; what is owed comes at the end.
+    #[test]
+    fn small_writes_are_credited_a_packet_at_a_time() {
+        struct Counted(Arc<AtomicU64>);
+        impl Write for Counted {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(data.len() as u64, Ordering::SeqCst);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let written = Arc::new(AtomicU64::new(0));
+        let (events, receiver) = event_channel();
+        let (sink, handle) = spawn_sink(
+            Counted(written.clone()),
+            5,
+            WhenBroken::Discard,
+            events.clone(),
+        );
+        let wait_for = |total: u64| {
+            let deadline = std::time::Instant::now() + PATIENCE;
+            while written.load(Ordering::SeqCst) < total {
+                assert!(std::time::Instant::now() < deadline, "the sink never wrote");
+                thread::yield_now();
+            }
+        };
+        let step = u64::from(CHANNEL_MAX_PACKET);
+        for typed in 1..step {
+            assert!(sink.send(b"a"));
+            wait_for(typed);
+        }
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a keystroke woke the core"
+        );
+        assert!(sink.send(b"a"));
+        assert!(matches!(
+            receiver.recv_timeout(PATIENCE),
+            Ok(Event::Consumed { channel: 5, bytes }) if bytes == CHANNEL_MAX_PACKET
+        ));
+        assert!(sink.send(b"abc"));
+        wait_for(step + 3);
+        drop(sink);
+        drop(events);
+        handle.unwrap().join().unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(PATIENCE),
+            Ok(Event::Consumed {
+                channel: 5,
+                bytes: 3
+            })
+        ));
+    }
+
     /// What waited is credited a packet at a time as it lands, not once all of it
     /// is through, so a slow consumer keeps the window moving.
     #[test]
@@ -1403,8 +1595,8 @@ mod tests {
         let (events, receiver) = event_channel();
         drop(receiver);
         let (sink, handle) = spawn_sink(Vec::new(), 5, WhenBroken::Discard, events);
-        assert!(sink.send(&[1; 10]));
-        // Its Consumed cannot be delivered, so the thread ends.
+        assert!(sink.send(&vec![1; CHANNEL_MAX_PACKET as usize]));
+        // A packet's credit is due and cannot be delivered, so the thread ends.
         handle.unwrap().join().unwrap();
         assert!(!sink.send(&[1; 10]));
         assert!(sink.shared.state.lock().unwrap().pending.is_empty());
