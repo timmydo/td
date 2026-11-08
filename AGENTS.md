@@ -604,6 +604,9 @@ message.
   `td-tls-provider`, td-primitives behind rustls's `CryptoProvider`, depends
   on rustls 0.23.46 with no built-in backend and on local `td-primitives`;
   its exact manifest, lock and active features are pinned in the same policy.
+  `td-crypto` names local `td-tls-provider` and `td-primitives` as
+  dev-dependencies only: its tests qualify that backend against AWS-LC, and
+  neither is in its selected normal/build graph.
   All eleven local manifests and locks are pinned, `td-primitives` among
   them. No roster crate outside the admission may depend on `td-crypto`,
   `td-mta` or `td-tls-provider`, directly or transitively; `td-header`,

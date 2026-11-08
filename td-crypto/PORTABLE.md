@@ -415,7 +415,11 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   selecting this exact `td-mta` under the separate fixture described above.
   It is a test controller, never a service dependency.
 - `td-crypto-smoke`: separate qualification test executable, not a service
-  dependency. It independently exercises the native backend and facade.
+  dependency. It independently exercises the native backend and facade. It
+  also compiles td-crypto's dev-dependencies, td-tls-provider and
+  td-primitives, from their staged trees, with the differential tests of that
+  test-only candidate backend (DESIGN.md); the clean runtime runs only its
+  named cases, which exclude them.
 - `td-mta-config-smoke`: integration test linked to the production td-mta
   library for the bounded configuration stack checks in td-mta/CONFIG.md.
   Generic loader/materializer/writer functions compile in the test crate;

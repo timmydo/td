@@ -563,8 +563,8 @@ const TLS12_RSA_SCHEMES: &[SignatureScheme] = &[
 ];
 
 macro_rules! tls12_suite {
-    ($name:ident, $suite:ident, $hash:ident, $hmac:ident, $limit:expr, $schemes:ident, $aead:expr) => {
-        static $name: SupportedCipherSuite = SupportedCipherSuite::Tls12(&Tls12CipherSuite {
+    ($vis:vis $name:ident, $suite:ident, $hash:ident, $hmac:ident, $limit:expr, $schemes:ident, $aead:expr) => {
+        $vis static $name: SupportedCipherSuite = SupportedCipherSuite::Tls12(&Tls12CipherSuite {
             common: CipherSuiteCommon {
                 suite: CipherSuite::$suite,
                 hash_provider: &$hash,
@@ -1006,6 +1006,105 @@ impl Signer for P256Signer {
     fn scheme(&self) -> SignatureScheme {
         SignatureScheme::ECDSA_NISTP256_SHA256
     }
+}
+
+/// Verifiers a consumer assembles its own `WebPkiSupportedAlgorithms` from, in
+/// its own order and mapping, as rustls's `webpki_algs` are. td-crypto's policy
+/// takes these; `provider()` keeps its own, and is unchanged by them.
+pub mod verifiers {
+    use super::{alg_id, Digest, Sha256, Sha384, Sha512, SignatureVerificationAlgorithm, Verifier};
+    use td_primitives::ec::{p256, p384, p521};
+
+    /// ECDSA whose key may also be in SEC 1's compressed form, as a certificate
+    /// may hold it (td-crypto admits compressed anchor keys: its DESIGN.md,
+    /// "Trust-store admission"); `uncompressed` validates either and refuses
+    /// the hybrid form and infinity. These verify signatures only: a TLS key
+    /// share is never compressed. `provider()`'s ECDSA takes only uncompressed.
+    macro_rules! ecdsa_any_point {
+        ($name:ident, $curve:ident, $hash:ident, $public:ident, $signature:ident) => {
+            pub static $name: &dyn SignatureVerificationAlgorithm = &Verifier {
+                name: stringify!($name),
+                public_key: alg_id::$public,
+                signature: alg_id::$signature,
+                check: |public, message, signature| {
+                    let point = $curve::uncompressed(public)?;
+                    $curve::verify(&point, $hash::digest(message).as_ref(), signature)
+                },
+            };
+        };
+    }
+
+    ecdsa_any_point!(ECDSA_P256_SHA256, p256, Sha256, ECDSA_P256, ECDSA_SHA256);
+    ecdsa_any_point!(ECDSA_P256_SHA384, p256, Sha384, ECDSA_P256, ECDSA_SHA384);
+    ecdsa_any_point!(ECDSA_P256_SHA512, p256, Sha512, ECDSA_P256, ECDSA_SHA512);
+    ecdsa_any_point!(ECDSA_P384_SHA256, p384, Sha256, ECDSA_P384, ECDSA_SHA256);
+    ecdsa_any_point!(ECDSA_P384_SHA384, p384, Sha384, ECDSA_P384, ECDSA_SHA384);
+    ecdsa_any_point!(ECDSA_P384_SHA512, p384, Sha512, ECDSA_P384, ECDSA_SHA512);
+    ecdsa_any_point!(ECDSA_P521_SHA256, p521, Sha256, ECDSA_P521, ECDSA_SHA256);
+    ecdsa_any_point!(ECDSA_P521_SHA384, p521, Sha384, ECDSA_P521, ECDSA_SHA384);
+    ecdsa_any_point!(ECDSA_P521_SHA512, p521, Sha512, ECDSA_P521, ECDSA_SHA512);
+
+    /// `provider()`'s own Ed25519 and RSA verifiers, the same statics.
+    pub static ED25519: &dyn SignatureVerificationAlgorithm = &super::ED25519;
+    pub static RSA_PSS_SHA256: &dyn SignatureVerificationAlgorithm = &super::RSA_PSS_SHA256;
+    pub static RSA_PSS_SHA384: &dyn SignatureVerificationAlgorithm = &super::RSA_PSS_SHA384;
+    pub static RSA_PSS_SHA512: &dyn SignatureVerificationAlgorithm = &super::RSA_PSS_SHA512;
+    pub static RSA_PKCS1_SHA256: &dyn SignatureVerificationAlgorithm = &super::RSA_PKCS1_SHA256;
+    pub static RSA_PKCS1_SHA384: &dyn SignatureVerificationAlgorithm = &super::RSA_PKCS1_SHA384;
+    pub static RSA_PKCS1_SHA512: &dyn SignatureVerificationAlgorithm = &super::RSA_PKCS1_SHA512;
+    /// PKCS#1 named by its signature identifier without the NULL parameters.
+    pub static RSA_PKCS1_SHA256_BARE: &dyn SignatureVerificationAlgorithm =
+        &super::RSA_PKCS1_SHA256_BARE;
+    pub static RSA_PKCS1_SHA384_BARE: &dyn SignatureVerificationAlgorithm =
+        &super::RSA_PKCS1_SHA384_BARE;
+    pub static RSA_PKCS1_SHA512_BARE: &dyn SignatureVerificationAlgorithm =
+        &super::RSA_PKCS1_SHA512_BARE;
+}
+
+/// `provider()`'s TLS 1.2 ECDHE-ECDSA suites with rustls's own providers' full
+/// server scheme list, which also names ECDSA_NISTP521_SHA512. The key provider
+/// here holds only P-256, so the list changes no handshake it can serve.
+pub mod tls12_ecdsa {
+    use super::{
+        Algorithm, CipherSuite, CipherSuiteCommon, KeyExchangeAlgorithm, PrfUsingHmac,
+        SignatureScheme, SupportedCipherSuite, Tls12ChaCha, Tls12CipherSuite, Tls12Gcm,
+        HASH_SHA256, HASH_SHA384, HMAC_SHA256, HMAC_SHA384,
+    };
+
+    const SCHEMES: &[SignatureScheme] = &[
+        SignatureScheme::ED25519,
+        SignatureScheme::ECDSA_NISTP521_SHA512,
+        SignatureScheme::ECDSA_NISTP384_SHA384,
+        SignatureScheme::ECDSA_NISTP256_SHA256,
+    ];
+
+    tls12_suite!(
+        pub TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        HASH_SHA256,
+        HMAC_SHA256,
+        u64::MAX,
+        SCHEMES,
+        Tls12ChaCha
+    );
+    tls12_suite!(
+        pub TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        HASH_SHA256,
+        HMAC_SHA256,
+        1 << 24,
+        SCHEMES,
+        Tls12Gcm(Algorithm::Aes128Gcm)
+    );
+    tls12_suite!(
+        pub TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        HASH_SHA384,
+        HMAC_SHA384,
+        1 << 24,
+        SCHEMES,
+        Tls12Gcm(Algorithm::Aes256Gcm)
+    );
 }
 
 #[cfg(test)]
@@ -1722,8 +1821,271 @@ mod tests {
         );
     }
 
-    // tests/signature_answers.py made these with big integers; ring verified each.
+    // tests/signature_answers.py made these with big integers. ring verified each
+    // signed row it has the algorithm for; td-crypto's differential tests hold
+    // every row to AWS-LC, the P-521, SHA-512 ECDSA and refused ones included.
     const SIGNATURES: &str = include_str!("../tests/signature_answers.txt");
+
+    /// The algorithm a row signs under: a SMALL_ORDER_ row is a signature under
+    /// a small-order key, which verification takes, for any message. Every
+    /// REFUSED_ row is no algorithm's.
+    fn row_algorithm(name: &str) -> &str {
+        name.strip_prefix("SMALL_ORDER_").unwrap_or(name)
+    }
+
+    /// SEC 1's compressed form of an uncompressed point, by y's parity.
+    fn compressed(point: &[u8]) -> Vec<u8> {
+        let size = (point.len() - 1) / 2;
+        let mut out = vec![2 | (point[point.len() - 1] & 1)];
+        out.extend_from_slice(&point[1..=size]);
+        out
+    }
+
+    /// Every `verifiers` export.
+    fn exported() -> Vec<&'static dyn SignatureVerificationAlgorithm> {
+        use verifiers::*;
+        vec![
+            ECDSA_P256_SHA256,
+            ECDSA_P256_SHA384,
+            ECDSA_P256_SHA512,
+            ECDSA_P384_SHA256,
+            ECDSA_P384_SHA384,
+            ECDSA_P384_SHA512,
+            ECDSA_P521_SHA256,
+            ECDSA_P521_SHA384,
+            ECDSA_P521_SHA512,
+            ED25519,
+            RSA_PSS_SHA256,
+            RSA_PSS_SHA384,
+            RSA_PSS_SHA512,
+            RSA_PKCS1_SHA256,
+            RSA_PKCS1_SHA384,
+            RSA_PKCS1_SHA512,
+            RSA_PKCS1_SHA256_BARE,
+            RSA_PKCS1_SHA384_BARE,
+            RSA_PKCS1_SHA512_BARE,
+        ]
+    }
+
+    #[test]
+    fn the_provider_verifiers_take_only_uncompressed_keys() {
+        let all = SIGNATURE_ALGORITHMS.all;
+        let mut checked = 0;
+        for line in SIGNATURES.lines().filter(|l| !l.starts_with("PGP_")) {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let [name, public, message, signature] = fields[..] else {
+                panic!("malformed row: {line}");
+            };
+            // Only the curve and hash pairs `provider()` has.
+            let Some(own) = all.iter().find(|v| format!("{v:?}") == name) else {
+                continue;
+            };
+            if !name.starts_with("ECDSA_") {
+                continue;
+            }
+            let (public, message, signature) = (
+                from_hex(public).unwrap(),
+                from_hex(message).unwrap(),
+                from_hex(signature).unwrap(),
+            );
+            assert!(own.verify_signature(&public, &message, &signature).is_ok());
+            for verifier in all {
+                assert!(verifier
+                    .verify_signature(&compressed(&public), &message, &signature)
+                    .is_err());
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 4);
+    }
+
+    #[test]
+    fn exported_verifiers_take_their_own_rows_with_the_key_in_either_form() {
+        let all = exported();
+        let mut exercised = std::collections::BTreeSet::new();
+        for line in SIGNATURES.lines().filter(|l| !l.starts_with("PGP_")) {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let [name, public, message, signature] = fields[..] else {
+                panic!("malformed row: {line}");
+            };
+            let unhex = |text| from_hex(text).unwrap();
+            let (public, message, signature) = (unhex(public), unhex(message), unhex(signature));
+            // Each key form, and whether it is the row's key.
+            let mut keys = vec![(public.clone(), true)];
+            if name.contains("ECDSA_") {
+                let short = compressed(&public);
+                let mut negated = short.clone();
+                negated[0] ^= 1;
+                let mut hybrid = public.clone();
+                hybrid[0] = 6 | (public[public.len() - 1] & 1);
+                keys.extend([(short, true), (negated, false), (hybrid, false)]);
+            }
+            let algorithm = row_algorithm(name);
+            for verifier in &all {
+                let verifier_name = format!("{verifier:?}");
+                let own =
+                    verifier_name == algorithm || verifier_name == format!("{algorithm}_BARE");
+                for (form, (key, is_own_key)) in keys.iter().enumerate() {
+                    assert_eq!(
+                        verifier.verify_signature(key, &message, &signature).is_ok(),
+                        own && *is_own_key,
+                        "{name} under {verifier_name}, key form {form}"
+                    );
+                }
+                if own {
+                    exercised.insert(verifier_name.clone());
+                    for (key, _) in keys.iter().filter(|(_, own_key)| *own_key) {
+                        let mut changed = message.clone();
+                        changed[0] ^= 1;
+                        assert_eq!(
+                            verifier.verify_signature(key, &changed, &signature).is_ok(),
+                            algorithm != name,
+                            "{name} over another message"
+                        );
+                        let mut changed = signature.clone();
+                        let last = changed.len() - 1;
+                        changed[last] ^= 1;
+                        assert!(verifier.verify_signature(key, &message, &changed).is_err());
+                    }
+                }
+            }
+        }
+        assert_eq!(exercised.len(), all.len(), "{exercised:?}");
+    }
+
+    #[test]
+    fn the_exported_verifiers_name_their_algorithms() {
+        use alg_id::*;
+        let rsa_bare = |last: u8| {
+            AlgorithmIdentifier::from_slice(
+                [
+                    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, last,
+                ]
+                .to_vec()
+                .leak(),
+            )
+        };
+        let expected = [
+            ("ECDSA_P256_SHA256", ECDSA_P256, ECDSA_SHA256),
+            ("ECDSA_P256_SHA384", ECDSA_P256, ECDSA_SHA384),
+            ("ECDSA_P256_SHA512", ECDSA_P256, ECDSA_SHA512),
+            ("ECDSA_P384_SHA256", ECDSA_P384, ECDSA_SHA256),
+            ("ECDSA_P384_SHA384", ECDSA_P384, ECDSA_SHA384),
+            ("ECDSA_P384_SHA512", ECDSA_P384, ECDSA_SHA512),
+            ("ECDSA_P521_SHA256", ECDSA_P521, ECDSA_SHA256),
+            ("ECDSA_P521_SHA384", ECDSA_P521, ECDSA_SHA384),
+            ("ECDSA_P521_SHA512", ECDSA_P521, ECDSA_SHA512),
+            ("ED25519", alg_id::ED25519, alg_id::ED25519),
+            ("RSA_PSS_SHA256", RSA_ENCRYPTION, alg_id::RSA_PSS_SHA256),
+            ("RSA_PSS_SHA384", RSA_ENCRYPTION, alg_id::RSA_PSS_SHA384),
+            ("RSA_PSS_SHA512", RSA_ENCRYPTION, alg_id::RSA_PSS_SHA512),
+            ("RSA_PKCS1_SHA256", RSA_ENCRYPTION, alg_id::RSA_PKCS1_SHA256),
+            ("RSA_PKCS1_SHA384", RSA_ENCRYPTION, alg_id::RSA_PKCS1_SHA384),
+            ("RSA_PKCS1_SHA512", RSA_ENCRYPTION, alg_id::RSA_PKCS1_SHA512),
+            ("RSA_PKCS1_SHA256_BARE", RSA_ENCRYPTION, rsa_bare(0x0b)),
+            ("RSA_PKCS1_SHA384_BARE", RSA_ENCRYPTION, rsa_bare(0x0c)),
+            ("RSA_PKCS1_SHA512_BARE", RSA_ENCRYPTION, rsa_bare(0x0d)),
+        ];
+        let all = exported();
+        assert_eq!(all.len(), expected.len());
+        for (verifier, (name, public, signature)) in all.iter().zip(expected) {
+            assert_eq!(format!("{verifier:?}"), name);
+            assert_eq!(verifier.public_key_alg_id(), public, "{name}");
+            assert_eq!(verifier.signature_alg_id(), signature, "{name}");
+            // Ed25519 and RSA are `provider()`'s own statics; ECDSA is not.
+            let shared = SIGNATURE_ALGORITHMS
+                .all
+                .iter()
+                .any(|v| std::ptr::addr_eq(*v, *verifier));
+            assert_eq!(shared, !name.starts_with("ECDSA_"), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_tls12_ecdsa_suites_are_the_provider_suites_with_rustls_scheme_list() {
+        let provider = provider();
+        // Written out: rustls's own providers' TLS 1.2 ECDSA list.
+        const ECDSA: &[SignatureScheme] = &[
+            SignatureScheme::ED25519,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+        ];
+        let suites = [
+            tls12_ecdsa::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            tls12_ecdsa::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            tls12_ecdsa::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        ];
+        for suite in suites {
+            let SupportedCipherSuite::Tls12(exported) = suite else {
+                panic!("a TLS 1.2 suite");
+            };
+            let name = exported.common.suite;
+            let ours = provider
+                .cipher_suites
+                .iter()
+                .find_map(|s| match s {
+                    SupportedCipherSuite::Tls12(s) if s.common.suite == name => Some(*s),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(exported.sign, ECDSA, "{name:?}");
+            assert!(exported.kx == KeyExchangeAlgorithm::ECDHE, "{name:?}");
+            assert_eq!(
+                exported.common.hash_provider.algorithm(),
+                ours.common.hash_provider.algorithm()
+            );
+            assert_eq!(
+                exported.common.confidentiality_limit,
+                ours.common.confidentiality_limit
+            );
+            let (shape, our_shape) = (
+                exported.aead_alg.key_block_shape(),
+                ours.aead_alg.key_block_shape(),
+            );
+            assert_eq!(
+                (
+                    shape.enc_key_len,
+                    shape.fixed_iv_len,
+                    shape.explicit_nonce_len
+                ),
+                (
+                    our_shape.enc_key_len,
+                    our_shape.fixed_iv_len,
+                    our_shape.explicit_nonce_len
+                ),
+                "{name:?}"
+            );
+            let (mut output, mut our_output) = ([0u8; 48], [0u8; 48]);
+            exported
+                .prf_provider
+                .for_secret(&mut output, b"td secret", b"td label", b"td seed");
+            ours.prf_provider
+                .for_secret(&mut our_output, b"td secret", b"td label", b"td seed");
+            assert_eq!(output, our_output, "{name:?}");
+        }
+        // And they serve over every group.
+        for suite in suites {
+            for group in provider.kx_groups.iter().copied() {
+                let narrowed = Arc::new(CryptoProvider {
+                    cipher_suites: vec![suite],
+                    kx_groups: vec![group],
+                    ..super::provider()
+                });
+                let (mut client, mut server) = connect(narrowed);
+                handshake(&mut client, &mut server);
+                assert_eq!(
+                    client.negotiated_cipher_suite().map(|s| s.suite()),
+                    Some(suite.suite())
+                );
+                client.writer().write_all(b"exported").unwrap();
+                shuttle(&mut client, &mut server).unwrap();
+                let mut got = [0; 8];
+                server.reader().read_exact(&mut got).unwrap();
+                assert_eq!(&got, b"exported");
+            }
+        }
+    }
 
     #[test]
     fn every_verifier_takes_its_own_signature_and_nobody_elses() {
@@ -1737,10 +2099,12 @@ mod tests {
             };
             let unhex = |text| from_hex(text).unwrap();
             let (public, message, signature) = (unhex(public), unhex(message), unhex(signature));
+            let algorithm = row_algorithm(name);
             for verifier in all {
                 let verifier_name = format!("{verifier:?}");
                 // The _BARE names are the same algorithm's other spelling.
-                let own = verifier_name == name || verifier_name == format!("{name}_BARE");
+                let own =
+                    verifier_name == algorithm || verifier_name == format!("{algorithm}_BARE");
                 assert_eq!(
                     verifier
                         .verify_signature(&public, &message, &signature)
@@ -1752,11 +2116,13 @@ mod tests {
                     exercised.insert(verifier_name.clone());
                     let mut changed = message.clone();
                     changed[0] ^= 1;
-                    assert!(
+                    // A small-order key's signature verifies any message.
+                    assert_eq!(
                         verifier
                             .verify_signature(&public, &changed, &signature)
-                            .is_err(),
-                        "{verifier_name} over another message"
+                            .is_ok(),
+                        algorithm != name,
+                        "{name} over another message"
                     );
                     let mut changed = signature.clone();
                     let last = changed.len() - 1;

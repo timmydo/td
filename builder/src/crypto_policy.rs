@@ -32,7 +32,7 @@ pub(crate) fn admitted(name: &str) -> bool {
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
-        "td-crypto" => "d838d471f755e194e2001229e67b04c8281b46b7cd134737b7c2b65077ef7aec",
+        "td-crypto" => "e695ab03b41873b801d895218bd6c822035ca9968477eb3c80128533217564b6",
         "td-mta" => "24f2b491cd3b9be70711ffdcd47b19baf6615a2637a411e3b1abc8235be41f6b",
         "td-fs" => "e685546b8dc4353148f58034fc27b8bd59490281944f9226f295b5d6d72240fc",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
@@ -54,7 +54,7 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
 pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "d05684e2af245c0a796e154148ced1bc85ea08d9f31799d65a4fe1a62b7fc66a",
-        "td-crypto" => "101fd34f66e0b38c153d6e8d11670f5cd757963fa50feb90336d3ebb71f8f92d",
+        "td-crypto" => "373b01906465294ebb74ad23412b881808add1cd481f3c98d76cea82c1146c87",
         "td-mta" => "26d27bb88497f325ac8935f0ae7cb3902fcafea1234766806dabf24051a2925f",
         "td-fs" => "d907e7d97198344c058b8403d2a07c08174081bcd8af0f4d9e276c0131766fe2",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
@@ -606,6 +606,19 @@ mod tests {
             ),
             graph.replace("webpki-roots v1.0.11|\n", ""),
             graph.replace(&crypto.display().to_string(), "/wrong/source"),
+            // The test-only candidate backend in the selected graph, or its
+            // rustls feature unified into it.
+            format!(
+                "{graph}td-tls-provider v0.1.0 ({})|\n",
+                root.join("td-tls-provider")
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+            ),
+            graph.replace(
+                "|aws-lc-rs,aws_lc_rs,std,tls12",
+                "|aws-lc-rs,aws_lc_rs,custom-provider,std,tls12",
+            ),
         ] {
             assert!(active_graph(&root, "td-crypto", &bad).is_err());
         }

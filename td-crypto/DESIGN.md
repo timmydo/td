@@ -19,7 +19,9 @@ immutable identity routing. M07c1 adds socket-free client sessions; M07c2
 adds server admission and verified-client evidence.
 Test-only backend qualification covers explicit provider construction,
 SHA-256, local TLS 1.2/1.3 data exchange, certificate verification and
-malformed/tampered-record refusals in the isolated static executable. Mocks
+malformed/tampered-record refusals in the isolated static executable. A
+test-only td-primitives backend, through td-tls-provider, is qualified
+against AWS-LC ("td-primitives backend qualification" below). Mocks
 and interface tests are not cryptographic conformance evidence.
 
 The target dependency graph is:
@@ -77,6 +79,10 @@ td-primitives and td-tls-provider. Their exact manifests and locks are
 pinned; td-civil, td-fs, td-header, td-html, td-json, td-mime, td-nfc and
 td-primitives remain std-only roster crates. td-primitives' dev-dependency
 td-source-scan is compiled into no admitted graph and is not pinned.
+td-crypto's own dev-dependencies, td-tls-provider and td-primitives, compile
+only into its test targets for the backend qualification below; the selected
+normal/build graph the wrapper checks excludes them, and td-mta's lock does
+not list them.
 td-tls-provider (its DESIGN.md) is admitted with its own pinned Rustls line
 and active graph, which select no backend. The Cargo config pin contains only target runner settings, for
 which Cargo selects the deepest definition. Any future pin change must
@@ -1175,13 +1181,14 @@ Future td-owned primitives replace the private backend behind this same facade;
 their implementation lives in `td-primitives` (AGENTS.md principle 2), and they
 do not introduce another public mail dependency. The Rustls provider bridge is
 the shared `td-tls-provider` crate, td-net's provider and admitted by the same
-policy, since code two crates need lives in one crate (principle 2). td-crypto
-does not use it yet; when it does, it assembles this document's and TLS.md's
-policy from it inside private fields and never re-exports it, so the bridge
-stays private to the facade. Replacing AWS-LC still retains the Rustls TLS engine;
-it does not make the entire crate std-only. This crate owns the inventory of
-existing engine SHA/Ed25519 and td-fido P-256 implementations and their audit
-evidence before reusing any code. Reuse confers no unproven side-channel claim
+policy, since code two crates need lives in one crate (principle 2). td-crypto's
+library does not use it yet; its tests qualify it ("td-primitives backend
+qualification" below). When the library does, it assembles this document's
+and TLS.md's policy from it inside private fields and never re-exports it, so
+the bridge stays private to the facade. Replacing AWS-LC still retains the
+Rustls TLS engine; it does not make the entire crate std-only. This crate owns
+the inventory of existing engine SHA/Ed25519 and td-fido P-256 implementations
+and their audit evidence before reusing any code. Reuse confers no unproven side-channel claim
 and does not migrate those consumers into this external-dependency crate.
 Cross-component primitive consolidation has its design in
 `td-primitives/DESIGN.md`; it is outside F04. td-mta/IMPLEMENTATION.md F04 owns mail integration staging
@@ -1205,6 +1212,43 @@ semantics; they are not qualified as nonblocking or latency-bounded. M07e must
 measure contention across handshake and established workers, along with the
 shared clock callback, before service admission. Any later lock-free health
 optimization must independently preserve those retirement fences.
+
+### td-primitives backend qualification
+
+The candidate backend is td-tls-provider and td-primitives, both
+dev-dependencies, so it exists only in this crate's test targets; no library
+path, feature or runtime selector reaches it. A private test module assembles
+this crate's exact policy from td-tls-provider's building blocks: tls_policy's
+nine suites in their order, from `provider()` and `tls12_ecdsa`; its three
+groups; a `WebPkiSupportedAlgorithms` of the test's own holding the nineteen
+certificate algorithms in order from `verifiers` and the ten handshake
+mappings; and `provider()`'s entropy and P-256 key provider. A test holds every
+suite, group, algorithm identifier pair and mapping, member by member, to the
+AWS-LC policy. The differential tests then hold the candidate's answers to
+AWS-LC's for signature verification under every certificate algorithm, with
+each EC key form and inputs both must refuse, for certificate paths, for TLS
+handshakes in both roles over every suite, group and handshake scheme, for
+fixed-size comparison, and for P-256 keys, PKCS#8 documents and ES256
+signatures crossing between the backends.
+
+`pkcs8::validate` is structural. AWS-LC also refuses a scalar outside 1 to
+n - 1 and, in the 138- and 150-byte shapes, an embedded public point other
+than the one the scalar derives. A cutover reader must keep both checks: the
+scalar in 1 to n - 1, and an embedded point equal to the derived one.
+td-tls-provider's key provider loads only the 138-byte shape, so a cutover
+keeps this crate's reader for all four accepted shapes and derives the point
+with td-primitives, which refuses the same scalars.
+
+This is functional evidence only. Before a cutover remain: F04's independent
+cryptographic and exact-artifact side-channel review of the td-primitives
+paths used; td-primitives replacements for entropy, comparison, P-256 keys,
+bulk SHA-256 and the native public-key reserialization certificate admission
+uses, under this document's failure, retirement and unwind contracts;
+allocation, stack and RSS qualification; running these tests on the
+portable musl artifact and its aarch64 cross-build, whose smoke executable
+compiles them but whose runtime runs only the named smoke cases; mail/TLS
+integration and persisted-key rollback fixtures; and the atomic switch that
+removes aws-lc-rs and its native build inputs.
 
 ### Exact issued DNS identifiers
 

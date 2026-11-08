@@ -21,6 +21,12 @@ never selected. Every locked package is also in the mail lock at the same
 version and checksum, so the common offline vendor serves it; a
 policy test holds that.
 
+td-crypto's lock also lists local td-tls-provider and td-primitives, its
+dev-dependencies, which compile only into its test targets. They add no
+registry package. Their Rustls `custom-provider` feature unifies into those
+test builds only; the selected normal/build graph above is unchanged, and
+td-mta's lock does not list them.
+
 Direct inputs are Rustls 0.23.46 (std, TLS 1.2, AWS-LC), aws-lc-rs 1.19.0
 (alloc, non-FIPS), and webpki-roots 1.0.11 (compiled Mozilla root data).
 Rustls owns TLS, webpki validates certificates, pki-types represents their

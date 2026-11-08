@@ -6,7 +6,14 @@ compute.
 
 One row for each distinct check in td-tls-provider/src/lib.rs, as `VERIFIER public-key
 message signature` in hex, the key as a TLS peer presents it: an EC point, a raw
-Ed25519 key or a DER RSAPublicKey.
+Ed25519 key or a DER RSAPublicKey. td-crypto's differential tests read the ECDSA, Ed25519
+and RSA rows too: four of the curve and hash pairs are ones AWS-LC will not sign with.
+
+`REFUSED_` rows are signatures no verifier may take: ECDSA r or s of 0 or n or more, or
+not strict DER; RSA moduli outside 2048 to 8192 bits and exponents that are 1, even or
+over 33 bits; Ed25519 S of L or more. A second RSA_PKCS1_SHA256 row has the largest
+exponent taken, 33 bits. SMALL_ORDER_ED25519 is a signature under the identity key,
+which verifies for any message whose R is rB and S is r.
 
 One OpenPGP row for net/src/openpgp.rs, `PGP_SHORT_MPI n e data subpackets value`: a
 v4 binary signature whose value has a leading zero octet, which its MPI drops, as
@@ -18,6 +25,7 @@ messages and nothing else.
 
 import hashlib
 import random
+from math import gcd
 
 P256 = {
     "p": 2**256 - 2**224 + 2**192 + 2**96 - 1,
@@ -32,6 +40,13 @@ P384 = {
     "gx": 0xaa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7,
     "gy": 0x3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f,
     "len": 48,
+}
+P521 = {
+    "p": 2**521 - 1,
+    "n": 0x01fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e91386409,
+    "gx": 0x00c6858e06b70404e9cd9e3ecb662395b4429c648139053fb521f828af606b4d3dbaa14b5e77efe75928fe1dc127a2ffa8de3348b3c1856a429bf97e7e31c2e5bd66,
+    "gy": 0x011839296a789a3bc0045c8a5fb42c7d1bd998f54449579b446817afbd17273e662c97ee72995ef42640c550b9013fad0761353c7086a272c24088be94769fd16650,
+    "len": 66,
 }
 INFO = {
     "sha256": bytes.fromhex("3031300d060960864801650304020105000420"),
@@ -98,6 +113,103 @@ def ecdsa_row(name, curve, hash_name, label):
     point = b"\x04" + public[0].to_bytes(size, "big") + public[1].to_bytes(size, "big")
     signature = der(0x30, integer(r) + integer(s))
     print(f"{name} {point.hex()} {message.hex()} {signature.hex()}")
+    return point, message, r, s
+
+
+def ecdsa_refusals(point, message, r, s):
+    # Each a signature no verifier may take, with its row's key and message.
+    n = P256["n"]
+    padded = der(2, b"\x00" + integer(r)[2:])
+    body = integer(r) + integer(s)
+    for name, signature in [
+        ("R_ZERO", der(0x30, integer(0) + integer(s))),
+        ("S_ZERO", der(0x30, integer(r) + integer(0))),
+        ("R_IS_N", der(0x30, integer(n) + integer(s))),
+        ("R_PLUS_N", der(0x30, integer(r + n) + integer(s))),
+        ("S_PLUS_N", der(0x30, integer(r) + integer(s + n))),
+        ("R_NOT_MINIMAL", der(0x30, padded + integer(s))),
+        ("LENGTH_NOT_MINIMAL", bytes([0x30, 0x81, len(body)]) + body),
+        ("TRAILING_BYTE", der(0x30, body) + b"\x00"),
+    ]:
+        row = f"REFUSED_ECDSA_P256_SHA256_{name}"
+        print(f"{row} {point.hex()} {message.hex()} {signature.hex()}")
+
+
+def pkcs1_signature(n, d, message):
+    size = (n.bit_length() + 7) // 8
+    tail = INFO["sha256"] + hashlib.sha256(message).digest()
+    em = b"\x00\x01" + b"\xff" * (size - len(tail) - 3) + b"\x00" + tail
+    return pow(int.from_bytes(em, "big"), d, n).to_bytes(size, "big"), em
+
+
+def multi_prime(count, rng, e):
+    # Squarefree n of 512-bit primes: verification reads only n and e.
+    while True:
+        primes = [prime_of(512, rng) for _ in range(count)]
+        n, lam = 1, 1
+        for p in primes:
+            n *= p
+            lam = lam * (p - 1) // gcd(lam, p - 1)
+        if len(set(primes)) == count and gcd(e, lam) == 1:
+            return n, pow(e, -1, lam)
+
+
+def rsa_edges(n, p, q):
+    # Moduli outside 2048..8192 bits and exponents outside odd 3..2^33.
+    rng = random.Random(8192)
+    message = b"td verifier table RSA_PKCS1_SHA256 edge"
+    phi = (p - 1) * (q - 1)
+    rows = []
+    for name, count in (("1024_BIT", 2), ("OVER_8192_BIT", 17)):
+        modulus, d = multi_prime(count, rng, 65537)
+        assert modulus.bit_length() in (1024, *range(8193, 8705))
+        signature, _ = pkcs1_signature(modulus, d, message)
+        rows.append(
+            (f"REFUSED_RSA_PKCS1_SHA256_{name}", modulus, 65537, message, signature)
+        )
+    _, em = pkcs1_signature(n, 1, message)
+    rows.append(("REFUSED_RSA_PKCS1_SHA256_E_1", n, 1, message, em))
+    rows.append(even_exponent_row(message))
+    # The largest exponents allowed and not: 34 bits refused, 33 taken.
+    for name, e in (
+        ("REFUSED_RSA_PKCS1_SHA256_E_34_BIT", 2**33 + 17),
+        ("RSA_PKCS1_SHA256", 2**32 + 15),
+    ):
+        assert all(e % f for f in range(2, 1 << 17)) and gcd(e, phi) == 1
+        signature, _ = pkcs1_signature(n, pow(e, -1, phi), message)
+        rows.append((name, n, e, message, signature))
+    for name, modulus, e, signed, signature in rows:
+        public = der(0x30, integer(modulus) + integer(e))
+        print(f"{name} {public.hex()} {signed.hex()} {signature.hex()}")
+
+
+def even_exponent_row(message):
+    # A 2048-bit key whose signature is one under e = 65538, so only the
+    # parity check refuses it: primes 3 mod 4 with 32769 invertible, a
+    # message whose padding is a square mod each, its root through the
+    # CRT, then that root's 32769th root.
+    rng = random.Random(65538)
+    while True:
+        p, q = prime_of(1024, rng), prime_of(1024, rng)
+        lam = (p - 1) * (q - 1) // gcd(p - 1, q - 1)
+        if p % 4 == 3 and q % 4 == 3 and gcd(32769, lam) == 1:
+            break
+    n = p * q
+    assert n.bit_length() == 2048
+    for counter in range(1000):
+        signed = message + b" " + str(counter).encode()
+        _, em = pkcs1_signature(n, 1, signed)
+        value = int.from_bytes(em, "big")
+        if all(pow(value, (f - 1) // 2, f) == 1 for f in (p, q)):
+            break
+    else:
+        raise AssertionError("no padding is a square")
+    rp, rq = pow(value, (p + 1) // 4, p), pow(value, (q + 1) // 4, q)
+    root = (rp * q * pow(q, -1, p) + rq * p * pow(p, -1, q)) % n
+    signature = pow(root, pow(32769, -1, lam), n)
+    assert pow(signature, 65538, n) == value
+    name = "REFUSED_RSA_PKCS1_SHA256_E_EVEN"
+    return (name, n, 65538, signed, signature.to_bytes(256, "big"))
 
 
 def is_prime(n, rng):
@@ -170,6 +282,7 @@ def rsa_rows():
         signature = pow(int.from_bytes(em, "big"), d, n).to_bytes(256, "big")
         print(f"{name} {public.hex()} {message.hex()} {signature.hex()}")
     pgp_row(n, e, d)
+    rsa_edges(n, p, q)
 
 
 def ed25519_row():
@@ -215,6 +328,16 @@ def ed25519_row():
     k = int.from_bytes(hashlib.sha512(big_r + public + message).digest(), "little") % order
     signature = big_r + ((r + k * a) % order).to_bytes(32, "little")
     print(f"ED25519 {public.hex()} {message.hex()} {signature.hex()}")
+    # S of L or more is refused, though S - L would verify.
+    s_plus_l = (r + k * a) % order + order
+    signature = big_r + s_plus_l.to_bytes(32, "little")
+    print(f"REFUSED_ED25519_S_PLUS_L {public.hex()} {message.hex()} {signature.hex()}")
+    # The identity, of order one: R = rB, S = r verifies any message under it.
+    identity = encode((0, 1))
+    message = b"td verifier table SMALL_ORDER_ED25519"
+    r = int.from_bytes(hashlib.sha512(message).digest(), "little") % order
+    signature = encode(times(r, base)) + r.to_bytes(32, "little")
+    print(f"SMALL_ORDER_ED25519 {identity.hex()} {message.hex()} {signature.hex()}")
 
 
 def pgp_row(n, e, d):
@@ -238,12 +361,18 @@ def pgp_row(n, e, d):
 
 
 def main():
-    ecdsa_row("ECDSA_P256_SHA256", P256, "sha256", b"p256")
+    p256 = ecdsa_row("ECDSA_P256_SHA256", P256, "sha256", b"p256")
     ecdsa_row("ECDSA_P256_SHA384", P256, "sha384", b"p256")
     ecdsa_row("ECDSA_P384_SHA256", P384, "sha256", b"p384")
     ecdsa_row("ECDSA_P384_SHA384", P384, "sha384", b"p384")
+    ecdsa_row("ECDSA_P256_SHA512", P256, "sha512", b"p256")
+    ecdsa_row("ECDSA_P384_SHA512", P384, "sha512", b"p384")
+    ecdsa_row("ECDSA_P521_SHA256", P521, "sha256", b"p521")
+    ecdsa_row("ECDSA_P521_SHA384", P521, "sha384", b"p521")
+    ecdsa_row("ECDSA_P521_SHA512", P521, "sha512", b"p521")
     ed25519_row()
     rsa_rows()
+    ecdsa_refusals(*p256)
 
 
 if __name__ == "__main__":

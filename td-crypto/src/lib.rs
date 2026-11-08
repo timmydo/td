@@ -109,6 +109,8 @@ pub trait Crypto: Send + Sync {
 }
 
 #[cfg(test)]
+mod candidate_tests;
+#[cfg(test)]
 mod certificate_fixtures;
 #[cfg(test)]
 mod tls_peer_tests;

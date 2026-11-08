@@ -10531,16 +10531,15 @@ mod tests {
         }
         let docs = path_output(&root, "td-crypto/TLS.md");
         assert!(docs.contains("Selected checks: none"), "{docs}");
-        // The shared provider is crypto-admitted but not mail: its change
-        // takes no mail leg.
+        // td-crypto's tests qualify the shared provider against AWS-LC, as a
+        // dev-dependency, and td-mta's leg builds those tests as its TLS peer:
+        // a provider change takes both crates' legs.
         let provider = cargo_test_cmds(&root, &["td-tls-provider/src/lib.rs".to_string()]).unwrap();
         for krate in ["td-crypto", "td-mta"] {
-            assert!(
-                !provider
-                    .iter()
-                    .any(|c| cmd_manifest_crate(c) == Some(krate)),
-                "{krate}"
-            );
+            for action in ["test", "clippy"] {
+                let leg = format!(" gate-crates crypto-cargo {action} --manifest-path {krate}");
+                assert!(provider.iter().any(|c| c.contains(&leg)), "{krate}: {leg}");
+            }
         }
         for path in ["td-crypto-x/src/lib.rs", "td-crypto/../td-sh/src/main.rs"] {
             assert!(
@@ -10551,9 +10550,9 @@ mod tests {
     }
 
     /// A td-tls-provider change, and a change to the td-primitives it reads,
-    /// selects the provider's legs through `crypto-cargo`, td-net's suite and
-    /// the target gates that build td-net; its design document selects
-    /// nothing.
+    /// selects the provider's, td-crypto's and td-mta's `crypto-cargo` legs,
+    /// td-net's suite and the target gates that build td-net; its design
+    /// document selects nothing.
     #[test]
     fn tls_provider_changes_run_its_wrapped_legs_and_td_net() {
         let root = repo_root();
@@ -10572,11 +10571,15 @@ mod tests {
             "td-primitives/src/ec.rs",
         ] {
             let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
-            for action in ["test", "clippy"] {
-                let leg = format!(
-                    " gate-crates crypto-cargo {action} --manifest-path td-tls-provider/Cargo.toml"
-                );
-                assert!(commands.iter().any(|c| c.contains(&leg)), "{path}: {leg}");
+            // td-crypto's tests qualify both against AWS-LC, and td-mta's
+            // leg builds them.
+            for krate in ["td-tls-provider", "td-crypto", "td-mta"] {
+                for action in ["test", "clippy"] {
+                    let leg = format!(
+                        " gate-crates crypto-cargo {action} --manifest-path {krate}/Cargo.toml"
+                    );
+                    assert!(commands.iter().any(|c| c.contains(&leg)), "{path}: {leg}");
+                }
             }
             let output = path_output(&root, path);
             assert!(output.contains("td-builder check"), "{path}: {output}");
@@ -12576,6 +12579,16 @@ mod tests {
             );
             assert!(manifest_path_dependencies("td-mta", &changed).is_err());
         }
+    }
+
+    /// td-crypto's siblings are test-only: the td-primitives backend it
+    /// qualifies against AWS-LC, through td-tls-provider, and no normal edge.
+    #[test]
+    fn crypto_names_its_candidate_backend_as_dev_dependencies_only() {
+        let admitted = include_str!("../../td-crypto/Cargo.toml");
+        let (paths, dev_paths) = manifest_path_dependencies("td-crypto", admitted).unwrap();
+        assert!(paths.is_empty(), "{paths:?}");
+        assert_eq!(dev_paths, ["td-primitives", "td-tls-provider"]);
     }
 
     #[test]

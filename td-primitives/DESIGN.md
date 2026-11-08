@@ -358,8 +358,9 @@ that run is a record in the landing commit, not a test to repeat.
 - `td-tls-provider` is the rustls `CryptoProvider` over this crate, td-net's
   today. It is crypto-admitted for its rustls dependency; this crate stays std
   only, and its manifest and lock are pinned with that admission.
-- `td-crypto` is a separate private Rustls/AWS-LC closure for mail serving. It
-  does not use this crate yet: td-mta/IMPLEMENTATION.md F04 moves it here
+- `td-crypto` is a separate private Rustls/AWS-LC closure for mail serving. Its
+  library does not use this crate yet, and its tests qualify it against AWS-LC
+  (td-crypto/DESIGN.md): td-mta/IMPLEMENTATION.md F04 moves it here
   through `td-tls-provider`, kept private behind td-crypto's facade, and P-521
   and `uncompressed` are here for the policy that td-crypto must keep.
 - `td-fido` keeps its own AES, P-256 and HMAC-SHA256 for the disk and login

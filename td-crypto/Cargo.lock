@@ -193,7 +193,21 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "rustls",
+ "td-primitives",
+ "td-tls-provider",
  "webpki-roots",
+]
+
+[[package]]
+name = "td-primitives"
+version = "0.1.0"
+
+[[package]]
+name = "td-tls-provider"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "td-primitives",
 ]
 
 [[package]]
