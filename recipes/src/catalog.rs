@@ -523,6 +523,7 @@ mod tests {
                 "td-taskmgr",
                 "td-term",
                 "td-time",
+                "td-web",
                 "uutils",
             ]
         );
@@ -685,6 +686,7 @@ mod tests {
                 "td-ui",
                 "td-url",
                 "td-util",
+                "td-web",
             ]
         );
         lone.sort_unstable();

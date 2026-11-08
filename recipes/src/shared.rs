@@ -58,6 +58,13 @@ pub const TD_NEWS_NAME: &str = "news";
 pub const TD_NEWS_ENTRY: &str = "/app/bin/td-news";
 pub const TD_NEWS_DISPLAY_NAME: &str = "News";
 pub const TD_NEWS_SEARCH_TERMS: &[&str] = &["news", "rss", "feeds", "td-news"];
+// td's own document browser (td-web/DESIGN.md §3): a td-owned static
+// program on the same runtime, but a service-account application, not the
+// login user's, so it has no `/bin` launcher; its launcher card starts it.
+pub const TD_WEB_NAME: &str = "web";
+pub const TD_WEB_ENTRY: &str = "/app/bin/td-web";
+pub const TD_WEB_DISPLAY_NAME: &str = "Web";
+pub const TD_WEB_SEARCH_TERMS: &[&str] = &["web", "browser", "www", "td-web"];
 /// The program a jailed entry runs as: the final component of its `/app`
 /// path, which `td-jail --probe-process-token` matches and the boot
 /// evidence names.

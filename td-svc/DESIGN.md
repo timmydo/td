@@ -325,7 +325,7 @@ table uses it for a live boot, whose initramfs alone mounts the install
 medium at `/run/td-media`: the stock session's window units name that path,
 so the live session opens only the installer (td-install/INSTALLER.md "Live
 startup") while boot health, which requires the terminal, still runs.
-Firefox, mail and news with the workspace switches around them, and the
+Firefox, mail, news and web with the workspace switches around them, and the
 oracles' install and request-path evidence name
 `/run/td-applications-on-demand` instead, which the init creates on every
 boot without the autotest token and on every live one, so they run at boot
@@ -428,11 +428,14 @@ Application units require successful firstboot and invoke the root typed
 launcher, with `cgroup=session` because the leader moves into its
 application's session leaf (`td-app-UID/session`, or the human's
 `td-user-1000/session` for the personal mail and news). Like Firefox's,
-the mail and news units run at boot only on an oracle's (§3's
-`unless-exists=`); an ordinary session starts those two from its own
-shell (APPLICATIONS.md §W.7). Firefox also requires `firefox-files`,
+the mail, news and web units run at boot only on an oracle's (§3's
+`unless-exists=`); an ordinary session starts mail and news from its own
+shell (APPLICATIONS.md §W.7), and Firefox and web from their launcher
+cards. Firefox also requires `firefox-files`,
 whose root grant oneshot finishes before it starts; mail and news
-require the human's `fetchd`. Shutdown releases Firefox's view after
+require the human's `fetchd`, and web its own `web-fetch`, td-fetchd run
+as web's account on every boot (td-web/DESIGN.md §3), since a skipped
+unit would satisfy `requires=` with no socket. Shutdown releases Firefox's view after
 services stop and before releasing the portal view and `/var`.
 
 Application audio uses both edges deliberately. `audio requires=seat`

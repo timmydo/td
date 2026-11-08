@@ -595,7 +595,7 @@ unit that opens a window (the shell's terminal) or proves the windows in
 the autotest evidence names the live medium's mount, `/run/td-media`, in
 td-svc's `unless-exists=` (td-svc/DESIGN.md §3), so each settles ready
 without running and what requires it, such as boot health after the
-terminal, still runs. Firefox, mail and news, and the workspace switches
+terminal, still runs. Firefox, mail, news and web, and the workspace switches
 that place them, name `/run/td-applications-on-demand` instead, which a
 live boot also has (APPLICATIONS.md §W.7, §W.9). The session's
 services, the secure attention path and td-authd's authority run as on an

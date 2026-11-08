@@ -4222,6 +4222,10 @@ mod tests {
         );
         for (name, runtime, flathub, host_mode) in [
             ("firefox", runtime, false, false),
+            // td-web is static on the same runtime, but no allowlist has
+            // been derived from its binary (APPLICATIONS.md, "Per-application
+            // allowlists"), so it keeps the standard program.
+            ("web", runtime, false, false),
             ("mail", runtime, false, true),
             ("news", runtime, false, true),
             ("mail", runtime, true, false),

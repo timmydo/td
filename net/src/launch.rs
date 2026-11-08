@@ -1,9 +1,9 @@
 // td-launch — run one application with a fetch service of its own, for a
 // host that has no session fetch service (APPLICATIONS.md §X.7). td-news,
 // td-mail, td-web and td-agent hold no network client: on td the jail binds
-// td-fetchd's socket into the first two (td-web's once it is packaged),
-// and td-agent, a program of td's
-// account there, finds it under the account's runtime directory. Run elsewhere,
+// td-fetchd's socket into the first three (td-web's is its own account's
+// service), and td-agent, a program of td's account there, finds it under
+// the account's runtime directory. Run elsewhere,
 // this applet serves one for the launch:
 //
 //   td-net launch PROGRAM [ARG...]

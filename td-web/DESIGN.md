@@ -1,8 +1,7 @@
 # td-web
 
-**Status: design; increments in progress (§9).** This document is
-normative for td-web once a section's increment has landed; a section
-whose increment has not landed is the reviewed plan.
+**Status: normative; the increments of §9 have landed.** The roadmap
+(§10) is not normative; each item there is its own amendment.
 
 td-web is td's own web browser: a td-ui program, built from source in
 td's target graph, that reads documents on the web. It complements
@@ -64,34 +63,64 @@ reserved; 65537-65539 stay reserved, APPLICATIONS.md §L), its home
 every application is.
 
 It is a `ShippedApplication` on `static-runtime`, packaged by the `web`
-recipe from the `td-web` recipe's static binary, started by
-`td-authd application-start 1000 web direct --` from its launcher card
-like any service-account application. Its permissions keyfile grants:
+recipe from the `td-web` recipe's static binary with its debug
+companion, like mail and news, but not run as the login user: it has no
+`/bin` name and no terminal starts it. Its launcher card ("Web"; found
+by web, browser, www or td-web; app id `td-web`) asks root to start
+td-svc's `[web]` unit, which runs `td-authd application-start 1000 web
+direct --`, ready once the compositor reports its window. Like the
+other applications' units it starts at boot only on an oracle's (it
+names `/run/td-applications-on-demand`), on the applications'
+workspace. Nothing observes that start: no unit requires `[web]` and
+no oracle reads a marker of it, so main's boot proves nothing of td-web
+yet (§10, "Boot evidence"). "web" and "browser" are Firefox's search
+terms too, so they list both cards, Firefox's first by label: Firefox
+stays the browser a bare search opens. Its permissions keyfile grants:
 
 ```text
 [Context]
 sockets=wayland;fetch
 
 [Resources]
-memory-high=...
-memory-max=...
-pids-max=...
-cpu-max=...
+memory-high=536870912
+memory-max=805306368
+pids-max=32
+cpu-max=100000 100000
 ```
 
 No `shared=network`: td-web holds no network. No `[Filesystem]` grant:
-the first increments keep nothing between runs, and a later one keeps
-its state in the account's own home, which is private to it. No bus names. The resource numbers
-are set by the packaging increment from measured use.
+td-web keeps nothing between runs, and a later increment that does keeps
+its state in the account's own home, which is private to it. No bus
+names, no environment and no terminal. The memory bounds hold a body at
+`MAX_DOCUMENT` (16 MiB), a picture of up to 16 Mi pixels decoded beside
+it, and a rendering of markup at `MAX_MARKUP`, which can transiently
+cost some 300 MB (§5), with room; `memory-high` throttles before
+`memory-max` ends the jail. The tasks hold the window's thread, td-ui's
+and `MAX_WORKERS` fetches with room, since td-svc does not restart a
+program that exits on the cap. One CPU, twice news's, since a page is
+rendered on the window's thread (§8).
+
+td-jail gives td-web the standard seccomp program, not an allowlist:
+mail's and news's lists were derived from their realized binaries
+(APPLICATIONS.md, "Per-application allowlists"), none has been derived
+from td-web's, and a compiled program beyond the five UNSAFE.md §9 names
+is an amendment there.
 
 **Its own fetch service.** A service-account jail takes the fetch
 socket only from its own runtime directory, owned by its own UID
 (td-jail `sockets=fetch`). td-web therefore has its own `td-fetchd`,
-run by td-svc as `tda65540` with its socket at
+td-svc's `[web-fetch]`, run as `tda65540` with its socket at
 `/run/user/65540/td-fetch/socket`, as mail's and news's were before
-they joined the login user. It shares nothing with the human's fetch
-service: no connection, no credential and no TLS trust beyond the
-service's compiled roots.
+they joined the login user; `[web]` requires it. It runs on every boot,
+not on demand: a unit skipped by `unless-exists=` settles ready, which
+would satisfy `[web]`'s requirement with no socket behind it.
+td-firstboot prepares the account's home and its `/run/user/65540`, as
+it does for every application with a service account. The service runs
+in the account's `td-app-65540/session` leaf, where exec-service-as puts
+it, beside td-web's jail rather than in it, so td-web's limits above do
+not count it, as the human's fetch service sits in `td-user-1000`. The service
+shares nothing with the human's: no connection, no credential and no
+TLS trust beyond the service's compiled roots.
 
 ## 4. Network
 
@@ -250,7 +279,7 @@ in the page yet.
    fetcher. Inline pictures, which are subresources, wait for §10.
 4. **Packaging**: the `td-web` and `web` recipes, the `web`
    `ShippedApplication` at 65540, its fetch service and application
-   units, its launcher card and its permissions (§3).
+   units, its launcher card and its permissions (§3). Landed.
 
 ## 10. Roadmap (not normative)
 
@@ -279,6 +308,13 @@ order; each is its own design amendment when it starts:
 - **Driving.** td-ui's control socket (td-ui/DESIGN.md), so a test or an
   agent can operate td-web through the verbs td-ui's other programs
   take, and an oracle can boot it in the image.
+- **Boot evidence**: a `[web-evidence]` unit, as news's, that probes
+  the running jail's process token and filter as tda65540 and prints a
+  marker main's system boot requires, so a launch path broken by the
+  ledger, the jail or the fetch directory reds there.
+- **An allowlist**: derive td-web's seccomp program from its realized
+  binary, as mail's and news's were (APPLICATIONS.md, "Per-application
+  allowlists"); it parses the most hostile input of td's programs.
 - **Text selection** in the page, and copying it.
 - **Bounded rendering**: a line limit inside td-html's rich output, and
   rendering off the window's thread, so a hostile page costs neither

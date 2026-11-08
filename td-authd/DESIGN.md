@@ -1237,7 +1237,10 @@ Mail and news share the human fetch daemon at
 `/run/user/1000/td-fetch/socket`. Its runtime directory is mode 0700 and the
 socket mode 0600. Their jails mount only this service directory. Fetch
 requests share the human UID domain; there is no per-application host-UID
-isolation from the daemon.
+isolation from the daemon. A service-account application's jail takes the
+fetch socket only from its own runtime directory: web (td-web/DESIGN.md §3)
+has its own daemon, run as its account, at
+`/run/user/65540/td-fetch/socket`.
 Production application units use the typed root launcher with null
 application stdio.
 Bus evidence connects as the human observer and independently checks the

@@ -2052,8 +2052,8 @@ launcher-table=/etc/td-launcher.tsv
 The relative state root is resolved beneath the real user's home. Rung 7
 does not create that writable directory; `td-jail` does so on first launch
 once the ownership and confinement boundary exists. One exception is
-deliberate: for a program that cannot start without a configuration (the
-two source-built applications, §D), `td-firstboot` creates the application's
+deliberate: for a program that cannot start without a configuration (mail
+and news, §D), `td-firstboot` creates the application's
 `config` directory ahead of its first launch, at sysinit, in exactly the
 shape the jail requires — 0700 directories and 0600 files owned by the
 user, handed over through their own descriptors, written once and never
@@ -3588,7 +3588,11 @@ allowlist program in place of the standard one, selected by stage 1 from the
 authenticated name and the `static-runtime` output, and carried to stage 2 as a
 closed word it cannot widen. Host mode keeps the standard program, because there
 the binary is whatever the host built against the host's libc. So does any other
-application, and a package of either name on any other runtime.
+application, and a package of either name on any other runtime. `web`, td's own
+browser (td-web/DESIGN.md §3), is a third td-built static package on that
+runtime, and it too keeps the standard program: no list has been derived from its
+binary in the way below, and a compiled program beyond the five UNSAFE.md §9
+names would be an amendment there.
 
 An allowlist answers `ENOSYS` for what it lacks, as a kernel without the call
 does, so that a program reports what failed. It keeps the arch and x32 kills. It
@@ -6199,7 +6203,7 @@ its own included, by either credentials method (rung 32).
 Every one of those was a problem between PEERS, and each now has a test that
 drives it through the broker. Firefox is the one selected application that
 holds a bus name; the first-window oracle drives one peer, not two
-applications' traffic on one live bus. `mail` and `news` ship beside it
+applications' traffic on one live bus. `mail`, `news` and `web` ship beside it
 with NO bus policy: they are static td-owned programs with no D-Bus
 client, drawing in td-ui windows of their own and started direct, as
 Firefox is (§W.8, "Reworked"). No shipped application holds the
@@ -6210,9 +6214,10 @@ the portal and itself — but the two surfaces it could once reach, the shared
 descriptor budget and its own init-namespace pid, are the closed gaps above.
 What can be machine-checked today is narrower: the system recipe asserts that
 exactly one shipped application's permission file carries a `[Session Bus
-Policy]` entry, and that every shipped application has an evidence unit; a
-second bus-holding entry, or an application without its oracle, breaks the
-build. The first message routed between two applications' peers is an oracle
+Policy]` entry, and that every shipped application but `web`, which no oracle
+drives until td-ui's control socket can (td-web/DESIGN.md §10), has an
+evidence unit; a second bus-holding entry, or another application without its
+oracle, breaks the build. The first message routed between two applications' peers is an oracle
 still to write.
 
 Be exact about what that tripwire does NOT cover, because a gate believed
@@ -7181,7 +7186,7 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   The image's optional persistent `/etc/timezone` symlink points there;
   first boot leaves it untouched and updates retain it. No selection
   leaves it absent. A post-install setter is still pending. The static
-  mail and news packages use `static-runtime`, containing only the
+  mail, news and web packages use `static-runtime`, containing only the
   approved source-built tzdata zones and license under `files/share`
   and td-ui's pinned outline face and its notices in one directory
   under `files/etc/fonts` (AGENTS.md, pinned upstream data), with no
@@ -7956,6 +7961,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 34 | **the admitted caller's working directory**: stage 1 maps its own directory through a declared filesystem grant and passes the bounded canonical result to stage 2, which starts there or falls back to `/` if it cannot enter it. The private-UID cutover makes the stock root authority the supported launcher; it starts from `/` and does not forward an operator's working directory. Direct human-UID application launch is refused (since admitted for the personal `mail` and `news`, whose shell launch keeps the shell's directory where a grant maps it, §W.7). A later typed launch request must carry an admitted working directory to restore that operator flow. The jail's existing grant mapping and argv/refusal tests remain applicable to admitted callers | an admitted caller's directory is retained only inside its declared grant; stock launches currently start at `/` |
 | 35 | **news in a td-ui window — LANDED** (§W.8, "Reworked"): td-ui gains the cell screen, a grid of styled cells presented as a plain toplevel that polls the program's handler each turn, and td-news's views draw on it whole; its terminal layer and UNSAFE.md §18 surface are gone, the crate forbids `unsafe`, the recipe is a static PIE Cargo build over the toolkit, the `news` package drops `devices=tty`, and the `[news]` unit launches it direct and is ready when the compositor's layout names its toplevel. Mail follows in its own increment. Reworked again (§W.8, "Reworked again"): for news the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted (`td-ui/DESIGN.md`, increment 13), and the recipe stages `td-editor` beside `td-ui` | one of the two source-built applications no longer needs a terminal, a pty grant or td-term to exist |
 | 36 | **mail in a td-ui window — LANDED** (§W.8, "Reworked"): td-mail's views keep their cursor-and-attribute writer over the window's cell screen, so they move untouched; its terminal layer and UNSAFE.md §17 are gone and the crate forbids `unsafe`; the recipe is a static PIE Cargo build over the toolkit, the `mail` package drops `devices=tty`, and the `[mail]` unit launches it direct with the anchored layout probe. The direct-rustc local-source ladder keeps one user, td-install-qemu-test. Reworked again (§W.8, "Reworked again"): for mail too the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted, and the recipe stages `td-editor` beside `td-ui`; composing is in an editable pane in the same window (§W.8, "Composing in place"), so the package ships no editor | neither source-built application needs a terminal, a pty grant or td-term to exist; no shipped application holds the terminal grant, and §W.7's relaunch is a window request |
+| 37 | **web, td's own browser — LANDED** (td-web/DESIGN.md §3): `web` (td-web) is a source-built static package on the data-only `static-runtime`, like mail and news, but a service-account application, `tda65540`, UID 65540, with no `/bin` name: its launcher card starts the `[web]` unit, which an oracle's boot alone starts unasked. A service-account jail takes the fetch socket only from its own runtime directory, so `[web-fetch]` runs td-fetchd as that account at `/run/user/65540/td-fetch/socket`, and `[web]` requires it. Its permissions are `sockets=wayland;fetch` and resource limits: no network, filesystem grant, bus name or terminal. It keeps the standard seccomp program and has no boot oracle yet | the session opens td-web from its card, in a jail of its own account with a fetch service of its own |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support
@@ -8724,11 +8730,13 @@ remains accessible; its immutability prevents modification. The portal owns
 the credential store and has a read-only mapped Downloads grant, with no
 access to the remaining private human home.
 
-Firefox runs under external service UID 65536. The source-built mail and
-news applications run as the login user, UID 1000, inside td-jail. Their
-former 65537 and 65538 account rows remain reserved and are never reused;
-firstboot prepares neither private homes nor service runtimes for those
-personal applications. The immutable bus table names the actual launch UID
+Firefox runs under external service UID 65536, and td's own browser,
+`web` (td-web/DESIGN.md §3), under 65540, `tda65540`. The source-built
+mail and news applications run as the login user, UID 1000, inside
+td-jail. Their former 65537 and 65538 account rows remain reserved and
+are never reused, as is Claude Code's 65539 (§W.9); firstboot prepares
+neither private homes nor service runtimes for those personal
+applications. The immutable bus table names the actual launch UID
 for each installed application. Root-configured units invoke
 `td-authd application-start`, which checks the enrolled account reservation
 and this table, then uses td-login's checked credential drop. Personal
@@ -8777,9 +8785,12 @@ assignment or grant; its exact admission rules are in `td-authd/DESIGN.md`.
 Compositor public Wayland and audio admission consume the same immutable
 application table; audio admits only its Firefox assignment. Human
 control/readiness sockets and the private portal
-Wayland listener keep their separate admission rules. Mail and news each
-have a fetch daemon at their application UID and private runtime path, so
-human-UID network helpers do not handle their credential-bearing requests.
+Wayland listener keep their separate admission rules. Mail and news, which
+run as the login user, use the human's fetch daemon. A service-account
+application takes the fetch socket only from its own runtime directory,
+so web has a fetch daemon at its application UID and private runtime path,
+`/run/user/65540/td-fetch/socket`, and shares no connection with the
+human's.
 The detailed account, migration, mount and launch contract is in
 `td-authd/DESIGN.md`. FIDO release and consent remain separate prerequisites.
 
@@ -10744,7 +10755,11 @@ webpki-roots, and no decoder. So:
    so reconnecting after a service restart reaches the new socket inode.
    These personal applications share the human UID; they do not have
    separate host-UID isolation from this daemon. The portal and foreign
-   application UIDs cannot access its private socket or memory.
+   application UIDs cannot access its private socket or memory. A
+   service-account jail takes the socket only from its own runtime
+   directory, so `web`, td's browser, has its own `[web-fetch]` at
+   `/run/user/65540/td-fetch/socket`, run as its account
+   (td-web/DESIGN.md §3).
 2. The grant is `sockets=fetch`, beside `sockets=wayland`. §C's mount
    plan step 12 binds the `td-fetch` directory into the jail's runtime
    directory when it is granted, read-only like the bus and as a

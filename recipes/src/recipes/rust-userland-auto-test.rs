@@ -3,14 +3,21 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // rust-userland-auto-test: the runtime contract of the Rust userland the
 // auto graph builds. ripgrep and fd hold td glibc's exact dynamic closure,
-// td-news and td-mail are td-owned static PIEs, and all four run.
+// td-news, td-mail and td-web are td-owned static PIEs, and all five run.
 //
 // Every step runs in the Debian build root under its bash with PATH the
 // root's /usr/bin alone, and grades with the root's readelf, grep and sed:
 // no subject is on PATH, and each is reached by its store path.
 
 /// The subjects, and td glibc for its loader's path.
-const INPUTS: &[&str] = &["ripgrep", "fd", "td-news", "td-mail", "glibc-x86-64"];
+const INPUTS: &[&str] = &[
+    "ripgrep",
+    "fd",
+    "td-news",
+    "td-mail",
+    "td-web",
+    "glibc-x86-64",
+];
 
 /// The provenance scans every contract shares. The scanner's positive control
 /// comes first: a NUL-filled probe longer than the tested binary with the
@@ -106,16 +113,18 @@ pub fn recipe() -> Recipe {
     let fd = "{in:fd}/bin/fd";
     let news = "{in:td-news}/bin/td-news";
     let mail = "{in:td-mail}/bin/td-mail";
+    let web = "{in:td-web}/bin/td-web";
     let fixture = "{root}/fixtures/known-needle.txt";
     let mut steps = vec![
         dynamic_contract("ripgrep", rg, "ld-linux-x86-64.so.2\nlibc.so.6"),
         dynamic_contract("fd", fd, "libc.so.6"),
-        // The two applications are td's own root crates built static from
-        // the checkout by the Cargo runner over td-ui (APPLICATIONS.md
-        // §W.8): their contract is the td-owned static PIE, not the glibc
-        // one.
+        // The three applications are td's own root crates built static
+        // from the checkout by the Cargo runner over td-ui (APPLICATIONS.md
+        // §W.8, td-web/DESIGN.md §3): their contract is the td-owned static
+        // PIE, not the glibc one.
         static_contract("td-news", news),
         static_contract("td-mail", mail),
+        static_contract("td-web", web),
         Step::MkDir {
             path: "{root}/fixtures".into(),
         },
@@ -139,7 +148,9 @@ pub fn recipe() -> Recipe {
                      usage=$('{news}' --help 2>&1) || {{ echo 'td-news --help failed' >&2; exit 1; }}; \
                      case \"$usage\" in *'Usage: td-news'*) :;; *) echo \"td-news --help returned unexpected output: $usage\" >&2; exit 1;; esac; \
                      usage=$('{mail}' --help 2>&1) || {{ echo 'td-mail --help failed' >&2; exit 1; }}; \
-                     case \"$usage\" in *'Usage: td-mail'*) :;; *) echo \"td-mail --help returned unexpected output: $usage\" >&2; exit 1;; esac"
+                     case \"$usage\" in *'Usage: td-mail'*) :;; *) echo \"td-mail --help returned unexpected output: $usage\" >&2; exit 1;; esac; \
+                     usage=$('{web}' --help 2>&1) || {{ echo 'td-web --help failed' >&2; exit 1; }}; \
+                     case \"$usage\" in *'usage: td-web'*) :;; *) echo \"td-web --help returned unexpected output: $usage\" >&2; exit 1;; esac"
                 ),
             ],
         )
@@ -150,7 +161,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: ripgrep and fd are target-built auto graph nodes with the declared td glibc runtime closure, td-news and td-mail are fully static PIEs over td-ui\n".into(),
+        content: "PASS: ripgrep and fd are target-built auto graph nodes with the declared td glibc runtime closure, td-news, td-mail and td-web are fully static PIEs over td-ui\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -165,7 +176,7 @@ pub fn recipe() -> Recipe {
         .checks(vec![
             RecipeCheck::new(
                 r#"
-echo ">> recipe-check rust-userland-auto-test: build-plan --auto builds ripgrep, fd, td-news and td-mail with upstream Rust through td-link, verifies the exact dynamic runtime closure of the first two, the td-owned static PIE shape of the last two, and runs real searches and usage output, graded in the Debian build root"
+echo ">> recipe-check rust-userland-auto-test: build-plan --auto builds ripgrep, fd, td-news, td-mail and td-web with upstream Rust through td-link, verifies the exact dynamic runtime closure of the first two, the td-owned static PIE shape of the last three, and runs real searches and usage output, graded in the Debian build root"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run rust-userland-auto-test 1
 "#,
@@ -176,13 +187,13 @@ exec "$TD_RECIPE_EVAL" check-run rust-userland-auto-test 1
 
 #[cfg(test)]
 mod tests {
-    /// The four programs are graded only by the root's bash and tools.
+    /// The five programs are graded only by the root's bash and tools.
     #[test]
     fn the_userland_is_graded_only_by_the_roots_bash_and_tools() {
         crate::shared::assert_build_root_test(
             &super::recipe(),
             super::INPUTS,
-            &["ripgrep", "fd", "td-news", "td-mail"],
+            &["ripgrep", "fd", "td-news", "td-mail", "td-web"],
         );
     }
 }

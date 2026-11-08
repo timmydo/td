@@ -1578,11 +1578,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // td-web (td-web/DESIGN.md) is, until its packaging increment, a host
-    // program `./install-apps` builds: no recipe builds it yet, so the
-    // cargo-test preflight is every tier that reads it.
+    // td-web (td-web/DESIGN.md) the same way as td-news: a toolkit consumer
+    // built static from its own `local_source` tree, whose staged identity
+    // is re-derived live, and packaged as the `web` application. Its source
+    // takes the cargo-test preflight and the realized-output proofs (the
+    // `web` package check, rust-userland-auto-test) through recipe-checks.
     if p.starts_with("td-web/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -3115,7 +3119,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         assert_no_target!(path, "recipe-checks");
         assert_no_target!(path, "check");
     }
-    // td-web is a host program no recipe builds yet, routed as td-pinentry is.
+    // td-web is a static target recipe packaged as `web`, routed as td-news
+    // is; its staged identity is re-derived live, so no local-source
+    // preflight.
     for path in [
         "td-web/src/main.rs",
         "td-web/src/app.rs",
@@ -3123,8 +3129,14 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-web/Cargo.lock",
     ] {
         assert_preflight!(path, "cargo-test");
-        assert_no_target!(path, "recipe-checks");
-        assert_no_target!(path, "check");
+        assert_target!(path, "recipe-checks");
+        assert_target!(path, "check");
+        assert_no_preflight!(path, "local-source-roster");
+        // A browser edit boots nothing: the qemu oracles stay main's.
+        assert_no_target!(path, crate::integration::GOAL);
+        if boot_path(path) {
+            fail(format!("{path}: td-web must not be on the boot path"));
+        }
     }
     // The record fixture is read by the builder AND td-review suites; the one
     // cargo-test preflight runs both, and it must not escalate to the full check.
@@ -9733,6 +9745,11 @@ mod tests {
         let setup = one("td-setup/src/welcome.rs");
         assert_eq!(setup.len(), 6, "{setup:?}");
         assert_eq!(names(&setup), ["td-setup"]);
+        // td-web, read by no crate: its own suite and the workspace's, so a
+        // browser edit stays a quick loop.
+        let web = one("td-web/src/app.rs");
+        assert_eq!(workspace(&web), 3);
+        assert_eq!(names(&web), ["td-web"]);
         // A crate others read brings its readers: td-portal and td-editor build
         // modules out of td-compositor sources, so a change there is a change
         // to what they compile, and td-photo reads td-ui, which reads
@@ -10688,36 +10705,6 @@ mod tests {
         let lines: Vec<&str> = staged.lines().filter(|l| l.contains(name)).collect();
         assert_eq!(lines.len(), 1, "{name} enters another recipe: {lines:?}");
         assert!(lines[0].starts_with("td-ssh-source "), "{lines:?}");
-    }
-
-    /// td-web's arm selects the cargo-test preflight alone because no
-    /// recipe builds it yet; the packaging increment that adds one moves
-    /// it to recipe-checks, which this test then says.
-    #[test]
-    fn web_reaches_no_recipe_yet() {
-        let root = repo_root();
-        if discover_gate_crates(&root).is_err() {
-            eprintln!("SKIP: no roster crates (builder-only sandbox)");
-            return;
-        }
-        let mut recipes = Vec::new();
-        collect_rs_recursive(&root.join("recipes/src"), &mut recipes);
-        assert!(!recipes.is_empty());
-        for path in recipes {
-            let text = std::fs::read_to_string(&path).unwrap();
-            for spelling in ["\"td-web\"", "td_web"] {
-                assert!(
-                    !text.contains(spelling),
-                    "{} names {spelling}; revisit td-web's affected-check mapping",
-                    path.display()
-                );
-            }
-        }
-        let staged = std::fs::read_to_string(root.join("seed/local-source-roster.txt")).unwrap();
-        assert!(
-            !staged.contains("td-web"),
-            "td-web now enters a recipe closure"
-        );
     }
 
     /// td-pinentry's arm selects the cargo-test preflight alone because no

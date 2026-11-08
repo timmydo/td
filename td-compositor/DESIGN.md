@@ -5577,9 +5577,9 @@ says which it is and a test pins it.
 
 The image's first scripted callers use that vocabulary and nothing finer. The
 `[applications-workspace]` unit switches to the applications' workspace
-before either of them starts, `[shell-workspace]` switches back to the first
-once both are decided, and Firefox maps only after that: a new window goes to
-the active workspace, so the two applications share the second and the first
+before any of them starts, `[shell-workspace]` switches back to the first
+once all are decided, and Firefox maps only after that: a new window goes to
+the active workspace, so mail, news and web share the second and the first
 stays the shell's and Firefox's, whose tiles the physical-input oracle binds.
 This is placement by the map rule, not by focus or identity: the windows do not
 exist when `[applications-workspace]` runs, so there is no id yet to address a

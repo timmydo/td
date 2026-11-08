@@ -33,8 +33,8 @@ use crate::shared::{
     TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER,
     TD_NEWS_ENTRY, TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
-    TD_SOFTWARE_INSTALL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
-    UUTILS_RUNTIME_MARKER,
+    TD_SOFTWARE_INSTALL_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, TD_WEB_ENTRY,
+    TD_WEB_NAME, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -428,6 +428,10 @@ const APPLICATION_SETTLE_SECS: u32 = 5;
 /// fixed coordinates.
 const TERMINAL_APPLICATION_WORKSPACE: u8 = 2;
 
+/// td-web's service account (td-web/DESIGN.md §3), which its fetch
+/// service's unit names as well as its registry row.
+const WEB_UID: u32 = 65540;
+
 const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
     ShippedApplication {
         name: FIREFOX_NAME,
@@ -437,9 +441,11 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         runtime: "freedesktop-platform-25-08",
         runtime_recipe: None,
     },
-    // The two source-built applications: td-owned static programs on the
-    // data-only runtime, each a td-ui window of its own at boot. Neither
-    // holds a bus name; the tripwire below counts the applications that do.
+    // The source-built applications: td-owned static programs on the
+    // data-only runtime, each a td-ui window of its own. None holds a bus
+    // name; the tripwire below counts the applications that do. Mail and
+    // news run as the login user (`launch_uid`); web, td's own browser,
+    // under its own service account, as Firefox does (td-web/DESIGN.md §3).
     ShippedApplication {
         name: TD_MAIL_NAME,
         package: TD_MAIL_NAME,
@@ -453,6 +459,16 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         package: TD_NEWS_NAME,
         package_recipe: super::news::recipe,
         external_uid: 65538,
+        runtime: "static-runtime",
+        runtime_recipe: Some(super::static_runtime::recipe),
+    },
+    // 65539 stays reserved: an install enrolled while Claude Code shipped
+    // there keeps it in its ledger.
+    ShippedApplication {
+        name: TD_WEB_NAME,
+        package: TD_WEB_NAME,
+        package_recipe: super::web::recipe,
+        external_uid: WEB_UID,
         runtime: "static-runtime",
         runtime_recipe: Some(super::static_runtime::recipe),
     },
@@ -1525,6 +1541,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "busd",
     "fetchd",
     "egressd",
+    "web-fetch",
     "firefox-files",
     "fetch-evidence",
     "portal-files",
@@ -1540,6 +1557,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "mail-evidence",
     "news",
     "news-evidence",
+    "web",
     "shell-workspace",
     "placement-evidence",
     "setup",
@@ -1872,9 +1890,10 @@ fn build_desktop_td_svc_conf() -> String {
          # Mints the per-machine identity everything below reads or checks.\n\
          # after=hostname serializes both provisioners' initialization of\n\
          # their shared /var/lib/td directory.\n\
-         # The primary selector adds a first configuration for the\n\
-         # applications (mail, news) under each private application home: created\n\
-         # once, owned by its service UID, never rewritten after provisioning.\n\
+         # The primary selector adds a first configuration for mail and news\n\
+         # under the human's state, and prepares each service-account\n\
+         # application's private home and runtime directory (web's among them):\n\
+         # created once, owned by its UID, never rewritten after provisioning.\n\
          [td-firstboot]\n\
          type=oneshot\n\
          exec=/bin/td-firstboot provision --application-primary --enroll-principals\n\
@@ -2070,6 +2089,22 @@ fn build_desktop_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
+         # td-web's own fetch service (td-web/DESIGN.md §3): a service-account\n\
+         # jail takes sockets=fetch only from its own runtime directory, which\n\
+         # td-firstboot prepares as the account's, so the browser's service\n\
+         # runs as that account and shares nothing with the human's fetchd.\n\
+         # Every boot, not on demand: the launcher's start of [web] requires\n\
+         # it running, and a skipped unit would satisfy that with no socket.\n\
+         [web-fetch]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         exec=/bin/td-login exec-service-as tda{web_uid} -- /bin/td-fetchd run --socket /run/user/{web_uid}/td-fetch/socket\n\
+         after=td-firstboot,netup\n\
+         requires=td-firstboot\n\
+         ready=/bin/td-login exec-service-as tda{web_uid} -- /bin/td-fetchd probe /run/user/{web_uid}/td-fetch/socket\n\
+         ready-timeout=30\n\
+         restart=always\n\
+         \n\
          [firefox-files]\n\
          type=oneshot\n\
          exec=/bin/td-authd prepare-application-files firefox\n\
@@ -2202,7 +2237,7 @@ fn build_desktop_td_svc_conf() -> String {
          restart=always\n\
          log=/var/log/svc/media-watch.log\n\
          \n\
-         # The two source-built applications, a td-ui window each, launched\n\
+         # The source-built applications, a td-ui window each, launched\n\
          # direct as Firefox is with no terminal: the program runs in its own\n\
          # jail, and the unit is ready once the compositor's layout report\n\
          # names its toplevel by the app id the client sets, anchored at the\n\
@@ -2213,12 +2248,14 @@ fn build_desktop_td_svc_conf() -> String {
          # start at boot only where the oracles ask ({applications_on_demand}\n\
          # is absent): an ordinary session runs `mail` or `news` from the\n\
          # terminal, where td-jail admits the session's own uid and its\n\
-         # diagnostics reach the shell (APPLICATIONS.md §W.7). restart=never:\n\
+         # diagnostics reach the shell (APPLICATIONS.md §W.7), and `web`\n\
+         # from its launcher card, since it runs as its own service account\n\
+         # (td-web/DESIGN.md §3). restart=never:\n\
          # a client that exits is not restarted by a loop that would hide a\n\
          # broken configuration behind a flickering window. The compositor\n\
          # tiles a new window into the active workspace, so on an oracle's\n\
          # boot the control channel makes workspace {application_workspace}\n\
-         # active before either starts and returns to the first once both are\n\
+         # active before any starts and returns to the first once all are\n\
          # decided: the first stays the shell's and Firefox's, whose tiles the\n\
          # physical-input oracle binds, and Firefox maps only after the return.\n\
          # The switch is an ordering, not a requirement: a channel that failed\n\
@@ -2288,14 +2325,30 @@ fn build_desktop_td_svc_conf() -> String {
          requires=news\n\
          timeout={application_evidence}\n\
          \n\
-         # The view returns to the first workspace once both applications are\n\
+         # td-web, td's own browser (td-web/DESIGN.md §3): a td-ui window as\n\
+         # news's is, ready the same way, but under its own service account\n\
+         # with its own fetch service, so no terminal starts it: on an\n\
+         # ordinary boot its launcher card does, through td-svc, and only an\n\
+         # oracle's boot starts it here, on the applications' workspace.\n\
+         [web]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         unless-exists={applications_on_demand}\n\
+         exec=/bin/td-authd application-start {ui_uid} {web_name} direct --\n\
+         after=busd,web-fetch,applications-workspace\n\
+         requires=wayland,busd,web-fetch,td-firstboot\n\
+         ready=/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{web_program} title=\"'\n\
+         ready-timeout=30\n\
+         restart=never\n\
+         \n\
+         # The view returns to the first workspace once the applications are\n\
          # decided, ready or not, so Firefox maps beside the shell.\n\
          [shell-workspace]\n\
          type=oneshot\n\
          cgroup=session\n\
          unless-exists={applications_on_demand}\n\
          exec=/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace 1\n\
-         after=mail,news\n\
+         after=mail,news,web\n\
          requires=wayland\n\
          timeout={application_place}\n\
          \n\
@@ -2610,6 +2663,9 @@ fn build_desktop_td_svc_conf() -> String {
         news_name = TD_NEWS_NAME,
         mail_program = entry_program(TD_MAIL_ENTRY),
         news_program = entry_program(TD_NEWS_ENTRY),
+        web_name = TD_WEB_NAME,
+        web_program = entry_program(TD_WEB_ENTRY),
+        web_uid = WEB_UID,
         window_record = WINDOW_RECORD,
         focused_record = FOCUSED_WINDOW_RECORD,
         live_cmdline_token = td_boot_protocol::LIVE_CMDLINE_TOKEN,
@@ -4571,8 +4627,9 @@ fn application_names(sys: &SystemDef) -> Vec<&'static str> {
 }
 
 /// td's own source-built mail and news clients run as the login user, not
-/// a service account (APPLICATIONS.md §D); every other application has
-/// its reserved external UID.
+/// a service account (APPLICATIONS.md §D); every other application, td's
+/// own web browser among them (td-web/DESIGN.md §3), has its reserved
+/// external UID.
 fn launch_uid(application: &ShippedApplication) -> u32 {
     if matches!(application.name, TD_MAIL_NAME | TD_NEWS_NAME) {
         UI_UID
@@ -7442,7 +7499,8 @@ mod tests {
                     && content == "td-profiler-application-roots-v1\n\
         firefox\tfirefox-stable\tforeign\truntime/org.freedesktop.Platform/x86_64/25.08\tforeign\n\
         mail\tmail-0.1\tsource\tstatic-runtime-1\tsource\n\
-        news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
+        news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n\
+        web\tweb-0.1\tsource\tstatic-runtime-1\tsource\n"
         )));
         assert!(steps.iter().any(|step| matches!(
             step,
@@ -8309,8 +8367,8 @@ mod tests {
     /// window, runs under the autotest token alone, and prints the marker
     /// only after td-jail finds the client itself, by the program its entry
     /// runs as, still in the instance. Placement is the compositor's own map
-    /// rule: the applications' workspace is made active before either starts,
-    /// the view returns to the first once both are decided, and Firefox maps
+    /// rule: the applications' workspace is made active before any starts,
+    /// the view returns to the first once all are decided, and Firefox maps
     /// only after the placement evidence has read the compositor's report
     /// with the shell alone on the first workspace.
     #[test]
@@ -8329,7 +8387,7 @@ mod tests {
                 TERMINAL_APPLICATION_WORKSPACE,
                 vec!["terminal"],
             ),
-            ("shell-workspace", 1, vec!["mail", "news"]),
+            ("shell-workspace", 1, vec!["mail", "news", "web"]),
         ] {
             let switch = format!(
                 "/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} \
@@ -8455,6 +8513,69 @@ mod tests {
                 "{evidence}"
             );
         }
+        // td-web's window is started as news's is, but as its own service
+        // account with a fetch service of its own (td-web/DESIGN.md §3),
+        // which it requires: the jail proves that socket accepting before
+        // it launches. On an ordinary boot the launcher card starts it.
+        assert_eq!(entry_program(TD_WEB_ENTRY), "td-web");
+        assert_eq!(
+            unit_key(TD_WEB_NAME, "exec"),
+            Some(format!(
+                "/bin/td-authd application-start {UI_UID} {TD_WEB_NAME} direct --"
+            ))
+        );
+        assert_eq!(
+            unit_key(TD_WEB_NAME, "ready"),
+            Some(format!(
+                "/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{WINDOW_RECORD}td-web title=\"'"
+            ))
+        );
+        for (key, value) in [
+            ("type", "daemon"),
+            ("restart", "never"),
+            ("cgroup", "session"),
+            ("unless-exists", APPLICATIONS_ON_DEMAND),
+            ("requires", "wayland,busd,web-fetch,td-firstboot"),
+        ] {
+            assert_eq!(unit_key(TD_WEB_NAME, key).as_deref(), Some(value), "{key}");
+        }
+        assert_eq!(
+            unit_after(TD_WEB_NAME),
+            vec!["busd", "web-fetch", "applications-workspace"]
+        );
+        let web = SHIPPED_APPLICATIONS
+            .iter()
+            .find(|application| application.name == TD_WEB_NAME)
+            .unwrap();
+        assert_eq!(web.external_uid, WEB_UID);
+        assert_eq!(launch_uid(web), WEB_UID);
+        for (key, value) in [
+            (
+                "exec",
+                format!(
+                    "/bin/td-login exec-service-as tda{WEB_UID} -- /bin/td-fetchd run --socket /run/user/{WEB_UID}/td-fetch/socket"
+                ),
+            ),
+            (
+                "ready",
+                format!(
+                    "/bin/td-login exec-service-as tda{WEB_UID} -- /bin/td-fetchd probe /run/user/{WEB_UID}/td-fetch/socket"
+                ),
+            ),
+            ("type", "daemon".into()),
+            ("restart", "always".into()),
+            ("cgroup", "session".into()),
+            ("requires", "td-firstboot".into()),
+        ] {
+            assert_eq!(
+                unit_key("web-fetch", key).as_deref(),
+                Some(value.as_str()),
+                "{key}"
+            );
+        }
+        // Not on demand: a skipped service would satisfy [web]'s requires=
+        // with no socket behind it.
+        assert_eq!(unit_key("web-fetch", "unless-exists"), None);
         let exec = unit_key("placement-evidence", "exec").unwrap_or_default();
         assert!(exec.contains(AUTOTEST_CMDLINE_TOKEN), "{exec}");
         assert!(
@@ -8534,14 +8655,25 @@ mod tests {
         ] {
             assert_eq!(AUTHORITY.matches(&declaration).count(), 1, "{declaration}");
         }
-        // And a third static application is a decision, not a silent default.
+        // And another static application is a decision, not a silent
+        // default. web is one: it runs on the standard program, since no
+        // allowlist has been derived from its realized binary
+        // (APPLICATIONS.md, "Per-application allowlists"), and td-jail's
+        // selection names it nowhere.
         let mut on_the_runtime: Vec<&str> = SHIPPED_APPLICATIONS
             .iter()
             .filter(|application| application.runtime == runtime.name)
             .map(|application| application.name)
             .collect();
         on_the_runtime.sort_unstable();
-        assert_eq!(on_the_runtime, [TD_MAIL_NAME, TD_NEWS_NAME]);
+        assert_eq!(on_the_runtime, [TD_MAIL_NAME, TD_NEWS_NAME, TD_WEB_NAME]);
+        let selection = AUTHORITY
+            .split("fn application_filter(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .unwrap();
+        assert!(selection.contains("MAIL_NAME => ApplicationFilter::Mail"));
+        assert!(!selection.contains("WEB") && !selection.contains(TD_WEB_NAME));
     }
 
     #[test]
@@ -9330,6 +9462,7 @@ mod tests {
                                     | "applications-workspace"
                                     | "mail"
                                     | "news"
+                                    | "web"
                                     | "shell-workspace"
                             ) =>
                     {
@@ -9360,6 +9493,7 @@ mod tests {
             "shell-workspace",
             "software-evidence",
             "terminal",
+            "web",
         ];
         expected.sort();
         assert_eq!(skipped, expected);
@@ -9658,7 +9792,9 @@ mod tests {
             ("mail-evidence", vec!["mail", "firefox-tls-setup"]),
             ("news", vec!["busd", "fetchd", "applications-workspace"]),
             ("news-evidence", vec!["news", "firefox-tls-setup"]),
-            ("shell-workspace", vec!["mail", "news"]),
+            ("web-fetch", vec!["td-firstboot", "netup"]),
+            ("web", vec!["busd", "web-fetch", "applications-workspace"]),
+            ("shell-workspace", vec!["mail", "news", "web"]),
             (
                 "placement-evidence",
                 vec!["shell-workspace", "firefox-tls-setup"],
@@ -9733,8 +9869,8 @@ mod tests {
     /// host pid, and the descriptor budget is charged per admission key. What
     /// remains is that no boot oracle drives two applications' traffic on one
     /// live bus: the entry that lifts this count brings that oracle. The
-    /// other applications ship with no bus policy at all: mail and news are
-    /// static td-owned programs with no D-Bus client, which the broker would
+    /// other applications ship with no bus policy at all: mail, news and web
+    /// are static td-owned programs with no D-Bus client, which the broker would
     /// admit as a peer that sees and addresses only the portal and itself,
     /// and the two surfaces it could once reach are now the closed gaps §D
     /// names.
@@ -9772,7 +9908,7 @@ mod tests {
         );
         // Every other shipped application holds no bus name; the broker
         // would admit it as a peer that sees and addresses only the portal
-        // and itself. mail and news are td-owned source builds on the
+        // and itself. mail, news and web are td-owned source builds on the
         // data-only static runtime, each in a td-ui window of its own.
         for application in SHIPPED_APPLICATIONS
             .iter()
@@ -9784,8 +9920,7 @@ mod tests {
                 .as_ref()
                 .expect("a shipped application declares its permissions");
             assert_eq!(permissions.session_bus().count(), 0, "{}", application.name);
-            // mail and news draw in td-ui windows of their own and hold no
-            // terminal.
+            // They draw in td-ui windows of their own and hold no terminal.
             assert!(
                 !permissions.terminal(),
                 "{} terminal grant",
@@ -9799,20 +9934,38 @@ mod tests {
         }
     }
 
-    /// Every shipped application has a boot oracle unit of its own, named
-    /// `<name>-evidence`, and the roster's length is pinned so that adding an
-    /// entry is a reviewed change here rather than a silent one.
+    /// Every shipped application but those named below has a boot oracle
+    /// unit of its own, named `<name>-evidence`, and the roster's length is
+    /// pinned so that adding an entry is a reviewed change here rather than
+    /// a silent one.
     #[test]
     fn every_shipped_application_has_a_boot_oracle_unit() {
+        // td-web has none yet (td-web/DESIGN.md §10, "Boot evidence"). Its
+        // `[web]` unit starts it on an oracle's boot, but nothing requires
+        // that unit or reads a marker, so main's boot does not prove it.
+        const WITHOUT_ORACLE: &[&str] = &[TD_WEB_NAME];
         assert_eq!(
             SHIPPED_APPLICATIONS.len(),
-            3,
+            4,
             "the roster changed: another application brings its own boot \
              oracle unit, named below, and APPLICATIONS.md §D says what a \
              package count cannot cover"
         );
         for application in SHIPPED_APPLICATIONS {
             let unit = format!("{}-evidence", application.name);
+            if WITHOUT_ORACLE.contains(&application.name) {
+                assert!(
+                    !TD_SVC_UNITS.contains(&unit.as_str()),
+                    "{unit} exists: {} is no longer without an oracle",
+                    application.name
+                );
+                assert!(
+                    TD_SVC_UNITS.contains(&application.name),
+                    "{} has no unit of its own",
+                    application.name
+                );
+                continue;
+            }
             assert!(
                 TD_SVC_UNITS.contains(&unit.as_str()),
                 "{} ships without a boot oracle unit {unit}",
@@ -10318,6 +10471,7 @@ mod tests {
             format!("{{payload:{TD_MAIL_NAME}}}"),
             format!("{{payload:{TD_NEWS_NAME}}}"),
             "{payload:static-runtime}".to_string(),
+            format!("{{payload:{TD_WEB_NAME}}}"),
         ];
         assert_eq!(
             roots.as_slice(),
@@ -11163,7 +11317,7 @@ mod tests {
             "only the applications the login user runs have a /bin name"
         );
 
-        assert_eq!(SYSTEM.applications.len(), 3);
+        assert_eq!(SYSTEM.applications.len(), 4);
         let shipped: Vec<_> = SYSTEM
             .applications
             .iter()
@@ -11175,9 +11329,10 @@ mod tests {
                 (FIREFOX_NAME, FIREFOX_NAME, "freedesktop-platform-25-08"),
                 (TD_MAIL_NAME, TD_MAIL_NAME, "static-runtime"),
                 (TD_NEWS_NAME, TD_NEWS_NAME, "static-runtime"),
+                (TD_WEB_NAME, TD_WEB_NAME, "static-runtime"),
             ],
             "the system image pairs each reviewed package with its runtime: \
-             Firefox, then the source-built mail and news"
+             Firefox, then the source-built mail, news and web"
         );
         let system_recipe = recipe();
         assert_eq!(
@@ -11187,6 +11342,7 @@ mod tests {
                 TD_MAIL_NAME.into(),
                 TD_NEWS_NAME.into(),
                 "static-runtime".into(),
+                TD_WEB_NAME.into(),
             ]),
             "each reviewed package and each built runtime is one payload input, deduped \
              and sorted; the Flathub runtime is fetched, not staged"
@@ -11831,13 +11987,16 @@ mod tests {
             application_bin_links(&SYSTEM),
             vec![TD_MAIL_NAME, TD_NEWS_NAME]
         );
-        assert_eq!(unlinked_application_names(&SYSTEM), vec![FIREFOX_NAME]);
+        assert_eq!(
+            unlinked_application_names(&SYSTEM),
+            vec![FIREFOX_NAME, TD_WEB_NAME]
+        );
         assert!(shape.contains(&format!(
             "for a in {TD_MAIL_NAME} {TD_NEWS_NAME}; do \
              [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = /bin/td-jail ]"
         )));
         assert!(shape.contains(&format!(
-            "for a in {FIREFOX_NAME}; do \
+            "for a in {FIREFOX_NAME} {TD_WEB_NAME}; do \
              if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then"
         )));
     }
@@ -13277,11 +13436,18 @@ mod tests {
             Some(APPLICATIONS_ON_DEMAND)
         );
         assert!(unit_after("firefox").contains(&"firefox-fetch".to_string()));
-        // Mail and news, and the workspace switches around them, run at
-        // boot only on an oracle's: an ordinary session starts each from
-        // the terminal. Their evidence keeps the live gate and exits 0
-        // without the autotest token, so a skipped window settles it.
-        for unit in ["applications-workspace", "mail", "news", "shell-workspace"] {
+        // Mail, news and web, and the workspace switches around them, run
+        // at boot only on an oracle's: an ordinary session starts mail and
+        // news from the terminal and web from its launcher card. Their
+        // evidence keeps the live gate and exits 0 without the autotest
+        // token, so a skipped window settles it.
+        for unit in [
+            "applications-workspace",
+            "mail",
+            "news",
+            "web",
+            "shell-workspace",
+        ] {
             assert_eq!(
                 unit_key(unit, "unless-exists").as_deref(),
                 Some(APPLICATIONS_ON_DEMAND),
@@ -17423,7 +17589,12 @@ mod principal_tests {
             (session.compositor, session.broker, session.portal),
             (993, 992, 991)
         );
-        for (name, uid) in [("firefox", 65536), ("mail", 65537), ("news", 65538)] {
+        for (name, uid) in [
+            ("firefox", 65536),
+            ("mail", 65537),
+            ("news", 65538),
+            ("web", 65540),
+        ] {
             assert_eq!(registry.application(UI_UID, name).unwrap().uid, uid);
             assert!(build_passwd(&SYSTEM).contains(&format!(
                 "tda{uid}:!td-service:{uid}:{uid}:td application:/var/lib/td/applications/{uid}:/bin/false\n"

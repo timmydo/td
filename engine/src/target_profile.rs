@@ -144,6 +144,7 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-update",
     "td-util",
     "td-vm-guest",
+    "td-web",
     "uutils",
 ];
 
@@ -320,7 +321,7 @@ mod tests {
         );
         // The terminal applications are std alone: only the boundaries every
         // Rust output has, and no entry of their own.
-        for application in ["td-mail", "td-news"] {
+        for application in ["td-mail", "td-news", "td-web"] {
             assert_eq!(
                 output_assembly_exceptions(application),
                 vec![

@@ -132,8 +132,8 @@ currently accepts runtime paths only under canonical `/td/store` children,
 so it does not discover this standalone `/opt` installation.
 
 A package that copies a source-built runtime out of the output that built it,
-as the `mail` and `news` application packages copy `td-mail` and
-`td-news` into `files/bin`,
+as the `mail`, `news` and `web` application packages copy `td-mail`,
+`td-news` and `td-web` into `files/bin`,
 carries the companion at the copied runtime's own path below its `lib/debug`
 and the producing output's `.td-assembly-exception` marker at that tree's root:
 the producing output is not in the image's closure, so nothing else would put

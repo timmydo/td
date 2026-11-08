@@ -8543,6 +8543,7 @@ mod tests {
                 "td-update",
                 "td-util",
                 "td-vm-guest",
+                "td-web",
                 "uutils",
                 "zlib-x86-64",
             ]
@@ -10824,6 +10825,20 @@ chmod 755 '{}'
             "c reads b's module; b reads a's module; a embeds td-x (td-x/y.rs)"
         );
         assert!(reached["w"].starts_with("w may read "), "{reached:?}");
+    }
+
+    #[test]
+    fn a_browser_edit_reaches_only_the_browsers_checks() {
+        // td-web's package, the static-userland proof that builds it, and
+        // td-portal-test, whose test code names the image module that names
+        // every application (its derivation does not read td-web, so it
+        // answers from its memo). None boots a machine.
+        let reach = checks_reaching(&["td-web/src/app.rs"]).expect("reach");
+        assert_eq!(
+            reach.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["rust-userland-auto-test", "td-portal-test", "web"],
+            "{reach:?}"
+        );
     }
 
     /// A compositor file the shared modules do not compile in reaches only
