@@ -1,9 +1,10 @@
 //! The browser in its window (DESIGN.md §8): the address row, the page
 //! and the status row; the history; and each navigation's fetch and
-//! decoding on a thread of its own, its document taken when the window
-//! next polls. Rendering at the page's width is the window's.
+//! decoding, a page's rendering into logical lines included, on a thread
+//! of its own, its document taken when the window next polls. Wrapping
+//! those lines at the page's width in pixels is the window's.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 
@@ -11,14 +12,15 @@ use td_ui::chrome::{Status, TextEntry, ROW};
 use td_ui::entry_model::{Action, EntryModel};
 use td_ui::keys::Section;
 use td_ui::picture::Fitted;
-use td_ui::raster::{fill, Raster, Rect, Surface, CHROME, PAPER};
+use td_ui::prose::{Faces, Metrics};
+use td_ui::raster::{fill, Raster, Rect, Scale, Surface, TextFamily, CHROME, PAPER};
 use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase};
-use td_ui::{CELL_HEIGHT, CELL_WIDTH};
+use td_ui::CELL_WIDTH;
 use td_url::{Reference, Url};
 
-use crate::document::{self, Document, Rendered};
+use crate::document::{self, Document, Place, Rendered};
 use crate::fetch::{self, Fetcher};
-use crate::view::{self, View};
+use crate::view::{self, Pane, View};
 
 /// The longest address the row holds, in characters.
 const MAX_ADDRESS: usize = 4096;
@@ -32,6 +34,10 @@ pub const MAX_WORKERS: usize = 4;
 /// How long a turn waits while a fetch is out, and otherwise.
 const LOADING_WAIT_MS: u64 = 50;
 const IDLE_WAIT_MS: u64 = 1000;
+/// The narrowest the page is wrapped, in ems of the prose size at the
+/// scale: a narrower pane shows each line's start, cut at its edge as a
+/// preformatted line is, rather than a line for every few glyphs.
+pub const MIN_WRAP_EMS: i64 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
@@ -41,12 +47,13 @@ enum Focus {
 }
 
 /// A place in the history: the URL, the fragment it named and how far
-/// down it was read.
+/// down it was read, as a place in its logical lines, so a page wrapped
+/// otherwise when it is back opens at the same text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Entry {
     url: Url,
     fragment: Option<String>,
-    top: usize,
+    top: Place,
 }
 
 /// What a navigation does to the history once its page arrives, and only
@@ -62,23 +69,42 @@ enum Motion {
 /// A navigation's answer: the document and the fragment it names.
 type Arrival = (Document, Option<String>);
 
-/// A fetch out on its thread.
+/// A fetch out on its thread. Dropping it, as stopping, overtaking or
+/// taking its answer does, tells its worker to skip any rendering or
+/// decoding it has not begun.
 struct Loading {
     url: Url,
     fragment: Option<String>,
     motion: Motion,
-    /// The line to show first once it is in, for a history step.
-    top: usize,
-    answer: Receiver<Arrival>,
+    /// Where to show first once it is in, for a history step.
+    top: Place,
+    answer: Receiver<Option<Arrival>>,
+    stopped: Arc<AtomicBool>,
 }
 
-/// The page shown, and its rendering at the width it was made for.
+impl Drop for Loading {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+}
+
+/// What a rendering was wrapped for: the width in pixels, the scale and
+/// whether proportional faces measured it, and the body text's family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Layout {
+    width: u32,
+    scale: usize,
+    proportional: bool,
+    body: TextFamily,
+}
+
+/// The page shown, and its rendering for the layout it was made for.
 struct Current {
     doc: Document,
     fragment: Option<String>,
     view: View,
     rendered: Rendered,
-    rendered_for: Option<usize>,
+    rendered_for: Option<Layout>,
     fitted: Option<Fitted>,
 }
 
@@ -101,6 +127,14 @@ pub struct App {
     redraw: bool,
     quit: bool,
     show_keys: bool,
+    /// A clone of the proportional faces the window draws prose with,
+    /// none drawing it on the cell, and what lays the page out with them
+    /// at the surface's scale: the same measurements the window's raster
+    /// draws with, made outside a paint.
+    faces: Option<Faces>,
+    metrics: Metrics,
+    /// Whether body text is in Serif rather than Sans.
+    serif: bool,
 }
 
 /// Counts a worker until its thread ends, however it ends.
@@ -112,26 +146,42 @@ impl Drop for Worker {
     }
 }
 
-/// Fetches `url` and makes its document, on a worker's thread.
-fn arrive(fetcher: &dyn Fetcher, url: Url, fragment: Option<String>) -> Arrival {
+/// Fetches `url` and makes its document, on a worker's thread; none
+/// once its navigation is `stopped` before the document's rendering or
+/// decoding begins.
+fn arrive(
+    fetcher: &dyn Fetcher,
+    url: Url,
+    fragment: Option<String>,
+    stopped: &AtomicBool,
+) -> Option<Arrival> {
     match fetch::navigate(fetcher, url.clone()) {
         Ok(loaded) => {
             let content_type = loaded.reply.header("content-type").map(str::to_string);
-            let doc = Document::from_reply(
+            let doc = Document::from_reply_unless(
                 loaded.url,
                 loaded.reply.status,
                 content_type.as_deref(),
                 loaded.reply.body,
-            );
-            (doc, loaded.fragment.or(fragment))
+                stopped,
+            )?;
+            Some((doc, loaded.fragment.or(fragment)))
         }
-        Err(why) => (Document::error(Some(url), &why), fragment),
+        Err(why) => Some((Document::error(Some(url), &why), fragment)),
     }
 }
 
 impl App {
-    pub fn new(fetcher: Arc<dyn Fetcher>, surface: Surface) -> Result<Self, String> {
+    /// A browser over `fetcher` on `surface`, its page laid out with
+    /// `faces`, the ones its window draws prose with; none lays it on the
+    /// cell.
+    pub fn new(
+        fetcher: Arc<dyn Fetcher>,
+        surface: Surface,
+        faces: Option<Faces>,
+    ) -> Result<Self, String> {
         let entry = |limit| EntryModel::new(limit).map_err(|why| format!("{why:?}"));
+        let metrics = Metrics::new(faces.as_ref(), surface.scale);
         Ok(Self {
             fetcher,
             workers: Arc::new(AtomicUsize::new(0)),
@@ -157,6 +207,9 @@ impl App {
             redraw: true,
             quit: false,
             show_keys: false,
+            faces,
+            metrics,
+            serif: false,
         })
     }
 
@@ -195,23 +248,42 @@ impl App {
         }
     }
 
-    fn cell(&self) -> (i64, i64) {
-        (
-            CELL_WIDTH as i64 * self.scale(),
-            CELL_HEIGHT as i64 * self.scale(),
-        )
+    /// The inset each side of the page's lines: a cell's width.
+    fn inset(&self) -> i64 {
+        CELL_WIDTH as i64 * self.scale()
     }
 
-    /// The page's text columns, a cell's inset each side.
-    fn columns(&self) -> usize {
-        let (cw, _) = self.cell();
-        ((i64::from(self.page_rect().width) / cw).max(3) - 2) as usize
+    /// The page as its lines are shown in it, in the line box they are
+    /// measured with.
+    fn pane(&self) -> Pane {
+        Pane {
+            rect: self.page_rect(),
+            inset: self.inset(),
+            line: self.metrics.line(),
+            scale: self.scale(),
+        }
     }
 
-    /// The page's rows shown whole.
+    /// What the page is wrapped for now: the page's width less an inset
+    /// each side, at least `MIN_WRAP_EMS`.
+    fn layout(&self) -> Layout {
+        let width = i64::from(self.page_rect().width) - 2 * self.inset();
+        let least = MIN_WRAP_EMS * i64::from(td_ui::prose::SIZE) * self.scale();
+        Layout {
+            width: u32::try_from(width.max(least)).unwrap_or(1),
+            scale: self.metrics.scale().value(),
+            proportional: self.metrics.proportional(),
+            body: if self.serif {
+                TextFamily::Serif
+            } else {
+                TextFamily::Sans
+            },
+        }
+    }
+
+    /// The page's lines shown whole, at least one.
     fn rows(&self) -> usize {
-        let (_, ch) = self.cell();
-        (i64::from(self.page_rect().height) / ch).max(1) as usize
+        self.pane().rows()
     }
 
     // Navigation.
@@ -235,7 +307,7 @@ impl App {
                     self.show_address();
                     self.focus = Focus::Page;
                 } else {
-                    self.load(url, fragment, Motion::New, 0);
+                    self.load(url, fragment, Motion::New, Place::default());
                 }
             }
             Reference::Other { scheme } => {
@@ -247,7 +319,7 @@ impl App {
         }
     }
 
-    fn load(&mut self, url: Url, fragment: Option<String>, motion: Motion, top: usize) {
+    fn load(&mut self, url: Url, fragment: Option<String>, motion: Motion, top: Place) {
         if self.workers.load(Ordering::SeqCst) >= MAX_WORKERS {
             self.message = Some("earlier pages are still loading; try again shortly".into());
             return;
@@ -255,13 +327,15 @@ impl App {
         let (send, answer) = mpsc::channel();
         let fetcher = Arc::clone(&self.fetcher);
         let (target, named) = (url.clone(), fragment.clone());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let told = Arc::clone(&stopped);
         self.workers.fetch_add(1, Ordering::SeqCst);
         let worker = Worker(Arc::clone(&self.workers));
         let spawned = std::thread::Builder::new()
             .name("td-web fetch".into())
             .spawn(move || {
                 let _worker = worker;
-                let _ = send.send(arrive(fetcher.as_ref(), target, named));
+                let _ = send.send(arrive(fetcher.as_ref(), target, named, &told));
             });
         if let Err(why) = spawned {
             self.message = Some(format!("the page could not be fetched: {why}"));
@@ -273,6 +347,7 @@ impl App {
             motion,
             top,
             answer,
+            stopped,
         });
         self.focus = Focus::Page;
         self.show_address();
@@ -285,9 +360,9 @@ impl App {
             return;
         };
         let (doc, fragment) = match loading.answer.try_recv() {
-            Ok(arrival) => arrival,
+            Ok(Some(arrival)) => arrival,
             Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => (
+            Ok(None) | Err(TryRecvError::Disconnected) => (
                 Document::error(
                     Some(loading.url.clone()),
                     "the fetch ended without an answer",
@@ -323,7 +398,7 @@ impl App {
         self.install(doc, fragment, loading.top);
     }
 
-    fn install(&mut self, doc: Document, fragment: Option<String>, top: usize) {
+    fn install(&mut self, doc: Document, fragment: Option<String>, top: Place) {
         self.title = match (&doc.title, &doc.url) {
             (Some(title), _) => format!("{title} - td-web"),
             (None, Some(url)) => format!("{} - td-web", url.text()),
@@ -332,15 +407,14 @@ impl App {
         self.current = Current {
             doc,
             fragment,
-            view: View {
-                top,
-                ..View::default()
-            },
+            view: View::default(),
             rendered: Rendered::default(),
             rendered_for: None,
             fitted: None,
         };
         self.relayout();
+        self.current.view.top = self.current.rendered.line_at(top);
+        self.scroll(0);
         self.show_address();
     }
 
@@ -349,7 +423,7 @@ impl App {
         Some(Entry {
             url: self.current.doc.url.clone()?,
             fragment: self.current.fragment.clone(),
-            top: self.current.view.top,
+            top: self.current.rendered.place(self.current.view.top),
         })
     }
 
@@ -403,19 +477,32 @@ impl App {
 
     // The page.
 
-    /// Renders the page again when its width changed, keeping the focused
-    /// link and what find marked, and keeps the view inside the page.
+    /// Wraps the page again when its width, scale or body face changed,
+    /// keeping the text at the top, the focused link and find's marks,
+    /// made again on the new lines without moving to a match, and keeps
+    /// the view inside the page. The old rendering is gone before the new
+    /// one is made.
     fn relayout(&mut self) {
-        let columns = self.columns();
-        if self.current.rendered_for != Some(columns) {
-            self.current.rendered = self.current.doc.render(columns);
-            self.current.rendered_for = Some(columns);
+        if self.metrics.scale() != self.surface.scale {
+            self.metrics = Metrics::new(self.faces.as_ref(), self.surface.scale);
+        }
+        let layout = self.layout();
+        if self.current.rendered_for != Some(layout) {
+            let old = std::mem::take(&mut self.current.rendered);
+            let top = old.place(self.current.view.top);
+            drop(old);
+            self.current.rendered =
+                self.current
+                    .doc
+                    .render(&mut self.metrics, layout.width, layout.body);
+            self.current.rendered_for = Some(layout);
+            let rendered = &self.current.rendered;
             let view = &mut self.current.view;
-            view.focus = view
-                .focus
-                .filter(|&link| link < self.current.rendered.links.len());
+            view.top = rendered.line_at(top);
+            view.focus = view.focus.filter(|&link| link < rendered.page.links.len());
             if !view.hits.is_empty() || self.focus == Focus::Find {
-                self.refind();
+                let query = self.query.text().to_string();
+                self.current.view.remark(&query, &self.current.rendered);
             }
         }
         self.scroll(0);
@@ -429,7 +516,7 @@ impl App {
     }
 
     fn follow_link(&mut self, link: usize) {
-        match self.current.rendered.target(link) {
+        match self.current.rendered.page.target(link) {
             Some(Ok(reference)) => self.follow(reference),
             Some(Err(why)) => self.message = Some(format!("the link is not followed: {why}")),
             None => {}
@@ -497,6 +584,18 @@ impl App {
         }
     }
 
+    /// Sets body text in the other of Sans and Serif, for this run only.
+    fn toggle_body(&mut self) {
+        self.serif = !self.serif;
+        self.relayout();
+        let family = if self.serif { "Serif" } else { "Sans" };
+        self.message = Some(if self.metrics.proportional() {
+            format!("body text in Noto {family}")
+        } else {
+            format!("body text in Noto {family}, which is not loaded: the page draws on the cell")
+        });
+    }
+
     fn open_find(&mut self) {
         self.focus = Focus::Find;
         let _ = self.query.act(Action::SelectAll);
@@ -510,7 +609,7 @@ impl App {
         };
         let text = text.or_else(|| {
             let link = self.current.view.focus?;
-            Some(self.current.rendered.shown(link)?.into())
+            Some(self.current.rendered.page.shown(link)?.into())
         });
         let text = text.or_else(|| Some(self.current.doc.url.as_ref()?.text().into()));
         if let Some(text) = text {
@@ -562,6 +661,7 @@ impl App {
             }
             "C-f" => return self.open_find(),
             "C-c" => return self.copy(clipboard),
+            "F8" => return self.toggle_body(),
             _ => {}
         }
         match self.focus {
@@ -637,23 +737,12 @@ impl App {
         }
     }
 
-    /// The link painted at a point: none in the inset, the cell the page
-    /// does not show whole on the right or the row below the last whole.
+    /// The link painted at a point, by the line it is on and the piece
+    /// under it: none in the inset or the line below the last whole.
     fn link_at(&self, x: i64, y: i64) -> Option<usize> {
-        let rect = self.page_rect();
-        let (cw, ch) = self.cell();
-        if !rect.contains(x, y) || x < rect.x + cw {
-            return None;
-        }
-        let column = usize::try_from((x - rect.x - cw) / cw).ok()?;
-        let painted = usize::try_from(i64::from(rect.width) / cw - 1).unwrap_or(0);
-        if column >= painted {
-            return None;
-        }
-        let row = usize::try_from((y - rect.y) / ch).ok()?;
         self.current
             .view
-            .link_at(&self.current.rendered, self.rows(), row, column)
+            .link_at(&self.current.rendered, &self.pane(), x, y)
     }
 
     /// What the status row says: what the last input made happen, else
@@ -667,7 +756,7 @@ impl App {
             return format!("loading {}", loading.url.text());
         }
         let link = self.hover.or(self.current.view.focus);
-        if let Some(shown) = link.and_then(|link| self.current.rendered.shown(link)) {
+        if let Some(shown) = link.and_then(|link| self.current.rendered.page.shown(link)) {
             return shown;
         }
         let doc = &self.current.doc;
@@ -688,6 +777,12 @@ impl App {
             parts.push(format!(
                 "only the first {} lines are shown",
                 document::MAX_LINES
+            ));
+        }
+        if rendered.page.trimmed {
+            parts.push(format!(
+                "unwrapped lines are cut at {} characters",
+                document::MAX_PRE_CHARS
             ));
         }
         if doc.url.is_none() && lines <= 1 {
@@ -717,6 +812,7 @@ const BROWSER_KEYS: &[(&str, &str)] = &[
     ("Alt+Left, Alt+Right", "back, forward"),
     ("Ctrl+R, F5", "reload"),
     ("Ctrl+C", "copy the link's or the page's address"),
+    ("F8", "body text in Sans or Serif"),
     ("Ctrl+Q, Ctrl+W", "close"),
 ];
 
@@ -820,8 +916,7 @@ impl Handler for App {
                 &self.current.rendered,
                 &self.current.view,
                 self.hover,
-                page,
-                surface.scale,
+                &self.pane(),
                 &mut sink,
             ),
         }
@@ -880,17 +975,18 @@ pub fn run(start: Option<String>) -> Result<(), String> {
         std::env::var_os("XDG_RUNTIME_DIR"),
     )?;
     let stream = td_ui::wayland::connect(endpoint)?;
-    let scale = td_ui::raster::Scale::new(1).map_err(|why| format!("{why:?}"))?;
+    let scale = Scale::new(1).map_err(|why| format!("{why:?}"))?;
     let surface = Surface::new(640, 480, scale).map_err(|why| format!("{why:?}"))?;
-    let mut app = App::new(Arc::new(fetch::Service), surface)?;
+    // The monospace face, and the proportional faces sharing its bytes;
+    // either missing is said once and drawn without.
+    let setting = std::env::var_os(td_ui::pinned_face::SETTING);
+    let typeface = td_ui::pinned_face::load_or_note("td-web", setting.as_deref());
+    let prose = td_ui::pinned_face::prose_or_note("td-web", setting.as_deref(), typeface.as_ref());
+    let mut app = App::new(Arc::new(fetch::Service), surface, prose.clone())?;
     if let Some(start) = start {
         app.open(&start);
     }
-    let typeface = td_ui::pinned_face::load_or_note(
-        "td-web",
-        std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
-    );
-    td_ui::window::run(&mut app, stream, std::env::temp_dir(), typeface)
+    td_ui::window::run_with_prose(&mut app, stream, std::env::temp_dir(), typeface, prose)
         .map_err(|why| why.to_string())
 }
 
@@ -901,7 +997,6 @@ mod tests {
     use crate::fetch::tests::Table;
     use crate::fetch::Reply;
     use std::sync::Mutex;
-    use td_ui::raster::Scale;
 
     #[derive(Default)]
     struct Board {
@@ -945,7 +1040,7 @@ mod tests {
     }
 
     fn app_over(fetcher: Arc<dyn Fetcher>) -> App {
-        App::new(fetcher, surface(800)).unwrap()
+        App::new(fetcher, surface(800), None).unwrap()
     }
 
     fn app(table: Table) -> App {
@@ -1024,6 +1119,11 @@ mod tests {
             )
     }
 
+    /// The text a wrapped line shows, from its glyphs.
+    fn shown(line: &td_ui::prose::Line) -> String {
+        line.glyphs.iter().map(|glyph| glyph.scalar).collect()
+    }
+
     fn history(app: &App) -> (Vec<String>, Vec<String>) {
         let paths = |list: &Vec<Entry>| list.iter().map(|entry| entry.url.text()).collect();
         (paths(&app.back), paths(&app.forward))
@@ -1035,7 +1135,7 @@ mod tests {
         typed(&mut app, "example.org");
         assert_eq!(app.title(), "Home - td-web");
         assert_eq!(app.address.text(), "https://example.org/");
-        assert_eq!(app.current.rendered.links.len(), 2);
+        assert_eq!(app.current.rendered.page.links.len(), 2);
         assert_eq!(app.focus, Focus::Page);
     }
 
@@ -1164,10 +1264,7 @@ mod tests {
     fn a_failed_fetch_is_a_page_that_says_why() {
         let mut app = app(site());
         typed(&mut app, "example.org/missing");
-        let text: String = app.current.rendered.lines[0]
-            .iter()
-            .map(|run| run.text.as_str())
-            .collect();
+        let text = shown(&app.current.rendered.lines[0].line);
         assert!(
             text.contains("no route to https://example.org/missing"),
             "{text}"
@@ -1208,7 +1305,7 @@ mod tests {
         key(&mut app, "Tab");
         let mut board = Board::default();
         app.input(Input::Resize(surface(400)), &mut board);
-        assert_eq!(app.current.rendered_for, Some(app.columns()));
+        assert_eq!(app.current.rendered_for, Some(app.layout()));
         assert_eq!(app.current.view.hits.len(), 1, "kept");
         assert_eq!(app.current.view.focus, Some(0), "kept");
         app.input(
@@ -1230,18 +1327,21 @@ mod tests {
     fn a_click_on_a_link_follows_it_and_the_inset_is_no_link() {
         let mut app = app(site());
         typed(&mut app, "example.org");
-        let (cw, ch) = app.cell();
+        let (inset, height) = (app.inset(), i64::from(app.metrics.line().height));
         let page = app.page_rect();
-        let line = app.current.rendered.link_lines[0] as i64;
-        let column = app.current.rendered.lines[line as usize]
+        let line = app.current.rendered.link_lines[0];
+        let left = app.current.rendered.lines[line]
+            .line
+            .pieces
             .iter()
-            .take_while(|run| run.link != Some(0))
-            .map(|run| run.text.chars().count())
-            .sum::<usize>() as i64;
-        assert_eq!(column, 0, "the page begins with the link");
-        app.motion(Some((page.x + cw - 1, page.y + line * ch + 1)));
+            .find(|piece| piece.tag == 0)
+            .unwrap()
+            .left;
+        assert_eq!(left, 0, "the page begins with the link");
+        let y = page.y + line as i64 * height + 1;
+        app.motion(Some((page.x + inset - 1, y)));
         assert_eq!(app.hover, None, "the inset");
-        let (x, y) = (page.x + cw + column * cw + 1, page.y + line * ch + 1);
+        let x = page.x + inset + i64::from(left) + 1;
         app.motion(Some((x, y)));
         assert_eq!(app.status_text(), "https://example.org/a");
         let mut board = Board::default();
@@ -1268,9 +1368,8 @@ mod tests {
         }
         let mut app = app(site().page("https://example.org/long", "text/html", &lines));
         typed(&mut app, "example.org/long");
-        let (cw, _) = app.cell();
         let page = app.page_rect();
-        app.motion(Some((page.x + cw + 1, page.y + 1)));
+        app.motion(Some((page.x + app.inset() + 1, page.y + 1)));
         assert_eq!(app.hover, Some(0));
         key(&mut app, "Down");
         assert_eq!(app.hover, None, "the link scrolled away");
@@ -1300,5 +1399,299 @@ mod tests {
         key(&mut app, "Return");
         settle(&mut app);
         assert_eq!(app.address.text(), "https://example.org/a#x%01y");
+    }
+
+    #[test]
+    fn f8_sets_body_text_in_serif_and_back_and_is_listed() {
+        let mut app = app(site());
+        typed(&mut app, "example.org");
+        let family = |app: &App| app.current.rendered.lines[0].line.pieces[0].style.family;
+        assert_eq!(family(&app), TextFamily::Sans);
+        key(&mut app, "F8");
+        assert_eq!(family(&app), TextFamily::Serif);
+        assert_eq!(app.current.rendered_for, Some(app.layout()));
+        assert!(
+            app.status_text().contains("Serif") && app.status_text().contains("not loaded"),
+            "{}",
+            app.status_text()
+        );
+        key(&mut app, "F8");
+        assert_eq!(family(&app), TextFamily::Sans);
+        assert!(BROWSER_KEYS.iter().any(|(keys, _)| *keys == "F8"));
+    }
+
+    /// The words a line shows.
+    fn words(app: &App, line: usize) -> String {
+        shown(&app.current.rendered.lines[line].line)
+    }
+
+    /// A page that is one logical line of numbered words, and an app
+    /// scrolled into it.
+    fn one_paragraph() -> App {
+        let words: Vec<String> = (0..2000).map(|n| format!("w{n}")).collect();
+        let page = format!("<div><a href=\"/a\">to a</a> {}</div>", words.join(" "));
+        let mut app = app(site().page("https://example.org/p", "text/html", &page));
+        typed(&mut app, "example.org/p");
+        for _ in 0..30 {
+            key(&mut app, "Down");
+        }
+        app
+    }
+
+    #[test]
+    fn a_resize_or_f8_keeps_the_place_inside_a_logical_line() {
+        let mut app = one_paragraph();
+        assert_eq!(app.current.rendered.page.lines.len(), 1);
+        // Each time the line at the top holds the word the last top
+        // began with.
+        let first = |app: &App| {
+            let top = app.current.view.top;
+            words(app, top).split(' ').next().unwrap().to_string()
+        };
+        let mut board = Board::default();
+        for change in [Some(surface(300)), Some(surface(800)), None] {
+            let word = first(&app);
+            match change {
+                Some(surface) => {
+                    app.input(Input::Resize(surface), &mut board);
+                }
+                None => key(&mut app, "F8"),
+            }
+            let top = app.current.view.top;
+            assert!(top > 0, "not the paragraph's start");
+            let shown = words(&app, top);
+            assert!(shown.split(' ').any(|w| w == word), "{word} in {shown}");
+        }
+    }
+
+    #[test]
+    fn back_after_a_resize_opens_at_the_same_text() {
+        let mut app = one_paragraph();
+        let mut board = Board::default();
+        app.input(Input::Resize(surface(300)), &mut board);
+        let top = app.current.view.top;
+        let word = words(&app, top).split(' ').next().unwrap().to_string();
+        typed(&mut app, "example.org/a");
+        app.input(Input::Resize(surface(800)), &mut board);
+        key(&mut app, "M-Left");
+        settle(&mut app);
+        let top = app.current.view.top;
+        assert!(top > 0);
+        let shown = words(&app, top);
+        assert!(shown.split(' ').any(|w| w == word), "{word} in {shown}");
+    }
+
+    #[test]
+    fn a_relayout_marks_matches_again_without_moving_to_one() {
+        let mut lines = String::new();
+        for n in 0..200 {
+            lines.push_str(&format!("<p>line {n}</p>"));
+        }
+        let mut app = app(site().page("https://example.org/long", "text/html", &lines));
+        typed(&mut app, "example.org/long");
+        key(&mut app, "/");
+        for c in "line 15".chars() {
+            let chord = if c == ' ' {
+                "space".to_string()
+            } else {
+                c.to_string()
+            };
+            key(&mut app, &chord);
+        }
+        key(&mut app, "Return");
+        assert!(app.current.view.top > 0, "find moved to a match");
+        let at = app.current.view.at;
+        let hits = app.current.view.hits.len();
+        key(&mut app, "Escape");
+        key(&mut app, "Home");
+        let mut board = Board::default();
+        app.input(Input::Resize(surface(400)), &mut board);
+        assert_eq!(app.current.view.top, 0, "not moved to the match");
+        assert_eq!(app.current.view.hits.len(), hits);
+        assert_eq!(app.current.view.at, at);
+    }
+
+    #[test]
+    fn a_stopped_or_overtaken_navigation_tells_its_worker() {
+        let (release, held) = mpsc::channel();
+        let mut app = app_over(Arc::new(Held {
+            table: site(),
+            release: Mutex::new(held),
+        }));
+        type_address(&mut app, "example.org/a");
+        let first = Arc::clone(&app.loading.as_ref().unwrap().stopped);
+        type_address(&mut app, "example.org/b");
+        assert!(first.load(Ordering::SeqCst), "overtaken");
+        let second = Arc::clone(&app.loading.as_ref().unwrap().stopped);
+        assert!(!second.load(Ordering::SeqCst));
+        key(&mut app, "Escape");
+        assert!(second.load(Ordering::SeqCst), "stopped");
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        idle(&app);
+    }
+
+    #[test]
+    fn a_narrow_pane_wraps_at_the_least_width_and_cuts_lines_at_its_edge() {
+        let mut app = one_paragraph();
+        let mut board = Board::default();
+        app.input(Input::Resize(surface(40)), &mut board);
+        let least = MIN_WRAP_EMS * i64::from(td_ui::prose::SIZE);
+        assert_eq!(i64::from(app.layout().width), least);
+        let pane = app.pane();
+        let edge = pane.rect.x + i64::from(pane.rect.width);
+        let left = pane.rect.x + pane.inset;
+        let laid = &app.current.rendered.lines;
+        assert!(
+            laid.iter()
+                .any(|wrapped| left + i64::from(wrapped.line.width) > edge),
+            "lines wider than the pane"
+        );
+        let mut pens = Vec::new();
+        view::paint(
+            &app.current.rendered,
+            &app.current.view,
+            None,
+            &pane,
+            &mut |draw| {
+                if let td_ui::raster::Primitive::Glyph { x, .. } = draw.primitive {
+                    pens.push(x);
+                }
+            },
+        );
+        assert!(!pens.is_empty());
+        let overhang = i64::from(td_ui::prose::OVERHANG);
+        assert!(pens.iter().all(|&x| x < edge + overhang), "{pens:?}");
+    }
+
+    #[test]
+    fn a_resize_keeps_the_line_at_the_top() {
+        let mut page = String::new();
+        for n in 0..100 {
+            page.push_str(&format!("<p>paragraph {n} has words enough to wrap</p>"));
+        }
+        let mut app = app(site().page("https://example.org/p", "text/html", &page));
+        typed(&mut app, "example.org/p");
+        for _ in 0..41 {
+            key(&mut app, "Down");
+        }
+        let logical = |app: &App| app.current.rendered.lines[app.current.view.top].logical;
+        assert_eq!(logical(&app), 41);
+        let wide = app.current.rendered.lines.len();
+        let mut board = Board::default();
+        app.input(Input::Resize(surface(200)), &mut board);
+        assert!(app.current.rendered.lines.len() > wide);
+        assert_eq!(logical(&app), 41);
+        let top = app.current.view.top;
+        assert_eq!(
+            app.current.rendered.lines[top - 1].logical,
+            40,
+            "its first line"
+        );
+    }
+
+    /// The pinned faces' directories for `family`: the image's and the
+    /// XDG data home's, never a host's packaged faces.
+    fn pinned(family: td_ui::face_file::Family) -> Vec<td_ui::face_file::Place> {
+        family
+            .host_places()
+            .into_iter()
+            .filter(|place| place.depth == 0)
+            .collect()
+    }
+
+    // Over the pinned faces, read only where ./install-fonts and the
+    // image put them; it fails without them and is ignored unless asked
+    // for: `XDG_DATA_HOME=<an install> cargo test -- --ignored`.
+    #[test]
+    #[ignore = "needs the pinned faces: ./install-fonts, or XDG_DATA_HOME at an install"]
+    fn over_the_pinned_faces_a_page_is_laid_hit_found_and_drawn_by_pixel() {
+        use td_ui::face_file::Family;
+        let mono = td_ui::pinned_face::load_in(&pinned(Family::MONO))
+            .unwrap_or_else(|why| panic!("the pinned monospace face is not installed: {why}"));
+        let faces = td_ui::pinned_face::prose_in(&pinned(Family::SANS))
+            .unwrap_or_else(|why| panic!("the pinned prose faces are not installed: {why}"))
+            .with_mono(&mono)
+            .unwrap();
+        let table = site().page(
+            "https://example.org/p",
+            "text/html",
+            "<p>iiii mmmm <a href=\"/a\">a link</a> after</p><pre>i  m\nmm i</pre>",
+        );
+        let mut app = App::new(Arc::new(table), surface(800), Some(faces.clone())).unwrap();
+        typed(&mut app, "example.org/p");
+        assert!(app.metrics.proportional());
+        assert_eq!(app.metrics.line().height, 22);
+        let rendered = app.current.rendered.clone();
+        let first = &rendered.lines[0].line;
+        assert_eq!(shown(first), "iiii mmmm a link after");
+        let advance = |at: usize| first.glyphs[at + 1].x - first.glyphs[at].x;
+        assert!(
+            advance(0) * 2 < advance(5),
+            "i {} m {}",
+            advance(0),
+            advance(5)
+        );
+        // The pointer over the link's piece names it; past it, nothing.
+        // td-html may give one link several runs: its extent is theirs.
+        let link = first.pieces.iter().filter(|piece| piece.tag == 0);
+        let start = link.clone().map(|piece| piece.left).min().unwrap();
+        let end = link.map(|piece| piece.right).max().unwrap();
+        let page = app.page_rect();
+        let left = page.x + app.inset();
+        app.motion(Some((left + i64::from(start + end) / 2, page.y + 1)));
+        assert_eq!(app.status_text(), "https://example.org/a");
+        app.motion(Some((left + i64::from(end) + 2, page.y + 1)));
+        assert_eq!(app.hover, None);
+        // A match spans its glyphs' pixels.
+        key(&mut app, "/");
+        for c in "after".chars() {
+            key(&mut app, &c.to_string());
+        }
+        let hit = app.current.view.hits[0];
+        assert_eq!((hit.line, hit.left), (0, first.glyphs[17].x));
+        assert_eq!(hit.right, first.width);
+        key(&mut app, "Escape");
+        // A preformatted line is in the monospace face, one advance a
+        // glyph, and not wrapped.
+        let pre = &rendered.lines[2].line;
+        assert!(pre
+            .pieces
+            .iter()
+            .all(|p| p.style.family == TextFamily::Mono));
+        let mut mono = |scalar| {
+            app.metrics
+                .advance(TextFamily::Mono, td_ui::atlas::Style::Regular, scalar)
+        };
+        assert_eq!(mono('i'), mono('m'));
+        // Pens are the advances summed and rounded: a pixel apart at most.
+        let steps: Vec<u32> = pre.glyphs.windows(2).map(|w| w[1].x - w[0].x).collect();
+        let (low, high) = (steps.iter().min().unwrap(), steps.iter().max().unwrap());
+        assert!(high - low <= 1, "{steps:?}");
+        // Serif measures otherwise than Sans.
+        key(&mut app, "F8");
+        let serif = &app.current.rendered.lines[0].line;
+        assert_eq!(serif.pieces[0].style.family, TextFamily::Serif);
+        assert_ne!(serif.width, first.width);
+        // And the window's raster, lent the same faces, draws it.
+        let mut faces = faces;
+        let font = td_ui::font::pinned().unwrap();
+        let surface = app.surface;
+        let mut pixels = vec![0u8; surface.width * surface.height * 4];
+        {
+            let mut raster = Raster::new(&mut pixels, &font, surface, surface.width * 4)
+                .unwrap()
+                .with_prose(Some(&mut faces));
+            app.paint(&mut raster, surface).unwrap();
+        }
+        let row = |y: i64| {
+            let start = (y as usize * surface.width + left as usize) * 4;
+            pixels[start..start + 200 * 4].to_vec()
+        };
+        let ink = (page.y..page.y + 22).any(|y| {
+            let row = row(y);
+            row.chunks(4).any(|pixel| pixel != &row[..4])
+        });
+        assert!(ink, "the first line is drawn");
     }
 }

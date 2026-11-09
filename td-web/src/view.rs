@@ -1,24 +1,55 @@
 //! Where the reader is in a rendered page: the first line shown, the
 //! focused link and what find matched; and the page painted over its
-//! rectangle, one cell a character.
+//! pane in prose, each glyph at the pen its line was laid with.
 
+use td_ui::prose::{LineBox, OVERHANG, SIZE};
 use td_ui::raster::{
-    fill, text_run, Draw, GlyphStyle, Rect, Scale, ACCENT, CHROME, INACTIVE_SELECTION, INK, PAPER,
+    fill, Draw, GlyphStyle, Primitive, Rect, ACCENT, CHROME, INACTIVE_SELECTION, INK, PAPER,
     SELECTED,
 };
-use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
-use crate::document::Rendered;
+use crate::document::{Rendered, NO_LINK};
 
 /// The most matches find marks.
 pub const MAX_HITS: usize = 10_000;
+/// The most glyphs drawn at one pen: combining marks take no advance in
+/// Noto, so without a bound one line could ask a paint for as many glyphs
+/// as the page has characters.
+const MAX_STACKED: usize = 8;
 
-/// A match: its line, its first column and its length, in characters.
+/// A match: its line, and the pixels it spans from the line's left
+/// (`left` inclusive, `right` exclusive).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Hit {
     pub line: usize,
-    pub column: usize,
-    pub len: usize,
+    pub left: u32,
+    pub right: u32,
+}
+
+/// Where a page is shown: its pane, the inset left of its lines, the
+/// line box they are laid in and the scale.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Pane {
+    pub rect: Rect,
+    pub inset: i64,
+    pub line: LineBox,
+    pub scale: i64,
+}
+
+impl Pane {
+    fn height(&self) -> i64 {
+        i64::from(self.line.height.max(1))
+    }
+
+    /// The lines shown whole.
+    pub fn shown(&self) -> usize {
+        usize::try_from(i64::from(self.rect.height) / self.height()).unwrap_or(0)
+    }
+
+    /// The lines shown whole, at least one, as scrolling counts them.
+    pub fn rows(&self) -> usize {
+        self.shown().max(1)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -65,7 +96,7 @@ impl View {
     /// Focuses the next link (`forward`) or the previous one: from the
     /// focused link, else from the screen, the first shown or the last.
     pub fn step_link(&mut self, forward: bool, rendered: &Rendered, rows: usize) {
-        let count = rendered.links.len();
+        let count = rendered.page.links.len();
         if count == 0 {
             self.focus = None;
             return;
@@ -93,9 +124,30 @@ impl View {
         }
     }
 
-    /// Marks every match of `query`, ignoring case, at most `MAX_HITS`,
-    /// and makes current the first at or after the screen's top.
+    /// Marks every match of `query` (`mark`) and makes current the first
+    /// at or after the screen's top, scrolling to it.
     pub fn find(&mut self, query: &str, rendered: &Rendered, rows: usize) {
+        self.mark(query, rendered);
+        self.at = self
+            .hits
+            .iter()
+            .position(|hit| hit.line >= self.top)
+            .unwrap_or(0);
+        self.show_hit(rows);
+    }
+
+    /// Marks every match of `query` again on lines wrapped anew, keeping
+    /// which is current as far as there are as many, and not scrolling.
+    pub fn remark(&mut self, query: &str, rendered: &Rendered) {
+        let at = self.at;
+        self.mark(query, rendered);
+        self.at = at.min(self.hits.len().saturating_sub(1));
+    }
+
+    /// Marks every match of `query` on a line, across its runs and
+    /// ignoring case, at most `MAX_HITS`, each by the pixels its glyphs
+    /// span.
+    fn mark(&mut self, query: &str, rendered: &Rendered) {
         self.hits.clear();
         self.at = 0;
         let needle: Vec<char> = query.chars().map(fold).collect();
@@ -103,32 +155,31 @@ impl View {
             return;
         }
         let mut hay: Vec<char> = Vec::new();
-        'lines: for (line, runs) in rendered.lines.iter().enumerate() {
+        'lines: for (line, wrapped) in rendered.lines.iter().enumerate() {
+            let glyphs = &wrapped.line.glyphs;
             hay.clear();
-            hay.extend(runs.iter().flat_map(|run| run.text.chars()).map(fold));
-            let mut column = 0;
-            while let Some(window) = hay.get(column..column + needle.len()) {
+            hay.extend(glyphs.iter().map(|glyph| fold(glyph.scalar)));
+            let mut at = 0;
+            while let Some(window) = hay.get(at..at + needle.len()) {
                 if window == needle.as_slice() {
                     if self.hits.len() == MAX_HITS {
                         break 'lines;
                     }
+                    let left = glyphs.get(at).map_or(0, |glyph| glyph.x);
+                    let right = glyphs
+                        .get(at + needle.len())
+                        .map_or(wrapped.line.width, |glyph| glyph.x);
                     self.hits.push(Hit {
                         line,
-                        column,
-                        len: needle.len(),
+                        left,
+                        right: right.max(left),
                     });
-                    column += needle.len();
+                    at += needle.len();
                 } else {
-                    column += 1;
+                    at += 1;
                 }
             }
         }
-        self.at = self
-            .hits
-            .iter()
-            .position(|hit| hit.line >= self.top)
-            .unwrap_or(0);
-        self.show_hit(rows);
     }
 
     /// Moves to the next match or the previous one, around the ends.
@@ -151,28 +202,21 @@ impl View {
         }
     }
 
-    /// The link under a cell, its row counted from the screen's top, of
-    /// `rows` shown whole.
-    pub fn link_at(
-        &self,
-        rendered: &Rendered,
-        rows: usize,
-        row: usize,
-        column: usize,
-    ) -> Option<usize> {
-        if row >= rows {
+    /// The link painted at a point of `pane`: none in the inset left of
+    /// the lines, and none on the line below the last shown whole.
+    pub fn link_at(&self, rendered: &Rendered, pane: &Pane, x: i64, y: i64) -> Option<usize> {
+        let rect = pane.rect;
+        let left = rect.x.saturating_add(pane.inset);
+        if !rect.contains(x, y) || x < left {
             return None;
         }
-        let runs = rendered.lines.get(self.top.saturating_add(row))?;
-        let mut start = 0;
-        for run in runs {
-            let end = start + run.text.chars().count();
-            if (start..end).contains(&column) {
-                return run.link;
-            }
-            start = end;
+        let row = usize::try_from((y - rect.y) / pane.height()).ok()?;
+        if row >= pane.shown() {
+            return None;
         }
-        None
+        let wrapped = rendered.lines.get(self.top.saturating_add(row))?;
+        let piece = wrapped.line.hit(x - left)?;
+        (piece.tag < rendered.page.links.len()).then_some(piece.tag)
     }
 }
 
@@ -185,101 +229,145 @@ fn fold(c: char) -> char {
     }
 }
 
-/// Paints `rendered` as `view` shows it inside `rect`, a cell's inset
-/// left; `hover` is the link under the pointer.
+/// What a pass over a line paints: the grounds under its glyphs, the
+/// glyphs over them, then the strokes, so no ground covers ink a
+/// neighbouring glyph hangs over it.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Pass {
+    Ground,
+    Glyph,
+    Stroke,
+}
+
+/// Paints `rendered` as `view` shows it inside `pane`, its lines the
+/// pane's inset from its left; `hover` is the link under the pointer. A
+/// line wider than the pane, a preformatted one, is cut at its edge.
 pub fn paint(
     rendered: &Rendered,
     view: &View,
     hover: Option<usize>,
-    rect: Rect,
-    scale: Scale,
+    pane: &Pane,
     sink: &mut dyn FnMut(Draw),
 ) {
+    let rect = pane.rect;
     fill(rect, PAPER, rect, sink);
-    let s = scale.value() as i64;
-    let cw = CELL_WIDTH as i64 * s;
-    let ch = CELL_HEIGHT as i64 * s;
-    let rows = (i64::from(rect.height) / ch).max(0) as usize;
-    let columns = (i64::from(rect.width) / cw).saturating_sub(1).max(0) as usize;
+    let s = pane.scale;
+    let height = pane.height();
+    let baseline = i64::from(pane.line.baseline);
+    // About half an x-height above the baseline: 9 of the cell's 16 rows.
+    let strike = baseline - i64::from(SIZE) * s * 5 / 16;
+    let left = rect.x.saturating_add(pane.inset);
+    // Past this a glyph inks nothing inside the pane, even one whose ink
+    // hangs left of its pen (`prose::OVERHANG`).
+    let edge = rect
+        .x
+        .saturating_add(i64::from(rect.width))
+        .saturating_add(i64::from(OVERHANG));
     let current = view.hits.get(view.at).copied();
-    for (row, runs) in rendered.lines.iter().skip(view.top).take(rows).enumerate() {
-        let line = view.top + row;
-        let y = rect.y + row as i64 * ch;
+    let lines = rendered.lines.iter().skip(view.top).take(pane.shown());
+    for (row, wrapped) in lines.enumerate() {
+        let index = view.top + row;
+        let y = rect.y + row as i64 * height;
         // The line's matches: `hits` is in line order.
-        let first = view.hits.partition_point(|hit| hit.line < line);
-        let last = view.hits.partition_point(|hit| hit.line <= line);
+        let first = view.hits.partition_point(|hit| hit.line < index);
+        let last = view.hits.partition_point(|hit| hit.line <= index);
         let hits = view.hits.get(first..last).unwrap_or_default();
-        let mut column = 0usize;
-        'runs: for run in runs {
-            let focused = run.link.is_some() && run.link == view.focus;
-            let hovered = run.link.is_some() && run.link == hover;
-            for scalar in run.text.chars() {
-                if column >= columns {
-                    break 'runs;
-                }
-                let x = rect.x + cw + column as i64 * cw;
-                let hit = hits
-                    .iter()
-                    .find(|hit| (hit.column..hit.column + hit.len).contains(&column))
-                    .copied();
-                let ground = if focused || (hit.is_some() && hit == current) {
-                    SELECTED
-                } else if hit.is_some() {
-                    INACTIVE_SELECTION
-                } else if run.style.code {
-                    CHROME
-                } else {
-                    PAPER
+        let line = &wrapped.line;
+        for pass in [Pass::Ground, Pass::Glyph, Pass::Stroke] {
+            // The line's matches in order, as its glyphs are: the first
+            // not wholly left of the glyph.
+            let mut next = 0;
+            'pieces: for piece in &line.pieces {
+                let Some(run) = rendered.page.run(wrapped, piece) else {
+                    continue;
                 };
-                let ink = if ground == SELECTED {
-                    PAPER
-                } else if run.link.is_some() {
-                    ACCENT
-                } else {
-                    INK
-                };
-                let cell = Rect {
-                    x,
-                    y,
-                    width: cw as u32,
-                    height: ch as u32,
-                };
-                if ground != PAPER {
-                    fill(cell, ground, rect, sink);
-                }
-                let mut style = GlyphStyle::medium(ink, ground);
-                if run.style.bold {
-                    style = style.bold();
-                }
-                if run.style.italic {
-                    style = style.italic();
-                }
-                text_run(
-                    scale,
-                    std::iter::once(scalar),
-                    (x, y),
-                    rect,
-                    style,
-                    rect,
-                    sink,
-                );
-                if run.style.strike {
-                    let strike = Rect {
-                        y: y + ch / 2,
-                        height: s as u32,
-                        ..cell
+                let link = (piece.tag != NO_LINK).then_some(piece.tag);
+                let focused = link.is_some() && link == view.focus;
+                let hovered = link.is_some() && link == hover;
+                for at in piece.glyphs.clone() {
+                    let Some(glyph) = line.glyphs.get(at) else {
+                        break;
                     };
-                    fill(strike, ink, rect, sink);
-                }
-                if run.link.is_some() && (hovered || ground != SELECTED) {
-                    let underline = Rect {
-                        y: y + ch - s,
-                        height: s as u32,
-                        ..cell
+                    let x = left.saturating_add(i64::from(glyph.x));
+                    if x >= edge {
+                        break 'pieces;
+                    }
+                    // Pens never go back, so this glyph and the
+                    // `MAX_STACKED` before it share one pen: marks of no
+                    // advance, which a hostile page can pile by the
+                    // million. The rest of the pile is not drawn.
+                    let stacked = at
+                        .checked_sub(MAX_STACKED)
+                        .and_then(|back| line.glyphs.get(back))
+                        .is_some_and(|earlier| earlier.x == glyph.x);
+                    if stacked {
+                        continue;
+                    }
+                    let right = line
+                        .glyphs
+                        .get(at + 1)
+                        .map_or(line.width, |next| next.x)
+                        .max(glyph.x);
+                    while hits.get(next).is_some_and(|hit| hit.right <= glyph.x) {
+                        next += 1;
+                    }
+                    let hit = hits.get(next).filter(|hit| hit.left <= glyph.x).copied();
+                    let ground = if focused || (hit.is_some() && hit == current) {
+                        SELECTED
+                    } else if hit.is_some() {
+                        INACTIVE_SELECTION
+                    } else if run.style.code {
+                        CHROME
+                    } else {
+                        PAPER
                     };
-                    fill(underline, ink, rect, sink);
+                    let ink = if ground == SELECTED {
+                        PAPER
+                    } else if link.is_some() {
+                        ACCENT
+                    } else {
+                        INK
+                    };
+                    let extent = Rect {
+                        x,
+                        y,
+                        width: right - glyph.x,
+                        height: height as u32,
+                    };
+                    match pass {
+                        Pass::Ground => {
+                            if ground != PAPER {
+                                fill(extent, ground, rect, sink);
+                            }
+                        }
+                        Pass::Glyph => sink(Draw {
+                            clip: rect,
+                            primitive: Primitive::Glyph {
+                                x,
+                                y,
+                                scalar: glyph.scalar,
+                                style: GlyphStyle {
+                                    ink,
+                                    background: ground,
+                                    ..piece.style
+                                },
+                            },
+                        }),
+                        Pass::Stroke => {
+                            let stroke = |at: i64| Rect {
+                                y: y + at,
+                                height: s as u32,
+                                ..extent
+                            };
+                            if run.style.strike {
+                                fill(stroke(strike), ink, rect, sink);
+                            }
+                            if link.is_some() && (hovered || ground != SELECTED) {
+                                fill(stroke(height - s), ink, rect, sink);
+                            }
+                        }
+                    }
                 }
-                column += 1;
             }
         }
     }
@@ -289,30 +377,63 @@ pub fn paint(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
-    use crate::document::{Link, Run, Style};
+    use crate::document::{Link, Logical, Page, Run, Style};
+    use std::sync::Arc;
+    use td_ui::prose::Metrics;
+    use td_ui::raster::{Scale, TextFamily};
+    use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
-    fn rendered(lines: &[&[(&str, Option<usize>)]]) -> Rendered {
-        let mut out = Rendered::default();
+    const CW: i64 = CELL_WIDTH as i64;
+    const CH: i64 = CELL_HEIGHT as i64;
+
+    fn cell() -> Metrics {
+        Metrics::new(None, Scale::new(1).unwrap())
+    }
+
+    fn page(lines: &[&[(&str, Option<usize>)]], style: Style) -> Page {
+        let mut page = Page::default();
         for (number, line) in lines.iter().enumerate() {
             let mut runs = Vec::new();
             for &(text, link) in line.iter() {
                 if let Some(at) = link {
-                    if out.links.len() == at {
-                        out.links.push(Link {
+                    if page.links.len() == at {
+                        page.links.push(Link {
                             written: format!("/{at}"),
+                            line: number,
                         });
-                        out.link_lines.push(number);
                     }
                 }
                 runs.push(Run {
                     text: text.into(),
-                    style: Style::default(),
+                    style,
                     link,
                 });
             }
-            out.lines.push(runs);
+            page.lines.push(Logical { runs, wrap: true });
         }
-        out
+        page
+    }
+
+    /// `lines` laid on the cell, 100 cells wide.
+    fn rendered(lines: &[&[(&str, Option<usize>)]]) -> Rendered {
+        let page = Arc::new(page(lines, Style::default()));
+        Rendered::wrap(&page, &mut cell(), 800, TextFamily::Sans)
+    }
+
+    /// A pane of `rows` lines on the cell, a cell's inset left.
+    fn pane(rows: i64) -> Pane {
+        let metrics = cell();
+        Pane {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: (rows * CH) as u32,
+            },
+            inset: CW,
+            line: metrics.line(),
+            scale: 1,
+        }
     }
 
     #[test]
@@ -357,52 +478,209 @@ mod tests {
     }
 
     #[test]
-    fn find_ignores_case_and_steps_round() {
+    fn find_ignores_case_and_steps_round_marking_pixels() {
         let page = rendered(&[
             &[("Alpha ", None), ("beta", Some(0))],
             &[("ALPHA alpha", None)],
         ]);
         let mut view = View::default();
         view.find("alpha", &page, 5);
+        let w = CELL_WIDTH as u32;
         assert_eq!(
             view.hits,
             [
                 Hit {
                     line: 0,
-                    column: 0,
-                    len: 5
+                    left: 0,
+                    right: 5 * w
                 },
                 Hit {
                     line: 1,
-                    column: 0,
-                    len: 5
+                    left: 0,
+                    right: 5 * w
                 },
                 Hit {
                     line: 1,
-                    column: 6,
-                    len: 5
+                    left: 6 * w,
+                    right: 11 * w
                 },
             ]
         );
         view.step_hit(false, 5);
         assert_eq!(view.at, 2);
         view.find("a b", &page, 5);
-        assert_eq!(view.hits.len(), 1, "across runs");
+        assert_eq!(
+            view.hits,
+            [Hit {
+                line: 0,
+                left: 4 * w,
+                right: 7 * w
+            }],
+            "across runs"
+        );
         view.find("", &page, 5);
         assert!(view.hits.is_empty());
     }
 
     #[test]
-    fn a_cell_names_the_link_it_shows() {
+    fn a_pixel_names_the_link_it_shows() {
         let page = rendered(&[&[("go ", None), ("here", Some(0))], &[("x", None)]]);
         let view = View::default();
-        assert_eq!(view.link_at(&page, 2, 0, 3), Some(0));
-        assert_eq!(view.link_at(&page, 2, 0, 6), Some(0));
-        assert_eq!(view.link_at(&page, 2, 0, 7), None);
-        assert_eq!(view.link_at(&page, 2, 0, 1), None);
-        assert_eq!(view.link_at(&page, 2, 5, 0), None);
-        let page = rendered(&[&[("a", None)], &[("here", Some(0))]]);
-        assert_eq!(view.link_at(&page, 2, 1, 0), Some(0));
-        assert_eq!(view.link_at(&page, 1, 1, 0), None, "a row not shown whole");
+        let at = |column: i64| CW + column * CW + 1;
+        assert_eq!(view.link_at(&page, &pane(2), at(3), 1), Some(0));
+        assert_eq!(view.link_at(&page, &pane(2), at(6), 1), Some(0));
+        assert_eq!(view.link_at(&page, &pane(2), at(7), 1), None);
+        assert_eq!(view.link_at(&page, &pane(2), at(1), 1), None);
+        assert_eq!(view.link_at(&page, &pane(2), at(0), 5 * CH), None);
+        let page = rendered(&[&[("here", Some(0))], &[("here", Some(0))]]);
+        assert_eq!(view.link_at(&page, &pane(2), at(0), CH + 1), Some(0));
+        assert_eq!(view.link_at(&page, &pane(2), CW - 1, 1), None, "the inset");
+        let mut short = pane(2);
+        short.rect.height += (CH - 1) as u32;
+        assert_eq!(
+            view.link_at(&page, &short, at(0), 2 * CH + 1),
+            None,
+            "a row not shown whole"
+        );
+    }
+
+    /// The draws `paint` streams for `rendered`, as fills (rect, colour)
+    /// and glyphs (x, y, scalar, ink, ground).
+    #[allow(clippy::type_complexity)]
+    fn painted(
+        rendered: &Rendered,
+        view: &View,
+        hover: Option<usize>,
+        pane: &Pane,
+    ) -> (Vec<(Rect, u32)>, Vec<(i64, i64, char, u32, u32)>) {
+        let (mut fills, mut glyphs) = (Vec::new(), Vec::new());
+        paint(
+            rendered,
+            view,
+            hover,
+            pane,
+            &mut |draw| match draw.primitive {
+                Primitive::Fill { rect, color } => fills.push((rect, color)),
+                Primitive::Glyph {
+                    x,
+                    y,
+                    scalar,
+                    style,
+                } => glyphs.push((x, y, scalar, style.ink, style.background)),
+                _ => {}
+            },
+        );
+        (fills, glyphs)
+    }
+
+    #[test]
+    fn a_line_paints_its_glyphs_at_their_pens_with_their_looks() {
+        let page = rendered(&[&[("ab ", None), ("cd", Some(0))], &[("ab", None)]]);
+        let mut view = View::default();
+        view.find("b", &page, 2);
+        let (fills, glyphs) = painted(&page, &view, None, &pane(2));
+        let pens: Vec<(i64, i64, char)> = glyphs.iter().map(|g| (g.0, g.1, g.2)).collect();
+        assert_eq!(
+            pens,
+            [
+                (CW, 0, 'a'),
+                (2 * CW, 0, 'b'),
+                (3 * CW, 0, ' '),
+                (4 * CW, 0, 'c'),
+                (5 * CW, 0, 'd'),
+                (CW, CH, 'a'),
+                (2 * CW, CH, 'b'),
+            ]
+        );
+        // The current match on SELECTED, the other on its own ground.
+        assert_eq!(glyphs[1].3, PAPER);
+        assert_eq!(glyphs[1].4, SELECTED);
+        assert_eq!(glyphs[6].4, INACTIVE_SELECTION);
+        assert_eq!(glyphs[3].3, ACCENT, "a link's ink");
+        // A link is underlined, a cell under each glyph.
+        let underlines: Vec<Rect> = fills
+            .iter()
+            .filter(|(rect, color)| *color == ACCENT && rect.height == 1)
+            .map(|(rect, _)| *rect)
+            .collect();
+        assert_eq!(underlines.len(), 2);
+        assert_eq!(underlines[0].y, CH - 1);
+        assert_eq!(underlines[0].x, 4 * CW);
+        // The focused link is SELECTED and not underlined.
+        view.hits.clear();
+        view.focus = Some(0);
+        let (fills, glyphs) = painted(&page, &view, None, &pane(2));
+        assert_eq!(glyphs[3].4, SELECTED);
+        assert!(fills
+            .iter()
+            .all(|(rect, color)| !(rect.height == 1 && rect.y == CH - 1 && *color == PAPER)));
+        assert!(fills.iter().any(|(rect, color)| *color == SELECTED
+            && *rect
+                == Rect {
+                    x: 4 * CW,
+                    y: 0,
+                    width: CW as u32,
+                    height: CH as u32
+                }));
+    }
+
+    #[test]
+    fn struck_and_code_text_paint_their_own_stroke_and_ground() {
+        let struck = Style {
+            strike: true,
+            ..Style::default()
+        };
+        let struck = Arc::new(page(&[&[("ab", None)]], struck));
+        let rendered = Rendered::wrap(&struck, &mut cell(), 800, TextFamily::Sans);
+        let (fills, _) = painted(&rendered, &View::default(), None, &pane(1));
+        let strokes: Vec<Rect> = fills
+            .iter()
+            .filter(|(_, color)| *color == INK)
+            .map(|(rect, _)| *rect)
+            .collect();
+        assert_eq!(strokes.len(), 2);
+        assert_eq!((strokes[0].x, strokes[0].y, strokes[0].height), (CW, 9, 1));
+        let code = Style {
+            code: true,
+            ..Style::default()
+        };
+        let code = Arc::new(page(&[&[("ab", None)]], code));
+        let rendered = Rendered::wrap(&code, &mut cell(), 800, TextFamily::Sans);
+        let (fills, glyphs) = painted(&rendered, &View::default(), None, &pane(1));
+        assert_eq!(
+            fills.iter().filter(|(_, color)| *color == CHROME).count(),
+            2
+        );
+        assert!(glyphs.iter().all(|glyph| glyph.4 == CHROME));
+    }
+
+    #[test]
+    fn a_line_wider_than_the_pane_is_cut_at_its_edge() {
+        let wide = "x".repeat(1000);
+        let mut page = page(&[&[(&wide, None)]], Style::default());
+        page.lines[0].wrap = false;
+        let rendered = Rendered::wrap(&Arc::new(page), &mut cell(), 800, TextFamily::Sans);
+        assert_eq!(rendered.lines.len(), 1);
+        let (_, glyphs) = painted(&rendered, &View::default(), None, &pane(1));
+        let last = glyphs.last().unwrap().0;
+        assert!(last < 800 + i64::from(OVERHANG), "{last}");
+        assert!(last >= 800, "{last}");
+    }
+
+    #[test]
+    fn a_pile_of_marks_at_one_pen_draws_only_its_first() {
+        let marks = "\u{301}".repeat(100);
+        let mut page = page(&[&[(&marks, None)]], Style::default());
+        page.lines[0].wrap = false;
+        let mut rendered = Rendered::wrap(&Arc::new(page), &mut cell(), 800, TextFamily::Sans);
+        // As Noto measures them: no advance.
+        let line = &mut rendered.lines[0].line;
+        for glyph in &mut line.glyphs {
+            glyph.x = 0;
+        }
+        line.pieces[0].right = 0;
+        line.width = 0;
+        let (_, glyphs) = painted(&rendered, &View::default(), None, &pane(1));
+        assert_eq!(glyphs.len(), MAX_STACKED);
     }
 }

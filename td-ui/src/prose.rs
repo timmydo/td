@@ -543,8 +543,18 @@ struct Pending {
 /// text, and one more after each newline. Work and memory are linear in
 /// the runs' text: a consumer bounds what it hands over.
 pub fn wrap(metrics: &mut Metrics, runs: &[Run], width: u32) -> Vec<Line> {
+    wrap_at_most(metrics, runs, width, usize::MAX)
+}
+
+/// `wrap`'s first `most` lines, none for none: it stops laying out once it
+/// has them, so a consumer that keeps a bounded number of lines pays for
+/// no more however narrow the width or long the text.
+pub fn wrap_at_most(metrics: &mut Metrics, runs: &[Run], width: u32, most: usize) -> Vec<Line> {
     let limit = u64::from(width);
     let mut lines = Vec::new();
+    if most == 0 {
+        return lines;
+    }
     let mut line: Vec<Pending> = Vec::new();
     let mut pen = 0u64;
     // Where the line may break: the glyphs before this index stay.
@@ -553,6 +563,9 @@ pub fn wrap(metrics: &mut Metrics, runs: &[Run], width: u32) -> Vec<Line> {
         for (at, scalar) in run.text.char_indices() {
             if scalar == '\n' {
                 lines.push(finish(&line));
+                if lines.len() >= most {
+                    return lines;
+                }
                 line.clear();
                 (pen, after_space) = (0, None);
                 continue;
@@ -572,6 +585,9 @@ pub fn wrap(metrics: &mut Metrics, runs: &[Run], width: u32) -> Vec<Line> {
                 // word moved from them go with the break.
                 if line.iter().any(|glyph| !glyph.space) {
                     lines.push(finish(&line));
+                    if lines.len() >= most {
+                        return lines;
+                    }
                 }
                 let shift = rest.first().map_or(pen, |first| first.pen);
                 line = rest;
@@ -581,6 +597,9 @@ pub fn wrap(metrics: &mut Metrics, runs: &[Run], width: u32) -> Vec<Line> {
                 pen -= shift.min(pen);
                 if over(pen) && !line.is_empty() {
                     lines.push(finish(&line));
+                    if lines.len() >= most {
+                        return lines;
+                    }
                     line.clear();
                     pen = 0;
                 }

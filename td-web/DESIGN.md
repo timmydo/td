@@ -1,9 +1,7 @@
 # td-web
 
-**Status: normative for §9's landed increments; increment 5 is the
-reviewed plan, and where it changes a section that section says so.**
-The roadmap (§10) is not normative; each item there is its own
-amendment.
+**Status: normative; every increment of §9 has landed.** The roadmap
+(§10) is not normative; each item there is its own amendment.
 
 td-web is td's own web browser: a td-ui program, built from source in
 td's target graph, that reads documents on the web. It complements
@@ -97,13 +95,22 @@ WORKLOADS.md's terms td-web is already the target shape: an account of
 its own (its reserved row carries into the workload ledger), a private
 home, and no grant of the human's files. No bus
 names, no environment and no terminal. The memory bounds hold a body at
-`MAX_DOCUMENT` (16 MiB), a picture of up to 16 Mi pixels decoded beside
-it, and a rendering of markup at `MAX_MARKUP`, which can transiently
-cost some 300 MB (§5), with room; `memory-high` throttles before
-`memory-max` ends the jail. The tasks hold the window's thread, td-ui's
-and `MAX_WORKERS` fetches with room, since td-svc does not restart a
+`MAX_DOCUMENT` (16 MiB) for each fetch out, one rendering of markup
+at `MAX_MARKUP` or one decoding of a picture of up to 16 Mi pixels
+(some 112 MB), which the fetch threads take one at a time, a
+navigation stopped or overtaken before its turn taking neither, and
+the page shown with its wrap, which keep at most some 140 MB measured
+and more while the wrap is made (§5). A rendering of a hostile page
+of empty paragraphs peaks at some 260 MB, but td-html's work grows
+with how deeply quotes and lists nest: 2 MiB of short paragraphs
+inside eight quotes peaks at some 750 MB, and deeper reaches
+`memory-max`, which ends the jail (§5, §10). The allocator keeps much
+of a rendering's peak after it, so a page near the bound leaves less
+room for the next. `memory-high` throttles before `memory-max` ends
+the jail. The tasks hold the window's thread, td-ui's and
+`MAX_WORKERS` fetches with room, since td-svc does not restart a
 program that exits on the cap. One CPU, twice news's, since a page is
-rendered on the window's thread (§8).
+rendered on a fetch thread and wrapped on the window's (§8).
 
 td-jail gives td-web the standard seccomp program, not an allowlist:
 mail's and news's lists were derived from their realized binaries
@@ -180,48 +187,115 @@ A response is shown by its type, the `content-type` media type, else a
 sniff of its first bytes for `<!doctype html` or `<html`:
 
 - `text/html` and `application/xhtml+xml` are rendered through td-html
-  (`to_rich`) at the page pane's width in cells, and rendered again when
-  the width changes. Increment 5 changes this: td-html renders the page
-  once, unwrapped (width 0), on the fetch thread, into its logical
-  lines, and td-web wraps them in pixels with td-ui's `prose::wrap` at
-  the pane's width, again on a resize. Body text is in Noto Sans, or
-  Noto Serif after `F8`; code and preformatted text in the monospace
-  face on the prose line (td-ui's `Mono`), a preformatted line never
-  wrapped and cut at the pane's edge. Without the proportional faces it
-  draws on the cell as before. Links, emphasis, code and preformatted
-  text keep their looks; colours named by the document are not applied, so text
-  is always the theme's ink on the theme's ground. An image with `alt`
-  text shows that text as a link to the image; td-html drops one
-  without. td-html keeps no element ids, so a link's `#fragment` is
-  kept in the address but not scrolled to.
-- `text/*` is shown as it is, wrapped at the pane's width (from
-  increment 5, in the monospace face on prose lines).
+  (`to_rich`) once, unwrapped (width 0), on the navigation's fetch
+  thread, into the page's logical lines, the runs td-html gives each
+  word joined where they look and link alike. td-web wraps those by
+  pixel width with td-ui's `prose::wrap_at_most` at the page pane's
+  width less a cell's inset each side, but never narrower than
+  `MIN_WRAP_EMS` (8) ems, 128 pixels at scale one, a narrower pane
+  showing each line's start, cut at its edge; measured with the faces
+  the window draws with, and again when the width, the scale or the
+  body face changes.
+  Body text is in Noto Sans, or Noto Serif after `F8` (not kept between
+  runs); `<strong>` and `<em>` in its bold and italic styles; code and
+  preformatted text in the monospace face on the prose line (td-ui's
+  `Mono`), code on a ground of its own. A line holding preformatted
+  text, and one of a table's rules or rows (a line with a run of
+  box-drawing characters alone, U+2500 to U+257F, as td-html draws a
+  table's rules and column bars), is never wrapped: it is cut at the
+  pane's edge and kept, when td-web renders it, to its first
+  `MAX_PRE_CHARS` (4096) characters, which is all a pane can show of it
+  without horizontal scrolling (§10), a link left with no text no link.
+  Without the proportional faces (none installed, `TD_UI_FACE=bitmap`,
+  every in-process test) td-ui measures every glyph a cell and the page
+  draws on the cell. Links keep their looks; colours named by the
+  document are not applied, so text is always the theme's ink on the
+  theme's ground. An image with `alt` text shows that text as a link to
+  the image; td-html drops one without. td-html keeps no element ids,
+  so a link's `#fragment` is kept in the address but not scrolled to.
+- `text/*` is shown as it is, its tabs expanded every eight
+  characters, wrapped at the pane's width in the monospace face on
+  prose lines.
 - `image/png` and `image/jpeg` reached by navigation are decoded and
   shown fitted to the pane, never enlarged.
 - Anything else is not shown: the page names the type and size and
   says that Firefox opens it. Downloads are a later increment (§10).
 
 Text is decoded as UTF-8, invalid sequences replaced and a byte order
-mark dropped; other charsets are a later increment. Markup past
-`MAX_MARKUP` (2 MiB) and text past `MAX_TEXT` (4 MiB) are not rendered,
-a rendering keeps at most `MAX_LINES` (100,000) lines, and the status
-row says when either cut the page short. td-html builds a rendering
-whole before td-web cuts it, so the markup bound is what bounds that
-work: a hostile page of empty paragraphs at the bound costs about a
-second and some 270 MB at each width (§10). A status other than `2xx` with a body is shown with its
-status in the status row; one without a body is an error page.
+mark dropped; other charsets are a later increment. Control
+characters other than the tab (C0, DEL and C1), which prose would show
+as U+FFFD, are dropped before the page is wrapped, a CR before an LF
+among them. Markup past `MAX_MARKUP` (2 MiB) and text past `MAX_TEXT`
+(4 MiB) are not rendered, a page keeps at most `MAX_LINES` (100,000)
+logical lines and a rendering lays out and keeps as many wrapped ones
+however narrow it is, an unwrapped line at most `MAX_PRE_CHARS`
+characters, and the status row says when any of these cut the page
+short. A status other than `2xx` with a body is shown with its status
+in the status row; one without a body is an error page.
 
-Each character takes one cell: td-html's own stroke marks are dropped
-from struck text, which td-web strikes itself, but a wide character or
-a combining mark still takes one cell of its own, and a preformatted
-line wider than the page is cut at its edge (§10). From increment 5 a
-character takes its face's advance instead, and a combining mark its
-own, zero in Noto's faces.
+td-html builds a rendering whole before td-web cuts it, so the markup
+bound is what bounds that work, which runs on a fetch thread, one
+rendering or picture decoding at a time across them (`RENDERING`).
+Measured on a development host, a hostile page of empty paragraphs at
+the bound costs there about 0.38 s and some 260 MB at its peak. td-html
+renders a quote's or list's content and then each of its lines again
+with the prefix a run of its own, at every level, so nesting
+multiplies that work: 2 MiB of short paragraphs inside eight quotes
+costs about 1.5 s and 750 MB, inside fifteen 3.3 s and 1.7 GB, and at
+td-html's nesting limit (some 62 levels) about 27 s and 11 GB, far
+past td-web's `memory-max` (§3, §10). What runs on the window's thread
+is the wrap, at each width and body face, at most `MAX_LINES` lines
+laid out. Measured there, with the page and wrap kept: the costliest
+of the 2 MiB pages tried, short paragraphs inside 62 quotes, each line
+repeating 124 characters of marks, takes about 0.53 s and keeps
+140 MB (23 MB of page, 116 MB of wrap) at 2000 px or wider, though
+td-web's jail ends the rendering before it (§3). Below that, a list of
+eight-word items nested eight deep takes about 0.2 s and keeps 63 MB
+at 300 px and at 3840; one of eight-word items about 0.1 s and
+51 MB; one paragraph inside eight quotes at 300 px 92 ms and 46 MB;
+one word wrapped at the least width 87 ms and 31 MB, 60 MB more at
+its peak; one paragraph of `a a a` at that width 68 ms and 30 MB;
+100,000 empty paragraphs 13 ms and 19 MB. A
+paint walks only the lines shown, each up to the pane's edge, and
+draws at most eight glyphs at one pen (`MAX_STACKED`), so a pile of
+combining marks costs a walk rather than a glyph each (§10).
 
-The rendered page is td-web's own model, a list of lines of styled runs
-with link targets, independent of how it was produced: the first
-increments fill it from td-html's rich output, and the layout engine of
-§10 replaces that producer without changing the view above it.
+Each character takes the advance of the face that draws it: Noto's
+for body text, the monospace face's one advance for code, preformatted
+and plain text and for a scalar Noto lacks, a cell's for one neither
+has (drawn from Unifont), and a combining mark its own, zero in Noto's
+faces. Text is unkerned and unshaped (td-ui/DESIGN.md, "Proportional
+faces"). td-html's own stroke marks are dropped from struck text, which
+td-web strikes itself over each glyph's extent.
+
+td-html lays the page out unwrapped and in characters. td-web hangs a
+wrapped line from what td-html starts it with, as it does a list, a
+nested list, a quote, a heading or a definition: whole runs, at most
+256 characters, each holding only spaces, a quote's mark (`> `), a
+heading's (one to six `#` and a space) and a list's marker (`*`, `-`,
+`+`, `•`, `◦` or `▪` and a space, or digits, after a `-` or not, then
+`.` or `)` and a space), in any order. The rest of the line is wrapped
+at the width less that prefix's, measured as the line is, and every
+line of it starts that far in: the first after the whole prefix, each
+continuation after the quote's and heading's marks alone, drawn where
+the first line has them, and no list marker, one piece for each run
+of them however deeply they nest. A prefix wider than half
+the width does not hang, so the text keeps room. Marks that share a
+run with text, as every line of plain text does, do not hang; but
+td-html's rich output gives each word of a paragraph a run of its own,
+so a paragraph of the document's own that begins `> `, `# ` or `- `
+hangs as td-html's structure does, which nothing in that output tells
+apart. What else td-html lays out by width does not carry into pixels:
+a table's columns, padded with spaces between box-drawing rules, line
+up only on the cell, which is why its lines are not wrapped, and a
+rule is three dashes (§10).
+
+The rendered page is td-web's own model, independent of how it was
+produced: a page of logical lines of styled runs with link targets,
+filled once from td-html's rich output, and its rendering, those lines
+wrapped into prose lines whose pieces carry their run's link as their
+tag. The layout engine of §10 replaces that producer without changing
+the view above it.
 
 ## 6. State
 
@@ -263,22 +337,32 @@ else its URL, then ` - td-web`.
 | `Ctrl+F`, `/` | find in page; `Enter`/`Shift+Enter`, then `n`/`N`, next/previous |
 | `Up`, `Down`, `PageUp`, `PageDown`, `Space`, `Home`, `End` | scroll |
 | `Ctrl+C` | copy the address or find row's selection while it has focus, else the focused link's URL, else the page's |
+| `F8` | body text in Noto Sans or Noto Serif, for this run |
 | `Ctrl+Q`, `Ctrl+W` | close |
 | `?`, `F1` | the key list (`F1` is the window's own) |
 
 A click on a link follows it, the pointer over one says where it goes,
-and the wheel scrolls. A navigation's fetch and its decoding, a
-picture's included, run on a thread of its own, so the window stays
-responsive while a page loads, and `Escape` on the page stops waiting
-for it; rendering at the page's width, again on a resize, is the
-window's. A stopped fetch runs on until the service answers or times
-out, so td-web keeps at most `MAX_WORKERS` (4) fetches out, stopped
-ones included, and asks the person to wait past that; a navigation
-overtaken by another is stopped. The history keeps at most 100 pages
-each way, and moves only when a page arrives: a step back or forward
-that is stopped, refused or overtaken leaves it as it was. A resize
-keeps the focused link and what find marked. There is no text selection
-in the page yet.
+and the wheel scrolls; which link a point is on is the piece of its
+line under it, by pixel, never in the inset left of the lines or on a
+line not shown whole. Find matches within a line, across its runs and
+ignoring case, and marks each match by the pixels its glyphs span. A
+navigation's fetch and its decoding, a picture's and a page's
+rendering into logical lines included, run on a thread of its own, so
+the window stays responsive while a page loads, and `Escape` on the
+page stops waiting for it; wrapping at the page's width, again on a
+resize or `F8`, is the window's. A stopped fetch runs on until the
+service answers or times out, so td-web keeps at most `MAX_WORKERS` (4)
+fetches out, stopped ones included, and asks the person to wait past
+that; a navigation overtaken by another is stopped. The history keeps
+at most 100 pages each way, each at the text its top line began with,
+and moves only when a page arrives: a step back or forward that is
+stopped, refused or overtaken leaves it as it was. A resize or `F8`
+keeps the text at the top, inside a long paragraph too, and the
+focused link; find's marks are made again on the new lines, the
+current match's index kept as far as there are as many matches,
+without moving to it. Coming back to a page opens it
+at the text its top line began with, however it is wrapped now. There
+is no text selection in the page yet.
 
 ## 9. Increments
 
@@ -300,7 +384,7 @@ in the page yet.
    says, hit testing, find and link focus by pixel, `F8` between Sans
    and Serif (not kept), and the faces loaded at startup beside the
    monospace one, a missing one said once and the page drawn on the
-   cell.
+   cell. Landed.
 
 ## 10. Roadmap (not normative)
 
@@ -324,7 +408,11 @@ order; each is its own design amendment when it starts:
   Firefox alone; td-web's account owns no file of the human's.
 - **Driving.** td-ui's control socket (td-ui/DESIGN.md), so a test or an
   agent can operate td-web through the verbs td-ui's other programs
-  take, and an oracle can boot it in the image.
+  take, and an oracle can boot it in the image. Reading a page back
+  needs td-ui's prose-aware read-back first (td-ui/DESIGN.md,
+  "Proportional faces", "Not yet"): its seam reads the cell grid, and
+  over proportional faces narrow glyphs share a cell, so the text it
+  reads is not the text drawn.
 - **Boot evidence**: a `[web-evidence]` unit, as news's, that probes
   the running jail's process token and filter as tda65540 and prints a
   marker main's system boot requires, so a launch path broken by the
@@ -333,12 +421,21 @@ order; each is its own design amendment when it starts:
   binary, as mail's and news's were (APPLICATIONS.md, "Per-application
   allowlists"); it parses the most hostile input of td's programs.
 - **Text selection** in the page, and copying it.
-- **Bounded rendering**: a line limit inside td-html's rich output, and
-  rendering off the window's thread, so a hostile page costs neither
-  the memory nor the pause §5 states.
-- **Wide text**: horizontal scrolling for preformatted lines, and cells
-  by character width (td-html already counts wide characters as two and
-  combining marks as none).
+- **Bounded rendering**: the rendering is off the window's thread and
+  one at a time, but td-html still builds it whole before td-web keeps
+  `MAX_LINES` of it, so a hostile page costs a fetch thread the memory
+  and time §5 states, and one nesting quotes or lists around many short
+  lines more than td-web's jail allows; td-html adding each enclosing
+  prefix once as it emits a line, rather than rendering every level
+  again, and a line limit inside its rich output would bound it. The
+  window's thread wraps the page at each width up to `MAX_LINES`
+  lines, an unwrapped line only to `MAX_PRE_CHARS`:
+  wrapping only the lines near those shown would bound that pause
+  further.
+- **Wide text**: horizontal scrolling for preformatted lines, with
+  the rest of a line past `MAX_PRE_CHARS` kept for it; table columns
+  and rules laid out in pixels rather than td-html's characters, until
+  the layout engine above replaces it.
 - **Toward replacing Firefox.** Script (an interpreter, §2),
   bidirectional text and shaping, a per-site process model (which td-jail
   does not offer today: one jail, no nested namespaces), and becoming a

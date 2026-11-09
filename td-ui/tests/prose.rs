@@ -32,8 +32,8 @@ use td_ui::face_file::Family;
 use td_ui::font::pinned;
 use td_ui::pinned_face::{load_styled_in, prose_from, prose_in, prose_in_or_note};
 use td_ui::prose::{
-    draw, wrap, Faces, Line, LineBox, Metrics, Refused, Run, Source, CELL_BASELINE, OVERHANG, SIZE,
-    UNIT,
+    draw, wrap, wrap_at_most, Faces, Line, LineBox, Metrics, Refused, Run, Source, CELL_BASELINE,
+    OVERHANG, SIZE, UNIT,
 };
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, TextFamily,
@@ -302,6 +302,25 @@ fn on_the_cell_wrap_breaks_after_a_space_and_inside_a_word_too_long() {
     let lines = wrap(&mut metrics, &runs, 80);
     let scalars: String = lines[0].glyphs.iter().map(|g| g.scalar).collect();
     assert_eq!(scalars, "a b\u{fffd}");
+}
+
+#[test]
+fn wrap_at_most_stops_at_its_lines_and_they_are_wraps_first() {
+    let mut metrics = Metrics::new(None, scale(1));
+    let text = "ab cd\nef gh ijklmnop\n\nq";
+    let runs = [run(text, TextFamily::Sans, 0)];
+    let all = wrap(&mut metrics, &runs, 24);
+    assert_eq!(all.len(), 9);
+    for most in 0..=all.len() + 2 {
+        let some = wrap_at_most(&mut metrics, &runs, 24, most);
+        assert_eq!(some, all[..most.min(all.len())], "{most}");
+    }
+    // However long the text, a narrow width lays out only what is kept.
+    let long = "x".repeat(100_000);
+    let runs = [run(&long, TextFamily::Sans, 0)];
+    let lines = wrap_at_most(&mut metrics, &runs, 1, 3);
+    assert_eq!(lines.len(), 3);
+    assert!(lines.iter().all(|line| line.glyphs.len() == 1));
 }
 
 #[test]

@@ -428,11 +428,11 @@ of its own files may name each module.
   faces), `Metrics` (`new` over optional faces at a `Scale`, `scale`,
   `proportional`, `line`, `advance`, `source` and `width`), `LineBox`
   (`height`, `baseline`), `Source` (`Cell`, `Family`, `Mono`,
-  `Bitmap`), `Run` (`text`, `style`, `tag`), `wrap`, `Line` (`width`,
-  `pieces`, `glyphs`, and `hit`), `Piece` (`run`, `tag`, `style`,
-  `text`, `left`, `right`, `glyphs`), `Placed` (`x`, `scalar`), `draw`,
-  `shown`, and `SIZE`, `CELL_BASELINE`, `UNIT`, `OVERHANG` and
-  `MAX_MEASURES`; pure,
+  `Bitmap`), `Run` (`text`, `style`, `tag`), `wrap`, `wrap_at_most`,
+  `Line` (`width`, `pieces`, `glyphs`, and `hit`), `Piece` (`run`,
+  `tag`, `style`, `text`, `left`, `right`, `glyphs`), `Placed` (`x`,
+  `scalar`), `draw`, `shown`, and `SIZE`, `CELL_BASELINE`, `UNIT`,
+  `OVERHANG` and `MAX_MEASURES`; pure,
   under "Proportional faces".
 - `face_file`: `DIR`, `INSTALLED` (the same directory under the XDG
   data home) and the four styles' file names (`REGULAR`, `BOLD`,
@@ -4098,9 +4098,9 @@ glyphs it shows, once.
 ## Proportional faces
 
 **Status: increments 38 and 39 landed: the faces are pinned, delivered,
-found and loaded, and td-ui measures, wraps and draws prose in them; no
-program draws prose yet. td-web's increment 5 (td-web/DESIGN.md §9),
-its first consumer, is design.** Every face above lays text on a
+found and loaded, and td-ui measures, wraps and draws prose in them.
+td-web, its first consumer, draws its pages in prose (td-web/DESIGN.md
+§5, its increment 5).** Every face above lays text on a
 cell: one advance for every scalar, glyphs clipped to it. Prose reads
 better in a face whose glyphs take their own widths, and td-web, which
 shows documents, needs one. This section adds two proportional families
@@ -4271,6 +4271,9 @@ whole line's inside its damage. The raster clips the rest. On the cell
 a line's draw stream
 is exactly `text_run`'s of its text. Wrapping is bounded by its input: a
 consumer caps what it hands over, as td-web caps its rendering.
+`wrap_at_most` is `wrap`'s first lines up to a count, and stops laying
+out once it has them, so a consumer keeping a bounded number of lines
+pays for no more however narrow the width or long the text.
 
 The default size is `SIZE`, 16 pixels per em at scale 1, the device size
 the scale times that; its line is 22 pixels with the baseline at 17.
