@@ -31,6 +31,8 @@ const GIT_LINUX_FIRMWARE: &str =
     "https://gitlab.com/kernel-firmware/linux-firmware.git/info/refs?service=git-upload-pack";
 const GIT_NERD_FONTS: &str =
     "https://github.com/ryanoasis/nerd-fonts.git/info/refs?service=git-upload-pack";
+const GIT_NOTO_LATIN_GREEK_CYRILLIC: &str =
+    "https://github.com/notofonts/latin-greek-cyrillic.git/info/refs?service=git-upload-pack";
 const GIT_RIPGREP: &str =
     "https://github.com/BurntSushi/ripgrep.git/info/refs?service=git-upload-pack";
 const GIT_ZLIB: &str = "https://github.com/madler/zlib.git/info/refs?service=git-upload-pack";
@@ -48,6 +50,16 @@ const INTEL_MICROCODE: Watch = Watch::Index {
 const NERD_FONTS: Watch = Watch::Index {
     index: GIT_NERD_FONTS,
     pattern: "refs/tags/v{}",
+};
+// The source repository tags each family's release; the faces are pinned at
+// the distribution repository's commit that published it.
+const NOTO_SANS: Watch = Watch::Index {
+    index: GIT_NOTO_LATIN_GREEK_CYRILLIC,
+    pattern: "refs/tags/NotoSans-v{}",
+};
+const NOTO_SERIF: Watch = Watch::Index {
+    index: GIT_NOTO_LATIN_GREEK_CYRILLIC,
+    pattern: "refs/tags/NotoSerif-v{}",
 };
 
 const WATCHES: &[(&str, Watch)] = &[
@@ -82,6 +94,15 @@ const WATCHES: &[(&str, Watch)] = &[
     ("nerd-fonts-powerline-extra-license-source", NERD_FONTS),
     ("nerd-fonts-powerline-symbols-license-source", NERD_FONTS),
     ("nerd-fonts-weather-icons-license-source", NERD_FONTS),
+    ("noto-sans-regular-source", NOTO_SANS),
+    ("noto-sans-bold-source", NOTO_SANS),
+    ("noto-sans-italic-source", NOTO_SANS),
+    ("noto-sans-bold-italic-source", NOTO_SANS),
+    ("noto-serif-regular-source", NOTO_SERIF),
+    ("noto-serif-bold-source", NOTO_SERIF),
+    ("noto-serif-italic-source", NOTO_SERIF),
+    ("noto-serif-bold-italic-source", NOTO_SERIF),
+    ("noto-fonts-license-source", NOTO_SANS),
     ("intel-microcode-source", INTEL_MICROCODE),
     ("linux-firmware-iwlwifi-6000g2a-source", LINUX_FIRMWARE),
     ("linux-firmware-iwlwifi-7260-source", LINUX_FIRMWARE),

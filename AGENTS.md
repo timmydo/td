@@ -181,8 +181,10 @@ account's cache (§W.9).
 ## Pinned upstream data
 
 Some data td takes as upstream built rather than rebuilding it from
-source: curl's rendering of Mozilla's trust store, and the Nerd Fonts
-JetBrains Mono release, whose compiled TrueType faces td-ui parses. Such
+source: curl's rendering of Mozilla's trust store, the Nerd Fonts
+JetBrains Mono release, and Noto Sans and Noto Serif from Noto's
+release,
+whose compiled TrueType faces td-ui parses. Such
 a pin carries a reviewed URL and SHA-256 like any source, and stays
 unmarked because nothing executes, links, or loads it as code: td's
 builder copies it into zone-one outputs, and td-built programs parse it

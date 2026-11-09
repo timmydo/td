@@ -84,9 +84,18 @@ is ported.
 
 Read a `-> NEW` as "upstream has released NEW", then decide:
 
-- A Git-tag watch (zlib, Nerd Fonts, the ripgrep
+- A Git-tag watch (zlib, Nerd Fonts, Noto, the ripgrep
   seed) can see a tag before its release tarball exists. Fetch the tarball
   before trusting the tag.
+- Noto's watches read the source repository's `NotoSans-v` and
+  `NotoSerif-v` tags, but its faces are pinned at the distribution
+  repository (`notofonts/notofonts.github.io`) commit that published
+  that release, and its licence at the Sans tag. Each family follows its
+  own tag: a bump finds the distribution commit that published it and
+  moves that family's four pins (and the licence, with Sans) to it,
+  keeping the other family's version and commit where they are, so its
+  watch still reads current. Both families at one release move all
+  nine.
 
 Each watch is a row in `recipes/src/source_watches.rs`: an index URL and a
 pattern in which `{}` stands for the version. A `PointReleases` watch (the
@@ -109,7 +118,7 @@ takes.
 # Source pins
 
 One pin, or one tight group (the four Rust components, the Nerd Fonts archive
-and its licences), per commit.
+and its licences, Noto's eight faces and their licence), per commit.
 
 1. Edit the `PinDef` in `recipes/src/source_pins.rs`: `url`, `file`,
    `version` and `sha256`. Also change any version the pin's comment or
@@ -131,8 +140,10 @@ and its licences), per commit.
 
    Where upstream publishes only a signature (tzdata), verify
    it with the maintainer's key, then hash the verified bytes. Where it
-   publishes neither (json-c's S3 tarball, LVM2's sha512 list, popt), hash
-   the download and cross-check it against a second upstream copy or digest.
+   publishes neither (json-c's S3 tarball, LVM2's sha512 list, popt, Noto's
+   files at a repository commit), hash the download and cross-check it
+   against a second upstream copy or digest (for Noto, the same file in
+   that family's GitHub release archive).
    Name the source of each hash in the commit message.
 
 3. Find every other place that restates the old version, and change each

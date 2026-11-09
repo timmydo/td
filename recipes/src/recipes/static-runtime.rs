@@ -1,13 +1,15 @@
 use super::jetbrains_mono_nerd_font::DIR as FONT_DIR;
+use super::noto_fonts::DIR as PROSE_DIR;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 /// Data for source-built static applications; no loader or executable ABI.
-/// The outline face sits under `files/etc/fonts`, a real directory td-jail
-/// binds at `/etc/fonts`, so a jailed td-ui program reads it at the name the
-/// image's `/etc/fonts/jetbrains-mono-nerd` gives an unjailed one.
+/// td-ui's faces sit under `files/etc/fonts`, a real directory td-jail
+/// binds at `/etc/fonts`, so a jailed td-ui program reads each at the name
+/// the image's `/etc/fonts/jetbrains-mono-nerd` and `/etc/fonts/noto` give
+/// an unjailed one.
 pub fn recipe() -> Recipe {
     Recipe::mesboot("static-runtime", "1")
-        .inputs(&["tzdata", "jetbrains-mono-nerd-font"])
+        .inputs(&["tzdata", "jetbrains-mono-nerd-font", "noto-fonts"])
         .steps(vec![
             Step::CopyTree {
                 from: "{in:tzdata}/share/zoneinfo".into(),
@@ -21,6 +23,10 @@ pub fn recipe() -> Recipe {
                 from: format!("{{in:jetbrains-mono-nerd-font}}/{FONT_DIR}"),
                 dest: "{out}/files/etc/fonts/jetbrains-mono-nerd".into(),
             },
+            Step::CopyTree {
+                from: format!("{{in:noto-fonts}}/{PROSE_DIR}"),
+                dest: "{out}/files/etc/fonts/noto".into(),
+            },
             Step::Require {
                 paths: vec![
                     "{out}/files/share/zoneinfo/Etc/UTC".into(),
@@ -29,6 +35,9 @@ pub fn recipe() -> Recipe {
                     "{out}/files/etc/fonts/jetbrains-mono-nerd/JetBrainsMonoNerdFontMono-Regular.ttf"
                         .into(),
                     "{out}/files/etc/fonts/jetbrains-mono-nerd/OFL.txt".into(),
+                    "{out}/files/etc/fonts/noto/NotoSans-Regular.ttf".into(),
+                    "{out}/files/etc/fonts/noto/NotoSerif-Regular.ttf".into(),
+                    "{out}/files/etc/fonts/noto/OFL.txt".into(),
                 ],
                 exec: false,
             },
@@ -44,24 +53,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn static_runtime_contains_only_timezone_data_and_the_outline_face() {
+    fn static_runtime_contains_only_timezone_data_and_td_uis_faces() {
         let recipe = recipe();
         assert!(!recipe.is_foreign());
         assert_eq!(
             recipe.inputs,
-            Some(vec!["tzdata".into(), "jetbrains-mono-nerd-font".into()])
+            Some(vec![
+                "tzdata".into(),
+                "jetbrains-mono-nerd-font".into(),
+                "noto-fonts".into()
+            ])
         );
         let steps = recipe.steps.as_deref().unwrap_or_default();
         assert!(
             matches!(steps, [Step::CopyTree { from: zones, dest: zone_dest },
             Step::CopyTree { from: docs, dest: doc_dest },
-            Step::CopyTree { from: face, dest: face_dest }, Step::Require { exec: false, .. }]
+            Step::CopyTree { from: face, dest: face_dest },
+            Step::CopyTree { from: prose, dest: prose_dest }, Step::Require { exec: false, .. }]
             if zones == "{in:tzdata}/share/zoneinfo"
                 && zone_dest == "{out}/files/share/zoneinfo"
                 && docs == "{in:tzdata}/share/doc/tzdata"
                 && doc_dest == "{out}/files/share/doc/tzdata"
                 && face == "{in:jetbrains-mono-nerd-font}/share/fonts/jetbrains-mono-nerd"
-                && face_dest == "{out}/files/etc/fonts/jetbrains-mono-nerd")
+                && face_dest == "{out}/files/etc/fonts/jetbrains-mono-nerd"
+                && prose == "{in:noto-fonts}/share/fonts/noto"
+                && prose_dest == "{out}/files/etc/fonts/noto")
         );
     }
 }

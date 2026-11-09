@@ -139,6 +139,85 @@ const PINS: &[PinDef] = &[
         version: "3.5.1",
     },
     PinDef {
+        key: "noto-sans-regular-source",
+        aliases: &[],
+        // Pinned upstream data (AGENTS.md): Noto Sans and Noto Serif 2.015,
+        // the static unhinted TrueType faces of Noto's distribution
+        // repository at its commit, which td-ui parses and never runs;
+        // noto-fonts copies them and builds nothing.
+        url: "https://raw.githubusercontent.com/notofonts/notofonts.github.io/28b15b4b43b7bed62b5cf6e6b0b5ff5846270535/fonts/NotoSans/unhinted/ttf/NotoSans-Regular.ttf",
+        sha256: "f3961a9cde016d41a4879aecda1474d3a36d6bf54fa0e4643de029cc2248b0e8",
+        file: "noto-sans-2.015-Regular.ttf",
+        version: "2.015",
+    },
+    PinDef {
+        key: "noto-sans-bold-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/notofonts/notofonts.github.io/28b15b4b43b7bed62b5cf6e6b0b5ff5846270535/fonts/NotoSans/unhinted/ttf/NotoSans-Bold.ttf",
+        sha256: "87cb2d84472a7d66da659ee47b6cdb9552326e8c128245231f191b6ac72529d9",
+        file: "noto-sans-2.015-Bold.ttf",
+        version: "2.015",
+    },
+    PinDef {
+        key: "noto-sans-italic-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/notofonts/notofonts.github.io/28b15b4b43b7bed62b5cf6e6b0b5ff5846270535/fonts/NotoSans/unhinted/ttf/NotoSans-Italic.ttf",
+        sha256: "678288f868807d4d64a6f3b51466871d117d915780381ce9d0ed4b3bcbd06d37",
+        file: "noto-sans-2.015-Italic.ttf",
+        version: "2.015",
+    },
+    PinDef {
+        key: "noto-sans-bold-italic-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/notofonts/notofonts.github.io/28b15b4b43b7bed62b5cf6e6b0b5ff5846270535/fonts/NotoSans/unhinted/ttf/NotoSans-BoldItalic.ttf",
+        sha256: "3d367743f371f28671d2764e911a53d7c20ec9b6aa8791d059e7090389fc52a5",
+        file: "noto-sans-2.015-BoldItalic.ttf",
+        version: "2.015",
+    },
+    PinDef {
+        key: "noto-serif-regular-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/notofonts/notofonts.github.io/28b15b4b43b7bed62b5cf6e6b0b5ff5846270535/fonts/NotoSerif/unhinted/ttf/NotoSerif-Regular.ttf",
+        sha256: "a15cfbbc1539d707115111d672d590a3d70d4f74b4c0a315956da20ae19a14e1",
+        file: "noto-serif-2.015-Regular.ttf",
+        version: "2.015",
+    },
+    PinDef {
+        key: "noto-serif-bold-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/notofonts/notofonts.github.io/28b15b4b43b7bed62b5cf6e6b0b5ff5846270535/fonts/NotoSerif/unhinted/ttf/NotoSerif-Bold.ttf",
+        sha256: "24ad531e6b05ddad8c3d89572d2c93eb86a6b74e652ce7ee3c3e171de68e84c3",
+        file: "noto-serif-2.015-Bold.ttf",
+        version: "2.015",
+    },
+    PinDef {
+        key: "noto-serif-italic-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/notofonts/notofonts.github.io/28b15b4b43b7bed62b5cf6e6b0b5ff5846270535/fonts/NotoSerif/unhinted/ttf/NotoSerif-Italic.ttf",
+        sha256: "c4b3c971741ecdb40f5a443bce754e8fe91efe761b6ea10c92be7c3597cdadc4",
+        file: "noto-serif-2.015-Italic.ttf",
+        version: "2.015",
+    },
+    PinDef {
+        key: "noto-serif-bold-italic-source",
+        aliases: &[],
+        url: "https://raw.githubusercontent.com/notofonts/notofonts.github.io/28b15b4b43b7bed62b5cf6e6b0b5ff5846270535/fonts/NotoSerif/unhinted/ttf/NotoSerif-BoldItalic.ttf",
+        sha256: "1bc4f86502eaa368718f6192bee022ea9a703d5af1c18b7d291212657b63074a",
+        file: "noto-serif-2.015-BoldItalic.ttf",
+        version: "2.015",
+    },
+    PinDef {
+        key: "noto-fonts-license-source",
+        aliases: &[],
+        // The SIL Open Font License both families are under, from the source
+        // repository at the release's tag; its text is the same at the
+        // NotoSerif-v2.015 tag.
+        url: "https://raw.githubusercontent.com/notofonts/latin-greek-cyrillic/NotoSans-v2.015/OFL.txt",
+        sha256: "cee9892f9f0cc8fe882c9e9537ee6a89621d86ee7ceaf70b02e2b2b1c25c061a",
+        file: "noto-fonts-2.015-OFL.txt",
+        version: "2.015",
+    },
+    PinDef {
         key: "linux-firmware-amdgpu-dcn-3-1-4-dmcub-source",
         aliases: &[],
         version: "20261019",
@@ -1300,7 +1379,7 @@ mod tests {
 
     #[test]
     fn catalog_carries_all_legacy_source_locks() {
-        assert_eq!(all().len(), 119);
+        assert_eq!(all().len(), 128);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

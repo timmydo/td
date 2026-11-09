@@ -275,12 +275,14 @@ fn source_inventory_and_shared_mounts_are_closed() {
         }
         if name == "face_file.rs" {
             // One file opened, checked and bounded before it is read; a
-            // search that only lists directories and looks at the regular
-            // style's name, over places built from the image's directory,
-            // the installed one and the XDG font roots; three environment
-            // values; nothing written.
+            // search that only lists directories and looks at a family's
+            // regular style's name, over places built from the family's
+            // image directory, its installed one and the XDG font roots;
+            // three environment values; nothing written.
             assert!(text.contains("pub const DIR: &str = \"/etc/fonts/jetbrains-mono-nerd\";"));
             assert!(text.contains("pub const INSTALLED: &str = \"fonts/jetbrains-mono-nerd\";"));
+            assert!(text.contains("pub const NOTO_DIR: &str = \"/etc/fonts/noto\";"));
+            assert!(text.contains("pub const NOTO_INSTALLED: &str = \"fonts/noto\";"));
             assert_eq!(compact.matches(".open(&path)").count(), 1);
             assert!(compact
                 .contains("OpenOptions::new().read(true).custom_flags(O_NONBLOCK).open(&path)"));
@@ -288,7 +290,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
             assert_eq!(compact.matches("file.metadata()").count(), 1);
             assert_eq!(compact.matches("fs::metadata(").count(), 2);
             assert_eq!(
-                compact.matches("fs::metadata(dir.join(REGULAR))").count(),
+                compact.matches("fs::metadata(dir.join(regular))").count(),
                 1
             );
             assert_eq!(compact.matches("fs::read_dir(").count(), 1);
@@ -304,9 +306,9 @@ fn source_inventory_and_shared_mounts_are_closed() {
                     "\".fonts\"",
                     "\".local/share\"",
                     "\"fonts\"",
-                    "INSTALLED",
-                    "REGULAR",
+                    "family.installed",
                     "name",
+                    "regular",
                 ]),
                 "the paths face_file builds"
             );

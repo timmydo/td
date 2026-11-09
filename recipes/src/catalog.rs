@@ -85,8 +85,42 @@ pub fn recipe_source_digest(stem: &str) -> Option<&'static str> {
 }
 
 /// The outline face's recipe, whose install plan `install-fonts-plan`
-/// prints.
+/// prints first.
 pub use registry::jetbrains_mono_nerd_font as outline_face;
+
+/// The proportional faces' recipe, whose install plan follows the
+/// outline face's.
+pub use registry::noto_fonts as prose_faces;
+
+/// What `td-builder install-fonts` installs: each face recipe's plan in
+/// turn, every face's block opening with its `dir` line.
+pub fn install_fonts_plan() -> Result<Vec<String>, String> {
+    let mut lines = outline_face::install_plan()?;
+    lines.extend(prose_faces::install_plan()?);
+    Ok(lines)
+}
+
+#[cfg(test)]
+mod install_fonts_plan_tests {
+    /// The builder refuses faces at one directory or one inside another;
+    /// the recipes' plans together must never ask for that.
+    #[test]
+    fn the_faces_install_into_distinct_unnested_directories() {
+        let plan = super::install_fonts_plan().unwrap();
+        let dirs: Vec<&str> = plan
+            .iter()
+            .filter_map(|line| line.strip_prefix("dir\t"))
+            .collect();
+        assert_eq!(dirs, ["fonts/jetbrains-mono-nerd", "fonts/noto"]);
+        for (i, a) in dirs.iter().enumerate() {
+            for b in dirs.iter().skip(i + 1) {
+                assert!(
+                    a != b && !b.starts_with(&format!("{a}/")) && !a.starts_with(&format!("{b}/"))
+                );
+            }
+        }
+    }
+}
 
 mod registry {
     include!(concat!(env!("OUT_DIR"), "/registry.rs"));

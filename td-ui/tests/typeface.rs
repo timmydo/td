@@ -14,6 +14,10 @@
 //! directory over trees the test writes.
 
 mod fonts;
+// The shared temporary-tree guard (AGENTS.md "Parallel work"), compiled
+// in because td-ui, the leaf, names no dependency.
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod temp_dir;
 
 use std::ffi::OsStr;
 use std::fs;
@@ -23,8 +27,8 @@ use fonts::{Builder, Glyph, Segment};
 use td_ui::atlas::{Slot, Style};
 use td_ui::face::{Face, Sizing};
 use td_ui::face_file::{
-    find, places, Place, BOLD, BOLD_ITALIC, DIR, INSTALLED, INSTALL_HINT, ITALIC, REGULAR,
-    SEARCH_DEPTH, SEARCH_ENTRIES,
+    find, places, Family, Place, BOLD, BOLD_ITALIC, DIR, INSTALLED, INSTALL_HINT, ITALIC, NOTO_DIR,
+    NOTO_INSTALLED, REGULAR, SEARCH_DEPTH, SEARCH_ENTRIES,
 };
 use td_ui::font::pinned;
 use td_ui::notices::OUTLINE_FACE;
@@ -321,6 +325,82 @@ fn the_places_are_the_image_the_install_and_the_font_roots_in_order() {
         places(None, os("/d"), None),
         places(os("rel"), os("/d"), None)
     );
+}
+
+#[test]
+fn each_family_is_looked_for_in_its_own_directories_then_the_shared_roots() {
+    fn os(value: &str) -> Option<&OsStr> {
+        Some(OsStr::new(value))
+    }
+    let place = |dir: &str, depth: usize| Place {
+        dir: dir.into(),
+        depth,
+    };
+    // The monospace family is the constants every existing caller names.
+    assert_eq!(
+        Family::MONO,
+        Family {
+            dir: DIR,
+            installed: INSTALLED,
+            regular: REGULAR,
+            bold: BOLD,
+            italic: ITALIC,
+            bold_italic: BOLD_ITALIC,
+        }
+    );
+    assert_eq!(
+        Family::MONO.places(os("/h"), None, None),
+        places(os("/h"), None, None)
+    );
+    assert_eq!(
+        (NOTO_DIR, NOTO_INSTALLED),
+        ("/etc/fonts/noto", "fonts/noto")
+    );
+    for (family, stem) in [(Family::SANS, "NotoSans"), (Family::SERIF, "NotoSerif")] {
+        assert_eq!((family.dir, family.installed), (NOTO_DIR, NOTO_INSTALLED));
+        assert_eq!(
+            [
+                family.regular,
+                family.bold,
+                family.italic,
+                family.bold_italic
+            ],
+            ["Regular", "Bold", "Italic", "BoldItalic"].map(|style| format!("{stem}-{style}.ttf"))
+        );
+        assert_eq!(
+            family.places(os("/h"), None, None),
+            [
+                place("/etc/fonts/noto", 0),
+                place("/h/.local/share/fonts/noto", 0),
+                place("/h/.local/share/fonts", SEARCH_DEPTH),
+                place("/h/.fonts", SEARCH_DEPTH),
+                place("/usr/local/share/fonts", SEARCH_DEPTH),
+                place("/usr/share/fonts", SEARCH_DEPTH),
+            ]
+        );
+    }
+}
+
+#[test]
+fn a_familys_search_takes_the_directory_holding_its_own_regular_style() {
+    let temp = temp_dir::TempDir::new("td-ui-family").unwrap();
+    let base = temp.path().to_path_buf();
+    let root = base.join("fonts");
+    let mono = face_in(&root.join("a-mono"));
+    let noto = root.join("b-noto");
+    fs::create_dir_all(&noto).unwrap();
+    fs::write(noto.join(Family::SANS.regular), font()).unwrap();
+    let order = [walked(&root)];
+    assert_eq!(Family::MONO.find(&order).unwrap(), mono);
+    assert_eq!(find(&order).unwrap(), mono);
+    assert_eq!(Family::SANS.find(&order).unwrap(), noto);
+    // Serif's regular style is not Sans's: none is found, and the error
+    // names the style looked for.
+    let missing = Family::SERIF.find(&order).unwrap_err();
+    assert!(missing.starts_with(Family::SERIF.regular), "{missing}");
+    fs::write(noto.join(Family::SERIF.regular), font()).unwrap();
+    assert_eq!(Family::SERIF.find(&order).unwrap(), noto);
+    temp.cleanup().unwrap();
 }
 
 #[test]

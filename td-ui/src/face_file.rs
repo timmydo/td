@@ -1,8 +1,8 @@
-//! The pinned outline face's files: the one directory both the image and a
-//! jailed program's runtime give it (td-ui/DESIGN.md, "Delivery and trust
-//! position"), the host directories a program run outside the image looks
-//! in, its styles' names, and the bounded read of one of them.
-//! `pinned_face` reads through it.
+//! The pinned faces' files: the one directory both the image and a jailed
+//! program's runtime give each family (td-ui/DESIGN.md, "Delivery and trust
+//! position" and "Proportional faces"), the host directories a program run
+//! outside the image looks in, its styles' names, and the bounded read of
+//! one of them. `pinned_face` reads the monospace family through it.
 
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -20,6 +20,77 @@ pub const REGULAR: &str = "JetBrainsMonoNerdFontMono-Regular.ttf";
 pub const BOLD: &str = "JetBrainsMonoNerdFontMono-Bold.ttf";
 pub const ITALIC: &str = "JetBrainsMonoNerdFontMono-Italic.ttf";
 pub const BOLD_ITALIC: &str = "JetBrainsMonoNerdFontMono-BoldItalic.ttf";
+/// The proportional families' directory, Noto Sans and Noto Serif side by
+/// side.
+pub const NOTO_DIR: &str = "/etc/fonts/noto";
+/// The same directory under a host user's XDG data home.
+pub const NOTO_INSTALLED: &str = "fonts/noto";
+
+/// One family's files: the image's directory, the same under the XDG data
+/// home, and its four styles' names. The search looks for its regular
+/// style.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Family {
+    pub dir: &'static str,
+    pub installed: &'static str,
+    pub regular: &'static str,
+    pub bold: &'static str,
+    pub italic: &'static str,
+    pub bold_italic: &'static str,
+}
+
+impl Family {
+    /// The monospace face every cell consumer draws with.
+    pub const MONO: Family = Family {
+        dir: DIR,
+        installed: INSTALLED,
+        regular: REGULAR,
+        bold: BOLD,
+        italic: ITALIC,
+        bold_italic: BOLD_ITALIC,
+    };
+    pub const SANS: Family = Family {
+        dir: NOTO_DIR,
+        installed: NOTO_INSTALLED,
+        regular: "NotoSans-Regular.ttf",
+        bold: "NotoSans-Bold.ttf",
+        italic: "NotoSans-Italic.ttf",
+        bold_italic: "NotoSans-BoldItalic.ttf",
+    };
+    pub const SERIF: Family = Family {
+        dir: NOTO_DIR,
+        installed: NOTO_INSTALLED,
+        regular: "NotoSerif-Regular.ttf",
+        bold: "NotoSerif-Bold.ttf",
+        italic: "NotoSerif-Italic.ttf",
+        bold_italic: "NotoSerif-BoldItalic.ttf",
+    };
+
+    /// Where this family is looked for: `places` with its directories.
+    pub fn places(
+        self,
+        home: Option<&OsStr>,
+        data_home: Option<&OsStr>,
+        data_dirs: Option<&OsStr>,
+    ) -> Vec<Place> {
+        family_places(self, home, data_home, data_dirs)
+    }
+
+    /// `Family::places` from this process's environment.
+    pub fn host_places(self) -> Vec<Place> {
+        self.places(
+            std::env::var_os("HOME").as_deref(),
+            std::env::var_os("XDG_DATA_HOME").as_deref(),
+            std::env::var_os("XDG_DATA_DIRS").as_deref(),
+        )
+    }
+
+    /// `find` for this family's regular style.
+    pub fn find(self, places: &[Place]) -> Result<PathBuf, String> {
+        family_find(self, places)
+    }
+}
+
 /// The environment variable whose value a program passes to `wanted`;
 /// `bitmap` is the one value that changes anything.
 pub const SETTING: &str = "TD_UI_FACE";
@@ -46,8 +117,17 @@ pub struct Place {
     pub depth: usize,
 }
 
-/// Where the face is looked for, in order, given `HOME`, `XDG_DATA_HOME`
-/// and `XDG_DATA_DIRS`: `DIR`; `INSTALLED` under the data home
+/// Where the monospace face is looked for: `Family::MONO.places`.
+pub fn places(
+    home: Option<&OsStr>,
+    data_home: Option<&OsStr>,
+    data_dirs: Option<&OsStr>,
+) -> Vec<Place> {
+    Family::MONO.places(home, data_home, data_dirs)
+}
+
+/// Where `family` is looked for, in order, given `HOME`, `XDG_DATA_HOME`
+/// and `XDG_DATA_DIRS`: its `dir`; its `installed` under the data home
 /// (`XDG_DATA_HOME`, else `HOME/.local/share`); then, `SEARCH_DEPTH` deep,
 /// the font roots: the data home's `fonts`, `HOME/.fonts`, and `fonts`
 /// under each data directory (`XDG_DATA_DIRS`, else `/usr/local/share`
@@ -55,7 +135,8 @@ pub struct Place {
 /// ignored, as is a relative entry of `XDG_DATA_DIRS`, as the XDG base
 /// directory specification says; its defaults stand only for an unset or
 /// empty list. A repeated place is kept once.
-pub fn places(
+fn family_places(
+    family: Family,
     home: Option<&OsStr>,
     data_home: Option<&OsStr>,
     data_dirs: Option<&OsStr>,
@@ -75,8 +156,8 @@ pub fn places(
         None => vec!["/usr/local/share".into(), "/usr/share".into()],
     };
     let exact = [
-        Some(PathBuf::from(DIR)),
-        data_home.as_ref().map(|d| d.join(INSTALLED)),
+        Some(PathBuf::from(family.dir)),
+        data_home.as_ref().map(|d| d.join(family.installed)),
     ];
     let roots = [
         data_home.as_ref().map(|d| d.join("fonts")),
@@ -107,25 +188,27 @@ pub fn places(
 
 /// `places` from this process's environment.
 pub fn host_places() -> Vec<Place> {
-    places(
-        std::env::var_os("HOME").as_deref(),
-        std::env::var_os("XDG_DATA_HOME").as_deref(),
-        std::env::var_os("XDG_DATA_DIRS").as_deref(),
-    )
+    Family::MONO.host_places()
 }
 
-/// The first directory that holds `REGULAR` as a regular file: the places
-/// in order, each walked a level at a time, so a shallower directory wins,
-/// and each level in its parents' order and then name order. The walk reads
-/// at most `SEARCH_ENTRIES` directory entries in all and skips hidden
-/// names, and one entry past that bound ends every walk; it follows a
-/// symbolic link to a directory, as a Guix or Nix profile's font
-/// directories are, the depth bounding a cycle. The answer names the
-/// face's directory and nothing is read from it here.
+/// The monospace face's directory: `Family::MONO.find`.
 pub fn find(places: &[Place]) -> Result<PathBuf, String> {
+    Family::MONO.find(places)
+}
+
+/// The first directory that holds `family`'s regular style as a regular
+/// file: the places in order, each walked a level at a time, so a
+/// shallower directory wins, and each level in its parents' order and then
+/// name order. The walk reads at most `SEARCH_ENTRIES` directory entries in
+/// all and skips hidden names, and one entry past that bound ends every
+/// walk; it follows a symbolic link to a directory, as a Guix or Nix
+/// profile's font directories are, the depth bounding a cycle. The answer
+/// names the face's directory and nothing is read from it here.
+fn family_find(family: Family, places: &[Place]) -> Result<PathBuf, String> {
+    let regular = family.regular;
     let mut budget = Some(SEARCH_ENTRIES);
     for place in places {
-        if let Some(dir) = search(&place.dir, place.depth, &mut budget) {
+        if let Some(dir) = search(&place.dir, place.depth, regular, &mut budget) {
             return Ok(dir);
         }
     }
@@ -138,22 +221,22 @@ pub fn find(places: &[Place]) -> Result<PathBuf, String> {
         None => format!(" (stopped after {SEARCH_ENTRIES} entries)"),
     };
     Err(format!(
-        "{REGULAR} is in none of {}{stopped}",
+        "{regular} is in none of {}{stopped}",
         named.join(", ")
     ))
 }
 
 /// The first directory at most `depth` levels under `root`, `root` itself
-/// first, that holds `REGULAR`. A directory with more entries than the
+/// first, that holds `regular`. A directory with more entries than the
 /// budget has left spends it, `None` thereafter, which ends this walk and
 /// every later one, so where the search stops does not depend on the order
 /// a directory lists its entries in.
-fn search(root: &Path, depth: usize, budget: &mut Option<usize>) -> Option<PathBuf> {
+fn search(root: &Path, depth: usize, regular: &str, budget: &mut Option<usize>) -> Option<PathBuf> {
     let mut level = vec![root.to_path_buf()];
     for below in (0..=depth).rev() {
         if let Some(dir) = level
             .iter()
-            .find(|dir| fs::metadata(dir.join(REGULAR)).is_ok_and(|m| m.is_file()))
+            .find(|dir| fs::metadata(dir.join(regular)).is_ok_and(|m| m.is_file()))
         {
             return Some(dir.clone());
         }

@@ -415,13 +415,18 @@ of its own files may name each module.
   changes).
 - `face_file`: `DIR`, `INSTALLED` (the same directory under the XDG
   data home) and the four styles' file names (`REGULAR`, `BOLD`,
-  `ITALIC`, `BOLD_ITALIC`); `SETTING` (`TD_UI_FACE`), the variable whose
-  value a program passes, and `wanted`, whether that value asks for the
-  face (all but `bitmap` do); `Place`, `places` and `host_places`, where
-  the face is looked for, and `find`, the bounded search of them
-  (`SEARCH_DEPTH`, `SEARCH_ENTRIES`); `INSTALL_HINT`, what a program
-  without the face says to do; and `read`, the bounded read of one file.
-  td-term reads the four styles through it.
+  `ITALIC`, `BOLD_ITALIC`); `NOTO_DIR` and `NOTO_INSTALLED`, the
+  proportional families' directories; `Family` (a family's two
+  directories and four styles' names, with `places`, `host_places` and
+  `find` for that family) and `Family::MONO`, the constants above,
+  `Family::SANS` and `Family::SERIF`; `SETTING` (`TD_UI_FACE`), the
+  variable whose value a program passes, and `wanted`, whether that
+  value asks for the face (all but `bitmap` do); `Place`, `places` and
+  `host_places`, where the monospace face is looked for, and `find`, the
+  bounded search of them (`SEARCH_DEPTH`, `SEARCH_ENTRIES`), each
+  `Family::MONO`'s; `INSTALL_HINT`, what a program without the face says
+  to do; and `read`, the bounded read of one file. td-term reads the
+  four styles through it.
 - `text`: `wrap`, the greedy word wrap of a string into rows of at most
   a number of characters (whitespace runs as one space, an overlong word
   split, empty text one empty row, no columns the whole text as one
@@ -3667,24 +3672,34 @@ before it opens it and on the opened descriptor, and opens it without
 waiting: a pipe swapped in between the two can neither hold a program's
 start nor be read. On the image and in a jail the first place answers.
 
-`./install-fonts` (`td-builder install-fonts`) puts the pinned face in
+`./install-fonts` (`td-builder install-fonts`) puts the pinned faces in
 the data-home directory. It builds `td-recipe-eval` with the host's
-cargo and has it print the font recipe's plan: the directory, the
-archive's pin, the members and each notice's pin and path. A pin found
-in the shared sources cache (`~/.td/sources`) with its digest is used as
-is. A cold one is fetched by the checkout's td-net, verified and moved
-into the cache. Every pin is verified again before it is read. The
-archive is unpacked by the reader the recipe's `unpack` step uses, and
-the members, regular files only, and the notices are staged beside the
-directory and put in its place. The installed directory is the recipe's
-output directory, notices included. Scratch, staged and replaced
-directories are hidden and named for the installing process, and those
-of an install that was killed are swept by the next.
+cargo and has it print the font recipes' plan, a list of faces, this
+one and those of "Proportional faces" below. Each face is its
+directory, then either a release archive's pin with the members copied
+from it or the pins of files placed each at its path, then each
+notice's pin and path. Directories that are one another's, or nested,
+and a path a face places twice are refused. A pin found in the shared
+sources cache (`~/.td/sources`) with its digest is used as is. A cold
+one is fetched by the checkout's td-net, verified and moved into the
+cache. Every pin of every face is verified again before any is read.
+An archive is unpacked by the reader the recipe's `unpack` step uses,
+and its members, regular files only, or the pinned files, and the
+notices are staged beside the face's directory. Only once every face
+is staged is each staged directory put in its directory's place, so a
+face that cannot be staged changes none. Each installed directory is a
+recipe's output directory, notices included. Scratch, staged and
+replaced directories are hidden and named for the installing process,
+and those of an install that was killed are swept by the next.
 
 A face found under a host font root is whatever the host packaged under
 the regular style's name, not the pinned bytes. It is parsed under the
 same bounds as any other input, so it can only change what a glyph looks
-like; nothing executes it.
+like; nothing executes it. For Noto this is the likely case on a host
+without `./install-fonts`: Debian's `fonts-noto-core`, for one, ships
+`NotoSans-Regular.ttf`, hinted and of its own release, under
+`/usr/share/fonts`, and its metrics, not the pinned ones, then lay out
+the prose.
 
 A compiled TTF is not source: JetBrains builds it with fontmake from
 `.glyphs` sources, and Nerd Fonts patches it with FontForge. Neither
@@ -4003,8 +4018,9 @@ glyphs it shows, once.
 
 ## Proportional faces
 
-**Status: design; increments 38 and 39, and td-web's increment 5
-(td-web/DESIGN.md §9).** Every face above lays text on a
+**Status: increment 38 landed: the faces are pinned, delivered and
+found, and no program draws them yet. Increment 39 and td-web's
+increment 5 (td-web/DESIGN.md §9) are design.** Every face above lays text on a
 cell: one advance for every scalar, glyphs clipped to it. Prose reads
 better in a face whose glyphs take their own widths, and td-web, which
 shows documents, needs one. This section adds two proportional families
@@ -4056,11 +4072,11 @@ carries it at `files/etc/fonts/noto` (td-jail binds the whole
 `files/etc/fonts`, so a jailed program reads it at the same path), and
 `./install-fonts` installs it under the XDG data home at `fonts/noto`
 beside the monospace face. `face_file` finds a family by its directory
-and regular file, `Family::MONO` today's and `Family::SANS` and
-`Family::SERIF` in `noto`, in the same places, order and bounds. The
-install plan grows from one archive to a list of faces, each a
-directory and either an archive with members or pinned files, and
-notices.
+and regular file, `Family::MONO` the monospace face's and
+`Family::SANS` and `Family::SERIF` in `noto`, in the same places, order
+and bounds. The install plan is a list of faces, each a directory and
+either an archive with members or pinned files, and notices; this
+directory's face is pinned files, `OFL.txt` its notice.
 
 ### Glyph semantics
 
@@ -4366,7 +4382,7 @@ regressions. Those increments extend the original sequence below.
     recipe and its nine pins and watches, the image's `/etc/fonts/noto`
     link, `static-runtime`'s copy, `./install-fonts`' plan of several
     faces, and `face_file`'s families, with the AGENTS.md amendment
-    naming the class's new member. No program draws them yet.
+    naming the class's new member. No program draws them yet. Landed.
 39. Prose: `GlyphStyle`'s family and the prose glyph semantics, a
     raster's set of faces, `prose::Metrics` and `prose::wrap`, and the
     loader of the prose faces, with oracles on the bitmap face and on

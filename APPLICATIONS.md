@@ -7188,8 +7188,9 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   leaves it absent. A post-install setter is still pending. The static
   mail, news and web packages use `static-runtime`, containing only the
   approved source-built tzdata zones and license under `files/share`
-  and td-ui's pinned outline face and its notices in one directory
-  under `files/etc/fonts` (AGENTS.md, pinned upstream data), with no
+  and td-ui's pinned faces and their notices, one directory per font
+  recipe under `files/etc/fonts` (`jetbrains-mono-nerd` and `noto`;
+  AGENTS.md, pinned upstream data), with no
   fontconfig configuration. It has no executable, loader, or rendering
   override. Their launcher
   can therefore answer a named zone with the runtime's own file.

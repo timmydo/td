@@ -84,8 +84,9 @@
 //!   source-pin STEM       print the fixed-output source pin(s) owned by STEM
 //!                         in the same tab-separated form
 //!   install-fonts-plan    print what `td-builder install-fonts` installs:
-//!                         the outline face recipe's archive pin, members
-//!                         and notice pins, tab-separated
+//!                         each face recipe's directory, its archive pin
+//!                         and members or its file pins, and its notice
+//!                         pins, tab-separated
 //! This is the loop tool the `recipe-rs` gate drives AND the corpus consumer
 //! entry (replacing `ts-emit` on the boa path). (The system-spec subcommands —
 //! list-specs/emit-spec/verify-spec — were retired with the guix-system museum
@@ -600,7 +601,7 @@ fn main() {
             if args.get(2).is_some() {
                 die("usage: install-fonts-plan");
             }
-            match catalog::outline_face::install_plan() {
+            match catalog::install_fonts_plan() {
                 Ok(lines) => {
                     for line in lines {
                         println!("{line}");
@@ -701,7 +702,7 @@ mod tests {
         let pins = td_recipe::source_pins::all();
         // source_pins::tests::catalog_carries_all_legacy_source_locks names
         // each of them.
-        assert_eq!(pins.len(), 119);
+        assert_eq!(pins.len(), 128);
         assert!(pins.iter().all(|pin| pin.key != "stage0-source"));
         // The build root lists through `build-root-pins` alone.
         assert!(pins.iter().all(|pin| !pin.key.starts_with("debian-root-")));
@@ -710,6 +711,9 @@ mod tests {
         assert!(pins
             .iter()
             .any(|pin| pin.key == "jetbrains-mono-nerd-font-source"));
+        assert!(pins
+            .iter()
+            .any(|pin| pin.key == "noto-fonts-license-source"));
         for key in [
             "rust-rustc-dist",
             "rust-std-dist",

@@ -10791,10 +10791,11 @@ chmod 755 '{}'
             "recipes/locks/no-such/Cargo.lock",
             "recipes/src/recipes/no-such.mk",
             // What the evaluator's own code reads, beside a recipe: the
-            // fixture the qemu secret path mounts, the font recipe catalog
+            // fixture the qemu secret path mounts, the font recipes catalog
             // re-exports.
             "recipes/src/fixtures/secret_vm.rs",
             "recipes/src/recipes/jetbrains-mono-nerd-font.rs",
+            "recipes/src/recipes/noto-fonts.rs",
         ] {
             assert!(checks_reaching(&[scope]).is_err(), "{scope}");
             let beside = ["recipes/src/recipes/uutils.rs", scope];

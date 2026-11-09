@@ -1,7 +1,7 @@
 #!/bin/sh
-# ./install-fonts — install the pinned JetBrains Mono Nerd Font, the outline
-# face td-ui and td-term draw with, for this host's user, where td programs
-# run on this host look for it (td-builder install-fonts,
+# ./install-fonts — install td-ui's pinned faces, the JetBrains Mono Nerd Font
+# td-ui and td-term draw with and Noto Sans and Serif, for this host's user,
+# where td programs run on this host look for them (td-builder install-fonts,
 # builder/src/install_fonts.rs). Not ./start's preflight: that provisions the
 # seed toolchain, musl target included, for control-plane artifacts that
 # enter builds; nothing here does, so the host's own cargo is enough.

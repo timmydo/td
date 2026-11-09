@@ -4405,6 +4405,14 @@ const IMMUTABLE_ETC: &[ImmutableEtc] = &[
               content-addressed store path is neither",
         desktop_only: true,
     },
+    ImmutableEtc {
+        etc: "fonts/noto",
+        target: "{in:noto-fonts}/share/fonts/noto",
+        why: "td-ui programs read their proportional faces by a fixed name, \
+              which a jailed program under static-runtime spells the same way; \
+              a content-addressed store path is neither",
+        desktop_only: true,
+    },
 ];
 
 const MUTABLE_ETC: &[MutableEtc] = &[
@@ -5521,11 +5529,15 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         from: "{in:ca-certificates}".into(),
         dest: "{root}/real-root{in:ca-certificates}".into(),
     });
-    // The outline face is pinned upstream data with no ELF runtime closure.
+    // td-ui's faces are pinned upstream data with no ELF runtime closure.
     if sys.desktop() {
         steps.push(Step::CopyTree {
             from: "{in:jetbrains-mono-nerd-font}".into(),
             dest: "{root}/real-root{in:jetbrains-mono-nerd-font}".into(),
+        });
+        steps.push(Step::CopyTree {
+            from: "{in:noto-fonts}".into(),
+            dest: "{root}/real-root{in:noto-fonts}".into(),
         });
     }
     // Device firmware for the drivers in the kernel, after switch_root: ath11k
@@ -6554,10 +6566,11 @@ pub(super) fn server_recipe() -> Recipe {
 
 /// The packages only the desktop packs: the session substrate, the td-ui
 /// programs, in-guest update and installation, the development VM bridge,
-/// the session authority and the outline face.
+/// the session authority and td-ui's faces.
 const DESKTOP_INPUTS: &[&str] = &[
     "device-firmware",
     "jetbrains-mono-nerd-font",
+    "noto-fonts",
     "td-authd",
     "td-taskmgr",
     "td-time",
@@ -6809,6 +6822,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
         // tzdata: immutable compiled zones and geographic tables at /etc/zoneinfo.
         // jetbrains-mono-nerd-font: the pinned outline face at
         //   /etc/fonts/jetbrains-mono-nerd.
+        // noto-fonts: the pinned proportional faces at /etc/fonts/noto.
         // cpu-microcode: both vendors' microcode for the deployment initramfs.
         // device-firmware: the files drivers ask the kernel's loader for, with
         //   their notices and licences, in a desktop's store and initramfs.
@@ -6863,6 +6877,7 @@ fn system_recipe(sys: &SystemDef) -> Recipe {
                 "ca-certificates",
                 "tzdata",
                 "jetbrains-mono-nerd-font",
+                "noto-fonts",
                 "device-firmware",
                 "cpu-microcode",
                 "glibc-x86-64",
@@ -12174,6 +12189,47 @@ mod tests {
             assert!(
                 super::super::jetbrains_mono_nerd_font::FILES.contains(&file),
                 "td-ui reads {file:?}, which the font recipe does not ship"
+            );
+        }
+    }
+
+    /// The same agreement for the proportional families: td-ui's Noto
+    /// directory is the image's link to noto-fonts' output, its installed
+    /// one install-fonts' directory, and every Noto file it names one the
+    /// recipe ships.
+    #[test]
+    fn td_ui_reads_the_proportional_faces_where_the_image_links_them() {
+        use super::super::noto_fonts;
+        const FACE_FILE_RS: &str = include_str!("../../../td-ui/src/face_file.rs");
+        let constant = |name: &str| {
+            FACE_FILE_RS
+                .split_once(&format!("pub const {name}: &str = \""))
+                .and_then(|(_, after)| after.split_once('"'))
+                .map(|(value, _)| value)
+        };
+        let dir = constant("NOTO_DIR").unwrap_or_default();
+        let entry = IMMUTABLE_ETC
+            .iter()
+            .find(|entry| format!("/etc/{}", entry.etc) == dir)
+            .unwrap_or_else(|| unreachable!("no IMMUTABLE_ETC entry is td-ui's {dir:?}"));
+        assert_eq!(
+            entry.target,
+            format!("{{in:noto-fonts}}/{}", noto_fonts::DIR)
+        );
+        assert!(entry.desktop_only);
+        assert_eq!(constant("NOTO_INSTALLED"), Some(noto_fonts::DATA_DIR));
+        // Every Noto face td-ui names, the four styles of both families.
+        let named: Vec<&str> = FACE_FILE_RS
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|text| text.starts_with("Noto") && text.ends_with(".ttf"))
+            .collect();
+        assert_eq!(named.len(), noto_fonts::FILES.len());
+        for file in named {
+            assert!(
+                noto_fonts::FILES.iter().any(|(_, name)| *name == file),
+                "td-ui reads {file:?}, which noto-fonts does not ship"
             );
         }
     }
