@@ -5673,7 +5673,7 @@ fn flathub_application_runtime(
         return Ok(None);
     }
     let Some(source) = td_engine::flathub_app::flathub_source(name)
-        .filter(|source| source.policy_runtime == declaration.runtime())
+        .filter(|source| source.runtime.name == declaration.runtime())
     else {
         return Ok(None);
     };
@@ -5685,7 +5685,7 @@ fn flathub_application_runtime(
             source.entry
         ));
     }
-    Ok(Some(source.runtime))
+    Ok(Some(source.runtime.exact_ref))
 }
 
 /// A Flathub application is a declaration alone: td-app fetches both its

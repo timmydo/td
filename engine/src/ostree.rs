@@ -2179,7 +2179,7 @@ pub(crate) mod tests {
         .unwrap();
         let metadata = commit.metadata.flatpak_metadata.unwrap();
         let firefox = crate::flathub_app::flathub_source("firefox").unwrap();
-        crate::flathub_app::require_runtime(&metadata, firefox.runtime).unwrap();
+        crate::flathub_app::require_runtime(&metadata, firefox.runtime.exact_ref).unwrap();
         assert!(crate::flathub_app::require_runtime(
             &metadata,
             "runtime/org.freedesktop.Platform/x86_64/24.08"

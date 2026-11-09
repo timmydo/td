@@ -6,33 +6,47 @@
 //! none and uses no other module, so td-jail can `#[path]`-include it to
 //! read the same `selection` and pointers td-app writes.
 
-/// One declared Flathub application: its app ref and the one runtime ref it
-/// accepts, both fetched. The bytes are not reviewed; these names, Flathub's
-/// signing key and the admission rules are.
+/// One declared Flathub runtime (APPLICATIONS.md §W.9): the ref fetched and
+/// its td name. The bytes are not reviewed; the ref, Flathub's signing key
+/// and the admission rules are.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlathubRuntime {
+    /// The td runtime name: what an application's manifest names, and the
+    /// key of its environment policy and, with the application's name, of
+    /// its dynamic-library policy.
+    pub name: &'static str,
+    /// The runtime ref.
+    pub exact_ref: &'static str,
+}
+
+/// One declared Flathub application: its app ref, fetched, and the one
+/// declared runtime it accepts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlathubSource {
     /// The td application name: its registry row and launcher name.
     pub name: &'static str,
     /// The app ref.
     pub application: &'static str,
-    /// The one runtime ref the application accepts.
-    pub runtime: &'static str,
+    /// The one runtime the application accepts.
+    pub runtime: FlathubRuntime,
     /// The application's entry inside its namespace.
     pub entry: &'static str,
-    /// The runtime key of the application's dynamic-library policy.
-    pub policy_runtime: &'static str,
 }
 
 pub const REPOSITORY: &str = "https://dl.flathub.org/repo";
 
-const PLATFORM_25_08: &str = "runtime/org.freedesktop.Platform/x86_64/25.08";
+const PLATFORM_25_08: FlathubRuntime = FlathubRuntime {
+    name: "freedesktop-platform-25-08",
+    exact_ref: "runtime/org.freedesktop.Platform/x86_64/25.08",
+};
+
+pub const FLATHUB_RUNTIMES: &[FlathubRuntime] = &[PLATFORM_25_08];
 
 pub const FLATHUB_SOURCES: &[FlathubSource] = &[FlathubSource {
     name: "firefox",
     application: "app/org.mozilla.firefox/x86_64/stable",
     runtime: PLATFORM_25_08,
     entry: "/app/bin/firefox",
-    policy_runtime: "freedesktop-platform-25-08",
 }];
 
 pub fn flathub_source(name: &str) -> Option<FlathubSource> {
@@ -60,7 +74,7 @@ pub fn spec_source(
     }
     let declared =
         flathub_source(name).ok_or_else(|| format!("{name} declares no Flathub runtime ref"))?;
-    if runtime != declared.runtime || source != Some(declared.application) {
+    if runtime != declared.runtime.exact_ref || source != Some(declared.application) {
         return Err(format!(
             "{name}'s spec does not name its declared Flathub refs"
         ));
@@ -883,16 +897,16 @@ mod tests {
         let firefox = flathub_source("firefox").unwrap();
         let app = Some(firefox.application);
         assert_eq!(
-            spec_source("firefox", app, firefox.runtime),
+            spec_source("firefox", app, firefox.runtime.exact_ref),
             Ok(Some(firefox))
         );
         for (name, source, runtime) in [
             ("firefox", app, store),
             // A runtime ref alone names no application tree.
-            ("firefox", None, firefox.runtime),
-            ("other", app, firefox.runtime),
+            ("firefox", None, firefox.runtime.exact_ref),
+            ("other", app, firefox.runtime.exact_ref),
             ("firefox", app, "runtime/org.example.Other/x86_64/1"),
-            ("mail", None, firefox.runtime),
+            ("mail", None, firefox.runtime.exact_ref),
         ] {
             assert!(
                 spec_source(name, source, runtime).is_err(),

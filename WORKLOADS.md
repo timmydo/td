@@ -95,10 +95,12 @@ every workload that names it:
 - **a layered application**: a Flathub runtime at `/usr` plus the
   application's tree at `/app`.
 
-Runtime declarations are a table of their own (repository, ref, the
-environment and `/etc` allowlist, the dynamic-library policy key).
-Application declarations name the runtime they accept. Workspaces name a
-runtime by its declaration name.
+Runtime declarations are a table of their own, `FLATHUB_RUNTIMES`
+(`engine/src/flathub_app.rs`): each runtime's ref and its td name, which
+its environment policy and, with the application, its dynamic-library
+policy are keyed by. Every Flathub declaration uses the one repository
+constant. Application declarations name the runtime they accept.
+Workspaces name a runtime by its td name.
 
 Runtimes live in one store, `/var/lib/td/runtimes/`, owned by a dedicated
 runtime account and written only by td-app running as it, with §W.9's

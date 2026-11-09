@@ -4691,7 +4691,7 @@ fn shipped_runtime(application: &ShippedApplication) -> String {
         application.runtime_recipe,
         td_engine::flathub_app::flathub_source(application.name),
     ) {
-        (None, Some(source)) => source.runtime.to_string(),
+        (None, Some(source)) => source.runtime.exact_ref.to_string(),
         _ => format!("{{payload:{}}}", application.runtime),
     }
 }
@@ -11047,8 +11047,8 @@ mod tests {
                 None => {
                     let source = td_engine::flathub_app::flathub_source(application.name)
                         .expect("a fetched runtime is declared");
-                    assert_eq!(source.policy_runtime, application.runtime);
-                    assert_eq!(package.flathub_runtime(), Some(source.runtime));
+                    assert_eq!(source.runtime.name, application.runtime);
+                    assert_eq!(package.flathub_runtime(), Some(source.runtime.exact_ref));
                 }
             }
         }

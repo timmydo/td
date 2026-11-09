@@ -6174,8 +6174,8 @@ fn application_store_closure_report(
 ) -> Result<String, String> {
     let application_path = step_store_path(target, steps)?;
     let flathub_runtime = td_engine::flathub_app::flathub_source(target)
-        .filter(|source| source.policy_runtime == declaration.runtime())
-        .map(|source| source.runtime)
+        .filter(|source| source.runtime.name == declaration.runtime())
+        .map(|source| source.runtime.exact_ref)
         .filter(|runtime| spec.runtime() == *runtime);
     let runtime_path = match flathub_runtime {
         Some(runtime) => runtime.to_string(),

@@ -11396,10 +11396,15 @@ the exact app ref (`app/org.mozilla.firefox/x86_64/stable`), the one
 runtime ref it accepts (`runtime/org.freedesktop.Platform/x86_64/25.08`),
 the entry, td's permission policy, launcher presentation, environment
 and the dynamic-library policy, which is keyed by application and
-runtime branch, never by commit. The repository and refs, the entry
-and the policy's runtime key are one table, `FLATHUB_SOURCES` in
-`engine/src/flathub_app.rs`, which td-app reads and the cutover's specs
-are compiled from. Flathub's signing key is compiled into td-net
+runtime branch, never by commit. The repository, the refs, the entry
+and the runtime's td name are declared in `engine/src/flathub_app.rs`,
+which td-app reads and the cutover's specs are compiled from: the
+repository is one constant, `REPOSITORY`; `FLATHUB_RUNTIMES` declares
+each runtime's ref and td name (`freedesktop-platform-25-08`), which an
+application's manifest names and, with the application, keys its
+dynamic-library policy; and `FLATHUB_SOURCES` declares each
+application's app ref, entry and the one declared runtime it accepts.
+Flathub's signing key is compiled into td-net
 (§B.3.1). The payload bytes are *not* reviewed: whatever commit
 the ref names when a machine asks is admitted only if all of these hold:
 

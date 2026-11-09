@@ -449,7 +449,7 @@ fn deploy(
 /// The rule-5 inputs no commit carries, and their digest, recorded in the
 /// selection so a change to any of them forces a fresh validation.
 fn expect(source: FlathubSource) -> Result<Expected, String> {
-    let policy = dynamic_application_policy(source.name, source.policy_runtime)
+    let policy = dynamic_application_policy(source.name, source.runtime.name)
         .ok_or_else(|| format!("{} has no dynamic-library policy", source.name))?;
     let mut hasher = td_engine::sha256::Sha256::new();
     let mut record = |key: &str, value: &[u8]| {
@@ -484,7 +484,7 @@ fn serves(cache: &Path, selection: &Selection, source: FlathubSource, expected: 
     selection.name == source.name
         && selection.checks == expected.checks
         && selection.application.exact_ref == source.application
-        && selection.runtime.exact_ref == source.runtime
+        && selection.runtime.exact_ref == source.runtime.exact_ref
         && selection.commits().all(|commit| deployed(cache, commit))
 }
 
@@ -967,7 +967,9 @@ fn check(
         Some(text) => flathub_app::parse_admitted(&text)?,
         None => Vec::new(),
     };
-    admitted.retain(|row| row.exact_ref == source.runtime || row.exact_ref == source.application);
+    admitted.retain(|row| {
+        row.exact_ref == source.runtime.exact_ref || row.exact_ref == source.application
+    });
     let known: Vec<&Admitted> = admitted
         .iter()
         .chain(current.iter().flat_map(|(_, selection)| selection.rows()))
@@ -979,14 +981,21 @@ fn check(
         .checked_add(RESOLVE_TIME)
         .ok_or("resolve deadline overflows")?;
     tracker.set(Stage::Resolve, Some(Part::Runtime));
-    let runtime = resolve(admission, &work, source.runtime, &known, now, deadline)?;
+    let runtime = resolve(
+        admission,
+        &work,
+        source.runtime.exact_ref,
+        &known,
+        now,
+        deadline,
+    )?;
     tracker.set(Stage::Resolve, Some(Part::Application));
     let application = resolve(admission, &work, source.application, &known, now, deadline)?;
     let metadata = application
         .metadata
         .as_deref()
         .ok_or_else(|| format!("{} commit carries no xa.metadata", source.application))?;
-    flathub_app::require_runtime(metadata, source.runtime)?;
+    flathub_app::require_runtime(metadata, source.runtime.exact_ref)?;
     drop(known);
 
     let selection = Selection {
@@ -1345,7 +1354,7 @@ fn revalidate(
     let revalidated = (|| {
         if selection.name != source.name
             || selection.application.exact_ref != source.application
-            || selection.runtime.exact_ref != source.runtime
+            || selection.runtime.exact_ref != source.runtime.exact_ref
         {
             return Err(format!(
                 "{}'s declaration names other refs; it needs an update",
@@ -1594,7 +1603,7 @@ pub(crate) fn export_to(store: &Path) -> Result<Vec<String>, String> {
     };
     let mut refs: Vec<&str> = flathub_app::FLATHUB_SOURCES
         .iter()
-        .flat_map(|source| [source.application, source.runtime])
+        .flat_map(|source| [source.application, source.runtime.exact_ref])
         .collect();
     refs.sort_unstable();
     refs.dedup();
@@ -1721,9 +1730,13 @@ mod tests {
         FlathubSource {
             name: "firefox",
             application: APP,
-            runtime: RUNTIME,
+            // Synthetic refs, but the real runtime name: `expect` looks the
+            // dynamic-library policy up by it.
+            runtime: flathub_app::FlathubRuntime {
+                name: "freedesktop-platform-25-08",
+                exact_ref: RUNTIME,
+            },
             entry: "/app/bin/firefox",
-            policy_runtime: "freedesktop-platform-25-08",
         }
     }
 
@@ -3028,7 +3041,10 @@ mod tests {
             .reason
             .contains("missing"));
         let other = FlathubSource {
-            runtime: "runtime/org.example.Platform/x86_64/2",
+            runtime: flathub_app::FlathubRuntime {
+                exact_ref: "runtime/org.example.Platform/x86_64/2",
+                ..source().runtime
+            },
             ..source()
         };
         assert_eq!(

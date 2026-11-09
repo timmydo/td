@@ -815,7 +815,7 @@ fn resolve_trees(
     let generation = crate::flathub::hold_generation(source, home, uid)?;
     let selection = &generation.selection;
     if selection.name != name
-        || selection.runtime.exact_ref != source.runtime
+        || selection.runtime.exact_ref != source.runtime.exact_ref
         || selection.application.exact_ref != source.application
     {
         return Err(invalid(format!(
@@ -1410,7 +1410,7 @@ fn runtime_output_name(runtime: &str) -> io::Result<&str> {
 /// answers through the policy its declaration names.
 fn dynamic_runtime(runtime: &str, flathub: Option<FlathubSource>) -> io::Result<bool> {
     let output = match flathub {
-        Some(source) => source.policy_runtime,
+        Some(source) => source.runtime.name,
         None => runtime_output_name(runtime)?,
     };
     Ok(output == DYNAMIC_RUNTIME
@@ -4889,7 +4889,7 @@ mod tests {
         }
         assert!(dynamic_runtime("/usr/lib/runtime", None).is_err());
         let firefox = flathub_app::flathub_source("firefox").unwrap();
-        assert!(dynamic_runtime(firefox.runtime, Some(firefox)).unwrap());
+        assert!(dynamic_runtime(firefox.runtime.exact_ref, Some(firefox)).unwrap());
     }
 
     /// An application with no reviewed loader path is held to carrying NONE:

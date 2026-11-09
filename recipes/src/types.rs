@@ -1334,12 +1334,12 @@ impl Recipe {
     pub fn flathub_runtime(&self) -> Option<&'static str> {
         let declaration = self.application.as_ref()?;
         let source = td_engine::flathub_app::flathub_source(&self.name)
-            .filter(|source| source.policy_runtime == declaration.runtime())?;
+            .filter(|source| source.runtime.name == declaration.runtime())?;
         let staged = self
             .payload_inputs
             .as_ref()
             .is_some_and(|inputs| inputs.iter().any(|input| input == declaration.runtime()));
-        (!staged).then_some(source.runtime)
+        (!staged).then_some(source.runtime.exact_ref)
     }
 
     /// Whether `source_input` itself resolves to a foreign pin. A recipe may be

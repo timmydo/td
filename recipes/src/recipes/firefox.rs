@@ -71,9 +71,9 @@ mod tests {
     fn the_package_is_a_declaration_whose_refs_td_app_fetches() {
         let recipe = recipe();
         let source = td_engine::flathub_app::flathub_source("firefox").expect("declared");
-        assert_eq!(recipe.flathub_runtime(), Some(source.runtime));
+        assert_eq!(recipe.flathub_runtime(), Some(source.runtime.exact_ref));
         assert_eq!(source.application, "app/org.mozilla.firefox/x86_64/stable");
-        assert_eq!(source.policy_runtime, RUNTIME);
+        assert_eq!(source.runtime.name, RUNTIME);
         assert!(recipe.is_foreign());
         assert!(!recipe.is_foreign_source());
         assert_eq!(recipe.source_input, None);

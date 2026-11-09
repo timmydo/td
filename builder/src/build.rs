@@ -3986,7 +3986,7 @@ fn compile_application_tables_in(
         }
         // A declared Flathub runtime ref is fetched by td-app, not staged.
         let flathub_runtime = td_engine::flathub_app::flathub_source(expected_name)
-            .is_some_and(|source| source.runtime == expected_runtime);
+            .is_some_and(|source| source.runtime.exact_ref == expected_runtime);
         if !flathub_runtime && !payload_paths.contains(expected_runtime.as_str()) {
             return Err(format!(
                 "compileApplicationTables: runtime {expected_runtime} is not a declared payload"

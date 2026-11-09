@@ -140,14 +140,14 @@ impl ApplicationSpec {
         permissions: PermissionPolicy,
     ) -> Result<ApplicationSpec, String> {
         let flathub = flathub_app::flathub_source(manifest.name())
-            .filter(|declared| declared.runtime == runtime_path);
+            .filter(|declared| declared.runtime.exact_ref == runtime_path);
         match flathub {
-            Some(declared) if manifest.runtime() != declared.policy_runtime => {
+            Some(declared) if manifest.runtime() != declared.runtime.name => {
                 return Err(format!(
                     "application {} declares runtime {:?}, not its Flathub runtime's {:?}",
                     manifest.name(),
                     manifest.runtime(),
-                    declared.policy_runtime
+                    declared.runtime.name
                 ));
             }
             Some(_) => {}
@@ -480,7 +480,7 @@ impl ApplicationSpec {
         // The reviewed loader path, or None where the policy names no package
         // library root: that application is held to carrying no variable.
         let loader_path = flathub
-            .map(|declared| declared.policy_runtime)
+            .map(|declared| declared.runtime.name)
             .or_else(|| runtime_recipe_name(&self.runtime))
             .and_then(|runtime| dynamic_application_policy(&self.name, runtime))
             .map(|policy| policy.library_paths().join(":"))
@@ -616,7 +616,7 @@ fn at_line(line: usize, reason: &str) -> String {
 mod tests {
     use super::*;
     use crate::application::{ApplicationDeclaration, ApplicationProvenance};
-    use crate::flathub_app::{flathub_source, valid_ref, FLATHUB_SOURCES};
+    use crate::flathub_app::{flathub_source, valid_ref, FLATHUB_RUNTIMES, FLATHUB_SOURCES};
     use crate::permissions::{BusAccess, FilesystemAccess, PermissionSocket};
 
     fn manifest() -> ApplicationManifest {
@@ -870,10 +870,14 @@ mod tests {
                 .unwrap()
                 .manifest("firefox", "154.0", ApplicationProvenance::Foreign)
                 .unwrap();
-        let spec =
-            ApplicationSpec::compile(&manifest, firefox.runtime, PermissionPolicy::new()).unwrap();
+        let spec = ApplicationSpec::compile(
+            &manifest,
+            firefox.runtime.exact_ref,
+            PermissionPolicy::new(),
+        )
+        .unwrap();
         assert_eq!(spec.source(), Some(firefox.application));
-        assert_eq!(spec.runtime(), firefox.runtime);
+        assert_eq!(spec.runtime(), firefox.runtime.exact_ref);
         let text = spec.to_keyfile();
         assert!(text.starts_with(
             "format=1\nname=firefox\nsource=app/org.mozilla.firefox/x86_64/stable\n\
@@ -904,16 +908,24 @@ mod tests {
             .unwrap()
             .manifest("firefox", "1", ApplicationProvenance::Foreign)
             .unwrap();
-        let error = ApplicationSpec::compile(&manifest, firefox.runtime, PermissionPolicy::new())
-            .unwrap_err();
+        let error = ApplicationSpec::compile(
+            &manifest,
+            firefox.runtime.exact_ref,
+            PermissionPolicy::new(),
+        )
+        .unwrap_err();
         assert!(error.contains("not its Flathub runtime"), "{error}");
         // td-app validates the declared entry, so a ref launches no other.
         let manifest = ApplicationDeclaration::new("freedesktop-platform-25-08", "/app/bin/other")
             .unwrap()
             .manifest("firefox", "1", ApplicationProvenance::Foreign)
             .unwrap();
-        let error = ApplicationSpec::compile(&manifest, firefox.runtime, PermissionPolicy::new())
-            .unwrap_err();
+        let error = ApplicationSpec::compile(
+            &manifest,
+            firefox.runtime.exact_ref,
+            PermissionPolicy::new(),
+        )
+        .unwrap_err();
         assert!(error.contains("not its Flathub declaration's"), "{error}");
     }
 
@@ -1098,14 +1110,42 @@ mod tests {
         sorted.dedup();
         assert_eq!(names, sorted);
         for source in FLATHUB_SOURCES {
-            crate::ostree::validate_exact_ref(source.runtime).unwrap();
-            assert!(valid_ref(source.runtime) && source.runtime.starts_with("runtime/"));
             crate::ostree::validate_exact_ref(source.application).unwrap();
             assert!(valid_ref(source.application) && source.application.starts_with("app/"));
             assert!(source.entry.starts_with("/app/"));
-            assert!(dynamic_application_policy(source.name, source.policy_runtime).is_some());
+            assert!(dynamic_application_policy(source.name, source.runtime.name).is_some());
         }
         assert_eq!(flathub_source("firefox").unwrap().entry, "/app/bin/firefox");
         assert!(flathub_source("mail").is_none());
+    }
+
+    #[test]
+    fn flathub_runtimes_are_sorted_unique_and_every_application_names_one() {
+        let names: Vec<&str> = FLATHUB_RUNTIMES
+            .iter()
+            .map(|runtime| runtime.name)
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names, sorted);
+        let mut refs: Vec<&str> = FLATHUB_RUNTIMES
+            .iter()
+            .map(|runtime| runtime.exact_ref)
+            .collect();
+        refs.sort_unstable();
+        refs.dedup();
+        assert_eq!(refs.len(), FLATHUB_RUNTIMES.len());
+        for runtime in FLATHUB_RUNTIMES {
+            crate::ostree::validate_exact_ref(runtime.exact_ref).unwrap();
+            assert!(valid_ref(runtime.exact_ref) && runtime.exact_ref.starts_with("runtime/"));
+        }
+        for source in FLATHUB_SOURCES {
+            assert!(
+                FLATHUB_RUNTIMES.contains(&source.runtime),
+                "{}",
+                source.name
+            );
+        }
     }
 }
