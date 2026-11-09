@@ -15,6 +15,9 @@ needs them:
 - To find or bump outdated pins (sources, the Rust toolchain, the Debian
   build root, Cargo locks), read `UPDATING.md`.
 - For application packaging or confinement, read `APPLICATIONS.md`.
+- For the account a workload (an application, a td-sandbox profile or a
+  td-agent workspace) runs as, shared runtimes, or grants of the human's
+  files to a workload, read `WORKLOADS.md`.
 - Before changing or adding `unsafe`, read `UNSAFE.md` and the touched crate's
   normative document.
 - For login or credentials, read `td-login/THREAT-MODEL.md`.
