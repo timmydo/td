@@ -117,18 +117,26 @@ already requires of Flathub bytes. No Flathub byte enters the image.
 
 ## Accounts
 
-Applications keep fixed reservations: Firefox 65536, mail 65537, news
-65538, td-web 65540.
+Every workload account comes from one root-owned ledger, keyed by kind
+and name (`application firefox`, `sandbox default`, `workspace <id>`).
+td-authd allocates the uid when the workload is first installed or
+created, on the human's request; no caller supplies a uid. A uid is never
+reused, after removal included, which the reservation ledger already
+guarantees. An application is allocated when td-software installs it, not
+when the image declares it.
 
-Sandboxes and agent workspaces get **allocated accounts**: one uid each,
-from a range reserved for allocation and disjoint from application
-reservations, recorded in the reservation ledger when allocated and never
-reused after removal. td-authd allocates on the human's request; no
-caller supplies a uid. The exact range lands with the allocation
-increment.
+The uids the image reserves today carry over as rows already present:
+Firefox 65536, and mail 65537 and news 65538, which return to use. A
+workload's kind and name join the ledger to its policy: an application's
+reviewed declaration in the image, or the grants the human made for a
+sandbox or workspace. So the bus broker and td-portal take an
+application's uid from the ledger, not from a build-time table.
 
-An allocated account's home is root-created under `/var/lib/td/workloads/`
-at mode 0700. td-sandbox's current per-profile home moves there.
+A workload account's home is root-created at mode 0700:
+`/var/lib/td/applications/<uid>` for applications, as today, and
+`/var/lib/td/workloads/<uid>` for sandboxes and workspaces. td-sandbox's
+current per-profile home moves there. The allocation range and the
+ledger's row format land with the allocator.
 
 ## Grants
 
@@ -159,10 +167,10 @@ All workload launches go through root:
 
 - applications: `application-start`, unchanged except that mail and news
   use `exec-service-as` with their reserved accounts;
-- workspaces: a new operation that checks the allocated account in the
-  ledger, applies its grants, and runs `td-jail --workspace` as that
-  account. td-jail's workspace kind then requires its caller to be an
-  allocated workspace account rather than uid 1000.
+- workspaces: a new operation that checks the workspace's ledger row,
+  applies its grants, and runs `td-jail --workspace` as that account.
+  td-jail's workspace kind then requires its caller to be a workspace
+  account in the ledger rather than uid 1000.
 
 td-sandbox and td-agent stop launching td-jail themselves; they ask for a
 launch. td-agent's unconfined workspace, which runs tools as the human
@@ -178,13 +186,16 @@ account.
    runtime moves out of its account's cache in the same landing.
 4. One td-jail runtime mount shared by the application and workspace
    kinds; workspace `runtime=`.
-5. The allocated-account range, ledger rows and td-authd allocation.
+5. The ledger allocator in td-authd, with applications moved onto it:
+   the bus broker and td-portal read application uids from the ledger,
+   and td-software's installs allocate.
 6. The grant table and the generalized idmapped grant (`UNSAFE.md` §16).
-7. Workspace launches through root; td-sandbox profiles move to allocated
+7. Workspace launches through root; td-sandbox profiles move to ledger
    accounts and their `share` becomes a grant request.
-8. td-agent workspaces on allocated accounts; the unconfined workspace is
+8. td-agent workspaces on ledger accounts; the unconfined workspace is
    retired.
-9. mail and news on their reserved accounts; td-web packaged on 65540.
+9. mail and news on their reserved rows; td-web packaged on a ledger
+   account.
 10. td-software's runtime and grant views.
 
 ## Open questions
