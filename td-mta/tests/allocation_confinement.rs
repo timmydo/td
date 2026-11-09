@@ -79,22 +79,6 @@ fn scan(root: &Path, path: &Path) {
                 &source,
                 "5e32cd6f5f5c9e32c073ef5cbbed1afe01e939fdc92c9f8e97c8b3566a09bf6b",
             );
-        } else if relative == "td-mta/tests/support/native_allocator_bridge.rs" {
-            assert_eq!(words(&source, "unsafe"), 20);
-            assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 7);
-            assert!(!source.contains("global_allocator"));
-            fingerprint(
-                &source,
-                "f552000f6717c0eee3a3b3ab8fa6abea2c2f74e7fed9bf7a9dd2b1344509fcd3",
-            );
-        } else if relative == "td-mta/tests/support/native_allocation_controls.rs" {
-            assert_eq!(words(&source, "unsafe"), 10);
-            assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 2);
-            assert!(!source.contains("global_allocator"));
-            fingerprint(
-                &source,
-                "668320d1f8caf82018331e0325571b16f69423794d4bff888a410a2c416d3702",
-            );
         } else {
             assert_eq!(words(&source, "unsafe"), 0, "{relative}");
             assert!(!source.contains("allow(unsafe_code"), "{relative}");
@@ -193,22 +177,9 @@ fn scan(root: &Path, path: &Path) {
                 "14e2ef08d8dea85709f5d86e2a60e0b2e965903f5c001e9a46fa9bdecfe9e7d1",
             );
         }
-        if !matches!(
-            relative,
-            "td-mta/tests/native_alloc_probe.rs"
-                | "td-mta/tests/support/native_allocator_bridge.rs"
-                | "td-mta/tests/support/native_allocation_controls.rs"
-        ) {
-            for forbidden in [
-                "native_alloc_probe",
-                "native_allocator_bridge",
-                "native_allocation_controls",
-                "TD_MTA_NATIVE_REGISTRY",
-                "__wrap_",
-                "__real_",
-            ] {
-                assert!(!source.contains(forbidden), "{relative}: {forbidden}");
-            }
+        // No libc allocator interposition remains anywhere in the crate.
+        for forbidden in ["__wrap_", "__real_"] {
+            assert!(!source.contains(forbidden), "{relative}: {forbidden}");
         }
         if relative.starts_with("td-mta/src/") || relative.starts_with("td-mime/src/") {
             assert!(!source.contains("allocation_registry"), "{relative}");
@@ -248,20 +219,6 @@ fn allocation_surface_is_separate_and_exact() {
     assert_eq!(probe.matches("mod allocation_shim;").count(), 1);
     assert!(include_str!("../Cargo.toml")
         .contains("[[test]]\nname = \"rust_alloc_probe\"\nharness = false\n"));
-    let native = include_str!("native_alloc_probe.rs");
-    assert_eq!(native.matches("#![cfg(test)]").count(), 1);
-    assert_eq!(native.matches("#![deny(unsafe_code)]").count(), 1);
-    for module in [
-        "allocation_registry",
-        "native_allocator_bridge",
-        "native_allocation_controls",
-    ] {
-        assert!(native.contains(&format!(
-            "#[cfg(td_native_alloc_probe)]\n#[path = \"support/{module}.rs\"]\nmod {module};"
-        )));
-    }
-    assert!(include_str!("../Cargo.toml")
-        .contains("[[test]]\nname = \"native_alloc_probe\"\nharness = false\n"));
     let repository = root.parent().unwrap();
     scan(repository, &root.join("src"));
     scan(repository, &root.join("tests"));

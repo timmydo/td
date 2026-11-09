@@ -1,5 +1,5 @@
 //! Inspect the resolved public surface of the pinned compiler's diagnostic graph.
-use crate::crypto_headers::Architecture;
+use crate::crypto_musl::Architecture;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
@@ -305,7 +305,9 @@ const CFG_GUARD: &[&str] = &[
     "--check-cfg=cfg(doc,debug_assertions,values())",
     "-Funexpected_cfgs",
 ];
-const PRIVATE_DEPENDENCIES: &[&str] = &["rustls", "aws_lc_rs", "webpki_roots"];
+/// td-crypto's every extern, none of which its public API may expose.
+const PRIVATE_DEPENDENCIES: &[&str] =
+    &["rustls", "td_primitives", "td_tls_provider", "webpki_roots"];
 
 fn diagnostic(
     name: &str,
@@ -343,10 +345,10 @@ fn cargo_diagnostic(
     manifest: &Path,
     package: &str,
     structured_messages: bool,
-    c: &crate::crypto_isolated::CFlags,
+    architecture: Architecture,
 ) -> Command {
-    let architecture = c.architecture();
-    let mut command = crate::crypto_isolated::cargo_manifest_architecture(verb, manifest, c);
+    let mut command =
+        crate::crypto_isolated::cargo_manifest_architecture(verb, manifest, architecture);
     command
         .env("CARGO_TARGET_DIR", "/output/api-target")
         .args([
@@ -393,15 +395,14 @@ fn private_dependencies(command: &mut Command, package: &str, dependencies: &[&s
 }
 
 /// Diagnose a second compilation; unstable options never produce shipping bytes.
-pub(crate) fn qualify(receipt: &mut String, c: &crate::crypto_isolated::CFlags) -> Result<()> {
-    let architecture = c.architecture();
+pub(crate) fn qualify(receipt: &mut String, architecture: Architecture) -> Result<()> {
     let root = Path::new("/output/api");
     fs::create_dir(root).map_err(|e| format!("API scratch: {e}"))?;
     let manifest = Path::new("/source/td-mta/Cargo.toml");
-    let mut command = cargo_diagnostic("rustc", manifest, "td-crypto", false, c);
+    let mut command = cargo_diagnostic("rustc", manifest, "td-crypto", false, architecture);
     crate::crypto_isolated::command_record(&command, "api-compile", receipt)?;
     crate::crypto_isolated::bounded_output(&mut command, "api-compile", 8 * 1024 * 1024, 1200)?;
-    let mut command = cargo_diagnostic("rustc", manifest, "td-crypto", false, c);
+    let mut command = cargo_diagnostic("rustc", manifest, "td-crypto", false, architecture);
     private_dependencies(&mut command, "td-crypto", PRIVATE_DEPENDENCIES);
     crate::crypto_isolated::command_record(&command, "api-private-dependencies", receipt)?;
     crate::crypto_isolated::bounded_output(
@@ -410,7 +411,7 @@ pub(crate) fn qualify(receipt: &mut String, c: &crate::crypto_isolated::CFlags) 
         8 * 1024 * 1024,
         1200,
     )?;
-    let mut command = cargo_diagnostic("rustdoc", manifest, "td-crypto", false, c);
+    let mut command = cargo_diagnostic("rustdoc", manifest, "td-crypto", false, architecture);
     crate::crypto_isolated::command_record(&command, "api-rustdoc", receipt)?;
     crate::crypto_isolated::bounded_output(&mut command, "api-rustdoc", 8 * 1024 * 1024, 1200)?;
     let triple = architecture.triple();
@@ -419,7 +420,7 @@ pub(crate) fn qualify(receipt: &mut String, c: &crate::crypto_isolated::CFlags) 
         architecture,
     )?;
     fixtures(root, architecture)?;
-    cargo_fixtures(root, receipt, c)?;
+    cargo_fixtures(root, receipt, architecture)?;
     receipt.push_str(&format!(
         "api-schema 61\napi-target {triple}\napi-cpu-features {}\napi-reachable-items {count}\napi-fixtures {}\n",
         cpu_features(architecture).join(","), FIXTURES.len()
@@ -427,12 +428,7 @@ pub(crate) fn qualify(receipt: &mut String, c: &crate::crypto_isolated::CFlags) 
     Ok(())
 }
 
-fn cargo_fixtures(
-    root: &Path,
-    receipt: &mut String,
-    c: &crate::crypto_isolated::CFlags,
-) -> Result<()> {
-    let architecture = c.architecture();
+fn cargo_fixtures(root: &Path, receipt: &mut String, architecture: Architecture) -> Result<()> {
     let manifest = root.join("Cargo.toml");
     let source = root.join("lib.rs");
     fs::write(&manifest, "[package]\nname=\"api_probe\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[lib]\npath=\"lib.rs\"\n[dependencies]\napi_probe_backend={path=\"backend\"}\n[workspace]\n").map_err(|e| e.to_string())?;
@@ -446,7 +442,7 @@ fn cargo_fixtures(
     )
     .map_err(|e| e.to_string())?;
     fs::write(&source, format!("#[cfg(all(target_env=\"musl\",target_arch=\"{}\",target_feature=\"crt-static\",not(test)))] pub struct Qualified;", architecture.name())).map_err(|e| e.to_string())?;
-    let mut command = cargo_diagnostic("rustdoc", &manifest, "api_probe", true, c);
+    let mut command = cargo_diagnostic("rustdoc", &manifest, "api_probe", true, architecture);
     crate::crypto_isolated::command_record(&command, "api-cargo-target", receipt)?;
     crate::crypto_isolated::bounded_output(&mut command, "api-cargo-target", 8 * 1024 * 1024, 120)?;
     let document = parse(&crate::crypto_isolated::read_output(
@@ -465,7 +461,7 @@ fn cargo_fixtures(
         return Err("Cargo rustdoc lost the static musl production cfg".into());
     }
     fs::write(&source, "#[cfg(not(doc))] pub struct Hidden;").map_err(|e| e.to_string())?;
-    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true, c);
+    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true, architecture);
     crate::crypto_isolated::command_record(&command, "api-cargo-guard", receipt)?;
     let output = crate::crypto_isolated::bounded_exit_output(
         &mut command,
@@ -482,7 +478,7 @@ fn cargo_fixtures(
         return Err("Cargo API guard did not produce the expected compiler error".into());
     }
     fs::write(&source, "pub trait Local {} impl dyn Local {pub fn leak(&self)->api_probe_backend::Key {api_probe_backend::Key}}").map_err(|e| e.to_string())?;
-    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true, c);
+    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true, architecture);
     crate::crypto_isolated::command_record(&command, "api-cargo-private-baseline", receipt)?;
     crate::crypto_isolated::bounded_output(
         &mut command,
@@ -490,7 +486,7 @@ fn cargo_fixtures(
         8 * 1024 * 1024,
         120,
     )?;
-    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true, c);
+    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true, architecture);
     private_dependencies(&mut command, "api_probe", &["api_probe_backend"]);
     crate::crypto_isolated::command_record(&command, "api-cargo-private", receipt)?;
     let output = crate::crypto_isolated::bounded_exit_output(
@@ -911,6 +907,7 @@ mod tests {
                     .0
                     .replace('-', "_")
             })
+            .chain(["td_primitives".to_owned(), "td_tls_provider".to_owned()])
             .collect::<BTreeSet<_>>();
         assert_eq!(
             admitted,

@@ -311,7 +311,7 @@ fn capacity_failure_and_retired_keys_preserve_caller_output() {
         panic!("fixture lock poison");
     });
     assert_eq!(key.operate(|_| Ok(())), Err(Error::Crypto));
-    assert!(key.key.lock().unwrap_err().into_inner().is_none());
+    assert!(matches!(key.key.lock(), Err(poisoned) if poisoned.get_ref().is_none()));
 }
 
 #[test]
@@ -376,4 +376,61 @@ fn signature_transform_failure_retires_before_key_restore() {
         );
         assert_eq!(output, [0xa5; 64]);
     }
+}
+
+#[test]
+fn generation_maps_random_failure_and_exhausted_draws() {
+    let mut output = [0x5a; P256_PKCS8_CAPACITY];
+    // A refused fill is Entropy, before or after a rejected draw.
+    let refused = generate(&mut output, || {
+        fresh_document(|_: &mut [u8]| Err(td_primitives::Refused))
+    });
+    assert_eq!(refused, Err(Error::Entropy));
+    let mut draws = 0;
+    let refused_late = fresh_document(|bytes: &mut [u8]| {
+        draws += 1;
+        if draws == 1 {
+            bytes.fill(0xff);
+            Ok(())
+        } else {
+            Err(td_primitives::Refused)
+        }
+    });
+    assert_eq!(refused_late.err(), Some(Error::Entropy));
+    assert_eq!(draws, 2);
+    // Every draw at or above the order, or zero, is rejected; 64 is Crypto.
+    for value in [0xff, 0x00] {
+        let mut draws = 0;
+        let exhausted = fresh_document(|bytes: &mut [u8]| {
+            draws += 1;
+            bytes.fill(value);
+            Ok(())
+        });
+        assert_eq!(exhausted.err(), Some(Error::Crypto));
+        assert_eq!(draws, GENERATION_DRAWS);
+    }
+    assert!(output.iter().all(|&byte| byte == 0x5a));
+    // An accepted draw is the document's scalar.
+    let document = fresh_document(|bytes: &mut [u8]| {
+        bytes.copy_from_slice(&scalar_one());
+        Ok(())
+    })
+    .unwrap();
+    let key = Provider.load_p256(&document).unwrap();
+    let mut public = [0; 65];
+    Provider.p256_public(&key, &mut public).unwrap();
+    assert_eq!(public, generator());
+}
+
+#[test]
+fn generated_documents_differ() {
+    let mut first = [0; P256_PKCS8_CAPACITY];
+    let mut second = [0; P256_PKCS8_CAPACITY];
+    let length = Provider.generate_p256(&mut first).unwrap();
+    assert_eq!(Provider.generate_p256(&mut second).unwrap(), length);
+    assert_ne!(first[..length], second[..length]);
+    assert_ne!(
+        crate::pkcs8::parse(&first[..length]).unwrap().scalar,
+        crate::pkcs8::parse(&second[..length]).unwrap().scalar
+    );
 }

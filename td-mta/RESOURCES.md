@@ -2615,17 +2615,16 @@ This checks those test-compiled paths against the existing worker allowance;
 it neither measures peak used stack bytes nor qualifies every provider/CPU
 path, maximum configuration/certificate layout, production opener, scheduler
 frame or simultaneous worker. Initial and later RNG work for this one worker
-is included in its exercised paths; per-worker native heap state is not
-measured. Rust/native allocation, complete generation/session coexistence
+is included in its exercised paths. Rust allocation, complete generation/session coexistence
 and whole-process RSS remain unmeasured service dimensions. Under DESIGN
 section 5 they do not create a byte-ledger prerequisite for functional work.
 The retained-connection scenarios also exercise implicit handoff tails, tightened
 handshake deadlines, sticky failure, gateway reload refusal, established clock
 failure and authorization/permit release. Successful execution on the observed
-mapping does not prove native stack probing: the pinned native flags do not
-enable stack-clash protection. This fixture cannot establish that every native
-overflow would fault on the guard. Native-frame auditing/probing remains required
-before claiming an enforced end-to-end stack bound.
+mapping does not prove stack probing in the prebuilt musl libc and Rust std
+objects, whose frames could skip the guard. This fixture cannot establish
+that every overflow would fault on the guard. Auditing/probing those frames
+remains required before claiming an enforced end-to-end stack bound.
 The fixture adds no runtime thread or reservation, dependency or unsafe code.
 The existing configuration fixtures share the exact mapping parser so their
 guard/growth rules cannot drift; their labels and ceilings remain unchanged.
@@ -2766,9 +2765,9 @@ allocation, reallocation, deallocation and failed calls, requested live bytes
 and lifetime peak bytes. Atomics are fixed static test overhead. Any arithmetic
 failure invalidates the run. It does not track pointer identities; valid
 GlobalAlloc callers supply matching layouts. It does not measure allocator
-headers, fragmentation, transient realloc copies, direct native allocations,
-RSS or stack bytes. Native/C measurements may overlap System traffic and must
-never be added as disjoint totals without evidence.
+headers, fragmentation, transient realloc copies, libc's internal
+allocations, RSS or stack bytes. The admitted closure compiles no C, so every
+other heap request td-mta's code and its crates make reaches this counter.
 
 All observations here run sequentially on the dedicated process's main thread.
 Snapshots require quiescence; no counter is reset. A successful call's charge
@@ -2789,10 +2788,12 @@ parallel workers, maximum inputs or whole-service memory, and it changes no
 ledger allowance or service admission condition. Portable qualification runs
 the fresh static executable and requires its exact completion record.
 
-## Native allocation ownership table
+## Allocation ownership table
 
-M07e2b adds test-only, fixed-capacity address/size bookkeeping for the
-C boundary probe. Entries contain integer addresses, never dereferenceable
+M07e2b's test-only, fixed-capacity address/size bookkeeping
+(`tests/support/allocation_registry.rs`) is exercised by the Rust allocation
+probe; no executable intercepts libc allocations with it (the libc-boundary
+probe, UNSAFE.md T2, is retired). Entries contain integer addresses, never dereferenceable
 borrowed pointers. Zero marks an empty slot and one remains a reserved invalid
 address; real allocator results must be checked before insertion. Null
 arguments to `free(NULL)` and `realloc(NULL, n)` must bypass removal. A zero-
@@ -2823,8 +2824,7 @@ A failed nonzero realloc must restore its old address/size. If another thread
 occupied the vacant slot, restoration may fail with full capacity; this also
 invalidates evidence without changing the real allocator result. Table bytes/peak
 track bookkeeping instants, excluding storage inside the real allocator during
-that call. The wrapper contract below handles zero-size resizes explicitly;
-a generic null result does not establish ownership.
+that call. A generic null result does not establish ownership.
 
 Host tests exercise collisions, closed-gap reuse, saturation, zero-size
 ownership, arithmetic overflow, duplicate/unknown addresses, failed/moved
@@ -2833,9 +2833,8 @@ construction through the shared guard; the concurrent test is a smoke check,
 not deterministic coverage of every interleaving. The Rust allocation probe
 also exercises table insert/remove/snapshot in its no-call interval. Its
 unchanged v1 success record intentionally includes these added table checks.
-This table alone intercepts no native allocation, makes no libc coverage claim
-and changes no runtime memory allowance. The C probe below reports fixed table
-storage separately as instrumentation overhead.
+This table intercepts no allocation, makes no libc coverage claim and changes
+no runtime memory allowance.
 
 The gap-closing tests include wrapped clusters, a slot-at-home that must not
 move, complete return to empty slots under churn, and deterministic operation
@@ -2847,48 +2846,36 @@ becomes sticky after the first error. Separate valid-only traces compare
 200000 operations and require evidence to remain valid throughout. Immediate
 error-path assertions pin duplicate and arithmetic-failure invalidation.
 
-## Native allocator diagnostic executable
+## Libc-boundary observation
 
-M07e2c adds a separate static musl test executable behind UNSAFE.md T2. Six
-final-link wrappers preserve libc results, arguments, alignment and failure
-behavior. A const, drop-free thread-local recursion guard makes nested calls
-part of their outer operation; registry locks cover only bookkeeping and are
-released before real allocator calls. The fixed 65536-slot table and counters
-are instrumentation overhead, excluded from service memory evidence.
+No libc-boundary allocation diagnostic is built: the selected closure
+compiles no C, so the heap td-mta and its crates request goes through
+Rust's global allocator, which the Rust allocation probe counts. libc's own
+internal allocations remain outside every counter here; M23 measures
+integrated service memory. The portable build refuses any `__wrap_` symbol
+and any AWS-LC, OpenSSL-family or ring C symbol in every retained
+executable (td-crypto/PORTABLE.md).
 
-Null free/realloc arguments bypass removal. Nonnull zero-size results own an
-entry with zero requested bytes. A failed nonzero realloc restores ownership;
-a nonnull-pointer zero-size realloc is forwarded but invalidates evidence.
-Overflow, table saturation, unknown ownership and failed TLS access also
-retire the observation. No fork, signal-handler or asynchronous cancellation
-use is qualified. Native snapshots are read only at quiescent control
-boundaries. Four concurrent workers exercise forwarding and release; a
-separate fresh process verifies that zero-size resize invalidates evidence.
-
-The initial positive controls qualify forwarding and outer-call accounting;
-provider RNG initialization requires a positive boundary call and keeps actual
-native allocation paths in the link. Successful output separately reports
-registry bytes, fixed counter bytes and per-thread flag bytes. TLS-block and
-runtime thread overhead are outside those instrumentation figures.
-Link wrapping covers undefined references only. Hidden/local libc calls,
-startup paths and unqualified alternate allocators remain outside the counts.
-Thus these are diagnostic C boundary observations, potentially overlapping
-Rust System calls, not exact native heap or whole-service RSS measurements.
-M23 measures integrated service memory; this diagnostic supplies no service
-memory claim or exhaustive pre-integration qualification requirement.
-
-Positive controls use opaque C function pointers and require exact nonzero
-call deltas. Direct allocator calls used only in null checks can disappear
-under compiler optimization; black-boxing the size arguments alone does not
-establish that libc executed. These are checks of the pinned compiled
-execution, never memory-safety assumptions about source allocation calls.
+These are the only recorded results of the portable run; td-crypto's
+PORTABLE.md refers here rather than repeating them. Current run (pinned
+Rust 1.99.1, x86_64-unknown-linux-musl): every step passed, and no
+retained executable carries a refused symbol. Configuration stack
+mappings: 167936, 249856 and 258048 bytes. Rust requested bytes
+(live/peak): `--tls-clients` 770402 after generation, peak 889480, 0
+after drop; `--tls-handshake` peak 922309, warm records leaving live
+bytes at 905903; `--entropy-workers` peak 4096, warm fills adding no
+allocation (40 allocations from spawn through repeat), 544 bytes left at
+drop; `remote13large` peak 1084964. RSS (KiB): control baseline 860;
+handshake peak 3464; large chain peak 3636; at the candidate phase,
+generation 4808, routing 6060 and trust 6008; `remote13large` peak
+3480, 2536 after drop.
 
 ## Outbound lifecycle allocation observations
 
-The dedicated Rust and native probes can each run the same socket-free
-outbound scenario in a fresh process. Twelve ordered snapshots cover the
+The dedicated Rust probe runs a socket-free outbound scenario in a fresh
+process. Twelve ordered snapshots cover the
 initial baseline, materialized configuration, first relay/ACME generation,
-four allocated wire buffers plus handshake pool, reservation, native client
+four allocated wire buffers plus handshake pool, reservation, client
 construction, a second published generation retaining the first through its
 session, two pending sessions, capacity refusals, session release, 32 repeated
 constructions using returned buffers, and final owner destruction. No server
@@ -2903,21 +2890,17 @@ single-threaded scenario make snapshots quiescent. Reservation and saturation
 must not change any counter; repeated warm construction must not retain
 additional requested bytes. Cold provider initialization and its retained
 state are included in observations, without assuming final totals return to
-zero. The native controls' worker threads finish before measurement begins.
+zero.
 
-Rows start with `tls-rust` or `tls-native` and an ordered phase name. Rust
-columns are cumulative alloc, zeroed, realloc, free, failed calls, requested
-live bytes and lifetime peak. Native columns are cumulative malloc, calloc,
-realloc, free, posix_memalign, aligned_alloc calls, live tracked blocks,
-requested live bytes and lifetime peak. Peaks include controls and earlier
-phases; subtracting snapshots does not produce a phase peak. Native counts
-overlap Rust System allocations, so the separate runs cannot be summed.
-Neither observation includes allocator overhead, all internal libc paths,
-RSS, or stack storage. Instrumentation storage remains separately reported.
+Rows start with `tls-rust` and an ordered phase name. Columns are cumulative
+alloc, zeroed, realloc, free, failed calls, requested live bytes and lifetime
+peak. Peaks include controls and earlier phases; subtracting snapshots does
+not produce a phase peak. Observations include no allocator overhead,
+internal libc paths, RSS, or stack storage.
 
 ## Local handshake and record observations
 
-Each allocation probe also has a fresh-process `--tls-handshake` mode. It
+The allocation probe also has a fresh-process `--tls-handshake` mode. It
 reuses the transport tests' synthetic P-256 certificate encoder, generates
 private test keys, and compiles one complete SMTP/HTTPS/relay policy generation.
 Only an ephemeral loopback socket pair is opened; configured production ports,
@@ -2934,8 +2917,8 @@ the server and all returned buffers retained, release of both connections
 with all four buffers retained, explicit release of those buffers, and
 complete owner destruction. Each transfer verifies all plaintext bytes.
 Snapshot storage is fixed and output follows owner destruction. The columns
-match the outbound lifecycle observations. Row prefixes are
-`tls-rust-handshake` and `tls-native-handshake`. The builder accepts only the
+match the outbound lifecycle observations. The row prefix is
+`tls-rust-handshake`. The builder accepts only the
 ordered handshake schema and gives each process a distinct command log. The
 handshake and large-chain completion records use allocation schema v2;
 client, entropy and fragmented-input allocation records remain v1.
@@ -2945,35 +2928,34 @@ deltas show state released by each endpoint while shared generation/material
 and wire reservations remain alive. They exclude fixed object/stack storage,
 shared ownership and process-lifetime provider state; they are not complete
 session costs. Releasing the four returned buffers must remove exactly
-73748 requested bytes in each counter domain and four native tracked blocks.
+73748 requested bytes.
 This pins their allocation ownership independently of endpoint state. RSS
 observes the same phases but does not require an equivalent resident decrease;
 allocator retention and page accounting differ from requested-byte ownership.
 
-Warm repeated records must retain no additional requested Rust bytes or tracked
-C boundary bytes/blocks. This is a retention check, not a zero-call assertion:
+Warm repeated records must retain no additional requested Rust bytes. This
+is a retention check, not a zero-call assertion:
 TLS record operations can allocate and resize buffers. Requested lifetime peaks
 include fixture material generation and prior controls. There is no per-phase
-peak reset, and no attempt to sum overlapping counter domains. The fixture does
+peak reset. The fixture does
 not cover TLS 1.2, mTLS, maximal certificate chains, maximum configuration,
 concurrent workers, malicious peers, stalled sockets, process RSS or stack
 ceilings. It neither changes the resource ledger nor activates the service.
 
 ## Entropy worker lifetime observations
 
-Each counter domain also runs `--entropy-workers` in a fresh process after
-its forwarding controls. Eight test workers request 240 KiB stacks, announce
+The Rust probe also runs `--entropy-workers` in a fresh process after its
+forwarding controls. Eight test workers request 240 KiB stacks, announce
 startup, and wait without allocating. One worker initializes SystemEntropy
 and fills 32 bytes; the remaining seven then do the same. All workers perform
 64 further fills before waiting again. The observer requires every counter
-to remain unchanged across those warmed fills. Native cold initialization
-must increase malloc or calloc calls. Only after taking the repeated snapshot
+to remain unchanged across those warmed fills. Only after taking the repeated snapshot
 does the main thread release and explicitly join every worker, including
 thread-local destructors. A final snapshot follows scope teardown.
 
 The seven phases are baseline, spawned, first_warm, all_warm, repeated, joined
 and dropped. Fixed snapshot arrays are formatted after teardown; prefixes are
-`tls-rust-entropy` and `tls-native-entropy`, with the same columns and lifetime
+`tls-rust-entropy`, with the same columns and lifetime
 peak semantics as the TLS observations. Release/acquire checkpoints establish
 that workers have finished each operation before the observer reads counters.
 A drop guard releases waiting workers on a parent failure, checkpoint waits
@@ -2984,9 +2966,9 @@ after worker exit without assigning each allocation to a provider subsystem.
 They neither assert that process-lifetime provider state returns to baseline
 nor include stack mappings, allocator overhead or all libc internal paths.
 The requested test stack size is not measured stack/RSS evidence. Different
-crypto operations, reseeding, maximum concurrency workloads and production
-worker integration still require qualification. No ledger or service worker
-count changes; Rust and C observations continue to overlap.
+crypto operations, maximum concurrency workloads and production worker
+integration still require qualification. No ledger or service worker count
+changes.
 
 ## Fragmented handshake refusal observations
 
@@ -3006,17 +2988,14 @@ precedes the final record; it is not a snapshot at the exact transient peak.
 The `large_refused` and `small_refused` snapshots follow explicit session drop;
 they cannot distinguish release at refusal from release during drop. Refusal
 must retire handshake evidence, and the fixture then drops the session.
-Repeated cycles must retain no additional requested Rust bytes or tracked
-C bytes/blocks. Counter
-rows use `tls-rust-fragment` and `tls-native-fragment` with the established
-columns. Lifetime peaks still include controls and policy setup.
+Repeated cycles must retain no additional requested Rust bytes. Counter
+rows use `tls-rust-fragment` with the established columns. Lifetime peaks still include controls and policy setup.
 
 This fixture generates no valid peer certificate chain, successful handshake
 or established traffic. It does not add mail pump buffers, service admission,
 concurrent handshake slots or whole-process RSS accounting. It measures a
 specific untrusted-input allocation path, not every adversarial handshake or
-a total session bound. Provider state can survive session teardown; the two
-counter domains remain overlapping observations.
+a total session bound. Provider state can survive session teardown.
 
 ## Large local certificate-chain observations
 
@@ -3029,10 +3008,10 @@ ceiling; this tests a large admitted chain, not every maximum encoding.
 Ordinary fixtures retain their original certificate shape without padding.
 
 The thirteen phases and columns match the ordinary handshake scenario, with
-`tls-rust-large-chain` and `tls-native-large-chain` prefixes. Require
+the `tls-rust-large-chain` prefix. Require
 authenticated server name, TLS 1.3, returned handshake permits, verified
 bidirectional 16 KiB
-traffic and no additional retained bytes/blocks across repeated records.
+traffic and no additional retained bytes across repeated records.
 Fixture material, its source PEM bytes and both endpoints remain charged in
 these observations; they are not isolated per-session or per-generation costs.
 Lifetime peaks include earlier controls. No ledger limit, production trust
@@ -3041,8 +3020,8 @@ policy, generation admission or whole-service RSS claim changes.
 ## Sampled process RSS observations
 
 A separate unwrapped `rss_probe` integration executable reuses the shared
-allocation scenarios. Each mode runs in a fresh process without either
-allocation counter or the native registry. An observer opened before the
+allocation scenarios. Each mode runs in a fresh process without the
+allocation counter. An observer opened before the
 scenario rewinds `/proc/self/smaps_rollup` into a fixed 4096-byte buffer and
 requires one complete read followed by EOF. It extracts exactly one positive
 `Rss:` value with kernel `kB` units (KiB); duplicate, missing, malformed or
@@ -3067,8 +3046,8 @@ formatted after scenario teardown. Positive controls use the control scenario
 with baseline, touched and dropped phases.
 
 RSS includes resident code, stacks, shared pages, allocator overhead, fixture
-material and the observer itself. It is neither a disjoint native-allocation
-count nor a per-session charge. A rollup is a kernel walk, not an atomic
+material and the observer itself. It is neither an allocation count nor a
+per-session charge. A rollup is a kernel walk, not an atomic
 snapshot of concurrently running threads. Checkpoints reduce fixture activity
 but do not turn these samples into transient high-water marks. Page residency
 and allocator retention vary by host and run. Whole-service worst-case RSS,
@@ -3077,7 +3056,7 @@ these observations change no memory allowance or service activation rule.
 
 ## Sixteen-profile generation observations
 
-The `--tls-generations` mode in each counter executable and the unwrapped RSS
+The `--tls-generations` mode in the counter executable and the unwrapped RSS
 executable constructs sixteen independently admitted files identities from
 synthetic large chain/key material. A direct SMTP listener and one HTTPS
 listener consume two profiles; fourteen MTA-STS domain names select the other
@@ -3107,13 +3086,12 @@ refusal, old-lease release, four further replacements, current-generation
 release and complete scope teardown. The capacity refusal must leave both
 counter snapshots unchanged. Releasing the old lease must return live
 requested bytes to the first-generation level; repeated replacements must
-preserve that level. Native tracking also checks live blocks at both
-boundaries. The raw material, configuration and clock remain alive at the
+preserve that level. The raw material, configuration and clock remain alive at the
 current-generation-release checkpoint. Fixed arrays hold observations until
 all owners drop. Allocation records use the distinct
-`tls-generation-allocation-v1: DOMAIN passed` completion; RSS uses its
+`tls-generation-allocation-v1: rust passed` completion; RSS uses its
 existing v2 completion with the generation scenario. The routing mode
-instead uses `tls-generation-routing-allocation-v1: DOMAIN passed` and the
+instead uses `tls-generation-routing-allocation-v1: rust passed` and the
 `generation-routing` RSS scenario. Both use the same checkpoints and
 oracles; the parser rejects crossed scenario names as well as missing,
 duplicate, reordered or wrong-version records.
@@ -3121,13 +3099,13 @@ duplicate, reordered or wrong-version records.
 These requested-byte differences include the independently compiled identities
 and shared HTTPS routing objects, but exclude fixed caller state, stack and
 allocator overhead. Their lifetime peaks include fixture preparation and both
-generations. The domains overlap. RSS includes the entire fixture and observer
+generations. RSS includes the entire fixture and observer
 and need not fall on release. The routing case reaches the schema's profile,
 listener and domain counts with long derived names. It does not maximize every
 profile's name count, certificate-name length, gateway policies, trust bundles
 or mixed key algorithms. A configuration with explicit MX on every domain can
 use sixteen HTTPS listeners without direct SMTP; this case has only fifteen
-HTTPS tables. The allocation probes additionally require this routing case's
+HTTPS tables. The allocation probe additionally requires this routing case's
 first-to-candidate requested-byte increase to fit a narrower 1 MiB regression
 guard. Shared HTTPS identity views avoid retaining another copy of the same
 names for every listener. This fixture-specific check excludes allocator
@@ -3165,15 +3143,15 @@ external MX for every domain, with no direct SMTP listener. These settings
 belong to the fixture. Assertions check the decoded profile/listener/gateway
 counts, material-open counts and complete seventeen-entry policy table.
 
-Rust/native allocation processes enforce the same unchanged third-slot
+The Rust allocation process enforces the same unchanged third-slot
 refusal, old-generation release and four stable replacements as the other
 generation cases. RSS is sampled in its own process. Exact
 `generation-trust` schema labels distinguish all eleven lifecycle phases,
-with allocation completion `tls-generation-trust-allocation-v1: DOMAIN passed`
+with allocation completion `tls-generation-trust-allocation-v1: rust passed`
 and RSS completion `rss-observation-v2: generation-trust passed`. Other
 scenario output cannot supply its evidence. The first-to-candidate retained
-delta is about 1.2 MiB in both counter domains, compared with the generation
-estimate. Its single HTTPS listener has no views to share across listeners.
+delta was about 1.2 MiB under the earlier AWS-LC backend, compared with the
+generation estimate. Its single HTTPS listener has no views to share across listeners.
 Integrated memory measurements remain M23 work; this fixture alone supplies
 no service memory claim.
 The case does not establish a maximum for arbitrary subjects, mixed algorithms,
@@ -3197,15 +3175,15 @@ Instrumented processes never spawn children. Cleanup runs on normal return and
 unwinding; an outer hard kill can leave children and temporary material until
 runtime namespace cleanup.
 
-For each version/ticket mode, the runner starts three fresh controllers. Each
-controller starts one Rust, native or unwrapped RSS observer with an explicit
+For each version/ticket mode, the runner starts two fresh controllers. Each
+controller starts one Rust or unwrapped RSS observer with an explicit
 peer address and root. Eleven snapshots cover baseline, loaded
 configuration/root, client generation, reserved wire buffers/socket, session
 construction, authenticated handshake, one echoed 16 KiB record, thirty-two
 further verified echoes, client release, returned-buffer release and final
-owner teardown. Both counter domains require stable requested bytes across
-repeated records; native also checks blocks. Dropping the returned pair must
-release exactly 36874 requested bytes and two native blocks. The handshake
+owner teardown. The counter requires stable requested bytes across
+repeated records. Dropping the returned pair must
+release exactly 36874 requested bytes. The handshake
 must report the requested version and server-name verification. Record
 processing includes any queued tickets; it does not isolate their transient
 peak. Fixture configuration and trust remain alive through client and buffer
@@ -3222,9 +3200,9 @@ channels, not service configuration or a public backend interface.
 The repeated-to-released delta exposes client-owned requested heap; adding the
 separately released wire pair counts each once. It still excludes shared
 configuration, fixed objects, stacks and allocator overhead. The allocation
-probes require the record checkpoint's retained bytes minus the retained
+probe requires the record checkpoint's retained bytes minus the retained
 generation checkpoint to fit `TLS_SESSION_BYTES`. This includes the wire pair
-and conservatively charges native caches initialized during session work.
+and conservatively charges backend caches initialized during session work.
 The repeated checkpoint's lifetime peak minus that generation baseline must
 fit the session entry plus the larger handshake/established-processing entry.
 A separate guard subtracts the retained authenticated-handshake snapshot
@@ -3232,8 +3210,7 @@ from the repeated-record lifetime peak and checks only the established-
 processing entry. Earlier construction/handshake peaks are included, not
 isolated. These are guards on the measured cases, not worst-case accounting
 over all peer inputs. Retained bytes, lifetime high-water observations and
-sampled RSS remain distinct, and the
-Rust/native domains overlap. This fixture is not maximum simultaneous queued
+sampled RSS remain distinct. This fixture is not maximum simultaneous queued
 traffic, maximum tickets, mTLS or complete service qualification. The
 large-ticket case covers one near-ceiling fragmented ticket. Socket-free
 crypto fixtures also qualify selected accepted flights and terminal refusal
@@ -3244,7 +3221,7 @@ estimates; configured queue limits are not a whole-memory bound.
 ## Decoded certificate-list refusal observations
 
 The existing diagnostic artifacts accept `--tls-certificate-list` in
-separate fresh Rust/native/RSS processes. This untrusted outbound-client
+separate fresh Rust/RSS processes. This untrusted outbound-client
 case sends an unexpected plaintext Certificate message in the TLS 1.2 format
 before ServerHello, carrying 21800 empty DER entries. Its three-byte list
 length plus entries form a 65403-byte body; records fragment it at 16 KiB
@@ -3255,15 +3232,15 @@ peer authentication.
 
 Eleven phases cover baseline, retained client policy, wire storage, each
 fragmentation case's constructed/pending/refused states, 32 repetitions of
-both cases and final teardown. Rows use `tls-DOMAIN-certificate-list` with
-completion `tls-certificate-list-allocation-v1: DOMAIN passed`, or the
-independent RSS schema. Both allocation probes require at least 512 KiB of
+both cases and final teardown. Rows use `tls-rust-certificate-list` with
+completion `tls-certificate-list-allocation-v1: rust passed`, or the
+independent RSS schema. The allocation probe requires at least 512 KiB of
 additional lifetime requested-byte peak above the first pending peak
 snapshot, proving this pin exercises decoded-entry allocation. This is a
 qualification control, not a required allocation floor for future backends:
 it relies on this pin's vector growth, including spare capacity. After the
 second refusal, all repetitions must leave retained requested bytes
-unchanged; native live block counts must also stay fixed. Refusal consumes
+unchanged. Refusal consumes
 the session, discards queued output and refuses later reads, writes and
 records.
 
@@ -3275,7 +3252,7 @@ processing entry.
 
 The input is bounded but decoded storage can be much larger than its wire
 body. Counter peaks do not include allocator metadata or every realloc
-transient; Rust/native domains overlap. RSS samples occur between calls and
+transient. RSS samples occur between calls and
 can miss allocations already freed by a refused call. This single TLS 1.2
 pre-ServerHello case does not bound encrypted TLS 1.3 certificate lists,
 post-handshake messages, concurrent sessions or total service memory. M07e

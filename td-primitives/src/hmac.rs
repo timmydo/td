@@ -43,12 +43,23 @@ impl<D: Digest> Hmac<D> {
         self.inner.update(data);
     }
 
-    pub fn finalize(self) -> D::Output {
-        let Self { inner, mut outer } = self;
+    pub fn finalize(mut self) -> D::Output {
+        let inner = std::mem::replace(&mut self.inner, D::new());
         let mut hashed = inner.finalize();
-        outer.update(hashed.as_ref());
+        self.outer.update(hashed.as_ref());
         zero_output(&mut hashed);
-        outer.finalize()
+        std::mem::replace(&mut self.outer, D::new()).finalize()
+    }
+}
+
+/// Both hash states are key-equivalent, so dropping overwrites each with a
+/// fresh one, best effort: copies a move or `finalize` left are not reached.
+impl<D: Digest> Drop for Hmac<D> {
+    fn drop(&mut self) {
+        self.inner = D::new();
+        self.outer = D::new();
+        std::hint::black_box(&self.inner);
+        std::hint::black_box(&self.outer);
     }
 }
 

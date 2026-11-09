@@ -125,17 +125,17 @@ service/resource qualification remain pending.
 
 The M03a boundary moves the existing Crypto/Entropy/Digest traits and fixed
 crypto errors into td-crypto. Mail ports re-export those traits and translate
-shared errors. M03b1 admits the approved Rustls/AWS-LC closure inside td-crypto
-only. M07a1 implements opaque SHA-256; M07a2 qualifies it against the existing
+shared errors. td-crypto holds the approved Rustls closure, its
+cryptography td-primitives through td-tls-provider, and no other crate
+does. M07a1 implements opaque SHA-256; M07a2 qualifies it against the existing
 mail-format digest fixtures. M07a3 adds worker-local entropy initialization;
 M07a4 implements the Crypto factory and opaque P-256 operations.
 TLS sessions and bounded mail record progress are implemented; admitted
 service integration and resource qualification remain pending.
 Direct streaming digests use td-owned inline SHA-256 without heap allocation
 or provider calls.
-Other native operations still require resource qualification. No
-Rustls/AWS-LC public types, re-exports or configuration escape hatches cross
-its facade.
+No Rustls, td-tls-provider or td-primitives public types, re-exports or
+configuration escape hatches cross its facade.
 Mail transport adapters consume opaque td-crypto configurations/session state.
 The service's transitive lock/executable still includes the backend dependencies;
 it is not described as dependency-free once they are added.
@@ -984,9 +984,9 @@ These are named data dependencies, not permission to import a Unicode or
 mail parsing library.
 
 The backend admission and gate contract lives in td-crypto/DESIGN.md. All
-three packages stay in the test roster. The user approved Rustls with AWS-LC;
-M03b1 records exact transitive pins, features, licenses, roots and rationale;
-M03b2 pins the portable native inputs. The separate, user-approved private
+three packages stay in the test roster. The user approved Rustls as the TLS
+engine; td-crypto/DEPENDENCIES.md records exact transitive pins, features,
+licenses, roots and rationale, and td-crypto/PORTABLE.md the portable inputs. The separate, user-approved private
 PostgreSQL storage closure is pinned in td-crypto/DEPENDENCIES.md and
 POSTGRES.md. No external async runtime, web framework, mail parser,
 serialization or ACME framework rides along.
@@ -995,9 +995,10 @@ behavior before consumers depend on it; exact versions belong in the
 lock/review.
 
 The portable musl artifact has a separate, host-only build manifest: pin Rust
-and its target standard library, the musl headers, the C compiler and binutils
-needed by the crypto provider (the pinned Debian build root's), and their
-source/artifact checksums and provenance.
+and its target standard library, the binutils the build inspects and splits
+with (the pinned Debian build root's), the musl source archive whose notice the
+linked libc carries, and their source/artifact checksums and provenance.
+Nothing in the closure compiles C.
 Provision them before offline builds; ambient host tools cannot silently fill
 missing inputs. M03b2 owns these exact pins and a clean build fixture. This
 portability workflow is outside td's Debian-runtime target artifact graph;
@@ -1020,14 +1021,11 @@ bypass the store's commit API. TLS framing/cryptographic verification belongs
 to td-crypto; mail STARTTLS transitions, deadline/lease accounting and gateway
 allowlist authorization belong to td-mta. API section 1.1 owns that integration.
 
-Future td-owned cryptographic primitives, implemented in `td-primitives`,
-replace AWS-LC internally behind the same td-crypto facade. Its Rustls provider bridge changes there too, to the
-shared `td-tls-provider` crate, kept private behind the facade;
-mail/storage code and the direct dependency remain stable. F04 requires
-cryptographic, interoperability and resource qualification before deployment.
-Replacing only the direct digest/signing operations does not replace TLS's
-cryptography. Retaining Rustls means td-crypto still has an external TLS
-implementation even after AWS-LC is removed.
+td-crypto's cryptography is td-owned: `td-primitives` behind the facade,
+and for TLS the shared `td-tls-provider` crate, kept private behind it;
+mail/storage code and the direct dependency do not see it. F04 records what
+of its qualification remains before deployment. Retaining Rustls means
+td-crypto still has an external TLS implementation.
 
 The production library retains `forbid(unsafe_code)`. The binary denies it
 with function-scoped termination and listener exceptions recorded in
@@ -1062,14 +1060,13 @@ The separate test executable
 exception specified in UNSAFE.md T1. Its single scoped GlobalAlloc
 implementation forwards all four operations to System without changing
 layouts, pointers, results or failure behavior. Fixed atomic counters observe
-requested Rust bytes; native allocation and RSS need separate measurements.
+requested Rust bytes, which are all the heap the selected crates
+themselves request, as none of them compiles C; libc's own internal
+allocations and thread stacks are outside the count, and RSS needs a
+separate measurement.
 The probe has its own main and no libtest workers. It is never a library
 module, runtime feature or installed executable. Source confinement and the
 portable artifact inventory/symbol check enforce this boundary.
-A separate native allocation qualification executable uses the approved
-UNSAFE.md T2 boundary: six libc forwarding wrappers linked only into that
-static musl test. Its observations remain diagnostic C boundary counts, may
-include Rust System calls, and do not establish whole-service memory.
 Any further platform or test instrumentation surface must amend UNSAFE.md and
 this design, name each operation, and add confinement tests before landing.
 

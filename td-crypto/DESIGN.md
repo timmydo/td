@@ -4,8 +4,8 @@
 
 This crate owns td's provider-independent cryptographic API. The compiling
 M03a surface contains `Error`, `Entropy`, `Digest` and `Crypto`, extracted
-from td-mta's existing ports. M03b1 admits the private Rustls/AWS-LC
-dependencies and checks their offline host build. M07a1 implements opaque
+from td-mta's existing ports. M03b1 admits the private Rustls dependencies
+and checks their offline host build. M07a1 implements opaque
 streaming SHA-256; its direct operation uses the owned fixed-state
 primitive. M07a3 adds the opaque worker-local entropy handle. M07a4
 implements the Crypto factory, fixed-size comparison and opaque P-256 key
@@ -19,10 +19,13 @@ immutable identity routing. M07c1 adds socket-free client sessions; M07c2
 adds server admission and verified-client evidence.
 Test-only backend qualification covers explicit provider construction,
 SHA-256, local TLS 1.2/1.3 data exchange, certificate verification and
-malformed/tampered-record refusals in the isolated static executable. A
-test-only td-primitives backend, through td-tls-provider, is qualified
-against AWS-LC ("td-primitives backend qualification" below). Mocks
-and interface tests are not cryptographic conformance evidence.
+malformed/tampered-record refusals in the isolated static executable. The
+backend is td-primitives, for TLS through td-tls-provider; fixed known
+answers from AWS-LC, the backend it replaced, pin compatibility
+("td-primitives backend qualification" below). Mocks and interface tests are
+not cryptographic conformance evidence. In this document "native" names the
+backend's own objects and calls (Rustls, td-tls-provider and td-primitives),
+as distinct from the facade's.
 
 The target dependency graph is:
 
@@ -36,7 +39,9 @@ td-mta (library and packaging executable)
   -> td-nfc (std-only bounded canonical composition)
   -> tokio-postgres (private PostgreSQL backend, runtime disabled)
   -> td-crypto (td-owned API and private backend)
-       -> rustls + aws-lc-rs + reviewed root data
+       -> rustls (no built-in backend) + reviewed root data
+       -> td-tls-provider (rustls CryptoProvider over td-primitives)
+       -> td-primitives (std-only primitives)
 ```
 
 td-mta/DESIGN.md section 3 owns the direct mail dependency rule. After backend
@@ -53,9 +58,9 @@ provider. Tokio supplies I/O traits and synchronization only; its runtime,
 net and time features are absent. No other roster consumer is admitted.
 
 The common offline vendor uses the mail lock's union of crypto and PostgreSQL
-sources, checking every archive checksum. Crypto's selected 19-package graph
-is unchanged; mail adds the 55 selected PostgreSQL packages listed in
-DEPENDENCIES.md. Exact manifests, locks and active features are pinned in the
+sources, checking every archive checksum. Crypto's selected graph is eight
+registry packages, td-tls-provider's seven and webpki-roots; mail adds the 56
+selected PostgreSQL-side packages listed in DEPENDENCIES.md. Exact manifests, locks and active features are pinned in the
 shared policy. Mail's POSTGRES.md owns SQL and database resource semantics;
 STORAGE.md owns local runtime and response scratch. Native mail qualification
 requires independently installed PostgreSQL binaries; these host test tools
@@ -63,8 +68,9 @@ are not inputs to a target artifact.
 
 `td-crypto` does not depend on td-mta, its identifiers, configuration grammar,
 mail protocols, storage, logging, workers or service administration. Its own
-code uses std and follows the panic/indexing and unsafe contracts. The initial
-backend uses the approved Rustls/AWS-LC category. AGENTS.md and the shared
+code uses std and follows the panic/indexing and unsafe contracts. Its
+backend is the approved Rustls engine over td-tls-provider and td-primitives.
+AGENTS.md and the shared
 host/sandbox gate admit only the exact named manifests, locks, root Cargo
 configuration and selected normal/build features in
 `builder/src/crypto_policy.rs`. Other roster closures remain std-only.
@@ -79,12 +85,10 @@ td-primitives and td-tls-provider. Their exact manifests and locks are
 pinned; td-civil, td-fs, td-header, td-html, td-json, td-mime, td-nfc and
 td-primitives remain std-only roster crates. td-primitives' dev-dependency
 td-source-scan is compiled into no admitted graph and is not pinned.
-td-crypto's own dev-dependencies, td-tls-provider and td-primitives, compile
-only into its test targets for the backend qualification below; the selected
-normal/build graph the wrapper checks excludes them, and td-mta's lock does
-not list them.
-td-tls-provider (its DESIGN.md) is admitted with its own pinned Rustls line
-and active graph, which select no backend. The Cargo config pin contains only target runner settings, for
+td-crypto depends on td-tls-provider and td-primitives by path; td-crypto's
+and td-mta's selected graphs contain both. td-tls-provider (its DESIGN.md) is
+admitted with its own pinned Rustls line, which td-crypto's matches, and
+active graph, which select no backend. The Cargo config pin contains only target runner settings, for
 which Cargo selects the deepest definition. Any future pin change must
 recheck ancestor merging and relative path behavior; identical files with
 other settings need not have identical effective behavior. A nested
@@ -112,14 +116,15 @@ allowlist. The td-net archives are prepared only for native mail tests;
 portable crypto/mail builds and crypto-only qualification do not require them.
 DEVELOPMENT.md owns helper selection and test-runner bounds; td-mta's
 CONFORMANCE.md owns the fixture's evidence and limits.
-Repository Cargo configuration cannot set AWS_LC_SYS controls, including
-through escaped keys or inline environment tables.
-The wrapper qualifies the provisioned host Rust/C toolchain. Host invocations
+The wrapper qualifies the provisioned host Rust toolchain, with the
+provisioned `cc` (td-link on a td host) as its linker driver only: no
+admitted crate compiles C, and the wrapper sets no C compiler or archiver
+for build scripts. Host invocations
 share `.td-build-cache/crypto-target` unless CARGO_TARGET_DIR is supplied.
 Verified archive extraction and tree hashing repeat for each invocation; a
 persisted digest alone cannot authenticate changed source bytes. Its build is
-not the portable artifact: M03b2 must separately pin all portable native and
-Rust inputs and prove the clean musl build before M03 completes.
+not the portable artifact: M03b2 separately pins all portable inputs and
+proves the clean musl build (PORTABLE.md).
 
 ## Public API and failure rules
 
@@ -171,69 +176,40 @@ they follow the same ownership and redaction rules.
 `SystemEntropy::try_new` performs a nonempty one-byte random fill before
 returning a handle. Construct it on its owning worker during cold setup. The
 handle is neither Send nor Sync, so it cannot transfer an initialized handle
-to an unwarmed thread. This warms only the RNG path used by this API; other
-crypto/TLS paths still require their own qualification. Empty fills succeed
-but do not initialize native state. No Default constructor bypasses warm-up.
+to an unwarmed thread. Empty fills succeed without reading. No Default
+constructor bypasses warm-up.
 
-The opaque handle owns no Rust heap buffer. Native per-thread state survives
-handle drop. Initial use can allocate RNG state, a pthread pointer table and
-source-specific state; moving a Rust value would not transfer those allocations.
-There is also lazy process-wide state. The admitted Linux build includes jitter
-entropy; absent the native VM-generation-detection alternative, it initializes
-a global seed DRBG and jitter collector with its memory buffer/self-test.
-OS-randomness setup, VM-generation probing and the fork-detection mapping also
-have process-wide costs. Each worker's tree-seed initialization and later
-reseeds take a shared global lock; reseeding can collect jitter entropy while
-holding it. First use in the process costs more than later worker warm-up.
-M07 must measure both global and per-worker memory, stack and lock contention.
-Constructor success establishes neither a no-allocation hot path nor a bound
-on later native calls or elapsed time.
+Each nonempty fill is td-primitives' `random::fill`: it opens `/dev/random`
+and reads exactly the requested bytes, so a process using td-crypto needs
+`/dev/random` reachable and readable in its mount namespace; where it is
+not, construction and every fill return Entropy. Since Linux 5.6 that read blocks only until the
+kernel's CRNG is initialized, so the constructor's fill, and any fill before
+that point, can wait without a deadline; this constructor supplies no timeout
+or cancellation mechanism, and M07 must qualify startup ordering and
+supervision around it. The handle holds no state and no Rust heap buffer;
+there is no per-thread or process-wide generator state, no reseeding and no
+exit-time cleanup. Each fill opens and closes one file descriptor, so
+descriptor exhaustion is a returned failure. Constructor success establishes
+no bound on later elapsed time.
 
-The admitted non-FIPS `aws_lc_rs::rand::fill` path calls native `RAND_bytes`
-and maps its return status without a Rust unwrap/expect path. The pinned
-native function returns one on every normal return. Allocation, entropy,
-initialization/reseed/generation, lock/once and state-validation failures can
-abort the process. Those failures cannot become `Error::Entropy` or be caught
-by Rust unwinding. There is no weak-randomness or partial-byte fallback.
-
-Native calls can also block: early-boot OS entropy initialization may wait
-without a deadline, and calls after exit-time zeroization can remain locked
-forever (or abort when a lock reports an error). Waiting/fatal native paths
-can write diagnostics directly to stderr, including the executable path from
-AT_EXECFN; td's fixed returned errors do not redact that separate channel.
-M07 must qualify startup/shutdown ordering and supervision around these limits;
-this constructor supplies no timeout or cancellation mechanism.
-
-An ordinary returned provider error maps to fixed `Error::Entropy` and
-clears the entire caller slice. Callers must still discard it; zeroed bytes
-are never successful entropy. This is observable hygiene, not guaranteed
-erasure of compiler/caller copies. Private callback tests inject a returned
-error after a partial write at the same boundary; they do not simulate native
-entropy failure, OOM or process-death recovery. A local sample comparison is
-only a no-op/constant-output wiring check, not an entropy-quality test.
-
-Normal pthread teardown invokes native entropy-source cleanup and frees its
-source/RNG allocations through the default cleansing allocator. Dropping the
-handle does not trigger it; normal process exit does not run the main thread's
-pthread key destructors. Exit destructors clear registered frontend DRBGs,
-lock against later output and invoke source-specific zeroization. The tree-seed
-DRBG path reseeds with OS data (zeros if entropy is unavailable), rather than
-simply clearing its bytes. A separate destructor frees the global seed DRBG
-and jitter collector. Some thread nodes remain for OS reclaim at exit,
-including the main thread's node and nodes racing shutdown. These destructors
-are normal-exit paths; `_exit`, abort and kill can bypass them. This audit
-supplies no all-path erasure claim for source-owned storage, stack temporaries
-or compiler/caller copies.
+An open or read failure, a short read among them, maps to fixed
+`Error::Entropy` and clears the entire caller slice. Callers must still
+discard it; zeroed bytes are never successful entropy. There is no
+weak-randomness or partial-byte fallback. This is observable hygiene, not
+guaranteed erasure of compiler/caller copies. Private callback tests inject a
+returned error after a partial write at the same boundary. A local sample
+comparison is only a no-op/constant-output wiring check, not an
+entropy-quality test.
 
 ### Streaming SHA-256
 
 `Sha256::try_new` creates one inline td-owned operation with eight chaining
 words, one 64-byte partial block, a checked byte counter and terminal-state
-flag. Construction, updates and consuming finish use no heap, native provider,
+flag. Construction, updates and consuming finish use no heap, provider calls,
 locks or OS calls. The fallible public API remains unchanged. The concrete
 `Crypto` factory delegates to this constructor. This direct streaming operation
-uses the owned primitive; bulk worker hashing, Rustls and ES256 signing use
-AWS-LC.
+uses the owned primitive; bulk worker hashing, TLS and ES256 signing use
+td-primitives' SHA-256.
 
 The implementation adapts the FIPS 180-4 constants and compression algorithm
 already present in engine/src/sha256.rs. It owns its checked streaming and
@@ -249,7 +225,7 @@ the counted update path. Length refusal or an internal bounds failure clears
 and retires the state; later updates and finish return `Error::Crypto`. Only a
 successful consuming finish returns 32 bytes. No clone/reset or alternate
 backend selector is exposed. This implementation has no provider panic to
-catch; the crate still requires unwinding for its remaining native adapters.
+catch; the crate still requires unwinding for its other operations.
 
 Retirement and Drop clear retained words, block and counters; compression
 clears its schedule. `std::hint::black_box` follows those writes to discourage
@@ -262,9 +238,10 @@ clear state in place. Consuming finish clears a moved copy; the caller's
 original stack slot and compression spills can retain message/state bytes.
 
 Tests retain the four existing known answers and compare boundary lengths,
-fragmentation and every split through 257 bytes against the admitted AWS-LC
-implementation. Engine-derived code is not an independent oracle for this
-replacement. Synthetic counters exercise the limit without hashing exabytes;
+fragmentation and every split through 257 bytes against td-primitives'
+separately written, CPU-dispatched SHA-256. Engine-derived code is not an
+independent oracle for this implementation. Synthetic counters exercise the
+limit without hashing exabytes;
 counter differences also check that each upper padding-length byte matters.
 Malformed private-state fixtures check fail-closed retirement. The portable
 harness runs these cases and the existing mail-format digest fixtures. Its
@@ -277,40 +254,47 @@ primitives, targets or microarchitectural leakage outside that review scope.
 ### Bulk worker SHA-256
 
 `BulkSha256` is an opaque streaming digest for bulk I/O workers, implemented
-with the already admitted AWS-LC SHA-256 context and CPU dispatch. It implements
-`Digest` but does not replace `Sha256` or the `Crypto::sha256` factory. This
-separate API permits native allocation; it makes no allocation-free, constant
-stack/RSS, or portable secure-erasure claim. The caller bounds simultaneous
-contexts, input chunks and total input, and checks deadlines between chunks.
-No backend context, algorithm choice, clone or reset crosses the API.
+with td-primitives' inline SHA-256 context, which uses the CPU's SHA
+extensions where a runtime check finds them. It implements `Digest` but does
+not replace `Sha256` or the `Crypto::sha256` factory. Its contract permits
+allocation and CPU dispatch; it makes no allocation-free, constant stack/RSS,
+or portable secure-erasure claim. The caller bounds simultaneous contexts,
+input chunks and total input, and checks deadlines between chunks. No backend
+context, algorithm choice, clone or reset crosses the API.
 
 Construction and consuming finish catch Rust unwinds and return only Crypto.
-Each update removes the native context before checking the cumulative
+Each update removes the context before checking the cumulative
 `u64::MAX / 8` byte limit and before entering the unwind boundary. Only success
 restores it. Length refusal, returned error or unwind permanently retires the
-operation, including after a partial native update. Native cleanup releases
-context storage; compiler copies and abort/kill paths retain the ordinary
-backend limitations. Native abort, OOM, panic hooks and blocking are not
-contained. Tests compare padding and chunk boundaries with the independently
-qualified owned digest and inject update errors/unwinds; no test asserts a
-wall-clock performance threshold.
+operation, including after a partial update. A retired context is dropped
+without clearing; compiler copies and abort/kill paths retain the ordinary
+limitations. Abort, OOM and panic hooks are not contained. Tests compare
+padding and chunk boundaries with the independently qualified owned digest
+and inject update errors/unwinds; no test asserts a wall-clock performance
+threshold.
 
 ### Crypto factory and P-256 signing keys
 
 `Provider` is a stateless td-owned implementation of `Crypto`; creating it does
-not initialize native state or warm a worker. Its SHA-256 factory delegates to
-`Sha256::try_new`. Fixed 32-byte equality calls the admitted provider's
-constant-time comparison (`CRYPTO_memcmp`), with no ordinary-equality fallback.
-Functional comparison tests do not establish exact-artifact timing behavior.
+not initialize state or warm a worker. Its SHA-256 factory delegates to
+`Sha256::try_new`. Fixed 32-byte equality calls td-primitives' `ct::eq`,
+which folds the XOR of every byte pair into one accumulator without an early
+exit and passes the result through `std::hint::black_box`, with no
+ordinary-equality fallback. That
+is a source-level property; td-primitives/DESIGN.md records that no
+instruction-level inspection has confirmed it in a compiled artifact, and
+functional comparison tests do not establish exact-artifact timing behavior.
 
-`P256Key` owns the backend key behind a private mutex. Public-point extraction
-and signing serialize on that handle. Each operation takes ownership of the
-native key inside the same narrow unwind boundary; only success restores it.
-A returned operation error or Rust unwind drops the key and leaves the handle
-retired. Later operations fail Crypto; a poisoned mutex also refuses access.
-No clone, private-scalar export or backend handle is exposed. The mutex can
-block; these operations have no timeout/cancellation mechanism. M07 must fit
-actual usage into the control-worker lifecycle before enabling service.
+`P256Key` owns a td-primitives P-256 secret key and the public point derived
+from it once at load, behind a private mutex. Public-point extraction and
+signing serialize on that handle. Each operation borrows the key where it
+lies, inside the same narrow unwind boundary, so a signature moves no copy
+of the scalar. A returned
+operation error or Rust unwind drops the key and leaves the handle retired.
+Later operations fail Crypto; a poisoned mutex also refuses access. No clone,
+private-scalar export or backend handle is exposed. The mutex can block;
+these operations have no timeout/cancellation mechanism. M07 must fit actual
+usage into the control-worker lifecycle before enabling service.
 
 Key input is one complete unencrypted PKCS#8 v1 DER PrivateKeyInfo (version
 integer zero), capped at `P256_PKCS8_CAPACITY = 150` bytes. The outer algorithm
@@ -320,47 +304,53 @@ OCTET STRING contains one SEC1 ECPrivateKey sequence: version one, exactly
 optional explicit [1] containing a zero-padding BIT STRING with a 65-byte
 uncompressed point. All lengths use minimal definite DER encoding; every
 container must end exactly. The four accepted shapes are 67, 79, 138 and 150
-bytes, depending on the two optional inner fields. The provider validates
-scalar range, curve membership and embedded-public-key consistency, deriving
-the public point when omitted. Structural acceptance alone is no key proof.
+bytes, depending on the two optional inner fields. That parse is structural.
+The loader then refuses a scalar outside 1..n-1 and an embedded point that
+differs from the one it derives, both Invalid, deriving the public point when
+omitted. Structural acceptance alone is no key proof.
 
 The DER entry point refuses encrypted keys, PEM, bare SEC1, PKCS#8 v2,
 attributes, explicit curve parameters, compressed/hybrid/infinity encodings, overlong/indefinite lengths,
 wrong/duplicate/reordered fields and trailing bytes at every level. These are
-intentional subset restrictions. The bounded precheck is needed because the
-pinned provider's outer PKCS#8 reader does not reject trailing input itself.
-The formats follow [PKCS#8](https://www.rfc-editor.org/rfc/rfc5208) and the
+intentional subset restrictions. The formats follow
+[PKCS#8](https://www.rfc-editor.org/rfc/rfc5208) and the
 [ECPrivateKey structure](https://www.rfc-editor.org/rfc/rfc5915); curve
-parameters may be inherited from the outer algorithm for compatibility with
-the provider's conventional PKCS#8 encoding.
+parameters may be inherited from the outer algorithm, the conventional
+PKCS#8 encoding.
 
-Generation requires caller capacity of at least 150 bytes before invoking the
-provider. The pinned provider emits a 138-byte document with an inner public
-point and curve parameters only in the outer algorithm; validate it against
-the same accepted subset before copying. Return the used length and leave the
-unused tail unchanged. Public-point output is exactly 65-byte SEC1; ES256
-output is exactly 64-byte r || s. Signing hashes the complete message with
-SHA-256 once; it accepts no prehashed convention. Refuse messages beyond the
-SHA-256 bit-length limit. Output buffers remain unchanged on returned errors;
-callers must treat them as having no result. Caller-owned private-key input
-and generated output remain the caller's secret-lifecycle responsibility.
+Generation requires caller capacity of at least 150 bytes before drawing.
+It draws 32 bytes from td-primitives' `random::fill` and takes them as the
+scalar when they lie in 1..n-1, drawing again otherwise (about once in four
+billion draws), at most 64 times: a random failure maps to Entropy and
+exhaustion to Crypto. It writes the 138-byte document with an inner public
+point and curve parameters only in the outer algorithm, the shape AWS-LC
+generated, and validates it against the same accepted subset before copying.
+Return the used length and leave the unused tail unchanged. Public-point
+output is exactly 65-byte SEC1; ES256 output is exactly 64-byte r || s.
+Signing hashes the complete message with SHA-256 once; it accepts no
+prehashed convention. Refuse messages beyond the SHA-256 bit-length limit.
+Output buffers remain unchanged on returned errors; callers must treat them
+as having no result. Caller-owned private-key input and generated output
+remain the caller's secret-lifecycle responsibility.
 
-Generation, parsing, public-state construction and signing can allocate native
-and Rust memory. The pinned signing path constructs digest/signing contexts
-and temporary signature buffers for each call. This is not qualified for a
-no-allocation hot path. The compatibility SecureRandom argument to native key
-generation/signing is ignored by the pinned provider; those calls use native
-RNG state, with the blocking/abort/stderr limits above. A synthetic Rust error
-or unwind injection is not a native RNG-failure test.
+Signing is td-primitives' ECDSA with RFC 6979's deterministic nonce from
+HMAC-SHA256, so equal messages under one key give equal signatures and a
+failed random source cannot repeat a nonce; it uses no entropy. It returns a
+DER signature in a heap vector, which td-crypto converts to r || s, so each
+signature allocates. This is not qualified for a no-allocation hot path.
+A synthetic Rust error or unwind injection is not a random-failure test.
 
-The native key and its public view hold references to the same EVP key; their
-final release frees the wrapped scalar through the default cleansing allocator.
-Generated provider Document storage uses its zeroizing destructor; temporary
-native encoding buffers use native cleanup. This does not guarantee erasure
-of stack/compiler copies or cleanup after abort/kill. Ordinary parse failures
-map to Invalid; generation/signing failures and caught Rust unwinds map to
-Crypto. No native diagnostics or panic payload becomes a public error. The
-whole-graph unwind and hook limitations below apply.
+td-primitives' secret key clears its scalar words when dropped, and its
+signer clears the nonce and the intermediate values it names, best effort;
+td-crypto clears its scalar draw and its local copy of a generated document
+with `ct::zero`. td-primitives/DESIGN.md's erasure non-claims apply: the
+RFC 6979 generator's HMAC state, registers, stack spills, moved values,
+caller buffers and the DER signature vector are not cleared, and abort/kill
+bypasses every cleanup. Ordinary parse failures and an out-of-range or
+inconsistent key map to Invalid; generation entropy failure maps to Entropy;
+other generation/signing failures and caught Rust unwinds map to Crypto. No
+panic payload becomes a public error. The whole-graph unwind and hook
+limitations below apply.
 
 This boundary requires Rust unwinding throughout the target graph, including
 the final executable. The crate refuses its own compilation with `panic=abort`;
@@ -369,21 +359,22 @@ compiled aborting executable. The supported portable Cargo build compiles the
 whole graph with the default unwind strategy. Every future target recipe or
 consumer build must preserve that strategy through final linking; a final-only
 abort override is unsupported. Panic hooks still execute, and an aborting or
-panicking hook is outside the boundary. Native aborts, OOM and unwinding failures are not contained.
+panicking hook is outside the boundary. Aborts, OOM and unwinding failures are not contained.
 P-256 failure tests inject Rust unwinds at its private operation boundaries;
-they do not establish native allocation-failure or entropy-failure recovery.
+they do not establish allocation-failure or entropy-failure recovery.
 
 Tests use only existing repository crypto material: the engine SHA-256 and
 td-fido P-256 source/vector fixtures are compiled as test-only independent
-oracles for the native ES256 signer. Their own known-answer, valid/invalid
+oracles for the ES256 signer. Their own known-answer, valid/invalid
 signature and arithmetic cases
 qualify the oracle; generated signatures must verify against the message,
-not its digest, and modified messages/signatures are refused. No randomized
-signature-byte equality is required. These sources never enter the shipped
-backend or add a Cargo dependency. Portable staging includes the exact oracle
-source files and vector data in its source digest. Functional, grammar and
-failure qualification does not complete native allocation, timing, stack/RSS
-or service integration work.
+not its digest, and modified messages/signatures are refused. These sources
+never enter the shipped backend or add a Cargo dependency. Portable staging
+includes the exact oracle source files and vector data in its source digest.
+The persisted-key fixtures under "td-primitives backend qualification" below
+pin compatibility with keys AWS-LC wrote. Functional, grammar and failure
+qualification does not complete allocation, timing, stack/RSS or service
+integration work.
 
 ### Bounded PEM material syntax
 
@@ -423,11 +414,9 @@ while caller certificate output shortage returns Capacity. The temporary
 clears on normal return, returned error and Rust unwind, with black_box after
 clearing. That supplies ordinary hygiene only: decoded quantum temporaries,
 registers, caller input and compiler copies may remain, and abort/kill can
-bypass cleanup. Backend key construction still allocates and retains the
-native failure limits above.
+bypass cleanup. Key construction retains the failure limits above.
 
-Tests compare certificate decoding with the already admitted backend's PEM
-reader over padding, byte-value and DER-length boundaries; local generated
+Tests compare certificate decoding with Rustls pki-types' PEM reader over padding, byte-value and DER-length boundaries; local generated
 keys compare decoded PKCS#8 and public points. Exact input/count/DER limits,
 truncations, malformed envelopes/padding, retry and output preservation run
 in host tests and the isolated portable artifact. Syntax acceptance does
@@ -486,20 +475,16 @@ RSA issuer modulus size is 2048 through 8192 bits; the provider validates
 actual key/signature mathematics. Remaining supported issuer algorithms
 follow TLS.md's classical certificate inventory.
 
-The certificate algorithm selector checks all nineteen exact public-key and
-signature AlgorithmIdentifier pairs against the pinned backend prefix,
-including parameters, before returning its static slice. The three excluded
-ML-DSA pairs and their order are also checked.
-The backend must still have its reviewed 22-entry inventory; changes refuse
-with Crypto.
-No ML-DSA entry or global provider is inherited. Constructing that backend
-inventory creates temporary cold allocations; this is not an allocation-free
-configuration path. The same private provider also validates handshake mappings; complete
-configuration policy remains M07b3.
+The certificate algorithm table is td-crypto's own private static: nineteen
+td-tls-provider verifiers in the order of the exact public-key and signature
+AlgorithmIdentifier pairs it pins, including parameters. The selector checks
+the count and every pair before returning the slice; drift refuses with
+Crypto. It names no ML-DSA algorithm, and no global provider is consulted.
+The same private provider also validates handshake mappings.
 
 Reject duplicate or misordered certificates, and repeated issuer
 subject/key pairs even when their certificate bytes differ. The key
-comparison uses native-parsed, reserialized SubjectPublicKeyInfo, so
+comparison uses validated, reserialized SubjectPublicKeyInfo, so
 compressed/uncompressed EC point aliases compare equal. Original
 certificate bytes remain unchanged. This prevents backend path building
 from bypassing an issuer and its constraints through an equivalent anchor
@@ -533,15 +518,14 @@ Crypto. Input/format errors return Invalid; a mismatched valid local key
 returns KeyMismatch. Missing time returns Clock. Time, name, usage and
 signature failures carry the matching fixed verification reason; remaining
 backend path constraints use Other. No provider error or input becomes an
-error source. Native abort/OOM, panic hooks and backend blocking retain the
-limits above. No secret erasure, timing or whole-service resource guarantee
-follows from a returned Result or a synthetic unwind fixture.
+error source. Abort/OOM and panic hooks retain the limits above. No secret
+erasure, timing or whole-service resource guarantee follows from a returned
+Result or a synthetic unwind fixture.
 
-Owned vectors reserve checked bounded capacities; the key and native
-verification code still allocate. M07e must charge inputs, decode scratch,
-certificate/name copies, temporary native key parsing/canonical public-key
-copies, backend inventories/path state, retained keys and overlapping
-generations before the service can use this handle.
+Owned vectors reserve checked bounded capacities; webpki path verification
+and the key still allocate. M07e must charge inputs, decode scratch,
+certificate/name copies, canonical public-key copies, path state, retained
+keys and overlapping generations before the service can use this handle.
 No listener or outbound adapter is enabled by M07b2a.
 
 ### Owned-key TLS signing bridge
@@ -551,25 +535,25 @@ and its existing opaque P256Key behind an Arc. The private TLS adapter retains
 that same key, with no private-key export, reload or independent failure state.
 Certificate byte vectors move into the retained chain without copying their
 contents. Public inspection still returns the same certificate bytes and
-counts. A cached 91-byte P-256 SPKI contains only public key material; native
+counts. A cached 91-byte P-256 SPKI contains only public key material;
 key/leaf matching checks it before publication. No backend handle crosses the
 public API, and no reference cycle retains an identity.
 ServerIdentity retains Send, Sync, UnwindSafe and RefUnwindSafe. The erased
 backend signing trait does not express the last two; the owned identity
 implements them because its sole adapter has immutable public state and the
 existing mutex-fenced, retiring key. Tests pin the concrete adapter's inferred
-unwind traits. This is not a promise that native aborts or panic hooks recover.
+unwind traits. This is not a promise that aborts or panic hooks recover.
 
 The adapter advertises only ecdsa_secp256r1_sha256 and passes the unhashed
 handshake message into the existing SHA-256 ECDSA operation. It converts the
 64-byte r || s result into canonical positive DER INTEGERs and a SEQUENCE of
 at most 72 bytes. Leading zero octets are removed, sign padding is inserted
-when needed, and a zero scalar is refused as an internal failure. The native
+when needed, and a zero scalar is refused as an internal failure. The
 signer supplies valid scalars; this private encoder is not a separate public
 signature-validation interface.
 
 Signature construction and its fallible Vec reserve run inside the same
-locked operation/unwind boundary that owns the native key. A transform error
+locked operation/unwind boundary that owns the key. A transform error
 or unwind drops the key before restoration; all adapters/configurations
 sharing it refuse later signing. The raw ES256 API uses that same boundary
 with an identity transform, preserving its fixed output and error semantics.
@@ -579,16 +563,17 @@ handshake-evidence publication points. Cached public bytes and certificate
 inspection are not proof of live key state. Ordinary remote protocol/name
 refusals do not retire the shared key.
 
-Only fixed td-owned TlsError tags travel through the private native error
-channel. Public errors never include native diagnostics, certificates,
+Only fixed td-owned TlsError tags travel through the private Rustls error
+channel. Public errors never include backend diagnostics, certificates,
 signatures, names or secrets. Debug for the adapter/signer is fixed redacted
-text. Rustls selector boxing and the returned signature Vec are TLS
-allocations; chain/header vectors, SPKI and Arc ownership are cold generation
-costs. M07e still must measure them with native signing/entropy costs. Native
-abort/OOM, panic hooks, blocking and secret-erasure limits remain unchanged.
+text. Rustls selector boxing, td-primitives' DER signature and the returned
+signature Vec are TLS allocations; chain/header vectors, SPKI and Arc
+ownership are cold generation costs. M07e still must measure them with
+signing costs. Abort/OOM, panic hooks, blocking and secret-erasure limits
+remain unchanged.
 
-Tests cover canonical DER integer boundaries, native ASN.1 verification and
-hash-once behavior, wrong scheme refusal, synthetic post-sign transform errors
+Tests cover canonical DER integer boundaries, verification under td-fido's
+independent P-256 verifier and hash-once behavior, wrong scheme refusal, synthetic post-sign transform errors
 and unwinds, shared retired-key refusal and unchanged raw ES256 outputs. Local
 TLS 1.2/1.3 fixtures complete full handshakes with the owned signer, retain key
 health after remote name/protocol failures, including receipt of the refusing
@@ -631,14 +616,19 @@ ordinary ignore semantics. A local self-signed server leaf remains a valid
 ServerIdentity, independently of the remote endpoint's trust configuration.
 
 Private anchor keys follow the classical public-key inventory: P-256,
-P-384, P-521, Ed25519 or RSA 2048..8192. Parse the key with the admitted native
-safe API during construction after exact raw-format checks. EC keys require
+P-384, P-521, Ed25519 or RSA 2048..8192. After exact raw-format checks,
+construction validates the key with td-primitives. EC keys require
 SEC1 points: uncompressed 04 with 65/97/133 bytes, or compressed 02/03 with
-33/49/67 bytes for P-256/P-384/P-521. Ed25519 requires exactly 32 bytes; RSA
-uses the minimal PKCS#1 public encoding already checked above. Nested SPKI,
+33/49/67 bytes for P-256/P-384/P-521, which td-primitives' `uncompressed`
+checks are on the curve and stores uncompressed; the hybrid form and the
+point at infinity are refused. Ed25519 takes any 32 bytes, as a verifier
+would. RSA uses the minimal PKCS#1 public encoding already checked above,
+which td-primitives' RSA public-key parser must accept: an odd modulus of
+2048 through 8192 bits and an odd exponent of at least 3 and at most 33
+bits. These are the keys AWS-LC admitted when it was the backend. Nested SPKI,
 trailing bytes and incompatible encodings are Invalid. Local identity
 issuers share these checks; the local P-256 leaf remains uncompressed only.
-Native key parsing is not a peer signature proof. The certificate's unused
+Key validation is not a peer signature proof. The certificate's unused
 self/issuer signature need not use an admitted path-signature algorithm.
 Peer verification still uses the separate pinned path/handshake inventories.
 
@@ -652,14 +642,14 @@ outbound server verification. M07b3's mandatory client-auth factory must
 refuse a handle marked public; this constructor alone authenticates no peer.
 
 Configured-bundle syntax, constraint, duplicate, key and CA/usage refusals
-all return Invalid. Allocation-reserve failures return Capacity; native
+all return Invalid. Allocation-reserve failures return Capacity;
 reserialization failures and caught Rust unwinds return Crypto. No peer
 Verification result is produced by trust construction.
 
 Cold construction catches Rust unwinds and drops unpublished state. Checked
-vector reserves, decode scratch, native public-key parsing and owned anchor
+vector reserves, decode scratch, public-key validation and owned anchor
 copies remain part of the future M07e generation allocation qualification.
-Native abort/OOM/blocking and unwind-hook limits remain unchanged. Tests use
+Abort/OOM/blocking and unwind-hook limits remain unchanged. Tests use
 disjoint generated CAs to prove complete replacement, ownership after input
 reuse, atomic refusal, caps, supported key families, constraints and fixed
 public inventory. A private client-auth verifier fixture proves certificate
@@ -670,41 +660,44 @@ run in the portable artifact; no listener is enabled by this increment.
 
 One private constructor supplies TLS.md's exact nine cipher suites, three
 classical key-exchange groups, nineteen certificate algorithms and ten
-handshake signature mappings. Cipher/group lists are constructed explicitly.
-The certificate selector checks the full native inventory, including
-excluded entries. The handshake selector checks all thirteen native
-mappings, each scheme and every mapped algorithm identifier pair in order,
-then retains only the ten classical mappings. This pins the first ECDSA
-verifier used by TLS 1.3 as well as the alternatives available in TLS 1.2.
-These checks pin identifiers and ordering, not verifier behavior such as RSA
-modulus bounds; the reviewed source/lock pins retain that behavior. Any
-signature identifier inventory drift returns Crypto; no global provider is
-installed or consulted.
+handshake signature mappings. It starts from td-tls-provider's `provider()`
+and selects its TLS 1.3 and ECDHE-RSA suites and its three groups by name, in
+TLS.md's order, and that crate's `tls12_ecdsa` suites; a missing suite or
+group refuses with Crypto. The provider's entropy and key provider come with
+it. The certificate algorithms and scheme mappings are td-crypto's own
+private table over td-tls-provider's `verifiers`, never re-exported. The
+handshake selector checks the ten mappings, each scheme and every mapped
+algorithm identifier pair in order. This pins the first ECDSA verifier used by
+TLS 1.3 as well as the alternatives available in TLS 1.2. These checks pin
+identifiers and ordering, not verifier behavior such as RSA modulus bounds;
+the reviewed source/lock pins and the known-answer tests below retain that
+behavior. Any signature identifier inventory drift returns Crypto; no global
+provider is installed or consulted. The provider offers no ML-DSA verifier and
+no hybrid group, so none can be inherited.
 
 Local certificate admission uses this shared provider's certificate list.
-The local backend TLS fixtures now use it for both endpoints; designated
-remote fixtures can still use native defaults to prove exclusion. Inventory
-fixtures test truncated, expanded, reordered and substituted mappings,
-including the three excluded ML-DSA mappings. A valid ML-DSA-signed leaf
-passes the native certificate baseline and fails the selected certificate
-policy. Local handshakes exercise all three classical groups under TLS 1.2
-and 1.3, each TLS 1.3/ECDSA TLS 1.2 cipher, hybrid-only peer refusal in both
-directions and refusal of a native ML-DSA server with a successful native
-client baseline. Inventory tests alone cover RSA suites and P-384/P-521/
-Ed25519 signing schemes; local positive handshakes use a P-256 signer.
+The local backend TLS fixtures use it for both endpoints. Inventory fixtures
+test truncated, expanded, reordered and substituted certificate tables and
+mappings. An ML-DSA-44 root and the P-256 leaf it signed, written by AWS-LC
+(whose verifiers accepted the path) when it was the backend, fail the
+policy's certificate verification. Local handshakes exercise all three
+classical groups under TLS 1.2 and 1.3, each TLS 1.3/ECDSA TLS 1.2 cipher,
+refusal in both directions of a peer offering only a group named
+X25519MLKEM768, and refusal by a policy client of a server whose only key
+signs ML-DSA-44. Those peers are test fakes: no implementation of either
+algorithm runs in these tests. Inventory tests alone cover RSA suites and
+P-384/P-521/Ed25519 signing schemes; local positive handshakes use a P-256
+signer.
 
 Construction catches Rust unwinds and publishes no partial provider. Cold
-native-default vectors and replacement vectors allocate; the native entropy,
-key, abort/OOM and hook limits are unchanged. This is an algorithm policy
-component, not a configuration handle, key-signing bridge or session API.
-Version selection, role policy, SNI, ALPN, clock, resumption and resource
-qualification still require their following increments before service use.
-The native key loader and random source are retained backend components, not
-restricted by these algorithm lists. Test-only configurations may load
-native keys, including the excluded peer fixtures. Future production
-configurations must use the owned P-256 signing bridge and must never call
-the native arbitrary-format key loader through with_single_cert or
-equivalent APIs.
+suite and group vectors allocate; the entropy, key, abort/OOM and hook limits
+are unchanged. This is an algorithm policy component, not a configuration
+handle, key-signing bridge or session API. Version selection, role policy,
+SNI, ALPN, clock, resumption and resource qualification still require their
+following increments before service use. td-tls-provider's key provider is
+not restricted by these algorithm lists; it loads only one P-256 PKCS#8
+shape. Production configurations use the owned P-256 signing bridge and
+never load keys through with_single_cert or equivalent APIs.
 
 ### Outbound configuration and shared clock
 
@@ -1078,37 +1071,32 @@ contact no external service and add no fixture dependency.
 ### Build, provider confinement and TLS policy
 
 M03b1 pins versions, features, licenses and roots; M03b2 pins the portable
-native build inputs.
-M03b2a implements checksum-pinned x86-64 musl header preparation as specified
-in `PORTABLE.md`. Its aarch64 extension prepares the matching ARM headers.
-Neither header preparer invokes a compiler or upstream script. M03b2b adds the
-pinned host Rust kit and the authenticated Debian build root, whose GCC and
-binutils compile the C. M03b2c implements the
+build inputs: the pinned host Rust kit and its musl target libraries, the
+authenticated Debian build root, whose binutils inspect and split the
+artifacts, and the checksum-pinned musl source archive, whose notice the
+linked libc carries. Nothing in the closure compiles C. M03b2c implements the
 isolated static musl build, packaging binary and clean-runtime smoke specified
 in PORTABLE.md. M03b2d1 adds compiler-resolved API confinement;
 M03b2d2 adds the bounded local TLS smoke specified in PORTABLE.md.
 The aarch64 cross-build uses the separately pinned target library and the
-build root's Debian aarch64 cross GCC and binutils described there. It checks
+build root's Debian aarch64 cross binutils described there. It checks
 static ELF architecture
 and API confinement but reports runtime untested; successful compilation
 is not x86-64 runtime or resource qualification.
 Reuse compatible reviewed pins without inheriting td-net's dependency set.
-aws-lc-rs is a direct dependency only of td-crypto, resolving one AWS-LC
-version pair for bulk digests, entropy, comparison, P-256 signing and TLS.
-Rustls is a direct dependency of td-crypto and of td-tls-provider, at the
-same pinned version.
-The owned SHA-256 implementation serves allocation-free streaming digests.
-Disable unused
-features and all undeclared build fallbacks.
+Rustls is a direct dependency of td-crypto and of td-tls-provider, with the
+same pinned line and no built-in backend. td-primitives supplies bulk digests,
+entropy, comparison, P-256 keys and signing and certificate key validation,
+directly and, for TLS, through td-tls-provider. The owned SHA-256
+implementation serves allocation-free streaming digests. Disable unused
+features.
 The portable musl artifact follows td-mta/DESIGN.md section 3; it does not
 inherit the provenance of td's separate target image graph.
 
-Use the checked source/cc build path. Disable system libcrypto discovery and
-fallback to CMake, bindgen or prebuilt NASM; put the pinned version's controls
-in build wiring. For the interface using these names, force
-AWS_LC_SYS_USE_SYSTEM=0 and AWS_LC_SYS_CMAKE_BUILDER=0. Reject incompatible
-overrides. Plant decoy OPENSSL_DIR/pkg-config/CMake inputs and prove none is
-consumed. Missing declared inputs fail.
+No selected package compiles C or links a system library; the exact
+active-graph check refuses one that would. The portable build still plants
+decoy compiler, OPENSSL_DIR, pkg-config and CMake inputs, so a build script
+that reached for one fails. Missing declared inputs fail.
 
 The portable build combines rustc's private-dependency check with a resolved
 public API graph, including
@@ -1146,8 +1134,9 @@ provider contexts or backend IDs. Retain non-secret golden key fixtures,
 including generated,
 accepted and rejected PKCS#8 variants and inconsistent embedded public keys.
 Replacement reconstructs contexts after restart and tests key interchange and
-rollback in both directions. Algorithm, trust or format changes need their own
-explicit compatibility handling.
+rollback in both directions; "td-primitives backend qualification" below holds
+those fixtures. Algorithm, trust or format changes need their own explicit
+compatibility handling.
 
 ## Qualification and later owned primitives
 
@@ -1162,50 +1151,61 @@ never randomized signature bytes. Pin and approve external vectors/tools
 before adding them. TLS tests cover the configured policy and malformed/refused
 peers. All endpoints are local.
 
-The initial backend and every replacement must qualify allocations, native C
-allocations, per-thread RNG state, peak Rust/C stack and whole-process RSS on
-the supported artifact/CPU paths. td-mta/RESOURCES.md owns the service budgets;
+Every backend change must requalify allocations, peak stack and
+whole-process RSS on the supported artifact/CPU paths; with no C in the
+closure, all heap goes through Rust's allocator, which the allocation probe
+counts. td-mta/RESOURCES.md owns the service budgets;
 wrapping a library does not establish those bounds. Warm crypto-using workers
 before admission. Document and verify secret ownership, wipe-on-release and
 its limits, including provider internals and compiler-created copies. Drop or
 Vec::clear alone does not prove erasure. An allocator hook
 or any other new unsafe surface first requires the normal UNSAFE.md amendment.
 
-A Result wrapper cannot contain a native abort. AWS-LC's fatal RNG paths can
-terminate the process; there is no weaker randomness or partial-byte fallback.
-Callers must recover durable state after process death. Test returned-error
+A Result wrapper cannot contain an abort. The random source refuses rather
+than falls back; there is no weaker randomness or partial-byte fallback, but
+OOM and abort still terminate the process. Callers must recover durable state
+after process death. Test returned-error
 handling separately from process-death recovery and report which fatal paths
 were audited/exercised. Do not claim arbitrary provider panic/OOM survival.
 
-Future td-owned primitives replace the private backend behind this same facade;
-their implementation lives in `td-primitives` (AGENTS.md principle 2), and they
-do not introduce another public mail dependency. The Rustls provider bridge is
-the shared `td-tls-provider` crate, td-net's provider and admitted by the same
-policy, since code two crates need lives in one crate (principle 2). td-crypto's
-library does not use it yet; its tests qualify it ("td-primitives backend
-qualification" below). When the library does, it assembles this document's
-and TLS.md's policy from it inside private fields and never re-exports it, so
-the bridge stays private to the facade. Replacing AWS-LC still retains the
-Rustls TLS engine; it does not make the entire crate std-only. This crate owns
-the inventory of existing engine SHA/Ed25519 and td-fido P-256 implementations
-and their audit evidence before reusing any code. Reuse confers no unproven side-channel claim
-and does not migrate those consumers into this external-dependency crate.
-Cross-component primitive consolidation has its design in
-`td-primitives/DESIGN.md`; it is outside F04. td-mta/IMPLEMENTATION.md F04 owns mail integration staging
-and cutover. Each primitive needs
-independent cryptographic and exact-artifact side-channel review, including
-compiler/flags/target, nonce generation and entropy/optimization-barrier choices.
-Passing functional tests alone is insufficient. The direct streaming SHA-256
-operation is an independently qualified early
-cutover from F04: its native Context adapter was removed atomically. Bulk
-workers now have the separate allocating digest contract above; AWS-LC also
-remains required for entropy, comparison, P-256 and Rustls. Further
-candidates stay test-only until their qualified cutover; remove each obsolete
-adapter and remove native dependencies/build inputs when their final user
-is replaced. Do not prebuild unused primitive interfaces.
+td-owned primitives implement the private backend behind this same facade;
+they live in `td-primitives` (AGENTS.md principle 2), and they introduce no
+public mail dependency. The Rustls provider bridge is the shared
+`td-tls-provider` crate, td-net's provider and admitted by the same policy,
+since code two crates need lives in one crate (principle 2). This crate
+assembles its and TLS.md's policy from it inside private fields and never
+re-exports it, so the bridge stays private to the facade. Retaining the Rustls
+TLS engine means the crate is not std-only. Reuse of the existing engine
+SHA/Ed25519 and td-fido P-256 implementations confers no unproven
+side-channel claim and does not migrate those consumers into this
+external-dependency crate. Cross-component primitive consolidation has its
+design in `td-primitives/DESIGN.md`. td-mta/IMPLEMENTATION.md F04 owns mail
+integration staging. Each primitive needs independent cryptographic and
+exact-artifact side-channel review, including compiler/flags/target, nonce
+generation and entropy/optimization-barrier choices; passing functional tests
+alone is insufficient. td-primitives/DESIGN.md states the source-level
+claims and what is not claimed. Do not prebuild unused primitive interfaces.
+
+Side-channel review scope. A model-run side-channel review (Claude Opus
+5.5) of the secret paths td-crypto uses (td-mta/IMPLEMENTATION.md F04 step 2
+lists them; private-key PEM decoding included) found no secret-dependent
+branch, secret-indexed load or nonce flaw. It covered their source and the
+disassembly of the crypto-cargo gate's host build and of the portable td-mta
+artifacts PORTABLE.md's builds produce for x86_64-unknown-linux-musl and
+aarch64-unknown-linux-musl: pinned Rust 1.99.1 and LLD 23.1.1, the release
+profile, `target-cpu=x86-64` and `generic` respectively, `+crt-static`, frame
+pointers and `debuginfo=1`. It measured nothing: no timing, power,
+electromagnetic or microarchitectural leakage. It assumes data-independent
+timing of AESENC, PCLMULQDQ, MUL and UMULH and the conditional moves and
+selects, which on aarch64 holds without PSTATE.DIT only by core
+implementation. It does not cover rustls's internals, and it holds for that
+toolchain, those flags and those targets only. No gate asserts the compiled
+form of the constant-time routines, so a change to any of them needs the
+review again. The independent cryptographic review F04 requires has not
+taken place.
 
 Selected-key health currently uses the owned key's mutex-backed public-point
-operation. A server session checks it before work, after native calls and at
+operation. A server session checks it before work, after backend calls and at
 publication, so established record work can wait behind another session's
 signing operation. These repeated acquisitions preserve shared retirement
 semantics; they are not qualified as nonblocking or latency-bounded. M07e must
@@ -1215,40 +1215,59 @@ optimization must independently preserve those retirement fences.
 
 ### td-primitives backend qualification
 
-The candidate backend is td-tls-provider and td-primitives, both
-dev-dependencies, so it exists only in this crate's test targets; no library
-path, feature or runtime selector reaches it. A private test module assembles
-this crate's exact policy from td-tls-provider's building blocks: tls_policy's
-nine suites in their order, from `provider()` and `tls12_ecdsa`; its three
-groups; a `WebPkiSupportedAlgorithms` of the test's own holding the nineteen
-certificate algorithms in order from `verifiers` and the ten handshake
-mappings; and `provider()`'s entropy and P-256 key provider. A test holds every
-suite, group, algorithm identifier pair and mapping, member by member, to the
-AWS-LC policy. The differential tests then hold the candidate's answers to
-AWS-LC's for signature verification under every certificate algorithm, with
-each EC key form and inputs both must refuse, for certificate paths, for TLS
-handshakes in both roles over every suite, group and handshake scheme, for
-fixed-size comparison, and for P-256 keys, PKCS#8 documents and ES256
-signatures crossing between the backends.
+AWS-LC was this crate's backend until td-primitives replaced it. What it
+wrote and checked is kept as fixed known answers in `src/fixtures/`, read by
+`backend_tests.rs`, so compatibility with keys and signatures made under it
+needs no AWS-LC at test time:
 
-`pkcs8::validate` is structural. AWS-LC also refuses a scalar outside 1 to
-n - 1 and, in the 138- and 150-byte shapes, an embedded public point other
-than the one the scalar derives. A cutover reader must keep both checks: the
-scalar in 1 to n - 1, and an embedded point equal to the derived one.
-td-tls-provider's key provider loads only the 138-byte shape, so a cutover
-keeps this crate's reader for all four accepted shapes and derives the point
-with td-primitives, which refuses the same scalars.
+- `aws_lc_keys.txt`: four P-256 keys AWS-LC generated, as its 138-byte PKCS#8
+  documents, with their public points and AWS-LC's raw and DER signatures.
+  Each loads here in all four accepted shapes to AWS-LC's public point,
+  AWS-LC's signatures verify under td-fido's independent verifier and
+  td-primitives, and this backend's signatures with the key verify under the
+  independent verifier.
+- `td_keys.txt`: four keys in this backend's generated shape, from
+  td-primitives scalars, with td-primitives' DER signatures. When they were
+  written AWS-LC loaded each to the same public point and verified each
+  signature, so a key generated here loads under the backend it replaced;
+  the test holds that a freshly generated document has that same layout,
+  and that td-tls-provider's key provider loads it.
+- `aws_lc_signatures.txt`: AWS-LC's signatures under each certificate
+  algorithm it signs. With td-tls-provider's big-integer rows
+  (`td-tls-provider/tests/signature_answers.txt`), each must be taken by
+  exactly its own algorithm's policy verifiers (PKCS#1 also under the
+  identifier without NULL parameters), with an EC key uncompressed or
+  compressed but never in another form, refused after a changed message or
+  signature byte, and no refused row may be taken by any verifier: the
+  answers AWS-LC gave for the same inputs.
+- `certificate_paths.txt`: twenty AWS-LC-signed paths, a P-256 leaf under a
+  root for each algorithm it signs with and each EC root's key in both point
+  forms, which verify under the policy's certificate algorithms, and fail
+  with a changed leaf signature; and `ml_dsa_path.txt`, an ML-DSA-44 path
+  AWS-LC accepted, which the policy refuses.
 
-This is functional evidence only. Before a cutover remain: F04's independent
-cryptographic and exact-artifact side-channel review of the td-primitives
-paths used; td-primitives replacements for entropy, comparison, P-256 keys,
-bulk SHA-256 and the native public-key reserialization certificate admission
-uses, under this document's failure, retirement and unwind contracts;
-allocation, stack and RSS qualification; running these tests on the
-portable musl artifact and its aarch64 cross-build, whose smoke executable
-compiles them but whose runtime runs only the named smoke cases; mail/TLS
-integration and persisted-key rollback fixtures; and the atomic switch that
-removes aws-lc-rs and its native build inputs.
+The loader test holds the scalar and embedded-point checks pkcs8 parsing
+leaves to it: scalars 0, n, n + 1 and all ones are Invalid in every shape, 1
+and n - 1 load, and another key's embedded point is Invalid, as AWS-LC
+refused them. Policy assembly tests pin every suite, group, algorithm
+identifier pair and mapping, each TLS 1.2 suite's signature schemes and each
+suite's confidentiality limit. Local handshakes in both roles cover the TLS
+1.3 and ECDHE-ECDSA suites, every group and the ECDSA P-256 scheme, the only
+key this crate signs with. The ECDHE-RSA suites and the other handshake
+schemes are held by that inventory only: no test here signs a handshake
+with an RSA, Ed25519, P-384 or P-521 key. Certificate key admission has
+known answers built with Python's big integers
+(`src/fixtures/canonical_keys.py`): valid, off-curve, out-of-range,
+non-residue, hybrid, infinity and truncated EC points in both forms, with
+compressed and uncompressed aliases comparing equal, and RSA keys at and
+past each modulus and exponent bound.
+
+The same tests run on the portable musl artifact as named smoke cases
+(PORTABLE.md); its aarch64 cross-build compiles them. This is functional
+evidence. Allocation, stack and RSS evidence is in td-mta/RESOURCES.md and
+PORTABLE.md; F04's independent cryptographic and exact-artifact
+side-channel review and the M07 mail/TLS service integration remain open
+(td-mta/IMPLEMENTATION.md F04).
 
 ### Exact issued DNS identifiers
 

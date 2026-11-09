@@ -50,9 +50,42 @@ impl<'a> Der<'a> {
     }
 }
 
-// Structural admission only: the provider checks scalar range, curve membership
-// and consistency of the embedded public point. No borrowed secret is copied.
+/// The generated shape: the curve in the outer algorithm only and the public
+/// point inside, as AWS-LC, ring and OpenSSL write it.
+pub(super) const GENERATED_LEN: usize = 138;
+const GENERATED_HEAD: &[u8] = &[
+    0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
+    0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x6d, 0x30, 0x6b, 0x02,
+    0x01, 0x01, 0x04, 0x20,
+];
+const GENERATED_POINT: &[u8] = &[0xa1, 0x44, 0x03, 0x42, 0x00];
+
+pub(super) fn write(scalar: &[u8; 32], public: &[u8; 65]) -> [u8; GENERATED_LEN] {
+    let mut out = [0; GENERATED_LEN];
+    let parts: [&[u8]; 4] = [GENERATED_HEAD, scalar, GENERATED_POINT, public];
+    let mut at = 0;
+    for part in parts {
+        for (slot, byte) in out.iter_mut().skip(at).zip(part) {
+            *slot = *byte;
+        }
+        at += part.len();
+    }
+    out
+}
+
+/// The scalar and optional embedded point of an admitted document, borrowed.
+pub(super) struct Parts<'a> {
+    pub(super) scalar: &'a [u8; 32],
+    pub(super) public: Option<&'a [u8; 65]>,
+}
+
 pub(super) fn validate(bytes: &[u8]) -> Result<(), Error> {
+    parse(bytes).map(|_| ())
+}
+
+// Structural admission only: the key loader checks the scalar's range and the
+// embedded point against the one it derives. No borrowed secret is copied.
+pub(super) fn parse(bytes: &[u8]) -> Result<Parts<'_>, Error> {
     if bytes.len() > MAX_LEN {
         return Err(Error::Invalid);
     }
@@ -69,21 +102,26 @@ pub(super) fn validate(bytes: &[u8]) -> Result<(), Error> {
     let mut key = Der(wrapped.element(0x30)?);
     wrapped.end()?;
     key.exact(0x02, &[1])?;
-    if key.element(0x04)?.len() != 32 {
-        return Err(Error::Invalid);
-    }
+    let scalar: &[u8; 32] = key.element(0x04)?.try_into().map_err(|_| Error::Invalid)?;
     if key.0.first() == Some(&0xa0) {
         let mut parameters = Der(key.element(0xa0)?);
         parameters.exact(0x06, P256)?;
         parameters.end()?;
     }
+    let mut embedded = None;
     if key.0.first() == Some(&0xa1) {
         let mut public = Der(key.element(0xa1)?);
         let bits = public.element(0x03)?;
-        if bits.len() != 66 || bits.get(..2) != Some(&[0, 4]) {
-            return Err(Error::Invalid);
-        }
+        let point = match bits.split_first() {
+            Some((0, point)) if point.first() == Some(&4) => point,
+            _ => return Err(Error::Invalid),
+        };
+        embedded = Some(point.try_into().map_err(|_| Error::Invalid)?);
         public.end()?;
     }
-    key.end()
+    key.end()?;
+    Ok(Parts {
+        scalar,
+        public: embedded,
+    })
 }

@@ -1,26 +1,22 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
+use crate::certificate_fixtures::TestKey;
 use crate::certificate_fixtures::{self as fixture, der, extension, oid, seq, Parameters};
 use crate::pem::tests::pem;
-use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
 const NOW: u64 = 1_800_000_000;
 const START: u64 = 1_735_689_600;
 const END: u64 = 2_051_222_400;
 
-fn key() -> (aws_lc_rs::pkcs8::Document, EcdsaKeyPair) {
-    let bytes = EcdsaKeyPair::generate_pkcs8(
-        &ECDSA_P256_SHA256_ASN1_SIGNING,
-        &aws_lc_rs::rand::SystemRandom::new(),
-    )
-    .unwrap();
-    let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, bytes.as_ref()).unwrap();
+fn key() -> (Vec<u8>, TestKey) {
+    let bytes = TestKey::generate_pkcs8().unwrap();
+    let key = TestKey::from_pkcs8(bytes.as_ref()).unwrap();
     (bytes, key)
 }
 
 struct Fixture {
-    root: EcdsaKeyPair,
-    leaf: EcdsaKeyPair,
+    root: TestKey,
+    leaf: TestKey,
     secret: Vec<u8>,
 }
 
@@ -560,24 +556,14 @@ fn local_identity_chain_constraints_and_maximum_depth() {
         spki.clone(),
         fixture::signature_algorithm(),
         &Parameters::new(true),
-        |body| {
-            Ok(fixture
-                .root
-                .sign(&aws_lc_rs::rand::SystemRandom::new(), body)?
-                .as_ref()
-                .to_vec())
-        },
+        |body| fixture.root.sign(body),
     )
     .unwrap();
     assert!(fixture
         .admit(&[basic[0].clone(), plain_root], &["localhost"], Some(NOW))
         .is_ok());
     let repeated = fixture::build(spki, fixture::signature_algorithm(), &constrained, |body| {
-        Ok(fixture
-            .root
-            .sign(&aws_lc_rs::rand::SystemRandom::new(), body)?
-            .as_ref()
-            .to_vec())
+        fixture.root.sign(body)
     })
     .unwrap();
     assert_eq!(
@@ -640,52 +626,24 @@ fn local_identity_chain_constraints_and_maximum_depth() {
 
 #[test]
 fn local_identity_accepts_rsa_issuer_and_refuses_unsupported_algorithms() {
-    use aws_lc_rs::signature::RSA_PKCS1_SHA256;
+    // A 2048-bit RSA root and the P-256 leaf it signed with PKCS#1 SHA-256,
+    // both written by AWS-LC: td-primitives verifies RSA but does not sign.
     let fixture = Fixture::new();
-    let rsa = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
-    let rsa_algorithm = seq(&[
-        oid(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1]),
-        der(5, &[]),
-    ]);
-    let signature = seq(&[
-        oid(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 11]),
-        der(5, &[]),
-    ]);
-    let public = [b"\0".as_slice(), rsa.public_key().as_ref()].concat();
-    let spki = seq(&[rsa_algorithm, der(3, &public)]);
-    let sign = |body: &[u8]| -> fixture::Result<Vec<u8>> {
-        let mut signature = vec![0; rsa.public_modulus_len()];
-        rsa.sign(
-            &RSA_PKCS1_SHA256,
-            &aws_lc_rs::rand::SystemRandom::new(),
-            body,
-            &mut signature,
-        )?;
-        Ok(signature)
-    };
-    let root = fixture::build(spki, signature.clone(), &Parameters::new(true), sign).unwrap();
-    let leaf = fixture::build(
-        fixture::p256_spki(&fixture.leaf),
-        signature,
-        &Parameters::new(false),
-        sign,
+    let (root, leaf) = fixture::certificate_path("RSA_PKCS1_SHA256");
+    let secret = pem("PRIVATE KEY", &fixture::path_leaf_key());
+    assert!(ServerIdentity::from_pem(
+        &chain_pem(&[leaf, root]),
+        &secret,
+        &["localhost"],
+        Some(NOW)
     )
-    .unwrap();
-    assert!(fixture
-        .admit(&[leaf, root], &["localhost"], Some(NOW))
-        .is_ok());
+    .is_ok());
     let unsupported = seq(&[oid(&[0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3, 1])]);
     let leaf = fixture::build(
         fixture::p256_spki(&fixture.leaf),
         unsupported,
         &Parameters::new(false),
-        |body| {
-            Ok(fixture
-                .root
-                .sign(&aws_lc_rs::rand::SystemRandom::new(), body)?
-                .as_ref()
-                .to_vec())
-        },
+        |body| fixture.root.sign(body),
     )
     .unwrap();
     let root = fixture::certificate(&fixture.root, &fixture.root, true).unwrap();
@@ -816,13 +774,7 @@ fn local_identity_metadata_bounds_and_malformed_values() {
             spki,
             fixture::signature_algorithm(),
             &Parameters::new(false),
-            |body| {
-                Ok(fixture
-                    .root
-                    .sign(&aws_lc_rs::rand::SystemRandom::new(), body)?
-                    .as_ref()
-                    .to_vec())
-            },
+            |body| fixture.root.sign(body),
         )
         .unwrap();
         assert_eq!(
@@ -850,11 +802,7 @@ fn local_identity_metadata_bounds_and_malformed_values() {
         ]);
         let spki = seq(&[rsa_algorithm, der(3, &[b"\0".as_slice(), &public].concat())]);
         let certificate = fixture::build(spki, fixture::signature_algorithm(), &root, |body| {
-            Ok(fixture
-                .root
-                .sign(&aws_lc_rs::rand::SystemRandom::new(), body)?
-                .as_ref()
-                .to_vec())
+            fixture.root.sign(body)
         })
         .unwrap();
         assert_eq!(

@@ -1,15 +1,13 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
+use crate::certificate_fixtures::TestKey;
 use crate::certificate_fixtures::{self as f, Parameters};
-use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
 fn fixture() -> (Arc<P256Key>, Vec<Vec<u8>>) {
-    let rng = aws_lc_rs::rand::SystemRandom::new();
-    let bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-    let native = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, bytes.as_ref()).unwrap();
-    let root_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-    let root =
-        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, root_bytes.as_ref()).unwrap();
+    let bytes = TestKey::generate_pkcs8().unwrap();
+    let native = TestKey::from_pkcs8(bytes.as_ref()).unwrap();
+    let root_bytes = TestKey::generate_pkcs8().unwrap();
+    let root = TestKey::from_pkcs8(root_bytes.as_ref()).unwrap();
     let certificate = f::make(&native, &root, &Parameters::new(false)).unwrap();
     let root = f::make(&root, &root, &Parameters::new(true)).unwrap();
     (
@@ -84,19 +82,35 @@ fn tls_signer_uses_owned_key_and_hashes_once() {
     assert_eq!(format!("{signer:?}"), "TlsSigner(<redacted>)");
     let mut public = [0; 65];
     Provider.p256_public(&key, &mut public).unwrap();
-    let verifier = aws_lc_rs::signature::UnparsedPublicKey::new(
-        &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
-        public,
-    );
+    // td-tls-provider's own verifier for the scheme, which takes only an
+    // uncompressed key, as a TLS peer would verify the signature.
+    let strict = td_tls_provider::provider()
+        .signature_verification_algorithms
+        .mapping
+        .iter()
+        .find(|(scheme, _)| *scheme == SignatureScheme::ECDSA_NISTP256_SHA256)
+        .unwrap()
+        .1
+        .iter()
+        .find(|algorithm| algorithm.public_key_alg_id() == rustls::pki_types::alg_id::ECDSA_P256)
+        .copied()
+        .unwrap();
     for message in [b"".as_slice(), b"TLS transcript", &[0xa5; 1024]] {
         let signature = signer.sign(message).unwrap();
         assert!(signature.len() <= 72);
-        verifier.verify(message, &signature).unwrap();
-        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, message);
-        assert!(verifier.verify(digest.as_ref(), &signature).is_err());
+        assert!(f::oracle_verifies(&public, message, &signature));
+        assert!(strict
+            .verify_signature(&public, message, &signature)
+            .is_ok());
+        assert!(strict
+            .verify_signature(&public, b"other", &signature)
+            .is_err());
+        let mut hash = crate::sha256_oracle::Sha256::new();
+        hash.update(message);
+        assert!(!f::oracle_verifies(&public, &hash.finalize(), &signature));
         let mut changed = message.to_vec();
         changed.push(0);
-        assert!(verifier.verify(&changed, &signature).is_err());
+        assert!(!f::oracle_verifies(&public, &changed, &signature));
     }
 }
 

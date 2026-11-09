@@ -89,7 +89,7 @@ The shared contract and implementation rules live in
 contract in [td-crypto/TLS.md](../td-crypto/TLS.md). Its implemented Crypto
 factory, SHA-256, worker-local entropy and P-256 key operations use opaque td-owned
 handles. Direct streaming SHA-256 uses owned inline state; other implemented
-operations retain the private AWS-LC backend. Opaque client/server TLS sessions
+operations use the private td-primitives backend. Opaque client/server TLS sessions
 are implemented; service/resource qualification remains M07 work. Shared backend conformance
 fixtures live in td-crypto; service integration tests reach it through the same
 public facade as production.

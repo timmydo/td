@@ -244,11 +244,11 @@ test-only fake is described as a cryptographic implementation.
 
 ### M03b1 — Private backend admission and offline gates
 
-Add Rustls, aws-lc-rs and roots only inside td-crypto. Keep every public type,
-error and configuration opaque to upstream types. Pin a minimal compatible
-closure with one AWS-LC version pair and explicit features. Record licenses
-and why each dependency is present. M03b2 records all portable native
-compiler/assembler/generator inputs. td-mta's lock necessarily includes this
+Add Rustls, its cryptographic backend and roots only inside td-crypto. Keep
+every public type, error and configuration opaque to upstream types. Pin a
+minimal compatible closure with explicit features. Record licenses and why
+each dependency is present. M03b2 records all portable build inputs. F04
+made the backend td-primitives through td-tls-provider. td-mta's lock necessarily includes this
 transitive closure, while its manifest names td-crypto as its sole crypto
 provider. Amend AGENTS.md and the common host/gate checks atomically to admit
 these exact named closures and preserve the std-only rules for other crates.
@@ -275,7 +275,9 @@ This milestone lands in independently checked increments:
 - **M03b2a:** pinned x86-64 musl header preparation in the builder, with no
   upstream scripts, byte agreement with upstream `install-headers`, retained
   licensing and refusal of modified archives or cached output. This prepares
-  one native input and does not complete M03.
+  one native input and does not complete M03. F04's cutover removed header
+  preparation with the C that needed it; the verified archive remains the
+  source of the linked libc's notice.
 - **M03b2b:** prepare the pinned upstream Rust host/target components and
   authenticate the pinned Debian build root that supplies the C toolchain.
   This prepares build inputs only; no portable artifact is qualified yet.
@@ -2172,6 +2174,9 @@ Implement the remaining work as independently reviewable increments:
     controls, recursion suppression and symbol confinement precede any TLS
     memory interpretation. Counts remain diagnostic, not whole-native/RSS
     qualification; generation/session limits and admission remain pending.
+    F04's cutover deleted this executable and its bookkeeping: with no C in
+    the closure, every allocation goes through Rust's allocator, which the
+    Rust probe counts. The native observations below are its history.
 
   - **M07e3a — outbound lifecycle observations:** separate Rust and native
     processes record representative public-root relay/ACME generations,
@@ -2892,37 +2897,59 @@ with predictable quota/admission behavior and tests for rejected domains. No
 plus addressing, external forwarding, or regex address rewriting rides with it.
 
 **F04 — Owned cryptographic primitives behind td-crypto.** The facade crate
-exists from M03a. Direct streaming SHA-256 is brought forward to satisfy v1
-allocation constraints; the rest of AWS-LC replacement remains future work
-and does not block v1. Its normative contracts live in td-crypto/DESIGN.md.
-Mail code and its direct dependency do not change with backend selection.
+exists from M03a. Its normative contracts live in td-crypto/DESIGN.md. Mail
+code and its direct dependency do not change with backend selection.
 
 1. Follow td-crypto/DESIGN.md's primitive inventory and review requirements.
    Inventory the entire configured TLS backend, plus DKIM operations if F02
    has landed. Specify algorithms, secret lifetimes/erasure limits,
    constant-time and failure contracts, ECDSA nonces, entropy and optimization
    barriers. New unsafe surfaces need the normal UNSAFE.md amendment first.
-2. Implement independently reviewed primitive increments in `td-primitives`,
-   behind td-crypto's private bridge,
-   with pinned/approved known-answer, adversarial and differential inputs.
-   Require independent cryptographic and exact-artifact side-channel review,
-   repeated when compiler/flags/target change. Tests alone are insufficient.
-3. Take its Rustls CryptoProvider from `td-tls-provider`, the provider td-net
+   td-primitives/DESIGN.md states its algorithms and its side-channel claims
+   and non-claims; td-crypto/DESIGN.md states the facade's.
+2. Implement primitive increments in `td-primitives`, behind td-crypto's
+   private bridge, with pinned/approved known-answer, adversarial and
+   differential inputs. Done for the configured TLS backend and the direct
+   operations. Still required: independent cryptographic and exact-artifact
+   side-channel review of the secret-dependent paths td-crypto uses (P-256
+   key generation and signing with its RFC 6979 nonce; X25519, P-256 and
+   P-384 ECDH; AES-GCM; ChaCha20-Poly1305; HMAC and HKDF; comparison;
+   entropy), repeated when compiler, flags or target change. A model-run
+   side-channel review has covered these paths' source and the disassembly
+   of the gate's host build and of the pinned Rust 1.99.1 x86-64 and
+   aarch64 musl artifacts td-crypto/PORTABLE.md's builds produce, and found
+   no secret-dependent branch, secret-indexed load or nonce flaw;
+   td-crypto/DESIGN.md states its scope and assumptions. It measured
+   nothing, and no gate asserts the constant-time routines' compiled form.
+   No independent cryptographic review has taken place. Tests alone are
+   insufficient, and this blocks deployment.
+3. Take the Rustls CryptoProvider from `td-tls-provider`, the provider td-net
    also uses, so that both consumers share one implementation (the
-   repository user's decision, under AGENTS.md principle 2), extending it
-   with what TLS.md's policy needs and keeping it private behind the facade,
-   and implement the direct operations, except the separately qualified
-   direct SHA-256 cutover. Other
-   candidate paths stay test-only until cutover; there is no public
-   feature/configuration selector or new mail dependency. The reviewed test
-   closure may contain both implementations for qualification.
-4. Run shared conformance, complete M07 mail/TLS integration and bidirectional
-   persisted-key/rollback fixtures. Requalify resources and static x86-64 musl
-   linkage; record aarch64 validation status. Atomically select the qualified
-   backend and remove obsolete AWS-LC dependencies/native build inputs from all
-   affected locks/build wiring. Rustls remains private inside td-crypto; this
-   replacement alone does not make its entire closure std-only. Algorithm,
-   trust or format changes are separate explicit compatibility work.
+   repository user's decision, under AGENTS.md principle 2), kept private
+   behind the facade. Done: td-crypto assembles its TLS.md policy from it and
+   implements the direct operations on td-primitives; there is no public
+   feature/configuration selector or new mail dependency.
+4. Cut over. This step was reordered: it first required the M07 mail/TLS
+   integration and step 2's review before the atomic switch, and the switch
+   now precedes both, which remain below. Done: td-crypto's library uses td-primitives and
+   td-tls-provider and nothing else for cryptography; AWS-LC and every
+   package and native build input only it needed left the manifests, locks,
+   crypto-cargo wiring and portable builds, and no admitted crate compiles
+   C. Persisted keys load in both directions: committed AWS-LC-generated
+   PKCS#8 keys load here to the same public points, and AWS-LC loaded keys
+   in this backend's generated shape before it was removed. AWS-LC's
+   signatures and certificate paths are kept as fixed known answers in
+   td-crypto's tests. Resources and the static x86-64 musl build were
+   requalified, and the aarch64 artifact rebuilt; td-crypto/PORTABLE.md and
+   RESOURCES.md record the evidence and the aarch64 validation status.
+   Rustls remains private inside td-crypto; this replacement does not make
+   its closure std-only. Algorithm, trust or format changes are
+   separate explicit compatibility work.
+
+What remains of F04 is step 2's independent cryptographic review and the
+M07 mail/TLS service integration and resource qualification it shares with
+v1, both of which the original order put before the cutover, and a repeat of
+the side-channel review whenever toolchain, flags or target change.
 
 ## Completion report for each milestone
 

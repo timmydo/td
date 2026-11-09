@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
+use crate::certificate_fixtures::TestKey;
 use crate::{certificate_fixtures as f, pem::tests::pem, ServerIdentity, UtcClock};
-use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use std::{
     io::{Cursor, Read, Write},
     sync::atomic::{AtomicU64, Ordering},
@@ -26,10 +26,9 @@ fn fixture() -> (ServerIdentity, TrustStore) {
     fixture_with_issuer(b"td-test-root")
 }
 fn fixture_with_issuer(issuer: &[u8]) -> (ServerIdentity, TrustStore) {
-    let rng = aws_lc_rs::rand::SystemRandom::new();
     let generate = || {
-        let der = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, der.as_ref()).unwrap();
+        let der = TestKey::generate_pkcs8().unwrap();
+        let key = TestKey::from_pkcs8(der.as_ref()).unwrap();
         (der, key)
     };
     let (_, root) = generate();

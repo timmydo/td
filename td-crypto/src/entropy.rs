@@ -1,9 +1,10 @@
-//! Opaque randomness over the private admitted provider.
+//! Opaque randomness from td-primitives' `/dev/random` reader.
 use crate::{Entropy, Error};
 use std::{marker::PhantomData, rc::Rc};
+use td_primitives::Refused;
 
 /// A handle initialized on its owning worker by a nonempty random fill.
-/// Native state is thread-local and remains alive after this handle is dropped.
+/// It holds no state; each fill reads the kernel's random device afresh.
 ///
 /// The warmed handle cannot move to another thread:
 /// ```compile_fail,E0277
@@ -22,14 +23,12 @@ pub struct SystemEntropy {
 
 impl SystemEntropy {
     /// Cold initialization on the worker that will consume randomness.
-    /// Native failures may abort; returned failures use the fixed error.
+    /// It waits until the kernel's random generator is initialized.
     pub fn try_new() -> Result<Self, Error> {
-        Self::create(aws_lc_rs::rand::fill)
+        Self::create(td_primitives::random::fill)
     }
 
-    fn create(
-        fill: impl FnOnce(&mut [u8]) -> Result<(), aws_lc_rs::error::Unspecified>,
-    ) -> Result<Self, Error> {
+    fn create(fill: impl FnOnce(&mut [u8]) -> Result<(), Refused>) -> Result<Self, Error> {
         fill_with(&mut [0; 1], fill)?;
         Ok(Self {
             _thread: PhantomData,
@@ -43,12 +42,15 @@ impl std::fmt::Debug for SystemEntropy {
     }
 }
 
-// The admitted non-FIPS Rust path directly invokes RAND_bytes and maps its
-// status. Native failures abort; this only handles an ordinary error return.
+// An open or read failure, a short read among them, is the reader's refusal.
+// An empty fill succeeds without calling the reader, so opens no device.
 fn fill_with(
     output: &mut [u8],
-    fill: impl FnOnce(&mut [u8]) -> Result<(), aws_lc_rs::error::Unspecified>,
+    fill: impl FnOnce(&mut [u8]) -> Result<(), Refused>,
 ) -> Result<(), Error> {
+    if output.is_empty() {
+        return Ok(());
+    }
     if fill(output).is_err() {
         output.fill(0);
         return Err(Error::Entropy);
@@ -58,12 +60,12 @@ fn fill_with(
 
 impl Entropy for SystemEntropy {
     fn fill(&mut self, output: &mut [u8]) -> Result<(), Error> {
-        fill_with(output, aws_lc_rs::rand::fill)
+        fill_with(output, td_primitives::random::fill)
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -98,7 +100,7 @@ mod tests {
         assert!(matches!(
             SystemEntropy::create(|bytes| {
                 bytes.fill(0x42);
-                Err(aws_lc_rs::error::Unspecified)
+                Err(Refused)
             }),
             Err(Error::Entropy)
         ));
@@ -106,7 +108,11 @@ mod tests {
 
     #[test]
     fn synthetic_partial_error_clears_the_entire_caller_slice() {
-        for length in [0, 1, 64] {
+        assert_eq!(
+            fill_with(&mut [], |_| panic!("an empty fill reads nothing")),
+            Ok(())
+        );
+        for length in [1, 64] {
             let mut output = [0xa5; 66];
             let target = output.get_mut(1..1 + length).unwrap();
             assert_eq!(
@@ -114,7 +120,7 @@ mod tests {
                     for byte in bytes.iter_mut().take(3) {
                         *byte = 0x42;
                     }
-                    Err(aws_lc_rs::error::Unspecified)
+                    Err(Refused)
                 }),
                 Err(Error::Entropy)
             );

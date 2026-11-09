@@ -4,8 +4,8 @@ This crate is the one implementation of rustls's `CryptoProvider` that td's
 TLS consumers share. rustls is the TLS engine; every cryptographic operation
 it asks for is td-primitives (`td-primitives/DESIGN.md`). It is a crate of its
 own, not a module of td-net, because it is the designated Rustls provider
-bridge for td-crypto, whose tests qualify it against AWS-LC and whose library
-does not use it yet (`td-crypto/DESIGN.md`), and AGENTS.md principle 2 puts
+bridge for td-crypto, whose library assembles its TLS policy from it
+(`td-crypto/DESIGN.md`), and AGENTS.md principle 2 puts
 code two crates need in one `td-*` crate rather than a copy per consumer. That
 placement is the repository user's decision.
 
@@ -67,8 +67,9 @@ The crate makes no protocol choice rustls would not already refuse. Versions,
 roles, trust anchors, names, ALPN, resumption and every other configuration
 policy belong to the consumer, which builds its configurations from
 `provider()` and the building blocks above, and may narrow or reorder its
-suites, groups or verifiers. td-net takes `provider()` whole; td-crypto's tests
-assemble its policy's order and mapping themselves. A consumer behind a facade
+suites, groups or verifiers. td-net takes `provider()` whole; td-crypto
+selects its policy's suites and groups from it and assembles its own
+certificate algorithm order and scheme mapping from `verifiers`. A consumer behind a facade
 of its own, as td-crypto's is (`td-crypto/DESIGN.md`), keeps these parts
 private and never re-exports them.
 
@@ -77,10 +78,12 @@ private and never re-exports them.
 The crate depends on exactly two things: rustls 0.23.46 with `custom-provider`,
 `std` and `tls12` and no built-in backend, and local td-primitives. It is
 admitted beside td-crypto and td-mta in `builder/src/crypto_policy.rs`, which
-pins its manifest, lock, rustls line and selected graph, and its legs run
+pins its manifest, lock, rustls line and selected graph (td-crypto's rustls
+line is the same, and its graph contains this crate's), and its legs run
 offline through `td-builder gate-crates crypto-cargo`. ring sits in the lock
 through rustls-webpki's weak feature edge and is never selected. No roster
-crate outside the admission may depend on it. The crate has no `unsafe` and no
+crate outside the admission (td-crypto and, through it, td-mta) may depend
+on it. The crate has no `unsafe` and no
 build script.
 
 ## Tests
@@ -94,8 +97,9 @@ one row per verifier, a signature under the small-order Ed25519 identity key,
 which verification takes for any message, and `REFUSED_` rows no verifier may
 take (ECDSA r or s out of range or not strict DER, RSA moduli outside 2048
 to 8192 bits and exponents of 1, even or over 33 bits, Ed25519 S of L or
-more). ring verified the signed rows it has the algorithm for, and
-td-crypto's differential tests hold every row to AWS-LC. The tests pin each
+more). ring verified the signed rows it has the algorithm for, and AWS-LC
+gave the same answer for every row when it was td-crypto's backend;
+td-crypto's tests hold its policy's verifiers to these rows. The tests pin each
 `verifiers` export's name and identifiers, that its Ed25519 and RSA exports
 are `provider()`'s statics and its ECDSA ones are not, and that each takes its
 rows with the key in either point form and refuses the other y, the hybrid
@@ -106,5 +110,4 @@ td-net's tests read both: its fetch tests the CA, including `expired.pem`,
 which only they use, and its OpenPGP tests a row of
 `tests/signature_answers.txt`; td-crypto's tests read the signature rows.
 Changing either file therefore runs td-net's tests too, and any change here
-runs td-crypto's and td-mta's legs, since td-crypto's tests depend on this
-crate and td-mta's leg builds them.
+runs td-crypto's and td-mta's legs, since td-crypto depends on this crate.

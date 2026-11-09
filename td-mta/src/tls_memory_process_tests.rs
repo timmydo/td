@@ -109,7 +109,7 @@ fn remote_large_ticket_observations() {
 
 fn observe(large_ticket: bool) {
     let domain = std::env::var("TD_MTA_TEST_MEMORY_DOMAIN").unwrap();
-    assert!(matches!(domain.as_str(), "rust" | "native" | "rss"));
+    assert!(matches!(domain.as_str(), "rust" | "rss"));
     let version = std::env::var("TD_MTA_TEST_PEER_VERSION").unwrap();
     assert!(matches!(version.as_str(), "1.2" | "1.3"));
     let scenario = match (version.as_str(), large_ticket) {

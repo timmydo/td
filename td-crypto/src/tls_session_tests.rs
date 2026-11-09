@@ -1,10 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
+use crate::certificate_fixtures::TestKey;
 use crate::{
     certificate_fixtures as f, pem::tests::pem, ClockHandle, IdentitySelection, ServerConfig,
     ServerIdentity, TrustStore, UtcClock,
 };
-use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use std::{
     collections::VecDeque,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -47,14 +47,10 @@ impl ClockControl {
         }
     }
 }
-fn key() -> (Vec<u8>, EcdsaKeyPair) {
-    let doc = EcdsaKeyPair::generate_pkcs8(
-        &ECDSA_P256_SHA256_ASN1_SIGNING,
-        &aws_lc_rs::rand::SystemRandom::new(),
-    )
-    .unwrap();
-    let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, doc.as_ref()).unwrap();
-    (doc.as_ref().to_vec(), key)
+fn key() -> (Vec<u8>, TestKey) {
+    let doc = TestKey::generate_pkcs8().unwrap();
+    let key = TestKey::from_pkcs8(doc.as_ref()).unwrap();
+    (doc.clone(), key)
 }
 fn fixture() -> (Arc<ServerIdentity>, TrustStore) {
     let (_, ca) = key();
@@ -94,6 +90,78 @@ impl rustls::server::ProducesTickets for TicketPayload {
         None
     }
 }
+/// Test peer only: td-tls-provider refuses secret extraction, so this AEAD
+/// wraps its TLS 1.2 AES-256-GCM and reports the key and nonce salt it is given.
+struct Extractable(&'static dyn rustls::crypto::cipher::Tls12AeadAlgorithm);
+impl rustls::crypto::cipher::Tls12AeadAlgorithm for Extractable {
+    fn encrypter(
+        &self,
+        key: rustls::crypto::cipher::AeadKey,
+        iv: &[u8],
+        extra: &[u8],
+    ) -> Box<dyn rustls::crypto::cipher::MessageEncrypter> {
+        self.0.encrypter(key, iv, extra)
+    }
+    fn decrypter(
+        &self,
+        key: rustls::crypto::cipher::AeadKey,
+        iv: &[u8],
+    ) -> Box<dyn rustls::crypto::cipher::MessageDecrypter> {
+        self.0.decrypter(key, iv)
+    }
+    fn key_block_shape(&self) -> rustls::crypto::cipher::KeyBlockShape {
+        self.0.key_block_shape()
+    }
+    fn extract_keys(
+        &self,
+        key: rustls::crypto::cipher::AeadKey,
+        iv: &[u8],
+        explicit: &[u8],
+    ) -> Result<rustls::ConnectionTrafficSecrets, rustls::crypto::cipher::UnsupportedOperationError>
+    {
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(iv);
+        nonce[4..].copy_from_slice(explicit);
+        Ok(rustls::ConnectionTrafficSecrets::Aes256Gcm {
+            key,
+            iv: rustls::crypto::cipher::Iv::new(nonce),
+        })
+    }
+}
+
+/// The server's provider with its TLS 1.2 AES-256-GCM suite extractable.
+fn extractable(provider: &rustls::crypto::CryptoProvider) -> rustls::crypto::CryptoProvider {
+    let cipher_suites = provider
+        .cipher_suites
+        .iter()
+        .map(|suite| match suite {
+            rustls::SupportedCipherSuite::Tls12(tls12)
+                if tls12.common.suite
+                    == rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 =>
+            {
+                let wrapped: &'static rustls::Tls12CipherSuite =
+                    Box::leak(Box::new(rustls::Tls12CipherSuite {
+                        common: rustls::crypto::CipherSuiteCommon {
+                            suite: tls12.common.suite,
+                            hash_provider: tls12.common.hash_provider,
+                            confidentiality_limit: tls12.common.confidentiality_limit,
+                        },
+                        prf_provider: tls12.prf_provider,
+                        kx: tls12.kx,
+                        sign: tls12.sign,
+                        aead_alg: Box::leak(Box::new(Extractable(tls12.aead_alg))),
+                    }));
+                rustls::SupportedCipherSuite::Tls12(wrapped)
+            }
+            other => *other,
+        })
+        .collect();
+    rustls::crypto::CryptoProvider {
+        cipher_suites,
+        ..provider.clone()
+    }
+}
+
 struct Driver {
     client: TlsSession,
     server: rustls::Connection,
@@ -144,7 +212,7 @@ impl Driver {
         .unwrap();
         let mut native = (*config.native).clone();
         // Restrict the remote protocol, retaining the owned key/verifier/clock.
-        let provider = native.crypto_provider().clone();
+        let provider = Arc::new(extractable(native.crypto_provider()));
         let mut selected =
             rustls::ServerConfig::builder_with_details(provider, native.time_provider.clone())
                 .with_protocol_versions(&[version])
@@ -929,7 +997,6 @@ fn client_session_unfinished_cancellation_eof_and_alert_refuse_evidence() {
 
 #[test]
 fn client_session_tls12_hello_request_never_adds_post_close_output() {
-    use aws_lc_rs::aead;
     for close_state in [0, 1, 2, 3] {
         let mut d = Driver::new(&rustls::version::TLS12);
         d.handshake(false).unwrap();
@@ -941,9 +1008,7 @@ fn client_session_tls12_hello_request_never_adds_post_close_output() {
         let rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv } = traffic else {
             panic!("expected pinned AES-256-GCM fixture suite");
         };
-        let key = aead::LessSafeKey::new(
-            aead::UnboundKey::new(&aead::AES_256_GCM, key.as_ref()).unwrap(),
-        );
+        let key = td_primitives::aes_gcm::AesGcm::new_256(key.as_ref().try_into().unwrap());
         let explicit = sequence.to_be_bytes();
         let mut nonce = [0; 12];
         nonce[..4].copy_from_slice(&iv.as_ref()[..4]);
@@ -951,12 +1016,8 @@ fn client_session_tls12_hello_request_never_adds_post_close_output() {
         let mut aad = sequence.to_be_bytes().to_vec();
         aad.extend_from_slice(&[22, 3, 3, 0, 4]);
         let mut message = vec![0, 0, 0, 0]; // TLS 1.2 HelloRequest.
-        key.seal_in_place_append_tag(
-            aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(aad),
-            &mut message,
-        )
-        .unwrap();
+        let tag = key.seal(&nonce, &aad, &mut message).unwrap();
+        message.extend_from_slice(&tag);
         let mut record = vec![22, 3, 3, 0, 28];
         record.extend_from_slice(&explicit);
         record.extend_from_slice(&message);

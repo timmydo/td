@@ -3286,21 +3286,8 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                 Err(e) => fail(&e),
             }
         }
-        [op, flag, archive] if op == "crypto-musl-headers" && flag == "--archive" => {
-            match crate::crypto_headers::prepare(&root, Path::new(archive)) {
-                Ok(path) => {
-                    println!("{}", path.display());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => fail(&e),
-            }
-        }
-        [op, flag, archive, arch_flag, arch]
-            if op == "crypto-musl-headers" && flag == "--archive" && arch_flag == "--arch" =>
-        {
-            match crate::crypto_headers::Architecture::parse(arch).and_then(|architecture| {
-                crate::crypto_headers::prepare_architecture(&root, Path::new(archive), architecture)
-            }) {
+        [op, flag, archive] if op == "crypto-musl-notice" && flag == "--archive" => {
+            match crate::crypto_musl::prepare(&root, Path::new(archive)) {
                 Ok(path) => {
                     println!("{}", path.display());
                     ExitCode::SUCCESS
@@ -3317,7 +3304,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
         [op, flag, archives, arch_flag, arch]
             if op == "crypto-portable-prepare" && flag == "--archives" && arch_flag == "--arch" =>
         {
-            match crate::crypto_headers::Architecture::parse(arch).and_then(|architecture| {
+            match crate::crypto_musl::Architecture::parse(arch).and_then(|architecture| {
                 crate::crypto_portable::prepare_architecture(
                     &root,
                     Path::new(archives),
@@ -3422,7 +3409,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                 "       td-builder gate-crates crypto-cargo perf --manifest-path td-mta/Cargo.toml"
             );
             eprintln!(
-                "       td-builder gate-crates crypto-musl-headers --archive musl-1.2.5.tar.gz [--arch x86_64|aarch64]"
+                "       td-builder gate-crates crypto-musl-notice --archive musl-1.2.5.tar.gz"
             );
             eprintln!("       td-builder gate-crates crypto-portable-prepare --archives DIRECTORY [--arch x86_64|aarch64]");
             eprintln!("       td-builder gate-crates crypto-portable-build --archives DIRECTORY");
@@ -4894,11 +4881,6 @@ fn refuse_cargo_config_overrides(root: &Path, roster: &[GateCrate]) -> Result<()
             // `include` loads further config files this guard would never
             // read; it is refused with the redirects.
             let table = segment.trim_matches(['"', '\'']).trim();
-            // Cargo applies [env] after the wrapper checks its inherited
-            // environment. Reserve every native mail control for the wrapper.
-            if ["AWS_LC_SYS_"].iter().any(|prefix| line.contains(prefix)) {
-                return Err(format!("{name} sets a reserved native mail build control"));
-            }
             if matches!(table, "paths" | "patch" | "source" | "include") {
                 return Err(format!(
                     "{name} redirects dependency resolution (`{line}`) — the roster's \
@@ -5772,8 +5754,8 @@ const CRATE_LEG_SOURCES: &[&str] = &[
     "builder/src/affected.rs",
     "builder/src/check_loop.rs",
     "builder/src/crypto_build.rs",
-    "builder/src/crypto_headers.rs",
     "builder/src/crypto_isolated.rs",
+    "builder/src/crypto_musl.rs",
     "builder/src/crypto_policy.rs",
     "builder/src/crypto_portable.rs",
     "builder/src/gate_defs/325-cargo-test.rs",
@@ -10548,8 +10530,7 @@ mod tests {
         }
         let docs = path_output(&root, "td-crypto/TLS.md");
         assert!(docs.contains("Selected checks: none"), "{docs}");
-        // td-crypto's tests qualify the shared provider against AWS-LC, as a
-        // dev-dependency, and td-mta's leg builds those tests as its TLS peer:
+        // td-crypto builds on the shared provider and td-mta on td-crypto:
         // a provider change takes both crates' legs.
         let provider = cargo_test_cmds(&root, &["td-tls-provider/src/lib.rs".to_string()]).unwrap();
         for krate in ["td-crypto", "td-mta"] {
@@ -10588,8 +10569,7 @@ mod tests {
             "td-primitives/src/ec.rs",
         ] {
             let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
-            // td-crypto's tests qualify both against AWS-LC, and td-mta's
-            // leg builds them.
+            // td-crypto depends on both, and td-mta on td-crypto.
             for krate in ["td-tls-provider", "td-crypto", "td-mta"] {
                 for action in ["test", "clippy"] {
                     let leg = format!(
@@ -12568,14 +12548,14 @@ mod tests {
         }
     }
 
-    /// td-crypto's siblings are test-only: the td-primitives backend it
-    /// qualifies against AWS-LC, through td-tls-provider, and no normal edge.
+    /// td-crypto's backend is td-primitives behind td-tls-provider, both
+    /// normal edges; it names no test-only sibling.
     #[test]
-    fn crypto_names_its_candidate_backend_as_dev_dependencies_only() {
+    fn crypto_names_its_backend_as_normal_dependencies() {
         let admitted = include_str!("../../td-crypto/Cargo.toml");
         let (paths, dev_paths) = manifest_path_dependencies("td-crypto", admitted).unwrap();
-        assert!(paths.is_empty(), "{paths:?}");
-        assert_eq!(dev_paths, ["td-primitives", "td-tls-provider"]);
+        assert_eq!(paths, ["td-primitives", "td-tls-provider"]);
+        assert!(dev_paths.is_empty(), "{dev_paths:?}");
     }
 
     #[test]
@@ -12787,11 +12767,8 @@ mod tests {
             }
         }
         for config in [
-            "[env]\nAWS_LC_SYS_NO_ASM = \"1\"\n",
-            "[env.AWS_LC_SYS_SYSTEM_DIR]\nvalue = \"/system\"\nforce = true\n",
-            "env = { AWS_LC_SYS_CMAKE_BUILDER = \"1\" }\n",
-            "[env.\"AWS_LC_SYS_NO_\\u0041SM\"]\nvalue = \"1\"\n",
-            "env = { \"AW\\u0053_LC_SYS_NO_ASM\" = \"1\" }\n",
+            "[env.\"RUSTC_BOOTSTR\\u0041P\"]\nvalue = \"1\"\n",
+            "env = { \"RUSTC_BOOTSTR\\u0041P\" = \"1\" }\n",
         ] {
             for file in [".cargo/config.toml", ".cargo/config"] {
                 write(file, config);

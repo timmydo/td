@@ -318,11 +318,10 @@ mod tests {
         }
     }
 
+    /// td-primitives' separate SHA-256, CPU-dispatched where SHA-NI exists.
     fn native(input: &[u8]) -> [u8; 32] {
-        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, input)
-            .as_ref()
-            .try_into()
-            .unwrap()
+        use td_primitives::sha::Digest as _;
+        td_primitives::sha::Sha256::digest(input)
     }
 
     #[test]

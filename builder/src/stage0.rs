@@ -571,7 +571,7 @@ pub(crate) fn provision_cc(env: &ProvisionEnv) -> Result<String, ProvisionErr> {
     ))
 }
 
-/// [`provision_cc`] for a build that compiles C (cc-rs, AWS-LC) rather than
+/// [`provision_cc`] for a build that compiles C (cc-rs) rather than
 /// only linking. A td image's `cc` is td-link, td's Rust linker, which
 /// refuses compile requests; C there builds in the Debian build root, so
 /// such a host is unprovisioned for host C, not broken.

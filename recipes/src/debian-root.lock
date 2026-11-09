@@ -17,10 +17,11 @@
 # bc, pkgconf and libelf-dev; rsync serves `make headers_install`, which
 # no recipe runs yet; cryptsetup's json-c needs cmake. This root also
 # supplies the imported glibc/libgcc runtime and development files.
-# td-crypto's host-only portable kit
-# (td-crypto/PORTABLE.md) cross-compiles AWS-LC's C for aarch64 with
-# gcc-aarch64-linux-gnu and binutils-aarch64-linux-gnu; the rest serve the
-# C packages and the C inside Rust crates.
+# td-crypto's host-only portable kit (td-crypto/PORTABLE.md) uses
+# binutils-aarch64-linux-gnu's nm and objcopy for its aarch64 artifacts and
+# compiles no C; gcc-aarch64-linux-gnu served AWS-LC's C and is now unused,
+# kept until a separately reviewed root change removes it. The rest serve
+# the C packages and the C inside Rust crates.
 image library/debian:trixie-20261104-slim
 snapshot 20261105T000000Z
 archive debian trixie

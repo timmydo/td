@@ -51,6 +51,28 @@ fn positive(bytes: &[u8]) -> Result<u64, TlsError> {
 }
 
 impl<'a> Certificate<'a> {
+    /// A certificate carrying only a subject key, for key admission tests.
+    #[cfg(test)]
+    pub fn for_key(key_algorithm: &'a [u8], public_key: &'a [u8]) -> Self {
+        Self {
+            tbs: &[],
+            signature_algorithm: &[],
+            signature: &[],
+            issuer: &[],
+            subject: &[],
+            key_algorithm,
+            public_key,
+            not_before: 0,
+            not_after: 0,
+            ca: false,
+            path_length: None,
+            key_usage: None,
+            extended_usage: None,
+            has_name_constraints: false,
+            subject_alt_names: None,
+        }
+    }
+
     pub fn rsa_size(&self) -> Result<(), TlsError> {
         if self.key_algorithm != crate::certificate_algorithms::RSA_KEY {
             return Ok(());

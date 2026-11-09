@@ -1,6 +1,6 @@
 //! Host-only, pinned inputs for the standalone musl artifact.
 
-use crate::crypto_headers::Architecture;
+use crate::crypto_musl::Architecture;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -415,7 +415,8 @@ fn prepare_rust(root: &Path, archives: &Path, architecture: Architecture) -> Res
 
 pub(crate) struct Inputs {
     pub(crate) rust: PathBuf,
-    pub(crate) headers: PathBuf,
+    /// musl's COPYRIGHT, for the libc Rust's self-contained target links.
+    pub(crate) musl: PathBuf,
     pub(crate) build_root: BuildRoot,
 }
 
@@ -426,11 +427,7 @@ pub(crate) fn inputs_architecture(
 ) -> Result<Inputs> {
     Ok(Inputs {
         rust: prepare_rust(root, archives, architecture)?,
-        headers: crate::crypto_headers::prepare_architecture(
-            root,
-            &archives.join("musl-1.2.5.tar.gz"),
-            architecture,
-        )?,
+        musl: crate::crypto_musl::prepare(root, &archives.join("musl-1.2.5.tar.gz"))?,
         build_root: build_root(root)?,
     })
 }
@@ -446,7 +443,7 @@ pub(crate) fn prepare_architecture(
 ) -> Result<()> {
     let inputs = inputs_architecture(root, archives, architecture)?;
     println!("portable-rust {}", inputs.rust.display());
-    println!("portable-musl-headers {}", inputs.headers.display());
+    println!("portable-musl-notice {}", inputs.musl.display());
     print!("{}", inputs.build_root.record);
     println!(
         "portable-build-root {}",

@@ -970,10 +970,10 @@ The target artifact graph retains its own declared tool inputs. See
 
 A td system is not a full host for these preparations: its `/bin/cc` is
 td-link, which links Rust and compiles no C, and it ships no `gcc`. Rust
-builds and tests link through it, but what needs host C fails there:
-`gate-crates crypto-cargo`, whose wrapper requires a host C compiler and
-`ar` for every admitted crate (the mail crates' AWS-LC compiles C), with
-that diagnosis, and the td-update,
+builds and tests link through it, `gate-crates crypto-cargo` among them
+(no admitted crate compiles C, so its wrapper takes the provisioned `cc`,
+td-link there, as Rust's linker driver only; no td host has run it yet),
+but what needs host C fails there: the td-update,
 td-vm and td-vm-guest test fixtures that link with `-Clinker=gcc` (GNU ld,
 not bundled LLD) for want of a `gcc`; run `ready` on a host with a C
 toolchain.

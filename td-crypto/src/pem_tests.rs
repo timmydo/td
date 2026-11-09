@@ -385,3 +385,156 @@ fn p256_pem_loading_and_refusals() {
     secret.clear();
     assert_eq!(secret.0, [0; P256_PKCS8_CAPACITY]);
 }
+
+/// The branching decoder this file replaced, kept as the differential
+/// reference for the branch-free one.
+fn reference_sextet(byte: u8) -> Result<u8, Error> {
+    match byte {
+        b'A'..=b'Z' => Ok(byte - b'A'),
+        b'a'..=b'z' => Ok(byte - b'a' + 26),
+        b'0'..=b'9' => Ok(byte - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err(Error::Invalid),
+    }
+}
+
+fn reference_base64(input: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut previous_cr = false;
+    for &byte in input {
+        if previous_cr && byte != b'\n' {
+            return Err(Error::Invalid);
+        }
+        previous_cr = byte == b'\r';
+    }
+    if previous_cr {
+        return Err(Error::Invalid);
+    }
+    let mut input = input
+        .iter()
+        .copied()
+        .filter(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
+    let mut out = Vec::new();
+    while let Some(first) = input.next() {
+        let a = reference_sextet(first)?;
+        let b = reference_sextet(input.next().ok_or(Error::Invalid)?)?;
+        let third = input.next().ok_or(Error::Invalid)?;
+        let fourth = input.next().ok_or(Error::Invalid)?;
+        let (c, d, count) = match (third, fourth) {
+            (b'=', b'=') if b & 15 == 0 => (0, 0, 1),
+            (b'=', _) => return Err(Error::Invalid),
+            (_, b'=') => {
+                let c = reference_sextet(third)?;
+                if c & 3 != 0 {
+                    return Err(Error::Invalid);
+                }
+                (c, 0, 2)
+            }
+            _ => (reference_sextet(third)?, reference_sextet(fourth)?, 3),
+        };
+        let decoded = [(a << 2) | (b >> 4), (b << 4) | (c >> 2), (c << 6) | d];
+        out.extend_from_slice(&decoded[..count]);
+        if count != 3 && input.next().is_some() {
+            return Err(Error::Invalid);
+        }
+    }
+    if out.is_empty() {
+        return Err(Error::Invalid);
+    }
+    Ok(out)
+}
+
+fn branch_free_base64(input: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    let length = base64(input, |bytes| {
+        out.extend_from_slice(bytes);
+        Ok(())
+    })?;
+    assert_eq!(length, out.len());
+    Ok(out)
+}
+
+#[test]
+fn branch_free_sextet_matches_every_byte() {
+    for byte in 0..=255u8 {
+        let (value, valid) = sextet(byte);
+        match reference_sextet(byte) {
+            Ok(expected) => assert_eq!((value, valid), (expected, 0xff), "{byte}"),
+            Err(_) => assert_eq!(valid, 0, "{byte}"),
+        }
+    }
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (index, &byte) in alphabet.iter().enumerate() {
+        assert_eq!(sextet(byte), (index as u8, 0xff));
+    }
+}
+
+#[test]
+fn branch_free_base64_classes_padding_and_refusals() {
+    type Case = (&'static [u8], Result<&'static [u8], Error>);
+    let cases: &[Case] = &[
+        (b"AZaz09+/", Ok(&[0x01, 0x96, 0xb3, 0xd3, 0xdf, 0xbf])),
+        (b"Zg==", Ok(b"f")),
+        (b"Zm8=", Ok(b"fo")),
+        (b"Zm9v\r\nYg==", Ok(b"foob")),
+        (b" Zm9v\tYmFy\n", Ok(b"foobar")),
+        (b"", Err(Error::Invalid)),
+        (b"Zh==", Err(Error::Invalid)),
+        (b"Zm9=", Err(Error::Invalid)),
+        (b"Zg=a", Err(Error::Invalid)),
+        (b"Z===", Err(Error::Invalid)),
+        (b"Zg==Zg==", Err(Error::Invalid)),
+        (b"Zm9", Err(Error::Invalid)),
+        (b"Zm9-", Err(Error::Invalid)),
+        (b"Zm9_", Err(Error::Invalid)),
+        (b"Zm\x009", Err(Error::Invalid)),
+        (b"Zm\xc39", Err(Error::Invalid)),
+        (b"Zm9v\rYg==", Err(Error::Invalid)),
+        (b"Zm9v\r", Err(Error::Invalid)),
+    ];
+    for (input, expected) in cases {
+        let expected = expected.map(<[u8]>::to_vec);
+        assert_eq!(branch_free_base64(input), expected, "{input:?}");
+        assert_eq!(reference_base64(input), expected, "{input:?}");
+    }
+}
+
+#[test]
+fn branch_free_base64_matches_the_reference_on_random_input() {
+    // Inputs weighted toward the alphabet, padding and whitespace, so most
+    // reach the later checks, plus arbitrary bytes.
+    let symbols = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/==\r\n \t-_.";
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut accepted = 0;
+    for round in 0..20_000 {
+        let length = (next() % 24) as usize;
+        let input: Vec<u8> = (0..length)
+            .map(|_| {
+                let draw = next();
+                if round % 4 == 3 && draw % 9 == 0 {
+                    (draw >> 8) as u8
+                } else {
+                    symbols[(draw >> 8) as usize % symbols.len()]
+                }
+            })
+            .collect();
+        let expected = reference_base64(&input);
+        accepted += usize::from(expected.is_ok());
+        assert_eq!(branch_free_base64(&input), expected, "{input:?}");
+    }
+    // Valid encodings of random bytes, where the two must agree on output.
+    for _ in 0..2_000 {
+        let length = 1 + (next() % 48) as usize;
+        let bytes: Vec<u8> = (0..length).map(|_| next() as u8).collect();
+        let encoded = encode(&bytes);
+        assert_eq!(branch_free_base64(&encoded).unwrap(), bytes);
+        assert_eq!(reference_base64(&encoded).unwrap(), bytes);
+    }
+    assert!(accepted > 100, "{accepted}");
+}

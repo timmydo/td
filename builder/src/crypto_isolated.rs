@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, String>;
-use crate::crypto_headers::Architecture;
+use crate::crypto_musl::Architecture;
 const BINARIES: &[&str] = &[
     "td-mta",
     "td-crypto-smoke",
@@ -16,7 +16,6 @@ const BINARIES: &[&str] = &[
     "td-mta-format-smoke",
     "td-mta-transport-smoke",
     "td-mta-rust-allocation-probe",
-    "td-mta-native-allocation-probe",
     "td-mta-rss-probe",
 ];
 const ARM_BINARIES: &[&str] = &[
@@ -48,91 +47,23 @@ const BUILD_ROOT_BINDS: &[(&str, &str)] = &[
 const HOST_CC: &str = "/usr/bin/gcc";
 const HOST_BINUTILS: &str = "/usr/bin/";
 
-/// One target's C tools from the build root, by absolute path: `/usr/bin`
-/// stays off `PATH`, since it also holds the root's cmake and pkg-config.
+/// One target's binutils from the build root, by absolute path: `nm` lists
+/// symbols and `objcopy` splits debug companions. Nothing compiles C.
 struct Tools {
-    cc: &'static str,
-    ar: &'static str,
     nm: &'static str,
     objcopy: &'static str,
-    /// The `-B` prefix GCC finds its assembler under.
-    binutils: &'static str,
-    /// Where GCC's own freestanding headers must lie.
-    gcc_lib: &'static str,
-    /// Code generation, pinned rather than left to the root GCC's defaults.
-    machine: &'static str,
 }
 
 fn tools(architecture: Architecture) -> Tools {
     match architecture {
         Architecture::X86_64 => Tools {
-            cc: HOST_CC,
-            ar: "/usr/bin/ar",
             nm: "/usr/bin/nm",
             objcopy: "/usr/bin/objcopy",
-            binutils: HOST_BINUTILS,
-            gcc_lib: "/usr/lib/gcc/x86_64-linux-gnu/",
-            machine: "-march=x86-64 -mtune=generic -fcf-protection=none",
         },
         Architecture::Aarch64 => Tools {
-            cc: "/usr/bin/aarch64-linux-gnu-gcc",
-            ar: "/usr/bin/aarch64-linux-gnu-ar",
             nm: "/usr/bin/aarch64-linux-gnu-nm",
             objcopy: "/usr/bin/aarch64-linux-gnu-objcopy",
-            binutils: "/usr/aarch64-linux-gnu/bin/",
-            gcc_lib: "/usr/lib/gcc-cross/aarch64-linux-gnu/",
-            machine: "-march=armv8-a -mtune=generic -mno-outline-atomics -mbranch-protection=none",
         },
-    }
-}
-
-/// The C compiler flags for one target: musl's headers and GCC's own
-/// freestanding ones only, at the include directory the root's GCC reports.
-pub(crate) struct CFlags {
-    architecture: Architecture,
-    flags: String,
-}
-
-impl CFlags {
-    fn new(architecture: Architecture, include: &str) -> Self {
-        let tools = tools(architecture);
-        let flags = format!(
-            "-nostdinc -isystem /musl/include -isystem {include} -B{} {} -fno-stack-protector -fno-stack-clash-protection -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g1 -ffile-prefix-map=/source=/td-build -ffile-prefix-map=/vendor=/td-cargo/vendor -ffile-prefix-map=/output=/td-build-root",
-            tools.binutils, tools.machine
-        );
-        Self {
-            architecture,
-            flags,
-        }
-    }
-
-    /// Ask the root's GCC for its freestanding include directory.
-    pub(crate) fn probe(architecture: Architecture) -> Result<Self> {
-        let tools = tools(architecture);
-        let mut command = Command::new(tools.cc);
-        command
-            .arg("-print-file-name=include")
-            .env_clear()
-            .stdin(Stdio::null());
-        crate::host_bin::arm_check_child(&mut command);
-        let name = format!("gcc-include-{}", architecture.name());
-        let output = bounded_output(&mut command, &name, 4096, 30)?;
-        let include = output.trim_end_matches('\n');
-        if include.contains(char::is_whitespace)
-            || !include.starts_with(tools.gcc_lib)
-            || include.split('/').any(|part| part == "..")
-            || !Path::new(include).join("stddef.h").is_file()
-        {
-            return Err(format!(
-                "{} names no freestanding include directory under {}: `{include}'",
-                tools.cc, tools.gcc_lib
-            ));
-        }
-        Ok(Self::new(architecture, include))
-    }
-
-    pub(crate) fn architecture(&self) -> Architecture {
-        self.architecture
     }
 }
 
@@ -193,12 +124,19 @@ pub(crate) fn rust_flags_architecture(architecture: Architecture) -> String {
     flags.join("\x1f")
 }
 
-pub(crate) fn cargo(verb: &str, package: &str, c: &CFlags) -> Command {
-    cargo_manifest_architecture(verb, Path::new(&format!("/source/{package}/Cargo.toml")), c)
+pub(crate) fn cargo(verb: &str, package: &str, architecture: Architecture) -> Command {
+    cargo_manifest_architecture(
+        verb,
+        Path::new(&format!("/source/{package}/Cargo.toml")),
+        architecture,
+    )
 }
 
-pub(crate) fn cargo_manifest_architecture(verb: &str, manifest: &Path, c: &CFlags) -> Command {
-    let architecture = c.architecture;
+pub(crate) fn cargo_manifest_architecture(
+    verb: &str,
+    manifest: &Path,
+    architecture: Architecture,
+) -> Command {
     let mut command = Command::new("/rust/bin/cargo");
     command
         .current_dir("/tmp")
@@ -240,33 +178,21 @@ pub(crate) fn cargo_manifest_architecture(verb: &str, manifest: &Path, c: &CFlag
         .env("PKG_CONFIG", "/td-crypto-decoy")
         .env("OPENSSL_DIR", "/undeclared-openssl")
         .stdin(Stdio::null());
-    let tools = tools(architecture);
-    let (cc, ar, flags) = (tools.cc, tools.ar, c.flags.as_str());
+    // No admitted package compiles C: a build script reaching for a C
+    // compiler or archiver, for either target, runs the decoy and fails.
     for suffix in [
         String::new(),
         format!("_{}", architecture.triple()),
         format!("_{}", architecture.triple().replace('-', "_")),
+        "_x86_64-unknown-linux-gnu".to_string(),
+        "_x86_64_unknown_linux_gnu".to_string(),
     ] {
         command
-            .env(format!("CC{suffix}"), cc)
-            .env(format!("AR{suffix}"), ar)
-            .env(format!("CFLAGS{suffix}"), flags);
+            .env(format!("CC{suffix}"), "/td-crypto-decoy")
+            .env(format!("AR{suffix}"), "/td-crypto-decoy");
     }
-    if architecture == Architecture::Aarch64 {
-        // Native C build-script outputs are not part of this admitted graph.
-        for key in [
-            "HOST_CC",
-            "HOST_AR",
-            "CC_x86_64-unknown-linux-gnu",
-            "CC_x86_64_unknown_linux_gnu",
-            "AR_x86_64-unknown-linux-gnu",
-            "AR_x86_64_unknown_linux_gnu",
-        ] {
-            command.env(key, "/td-crypto-decoy");
-        }
-    }
-    for (key, value) in crate::crypto_build::CONTROLS {
-        command.env(key, value);
+    for key in ["HOST_CC", "HOST_AR", "TARGET_CC", "TARGET_AR"] {
+        command.env(key, "/td-crypto-decoy");
     }
     crate::host_bin::arm_check_child(&mut command);
     command
@@ -581,18 +507,16 @@ pub(crate) fn build_inner() -> Result<()> {
         "/source/td-mta/Cargo.toml",
         "/vendor",
         "/rust/bin/cargo",
-        "/musl/include/stdint.h",
         HOST_CC,
-        "/usr/bin/ar",
         "/usr/bin/nm",
         "/usr/bin/objcopy",
         "/lib64/ld-linux-x86-64.so.2",
     ])?;
     fs::create_dir_all("/tmp/home").map_err(|e| format!("portable Cargo home: {e}"))?;
-    let c = CFlags::probe(Architecture::X86_64)?;
+    let architecture = Architecture::X86_64;
     let mut receipt = String::from("cargo-environment cleared\n");
     for package in ["td-crypto", "td-mta"] {
-        let mut command = cargo("tree", package, &c);
+        let mut command = cargo("tree", package, architecture);
         command.args([
             "--edges",
             "normal,build",
@@ -607,7 +531,7 @@ pub(crate) fn build_inner() -> Result<()> {
         let graph = bounded_output(&mut command, &name, 256 * 1024, 1200)?;
         crate::crypto_policy::active_graph(Path::new("/source"), package, &graph)?;
     }
-    let mut command = cargo("build", "td-mta", &c);
+    let mut command = cargo("build", "td-mta", architecture);
     command.args([
         "--release",
         "--bin",
@@ -617,7 +541,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "mail-build", &mut receipt)?;
     let output = bounded_output(&mut command, "mail-build", 8 * 1024 * 1024, 1200)?;
     let mail = executable(&output, "td-mta", ArtifactKind::Installed)?;
-    let mut command = cargo("test", "td-mta", &c);
+    let mut command = cargo("test", "td-mta", architecture);
     command.args([
         "--release",
         "--test",
@@ -629,7 +553,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "mail-cli-build", &mut receipt)?;
     let output = bounded_output(&mut command, "mail-cli-build", 8 * 1024 * 1024, 1200)?;
     let cli = executable(&output, "operator_cli", ArtifactKind::IntegrationTest)?;
-    let mut command = cargo("test", "td-crypto", &c);
+    let mut command = cargo("test", "td-crypto", architecture);
     command.args([
         "--release",
         "--lib",
@@ -639,7 +563,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "crypto-build", &mut receipt)?;
     let output = bounded_output(&mut command, "crypto-build", 8 * 1024 * 1024, 1200)?;
     let crypto = executable(&output, "td_crypto", ArtifactKind::LibraryTest)?;
-    let mut command = cargo("test", "td-mta", &c);
+    let mut command = cargo("test", "td-mta", architecture);
     command.args([
         "--release",
         "--test",
@@ -650,7 +574,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "config-stack-build", &mut receipt)?;
     let output = bounded_output(&mut command, "config-stack-build", 8 * 1024 * 1024, 1200)?;
     let config = executable(&output, "config_stack", ArtifactKind::IntegrationTest)?;
-    let mut command = cargo("test", "td-mta", &c);
+    let mut command = cargo("test", "td-mta", architecture);
     command.args([
         "--release",
         "--test",
@@ -661,7 +585,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "format-digest-build", &mut receipt)?;
     let output = bounded_output(&mut command, "format-digest-build", 8 * 1024 * 1024, 1200)?;
     let format = executable(&output, "format_rows", ArtifactKind::IntegrationTest)?;
-    let mut command = cargo("test", "td-mta", &c);
+    let mut command = cargo("test", "td-mta", architecture);
     command.args([
         "--release",
         "--lib",
@@ -671,7 +595,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "mail-transport-build", &mut receipt)?;
     let output = bounded_output(&mut command, "mail-transport-build", 8 * 1024 * 1024, 1200)?;
     let transport = executable(&output, "td_mta", ArtifactKind::LibraryTest)?;
-    let mut command = cargo("test", "td-mta", &c);
+    let mut command = cargo("test", "td-mta", architecture);
     command.args([
         "--release",
         "--test",
@@ -682,30 +606,7 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "rust-allocation-build", &mut receipt)?;
     let output = bounded_output(&mut command, "rust-allocation-build", 8 * 1024 * 1024, 1200)?;
     let allocation = executable(&output, "rust_alloc_probe", ArtifactKind::IntegrationTest)?;
-    let mut command = cargo("rustc", "td-mta", &c);
-    command.args([
-        "--release",
-        "--test",
-        "native_alloc_probe",
-        "--message-format=json-render-diagnostics",
-        "--",
-        "--cfg",
-        "td_native_alloc_probe",
-        "-D",
-        "warnings",
-    ]);
-    for symbol in NATIVE_WRAPPERS {
-        command.args(["-C", &format!("link-arg=--wrap={symbol}")]);
-    }
-    command_record(&command, "native-allocation-build", &mut receipt)?;
-    let output = bounded_output(
-        &mut command,
-        "native-allocation-build",
-        8 * 1024 * 1024,
-        1200,
-    )?;
-    let native = executable(&output, "native_alloc_probe", ArtifactKind::IntegrationTest)?;
-    let mut command = cargo("test", "td-mta", &c);
+    let mut command = cargo("test", "td-mta", architecture);
     command.args([
         "--release",
         "--test",
@@ -716,16 +617,15 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "rss-probe-build", &mut receipt)?;
     let output = bounded_output(&mut command, "rss-probe-build", 8 * 1024 * 1024, 1200)?;
     let rss = executable(&output, "rss_probe", ArtifactKind::IntegrationTest)?;
-    for (index, (binary, probe, native_probe)) in [
-        (&mail, false, false),
-        (&cli, false, false),
-        (&crypto, false, false),
-        (&config, false, false),
-        (&format, false, false),
-        (&transport, false, false),
-        (&allocation, true, false),
-        (&native, false, true),
-        (&rss, false, false),
+    for (index, (binary, probe)) in [
+        (&mail, false),
+        (&cli, false),
+        (&crypto, false),
+        (&config, false),
+        (&format, false),
+        (&transport, false),
+        (&allocation, true),
+        (&rss, false),
     ]
     .into_iter()
     .enumerate()
@@ -741,7 +641,7 @@ pub(crate) fn build_inner() -> Result<()> {
         command_record(&command, &name, &mut receipt)?;
         let symbols = bounded_output(&mut command, &name, 8 * 1024 * 1024, 30)?;
         allocation_symbols(&symbols, probe)?;
-        native_allocation_symbols(&symbols, native_probe)?;
+        foreign_symbols(&symbols)?;
         rss_symbols(&symbols, binary == &rss)?;
     }
     refuse_decoy(Path::new("/output"))?;
@@ -759,13 +659,9 @@ pub(crate) fn build_inner() -> Result<()> {
         &allocation,
         Path::new("/output/artifacts/td-mta-rust-allocation-probe"),
     )?;
-    copy_binary(
-        &native,
-        Path::new("/output/artifacts/td-mta-native-allocation-probe"),
-    )?;
     copy_binary(&rss, Path::new("/output/artifacts/td-mta-rss-probe"))?;
     split_mail_debug(&mut receipt)?;
-    crate::crypto_api::qualify(&mut receipt, &c)?;
+    crate::crypto_api::qualify(&mut receipt, architecture)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
     Ok(())
@@ -778,21 +674,16 @@ pub(crate) fn cross_build_inner() -> Result<()> {
         "/source/td-mta/Cargo.toml",
         "/vendor",
         "/rust/bin/cargo",
-        "/musl/include/stdint.h",
         HOST_CC,
-        "/usr/bin/aarch64-linux-gnu-gcc",
-        "/usr/bin/aarch64-linux-gnu-ar",
         "/usr/bin/aarch64-linux-gnu-nm",
         "/usr/bin/aarch64-linux-gnu-objcopy",
-        "/usr/aarch64-linux-gnu/bin/as",
         "/lib64/ld-linux-x86-64.so.2",
     ])?;
     fs::create_dir_all("/tmp/home").map_err(|e| format!("portable Cargo home: {e}"))?;
-    let c = CFlags::probe(architecture)?;
     let mut receipt = String::from("cargo-environment cleared\nruntime not-run cross-compiled\n");
     for package in ["td-crypto", "td-mta"] {
         let manifest = format!("/source/{package}/Cargo.toml");
-        let mut command = cargo_manifest_architecture("tree", Path::new(&manifest), &c);
+        let mut command = cargo_manifest_architecture("tree", Path::new(&manifest), architecture);
         command.args([
             "--edges",
             "normal,build",
@@ -850,7 +741,7 @@ pub(crate) fn cross_build_inner() -> Result<()> {
         let mut command = cargo_manifest_architecture(
             if test { "test" } else { "build" },
             Path::new(&manifest),
-            &c,
+            architecture,
         );
         command
             .args(["--release", "--message-format=json-render-diagnostics"])
@@ -873,29 +764,19 @@ pub(crate) fn cross_build_inner() -> Result<()> {
         command_record(&symbols, &label, &mut receipt)?;
         let symbols = bounded_output(&mut symbols, &label, 8 * 1024 * 1024, 30)?;
         allocation_symbols(&symbols, false)?;
-        native_allocation_symbols(&symbols, false)?;
+        foreign_symbols(&symbols)?;
         rss_symbols(&symbols, false)?;
         copy_binary(&binary, &Path::new("/output/artifacts").join(installed))?;
     }
     refuse_decoy(Path::new("/output"))?;
     split_mail_debug_architecture(&mut receipt, architecture)?;
-    crate::crypto_api::qualify(&mut receipt, &c)?;
+    crate::crypto_api::qualify(&mut receipt, architecture)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
     Ok(())
 }
 
-const NATIVE_WRAPPERS: &[&str] = &[
-    "malloc",
-    "calloc",
-    "realloc",
-    "free",
-    "posix_memalign",
-    "aligned_alloc",
-];
-const NATIVE_SUCCESS: &str = "native-allocation-probe-v1: forwarding provider diagnostic passed\n";
-
-fn tls_allocation_evidence(output: &str, native: bool) -> Result<()> {
+fn tls_allocation_evidence(output: &str) -> Result<()> {
     let phases = [
         "baseline",
         "config",
@@ -910,13 +791,12 @@ fn tls_allocation_evidence(output: &str, native: bool) -> Result<()> {
         "repeated",
         "dropped",
     ];
-    tls_phase_evidence(output, native, "", "client", &phases)
+    tls_phase_evidence(output, "", "client", &phases)
 }
 
-fn tls_handshake_evidence(output: &str, native: bool) -> Result<()> {
+fn tls_handshake_evidence(output: &str) -> Result<()> {
     tls_phase_evidence(
         output,
-        native,
         "-handshake",
         "handshake",
         &[
@@ -975,20 +855,14 @@ fn remote_chain_evidence<'a>(output: &'a str, domain: &str, scenario: &str) -> R
         return Err("remote chain controller did not complete".into());
     }
     match domain {
-        "rust" | "native" => tls_phase_evidence(
-            body,
-            domain == "native",
-            &format!("-{scenario}"),
-            scenario,
-            REMOTE_CHAIN_PHASES,
-        )?,
+        "rust" => tls_phase_evidence(body, &format!("-{scenario}"), scenario, REMOTE_CHAIN_PHASES)?,
         "rss" => rss_evidence(body, scenario)?,
         _ => return Err("unknown remote chain observation domain".into()),
     }
     Ok(body)
 }
 
-fn tls_generation_evidence(output: &str, native: bool, scenario: &str) -> Result<()> {
+fn tls_generation_evidence(output: &str, scenario: &str) -> Result<()> {
     if !matches!(
         scenario,
         "generation" | "generation-routing" | "generation-trust"
@@ -997,7 +871,6 @@ fn tls_generation_evidence(output: &str, native: bool, scenario: &str) -> Result
     }
     tls_phase_evidence(
         output,
-        native,
         &format!("-{scenario}"),
         scenario,
         &[
@@ -1016,10 +889,9 @@ fn tls_generation_evidence(output: &str, native: bool, scenario: &str) -> Result
     )
 }
 
-fn tls_large_chain_evidence(output: &str, native: bool) -> Result<()> {
+fn tls_large_chain_evidence(output: &str) -> Result<()> {
     tls_phase_evidence(
         output,
-        native,
         "-large-chain",
         "large-chain",
         &[
@@ -1040,10 +912,9 @@ fn tls_large_chain_evidence(output: &str, native: bool) -> Result<()> {
     )
 }
 
-fn tls_fragment_evidence(output: &str, native: bool) -> Result<()> {
+fn tls_fragment_evidence(output: &str) -> Result<()> {
     tls_phase_evidence(
         output,
-        native,
         "-fragment",
         "fragment",
         &[
@@ -1063,10 +934,9 @@ fn tls_fragment_evidence(output: &str, native: bool) -> Result<()> {
     )
 }
 
-fn tls_certificate_list_evidence(output: &str, native: bool) -> Result<()> {
+fn tls_certificate_list_evidence(output: &str) -> Result<()> {
     tls_phase_evidence(
         output,
-        native,
         "-certificate-list",
         "certificate-list",
         &[
@@ -1085,10 +955,9 @@ fn tls_certificate_list_evidence(output: &str, native: bool) -> Result<()> {
     )
 }
 
-fn entropy_worker_evidence(output: &str, native: bool) -> Result<()> {
+fn entropy_worker_evidence(output: &str) -> Result<()> {
     tls_phase_evidence(
         output,
-        native,
         "-entropy",
         "entropy",
         &[
@@ -1103,18 +972,10 @@ fn entropy_worker_evidence(output: &str, native: bool) -> Result<()> {
     )
 }
 
-fn tls_phase_evidence(
-    output: &str,
-    native: bool,
-    suffix: &str,
-    scenario: &str,
-    phases: &[&str],
-) -> Result<()> {
-    let domain = if native { "native" } else { "rust" };
-    let width = if native { 9 } else { 7 };
+fn tls_phase_evidence(output: &str, suffix: &str, scenario: &str, phases: &[&str]) -> Result<()> {
     let mut lines = output.lines();
     for phase in phases {
-        let prefix = format!("tls-{domain}{suffix} {phase} ");
+        let prefix = format!("tls-rust{suffix} {phase} ");
         let row = lines
             .next()
             .and_then(|line| line.strip_prefix(&prefix))
@@ -1129,7 +990,7 @@ fn tls_phase_evidence(
             }
             columns += 1;
         }
-        if columns != width {
+        if columns != 7 {
             return Err("wrong TLS allocation measurement width".into());
         }
     }
@@ -1138,7 +999,7 @@ fn tls_phase_evidence(
     } else {
         1
     };
-    let success = format!("tls-{scenario}-allocation-v{version}: {domain} passed");
+    let success = format!("tls-{scenario}-allocation-v{version}: rust passed");
     if lines.next() != Some(success.as_str()) || lines.next().is_some() || !output.ends_with('\n') {
         return Err("invalid TLS allocation completion".into());
     }
@@ -1260,58 +1121,34 @@ fn rss_evidence(output: &str, scenario: &str) -> Result<()> {
     Ok(())
 }
 
-fn native_allocation_evidence(output: &str, zero_resize: bool) -> Result<()> {
-    if zero_resize {
-        if output != "native-allocation-probe-v1: zero-resize invalidated\n" {
-            return Err("portable native zero-resize control did not complete exactly".into());
-        }
-        return Ok(());
+/// No libc allocator interposition and no AWS-LC, OpenSSL-family or ring C
+/// symbol. This refuses the native backends by their symbol prefixes; it
+/// does not by itself prove every cryptographic routine is td-primitives.
+fn foreign_symbols(symbols: &str) -> Result<()> {
+    if symbols.trim().is_empty() {
+        return Err("portable symbol listing is empty".into());
     }
-    if output.lines().count() != 4 || !output.ends_with(NATIVE_SUCCESS) {
-        return Err("portable native allocation probe did not complete exactly".into());
-    }
-    for (prefix, ceiling) in [
-        ("native_registry_storage_bytes=", 2 * 1024 * 1024),
-        ("native_counter_storage_bytes=", 4096),
-        ("native_thread_flag_bytes=", 64),
-    ] {
-        stack_evidence(output, prefix, ceiling)?;
-    }
-    Ok(())
-}
-
-fn native_allocation_symbols(symbols: &str, probe: bool) -> Result<()> {
-    let names: std::collections::BTreeSet<_> = symbols
+    for name in symbols
         .lines()
         .filter_map(|line| line.split_whitespace().last())
-        .collect();
-    let has_registry = symbols.contains("TD_MTA_NATIVE_REGISTRY");
-    let has_probe = symbols.contains("native_alloc_probe");
-    if symbols.trim().is_empty() || has_registry != probe || has_probe != probe {
-        return Err("portable native allocation probe sentinel boundary failed".into());
-    }
-    for name in NATIVE_WRAPPERS {
-        if names.contains(format!("__wrap_{name}").as_str()) != probe {
-            return Err("portable native allocation wrapper symbol boundary failed".into());
-        }
-    }
-    if names.iter().any(|name| {
-        name.starts_with("__wrap_")
-            && (!probe
-                || !NATIVE_WRAPPERS
-                    .iter()
-                    .any(|allowed| *name == format!("__wrap_{allowed}")))
-    }) {
-        return Err("portable executable contains an unadmitted allocation wrapper".into());
-    }
-    if probe
-        && names.iter().any(|name| {
-            *name == "sdallocx"
-                || name.starts_with("OPENSSL_memory_")
-                || matches!(*name, "memalign" | "valloc" | "pvalloc" | "reallocarray")
-        })
     {
-        return Err("portable native allocation probe resolves an alternate allocator hook".into());
+        if name.starts_with("__wrap_") {
+            return Err(format!("portable executable interposes {name}"));
+        }
+        // aws-lc-sys and ring prefix their C symbols; the AWS-LC Rust crates
+        // show in mangled paths. td's own names may mention AWS-LC in prose,
+        // as tests do.
+        if ["aws_lc_", "OPENSSL_", "BORINGSSL_", "ring_core_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+            || ["aws_lc_rs", "aws_lc_sys"]
+                .iter()
+                .any(|krate| name.contains(krate))
+        {
+            return Err(format!(
+                "portable executable carries native crypto symbol {name}"
+            ));
+        }
     }
     Ok(())
 }
@@ -1472,7 +1309,6 @@ fn compile_binds(
         bind(source, "/source", true)?,
         bind(vendor, "/vendor", true)?,
         bind(&inputs.rust, "/rust", true)?,
-        bind(&inputs.headers, "/musl", true)?,
         bind(helper, "/td-builder", true)?,
         bind(helper, "/td-crypto-host-linker", true)?,
         bind(helper, "/td-crypto-decoy", true)?,
@@ -1642,7 +1478,6 @@ pub(crate) fn runtime_inner() -> Result<()> {
         "/artifacts/td-mta-format-smoke",
         "/artifacts/td-mta-transport-smoke",
         "/artifacts/td-mta-rust-allocation-probe",
-        "/artifacts/td-mta-native-allocation-probe",
         "/artifacts/td-mta-rss-probe",
         "/output",
     ])?;
@@ -1687,7 +1522,11 @@ pub(crate) fn runtime_inner() -> Result<()> {
         return Err("portable binary returned an unexpected version".into());
     }
     for (index, (binary, case, ignored)) in [
-        ("td-crypto-smoke", "tests::admitted_native_backend_sha256_smoke", false),
+        ("td-crypto-smoke", "backend_tests::keys_aws_lc_wrote_load_and_sign_here", false),
+        ("td-crypto-smoke", "backend_tests::keys_written_here_have_the_shape_aws_lc_loaded", false),
+        ("td-crypto-smoke", "backend_tests::policy_verifiers_take_exactly_their_own_signatures", false),
+        ("td-crypto-smoke", "backend_tests::committed_certificate_paths_verify_under_the_policy", false),
+        ("td-crypto-smoke", "backend_tests::the_loader_checks_scalar_range_and_embedded_point", false),
         ("td-crypto-smoke", "sha256::tests::known_answers_and_fragmented_updates", false),
         ("td-crypto-smoke", "sha256::tests::differential_padding_blocks_and_every_split", false),
         ("td-crypto-smoke", "sha256::tests::refusal_retires_and_clears_state", false),
@@ -1703,9 +1542,13 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "pem::tests::certificate_envelopes_and_retry", false),
         ("td-crypto-smoke", "pem::tests::certificate_limits_and_der_envelopes", false),
         ("td-crypto-smoke", "pem::tests::p256_pem_loading_and_refusals", false),
+        ("td-crypto-smoke", "pem::tests::branch_free_sextet_matches_every_byte", false),
+        ("td-crypto-smoke", "pem::tests::branch_free_base64_classes_padding_and_refusals", false),
+        ("td-crypto-smoke", "pem::tests::branch_free_base64_matches_the_reference_on_random_input", false),
         ("td-crypto-smoke", "der::tests::certificate_der_lengths_bit_strings_and_oids", false),
         ("td-crypto-smoke", "der::tests::certificate_calendar_boundaries", false),
         ("td-crypto-smoke", "certificate_algorithms::tests::certificate_algorithm_inventory_fails_closed", false),
+        ("td-crypto-smoke", "certificate_algorithms::tests::certificate_key_admission_known_answers", false),
         ("td-crypto-smoke", "identity::tests::local_identity_owns_material_and_checks_validity", false),
         ("td-crypto-smoke", "identity::tests::narrowed_identity_shares_material_and_cannot_expand_or_revive_bindings", false),
         ("td-crypto-smoke", "identity::tests::identity_refuses_wrong_key_name_time_and_order", false),
@@ -1724,6 +1567,8 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "provider::tests::accepted_pkcs8_variants_and_public_point_known_answer", false),
         ("td-crypto-smoke", "provider::tests::malformed_der_and_inconsistent_keys_are_refused", false),
         ("td-crypto-smoke", "provider::tests::generated_keys_and_signatures_pass_independent_verification", false),
+        ("td-crypto-smoke", "provider::tests::generation_maps_random_failure_and_exhausted_draws", false),
+        ("td-crypto-smoke", "provider::tests::generated_documents_differ", false),
         ("td-crypto-smoke", "provider::tests::capacity_failure_and_retired_keys_preserve_caller_output", false),
         ("td-crypto-smoke", "provider::tests::shared_key_serializes_success_and_terminal_failure", false),
         ("td-crypto-smoke", "sha256_oracle::tests::empty_input", false),
@@ -1737,7 +1582,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "p256_oracle::tests::scalar_and_coordinate_admission_never_reduce_untrusted_values", false),
         ("td-crypto-smoke", "p256_oracle::tests::exceptional_point_cases_and_projective_representations", false),
         ("td-crypto-smoke", "p256_oracle::tests::signature_scalar_ranges_and_infinity_result_are_refused", false),
-        ("td-crypto-smoke", "tests::explicit_aws_provider_and_roots_construct_without_global_default", false),
+        ("td-crypto-smoke", "tests::explicit_provider_and_roots_construct_without_global_default", false),
         ("td-crypto-smoke", "provider::tests::signature_transform_failure_retires_before_key_restore", false),
         ("td-crypto-smoke", "tls_signer::tests::canonical_tls_signature_encoding_boundaries", false),
         ("td-crypto-smoke", "tls_signer::tests::tls_signer_uses_owned_key_and_hashes_once", false),
@@ -1793,7 +1638,7 @@ pub(crate) fn runtime_inner() -> Result<()> {
         ("td-crypto-smoke", "tls_session::tests::server::server_session_clock_failures_and_acceptor_unwind_retire_owned_state", false),
         ("td-crypto-smoke", "tls_policy::tests::exact_tls_algorithm_inventory", false),
         ("td-crypto-smoke", "tls_policy::tests::handshake_mapping_drift_is_refused", false),
-        ("td-crypto-smoke", "tls_policy::tests::excluded_certificate_signature_has_a_valid_baseline", false),
+        ("td-crypto-smoke", "tls_policy::tests::excluded_certificate_signature_is_refused", false),
         ("td-crypto-smoke", "tls_smoke::explicit_policy_negotiates_classical_groups_and_suites", false),
         ("td-crypto-smoke", "tls_smoke::explicit_policy_refuses_excluded_peer_algorithms", false),
         ("td-crypto-smoke", "tls_smoke::tls12_local_round_trip", false),
@@ -1927,114 +1772,37 @@ pub(crate) fn runtime_inner() -> Result<()> {
     let output = bounded_output(&mut command, "rust-allocation-probe", 4096, 30)?;
     allocation_evidence(&output)?;
     println!("portable runtime: Rust allocation counter model, forwarding and digest/SMTP hot paths passed");
-    let mut command = Command::new("/artifacts/td-mta-native-allocation-probe");
-    command.env_clear().stdin(Stdio::null());
-    crate::host_bin::arm_check_child(&mut command);
-    let output = bounded_output(&mut command, "native-allocation-probe", 4096, 30)?;
-    native_allocation_evidence(&output, false)?;
-    for line in output.lines().take(3) {
-        println!("portable native diagnostic: {line}");
-    }
-    let mut command = Command::new("/artifacts/td-mta-native-allocation-probe");
-    command
-        .arg("--zero-resize")
-        .env_clear()
-        .stdin(Stdio::null());
-    crate::host_bin::arm_check_child(&mut command);
-    let output = bounded_output(&mut command, "native-allocation-zero-resize", 4096, 30)?;
-    native_allocation_evidence(&output, true)?;
-    println!("portable runtime: native allocator forwarding/provider diagnostics passed");
-    for (native, path) in [
-        (false, "/artifacts/td-mta-rust-allocation-probe"),
-        (true, "/artifacts/td-mta-native-allocation-probe"),
-    ] {
-        let mut command = Command::new(path);
-        command
-            .arg("--tls-clients")
-            .env_clear()
-            .stdin(Stdio::null());
+    type Evidence = fn(&str) -> Result<()>;
+    let scenarios: &[(&str, &str, Evidence)] = &[
+        ("client", "--tls-clients", tls_allocation_evidence),
+        ("handshake", "--tls-handshake", tls_handshake_evidence),
+        ("entropy", "--entropy-workers", entropy_worker_evidence),
+        ("fragment", "--tls-fragments", tls_fragment_evidence),
+        (
+            "certificate-list",
+            "--tls-certificate-list",
+            tls_certificate_list_evidence,
+        ),
+        ("large-chain", "--tls-large-chain", tls_large_chain_evidence),
+        ("generation", "--tls-generations", |output| {
+            tls_generation_evidence(output, "generation")
+        }),
+        ("generation-routing", "--tls-generation-routing", |output| {
+            tls_generation_evidence(output, "generation-routing")
+        }),
+        ("generation-trust", "--tls-generation-trust", |output| {
+            tls_generation_evidence(output, "generation-trust")
+        }),
+    ];
+    for (scenario, argument, evidence) in scenarios {
+        let mut command = Command::new("/artifacts/td-mta-rust-allocation-probe");
+        command.arg(argument).env_clear().stdin(Stdio::null());
         crate::host_bin::arm_check_child(&mut command);
-        let domain = if native { "native" } else { "rust" };
-        let name = format!("tls-client-allocation-{domain}");
+        let name = format!("tls-{scenario}-allocation-rust");
         let output = bounded_output(&mut command, &name, 8192, 30)?;
-        tls_allocation_evidence(&output, native)?;
+        evidence(&output)?;
         for line in output.lines() {
             println!("portable allocation diagnostic: {line}");
-        }
-        let mut command = Command::new(path);
-        command
-            .arg("--tls-handshake")
-            .env_clear()
-            .stdin(Stdio::null());
-        crate::host_bin::arm_check_child(&mut command);
-        let name = format!("tls-handshake-allocation-{domain}");
-        let output = bounded_output(&mut command, &name, 8192, 30)?;
-        tls_handshake_evidence(&output, native)?;
-        for line in output.lines() {
-            println!("portable allocation diagnostic: {line}");
-        }
-        let mut command = Command::new(path);
-        command
-            .arg("--entropy-workers")
-            .env_clear()
-            .stdin(Stdio::null());
-        crate::host_bin::arm_check_child(&mut command);
-        let name = format!("tls-entropy-allocation-{domain}");
-        let output = bounded_output(&mut command, &name, 8192, 30)?;
-        entropy_worker_evidence(&output, native)?;
-        for line in output.lines() {
-            println!("portable allocation diagnostic: {line}");
-        }
-        let mut command = Command::new(path);
-        command
-            .arg("--tls-fragments")
-            .env_clear()
-            .stdin(Stdio::null());
-        crate::host_bin::arm_check_child(&mut command);
-        let name = format!("tls-fragment-allocation-{domain}");
-        let output = bounded_output(&mut command, &name, 8192, 30)?;
-        tls_fragment_evidence(&output, native)?;
-        for line in output.lines() {
-            println!("portable allocation diagnostic: {line}");
-        }
-        let mut command = Command::new(path);
-        command
-            .arg("--tls-certificate-list")
-            .env_clear()
-            .stdin(Stdio::null());
-        crate::host_bin::arm_check_child(&mut command);
-        let name = format!("tls-certificate-list-allocation-{domain}");
-        let output = bounded_output(&mut command, &name, 8192, 30)?;
-        tls_certificate_list_evidence(&output, native)?;
-        for line in output.lines() {
-            println!("portable allocation diagnostic: {line}");
-        }
-        let mut command = Command::new(path);
-        command
-            .arg("--tls-large-chain")
-            .env_clear()
-            .stdin(Stdio::null());
-        crate::host_bin::arm_check_child(&mut command);
-        let name = format!("tls-large-chain-allocation-{domain}");
-        let output = bounded_output(&mut command, &name, 8192, 30)?;
-        tls_large_chain_evidence(&output, native)?;
-        for line in output.lines() {
-            println!("portable allocation diagnostic: {line}");
-        }
-        for (scenario, argument) in [
-            ("generation", "--tls-generations"),
-            ("generation-routing", "--tls-generation-routing"),
-            ("generation-trust", "--tls-generation-trust"),
-        ] {
-            let mut command = Command::new(path);
-            command.arg(argument).env_clear().stdin(Stdio::null());
-            crate::host_bin::arm_check_child(&mut command);
-            let name = format!("tls-{scenario}-allocation-{domain}");
-            let output = bounded_output(&mut command, &name, 8192, 30)?;
-            tls_generation_evidence(&output, native, scenario)?;
-            for line in output.lines() {
-                println!("portable allocation diagnostic: {line}");
-            }
         }
     }
 
@@ -2083,7 +1851,6 @@ pub(crate) fn runtime_inner() -> Result<()> {
     ] {
         for (domain, binary) in [
             ("rust", "td-mta-rust-allocation-probe"),
-            ("native", "td-mta-native-allocation-probe"),
             ("rss", "td-mta-rss-probe"),
         ] {
             let mut command = Command::new("/artifacts/td-mta-transport-smoke");
@@ -2174,13 +1941,13 @@ fn build_architecture(
     let output = scratch.0.join("output");
     fs::create_dir(&output).map_err(|e| format!("create portable output: {e}"))?;
     let binds = compile_binds(&source, &vendor, &inputs, &helper, &output)?;
-    let header_digest = crate::sandbox::nar_hash_of(&inputs.headers)
-        .map_err(|e| format!("hash portable headers: {e}"))?;
+    let musl_digest = crate::sandbox::nar_hash_of(&inputs.musl)
+        .map_err(|e| format!("hash portable musl notice: {e}"))?;
     let helper_digest =
         crate::sandbox::nar_hash_of(&helper).map_err(|e| format!("hash portable helper: {e}"))?;
     let target = architecture.triple();
     let mut receipt = format!(
-        "portable-build 1\nsource {source_digest}\nvendor {vendor_digest}\nrust-kit {kit_digest}\nheaders {header_digest}\nhelper {helper_digest}\ntarget {target}\n"
+        "portable-build 1\nsource {source_digest}\nvendor {vendor_digest}\nrust-kit {kit_digest}\nmusl-notice {musl_digest}\nhelper {helper_digest}\ntarget {target}\n"
     );
     receipt.push_str(&inputs.build_root.record);
     enter(
@@ -2222,7 +1989,7 @@ fn build_architecture(
         &crate::crypto_policy::active_vendor_dirs(),
     )?;
     retain_notices(&inputs.rust, &artifacts.join("notices/rust"), 0)?;
-    retain_notices(&inputs.headers, &artifacts.join("notices/musl"), 0)?;
+    retain_notices(&inputs.musl, &artifacts.join("notices/musl"), 0)?;
     write_new(&artifacts.join("BUILD-INPUTS"), receipt.as_bytes())?;
     let digest = crate::sandbox::nar_hash_of(&artifacts)
         .map_err(|e| format!("hash portable artifact: {e}"))?;
@@ -2374,223 +2141,188 @@ mod tests {
 
     #[test]
     fn fragment_records_require_pending_refusal_and_repetition() {
-        for native in [false, true] {
-            let domain = if native { "native" } else { "rust" };
-            let values = if native {
-                "1 2 3 4 5 6 7 8 9"
-            } else {
-                "1 2 3 4 5 6 7"
-            };
-            let mut output = String::new();
-            for phase in [
-                "baseline",
-                "policy",
-                "storage",
-                "large_constructed",
-                "large_pending",
-                "large_refused",
-                "small_constructed",
-                "small_pending",
-                "small_refused",
-                "over_limit",
-                "repeated",
-                "dropped",
-            ] {
-                output.push_str(&format!("tls-{domain}-fragment {phase} {values}\n"));
-            }
-            output.push_str(&format!("tls-fragment-allocation-v1: {domain} passed\n"));
-            assert!(tls_fragment_evidence(&output, native).is_ok());
-            assert!(tls_fragment_evidence(&output, !native).is_err());
-            assert!(tls_handshake_evidence(&output, native).is_err());
-            assert!(entropy_worker_evidence(&output, native).is_err());
-            for bad in [
-                output.replace("large_pending", "large_refused"),
-                output.replace(" 1 2", " 1"),
-                output.replace(" 1 2", " x 2"),
-                output.replace("passed", "failed"),
-                format!("{output}extra\n"),
-            ] {
-                assert!(tls_fragment_evidence(&bad, native).is_err());
-            }
+        let domain = "rust";
+        let values = "1 2 3 4 5 6 7";
+        let mut output = String::new();
+        for phase in [
+            "baseline",
+            "policy",
+            "storage",
+            "large_constructed",
+            "large_pending",
+            "large_refused",
+            "small_constructed",
+            "small_pending",
+            "small_refused",
+            "over_limit",
+            "repeated",
+            "dropped",
+        ] {
+            output.push_str(&format!("tls-{domain}-fragment {phase} {values}\n"));
+        }
+        output.push_str(&format!("tls-fragment-allocation-v1: {domain} passed\n"));
+        assert!(tls_fragment_evidence(&output).is_ok());
+        assert!(tls_handshake_evidence(&output).is_err());
+        assert!(entropy_worker_evidence(&output).is_err());
+        for bad in [
+            output.replace("large_pending", "large_refused"),
+            output.replace(" 1 2", " 1"),
+            output.replace(" 1 2", " x 2"),
+            output.replace("passed", "failed"),
+            format!("{output}extra\n"),
+        ] {
+            assert!(tls_fragment_evidence(&bad).is_err());
         }
     }
 
     #[test]
     fn certificate_list_records_require_pending_refusal_and_repetition() {
-        for native in [false, true] {
-            let domain = if native { "native" } else { "rust" };
-            let values = if native {
-                "1 2 3 4 5 6 7 8 9"
-            } else {
-                "1 2 3 4 5 6 7"
-            };
-            let mut output = String::new();
-            for phase in [
-                "baseline",
-                "policy",
-                "storage",
-                "large_constructed",
-                "large_pending",
-                "large_refused",
-                "small_constructed",
-                "small_pending",
-                "small_refused",
-                "repeated",
-                "dropped",
-            ] {
-                output.push_str(&format!("tls-{domain}-certificate-list {phase} {values}\n"));
-            }
-            output.push_str(&format!(
-                "tls-certificate-list-allocation-v1: {domain} passed\n"
-            ));
-            assert!(tls_certificate_list_evidence(&output, native).is_ok());
-            let mut rss = String::new();
-            for phase in [
-                "baseline",
-                "policy",
-                "storage",
-                "large_constructed",
-                "large_pending",
-                "large_refused",
-                "small_constructed",
-                "small_pending",
-                "small_refused",
-                "repeated",
-                "dropped",
-            ] {
-                rss.push_str(&format!("rss certificate-list {phase} 100\n"));
-            }
-            rss.push_str("rss-observation-v2: certificate-list passed\n");
-            assert!(rss_evidence(&rss, "certificate-list").is_ok());
-            assert!(rss_evidence(&rss, "fragment").is_err());
-            for bad in [
-                rss.replace("certificate-list", "fragment"),
-                rss.replace("large_pending", "large_refused"),
-                rss.replace("-v2:", "-v1:"),
-                rss.trim_end().to_owned(),
-            ] {
-                assert!(rss_evidence(&bad, "certificate-list").is_err());
-            }
-
-            assert!(tls_certificate_list_evidence(&output, !native).is_err());
-            assert!(tls_handshake_evidence(&output, native).is_err());
-            assert!(tls_fragment_evidence(&output, native).is_err());
-            assert!(tls_certificate_list_evidence(
-                &output.replace("certificate-list", "fragment"),
-                native
-            )
-            .is_err());
-            assert!(entropy_worker_evidence(&output, native).is_err());
-            for bad in [
-                output.replace("large_pending", "large_refused"),
-                output.replace(" 1 2", " 1"),
-                output.replace(" 1 2", " x 2"),
-                output.replace("passed", "failed"),
-                output.replace("-v1:", "-v2:"),
-                output.trim_end().to_owned(),
-                format!("{output}extra\n"),
-            ] {
-                assert!(tls_certificate_list_evidence(&bad, native).is_err());
-            }
+        let domain = "rust";
+        let values = "1 2 3 4 5 6 7";
+        let mut output = String::new();
+        for phase in [
+            "baseline",
+            "policy",
+            "storage",
+            "large_constructed",
+            "large_pending",
+            "large_refused",
+            "small_constructed",
+            "small_pending",
+            "small_refused",
+            "repeated",
+            "dropped",
+        ] {
+            output.push_str(&format!("tls-{domain}-certificate-list {phase} {values}\n"));
+        }
+        output.push_str(&format!(
+            "tls-certificate-list-allocation-v1: {domain} passed\n"
+        ));
+        assert!(tls_certificate_list_evidence(&output).is_ok());
+        let mut rss = String::new();
+        for phase in [
+            "baseline",
+            "policy",
+            "storage",
+            "large_constructed",
+            "large_pending",
+            "large_refused",
+            "small_constructed",
+            "small_pending",
+            "small_refused",
+            "repeated",
+            "dropped",
+        ] {
+            rss.push_str(&format!("rss certificate-list {phase} 100\n"));
+        }
+        rss.push_str("rss-observation-v2: certificate-list passed\n");
+        assert!(rss_evidence(&rss, "certificate-list").is_ok());
+        assert!(rss_evidence(&rss, "fragment").is_err());
+        for bad in [
+            rss.replace("certificate-list", "fragment"),
+            rss.replace("large_pending", "large_refused"),
+            rss.replace("-v2:", "-v1:"),
+            rss.trim_end().to_owned(),
+        ] {
+            assert!(rss_evidence(&bad, "certificate-list").is_err());
+        }
+        assert!(tls_handshake_evidence(&output).is_err());
+        assert!(tls_fragment_evidence(&output).is_err());
+        assert!(
+            tls_certificate_list_evidence(&output.replace("certificate-list", "fragment")).is_err()
+        );
+        assert!(entropy_worker_evidence(&output).is_err());
+        for bad in [
+            output.replace("large_pending", "large_refused"),
+            output.replace(" 1 2", " 1"),
+            output.replace(" 1 2", " x 2"),
+            output.replace("passed", "failed"),
+            output.replace("-v1:", "-v2:"),
+            output.trim_end().to_owned(),
+            format!("{output}extra\n"),
+        ] {
+            assert!(tls_certificate_list_evidence(&bad).is_err());
         }
     }
 
     #[test]
     fn entropy_worker_records_require_teardown_and_distinct_phases() {
-        for native in [false, true] {
-            let domain = if native { "native" } else { "rust" };
-            let values = if native {
-                "1 2 3 4 5 6 7 8 9"
-            } else {
-                "1 2 3 4 5 6 7"
-            };
-            let mut output = String::new();
-            for phase in [
-                "baseline",
-                "spawned",
-                "first_warm",
-                "all_warm",
-                "repeated",
-                "joined",
-                "dropped",
-            ] {
-                output.push_str(&format!("tls-{domain}-entropy {phase} {values}\n"));
-            }
-            output.push_str(&format!("tls-entropy-allocation-v1: {domain} passed\n"));
-            assert!(entropy_worker_evidence(&output, native).is_ok());
-            assert!(entropy_worker_evidence(&output, !native).is_err());
-            assert!(tls_handshake_evidence(&output, native).is_err());
-            assert!(tls_allocation_evidence(&output, native).is_err());
-            for bad in [
-                output.replace("joined", "repeated"),
-                output.replace(" 1 2", " 1"),
-                output.replace(" 1 2", " -1 2"),
-                output.replace("passed", "failed"),
-                format!("{output}extra\n"),
-            ] {
-                assert!(entropy_worker_evidence(&bad, native).is_err());
-            }
+        let domain = "rust";
+        let values = "1 2 3 4 5 6 7";
+        let mut output = String::new();
+        for phase in [
+            "baseline",
+            "spawned",
+            "first_warm",
+            "all_warm",
+            "repeated",
+            "joined",
+            "dropped",
+        ] {
+            output.push_str(&format!("tls-{domain}-entropy {phase} {values}\n"));
+        }
+        output.push_str(&format!("tls-entropy-allocation-v1: {domain} passed\n"));
+        assert!(entropy_worker_evidence(&output).is_ok());
+        assert!(tls_handshake_evidence(&output).is_err());
+        assert!(tls_allocation_evidence(&output).is_err());
+        for bad in [
+            output.replace("joined", "repeated"),
+            output.replace(" 1 2", " 1"),
+            output.replace(" 1 2", " -1 2"),
+            output.replace("passed", "failed"),
+            format!("{output}extra\n"),
+        ] {
+            assert!(entropy_worker_evidence(&bad).is_err());
         }
     }
 
     #[test]
     fn tls_handshake_records_are_distinct_from_client_construction() {
-        for native in [false, true] {
-            let domain = if native { "native" } else { "rust" };
-            let values = if native {
-                "1 2 3 4 5 6 7 8 9"
-            } else {
-                "1 2 3 4 5 6 7"
-            };
-            let mut output = String::new();
-            for phase in [
-                "baseline",
-                "material",
-                "config",
-                "generation",
-                "buffers",
-                "constructed",
-                "handshake",
-                "record",
-                "repeated",
-                "client_released",
-                "released",
-                "buffers_released",
-                "dropped",
-            ] {
-                output.push_str(&format!("tls-{domain}-handshake {phase} {values}\n"));
-            }
-            output.push_str(&format!("tls-handshake-allocation-v2: {domain} passed\n"));
-            assert!(tls_handshake_evidence(&output, native).is_ok());
-            assert!(tls_handshake_evidence(&output.replace("-v2:", "-v1:"), native).is_err());
-            assert!(tls_handshake_evidence(&output, !native).is_err());
-            assert!(tls_allocation_evidence(&output, native).is_err());
-            for bad in [
-                output.replace("material", "config"),
-                output.replace(" 1 2", " 1"),
-                output.replace(" 1 2", " x 2"),
-                output.replace("passed", "failed"),
-                format!("{output}extra\n"),
-            ] {
-                assert!(tls_handshake_evidence(&bad, native).is_err());
-            }
+        let domain = "rust";
+        let values = "1 2 3 4 5 6 7";
+        let mut output = String::new();
+        for phase in [
+            "baseline",
+            "material",
+            "config",
+            "generation",
+            "buffers",
+            "constructed",
+            "handshake",
+            "record",
+            "repeated",
+            "client_released",
+            "released",
+            "buffers_released",
+            "dropped",
+        ] {
+            output.push_str(&format!("tls-{domain}-handshake {phase} {values}\n"));
+        }
+        output.push_str(&format!("tls-handshake-allocation-v2: {domain} passed\n"));
+        assert!(tls_handshake_evidence(&output).is_ok());
+        assert!(tls_handshake_evidence(&output.replace("-v2:", "-v1:")).is_err());
+        assert!(tls_allocation_evidence(&output).is_err());
+        for bad in [
+            output.replace("material", "config"),
+            output.replace(" 1 2", " 1"),
+            output.replace(" 1 2", " x 2"),
+            output.replace("passed", "failed"),
+            format!("{output}extra\n"),
+        ] {
+            assert!(tls_handshake_evidence(&bad).is_err());
         }
     }
 
     #[test]
     fn remote_chain_records_require_the_controller_and_inner_schema() {
         for scenario in ["remote12", "remote13", "remote13large"] {
-            for domain in ["rust", "native", "rss"] {
+            for domain in ["rust", "rss"] {
                 let mut body = String::new();
                 for phase in REMOTE_CHAIN_PHASES {
                     if domain == "rss" {
                         body.push_str(&format!("rss {scenario} {phase} 100\n"));
                     } else {
-                        let values = if domain == "native" {
-                            "1 2 3 4 5 6 7 8 9"
-                        } else {
-                            "1 2 3 4 5 6 7"
-                        };
+                        let values = "1 2 3 4 5 6 7";
                         body.push_str(&format!("tls-{domain}-{scenario} {phase} {values}\n"));
                     }
                 }
@@ -2649,158 +2381,137 @@ mod tests {
     #[test]
     fn generation_records_require_complete_ordered_owners_and_domains() {
         for scenario in ["generation", "generation-routing", "generation-trust"] {
-            for native in [false, true] {
-                let domain = if native { "native" } else { "rust" };
-                let values = if native {
-                    "1 2 3 4 5 6 7 8 9"
-                } else {
-                    "1 2 3 4 5 6 7"
-                };
-                let mut output = String::new();
-                let mut rss = String::new();
-                for phase in [
-                    "baseline",
-                    "material",
-                    "config",
-                    "first",
-                    "candidate",
-                    "overlap",
-                    "refused",
-                    "old_released",
-                    "repeated",
-                    "current_released",
-                    "dropped",
-                ] {
-                    output.push_str(&format!("tls-{domain}-{scenario} {phase} {values}\n"));
-                    rss.push_str(&format!("rss {scenario} {phase} 100\n"));
+            let domain = "rust";
+            let values = "1 2 3 4 5 6 7";
+            let mut output = String::new();
+            let mut rss = String::new();
+            for phase in [
+                "baseline",
+                "material",
+                "config",
+                "first",
+                "candidate",
+                "overlap",
+                "refused",
+                "old_released",
+                "repeated",
+                "current_released",
+                "dropped",
+            ] {
+                output.push_str(&format!("tls-{domain}-{scenario} {phase} {values}\n"));
+                rss.push_str(&format!("rss {scenario} {phase} 100\n"));
+            }
+            output.push_str(&format!("tls-{scenario}-allocation-v1: {domain} passed\n"));
+            rss.push_str(&format!("rss-observation-v2: {scenario} passed\n"));
+            assert!(tls_generation_evidence(&output, scenario).is_ok());
+            let unknown = output.replace(scenario, "unknown");
+            assert!(tls_generation_evidence(&unknown, "unknown").is_err());
+            assert!(rss_evidence(&rss.replace(scenario, "unknown"), "unknown").is_err());
+            assert!(rss_evidence(&rss, scenario).is_ok());
+            for other in [
+                "generation",
+                "generation-routing",
+                "generation-trust",
+                "unknown",
+            ] {
+                if other != scenario {
+                    assert!(tls_generation_evidence(&output, other).is_err());
+                    assert!(rss_evidence(&rss, other).is_err());
                 }
-                output.push_str(&format!("tls-{scenario}-allocation-v1: {domain} passed\n"));
-                rss.push_str(&format!("rss-observation-v2: {scenario} passed\n"));
-                assert!(tls_generation_evidence(&output, native, scenario).is_ok());
-                let unknown = output.replace(scenario, "unknown");
-                assert!(tls_generation_evidence(&unknown, native, "unknown").is_err());
-                assert!(rss_evidence(&rss.replace(scenario, "unknown"), "unknown").is_err());
-                assert!(rss_evidence(&rss, scenario).is_ok());
-                assert!(tls_generation_evidence(&output, !native, scenario).is_err());
-                for other in [
-                    "generation",
-                    "generation-routing",
-                    "generation-trust",
-                    "unknown",
-                ] {
-                    if other != scenario {
-                        assert!(tls_generation_evidence(&output, native, other).is_err());
-                        assert!(rss_evidence(&rss, other).is_err());
-                    }
-                }
-                assert!(tls_large_chain_evidence(&output, native).is_err());
-                for bad in [
-                    output.replace("candidate", "overlap"),
-                    output.replace("current_released", "old_released"),
-                    output.replace("-v1:", "-v2:"),
-                    output.replace(&format!("tls-{domain}-{scenario} refused {values}\n"), ""),
-                    format!("{output}extra\n"),
-                    output.trim_end().to_owned(),
-                ] {
-                    assert!(tls_generation_evidence(&bad, native, scenario).is_err());
-                }
-                for bad in [
-                    rss.replace("candidate", "overlap"),
-                    rss.replace(&format!("rss {scenario} refused 100\n"), ""),
-                    rss.replace("-v2:", "-v1:"),
-                    format!("{rss}extra\n"),
-                ] {
-                    assert!(rss_evidence(&bad, scenario).is_err());
-                }
+            }
+            assert!(tls_large_chain_evidence(&output).is_err());
+            for bad in [
+                output.replace("candidate", "overlap"),
+                output.replace("current_released", "old_released"),
+                output.replace("-v1:", "-v2:"),
+                output.replace(&format!("tls-{domain}-{scenario} refused {values}\n"), ""),
+                format!("{output}extra\n"),
+                output.trim_end().to_owned(),
+            ] {
+                assert!(tls_generation_evidence(&bad, scenario).is_err());
+            }
+            for bad in [
+                rss.replace("candidate", "overlap"),
+                rss.replace(&format!("rss {scenario} refused 100\n"), ""),
+                rss.replace("-v2:", "-v1:"),
+                format!("{rss}extra\n"),
+            ] {
+                assert!(rss_evidence(&bad, scenario).is_err());
             }
         }
     }
 
     #[test]
     fn large_chain_records_are_distinct_from_ordinary_handshake() {
-        for native in [false, true] {
-            let domain = if native { "native" } else { "rust" };
-            let values = if native {
-                "1 2 3 4 5 6 7 8 9"
-            } else {
-                "1 2 3 4 5 6 7"
-            };
-            let mut output = String::new();
-            for phase in [
-                "baseline",
-                "material",
-                "config",
-                "generation",
-                "buffers",
-                "constructed",
-                "handshake",
-                "record",
-                "repeated",
-                "client_released",
-                "released",
-                "buffers_released",
-                "dropped",
-            ] {
-                output.push_str(&format!("tls-{domain}-large-chain {phase} {values}\n"));
-            }
-            output.push_str(&format!("tls-large-chain-allocation-v2: {domain} passed\n"));
-            assert!(tls_large_chain_evidence(&output, native).is_ok());
-            assert!(tls_large_chain_evidence(&output.replace("-v2:", "-v1:"), native).is_err());
-            assert!(tls_large_chain_evidence(&output, !native).is_err());
-            assert!(tls_handshake_evidence(&output, native).is_err());
-            for bad in [
-                output.replace("material", "config"),
-                output.replace(" 1 2", " 1"),
-                output.replace(" 1 2", " x 2"),
-                output.replace("passed", "failed"),
-                format!("{output}extra\n"),
-            ] {
-                assert!(tls_large_chain_evidence(&bad, native).is_err());
-            }
+        let domain = "rust";
+        let values = "1 2 3 4 5 6 7";
+        let mut output = String::new();
+        for phase in [
+            "baseline",
+            "material",
+            "config",
+            "generation",
+            "buffers",
+            "constructed",
+            "handshake",
+            "record",
+            "repeated",
+            "client_released",
+            "released",
+            "buffers_released",
+            "dropped",
+        ] {
+            output.push_str(&format!("tls-{domain}-large-chain {phase} {values}\n"));
+        }
+        output.push_str(&format!("tls-large-chain-allocation-v2: {domain} passed\n"));
+        assert!(tls_large_chain_evidence(&output).is_ok());
+        assert!(tls_large_chain_evidence(&output.replace("-v2:", "-v1:")).is_err());
+        assert!(tls_handshake_evidence(&output).is_err());
+        for bad in [
+            output.replace("material", "config"),
+            output.replace(" 1 2", " 1"),
+            output.replace(" 1 2", " x 2"),
+            output.replace("passed", "failed"),
+            format!("{output}extra\n"),
+        ] {
+            assert!(tls_large_chain_evidence(&bad).is_err());
         }
     }
 
     #[test]
     fn tls_allocation_records_require_all_ordered_phases_and_exact_width() {
-        for native in [false, true] {
-            let domain = if native { "native" } else { "rust" };
-            let values = if native {
-                "1 2 3 4 5 6 7 8 9"
-            } else {
-                "1 2 3 4 5 6 7"
-            };
-            let mut output = String::new();
-            for phase in [
-                "baseline",
-                "config",
-                "generation",
-                "buffers",
-                "reserved",
-                "constructed",
-                "overlap",
-                "two_sessions",
-                "refused",
-                "released",
-                "repeated",
-                "dropped",
-            ] {
-                output.push_str(&format!("tls-{domain} {phase} {values}\n"));
-            }
-            output.push_str(&format!("tls-client-allocation-v1: {domain} passed\n"));
-            assert!(tls_allocation_evidence(&output, native).is_ok());
-            for bad in [
-                output.replace("baseline", "config"),
-                output.replace(" 1 2", "  1 2"),
-                output.replace(" 1 2", " -1 2"),
-                output.replace(" 1 2", " 999999999999999999999999999999 2"),
-                output.replace(" 1 2", " 1"),
-                output.replace("passed", "failed"),
-                format!("{output}extra\n"),
-                output.trim_end().to_owned(),
-            ] {
-                assert!(tls_allocation_evidence(&bad, native).is_err());
-            }
-            assert!(tls_allocation_evidence(&output, !native).is_err());
+        let domain = "rust";
+        let values = "1 2 3 4 5 6 7";
+        let mut output = String::new();
+        for phase in [
+            "baseline",
+            "config",
+            "generation",
+            "buffers",
+            "reserved",
+            "constructed",
+            "overlap",
+            "two_sessions",
+            "refused",
+            "released",
+            "repeated",
+            "dropped",
+        ] {
+            output.push_str(&format!("tls-{domain} {phase} {values}\n"));
+        }
+        output.push_str(&format!("tls-client-allocation-v1: {domain} passed\n"));
+        assert!(tls_allocation_evidence(&output).is_ok());
+        for bad in [
+            output.replace("baseline", "config"),
+            output.replace(" 1 2", "  1 2"),
+            output.replace(" 1 2", " -1 2"),
+            output.replace(" 1 2", " 999999999999999999999999999999 2"),
+            output.replace(" 1 2", " 1"),
+            output.replace("passed", "failed"),
+            format!("{output}extra\n"),
+            output.trim_end().to_owned(),
+        ] {
+            assert!(tls_allocation_evidence(&bad).is_err());
         }
     }
 
@@ -2876,69 +2587,30 @@ mod tests {
     }
 
     #[test]
-    fn native_allocation_probe_requires_exact_wrappers_and_rejects_hooks() {
-        let mut symbols = String::from("000 b native_alloc_probe_TD_MTA_NATIVE_REGISTRY\n");
-        for name in NATIVE_WRAPPERS {
-            symbols.push_str(&format!("000 T __wrap_{name}\n"));
-        }
-        assert!(native_allocation_symbols(&symbols, true).is_ok());
-        assert!(native_allocation_symbols(&symbols, false).is_err());
-        assert!(native_allocation_symbols("000 t ordinary_main", false).is_ok());
-        assert!(native_allocation_symbols("", false).is_err());
-        for name in NATIVE_WRAPPERS {
-            assert!(native_allocation_symbols(
-                &symbols.replace(&format!("000 T __wrap_{name}\n"), ""),
-                true
-            )
-            .is_err());
-        }
-        for name in [
-            "sdallocx",
-            "OPENSSL_memory_alloc",
-            "OPENSSL_memory_free",
-            "__wrap_memalign",
-            "memalign",
-            "valloc",
-            "pvalloc",
-            "reallocarray",
-        ] {
-            assert!(native_allocation_symbols(&format!("{symbols}000 T {name}\n"), true).is_err());
-        }
-        assert!(native_allocation_symbols("000 T __wrap_memalign", false).is_err());
-        assert!(!rust_flags().contains("--wrap"));
-        assert!(!CFlags::new(Architecture::X86_64, "/include")
-            .flags
-            .contains("--wrap"));
-        let measured = format!("native_registry_storage_bytes=1048608\nnative_counter_storage_bytes=56\nnative_thread_flag_bytes=1\n{NATIVE_SUCCESS}");
-        assert!(native_allocation_evidence(&measured, false).is_ok());
-        assert!(native_allocation_evidence(&measured.replace("=56", "=0"), false).is_err());
-        assert!(native_allocation_evidence(&measured.replace("=56", "=4097"), false).is_err());
-        assert!(native_allocation_evidence(
-            &measured.replace(
-                "native_thread_flag_bytes=1",
-                "native_counter_storage_bytes=1"
-            ),
-            false
+    fn portable_symbols_refuse_interposition_and_native_crypto() {
+        assert!(foreign_symbols("000 t ordinary_main\n000 T rust_begin_unwind\n").is_ok());
+        // A td test whose name mentions AWS-LC is not AWS-LC.
+        assert!(foreign_symbols(
+            "000 t _RNvNtCs1a_9td_crypto13backend_tests36keys_aws_lc_wrote_load_and_sign_here\n"
         )
-        .is_err());
-        assert!(native_allocation_evidence(NATIVE_SUCCESS, false).is_err());
-        assert!(native_allocation_evidence(NATIVE_SUCCESS, true).is_err());
-        let zero = "native-allocation-probe-v1: zero-resize invalidated\n";
-        assert!(native_allocation_evidence(zero, true).is_ok());
-        assert!(native_allocation_evidence(zero, false).is_err());
-        for bad in [
-            "",
-            NATIVE_SUCCESS.trim_end(),
-            "test result: ok. 0 passed; 0 failed;\n",
-            "native allocation probe unqualified: use the isolated musl build\n",
+        .is_ok());
+        assert!(foreign_symbols("").is_err());
+        for name in [
+            "__wrap_malloc",
+            "__wrap_memalign",
+            "aws_lc_0_47_0_EVP_DigestInit",
+            "OPENSSL_malloc",
+            "OPENSSL_memory_alloc",
+            "BORINGSSL_self_test",
+            "ring_core_0_17_14_bn_mul_mont",
+            "_RNvNtCs1a_9aws_lc_rs6digest6digest",
         ] {
-            assert!(native_allocation_evidence(bad, false).is_err());
-            assert!(native_allocation_evidence(bad, true).is_err());
+            assert!(
+                foreign_symbols(&format!("000 t ordinary_main\n000 T {name}\n")).is_err(),
+                "{name}"
+            );
         }
-        assert!(
-            native_allocation_evidence(&format!("{NATIVE_SUCCESS}{NATIVE_SUCCESS}"), false)
-                .is_err()
-        );
+        assert!(!rust_flags().contains("--wrap"));
     }
 
     #[test]
@@ -3259,12 +2931,11 @@ mod tests {
     }
 
     #[test]
-    fn arm_cargo_selects_cross_tools_but_keeps_the_host_linker() {
-        let include = "/usr/lib/gcc-cross/aarch64-linux-gnu/14/include";
+    fn arm_cargo_targets_musl_but_keeps_the_host_linker() {
         let command = cargo_manifest_architecture(
             "build",
             Path::new("/source/td-mta/Cargo.toml"),
-            &CFlags::new(Architecture::Aarch64, include),
+            Architecture::Aarch64,
         );
         let args: Vec<_> = command.get_args().collect();
         assert!(args.contains(&std::ffi::OsStr::new("aarch64-unknown-linux-musl")));
@@ -3273,47 +2944,22 @@ mod tests {
             "CC",
             "CC_aarch64-unknown-linux-musl",
             "CC_aarch64_unknown_linux_musl",
+            "AR_aarch64_unknown_linux_musl",
+            "HOST_CC",
+            "CC_x86_64-unknown-linux-gnu",
         ] {
             assert_eq!(
                 env.get(std::ffi::OsStr::new(key)),
-                Some(&Some(std::ffi::OsStr::new(
-                    "/usr/bin/aarch64-linux-gnu-gcc"
-                )))
-            );
-            let ar = key.replacen("CC", "AR", 1);
-            assert_eq!(
-                env.get(std::ffi::OsStr::new(&ar)),
-                Some(&Some(std::ffi::OsStr::new("/usr/bin/aarch64-linux-gnu-ar")))
+                Some(&Some(std::ffi::OsStr::new("/td-crypto-decoy"))),
+                "{key}"
             );
         }
+        assert!(!env.contains_key(std::ffi::OsStr::new("CFLAGS")));
         assert_eq!(
             env.get(std::ffi::OsStr::new(
                 "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"
             )),
             Some(&Some(std::ffi::OsStr::new("/td-crypto-host-linker")))
-        );
-        let flags = env
-            .get(std::ffi::OsStr::new("CFLAGS"))
-            .unwrap()
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(flags.contains(&format!("-isystem /musl/include -isystem {include} ")));
-        assert!(flags.contains("-B/usr/aarch64-linux-gnu/bin/ "));
-        for pinned in [
-            "-march=armv8-a",
-            "-mno-outline-atomics",
-            "-mbranch-protection=none",
-            "-fno-stack-protector",
-            "-fno-stack-clash-protection",
-            "-fno-omit-frame-pointer",
-        ] {
-            assert!(flags.contains(pinned), "{pinned}");
-        }
-        assert!(!flags.contains("-march=x86-64"));
-        assert_eq!(
-            env.get(std::ffi::OsStr::new("HOST_CC")),
-            Some(&Some(std::ffi::OsStr::new("/td-crypto-decoy")))
         );
         let rust_flags = rust_flags_architecture(Architecture::Aarch64);
         assert!(rust_flags.contains("link-self-contained=no"));
@@ -3324,44 +2970,32 @@ mod tests {
     }
 
     #[test]
-    fn cargo_uses_fixed_tools_flags_and_native_fallback_decoys() {
-        let include = "/usr/lib/gcc/x86_64-linux-gnu/14/include";
-        let command = cargo(
-            "build",
-            "td-mta",
-            &CFlags::new(Architecture::X86_64, include),
-        );
+    fn cargo_compiles_no_c_and_decoys_every_native_fallback() {
+        let command = cargo("build", "td-mta", Architecture::X86_64);
         let env: BTreeMap<_, _> = command
             .get_envs()
             .filter_map(|(k, v)| v.map(|v| (k.to_string_lossy(), v.to_string_lossy())))
             .collect();
-        assert_eq!(env.get("CC").unwrap(), "/usr/bin/gcc");
-        assert_eq!(env.get("AR").unwrap(), "/usr/bin/ar");
-        assert_eq!(env.get("CMAKE").unwrap(), "/td-crypto-decoy");
-        assert_eq!(env.get("PKG_CONFIG").unwrap(), "/td-crypto-decoy");
+        for key in [
+            "CC",
+            "AR",
+            "CC_x86_64-unknown-linux-musl",
+            "AR_x86_64_unknown_linux_musl",
+            "HOST_CC",
+            "TARGET_CC",
+            "CMAKE",
+            "PKG_CONFIG",
+        ] {
+            assert_eq!(env.get(key).unwrap(), "/td-crypto-decoy", "{key}");
+        }
+        assert!(!env.keys().any(|key| key.starts_with("CFLAGS")));
         // The root's /usr/bin holds a real cmake and pkg-config.
         assert_eq!(env.get("PATH").unwrap(), "/rust/bin");
         assert!(!env.contains_key("LD_LIBRARY_PATH"));
-        let flags = env.get("CFLAGS").unwrap();
-        assert!(flags.starts_with(&format!(
-            "-nostdinc -isystem /musl/include -isystem {include} -B/usr/bin/ "
-        )));
-        for pinned in [
-            "-march=x86-64",
-            "-fcf-protection=none",
-            "-fno-stack-protector",
-            "-fno-stack-clash-protection",
-            "-fno-omit-frame-pointer",
-        ] {
-            assert!(flags.contains(pinned), "{pinned}");
-        }
         assert!(env
             .get("CARGO_ENCODED_RUSTFLAGS")
             .unwrap()
             .contains("force-frame-pointers=yes"));
-        for &(key, value) in crate::crypto_build::CONTROLS {
-            assert_eq!(env.get(key).unwrap(), value);
-        }
         assert_eq!(env.get("CARGO_PROFILE_RELEASE_STRIP").unwrap(), "none");
         assert!(!env.contains_key("RUSTC_BOOTSTRAP"));
         assert!(!env.contains_key("RUSTC_WRAPPER"));
@@ -3399,7 +3033,7 @@ mod tests {
         }
         let inputs = crate::crypto_portable::Inputs {
             rust: scratch.join("rust"),
-            headers: scratch.join("musl"),
+            musl: scratch.join("musl"),
             build_root: crate::crypto_portable::BuildRoot {
                 directory: root.clone(),
                 record: String::new(),
@@ -3443,7 +3077,6 @@ mod tests {
             [
                 "/lib",
                 "/lib64",
-                "/musl",
                 "/output",
                 "/rust",
                 "/source",

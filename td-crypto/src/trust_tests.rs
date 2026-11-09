@@ -1,21 +1,17 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
+use crate::certificate_fixtures::TestKey;
 use crate::certificate_fixtures::{self as fixture, der, extension, oid, seq, Parameters};
 use crate::pem::tests::pem;
 use crate::VerificationFailure;
-use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use rustls::pki_types::{ServerName, UnixTime};
 use std::time::Duration;
 
 const NOW: u64 = 1_800_000_000;
 
-fn key() -> EcdsaKeyPair {
-    let bytes = EcdsaKeyPair::generate_pkcs8(
-        &ECDSA_P256_SHA256_ASN1_SIGNING,
-        &aws_lc_rs::rand::SystemRandom::new(),
-    )
-    .unwrap();
-    EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, bytes.as_ref()).unwrap()
+fn key() -> TestKey {
+    let bytes = TestKey::generate_pkcs8().unwrap();
+    TestKey::from_pkcs8(bytes.as_ref()).unwrap()
 }
 
 fn verify(store: &TrustStore, leaf: &[u8]) -> Result<(), TlsError> {
@@ -77,7 +73,7 @@ fn private_trust_replaces_public_and_other_private_roots() {
     let client = fixture::make(&leaf_key, &a, &client).unwrap();
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
         std::sync::Arc::new(a_store.roots.clone()),
-        std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        std::sync::Arc::new(crate::tls_policy::provider().unwrap()),
     )
     .build()
     .unwrap();
@@ -125,12 +121,7 @@ fn private_trust_bundle_limits_duplicates_and_atomic_refusal() {
         spki,
         fixture::signature_algorithm(),
         &Parameters::new(true),
-        |body| {
-            Ok(key
-                .sign(&aws_lc_rs::rand::SystemRandom::new(), body)?
-                .as_ref()
-                .to_vec())
-        },
+        |body| key.sign(body),
     )
     .unwrap();
     assert_eq!(
@@ -175,37 +166,31 @@ fn private_trust_anchor_policy_and_ignored_self_signature() {
     let leaf = fixture::certificate(&leaf_key, &root_key, false).unwrap();
     // Anchor public-key parsing covers every admitted key family. Their
     // issuing certificate signature is deliberately a separate P-256 key.
-    use aws_lc_rs::signature as native;
-    let mut public_keys = vec![(
-        certificate_algorithms::P256_KEY,
-        root_key.public_key().as_ref().to_vec(),
-    )];
-    for (algorithm, identifier) in [
+    // P-384 from td-primitives; P-521, Ed25519 and RSA keys from td-tls-provider's
+    // big-integer signature rows.
+    let p384 = td_primitives::ec::p384::SecretKey::generate().unwrap();
+    let public_keys = vec![
         (
-            &native::ECDSA_P384_SHA384_ASN1_SIGNING,
+            certificate_algorithms::P256_KEY,
+            root_key.public_key().as_ref().to_vec(),
+        ),
+        (
             certificate_algorithms::P384_KEY,
+            p384.public_key().unwrap().to_vec(),
         ),
         (
-            &native::ECDSA_P521_SHA512_ASN1_SIGNING,
             certificate_algorithms::P521_KEY,
+            fixture::answer_public("ECDSA_P521_SHA512"),
         ),
-    ] {
-        let document =
-            EcdsaKeyPair::generate_pkcs8(algorithm, &aws_lc_rs::rand::SystemRandom::new()).unwrap();
-        let key = EcdsaKeyPair::from_pkcs8(algorithm, document.as_ref()).unwrap();
-        public_keys.push((identifier, key.public_key().as_ref().to_vec()));
-    }
-    let ed = native::Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
-    let ed = native::Ed25519KeyPair::from_pkcs8(ed.as_ref()).unwrap();
-    public_keys.push((
-        certificate_algorithms::ED25519_KEY,
-        ed.public_key().as_ref().to_vec(),
-    ));
-    let rsa = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
-    public_keys.push((
-        certificate_algorithms::RSA_KEY,
-        rsa.public_key().as_ref().to_vec(),
-    ));
+        (
+            certificate_algorithms::ED25519_KEY,
+            fixture::answer_public("ED25519"),
+        ),
+        (
+            certificate_algorithms::RSA_KEY,
+            fixture::answer_public("RSA_PSS_SHA256"),
+        ),
+    ];
     for (identifier, public) in public_keys {
         let spki = seq(&[
             der(0x30, identifier),
@@ -214,10 +199,7 @@ fn private_trust_anchor_policy_and_ignored_self_signature() {
         let mut ca = Parameters::new(true);
         ca.issuer = b"external-issuer".to_vec();
         let bytes = fixture::build(spki.clone(), fixture::signature_algorithm(), &ca, |body| {
-            Ok(root_key
-                .sign(&aws_lc_rs::rand::SystemRandom::new(), body)?
-                .as_ref()
-                .to_vec())
+            root_key.sign(body)
         })
         .unwrap();
         assert_eq!(
@@ -233,10 +215,7 @@ fn private_trust_anchor_policy_and_ignored_self_signature() {
         ] {
             let bad = seq(&[der(0x30, identifier), der(3, &[vec![0], raw].concat())]);
             let bytes = fixture::build(bad, fixture::signature_algorithm(), &ca, |body| {
-                Ok(root_key
-                    .sign(&aws_lc_rs::rand::SystemRandom::new(), body)?
-                    .as_ref()
-                    .to_vec())
+                root_key.sign(body)
             })
             .unwrap();
             assert_eq!(
@@ -295,12 +274,7 @@ fn private_trust_anchor_policy_and_ignored_self_signature() {
         spki,
         fixture::signature_algorithm(),
         &Parameters::new(true),
-        |body| {
-            Ok(root_key
-                .sign(&aws_lc_rs::rand::SystemRandom::new(), body)?
-                .as_ref()
-                .to_vec())
-        },
+        |body| root_key.sign(body),
     )
     .unwrap();
     assert_eq!(

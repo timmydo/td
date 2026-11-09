@@ -156,15 +156,23 @@ fn block(input: &[u8], label: Label) -> Result<Block<'_>, Error> {
     Err(Error::Invalid)
 }
 
-fn sextet(byte: u8) -> Result<u8, Error> {
-    match byte {
-        b'A'..=b'Z' => Ok(byte - b'A'),
-        b'a'..=b'z' => Ok(byte - b'a' + 26),
-        b'0'..=b'9' => Ok(byte - b'0' + 52),
-        b'+' => Ok(62),
-        b'/' => Ok(63),
-        _ => Err(Error::Invalid),
-    }
+/// A base64 character's value and a validity mask (0xff valid, 0 not),
+/// with no branch and no table: a private key's characters are secret, so
+/// which class each falls in must not steer control flow or memory access.
+/// Each range test is an arithmetic sign mask.
+fn sextet(byte: u8) -> (u8, u8) {
+    let x = i16::from(byte);
+    // -1 when lo <= x <= hi, else 0.
+    let within = |lo: i16, hi: i16| ((lo - 1 - x) & (x - hi - 1)) >> 15;
+    let upper = within(65, 90);
+    let lower = within(97, 122);
+    let digit = within(48, 57);
+    let plus = within(43, 43);
+    let slash = within(47, 47);
+    let value =
+        (upper & (x - 65)) | (lower & (x - 71)) | (digit & (x + 4)) | (plus & 62) | (slash & 63);
+    let valid = upper | lower | digit | plus | slash;
+    ((value & 63) as u8, (valid & 0xff) as u8)
 }
 
 // Validate line endings before allowing CR as base64 whitespace.
@@ -187,22 +195,34 @@ fn base64(
         .copied()
         .filter(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
     let mut length = 0usize;
+    // Every data character's validity folds into one mask, tested once at the
+    // end; only padding, whose position the input's length fixes, and the
+    // final verdict branch. Bytes handed to `consume` before an invalid
+    // character is found are discarded: callers decode only validated input.
+    let mut valid = 0xffu8;
     while let Some(first) = input.next() {
-        let a = sextet(first)?;
-        let b = sextet(input.next().ok_or(Error::Invalid)?)?;
+        let (a, valid_a) = sextet(first);
+        let (b, valid_b) = sextet(input.next().ok_or(Error::Invalid)?);
         let third = input.next().ok_or(Error::Invalid)?;
         let fourth = input.next().ok_or(Error::Invalid)?;
+        let (c, valid_c) = sextet(third);
+        let (d, valid_d) = sextet(fourth);
+        valid &= valid_a & valid_b;
         let (c, d, count) = match (third, fourth) {
-            (b'=', b'=') if b & 15 == 0 => (0, 0, 1),
+            (b'=', b'=') => {
+                // Non-canonical trailing bits refuse, as a bad character does.
+                valid &= 0u8.wrapping_sub(u8::from(b & 15 == 0));
+                (0, 0, 1)
+            }
             (b'=', _) => return Err(Error::Invalid),
             (_, b'=') => {
-                let c = sextet(third)?;
-                if c & 3 != 0 {
-                    return Err(Error::Invalid);
-                }
+                valid &= valid_c & 0u8.wrapping_sub(u8::from(c & 3 == 0));
                 (c, 0, 2)
             }
-            _ => (sextet(third)?, sextet(fourth)?, 3),
+            _ => {
+                valid &= valid_c & valid_d;
+                (c, d, 3)
+            }
         };
         let decoded = [(a << 2) | (b >> 4), (b << 4) | (c >> 2), (c << 6) | d];
         length = length.checked_add(count).ok_or(Error::Invalid)?;
@@ -211,7 +231,7 @@ fn base64(
             return Err(Error::Invalid);
         }
     }
-    if length == 0 {
+    if length == 0 || valid != 0xff {
         return Err(Error::Invalid);
     }
     Ok(length)

@@ -7283,15 +7283,16 @@ another's next transaction.
 ## Bulk body verification
 
 The verified body reader hashes all chunks with td-crypto's opaque
-`BulkSha256`, backed by the existing admitted AWS-LC SHA-256 implementation.
+`BulkSha256`, backed by td-primitives' SHA-256, which uses the CPU's SHA
+extensions where present.
 It retains one digest context only for the verification pass, feeding the
 existing 64 KiB chunks from batches of at most eight. The account, immutable
 snapshot, ordinal/extent checks, final constant-time digest comparison and
 original deadline remain unchanged. Error or unwind retires the digest and
 refuses the verified pin. Empty bodies still require the SHA-256 empty digest.
 The worker checks its original deadline around each bounded chunk batch;
-native hashing is not independently cancellable. Native context allocation
-belongs to the existing process/provider allowance, bounded by active workers.
+a chunk's hashing is not independently cancellable. The digest context is
+inline and bounded by active workers.
 This path is not an allocation-free primitive. Other digest callers retain
 the existing owned implementation and storage bytes are unchanged.
 

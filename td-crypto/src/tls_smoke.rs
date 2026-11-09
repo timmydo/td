@@ -1,6 +1,6 @@
 //! Local backend qualification only; no production TLS adapter.
 //! Generated keys, certificates and fixed time keep this fixture offline.
-use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use crate::certificate_fixtures::TestKey;
 use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,11 +54,10 @@ fn pair_with_providers(
     client_provider: rustls::crypto::CryptoProvider,
     server_provider: rustls::crypto::CryptoProvider,
 ) -> Result<(rustls::Connection, rustls::Connection)> {
-    let rng = aws_lc_rs::rand::SystemRandom::new();
-    let root_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
-    let root = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, root_bytes.as_ref())?;
-    let leaf_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
-    let leaf = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, leaf_bytes.as_ref())?;
+    let root_bytes = TestKey::generate_pkcs8()?;
+    let root = TestKey::from_pkcs8(root_bytes.as_ref())?;
+    let leaf_bytes = TestKey::generate_pkcs8()?;
+    let leaf = TestKey::from_pkcs8(leaf_bytes.as_ref())?;
     // Same issuer name but a different trusted public key forces verification.
     let root_cert = match trust {
         Trust::WrongKey => certificate(&leaf, &leaf, true)?,
@@ -71,7 +70,7 @@ fn pair_with_providers(
         .with_no_client_auth()
         .with_single_cert(
             vec![leaf_cert.into()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_bytes.as_ref().to_vec()).into(),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_bytes.clone()).into(),
         )?;
     let mut roots = rustls::RootCertStore::empty();
     if !matches!(trust, Trust::Empty) {
@@ -343,15 +342,12 @@ fn mutual_configs(
     case: ClientCase,
 ) -> Result<MutualConfigs> {
     assert!(rustls::crypto::CryptoProvider::get_default().is_none());
-    let rng = aws_lc_rs::rand::SystemRandom::new();
-    let root_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
-    let root = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, root_bytes.as_ref())?;
-    let server_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
-    let server_key =
-        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, server_bytes.as_ref())?;
-    let client_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
-    let client_key =
-        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, client_bytes.as_ref())?;
+    let root_bytes = TestKey::generate_pkcs8()?;
+    let root = TestKey::from_pkcs8(root_bytes.as_ref())?;
+    let server_bytes = TestKey::generate_pkcs8()?;
+    let server_key = TestKey::from_pkcs8(server_bytes.as_ref())?;
+    let client_bytes = TestKey::generate_pkcs8()?;
+    let client_key = TestKey::from_pkcs8(client_bytes.as_ref())?;
     let root_cert = certificate(&root, &root, true)?;
     let server_cert = certificate(&server_key, &root, false)?;
     let client_cert = certificate_with(
@@ -393,7 +389,7 @@ fn mutual_configs(
             .with_client_cert_verifier(verifier)
             .with_single_cert(
                 vec![server_cert.into()],
-                rustls::pki_types::PrivatePkcs8KeyDer::from(server_bytes.as_ref().to_vec()).into(),
+                rustls::pki_types::PrivatePkcs8KeyDer::from(server_bytes.clone()).into(),
             )?;
     server.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     server.send_tls13_tickets = 0;
@@ -404,7 +400,7 @@ fn mutual_configs(
     let mut client = if matches!(case, ClientCase::Missing) {
         builder.with_no_client_auth()
     } else {
-        let key = if matches!(case, ClientCase::WrongKey) {
+        let key: &[u8] = if matches!(case, ClientCase::WrongKey) {
             root_bytes.as_ref()
         } else {
             client_bytes.as_ref()
@@ -645,11 +641,85 @@ fn explicit_policy_negotiates_classical_groups_and_suites() -> Result<()> {
     Ok(())
 }
 
+/// A group that only names X25519MLKEM768, offering a share of the hybrid's
+/// length. A classical peer refuses it before any share is completed.
+#[derive(Debug)]
+struct NamedHybrid;
+struct NamedShare(Vec<u8>);
+impl rustls::crypto::SupportedKxGroup for NamedHybrid {
+    fn start(
+        &self,
+    ) -> std::result::Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+        Ok(Box::new(NamedShare(vec![0x42; 1216])))
+    }
+    fn name(&self) -> rustls::NamedGroup {
+        rustls::NamedGroup::X25519MLKEM768
+    }
+}
+impl rustls::crypto::ActiveKeyExchange for NamedShare {
+    fn complete(
+        self: Box<Self>,
+        _peer: &[u8],
+    ) -> std::result::Result<rustls::crypto::SharedSecret, rustls::Error> {
+        Err(rustls::Error::General(
+            "a named-only share never completes".into(),
+        ))
+    }
+    fn pub_key(&self) -> &[u8] {
+        &self.0
+    }
+    fn group(&self) -> rustls::NamedGroup {
+        rustls::NamedGroup::X25519MLKEM768
+    }
+}
+
+/// A server key that signs only with ML-DSA-44, and then only refuses.
+#[derive(Debug)]
+struct MlDsaOnly;
+#[derive(Debug)]
+struct RefusingSigner;
+impl rustls::sign::SigningKey for MlDsaOnly {
+    fn choose_scheme(
+        &self,
+        offered: &[rustls::SignatureScheme],
+    ) -> Option<Box<dyn rustls::sign::Signer>> {
+        offered
+            .contains(&rustls::SignatureScheme::ML_DSA_44)
+            .then(|| Box::new(RefusingSigner) as Box<dyn rustls::sign::Signer>)
+    }
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        rustls::SignatureAlgorithm::Unknown(0)
+    }
+}
+impl rustls::sign::Signer for RefusingSigner {
+    fn sign(&self, _message: &[u8]) -> std::result::Result<Vec<u8>, rustls::Error> {
+        Err(rustls::Error::General(
+            "refusing ML-DSA fixture signer".into(),
+        ))
+    }
+    fn scheme(&self) -> rustls::SignatureScheme {
+        rustls::SignatureScheme::ML_DSA_44
+    }
+}
+
+#[derive(Debug)]
+struct Resolves(Arc<rustls::sign::CertifiedKey>);
+impl rustls::server::ResolvesServerCert for Resolves {
+    fn resolve(
+        &self,
+        _hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
+    }
+}
+
 #[test]
 fn explicit_policy_refuses_excluded_peer_algorithms() -> Result<()> {
     for restricted_server in [false, true] {
-        let mut remote = rustls::crypto::aws_lc_rs::default_provider();
-        remote.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
+        let remote = rustls::crypto::CryptoProvider {
+            kx_groups: vec![&NamedHybrid],
+            ..crate::tls_policy::provider()?
+        };
         let local = crate::tls_policy::provider()?;
         let (client, server) = if restricted_server {
             (remote, local)
@@ -677,79 +747,53 @@ fn explicit_policy_refuses_excluded_peer_algorithms() -> Result<()> {
             "{error:?}"
         );
     }
-    // A native client must finish against the excluded signer before its
-    // refusal can establish that the selected handshake mapping matters.
-    use crate::certificate_fixtures::{self as f, Parameters};
-    use aws_lc_rs::{
-        encoding::AsDer,
-        signature::{KeyPair, PqdsaKeyPair, ML_DSA_44_SIGNING},
-    };
-    let rng = aws_lc_rs::rand::SystemRandom::new();
-    let root_bytes = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
-    let root = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, root_bytes.as_ref())?;
-    let leaf = PqdsaKeyPair::generate(&ML_DSA_44_SIGNING)?;
-    let certificate = f::build(
-        leaf.public_key().as_der()?.as_ref().to_vec(),
-        f::signature_algorithm(),
-        &Parameters::new(false),
-        |body| Ok(root.sign(&rng, body)?.as_ref().to_vec()),
-    )?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    // The policy client offers no ML-DSA scheme, so a server holding only an
+    // ML-DSA key finds none to sign with. The certificate is AWS-LC's
+    // ML-DSA-44 root, which the server never reaches sending.
+    let line = include_str!("fixtures/ml_dsa_path.txt");
+    let root = line.split(' ').nth(2).ok_or("malformed ML-DSA fixture")?;
+    let certified = Arc::new(rustls::sign::CertifiedKey::new(
+        vec![crate::certificate_fixtures::unhex(root).into()],
+        Arc::new(MlDsaOnly),
+    ));
     let server = Arc::new(
-        rustls::ServerConfig::builder_with_details(provider, Arc::new(Time(VALID_TIME)))
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![certificate.into()],
-                rustls::pki_types::PrivatePkcs8KeyDer::from(leaf.to_pkcs8v1()?.as_ref().to_vec())
-                    .into(),
-            )?,
-    );
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(f::certificate(&root, &root, true)?.into())?;
-    for restricted in [false, true] {
-        let provider = if restricted {
-            crate::tls_policy::provider()?
-        } else {
-            rustls::crypto::aws_lc_rs::default_provider()
-        };
-        let client = rustls::ClientConfig::builder_with_details(
-            Arc::new(provider),
+        rustls::ServerConfig::builder_with_details(
+            Arc::new(crate::tls_policy::provider()?),
             Arc::new(Time(VALID_TIME)),
         )
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_root_certificates(roots.clone())
-        .with_no_client_auth();
-        let mut client = rustls::Connection::Client(rustls::ClientConnection::new(
-            Arc::new(client),
-            "localhost".try_into()?,
-        )?);
-        let mut server = rustls::Connection::Server(rustls::ServerConnection::new(server.clone())?);
-        client.set_buffer_limit(Some(BUFFER_BYTES));
-        server.set_buffer_limit(Some(BUFFER_BYTES));
-        let result = drive(&mut client, &mut server);
-        if restricted {
-            let error = result
-                .err()
-                .ok_or("excluded signer accepted by policy client")?;
-            assert!(
-                matches!(
-                    error.downcast_ref::<rustls::Error>(),
-                    Some(rustls::Error::PeerIncompatible(
-                        rustls::PeerIncompatible::NoSignatureSchemesInCommon
-                    ))
-                ),
-                "{error:?}"
-            );
-        } else {
-            result?;
-            assert!(!client.is_handshaking() && !server.is_handshaking());
-            assert_eq!(
-                client.protocol_version(),
-                Some(rustls::ProtocolVersion::TLSv1_3)
-            );
-        }
-    }
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(Resolves(certified))),
+    );
+    let root_key = TestKey::generate();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate(&root_key, &root_key, true)?.into())?;
+    let client = rustls::ClientConfig::builder_with_details(
+        Arc::new(crate::tls_policy::provider()?),
+        Arc::new(Time(VALID_TIME)),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let mut client = rustls::Connection::Client(rustls::ClientConnection::new(
+        Arc::new(client),
+        "localhost".try_into()?,
+    )?);
+    let mut server = rustls::Connection::Server(rustls::ServerConnection::new(server)?);
+    client.set_buffer_limit(Some(BUFFER_BYTES));
+    server.set_buffer_limit(Some(BUFFER_BYTES));
+    let error = drive(&mut client, &mut server)
+        .err()
+        .ok_or("excluded signer accepted by policy client")?;
+    assert!(
+        matches!(
+            error.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::PeerIncompatible(
+                rustls::PeerIncompatible::NoSignatureSchemesInCommon
+            ))
+        ),
+        "{error:?}"
+    );
     assert!(rustls::crypto::CryptoProvider::get_default().is_none());
     Ok(())
 }

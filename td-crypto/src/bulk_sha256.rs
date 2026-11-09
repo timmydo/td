@@ -1,12 +1,12 @@
-//! Backend-accelerated SHA-256 for bounded bulk I/O workers.
+//! td-primitives' CPU-dispatched SHA-256 for bounded bulk I/O workers.
 use crate::{Digest, Error};
-use aws_lc_rs::digest::{Context, SHA256};
 use std::panic::{catch_unwind, UnwindSafe};
+use td_primitives::sha::{Digest as _, Sha256 as Context};
 
 const MAX_INPUT_BYTES: u64 = u64::MAX / 8;
 
-/// Streaming bulk digest with opaque native storage. Unlike `Sha256`, this
-/// operation may allocate. Callers bound update sizes and enforce deadlines.
+/// Streaming bulk digest. Unlike `Sha256`, its contract permits allocation and
+/// CPU dispatch. Callers bound update sizes and enforce deadlines.
 pub struct BulkSha256 {
     context: Option<Context>,
     bytes: u64,
@@ -20,7 +20,7 @@ impl std::fmt::Debug for BulkSha256 {
 
 impl BulkSha256 {
     pub fn try_new() -> Result<Self, Error> {
-        let context = catch_unwind(|| Context::new(&SHA256)).map_err(|_| Error::Crypto)?;
+        let context = catch_unwind(Context::new).map_err(|_| Error::Crypto)?;
         Ok(Self {
             context: Some(context),
             bytes: 0,
@@ -59,14 +59,7 @@ impl Digest for BulkSha256 {
 
     fn finish(mut self) -> Result<[u8; 32], Error> {
         let context = self.context.take().ok_or(Error::Crypto)?;
-        catch_unwind(move || {
-            context
-                .finish()
-                .as_ref()
-                .try_into()
-                .map_err(|_| Error::Crypto)
-        })
-        .map_err(|_| Error::Crypto)?
+        catch_unwind(move || context.finalize()).map_err(|_| Error::Crypto)
     }
 }
 

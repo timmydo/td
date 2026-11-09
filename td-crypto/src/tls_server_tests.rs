@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
+use crate::certificate_fixtures::TestKey;
 use crate::{certificate_fixtures as f, pem::tests::pem, UtcClock};
-use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use std::sync::atomic::{AtomicU64, Ordering};
 const NOW: u64 = 1_800_000_000;
 struct Source(Arc<AtomicU64>);
@@ -17,18 +17,14 @@ fn test_clock() -> (Arc<AtomicU64>, Arc<ClockHandle>) {
     let value = Arc::new(AtomicU64::new(NOW));
     (value.clone(), Arc::new(ClockHandle::new(Source(value))))
 }
-fn key() -> (Vec<u8>, EcdsaKeyPair) {
-    let der = EcdsaKeyPair::generate_pkcs8(
-        &ECDSA_P256_SHA256_ASN1_SIGNING,
-        &aws_lc_rs::rand::SystemRandom::new(),
-    )
-    .unwrap();
-    let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, der.as_ref()).unwrap();
-    (der.as_ref().to_vec(), key)
+fn key() -> (Vec<u8>, TestKey) {
+    let der = TestKey::generate_pkcs8().unwrap();
+    let key = TestKey::from_pkcs8(der.as_ref()).unwrap();
+    (der.clone(), key)
 }
 struct Fixture {
     issuer: Vec<u8>,
-    ca: EcdsaKeyPair,
+    ca: TestKey,
     root: Vec<u8>,
     secret: Vec<u8>,
     chain: Vec<u8>,

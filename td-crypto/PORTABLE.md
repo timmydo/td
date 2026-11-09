@@ -2,23 +2,25 @@
 
 ## Status
 
-M03b2a implements header preparation; M03b2b prepares the remaining Rust
-inputs and the Debian build root's C toolchain. M03b2c supplies isolated
-compilation and static artifact
+M03b2a pins the musl notice source; M03b2b prepares the Rust inputs and the
+Debian build root's host linker, binutils and host runtime. M03b2c supplies
+isolated compilation and static artifact
 qualification. M03b2d1 adds API confinement; M03b2d2 adds local TLS smoke.
 This is a host build path for the
 standalone td-mta executable; it does not grant the provenance of td's
 target image graph. Nothing prepared here is automatically admitted
 as a target recipe input.
 
-## x86-64 and aarch64 musl headers
+## Musl notice source
 
-The header source is musl 1.2.5, matching the version named by Rust 1.99.1's
-`src/ci/docker/scripts/musl-toolchain.sh`. Rust's target standard library owns
-the linked libc and its upstream patches. This command generates headers;
-it does not build or replace libc, and does not claim that an unpatched musl
-1.2.5 runtime is suitable for deployment. The complete Rust target archive
-pin is below; runtime qualification belongs to M03b2c/M03b2d.
+The musl libc linked into both architectures' artifacts is the
+self-contained `libc.a` of the pinned Rust target standard library below,
+built by Rust from musl 1.2.5 (the version Rust 1.99.1's
+`src/ci/docker/scripts/musl-toolchain.sh` names) with its upstream patches.
+Nothing in the portable build compiles C, so no musl headers are prepared.
+The upstream release is pinned only as the verified source of musl's
+COPYRIGHT notice for that libc; it does not build or replace libc, and does
+not claim that an unpatched musl 1.2.5 runtime is suitable for deployment.
 
 | Input | Pin |
 | --- | --- |
@@ -26,62 +28,34 @@ pin is below; runtime qualification belongs to M03b2c/M03b2d.
 | Archive bytes | `1080786` |
 | SHA-256 | `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4` |
 
-Both architecture header sets contain 218 installed files. Each has its own
-complete upstream `make ARCH=ARCH install-headers` digest:
-
-| Architecture | Header tree SHA-256 |
-| --- | --- |
-| `x86_64` | `a673b15579a83881c2d9aa61a65ce26dd62557d16c497e5a04e4e6a8bb6d601b` |
-| `aarch64` | `28de375648bca0be1af345c98b542e3eac2cc714b473ee4d9a831d96a3cc5c5c` |
-
 Prepare a previously fetched archive offline:
 
 ```text
-td-builder gate-crates crypto-musl-headers --archive /path/to/musl-1.2.5.tar.gz [--arch x86_64|aarch64]
+td-builder gate-crates crypto-musl-notice --archive /path/to/musl-1.2.5.tar.gz
 ```
 
 The command prints the prepared directory under the worktree's
-`.td-build-cache/crypto-musl-<arch>-1.2.5-<output-digest>`. Omitting `--arch`
-keeps the x86-64 default and its existing cache identity. Unknown architectures
-are refused before opening the archive. The archive argument
+`.td-build-cache/crypto-musl-1.2.5-<output-digest>`. The archive argument
 must name a regular file, not a symlink. It verifies a bounded in-memory copy
 of the archive and passes those same bytes to td's existing gzip/tar reader. An
-oversized archive fails the bounded read before hashing. It
-does not fetch, run `configure`, execute `make`/`sed`, or search host headers.
-Its std-only generator follows musl's installed-header rules: public include
-files, architecture bits overriding generic bits, guarded alltypes
-declarations, and syscall aliases. This is a version-specific generator;
-changing the archive or architecture requires reviewing the rules and output.
+oversized archive fails the bounded read before hashing. It does not fetch,
+run `configure` or execute `make`/`sed`.
 
-The tree digest covers each relative header path in ascending byte order,
-then NUL, the decimal byte length, NUL, and the file bytes, concatenated into
-SHA-256. It was derived from the complete upstream `make install-headers`
-output, independently of td's generator. Every invocation checks the generated
-tree against it, including the header count. This catches wrong overrides,
-declaration transformations, omitted files and extra files.
-
-Output contains `include/`, the upstream `COPYRIGHT`, and a `SOURCE` receipt
-naming the URL, archive hash and header-only scope. Musl is predominantly
+Output contains exactly the upstream `COPYRIGHT` and a `SOURCE` receipt
+naming the URL, archive hash and notice-only scope. Musl is predominantly
 MIT-licensed; retain the complete upstream notice for its additional notices.
 A fresh output is staged privately and published as one directory. The suffix
-hashes all output file paths and bytes with the same encoding as the header
-digest, so a changed receipt or license selects a new cache entry. Existing
-output is re-read and compared with freshly verified source bytes, including
-the license and receipt. Modified, missing, added or symlink files fail;
-the command does not silently repair them. A concurrent identical publication
-may be reused. Empty extra directories carry no build input and are ignored.
-The host cache is caller-owned, not a security boundary against another process
-with the same uid. A later isolated compilation must bind its verified input
-read-only and exclude undeclared paths and ambient flags.
-On a cache mismatch, remove only the named cache entry and retry. This cache
-is reconstructible and publication is not fsynced. A hard-killed preparer may
-leave a private `crypto-headers-<pid>-<attempt>` scratch directory; remove it
-only after confirming that preparer is no longer running.
-
-The aarch64 digest was independently measured from the same pinned upstream
-archive with `make ARCH=aarch64 prefix=DEST install-headers`; the generator
-must reproduce all installed paths and bytes. This prepares headers only;
-producing an executable requires the matching target kit and compiler below.
+hashes both file paths and bytes (each relative path in ascending byte order,
+then NUL, the decimal byte length, NUL and the bytes, concatenated into
+SHA-256), so a changed receipt or license selects a new cache entry. Existing
+output is re-read and compared with freshly verified source bytes. Modified,
+missing, added or symlink files fail; the command does not silently repair
+them. A concurrent identical publication may be reused. The host cache is
+caller-owned, not a security boundary against another process with the same
+uid. On a cache mismatch, remove only the named cache entry and retry. This
+cache is reconstructible and publication is not fsynced. A hard-killed
+preparer may leave a private `crypto-musl-notice-<pid>-<attempt>` scratch
+directory; remove it only after confirming that preparer is no longer running.
 
 ## Rust host kit and target standard library
 
@@ -105,7 +79,7 @@ Each build selects four archives under the upstream prefix
 
 These hashes are from the Rust 1.99.1 upstream distribution manifest. Select
 the first three host archives and one target musl standard library. Prepare
-those four files and the musl header archive in one directory, then run:
+those four files and the musl archive in one directory, then run:
 
 ```text
 td-builder gate-crates crypto-portable-prepare --archives /path/to/archives [--arch x86_64|aarch64]
@@ -135,10 +109,11 @@ and notices. A changed or symlink cache root fails. No persisted digest alone
 authenticates a mutable tree. This prepares binaries and libraries as data;
 preparation alone does not execute them or prove their runtime closure.
 
-## Debian build root: C toolchain and host runtime
+## Debian build root: host linker, binutils and host runtime
 
-The C compiler, binutils, and the host runtime the upstream Rust tools run
-on are td's pinned Debian build root (AGENTS.md, "Debian build root";
+The host linker for build scripts and proc macros, the binutils that list
+symbols and split debug companions, and the host runtime the upstream Rust
+tools run on are td's pinned Debian build root (AGENTS.md, "Debian build root";
 `recipes/src/debian-root.lock`), the same tree td's C recipes build in. The
 kit stays host-only: it is not a recipe and adds nothing to the target graph.
 The preparer rebuilds or reuses a source-fingerprinted td-recipe-eval and
@@ -162,22 +137,26 @@ read-only, each at its path in the root, and nothing else of it:
 
 | Root directory | Mounted at | Role |
 | --- | --- | --- |
-| `usr` | `/usr` | Debian's GCC 14.2.0 and binutils 2.44, x86-64 and `aarch64-linux-gnu` cross; glibc 2.41, libgcc_s and zlib for the upstream Rust host tools, build scripts and proc macros |
+| `usr` | `/usr` | Debian's GCC 14.2.0 (the host linker driver only) and binutils 2.44, x86-64 and `aarch64-linux-gnu` cross; glibc 2.41, libgcc_s and zlib for the upstream Rust host tools, build scripts and proc macros |
 | `usr/lib` | `/lib` | the usrmerge link the root's loader link and `libc.so` script name |
 | `usr/lib64` | `/lib64` | the loader, `/lib64/ld-linux-x86-64.so.2` |
 
-| Target | C compiler | `ar`, `nm`, `objcopy` | assembler prefix (`-B`) |
-| --- | --- | --- | --- |
-| `x86_64` | `/usr/bin/gcc` | `/usr/bin/ar`, `nm`, `objcopy` | `/usr/bin/` |
-| `aarch64` | `/usr/bin/aarch64-linux-gnu-gcc` | `/usr/bin/aarch64-linux-gnu-ar`, `-nm`, `-objcopy` | `/usr/aarch64-linux-gnu/bin/` |
+| Target | `nm`, `objcopy` |
+| --- | --- |
+| `x86_64` | `/usr/bin/nm`, `/usr/bin/objcopy` |
+| `aarch64` | `/usr/bin/aarch64-linux-gnu-nm`, `/usr/bin/aarch64-linux-gnu-objcopy` |
 
-td glibc is mounted nowhere, so nothing the root's GCC links can resolve
-td's loader. The root's `/usr/bin` stays off `PATH` (`/rust/bin` alone),
-since it also holds cmake and pkg-config: every tool is named by absolute
-path, and `CMAKE` and `PKG_CONFIG` still reach only the decoy. That
-guarantee is about lookup, not presence: the root's cmake, pkg-config,
-perl, python3, glibc headers and static archives are in the namespace,
-and a build script naming one by absolute path would reach it. The
+No target C compiler, archiver or assembler is used: no admitted package
+compiles C. Every `CC` and `AR` spelling Cargo's build scripts consult (plain,
+both spellings of the target triple and of `x86_64-unknown-linux-gnu`, and
+`HOST_CC`, `HOST_AR`, `TARGET_CC`, `TARGET_AR`) names the failing decoy, as
+`CMAKE` and `PKG_CONFIG` do. td glibc is mounted nowhere, so nothing the
+root's GCC links can resolve td's loader. The root's `/usr/bin` stays off
+`PATH` (`/rust/bin` alone), since it also holds gcc, cmake and pkg-config:
+every tool is named by absolute path. That guarantee is about lookup, not
+presence: the root's compilers, cmake, pkg-config, perl, python3, glibc
+headers and static archives are in the namespace, and a build script naming
+one by absolute path would reach it. The
 reviewed, policy-pinned dependency graph (`crypto_policy.rs`) is what
 excludes that; the decoys prove only that no tool was found through
 the environment. There is no
@@ -188,25 +167,7 @@ through the root's loader. Build scripts and proc macros link through
 the root's own glibc. The target link is unchanged: rust-lld with
 `+crt-static` and the musl libc of Rust's self-contained target library.
 
-Inside the namespace the compile asks the root's GCC for its freestanding
-include directory (`-print-file-name=include`) and refuses one outside
-`/usr/lib/gcc/x86_64-linux-gnu/` (`/usr/lib/gcc-cross/aarch64-linux-gnu/`)
-or without `stddef.h`; CFLAGS name it after musl's headers. Debian's GCC is
-configured `--enable-default-pie`, but the cc builder compiles every object
-`-fPIC` regardless. CFLAGS pin `-fno-stack-protector`,
-`-fno-stack-clash-protection` and `-fcf-protection=none` (x86-64) or
-`-mbranch-protection=none` (aarch64), today's defaults of both compilers,
-so a re-pinned root cannot change them silently; with these flags, the
-aarch64 compiler's `-Q --help=common,target,optimizers` report matched the
-retired source-built `aarch64-linux-musl` cross compiler's exactly. The cross
-compiler targets `aarch64-linux-gnu` but only compiles, freestanding against
-musl's headers, so its glibc target shows only as predefined macros
-(`__gnu_linux__`, decimal-float limits, `__INT_FAST16_TYPE__` and
-`__INT_FAST32_TYPE__`, which musl's own `stdint.h` does not read). The
-root's arm64 cross runtime packages (`libc6-arm64-cross`, libgcc's and the
-sanitizers') come with that compiler as dependencies and are never linked.
-
-Success prints `portable-rust`, `portable-musl-headers`, the root's
+Success prints `portable-rust`, `portable-musl-notice`, the root's
 `build-root` store path and pinned NAR record, and its `portable-build-root`
 directory. This is preparation output, not an installed artifact manifest.
 No tool flags, API confinement, static-linking result or service capability
@@ -232,23 +193,20 @@ build host; aarch64 is a cross-compilation target, not a supported build host.
 td-builder gate-crates crypto-portable-cross-build --archives /path/to/archives
 ```
 
-This command uses the aarch64 kit and headers and the build root's Debian
-`aarch64-linux-gnu` cross GCC and binutils in an isolated offline build. It
-applies the same dependency admission, API confinement and fallback refusal
-as the x86-64 path. Rust uses its generic ARM CPU baseline; C uses
-`-march=armv8-a -mtune=generic` and disables outlined atomics so GCC does not
-introduce a dependency on a target libgcc, which nothing links: the root's
-arm64 libgcc stays out of the link. Both request frame pointers and level-1
-debug data. Rustdoc's pinned
+This command uses the aarch64 kit and the build root's Debian
+`aarch64-linux-gnu` binutils (`nm`, `objcopy`) in an isolated offline build.
+It applies the same dependency admission, API confinement and fallback refusal
+as the x86-64 path. Rust uses its generic ARM CPU baseline and requests frame
+pointers and level-1 debug data. No C is compiled, so the root's arm64 cross
+compiler and libgcc take no part. Rustdoc's pinned
 baseline features are `neon` and `outline-atomics`.
 
 Rust's ARM target defaults to a non-PIE static executable. This build uses
 stable `link-self-contained=no`, PIC and explicit linker flags to select the
 pinned target kit's `rcrt1.o`, `crti.o`, `crtbeginS.o`, `crtendS.o` and `crtn.o`.
 The musl static-PIE startup performs relocation; no runtime loader is needed.
-The output must still pass the static-PIE check. Host C build-script compiler
-and archiver selections point to refusal decoys, preventing accidental ARM
-objects in host executables.
+The output must still pass the static-PIE check. Every host and target C
+compiler and archiver selection points to the refusal decoy.
 
 The output name is `crypto-artifact-aarch64-cross-<NAR-sha256>`, distinct
 from the x86-64 runtime-qualified artifact. It contains `td-mta`, its
@@ -263,8 +221,13 @@ Cross-compilation does not execute ARM code. Its receipt explicitly records
 runtime was not tested. The test executables are retained for separate native
 or emulated functional validation. It does not run the x86-64 clean-runtime
 process suite or allocation/RSS probes and cannot substitute for that evidence.
-On a native ARM host, run these selected functional cases from the retained
-artifact directory and require a nonzero passing test count for each command:
+Current cross-build result:
+`crypto-portable-cross-build` passed: all five aarch64 executables built
+with no C compiled, passed the static-PIE, symbol, graph and API checks, and
+were published as `crypto-artifact-aarch64-cross-d71f6bbb...`. Their runtime
+is not tested; it needs an ARM host. On a native ARM host, run these
+selected functional cases from the retained artifact directory and require a
+nonzero passing test count for each command:
 
 ```text
 ./td-crypto-smoke --test-threads=1
@@ -308,33 +271,30 @@ no previous Cargo target directory is reused. Caller-owned source/cache
 trees must not be concurrently modified. No hostile same-uid writer
 boundary is claimed.
 
-The namespace has only these mounts plus the Rust kit, musl headers and the
-build root's `/usr`, `/lib` and `/lib64` listed above. It has private `/tmp`,
+The namespace has only these mounts plus the Rust kit and the
+build root's `/usr`, `/lib` and `/lib64` listed above; the musl notice is
+hashed and retained by the host, not mounted. It has private `/tmp`,
 minimal `/dev`, private `/proc` and no host `/usr` or `/bin`, no td glibc, no
 OpenSSL headers and no Cargo configuration. Cargo's
 environment is cleared and reconstructed. The inner helper records each actual
 Cargo command's arguments, working directory and explicit environment in
 `BUILD-INPUTS`; these include frozen/offline source replacement, two jobs, epoch 0,
-explicit Rust/C/ar/linker paths, all five AWS-LC source-build controls and
-the fixed AWS-LC provider controls.
-CMake and pkg-config point to a failing td-builder applet which writes a marker;
-OpenSSL points to a nonexistent directory. The positive build refuses any marker.
-A missing compiler, header, archive or library is an error, with no ambient
-substitute. There is no Zig dependency.
+explicit Rust and host-linker paths and the C fallback decoys.
+Every C compiler and archiver spelling, CMake and pkg-config point to a failing
+td-builder applet which writes a marker; OpenSSL points to a nonexistent
+directory. The positive build refuses any marker. A missing tool, archive or
+library is an error, with no ambient substitute. There is no Zig dependency.
 
 Rust links the target through its bundled rust-lld, static musl target std and
-`+crt-static`, with `target-cpu=x86-64`. The root's GCC uses `-nostdinc`, only
-musl's and its own freestanding includes and the root's binutils, and
-`-march=x86-64 -mtune=generic`.
-Compiled Rust and C request frame pointers and level-1 debug information;
+`+crt-static`, with `target-cpu=x86-64`.
+Compiled Rust requests frame pointers and level-1 debug information;
 release/bench profile stripping is explicitly disabled, and the artifact check
 requires an ordinary symbol table in every executable but the split receiver.
 Source/vendor/output paths map to `/td-build`, `/td-cargo/vendor` and
-`/td-build-root`. Upstream prebuilt std/libc and hand-written provider assembly
-remain profiling boundaries. This host portable artifact is not the target
+`/td-build-root`. Upstream prebuilt std/libc remain profiling boundaries. This host portable artifact is not the target
 image's whole-closure profiling qualification.
 
-The linker requests a deterministic SHA-1 GNU build ID. After allocator-symbol
+The linker requests a deterministic SHA-1 GNU build ID. After symbol
 inspection, the build root's `objcopy` creates `td-mta.debug` from the
 receiver, prunes all DWARF, line tables included, using the shared target
 profiling policy, then strips the runtime. The existing ELF pair validator
@@ -344,12 +304,11 @@ collected copy before running the process suite against the exact stripped
 receiver. Both files ship
 in the same content-addressed artifact. Probe executables retain embedded debug
 data and never become installed service dependencies. This pair does not
-establish frame-pointer coverage for the upstream prebuilt std/libc or provider
-assembly. [DEPLOYMENT.md](../td-mta/DEPLOYMENT.md) documents the installation
+establish frame-pointer coverage for the upstream prebuilt std/libc. [DEPLOYMENT.md](../td-mta/DEPLOYMENT.md) documents the installation
 layout and receiver operations.
 
 Cargo's selected normal/build graphs must match admission. Its artifact records
-must select exactly one expected binary/test profile. All nine results must be
+must select exactly one expected binary/test profile. All eight results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
@@ -385,11 +344,11 @@ suite has its cumulative 120-second externally supervised deadline. Each
 Cargo command has a 20-minute deadline. Parsed Cargo stdout is limited to
 8 MiB (graphs to 256 KiB); each JSON record is limited to
 256 KiB and 64 nesting levels. Logs on disk are temporary, not a streaming
-output quota. M07 owns native/TLS allocation and entropy-failure qualification;
-a Result wrapper cannot contain provider aborts.
+output quota. M07 owns TLS allocation and entropy-failure qualification;
+a Result wrapper cannot contain aborts.
 
 After the compile namespace exits and its descendants are reaped, the host
-requires an exact regular-file output inventory: nine binaries and the inner
+requires an exact regular-file output inventory: eight binaries and the inner
 command record plus the receiver debug companion. It rejects output
 directory/file symlinks and additional files, then copies these checked inputs
 into a fresh private directory outside the compiler's writable mount. Only this directory receives host-written metadata
@@ -402,8 +361,6 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
 
 - `td-mta-rss-probe`: separate unwrapped process RSS observations, with no
   service use or inferred whole-service/transient-peak bound.
-- `td-mta-native-allocation-probe`: separate libc forwarding diagnostic with
-  explicit registry/counter/per-thread-flag storage evidence and no service use.
 - `td-mta-rust-allocation-probe`: dedicated System-forwarding allocation
   qualification process; never an installed executable or service dependency.
 - `td-mta`: the installed receiving-only executable. Its supported store,
@@ -415,11 +372,10 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   selecting this exact `td-mta` under the separate fixture described above.
   It is a test controller, never a service dependency.
 - `td-crypto-smoke`: separate qualification test executable, not a service
-  dependency. It independently exercises the native backend and facade. It
-  also compiles td-crypto's dev-dependencies, td-tls-provider and
-  td-primitives, from their staged trees, with the differential tests of that
-  test-only candidate backend (DESIGN.md); the clean runtime runs only its
-  named cases, which exclude them.
+  dependency. It exercises the facade over td-primitives and td-tls-provider,
+  compiled from their staged trees, including the known-answer tests over
+  the committed AWS-LC fixtures (DESIGN.md); the clean runtime runs its 135
+  named cases.
 - `td-mta-config-smoke`: integration test linked to the production td-mta
   library for the bounded configuration stack checks in td-mta/CONFIG.md.
   Generic loader/materializer/writer functions compile in the test crate;
@@ -452,12 +408,13 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   `tls_policy_transport_stack_mapping_bytes`; the portable driver requires
   exactly one bounded decimal observation. This qualifies only those exercised
   test-compiled paths. It excludes the separate gateway peer's stack and does
-  not establish native heap, maximum-input/CPU-path coverage or service RSS.
+  not establish heap, maximum-input/CPU-path coverage or service RSS.
   The same combined scenario set runs in an ordinary host test for fixture
   drift only; host execution provides no target stack bound.
-  Native C/assembly stack probing is not qualified: a native frame could skip
-  the guard. Successful execution and an observed mapping do not prove every
-  native overflow would fault. RESOURCES.md retains that admission obligation.
+  Stack probing in the prebuilt musl libc and Rust std objects is not
+  qualified: such a frame could skip the guard. Successful execution and an
+  observed mapping do not prove every overflow would fault. RESOURCES.md
+  retains that admission obligation.
   Five outbound additions cover complete EHLO offers, malformed extension
   skipping, fragmented/multiline 220, buffered-tail refusal, role/scratch/time
   admission, cancellation and both upgrade owners through verified local TLS.
@@ -468,7 +425,7 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   complete TLS policy compilation and HTTPS name subsets, reader
   caps/refusals, client-only startup/expiry admission,
   strict client trust and complete-table replacement within the same
-  generation budget, generation-bound IDs, queued/native session ownership,
+  generation budget, generation-bound IDs, queued/backend session ownership,
   exact buffer recovery and gateway policy/binding comparison; local
   compiled-policy peers verify relay trust, name routing and mandatory
   client authentication. Retained TCP handoff cases cover plaintext tails,
@@ -494,14 +451,15 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   fixtures bind only ephemeral IPv4 loopback ports; certificates are
   generated locally through the public crypto facade. No provider, CA or
   deployment server is contacted. This qualifies those adapter behaviors on
-  musl, not full service admission, native allocation/stack/RSS, or
+  musl, not full service admission, allocation/stack/RSS, or
   complete SMTP/STARTTLS protocol integration.
-- `BUILD-INPUTS`: staged source, vendor, reconstructed Rust kit, headers and
-  helper NAR hashes, the build root's store path and pinned NAR hash
+- `BUILD-INPUTS`: staged source, vendor, reconstructed Rust kit, musl notice
+  (`musl-notice`) and helper NAR hashes, the build root's store path and pinned NAR hash
   (`build-root PATH sha256:...`), target and actual inner
   Cargo argument/environment records.
 - `notices/`: upstream LICENSE/COPYING/COPYRIGHT/NOTICE/AUTHORS files, including nested
-  provider attribution and Rust's bundled library notices. Every package of
+  provider attribution, Rust's bundled library notices and musl's COPYRIGHT
+  (`notices/musl`) for the linked libc. Every package of
   the pinned active graph (`crypto_policy.rs`'s ACTIVE and POSTGRES_ACTIVE),
   build-only packages included, must contribute at least one notice. A
   locked-only package compiles into nothing here: its notices are retained
@@ -535,21 +493,22 @@ claim runtime allocation/stack/RSS qualification.
 
 The runtime runs the owned SHA-256 facade's four existing known-answer
 fixtures, including fragmented updates around block boundaries and a million
-`a` bytes. Differential cases compare against the admitted native SHA-256
-implementation at every byte length through 257 and selected larger block
+`a` bytes. Differential cases compare against td-primitives' separate SHA-256
+(CPU-dispatched to SHA-NI where present) at every byte length through 257 and selected larger block
 boundaries through 4097, with varied chunks and every split through 257.
 Separate cases verify terminal refusal, retained-state clearing, bounded inline
 storage and redacted Debug. The length limit uses a synthetic counter near its
 ceiling; synthetic differences exercise upper padding-length bytes without
 hashing exabytes.
 
-Direct digests have no provider unwind path, heap allocation or native crypto
+Direct digests have no provider unwind path, heap allocation or backend
 calls. Source and exact-artifact control/address and call-graph review qualify
 that narrow primitive; retain compiler/flags/target and artifact identity in the landing
 record. This is not a guarantee for arbitrary compiler changes, other CPU
-paths, secure erasure of all copies, or whole-service resource use. The native
-adapters still require whole-graph `panic=unwind`; their synthetic failures do
-not simulate native abort/OOM or entropy failure. DESIGN.md owns those limits.
+paths, secure erasure of all copies, or whole-service resource use. The
+backend adapters still require whole-graph `panic=unwind`; their synthetic
+failures do not simulate abort/OOM or entropy failure. DESIGN.md owns those
+limits.
 
 ## Entropy qualification
 
@@ -561,10 +520,9 @@ The local sample comparison catches no-op/constant-output wiring; it is not
 an entropy-quality test. The host compile-fail doctests separately pin the handle's
 Send and Sync refusals. No new portable executable is added.
 
-These cases do not induce native RNG failure or prove recovery from native
-abort/OOM or bounded native wait time. Process-wide/per-thread state, shared
-locks, direct native stderr, warm-up, cleanup and remaining allocation/stack/RSS
-qualification follow DESIGN.md. No service is enabled by this probe.
+These cases do not induce a kernel random-device failure or prove recovery
+from abort/OOM or a bounded wait for the kernel's generator. Remaining
+allocation/stack/RSS qualification follows DESIGN.md. No service is enabled by this probe.
 
 ## Crypto factory and P-256 qualification
 
@@ -582,9 +540,20 @@ The runtime separately runs the oracle's four SHA-256 known-answer cases and
 all seven P-256 arithmetic, point, range and signature-vector cases, requiring
 one exact passing result for each. Functional comparison results do not prove
 constant-time lowering. Key/signing returned-error and unwind injection do not
-induce native RNG failure; native allocation, blocking, stack/RSS and timing
+induce random-device failure; allocation, blocking, stack/RSS and timing
 qualification remain M07 obligations. DESIGN.md owns the accepted key formats,
-secret lifecycle, output/retirement contract and native failure limits.
+secret lifecycle, output/retirement contract and failure limits.
+
+Five `backend_tests` cases are fixed known answers from the committed
+fixtures AWS-LC wrote while it was the backend: its four generated P-256
+keys load here in all four accepted PKCS#8 shapes to its public points, and
+its signatures verify under the independent oracle; four keys in this
+backend's generated shape, which AWS-LC loaded and whose signatures it
+verified when written, load to the same points; AWS-LC's signatures and
+td-tls-provider's big-integer rows are taken by exactly their own policy
+verifiers; AWS-LC's twenty certificate paths verify under the policy and a
+changed signature does not; and the loader refuses out-of-range scalars and
+mismatched embedded points.
 
 ## Mail-format digest qualification
 
@@ -603,7 +572,7 @@ trust, publication, recovery, allocation bounds or service operation.
 ## Local TLS smoke
 
 The test-only backend module generates an ephemeral P-256 root and localhost
-leaf with the admitted signing backend. A small fixture DER encoder builds
+leaf with td-primitives' P-256 signing. A small fixture DER encoder builds
 certificates normally valid from 2025-01-01 to 2035-01-01; the client-expiry
 case ends its leaf's validity at 2026-01-01. No external certificate,
 private key, server, OpenSSL command or new dependency is needed. Both peers
@@ -646,7 +615,7 @@ The baseline round trips assert X25519 key exchange and AES-256-GCM/SHA-384 suit
 for both versions. The fixture certificate and handshake signatures use
 ECDSA P-256/SHA-256. The algorithm-policy cases below cover the additional
 classical groups and suites. RSA, P-384, P-521 and Ed25519 signing schemes
-remain inventory-only; alternative CPU/assembly paths are not exercised.
+remain inventory-only; alternative CPU paths are not exercised.
 This check covers the CPU paths selected on the test host.
 
 Each drive uses a 32 KiB caller buffer and permits at most 256 KiB wire
@@ -673,7 +642,7 @@ within the pinned backend, not independent cryptographic conformance.
 Before publication, the portable command compiles the production td-crypto
 library again in a separate diagnostic target directory, selecting `-p td-crypto`
 through td-mta's Cargo manifest, lock and release profile, with the same target,
-native controls and Rust target flags as the shipping binary. This ordinary
+fallback decoys and Rust target flags as the shipping binary. This ordinary
 stable compilation forbids `unexpected_cfgs` and declares
 `--check-cfg=cfg(doc,debug_assertions,values())`. Every reachable use of either
 condition, including cfg_attr, cfg! and expanded macros, is an error. Source
@@ -686,7 +655,8 @@ declarations that could merge additional allowed conditions into this guard.
 Those are forbidden in future pin updates too; changing this rule requires
 requalifying the guard. Mutation tests exercise the pin refusals.
 
-A second compiler pass marks all three direct backend dependencies private
+A second compiler pass marks all four direct dependencies (rustls,
+td-primitives, td-tls-provider and webpki-roots) private
 using `--extern priv:NAME` and forbids `exported_private_dependencies`. This
 also catches transitive foreign types and methods/associated types involving
 `dyn` local traits that pinned Rust 1.99.1 rustdoc omits from its JSON. The
@@ -761,7 +731,7 @@ constraints, exact name/extension/depth limits, malformed DER and metadata,
 and synthetic Rust construction unwinds. Existing TLS fixtures share their
 certificate generator with these tests. Every case remains in-memory and
 contacts no CA or deployment. This does not qualify trust-store selection,
-TLS sessions or native allocation/stack/RSS admission.
+TLS sessions or allocation/stack/RSS admission.
 
 ## Trust-store qualification
 
@@ -777,13 +747,15 @@ permission or the service's resource budget. No test contacts a public server.
 ## Explicit algorithm policy qualification
 
 The portable artifact runs the exact suite/group/signature inventory and
-mapping-drift fixtures, plus a generated ML-DSA-signed leaf accepted by the
-native baseline and refused by the selected certificate policy. Backend
-TLS fixtures use the selected provider. Additional bounded local handshakes
-cover each classical group under TLS 1.2/1.3 and the six TLS 1.3/ECDSA TLS 1.2
-suites. Hybrid-only peers fail in either direction. An ML-DSA server signed by a
-classical CA completes a handshake with a native-default client, while the
-policy client refuses its signing scheme. RSA suites and P-384/P-521/Ed25519
+mapping-drift fixtures, plus the committed ML-DSA-44 path AWS-LC wrote (and
+verified with its defaults when it was the backend), which the selected
+certificate policy refuses. Backend TLS fixtures use the selected provider.
+Additional bounded local handshakes cover each classical group under TLS
+1.2/1.3 and the six TLS 1.3/ECDSA TLS 1.2 suites. A peer offering only a test
+group named X25519MLKEM768 fails in either direction (`NoKxGroupsInCommon`),
+and a policy client refuses a server whose only key signs ML-DSA-44
+(`NoSignatureSchemesInCommon`). td-primitives implements neither algorithm,
+so no positive hybrid or ML-DSA baseline runs. RSA suites and P-384/P-521/Ed25519
 signing schemes receive inventory coverage only. These checks qualify the algorithm component; they do not
 claim public configurations, session limits or service admission.
 
@@ -794,7 +766,7 @@ shared-key transform-error/unwind retirement, retained-identity lifecycle and
 local TLS 1.2/1.3 handshakes through the owned signer. Both configurations
 refuse after shared-key retirement; preceding peer name/protocol refusals
 leave it usable. Resumption is disabled in this fixture. Private state faults
-are synthetic Rust failures, not native RNG/OOM/abort simulation. TLS roles,
+are synthetic Rust failures, not random-device/OOM/abort simulation. TLS roles,
 sessions and resource qualification remain separate.
 
 ## Outbound TLS configuration qualification
@@ -830,7 +802,7 @@ also copies secret and certificate state before the no-op store drops it.
 Verifier fixtures check certificate count, per-certificate and aggregate
 ceilings before path work. Backend parsing occurs earlier and may allocate;
 these are not whole-session memory bounds. Constructors, root copies, clocks,
-verifiers and native connections remain subject to M07e allocation/stack/RSS
+verifiers and backend connections remain subject to M07e allocation/stack/RSS
 qualification. No listener or live network service is used.
 
 ## Inbound TLS configuration qualification
@@ -885,7 +857,7 @@ and local flight drain. TLS 1.2/1.3 fixtures exercise the transition and a
 synthetic backend-growth refusal using real encrypted records; healthy
 configuration reuse must remain possible. Established ciphertext is capped
 at 36874 bytes. This is a post-operation queue check, not an allocation bound.
-The native deframer
+The backend's deframer
 retains record headers: a 65511-byte malformed handshake payload fits with
 16384-byte fragments, while one extra byte exhausts capacity; 4096-byte
 fragments lower that boundary to 65451. These fixtures qualify progress and
@@ -905,7 +877,9 @@ An independently encrypted TLS 1.2 HelloRequest has a valid open-connection
 warning-response baseline. After local close, with close ciphertext pending,
 partially drained or fully drained, the same request instead retires the
 session without drainable output. Test-only extraction is enabled on that
-remote peer; facade configurations still disable extraction. Separate cases
+remote peer, through a test wrapper around td-tls-provider's TLS 1.2
+AES-256-GCM, which itself refuses extraction; facade configurations still
+disable extraction. Separate cases
 pin the conservative simultaneous-close refusal when TLS 1.2 output remains
 inside the facade or in the caller's socket-write tail.
 
@@ -943,60 +917,42 @@ allocator machinery; source confinement enforces its import boundary. The artifa
 namespace include this executable explicitly. No common compiler/linker flag
 changes. The runtime runs each mode in a fresh process. The default requires
 its exact success line after model, forwarding and digest/SMTP checks. UNSAFE.md T1 and
-td-mta/RESOURCES.md define the scope: requested Rust bytes only; no native,
-RSS, whole-service or allocation-elimination guarantee is inferred.
+td-mta/RESOURCES.md define the scope: requested Rust bytes only; libc's
+internal allocations are outside it, and no RSS, whole-service or
+allocation-elimination guarantee is inferred.
 
-## Mail native allocation diagnostic artifact
+## Libc-boundary and foreign-symbol checks
 
-`td-mta-native-allocation-probe` is a seventh, separate integration executable.
-Only its final Cargo rustc invocation receives `td_native_alloc_probe` and six
-rust-lld `--wrap` arguments: malloc, calloc, realloc, free, posix_memalign and
-aligned_alloc. Shared Rust/native flags and the installed executable are
-unchanged. The normal host target prints an unqualified stub record; only the
-portable run can produce the accepted forwarding/provider diagnostic record.
+No libc-boundary allocation diagnostic is built (UNSAFE.md T2 is retired);
+td-mta/RESOURCES.md, "Libc-boundary observation", says why and records the
+current run's stack-mapping, requested-byte and RSS results. The build
+lists each retained executable's defined symbols with the build root's
+`nm` and refuses any `__wrap_` symbol, any symbol starting `aws_lc_`,
+`OPENSSL_`, `BORINGSSL_` or `ring_core_` (the native backends' prefixed
+C symbols) and any mangled path naming the `aws_lc_rs` or `aws_lc_sys`
+crates. This refuses those backends by name; it does not by itself prove
+that every cryptographic routine is td-primitives.
 
-A const, drop-free native TLS guard suppresses nested libc calls, so requested
-size and ownership follow the outermost call. Fixed state has 65536 registry
-slots; its storage is test overhead, not service memory. Positive controls
-exercise the six entry points, null arguments, successful zero-size ownership,
-failed growth preserving storage, zeroing, alignment and output-pointer
-preservation and four concurrent allocation/resize/free workers. A separate
-process requires zero-size resize to invalidate evidence. RNG initialization
-requires a positive provider boundary call and links native code for inspection.
-Successful output reports registry bytes, fixed counter bytes and one thread
-flag separately; thread TLS-block/runtime overhead is outside these figures.
-The builder requires positive bounded values plus the exact completion record.
-It requires wrapper/registry sentinels in this executable, refuses
-any wrapper in the other seven executables and refuses resolved sdallocx or
-OPENSSL_memory allocator hooks and unqualified aligned/array entry points. These checks do not classify all allocation
-machinery or cover hidden/local references; counts remain diagnostic.
-
-UNSAFE.md T2 and td-mta/RESOURCES.md define this observation. It does not replace
-independent RSS/stack checks, establish TLS generation/session peak memory or
-change the ledger. C boundary counts may include Rust System calls and must
-never be added to Rust counts as disjoint native memory.
-
-The two allocation executables also run `--tls-clients` in independent fresh
-processes. The runtime validates all twelve ordered snapshot rows and their
+The Rust allocation executable also runs `--tls-clients` in a fresh
+process. The runtime validates all twelve ordered snapshot rows and their
 completion records before printing observations. This exercises representative
 public-root outbound policy generations and pending client construction through
 the mail facade, without sockets. RESOURCES.md in td-mta defines columns,
 positive controls and the limits of those diagnostic observations; they do not
 qualify TLS session ceilings or whole-service RSS.
 
-A separate `--tls-handshake` process per counter domain additionally qualifies
+A separate `--tls-handshake` process additionally qualifies
 the local TLS 1.3 observation path. It generates synthetic material, completes
 an admitted loopback pair, transfers verified 16 KiB records in both directions,
 and requires stable retained requested bytes across repeated transfers. All
 thirteen ordered rows are validated before logging. These representative
 requested allocation observations do not establish TLS memory ceilings or RSS bounds.
 
-Each domain additionally runs `--entropy-workers` in a fresh process. Seven
+It additionally runs `--entropy-workers` in a fresh process. Seven
 ordered rows record startup of eight test workers, cold RNG work on one then
 all workers, repeated warmed fills, explicit joins including TLS destructors,
-and final scope teardown. Warm fills must leave counters unchanged; native
-cold RNG work must produce a positive malloc/calloc observation. Domain and
-scenario logs are distinct and completion records are exact. Requested
+and final scope teardown. Warm fills must leave counters unchanged. Scenario
+logs are distinct and completion records are exact. Requested
 bytes/blocks can remain after all workers exit. These diagnostics do not
 measure worker stack mappings or RSS and do not change service admission.
 
@@ -1005,38 +961,37 @@ existing malformed-handshake reassembly boundaries with 16384-byte and 4096-byte
 fragments. Twelve ordered rows distinguish setup, retained incomplete input,
 decoding/capacity refusals, repeated cycles and teardown. The pending snapshot
 precedes the final record and does not isolate a transient peak. All rows and
-completion markers must match their domain/scenario schema before logging.
+completion markers must match their scenario schema before logging.
 This is an untrusted-input diagnostic, not a complete TLS/session/RSS bound.
 
 The fresh `--tls-large-chain` processes reuse the local authenticated TLS 1.3
 scenario with a signed leaf/intermediate/root chain above 60 KiB of PEM but
 within the local loader's 64 KiB limit. Each padded certificate remains within
 16 KiB DER. Thirteen ordered observations and exact completion use a separate
-large-chain schema and log per domain. Both endpoints and retained fixture
+large-chain schema and log. Both endpoints and retained fixture
 material are included; successful large-chain traffic is not a total service,
 maximum-profile or RSS qualification.
 
 Handshake and large-chain allocation records use schema v2 with separate
 client, remaining-server and returned-wire-buffer release checkpoints. The
-counter probes require exactly 73748 requested bytes to disappear when the
-four returned buffers drop; native tracking additionally requires four fewer
-blocks. Other allocation scenarios retain v1. Endpoint release deltas exclude
+counter probe requires exactly 73748 requested bytes to disappear when the
+four returned buffers drop. Other allocation scenarios retain v1. Endpoint release deltas exclude
 shared state and stack storage.
 
-Fresh `--tls-generations` processes in both counter domains compile sixteen
+Fresh `--tls-generations` processes compile sixteen
 large files profiles into direct SMTP, HTTPS/MTA-STS and relay policies, retain
 old and replacement owners, refuse a third generation, and repeat replacement
 after releasing the old lease. Eleven ordered rows and a distinct v1 completion
 are required. Counter refusal must be unchanged and repeated replacements must
-not retain requested bytes or native blocks. This is a profile-count fixture,
+not retain requested bytes. This is a profile-count fixture,
 not a complete generation-memory bound; td-mta/RESOURCES.md defines its scope.
 
 ## Mail sampled RSS diagnostic artifact
 
-`td-mta-rss-probe` is an eighth integration executable with its own main.
-It uses the ordinary allocator, no native wrappers and no allocation-counter
-storage. Symbol checks require the `rss_probe` sentinel only in this artifact
-and refuse the Rust/native probe sentinels there. The exact artifact inventory,
+`td-mta-rss-probe` is a separate integration executable with its own main.
+It uses the ordinary allocator and no allocation-counter storage. Symbol
+checks require the `rss_probe` sentinel only in this artifact and refuse the
+Rust probe sentinels there. The exact artifact inventory,
 static ELF validation and fresh runtime namespace include it explicitly.
 
 The default process checks the bounded rollup parser and observes a positive
@@ -1060,15 +1015,14 @@ allocation delta.
 
 ## Remote peer-chain memory observations
 
-The existing unwrapped mail test executable additionally controls nine local
+The existing unwrapped mail test executable additionally controls six local
 process fixtures: TLS 1.2, TLS 1.3 with two tickets, and TLS 1.3 with one large
-ticket, each with a fresh Rust, native or RSS observer. A private test-only
+ticket, each with a fresh Rust or RSS observer. A private test-only
 crypto server reads four synthetic DER objects whose total exceeds 63 KiB and
 fits 65000 bytes, independently of the local PEM loader ceiling. TLS 1.3 emits
 either two counted opaque 16000-byte test tickets or one 65000-byte ticket;
 the private ticketer refuses resumption and performs no encryption. Controller
-and peer allocations are outside each observer; native instrumentation never
-crosses a fork. Explicit paths select only the existing qualification
+and peer allocations are outside each observer. Explicit paths select only the existing qualification
 executables, and no artifact, link flag or API is added.
 
 Each controller requires the complete authenticated handshake, verified record
@@ -1082,8 +1036,8 @@ session admission or an isolated maximum ticket-processing peak.
 
 ## Large generation routing observations
 
-Both allocation executables and the unwrapped RSS executable additionally run
-`--tls-generation-routing` in fresh processes. It combines sixteen profiles,
+The Rust allocation executable and the unwrapped RSS executable additionally
+run `--tls-generation-routing` in fresh processes. It combines sixteen profiles,
 sixteen listeners and 256 MTA-STS domains, including 255 long derived names,
 while retaining two generations and repeating replacement. Every local chain
 still obeys the PEM/DER ceilings. The runtime requires distinct ordered
@@ -1094,8 +1048,8 @@ release/refusal invariants and the remaining aggregate-admission limits.
 
 ## Gateway trust generation observations
 
-Both allocation executables and the unwrapped RSS executable additionally run
-`--tls-generation-trust` in fresh processes. It constructs sixteen admitted
+The Rust allocation executable and the unwrapped RSS executable additionally
+run `--tls-generation-trust` in fresh processes. It constructs sixteen admitted
 large file profiles, fifteen gateway policies with full 128-anchor private
 bundles, one HTTPS listener and relay trust. The fixture's explicit fifteen
 SMTP slots, 512 KiB disposable index cache and 128 MiB planner budget form
@@ -1112,7 +1066,7 @@ their attribution limits and pending aggregate admission work.
 
 ## Certificate-list refusal observations
 
-Fresh `--tls-certificate-list` modes in the existing Rust/native/RSS
+Fresh `--tls-certificate-list` modes in the existing Rust allocation and RSS
 artifacts send an unexpected plaintext Certificate message in the TLS 1.2
 format before ServerHello. Its 21800 empty DER entries fit in a bounded
 65403-byte body, delivered as either 16 KiB or 4 KiB record fragments. The
@@ -1121,12 +1075,12 @@ certificate or peer is authenticated.
 
 Eleven exact `certificate-list` phase records and allocation v1/RSS v2
 completions distinguish these observations from malformed ServerHello tests.
-Allocation probes require the first final-record step to exercise at least
+The allocation probe requires the first final-record step to exercise at least
 512 KiB of additional requested-byte peak above its pending peak snapshot;
 this qualifies the current pinned decoder path and is not a desired minimum
 for a future implementation. It relies on the pin's vector growth and spare
-capacity. Repeated refusals must retain no extra requested bytes or native
-blocks. Terminal failure must discard output and refuse further operations.
+capacity. Repeated refusals must retain no extra requested bytes. Terminal
+failure must discard output and refuse further operations.
 No executable, unsafe surface or link flag is introduced. RESOURCES.md
 defines the attribution limits and remaining admission work.
 

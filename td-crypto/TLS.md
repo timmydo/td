@@ -66,13 +66,13 @@ cipher-suite order. Clients offer groups in the order X25519, secp256r1,
 secp384r1. Servers accept exactly that set but select according to the
 client's group order under the pinned backend; cipher-suite preference does
 not establish server group preference. Post-quantum and hybrid groups are
-outside this initial qualification scope. Their additional handshake/native
+outside this initial qualification scope. Their additional handshake
 memory and stack paths remain unqualified, not proven too large. This
 deliberately supplies no protection against future quantum decryption of
-recorded traffic. Adding hybrid support needs its own resource and
-interoperability qualification, though the existing dependency can implement
-it. Disabling the provider's preference feature does not remove its hybrid
-fallback; set and test the accepted groups explicitly.
+recorded traffic. td-tls-provider offers no hybrid group; adding one needs a
+provider group over td-primitives' ML-KEM-768 and its own resource and
+interoperability qualification. Set and test the accepted groups
+explicitly.
 
 Certificate signatures may use ECDSA with P-256, P-384 or P-521 and SHA-256,
 SHA-384 or SHA-512; Ed25519; or RSA with 2048..8192-bit keys and SHA-256,
@@ -81,9 +81,7 @@ public keys, not restricted RSASSA-PSS SubjectPublicKeyInfo. Require MGF1
 with the same hash, salt length equal to the digest length and trailer field
 one. Accept the pinned backend's RSA PKCS#1 signature identifiers with
 absent or NULL parameters. No SHA-1, DSA, Ed448 or post-quantum signature
-algorithm is admitted. The provider defaults also include ML-DSA in both
-verification lists: excluding hybrid key exchange does not remove those
-signatures. Trust anchor self-signatures are not path signatures and need
+algorithm is admitted; neither verification list names ML-DSA. Trust anchor self-signatures are not path signatures and need
 not be reverified; anchors remain explicit trusted configuration, not
 verified peer identities.
 
@@ -369,7 +367,7 @@ that outstanding suffix to intake. Never regenerate drained bytes.
 
 Pin the exact internal plaintext/ciphertext queue and protocol-output
 reserve limits in implementation and memory qualification. The client sets
-its native application buffer limit to 32 KiB. Both roles initially cap
+its Rustls application buffer limit to 32 KiB. Both roles initially cap
 drainable output at 65536 protocol bytes plus one 18437-byte application wire
 reservation. Once Finished is authenticated and the final local handshake
 flight has completely drained from the facade, permanently reduce that output
@@ -380,7 +378,7 @@ its final flight remains queued; later application/protocol output cannot
 restore it. Overflow is terminal Capacity, never an additional wait cycle.
 These post-operation refusals are not preallocation or whole-memory bounds;
 M07e must qualify retained and temporary backend work as well. Buffer settings
-do not cap certificates, handshake state, native contexts or allocator
+do not cap certificates, handshake state, cipher contexts or allocator
 overhead. Permit at most one pending application record per direction;
 unread plaintext blocks intake until drained. Available handshake work must
 advance without a new socket-read event. Prove progress with a
@@ -391,8 +389,8 @@ establish absence of a backpressure deadlock.
 The backend may parse several handshake messages carried in one record, or
 finish a message fragmented across records. The input/reassembly ceilings
 bound that work; a call count alone supplies no elapsed-time bound on
-certificate verification or native entropy. Deadline expiry is enforced
-between calls by the owner. DESIGN.md's native blocking/abort limits remain
+certificate verification or entropy. Deadline expiry is enforced
+between calls by the owner. DESIGN.md's blocking/abort limits remain
 unchanged.
 
 ## Authentication evidence, failure and close
@@ -444,7 +442,7 @@ generation accounting. Immutable policy does not prevent a shared retirement
 flag. A retired shared clock similarly refuses new session work; ordinary
 missing time retires the affected session without retiring that source.
 Ordinary remote verification/protocol refusals do not retire shared keys.
-Native abort, OOM and panic hooks retain DESIGN.md's limits.
+Abort, OOM and panic hooks retain DESIGN.md's limits.
 
 Requesting clean close stops new plaintext writes and appends close_notify
 after queued output. Drain it completely before transport close completion;
@@ -484,8 +482,8 @@ in host builds while release queues an alert. Exercise malformed/oversized and
 bad-MAC records after local close in both profiles: no unwind escapes, no
 subsequent alert/application output is emitted, and the session is retired.
 After appending local close_notify, retain the drainable output count as a
-baseline and reduce it as bytes drain. Any later native output growth is
-terminal Protocol, even if native processing reports success: a TLS 1.2
+baseline and reduce it as bytes drain. Any later Rustls output growth is
+terminal Protocol, even if Rustls processing reports success: a TLS 1.2
 HelloRequest can otherwise append a no_renegotiation warning after close.
 A caught session-state debug assertion maps to Crypto; ordinary protocol
 refusal maps to Protocol. Neither implies a shared key failure.
@@ -508,8 +506,8 @@ records; the adapter also closes the socket. Close/abort are idempotent.
 4. Integrate td-mta's staged TLS factory/TlsTransport with leases, deadlines and
    explicit STARTTLS flush/tail refusal/reset; test implicit client TLS and
    gateway pin/IP admission through the public facade only.
-5. Measure Rust/native allocations, stack and whole-process RSS for complete
-   generations, all admitted sessions and worker warm-up/reseeds. Qualify
+5. Measure Rust allocations, stack and whole-process RSS for complete
+   generations, all admitted sessions and worker warm-up. Qualify
    normal and refused peers on the isolated musl artifact, then enable service.
 
 No row authorizes new dependencies or unsafe surfaces. Every implementation

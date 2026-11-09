@@ -1,13 +1,16 @@
-//! Opaque cryptography APIs with owned SHA-256 and a private AWS-LC backend.
+//! Opaque cryptography APIs over td-primitives, with Rustls behind td-tls-provider.
 //! TLS configurations and socket-free client/server sessions are implemented.
 //!
-//! These checks reject the two named root exports; backend integration must
+//! These checks reject the named root exports; backend integration must
 //! also check nested exports, aliases and public signatures.
 //! ```compile_fail,E0432
 //! use td_crypto::rustls;
 //! ```
 //! ```compile_fail,E0432
-//! use td_crypto::aws_lc_rs;
+//! use td_crypto::td_tls_provider;
+//! ```
+//! ```compile_fail,E0432
+//! use td_crypto::td_primitives;
 //! ```
 #![forbid(unsafe_code)]
 
@@ -109,7 +112,7 @@ pub trait Crypto: Send + Sync {
 }
 
 #[cfg(test)]
-mod candidate_tests;
+mod backend_tests;
 #[cfg(test)]
 mod certificate_fixtures;
 #[cfg(test)]
@@ -120,10 +123,11 @@ mod tls_smoke;
 #[cfg(test)]
 mod tests {
     #[test]
-    fn explicit_aws_provider_and_roots_construct_without_global_default(
-    ) -> Result<(), rustls::Error> {
+    fn explicit_provider_and_roots_construct_without_global_default() -> Result<(), rustls::Error> {
         assert!(rustls::crypto::CryptoProvider::get_default().is_none());
-        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = std::sync::Arc::new(
+            crate::tls_policy::provider().map_err(|_| rustls::Error::General("policy".into()))?,
+        );
         let roots =
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         assert!(!roots.is_empty());
@@ -133,19 +137,6 @@ mod tests {
             .with_no_client_auth();
         assert!(rustls::crypto::CryptoProvider::get_default().is_none());
         Ok(())
-    }
-
-    #[test]
-    fn admitted_native_backend_sha256_smoke() {
-        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b"abc");
-        assert_eq!(
-            digest.as_ref(),
-            &[
-                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
-                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
-                0xf2, 0x00, 0x15, 0xad,
-            ]
-        );
     }
 }
 

@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 use super::*;
 
 #[test]
@@ -31,6 +31,58 @@ fn exact_tls_algorithm_inventory() {
             .collect::<Vec<_>>(),
         [G::X25519, G::secp256r1, G::secp384r1,]
     );
+    // td-crypto's own expectations, not td-tls-provider's constants: each
+    // suite's confidentiality limit (records under one key) and each TLS 1.2
+    // suite's server signature schemes, in order. The ECDHE-ECDSA list is
+    // rustls's own, P-521 included (`tls12_ecdsa`).
+    const ECDSA: &[Scheme] = &[
+        Scheme::ED25519,
+        Scheme::ECDSA_NISTP521_SHA512,
+        Scheme::ECDSA_NISTP384_SHA384,
+        Scheme::ECDSA_NISTP256_SHA256,
+    ];
+    const RSA: &[Scheme] = &[
+        Scheme::RSA_PSS_SHA512,
+        Scheme::RSA_PSS_SHA384,
+        Scheme::RSA_PSS_SHA256,
+        Scheme::RSA_PKCS1_SHA512,
+        Scheme::RSA_PKCS1_SHA384,
+        Scheme::RSA_PKCS1_SHA256,
+    ];
+    let expected: &[(u64, Option<&[Scheme]>)] = &[
+        (1 << 24, None),
+        (1 << 24, None),
+        (u64::MAX, None),
+        (1 << 24, Some(ECDSA)),
+        (1 << 24, Some(ECDSA)),
+        (u64::MAX, Some(ECDSA)),
+        (1 << 24, Some(RSA)),
+        (1 << 24, Some(RSA)),
+        (u64::MAX, Some(RSA)),
+    ];
+    assert_eq!(provider.cipher_suites.len(), expected.len());
+    for (suite, (limit, sign)) in provider.cipher_suites.iter().zip(expected) {
+        match (suite, sign) {
+            (rustls::SupportedCipherSuite::Tls13(tls13), None) => {
+                assert_eq!(
+                    tls13.common.confidentiality_limit,
+                    *limit,
+                    "{:?}",
+                    suite.suite()
+                );
+            }
+            (rustls::SupportedCipherSuite::Tls12(tls12), Some(sign)) => {
+                assert_eq!(
+                    tls12.common.confidentiality_limit,
+                    *limit,
+                    "{:?}",
+                    suite.suite()
+                );
+                assert_eq!(tls12.sign, *sign, "{:?}", suite.suite());
+            }
+            _ => panic!("{:?} has the wrong protocol version", suite.suite()),
+        }
+    }
     let algorithms = provider.signature_verification_algorithms;
     assert_eq!(algorithms.all.len(), 19);
     assert_eq!(
@@ -79,7 +131,7 @@ fn exact_tls_algorithm_inventory() {
 
 #[test]
 fn handshake_mapping_drift_is_refused() {
-    let native = backend::default_provider().signature_verification_algorithms;
+    let native = crate::certificate_algorithms::SIGNATURE_ALGORITHMS;
     assert_eq!(
         select_mapping(native.all, native.mapping).unwrap().len(),
         10
@@ -113,57 +165,34 @@ fn handshake_mapping_drift_is_refused() {
     let mut changed = native.mapping.to_vec();
     changed[0].1 = reversed;
     assert!(select_mapping(native.all, &changed).is_err());
-    assert!(select_mapping(&native.all[..21], native.mapping).is_err());
+    assert!(select_mapping(&native.all[..18], native.mapping).is_err());
     assert!(CryptoProvider::get_default().is_none());
 }
 
 #[test]
-fn excluded_certificate_signature_has_a_valid_baseline() -> crate::certificate_fixtures::Result<()>
-{
-    use crate::certificate_fixtures::{self as f, Parameters};
-    use aws_lc_rs::{encoding::AsDer, signature as s};
+fn excluded_certificate_signature_is_refused() -> crate::certificate_fixtures::Result<()> {
+    use crate::certificate_fixtures::unhex;
     use rustls::pki_types::{CertificateDer, UnixTime};
-    use s::KeyPair;
-    let root = s::PqdsaKeyPair::generate(&s::ML_DSA_44_SIGNING)?;
-    let rng = aws_lc_rs::rand::SystemRandom::new();
-    let key_bytes = s::EcdsaKeyPair::generate_pkcs8(&s::ECDSA_P256_SHA256_ASN1_SIGNING, &rng)?;
-    let leaf = s::EcdsaKeyPair::from_pkcs8(&s::ECDSA_P256_SHA256_ASN1_SIGNING, key_bytes.as_ref())?;
-    let algorithm = f::seq(&[f::oid(&[0x60, 0x86, 0x48, 1, 0x65, 3, 4, 3, 0x11])]);
-    let sign = |body: &[u8]| -> crate::certificate_fixtures::Result<Vec<u8>> {
-        let mut signature = vec![0; s::ML_DSA_44_SIGNING.signature_len()];
-        let length = root.sign(body, &mut signature)?;
-        signature.truncate(length);
-        Ok(signature)
+    // An ML-DSA-44 root and the P-256 leaf it signed, which AWS-LC wrote and
+    // verified with its default verifiers when it was the backend.
+    let line = include_str!("fixtures/ml_dsa_path.txt");
+    let fields: Vec<&str> = line.trim_end().split(' ').collect();
+    let [_, "ML_DSA_44", root, leaf] = fields[..] else {
+        return Err("malformed ML-DSA fixture".into());
     };
-    let root_cert = f::build(
-        root.public_key().as_der()?.as_ref().to_vec(),
-        algorithm.clone(),
-        &Parameters::new(true),
-        sign,
-    )?;
-    let leaf = f::build(
-        f::p256_spki(&leaf),
-        algorithm,
-        &Parameters::new(false),
-        sign,
-    )?;
-    let leaf = CertificateDer::from(leaf);
+    let leaf = CertificateDer::from(unhex(leaf));
     let parsed = rustls::server::ParsedCertificate::try_from(&leaf)?;
     let mut roots = rustls::RootCertStore::empty();
-    roots.add(root_cert.into())?;
+    roots.add(CertificateDer::from(unhex(root)))?;
     let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_800_000_000));
-    let verify = |provider: CryptoProvider| {
+    assert!(matches!(
         rustls::client::verify_server_cert_signed_by_trust_anchor(
             &parsed,
             &roots,
             &[],
             now,
-            provider.signature_verification_algorithms.all,
-        )
-    };
-    verify(backend::default_provider())?;
-    assert!(matches!(
-        verify(provider()?),
+            provider()?.signature_verification_algorithms.all,
+        ),
         Err(rustls::Error::InvalidCertificate(
             rustls::CertificateError::UnsupportedSignatureAlgorithmContext { .. }
         ))

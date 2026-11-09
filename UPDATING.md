@@ -345,14 +345,15 @@ waiver, so that commit has to touch a document.
   warms the vendored closure from the committed lock, and `net-test` runs
   td-net's suite.
 - td-crypto, td-mta and td-tls-provider pin their direct dependencies
-  exactly (`=1.19.0`) in their manifests and in
+  exactly (`=0.23.46`) in their manifests and in
   `crypto_policy::DEPENDENCIES` (td-crypto's), `POSTGRES_DEPENDENCIES`
   (td-mta's) and `TLS_PROVIDER_DEPENDENCIES` (td-tls-provider's), so
   `cargo update` alone moves only what those exact pins leave free. Edit
-  each manifest and its list together, then update the lock. td-net's
-  caret `rustls` line in `net/Cargo.toml` unifies with td-tls-provider's
-  exact one into a single rustls in `net/Cargo.lock`, so bump the two
-  alongside and update td-net's lock with them. After that,
+  each manifest and its list together, then update the lock. td-crypto's
+  `rustls` line is td-tls-provider's exactly, so the two move together.
+  td-net's caret `rustls` line in `net/Cargo.toml` unifies with
+  td-tls-provider's exact one into a single rustls in `net/Cargo.lock`, so
+  bump it alongside and update td-net's lock with them. After that,
   update what `builder/src/crypto_policy.rs` pins: the manifest and lock
   digests, and the active-graph strings (`ACTIVE`, `POSTGRES_ACTIVE`,
   `TLS_PROVIDER_ACTIVE`).

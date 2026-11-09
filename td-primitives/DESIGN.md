@@ -154,9 +154,10 @@ What is **not** claimed:
   operand-dependent instruction latency.
 - Erasure. `ct::zero` and the `Drop` impls clear what they own, best effort.
   Registers, stack copies and moved values are not cleared, as `td-fido`'s
-  `hmac.rs` already records for its own buffers. `Hmac` has no `Drop`: its two
-  hash states are key-equivalent and stay in memory until overwritten, and a
-  long key's tail stays in the temporary hash that shortened it. Key expansion
+  `hmac.rs` already records for its own buffers. `Hmac`'s two hash states are
+  key-equivalent: its `Drop` overwrites each with a fresh state, but the
+  copies a clone, a move or `finalize` leaves are not reached, and a long
+  key's tail stays in the temporary hash that shortened it. Key expansion
   uses two buffers that never grow and clears both, so it leaves no freed copy
   of the key; the round keys live in one box, cleared on drop, so moving a
   software cipher copies only H and a hardware one only a pointer. The hardware
@@ -356,13 +357,14 @@ that run is a record in the landing commit, not a test to repeat.
 ## Relation to other crates
 
 - `td-tls-provider` is the rustls `CryptoProvider` over this crate, td-net's
-  today. It is crypto-admitted for its rustls dependency; this crate stays std
+  and td-crypto's. It is crypto-admitted for its rustls dependency; this crate stays std
   only, and its manifest and lock are pinned with that admission.
-- `td-crypto` is a separate private Rustls/AWS-LC closure for mail serving. Its
-  library does not use this crate yet, and its tests qualify it against AWS-LC
-  (td-crypto/DESIGN.md): td-mta/IMPLEMENTATION.md F04 moves it here
-  through `td-tls-provider`, kept private behind td-crypto's facade, and P-521
-  and `uncompressed` are here for the policy that td-crypto must keep.
+- `td-crypto`, the private Rustls closure for mail serving, takes all its
+  cryptography from this crate, directly for entropy, comparison, P-256 keys
+  and signing, SHA-256 and certificate key checks, and through
+  `td-tls-provider` for TLS, kept private behind its facade
+  (td-crypto/DESIGN.md). P-521 and `uncompressed` are here for its
+  certificate and handshake policy.
 - `td-fido` keeps its own AES, P-256 and HMAC-SHA256 for the disk and login
   path, `td-netd` its SHA-1, and the engine its SHA-256. Moving them here is
   possible now that this crate exists, and is a separate change because each

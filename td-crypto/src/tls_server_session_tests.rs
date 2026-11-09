@@ -238,7 +238,9 @@ fn server_session_mandatory_client_proof_and_typed_refusals() {
             if kind == "bad-signature" {
                 *leaf.last_mut().unwrap() ^= 1;
             }
-            let expected = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &leaf);
+            let mut expected = crate::sha256_oracle::Sha256::new();
+            expected.update(&leaf);
+            let expected = expected.finalize();
             let mut chain = vec![
                 CertificateDer::from(leaf),
                 CertificateDer::from(root.clone()),

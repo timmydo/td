@@ -19,9 +19,10 @@ pub(crate) const LOCAL_SOURCES: &[&str] = &[
     "td-tls-provider",
 ];
 
+/// td-crypto's external lines: td-tls-provider's rustls line exactly, so the
+/// two share one engine with no built-in backend, and Mozilla's roots.
 pub(crate) const DEPENDENCIES: &[&str] = &[
-    "aws-lc-rs = { version = \"=1.19.0\", default-features = false, features = [\"alloc\", \"non-fips\"] }",
-    "rustls = { version = \"=0.23.46\", default-features = false, features = [\"std\", \"tls12\", \"aws_lc_rs\"] }",
+    "rustls = { version = \"=0.23.46\", default-features = false, features = [\"custom-provider\", \"std\", \"tls12\"] }",
     "webpki-roots = \"=1.0.11\"",
 ];
 
@@ -32,8 +33,8 @@ pub(crate) fn admitted(name: &str) -> bool {
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
-        "td-crypto" => "e695ab03b41873b801d895218bd6c822035ca9968477eb3c80128533217564b6",
-        "td-mta" => "24f2b491cd3b9be70711ffdcd47b19baf6615a2637a411e3b1abc8235be41f6b",
+        "td-crypto" => "720198b066801724a9d45a0cdc85d9c61f20033a6610795bb7cd897fe165b443",
+        "td-mta" => "14be5df8fd752afec8e1382e0349c85aef2db59ac7795355ba859e331b4301ed",
         "td-fs" => "e685546b8dc4353148f58034fc27b8bd59490281944f9226f295b5d6d72240fc",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-html" => "e4c924efdc7deab65fcc5cfa64bd5349935d5f3094e4310125ddb173af0b1c14",
@@ -54,8 +55,8 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
 pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "d05684e2af245c0a796e154148ced1bc85ea08d9f31799d65a4fe1a62b7fc66a",
-        "td-crypto" => "373b01906465294ebb74ad23412b881808add1cd481f3c98d76cea82c1146c87",
-        "td-mta" => "26d27bb88497f325ac8935f0ae7cb3902fcafea1234766806dabf24051a2925f",
+        "td-crypto" => "63993ee6fdf15482e7a8493c2509e078aade1fe064bc65f46245999b368f66f2",
+        "td-mta" => "a0c044651f624d1a0a6851d659c301301b684a15976d0e287052a6686d39892b",
         "td-fs" => "d907e7d97198344c058b8403d2a07c08174081bcd8af0f4d9e276c0131766fe2",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-html" => "5bc92c6117fc17c612004a1b025a6ad42171c3d185d9af7eb47dd13a9168e8e3",
@@ -149,25 +150,9 @@ pub(crate) fn no_build_script(root: &Path, name: &str) -> Result<(), String> {
 
 // Cargo metadata can include inactive optional edges. Cargo tree's selected
 // normal/build graph is checked separately from the complete locked sources.
-const ACTIVE: &str = "aws-lc-rs v1.19.0|alloc,aws-lc-sys,non-fips,prebuilt-nasm
-aws-lc-sys v0.47.0|prebuilt-nasm
-cc v1.11.0|parallel
-cmake v0.1.58|
-dunce v1.0.5|
-find-msvc-tools v0.1.15|
-fs_extra v1.3.0|
-jobserver v0.1.35|
-libc v0.2.191|default,std
-once_cell v1.21.4|alloc,race,std
-pkg-config v0.3.34|
-rustls v0.23.46|aws-lc-rs,aws_lc_rs,std,tls12
-rustls-pki-types v1.15.1|alloc,default,std
-rustls-webpki v0.103.16|alloc,aws-lc-rs,std
-shlex v2.0.1|default,std
-subtle v2.6.1|
-untrusted v0.9.0|
-webpki-roots v1.0.11|
-zeroize v1.9.1|alloc,default
+// td-crypto's graph is td-tls-provider's and Mozilla's roots: no package in it
+// has a build script that compiles C.
+const ACTIVE: &str = "webpki-roots v1.0.11|
 ";
 
 const POSTGRES_ACTIVE: &str = "async-trait v0.1.92 (proc-macro)|
@@ -192,6 +177,7 @@ futures-util v0.3.34|futures-sink,sink
 getrandom v0.4.3|std,sys_rng
 hmac v0.13.0|
 hybrid-array v0.4.15|
+libc v0.2.191|default,std
 lock_api v0.4.14|atomic_usize,default
 log v0.4.35|
 md-5 v0.11.0|alloc,default,oid
@@ -259,17 +245,12 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
             "{name} has no external crypto dependency admission"
         ));
     }
-    let (mut expected, mut local): (BTreeSet<String>, _) = if name == "td-tls-provider" {
-        (
-            TLS_PROVIDER_ACTIVE.lines().map(str::to_owned).collect(),
-            vec!["td-primitives", "td-tls-provider"],
-        )
-    } else {
-        (
-            ACTIVE.lines().map(str::to_owned).collect(),
-            vec!["td-crypto"],
-        )
-    };
+    let mut expected: BTreeSet<String> = TLS_PROVIDER_ACTIVE.lines().map(str::to_owned).collect();
+    let mut local = vec!["td-primitives", "td-tls-provider"];
+    if name != "td-tls-provider" {
+        expected.extend(ACTIVE.lines().map(str::to_owned));
+        local.push("td-crypto");
+    }
     if name == "td-mta" {
         expected.extend(POSTGRES_ACTIVE.lines().map(str::to_owned));
         local.extend([
@@ -339,10 +320,10 @@ mod tests {
         std::fs::write(&path, &config).unwrap();
         assert!(cargo_config(&checkout).is_ok());
         for extra in [
-            "[env]\nAWS_LC_SYS_NO_ASM = \"1\"\n",
-            "[env]\nAWS_LC_SYS_USE_SYSTEM_x86_64_unknown_linux_gnu = \"1\"\n",
+            "[env]\nRUSTC_BOOTSTRAP = \"1\"\n",
+            "[env]\nCARGO_ENCODED_RUSTFLAGS = \"-Clinker=cc\"\n",
             "[env]\nCC = { value = \"/unapproved/cc\", force = true }\n",
-            "[target.x86_64-unknown-linux-gnu.aws_lc_0_47_0]\nrustc-link-lib = [\"crypto\"]\n",
+            "[target.x86_64-unknown-linux-gnu.ring_core_0_17_14_]\nrustc-link-lib = [\"crypto\"]\n",
         ] {
             std::fs::write(&path, format!("{config}\n{extra}")).unwrap();
             assert!(cargo_config(&checkout).is_err());
@@ -351,12 +332,12 @@ mod tests {
         for directory in [&checkout, &base] {
             std::fs::create_dir_all(directory.join(".cargo")).unwrap();
             let extra = directory.join(".cargo/config");
-            std::fs::write(&extra, "[env]\nAWS_LC_SYS_NO_ASM = \"1\"\n").unwrap();
+            std::fs::write(&extra, "[env]\nRUSTC_BOOTSTRAP = \"1\"\n").unwrap();
             assert!(cargo_config(&checkout).is_err());
             std::fs::remove_file(extra).unwrap();
         }
         let parent = base.join(".cargo/config.toml");
-        std::fs::write(&parent, "[env]\nAWS_LC_SYS_NO_ASM = \"1\"\n").unwrap();
+        std::fs::write(&parent, "[env]\nRUSTC_BOOTSTRAP = \"1\"\n").unwrap();
         assert!(cargo_config(&checkout).is_err());
         std::fs::remove_file(&parent).unwrap();
         assert!(cargo_config(&checkout).is_ok());
@@ -478,7 +459,7 @@ mod tests {
                 assert!(manifest_pin(name, &bad).is_err());
             }
             for bad in [
-                lock.replace("version = \"0.47.0\"", "version = \"0.46.0\""),
+                lock.replace("version = \"0.23.46\"", "version = \"0.23.45\""),
                 lock.replace("checksum = \"", "checksum = \"0"),
                 format!("{lock}\n[[package]]\nname = \"unapproved\"\nversion = \"1.0.0\"\n"),
             ] {
@@ -525,7 +506,9 @@ mod tests {
             .filter_map(|line| line.split_once('|').map(|(package, _)| package))
             .collect();
         assert_eq!(dirs.len(), packages.len());
-        assert!(dirs.contains("aws-lc-rs-1.19.0"));
+        assert!(dirs.contains("webpki-roots-1.0.11"));
+        assert!(!dirs.contains("aws-lc-rs-1.19.0"));
+        assert!(!dirs.contains("cc-1.11.0"));
         assert!(dirs.contains("async-trait-0.1.92"));
         assert!(dirs.contains("whoami-2.1.3"));
         assert!(!dirs.contains("objc2-core-foundation-0.3.2"));
@@ -595,29 +578,37 @@ mod tests {
             return;
         }
         let crypto = root.join("td-crypto").canonicalize().unwrap();
-        let graph = format!("{ACTIVE}td-crypto v0.1.0 ({})|\n", crypto.display());
+        let provider = root.join("td-tls-provider").canonicalize().unwrap();
+        let primitives = root.join("td-primitives").canonicalize().unwrap();
+        let tls = format!(
+            "{TLS_PROVIDER_ACTIVE}td-tls-provider v0.1.0 ({})|\ntd-primitives v0.1.0 ({})|\n",
+            provider.display(),
+            primitives.display()
+        );
+        let graph = format!("{tls}{ACTIVE}td-crypto v0.1.0 ({})|\n", crypto.display());
         assert!(active_graph(&root, "td-crypto", &graph).is_ok());
         for bad in [
+            // A built-in backend, or a C build, back in the selected graph.
             format!("{graph}ring v0.17.14|alloc\n"),
-            graph.replace("aws-lc-sys v0.47.0", "aws-lc-sys v0.46.0"),
+            format!("{graph}aws-lc-rs v1.19.0|alloc,aws-lc-sys,non-fips,prebuilt-nasm\n"),
+            format!("{graph}cc v1.11.0|parallel\n"),
             graph.replace(
-                "|aws-lc-rs,aws_lc_rs,std,tls12",
-                "|aws-lc-rs,aws_lc_rs,ring,std,tls12",
+                "rustls v0.23.46|custom-provider,std,tls12",
+                "rustls v0.23.46|aws-lc-rs,aws_lc_rs,custom-provider,std,tls12",
+            ),
+            graph.replace(
+                "rustls-webpki v0.103.16|alloc,std",
+                "rustls-webpki v0.103.16|alloc,ring,std",
             ),
             graph.replace("webpki-roots v1.0.11|\n", ""),
             graph.replace(&crypto.display().to_string(), "/wrong/source"),
-            // The test-only candidate backend in the selected graph, or its
-            // rustls feature unified into it.
-            format!(
-                "{graph}td-tls-provider v0.1.0 ({})|\n",
-                root.join("td-tls-provider")
-                    .canonicalize()
-                    .unwrap()
-                    .display()
+            graph.replace(
+                &format!("td-tls-provider v0.1.0 ({})|\n", provider.display()),
+                "",
             ),
             graph.replace(
-                "|aws-lc-rs,aws_lc_rs,std,tls12",
-                "|aws-lc-rs,aws_lc_rs,custom-provider,std,tls12",
+                &format!("td-primitives v0.1.0 ({})|\n", primitives.display()),
+                "",
             ),
         ] {
             assert!(active_graph(&root, "td-crypto", &bad).is_err());
@@ -715,13 +706,6 @@ mod tests {
         }
         assert!(active_graph(&root, "td-mta", &graph).is_err());
 
-        let provider = root.join("td-tls-provider").canonicalize().unwrap();
-        let primitives = root.join("td-primitives").canonicalize().unwrap();
-        let tls = format!(
-            "{TLS_PROVIDER_ACTIVE}td-tls-provider v0.1.0 ({})|\ntd-primitives v0.1.0 ({})|\n",
-            provider.display(),
-            primitives.display()
-        );
         assert!(active_graph(&root, "td-tls-provider", &tls).is_ok());
         assert!(active_graph(&root, "td-crypto", &tls).is_err());
         assert!(active_graph(&root, "td-tls-provider", &graph).is_err());

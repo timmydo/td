@@ -310,7 +310,7 @@ linker, wrapper settings, and Cargo flags are pinned at helper build sites.
 td-link compiles no C and the network helper's native build provisions a C
 toolchain, so it does not build on a standard td system: the resolver uses the deployed
 target-built td-net that `/bin/td-feed` names, the deployed commit's rather
-than the checkout's, and host-only AWS-LC builds fail.
+than the checkout's.
 Elsewhere the native network helper builds offline and frozen from the
 verified `td-net` vendor directory prepared through td-feed. Both the prelude
 and native compiler path require its completion record to match the current lock.
