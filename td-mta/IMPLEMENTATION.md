@@ -2939,7 +2939,11 @@ code and its direct dependency do not change with backend selection.
    PKCS#8 keys load here to the same public points, and AWS-LC loaded keys
    in this backend's generated shape before it was removed. AWS-LC's
    signatures and certificate paths are kept as fixed known answers in
-   td-crypto's tests. Resources and the static x86-64 musl build were
+   td-crypto's tests. Handshakes in both roles against a peer whose
+   handshake signatures td-crypto's tests compute independently cover the
+   ECDHE-RSA suites and every admitted scheme, with corrupted signatures and
+   curve, hash and scheme mismatches refused (td-crypto/DESIGN.md).
+   Resources and the static x86-64 musl build were
    requalified, and the aarch64 artifact rebuilt; td-crypto/PORTABLE.md and
    RESOURCES.md record the evidence and the aarch64 validation status.
    Rustls remains private inside td-crypto; this replacement does not make

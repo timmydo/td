@@ -90,8 +90,12 @@ ecdsa_secp256r1_sha256, ecdsa_secp521r1_sha512, ed25519,
 rsa_pss_rsae_sha512, rsa_pss_rsae_sha384, rsa_pss_rsae_sha256,
 rsa_pkcs1_sha512, rsa_pkcs1_sha384, rsa_pkcs1_sha256. The last three are TLS
 1.2 only. TLS 1.2 ECDSA scheme hash selection does not constrain the signing
-curve; TLS 1.3 requires the named curve. Certificate-path verification and
-handshake-signature verification have separate pinned algorithm sets.
+curve; TLS 1.3 requires the named curve. The TLS 1.2 client accepts a
+server ECDSA key on any admitted curve, including one not among the
+groups it offered: RFC 8422 section 5.1 puts that compliance on the
+server, and the client tolerates its absence. Certificate-path
+verification and handshake-signature verification have separate pinned
+algorithm sets.
 Neither inherits additional algorithms when the provider defaults change.
 Pin each scheme-to-algorithm mapping and its internal order too: TLS 1.3
 uses only the first verification algorithm mapped to a scheme.

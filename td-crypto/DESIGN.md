@@ -685,9 +685,9 @@ classical groups under TLS 1.2 and 1.3, each TLS 1.3/ECDSA TLS 1.2 cipher,
 refusal in both directions of a peer offering only a group named
 X25519MLKEM768, and refusal by a policy client of a server whose only key
 signs ML-DSA-44. Those peers are test fakes: no implementation of either
-algorithm runs in these tests. Inventory tests alone cover RSA suites and
-P-384/P-521/Ed25519 signing schemes; local positive handshakes use a P-256
-signer.
+algorithm runs in these tests. The ECDHE-RSA suites and the RSA, P-384,
+P-521 and Ed25519 handshake schemes are exercised against an independent
+signing peer ("td-primitives backend qualification" below).
 
 Construction catches Rust unwinds and publishes no partial provider. Cold
 suite and group vectors allocate; the entropy, key, abort/OOM and hook limits
@@ -1253,9 +1253,28 @@ refused them. Policy assembly tests pin every suite, group, algorithm
 identifier pair and mapping, each TLS 1.2 suite's signature schemes and each
 suite's confidentiality limit. Local handshakes in both roles cover the TLS
 1.3 and ECDHE-ECDSA suites, every group and the ECDSA P-256 scheme, the only
-key this crate signs with. The ECDHE-RSA suites and the other handshake
-schemes are held by that inventory only: no test here signs a handshake
-with an RSA, Ed25519, P-384 or P-521 key. Certificate key admission has
+key this crate signs with.
+
+`handshake_peer_tests.rs` runs this crate's own sessions, as a client and
+as a server requiring client certificates, against a rustls peer whose
+handshake signatures come from arithmetic in that file sharing no code
+with td-primitives: RSA PKCS#1 v1.5 and PSS, ECDSA on each admitted curve,
+Ed25519, SHA-384 and SHA-512. Its keys are `src/fixtures/handshake_keys.txt`,
+written by `handshake_keys.py`. As client, this crate completes every
+admitted scheme under each version and suite kind that allows it; as
+server, its P-256 identity fixes one suite per version, under which it
+takes every admitted client-proof scheme. Both roles refuse a corrupted
+signature, a scheme the key does not fit, the wrong hash, padding or PSS
+salt length, and a scheme not offered, pinning this crate's error and
+plain rustls's for the same handshake. TLS 1.2's curve rule is TLS.md's
+and is pinned as stated. Only the signing is independent: key exchange,
+AEAD and transcript hash are td-tls-provider's, rustls runs both ends, and
+the certificates are td-primitives' P-256 signatures. The hashes and
+Ed25519 have known answers there; the ECDSA and RSA encoders have none of
+their own, so their correctness rests on td-primitives' verifiers, which
+are anchored on AWS-LC's answers, accepting them.
+
+Certificate key admission has
 known answers built with Python's big integers
 (`src/fixtures/canonical_keys.py`): valid, off-curve, out-of-range,
 non-residue, hybrid, infinity and truncated EC points in both forms, with

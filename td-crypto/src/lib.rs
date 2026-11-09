@@ -116,6 +116,8 @@ mod backend_tests;
 #[cfg(test)]
 mod certificate_fixtures;
 #[cfg(test)]
+mod handshake_peer_tests;
+#[cfg(test)]
 mod tls_peer_tests;
 #[cfg(test)]
 mod tls_smoke;

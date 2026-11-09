@@ -614,8 +614,10 @@ handshake completion. These are private backend tests, not service adapters.
 The baseline round trips assert X25519 key exchange and AES-256-GCM/SHA-384 suites
 for both versions. The fixture certificate and handshake signatures use
 ECDSA P-256/SHA-256. The algorithm-policy cases below cover the additional
-classical groups and suites. RSA, P-384, P-521 and Ed25519 signing schemes
-remain inventory-only; alternative CPU paths are not exercised.
+classical groups and suites. Handshakes signed with RSA, P-384, P-521 and
+Ed25519 keys run in the crypto-cargo leg's `handshake_peer_tests`
+(DESIGN.md), not in this portable smoke; alternative CPU paths are not
+exercised.
 This check covers the CPU paths selected on the test host.
 
 Each drive uses a 32 KiB caller buffer and permits at most 256 KiB wire
