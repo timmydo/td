@@ -13,6 +13,9 @@ use crate::raster::Scale;
 use crate::sfnt::Error;
 use crate::{CELL_HEIGHT, CELL_WIDTH};
 
+/// One style's bytes, shared.
+type Bytes = Arc<[u8]>;
+
 #[derive(Clone, Debug)]
 pub struct Typeface {
     regular: Arc<[u8]>,
@@ -59,6 +62,19 @@ impl Typeface {
         let face = upright.with_slant(self.italic.clone(), self.bold_italic.clone())?;
         self.face = (1, Some(face));
         Ok(self)
+    }
+
+    /// The style bytes, shared: the regular, then bold, italic and bold
+    /// italic as the typeface has them.
+    pub(crate) fn styles(&self) -> (Bytes, [Option<Bytes>; 3]) {
+        (
+            self.regular.clone(),
+            [
+                self.bold.clone(),
+                self.italic.clone(),
+                self.bold_italic.clone(),
+            ],
+        )
     }
 
     /// The regular and bold styles fitted to the grid's cell at `scale`.

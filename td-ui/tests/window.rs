@@ -26,7 +26,10 @@ use td_ui::client::{App, DISPLAY, REGISTRY, SHM, SURFACE, SYNC, TOPLEVEL, XDG_SU
 use td_ui::clipboard::{MAX_BYTES, MAX_IMAGE_BYTES};
 use td_ui::data::{PLAIN, PNG, UTF8};
 use td_ui::keys::{self, Section};
-use td_ui::raster::{GlyphStyle, Primitive, Raster, Rect, Scale, Surface, PAPER, SELECTED};
+use td_ui::prose::Faces;
+use td_ui::raster::{
+    GlyphStyle, Primitive, Raster, Rect, Scale, Surface, TextFamily, PAPER, SELECTED,
+};
 use td_ui::theme::{HARBOR, MOSS, SAND};
 use td_ui::typeface::Typeface;
 use td_ui::wayland::{backing_file, peer, Connection, IDLE_WAIT};
@@ -113,6 +116,8 @@ struct Recorder {
     keys: Vec<Section>,
     help_on: Option<String>,
     show_keys: bool,
+    /// Paints a prose glyph beside the corner's.
+    prose: bool,
 }
 
 impl Recorder {
@@ -140,6 +145,7 @@ impl Recorder {
             keys: Vec::new(),
             help_on: None,
             show_keys: false,
+            prose: false,
         }
     }
     fn paints(&self) -> usize {
@@ -182,6 +188,19 @@ impl td_ui::raster::Composition for Corner {
                 style: GlyphStyle::regular(BLUE, PAPER),
             },
         });
+    }
+}
+
+/// A Sans 'm' right of the corner's glyph.
+fn prose_glyph(surface: Surface) -> td_ui::raster::Draw {
+    td_ui::raster::Draw {
+        clip: surface.bounds(),
+        primitive: Primitive::Glyph {
+            x: 56,
+            y: 10,
+            scalar: 'm',
+            style: GlyphStyle::regular(BLUE, PAPER).with_family(TextFamily::Sans),
+        },
     }
 }
 
@@ -262,7 +281,11 @@ impl Handler for Recorder {
         self.redraw = false;
         raster
             .paint(&Corner(surface), surface.bounds())
-            .map_err(|why| why.to_string())
+            .map_err(|why| why.to_string())?;
+        if self.prose {
+            raster.draw(prose_glyph(surface));
+        }
+        Ok(())
     }
     fn notice(&mut self, message: &str) {
         self.notices.push(message.to_string());
@@ -2257,4 +2280,68 @@ fn a_window_given_a_typeface_executes_glyphs_through_its_fitted_face() {
     assert_eq!(outline, direct(Some(&mut typeface())));
     assert_eq!(bitmap, direct(None));
     assert_ne!(outline, bitmap, "the glyph's cell differs");
+}
+
+/// Prose faces whose 'm' is 700 units wide and 500 tall, and '0' a square.
+fn prose_faces() -> Faces {
+    let rectangle = |right: i32| {
+        vec![
+            (0, 0, true),
+            (0, 500, true),
+            (right, 500, true),
+            (right, 0, true),
+        ]
+    };
+    let mut builder = fonts::Builder::new(vec![
+        fonts::Glyph::Empty,
+        fonts::Glyph::Simple(vec![rectangle(500)]),
+        fonts::Glyph::Simple(vec![rectangle(700)]),
+    ]);
+    builder.format4 = vec![
+        fonts::Segment::Delta(0x30, 0x30, 1u16.wrapping_sub(0x30)),
+        fonts::Segment::Delta(0x6d, 0x6d, 2u16.wrapping_sub(0x6d)),
+    ];
+    let bytes = builder.font();
+    let four = || [bytes.clone(), bytes.clone(), bytes.clone(), bytes.clone()];
+    Faces::new(four(), four()).unwrap()
+}
+
+/// The frame a window presents for the corner composition and a prose
+/// glyph, from `prose` when given.
+fn presented_prose(prose: Option<Faces>) -> Vec<u8> {
+    let mut handler = Recorder::new();
+    handler.prose = true;
+    let (mut w, peer, _, _) = fixture(&mut handler);
+    if let Some(prose) = prose {
+        w = w.with_prose(prose);
+    }
+    configure(&mut w, 83, 35);
+    drain(&peer);
+    w.draw().unwrap();
+    let (_, files) = drain(&peer);
+    let mut bytes = vec![0; 83 * 35 * 4];
+    files[0].read_exact_at(&mut bytes, 0).unwrap();
+    bytes
+}
+
+#[test]
+fn a_window_given_prose_faces_draws_prose_glyphs_through_them() {
+    let font = td_ui::font::pinned().unwrap();
+    let surface = Surface::new(83, 35, Scale::default()).unwrap();
+    let direct = |prose: Option<&mut Faces>| {
+        let mut pixels = vec![0; 83 * 35 * 4];
+        {
+            let mut raster = Raster::new(&mut pixels, &font, surface, 83 * 4)
+                .unwrap()
+                .with_prose(prose);
+            raster.paint(&Corner(surface), surface.bounds()).unwrap();
+            raster.draw(prose_glyph(surface));
+        }
+        pixels
+    };
+    let proportional = presented_prose(Some(prose_faces()));
+    let cell = presented_prose(None);
+    assert_eq!(proportional, direct(Some(&mut prose_faces())));
+    assert_eq!(cell, direct(None));
+    assert_ne!(proportional, cell, "the glyph's face differs");
 }

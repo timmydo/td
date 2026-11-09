@@ -343,9 +343,12 @@ of its own files may name each module.
   accepts; `PNG` and `JPEG`, the two picture MIMEs a paste may ask for;
   `OFFER_LIMIT`, `ANNOUNCEMENTS` and `MIME_BYTES`.
 - `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle` (its
-  ink, background, weight and `font_style`, an `atlas::Style`; `medium`
-  and `regular` over an ink and a background, `bold` and `italic` the
-  same style bold or italic), `Primitive`
+  ink, background, weight, `font_style`, an `atlas::Style`, and `family`,
+  a `TextFamily`; `medium` and `regular` over an ink and a background on
+  the cell, `bold` and `italic` the same style bold or italic,
+  `with_family` the same in another family), `TextFamily` (`Cell`, the
+  default, and the prose families `Sans`, `Serif` and `Mono`, under
+  "Proportional faces"), `Primitive`
   (`Fill`, `Glyph`, `Mark`, a scalar of the hint face in one ink, and
   `Image`, a fitted picture its composition names by id),
   `Draw`, `fill` (a `Fill` of a whole rectangle clipped to the damage,
@@ -365,6 +368,10 @@ of its own files may name each module.
   `face::Face`, through which it executes every `Glyph` from then on;
   `Raster::with_typeface` lends it a `typeface::Typeface`'s face at the
   raster's scale, or leaves the bitmap face when it has none.
+  `Raster::with_prose` lends it optional `prose::Faces`, sized at its
+  scale, through which it draws every prose glyph, and
+  `Raster::metrics` lends the `prose::Metrics` it draws prose with, the
+  cell's without faces.
   `Raster::with_theme` paints every draw's palette colours in a
   `theme::Theme`'s; a raster given none paints in `SAND`, the palette as
   it is.
@@ -413,6 +420,20 @@ of its own files may name each module.
   styles' bytes, refused as `Face::with_slant` refuses them at scale
   one; `face` at a `Scale`, every style refitted when the scale
   changes).
+- `prose`: `Faces` (`new` over Sans's and Serif's four styles' bytes
+  each, refused as a `Refused` naming the family, style and
+  `sfnt::Error`; `with_mono`, the monospace face's styles shared from a
+  `Typeface`, refused with the `sfnt::Error` of a style or size it
+  fails at; `has_mono`; a clone shares the bytes and sizes its own
+  faces), `Metrics` (`new` over optional faces at a `Scale`, `scale`,
+  `proportional`, `line`, `advance`, `source` and `width`), `LineBox`
+  (`height`, `baseline`), `Source` (`Cell`, `Family`, `Mono`,
+  `Bitmap`), `Run` (`text`, `style`, `tag`), `wrap`, `Line` (`width`,
+  `pieces`, `glyphs`, and `hit`), `Piece` (`run`, `tag`, `style`,
+  `text`, `left`, `right`, `glyphs`), `Placed` (`x`, `scalar`), `draw`,
+  `shown`, and `SIZE`, `CELL_BASELINE`, `UNIT`, `OVERHANG` and
+  `MAX_MEASURES`; pure,
+  under "Proportional faces".
 - `face_file`: `DIR`, `INSTALLED` (the same directory under the XDG
   data home) and the four styles' file names (`REGULAR`, `BOLD`,
   `ITALIC`, `BOLD_ITALIC`); `NOTO_DIR` and `NOTO_INSTALLED`, the
@@ -490,7 +511,12 @@ of its own files may name each module.
   a widget program whose glyphs are bold or italic, `load_styled_from`
   and `load_styled_in`, the four styles as a `Typeface`, refused whole
   as the terminal's are, with `load_styled_or_note` and
-  `load_styled_in_or_note`.
+  `load_styled_in_or_note`; and, for a program that draws prose,
+  `prose_from` two directories and `prose_in` given places, Noto Sans
+  and Serif in four styles each as `prose::Faces`, a refused face
+  naming its file, with `prose_or_note` and `prose_in_or_note`, which
+  take the setting and the program's monospace `Typeface` to share and
+  say on standard error why its prose draws on the cell instead.
 - `hint`: the hint face, a hand-authored 4x5 glyph (`WIDTH`, `HEIGHT`,
   `ADVANCE` 5) per printable ASCII scalar, `glyph` and the pixel `width`
   of a text; a scalar it lacks is a box. It is the small lighter text a
@@ -760,10 +786,11 @@ of its own files may name each module.
   run; the `Handler` trait (`app_id`, `title`, `input` with a clipboard,
   `poll`, `wait_ms`, `needs_redraw`, `paint`, `notice`,
   `take_withdrawal`, `take_scrub`, `keys`, `take_show_keys`); `Object`,
-  the empty tag; `Window<'h, H>` (`new`, `with_typeface`,
+  the empty tag; `Window<'h, H>` (`new`, `with_typeface`, `with_prose`,
   `with_theme_file`, `theme`, `help`, `handler`, `handler_mut`,
   `surface`), the `App` over a handler it borrows; and `run` with an
-  optional `Typeface`, which reads the program's theme file, under
+  optional `Typeface`, which reads the program's theme file, and
+  `run_with_prose`, the same with optional `prose::Faces`, under
   "Widget window" below.
 - The editor core, under "Editor core" below: `editor_text`, the text
   bounds and lossless codec; `editor_model`, the `Editor` with its
@@ -1489,7 +1516,10 @@ not frames, and stays its own).
   face's cell, so it keeps the cell model only for a composition laid
   out on that cell; the widgets lay out on the bitmap grid, so a
   consumer opts in with a face fitted to that grid (`Face::fit`) until
-  runtime cells (increment 25).
+  runtime cells (increment 25). Prose is that remodel for the glyphs
+  that name a prose family alone: a prose consumer emits the positions
+  `prose::wrap` measured, and `Raster::with_prose` draws them from the
+  faces measured; every `Cell` glyph's draw is unchanged.
 - The atlas is one 1024 by 1024 page (1 MiB) of at most 8192 keys, placed
   and missing together, with a pixel of gutter right of and below each
   entry, zeroed when it is placed and inside the dirty band; a full page
@@ -1499,7 +1529,8 @@ not frames, and stays its own).
   in the epoch that placed it. A face is 6 through 256 pixels per em with
   a cell of at most 512 on an axis, each style covered at its own units
   per em. The executor writes only inside the glyph's cell and the draw's
-  clip, only pixels with coverage, each the style's background moved
+  clip (a prose glyph, which has no cell, only inside the draw's clip),
+  only pixels with coverage, each the style's background moved
   toward its ink by the coverage, and never reads the buffer; a scalar the
   face lacks or refuses draws the bitmap face's glyph centred in the cell,
   and other primitives are the bitmap raster's unchanged.
@@ -1638,6 +1669,52 @@ styles loaded as a typeface whose faces keep bold, italic and bold
 italic at scales one, two and one again, an upright typeface resolving
 every style to regular, a refused slant, the bitmap setting, and a
 missing style refusing the typeface.
+
+`tests/prose.rs` holds prose. On the bitmap face: `Metrics` answering
+the cell for every family at scales one to four; `wrap` breaking after
+a space, a full line held, hanging trailing spaces dropped, an overlong
+word broken, spaces before a moved word dropped rather than left as an
+empty line (leading ones and after a newline included) and spaces that
+fit kept, newlines (an empty line and a trailing one), leading spaces
+kept, a line holding a glyph at width zero, a tab a space and a control
+the replacement; a wrapped line's draw stream exactly `text_run`'s of
+its text at scales one to four; `draw` nothing off the damage and
+nothing from `OVERHANG` past the clip; pieces keeping each run's bytes,
+extents and tag, and `hit` finding them and nothing past the ends; a
+prose glyph without faces equal pixel for pixel to a `Cell` one; and a
+page of prose read back by `driven::text` as its text. Over fonts
+`fonts` encodes: each scalar's advance and source from the family, the
+monospace face and the bitmap face, `Mono`'s and `Cell`'s, the line from
+one family's ascender to the other's descender, and both at scale two;
+a hundred pens summed in subpixels without drift; wrapping by pixel
+width at four widths, an overlong word, and two families' pieces and
+hits on one line; a repaint whose damage ends at the pen of a glyph
+hanging left of it equal to the whole paint inside the damage and
+untouched outside it; a prose glyph's ink at its pen and the line's
+baseline with its fractional edge blended, clipped to its draw's clip
+and not to a cell, taller and wider than one; a scalar the family lacks
+equal to the monospace face's glyph, one neither has equal to the
+bitmap glyph on the line's baseline at two scales, and the rule without
+the monospace face the bitmap one's; a `Cell` glyph unchanged by the
+faces; a raster lending the metrics of its faces across scale changes,
+and the cell's without; `Faces::new`'s refusal by family and style; and
+the loader over a directory the test writes, sharing a typeface, silent
+under `bitmap`, and naming a refused file, a missing style's path and a
+missing family's places. Five more read the pinned faces where the
+image and `./install-fonts` put them (`/etc/fonts/noto` and the XDG data
+home's `fonts/noto`, and the monospace face's two, never a host font
+root, so they never describe a host's packaged Noto), and are ignored
+unless asked for, since the gate has no faces; asked for without the
+faces they fail. With `./install-fonts` run, or with `XDG_DATA_HOME`
+naming the data home of an install,
+`cargo test --manifest-path td-ui/Cargo.toml --test prose -- --ignored`
+holds Sans and Serif's real advances ('i' under half of 'm' in every
+style), the line Noto's metrics give at four scales (22 and 17 at one),
+a paragraph wrapped greedily under three widths with no word broken, a
+long line's pens without drift, a private-use and a box-drawing scalar
+from the monospace face with its advance and from the bitmap face
+without it, a scalar no face has from Unifont, and Noto Sans's 'W'
+drawn past a cell and clipped to its draw.
 
 `tests/chrome.rs` holds the band oracles, draw-stream checks that read each
 band's fills and glyphs: the menu bar's fill, its labels from cell
@@ -1887,8 +1964,8 @@ shared sources bind no input interface, that `face_file` opens one file
 after checking it and bounding the read, lists directories in one place,
 builds its paths from its own names alone, reads exactly its three
 directory values from the environment and writes nothing, and that
-`pinned_face` reads only through it; that `theme` is pure and
-`keys` is pure and `theme_file` reads exactly its two configuration
+`pinned_face` reads only through it; that `theme`, `keys` and
+`prose` are pure and `theme_file` reads exactly its two configuration
 values, opens its file
 nonblocking under its bound, makes and locks its directory and writes
 only a private `create_new` sibling it renames over the file; and the
@@ -2008,7 +2085,9 @@ offer.
 
 `tests/window.rs` also presents the corner composition, whose glyph
 the window executes through a typeface's fitted face when it is given
-one, exactly as a raster with that face paints it.
+one, exactly as a raster with that face paints it, and a prose glyph
+beside it drawn through prose faces when the window is given them,
+exactly as a raster lent them paints it, and as a cell glyph without.
 
 `tests/confinement.rs` holds `window.rs` among the adapters, adds
 `control.rs` and `driven.rs` to the pure set and the three adapters to
@@ -4018,9 +4097,10 @@ glyphs it shows, once.
 
 ## Proportional faces
 
-**Status: increment 38 landed: the faces are pinned, delivered and
-found, and no program draws them yet. Increment 39 and td-web's
-increment 5 (td-web/DESIGN.md §9) are design.** Every face above lays text on a
+**Status: increments 38 and 39 landed: the faces are pinned, delivered,
+found and loaded, and td-ui measures, wraps and draws prose in them; no
+program draws prose yet. td-web's increment 5 (td-web/DESIGN.md §9),
+its first consumer, is design.** Every face above lays text on a
 cell: one advance for every scalar, glyphs clipped to it. Prose reads
 better in a face whose glyphs take their own widths, and td-web, which
 shows documents, needs one. This section adds two proportional families
@@ -4078,50 +4158,122 @@ and bounds. The install plan is a list of faces, each a directory and
 either an archive with members or pinned files, and notices; this
 directory's face is pinned files, `OFL.txt` its notice.
 
+A program reads the two families once at startup with
+`pinned_face::prose_or_note`, passing its `TD_UI_FACE` value and the
+monospace `Typeface` it loaded, if any: each family is read from the
+first place holding its regular style (both families' places are the
+same list), all four of its styles from that directory, and handed to
+`prose::Faces::new`, which refuses a style that does not parse, or a
+family that does not size at the prose size at scales one and four, by
+family and style; the loader names the file. A missing or refused
+family is the whole set missing: the program says so once on standard
+error, naming `./install-fonts`, and its prose draws on the cell. The
+monospace typeface's style bytes are shared, not read again
+(`Faces::with_mono`); a monospace face refused at the prose size is
+said, and the faces keep without it. `bitmap` reads and says nothing. A
+host-packaged Noto found first is parsed under the same bounds and only
+changes the measurements and the glyphs (see "Delivery and trust
+position").
+
 ### Glyph semantics
 
-`GlyphStyle` gains a `family`, `Cell` by default, so every draw stream
-that does not name one is unchanged: a `Cell` glyph draws as above, in
-the monospace face's cell. A `Sans`, `Serif` or `Mono` glyph is prose:
-drawn with its pen at the draw's `x` and the line's baseline at `y` plus
-the prose metrics' baseline, clipped only by the draw's bounds, not to a
-cell, at the prose size. `Mono` is the monospace face's outlines on a
-prose line, for code inside a page: its advance is the face's one
-advance at the prose size, and its baseline the line's. Without a
-proportional face loaded, a prose glyph draws as a `Cell` glyph does. A `Glyph` still names one scalar and a style, never a bitmap, so
-`driven`'s read-back and the draw-stream oracles see prose as they see
-cells, only at other positions.
+`GlyphStyle` gains a `family`, a `raster::TextFamily` (so named apart
+from `face_file::Family`), `Cell` by default, so every constructor and
+every draw stream that does not name one is unchanged: a `Cell` glyph
+draws as above, in the monospace face's cell. `with_family` sets it. A
+`Sans`, `Serif` or `Mono` glyph is prose: drawn with its pen at the
+draw's `x` and the line's baseline at `y` plus the prose line's baseline
+(`Metrics::line`), clipped only by the draw's clip, not to a cell, at the
+prose size. `Mono` is the monospace face's outlines on a prose line, for
+code inside a page: its advance is the face's one advance (that of `0`,
+else `M`) at the prose size, and its baseline the line's. Without the
+prose faces (none loaded, `TD_UI_FACE=bitmap`, every in-process test) a
+prose glyph draws exactly as a `Cell` glyph does. A `Glyph` still names
+one scalar and a style, never a bitmap, and the draw-stream oracles see
+prose as they see cells. `driven`'s read-back places each glyph in the
+cell its origin falls in, so it reads prose back exactly on the cell,
+where every pen is a cell's (no faces, `TD_UI_FACE=bitmap`, every
+in-process test); over proportional faces narrow glyphs share cells and
+the text it reads is not the text drawn (see "Not yet").
 
-A raster draws prose from a set of faces: the monospace face it has
-today and, when loaded, the two families in the four styles, each style
-covered at its own size into the atlas page the raster holds. A scalar
-the family lacks in its style is drawn from its regular style, then from
-the monospace face, then its stand-in, then Unifont, as a cell's is,
-with the advance of the face that draws it.
+A raster draws prose from `prose::Faces`, lent with
+`Raster::with_prose` (the window's `with_prose`, or
+`window::run_with_prose`): Sans and Serif in their four styles and, when
+the program has it, the monospace face, each sized at the prose size
+with an atlas page of its own (three pages beside a widget window's
+fitted face), made on first use and remade when the scale changes. A
+page is the 1 MiB one of "The atlas executor": at scale four, 64 pixels
+per em, it holds about 350 glyphs, so a frame drawing many scalars in a
+family's four styles can reset that family's page every frame. That is
+bounded work, not a fault, and a larger page is the remedy if a
+consumer meets it. Which
+face draws a scalar is what `Metrics::source` answers, the same
+measurement a consumer lays out with: the family in the glyph's style,
+as `Face::style` resolves it, else its regular; else the monospace face,
+in its style or regular, else its stand-in (`font::stand_in`); else the
+bitmap face, its baseline (14 of its 16 rows, `CELL_BASELINE`) on the
+line's. A scalar a proportional family does not map reaches the
+monospace face before any stand-in is tried, since `Metrics` asks the
+family only for what its character map holds. A glyph a family maps but
+whose outline it refuses falls back as `Face::glyph` does, through its
+regular style and then that family's own stand-in, and only then to the
+next face, at the advance measured. Each glyph
+takes the advance of the face that draws it: the monospace face's one
+advance, or `CELL_WIDTH` at the scale for the bitmap face.
 
 ### Measuring and wrapping
 
-`prose` is pure. `Metrics` answers, for a prose family and a style at the
-surface's pixel size, a scalar's advance, the line height (ascender to
-descender, rounded) and the baseline. It is built from the faces a
-raster draws with, so measurement and drawing agree. Advances are
-summed in 1/64 pixels and each glyph's pen rounded, so a line's width
-does not drift with its length. Without proportional faces (none
-loaded, `TD_UI_FACE=bitmap`, every in-process test) `Metrics` answers
-the cell: every scalar one `CELL_WIDTH` at the scale, the line one
-`CELL_HEIGHT`. So a prose consumer lays out through one interface and
-its oracles stay on the bitmap face, as a cell consumer's do.
+`prose` is pure. `Metrics::new(faces, scale)` answers, at the
+surface's scale, `advance` (a scalar's advance in a family and style, in
+`UNIT`s, 1/64 of a pixel), `source` (which face draws it), `width` (a
+run's advances summed, then rounded) and `line`, a `LineBox` holding
+both families: its baseline the higher of Sans's and Serif's regular
+ascenders, its height that ascender down to the lower of their
+descenders, each summed in `UNIT`s and rounded once; `Mono` takes the
+line's. `Raster::metrics` lends the metrics the raster draws prose
+with, the ones its faces hold at its scale, whose remembered
+measurements last as long as those faces at that scale (the cell's
+without faces), so measurement and drawing agree and a paint measures
+without a copy; a consumer laying out outside a paint builds the same
+from its own clone of the faces it gave the window. A metrics remembers
+at most `MAX_MEASURES` scalars and then
+starts again. Advances are summed in `UNIT`s and each glyph's pen
+rounded, so a line's width does not drift with its length. Without
+proportional faces `Metrics` answers the cell: every scalar one
+`CELL_WIDTH` at the scale, the line one `CELL_HEIGHT` with
+`CELL_BASELINE` its baseline. So a prose consumer lays out through one
+interface and its oracles stay on the bitmap face, as a cell consumer's
+do.
 
-`prose::wrap` lays styled runs into lines no wider than a width in
-pixels. It breaks after a space, and inside a word only when the word
-alone is wider than the line; a line's trailing spaces take no width; a
-newline ends a line. Each line keeps its runs' extents, so a consumer
-hit-tests a link by pixel and finds what is under the pointer. Wrapping
-is bounded by its input: a consumer caps what it hands over, as td-web
-caps its rendering.
+`prose::wrap` lays `Run`s (text, a `GlyphStyle` whose family and font
+style it is measured in, and a caller's tag, such as a link's index)
+into `Line`s no wider than a width in pixels. It breaks after a space,
+and inside a word only when the word alone is wider than the line; a
+line holds at least one glyph however narrow. A line's trailing spaces
+take no width and are dropped with the break, and a line never ends
+holding only spaces: when everything before a word that moves to the
+next line is spaces, leading ones included, they go with the break
+rather than leave an empty line. Spaces that fit stay, as indentation.
+A newline ends a line, so
+empty text is one empty line and a trailing newline one more. A tab is
+a space and another control the replacement character, as `text_run`
+draws one. Each line keeps its width, its glyphs (`Placed`: a scalar and
+its pen in pixels from the line's left) and its `Piece`s, one per run on
+the line in order, with the run's index, tag and style, the bytes of its
+text the line shows, and its extent in pixels; `Line::hit` finds the
+piece under a pixel, so a consumer hit-tests a link by pixel. `draw`
+streams a line's glyphs at an origin inside its bounds, clipped to the
+damage, up to the first whose pen is `OVERHANG` (one em at the largest
+scale, 64 pixels) or more past the clip's right: Noto's italic `f` and
+`j` hang their ink left of their pens, so a glyph just past the clip
+may still ink inside it, and a repaint of part of a line equals the
+whole line's inside its damage. The raster clips the rest. On the cell
+a line's draw stream
+is exactly `text_run`'s of its text. Wrapping is bounded by its input: a
+consumer caps what it hands over, as td-web caps its rendering.
 
-The default size is 16 pixels per em at scale 1, the device size the
-scale times that; its line is 22 pixels.
+The default size is `SIZE`, 16 pixels per em at scale 1, the device size
+the scale times that; its line is 22 pixels with the baseline at 17.
 
 ### Not yet
 
@@ -4130,7 +4282,11 @@ text, mark positioning (a combining mark draws at the pen with its own
 advance, zero in these faces), hyphenation, and faces beyond Latin,
 Greek and Cyrillic (Noto's CJK faces are CFF collections, which `sfnt`
 refuses by name). A scalar outside the families' coverage still draws:
-from the monospace face, its stand-in or Unifont.
+from the monospace face, its stand-in or Unifont. Nor does the seam
+read prose back over proportional faces: `driven::text` reads the cell
+grid, so a
+consumer whose text matters to an agent says it through its own verbs
+until the seam reads the pieces a consumer laid out.
 
 ## Independently landable increments
 
@@ -4387,7 +4543,7 @@ regressions. Those increments extend the original sequence below.
     raster's set of faces, `prose::Metrics` and `prose::wrap`, and the
     loader of the prose faces, with oracles on the bitmap face and on
     the pinned faces read from a checkout's install. td-web is the first
-    consumer, in its own increment.
+    consumer, in its own increment. Landed.
 
 ## Foreground terminal relay
 

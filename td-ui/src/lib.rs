@@ -30,7 +30,9 @@
 //! the reader of the selection's text), and the outline face's bounded
 //! TrueType reader (`sfnt`) with its antialiased coverage (`coverage`),
 //! the coverage page (`atlas`) and the face at one pixel size (`face`)
-//! through which a raster may execute its glyphs, and the embeddable
+//! through which a raster may execute its glyphs, prose in proportional
+//! faces (`prose`: the faces, their metrics, wrapping and drawing), and
+//! the embeddable
 //! terminal (td-term/DESIGN.md): the VT model (`vt`), its renderer
 //! (`vt_render`), the chord encoder and scrollback viewport (`vt_keys`),
 //! the terminfo compiler (`vt_terminfo`) and the PTY with its threads
@@ -96,6 +98,7 @@ pub mod pinned_face;
 pub mod pointer;
 #[path = "../../td-compositor/src/proc_status.rs"]
 pub mod proc_status;
+pub mod prose;
 pub mod pty;
 pub mod raster;
 pub mod repeat;

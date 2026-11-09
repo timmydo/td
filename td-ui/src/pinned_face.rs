@@ -7,15 +7,21 @@
 //! program reads the regular style alone unless it draws bold or italic
 //! glyphs, when it reads all four (`load_styled_or_note`); a terminal reads
 //! all four as one `Face`, fitted to its cell or at a size of its own
-//! (`styles_or_note`), which `vt_render::render_with` draws through.
+//! (`styles_or_note`), which `vt_render::render_with` draws through. A
+//! program that draws prose reads the proportional families' four styles
+//! each as `prose::Faces` (`prose_or_note`), sharing its monospace
+//! typeface's bytes; without them its prose draws on the cell.
 
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::Path;
 
+use crate::atlas::Style;
 use crate::face::{Face, Sizing};
 pub use crate::face_file::SETTING;
-use crate::face_file::{self, Place, BOLD, BOLD_ITALIC, INSTALL_HINT, ITALIC, REGULAR};
+use crate::face_file::{self, Family, Place, BOLD, BOLD_ITALIC, INSTALL_HINT, ITALIC, REGULAR};
+use crate::prose::Faces;
+use crate::raster::TextFamily;
 use crate::typeface::Typeface;
 
 /// The face's regular style from the first of `face_file::host_places`
@@ -161,6 +167,96 @@ pub fn styles_in_or_note(
     styles_in(places, sizing)
         .map_err(|why| note(program, &why))
         .ok()
+}
+
+/// Noto Sans and Noto Serif, four styles each, as `prose::Faces`: each
+/// family from the first of `places` that holds its regular style, every
+/// style of a family from that one directory. A refused face is an error
+/// naming its file.
+pub fn prose_in(places: &[Place]) -> Result<Faces, String> {
+    let sans = Family::SANS.find(places)?;
+    let serif = Family::SERIF.find(places)?;
+    prose_from(&sans, &serif)
+}
+
+/// The two families from `sans` and `serif`, as `prose_in` reads them.
+pub fn prose_from(sans: &Path, serif: &Path) -> Result<Faces, String> {
+    let read = |dir: &Path, family: Family| -> Result<[Vec<u8>; 4], String> {
+        Ok([
+            face_file::read(dir, family.regular)?,
+            face_file::read(dir, family.bold)?,
+            face_file::read(dir, family.italic)?,
+            face_file::read(dir, family.bold_italic)?,
+        ])
+    };
+    Faces::new(read(sans, Family::SANS)?, read(serif, Family::SERIF)?).map_err(|refused| {
+        let (dir, family) = match refused.family {
+            TextFamily::Serif => (serif, Family::SERIF),
+            _ => (sans, Family::SANS),
+        };
+        let name = match refused.style {
+            Style::Regular => family.regular,
+            Style::Bold => family.bold,
+            Style::Italic => family.italic,
+            Style::BoldItalic => family.bold_italic,
+        };
+        format!("{}: {}", dir.join(name).display(), refused.error)
+    })
+}
+
+/// `prose_in` the places `face_file` searches for the families (Sans's
+/// and Serif's are the same), with `mono`'s styles shared as the faces'
+/// monospace face; or a line on standard error naming `program`, why its
+/// prose draws on the cell instead and how to install the faces. A
+/// `setting` of `bitmap` reads and says nothing. A monospace face refused
+/// at the prose size is said too, and the faces keep without it.
+pub fn prose_or_note(
+    program: &str,
+    setting: Option<&OsStr>,
+    mono: Option<&Typeface>,
+) -> Option<Faces> {
+    if !face_file::wanted(setting) {
+        return None;
+    }
+    prose_in_or_note(&Family::SANS.host_places(), program, setting, mono)
+}
+
+/// `prose_or_note` from `places`.
+pub fn prose_in_or_note(
+    places: &[Place],
+    program: &str,
+    setting: Option<&OsStr>,
+    mono: Option<&Typeface>,
+) -> Option<Faces> {
+    if !face_file::wanted(setting) {
+        return None;
+    }
+    let faces = prose_in(places)
+        .map_err(|why| note_prose(program, &why))
+        .ok()?;
+    let Some(mono) = mono else {
+        return Some(faces);
+    };
+    match faces.clone().with_mono(mono) {
+        Ok(faces) => Some(faces),
+        Err(why) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "{program}: monospace face refused at the prose size ({why}); \
+                 prose in it draws from the bitmap face"
+            );
+            Some(faces)
+        }
+    }
+}
+
+/// The one line a program whose prose draws on the cell for want of the
+/// proportional faces says; a failed write is ignored.
+fn note_prose(program: &str, why: &str) {
+    let _ = writeln!(
+        std::io::stderr(),
+        "{program}: proportional faces unavailable ({why}); prose draws on the cell: {INSTALL_HINT}"
+    );
 }
 
 /// The one line a program that draws with Unifont for want of the face

@@ -22,6 +22,7 @@ pub use crate::driven::PointerPhase;
 use crate::font::Font;
 use crate::keys::{self, Help, Overlay, Section, Step};
 use crate::pointer::{self, Wheel};
+use crate::prose::Faces;
 use crate::raster::{Raster, Scale, Surface};
 use crate::theme::{self, Theme};
 use crate::theme_file::Kept;
@@ -453,6 +454,9 @@ pub struct Window<'h, H: Handler> {
     /// The outline face glyphs are executed through, when the window was
     /// given one; else the bitmap face draws them.
     typeface: Option<Typeface>,
+    /// The proportional faces prose glyphs are drawn from, when the window
+    /// was given them; else prose draws as cells.
+    prose: Option<Faces>,
     /// The theme every frame is painted in, and the file it is kept in
     /// when the window was given one.
     theme: Kept,
@@ -489,6 +493,7 @@ impl<'h, H: Handler> Window<'h, H> {
             handler,
             font: crate::font::pinned()?,
             typeface: None,
+            prose: None,
             theme: Kept::default(),
             clock: 0,
             surface,
@@ -510,6 +515,13 @@ impl<'h, H: Handler> Window<'h, H> {
     /// grid at the surface's scale, instead of the bitmap face.
     pub fn with_typeface(mut self, typeface: Typeface) -> Self {
         self.typeface = Some(typeface);
+        self
+    }
+
+    /// Draws the window's prose glyphs (`raster::TextFamily`) from
+    /// `faces`, sized at the surface's scale, instead of as cells.
+    pub fn with_prose(mut self, faces: Faces) -> Self {
+        self.prose = Some(faces);
         self
     }
 
@@ -1137,6 +1149,7 @@ impl<H: Handler> App for Window<'_, H> {
             handler,
             font,
             typeface,
+            prose,
             theme,
             keys,
             ..
@@ -1145,6 +1158,7 @@ impl<H: Handler> App for Window<'_, H> {
             let mut raster = Raster::new(pixels, font, surface, surface.width * 4)
                 .map_err(|why| why.to_string())?
                 .with_typeface(typeface.as_mut())
+                .with_prose(prose.as_mut())
                 .with_theme(theme.theme());
             handler.paint(&mut raster, surface)?;
             keys.emit(surface, surface.bounds(), &mut |draw| raster.draw(draw));
@@ -1168,10 +1182,24 @@ pub fn run<H: Handler>(
     temporary: PathBuf,
     typeface: Option<Typeface>,
 ) -> Result<()> {
+    run_with_prose(handler, stream, temporary, typeface, None)
+}
+
+/// `run`, its prose glyphs drawn from `prose` when given them.
+pub fn run_with_prose<H: Handler>(
+    handler: &mut H,
+    stream: UnixStream,
+    temporary: PathBuf,
+    typeface: Option<Typeface>,
+    prose: Option<Faces>,
+) -> Result<()> {
     let theme_path = crate::theme_file::host_path(handler.app_id());
     let mut window = Window::new(handler, stream, temporary)?;
     if let Some(typeface) = typeface {
         window = window.with_typeface(typeface);
+    }
+    if let Some(prose) = prose {
+        window = window.with_prose(prose);
     }
     if let Some(path) = theme_path {
         window = window.with_theme_file(path);

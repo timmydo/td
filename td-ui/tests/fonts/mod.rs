@@ -47,6 +47,8 @@ pub struct Builder {
     pub descender: i16,
     /// Every glyph's advance; `None` gives glyph `i` 500 + `i`.
     pub advance: Option<u16>,
+    /// Per-glyph advances by index, each in place of `advance`'s.
+    pub advances: Vec<u16>,
 }
 
 impl Builder {
@@ -64,6 +66,7 @@ impl Builder {
             ascender: 800,
             descender: -200,
             advance: None,
+            advances: vec![],
         }
     }
 
@@ -97,7 +100,10 @@ impl Builder {
             b"hmtx" => {
                 let mut hmtx = vec![];
                 for index in 0..self.glyphs.len() {
-                    let advance = self.advance.unwrap_or(500 + index as u16);
+                    let advance = match self.advances.get(index) {
+                        Some(&advance) => advance,
+                        None => self.advance.unwrap_or(500 + index as u16),
+                    };
                     if index < usize::from(self.long_metrics) {
                         hmtx.extend_from_slice(&advance.to_be_bytes());
                     }
