@@ -4001,6 +4001,121 @@ Measured on the Mono Regular face, every one of its 12608 glyphs parses
 and covers in about 30 ms at 16 pixels per em. A frame needs only the
 glyphs it shows, once.
 
+## Proportional faces
+
+**Status: design; increments 38 and 39, and td-web's increment 5
+(td-web/DESIGN.md §9).** Every face above lays text on a
+cell: one advance for every scalar, glyphs clipped to it. Prose reads
+better in a face whose glyphs take their own widths, and td-web, which
+shows documents, needs one. This section adds two proportional families
+beside the monospace one, a way to measure and wrap text in them, and
+the glyph semantics that draw it. Nothing here changes how a cell
+consumer draws.
+
+### The faces
+
+Noto Sans and Noto Serif, release 2.015, the static unhinted TrueType
+files of Noto's distribution repository in four styles each (Regular,
+Bold, Italic, BoldItalic). Each covers Latin, Greek and Cyrillic in
+about 3,880 glyphs at 1000 units per em, a 1069 ascender, a -293
+descender and no line gap, with a format 12 character map and
+quadratic `glyf` outlines that `sfnt` already reads. They carry no
+hinting programs, and their kerning is in `GPOS`, which td-ui does not
+read, so text in them is unkerned (see "Not yet").
+
+They are pinned upstream data (AGENTS.md), each file on its own by its
+URL at the distribution repository's commit and its SHA-256, with
+`OFL.txt` from the source repository at the release's tag (the recipe
+`noto-fonts`):
+
+```text
+https://raw.githubusercontent.com/notofonts/notofonts.github.io/28b15b4b43b7bed62b5cf6e6b0b5ff5846270535/fonts/NotoSans/unhinted/ttf/NotoSans-Regular.ttf
+sha256 f3961a9cde016d41a4879aecda1474d3a36d6bf54fa0e4643de029cc2248b0e8
+NotoSans-Bold.ttf        87cb2d84472a7d66da659ee47b6cdb9552326e8c128245231f191b6ac72529d9
+NotoSans-Italic.ttf      678288f868807d4d64a6f3b51466871d117d915780381ce9d0ed4b3bcbd06d37
+NotoSans-BoldItalic.ttf  3d367743f371f28671d2764e911a53d7c20ec9b6aa8791d059e7090389fc52a5
+NotoSerif-Regular.ttf    a15cfbbc1539d707115111d672d590a3d70d4f74b4c0a315956da20ae19a14e1
+NotoSerif-Bold.ttf       24ad531e6b05ddad8c3d89572d2c93eb86a6b74e652ce7ee3c3e171de68e84c3
+NotoSerif-Italic.ttf     c4b3c971741ecdb40f5a443bce754e8fe91efe761b6ea10c92be7c3597cdadc4
+NotoSerif-BoldItalic.ttf 1bc4f86502eaa368718f6192bee022ea9a703d5af1c18b7d291212657b63074a
+https://raw.githubusercontent.com/notofonts/latin-greek-cyrillic/NotoSans-v2.015/OFL.txt
+sha256 cee9892f9f0cc8fe882c9e9537ee6a89621d86ee7ceaf70b02e2b2b1c25c061a
+```
+
+The archives Noto releases hold every build of every face (117 MiB for
+Sans); the eight files are 3.5 MiB. Both families are under the SIL
+Open Font License 1.1, whose text is the same at both families' tags.
+
+### Delivery
+
+The recipe copies the eight files and `OFL.txt` into `share/fonts/noto`
+of its output and builds nothing. Everything "Delivery and trust
+position" says of the monospace face holds for this directory under its
+own name: the image links it at `/etc/fonts/noto`, `static-runtime`
+carries it at `files/etc/fonts/noto` (td-jail binds the whole
+`files/etc/fonts`, so a jailed program reads it at the same path), and
+`./install-fonts` installs it under the XDG data home at `fonts/noto`
+beside the monospace face. `face_file` finds a family by its directory
+and regular file, `Family::MONO` today's and `Family::SANS` and
+`Family::SERIF` in `noto`, in the same places, order and bounds. The
+install plan grows from one archive to a list of faces, each a
+directory and either an archive with members or pinned files, and
+notices.
+
+### Glyph semantics
+
+`GlyphStyle` gains a `family`, `Cell` by default, so every draw stream
+that does not name one is unchanged: a `Cell` glyph draws as above, in
+the monospace face's cell. A `Sans`, `Serif` or `Mono` glyph is prose:
+drawn with its pen at the draw's `x` and the line's baseline at `y` plus
+the prose metrics' baseline, clipped only by the draw's bounds, not to a
+cell, at the prose size. `Mono` is the monospace face's outlines on a
+prose line, for code inside a page: its advance is the face's one
+advance at the prose size, and its baseline the line's. Without a
+proportional face loaded, a prose glyph draws as a `Cell` glyph does. A `Glyph` still names one scalar and a style, never a bitmap, so
+`driven`'s read-back and the draw-stream oracles see prose as they see
+cells, only at other positions.
+
+A raster draws prose from a set of faces: the monospace face it has
+today and, when loaded, the two families in the four styles, each style
+covered at its own size into the atlas page the raster holds. A scalar
+the family lacks in its style is drawn from its regular style, then from
+the monospace face, then its stand-in, then Unifont, as a cell's is,
+with the advance of the face that draws it.
+
+### Measuring and wrapping
+
+`prose` is pure. `Metrics` answers, for a prose family and a style at the
+surface's pixel size, a scalar's advance, the line height (ascender to
+descender, rounded) and the baseline. It is built from the faces a
+raster draws with, so measurement and drawing agree. Advances are
+summed in 1/64 pixels and each glyph's pen rounded, so a line's width
+does not drift with its length. Without proportional faces (none
+loaded, `TD_UI_FACE=bitmap`, every in-process test) `Metrics` answers
+the cell: every scalar one `CELL_WIDTH` at the scale, the line one
+`CELL_HEIGHT`. So a prose consumer lays out through one interface and
+its oracles stay on the bitmap face, as a cell consumer's do.
+
+`prose::wrap` lays styled runs into lines no wider than a width in
+pixels. It breaks after a space, and inside a word only when the word
+alone is wider than the line; a line's trailing spaces take no width; a
+newline ends a line. Each line keeps its runs' extents, so a consumer
+hit-tests a link by pixel and finds what is under the pointer. Wrapping
+is bounded by its input: a consumer caps what it hands over, as td-web
+caps its rendering.
+
+The default size is 16 pixels per em at scale 1, the device size the
+scale times that; its line is 22 pixels.
+
+### Not yet
+
+Kerning (`GPOS` pair adjustment), ligatures and shaping, bidirectional
+text, mark positioning (a combining mark draws at the pen with its own
+advance, zero in these faces), hyphenation, and faces beyond Latin,
+Greek and Cyrillic (Noto's CJK faces are CFF collections, which `sfnt`
+refuses by name). A scalar outside the families' coverage still draws:
+from the monospace face, its stand-in or Unifont.
+
 ## Independently landable increments
 
 The task-manager widget sequence is tracked in
@@ -4247,6 +4362,16 @@ regressions. Those increments extend the original sequence below.
     press closing the open list (`Overlay::press` and the widget
     window), and the `BUTTON` and `ITEM` labels. Each program's rows,
     check tests and pointer entry follow in its own landing.
+38. Noto's faces as pinned data ("Proportional faces"): the `noto-fonts`
+    recipe and its nine pins and watches, the image's `/etc/fonts/noto`
+    link, `static-runtime`'s copy, `./install-fonts`' plan of several
+    faces, and `face_file`'s families, with the AGENTS.md amendment
+    naming the class's new member. No program draws them yet.
+39. Prose: `GlyphStyle`'s family and the prose glyph semantics, a
+    raster's set of faces, `prose::Metrics` and `prose::wrap`, and the
+    loader of the prose faces, with oracles on the bitmap face and on
+    the pinned faces read from a checkout's install. td-web is the first
+    consumer, in its own increment.
 
 ## Foreground terminal relay
 

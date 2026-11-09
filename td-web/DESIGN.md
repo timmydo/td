@@ -1,7 +1,9 @@
 # td-web
 
-**Status: normative; the increments of §9 have landed.** The roadmap
-(§10) is not normative; each item there is its own amendment.
+**Status: normative for §9's landed increments; increment 5 is the
+reviewed plan, and where it changes a section that section says so.**
+The roadmap (§10) is not normative; each item there is its own
+amendment.
 
 td-web is td's own web browser: a td-ui program, built from source in
 td's target graph, that reads documents on the web. It complements
@@ -179,13 +181,21 @@ sniff of its first bytes for `<!doctype html` or `<html`:
 
 - `text/html` and `application/xhtml+xml` are rendered through td-html
   (`to_rich`) at the page pane's width in cells, and rendered again when
-  the width changes. Links, emphasis, code and preformatted text keep
-  their looks; colours named by the document are not applied, so text
+  the width changes. Increment 5 changes this: td-html renders the page
+  once, unwrapped (width 0), on the fetch thread, into its logical
+  lines, and td-web wraps them in pixels with td-ui's `prose::wrap` at
+  the pane's width, again on a resize. Body text is in Noto Sans, or
+  Noto Serif after `F8`; code and preformatted text in the monospace
+  face on the prose line (td-ui's `Mono`), a preformatted line never
+  wrapped and cut at the pane's edge. Without the proportional faces it
+  draws on the cell as before. Links, emphasis, code and preformatted
+  text keep their looks; colours named by the document are not applied, so text
   is always the theme's ink on the theme's ground. An image with `alt`
   text shows that text as a link to the image; td-html drops one
   without. td-html keeps no element ids, so a link's `#fragment` is
   kept in the address but not scrolled to.
-- `text/*` is shown as it is, wrapped at the pane's width.
+- `text/*` is shown as it is, wrapped at the pane's width (from
+  increment 5, in the monospace face on prose lines).
 - `image/png` and `image/jpeg` reached by navigation are decoded and
   shown fitted to the pane, never enlarged.
 - Anything else is not shown: the page names the type and size and
@@ -204,7 +214,9 @@ status in the status row; one without a body is an error page.
 Each character takes one cell: td-html's own stroke marks are dropped
 from struck text, which td-web strikes itself, but a wide character or
 a combining mark still takes one cell of its own, and a preformatted
-line wider than the page is cut at its edge (§10).
+line wider than the page is cut at its edge (§10). From increment 5 a
+character takes its face's advance instead, and a combining mark its
+own, zero in Noto's faces.
 
 The rendered page is td-web's own model, a list of lines of styled runs
 with link targets, independent of how it was produced: the first
@@ -283,6 +295,12 @@ in the page yet.
 4. **Packaging**: the `td-web` and `web` recipes, the `web`
    `ShippedApplication` at 65540, its fetch service and application
    units, its launcher card and its permissions (§3). Landed.
+5. **Proportional text**, after td-ui's increments 38 and 39
+   (td-ui/DESIGN.md, "Proportional faces"): the page in prose as §5
+   says, hit testing, find and link focus by pixel, `F8` between Sans
+   and Serif (not kept), and the faces loaded at startup beside the
+   monospace one, a missing one said once and the page drawn on the
+   cell.
 
 ## 10. Roadmap (not normative)
 
@@ -293,14 +311,9 @@ order; each is its own design amendment when it starts:
   tree (the consumer td-mail and td-news later move to); a cookie jar
   kept in the account's home; forms; gzip through the fetch service;
   more concurrent fetches; legacy charsets.
-- **Proportional text in td-ui.** td-ui lays text on a cell grid
-  (td-ui/DESIGN.md "The pixel backend is a seam"); proportional layout is
-  a remodel above that seam. With it, pinned Noto faces as upstream
-  data (AGENTS.md "Pinned upstream data"): static Noto Sans and Noto
-  Serif TTFs in four styles for Latin, Greek and Cyrillic, with
-  JetBrains Mono kept for monospace and Unifont as the last fallback.
-  Noto's CJK (CFF collections), colour emoji and variable fonts wait for
-  td-ui's reader to take those forms (`td-ui/src/sfnt.rs`).
+- **More faces.** Kerning from `GPOS`, then Noto's CJK (CFF
+  collections), colour emoji and variable fonts, each waiting for
+  td-ui's reader to take that form (`td-ui/src/sfnt.rs`).
 - **CSS and layout.** A `td-css` crate (syntax, selectors, cascade,
   computed values) and a layout engine (block and inline flow, tables,
   then flexbox) replacing the rich-output producer of §5.
