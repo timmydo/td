@@ -57,7 +57,8 @@ Already built and reused by this design:
   `prepare-portal-files` (Downloads, 1000→991, read-only) and
   `prepare-application-files firefox` (Downloads, 1000→65536)
   (td-authd/DESIGN.md; `UNSAFE.md` §16);
-- the signed Flathub runtime fetch and its generations (`APPLICATIONS.md`
+- the signed Flathub runtime fetch and its generations, in the runtime
+  store below, and the leases a launch holds on them (`APPLICATIONS.md`
   §W.9);
 - td-portal's caller identity from the bus broker's uid and jail lineage
   (`APPLICATIONS.md` §E).
@@ -102,17 +103,25 @@ policy are keyed by. Every Flathub declaration uses the one repository
 constant. Application declarations name the runtime they accept.
 Workspaces name a runtime by its td name.
 
-Runtimes live in one store, `/var/lib/td/runtimes/`, owned by a dedicated
-runtime account and written only by td-app running as it, with §W.9's
-layout and admission rules 1–3 and 5. Deploy trees are readable by every
-account. A workload can therefore no longer write its own runtime, which
-§W.9 admits Firefox's account can today.
+Runtimes live in one store, `/var/lib/td/runtimes/`, one store per
+runtime named by its td name, owned by the runtime account `td-runtimes`
+(UID 998, the desktop's alone) and written only by td-app running as it,
+with §W.9's layout and admission rules 1–3 and 5. Deploy trees are
+readable by every account. A workload can therefore no longer write its
+own runtime. td-firstboot makes the store root and the account's cgroup
+delegation; root's `runtime-cache` operation, and `application-cache`'s
+install, update and remove, are the only ways anything runs as the
+account (td-authd/DESIGN.md).
 
 Each runtime keeps its `current` and `previous` generations and any
-generation a running launch holds (§W.9's shared `flock`). Applications and
-workspaces follow `current`; installing or updating an application checks
-it against the runtime's `current` under rule 4 and rule 5's dynamic
-validator.
+generation a running launch or an application's validation holds (§W.9's
+shared `flock`). Applications and workspaces follow `current`; installing
+or updating an application checks it against the runtime's `current`
+under rule 4 and rule 5's dynamic validator, and an application whose
+runtime's `current` moved revalidates offline at its next launch or is
+refused; no application pins an older runtime commit. Installing an
+application installs or updates its runtime first; removing the last
+installed application that names a runtime empties that runtime's store.
 
 Runtimes are never recipe inputs and are outside every closure, as §W.9
 already requires of Flathub bytes. No Flathub byte enters the image.
@@ -186,7 +195,9 @@ account.
 2. Split `FLATHUB_SOURCES` into runtime and application declarations. No
    behaviour change.
 3. The runtime account, store and root `runtime-cache` operation; Firefox's
-   runtime moves out of its account's cache in the same landing.
+   runtime moves out of its account's cache in the same landing. Landed;
+   until step 10 the runtime half of an install shows no progress in
+   td-software.
 4. One td-jail runtime mount shared by the application and workspace
    kinds; workspace `runtime=`.
 5. The ledger allocator in td-authd, with applications moved onto it:

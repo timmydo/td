@@ -2442,9 +2442,11 @@ fn validate_system_boot(
             "the compositor became ready, but td-software's request-path marker \
              ({TD_SOFTWARE_INSTALL_MARKER:?}) was absent — the control socket's install or \
              status, the compositor's forwarding of private request 24, root's \
-             application-cache operation as Firefox's account, or td-app's check against the \
-             host's feed failed, or the install before it left no current generation \
-             (td-software/DESIGN.md §6.4). Last serial output:\n{}",
+             application-cache operation as the runtime account and Firefox's, or td-app's \
+             checks against the host's feed failed, the install before it left no current \
+             generation, root's runtime-cache status named no current runtime, or Firefox's \
+             cache deployed more than its application (td-software/DESIGN.md §6.4). Last \
+             serial output:\n{}",
             tail(&result.console, 80)
         ));
     }

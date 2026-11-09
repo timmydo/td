@@ -1364,9 +1364,11 @@ pub const TD_FETCH_BOOT_MARKER: &str = "TD-FETCH-OK";
 // which the compositor forwards as private request `24`, had root run its
 // `application-cache` operation as Firefox's account, and `td-ctl status
 // firefox` then read that install's success with a record taken after it
-// that names a `current` generation. The oracle installs Firefox first as
-// root (`firefox-fetch`), so this install is the owner's check of an
-// installed application against the host's feed.
+// that names a `current` generation; root's `runtime-cache` status then
+// named the runtime store's `current`, and Firefox's cache deployed its
+// application's commit alone (WORKLOADS.md, "Runtimes"). The oracle
+// installs Firefox first as root (`firefox-fetch`), so this install is the
+// owner's check of an installed application against the host's feed.
 pub const TD_SOFTWARE_INSTALL_MARKER: &str = "TD-SOFTWARE-INSTALL-OK";
 // Printed by the `placement-evidence` unit under the autotest token once the
 // view is back on the first workspace and the compositor's own report shows

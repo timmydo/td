@@ -155,11 +155,13 @@ its delegated session cgroup before it loses root, otherwise a
 later unprivileged td-jail cannot move its child into a sibling per-instance
 leaf: cgroup v2 requires write authority at the source/destination common
 ancestor.
-The human UID 1000 selects `td-user-1000/session`; application UIDs
+The human UID 1000 selects `td-user-1000/session`; the Flathub runtime
+account, UID 998, selects `td-runtimes/session`; application UIDs
 65536 through 2147483647 select `td-app-UID/session`. Every other non-root
 UID reports that no delegation is configured. Firstboot prepares only the
-installed, durably reserved application accounts' cgroups at sysinit, as
-specified in `td-authd/DESIGN.md`; this selector alone activates nothing.
+installed, durably reserved application accounts' cgroups and, on the
+desktop, the runtime account's at sysinit, as specified in
+`td-authd/DESIGN.md`; this selector alone activates nothing.
 The root-configured td-authd application launcher makes a failed placement
 fatal before app code runs, as the terminal launcher does for the human
 session. Its active-account admission and post-switch checks are specified
@@ -194,7 +196,8 @@ for uid 1000 it writes its own pid to the fixed
 `/sys/fs/cgroup/td-user-1000/session/cgroup.procs` and requires
 `/proc/self/cgroup` to read back exactly `0::/td-user-1000/session`. Root
 sessions do nothing; application UIDs select their canonical
-`td-app-UID/session` path. Other nonroot UIDs have no configured delegation.
+`td-app-UID/session` path and the runtime account `td-runtimes/session`.
+Other nonroot UIDs have no configured delegation.
 No argv or account-database path field selects the path. This uses safe
 filesystem I/O
 and does not widen the unsafe surface. It must precede `creds::apply`; after the

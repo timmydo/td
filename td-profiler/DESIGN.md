@@ -768,7 +768,8 @@ user mode. Coverage degrades explicitly:
 
 - a marked foreign payload may lack frame pointers or debug information;
 - a Flathub application or runtime td-app fetches when the owner installs it
-  (APPLICATIONS.md §W.9) lives in its account's cache, not the image, so the
+  (APPLICATIONS.md §W.9) lives in its account's cache or the runtime store,
+  not the image, so the
   object index has no row for it and the registry's root policy names its
   runtime ref without an image root;
 - reviewed hand-written assembly may not preserve a frame chain;

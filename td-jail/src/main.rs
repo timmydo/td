@@ -269,9 +269,9 @@ mod confinement {
         assert_eq!(shipped.matches(".env_clear()").count(), 1);
         assert!(shipped.contains("file.lock_shared()?;"));
         let authority = strip_comments(AUTHORITY);
-        assert!(authority.contains("Ok((package_files, runtime_files, Some(generation.hold)))"));
+        assert!(authority.contains("Ok((package_files, runtime_files, generation.holds()))"));
         assert!(authority.contains("        generation,\n    })"));
-        assert!(TRANSITION.contains(".chain(generation_descriptor)"));
+        assert!(TRANSITION.contains(".chain(generation_descriptors)"));
         // No grant reaches the cache a later launch binds.
         assert!(authority.contains("canonical_candidate(&state.real_home.join(\".td\"))?,"));
     }
@@ -874,7 +874,7 @@ mod confinement {
         assert!(TRANSITION.contains("read_exact(&mut readiness)"));
         assert!(TRANSITION.contains("close_inherited_descriptors(cleanup_descriptor.as_slice())?;"));
         assert!(TRANSITION.contains(
-            "let preserved: Vec<u32> = cleanup_descriptor\n            .into_iter()\n            .chain(generation_descriptor)\n            .collect();\n        close_inherited_descriptors(&preserved)?;"
+            "let preserved: Vec<u32> = cleanup_descriptor\n            .into_iter()\n            .chain(generation_descriptors)\n            .collect();\n        close_inherited_descriptors(&preserved)?;"
         ));
         assert!(managed.contains("None if self.instance.is_none() => Ok(None)"));
         assert!(MAIN.contains("run_cgroup_cleanup_bootstrap(&membership)"));

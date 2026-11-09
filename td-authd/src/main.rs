@@ -100,6 +100,7 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd application-start OWNER APP direct -- ARG... | \
      td-authd application-exec UID OWNER APP direct -- ARG... | \
      td-authd application-cache OWNER APP install|update|remove|delete-data|status | \
+     td-authd runtime-cache RUNTIME install|update|remove|status | \
      td-authd request-update SOURCE DEPLOYMENT-ID | td-authd request-hostname NAME | \
      td-authd time ACTION VALUE | td-authd volume add|remove ...";
 
@@ -158,13 +159,17 @@ fn run(arguments: &[String]) -> Result<(), String> {
         if verb == "application-exec" {
             return application::exec(rest);
         }
-        if verb == "application-cache" {
-            let output = application_cache::run(rest)?;
+        if verb == "application-cache" || verb == "runtime-cache" {
+            let output = if verb == "application-cache" {
+                application_cache::run(rest)?
+            } else {
+                application_cache::run_runtime(rest)?
+            };
             let mut stdout = std::io::stdout().lock();
             return stdout
                 .write_all(&output)
                 .and_then(|()| stdout.flush())
-                .map_err(|e| format!("write application cache answer: {e}"));
+                .map_err(|e| format!("write {verb} answer: {e}"));
         }
         if verb == "notebook-ui" {
             return launch::notebook_ui(rest);

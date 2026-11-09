@@ -425,10 +425,22 @@ Only installed applications assigned service UIDs consume this preparation.
 Personal mail/news retain their old UID reservations but execute under the
 human account and share its runtime and fetch daemon.
 
+On the desktop, before any application's, firstboot prepares the Flathub
+runtime account's delegation the same way: `/sys/fs/cgroup/td-runtimes`,
+delegated to `td-runtimes` (UID 998), with its root-owned `session` leaf,
+so td-app running as that account for "Runtime cache operation" below
+lands in a cgroup of its own rather than in root's request's. It also
+prepares that account's home, the runtime store root
+`/var/lib/td/runtimes`, as for a notebook's: created below the
+root-owned `/var/lib/td`, owned 998:998, mode 0755 exactly, an existing
+one with another owner or mode refused and only an interrupted root-owned
+creation completed. No `/run/user` runtime is made for it.
+
 Before dropping credentials, td-login selects `td-user-1000/session` for
-the human and `td-app-APP_UID/session` for the reserved application UID
-range. The kernel enforces placement and td-login reads membership back.
-Its ordinary placement failure remains a diagnostic for console recovery;
+the human, `td-runtimes/session` for UID 998 and
+`td-app-APP_UID/session` for the reserved application UID range. The
+kernel enforces placement and td-login reads membership back. Its
+ordinary placement failure remains a diagnostic for console recovery;
 the application launcher must require the expected membership after the
 credential switch. UID selection creates no account, cgroup or privilege.
 
@@ -1028,7 +1040,38 @@ every other verb refuses.
 For a Flathub declaration root runs `/bin/td-login exec-service-as
 tdaUID -- /bin/td-app VERB APP`, with td-app's verb `update APP --force`
 for both `install` and `update` (they differ only in whether a `current`
-exists, which td-software shows) and the verb's own name otherwise. The
+exists, which td-software shows) and the verb's own name otherwise. An
+`install` or `update` first runs the declared runtime's check as the
+runtime account, `/bin/td-login exec-service-as td-runtimes --
+/bin/td-app runtime update RUNTIME --force` with RUNTIME the declared
+runtime's td name, and the application's only once that succeeds, since
+td-app validates the application against the runtime store's `current`
+(APPLICATIONS.md §W.9); a failed runtime check fails the operation with
+td-app's diagnostic. A `remove`, once the application's succeeded, asks
+the status of every other declared application that names the same
+runtime and that the image's registry lists, as its own account, and
+when none has a `current` or a writer holding its cache's lock (an
+install or update in flight) runs `/bin/td-app runtime remove RUNTIME`
+as the runtime account: the last installed application to go takes its
+runtime's store contents with it. A declaration the registry does not
+list has no account on this machine and keeps nothing. One whose
+registry, admission or status cannot be read counts as installed, so
+the runtime stays. A failed runtime removal fails the operation, saying
+the application is removed and its runtime is not.
+
+That is a check, then an act. Another application's install that starts
+after the check, while its runtime half runs and before its own cache's
+lock is taken, can see its freshly installed runtime removed. The cost
+is recoverable: that install's application half refuses for want of a
+runtime, or a launch of it refuses until the owner updates it, which
+installs the runtime again: as `not installed` after a first install,
+and after an update as not revalidating offline against its runtime,
+td-app recording that the runtime is not installed. td-app cannot close the
+window: it runs as one account, and no account reads another's cache,
+so the runtime account cannot see who is about to need its store; only
+root could, by holding every such cache's lock across the removal. Every one of these runs
+through one command builder (`td_app`), the credential drop into exactly
+an admitted `tdaUID` or the compiled `td-runtimes`, and one spawn. The
 environment is cleared, the working directory is `/` and stdin is null;
 td-login supplies the account's home, its other identity variables and
 its session cgroup, as for an application's launch. For `status`
@@ -1043,9 +1086,9 @@ failed exit reports the last line as printable ASCII in its own
 diagnostic. A failed `status` reports only td-app's exit. Either failure
 exits 1; success of a verb other than `status` prints nothing.
 
-Each run is bounded: an hour for `install` and `update`, a download of
-about a gigabyte on a slow link and the validator over it, ten minutes
-for `remove` and
+Each operation is bounded, every td-app run it makes sharing the bound:
+an hour for `install` and `update`, a download of about a gigabyte on a
+slow link and the validator over it, ten minutes for `remove` and
 `delete-data`, and 60 seconds for `status`, whose deploy-size walk runs
 on every poll. At the bound root kills and reaps td-app; td-app's cache
 lock and generation leases make a killed run safe to repeat. The bound
@@ -1065,9 +1108,42 @@ authority must run it as its own process rather than in its loop.
 None of these is elevation (td-software/DESIGN.md §3): each runs the
 application's own account on its own cache or state, which a first
 launch and the forced check did before td-software's cutover
-(td-software/DESIGN.md §6.4). The confinement test pins the
-one program, its argument shape, the order of parse, startup audit,
-admission and spawn, and no environment beyond the cleared one.
+(td-software/DESIGN.md §6.4), or the runtime account on the runtime
+store, which holds only what an application's install asked for. The
+confinement test pins the one program, the two accounts and argument
+shapes, the order of parse, startup audit, admission and spawn, and no
+environment beyond the cleared one.
+
+## Runtime cache operation
+
+The root operation `runtime-cache RUNTIME VERB` changes or reads one
+runtime's store as the runtime account (WORKLOADS.md, "Runtimes";
+APPLICATIONS.md §W.9). RUNTIME is the td name of a runtime
+`flathub_app::FLATHUB_RUNTIMES` declares, compiled into root; VERB is
+exactly `install`, `update`, `remove` or `status`. The account is
+compiled too, `td-runtimes`, UID 998: no caller supplies an account,
+UID, path, ref or flag. Startup is audited as for "Application cache
+operation", which has no admission step here: the account is no
+ledger's. Root runs `/bin/td-login exec-service-as td-runtimes --
+/bin/td-app runtime update RUNTIME --force` for `install` and `update`
+and `runtime VERB RUNTIME` otherwise, through the same command builder
+and spawn as the application operation, with the same cleared
+environment, bounds and output handling. For `status` root parses the
+record with `flathub_app::RuntimeStatus`, requires it to name RUNTIME
+with `kind=runtime`, and prints its canonical rendering. A `remove`
+refuses, running nothing, while a declared application naming the
+runtime is installed, has a writer, or cannot be read, as above, and
+leaves the same window. The confinement test pins both operations'
+order: parse, startup audit, admission, then the operation, whose
+install runs the runtime's check before the application's and whose
+removals ask the applications before removing a runtime; unit tests
+drive each operation against a scripted host and check the runs it
+makes.
+
+Nothing on the compositor's channel reaches this operation: td-software
+installs applications, and their runtimes come with them through
+"Application cache operation". Root's own units run it; the QEMU
+oracles read the store's status through it (APPLICATIONS.md §W.9).
 
 ## Application requests
 
@@ -1140,6 +1216,15 @@ none begun in the last two seconds, or an operation has ended since the
 last began: each read walks the generations' deploys, so a peer polling
 faster is answered from the last read and costs no more walks.
 
+The record is the application cache's alone. While an install or update
+runs its runtime's check, no writer holds that cache, so `OP` shows the
+operation running and the record shows no progress until the
+application's own check starts; the runtime store's progress reaches no
+peer until td-software's runtime views (WORKLOADS.md, "Landing order",
+step 10). For the same reason a read shows no writer while another
+application's install holds the runtime store: an operation started then
+waits on the runtime's lock within its own bound.
+
 Request `23`, with no operand, is the installed set the compositor's
 launcher follows (td-software/DESIGN.md §5). Root answers at once from
 the same entries as `24`'s status; it writes no file and reads only the
@@ -1187,8 +1272,10 @@ starting, each a root `application-cache` process, as fast as the
 control socket serves it, which costs the human's machine no more than
 any program the human runs. A paired generation's end, by either peer's
 exit, ends what root ran for it with the pair's cgroup, as a kill would:
-td-app, in its account's session cgroup, finishes its run under its
-lock, and td-app's lock and leases make the run safe to repeat. The next
+td-app, in its account's session cgroup or the runtime account's,
+finishes its run under its lock, and td-app's lock and leases make the
+run safe to repeat; an install whose runtime half finished that way
+never starts its application half. The next
 generation knows nothing of it but what td-app's status shows. None of
 this is elevation, for the operation's reason above; a human program
 reaching the control socket can run these operations, which

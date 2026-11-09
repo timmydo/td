@@ -38,7 +38,7 @@ where their bytes come from:
 | kind | example | declaration | bytes |
 |---|---|---|---|
 | image-shipped, source-built | mail, news | recipe, in the image | `/td/store`, in `root.erofs` (§B.1) |
-| Flathub | Firefox | `FLATHUB_SOURCES` row and spec, in the image | the account's `.td/flathub/` cache (§W.9) |
+| Flathub | Firefox | `FLATHUB_SOURCES` row and spec, in the image | the application in the account's `.td/flathub/` cache, its runtime in the runtime store `/var/lib/td/runtimes/<name>/` (§W.9) |
 
 The Claude release stream (§W.9) is the third kind today; its removal
 from td takes it out of scope here.
@@ -57,7 +57,10 @@ These are fixed by the deployment, and this proposal keeps them fixed:
 
 **Proposed.** A Flathub application is installed when its
 account's cache has a `current` generation. Install, update and remove
-change only that cache, which the account owns. The registry and
+change only that cache, which the account owns, and the runtime store
+of the runtime it declares, which the runtime account owns and which
+holds only what an installed application asked for (td-authd/DESIGN.md,
+"Application cache operation"). The registry and
 principal table still list every declaration the image ships, so the set
 an owner can install is the reviewed set in git. It changes through `td
 update` and `td upgrade`, as principle 6 and §W say. Image-shipped
@@ -211,22 +214,40 @@ td-jail refuses with exactly `NAME is not installed; install it in
 td-software`. With one, it runs `/bin/td-app revalidate NAME` as the
 account, with only `HOME`, and holds the generation that answers; when
 it answers `absent` too, td-jail refuses with exactly `NAME did not
-revalidate offline after a system update; update it in td-software`
-(or the not-installed refusal, should `current` have gone meanwhile).
+revalidate offline against this system and its runtime; update it in
+td-software` (or the not-installed refusal, should `current` have gone
+meanwhile). A generation stops serving when the system's policy or the
+runtime store's `current` changed, since an application follows its
+runtime's `current` (§W.9); with no runtime installed `revalidate`
+answers `absent`, so a machine whose cache held Firefox's runtime before
+the runtime store refuses Firefox until its owner updates it, which
+installs the runtime.
 It never runs `td-app update`: the check beside a launch is gone. The
 refusal is td-jail's failed exit, so the unit fails, td-svc's backoff
 holds a repeat, and the bar's launch reads `FAILED TO START`; the card
 lists only installed applications and the control socket's `launch`
 refuses one root says is not installed with the same first text
 (td-compositor/DESIGN.md §15), so a person meets the refusal there
-first. `revalidate` takes the cache lock, so a launch during a running
-check waits for it, as a stale generation must.
+first. `revalidate` never waits behind an update: it takes the cache
+lock only when no writer that fetches or removes holds it, and
+otherwise answers `busy`, which td-jail refuses with exactly `an update
+of NAME is running; launch it when it finishes`. A launch during an
+update therefore runs the generation `ready` answers while it still
+serves, as before, and refuses only once it stopped serving: when the
+update's runtime half moved the runtime store's `current` and its
+application half has not yet published, which lasts as long as that
+half's download and validation. It waits only behind another launch's
+revalidation, which fetches nothing, for up to two minutes.
 
 ### 4.2 Install, update and remove
 
-- **Install** runs `td-app update APP --force` on an account with no
-  `current`. Every admission rule of §W.9 applies unchanged, including
-  the feed transport under the autotest token.
+- **Install** runs `td-app runtime update RUNTIME --force` as the
+  runtime account, then `td-app update APP --force` on an account with
+  no `current`. Every admission rule of §W.9 applies unchanged,
+  including the feed transport under the autotest token. *As built:*
+  while the runtime half runs, the record shows the operation running
+  and no progress; the runtime store's progress reaches td-software
+  with its runtime views (WORKLOADS.md, "Landing order", step 10).
 - **Update** is the same command on an installed account, and the only
   way an installed application updates. It replaced the launcher's
   per-application UPDATE row and the daily check beside a launch, and
@@ -236,8 +257,11 @@ check waits for it, as a stale generation must.
   it schedules nothing in the background.
 - **Remove** is a new td-app verb. It clears `current` and `previous`,
   and collects every generation, deploy and object graph that no launch
-  holds. Held generations follow §W.9's lease and go when the last
-  launch ends.
+  holds. Held generations follow §W.9's lease: they outlive their last
+  launch until the store's next write collects them, a later update,
+  revalidation or removal. When no other installed application names
+  its runtime, root then runs `td-app runtime remove RUNTIME` as the
+  runtime account, which empties that runtime's store the same way.
 
   It keeps `admitted`, so a reinstall cannot admit a commit older than
   one already admitted. It also keeps the jail state under

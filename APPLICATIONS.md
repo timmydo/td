@@ -47,8 +47,9 @@ Settled by the maintainer; these are premises, not conclusions.
    step. A Flathub application the image declares (§W.9) is installed
    only when the session owner asks td-software: td-software asks root's
    fixed `application-cache` operation to fetch that reviewed,
-   image-declared application into its own account's cache, admitted
-   under §W.9's rules, and that operation is the one installer. There
+   image-declared application into its own account's cache and its
+   runtime into the runtime store, admitted under §W.9's rules, and that
+   operation is the one installer. There
    is still no package repository, no mutable registry and no install
    of anything the image does not declare. Choosing which installed
    application to run needs no authority beyond the user's own
@@ -9896,7 +9897,8 @@ deferring them. The shape:
   credentials. Stage 1 therefore starts in the session leaf; when it moves
   blocked stage 2 into a sibling per-instance leaf, the delegated root is the
   source/destination common ancestor and uid 1000 owns the required control files.
-  Activated app accounts select `td-app-APP_UID/session` instead. Firstboot
+  Activated app accounts select `td-app-APP_UID/session` instead, and the
+  Flathub runtime account (UID 998) `td-runtimes/session`. Firstboot
   prepares the installed assignments' sibling delegations after td-svc's root
   controller setup, then their private `/run/user/APP_UID` directories. The
   pre-session, ownership and refusal rules are in `td-authd/DESIGN.md` under
@@ -11414,15 +11416,19 @@ the ref names when a machine asks is admitted only if all of these hold:
    `ostree.collection-refs-binding` name exactly the requested ref in
    `org.flathub.Stable`, so a signed commit of another application or
    branch cannot be substituted;
-3. its timestamp is not older than the newest commit this cache has
-   admitted for that ref, and an equal timestamp admits only the same
-   commit, so an old signed commit cannot be replayed as an update;
+3. its timestamp is not older than the newest commit the store admitting
+   it (the runtime store for a runtime ref, the application's cache for
+   an app ref) has admitted for that ref, and an equal timestamp admits
+   only the same commit, so an old signed commit cannot be replayed as an
+   update;
 4. the application commit's `xa.metadata` `[Application]` `runtime=`
-   names exactly the accepted runtime ref, and the runtime commit passes
-   1–3 for that ref;
+   names exactly the accepted runtime ref, and the runtime store's
+   `current` for that ref passed 1–3;
 5. both graphs pass §B.3.1's bounds and both trees the deploy-tree rules
    and the dynamic validator, the checks the image build ran on the
-   pinned path.
+   pinned path: each graph and tree at its own store's check, and the
+   validator over the application's tree and the runtime store's
+   `current` at the application's.
 
 A refused candidate leaves the current generation in place and is
 reported. A new runtime branch (26.08) or a new Flathub subkey is a
@@ -11432,25 +11438,40 @@ keeps running. Key revocation is not consulted, and a freeze attack
 (serving an old but not older-than-admitted signed commit) is not
 detected; the signature, not freshness, is the claim.
 
-**Where the bytes live: the application account's own home.** Firefox
+**Where the bytes live: the runtime store and the application account's
+own home.** A runtime is stored once, in the runtime store
+(WORKLOADS.md, "Runtimes"): `/var/lib/td/runtimes/<name>/`, one store
+per declared runtime named by its td name
+(`/var/lib/td/runtimes/freedesktop-platform-25-08/`), below the home of
+the runtime account `td-runtimes`, UID 998, which only the desktop
+declares. td-firstboot makes the store root `/var/lib/td/runtimes`,
+owned by that account, mode 0755 (td-authd/DESIGN.md, "Application
+runtime preparation"); td-app, running as that account, makes each
+store, its root, `deploy/` and `generations/` mode 0755, set rather than
+created so neither the umask nor an earlier run narrows them, its
+`objects/`, `.work`, `lock` and state files private. Every account can
+therefore read a runtime's trees, and only the runtime account can write
+them: an application's account can no longer write its runtime. Firefox
 runs as its own account, `tda65536`, whose home is
 `/var/lib/td/applications/65536`. Its cache is
 `/var/lib/td/applications/65536/.td/flathub/`, owned by that account,
-mode 0700, beside the jail's `.td/app` state and never mounted into a
-jail: td-jail binds only the selected generation's two `files/` trees,
-read-only, at `/app` and `/usr`. It is per account on the machine, so it
-needs no access to any human home and no system location. The cost is
-that the cache is writable by the account the application runs as;
-outside the jail only td's own launch and update processes run as that
-account, and §B.1's "not writable by the uid that runs it" no longer
-holds for these payloads. Layout:
+mode 0700, beside the jail's `.td/app` state, and holds the
+application's tree alone. Neither is mounted into a jail: td-jail binds
+only the application generation's `files/` at `/app` and the runtime
+generation's at `/usr`, read-only. The application cache needs no
+access to any human home. The cost that remains is that the
+application's own tree is writable by the account the application runs
+as; outside the jail only td's own launch and update processes run as
+that account, and §B.1's "not writable by the uid that runs it" holds
+for the runtime but not for the application's payload. Each has the same
+layout:
 
 ```text
-.td/flathub/
+.td/flathub/ or /var/lib/td/runtimes/<name>/
   lock                        one writer at a time
   objects/<commit>/           §B.3.1 object graph caches, one per commit
-  deploy/<commit>/files/      materialized trees, app and runtime alike
-  generations/<n>/selection   app ref+commit+timestamp, runtime ref+commit+timestamp
+  deploy/<commit>/files/      materialized trees: the application's, or the runtime's
+  generations/<n>/selection   what the generation selects
   current -> generations/<n>  what td-app ready offers
   previous -> generations/<m> the generation before it
   admitted                    newest admitted timestamp per ref (rule 3)
@@ -11460,36 +11481,56 @@ holds for these payloads. Layout:
   .work/progress              what the writer holding `lock` is doing
 ```
 
-`selection` is `format=1`, `name=` the declaration, `checks=` a SHA-256
-over rule 5's inputs that no commit carries (the entry and the
-dynamic-library policy), then `app=REF<TAB>COMMIT<TAB>TIME` and
-`runtime=` in the same row form. A pointer
-names exactly `generations/<n>` with no leading zero. Both are parsed by
-`engine/src/flathub_app.rs`, which uses no other module so that td-jail
-can include it.
+An application's `selection` is `format=1`, `name=` the declaration,
+`checks=` a SHA-256 over rule 5's inputs that no commit carries (the
+entry and the dynamic-library policy), then `app=REF<TAB>COMMIT<TAB>TIME`
+and `runtime=` in the same row form: the runtime store's `current` it was
+validated against, whose tree is the store's. A runtime's is
+`format=1`, `name=` the runtime's td name and its `runtime=` row. A
+pointer names exactly `generations/<n>` with no leading zero. All three
+are parsed by `engine/src/flathub_app.rs`, which uses no other module so
+that td-jail can include it, and which compiles the runtime account's
+name, UID and store root.
 
 A generation is published by writing it completely, then replacing
 `current` with one `rename(2)`; the old `current` becomes `previous`.
-Only `current`, `previous` and generations a running launch holds (see
-"What a launch holds") are retained: after every check that passed rules
-1–4, other generations, and deploys and object graphs none of them
-names, are removed, except the commits that check tried, and so is
-anything else in the cache root. A refused candidate therefore keeps
-its deploy for the next attempt, and only the latest refused set
-survives. A deploy or object graph is renamed aside before it is
+Only `current`, `previous` and generations a running launch or an
+application's validation holds (see "What a launch holds") are retained:
+after every check that passed rules 1–4 (1–3 for a runtime), other
+generations, and deploys and object graphs none of them keeps, are
+removed, except the commit that check tried, and so is anything else in
+the store root. An application's generation keeps only its own commit:
+a runtime deploy and object graph an application cache holds from
+before the runtime store, when both trees lived there, go at that
+cache's next update or removal, or the next revalidation that publishes. A refused candidate
+therefore keeps its deploy for the next attempt, and only the latest
+refused one survives. A deploy or object graph is renamed aside before it is
 deleted, so an interrupted removal never leaves a `files/` that reads
 as complete. A deploy of `current` found missing is restored in place,
 with no new generation. A crash between replacing `previous` and
 `current` leaves both naming the old generation; that costs only the
 older rollback.
 The deploy trees follow §B.3.1's materialization rules, owned by the
-account rather than root, directories 0755 and files 0755/0644 from the
-executable bit.
+store's account rather than root, directories 0755 and files 0755/0644
+from the executable bit.
 
-**Who fetches: `td-app`, a td-net applet.** `td-app update NAME
---force` runs as the application's account, resolves the ref through
-`refs/heads/<ref>` (a mutable hint, never authority), and performs 1–5.
-It refuses to run as root or with a `HOME` another uid owns. Every
+**Who fetches: `td-app`, a td-net applet.** `td-app runtime update
+RUNTIME --force` runs as the runtime account and only as it, with
+`HOME` exactly the store root `/var/lib/td/runtimes` and owned by it;
+it resolves the runtime's ref through `refs/heads/<ref>` (a mutable
+hint, never authority), applies 1–3, acquires and materializes the
+commit, and publishes it in that runtime's store. `td-app update NAME
+--force` runs as the application's account, never root or the runtime
+account, with a `HOME` that account owns; it resolves the app ref the
+same way, applies 1–3 and rule 4 against the declared runtime ref, then
+takes a shared `flock` on the selection of the runtime store's
+`current`, which must be the runtime account's, writable by no one
+else, name the declared runtime and have a complete deploy whose
+`files/` is the runtime account's and writable by no one else, and
+holds it while it validates the application against that tree under
+rule 5. The selection's `runtime=` row is that `current`'s. With no
+runtime installed the update refuses: root's install runs the runtime's
+check first (td-authd/DESIGN.md, "Application cache operation"). Every
 update asks: the form without `--force`, which skipped a check made in
 the last 24 hours, went with the check beside a launch
 (td-software/DESIGN.md §6.4), so `td-app update NAME` alone is refused
@@ -11497,14 +11538,20 @@ as a usage error. `checked` is written only by a check that completed:
 a fetch failure or a refused candidate leaves it, so td-software shows
 when the application was last checked successfully. Before any tree
 is fetched it reads the ref, the commit and its commitmeta and applies
-1–4. Rule 3's floor is the newest row for the ref in `admitted`,
-`current` or `previous`, so a lost or stale
-`admitted` never admits a commit older than one already selected. It
-then acquires and materializes each new commit (an existing
+1–4. Rule 3's floor is the newest row for the ref in the store's
+`admitted`, `current` or `previous`, so a lost or stale `admitted` never
+admits a commit older than one already selected; each store's
+`admitted` keeps rows for its own ref alone. A runtime store a machine
+first fills at this landing starts with no floor of its own, as a fresh
+account's does: the runtime rows an older application cache admitted
+are the application account's, which the runtime account cannot read.
+It then acquires and materializes the new commit (an existing
 `deploy/<commit>/files` is complete, since it appears by one rename; a
-deploy without one is cleared first), validates under rule 5, writes
-`admitted`, and only then publishes. An
-unchanged check rewrites `admitted` too.
+deploy without one is cleared first), validates an application under
+rule 5, writes `admitted`, and only then publishes. An unchanged check
+rewrites `admitted` too. An application whose commit is unchanged but
+whose runtime's `current` moved is validated again and published as a
+new generation: applications always follow their runtime's `current`.
 The materializer and the dynamic validator move from the builder into
 td-engine, where td-app runs the implementation the image build ran; td-net
 stays free of `unsafe`, so publication uses the account-private lock and
@@ -11512,15 +11559,16 @@ an absence check and plain `rename(2)` under that lock instead of a
 no-replace rename.
 
 **What td-app answers and removes (td-software/DESIGN.md §6, increment
-1).** Four more verbs run as the account, each refusing root and a
-foreign `HOME` as `update` does:
+1).** Four more verbs run as the account, each refusing root, the
+runtime account and a foreign `HOME` as `update` does:
 
 - `td-app status NAME` prints one canonical record, parsed and rendered
   by `flathub_app::Status` (at most 4 KiB): `format=1`, `name=`,
   `kind=flathub`, then `current=` and `previous=` (`none`, or the
   generation and `serves` or `stale`, by `ready`'s test, each followed by
   its `.app=` and `.runtime=` rows: ref, commit, timestamp, and the
-  deploy's regular-file bytes or `-` when it is incomplete), `checked=`
+  deploy's regular-file bytes or `-` when it is incomplete, the
+  runtime's measured in the runtime store), `checked=`
   (`never` or the time), `refused=` (`none`, or the time and a printable
   reason of at most 512 bytes) and `progress=`. Like `ready` it takes no
   lock and writes nothing: `progress=` is `none` unless a shared
@@ -11542,7 +11590,8 @@ foreign `HOME` as `update` does:
   three lines through `kind=image` (td-authd/DESIGN.md).
 - `td-app remove NAME` clears `previous`, then `current`, and collects
   every generation, deploy and object graph no launch holds; a held
-  generation goes at a later collection once its launch ends. It keeps
+  generation outlives its launch until the store's next write (an
+  update, revalidation or removal) collects it. It keeps
   `admitted`, so a reinstall cannot admit a commit older than one already
   admitted, and `checked`, clears `refused`, and keeps the jail state.
   An emptied `generations/` numbers again from 1. With no `current` the
@@ -11561,19 +11610,46 @@ foreign `HOME` as `update` does:
   can read below is another filesystem's, and checks a sealed one again
   once it is aside. With neither a cache nor state it answers that nothing
   was deleted and creates neither.
-- `td-app revalidate NAME` reruns rule 5 over `current`'s deploys,
-  fetching nothing, when only what no commit carries changed (`checks=`
-  after a system update), and publishes the same rows under the new
-  digest. The stale copy is no rollback: `previous` stays what it was,
-  and the stale generation is collected. It answers as `ready` does;
-  when the refs changed, a deploy is missing or the validator refuses,
+- `td-app revalidate NAME` reruns rule 5 over `current`'s application
+  deploy, fetching nothing, when what it was validated against changed:
+  what no commit carries (`checks=` after a system update) or the
+  runtime store's `current`, which it holds as `update` does while it
+  validates. It publishes the same application row under the new digest
+  and that `current`'s `runtime=` row. The stale copy is no rollback:
+  `previous` stays what it was, and the stale generation is collected.
+  It answers as `ready` does; when the refs changed, the application's
+  deploy is missing, no runtime is installed or the validator refuses,
   it answers `absent` and records the reason in `refused`. It leaves
   `checked`, since it asked no one. td-jail runs it at a launch that
-  finds `current` no longer serving (below).
+  finds `current` no longer serving (below). It never waits behind a
+  writer that fetches or removes: while one holds the lock it answers
+  `busy` and changes nothing. It waits up to two minutes behind another
+  launch's revalidation, which fetches nothing, and two seconds behind a
+  writer that has not yet recorded its stage.
+
+`ready`'s test, and so `serves`, requires the generation's `runtime=`
+row to be the runtime store's `current` while that is the declared
+runtime with a complete deploy: an application never runs on a runtime
+it was not validated against, and follows the runtime's `current`
+rather than pin an older one.
+
+Three verbs run as the runtime account, each refusing any other UID and
+any `HOME` but its own store root: `td-app runtime update RUNTIME
+--force` above; `td-app runtime status RUNTIME`, the same record as
+`status` parsed by `flathub_app::RuntimeStatus` with `kind=runtime`, the
+runtime's td name and only `.runtime=` rows, `serves` meaning the
+generation names the declared ref with a complete deploy; and `td-app
+runtime remove RUNTIME`, `remove` for the store, which keeps a
+generation a launch or an application's validation holds. A runtime has
+no `delete-data`, `ready` or `revalidate`.
 
 td-authd's `application-cache` operation is the root path to `update
 --force`, `remove`, `delete-data` and `status`, selecting the account
-itself (td-authd/DESIGN.md, "Application cache operation"). td-software's
+itself; its install and update run the runtime's `runtime update` first,
+as the runtime account, and its remove runs `runtime remove` once no
+other installed application names the runtime (td-authd/DESIGN.md,
+"Application cache operation"). Its `runtime-cache` operation is the
+root path to the runtime verbs alone ("Runtime cache operation"). td-software's
 requests reach it from the compositor's control socket as private request
 `24`, which root runs as a process of its own, one operation per
 application at a time (td-authd/DESIGN.md, "Application requests"). That
@@ -11593,31 +11669,51 @@ environment. That takes no lock and answers with the generation
 test above, `checks` included), or `absent`. On `absent` with no
 `current` link in the cache, td-jail refuses: `NAME is not installed;
 install it in td-software`. On `absent` with one, the declaration or
-policy changed under a system update, or a deploy is damaged: td-jail
-runs `/bin/td-app revalidate NAME` the same way, which fetches nothing,
-and launches the generation it answers; if it answers `absent` too,
-td-jail refuses: `NAME did not revalidate offline after a system
-update; update it in td-software`, whose check fetches and admits again.
-A machine whose account had `current` before this cutover therefore
-launches its application with no fetch, and one that never installed it
-shows it as not installed. Host mode refuses such a spec.
+policy changed under a system update, the runtime's `current` moved, or
+a deploy is damaged: td-jail runs `/bin/td-app revalidate NAME` the same
+way, which fetches nothing, and launches the generation it answers; if
+it answers `absent` too, td-jail refuses: `NAME did not revalidate
+offline against this system and its runtime; update it in td-software`,
+whose check fetches and admits again, its runtime first. If it answers
+`busy`, td-jail refuses: `an update of NAME is running; launch it when
+it finishes`. A launch during an update therefore never waits for it:
+it runs the generation `ready` answers while that still serves, and
+refuses only in the stretch where the update has moved the runtime
+store's `current` and not yet published the application on it. A
+machine whose account had `current` before the runtime store has no
+runtime installed there, so its first launch after that landing refuses
+so until the owner updates the application, which installs the runtime
+and collects the runtime the account's cache held; one that never
+installed it shows it as not installed. Host mode refuses such a spec.
 
 **What a launch holds.** td-jail takes a shared `flock` on the
-generation's `selection` and keeps the descriptor in stage 1 for the
+application generation's `selection` and on the runtime store's
+`current` selection, and keeps both descriptors in stage 1 for the
 life of the application; td-app collects only a generation whose
 selection it can lock exclusively, and unlinks it under that lock; a
 selection it cannot open or read, other than one absent, a link or not
-a regular file, ends the collection. So a running application's trees
-outlive any number of newer generations, and a td-jail that locks a
-generation just collected finds it unlinked and asks again (three
-times at most). The trees it binds must each be a
-direct directory `deploy/<commit>/files` of the cache under the
-account's canonical home, owned by the account and writable by no one
-else; their contents are not validated again at launch. Rule 5 ran at
-admission, and outside a jail only td-app and td-jail run as the
-account, neither of which writes a deploy it has selected. No jail sees
-the cache: `~/.td` may not be granted (the permission policy refuses
-it), and td-jail reserves it at launch as it reserves the state.
+a regular file, ends the collection. An application's update or
+revalidation holds the runtime's `current` the same way while it
+validates. So a running application's trees outlive any number of newer
+generations of either, and a td-jail that locks a generation just
+collected finds it unlinked and asks again (three times at most). The
+held runtime generation must be the one the application generation's
+`runtime=` row names; when the runtime moved between td-app's answer and
+the hold, td-jail asks again, and that `ready` answers `absent`, so the
+revalidation follows the new `current`. The application tree it binds
+must be a direct directory `deploy/<commit>/files` of the cache under
+the account's canonical home, owned by the account and writable by no
+one else; the runtime tree a direct directory `deploy/<commit>/files`
+of the runtime store `/var/lib/td/runtimes/<name>`, canonical, whose
+selection and tree are owned by the runtime account and writable by no
+one else. Their contents are not validated again at launch. Rule 5 ran
+at admission, outside a jail only td-app and td-jail run as the
+application's account, and only td-app runs as the runtime account,
+none of them writing a deploy it has selected. No jail sees the
+application cache: `~/.td` may not be granted (the permission policy
+refuses it), and td-jail reserves it at launch as it reserves the
+state. A jail could not write the runtime store if it saw it: it is the
+runtime account's.
 
 **How a launch is requested.** Over the compositor's existing private
 channel to root td-authd (td-authd/DESIGN.md, "Fixed program launch
@@ -11663,7 +11759,10 @@ at 900 seconds, names the same path, and orders Firefox after it. Then
 seconds, drives td-software's request path as the human: `td-ctl install
 firefox` on the control socket, which the compositor forwards as `24`,
 then `td-ctl status firefox` until root reports that install's success
-and a later record naming `current`, and prints
+and a later record naming `current`; then root's `td-authd runtime-cache
+freedesktop-platform-25-08 status` must name the runtime store's
+`current`, and Firefox's cache's `deploy/` must hold exactly one commit,
+its application's. Only then does it print
 `TD-SOFTWARE-INSTALL-OK`, which every system boot oracle requires; it
 drives the control-socket verbs td-software sends rather than
 td-software's window. Anywhere else nothing installs until the owner
@@ -11677,7 +11776,8 @@ declared refs: `source=` the app ref, between `name=` and `runtime=`, and
 `runtime=` the runtime ref rather than a store path. It is foreign
 without a foreign pin (`Recipe::flathub_runtime`, the builder's rule),
 since it runs bytes it does not carry. td-jail resolves such a spec from
-the account's held generation instead of `/td/store`. The OSTree pins,
+the account's held generation and the runtime store's held `current`
+instead of `/td/store`. The OSTree pins,
 the Freedesktop 25.08 recipe, the graph cache's warm in `./update`,
 `td-feed warm ostree`, `td-feed export/consume graphs` and `td-builder
 ostree-materialize` were deleted in the same landing, and roughly 1 GB
@@ -11699,12 +11799,14 @@ its cache held, stays as inert data: firstboot prepares only the
 applications the deployment names, and no unit, launcher, grant or jail
 opens it. Root may delete that directory; the ledger row stays.
 
-**A spec's trees come from one place.** Either both come from
+**A spec's trees come from one source.** Either both come from
 `/td/store`, the application tree from its package (`files/`) and the
-runtime from a store path, or both come from the account's held
-generation, when `runtime=` names the declaration's Flathub runtime ref
-and `source=` its app ref. Firefox takes both from the cache; mail and
-news take both from the store. `flathub_app::spec_source` is the one rule
+runtime from a store path, or both come from Flathub, when `runtime=`
+names the declaration's Flathub runtime ref and `source=` its app ref:
+the application tree from the account's held generation and the
+runtime's from the runtime store's held `current`, the one that
+generation was validated against. Firefox takes both from Flathub; mail
+and news take both from `/td/store`. `flathub_app::spec_source` is the one rule
 the spec compiler and td-jail both apply: a `/td/store` runtime carries no
 `source=`; any other `runtime=` is the declaration's runtime ref beside
 `source=` the declaration's app ref, and the loader policy is the one the
@@ -11727,8 +11829,8 @@ for each ref and asks Flathub when the feed lacks it; a ref the feed
 serves takes its commit, metadata and graph from the feed alone, and a
 feed answer that fails a rule is a refusal, not a reason to ask Flathub.
 The feed is trusted for freshness and availability, never integrity:
-whoever runs it can hold an account at any Flathub-signed commit at or
-above its floor, which on a fresh account is any such commit, so a feed
+whoever runs it can hold a store at any Flathub-signed commit at or
+above its floor, which on a fresh store is any such commit, so a feed
 belongs to the host that runs the guest. Each oracle boot whose line
 carries the autotest token, live ones aside, gets a private `td-feed
 serve` of that feed for its lifetime, QEMU's user-mode NIC with no
@@ -11779,7 +11881,13 @@ and graph transfer (landed tenth). (11) td-software's cutover
 offline; the daily check beside a launch, td-app's throttle and unforced
 form, the launcher's update row, `0e` and `firefox-update` are gone; the
 oracles install through `application-cache` and drive td-software's
-request path.
+request path. (12) The runtime store (WORKLOADS.md, "Landing order",
+step 3): the `td-runtimes` account, its store and delegation from
+td-firstboot, td-app's runtime verbs, applications following the
+store's `current`, td-jail's second lease, root's `runtime-cache`
+operation and `application-cache`'s runtime half, and Firefox's runtime
+moved out of its account's cache, which keeps the application's tree
+alone.
 
 ## X. Host mode — development only
 

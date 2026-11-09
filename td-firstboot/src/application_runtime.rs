@@ -147,68 +147,87 @@ fn assign(file: &File, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// The account td-app's runtime verbs run as (`flathub_app::RUNTIME_UID`),
+/// and the delegation td-login places it in; the recipes hold the crates
+/// to one value.
+const RUNTIME_UID: u32 = 998;
+const RUNTIME_DELEGATION: &str = "td-runtimes";
+
 /// The immutable account and durable reservation must already be validated.
 /// Startup precedes every human/app process; this never repairs a live tree.
 pub(crate) fn prepare(uid: u32) -> Result<(), String> {
     if !(65536..=2147483647).contains(&uid) {
         return Err("invalid application runtime uid".into());
     }
-    let result = (|| {
-        let mut hierarchy = directory(Path::new("/"), &[0])?;
-        for component in ["sys", "fs", "cgroup"] {
-            hierarchy = directory(&at(&hierarchy, component), &[0])?;
-        }
-        require_mount(
-            &bounded(File::open("/proc/self/mountinfo")?, MOUNT_LIMIT)?,
-            hierarchy.metadata()?.dev(),
-        )?;
-        require_controllers(&read(&hierarchy, "cgroup.controllers", 0)?)?;
-        // td-svc enables these before firstboot. Failure withholds enrollment;
-        // this preparation never alters the system's top-level delegation.
-        require_controllers(&read(&hierarchy, "cgroup.subtree_control", 0)?)?;
-        let app = create(&hierarchy, &format!("td-app-{uid}"), uid)?;
-        if read(&app, "cgroup.type", uid)? != "domain"
-            || !read(&app, "cgroup.procs", uid)?.is_empty()
-            || !read(&app, "cgroup.threads", uid)?.is_empty()
-        {
-            return Err(invalid(
-                "application delegation must be an empty domain cgroup",
-            ));
-        }
-        if !read(&app, "cgroup.events", uid)?
-            .lines()
-            .any(|line| line == "populated 0")
-        {
-            return Err(invalid(
-                "application delegation has live descendant processes",
-            ));
-        }
-        require_controllers(&read(&app, "cgroup.controllers", uid)?)?;
-        write(&app, "cgroup.subtree_control", "+cpu +memory +pids\n", uid)?;
-        require_controllers(&read(&app, "cgroup.subtree_control", uid)?)?;
-        let session = create(&app, "session", 0)?;
-        if read(&session, "cgroup.type", 0)? != "domain"
-            || !read(&session, "cgroup.procs", uid)?.is_empty()
-            || !read(&session, "cgroup.threads", uid)?.is_empty()
-            || !read(&session, "cgroup.subtree_control", 0)?.is_empty()
-        {
-            return Err(invalid(
-                "application session must be an empty domain leaf before startup",
-            ));
-        }
-        assign(&session, 0)?;
-        for name in ["cgroup.procs", "cgroup.subtree_control", "cgroup.threads"] {
-            assign(&control(&app, name, false, uid)?, uid)?;
-        }
-        for name in ["cgroup.procs", "cgroup.threads"] {
-            assign(&control(&session, name, false, uid)?, uid)?;
-        }
-        // Delegate the directory only after controllers and ownership read back.
-        assign(&app, uid)
-    })();
-    result.map_err(|error| format!("prepare application uid {uid} cgroup: {error}"))?;
+    delegate(&format!("td-app-{uid}"), uid, "application")
+        .map_err(|error| format!("prepare application uid {uid} cgroup: {error}"))?;
     crate::principal_store::prepare_application_runtime(uid)
         .map_err(|error| format!("prepare application uid {uid} runtime: {error}"))
+}
+
+/// The runtime account's delegation, so td-app fetching a runtime runs in
+/// a cgroup of its own rather than in root's request's. Like an
+/// application's, it is prepared at sysinit, before anything runs as the
+/// account.
+pub(crate) fn prepare_runtime_account() -> Result<(), String> {
+    delegate(RUNTIME_DELEGATION, RUNTIME_UID, "runtime account")
+        .map_err(|error| format!("prepare runtime account cgroup: {error}"))
+}
+
+/// An empty domain cgroup `name` below the root, delegated to `uid`, with
+/// a root-owned `session` leaf whose membership files `uid` writes.
+fn delegate(name: &str, uid: u32, kind: &str) -> io::Result<()> {
+    let mut hierarchy = directory(Path::new("/"), &[0])?;
+    for component in ["sys", "fs", "cgroup"] {
+        hierarchy = directory(&at(&hierarchy, component), &[0])?;
+    }
+    require_mount(
+        &bounded(File::open("/proc/self/mountinfo")?, MOUNT_LIMIT)?,
+        hierarchy.metadata()?.dev(),
+    )?;
+    require_controllers(&read(&hierarchy, "cgroup.controllers", 0)?)?;
+    // td-svc enables these before firstboot. Failure withholds enrollment;
+    // this preparation never alters the system's top-level delegation.
+    require_controllers(&read(&hierarchy, "cgroup.subtree_control", 0)?)?;
+    let app = create(&hierarchy, name, uid)?;
+    if read(&app, "cgroup.type", uid)? != "domain"
+        || !read(&app, "cgroup.procs", uid)?.is_empty()
+        || !read(&app, "cgroup.threads", uid)?.is_empty()
+    {
+        return Err(invalid(&format!(
+            "{kind} delegation must be an empty domain cgroup"
+        )));
+    }
+    if !read(&app, "cgroup.events", uid)?
+        .lines()
+        .any(|line| line == "populated 0")
+    {
+        return Err(invalid(&format!(
+            "{kind} delegation has live descendant processes"
+        )));
+    }
+    require_controllers(&read(&app, "cgroup.controllers", uid)?)?;
+    write(&app, "cgroup.subtree_control", "+cpu +memory +pids\n", uid)?;
+    require_controllers(&read(&app, "cgroup.subtree_control", uid)?)?;
+    let session = create(&app, "session", 0)?;
+    if read(&session, "cgroup.type", 0)? != "domain"
+        || !read(&session, "cgroup.procs", uid)?.is_empty()
+        || !read(&session, "cgroup.threads", uid)?.is_empty()
+        || !read(&session, "cgroup.subtree_control", 0)?.is_empty()
+    {
+        return Err(invalid(&format!(
+            "{kind} session must be an empty domain leaf before startup"
+        )));
+    }
+    assign(&session, 0)?;
+    for name in ["cgroup.procs", "cgroup.subtree_control", "cgroup.threads"] {
+        assign(&control(&app, name, false, uid)?, uid)?;
+    }
+    for name in ["cgroup.procs", "cgroup.threads"] {
+        assign(&control(&session, name, false, uid)?, uid)?;
+    }
+    // Delegate the directory only after controllers and ownership read back.
+    assign(&app, uid)
 }
 
 #[cfg(test)]

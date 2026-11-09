@@ -1,13 +1,17 @@
-//! td-app: fetch, admit and select one account's Flathub application
+//! td-app: fetch, admit and select Flathub runtimes and applications
 //! (APPLICATIONS.md §W.9).
 //!
-//! `td-app update NAME --force` runs as the application's account and owns
-//! `$HOME/.td/flathub`. Every update asks: there is no throttle, since only
-//! the owner's request in td-software runs one (td-software/DESIGN.md §7).
-//! It follows the declared refs as hints, admits a candidate only under
-//! rules 1–5, and publishes a generation by replacing `current` with one
-//! rename. A refusal or failure leaves `current` as it was.
-//! `td-app ready NAME` names the generation td-jail may launch.
+//! `td-app runtime update NAME --force` runs as the runtime account and owns
+//! one store below its home, `/var/lib/td/runtimes/NAME`, which every
+//! account may read. `td-app update NAME --force` runs as an application's
+//! account and owns `$HOME/.td/flathub`, which holds the application's tree
+//! alone: it is validated against the runtime store's `current`, and
+//! follows it. Every update asks: there is no throttle, since only the
+//! owner's request in td-software runs one (td-software/DESIGN.md §7). Each
+//! follows its declared ref as a hint, admits a candidate only under rules
+//! 1–5, and publishes a generation by replacing `current` with one rename.
+//! A refusal or failure leaves `current` as it was. `td-app ready NAME`
+//! names the generation td-jail may launch.
 //!
 //! A provisioned feed (td-vm/DESIGN.md) is tried first for every ref and
 //! is transport only: whatever it serves passes the same rules. The host
@@ -35,9 +39,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use td_engine::application_spec::dynamic_application_policy;
 use td_engine::flathub_app::{
-    self, Admitted, CacheStatus, DeployStatus, FlathubSource, GenerationStatus, Part, Progress,
-    Refusal, Selection, Stage, Status, ADMITTED, CACHE_DIR, CACHE_ENTRIES, CHECKED, CURRENT,
-    DEPLOY, FILES, GENERATIONS, LOCK, OBJECTS, PREVIOUS, PROGRESS, REFUSED, SELECTION, WORK,
+    self, Admitted, CacheStatus, DeployStatus, FlathubRuntime, FlathubSource, GenerationStatus,
+    Part, Progress, Refusal, RuntimeGenerationStatus, RuntimeSelection, RuntimeStatus, Selection,
+    Stage, Status, ADMITTED, CACHE_DIR, CACHE_ENTRIES, CHECKED, CURRENT, DEPLOY, FILES,
+    GENERATIONS, LOCK, OBJECTS, PREVIOUS, PROGRESS, REFUSED, RUNTIME_ACCOUNT, RUNTIME_STORE,
+    RUNTIME_UID, SELECTION, WORK,
 };
 use td_engine::ostree::{self, Checksum, Commit, ObjectKey, ObjectKind};
 
@@ -81,7 +87,11 @@ const EXPORTED: &str = "exported";
 #[derive(Debug, Eq, PartialEq)]
 enum Outcome {
     Ready(Option<u64>),
+    /// `revalidate` found a writer that fetches or removes holding the
+    /// cache's lock, and did not wait for it.
+    Busy,
     Status(Box<Status>),
+    RuntimeStatus(Box<RuntimeStatus>),
     Removed,
     /// Whether there was state to delete.
     Deleted(bool),
@@ -143,10 +153,63 @@ fn unix_now() -> Result<u64, String> {
         .map_err(|error| format!("system clock is before the epoch: {error}"))
 }
 
+/// What a store holds: an application's cache, private to its account, or
+/// one runtime's store, which every account reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Kind {
+    Application,
+    Runtime,
+}
+
 /// A cache td-app writes, which its verbs take rather than each deriving
 /// it from the account's home.
 struct Store {
     root: PathBuf,
+    kind: Kind,
+}
+
+impl Store {
+    fn application(root: PathBuf) -> Store {
+        Store {
+            root,
+            kind: Kind::Application,
+        }
+    }
+
+    fn runtime(root: PathBuf) -> Store {
+        Store {
+            root,
+            kind: Kind::Runtime,
+        }
+    }
+
+    /// The mode of the root, `deploy/` and `generations/`: a runtime store
+    /// is read by every application account that validates or launches on
+    /// it, so those three are 0755 there; `objects/`, `.work`, the lock and
+    /// the state files stay private.
+    fn reader_mode(&self) -> u32 {
+        match self.kind {
+            Kind::Application => 0o700,
+            Kind::Runtime => 0o755,
+        }
+    }
+
+    /// The commits a generation keeps here. An application's keeps only
+    /// its own: its runtime's tree is the runtime store's, so a runtime
+    /// deploy an older cache holds goes at the next collection.
+    fn kept(&self, text: &str) -> Result<String, String> {
+        Ok(match self.kind {
+            Kind::Application => Selection::parse(text)?.application.commit,
+            Kind::Runtime => RuntimeSelection::parse(text)?.runtime.commit,
+        })
+    }
+}
+
+/// A runtime store as an application's verbs see it: read, never written,
+/// and trusted only as `owner`'s.
+struct RuntimeView {
+    root: PathBuf,
+    owner: u32,
 }
 
 fn private_dir(path: &Path) -> Result<(), String> {
@@ -178,10 +241,17 @@ fn prepare_cache(store: &Store) -> Result<(), String> {
         .create(parent)
         .map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
     private_dir(cache)?;
-    fs::set_permissions(cache, fs::Permissions::from_mode(0o700))
+    // Set rather than created: the umask clips a mkdir mode, and an
+    // existing directory keeps whatever it had.
+    let mode = store.reader_mode();
+    fs::set_permissions(cache, fs::Permissions::from_mode(mode))
         .map_err(|error| format!("chmod {}: {error}", cache.display()))?;
-    for name in [OBJECTS, DEPLOY, GENERATIONS] {
-        private_dir(&cache.join(name))?;
+    private_dir(&cache.join(OBJECTS))?;
+    for name in [DEPLOY, GENERATIONS] {
+        let path = cache.join(name);
+        private_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("chmod {}: {error}", path.display()))?;
     }
     Ok(())
 }
@@ -206,6 +276,14 @@ fn open_regular(path: &Path, options: &mut OpenOptions) -> Result<Option<File>, 
 }
 
 fn lock(cache: &Path) -> Result<File, String> {
+    let (path, file) = lock_file(cache)?;
+    file.lock()
+        .map_err(|error| format!("lock {}: {error}", path.display()))?;
+    forget_progress(cache);
+    Ok(file)
+}
+
+fn lock_file(cache: &Path) -> Result<(PathBuf, File), String> {
     let path = cache.join(LOCK);
     let file = open_regular(
         &path,
@@ -216,13 +294,14 @@ fn lock(cache: &Path) -> Result<File, String> {
             .mode(0o600),
     )?
     .ok_or_else(|| format!("{} vanished", path.display()))?;
-    file.lock()
-        .map_err(|error| format!("lock {}: {error}", path.display()))?;
-    // A record a killed writer left would read as this writer's until it
-    // writes its own. Best effort: debris here must not block the run
-    // that clears `.work`.
+    Ok((path, file))
+}
+
+/// A record a killed writer left would read as this writer's until it
+/// writes its own. Best effort: debris here must not block the run that
+/// clears `.work`.
+fn forget_progress(cache: &Path) {
     let _ = remove_entry(&cache.join(WORK).join(PROGRESS));
-    Ok(file)
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
@@ -254,8 +333,8 @@ fn write_state(path: &Path, text: &str) -> Result<(), String> {
         .map_err(|error| format!("write {}: {error}", path.display()))
 }
 
-/// The generation a pointer names, and its selection.
-fn read_pointer(cache: &Path, name: &str) -> Result<Option<(u64, Selection)>, String> {
+/// The generation a pointer names, without reading it.
+fn pointer(cache: &Path, name: &str) -> Result<Option<u64>, String> {
     let link = cache.join(name);
     let target = match fs::read_link(&link) {
         Ok(target) => target,
@@ -265,14 +344,44 @@ fn read_pointer(cache: &Path, name: &str) -> Result<Option<(u64, Selection)>, St
     let target = target
         .to_str()
         .ok_or_else(|| format!("{} is not UTF-8", link.display()))?;
-    let generation = flathub_app::parse_pointer(target)
-        .map_err(|error| format!("{}: {error}", link.display()))?;
-    let path = cache
+    flathub_app::parse_pointer(target)
+        .map(Some)
+        .map_err(|error| format!("{}: {error}", link.display()))
+}
+
+fn selection_path(cache: &Path, generation: u64) -> PathBuf {
+    cache
         .join(GENERATIONS)
         .join(generation.to_string())
-        .join(SELECTION);
+        .join(SELECTION)
+}
+
+/// The generation a pointer names, and its selection's text.
+fn read_pointer_text(cache: &Path, name: &str) -> Result<Option<(u64, String)>, String> {
+    let Some(generation) = pointer(cache, name)? else {
+        return Ok(None);
+    };
+    let path = selection_path(cache, generation);
     let text = read_text(&path)?.ok_or_else(|| format!("{} is missing", path.display()))?;
-    Ok(Some((generation, Selection::parse(&text)?)))
+    Ok(Some((generation, text)))
+}
+
+/// The generation a pointer of an application's cache names, and its
+/// selection.
+fn read_pointer(cache: &Path, name: &str) -> Result<Option<(u64, Selection)>, String> {
+    read_pointer_text(cache, name)?
+        .map(|(generation, text)| Ok((generation, Selection::parse(&text)?)))
+        .transpose()
+}
+
+/// The generation a pointer of a runtime store names, and its selection.
+fn read_runtime_pointer(
+    cache: &Path,
+    name: &str,
+) -> Result<Option<(u64, RuntimeSelection)>, String> {
+    read_pointer_text(cache, name)?
+        .map(|(generation, text)| Ok((generation, RuntimeSelection::parse(&text)?)))
+        .transpose()
 }
 
 /// `.work` is recreated under the lock just before these fetches, and only
@@ -435,7 +544,7 @@ impl RefCheck<'_> {
             return Ok(out);
         }
         if fs::symlink_metadata(&out).is_ok() {
-            remove_tree(&out)?;
+            remove_tree(&set_aside(cache, DEPLOY, hex)?)?;
         }
         let objects = cache.join(OBJECTS).join(hex);
         let spec = AcquireSpec::parse(
@@ -509,13 +618,126 @@ fn expect(source: FlathubSource) -> Result<Expected, String> {
 }
 
 /// A selection still serves the declaration: its name, refs and recorded
-/// checks match, and every deploy it names is complete.
-fn serves(cache: &Path, selection: &Selection, source: FlathubSource, expected: &Expected) -> bool {
+/// checks match, its application deploy is complete, and it was validated
+/// against `runtime`, the runtime store's serving `current`, which every
+/// application follows.
+fn serves(
+    cache: &Path,
+    selection: &Selection,
+    source: FlathubSource,
+    expected: &Expected,
+    runtime: Option<&Admitted>,
+) -> bool {
     selection.name == source.name
         && selection.checks == expected.checks
         && selection.application.exact_ref == source.application
         && selection.runtime.exact_ref == source.runtime.exact_ref
-        && selection.commits().all(|commit| deployed(cache, commit))
+        && runtime == Some(&selection.runtime)
+        && deployed(cache, &selection.application.commit)
+}
+
+/// A runtime store's generation still serves its declaration.
+fn runtime_serves(cache: &Path, selection: &RuntimeSelection, runtime: FlathubRuntime) -> bool {
+    selection.name == runtime.name
+        && selection.runtime.exact_ref == runtime.exact_ref
+        && deployed(cache, &selection.runtime.commit)
+}
+
+/// The runtime store's `current` row while it serves, read without a lock
+/// as `ready` and `status` read; a store that cannot be read serves
+/// nothing, and the revalidation that follows says why.
+fn runtime_serving(view: &RuntimeView, runtime: FlathubRuntime) -> Option<Admitted> {
+    read_pointer_settled(&view.root, CURRENT, RuntimeSelection::parse)
+        .ok()
+        .flatten()
+        .filter(|(_, selection)| runtime_serves(&view.root, selection, runtime))
+        .map(|(_, selection)| selection.runtime)
+}
+
+/// A runtime store's `current`, held: the shared lock on its selection
+/// keeps the runtime account's collection from removing it while an
+/// application is validated against it.
+struct HeldRuntime {
+    selection: RuntimeSelection,
+    /// Its `deploy/<commit>`, which the validator reads.
+    deploy: PathBuf,
+    _lease: File,
+}
+
+/// Hold the runtime store's `current` and check it is the owner's: its
+/// selection and its deploy's `files/` owned by `view.owner` and writable
+/// by no one else. One collected between the link and the lock is read
+/// again, as td-jail does.
+fn hold_runtime(view: &RuntimeView, runtime: FlathubRuntime) -> Result<HeldRuntime, String> {
+    for _ in 0..POINTER_ATTEMPTS {
+        let Some(generation) = pointer(&view.root, CURRENT)? else {
+            return Err(format!(
+                "runtime {} is not installed; update the application to install it",
+                runtime.name
+            ));
+        };
+        let path = selection_path(&view.root, generation);
+        let lease = match OpenOptions::new()
+            .read(true)
+            .custom_flags(crate::feed::OPEN_REGULAR_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("open {}: {error}", path.display())),
+        };
+        lease
+            .lock_shared()
+            .map_err(|error| format!("lock {}: {error}", path.display()))?;
+        let metadata = lease
+            .metadata()
+            .map_err(|error| format!("stat {}: {error}", path.display()))?;
+        if metadata.nlink() == 0 {
+            continue;
+        }
+        if !metadata.is_file() || metadata.uid() != view.owner || metadata.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{} is not a regular file only the runtime account writes",
+                path.display()
+            ));
+        }
+        let limit = u64::try_from(flathub_app::MAX_STATE_BYTES)
+            .map_err(|_| "state limit does not fit u64".to_string())?;
+        let mut bytes = Vec::new();
+        (&lease)
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        let text =
+            String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
+        let selection = RuntimeSelection::parse(&text)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if selection.name != runtime.name || selection.runtime.exact_ref != runtime.exact_ref {
+            return Err(format!(
+                "runtime store {}'s current names another runtime",
+                view.root.display()
+            ));
+        }
+        let deploy = deploy_path(&view.root, &selection.runtime.commit);
+        let files = deploy.join(FILES);
+        let tree = fs::symlink_metadata(&files)
+            .map_err(|error| format!("stat {}: {error}", files.display()))?;
+        if !tree.is_dir() || tree.uid() != view.owner || tree.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{} is not a directory only the runtime account writes",
+                files.display()
+            ));
+        }
+        return Ok(HeldRuntime {
+            selection,
+            deploy,
+            _lease: lease,
+        });
+    }
+    Err(format!(
+        "runtime {}'s current generation was collected each time td-app tried to hold it",
+        runtime.name
+    ))
 }
 
 fn sync_dir(path: &Path) -> Result<(), String> {
@@ -554,7 +776,8 @@ fn list(directory: &Path) -> Result<Vec<(String, PathBuf)>, String> {
 /// both naming the old generation, which costs only the older rollback.
 /// `previous` becomes the `previous` pointer: an update passes the
 /// generation it replaces, a revalidation the rollback it keeps.
-fn publish(cache: &Path, selection: &Selection, previous: Option<u64>) -> Result<u64, String> {
+/// `selection` is the rendered selection, an application's or a runtime's.
+fn publish(cache: &Path, selection: &str, previous: Option<u64>) -> Result<u64, String> {
     let next = list(&cache.join(GENERATIONS))?
         .iter()
         .filter_map(|(name, _)| flathub_app::generation_number(name))
@@ -573,7 +796,7 @@ fn publish(cache: &Path, selection: &Selection, previous: Option<u64>) -> Result
         .mode(0o644)
         .open(&path)
         .map_err(|error| format!("create {}: {error}", path.display()))?;
-    file.write_all(selection.render().as_bytes())
+    file.write_all(selection.as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("write {}: {error}", path.display()))?;
     sync_dir(&directory)?;
@@ -710,18 +933,36 @@ fn hold(selection: &Path) -> Result<Hold, String> {
     }
 }
 
-/// Keep `current`, `previous`, every generation a running td-jail holds,
-/// the commits they name and `also`; nothing else in the cache survives. A
+/// Rename `area`'s entry `name` to `.removing-<name>` beside it, removing
+/// one an earlier removal cut short, and return where it went. Removal
+/// opens a tree's directories to their owner only, so in a runtime store,
+/// which other accounts read, a tree must leave its name first: a reader
+/// looking it up then finds it absent, which it reads as collected, never
+/// a directory it may not enter.
+fn set_aside(cache: &Path, area: &str, name: &str) -> Result<PathBuf, String> {
+    let path = cache.join(area).join(name);
+    let doomed = cache.join(area).join(format!("{REMOVING}{name}"));
+    if fs::symlink_metadata(&doomed).is_ok() {
+        remove_tree(&doomed)?;
+    }
+    fs::rename(&path, &doomed)
+        .map_err(|error| format!("rename {} for removal: {error}", path.display()))?;
+    Ok(doomed)
+}
+
+/// Keep `current`, `previous`, every generation a running td-jail or an
+/// application's validation holds, the commits they keep here
+/// ([`Store::kept`]) and `also`; nothing else in the cache survives. A
 /// generation goes only under an exclusive lock on its selection, so a
-/// td-jail that locks it afterwards finds it unlinked and asks again.
+/// holder that locks it afterwards finds it unlinked and asks again.
 fn collect(store: &Store, also: &[String]) -> Result<(), String> {
     let cache = &store.root;
     let mut keep_generations = Vec::new();
     let mut keep_commits: Vec<String> = also.to_vec();
-    for pointer in [CURRENT, PREVIOUS] {
-        if let Some((generation, selection)) = read_pointer(cache, pointer)? {
+    for name in [CURRENT, PREVIOUS] {
+        if let Some((generation, text)) = read_pointer_text(cache, name)? {
             keep_generations.push(generation.to_string());
-            keep_commits.extend(selection.commits().map(str::to_string));
+            keep_commits.push(store.kept(&text)?);
         }
     }
     for (name, path) in list(&cache.join(GENERATIONS))? {
@@ -729,18 +970,26 @@ fn collect(store: &Store, also: &[String]) -> Result<(), String> {
             continue;
         }
         let selection = path.join(SELECTION);
+        // A generation a reader may look up by number goes aside first,
+        // as a deploy does.
+        let numbered = flathub_app::generation_number(&name).is_some();
         match hold(&selection)? {
+            Hold::Debris if numbered => remove_tree(&set_aside(cache, GENERATIONS, &name)?)?,
             Hold::Debris => remove_tree(&path)?,
             Hold::Free(proof) => {
-                remove_tree(&path)?;
+                if numbered {
+                    remove_tree(&set_aside(cache, GENERATIONS, &name)?)?;
+                } else {
+                    remove_tree(&path)?;
+                }
                 drop(proof);
             }
             Hold::Held => {
                 // A read that fails ends collection, as an open does; one
                 // that does not parse names nothing td-jail could launch.
                 if let Some(text) = read_text(&selection)? {
-                    if let Ok(selection) = Selection::parse(&text) {
-                        keep_commits.extend(selection.commits().map(str::to_string));
+                    if let Ok(commit) = store.kept(&text) {
+                        keep_commits.push(commit);
                     }
                 }
             }
@@ -759,15 +1008,7 @@ fn collect(store: &Store, also: &[String]) -> Result<(), String> {
                     // Not a commit, so nothing reads it as complete.
                     path
                 } else {
-                    let doomed = cache.join(area).join(format!("{REMOVING}{name}"));
-                    // An earlier removal of the same commit cut short.
-                    if fs::symlink_metadata(&doomed).is_ok() {
-                        remove_tree(&doomed)?;
-                    }
-                    fs::rename(&path, &doomed).map_err(|error| {
-                        format!("rename {} for removal: {error}", path.display())
-                    })?;
-                    doomed
+                    set_aside(cache, area, &name)?
                 };
                 remove_tree(&doomed)?;
             }
@@ -935,158 +1176,75 @@ fn clear_work(work: &Path) {
     }
 }
 
-fn update(
-    admission: &Admission<'_>,
+/// One check of a store under its lock, beside a progress record: whatever
+/// fails is the last refusal, and one that completes writes `checked`.
+fn checked_run(
     store: &Store,
-    source: FlathubSource,
     now: u64,
+    body: impl FnOnce(&Tracker) -> Result<Outcome, String>,
 ) -> Result<Outcome, String> {
     prepare_cache(store)?;
-    let _lock = lock(&store.root)?;
-    let outcome = locked_update(admission, store, source, now);
+    let cache = &store.root;
+    let _lock = lock(cache)?;
+    let outcome = (|| -> Result<Outcome, String> {
+        let work = fresh_work(cache)?;
+        let tracker = Tracker::new(&work, Stage::Resolve);
+        let outcome = tracker.run(|| body(&tracker));
+        clear_work(&work);
+        let outcome = outcome?;
+        write_state(&cache.join(CHECKED), &format!("{now}\n"))?;
+        clear_refusal(cache)?;
+        Ok(outcome)
+    })();
     if let Err(error) = &outcome {
-        record_refusal(&store.root, now, error);
+        record_refusal(cache, now, error);
     }
     outcome
 }
 
-/// `update` under the lock: whatever fails here is the last refusal.
-fn locked_update(
+/// `td-app update`: the application against the runtime store's `current`.
+fn update(
     admission: &Admission<'_>,
     store: &Store,
+    view: &RuntimeView,
     source: FlathubSource,
     now: u64,
 ) -> Result<Outcome, String> {
-    let cache = &store.root;
-    let expected = expect(source)?;
-    let current = read_pointer(cache, CURRENT)?;
-    let previous = read_pointer(cache, PREVIOUS)?;
-    let work = fresh_work(cache)?;
-    let tracker = Tracker::new(&work, Stage::Resolve);
-    let outcome = tracker.run(|| {
+    checked_run(store, now, |tracker| {
+        let current = read_pointer(&store.root, CURRENT)?;
+        let previous = read_pointer(&store.root, PREVIOUS)?;
         check(
             admission,
             store,
+            view,
             source,
-            &expected,
             (current, previous),
             now,
-            &tracker,
+            tracker,
         )
-    });
-    clear_work(&work);
-    let outcome = outcome?;
-    write_state(&cache.join(CHECKED), &format!("{now}\n"))?;
-    clear_refusal(cache)?;
-    Ok(outcome)
+    })
 }
 
-type Pointers = (Option<(u64, Selection)>, Option<(u64, Selection)>);
-
-/// Rules 1–5 for what the declaration's refs name now, then publication
-/// and collection, under the lock and beside `tracker`'s record. Every ref
-/// is admitted before any is deployed, so rule 4 and an unchanged
-/// selection are settled before a tree is fetched.
-fn check(
+/// `td-app runtime update`: the runtime account's store for one runtime.
+fn runtime_update(
     admission: &Admission<'_>,
     store: &Store,
-    source: FlathubSource,
-    expected: &Expected,
-    (current, previous): Pointers,
+    runtime: FlathubRuntime,
     now: u64,
-    tracker: &Tracker,
 ) -> Result<Outcome, String> {
-    let cache = &store.root;
-    // Rows for refs no longer declared are dropped, which bounds the file.
-    let mut admitted: Vec<Admitted> = match read_text(&cache.join(ADMITTED))? {
-        Some(text) => flathub_app::parse_admitted(&text)?,
-        None => Vec::new(),
-    };
-    admitted.retain(|row| {
-        row.exact_ref == source.runtime.exact_ref || row.exact_ref == source.application
-    });
-    let known: Vec<&Admitted> = admitted
-        .iter()
-        .chain(current.iter().flat_map(|(_, selection)| selection.rows()))
-        .chain(previous.iter().flat_map(|(_, selection)| selection.rows()))
-        .collect();
+    checked_run(store, now, |tracker| {
+        let current = read_runtime_pointer(&store.root, CURRENT)?;
+        let previous = read_runtime_pointer(&store.root, PREVIOUS)?;
+        runtime_check(admission, store, runtime, (current, previous), now, tracker)
+    })
+}
 
-    let deadline = Instant::now()
-        .checked_add(RESOLVE_TIME)
-        .ok_or("resolve deadline overflows")?;
-    let refs = RefCheck {
-        admission,
-        store,
-        tracker,
-        work: cache.join(WORK),
-        now,
-        deadline,
-    };
-    let runtime = refs.admit(source.runtime.exact_ref, Part::Runtime, &known)?;
-    let application = refs.admit(source.application, Part::Application, &known)?;
-    let metadata = application
-        .metadata
-        .as_deref()
-        .ok_or_else(|| format!("{} commit carries no xa.metadata", source.application))?;
-    flathub_app::require_runtime(metadata, source.runtime.exact_ref)?;
-    drop(known);
-
-    let selection = Selection {
-        name: source.name.to_string(),
-        checks: expected.checks.clone(),
-        application: application.admitted.clone(),
-        runtime: runtime.admitted.clone(),
-    };
-    let candidates = [&application, &runtime];
-    for candidate in &candidates {
-        admitted.retain(|row| row.exact_ref != candidate.admitted.exact_ref);
-        admitted.push(candidate.admitted.clone());
-    }
-    let admitted_text = flathub_app::render_admitted(&admitted);
-
-    let outcome = (|| {
-        let same = current
-            .as_ref()
-            .is_some_and(|(_, selected)| *selected == selection);
-        if same && serves(cache, &selection, source, expected) {
-            // Heals an `admitted` that an interrupted run left behind.
-            write_state(&cache.join(ADMITTED), &admitted_text)?;
-            return Ok(Outcome::Unchanged);
-        }
-        let runtime_out = refs.deploy(&runtime, Part::Runtime)?;
-        let application_out = refs.deploy(&application, Part::Application)?;
-        tracker.set(Stage::Validate, None);
-        (admission.validate)(
-            &application_out,
-            source.entry,
-            &runtime_out,
-            &expected.library_paths,
-            &expected.optional_targets,
-            expected.optional_links,
-        )?;
-        // Written before the flip, so the floor is never below `current`.
-        write_state(&cache.join(ADMITTED), &admitted_text)?;
-        if same {
-            // Current's deploys were restored in place; a new generation
-            // would only push the real rollback out.
-            return Ok(Outcome::Unchanged);
-        }
-        tracker.set(Stage::Publish, None);
-        let generation = publish(
-            cache,
-            &selection,
-            current.as_ref().map(|(number, _)| *number),
-        )?;
-        Ok(Outcome::Selected(generation))
-    })();
-    // A refused candidate keeps its deploy for the next attempt, and only it.
-    let attempted: Vec<String> = candidates
-        .iter()
-        .map(|candidate| candidate.admitted.commit.clone())
-        .collect();
-    tracker.set(Stage::Collect, None);
-    let collected = collect(store, &attempted);
-    match (outcome, collected) {
+/// A check's outcome after the collection that follows it either way.
+fn collected(
+    outcome: Result<Outcome, String>,
+    collection: Result<(), String>,
+) -> Result<Outcome, String> {
+    match (outcome, collection) {
         (Ok(outcome), Ok(())) => Ok(outcome),
         (Ok(_), Err(error)) => Err(error),
         (Err(error), Ok(())) => Err(error),
@@ -1096,14 +1254,206 @@ fn check(
     }
 }
 
-/// The generation td-jail may launch: `current`, while it still serves the
-/// declaration. It takes no lock, so a launch never waits behind a fetch;
-/// collection never removes what `current` names.
-fn ready(store: &Store, source: FlathubSource) -> Result<Option<u64>, String> {
+/// The rows a store already holds for its floor (rule 3), and its
+/// `admitted` rows for `exact_ref` alone, which bounds the file.
+fn admitted_rows(cache: &Path, exact_ref: &str) -> Result<Vec<Admitted>, String> {
+    let mut admitted: Vec<Admitted> = match read_text(&cache.join(ADMITTED))? {
+        Some(text) => flathub_app::parse_admitted(&text)?,
+        None => Vec::new(),
+    };
+    admitted.retain(|row| row.exact_ref == exact_ref);
+    Ok(admitted)
+}
+
+fn deadline() -> Result<Instant, String> {
+    Instant::now()
+        .checked_add(RESOLVE_TIME)
+        .ok_or_else(|| "resolve deadline overflows".to_string())
+}
+
+type RuntimePointers = (
+    Option<(u64, RuntimeSelection)>,
+    Option<(u64, RuntimeSelection)>,
+);
+
+/// Rules 1–3 for what the runtime's ref names now, its deploy, then
+/// publication and collection, under the store's lock. The runtime has no
+/// validator of its own: rule 5's runs per application, against whatever
+/// `current` it follows.
+fn runtime_check(
+    admission: &Admission<'_>,
+    store: &Store,
+    runtime: FlathubRuntime,
+    (current, previous): RuntimePointers,
+    now: u64,
+    tracker: &Tracker,
+) -> Result<Outcome, String> {
+    let cache = &store.root;
+    let mut admitted = admitted_rows(cache, runtime.exact_ref)?;
+    let known: Vec<&Admitted> = admitted
+        .iter()
+        .chain(current.iter().map(|(_, selection)| &selection.runtime))
+        .chain(previous.iter().map(|(_, selection)| &selection.runtime))
+        .collect();
+    let refs = RefCheck {
+        admission,
+        store,
+        tracker,
+        work: cache.join(WORK),
+        now,
+        deadline: deadline()?,
+    };
+    let candidate = refs.admit(runtime.exact_ref, Part::Runtime, &known)?;
+    drop(known);
+    let selection = RuntimeSelection {
+        name: runtime.name.to_string(),
+        runtime: candidate.admitted.clone(),
+    };
+    admitted.retain(|row| row.exact_ref != runtime.exact_ref);
+    admitted.push(candidate.admitted.clone());
+    let admitted_text = flathub_app::render_admitted(&admitted);
+    let outcome = (|| {
+        let same = current
+            .as_ref()
+            .is_some_and(|(_, selected)| *selected == selection);
+        if same && runtime_serves(cache, &selection, runtime) {
+            write_state(&cache.join(ADMITTED), &admitted_text)?;
+            return Ok(Outcome::Unchanged);
+        }
+        refs.deploy(&candidate, Part::Runtime)?;
+        write_state(&cache.join(ADMITTED), &admitted_text)?;
+        if same {
+            // Restored in place.
+            return Ok(Outcome::Unchanged);
+        }
+        tracker.set(Stage::Publish, None);
+        let generation = publish(
+            cache,
+            &selection.render(),
+            current.as_ref().map(|(number, _)| *number),
+        )?;
+        Ok(Outcome::Selected(generation))
+    })();
+    tracker.set(Stage::Collect, None);
+    let collection = collect(store, std::slice::from_ref(&candidate.admitted.commit));
+    collected(outcome, collection)
+}
+
+type Pointers = (Option<(u64, Selection)>, Option<(u64, Selection)>);
+
+/// Rules 1–5 for what the application's ref names now, against the
+/// runtime store's `current`, then publication and collection, under the
+/// lock and beside `tracker`'s record. The ref is admitted and rule 4
+/// checked before its tree is fetched, so an unchanged selection is
+/// settled first. The runtime is the runtime account's to fetch: this
+/// holds its `current` while the application is validated against it, and
+/// records that commit as the selection's `runtime=` row.
+fn check(
+    admission: &Admission<'_>,
+    store: &Store,
+    view: &RuntimeView,
+    source: FlathubSource,
+    (current, previous): Pointers,
+    now: u64,
+    tracker: &Tracker,
+) -> Result<Outcome, String> {
     let cache = &store.root;
     let expected = expect(source)?;
+    let mut admitted = admitted_rows(cache, source.application)?;
+    let known: Vec<&Admitted> = admitted
+        .iter()
+        .chain(current.iter().flat_map(|(_, selection)| selection.rows()))
+        .chain(previous.iter().flat_map(|(_, selection)| selection.rows()))
+        .collect();
+    let refs = RefCheck {
+        admission,
+        store,
+        tracker,
+        work: cache.join(WORK),
+        now,
+        deadline: deadline()?,
+    };
+    let application = refs.admit(source.application, Part::Application, &known)?;
+    let metadata = application
+        .metadata
+        .as_deref()
+        .ok_or_else(|| format!("{} commit carries no xa.metadata", source.application))?;
+    flathub_app::require_runtime(metadata, source.runtime.exact_ref)?;
+    drop(known);
+    let runtime = hold_runtime(view, source.runtime)?;
+
+    let selection = Selection {
+        name: source.name.to_string(),
+        checks: expected.checks.clone(),
+        application: application.admitted.clone(),
+        runtime: runtime.selection.runtime.clone(),
+    };
+    admitted.retain(|row| row.exact_ref != source.application);
+    admitted.push(application.admitted.clone());
+    let admitted_text = flathub_app::render_admitted(&admitted);
+
+    let outcome = (|| {
+        let same = current
+            .as_ref()
+            .is_some_and(|(_, selected)| *selected == selection);
+        if same
+            && serves(
+                cache,
+                &selection,
+                source,
+                &expected,
+                Some(&runtime.selection.runtime),
+            )
+        {
+            // Heals an `admitted` that an interrupted run left behind.
+            write_state(&cache.join(ADMITTED), &admitted_text)?;
+            return Ok(Outcome::Unchanged);
+        }
+        let application_out = refs.deploy(&application, Part::Application)?;
+        tracker.set(Stage::Validate, None);
+        (admission.validate)(
+            &application_out,
+            source.entry,
+            &runtime.deploy,
+            &expected.library_paths,
+            &expected.optional_targets,
+            expected.optional_links,
+        )?;
+        // Written before the flip, so the floor is never below `current`.
+        write_state(&cache.join(ADMITTED), &admitted_text)?;
+        if same {
+            // Current's deploy was restored in place; a new generation
+            // would only push the real rollback out.
+            return Ok(Outcome::Unchanged);
+        }
+        tracker.set(Stage::Publish, None);
+        let generation = publish(
+            cache,
+            &selection.render(),
+            current.as_ref().map(|(number, _)| *number),
+        )?;
+        Ok(Outcome::Selected(generation))
+    })();
+    drop(runtime);
+    // A refused candidate keeps its deploy for the next attempt, and only it.
+    tracker.set(Stage::Collect, None);
+    let collection = collect(store, std::slice::from_ref(&application.admitted.commit));
+    collected(outcome, collection)
+}
+
+/// The generation td-jail may launch: `current`, while it still serves the
+/// declaration against the runtime store's `current`. It takes no lock,
+/// and `revalidate` answers `busy` rather than wait behind a writer that
+/// fetches or removes, so a launch never waits behind a fetch; collection
+/// never removes what `current` names.
+fn ready(store: &Store, view: &RuntimeView, source: FlathubSource) -> Result<Option<u64>, String> {
+    let cache = &store.root;
+    let expected = expect(source)?;
+    let runtime = runtime_serving(view, source.runtime);
     Ok(match read_pointer(cache, CURRENT)? {
-        Some((generation, selection)) if serves(cache, &selection, source, &expected) => {
+        Some((generation, selection))
+            if serves(cache, &selection, source, &expected, runtime.as_ref()) =>
+        {
             Some(generation)
         }
         _ => None,
@@ -1147,11 +1497,20 @@ fn deploy_bytes(files: &Path) -> Result<u64, String> {
 /// A pointer as `status` reads it without the lock: a check can move it
 /// and collect the generation it named between the link and the
 /// selection, so a missing selection is read again from the link.
-fn read_pointer_settled(cache: &Path, pointer: &str) -> Result<Option<(u64, Selection)>, String> {
+fn read_pointer_settled<T>(
+    cache: &Path,
+    name: &str,
+    parse: fn(&str) -> Result<T, String>,
+) -> Result<Option<(u64, T)>, String> {
     let mut attempts = 0;
     loop {
         attempts += 1;
-        match read_pointer(cache, pointer) {
+        let read = read_pointer_text(cache, name).and_then(|found| {
+            found
+                .map(|(generation, text)| Ok((generation, parse(&text)?)))
+                .transpose()
+        });
+        match read {
             Err(_) if attempts < POINTER_ATTEMPTS => {}
             settled => return settled,
         }
@@ -1198,42 +1557,71 @@ fn writer_progress(cache: &Path) -> Result<Option<Progress>, String> {
     }
 }
 
-/// `td-app status`: the cache as it reads now, taking no lock, as `ready`
-/// takes none. It writes nothing, and a cache that does not exist reads as
-/// one with nothing installed.
-fn status(store: &Store, source: FlathubSource) -> Result<Status, String> {
-    let cache = &store.root;
-    let expected = expect(source)?;
-    let generation = |pointer| -> Result<Option<GenerationStatus>, String> {
-        Ok(
-            read_pointer_settled(cache, pointer)?.map(|(generation, selection)| GenerationStatus {
-                generation,
-                serves: serves(cache, &selection, source, &expected),
-                application: deploy_status(cache, &selection.application),
-                runtime: deploy_status(cache, &selection.runtime),
-            }),
-        )
-    };
-    let current = generation(CURRENT)?;
-    let previous = generation(PREVIOUS)?;
-    // A damaged refusal record is no refusal; it is rewritten or cleared by
-    // the next check.
-    let refused = read_text(&cache.join(REFUSED))
+/// The last refusal a store records. A damaged record is no refusal; it is
+/// rewritten or cleared by the next check.
+fn read_refusal(cache: &Path) -> Option<Refusal> {
+    read_text(&cache.join(REFUSED))
         .ok()
         .flatten()
         .and_then(|text| {
             text.strip_suffix('\n')
                 .and_then(|line| Refusal::parse(line).ok())
-        });
+        })
+}
+
+/// `td-app status`: the cache as it reads now, taking no lock, as `ready`
+/// takes none. It writes nothing, and a cache that does not exist reads as
+/// one with nothing installed. A generation's runtime row is measured in
+/// the runtime store, where its tree is.
+fn status(store: &Store, view: &RuntimeView, source: FlathubSource) -> Result<Status, String> {
+    let cache = &store.root;
+    let expected = expect(source)?;
+    let runtime = runtime_serving(view, source.runtime);
+    let generation = |pointer| -> Result<Option<GenerationStatus>, String> {
+        Ok(read_pointer_settled(cache, pointer, Selection::parse)?.map(
+            |(generation, selection)| GenerationStatus {
+                generation,
+                serves: serves(cache, &selection, source, &expected, runtime.as_ref()),
+                application: deploy_status(cache, &selection.application),
+                runtime: deploy_status(&view.root, &selection.runtime),
+            },
+        ))
+    };
+    let current = generation(CURRENT)?;
+    let previous = generation(PREVIOUS)?;
     Ok(Status {
         name: source.name.to_string(),
         cache: Some(CacheStatus {
             current,
             previous,
             checked: read_checked(cache)?,
-            refused,
+            refused: read_refusal(cache),
             progress: writer_progress(cache)?,
         }),
+    })
+}
+
+/// `td-app runtime status`: one runtime store as `status` reads a cache.
+fn runtime_status(store: &Store, runtime: FlathubRuntime) -> Result<RuntimeStatus, String> {
+    let cache = &store.root;
+    let generation = |pointer| -> Result<Option<RuntimeGenerationStatus>, String> {
+        Ok(
+            read_pointer_settled(cache, pointer, RuntimeSelection::parse)?.map(
+                |(generation, selection)| RuntimeGenerationStatus {
+                    generation,
+                    serves: runtime_serves(cache, &selection, runtime),
+                    runtime: deploy_status(cache, &selection.runtime),
+                },
+            ),
+        )
+    };
+    Ok(RuntimeStatus {
+        name: runtime.name.to_string(),
+        current: generation(CURRENT)?,
+        previous: generation(PREVIOUS)?,
+        checked: read_checked(cache)?,
+        refused: read_refusal(cache),
+        progress: writer_progress(cache)?,
     })
 }
 
@@ -1363,28 +1751,86 @@ fn delete_state(home: &Path, name: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// `td-app revalidate`: rule 5 again over the deploys `current` already
-/// has, fetching nothing, when only what no commit carries changed (a
-/// system update's entry or loader policy, `checks=`). It answers as
-/// `ready` does: the generation that serves now, or `absent` with the
-/// reason recorded as the last refusal.
+/// `td-app revalidate`: rule 5 again over the application deploy `current`
+/// already has, fetching nothing, when what it was validated against
+/// changed: what no commit carries (a system update's entry or loader
+/// policy, `checks=`) or the runtime store's `current`, which every
+/// application follows. It answers as `ready` does: the generation that
+/// serves now, or `absent` with the reason recorded as the last refusal;
+/// or `busy`, changing nothing, while an update or removal holds the
+/// cache, which a launch does not wait for.
 fn revalidate(
     admission: &Admission<'_>,
     store: &Store,
+    view: &RuntimeView,
+    source: FlathubSource,
+    now: u64,
+) -> Result<Outcome, String> {
+    let cache = &store.root;
+    if fs::symlink_metadata(cache).is_err() {
+        return Ok(Outcome::Ready(None));
+    }
+    prepare_cache(store)?;
+    let Some(_lock) = launch_lock(cache)? else {
+        return Ok(Outcome::Busy);
+    };
+    revalidate_held(admission, store, view, source, now).map(Outcome::Ready)
+}
+
+/// How long a launch's revalidation waits behind another launch's, which
+/// fetches nothing; and how long behind a writer that has not yet said
+/// what it is doing.
+const REVALIDATION_WAIT: Duration = Duration::from_secs(120);
+const UNANNOUNCED_WAIT: Duration = Duration::from_secs(2);
+
+/// The cache's lock for a launch, or `None` while a writer that fetches
+/// or removes holds it: a launch never waits behind an update, whose
+/// bound is an hour. It waits only behind another launch's revalidation,
+/// within its own bound, and a writer's first moments.
+fn launch_lock(cache: &Path) -> Result<Option<File>, String> {
+    let (path, file) = lock_file(cache)?;
+    let begin = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                forget_progress(cache);
+                return Ok(Some(file));
+            }
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(error)) => {
+                return Err(format!("lock {}: {error}", path.display()))
+            }
+        }
+        let waited = begin.elapsed();
+        let stage = writer_progress(cache)?.map(|progress| progress.stage);
+        let wait = match stage {
+            // Released between the two looks: try again.
+            None | Some(Stage::Revalidate) => waited < REVALIDATION_WAIT,
+            Some(Stage::Busy) => waited < UNANNOUNCED_WAIT,
+            Some(_) => false,
+        };
+        if !wait {
+            return Ok(None);
+        }
+        std::thread::sleep(PROGRESS_TICK);
+    }
+}
+
+/// `revalidate` under the cache's lock.
+fn revalidate_held(
+    admission: &Admission<'_>,
+    store: &Store,
+    view: &RuntimeView,
     source: FlathubSource,
     now: u64,
 ) -> Result<Option<u64>, String> {
     let cache = &store.root;
-    if fs::symlink_metadata(cache).is_err() {
-        return Ok(None);
-    }
-    prepare_cache(store)?;
-    let _lock = lock(cache)?;
     let expected = expect(source)?;
     let Some((number, selection)) = read_pointer(cache, CURRENT)? else {
         return Ok(None);
     };
-    if serves(cache, &selection, source, &expected) {
+    let serving = runtime_serving(view, source.runtime);
+    if serves(cache, &selection, source, &expected, serving.as_ref()) {
         return Ok(Some(number));
     }
     let work = fresh_work(cache)?;
@@ -1399,27 +1845,30 @@ fn revalidate(
                 source.name
             ));
         }
-        if !selection.commits().all(|commit| deployed(cache, commit)) {
+        if !deployed(cache, &selection.application.commit) {
             return Err(format!(
-                "a deploy of {}'s current generation is missing; it needs an update",
+                "the deploy of {}'s current generation is missing; it needs an update",
                 source.name
             ));
         }
+        let runtime = hold_runtime(view, source.runtime)?;
         (admission.validate)(
             &deploy_path(cache, &selection.application.commit),
             source.entry,
-            &deploy_path(cache, &selection.runtime.commit),
+            &runtime.deploy,
             &expected.library_paths,
             &expected.optional_targets,
             expected.optional_links,
         )?;
         let next = Selection {
             checks: expected.checks.clone(),
+            runtime: runtime.selection.runtime.clone(),
             ..selection.clone()
         };
+        drop(runtime);
         // The stale copy is no rollback: `previous` stays what it was.
         let previous = read_pointer(cache, PREVIOUS)?.map(|(generation, _)| generation);
-        let generation = publish(cache, &next, previous)?;
+        let generation = publish(cache, &next.render(), previous)?;
         collect(store, &[])?;
         Ok(generation)
     })();
@@ -1436,22 +1885,60 @@ fn revalidate(
     }
 }
 
+fn process_uid() -> Result<u32, String> {
+    Ok(fs::metadata("/proc/self")
+        .map_err(|error| format!("stat /proc/self: {error}"))?
+        .uid())
+}
+
+fn home_owner(home: &Path) -> Result<u32, String> {
+    Ok(fs::metadata(home)
+        .map_err(|error| format!("stat {}: {error}", home.display()))?
+        .uid())
+}
+
 /// The cache must belong to the account td-app runs as: as root it would
 /// leave entries the account cannot remove and follow links the account
-/// planted.
+/// planted. The runtime account has no application cache.
 fn require_account(home: &Path) -> Result<(), String> {
-    let uid = fs::metadata("/proc/self")
-        .map_err(|error| format!("stat /proc/self: {error}"))?
-        .uid();
+    application_account(process_uid()?, home, home_owner(home)?)
+}
+
+fn application_account(uid: u32, home: &Path, owner: u32) -> Result<(), String> {
     if uid == 0 {
         return Err("td-app runs as an application account, not root".into());
     }
-    let owner = fs::metadata(home)
-        .map_err(|error| format!("stat {}: {error}", home.display()))?
-        .uid();
+    if uid == RUNTIME_UID {
+        return Err(format!(
+            "{RUNTIME_ACCOUNT} owns runtimes, not an application; use td-app runtime"
+        ));
+    }
     if owner != uid {
         return Err(format!(
             "HOME {} belongs to uid {owner}, not this account's {uid}",
+            home.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The runtime verbs run only as the runtime account, on its own home,
+/// which is the store's root.
+fn runtime_account(uid: u32, home: &Path, owner: u32) -> Result<(), String> {
+    if uid != RUNTIME_UID {
+        return Err(format!(
+            "td-app runtime runs as {RUNTIME_ACCOUNT} (uid {RUNTIME_UID}), not uid {uid}"
+        ));
+    }
+    if home != Path::new(RUNTIME_STORE) {
+        return Err(format!(
+            "HOME {} is not the runtime store {RUNTIME_STORE}",
+            home.display()
+        ));
+    }
+    if owner != uid {
+        return Err(format!(
+            "HOME {} belongs to uid {owner}, not {RUNTIME_ACCOUNT}'s",
             home.display()
         ));
     }
@@ -1470,9 +1957,7 @@ fn export(
     feed_store: &Path,
     now: u64,
 ) -> Result<Vec<String>, String> {
-    prepare_cache(&Store {
-        root: cache.to_path_buf(),
-    })?;
+    prepare_cache(&Store::application(cache.to_path_buf()))?;
     let _lock = lock(cache)?;
     let work = cache.join(WORK);
     if fs::symlink_metadata(&work).is_ok() {
@@ -1659,11 +2144,14 @@ pub(crate) fn export_to(store: &Path) -> Result<Vec<String>, String> {
 fn usage() -> ! {
     eprintln!(
         "usage: td-app update NAME --force | td-app ready NAME | td-app status NAME | \
-         td-app remove NAME | td-app delete-data NAME | td-app revalidate NAME"
+         td-app remove NAME | td-app delete-data NAME | td-app revalidate NAME | \
+         td-app runtime update RUNTIME --force | td-app runtime status RUNTIME | \
+         td-app runtime remove RUNTIME"
     );
     std::process::exit(2);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Verb {
     Update,
     Ready,
@@ -1673,63 +2161,146 @@ enum Verb {
     Revalidate,
 }
 
-pub fn run(args: &[String]) {
-    let (name, verb) = match args.get(1..) {
-        // Every update is the owner's forced check; the unforced, throttled
-        // form is gone with the check beside a launch.
-        Some([verb, name, flag]) if verb == "update" && flag == "--force" => (name, Verb::Update),
-        Some([verb, name]) => match verb.as_str() {
-            "ready" => (name, Verb::Ready),
-            "status" => (name, Verb::Status),
-            "remove" => (name, Verb::Remove),
-            "delete-data" => (name, Verb::DeleteData),
-            "revalidate" => (name, Verb::Revalidate),
-            _ => usage(),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeVerb {
+    Update,
+    Status,
+    Remove,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum Request<'a> {
+    Application(Verb, &'a str),
+    Runtime(RuntimeVerb, &'a str),
+}
+
+/// Every update is the owner's forced check; the unforced, throttled form
+/// is gone with the check beside a launch.
+fn parse_request(args: &[String]) -> Option<Request<'_>> {
+    Some(match args.get(1..)? {
+        [scope, verb, name, flag]
+            if scope == "runtime" && verb == "update" && flag == "--force" =>
+        {
+            Request::Runtime(RuntimeVerb::Update, name)
+        }
+        [scope, verb, name] if scope == "runtime" => match verb.as_str() {
+            "status" => Request::Runtime(RuntimeVerb::Status, name),
+            "remove" => Request::Runtime(RuntimeVerb::Remove, name),
+            _ => return None,
         },
-        _ => usage(),
-    };
-    let Some(source) = flathub_app::flathub_source(name) else {
-        eprintln!("td-app: {name} is not a Flathub application");
-        std::process::exit(2);
-    };
-    let result = (|| {
-        let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-        let home = Path::new(&home);
-        if !home.is_absolute() {
-            return Err(format!("HOME {} is not absolute", home.display()));
+        [verb, name, flag] if verb == "update" && flag == "--force" => {
+            Request::Application(Verb::Update, name)
         }
-        require_account(home)?;
-        // Only an update fetches; nothing else asks for a feed.
-        let feed = match verb {
-            Verb::Update => crate::feed::provisioned_feed_base()?,
-            _ => None,
-        };
-        let admission = Admission {
-            repository: flathub_app::REPOSITORY,
-            feed: feed.as_deref(),
-            verify: verify_flathub,
-            validate: validate_dynamic,
-        };
-        let cache = Store {
-            root: home.join(CACHE_DIR),
-        };
-        match verb {
-            Verb::Update => update(&admission, &cache, source, unix_now()?),
-            Verb::Ready => ready(&cache, source).map(Outcome::Ready),
-            Verb::Status => status(&cache, source).map(|status| Outcome::Status(Box::new(status))),
-            Verb::Remove => remove(&cache),
-            Verb::DeleteData => delete_data(home, &cache, source),
-            Verb::Revalidate => {
-                revalidate(&admission, &cache, source, unix_now()?).map(Outcome::Ready)
-            }
+        [verb, name] => Request::Application(
+            match verb.as_str() {
+                "ready" => Verb::Ready,
+                "status" => Verb::Status,
+                "remove" => Verb::Remove,
+                "delete-data" => Verb::DeleteData,
+                "revalidate" => Verb::Revalidate,
+                _ => return None,
+            },
+            name,
+        ),
+        _ => return None,
+    })
+}
+
+fn admission(feed: Option<&str>) -> Admission<'_> {
+    Admission {
+        repository: flathub_app::REPOSITORY,
+        feed,
+        verify: verify_flathub,
+        validate: validate_dynamic,
+    }
+}
+
+/// An application's verbs, as its account, on its cache and the runtime
+/// store it reads.
+fn run_application(home: &Path, verb: Verb, source: FlathubSource) -> Result<Outcome, String> {
+    require_account(home)?;
+    // Only an update fetches; nothing else asks for a feed.
+    let feed = match verb {
+        Verb::Update => crate::feed::provisioned_feed_base()?,
+        _ => None,
+    };
+    let admission = admission(feed.as_deref());
+    let cache = Store::application(home.join(CACHE_DIR));
+    let view = RuntimeView {
+        root: Path::new(RUNTIME_STORE).join(source.runtime.name),
+        owner: RUNTIME_UID,
+    };
+    match verb {
+        Verb::Update => update(&admission, &cache, &view, source, unix_now()?),
+        Verb::Ready => ready(&cache, &view, source).map(Outcome::Ready),
+        Verb::Status => {
+            status(&cache, &view, source).map(|status| Outcome::Status(Box::new(status)))
         }
-    })();
+        Verb::Remove => remove(&cache),
+        Verb::DeleteData => delete_data(home, &cache, source),
+        Verb::Revalidate => revalidate(&admission, &cache, &view, source, unix_now()?),
+    }
+}
+
+/// A runtime's verbs, as the runtime account, on its store.
+fn run_runtime(home: &Path, verb: RuntimeVerb, runtime: FlathubRuntime) -> Result<Outcome, String> {
+    runtime_account(process_uid()?, home, home_owner(home)?)?;
+    let store = Store::runtime(home.join(runtime.name));
+    match verb {
+        RuntimeVerb::Update => {
+            let feed = crate::feed::provisioned_feed_base()?;
+            runtime_update(&admission(feed.as_deref()), &store, runtime, unix_now()?)
+        }
+        RuntimeVerb::Status => {
+            runtime_status(&store, runtime).map(|status| Outcome::RuntimeStatus(Box::new(status)))
+        }
+        RuntimeVerb::Remove => remove(&store),
+    }
+}
+
+fn account_home() -> Result<PathBuf, String> {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
+    if !home.is_absolute() {
+        return Err(format!("HOME {} is not absolute", home.display()));
+    }
+    Ok(home)
+}
+
+pub fn run(args: &[String]) {
+    let Some(request) = parse_request(args) else {
+        usage();
+    };
+    let (name, result) = match request {
+        Request::Application(verb, name) => {
+            let Some(source) = flathub_app::flathub_source(name) else {
+                eprintln!("td-app: {name} is not a Flathub application");
+                std::process::exit(2);
+            };
+            (
+                name,
+                account_home().and_then(|home| run_application(&home, verb, source)),
+            )
+        }
+        Request::Runtime(verb, name) => {
+            let Some(runtime) = flathub_app::flathub_runtime(name) else {
+                eprintln!("td-app: {name} is not a declared Flathub runtime");
+                std::process::exit(2);
+            };
+            (
+                name,
+                account_home().and_then(|home| run_runtime(&home, verb, runtime)),
+            )
+        }
+    };
     match result {
-        // td-jail's answer: one line, a generation or `absent`.
+        // td-jail's answer: one line, a generation, `absent` or `busy`.
         Ok(Outcome::Ready(Some(generation))) => println!("{generation}"),
         Ok(Outcome::Ready(None)) => println!("absent"),
+        // A launch's revalidation found an update or removal running.
+        Ok(Outcome::Busy) => println!("busy"),
         // The status record, which the root operation relays.
         Ok(Outcome::Status(status)) => print!("{}", status.render()),
+        Ok(Outcome::RuntimeStatus(status)) => print!("{}", status.render()),
         Ok(Outcome::Removed) => println!("td-app: {name} is removed"),
         Ok(Outcome::Deleted(true)) => println!("td-app: {name}'s data is deleted"),
         Ok(Outcome::Deleted(false)) => println!("td-app: {name} has no data to delete"),
@@ -1755,6 +2326,20 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
+    /// `revalidate`'s answer to a launch with no writer in its way.
+    fn revalidate(
+        admission: &Admission<'_>,
+        store: &Store,
+        view: &RuntimeView,
+        source: FlathubSource,
+        now: u64,
+    ) -> Result<Option<u64>, String> {
+        match super::revalidate(admission, store, view, source, now)? {
+            Outcome::Ready(answer) => Ok(answer),
+            other => Err(format!("{other:?}")),
+        }
+    }
+
     const APP: &str = "app/org.example.App/x86_64/stable";
     const RUNTIME: &str = "runtime/org.example.Platform/x86_64/1";
     const APP_METADATA: &str =
@@ -1766,6 +2351,10 @@ mod tests {
     thread_local! {
         static VALIDATED: RefCell<Vec<(PathBuf, PathBuf)>> = const { RefCell::new(Vec::new()) };
         static REFUSE: RefCell<bool> = const { RefCell::new(false) };
+        /// A runtime store whose `current` the validator finds held, or
+        /// not, by a shared lease: what it saw is pushed to `LEASED`.
+        static PROBE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+        static LEASED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
     }
 
     fn source() -> FlathubSource {
@@ -1809,6 +2398,12 @@ mod tests {
     ) -> Result<(), String> {
         if REFUSE.with(|refuse| *refuse.borrow()) {
             return Err("fixture validator refuses".into());
+        }
+        if let Some(store) = PROBE.with(|probe| probe.borrow().clone()) {
+            let generation = pointer(&store, CURRENT).unwrap().unwrap();
+            let probe = File::open(selection_path(&store, generation)).unwrap();
+            let held = matches!(probe.try_lock(), Err(TryLockError::WouldBlock));
+            LEASED.with(|leased| leased.borrow_mut().push(held));
         }
         VALIDATED.with(|seen| {
             seen.borrow_mut()
@@ -1893,9 +2488,15 @@ mod tests {
     struct Fixture {
         _root: crate::test_temp::TempDir,
         home: PathBuf,
+        /// The runtime account's home: the store root.
+        runtimes: PathBuf,
         repository: Repository,
         url: String,
         feed: Option<String>,
+    }
+
+    fn own_uid() -> u32 {
+        process_uid().unwrap()
     }
 
     impl Fixture {
@@ -1903,11 +2504,14 @@ mod tests {
             let root = crate::test_temp::TempDir::new(&format!("td-app-{label}")).unwrap();
             let home = root.join("home");
             fs::create_dir(&home).unwrap();
+            let runtimes = root.join("runtimes");
+            fs::create_dir(&runtimes).unwrap();
             let repository = Repository::default();
             let url = serve(repository.clone());
             Fixture {
                 _root: root,
                 home,
+                runtimes,
                 repository,
                 url,
                 feed: None,
@@ -1919,31 +2523,70 @@ mod tests {
         }
 
         fn store(&self) -> Store {
-            Store { root: self.cache() }
+            Store::application(self.cache())
         }
 
+        /// The runtime store `source()` names.
+        fn runtime_cache(&self) -> PathBuf {
+            self.runtimes.join(source().runtime.name)
+        }
+
+        fn runtime_store(&self) -> Store {
+            Store::runtime(self.runtime_cache())
+        }
+
+        /// The store as the application's verbs see it; the test's own
+        /// uid stands for the runtime account's.
+        fn view(&self) -> RuntimeView {
+            RuntimeView {
+                root: self.runtime_cache(),
+                owner: own_uid(),
+            }
+        }
+
+        /// What root's install and update run: the runtime's check as the
+        /// runtime account, then the application's.
         fn update(&self, source: FlathubSource, now: u64) -> Result<Outcome, String> {
-            let admission = Admission {
-                repository: &self.url,
-                feed: self.feed.as_deref(),
-                verify: verify_fixture,
-                validate: validate_fixture,
-            };
-            update(&admission, &self.store(), source, now)
+            self.update_runtime(source.runtime, now)?;
+            self.update_application(source, now)
+        }
+
+        fn update_runtime(&self, runtime: FlathubRuntime, now: u64) -> Result<Outcome, String> {
+            runtime_update(&self.admission(), &self.runtime_store(), runtime, now)
+        }
+
+        fn update_application(&self, source: FlathubSource, now: u64) -> Result<Outcome, String> {
+            update(&self.admission(), &self.store(), &self.view(), source, now)
         }
 
         fn current(&self) -> Option<(u64, Selection)> {
             read_pointer(&self.cache(), CURRENT).unwrap()
         }
 
-        fn names(&self, area: &str) -> Vec<String> {
-            let mut names: Vec<String> = fs::read_dir(self.cache().join(area))
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-                .collect();
-            names.sort();
-            names
+        fn runtime_current(&self) -> Option<(u64, RuntimeSelection)> {
+            read_runtime_pointer(&self.runtime_cache(), CURRENT).unwrap()
         }
+
+        fn names(&self, area: &str) -> Vec<String> {
+            names_in(&self.cache().join(area))
+        }
+
+        fn runtime_names(&self, area: &str) -> Vec<String> {
+            names_in(&self.runtime_cache().join(area))
+        }
+    }
+
+    fn names_in(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
     }
 
     fn sorted(mut names: Vec<String>) -> Vec<String> {
@@ -1973,30 +2616,445 @@ mod tests {
         assert_eq!(selection.runtime.timestamp, 10);
         assert_eq!(selection.application.commit, app);
         assert!(read_pointer(&fixture.cache(), PREVIOUS).unwrap().is_none());
+        // The application's tree is its cache's; the runtime's is the
+        // runtime store's alone.
         let deploy = fixture.cache().join(DEPLOY);
+        let runtime_deploy = fixture.runtime_cache().join(DEPLOY);
         assert_eq!(
             fs::read(deploy.join(&app).join("files/payload")).unwrap(),
             b"app"
         );
+        assert_eq!(fixture.names(DEPLOY), vec![app.clone()]);
+        assert_eq!(fixture.names(OBJECTS), vec![app.clone()]);
         assert_eq!(
-            fs::read(deploy.join(&runtime).join("files/payload")).unwrap(),
+            fs::read(runtime_deploy.join(&runtime).join("files/payload")).unwrap(),
             b"usr"
         );
+        let (number, held) = fixture.runtime_current().unwrap();
+        assert_eq!((number, held.runtime.commit), (1, runtime.clone()));
         VALIDATED.with(|seen| {
             assert_eq!(
                 *seen.borrow(),
-                vec![(deploy.join(&app), deploy.join(&runtime))]
+                vec![(deploy.join(&app), runtime_deploy.join(&runtime))]
             );
         });
-        let admitted = fs::read_to_string(fixture.cache().join(ADMITTED)).unwrap();
-        assert_eq!(flathub_app::parse_admitted(&admitted).unwrap().len(), 2);
+        for (cache, exact_ref) in [(fixture.cache(), APP), (fixture.runtime_cache(), RUNTIME)] {
+            let admitted = fs::read_to_string(cache.join(ADMITTED)).unwrap();
+            let rows = flathub_app::parse_admitted(&admitted).unwrap();
+            let [row] = rows.as_slice() else {
+                panic!("{rows:?}")
+            };
+            assert_eq!(row.exact_ref, exact_ref);
+            assert_eq!(
+                fs::read_to_string(cache.join(CHECKED)).unwrap(),
+                format!("{NOW}\n")
+            );
+            assert!(!cache.join(WORK).exists());
+        }
+        assert_eq!(mode(&fixture.cache()), 0o700);
+    }
+
+    /// The runtime store is the runtime account's and every account reads
+    /// it: the root, `deploy/` and `generations/` are 0755 whatever the
+    /// umask or an earlier run left, and what only the writer needs stays
+    /// private.
+    #[test]
+    fn the_runtime_store_is_readable_and_its_writer_state_private() {
+        let fixture = Fixture::new("runtime-modes");
+        let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        let cache = fixture.runtime_cache();
+        // A store an earlier run or another umask left closed.
+        prepare_cache(&fixture.runtime_store()).unwrap();
+        for area in ["", DEPLOY, GENERATIONS] {
+            fs::set_permissions(cache.join(area), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         assert_eq!(
-            fs::read_to_string(fixture.cache().join(CHECKED)).unwrap(),
-            format!("{NOW}\n")
+            fixture.update_runtime(source().runtime, NOW),
+            Ok(Outcome::Selected(1))
         );
-        assert!(!fixture.cache().join(WORK).exists());
-        let mode = fs::metadata(fixture.cache()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
+        for path in [
+            cache.clone(),
+            cache.join(DEPLOY),
+            cache.join(GENERATIONS),
+            cache.join(GENERATIONS).join("1"),
+            cache.join(DEPLOY).join(&runtime),
+            cache.join(DEPLOY).join(&runtime).join(FILES),
+        ] {
+            assert_eq!(mode(&path), 0o755, "{}", path.display());
+        }
+        assert_eq!(mode(&selection_path(&cache, 1)), 0o644);
+        assert_eq!(mode(&cache.join(OBJECTS)), 0o700);
+        assert_eq!(mode(&cache.join(LOCK)), 0o600);
+        for state in [ADMITTED, CHECKED] {
+            assert_eq!(mode(&cache.join(state)) & 0o077, 0, "{state}");
+        }
+        let (_, selection) = fixture.runtime_current().unwrap();
+        assert_eq!(
+            selection,
+            RuntimeSelection {
+                name: source().runtime.name.into(),
+                runtime: Admitted {
+                    exact_ref: RUNTIME.into(),
+                    commit: runtime.clone(),
+                    timestamp: 10,
+                },
+            }
+        );
+        // An unchanged check publishes nothing, and its status reads it.
+        assert_eq!(
+            fixture.update_runtime(source().runtime, NOW + 1),
+            Ok(Outcome::Unchanged)
+        );
+        let status = runtime_status(&fixture.runtime_store(), source().runtime).unwrap();
+        assert_eq!(RuntimeStatus::parse(&status.render()).unwrap(), status);
+        let current = status.current.unwrap();
+        assert_eq!(current.generation, 1);
+        assert!(current.serves);
+        assert_eq!(current.runtime.bytes, Some(3));
+        assert_eq!(status.previous, None);
+        assert_eq!(status.checked, Some(NOW + 1));
+        // Its rules 1–3 are the store's own.
+        publish_commit(&fixture.repository, RUNTIME, b"old", 9, None, b"signed");
+        let error = fixture
+            .update_runtime(source().runtime, NOW + 2)
+            .unwrap_err();
+        assert!(error.contains("does not supersede"), "{error}");
+        let refused = runtime_status(&fixture.runtime_store(), source().runtime)
+            .unwrap()
+            .refused
+            .unwrap();
+        assert!(refused.reason.contains("does not supersede"), "{refused:?}");
+    }
+
+    /// A runtime's collection keeps `current`, `previous` and a generation
+    /// a launch or an application's validation holds, and `remove` clears
+    /// the pointers and collects what no one holds.
+    #[test]
+    fn runtime_collection_spares_held_generations_and_remove_clears_the_store() {
+        let fixture = Fixture::new("runtime-held");
+        let first = publish_commit(&fixture.repository, RUNTIME, b"one", 10, None, b"signed");
+        fixture.update_runtime(source().runtime, NOW).unwrap();
+        let launch = File::open(selection_path(&fixture.runtime_cache(), 1)).unwrap();
+        launch.lock_shared().unwrap();
+        publish_commit(&fixture.repository, RUNTIME, b"two", 20, None, b"signed");
+        fixture.update_runtime(source().runtime, NOW).unwrap();
+        let third = publish_commit(&fixture.repository, RUNTIME, b"three", 30, None, b"signed");
+        assert_eq!(
+            fixture.update_runtime(source().runtime, NOW),
+            Ok(Outcome::Selected(3))
+        );
+        assert_eq!(fixture.runtime_names(GENERATIONS), vec!["1", "2", "3"]);
+        assert!(deployed(&fixture.runtime_cache(), &first));
+        drop(launch);
+        publish_commit(&fixture.repository, RUNTIME, b"four", 40, None, b"signed");
+        fixture.update_runtime(source().runtime, NOW).unwrap();
+        assert_eq!(fixture.runtime_names(GENERATIONS), vec!["3", "4"]);
+        assert!(!deployed(&fixture.runtime_cache(), &first));
+        assert!(deployed(&fixture.runtime_cache(), &third));
+
+        let launch = File::open(selection_path(&fixture.runtime_cache(), 4)).unwrap();
+        launch.lock_shared().unwrap();
+        assert_eq!(remove(&fixture.runtime_store()), Ok(Outcome::Removed));
+        assert!(fixture.runtime_current().is_none());
+        assert_eq!(fixture.runtime_names(GENERATIONS), vec!["4"]);
+        drop(launch);
+        remove(&fixture.runtime_store()).unwrap();
+        assert!(fixture.runtime_names(GENERATIONS).is_empty());
+        assert!(fixture.runtime_names(DEPLOY).is_empty());
+        assert!(fixture.runtime_cache().join(ADMITTED).exists());
+    }
+
+    /// A launch's revalidation does not wait behind a writer that fetches
+    /// or removes: it answers `busy`, which td-jail refuses with. It waits
+    /// only behind another launch's revalidation, and a writer that has
+    /// not yet said what it does only briefly.
+    #[test]
+    fn a_launch_does_not_wait_behind_an_update() {
+        let fixture = Fixture::new("busy");
+        let admission = fixture.admission();
+        publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        app_commit(&fixture, b"app", 20);
+        fixture.update(source(), NOW).unwrap();
+        let cache = fixture.cache();
+        let announce = |stage| {
+            fs::create_dir_all(cache.join(WORK)).unwrap();
+            let line = Progress::idle(stage).render();
+            fs::write(cache.join(WORK).join(PROGRESS), format!("{line}\n")).unwrap();
+        };
+        let ask =
+            || super::revalidate(&admission, &fixture.store(), &fixture.view(), source(), NOW);
+        for stage in [Stage::Resolve, Stage::Fetch, Stage::Validate, Stage::Remove] {
+            let writer = lock(&cache).unwrap();
+            announce(stage);
+            let begin = Instant::now();
+            assert_eq!(ask(), Ok(Outcome::Busy), "{stage:?}");
+            assert!(begin.elapsed() < Duration::from_secs(1));
+            drop(writer);
+        }
+        // A writer that never says what it does is waited for briefly.
+        let writer = lock(&cache).unwrap();
+        let begin = Instant::now();
+        assert_eq!(ask(), Ok(Outcome::Busy));
+        assert!(begin.elapsed() >= UNANNOUNCED_WAIT);
+        drop(writer);
+        // Another launch's revalidation is waited for.
+        let writer = lock(&cache).unwrap();
+        announce(Stage::Revalidate);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(writer);
+        });
+        assert_eq!(ask(), Ok(Outcome::Ready(Some(1))));
+        release.join().unwrap();
+        assert_eq!(ask(), Ok(Outcome::Ready(Some(1))));
+    }
+
+    /// A generation or deploy leaves its name before removal opens its
+    /// directories to the runtime account alone: another account looking
+    /// it up meanwhile finds it absent, as collected, never a directory it
+    /// may not enter. What a cut-short removal left aside goes next time.
+    #[test]
+    fn a_collected_tree_leaves_its_name_before_it_is_opened() {
+        let fixture = Fixture::new("aside");
+        publish_commit(&fixture.repository, RUNTIME, b"one", 10, None, b"signed");
+        fixture.update_runtime(source().runtime, NOW).unwrap();
+        let store = fixture.runtime_cache();
+        let aside = set_aside(&store, GENERATIONS, "1").unwrap();
+        assert_eq!(aside, store.join(GENERATIONS).join(".removing-1"));
+        assert_eq!(
+            File::open(selection_path(&store, 1)).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        // Still as readable as it was: nothing was opened yet.
+        assert_eq!(mode(&aside), 0o755);
+        // The pointer's generation is gone, so a holder reads it as
+        // collected, and the store holds no runtime.
+        let Err(error) = hold_runtime(&fixture.view(), source().runtime) else {
+            panic!("held a generation set aside");
+        };
+        assert!(error.contains("was collected each time"), "{error}");
+        // Set aside again over a removal cut short: the newer one replaces it.
+        fs::create_dir(store.join(GENERATIONS).join("1")).unwrap();
+        set_aside(&store, GENERATIONS, "1").unwrap();
+        assert!(!aside.join(SELECTION).exists());
+        remove_entry(&store.join(CURRENT)).unwrap();
+        collect(&fixture.runtime_store(), &[]).unwrap();
+        assert!(fixture.runtime_names(GENERATIONS).is_empty());
+        assert!(fixture.runtime_names(DEPLOY).is_empty());
+    }
+
+    /// An application follows the runtime store's `current` (D2 in
+    /// WORKLOADS.md's landing): once the runtime moves, the generation no
+    /// longer serves, and an offline revalidation against the new
+    /// `current`, holding it while it validates, publishes the same
+    /// application on it; a refusal is recorded and the launch has nothing.
+    #[test]
+    fn an_application_follows_the_runtime_current_and_revalidates_offline() {
+        let fixture = Fixture::new("follows");
+        let admission = fixture.admission();
+        publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        let app = app_commit(&fixture, b"app", 20);
+        fixture.update(source(), NOW).unwrap();
+        assert_eq!(fixture.ready(source()), Ok(Some(1)));
+
+        let moved = publish_commit(&fixture.repository, RUNTIME, b"usr2", 30, None, b"signed");
+        fixture.update_runtime(source().runtime, NOW + 1).unwrap();
+        assert_eq!(fixture.ready(source()), Ok(None));
+        assert!(!fixture.status(source()).current.unwrap().serves);
+
+        fixture.repository.lock().unwrap().clear();
+        REFUSE.with(|refuse| *refuse.borrow_mut() = true);
+        assert_eq!(
+            revalidate(
+                &admission,
+                &fixture.store(),
+                &fixture.view(),
+                source(),
+                NOW + 2
+            ),
+            Ok(None)
+        );
+        REFUSE.with(|refuse| *refuse.borrow_mut() = false);
+        assert!(fixture
+            .status(source())
+            .refused
+            .unwrap()
+            .reason
+            .contains("fixture validator refuses"));
+        assert_eq!(fixture.current().unwrap().0, 1);
+
+        VALIDATED.with(|seen| seen.borrow_mut().clear());
+        PROBE.with(|probe| *probe.borrow_mut() = Some(fixture.runtime_cache()));
+        LEASED.with(|leased| leased.borrow_mut().clear());
+        assert_eq!(
+            revalidate(
+                &admission,
+                &fixture.store(),
+                &fixture.view(),
+                source(),
+                NOW + 3
+            ),
+            Ok(Some(2))
+        );
+        PROBE.with(|probe| *probe.borrow_mut() = None);
+        LEASED.with(|leased| assert_eq!(*leased.borrow(), vec![true]));
+        VALIDATED.with(|seen| {
+            assert_eq!(
+                *seen.borrow(),
+                vec![(
+                    fixture.cache().join(DEPLOY).join(&app),
+                    fixture.runtime_cache().join(DEPLOY).join(&moved)
+                )]
+            );
+        });
+        let (_, selection) = fixture.current().unwrap();
+        assert_eq!(selection.application.commit, app);
+        assert_eq!(selection.runtime.commit, moved);
+        assert_eq!(fixture.ready(source()), Ok(Some(2)));
+        assert_eq!(fixture.status(source()).refused, None);
+        // Nothing held the old runtime generation: the runtime's next
+        // collection removes it.
+    }
+
+    /// The same move found by the owner's update rather than a launch: the
+    /// application's commit is unchanged, so it is validated again against
+    /// the new `current` and published as a new generation.
+    #[test]
+    fn an_update_after_the_runtime_moved_publishes_on_the_new_runtime() {
+        let fixture = Fixture::new("follows-update");
+        publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        app_commit(&fixture, b"app", 20);
+        fixture.update(source(), NOW).unwrap();
+        let moved = publish_commit(&fixture.repository, RUNTIME, b"usr2", 30, None, b"signed");
+        assert_eq!(fixture.update(source(), NOW + 1), Ok(Outcome::Selected(2)));
+        assert_eq!(fixture.current().unwrap().1.runtime.commit, moved);
+        assert_eq!(fixture.update(source(), NOW + 2), Ok(Outcome::Unchanged));
+    }
+
+    /// With no runtime installed, an application neither installs nor
+    /// revalidates: a machine whose cache predates the runtime store
+    /// launches nothing until its owner updates it.
+    #[test]
+    fn an_application_without_its_runtime_installed_is_refused() {
+        let fixture = Fixture::new("no-runtime");
+        publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        app_commit(&fixture, b"app", 20);
+        let error = fixture.update_application(source(), NOW).unwrap_err();
+        assert!(error.contains("is not installed"), "{error}");
+        assert!(fixture.current().is_none());
+        fixture.update(source(), NOW).unwrap();
+        remove(&fixture.runtime_store()).unwrap();
+        assert_eq!(fixture.ready(source()), Ok(None));
+        assert_eq!(
+            revalidate(
+                &fixture.admission(),
+                &fixture.store(),
+                &fixture.view(),
+                source(),
+                NOW
+            ),
+            Ok(None)
+        );
+        assert!(fixture
+            .status(source())
+            .refused
+            .unwrap()
+            .reason
+            .contains("freedesktop-platform-25-08 is not installed"));
+        // A store whose `current` is not the runtime account's is refused.
+        fixture.update_runtime(source().runtime, NOW).unwrap();
+        let foreign = RuntimeView {
+            root: fixture.runtime_cache(),
+            owner: own_uid().wrapping_add(1),
+        };
+        assert!(hold_runtime(&foreign, source().runtime)
+            .err()
+            .unwrap()
+            .contains("only the runtime account writes"));
+        assert!(hold_runtime(&fixture.view(), source().runtime).is_ok());
+    }
+
+    /// The migration: a cache from before the runtime store held its
+    /// runtime's deploy and graph beside the application's. Its next write
+    /// collects them, keeping only the application's commit.
+    #[test]
+    fn an_application_collection_removes_a_runtime_deploy_left_in_its_cache() {
+        let fixture = Fixture::new("legacy");
+        let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
+        let app = app_commit(&fixture, b"app", 20);
+        fixture.update(source(), NOW).unwrap();
+        for area in [DEPLOY, OBJECTS] {
+            fs::create_dir_all(fixture.cache().join(area).join(&runtime).join(FILES)).unwrap();
+        }
+        assert_eq!(fixture.update(source(), NOW + 1), Ok(Outcome::Unchanged));
+        assert_eq!(fixture.names(DEPLOY), vec![app.clone()]);
+        assert_eq!(fixture.names(OBJECTS), vec![app]);
+        assert!(deployed(&fixture.runtime_cache(), &runtime));
+    }
+
+    #[test]
+    fn requests_name_an_application_or_a_runtime_and_each_its_own_account() {
+        let args = |words: &[&str]| -> Vec<String> {
+            std::iter::once("td-app")
+                .chain(words.iter().copied())
+                .map(str::to_string)
+                .collect()
+        };
+        for (words, expected) in [
+            (
+                vec!["update", "firefox", "--force"],
+                Request::Application(Verb::Update, "firefox"),
+            ),
+            (
+                vec!["ready", "firefox"],
+                Request::Application(Verb::Ready, "firefox"),
+            ),
+            (
+                vec!["runtime", "update", "platform", "--force"],
+                Request::Runtime(RuntimeVerb::Update, "platform"),
+            ),
+            (
+                vec!["runtime", "status", "platform"],
+                Request::Runtime(RuntimeVerb::Status, "platform"),
+            ),
+            (
+                vec!["runtime", "remove", "platform"],
+                Request::Runtime(RuntimeVerb::Remove, "platform"),
+            ),
+        ] {
+            assert_eq!(parse_request(&args(&words)), Some(expected), "{words:?}");
+        }
+        for words in [
+            vec!["update", "firefox"],
+            vec!["runtime", "update", "platform"],
+            vec!["runtime", "ready", "platform"],
+            vec!["runtime", "revalidate", "platform"],
+            vec!["runtime", "delete-data", "platform"],
+            vec!["runtime", "status"],
+            vec!["runtime", "status", "platform", "extra"],
+        ] {
+            assert_eq!(parse_request(&args(&words)), None, "{words:?}");
+        }
+
+        let store = Path::new(RUNTIME_STORE);
+        let home = Path::new("/var/lib/td/applications/65536");
+        runtime_account(RUNTIME_UID, store, RUNTIME_UID).unwrap();
+        for (uid, home, owner) in [
+            (65536, store, RUNTIME_UID),
+            (0, store, 0),
+            (
+                RUNTIME_UID,
+                Path::new("/var/lib/td/runtimes/x"),
+                RUNTIME_UID,
+            ),
+            (RUNTIME_UID, store, 0),
+        ] {
+            assert!(runtime_account(uid, home, owner).is_err(), "{uid} {home:?}");
+        }
+        application_account(65536, home, 65536).unwrap();
+        for (uid, owner) in [(0, 0), (RUNTIME_UID, RUNTIME_UID), (65536, 65537)] {
+            assert!(application_account(uid, home, owner).is_err(), "{uid}");
+        }
     }
 
     impl Fixture {
@@ -2385,7 +3443,7 @@ mod tests {
         );
         assert_eq!(
             fixture.names(DEPLOY),
-            sorted(vec![first.clone(), second.clone(), runtime.clone()])
+            sorted(vec![first.clone(), second.clone()])
         );
 
         let third = publish_commit(
@@ -2398,9 +3456,12 @@ mod tests {
         );
         assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Selected(3)));
         assert_eq!(fixture.names(GENERATIONS), vec!["2", "3"]);
-        let kept = sorted(vec![second, third, runtime]);
+        let kept = sorted(vec![second, third]);
         assert_eq!(fixture.names(DEPLOY), kept);
         assert_eq!(fixture.names(OBJECTS), kept);
+        // The runtime never moved: one generation, one deploy.
+        assert_eq!(fixture.runtime_names(GENERATIONS), vec!["1"]);
+        assert_eq!(fixture.runtime_names(DEPLOY), vec![runtime]);
     }
 
     #[test]
@@ -2498,12 +3559,17 @@ mod tests {
         fixture.update(source(), NOW).unwrap();
         let objects = fixture.names(OBJECTS);
         let deploys = fixture.names(DEPLOY);
+        let runtime_objects = fixture.runtime_names(OBJECTS);
+        let runtime_deploys = fixture.runtime_names(DEPLOY);
         let refuse = |expected: &str| {
             let error = fixture.update(source(), NOW).unwrap_err();
             assert!(error.contains(expected), "{error}");
             assert_eq!(fixture.names(OBJECTS), objects);
             assert_eq!(fixture.names(DEPLOY), deploys);
+            assert_eq!(fixture.runtime_names(OBJECTS), runtime_objects);
+            assert_eq!(fixture.runtime_names(DEPLOY), runtime_deploys);
             assert_eq!(fixture.current().unwrap().0, 1);
+            assert_eq!(fixture.runtime_current().unwrap().0, 1);
         };
         // Rule 2: the app ref names a validly signed commit of another ref.
         fixture.repository.lock().unwrap().insert(
@@ -2511,7 +3577,7 @@ mod tests {
             format!("{runtime}\n").into_bytes(),
         );
         refuse("does not match exact ref");
-        // Rule 3 on the runtime ref.
+        // Rule 3 on the runtime ref, refused in the runtime's store.
         app_commit(&fixture, b"app", 20);
         publish_commit(
             &fixture.repository,
@@ -2551,14 +3617,14 @@ mod tests {
         app_commit(&fixture, b"two", 30);
         assert_eq!(fixture.update(source(), NOW), Ok(Outcome::Unchanged));
         let admitted = fs::read_to_string(fixture.cache().join(ADMITTED)).unwrap();
-        assert_eq!(flathub_app::parse_admitted(&admitted).unwrap().len(), 2);
+        assert_eq!(flathub_app::parse_admitted(&admitted).unwrap().len(), 1);
     }
 
     #[test]
     fn a_changed_declaration_or_a_missing_deploy_is_checked_again() {
         let fixture = Fixture::new("declaration");
         let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
-        app_commit(&fixture, b"app", 20);
+        let app = app_commit(&fixture, b"app", 20);
         fixture.update(source(), NOW).unwrap();
 
         // Another entry is another rule-5 input: the same commits are
@@ -2572,12 +3638,16 @@ mod tests {
         assert_ne!(fixture.current().unwrap().1.checks, previous.1.checks);
         assert_eq!(fixture.update(moved, NOW + 2), Ok(Outcome::Unchanged));
 
-        // A deploy current names has gone: the check runs and restores it
-        // in place, keeping generation 1 as the rollback.
-        remove_tree(&fixture.cache().join(DEPLOY).join(&runtime)).unwrap();
+        // A deploy current names has gone, the application's or the
+        // runtime's: each check restores its own in place, keeping
+        // generation 1 as the rollback.
+        remove_tree(&fixture.cache().join(DEPLOY).join(&app)).unwrap();
+        remove_tree(&fixture.runtime_cache().join(DEPLOY).join(&runtime)).unwrap();
         assert_eq!(fixture.update(moved, NOW + 3), Ok(Outcome::Unchanged));
-        assert!(deployed(&fixture.cache(), &runtime));
+        assert!(deployed(&fixture.cache(), &app));
+        assert!(deployed(&fixture.runtime_cache(), &runtime));
         assert_eq!(fixture.current().unwrap().0, 2);
+        assert_eq!(fixture.runtime_current().unwrap().0, 1);
         assert_eq!(
             read_pointer(&fixture.cache(), PREVIOUS).unwrap().unwrap().0,
             1
@@ -2675,7 +3745,7 @@ mod tests {
 
     impl Fixture {
         fn ready(&self, source: FlathubSource) -> Result<Option<u64>, String> {
-            ready(&self.store(), source)
+            ready(&self.store(), &self.view(), source)
         }
     }
 
@@ -2694,7 +3764,8 @@ mod tests {
             ..source()
         };
         assert_eq!(fixture.ready(moved), Ok(None));
-        remove_tree(&fixture.cache().join(DEPLOY).join(&runtime)).unwrap();
+        // A runtime store whose `current` lost its deploy serves nothing.
+        remove_tree(&fixture.runtime_cache().join(DEPLOY).join(&runtime)).unwrap();
         assert_eq!(fixture.ready(source()), Ok(None));
         // It reads and writes nothing it does not need: no lock file appears
         // in a cache that has none.
@@ -2772,7 +3843,7 @@ mod tests {
         }
 
         fn status(&self, source: FlathubSource) -> CacheStatus {
-            let status = status(&self.store(), source).unwrap();
+            let status = status(&self.store(), &self.view(), source).unwrap();
             assert_eq!(status.name, "firefox");
             // What root relays is the canonical rendering.
             assert_eq!(Status::parse(&status.render()).unwrap(), status);
@@ -2845,7 +3916,8 @@ mod tests {
             ..source()
         };
         assert!(!fixture.status(moved).current.unwrap().serves);
-        remove_tree(&fixture.cache().join(DEPLOY).join(&runtime)).unwrap();
+        // The runtime's size is its store's deploy, which it no longer has.
+        remove_tree(&fixture.runtime_cache().join(DEPLOY).join(&runtime)).unwrap();
         let damaged = fixture.status(source()).current.unwrap();
         assert!(!damaged.serves);
         assert_eq!(damaged.runtime.bytes, None);
@@ -3016,7 +4088,7 @@ mod tests {
         let fixture = Fixture::new("revalidate");
         let admission = fixture.admission();
         assert_eq!(
-            revalidate(&admission, &fixture.store(), source(), NOW),
+            revalidate(&admission, &fixture.store(), &fixture.view(), source(), NOW),
             Ok(None)
         );
         let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
@@ -3025,7 +4097,7 @@ mod tests {
         let app = app_commit(&fixture, b"app", 20);
         fixture.update(source(), NOW).unwrap();
         assert_eq!(
-            revalidate(&admission, &fixture.store(), source(), NOW),
+            revalidate(&admission, &fixture.store(), &fixture.view(), source(), NOW),
             Ok(Some(2))
         );
         let (_, stale) = fixture.current().unwrap();
@@ -3039,7 +4111,13 @@ mod tests {
 
         REFUSE.with(|refuse| *refuse.borrow_mut() = true);
         assert_eq!(
-            revalidate(&admission, &fixture.store(), moved, NOW + 1),
+            revalidate(
+                &admission,
+                &fixture.store(),
+                &fixture.view(),
+                moved,
+                NOW + 1
+            ),
             Ok(None)
         );
         REFUSE.with(|refuse| *refuse.borrow_mut() = false);
@@ -3050,14 +4128,23 @@ mod tests {
 
         VALIDATED.with(|seen| seen.borrow_mut().clear());
         assert_eq!(
-            revalidate(&admission, &fixture.store(), moved, NOW + 2),
+            revalidate(
+                &admission,
+                &fixture.store(),
+                &fixture.view(),
+                moved,
+                NOW + 2
+            ),
             Ok(Some(3))
         );
         let deploy = fixture.cache().join(DEPLOY);
         VALIDATED.with(|seen| {
             assert_eq!(
                 *seen.borrow(),
-                vec![(deploy.join(&app), deploy.join(&runtime))]
+                vec![(
+                    deploy.join(&app),
+                    fixture.runtime_cache().join(DEPLOY).join(&runtime)
+                )]
             );
         });
         assert_eq!(fixture.ready(moved), Ok(Some(3)));
@@ -3074,10 +4161,10 @@ mod tests {
         assert_eq!(fixture.status(moved).checked, Some(NOW));
 
         // A missing deploy or other refs need a fetch.
-        remove_tree(&deploy.join(&runtime)).unwrap();
+        remove_tree(&deploy.join(&app)).unwrap();
         let back = source();
         assert_eq!(
-            revalidate(&admission, &fixture.store(), back, NOW + 3),
+            revalidate(&admission, &fixture.store(), &fixture.view(), back, NOW + 3),
             Ok(None)
         );
         assert!(fixture
@@ -3094,7 +4181,13 @@ mod tests {
             ..source()
         };
         assert_eq!(
-            revalidate(&admission, &fixture.store(), other, NOW + 4),
+            revalidate(
+                &admission,
+                &fixture.store(),
+                &fixture.view(),
+                other,
+                NOW + 4
+            ),
             Ok(None)
         );
         assert!(fixture

@@ -421,6 +421,10 @@ fn run_with_primary(
         principal_store::prepare_broker_runtimes(&desired).map_err(Failure::Failed)?;
         principal_store::prepare_portal_runtimes(&desired).map_err(Failure::Failed)?;
         principal_store::prepare_notebooks(&desired).map_err(Failure::Failed)?;
+        // The runtime account's store and delegation, before anything runs
+        // as it: root's runtime-cache operation is its only door.
+        principal_store::prepare_runtime_store().map_err(Failure::Failed)?;
+        application_runtime::prepare_runtime_account().map_err(Failure::Failed)?;
         credentials::isolate_stores(&config.state, &desired)?;
         let policy = app_policy::load().map_err(Failure::Failed)?;
         for application in desired.active_applications().map_err(Failure::Failed)? {

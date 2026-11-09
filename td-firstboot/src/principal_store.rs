@@ -15,6 +15,11 @@ const STAGED: &str = ".principals.next";
 const NOTEBOOK_LEDGER: &str = "principals-notebooks.tsv";
 const NOTEBOOK_STAGED: &str = ".principals-notebooks.next";
 const LOCK: &str = ".principals.lock";
+/// `flathub_app::RUNTIME_STORE`'s last component, below `/var/lib/td`, and
+/// the runtime account that owns it (`flathub_app::RUNTIME_UID`). This file
+/// also builds alone in the recipe's principal tests, so it keeps a copy.
+const RUNTIME_UID: u32 = 998;
+const RUNTIME_STORE: &str = "runtimes";
 
 /// Publish broker runtimes only after the durable identity reservation passed.
 pub(crate) fn prepare_broker_runtimes(registry: &Registry) -> Result<(), String> {
@@ -56,6 +61,19 @@ pub(crate) fn prepare_notebooks(registry: &Registry) -> Result<(), String> {
         runtime_child_mode(&base, &owner.to_string(), (uid, uid), 0o700)?.sync()?;
     }
     base.sync()?;
+    td.sync()
+}
+
+/// The Flathub runtime store's root (WORKLOADS.md, "Runtimes"), below
+/// `/var/lib/td`: the runtime account's home, where td-app running as it
+/// keeps one store per runtime. Mode 0755, so every application account
+/// reads the stores; only the runtime account writes it.
+pub(crate) fn prepare_runtime_store() -> Result<(), String> {
+    let var = Directory::open(Path::new("/var"), 0, 0)?;
+    let lib = var.child("lib")?;
+    let td = lib.child("td")?;
+    let owner = RUNTIME_UID;
+    runtime_child(&td, RUNTIME_STORE, (owner, owner))?.sync()?;
     td.sync()
 }
 

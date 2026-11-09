@@ -73,9 +73,16 @@ fn session_paths(uid: u32) -> Result<(String, String), String> {
     ))
 }
 
+/// The runtime account td-app's runtime verbs run as
+/// (`flathub_app::RUNTIME_UID`), and its delegation, which td-firstboot
+/// prepares; the recipes hold the three crates to one value.
+const RUNTIME_UID: u32 = 998;
+const RUNTIME_DELEGATION: &str = "td-runtimes";
+
 fn delegation(uid: u32) -> Result<String, String> {
     match uid {
         1000 => Ok("td-user-1000".into()),
+        RUNTIME_UID => Ok(RUNTIME_DELEGATION.into()),
         65536..=2147483647 => Ok(format!("td-app-{uid}")),
         _ => Err(format!(
             "no delegated session cgroup is configured for uid {uid}"
@@ -112,8 +119,33 @@ mod tests {
         for uid in [65536, 65537, 2147483647] {
             assert_eq!(delegation(uid).unwrap(), format!("td-app-{uid}"));
         }
-        for uid in [0, 991, 1001, 65533, 65534, 65535, 2147483648, u32::MAX] {
+        for uid in [
+            0,
+            991,
+            997,
+            999,
+            1001,
+            65533,
+            65534,
+            65535,
+            2147483648,
+            u32::MAX,
+        ] {
             assert!(delegation(uid).is_err());
         }
+    }
+
+    /// The runtime account's td-app lands in a delegation of its own, not
+    /// in root's request cgroup and not in any application's.
+    #[test]
+    fn the_runtime_account_has_its_own_delegation() {
+        assert_eq!(delegation(RUNTIME_UID).unwrap(), "td-runtimes");
+        assert_eq!(
+            session_paths(RUNTIME_UID).unwrap(),
+            (
+                "/sys/fs/cgroup/td-runtimes/session/cgroup.procs".into(),
+                "0::/td-runtimes/session".into()
+            )
+        );
     }
 }

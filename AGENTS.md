@@ -159,11 +159,13 @@ Flathub applications and runtimes are the second class (`APPLICATIONS.md`
 (repository, exact app and runtime refs and td's own policy) and Flathub's
 signing key compiled into td-net. The payload is fetched, only when the
 session owner installs or updates it in td-software (or an autotest
-oracle boot installs it through the same root operation), into the
-application account's private cache and admitted only under that signature,
-exact ref bindings, a monotonic commit time and §B.3.1's bounds and
-validators. It is never an input to any recipe, is outside every closure
-and source-bootstrap claim, and runs only through the same confinement.
+oracle boot installs it through the same root operation), the
+application into its account's private cache and its runtime into the
+runtime store a dedicated runtime account owns, and admitted only under
+that signature, exact ref bindings, a monotonic commit time and
+§B.3.1's bounds and validators. It is never an input to any recipe, is
+outside every closure and source-bootstrap claim, and runs only through
+the same confinement.
 
 The image asserts that a dynamic payload's `PT_INTERP` is absent from the
 image root, but this does not prove the bytes can execute only in a jail: an
@@ -176,7 +178,7 @@ and Wayland boundaries. See `APPLICATIONS.md` §B.8.
 Image-shipped applications ride the system deployment, so independent
 side-by-side retention is deferred for them (`APPLICATIONS.md` §W.2); a
 Flathub application keeps its current and previous generations in its
-account's cache (§W.9).
+account's cache, and its runtime in the runtime store (§W.9).
 
 ## Pinned upstream data
 

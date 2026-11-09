@@ -211,9 +211,10 @@ pub(crate) struct LaunchPlan {
     pub(crate) isolate_network: bool,
     pub(crate) enforce_cgroup: bool,
     pub(crate) host_mode: bool,
-    /// For a spec served from the account's Flathub cache, the shared lock
-    /// on the generation it binds, which stage 1 keeps open for the launch.
-    pub(crate) generation: Option<File>,
+    /// For a spec served from Flathub, the shared locks on the generation
+    /// it binds and on the runtime store's `current` beside it, which
+    /// stage 1 keeps open for the launch.
+    pub(crate) generation: Vec<File>,
 }
 
 #[derive(Clone, Debug)]
@@ -786,14 +787,15 @@ where
 }
 
 /// The application and runtime trees: both from `/td/store`, or, for a spec
-/// naming Flathub refs, both from the account's cache (APPLICATIONS.md §W.9).
+/// naming Flathub refs, the application's from the account's cache and the
+/// runtime's from the runtime store, each held (APPLICATIONS.md §W.9).
 fn resolve_trees(
     name: &str,
     package: &Path,
     spec: &ParsedSpec,
     config: &ProductConfig,
     uid: u32,
-) -> io::Result<(PathBuf, PathBuf, Option<File>)> {
+) -> io::Result<(PathBuf, PathBuf, Vec<File>)> {
     let Some(source) = spec.flathub else {
         let package_files = canonical_child_directory(package, "files", "application files")?;
         let runtime = physical_store_directory(
@@ -803,7 +805,7 @@ fn resolve_trees(
         )?;
         let runtime_files =
             canonical_child_directory(&runtime, "files", "application runtime files")?;
-        return Ok((package_files, runtime_files, None));
+        return Ok((package_files, runtime_files, Vec::new()));
     };
     if config.host_mode {
         return Err(invalid("host mode resolves no Flathub cache"));
@@ -824,8 +826,13 @@ fn resolve_trees(
     }
     let package_files =
         crate::flathub::tree(&generation.cache, &selection.application.commit, uid)?;
-    let runtime_files = crate::flathub::tree(&generation.cache, &selection.runtime.commit, uid)?;
-    Ok((package_files, runtime_files, Some(generation.hold)))
+    let runtime = &generation.runtime;
+    let runtime_files = crate::flathub::tree(
+        &runtime.store,
+        &runtime.selection.runtime.commit,
+        flathub_app::RUNTIME_UID,
+    )?;
+    Ok((package_files, runtime_files, generation.holds()))
 }
 
 /// Display ownership is separate from the assigned application's runtime.

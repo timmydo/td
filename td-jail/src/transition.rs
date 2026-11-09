@@ -6255,10 +6255,10 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
     // Recorded because two reviewers had to find it.
     //
     // The connection is opened and dropped rather than held. The descriptor
-    // sweep preserves only the cleanup keepalive and a cache generation's
-    // lock, so no connection survives into phase two. That is the real
-    // reason §D compares the same PROCESS across the phases rather than the
-    // same connection.
+    // sweep preserves only the cleanup keepalive and a Flathub launch's
+    // generation and runtime locks, so no connection survives into phase
+    // two. That is the real reason §D compares the same PROCESS across the
+    // phases rather than the same connection.
     //
     // No predeclared service names yet. §D carries them for app-local
     // activation, which lands with the activation listener; an empty list is
@@ -6303,17 +6303,18 @@ pub fn launch_application(application: LaunchPlan) -> io::Result<()> {
             sys::bring_up_loopback()
                 .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
         }
-        // The cache generation's lock stays with stage 1, which outlives the
-        // application: td-app collects no generation a launch holds.
-        let generation_descriptor = application
+        // The generation's and the runtime's locks stay with stage 1, which
+        // outlives the application: td-app collects no generation a launch
+        // holds.
+        let generation_descriptors = application
             .generation
-            .as_ref()
+            .iter()
             .map(|file| u32::try_from(file.as_raw_fd()))
-            .transpose()
+            .collect::<Result<Vec<u32>, _>>()
             .map_err(|e| io::Error::other(format!("generation lock descriptor: {e}")))?;
         let preserved: Vec<u32> = cleanup_descriptor
             .into_iter()
-            .chain(generation_descriptor)
+            .chain(generation_descriptors)
             .collect();
         close_inherited_descriptors(&preserved)?;
         prepare_mount_plan(inside_identity, &executable, Some(&application))?;

@@ -1,6 +1,6 @@
 //! Flathub applications, installed from td-software (APPLICATIONS.md §W.9): the
-//! reviewed declarations, the per-account cache layout, and the pure halves
-//! of admission.
+//! reviewed declarations, the layout of an application's cache and of the
+//! runtime store, and the pure halves of admission.
 //!
 //! `td-app` (td-net) performs the I/O. Everything here is std-only, does
 //! none and uses no other module, so td-jail can `#[path]`-include it to
@@ -49,6 +49,13 @@ pub const FLATHUB_SOURCES: &[FlathubSource] = &[FlathubSource {
     entry: "/app/bin/firefox",
 }];
 
+pub fn flathub_runtime(name: &str) -> Option<FlathubRuntime> {
+    FLATHUB_RUNTIMES
+        .iter()
+        .find(|runtime| runtime.name == name)
+        .copied()
+}
+
 pub fn flathub_source(name: &str) -> Option<FlathubSource> {
     FLATHUB_SOURCES
         .iter()
@@ -58,9 +65,9 @@ pub fn flathub_source(name: &str) -> Option<FlathubSource> {
 
 /// Where a spec's trees come from. A `/td/store` runtime path takes both
 /// from the store and carries no `source=`; any other `runtime=` must be the
-/// declaration's runtime ref beside `source=` its app ref, and both trees
-/// come from the account's cache. The spec compiler and td-jail both hold
-/// specs to this.
+/// declaration's runtime ref beside `source=` its app ref: the application
+/// tree comes from the account's cache and the runtime's from the runtime
+/// store. The spec compiler and td-jail both hold specs to this.
 pub fn spec_source(
     name: &str,
     source: Option<&str>,
@@ -82,8 +89,15 @@ pub fn spec_source(
     Ok(Some(declared))
 }
 
-/// The cache, relative to the application account's home.
+/// An application's cache, relative to its account's home.
 pub const CACHE_DIR: &str = ".td/flathub";
+/// The account every Flathub runtime belongs to (WORKLOADS.md, "Runtimes"):
+/// td-app's runtime verbs run as it, and nothing else writes the store.
+pub const RUNTIME_ACCOUNT: &str = "td-runtimes";
+pub const RUNTIME_UID: u32 = 998;
+/// The runtime account's home and the runtime store: one store per
+/// declared runtime, named by its td name, in the cache layout below.
+pub const RUNTIME_STORE: &str = "/var/lib/td/runtimes";
 /// A feed endpoint named on the kernel command line, for a guest no VM
 /// bridge serves (the QEMU oracles): the deployment init writes the token's
 /// value here, root-owned, and td-app reads it after the bridge's.
@@ -132,7 +146,7 @@ pub struct Admitted {
     pub timestamp: u64,
 }
 
-/// What a generation runs, and what it was validated as.
+/// What an application's generation runs, and what it was validated as.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Selection {
     /// The declaration it was admitted for.
@@ -141,6 +155,8 @@ pub struct Selection {
     /// dynamic-library policy. td-app computes it.
     pub checks: String,
     pub application: Admitted,
+    /// The runtime store's `current` the application was validated
+    /// against; its tree is the store's, never the application cache's.
     pub runtime: Admitted,
 }
 
@@ -189,13 +205,52 @@ impl Selection {
         })
     }
 
-    /// The commits this generation keeps in the cache.
-    pub fn commits(&self) -> impl Iterator<Item = &str> {
-        self.rows().map(|admitted| admitted.commit.as_str())
-    }
-
     pub fn rows(&self) -> impl Iterator<Item = &Admitted> {
         [&self.application, &self.runtime].into_iter()
+    }
+}
+
+/// What a runtime store's generation holds: the runtime's td name and the
+/// commit admitted for its ref.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeSelection {
+    pub name: String,
+    pub runtime: Admitted,
+}
+
+impl RuntimeSelection {
+    pub fn render(&self) -> String {
+        format!(
+            "{SELECTION_FORMAT}\nname={}\n{}",
+            self.name,
+            render_row("runtime", &self.runtime)
+        )
+    }
+
+    pub fn parse(text: &str) -> Result<RuntimeSelection, String> {
+        if text.len() > MAX_STATE_BYTES {
+            return Err(format!("selection exceeds {MAX_STATE_BYTES} bytes"));
+        }
+        if !text.ends_with('\n') {
+            return Err("selection does not end in a newline".into());
+        }
+        let mut lines = text.split_terminator('\n');
+        if lines.next() != Some(SELECTION_FORMAT) {
+            return Err("selection has no format=1 header".into());
+        }
+        let name = field(lines.next(), "name")?;
+        if !valid_name(name) {
+            return Err(format!("selection name {name:?} is malformed"));
+        }
+        let runtime = parse_row(field(lines.next(), "runtime")?)?;
+        require_kind(&runtime, "runtime")?;
+        if let Some(line) = lines.next() {
+            return Err(format!("selection line {line:?} is out of place"));
+        }
+        Ok(RuntimeSelection {
+            name: name.to_string(),
+            runtime,
+        })
     }
 }
 
@@ -651,17 +706,20 @@ impl Refusal {
     }
 }
 
-fn render_generation(text: &mut String, key: &str, generation: Option<&GenerationStatus>) {
-    let Some(generation) = generation else {
+/// A generation's head line and its deploys' rows, `part` naming each.
+fn render_generation(
+    text: &mut String,
+    key: &str,
+    head: Option<(u64, bool)>,
+    deploys: &[(&str, &DeployStatus)],
+) {
+    let Some((generation, serves)) = head else {
         text.push_str(&format!("{key}=none\n"));
         return;
     };
-    let serves = if generation.serves { "serves" } else { "stale" };
-    text.push_str(&format!("{key}={}\t{serves}\n", generation.generation));
-    for (part, deploy) in [
-        ("app", &generation.application),
-        ("runtime", &generation.runtime),
-    ] {
+    let serves = if serves { "serves" } else { "stale" };
+    text.push_str(&format!("{key}={generation}\t{serves}\n"));
+    for (part, deploy) in deploys {
         let bytes = deploy
             .bytes
             .map_or_else(|| "-".to_string(), |bytes| bytes.to_string());
@@ -672,10 +730,11 @@ fn render_generation(text: &mut String, key: &str, generation: Option<&Generatio
     }
 }
 
-fn parse_generation<'a>(
+/// A generation's head line, `None` for `none`.
+fn parse_head<'a>(
     lines: &mut impl Iterator<Item = &'a str>,
     key: &str,
-) -> Result<Option<GenerationStatus>, String> {
+) -> Result<Option<(u64, bool)>, String> {
     let head = status_field(lines.next(), key)?;
     if head == "none" {
         return Ok(None);
@@ -690,27 +749,80 @@ fn parse_generation<'a>(
         "stale" => false,
         other => return Err(format!("status {key} state {other:?}")),
     };
-    let mut deploy = |part: &str| -> Result<DeployStatus, String> {
-        let row = status_field(lines.next(), &format!("{key}.{part}"))?;
-        let (row, bytes) = row
-            .rsplit_once('\t')
-            .ok_or_else(|| format!("status {key}.{part} has no size"))?;
-        let row = parse_row(row)?;
-        require_kind(&row, part)?;
-        let bytes = match bytes {
-            "-" => None,
-            bytes => Some(decimal(bytes)?),
-        };
-        Ok(DeployStatus { row, bytes })
+    Ok(Some((generation, serves)))
+}
+
+fn parse_deploy<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    key: &str,
+    part: &str,
+) -> Result<DeployStatus, String> {
+    let row = status_field(lines.next(), &format!("{key}.{part}"))?;
+    let (row, bytes) = row
+        .rsplit_once('\t')
+        .ok_or_else(|| format!("status {key}.{part} has no size"))?;
+    let row = parse_row(row)?;
+    require_kind(&row, part)?;
+    let bytes = match bytes {
+        "-" => None,
+        bytes => Some(decimal(bytes)?),
     };
-    let application = deploy("app")?;
-    let runtime = deploy("runtime")?;
+    Ok(DeployStatus { row, bytes })
+}
+
+fn parse_generation<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    key: &str,
+) -> Result<Option<GenerationStatus>, String> {
+    let Some((generation, serves)) = parse_head(lines, key)? else {
+        return Ok(None);
+    };
+    let application = parse_deploy(lines, key, "app")?;
+    let runtime = parse_deploy(lines, key, "runtime")?;
     Ok(Some(GenerationStatus {
         generation,
         serves,
         application,
         runtime,
     }))
+}
+
+fn render_tail(
+    text: &mut String,
+    checked: Option<u64>,
+    refused: Option<&Refusal>,
+    progress: Option<&Progress>,
+) {
+    match checked {
+        Some(time) => text.push_str(&format!("checked={time}\n")),
+        None => text.push_str("checked=never\n"),
+    }
+    match refused {
+        Some(refusal) => text.push_str(&format!("refused={}\n", refusal.render())),
+        None => text.push_str("refused=none\n"),
+    }
+    match progress {
+        Some(progress) => text.push_str(&format!("progress={}\n", progress.render())),
+        None => text.push_str("progress=none\n"),
+    }
+}
+
+type Tail = (Option<u64>, Option<Refusal>, Option<Progress>);
+
+fn parse_tail<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Result<Tail, String> {
+    let checked = match status_field(lines.next(), "checked")? {
+        "never" => None,
+        time => Some(decimal(time)?),
+    };
+    let refused = match status_field(lines.next(), "refused")? {
+        "none" => None,
+        line => Some(Refusal::parse(line)?),
+    };
+    let progress = match status_field(lines.next(), "progress")? {
+        "none" => None,
+        line => Some(Progress::parse(line)?),
+    };
+    Ok((checked, refused, progress))
 }
 
 fn status_field<'a>(line: Option<&'a str>, key: &str) -> Result<&'a str, String> {
@@ -727,20 +839,20 @@ impl Status {
             return text;
         };
         text.push_str("kind=flathub\n");
-        render_generation(&mut text, "current", cache.current.as_ref());
-        render_generation(&mut text, "previous", cache.previous.as_ref());
-        match cache.checked {
-            Some(time) => text.push_str(&format!("checked={time}\n")),
-            None => text.push_str("checked=never\n"),
+        for (key, generation) in [("current", &cache.current), ("previous", &cache.previous)] {
+            let head = generation.as_ref().map(|g| (g.generation, g.serves));
+            let deploys = generation
+                .as_ref()
+                .map(|g| vec![("app", &g.application), ("runtime", &g.runtime)])
+                .unwrap_or_default();
+            render_generation(&mut text, key, head, &deploys);
         }
-        match &cache.refused {
-            Some(refusal) => text.push_str(&format!("refused={}\n", refusal.render())),
-            None => text.push_str("refused=none\n"),
-        }
-        match &cache.progress {
-            Some(progress) => text.push_str(&format!("progress={}\n", progress.render())),
-            None => text.push_str("progress=none\n"),
-        }
+        render_tail(
+            &mut text,
+            cache.checked,
+            cache.refused.as_ref(),
+            cache.progress.as_ref(),
+        );
         text
     }
 
@@ -766,18 +878,7 @@ impl Status {
             "flathub" => {
                 let current = parse_generation(&mut lines, "current")?;
                 let previous = parse_generation(&mut lines, "previous")?;
-                let checked = match status_field(lines.next(), "checked")? {
-                    "never" => None,
-                    time => Some(decimal(time)?),
-                };
-                let refused = match status_field(lines.next(), "refused")? {
-                    "none" => None,
-                    line => Some(Refusal::parse(line)?),
-                };
-                let progress = match status_field(lines.next(), "progress")? {
-                    "none" => None,
-                    line => Some(Progress::parse(line)?),
-                };
+                let (checked, refused, progress) = parse_tail(&mut lines)?;
                 Some(CacheStatus {
                     current,
                     previous,
@@ -794,6 +895,98 @@ impl Status {
         let status = Status {
             name: name.to_string(),
             cache,
+        };
+        if status.render() != text {
+            return Err("status is not canonical".into());
+        }
+        Ok(status)
+    }
+}
+
+/// `td-app runtime status`'s answer and root's relay of it: one runtime
+/// store, in the application record's shape with `kind=runtime` and only
+/// `.runtime=` rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeStatus {
+    /// The runtime's td name.
+    pub name: String,
+    pub current: Option<RuntimeGenerationStatus>,
+    pub previous: Option<RuntimeGenerationStatus>,
+    pub checked: Option<u64>,
+    pub refused: Option<Refusal>,
+    pub progress: Option<Progress>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeGenerationStatus {
+    pub generation: u64,
+    /// Whether it still names the declared ref and its deploy is complete.
+    pub serves: bool,
+    pub runtime: DeployStatus,
+}
+
+impl RuntimeStatus {
+    pub fn render(&self) -> String {
+        let mut text = format!("{STATUS_FORMAT}\nname={}\nkind=runtime\n", self.name);
+        for (key, generation) in [("current", &self.current), ("previous", &self.previous)] {
+            let head = generation.as_ref().map(|g| (g.generation, g.serves));
+            let deploys = generation
+                .as_ref()
+                .map(|g| vec![("runtime", &g.runtime)])
+                .unwrap_or_default();
+            render_generation(&mut text, key, head, &deploys);
+        }
+        render_tail(
+            &mut text,
+            self.checked,
+            self.refused.as_ref(),
+            self.progress.as_ref(),
+        );
+        text
+    }
+
+    /// Only the canonical rendering parses, as for [`Status`].
+    pub fn parse(text: &str) -> Result<RuntimeStatus, String> {
+        if text.len() > MAX_STATUS_BYTES {
+            return Err(format!("status exceeds {MAX_STATUS_BYTES} bytes"));
+        }
+        if !text.ends_with('\n') {
+            return Err("status does not end in a newline".into());
+        }
+        let mut lines = text.split_terminator('\n');
+        if lines.next() != Some(STATUS_FORMAT) {
+            return Err("status has no format=1 header".into());
+        }
+        let name = status_field(lines.next(), "name")?;
+        if !valid_name(name) {
+            return Err(format!("status name {name:?} is malformed"));
+        }
+        if status_field(lines.next(), "kind")? != "runtime" {
+            return Err("status is not a runtime store's".into());
+        }
+        let mut generation = |key: &str| -> Result<Option<RuntimeGenerationStatus>, String> {
+            let Some((generation, serves)) = parse_head(&mut lines, key)? else {
+                return Ok(None);
+            };
+            Ok(Some(RuntimeGenerationStatus {
+                generation,
+                serves,
+                runtime: parse_deploy(&mut lines, key, "runtime")?,
+            }))
+        };
+        let current = generation("current")?;
+        let previous = generation("previous")?;
+        let (checked, refused, progress) = parse_tail(&mut lines)?;
+        if let Some(line) = lines.next() {
+            return Err(format!("status line {line:?} is out of place"));
+        }
+        let status = RuntimeStatus {
+            name: name.to_string(),
+            current,
+            previous,
+            checked,
+            refused,
+            progress,
         };
         if status.render() != text {
             return Err("status is not canonical".into());
@@ -852,9 +1045,15 @@ mod tests {
         };
         assert_eq!(Selection::parse(&fetched.render()).unwrap(), fetched);
         assert_eq!(
-            fetched.commits().collect::<Vec<_>>(),
+            fetched
+                .rows()
+                .map(|row| row.commit.as_str())
+                .collect::<Vec<_>>(),
             vec![COMMIT, RUNTIME_COMMIT]
         );
+        // A runtime store's generation is no application's, and the other
+        // way round.
+        assert!(RuntimeSelection::parse(&fetched.render()).is_err());
         let text = fetched.render();
         let lines: Vec<&str> = text.lines().collect();
         let refused = [
@@ -886,6 +1085,108 @@ mod tests {
         ];
         for bad in refused {
             assert!(Selection::parse(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn runtime_selections_round_trip_and_refuse_every_other_shape() {
+        let selection = RuntimeSelection {
+            name: "freedesktop-platform-25-08".into(),
+            runtime: admitted(
+                "runtime/org.freedesktop.Platform/x86_64/25.08",
+                RUNTIME_COMMIT,
+                10,
+            ),
+        };
+        let text = selection.render();
+        assert_eq!(
+            text,
+            format!(
+                "format=1\nname=freedesktop-platform-25-08\n\
+                 runtime=runtime/org.freedesktop.Platform/x86_64/25.08\t{RUNTIME_COMMIT}\t10\n"
+            )
+        );
+        assert_eq!(RuntimeSelection::parse(&text).unwrap(), selection);
+        assert!(Selection::parse(&text).is_err());
+        for bad in [
+            text.trim_end().to_string(),
+            text.replacen("format=1", "format=2", 1),
+            text.replacen("name=freedesktop", "name=Freedesktop", 1),
+            text.replacen("runtime=runtime/", "runtime=app/", 1),
+            text.replacen("runtime=", "app=", 1),
+            format!("{text}runtime=x\n"),
+            text.replacen("\t10\n", "\t010\n", 1),
+            "x".repeat(MAX_STATE_BYTES + 1),
+        ] {
+            assert!(RuntimeSelection::parse(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn runtime_declarations_are_found_by_name_and_owned_by_one_account() {
+        let firefox = flathub_source("firefox").unwrap();
+        assert_eq!(flathub_runtime(firefox.runtime.name), Some(firefox.runtime));
+        assert_eq!(flathub_runtime("firefox"), None);
+        // Every declared runtime has a store name the selection grammar
+        // admits, below the one store root.
+        for runtime in FLATHUB_RUNTIMES {
+            assert!(valid_name(runtime.name), "{}", runtime.name);
+        }
+    }
+
+    #[test]
+    fn runtime_statuses_round_trip_and_refuse_every_other_shape() {
+        let generation = |generation, serves, bytes| RuntimeGenerationStatus {
+            generation,
+            serves,
+            runtime: deploy(
+                "runtime/org.freedesktop.Platform/x86_64/25.08",
+                RUNTIME_COMMIT,
+                10,
+                bytes,
+            ),
+        };
+        let full = RuntimeStatus {
+            name: "freedesktop-platform-25-08".into(),
+            current: Some(generation(2, true, Some(4096))),
+            previous: Some(generation(1, false, None)),
+            checked: Some(1_800_000_000),
+            refused: None,
+            progress: Some(Progress::idle(Stage::Collect)),
+        };
+        let text = full.render();
+        assert!(text.starts_with(
+            "format=1\nname=freedesktop-platform-25-08\nkind=runtime\ncurrent=2\tserves\n\
+             current.runtime=runtime/"
+        ));
+        assert!(!text.contains(".app="));
+        assert_eq!(RuntimeStatus::parse(&text).unwrap(), full);
+        assert!(Status::parse(&text).is_err());
+        let empty = RuntimeStatus {
+            name: "freedesktop-platform-25-08".into(),
+            current: None,
+            previous: None,
+            checked: None,
+            refused: None,
+            progress: None,
+        };
+        assert_eq!(
+            empty.render(),
+            "format=1\nname=freedesktop-platform-25-08\nkind=runtime\ncurrent=none\n\
+             previous=none\nchecked=never\nrefused=none\nprogress=none\n"
+        );
+        assert_eq!(RuntimeStatus::parse(&empty.render()).unwrap(), empty);
+        for bad in [
+            text.replacen("kind=runtime", "kind=flathub", 1),
+            text.replacen("name=freedesktop", "name=Freedesktop", 1),
+            text.replacen("current.runtime=runtime/", "current.runtime=app/", 1),
+            text.replacen("current.runtime=", "current.app=", 1),
+            text.replacen("\t4096\n", "\t04096\n", 1),
+            format!("{text}extra=1\n"),
+            text.trim_end().to_string(),
+            "x".repeat(MAX_STATUS_BYTES + 1),
+        ] {
+            assert!(RuntimeStatus::parse(&bad).is_err(), "{bad:?}");
         }
     }
 

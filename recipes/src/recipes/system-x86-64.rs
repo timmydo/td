@@ -396,6 +396,12 @@ const FIREFOX_FETCH_WAIT_SECS: u16 =
 /// leaving the last poll (a control-socket answer is bounded at 5 seconds)
 /// and its report inside the unit's bound.
 const SOFTWARE_EVIDENCE_WAIT_SECS: u32 = svc_timeouts::SOFTWARE_EVIDENCE - 30;
+/// Firefox's declared runtime, whose store software-evidence reads through
+/// root's `runtime-cache` (WORKLOADS.md, "Runtimes").
+const FIREFOX_RUNTIME: &str = "freedesktop-platform-25-08";
+/// Firefox's account's deploys, which software-evidence requires to hold
+/// its application's commit alone: the runtime's tree is the store's.
+const FIREFOX_DEPLOYS: &str = "/var/lib/td/applications/65536/.td/flathub/deploy";
 // The greeter may observe deployment health before Firefox's fetch and
 // first ready timeout start the evidence unit. Its allowance includes that
 // offset and each separately bounded Firefox support and staged-input
@@ -509,6 +515,9 @@ fn valid_home(uid: u32, home: &str) -> bool {
     if uid == NETD_UID {
         return home == NETD_RUNTIME;
     }
+    if uid == td_engine::flathub_app::RUNTIME_UID {
+        return home == td_engine::flathub_app::RUNTIME_STORE;
+    }
     if uid == AUDIO_UID {
         return home == AUDIO_RUNTIME;
     }
@@ -580,6 +589,24 @@ const NETD_ACCOUNT: User = User {
     service_only: true,
 };
 
+/// The Flathub runtime account (WORKLOADS.md, "Runtimes"): td-app's runtime
+/// verbs run as it, through root's `runtime-cache` and `application-cache`
+/// operations alone, and its home is the runtime store td-firstboot makes.
+/// The desktop's alone, since only it declares Flathub applications.
+/// `runtime_account_is_the_one_its_crates_name` holds td-login's and
+/// td-firstboot's copies to the engine's.
+const RUNTIME_ACCOUNT: User = User {
+    name: td_engine::flathub_app::RUNTIME_ACCOUNT,
+    uid: td_engine::flathub_app::RUNTIME_UID,
+    gid: td_engine::flathub_app::RUNTIME_UID,
+    gecos: "Flathub Runtimes",
+    home: td_engine::flathub_app::RUNTIME_STORE,
+    shell: "/bin/false",
+    groups: &[],
+    passwordless: false,
+    service_only: true,
+};
+
 const ADMIN_ACCOUNT: User = User {
     name: "td-admin",
     uid: 986,
@@ -637,6 +664,7 @@ const SYSTEM: SystemDef = SystemDef {
         ADMIN_ACCOUNT,
         ADMIN_BUILD_ACCOUNT,
         NETD_ACCOUNT,
+        RUNTIME_ACCOUNT,
         User {
             name: NOTEBOOK_USER,
             uid: NOTEBOOK_RESERVED_UID,
@@ -2478,7 +2506,10 @@ fn build_desktop_td_svc_conf() -> String {
          # the marker precedes the greeter (td-software/DESIGN.md §6.4): as\n\
          # the human, the control socket's `install` (an update of the Firefox\n\
          # just installed, against the feed), then `status` until root reports\n\
-         # that install's success and a later record naming `current`. An\n\
+         # that install's success and a later record naming `current`; then\n\
+         # root's runtime-cache status must name the runtime store's\n\
+         # `current`, and Firefox's cache must deploy its application alone.\n\
+         # An\n\
          # `unavailable` (root reading the status first) is asked again until\n\
          # a deadline on /proc/uptime. A failed install, or the deadline\n\
          # passing, prints td-ctl's last answer. It\n\
@@ -2487,7 +2518,7 @@ fn build_desktop_td_svc_conf() -> String {
          [software-evidence]\n\
          type=oneshot\n\
          unless-exists={applications_on_demand}\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; read up rest </proc/uptime; end=$((${{up%%.*}}+{software_evidence_wait})); n=0; asked=; last=; while read up rest </proc/uptime && [ \"${{up%%.*}}\" -lt \"$end\" ]; do if [ -z \"$asked\" ]; then last=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} install {firefox_name} 2>&1) && asked=1; elif last=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} status {firefox_name} 2>&1); then case \"$last\" in *\"last=install\"?\"failed\"*) /bin/td-util printf \"software-evidence: the install failed: %s\\n\" \"$last\"; exit 1;; *\"operation=none\"*\"last=install\"?\"ok\"*\"record=current\"*\"current=\"[0-9]*) /bin/echo {software_marker}; exit 0;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; /bin/td-util printf \"software-evidence: no install record after %s polls: %s\\n\" \"$n\" \"$last\"; exit 1'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; read up rest </proc/uptime; end=$((${{up%%.*}}+{software_evidence_wait})); n=0; asked=; last=; while read up rest </proc/uptime && [ \"${{up%%.*}}\" -lt \"$end\" ]; do if [ -z \"$asked\" ]; then last=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} install {firefox_name} 2>&1) && asked=1; elif last=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} status {firefox_name} 2>&1); then case \"$last\" in *\"last=install\"?\"failed\"*) /bin/td-util printf \"software-evidence: the install failed: %s\\n\" \"$last\"; exit 1;; *\"operation=none\"*\"last=install\"?\"ok\"*\"record=current\"*\"current=\"[0-9]*) store=$(/bin/td-authd runtime-cache {firefox_runtime} status 2>&1); case \"$store\" in *\"kind=runtime\"*\"current=\"[0-9]*) :;; *) /bin/td-util printf \"software-evidence: the runtime store has no current generation: %s\\n\" \"$store\"; exit 1;; esac; deploys=$(/bin/ls -1 -A {firefox_deploys} 2>&1); case \"$deploys\" in \"\"|*[!0-9a-f]*) /bin/td-util printf \"software-evidence: the application cache deploys more than its application: %s\\n\" \"$deploys\"; exit 1;; esac; /bin/echo {software_marker}; exit 0;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; /bin/td-util printf \"software-evidence: no install record after %s polls: %s\\n\" \"$n\" \"$last\"; exit 1'\n\
          after=firefox-fetch,wayland,firefox-tls-setup\n\
          requires=wayland\n\
          timeout={software_evidence}\n\
@@ -2689,6 +2720,8 @@ fn build_desktop_td_svc_conf() -> String {
         software_evidence = svc_timeouts::SOFTWARE_EVIDENCE,
         software_evidence_wait = SOFTWARE_EVIDENCE_WAIT_SECS,
         software_marker = TD_SOFTWARE_INSTALL_MARKER,
+        firefox_runtime = FIREFOX_RUNTIME,
+        firefox_deploys = FIREFOX_DEPLOYS,
         placed_marker = TD_APPLICATIONS_PLACED_MARKER,
         firefox_content_marker = TD_FIREFOX_CONTENT_MARKER,
         firefox_support_marker = TD_FIREFOX_SUPPORT_MARKER,
@@ -8928,6 +8961,7 @@ mod tests {
             [
                 "td-admin-build",
                 "td-netd",
+                td_engine::flathub_app::RUNTIME_ACCOUNT,
                 NOTEBOOK_USER,
                 PORTAL_USER,
                 BROKER_USER,
@@ -10721,6 +10755,47 @@ mod tests {
         // The value of the two capabilities, CAP_NET_BIND_SERVICE and
         // CAP_NET_ADMIN, as privilege.rs's own test has them.
         assert!(netd_credentials().contains("prm=0000000000001400"));
+    }
+
+    /// The runtime account is the engine's (td-app, td-jail and td-authd
+    /// compile it from `flathub_app`), the desktop's alone, and the one
+    /// td-login places in its delegation and td-firstboot makes the store
+    /// and delegation for; those two build apart from the engine.
+    #[test]
+    fn runtime_account_is_the_one_its_crates_name() {
+        use td_engine::flathub_app::{RUNTIME_ACCOUNT as NAME, RUNTIME_STORE, RUNTIME_UID};
+        let account = SYSTEM.users.iter().find(|user| user.name == NAME);
+        let account = account.map(|user| (user.uid, user.gid, user.home, user.service_only));
+        assert_eq!(
+            account,
+            Some((RUNTIME_UID, RUNTIME_UID, RUNTIME_STORE, true))
+        );
+        assert!(build_group(&SYSTEM).contains(&format!("{NAME}:x:{RUNTIME_UID}:\n")));
+        assert!(SERVER.users.iter().all(|user| user.name != NAME));
+        assert!(SYSTEM
+            .users
+            .iter()
+            .all(|user| user.name == NAME || user.uid != RUNTIME_UID));
+        let cgroup = include_str!("../../../td-login/src/cgroup.rs");
+        assert!(cgroup.contains(&format!("const RUNTIME_UID: u32 = {RUNTIME_UID};")));
+        assert!(cgroup.contains("const RUNTIME_DELEGATION: &str = \"td-runtimes\";"));
+        let delegation = include_str!("../../../td-firstboot/src/application_runtime.rs");
+        assert!(delegation.contains(&format!("\nconst RUNTIME_UID: u32 = {RUNTIME_UID};")));
+        assert!(delegation.contains("const RUNTIME_DELEGATION: &str = \"td-runtimes\";"));
+        // The recipe's principal tests build this file alone, so it keeps
+        // its own copy of the owner.
+        let store = include_str!("../../../td-firstboot/src/principal_store.rs");
+        assert!(store.contains(&format!("\nconst RUNTIME_UID: u32 = {RUNTIME_UID};")));
+        let (parent, name) = RUNTIME_STORE.rsplit_once('/').unwrap();
+        assert_eq!(parent, "/var/lib/td");
+        assert!(store.contains(&format!("const RUNTIME_STORE: &str = \"{name}\";")));
+        let provision = include_str!("../../../td-firstboot/src/main.rs");
+        for call in [
+            "principal_store::prepare_runtime_store()",
+            "application_runtime::prepare_runtime_account()",
+        ] {
+            assert_eq!(provision.matches(call).count(), 1, "{call}");
+        }
     }
 
     /// The tailorable `SYSTEM` const is hand-edited to shape the distro; guard the
@@ -13536,9 +13611,31 @@ mod tests {
                 "/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} {request} {FIREFOX_NAME}"
             )));
         }
+        assert!(software.contains(
+            "*\"operation=none\"*\"last=install\"?\"ok\"*\"record=current\"*\"current=\"[0-9]*) store="
+        ));
+        // Before the marker: the runtime is in the runtime store, read
+        // through root's operation, and Firefox's cache deploys exactly one
+        // commit, its application's.
         assert!(software.contains(&format!(
-            "*\"operation=none\"*\"last=install\"?\"ok\"*\"record=current\"*\"current=\"[0-9]*) /bin/echo {TD_SOFTWARE_INSTALL_MARKER}; exit 0;;"
+            "store=$(/bin/td-authd runtime-cache {FIREFOX_RUNTIME} status 2>&1); case \"$store\" in *\"kind=runtime\"*\"current=\"[0-9]*) :;;"
         )));
+        assert!(software.contains(&format!(
+            "deploys=$(/bin/ls -1 -A {FIREFOX_DEPLOYS} 2>&1); case \"$deploys\" in \"\"|*[!0-9a-f]*) "
+        )));
+        assert!(software.contains(&format!(
+            "exit 1;; esac; /bin/echo {TD_SOFTWARE_INSTALL_MARKER}; exit 0;;"
+        )));
+        let firefox = td_engine::flathub_app::flathub_source(FIREFOX_NAME).unwrap();
+        assert_eq!(FIREFOX_RUNTIME, firefox.runtime.name);
+        assert_eq!(
+            FIREFOX_DEPLOYS,
+            format!(
+                "/var/lib/td/applications/65536/{}/{}",
+                td_engine::flathub_app::CACHE_DIR,
+                td_engine::flathub_app::DEPLOY
+            )
+        );
         assert_eq!(
             unit_key("software-evidence", "unless-exists").as_deref(),
             Some(APPLICATIONS_ON_DEMAND)

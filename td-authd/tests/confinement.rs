@@ -1062,17 +1062,52 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(cache.matches("Command::new(").count(), 1);
     assert!(cache.contains(
-        "Command::new(\"/bin/td-login\");\n        command\n            .args([\n                \"exec-service-as\",\n                &format!(\"tda{uid}\"),\n                \"--\",\n                \"/bin/td-app\",\n                verb,\n                &self.name,\n            ])\n            .args(flags);"
+        "Command::new(\"/bin/td-login\");\n    command\n        .args([\"exec-service-as\", account, \"--\", \"/bin/td-app\"])\n        .args(arguments);"
     ));
+    // The only two accounts td-app runs as: an admitted application's, by
+    // the UID admission selected, and the compiled runtime account.
+    assert_eq!(cache.matches("\n    td_app(").count(), 2);
+    assert!(cache.contains("    td_app(&format!(\"tda{uid}\"), &arguments)\n"));
+    assert!(cache.contains("    td_app(RUNTIME_ACCOUNT, &arguments)\n"));
+    assert!(cache.contains("let mut arguments = vec![word, name];"));
+    assert!(cache.contains("let mut arguments = vec![\"runtime\", word, runtime.name];"));
     assert_eq!(cache.matches(".spawn(").count(), 1);
     assert_eq!(cache.matches(".env_clear()").count(), 1);
     assert_eq!(cache.matches(".stdin(Stdio::null())").count(), 1);
+    // The spawn's command is dropped before its output is read, so EOF
+    // comes when td-app exits.
+    assert!(cache.contains("    drop(command);\n    let limit"));
+    // Each of the two operations audits its startup once.
     assert_eq!(
         cache
             .matches("crate::launch::require_operation_startup()")
             .count(),
-        1
+        2
     );
+    let runtime = cache.split_once("pub(crate) fn run_runtime(").unwrap().1;
+    let order = [
+        "RuntimeRequest::parse(arguments)?",
+        "crate::launch::require_operation_startup()",
+        "operate_runtime(&mut System, &request, deadline)",
+        // A removal asks the applications before it spawns anything.
+        "named_elsewhere(host, runtime, None, deadline)",
+        "host.td_app(",
+    ]
+    .map(|call| runtime.find(call).unwrap());
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    let application = cache.split_once("pub(crate) fn run(").unwrap().1;
+    let order = [
+        "Request::parse(arguments)?",
+        "crate::launch::require_operation_startup()",
+        "crate::application::admitted_uid(&request.name)?",
+        "operate(&mut System, &request, uid, source, deadline)",
+    ]
+    .map(|call| application.find(call).unwrap());
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    // Every td-app run goes through the host, whose only production form
+    // is the one spawn.
+    assert_eq!(cache.matches("run_td_app(").count(), 2);
+    assert!(cache.contains("        run_td_app(command, status, deadline, what)\n"));
     assert_eq!(
         cache
             .matches("crate::application::admitted_uid(&request.name)?")
@@ -1393,10 +1428,10 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0x10b1af1d87d02b94;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const CACHE_FINGERPRINT: u64 = 0xc55759a7b94b9e9d;
+const CACHE_FINGERPRINT: u64 = 0x71cde0436d992a4f;
 const SOFTWARE_FINGERPRINT: u64 = 0x2637cc331de38b7c;
 const LAUNCH_FINGERPRINT: u64 = 0x9b5957fe029e436e;
-const MAIN_FINGERPRINT: u64 = 0x2057ef8b5cd2c138;
+const MAIN_FINGERPRINT: u64 = 0x8926b3ca2853c8aa;
 const STDERR_TAIL_FINGERPRINT: u64 = 0x3b8b113de258e6ee;
 const SESSION_FINGERPRINT: u64 = 0xd7705b7717a76af5;
 
