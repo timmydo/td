@@ -35,30 +35,28 @@ pub(crate) struct Generation {
     /// A shared lock on the selection, held for the launch: td-app removes
     /// no generation it cannot lock exclusively.
     pub(crate) hold: File,
-    cache: PathBuf,
+    /// The canonical cache the generation was held in.
+    pub(crate) cache: PathBuf,
 }
 
-impl Generation {
-    /// A deploy tree the selection names: a direct directory of the cache,
-    /// the account's own and writable by nobody else.
-    pub(crate) fn tree(&self, commit: &str, uid: u32) -> io::Result<PathBuf> {
-        let path = self.cache.join(DEPLOY).join(commit).join(FILES);
-        let canonical = fs::canonicalize(&path).map_err(|error| {
-            io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-        })?;
-        let metadata = fs::symlink_metadata(&path)?;
-        if canonical != path
-            || !metadata.is_dir()
-            || metadata.uid() != uid
-            || metadata.mode() & 0o022 != 0
-        {
-            return Err(refused(format!(
-                "{} is not a direct directory only this account writes",
-                path.display()
-            )));
-        }
-        Ok(path)
+/// A deploy tree a selection names: a direct directory of the canonical
+/// `cache`, owned by `uid` and writable by nobody else.
+pub(crate) fn tree(cache: &Path, commit: &str, uid: u32) -> io::Result<PathBuf> {
+    let path = cache.join(DEPLOY).join(commit).join(FILES);
+    let canonical = fs::canonicalize(&path)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+    let metadata = fs::symlink_metadata(&path)?;
+    if canonical != path
+        || !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(refused(format!(
+            "{} is not a direct directory only this account writes",
+            path.display()
+        )));
     }
+    Ok(path)
 }
 
 /// The generation to launch, held. A launch never fetches
@@ -121,7 +119,7 @@ fn hold_with(
                 }
             },
         };
-        if let Some(held) = hold(home, generation, uid)? {
+        if let Some(held) = hold(&account_cache(home)?, generation, uid)? {
             return Ok(held);
         }
     }
@@ -181,10 +179,8 @@ fn answer(ask: Ask, name: &str, home: &Path) -> io::Result<Option<u64>> {
     }
 }
 
-/// Lock the generation's selection shared and read it. `None` when td-app
-/// collected it first: it unlinks a generation only under the exclusive
-/// lock, so one held here with a link left stays until the lock goes.
-fn hold(home: &Path, generation: u64, uid: u32) -> io::Result<Option<Generation>> {
+/// The account's cache, canonical and reached without a link.
+fn account_cache(home: &Path) -> io::Result<PathBuf> {
     let cache = fs::canonicalize(home)?.join(CACHE_DIR);
     if fs::canonicalize(&cache)? != cache {
         return Err(refused(format!(
@@ -192,6 +188,14 @@ fn hold(home: &Path, generation: u64, uid: u32) -> io::Result<Option<Generation>
             cache.display()
         )));
     }
+    Ok(cache)
+}
+
+/// Lock the generation's selection in the canonical `cache` shared and
+/// read it; it must be `uid`'s. `None` when td-app collected it first: it
+/// unlinks a generation only under the exclusive lock, so one held here
+/// with a link left stays until the lock goes.
+fn hold(cache: &Path, generation: u64, uid: u32) -> io::Result<Option<Generation>> {
     let path = cache
         .join(GENERATIONS)
         .join(generation.to_string())
@@ -240,7 +244,7 @@ fn hold(home: &Path, generation: u64, uid: u32) -> io::Result<Option<Generation>
     Ok(Some(Generation {
         selection,
         hold: file,
-        cache,
+        cache: cache.to_path_buf(),
     }))
 }
 
@@ -292,15 +296,19 @@ mod tests {
         let root = crate::test_temp::TempDir::new("td-jail-flathub-hold").unwrap();
         let home = root.path().join("home");
         let files = generation(&home, 1);
-        assert!(hold(&home, 2, uid()).unwrap().is_none());
-        let held = hold(&home, 1, uid()).unwrap().unwrap();
+        assert!(hold(&account_cache(&home).unwrap(), 2, uid())
+            .unwrap()
+            .is_none());
+        let held = hold(&account_cache(&home).unwrap(), 1, uid())
+            .unwrap()
+            .unwrap();
         assert_eq!(held.selection.runtime.commit, COMMIT);
-        assert_eq!(held.tree(COMMIT, uid()).unwrap(), files);
+        assert_eq!(tree(&held.cache, COMMIT, uid()).unwrap(), files);
         // A deploy the selection names but the cache lacks.
-        assert!(held.tree(APP_COMMIT, uid()).is_err());
-        assert!(held.tree(COMMIT, uid().wrapping_add(1)).is_err());
+        assert!(tree(&held.cache, APP_COMMIT, uid()).is_err());
+        assert!(tree(&held.cache, COMMIT, uid().wrapping_add(1)).is_err());
         fs::set_permissions(&files, fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(held.tree(COMMIT, uid()).is_err());
+        assert!(tree(&held.cache, COMMIT, uid()).is_err());
         fs::set_permissions(&files, fs::Permissions::from_mode(0o755)).unwrap();
         // td-app's collection finds the hold and leaves the generation.
         let probe = File::open(
@@ -323,8 +331,10 @@ mod tests {
         fs::create_dir(&elsewhere).unwrap();
         fs::remove_dir(&files).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &files).unwrap();
-        let held = hold(&home, 1, uid()).unwrap().unwrap();
-        assert!(held.tree(COMMIT, uid()).is_err());
+        let held = hold(&account_cache(&home).unwrap(), 1, uid())
+            .unwrap()
+            .unwrap();
+        assert!(tree(&held.cache, COMMIT, uid()).is_err());
     }
 
     #[test]
@@ -341,7 +351,9 @@ mod tests {
         collector.lock().unwrap();
         fs::remove_file(&selection).unwrap();
         drop(collector);
-        assert!(hold(&home, 1, uid()).unwrap().is_none());
+        assert!(hold(&account_cache(&home).unwrap(), 1, uid())
+            .unwrap()
+            .is_none());
     }
 
     /// A launch never fetches (td-software/DESIGN.md §4.1, §6): it asks
@@ -419,6 +431,6 @@ mod tests {
         generation(&other, 1);
         fs::create_dir_all(home.join(".td")).unwrap();
         std::os::unix::fs::symlink(other.join(CACHE_DIR), home.join(CACHE_DIR)).unwrap();
-        assert!(hold(&home, 1, uid()).is_err());
+        assert!(account_cache(&home).is_err());
     }
 }

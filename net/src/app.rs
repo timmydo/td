@@ -143,6 +143,12 @@ fn unix_now() -> Result<u64, String> {
         .map_err(|error| format!("system clock is before the epoch: {error}"))
 }
 
+/// A cache td-app writes, which its verbs take rather than each deriving
+/// it from the account's home.
+struct Store {
+    root: PathBuf,
+}
+
 fn private_dir(path: &Path) -> Result<(), String> {
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
@@ -161,7 +167,8 @@ fn private_dir(path: &Path) -> Result<(), String> {
     }
 }
 
-fn prepare_cache(cache: &Path) -> Result<(), String> {
+fn prepare_cache(store: &Store) -> Result<(), String> {
+    let cache = &store.root;
     let parent = cache
         .parent()
         .ok_or_else(|| format!("cache {} has no parent", cache.display()))?;
@@ -390,60 +397,83 @@ fn deployed(cache: &Path, commit: &str) -> bool {
         .is_ok_and(|metadata| metadata.is_dir())
 }
 
-/// Acquire and materialize one admitted commit unless its deploy exists.
-/// Publication is one rename, so an existing `files/` is complete; a deploy
-/// without one holds only what an interrupted run left.
-fn deploy(
-    admission: &Admission<'_>,
-    cache: &Path,
-    candidate: &Candidate,
-    part: Part,
-    tracker: &Tracker,
-) -> Result<PathBuf, String> {
-    let hex = &candidate.admitted.commit;
-    let out = deploy_path(cache, hex);
-    if deployed(cache, hex) {
-        return Ok(out);
+/// What a check holds while it takes each declared ref through a store:
+/// `admit`, then `deploy`.
+struct RefCheck<'a> {
+    admission: &'a Admission<'a>,
+    store: &'a Store,
+    tracker: &'a Tracker,
+    work: PathBuf,
+    now: u64,
+    deadline: Instant,
+}
+
+impl RefCheck<'_> {
+    /// Rules 1–3 for whatever commit `exact_ref` names now, above the
+    /// floor `known` sets.
+    fn admit(&self, exact_ref: &str, part: Part, known: &[&Admitted]) -> Result<Candidate, String> {
+        self.tracker.set(Stage::Resolve, Some(part));
+        resolve(
+            self.admission,
+            &self.work,
+            exact_ref,
+            known,
+            self.now,
+            self.deadline,
+        )
     }
-    if fs::symlink_metadata(&out).is_ok() {
-        remove_tree(&out)?;
-    }
-    let objects = cache.join(OBJECTS).join(hex);
-    let spec = AcquireSpec::parse(
-        admission.repository,
-        &candidate.admitted.exact_ref,
-        hex,
-        &candidate.content.to_hex(),
-    )?;
-    // A graph already complete is never fetched, so its counters stay at
-    // nothing rather than the last graph's.
-    tracker.graph.reset();
-    tracker.set(Stage::Fetch, Some(part));
-    let progress = Some(&tracker.graph);
-    match admission.feed {
-        Some(base) if candidate.from_feed => {
-            crate::ostree::acquire_from_feed(&spec, &objects, base, |_| Ok(()), progress)?;
+
+    /// Acquire and materialize one admitted commit unless its deploy
+    /// exists. Publication is one rename, so an existing `files/` is
+    /// complete; a deploy without one holds only what an interrupted run
+    /// left.
+    fn deploy(&self, candidate: &Candidate, part: Part) -> Result<PathBuf, String> {
+        let (admission, cache, tracker) = (self.admission, &self.store.root, self.tracker);
+        let hex = &candidate.admitted.commit;
+        let out = deploy_path(cache, hex);
+        if deployed(cache, hex) {
+            return Ok(out);
         }
-        _ => {
-            crate::ostree::acquire(&spec, &objects, progress)?;
+        if fs::symlink_metadata(&out).is_ok() {
+            remove_tree(&out)?;
         }
+        let objects = cache.join(OBJECTS).join(hex);
+        let spec = AcquireSpec::parse(
+            admission.repository,
+            &candidate.admitted.exact_ref,
+            hex,
+            &candidate.content.to_hex(),
+        )?;
+        // A graph already complete is never fetched, so its counters stay
+        // at nothing rather than the last graph's.
+        tracker.graph.reset();
+        tracker.set(Stage::Fetch, Some(part));
+        let progress = Some(&tracker.graph);
+        match admission.feed {
+            Some(base) if candidate.from_feed => {
+                crate::ostree::acquire_from_feed(&spec, &objects, base, |_| Ok(()), progress)?;
+            }
+            _ => {
+                crate::ostree::acquire(&spec, &objects, progress)?;
+            }
+        }
+        tracker.set(Stage::Materialize, Some(part));
+        private_dir(&out)?;
+        fs::set_permissions(&out, fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("chmod {}: {error}", out.display()))?;
+        let stats = td_engine::ostree_deploy::materialize(
+            &objects,
+            &candidate.admitted.exact_ref,
+            hex,
+            &candidate.content.to_hex(),
+            &out.join(FILES),
+            rename_absent,
+        )?;
+        for warning in stats.warnings {
+            eprintln!("td-app: {warning}");
+        }
+        Ok(out)
     }
-    tracker.set(Stage::Materialize, Some(part));
-    private_dir(&out)?;
-    fs::set_permissions(&out, fs::Permissions::from_mode(0o755))
-        .map_err(|error| format!("chmod {}: {error}", out.display()))?;
-    let stats = td_engine::ostree_deploy::materialize(
-        &objects,
-        &candidate.admitted.exact_ref,
-        hex,
-        &candidate.content.to_hex(),
-        &out.join(FILES),
-        rename_absent,
-    )?;
-    for warning in stats.warnings {
-        eprintln!("td-app: {warning}");
-    }
-    Ok(out)
 }
 
 /// The rule-5 inputs no commit carries, and their digest, recorded in the
@@ -684,7 +714,8 @@ fn hold(selection: &Path) -> Result<Hold, String> {
 /// the commits they name and `also`; nothing else in the cache survives. A
 /// generation goes only under an exclusive lock on its selection, so a
 /// td-jail that locks it afterwards finds it unlinked and asks again.
-fn collect(cache: &Path, also: &[String]) -> Result<(), String> {
+fn collect(store: &Store, also: &[String]) -> Result<(), String> {
+    let cache = &store.root;
     let mut keep_generations = Vec::new();
     let mut keep_commits: Vec<String> = also.to_vec();
     for pointer in [CURRENT, PREVIOUS] {
@@ -906,15 +937,15 @@ fn clear_work(work: &Path) {
 
 fn update(
     admission: &Admission<'_>,
-    cache: &Path,
+    store: &Store,
     source: FlathubSource,
     now: u64,
 ) -> Result<Outcome, String> {
-    prepare_cache(cache)?;
-    let _lock = lock(cache)?;
-    let outcome = locked_update(admission, cache, source, now);
+    prepare_cache(store)?;
+    let _lock = lock(&store.root)?;
+    let outcome = locked_update(admission, store, source, now);
     if let Err(error) = &outcome {
-        record_refusal(cache, now, error);
+        record_refusal(&store.root, now, error);
     }
     outcome
 }
@@ -922,10 +953,11 @@ fn update(
 /// `update` under the lock: whatever fails here is the last refusal.
 fn locked_update(
     admission: &Admission<'_>,
-    cache: &Path,
+    store: &Store,
     source: FlathubSource,
     now: u64,
 ) -> Result<Outcome, String> {
+    let cache = &store.root;
     let expected = expect(source)?;
     let current = read_pointer(cache, CURRENT)?;
     let previous = read_pointer(cache, PREVIOUS)?;
@@ -934,7 +966,7 @@ fn locked_update(
     let outcome = tracker.run(|| {
         check(
             admission,
-            cache,
+            store,
             source,
             &expected,
             (current, previous),
@@ -952,16 +984,19 @@ fn locked_update(
 type Pointers = (Option<(u64, Selection)>, Option<(u64, Selection)>);
 
 /// Rules 1–5 for what the declaration's refs name now, then publication
-/// and collection, under the lock and beside `tracker`'s record.
+/// and collection, under the lock and beside `tracker`'s record. Every ref
+/// is admitted before any is deployed, so rule 4 and an unchanged
+/// selection are settled before a tree is fetched.
 fn check(
     admission: &Admission<'_>,
-    cache: &Path,
+    store: &Store,
     source: FlathubSource,
     expected: &Expected,
     (current, previous): Pointers,
     now: u64,
     tracker: &Tracker,
 ) -> Result<Outcome, String> {
+    let cache = &store.root;
     // Rows for refs no longer declared are dropped, which bounds the file.
     let mut admitted: Vec<Admitted> = match read_text(&cache.join(ADMITTED))? {
         Some(text) => flathub_app::parse_admitted(&text)?,
@@ -976,21 +1011,19 @@ fn check(
         .chain(previous.iter().flat_map(|(_, selection)| selection.rows()))
         .collect();
 
-    let work = cache.join(WORK);
     let deadline = Instant::now()
         .checked_add(RESOLVE_TIME)
         .ok_or("resolve deadline overflows")?;
-    tracker.set(Stage::Resolve, Some(Part::Runtime));
-    let runtime = resolve(
+    let refs = RefCheck {
         admission,
-        &work,
-        source.runtime.exact_ref,
-        &known,
+        store,
+        tracker,
+        work: cache.join(WORK),
         now,
         deadline,
-    )?;
-    tracker.set(Stage::Resolve, Some(Part::Application));
-    let application = resolve(admission, &work, source.application, &known, now, deadline)?;
+    };
+    let runtime = refs.admit(source.runtime.exact_ref, Part::Runtime, &known)?;
+    let application = refs.admit(source.application, Part::Application, &known)?;
     let metadata = application
         .metadata
         .as_deref()
@@ -1020,8 +1053,8 @@ fn check(
             write_state(&cache.join(ADMITTED), &admitted_text)?;
             return Ok(Outcome::Unchanged);
         }
-        let runtime_out = deploy(admission, cache, &runtime, Part::Runtime, tracker)?;
-        let application_out = deploy(admission, cache, &application, Part::Application, tracker)?;
+        let runtime_out = refs.deploy(&runtime, Part::Runtime)?;
+        let application_out = refs.deploy(&application, Part::Application)?;
         tracker.set(Stage::Validate, None);
         (admission.validate)(
             &application_out,
@@ -1052,7 +1085,7 @@ fn check(
         .map(|candidate| candidate.admitted.commit.clone())
         .collect();
     tracker.set(Stage::Collect, None);
-    let collected = collect(cache, &attempted);
+    let collected = collect(store, &attempted);
     match (outcome, collected) {
         (Ok(outcome), Ok(())) => Ok(outcome),
         (Ok(_), Err(error)) => Err(error),
@@ -1066,7 +1099,8 @@ fn check(
 /// The generation td-jail may launch: `current`, while it still serves the
 /// declaration. It takes no lock, so a launch never waits behind a fetch;
 /// collection never removes what `current` names.
-fn ready(cache: &Path, source: FlathubSource) -> Result<Option<u64>, String> {
+fn ready(store: &Store, source: FlathubSource) -> Result<Option<u64>, String> {
+    let cache = &store.root;
     let expected = expect(source)?;
     Ok(match read_pointer(cache, CURRENT)? {
         Some((generation, selection)) if serves(cache, &selection, source, &expected) => {
@@ -1167,7 +1201,8 @@ fn writer_progress(cache: &Path) -> Result<Option<Progress>, String> {
 /// `td-app status`: the cache as it reads now, taking no lock, as `ready`
 /// takes none. It writes nothing, and a cache that does not exist reads as
 /// one with nothing installed.
-fn status(cache: &Path, source: FlathubSource) -> Result<Status, String> {
+fn status(store: &Store, source: FlathubSource) -> Result<Status, String> {
+    let cache = &store.root;
     let expected = expect(source)?;
     let generation = |pointer| -> Result<Option<GenerationStatus>, String> {
         Ok(
@@ -1214,11 +1249,12 @@ fn remove_entry(path: &Path) -> Result<(), String> {
 /// stays until a later collection finds it free. `admitted` stays, so a
 /// reinstall admits no commit older than one already admitted, and so does
 /// the jail state, which only `delete-data` removes.
-fn remove(cache: &Path) -> Result<Outcome, String> {
+fn remove(store: &Store) -> Result<Outcome, String> {
+    let cache = &store.root;
     if fs::symlink_metadata(cache).is_err() {
         return Ok(Outcome::Removed);
     }
-    prepare_cache(cache)?;
+    prepare_cache(store)?;
     let _lock = lock(cache)?;
     let work = fresh_work(cache)?;
     let _tracker = Tracker::new(&work, Stage::Remove);
@@ -1230,7 +1266,7 @@ fn remove(cache: &Path) -> Result<Outcome, String> {
         }
         sync_dir(cache)?;
         remove_entry(&cache.join(REFUSED))?;
-        collect(cache, &[])
+        collect(store, &[])
     })();
     clear_work(&work);
     removed?;
@@ -1263,14 +1299,15 @@ fn own_directory(path: &Path, uid: u32) -> Result<Option<fs::Metadata>, String> 
 /// collection under the lock is a running instance. A launch that starts
 /// meanwhile finds no `current` and waits for this lock before it fetches,
 /// so it starts on the state as this leaves it.
-fn delete_data(home: &Path, cache: &Path, source: FlathubSource) -> Result<Outcome, String> {
+fn delete_data(home: &Path, store: &Store, source: FlathubSource) -> Result<Outcome, String> {
+    let cache = &store.root;
     // Never installed and no state: nothing to lock against.
     if fs::symlink_metadata(cache).is_err()
         && fs::symlink_metadata(home.join(STATE_ROOT).join(source.name)).is_err()
     {
         return Ok(Outcome::Deleted(false));
     }
-    prepare_cache(cache)?;
+    prepare_cache(store)?;
     let _lock = lock(cache)?;
     let work = fresh_work(cache)?;
     let _tracker = Tracker::new(&work, Stage::DeleteData);
@@ -1283,7 +1320,7 @@ fn delete_data(home: &Path, cache: &Path, source: FlathubSource) -> Result<Outco
                 ));
             }
         }
-        collect(cache, &[])?;
+        collect(store, &[])?;
         if !list(&cache.join(GENERATIONS))?.is_empty() {
             return Err(format!(
                 "{} is running; its data stays until every instance exits",
@@ -1333,14 +1370,15 @@ fn delete_state(home: &Path, name: &str) -> Result<bool, String> {
 /// reason recorded as the last refusal.
 fn revalidate(
     admission: &Admission<'_>,
-    cache: &Path,
+    store: &Store,
     source: FlathubSource,
     now: u64,
 ) -> Result<Option<u64>, String> {
+    let cache = &store.root;
     if fs::symlink_metadata(cache).is_err() {
         return Ok(None);
     }
-    prepare_cache(cache)?;
+    prepare_cache(store)?;
     let _lock = lock(cache)?;
     let expected = expect(source)?;
     let Some((number, selection)) = read_pointer(cache, CURRENT)? else {
@@ -1382,7 +1420,7 @@ fn revalidate(
         // The stale copy is no rollback: `previous` stays what it was.
         let previous = read_pointer(cache, PREVIOUS)?.map(|(generation, _)| generation);
         let generation = publish(cache, &next, previous)?;
-        collect(cache, &[])?;
+        collect(store, &[])?;
         Ok(generation)
     })();
     clear_work(&work);
@@ -1429,10 +1467,12 @@ fn export(
     admission: &Admission<'_>,
     refs: &[&str],
     cache: &Path,
-    store: &Path,
+    feed_store: &Path,
     now: u64,
 ) -> Result<Vec<String>, String> {
-    prepare_cache(cache)?;
+    prepare_cache(&Store {
+        root: cache.to_path_buf(),
+    })?;
     let _lock = lock(cache)?;
     let work = cache.join(WORK);
     if fs::symlink_metadata(&work).is_ok() {
@@ -1462,7 +1502,7 @@ fn export(
         .map(str::to_string)
         .collect();
     let store_graph = |commit: Checksum| {
-        store.join(crate::ostree::feed_graph_base("", commit).trim_start_matches('/'))
+        feed_store.join(crate::ostree::feed_graph_base("", commit).trim_start_matches('/'))
     };
     let mut resolved = Vec::with_capacity(refs.len());
     for &exact_ref in refs {
@@ -1482,13 +1522,13 @@ fn export(
         {
             write_state(&exported_path, &render_commits(&owned))?;
         }
-        crate::ostree::export_feed(&spec, &objects, store, |_| Ok(()))?;
+        crate::ostree::export_feed(&spec, &objects, feed_store, |_| Ok(()))?;
         let graph = crate::ostree::feed_graph_base("", commit);
         let graph = graph.trim_start_matches('/');
         publish_to_feed(
             &work,
             &candidate.commitmeta,
-            &store.join(commitmeta_url(graph, commit)?),
+            &feed_store.join(commitmeta_url(graph, commit)?),
         )?;
         resolved.push((exact_ref, candidate.admitted.commit));
     }
@@ -1498,14 +1538,14 @@ fn export(
         publish_to_feed(
             &work,
             format!("{commit}\n").as_bytes(),
-            &store.join(FEED_REFS).join(exact_ref),
+            &feed_store.join(FEED_REFS).join(exact_ref),
         )?;
     }
     remove_tree(&work)?;
     // An owned graph leaves the store once no ref file there names it, a
     // ref no longer declared included, so the feed never names a graph it
     // lacks.
-    let named = feed_ref_commits(&store.join(FEED_REFS))?;
+    let named = feed_ref_commits(&feed_store.join(FEED_REFS))?;
     let mut removed = Vec::new();
     for commit in owned.iter().filter(|commit| !named.contains(*commit)) {
         let graph = store_graph(Checksum::from_hex(commit)?);
@@ -1670,7 +1710,9 @@ pub fn run(args: &[String]) {
             verify: verify_flathub,
             validate: validate_dynamic,
         };
-        let cache = home.join(CACHE_DIR);
+        let cache = Store {
+            root: home.join(CACHE_DIR),
+        };
         match verb {
             Verb::Update => update(&admission, &cache, source, unix_now()?),
             Verb::Ready => ready(&cache, source).map(Outcome::Ready),
@@ -1876,6 +1918,10 @@ mod tests {
             self.home.join(CACHE_DIR)
         }
 
+        fn store(&self) -> Store {
+            Store { root: self.cache() }
+        }
+
         fn update(&self, source: FlathubSource, now: u64) -> Result<Outcome, String> {
             let admission = Admission {
                 repository: &self.url,
@@ -1883,7 +1929,7 @@ mod tests {
                 verify: verify_fixture,
                 validate: validate_fixture,
             };
-            update(&admission, &self.cache(), source, now)
+            update(&admission, &self.store(), source, now)
         }
 
         fn current(&self) -> Option<(u64, Selection)> {
@@ -2418,7 +2464,7 @@ mod tests {
     #[test]
     fn pointers_name_only_a_generation() {
         let fixture = Fixture::new("pointers");
-        prepare_cache(&fixture.cache()).unwrap();
+        prepare_cache(&fixture.store()).unwrap();
         let link = fixture.cache().join(CURRENT);
         for target in [
             "../x",
@@ -2544,7 +2590,7 @@ mod tests {
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         let app = app_commit(&fixture, b"app", 20);
         let cache = fixture.cache();
-        prepare_cache(&cache).unwrap();
+        prepare_cache(&fixture.store()).unwrap();
         fs::create_dir_all(cache.join(WORK).join("ref")).unwrap();
         fs::create_dir_all(cache.join(GENERATIONS).join("9")).unwrap();
         let partial = cache
@@ -2613,7 +2659,7 @@ mod tests {
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         app_commit(&fixture, b"app", 20);
         let cache = fixture.cache();
-        prepare_cache(&cache).unwrap();
+        prepare_cache(&fixture.store()).unwrap();
         fs::create_dir(cache.join(ADMITTED)).unwrap();
         let error = fixture.update(source(), NOW).unwrap_err();
         assert!(error.contains("not a regular file"), "{error}");
@@ -2629,7 +2675,7 @@ mod tests {
 
     impl Fixture {
         fn ready(&self, source: FlathubSource) -> Result<Option<u64>, String> {
-            ready(&self.cache(), source)
+            ready(&self.store(), source)
         }
     }
 
@@ -2726,7 +2772,7 @@ mod tests {
         }
 
         fn status(&self, source: FlathubSource) -> CacheStatus {
-            let status = status(&self.cache(), source).unwrap();
+            let status = status(&self.store(), source).unwrap();
             assert_eq!(status.name, "firefox");
             // What root relays is the canonical rendering.
             assert_eq!(Status::parse(&status.render()).unwrap(), status);
@@ -2811,7 +2857,7 @@ mod tests {
     #[test]
     fn progress_is_read_only_while_a_writer_holds_the_lock() {
         let fixture = Fixture::new("progress");
-        prepare_cache(&fixture.cache()).unwrap();
+        prepare_cache(&fixture.store()).unwrap();
         let writer = lock(&fixture.cache()).unwrap();
         assert_eq!(
             fixture.status(source()).progress,
@@ -2879,7 +2925,7 @@ mod tests {
     #[test]
     fn remove_clears_the_pointers_keeps_the_floor_and_spares_a_held_generation() {
         let fixture = Fixture::new("remove");
-        assert_eq!(remove(&fixture.cache()), Ok(Outcome::Removed));
+        assert_eq!(remove(&fixture.store()), Ok(Outcome::Removed));
         assert!(!fixture.cache().exists());
         publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
         let first = app_commit(&fixture, b"one", 20);
@@ -2889,7 +2935,7 @@ mod tests {
         fs::create_dir_all(fixture.state()).unwrap();
         let launch = fixture.hold(2);
 
-        assert_eq!(remove(&fixture.cache()), Ok(Outcome::Removed));
+        assert_eq!(remove(&fixture.store()), Ok(Outcome::Removed));
         assert_eq!(fixture.ready(source()), Ok(None));
         let removed = fixture.status(source());
         assert_eq!((removed.current, removed.previous), (None, None));
@@ -2901,7 +2947,7 @@ mod tests {
         assert!(fixture.cache().join(ADMITTED).exists());
         assert!(fixture.state().exists());
         drop(launch);
-        remove(&fixture.cache()).unwrap();
+        remove(&fixture.store()).unwrap();
         assert!(fixture.names(GENERATIONS).is_empty());
         assert!(fixture.names(DEPLOY).is_empty());
         assert!(fixture.names(OBJECTS).is_empty());
@@ -2919,7 +2965,7 @@ mod tests {
     fn delete_data_waits_for_remove_and_for_every_instance() {
         let fixture = Fixture::new("delete-data");
         assert_eq!(
-            delete_data(&fixture.home, &fixture.cache(), source()),
+            delete_data(&fixture.home, &fixture.store(), source()),
             Ok(Outcome::Deleted(false))
         );
         assert!(!fixture.cache().exists());
@@ -2931,16 +2977,16 @@ mod tests {
         fs::write(profile.join("prefs.js"), b"x").unwrap();
         fs::set_permissions(&profile, fs::Permissions::from_mode(0o500)).unwrap();
 
-        let error = delete_data(&fixture.home, &fixture.cache(), source()).unwrap_err();
+        let error = delete_data(&fixture.home, &fixture.store(), source()).unwrap_err();
         assert!(error.contains("remove it before"), "{error}");
         let launch = fixture.hold(1);
-        remove(&fixture.cache()).unwrap();
-        let error = delete_data(&fixture.home, &fixture.cache(), source()).unwrap_err();
+        remove(&fixture.store()).unwrap();
+        let error = delete_data(&fixture.home, &fixture.store(), source()).unwrap_err();
         assert!(error.contains("is running"), "{error}");
         assert!(profile.join("prefs.js").exists());
         drop(launch);
         assert_eq!(
-            delete_data(&fixture.home, &fixture.cache(), source()),
+            delete_data(&fixture.home, &fixture.store(), source()),
             Ok(Outcome::Deleted(true))
         );
         assert!(!fixture.state().exists());
@@ -2952,7 +2998,7 @@ mod tests {
         let doomed = applications.join(format!("{REMOVING}firefox"));
         fs::create_dir_all(doomed.join("half")).unwrap();
         assert_eq!(
-            delete_data(&fixture.home, &fixture.cache(), source()),
+            delete_data(&fixture.home, &fixture.store(), source()),
             Ok(Outcome::Deleted(false))
         );
         assert!(!doomed.exists());
@@ -2961,7 +3007,7 @@ mod tests {
         let elsewhere = fixture.home.join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, fixture.state()).unwrap();
-        assert!(delete_data(&fixture.home, &fixture.cache(), source()).is_err());
+        assert!(delete_data(&fixture.home, &fixture.store(), source()).is_err());
         assert!(elsewhere.exists());
     }
 
@@ -2970,7 +3016,7 @@ mod tests {
         let fixture = Fixture::new("revalidate");
         let admission = fixture.admission();
         assert_eq!(
-            revalidate(&admission, &fixture.cache(), source(), NOW),
+            revalidate(&admission, &fixture.store(), source(), NOW),
             Ok(None)
         );
         let runtime = publish_commit(&fixture.repository, RUNTIME, b"usr", 10, None, b"signed");
@@ -2979,7 +3025,7 @@ mod tests {
         let app = app_commit(&fixture, b"app", 20);
         fixture.update(source(), NOW).unwrap();
         assert_eq!(
-            revalidate(&admission, &fixture.cache(), source(), NOW),
+            revalidate(&admission, &fixture.store(), source(), NOW),
             Ok(Some(2))
         );
         let (_, stale) = fixture.current().unwrap();
@@ -2993,7 +3039,7 @@ mod tests {
 
         REFUSE.with(|refuse| *refuse.borrow_mut() = true);
         assert_eq!(
-            revalidate(&admission, &fixture.cache(), moved, NOW + 1),
+            revalidate(&admission, &fixture.store(), moved, NOW + 1),
             Ok(None)
         );
         REFUSE.with(|refuse| *refuse.borrow_mut() = false);
@@ -3004,7 +3050,7 @@ mod tests {
 
         VALIDATED.with(|seen| seen.borrow_mut().clear());
         assert_eq!(
-            revalidate(&admission, &fixture.cache(), moved, NOW + 2),
+            revalidate(&admission, &fixture.store(), moved, NOW + 2),
             Ok(Some(3))
         );
         let deploy = fixture.cache().join(DEPLOY);
@@ -3031,7 +3077,7 @@ mod tests {
         remove_tree(&deploy.join(&runtime)).unwrap();
         let back = source();
         assert_eq!(
-            revalidate(&admission, &fixture.cache(), back, NOW + 3),
+            revalidate(&admission, &fixture.store(), back, NOW + 3),
             Ok(None)
         );
         assert!(fixture
@@ -3048,7 +3094,7 @@ mod tests {
             ..source()
         };
         assert_eq!(
-            revalidate(&admission, &fixture.cache(), other, NOW + 4),
+            revalidate(&admission, &fixture.store(), other, NOW + 4),
             Ok(None)
         );
         assert!(fixture

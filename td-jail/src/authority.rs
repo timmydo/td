@@ -822,8 +822,9 @@ fn resolve_trees(
             "the cache's selection does not serve {name}'s declaration"
         )));
     }
-    let package_files = generation.tree(&selection.application.commit, uid)?;
-    let runtime_files = generation.tree(&selection.runtime.commit, uid)?;
+    let package_files =
+        crate::flathub::tree(&generation.cache, &selection.application.commit, uid)?;
+    let runtime_files = crate::flathub::tree(&generation.cache, &selection.runtime.commit, uid)?;
     Ok((package_files, runtime_files, Some(generation.hold)))
 }
 
