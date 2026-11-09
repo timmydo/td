@@ -90,7 +90,10 @@ cpu-max=100000 100000
 
 No `shared=network`: td-web holds no network. No `[Filesystem]` grant:
 td-web keeps nothing between runs, and a later increment that does keeps
-its state in the account's own home, which is private to it. No bus
+its state in the account's own home, which is private to it. In
+WORKLOADS.md's terms td-web is already the target shape: an account of
+its own (its reserved row carries into the workload ledger), a private
+home, and no grant of the human's files. No bus
 names, no environment and no terminal. The memory bounds hold a body at
 `MAX_DOCUMENT` (16 MiB), a picture of up to 16 Mi pixels decoded beside
 it, and a rendering of markup at `MAX_MARKUP`, which can transiently
@@ -303,8 +306,9 @@ order; each is its own design amendment when it starts:
   then flexbox) replacing the rich-output producer of §5.
 - **Pictures.** Inline images through `public` subresource fetches;
   progressive JPEG in td-jpeg; GIF; then WebP and an SVG subset.
-- **Downloads** to `~/Downloads` through the portal, which today admits
-  Firefox alone.
+- **Downloads** to `~/Downloads`, through a directory grant of
+  WORKLOADS.md ("Grants") or td-portal's FileChooser, which today admits
+  Firefox alone; td-web's account owns no file of the human's.
 - **Driving.** td-ui's control socket (td-ui/DESIGN.md), so a test or an
   agent can operate td-web through the verbs td-ui's other programs
   take, and an oracle can boot it in the image.

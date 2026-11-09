@@ -42,7 +42,7 @@ login user (`APPLICATIONS.md` §L, "Firefox runs under external service UID
 | --- | --- | --- |
 | Firefox | `tda65536` | td-authd `application-start` |
 | mail, news | the human (1000); 65537 and 65538 stay reserved | `application-start` or the human's shell |
-| td-web | not packaged; designed for `tda65540` | `./install-apps` on a host, unjailed |
+| td-web | `tda65540`, with a fetch service of its own; on a host, the human | `application-start` from its launcher card; on a host, `./install-apps`, unjailed |
 | td-sandbox | the human: "It creates no account and gains no privilege" | `td-sandbox` → `td-jail --workspace` |
 | td-agent tool jails | the human (workspace kind requires uid 1000) | td-agent → `td-jail --workspace` |
 | td-agent unconfined workspace | the human, no jail | td-agent `--unconfined` |
@@ -126,7 +126,8 @@ guarantees. An application is allocated when td-software installs it, not
 when the image declares it.
 
 The uids the image reserves today carry over as rows already present:
-Firefox 65536, and mail 65537 and news 65538, which return to use. A
+Firefox 65536 and td-web 65540, and mail 65537 and news 65538, which
+return to use. A
 workload's kind and name join the ledger to its policy: an application's
 reviewed declaration in the image, or the grants the human made for a
 sandbox or workspace. So the bus broker and td-portal take an
@@ -194,8 +195,8 @@ account.
    accounts and their `share` becomes a grant request.
 8. td-agent workspaces on ledger accounts; the unconfined workspace is
    retired.
-9. mail and news on their reserved rows; td-web packaged on a ledger
-   account.
+9. mail and news on their reserved rows, with fetch services of their
+   own as td-web has (td-web/DESIGN.md §3).
 10. td-software's runtime and grant views.
 
 ## Open questions
