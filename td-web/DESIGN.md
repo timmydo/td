@@ -44,8 +44,9 @@ rules (no panicking calls or indexing; bounded inputs).
 
 Web content is hostile input. Every parser td-web feeds is bounded by
 the limits below and by its crate's own (td-html's depth and element
-caps, td-png's and td-jpeg's pixel caps), and a refused or malformed
-document is shown as an error page, never a crash.
+caps and output budget, td-png's and td-jpeg's pixel caps), and a
+refused or malformed document is shown as an error page, never a
+crash.
 
 **No executable memory.** td-web, and any later script support, never
 asks for writable and executable memory, never maps a file executable
@@ -101,10 +102,10 @@ at `MAX_MARKUP` or one decoding of a picture of up to 16 Mi pixels
 navigation stopped or overtaken before its turn taking neither, and
 the page shown with its wrap, which keep at most some 140 MB measured
 and more while the wrap is made (§5). A rendering of a hostile page
-of empty paragraphs peaks at some 260 MB, but td-html's work grows
-with how deeply quotes and lists nest: 2 MiB of short paragraphs
-inside eight quotes peaks at some 750 MB, and deeper reaches
-`memory-max`, which ends the jail (§5, §10). The allocator keeps much
+of empty paragraphs peaks at some 260 MB, and one nesting quotes or
+lists around many short lines, or the other hostile shapes td-html's
+design lists, no more than some 265 MB in td-html, whose output budget
+cuts such a page short (§5, §10). The allocator keeps much
 of a rendering's peak after it, so a page near the bound leaves less
 room for the next. `memory-high` throttles before `memory-max` ends
 the jail. The tasks hold the window's thread, td-ui's and
@@ -229,27 +230,39 @@ among them. Markup past `MAX_MARKUP` (2 MiB) and text past `MAX_TEXT`
 (4 MiB) are not rendered, a page keeps at most `MAX_LINES` (100,000)
 logical lines and a rendering lays out and keeps as many wrapped ones
 however narrow it is, an unwrapped line at most `MAX_PRE_CHARS`
-characters, and the status row says when any of these cut the page
-short. A status other than `2xx` with a body is shown with its status
-in the status row; one without a body is an error page.
+characters, and the status row says when any of these, or td-html's
+output budget (below), cut the page short. A status other than `2xx`
+with a body is shown with its status in the status row; one without a
+body is an error page.
 
 td-html builds a rendering whole before td-web cuts it, so the markup
-bound is what bounds that work, which runs on a fetch thread, one
-rendering or picture decoding at a time across them (`RENDERING`).
-Measured on a development host, a hostile page of empty paragraphs at
-the bound costs there about 0.38 s and some 260 MB at its peak. td-html
-renders a quote's or list's content and then each of its lines again
-with the prefix a run of its own, at every level, so nesting
-multiplies that work: 2 MiB of short paragraphs inside eight quotes
-costs about 1.5 s and 750 MB, inside fifteen 3.3 s and 1.7 GB, and at
-td-html's nesting limit (some 62 levels) about 27 s and 11 GB, far
-past td-web's `memory-max` (§3, §10). What runs on the window's thread
-is the wrap, at each width and body face, at most `MAX_LINES` lines
-laid out. Measured there, with the page and wrap kept: the costliest
-of the 2 MiB pages tried, short paragraphs inside 62 quotes, each line
-repeating 124 characters of marks, takes about 0.53 s and keeps
-140 MB (23 MB of page, 116 MB of wrap) at 2000 px or wider, though
-td-web's jail ends the rendering before it (§3). Below that, a list of
+bound and td-html's output budget (td-html/DESIGN.md, "Resident
+rendering cost") are what bound that work, which runs on a fetch
+thread, one rendering or picture decoding at a time across them
+(`RENDERING`). Measured on a development host, a hostile page of empty
+paragraphs at the bound costs there about 0.38 s and some 260 MB at its
+peak. td-html composes the marks of the quotes and lists around a line
+into it once, as it emits the line, but as a run per level, so its
+output still grows with how deeply they nest, and its budget stops a
+rendering once that has built 128 MiB of runs and lines. Measured
+through td-html alone, 2 MiB of one-letter paragraphs inside eight
+quotes costs about 0.23 s and 250 MB and keeps some 215,000 of its
+524,000 lines, and at td-html's nesting limit (some 62 levels) about
+the same, keeping some 32,000; the other hostile shapes
+td-html/DESIGN.md lists peak at 265 MB at most and take 0.3 s at most
+there. td-html ends a rendering it cut short
+with a line of notice (`td_html::CUT_NOTICE`), which td-web leaves out
+of the page, saying in the status row that the rest is too large to
+render; a page whose own last line is that text is taken for one cut.
+A page td-web cuts at `MAX_LINES` before the notice never reaches it,
+so its status row shows only the `MAX_LINES` note. What runs on the
+window's thread is the wrap, at each width and body face, at most
+`MAX_LINES` lines laid out. Measured
+there, with the page and wrap kept: the costliest of the 2 MiB pages
+tried, short paragraphs inside 62 quotes, each line repeating 124
+characters of marks, took about 0.53 s and kept 140 MB (23 MB of page,
+116 MB of wrap) at 2000 px or wider, measured at more of its lines
+than td-html's budget now leaves it. Below that, a list of
 eight-word items nested eight deep takes about 0.2 s and keeps 63 MB
 at 300 px and at 3840; one of eight-word items about 0.1 s and
 51 MB; one paragraph inside eight quotes at 300 px 92 ms and 46 MB;
@@ -422,12 +435,10 @@ order; each is its own design amendment when it starts:
   allowlists"); it parses the most hostile input of td's programs.
 - **Text selection** in the page, and copying it.
 - **Bounded rendering**: the rendering is off the window's thread and
-  one at a time, but td-html still builds it whole before td-web keeps
-  `MAX_LINES` of it, so a hostile page costs a fetch thread the memory
-  and time §5 states, and one nesting quotes or lists around many short
-  lines more than td-web's jail allows; td-html adding each enclosing
-  prefix once as it emits a line, rather than rendering every level
-  again, and a line limit inside its rich output would bound it. The
+  one at a time, but td-html still builds it whole, up to its output
+  budget, before td-web keeps `MAX_LINES` of it, so a hostile page costs
+  a fetch thread the memory and time §5 states; a line limit inside its
+  rich output at `MAX_LINES` would bound that further. The
   window's thread wraps the page at each width up to `MAX_LINES`
   lines, an unwrapped line only to `MAX_PRE_CHARS`:
   wrapping only the lines near those shown would bound that pause

@@ -17,7 +17,8 @@ use td_url::{Reference, Url};
 /// builds a page's whole rendering before td-web keeps `MAX_LINES` of it,
 /// so this bounds that work, which a fetch thread does: a hostile page of
 /// empty paragraphs this size costs about 0.38 s and some 260 MB, and
-/// nested quotes or lists multiply it (DESIGN.md §5).
+/// td-html's output budget holds nested quotes or lists to about as much
+/// in td-html (DESIGN.md §5).
 pub const MAX_MARKUP: usize = 2 << 20;
 /// The most bytes of text rendered.
 pub const MAX_TEXT: usize = 4 << 20;
@@ -46,7 +47,8 @@ const MAX_LEAD: usize = 256;
 
 /// One rendering of markup or decoding of a picture at a time, whichever
 /// fetch thread asks: a rendering can cost some 260 MB at `MAX_MARKUP`,
-/// more when quotes or lists nest, and a picture some 112 MB, and
+/// about as much in td-html when quotes or lists nest, and a picture
+/// some 112 MB, and
 /// `MAX_WORKERS` of them at once would not fit td-web's memory bound
 /// (DESIGN.md §3).
 static RENDERING: Mutex<()> = Mutex::new(());
@@ -114,6 +116,8 @@ pub struct Page {
     pub links: Vec<Link>,
     /// Whether lines past `MAX_LINES` were left out.
     pub cut: bool,
+    /// Whether td-html left the rest out, past its output budget.
+    pub unrendered: bool,
     /// Whether a preformatted line was cut at `MAX_PRE_CHARS`.
     pub trimmed: bool,
     pub base: Option<Url>,
@@ -762,7 +766,17 @@ fn html(source: &[u8], base: Option<Url>) -> Page {
         ..Page::default()
     };
     let mut last: Option<(String, usize)> = None;
-    for spans in td_html::to_rich(source, 0) {
+    let mut rendered = td_html::to_rich(source, 0).into_iter().peekable();
+    while let Some(spans) = rendered.next() {
+        // td-html ends a rendering it cut short with its notice, which the
+        // status row says instead.
+        if rendered.peek().is_none()
+            && matches!(spans.as_slice(), [span]
+                if span.text == td_html::CUT_NOTICE && span.tags.is_empty())
+        {
+            page.unrendered = true;
+            break;
+        }
         if page.lines.len() == MAX_LINES {
             page.cut = true;
             break;
@@ -1453,6 +1467,18 @@ mod tests {
         assert_eq!(rendered.page.lines.len(), MAX_LINES);
         assert_eq!(rendered.lines.len(), MAX_LINES);
         assert!(rendered.page.cut && rendered.cut);
+        assert!(!rendered.page.unrendered);
+        // Markup td-html cuts short past its output budget says so in the
+        // status row, not with td-html's notice as a line.
+        let mut deep = b"<blockquote>".repeat(62);
+        deep.extend(b"<p>x</p>".repeat(200_000));
+        let page = html(&deep, None);
+        assert!(page.unrendered && !page.cut);
+        assert!(page.lines.len() > 10_000);
+        assert!(page
+            .lines
+            .iter()
+            .all(|line| line.runs.iter().all(|run| run.text != td_html::CUT_NOTICE)));
         // Markup's logical lines are bounded as text's are.
         let doc = html_doc("a<br>".repeat(MAX_LINES + 10).as_bytes());
         let rendered = cells(&doc, 80);

@@ -779,6 +779,9 @@ impl App {
                 document::MAX_LINES
             ));
         }
+        if rendered.page.unrendered {
+            parts.push("the rest is too large to render".to_string());
+        }
         if rendered.page.trimmed {
             parts.push(format!(
                 "unwrapped lines are cut at {} characters",

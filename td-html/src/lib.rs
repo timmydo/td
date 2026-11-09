@@ -7,8 +7,10 @@
 //! rich output) so a reader sees the same page.
 //!
 //! Input is untrusted: the tokenizer never fails, element nesting is bounded,
-//! and every pass is linear in the input size. It is one crate td's
-//! applications depend on by path (AGENTS.md principle 2).
+//! and a rendering's time and memory are linear in its input plus its
+//! output, which an output budget bounds (td-html/DESIGN.md, "Resident
+//! rendering cost"). It is one crate td's applications depend on by path
+//! (AGENTS.md principle 2).
 //!
 //! [`to_text`] renders the plain form (the equivalent of `from_read`) and
 //! [`to_rich`] the tagged form (the equivalent of `from_read_coloured`'s input
@@ -18,13 +20,16 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+use std::rc::Rc;
+
 /// Bounded extraction; see `td-html/DESIGN.md` for its text heuristic.
 pub mod extract;
 /// Bounded references; see `td-html/DESIGN.md` for the streaming contract.
 pub mod reference;
 
 /// An RGB colour carried by [`Tag::Colour`] and [`Tag::BgColour`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rgb {
     pub r: u8,
     pub g: u8,
@@ -32,7 +37,7 @@ pub struct Rgb {
 }
 
 /// Inline markup attached to a [`Span`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Tag {
     Strong,
     Emphasis,
@@ -85,6 +90,11 @@ pub fn to_rich(html: &[u8], width: usize) -> Vec<Vec<Span>> {
     render(html, width, Decor::Rich)
 }
 
+/// The last line of a rendering cut short by its output budget, one plain
+/// span in rich output, and in no rendering that was not cut
+/// (td-html/DESIGN.md, "Resident rendering cost").
+pub const CUT_NOTICE: &str = "[the rest of this document is not shown: it is too large to render]";
+
 /// Maximum element nesting kept from the input; deeper elements are
 /// transparent (their text still renders).
 const MAX_DEPTH: usize = 64;
@@ -110,6 +120,10 @@ enum Decor {
 }
 
 fn render(html: &[u8], width: usize, decor: Decor) -> Vec<Vec<Span>> {
+    render_within(html, width, decor, OUTPUT_BUDGET)
+}
+
+fn render_within(html: &[u8], width: usize, decor: Decor, budget: usize) -> Vec<Vec<Span>> {
     let source = String::from_utf8_lossy(html);
     let nodes = build(&source);
     let (est, content) = measure(&nodes, decor);
@@ -119,14 +133,18 @@ fn render(html: &[u8], width: usize, decor: Decor) -> Vec<Vec<Span>> {
         content,
         decor,
         tags: Vec::new(),
+        tag_ids: Vec::new(),
+        interned: HashMap::new(),
         links: Vec::new(),
         strike: 0,
         pre: 0,
         table_depth: 0,
     };
-    let mut out = Out::new(width);
+    // The notice's own cost is set aside, so a cut rendering still fits.
+    let budget = Budget::new(budget.saturating_sub(cut_cost()));
+    let mut out = Out::new(width, budget.clone(), decor == Decor::Plain);
     rend.children(0, &mut out);
-    if decor == Decor::Plain && !rend.links.is_empty() {
+    if decor == Decor::Plain && !rend.links.is_empty() && !out.spent() {
         out.start_block();
         let links = std::mem::take(&mut rend.links);
         for (i, url) in links.iter().enumerate() {
@@ -137,14 +155,23 @@ fn render(html: &[u8], width: usize, decor: Decor) -> Vec<Vec<Span>> {
     while lines.last().is_some_and(|l| !line_has_content(l)) {
         lines.pop();
     }
+    if budget.spent() {
+        lines.push(vec![Span::plain(CUT_NOTICE.to_string())]);
+    }
     lines
+}
+
+/// What the cut notice's line costs the budget.
+fn cut_cost() -> usize {
+    LINE_COST + SPAN_COST + CUT_NOTICE.len()
 }
 
 /// Emit `[n]: url` on one line at any width, so the whole reference is
 /// recognisable on its line and its link, which a Control-press follows
 /// whole, is never split.
 fn push_footnote(out: &mut Out, index: usize, url: &str) {
-    out.push_line(vec![Span::plain(format!("[{index}]: {url}"))]);
+    let label = format!("[{index}]: ");
+    out.push_plain(label.len().saturating_add(url.len()), || label + url);
 }
 
 fn line_has_content(line: &[Span]) -> bool {
@@ -1694,10 +1721,101 @@ fn row_extent(
 // Line buffer and wrapping
 // ---------------------------------------------------------------------------
 
+/// Bytes of spans and lines one rendering may build, its table cells'
+/// included, before it stops (td-html/DESIGN.md, "Resident rendering
+/// cost").
+const OUTPUT_BUDGET: usize = 128 << 20;
+/// What a span costs the budget beyond its text and tags.
+const SPAN_COST: usize = 64;
+/// What a tag costs beyond the target it carries.
+const TAG_COST: usize = 32;
+/// What a line costs beyond its spans.
+const LINE_COST: usize = 32;
+
+fn tags_cost(tags: &[Tag]) -> usize {
+    tags.iter().fold(0usize, |sum, tag| {
+        let target = match tag {
+            Tag::Link(t) | Tag::Image(t) => t.len(),
+            _ => 0,
+        };
+        sum.saturating_add(TAG_COST).saturating_add(target)
+    })
+}
+
+fn span_cost(span: &Span) -> usize {
+    SPAN_COST
+        .saturating_add(span.text.len())
+        .saturating_add(tags_cost(&span.tags))
+}
+
+/// The bytes a rendering has left to build, shared by its table cells;
+/// `None` once a charge did not fit, after which nothing more is built.
+#[derive(Clone)]
+struct Budget(Rc<std::cell::Cell<Option<usize>>>);
+
+impl Budget {
+    fn new(bytes: usize) -> Budget {
+        Budget(Rc::new(std::cell::Cell::new(Some(bytes))))
+    }
+
+    fn spend(&self, cost: usize) -> bool {
+        match self.0.get() {
+            Some(left) if cost <= left => {
+                self.0.set(Some(left - cost));
+                true
+            }
+            _ => {
+                self.0.set(None);
+                false
+            }
+        }
+    }
+
+    fn spent(&self) -> bool {
+        self.0.get().is_none()
+    }
+
+    fn left(&self) -> usize {
+        self.0.get().unwrap_or(0)
+    }
+
+    fn exhaust(&self) {
+        self.0.set(None);
+    }
+}
+
+fn line_cost(line: &[Span]) -> usize {
+    line.iter()
+        .fold(LINE_COST, |sum, span| sum.saturating_add(span_cost(span)))
+}
+
+/// The tags around some text and their stack's id: equal stacks, and only
+/// they, share an id, so comparing ids compares the tags.
+#[derive(Clone, Copy)]
+struct TagSet<'t> {
+    tags: &'t [Tag],
+    id: usize,
+}
+
+/// The output of one block: the whole document, a table cell, or a prefixed
+/// block (a quote, list item, definition or heading) nested in another.
+///
+/// A prefixed block does not collect its own lines. Its state is the
+/// innermost of `nest`'s, and each of its lines is written to `lines` once,
+/// with every enclosing block's prefix composed in front of it as it is
+/// emitted, so deep nesting costs the prefixes the output carries and no
+/// copy of a line per level.
 struct Out {
     width: usize,
+    budget: Budget,
+    /// Plain output keeps no tags: its text is all that reaches the reader.
+    plain: bool,
     lines: Vec<Vec<Span>>,
     inline: Vec<Span>,
+    /// The tag stack id of `inline`'s last span.
+    inline_id: usize,
+    /// The columns `inline` takes.
+    inline_col: usize,
     /// Set when a block ends: whitespace before the next content is dropped
     /// and a blank line separates it.
     at_block_end: bool,
@@ -1705,23 +1823,177 @@ struct Out {
     verbatim: bool,
     /// Whether any line emitted so far carries text.
     seen_content: bool,
+    /// Open prefixed blocks, outermost first.
+    nest: Vec<Nest>,
+}
+
+/// One open prefixed block: the prefix its lines take and the state of the
+/// block it is nested in, restored when it closes.
+struct Nest {
+    first: String,
+    cont: String,
+    tags: Vec<Tag>,
+    /// What `first` and `cont` cost in front of a line.
+    first_cost: usize,
+    cont_cost: usize,
+    /// Whether the block has emitted a line, so the next takes `cont`.
+    started: bool,
+    outer: Saved,
+}
+
+struct Saved {
+    width: usize,
+    at_block_end: bool,
+    verbatim: bool,
+    seen_content: bool,
 }
 
 impl Out {
-    fn new(width: usize) -> Out {
+    fn new(width: usize, budget: Budget, plain: bool) -> Out {
         Out {
             width,
+            budget,
+            plain,
             lines: Vec::new(),
             inline: Vec::new(),
+            inline_id: 0,
+            inline_col: 0,
             at_block_end: false,
             verbatim: false,
             seen_content: false,
+            nest: Vec::new(),
         }
     }
 
+    /// A table cell's output, drawing on the same budget.
+    fn cell(&self, width: usize) -> Out {
+        Out::new(width, self.budget.clone(), self.plain)
+    }
+
+    fn spent(&self) -> bool {
+        self.budget.spent()
+    }
+
+    /// What the prefixes in front of the innermost block's next line cost.
+    fn prefix_cost(&self) -> usize {
+        self.nest.iter().fold(0usize, |sum, nest| {
+            sum.saturating_add(if nest.started {
+                nest.cont_cost
+            } else {
+                nest.first_cost
+            })
+        })
+    }
+
+    /// Charge the innermost block's next line, which costs `cost` before
+    /// its prefixes, before anything of it is built. Once a line is refused
+    /// the lines kept are those before it, and nothing more is built.
+    fn admit(&mut self, cost: usize) -> bool {
+        !self.spent() && self.budget.spend(cost.saturating_add(self.prefix_cost()))
+    }
+
+    /// Emit an admitted line of the innermost block.
     fn emit(&mut self, line: Vec<Span>) {
         self.seen_content |= line_has_content(&line);
-        self.lines.push(line);
+        self.deliver(line);
+    }
+
+    /// Emit a built line if the budget has room for it.
+    fn emit_line(&mut self, line: Vec<Span>) {
+        if self.admit(line_cost(&line)) {
+            self.emit(line);
+        }
+    }
+
+    /// An empty line, which counts as no content of the innermost block.
+    fn blank(&mut self) {
+        if self.admit(LINE_COST) {
+            self.deliver(Vec::new());
+        }
+    }
+
+    /// Write an admitted line of the innermost block, prefixed by each
+    /// enclosing block. Each enclosing block sees the line as emitted to it,
+    /// with the prefixes inside it, for its own `seen_content`.
+    fn deliver(&mut self, line: Vec<Span>) {
+        if self.nest.is_empty() {
+            self.lines.push(line);
+            return;
+        }
+        let mut has = line_has_content(&line);
+        for nest in self.nest.iter_mut().rev() {
+            let prefix = if nest.started {
+                &nest.cont
+            } else {
+                &nest.first
+            };
+            has |= !prefix.is_empty();
+            nest.outer.seen_content |= has;
+        }
+        let mut full = Vec::with_capacity(self.nest.len() + line.len());
+        for nest in &mut self.nest {
+            let prefix = if nest.started {
+                &nest.cont
+            } else {
+                &nest.first
+            };
+            if !prefix.is_empty() {
+                full.push(Span {
+                    text: prefix.clone(),
+                    tags: nest.tags.clone(),
+                });
+            }
+            nest.started = true;
+        }
+        full.extend(line);
+        self.lines.push(full);
+    }
+
+    /// Open a block nested in the current one, `width` columns wide, whose
+    /// lines take `first` and then `cont` in front of them.
+    fn open(&mut self, width: usize, first: &str, cont: &str, tags: &[Tag]) {
+        self.flush_line();
+        let outer = Saved {
+            width: std::mem::replace(&mut self.width, width),
+            at_block_end: std::mem::replace(&mut self.at_block_end, false),
+            verbatim: std::mem::replace(&mut self.verbatim, false),
+            seen_content: std::mem::replace(&mut self.seen_content, false),
+        };
+        let tags = if self.plain { &[] } else { tags };
+        let own = tags_cost(tags)
+            .saturating_add(first.len())
+            .saturating_add(cont.len());
+        // A block opened past the budget keeps no copy of the tags.
+        let tags = if self.budget.spend(own) { tags } else { &[] };
+        let cost = |prefix: &str| {
+            if prefix.is_empty() {
+                0
+            } else {
+                SPAN_COST
+                    .saturating_add(prefix.len())
+                    .saturating_add(tags_cost(tags))
+            }
+        };
+        self.nest.push(Nest {
+            first: first.to_string(),
+            cont: cont.to_string(),
+            tags: tags.to_vec(),
+            first_cost: cost(first),
+            cont_cost: cost(cont),
+            started: false,
+            outer,
+        });
+    }
+
+    /// Close the innermost nested block, returning to the one around it.
+    fn close(&mut self) {
+        self.flush_line();
+        let Some(nest) = self.nest.pop() else { return };
+        let outer = nest.outer;
+        self.width = outer.width;
+        self.at_block_end = outer.at_block_end && !nest.started;
+        self.verbatim = outer.verbatim;
+        self.seen_content = outer.seen_content;
     }
 
     fn ends_with_space(&self) -> bool {
@@ -1731,24 +2003,40 @@ impl Out {
         }
     }
 
-    fn push_span(&mut self, text: String, tags: &[Tag]) {
-        if text.is_empty() {
+    fn push_span(&mut self, text: String, set: TagSet) {
+        if text.is_empty() || self.spent() {
             return;
         }
-        if let Some(last) = self.inline.last_mut() {
-            if last.tags == tags {
-                last.text.push_str(&text);
-                return;
+        let (tags, id) = if self.plain {
+            (&[][..], 0)
+        } else {
+            (set.tags, set.id)
+        };
+        let width = str_width(&text);
+        if !self.inline.is_empty() && self.inline_id == id {
+            if self.budget.spend(text.len()) {
+                if let Some(last) = self.inline.last_mut() {
+                    last.text.push_str(&text);
+                    self.inline_col += width;
+                }
             }
+            return;
         }
-        self.inline.push(Span {
-            text,
-            tags: tags.to_vec(),
-        });
+        let cost = SPAN_COST
+            .saturating_add(text.len())
+            .saturating_add(tags_cost(tags));
+        if self.budget.spend(cost) {
+            self.inline.push(Span {
+                text,
+                tags: tags.to_vec(),
+            });
+            self.inline_id = id;
+            self.inline_col += width;
+        }
     }
 
     /// Add collapsed inline text.
-    fn add_text(&mut self, text: &str, tags: &[Tag], strike: bool) {
+    fn add_text(&mut self, text: &str, tags: TagSet, strike: bool) {
         if text.is_empty() {
             return;
         }
@@ -1781,7 +2069,7 @@ impl Out {
     }
 
     /// Add verbatim text, honouring embedded newlines and tabs.
-    fn add_pre(&mut self, text: &str, tags: &[Tag], strike: bool) {
+    fn add_pre(&mut self, text: &str, tags: TagSet, strike: bool) {
         if self.at_block_end && !text.is_empty() {
             self.start_block();
         }
@@ -1793,11 +2081,7 @@ impl Out {
             first = false;
             self.verbatim = true;
             let mut buf = String::with_capacity(part.len());
-            let mut col = self
-                .inline
-                .iter()
-                .map(|s| str_width(&s.text))
-                .sum::<usize>();
+            let mut col = self.inline_col;
             for c in part.chars() {
                 if c == '\r' || is_ignorable(c) {
                     continue;
@@ -1826,14 +2110,31 @@ impl Out {
             return;
         }
         let spans = std::mem::take(&mut self.inline);
-        if self.verbatim {
-            self.verbatim = false;
-            self.emit(spans);
+        self.inline_col = 0;
+        if self.spent() {
             return;
         }
-        for line in wrap(spans, self.width) {
-            self.emit(line);
+        if self.verbatim {
+            self.verbatim = false;
+            self.emit_line(spans);
+            return;
         }
+        let tag_costs: Vec<usize> = spans.iter().map(|span| tags_cost(&span.tags)).collect();
+        let budget = self.budget.clone();
+        let width = self.width;
+        let mut send = |pieces: Vec<Piece>| {
+            let cost = pieces.iter().fold(LINE_COST, |sum, piece| {
+                sum.saturating_add(SPAN_COST)
+                    .saturating_add(piece.text.len())
+                    .saturating_add(tag_costs.get(piece.src).copied().unwrap_or(0))
+            });
+            if !self.admit(cost) {
+                return false;
+            }
+            self.emit(materialise(pieces, &spans));
+            true
+        };
+        wrap(&spans, width, &budget, &mut send);
     }
 
     fn new_line(&mut self) {
@@ -1845,7 +2146,7 @@ impl Out {
         self.at_block_end = false;
         self.flush_line();
         if self.seen_content {
-            self.lines.push(Vec::new());
+            self.blank();
         }
     }
 
@@ -1859,41 +2160,33 @@ impl Out {
             self.at_block_end = false;
         }
         if self.inline.is_empty() {
-            self.lines.push(Vec::new());
+            self.blank();
         } else {
             self.flush_line();
         }
     }
 
-    fn push_line(&mut self, line: Vec<Span>) {
-        self.flush_line();
-        self.at_block_end = false;
-        self.emit(line);
+    /// Emit a line of one plain span of `len` bytes, which `build` makes
+    /// only if the budget has room for it.
+    fn push_plain(&mut self, len: usize, build: impl FnOnce() -> String) {
+        let cost = LINE_COST.saturating_add(SPAN_COST).saturating_add(len);
+        self.push_line_with(cost, || vec![Span::plain(build())]);
     }
 
-    /// Append an already rendered block, prefixing its lines.
-    fn append_sub(&mut self, sub: Out, first: &str, cont: &str, tags: &[Tag]) {
+    /// Emit the line `build` makes, which costs `cost`, building it only if
+    /// the budget has room for it.
+    fn push_line_with(&mut self, cost: usize, build: impl FnOnce() -> Vec<Span>) {
         self.flush_line();
-        let sub_lines = sub.into_lines();
-        if sub_lines.is_empty() {
-            return;
-        }
         self.at_block_end = false;
-        for (i, line) in sub_lines.into_iter().enumerate() {
-            let prefix = if i == 0 { first } else { cont };
-            let mut out_line = Vec::with_capacity(line.len() + 1);
-            if !prefix.is_empty() {
-                out_line.push(Span {
-                    text: prefix.to_string(),
-                    tags: tags.to_vec(),
-                });
-            }
-            out_line.extend(line);
-            self.emit(out_line);
+        if self.admit(cost) {
+            self.emit(build());
         }
     }
 
     fn into_lines(mut self) -> Vec<Vec<Span>> {
+        while !self.nest.is_empty() {
+            self.close();
+        }
         self.flush_line();
         self.lines
     }
@@ -1930,102 +2223,160 @@ fn materialise(pieces: Vec<Piece>, spans: &[Span]) -> Vec<Span> {
 
 /// Greedy word wrapping. Words longer than the width are split, but for one
 /// holding a link, which a Control-press follows whole; a width of 0 means
-/// no wrapping.
-fn wrap(spans: Vec<Span>, width: usize) -> Vec<Vec<Span>> {
-    let mut lines: Vec<Vec<Span>> = Vec::new();
-    let mut cur: Vec<Piece> = Vec::new();
-    let mut cur_w = 0usize;
-    let mut word: Vec<Piece> = Vec::new();
-    let mut word_w = 0usize;
-    let mut space: Option<usize> = None;
-
+/// no wrapping. Each line goes to `send` as it is made, which builds it or
+/// refuses it; wrapping stops at a refusal, and before one: once the line
+/// being gathered costs, by its pieces and text alone, more than `budget`
+/// has left, the budget is spent and nothing more is gathered.
+fn wrap(spans: &[Span], width: usize, budget: &Budget, send: &mut dyn FnMut(Vec<Piece>) -> bool) {
+    let mut w = Wrap {
+        width,
+        budget,
+        send,
+        cur: Vec::new(),
+        cur_w: 0,
+        cur_bytes: 0,
+        word: Vec::new(),
+        word_w: 0,
+        space: None,
+        sent: false,
+        stopped: false,
+    };
     for (src, span) in spans.iter().enumerate() {
         for c in span.text.chars() {
+            if w.stopped {
+                return;
+            }
             if c == ' ' {
-                if !word.is_empty() {
-                    flush_word(
-                        &mut lines,
-                        &mut cur,
-                        &mut cur_w,
-                        &mut word,
-                        &mut word_w,
-                        &mut space,
-                        width,
-                        &spans,
-                    );
+                if !w.word.is_empty() {
+                    w.flush_word();
                 }
-                if !cur.is_empty() || !lines.is_empty() || word_w > 0 {
-                    space = Some(src);
+                if !w.cur.is_empty() || w.sent || w.word_w > 0 {
+                    w.space = Some(src);
                 }
                 continue;
             }
-            push_piece(&mut word, src, c);
-            word_w += char_width(c);
+            push_piece(&mut w.word, src, c);
+            w.word_w += char_width(c);
         }
     }
-    flush_word(
-        &mut lines,
-        &mut cur,
-        &mut cur_w,
-        &mut word,
-        &mut word_w,
-        &mut space,
-        width,
-        &spans,
-    );
-    if !cur.is_empty() {
-        lines.push(materialise(cur, &spans));
+    w.flush_word();
+    if !w.cur.is_empty() {
+        let cur = std::mem::take(&mut w.cur);
+        w.line(cur);
     }
-    lines
 }
 
-#[allow(clippy::too_many_arguments)]
-fn flush_word(
-    lines: &mut Vec<Vec<Span>>,
-    cur: &mut Vec<Piece>,
-    cur_w: &mut usize,
-    word: &mut Vec<Piece>,
-    word_w: &mut usize,
-    space: &mut Option<usize>,
+struct Wrap<'b, 's> {
     width: usize,
-    spans: &[Span],
-) {
-    if word.is_empty() {
-        *space = None;
-        return;
-    }
-    let sep = usize::from(!cur.is_empty());
-    let fits = width == 0 || *cur_w + sep + *word_w <= width;
-    if fits {
-        if sep == 1 {
-            let src = space.unwrap_or_else(|| cur.last().map_or(0, |p| p.src));
-            push_piece(cur, src, ' ');
-            *cur_w += 1;
+    budget: &'b Budget,
+    send: &'s mut dyn FnMut(Vec<Piece>) -> bool,
+    cur: Vec<Piece>,
+    cur_w: usize,
+    /// The text bytes in `cur`.
+    cur_bytes: usize,
+    word: Vec<Piece>,
+    word_w: usize,
+    space: Option<usize>,
+    /// Whether a line has been sent.
+    sent: bool,
+    stopped: bool,
+}
+
+fn pieces_bytes(pieces: &[Piece]) -> usize {
+    pieces.iter().map(|piece| piece.text.len()).sum()
+}
+
+impl Wrap<'_, '_> {
+    fn line(&mut self, pieces: Vec<Piece>) {
+        if self.stopped {
+            return;
         }
-        cur.append(word);
-        *cur_w += *word_w;
-        *word_w = 0;
-        *space = None;
-        return;
-    }
-    if !cur.is_empty() {
-        lines.push(materialise(std::mem::take(cur), spans));
-        *cur_w = 0;
-    }
-    // The word starts a fresh line; split it if it still does not fit.
-    if width > 0 && *word_w > width && !holds_link(word) {
-        let (full, rest, rest_w) = split_word(std::mem::take(word), width);
-        for line in full {
-            lines.push(materialise(line, spans));
+        self.sent = true;
+        if !(self.send)(pieces) {
+            self.stopped = true;
         }
-        *cur = rest;
-        *cur_w = rest_w;
-    } else {
-        *cur = std::mem::take(word);
-        *cur_w = *word_w;
     }
-    *word_w = 0;
-    *space = None;
+
+    /// Stop once the line being gathered could not be kept.
+    fn check(&mut self) {
+        let least = self
+            .cur
+            .len()
+            .saturating_mul(SPAN_COST)
+            .saturating_add(self.cur_bytes);
+        if least > self.budget.left() {
+            self.budget.exhaust();
+            self.stopped = true;
+        }
+    }
+
+    /// Break an over-long word into width-sized lines, sending each as it
+    /// is made, and gather the rest as the line being built.
+    fn split(&mut self, word: Vec<Piece>) {
+        let mut cur: Vec<Piece> = Vec::new();
+        let mut cur_w = 0usize;
+        for piece in word {
+            for c in piece.text.chars() {
+                let cw = char_width(c);
+                if cur_w > 0 && cur_w + cw > self.width {
+                    self.line(std::mem::take(&mut cur));
+                    if self.stopped {
+                        return;
+                    }
+                    cur_w = 0;
+                }
+                push_piece(&mut cur, piece.src, c);
+                cur_w += cw;
+            }
+        }
+        self.cur_bytes = pieces_bytes(&cur);
+        self.cur = cur;
+        self.cur_w = cur_w;
+    }
+
+    fn flush_word(&mut self) {
+        if self.word.is_empty() {
+            self.space = None;
+            return;
+        }
+        let sep = usize::from(!self.cur.is_empty());
+        let fits = self.width == 0 || self.cur_w + sep + self.word_w <= self.width;
+        if fits {
+            if sep == 1 {
+                let src = self
+                    .space
+                    .unwrap_or_else(|| self.cur.last().map_or(0, |p| p.src));
+                push_piece(&mut self.cur, src, ' ');
+                self.cur_w += 1;
+                self.cur_bytes += 1;
+            }
+            self.cur_bytes += pieces_bytes(&self.word);
+            self.cur.append(&mut self.word);
+            self.cur_w += self.word_w;
+            self.word_w = 0;
+            self.space = None;
+            self.check();
+            return;
+        }
+        if !self.cur.is_empty() {
+            let cur = std::mem::take(&mut self.cur);
+            self.line(cur);
+            self.cur_w = 0;
+            self.cur_bytes = 0;
+        }
+        // The word starts a fresh line; split it if it still does not fit.
+        if self.width > 0 && self.word_w > self.width && !holds_link(&self.word) {
+            let word = std::mem::take(&mut self.word);
+            self.split(word);
+        } else {
+            self.cur = std::mem::take(&mut self.word);
+            self.cur_bytes = pieces_bytes(&self.cur);
+            self.cur_w = self.word_w;
+        }
+        self.word_w = 0;
+        self.space = None;
+        self.check();
+    }
 }
 
 /// Whether a word holds a link's scheme: a link split across lines would
@@ -2033,26 +2384,6 @@ fn flush_word(
 fn holds_link(word: &[Piece]) -> bool {
     let text: String = word.iter().map(|piece| piece.text.as_str()).collect();
     text.contains("https://") || text.contains("http://")
-}
-
-/// Break an over-long word into width-sized lines, returning the completed
-/// lines plus the remainder and its width.
-fn split_word(word: Vec<Piece>, width: usize) -> (Vec<Vec<Piece>>, Vec<Piece>, usize) {
-    let mut lines: Vec<Vec<Piece>> = Vec::new();
-    let mut cur: Vec<Piece> = Vec::new();
-    let mut cur_w = 0usize;
-    for piece in word {
-        for c in piece.text.chars() {
-            let cw = char_width(c);
-            if cur_w > 0 && cur_w + cw > width {
-                lines.push(std::mem::take(&mut cur));
-                cur_w = 0;
-            }
-            push_piece(&mut cur, piece.src, c);
-            cur_w += cw;
-        }
-    }
-    (lines, cur, cur_w)
 }
 
 // ---------------------------------------------------------------------------
@@ -2065,6 +2396,11 @@ struct Rend<'a> {
     content: Vec<bool>,
     decor: Decor,
     tags: Vec<Tag>,
+    /// The id of the tag stack at each depth of `tags`; 0 is the empty one.
+    tag_ids: Vec<usize>,
+    /// Each tag stack seen, by the id of the stack below its top and its
+    /// top, so equal stacks share one id.
+    interned: HashMap<(usize, Tag), usize>,
     links: Vec<String>,
     strike: usize,
     pre: usize,
@@ -2085,6 +2421,32 @@ impl<'a> Rend<'a> {
         self.content.get(idx).copied().unwrap_or(false)
     }
 
+    fn push_tag(&mut self, tag: Tag) {
+        let key = (self.tag_ids.last().copied().unwrap_or(0), tag);
+        let id = match self.interned.get(&key) {
+            Some(&id) => id,
+            None => {
+                let id = self.interned.len() + 1;
+                self.interned.insert((key.0, key.1.clone()), id);
+                id
+            }
+        };
+        self.tags.push(key.1);
+        self.tag_ids.push(id);
+    }
+
+    fn pop_tag(&mut self) {
+        self.tags.pop();
+        self.tag_ids.pop();
+    }
+
+    fn tag_set(&self) -> TagSet<'_> {
+        TagSet {
+            tags: &self.tags,
+            id: self.tag_ids.last().copied().unwrap_or(0),
+        }
+    }
+
     fn extent(&self, idx: usize) -> (usize, usize) {
         self.est.get(idx).copied().unwrap_or((0, 0))
     }
@@ -2096,6 +2458,9 @@ impl<'a> Rend<'a> {
             let Some(&child) = node.children.get(k) else {
                 break;
             };
+            if out.spent() {
+                break;
+            }
             self.node(child, out);
         }
     }
@@ -2107,9 +2472,9 @@ impl<'a> Rend<'a> {
             Kind::Root => self.children(idx, out),
             Kind::Text(text) => {
                 if self.pre > 0 {
-                    out.add_pre(text, &self.tags, self.strike > 0);
+                    out.add_pre(text, self.tag_set(), self.strike > 0);
                 } else {
-                    out.add_text(text, &self.tags, self.strike > 0);
+                    out.add_text(text, self.tag_set(), self.strike > 0);
                 }
             }
             Kind::Elem(elem) => self.elem(idx, elem, out),
@@ -2119,11 +2484,11 @@ impl<'a> Rend<'a> {
     fn elem(&mut self, idx: usize, elem: &'a Elem, out: &mut Out) {
         let mut pushed = 0usize;
         if let Some(c) = elem.colour {
-            self.tags.push(Tag::Colour(c));
+            self.push_tag(Tag::Colour(c));
             pushed += 1;
         }
         if let Some(c) = elem.bg {
-            self.tags.push(Tag::BgColour(c));
+            self.push_tag(Tag::BgColour(c));
             pushed += 1;
         }
         match elem.kind {
@@ -2159,16 +2524,16 @@ impl<'a> Rend<'a> {
             }
             ElemKind::Pre => {
                 out.start_block();
-                self.tags.push(Tag::Preformat);
+                self.push_tag(Tag::Preformat);
                 self.pre += 1;
                 self.children(idx, out);
                 self.pre -= 1;
-                self.tags.pop();
+                self.pop_tag();
                 out.end_block();
             }
             ElemKind::Rule => {
                 let w = if out.width == 0 { 3 } else { out.width };
-                out.push_line(vec![Span::plain("-".repeat(w))]);
+                out.push_plain(w, || "-".repeat(w));
             }
             ElemKind::Break => out.hard_break(),
             ElemKind::Ul => self.list(idx, out, None),
@@ -2201,31 +2566,30 @@ impl<'a> Rend<'a> {
             ElemKind::Link => self.link(idx, elem, out),
             ElemKind::Image => {
                 if !elem.alt.is_empty() {
-                    self.tags.push(Tag::Image(elem.target.clone()));
+                    self.push_tag(Tag::Image(elem.target.clone()));
                     let text = if self.plain() {
                         format!("[{}]", elem.alt)
                     } else {
                         elem.alt.clone()
                     };
-                    let tags = self.tags.clone();
-                    out.add_text(&text, &tags, false);
-                    self.tags.pop();
+                    out.add_text(&text, self.tag_set(), false);
+                    self.pop_tag();
                 }
             }
             ElemKind::Em => self.marked(idx, out, elem.mark, Some(Tag::Emphasis)),
             ElemKind::Strong => self.marked(idx, out, elem.mark, Some(Tag::Strong)),
             ElemKind::Code => self.marked(idx, out, elem.mark, Some(Tag::Code)),
             ElemKind::Strike => {
-                self.tags.push(Tag::Strikeout);
+                self.push_tag(Tag::Strikeout);
                 self.strike += 1;
                 self.children(idx, out);
                 self.strike -= 1;
-                self.tags.pop();
+                self.pop_tag();
             }
             ElemKind::Sup => self.superscript(idx, out),
         }
         for _ in 0..pushed {
-            self.tags.pop();
+            self.pop_tag();
         }
     }
 
@@ -2233,20 +2597,18 @@ impl<'a> Rend<'a> {
     fn marked(&mut self, idx: usize, out: &mut Out, mark: &str, tag: Option<Tag>) {
         let tagged = tag.is_some();
         if let Some(t) = tag {
-            self.tags.push(t);
+            self.push_tag(t);
         }
         let decorate = self.plain() && !mark.is_empty() && self.has_content(idx);
         if decorate {
-            let tags = self.tags.clone();
-            out.add_text(mark, &tags, false);
+            out.add_text(mark, self.tag_set(), false);
         }
         self.children(idx, out);
         if decorate {
-            let tags = self.tags.clone();
-            out.add_text(mark, &tags, false);
+            out.add_text(mark, self.tag_set(), false);
         }
         if tagged {
-            self.tags.pop();
+            self.pop_tag();
         }
     }
 
@@ -2255,22 +2617,19 @@ impl<'a> Rend<'a> {
             // html2text prunes links with no anchor text.
             return;
         }
-        self.tags.push(Tag::Link(elem.target.clone()));
+        self.push_tag(Tag::Link(elem.target.clone()));
         if self.plain() {
-            let tags = self.tags.clone();
-            out.add_text("[", &tags, false);
+            out.add_text("[", self.tag_set(), false);
         }
         self.children(idx, out);
         if self.plain() {
-            let tags = self.tags.clone();
-            out.add_text("]", &tags, false);
+            out.add_text("]", self.tag_set(), false);
         }
-        self.tags.pop();
+        self.pop_tag();
         if self.plain() {
             self.links.push(elem.target.clone());
             let marker = format!("[{}]", self.links.len());
-            let tags = self.tags.clone();
-            out.add_text(&marker, &tags, false);
+            out.add_text(&marker, self.tag_set(), false);
         }
     }
 
@@ -2285,15 +2644,12 @@ impl<'a> Rend<'a> {
                     buf.push(s);
                 }
             }
-            let tags = self.tags.clone();
-            out.add_text(&buf, &tags, false);
+            out.add_text(&buf, self.tag_set(), false);
             return;
         }
-        let tags = self.tags.clone();
-        out.add_text("^{", &tags, false);
+        out.add_text("^{", self.tag_set(), false);
         self.children(idx, out);
-        let tags = self.tags.clone();
-        out.add_text("}", &tags, false);
+        out.add_text("}", self.tag_set(), false);
     }
 
     fn subtree_text(&self, idx: usize) -> String {
@@ -2321,7 +2677,7 @@ impl<'a> Rend<'a> {
         buf.trim().to_string()
     }
 
-    /// Render children into a narrower block and append it with a prefix.
+    /// Render children as a narrower block whose lines take a prefix.
     /// Once nesting has eaten the whole width the prefix is dropped rather
     /// than pushing lines past it.
     fn sub_block(&mut self, idx: usize, out: &mut Out, first: &str, cont: &str) {
@@ -2332,19 +2688,18 @@ impl<'a> Rend<'a> {
             out.new_line();
             return;
         }
-        let sub = self.sub_render(idx, out.width, indent);
-        out.append_sub(sub, first, cont, &self.tags);
+        self.sub_render(idx, out, indent, first, cont);
     }
 
-    fn sub_render(&mut self, idx: usize, width: usize, indent: usize) -> Out {
-        let inner = if width == 0 {
+    fn sub_render(&mut self, idx: usize, out: &mut Out, indent: usize, first: &str, cont: &str) {
+        let inner = if out.width == 0 {
             0
         } else {
-            width.saturating_sub(indent).max(1)
+            out.width.saturating_sub(indent).max(1)
         };
-        let mut sub = Out::new(inner);
-        self.children(idx, &mut sub);
-        sub
+        out.open(inner, first, cont, &self.tags);
+        self.children(idx, out);
+        out.close();
     }
 
     fn list(&mut self, idx: usize, out: &mut Out, start: Option<i64>) {
@@ -2372,6 +2727,9 @@ impl<'a> Rend<'a> {
         };
         if out.width != 0 && prefix_width >= out.width {
             for &item in &items {
+                if out.spent() {
+                    break;
+                }
                 out.new_line();
                 self.children(item, out);
                 out.new_line();
@@ -2380,6 +2738,9 @@ impl<'a> Rend<'a> {
         }
         let indent = " ".repeat(prefix_width);
         for (i, &item) in items.iter().enumerate() {
+            if out.spent() {
+                break;
+            }
             let prefix = match start {
                 None => "* ".to_string(),
                 Some(first) => {
@@ -2387,8 +2748,7 @@ impl<'a> Rend<'a> {
                     format!("{:<width$}", format!("{}. ", n), width = prefix_width)
                 }
             };
-            let sub = self.sub_render(item, out.width, prefix_width);
-            out.append_sub(sub, &prefix, &indent, &self.tags);
+            self.sub_render(item, out, prefix_width, &prefix, &indent);
         }
     }
 
@@ -2462,16 +2822,19 @@ impl<'a> Rend<'a> {
         }
         let widths = self.column_widths(&rows, ncols, out.width);
         out.start_block();
-        out.push_line(vec![Span::plain(border(&widths, '┬'))]);
+        push_border(out, &widths, '┬');
         self.table_depth += 1;
         for (i, row) in rows.iter().enumerate() {
+            if out.spent() {
+                break;
+            }
             if i > 0 {
-                out.push_line(vec![Span::plain(border(&widths, '┼'))]);
+                push_border(out, &widths, '┼');
             }
             self.row(row, &widths, out);
         }
         self.table_depth -= 1;
-        out.push_line(vec![Span::plain(border(&widths, '┴'))]);
+        push_border(out, &widths, '┴');
     }
 
     fn column_widths(&self, rows: &[Vec<Cell>], ncols: usize, width: usize) -> Vec<usize> {
@@ -2566,6 +2929,9 @@ impl<'a> Rend<'a> {
         let mut rendered: Vec<(Vec<Vec<Span>>, usize)> = Vec::with_capacity(row.len());
         let mut col = 0usize;
         for cell in row {
+            if out.spent() {
+                return;
+            }
             let span = cell.colspan.max(1);
             let mut w = 0usize;
             for k in 0..span {
@@ -2574,46 +2940,69 @@ impl<'a> Rend<'a> {
                 }
             }
             let w = w.max(1);
-            let mut sub = Out::new(w);
+            let mut sub = out.cell(w);
             // Cell colours are pushed here because the layout path bypasses
             // the ordinary element handler.
             let mut pushed = 0usize;
             if let Some(Kind::Elem(e)) = self.nodes.get(cell.node).map(|n| &n.kind) {
                 if let Some(c) = e.colour {
-                    self.tags.push(Tag::Colour(c));
+                    self.push_tag(Tag::Colour(c));
                     pushed += 1;
                 }
                 if let Some(c) = e.bg {
-                    self.tags.push(Tag::BgColour(c));
+                    self.push_tag(Tag::BgColour(c));
                     pushed += 1;
                 }
             }
             self.children(cell.node, &mut sub);
             for _ in 0..pushed {
-                self.tags.pop();
+                self.pop_tag();
             }
             rendered.push((sub.into_lines(), w));
             col += span;
         }
+        if out.spent() {
+            return;
+        }
         let height = rendered.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+        let empty: Vec<Span> = Vec::new();
         for r in 0..height.max(1) {
-            let mut line: Vec<Span> = Vec::new();
+            if out.spent() {
+                break;
+            }
+            // The line's cost, reckoned before its cells' spans are copied.
+            let mut cost = LINE_COST;
             for (i, (cell_lines, w)) in rendered.iter().enumerate() {
                 if i > 0 {
-                    line.push(Span::plain("│".to_string()));
+                    cost = cost.saturating_add(SPAN_COST + "│".len());
                 }
-                let empty: Vec<Span> = Vec::new();
                 let cell_line = cell_lines.get(r).unwrap_or(&empty);
-                let mut used = 0usize;
-                for span in cell_line {
-                    used += str_width(&span.text);
-                    line.push(span.clone());
-                }
+                let used: usize = cell_line.iter().map(|span| str_width(&span.text)).sum();
+                cost = cell_line
+                    .iter()
+                    .fold(cost, |sum, span| sum.saturating_add(span_cost(span)));
                 if used < *w {
-                    line.push(Span::plain(" ".repeat(w - used)));
+                    cost = cost.saturating_add(SPAN_COST + (w - used));
                 }
             }
-            out.push_line(line);
+            out.push_line_with(cost, || {
+                let mut line: Vec<Span> = Vec::new();
+                for (i, (cell_lines, w)) in rendered.iter().enumerate() {
+                    if i > 0 {
+                        line.push(Span::plain("│".to_string()));
+                    }
+                    let cell_line = cell_lines.get(r).unwrap_or(&empty);
+                    let mut used = 0usize;
+                    for span in cell_line {
+                        used += str_width(&span.text);
+                        line.push(span.clone());
+                    }
+                    if used < *w {
+                        line.push(Span::plain(" ".repeat(w - used)));
+                    }
+                }
+                line
+            });
         }
     }
 }
@@ -2637,6 +3026,21 @@ fn grow(widths: &mut [usize], col: usize, span: usize, needed: usize) {
         }
         k += 1;
     }
+}
+
+fn push_border(out: &mut Out, widths: &[usize], join: char) {
+    let len = widths
+        .iter()
+        .fold(0usize, |sum, w| {
+            sum.saturating_add(w.saturating_mul('─'.len_utf8()))
+        })
+        .saturating_add(
+            widths
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(join.len_utf8()),
+        );
+    out.push_plain(len, || border(widths, join));
 }
 
 fn border(widths: &[usize], join: char) -> String {
@@ -3549,6 +3953,114 @@ mod tests {
         assert_eq!(text("long<wbr>word", 40), "longword\n");
         assert_eq!(text("a\u{200b}b", 40), "a\u{200b}b\n");
         assert_eq!(str_width("a\u{200b}b"), 2);
+    }
+
+    fn output_cost(lines: &[Vec<Span>]) -> usize {
+        lines
+            .iter()
+            .map(|line| line.iter().map(span_cost).sum::<usize>() + LINE_COST)
+            .sum()
+    }
+
+    #[test]
+    fn a_spent_budget_keeps_the_lines_before_it_and_says_so() {
+        let html = "<p>intro</p><blockquote><p>one two three</p>\
+                    <ul><li>a<li>b<blockquote>c d e f</blockquote></ul>\
+                    <table><tr><td>x<td><blockquote>y z</blockquote></table>\
+                    <p><a href=\"https://e.example/\">link</a> tail</p></blockquote>\
+                    <pre>a\tb\nc</pre><dl><dt>t<dd>d</dl>";
+        let notice = vec![Span::plain(CUT_NOTICE.to_string())];
+        for decor in [Decor::Plain, Decor::Rich] {
+            for width in [0, 6, 40] {
+                let full = render(html.as_bytes(), width, decor);
+                assert_ne!(full.last(), Some(&notice));
+                assert_eq!(render_within(html.as_bytes(), width, decor, 1 << 20), full);
+                assert_eq!(
+                    render_within(html.as_bytes(), width, decor, 0),
+                    std::slice::from_ref(&notice)
+                );
+                let mut cuts = 0;
+                for budget in (cut_cost()..cut_cost() + 6000).step_by(7) {
+                    let cut = render_within(html.as_bytes(), width, decor, budget);
+                    assert!(output_cost(&cut) <= budget, "budget {budget}");
+                    if cut == full {
+                        continue;
+                    }
+                    let (last, kept) = cut.split_last().unwrap();
+                    assert_eq!(last, &notice, "budget {budget}");
+                    assert!(kept.len() <= full.len());
+                    assert_eq!(kept[..], full[..kept.len()], "budget {budget}");
+                    cuts += 1;
+                }
+                assert!(cuts > 0);
+            }
+        }
+        // A paragraph whose own spans pass the budget leaves only the notice.
+        let long = format!("<p>{}</p>", "word ".repeat(1000));
+        assert_eq!(
+            render_within(long.as_bytes(), 40, Decor::Rich, cut_cost() + 2000),
+            [notice]
+        );
+    }
+
+    #[test]
+    fn nesting_is_paid_once_per_line_and_bounded() {
+        // Each line carries every enclosing quote's mark, so the output
+        // grows with depth; the budget cuts it rather than the jail.
+        let depth = 62;
+        let mut html = "<blockquote>".repeat(depth);
+        html.push_str(&"<p>x</p>".repeat(200_000));
+        let lines = to_rich(html.as_bytes(), 0);
+        assert!(output_cost(&lines) <= OUTPUT_BUDGET);
+        assert!(
+            lines.len() > 10_000 && lines.len() < 399_999,
+            "{}",
+            lines.len()
+        );
+        let (last, lines) = lines.split_last().unwrap();
+        assert_eq!(last, &[Span::plain(CUT_NOTICE.to_string())]);
+        for line in lines {
+            assert!(line.len() >= depth, "{line:?}");
+            assert!(line.iter().take(depth).all(|span| span.text == "> "));
+        }
+    }
+
+    #[test]
+    fn nothing_is_built_past_the_budget() {
+        // Each word of a linked paragraph is a span carrying the link's
+        // target, and each quote's prefix carries the tags around it: both
+        // are refused before they are built, under the test's memory cap.
+        let notice = [Span::plain(CUT_NOTICE.to_string())];
+        let target = format!("https://e.example/{}", "x".repeat(16 * 1024));
+        let words = format!("<a href=\"{target}\">{}</a>", "word ".repeat(100_000));
+        for width in [0, 80] {
+            let lines = to_rich(words.as_bytes(), width);
+            assert!(output_cost(&lines) <= OUTPUT_BUDGET);
+            assert_eq!(lines.last().map(Vec::as_slice), Some(&notice[..]));
+        }
+        let target = format!("https://e.example/{}", "x".repeat(16 << 20));
+        let quotes = format!("<a href=\"{target}\">{}x", "<blockquote>".repeat(62));
+        let lines = to_rich(quotes.as_bytes(), 0);
+        assert_eq!(lines, [notice.to_vec()]);
+        // An over-long word is split one line at a time, each charged as it
+        // is made.
+        let word = "w".repeat(6 << 20);
+        let lines = to_rich(word.as_bytes(), 1);
+        assert!(output_cost(&lines) <= OUTPUT_BUDGET);
+        assert_eq!(lines.last().map(Vec::as_slice), Some(&notice[..]));
+    }
+
+    #[test]
+    fn plain_output_keeps_no_tags() {
+        // A rich span carries every tag around it, a link's target in full;
+        // plain output needs only the text.
+        let target = format!("https://e.example/{}", "x".repeat(16 * 1024));
+        let mut html = format!("<a href=\"{target}\">");
+        html.push_str(&"<b>x</b> <i>y</i> ".repeat(50_000));
+        html.push_str("</a>");
+        let out = text(&html, 80);
+        assert_eq!(out.matches("**x**").count(), 50_000);
+        assert!(out.ends_with(&format!("[1]: {target}\n")), "{}", out.len());
     }
 
     #[test]

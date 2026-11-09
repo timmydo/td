@@ -106,3 +106,79 @@ contexts do, except that body start closes head as stated above. Any internal
 State refusal is terminal. A composing mail cursor must combine these
 diagnostics with source decoding and original admission before publishing
 output. Native mailbox composition and Mail advertisement remain separate.
+
+## Resident rendering cost
+
+The resident renderer's time and memory are linear in its input plus the
+output it builds, which the budget below bounds, apart from two bounded
+factors: each run of text and each piece of a wrapped line reckons the
+tags around it, a stack of at most some two hundred (element nesting is
+kept to 64, and an element adds at most three tags), and a superscript
+looks at most 4096 nodes ahead for its digits.
+
+A quote, list item, definition or heading renders its content once: each
+of its lines is emitted once, with the prefix of every block enclosing it
+composed in front of it as it is emitted, so nesting costs the prefixes
+the output carries and no copy of a line per level. Rich output still
+gives each enclosing prefix a span of its own on every line, each word of
+a wrapped paragraph a span of its own, and each span every tag around
+it, a link's or image's target in full, so rich output grows with nesting
+depth and with tags around many spans. Plain output keeps no tags while
+it renders, since only its text reaches the reader. Equal tag stacks
+share an id, so whether text joins the span before it is decided without
+comparing tags. A laid-out table cell renders into lines of its own,
+which its row then copies side by side, so each of the at most four
+levels of laid-out table copies its cells' lines once more. Preformatted
+text keeps the column its line has reached for its tab stops.
+
+Each rendering has an output budget of 128 MiB, which plain and rich
+rendering both spend: a span costs 64 bytes plus its text and, in rich
+output, 32 bytes per tag plus a link's or image's target; a line costs
+32 bytes plus its spans; a quote, list item, definition or heading costs,
+as it opens, its prefixes' text and, in rich output, its tags. Each is
+charged before it is built: text as it joins the line being gathered, a
+block as it opens, and a finished line, with its prefixes, before any
+span of it is made: a rule, a table's border, a link reference, a
+laid-out table's row line before its cells' spans are copied into it (the
+cells' own lines having been charged as they were made), and each line
+of a word too long for the width, split one line at a time. Wrapping
+gathers a line's words as pieces before the line is charged, and stops
+once those pieces, at 64 bytes each plus their text, pass what the budget
+has left, since that line could not be kept. So nothing is built past
+the budget but the pieces of the one line being gathered, within what is
+left and one word, and what is bounded by the input: its text, the
+element tree, plain output's link list and the table of tag stacks seen.
+
+When a charge does not fit, rendering stops. The output is then the lines
+kept before that charge, trimmed of trailing blank lines as usual,
+followed by one line, `CUT_NOTICE`, saying the rest of the document is
+not shown: a single plain span, unwrapped at any width, in no output that
+was not cut. The text being gathered when the charge failed is dropped,
+and plain output's link references are not appended if they had not
+begun. The notice's own cost is set aside from the budget before
+rendering, so a cut output still fits it. A rendering within the budget
+is therefore unchanged by it, and one past it returns a prefix of the
+lines it would have returned and the notice; a single paragraph whose own
+spans pass the budget contributes none of its lines, so the notice may
+follow only the lines before it, or stand alone. When what the refused
+charge was for would have added no line, the notice follows every line
+the rendering without a budget has: a trailing blank line, which the
+trim drops, or a trailing block that emits none, such as an empty list
+item. A caller can tell a cut by the last line, though a document may
+itself end with the notice's text.
+
+Measured on a development host, release build: 2 MiB of one-letter
+paragraphs rendered rich at width 0 peaks at some 140 MB flat and some
+260 MB inside eight quotes or more, where the budget cuts it, in a
+quarter of a second. The costliest hostile shapes tried, plain and rich
+at widths 0 and 80, each peak at 265 MB at most and take 0.3 s at most:
+2 MiB of words inside a link with a 16 KiB target, in a laid-out table
+cell or not; 62 quotes inside a link with an 8 MiB target; alternating
+bold and italic words inside a 16 KiB link; a link with a 1 MiB target
+around 130,000 bold letters, 87,000 superscripts or 40,000 images; a
+2 MiB preformatted run of bold letters; an 8 MiB table cell; a 2 MiB
+word with no break in a laid-out table of 64 columns, at width 1, or
+inside 38 quotes and a list item (8 MiB there too). The budget bounds
+what a rendering builds, not the memory a reader allows it: these peaks,
+some 265 MB at most, are what a caller must leave room for, which a
+reader whose own limit is smaller does not have.
