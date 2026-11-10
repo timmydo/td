@@ -256,6 +256,60 @@ indexing. No recipe or application integration is part of these tests.
 2. Syntax crate, committed standalone lock, tokenizer, parser and tests.
 3. Selector grammar, specificity, Element boundary and matching tests.
 4. Cascade, computed properties, HTML UA sheet and end-to-end tests.
+5. Real-stylesheet admission and coverage measurements. Keep downloaded
+   Wikipedia/MediaWiki, MDN, Bootstrap, Debian/kernel.org, Rust Book,
+   news and GitHub README pages and sheets only in the owning worktree's
+   `.td-build-cache/agent-scratch/`. Record URLs, capture dates, hashes,
+   source bytes, tokens, rules and declarations, nested conditional-rule
+   shares, unsupported selectors/properties and custom-property, var()
+   and calc() use. An approximate HTML extraction supplies tags, ids,
+   classes and tree relationships without depending on td-html. Report
+   accepted and skipped coverage beside median/p95/maximum matching work,
+   tree time and named refusals, so discarded CSS cannot masquerade as
+   good performance. Commit a short summary here and small original
+   synthetic regressions, never downloaded corpus material. These
+   measurements determine the tuning and property priorities below.
+6. A conservative rule index on rightmost-compound ids, classes, tags
+   and a universal fallback. Lists and logical functions must never lose
+   candidates; deduplication must preserve source order and specificity.
+   Charge candidate gathering as well as matching. Differential tests
+   compare values with an unindexed reference, including adversarial
+   universal rules. Tune admission and matching bounds from the corpus,
+   name remaining refusals and retain bounded worst-case work.
+7. Conditional rules. Bounded media-query evaluation takes an explicit
+   caller environment: screen/print, CSS-pixel viewport width/height,
+   resolution, preferred color scheme and reduced motion. Unsupported
+   features evaluate through the specification's unknown-query semantics;
+   nested conditions preserve order and are bounded even when false.
+   Supports conditions query the implemented property/value grammar.
+   Imports remain unfetched; a future caller may resolve imports under
+   its own fetch policy and supply ordered sheets with inherited import
+   conditions. td-css itself never follows a URL.
+8. Custom properties and arithmetic. Custom properties inherit computed
+   token values, with bounded maps, cycle detection, substitution depth,
+   expanded bytes and work. var() includes fallback and shorthand
+   substitution; a winning value invalid at computed-value time does not
+   resurrect an earlier declaration. calc() supports typed lengths and
+   percentages with +, -, *, / and bounded nesting; unresolved mixed
+   px/percentage values remain typed expressions for layout. This
+   increment may land as separate green custom-property and arithmetic
+   commits. Each amends the current cascade/value contract above.
+9. Layout-facing values chosen from the corpus frequencies: line-height,
+   border styles/colors and border/font shorthands, vertical-align,
+   text-indent/transform, visibility, overflow, float/clear, static and
+   relative positioning, box-sizing, min/max-width, letter-spacing and
+   opacity are the initial candidates. State selectors use explicit
+   caller observations for hover, focus and checked state. Visited
+   history remains absent and :visited always false; changing that needs
+   a separate privacy design. Compute values only, without layout or
+   painting. Repeat the corpus after conditional rules, variables and
+   added properties: the extra admitted work must also fit the bounds.
+
+Items 5–9 are the next standalone work, not claims of implemented syntax.
+Their specification references, exact accepted grammars, public interfaces,
+initial/inherited values and named limits join §§1–6 with each implementation.
+Corpus results describe the captured sample, not general Web conformance;
+ad-hoc HTML extraction is not an HTML5 tree-builder correctness oracle.
 
 Each increment is independently green, reviewed, readied and pushed on
 `td-css-rolling`. Integration into a document tree or renderer requires a
