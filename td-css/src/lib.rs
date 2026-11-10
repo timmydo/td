@@ -37,7 +37,7 @@ pub mod selectors;
 pub mod syntax;
 pub mod values;
 
-pub use cascade::{Origin, StyleSet, HTML_UA_CSS};
+pub use cascade::{ComputeStats, Origin, StyleSet, HTML_UA_CSS};
 pub use values::{ComputedStyle, ComputedValue, Property};
 
 #[cfg(test)]

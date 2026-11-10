@@ -265,7 +265,7 @@ fn matching_budgets_bound_cycles_and_large_attributes() {
         .unwrap()
         .is_some());
     assert_eq!(
-        SelectorList::parse("[huge][huge]")
+        SelectorList::parse(&"[huge]".repeat(MAX_MATCH_STEPS / MAX_ELEMENT_BYTES + 1))
             .unwrap()
             .matching_specificity(&node),
         Err(Error::Limit("MAX_MATCH_STEPS"))

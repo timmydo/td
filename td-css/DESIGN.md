@@ -109,6 +109,15 @@ Inline styles have normal or important author origin, and do not outrank
 important user or UA rules. There are no layers, scopes, presentational
 hints, animations or transitions.
 
+Compiled rules are indexed by a required id, class or tag in each
+rightmost compound, preferring id then class then tag. In their absence,
+a positive :is/:where supplies the union of its argument keys; negation,
+attributes and structural/state tests use a universal fallback. A list
+with any universal branch is wholly universal. An empty forgiving list
+contributes no key because it cannot match. Keys only select candidates:
+the complete selector list still determines matching and specificity.
+Candidate rule numbers are deduplicated and visited in original order.
+
 Only valid property values enter the cascade: a later invalid declaration
 cannot erase an earlier valid one. Supported shorthands expand before
 selection. Every implemented property accepts `initial`, `inherit` and
@@ -193,7 +202,8 @@ it as a stylesheet matching nothing.
 | MAX_SELECTOR_PARTS | 1,024 simple selectors and combinators per parsed list |
 | MAX_SELECTOR_DEPTH | 8 nested logical functions |
 | MAX_COMPOUNDS | 64 compounds per complex selector |
-| MAX_MATCH_STEPS | 100,000 selector tests, tree hops and inspected string bytes per public match or compute call |
+| MAX_MATCH_STEPS | 150,000 selector tests, tree hops, inspected string bytes, index lookups and gathered bucket entries per public match or compute call |
+| MAX_INDEX_ENTRIES | 262,144 rule-to-bucket entries per style set |
 | MAX_ELEMENT_BYTES | 65,536 bytes per observed tag or attribute string |
 | MAX_NTH_COEFFICIENT | 1,000,000,000 absolute magnitude for each An+B coefficient |
 | MAX_SHEETS | 64 sheets per style set |
@@ -205,7 +215,13 @@ Recovered syntax errors use a saturating counter. Tokenization and syntax
 parsing take linear work in admitted input plus owned output; selector
 compilation is bounded by the token and selector limits. Matching can
 backtrack over ancestors or siblings, but shares one work counter across
-logical functions and every rule of a compute call. Recursive matching
+logical functions and every candidate rule of a compute call. Index
+lookups charge observed tag/id/class bytes before scanning or folding,
+one step per lookup and one per bucket entry before deduplication.
+BTree lookups and candidate sorting have an additional logarithmic factor
+bounded by MAX_INDEX_ENTRIES and MAX_RULES; the work counter is an
+admission metric, not a CPU instruction count. Duplicate class words
+still charge repeated bucket visits. Only indexed fields are observed. Recursive matching
 depth is bounded by compounds and logical depth, not document depth.
 Attribute scans are bounded by MAX_ELEMENT_BYTES per observed string and
 charged by byte length to the same work budget. Substring matching uses
@@ -225,9 +241,14 @@ caller-constructed recursive AST. `selectors::SelectorList::parse` and
 `StyleSet::new` compiles ordered `(Origin, &str)` sheets; `compute` takes
 an element, optional parent `ComputedStyle`, root font size and inline
 style text. `ComputedStyle` exposes typed read-only property values.
+`compute_with_stats` has the same arguments plus a mutable `ComputeStats`.
+It resets and returns candidate-rule, matched-rule and consumed match-step
+counts even on refusal. Candidate count is zero if gathering fails before
+completion; consumed steps exclude the charge that refused. `compute`
+uses the same implementation. The unindexed implementation is test-only.
 No filesystem, network, clock, global mutable state or thread is needed.
 
-`cascade` exports `StyleSet`, `Origin` and `HTML_UA_CSS`; these and
+`cascade` exports `StyleSet`, `Origin`, `ComputeStats` and `HTML_UA_CSS`; these and
 `values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
 crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
 the fixed longhand roster. `ComputedStyle::get` yields immutable typed
@@ -330,7 +351,7 @@ Counts use td-css tokenization and recursively inspect grouping at-rules
 (media, supports, layer, container and related groups); keyframe bodies
 and font-face descriptors are not style rules/declarations. Tokens include
 whitespace. All eight complete sheet sets pass syntax and compilation
-admission with the original bounds; per-input bounds do not limit the
+admission with the original bounds (100,000 matching steps); per-input bounds do not limit the
 sum of tokens over separate sheets. The compiled count excludes skipped
 at-rules and invalid selectors, but includes rules with no valid values.
 Value acceptance below counts declarations, not expanded longhands, and
@@ -402,3 +423,33 @@ identifies the bundle without retaining downloaded bytes in git.
 | The Guardian | `1ef64be3026b305e77e319bba9be5996d21fe7c0fae9223b04364d361ad13a59` | `d41245206e720d343d3f3c0c564f52b58bb750f885054e337ad0ba8859b141bd` |
 | Rust Book | `f06a10a850287ef35db88d0f0080d269eea9f736f0e295e22d803ab7b635b7ce` | `caba047cab8ac3c227028122608833285f7a7ba0a26bb9228bfc0664aa016802` |
 | Wikipedia CSS | `7ac5bb7612c91b2b48ba95553b1eb8b4abeaa26deef7dc3a54e11a9f82694f6d` | `60b1fc167a3aea176e67ef38396975aa953885f2df4defbc7e57b5f09a4d0873` |
+
+### Indexed workload
+
+The same captured trees and sheets, with candidate collection charged,
+produce no element refusals at MAX_MATCH_STEPS = 150,000. At 100,000 the
+index alone left eight GitHub refusals; a diagnostic run with a larger
+scratch-only cap measured the full worst cost as 105,426. The chosen cap
+leaves about 42% headroom over that observed maximum; other existing
+admission bounds remain unchanged because no capture exhausted them.
+This is sample-based tuning, not a claim that arbitrary pages fit.
+
+| Capture | Candidate rules p95 / max | Match steps p50 / p95 / max | Compute ms |
+|---|---:|---:|---:|
+| Bootstrap | 57 / 61 | 914 / 3409 / 6394 | 9.69 |
+| Debian | 5 / 10 | 66 / 462 / 807 | 0.89 |
+| GitHub | 220 / 234 | 13083 / 78717 / 105426 | 67.63 |
+| kernel.org | 7 / 7 | 48 / 88 / 129 | 1.07 |
+| MDN | 40 / 97 | 1220 / 3294 / 4764 | 32.95 |
+| The Guardian | 35 / 39 | 847 / 1613 / 6122 | 32.86 |
+| Rust Book | 9 / 13 | 124 / 541 / 1429 | 1.03 |
+| Wikipedia | 20 / 121 | 2335 / 18048 / 28482 | 69.57 |
+
+Universal/structural rules, cyclic caller trees, repeated class words
+with large buckets, overlong observed fields and index-entry exhaustion
+still refuse under named bounds. Synthetic and deterministic generated
+differential tests compare computed values, list specificity and order
+against the unindexed path where both complete; admission errors may
+change because unrelated work is removed and candidate gathering is
+charged. The 5,000-rule fixture succeeds with zero candidates while its
+unindexed reference still exhausts the budget.

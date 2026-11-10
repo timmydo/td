@@ -853,7 +853,7 @@ fn aggregate_admission_limits_and_context_are_enforced() {
 }
 
 #[test]
-fn realistic_class_rule_fanout_exposes_unindexed_work() {
+fn realistic_class_rule_fanout_avoids_unrelated_work() {
     // Original synthetic shape: thousands of unrelated utility classes,
     // and a modest multi-class element. No downloaded stylesheet bytes.
     let css: String = (0..5000)
@@ -862,16 +862,22 @@ fn realistic_class_rule_fanout_exposes_unindexed_work() {
     let mut nodes = tree();
     nodes[3].attrs = vec![("class", "article body primary wide visible".into())];
     let set = StyleSet::new(&[(Origin::Author, &css)]).unwrap();
+    let element = Handle {
+        nodes: &nodes,
+        index: 3,
+    };
+    let mut stats = ComputeStats::default();
+    assert!(set
+        .compute_with_stats(&element, None, 16.0, "", &mut stats)
+        .is_ok());
+    assert_eq!(stats.candidate_rules, 0);
+    assert!(stats.match_steps < 100);
+    let mut reference = Work {
+        unindexed: true,
+        ..Work::default()
+    };
     assert_eq!(
-        set.compute(
-            &Handle {
-                nodes: &nodes,
-                index: 3
-            },
-            None,
-            16.0,
-            ""
-        ),
+        set.compute_inner(&element, None, 16.0, "", &mut reference),
         Err(Error::Limit("MAX_MATCH_STEPS"))
     );
 }
@@ -888,4 +894,208 @@ fn conditional_variables_do_not_masquerade_as_supported_coverage() {
         compute(css, "").get(Property::Width),
         Some(&V::Length(Length::Auto))
     );
+}
+
+#[test]
+fn indexed_and_reference_cascade_agree_on_lists_logic_and_order() {
+    let mut nodes = tree();
+    nodes[3].tag = "P";
+    let selectors = [
+        "*",
+        "p",
+        "P.hot",
+        "#container",
+        ".hot",
+        ".first,.last",
+        "p,#target",
+        ":is(.hot,#container)",
+        ":where(p,a)",
+        ":not(.second)",
+        ":is(.second,:not(.hot))",
+        ":where(:is(.first,p),a)",
+        ":is(p > a,div > p)",
+        "body :is(p,a)",
+        ":is(:future)",
+        "[lang]",
+        "p:empty",
+        "p:nth-child(2n+1)",
+        ".zone > .hot + span",
+        "p ~ p",
+        ":is([data-x],.hot)",
+        "#container .hot",
+    ];
+    for shift in 0..selectors.len() {
+        let css: String = selectors
+            .iter()
+            .cycle()
+            .skip(shift)
+            .take(selectors.len())
+            .enumerate()
+            .map(|(i, s)| {
+                format!(
+                    "{s}{{color:{};margin:{}px{}}}",
+                    if i % 2 == 0 { "red" } else { "blue" },
+                    i,
+                    if i % 3 == 0 { "!important" } else { "" }
+                )
+            })
+            .collect();
+        let set = StyleSet::new(&[
+            (Origin::UserAgent, "*{font-size:12px}"),
+            (Origin::Author, &css),
+            (Origin::User, ".hot{margin-left:17px!important}"),
+        ])
+        .unwrap();
+        for i in 0..nodes.len() {
+            let e = Handle {
+                nodes: &nodes,
+                index: i,
+            };
+            for inline in ["", "color:rebeccapurple;margin:2px!important"] {
+                let mut reference = Work {
+                    unindexed: true,
+                    ..Work::default()
+                };
+                assert_eq!(
+                    set.compute(&e, None, 16.0, inline),
+                    set.compute_inner(&e, None, 16.0, inline, &mut reference),
+                    "{shift}/{i}/{inline}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn generated_index_matches_unindexed_values() {
+    let nodes = tree();
+    let atoms = ["p", "span", ".hot", "#target", "[lang]", "*", ":not(.hot)"];
+    let mut seed = 91u64;
+    for _ in 0..64 {
+        let mut css = String::new();
+        for i in 0..48 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let a = atoms[(seed as usize) % atoms.len()];
+            let b = atoms[((seed >> 16) as usize) % atoms.len()];
+            let selector = match (seed >> 32) % 4 {
+                0 => format!("{a},{b}"),
+                1 => format!(":is({a},{b})"),
+                2 => format!("{a} > {b}"),
+                _ => format!("{a} {b}"),
+            };
+            css.push_str(&format!(
+                "{selector}{{margin:{}px;color:{}}}",
+                i,
+                if i % 2 == 0 { "red" } else { "blue" }
+            ));
+        }
+        let set = StyleSet::new(&[(Origin::Author, &css)]).unwrap();
+        for index in 0..nodes.len() {
+            let e = Handle {
+                nodes: &nodes,
+                index,
+            };
+            let mut work = Work {
+                unindexed: true,
+                ..Work::default()
+            };
+            assert_eq!(
+                set.compute(&e, None, 16.0, ""),
+                set.compute_inner(&e, None, 16.0, "", &mut work)
+            );
+        }
+    }
+}
+
+#[test]
+fn candidate_collection_and_diagnostics_are_bounded() {
+    let mut nodes = tree();
+    nodes[3].attrs = vec![("class", "hot ".repeat(1000))];
+    let set = StyleSet::new(&[(Origin::Author, &".hot{color:red}".repeat(200))]).unwrap();
+    let mut stats = ComputeStats::default();
+    assert_eq!(
+        set.compute_with_stats(
+            &Handle {
+                nodes: &nodes,
+                index: 3
+            },
+            None,
+            16.0,
+            "",
+            &mut stats
+        ),
+        Err(Error::Limit("MAX_MATCH_STEPS"))
+    );
+    assert!(stats.match_steps > 99_000);
+    assert_eq!(
+        set.compute_with_stats(
+            &Handle {
+                nodes: &nodes,
+                index: 3
+            },
+            None,
+            f64::NAN,
+            "",
+            &mut stats
+        ),
+        Err(Error::InvalidContext)
+    );
+    assert_eq!(stats, ComputeStats::default());
+    nodes[3].attrs = vec![("class", "x".repeat(crate::selectors::MAX_ELEMENT_BYTES + 1))];
+    assert_eq!(
+        set.compute(
+            &Handle {
+                nodes: &nodes,
+                index: 3
+            },
+            None,
+            16.0,
+            ""
+        ),
+        Err(Error::Limit("MAX_ELEMENT_BYTES"))
+    );
+    let universal = ":not(.missing)".repeat(200) + "{color:red}";
+    let set = StyleSet::new(&vec![(Origin::Author, universal.as_str()); 64]).unwrap();
+    let normal = tree();
+    assert_eq!(
+        set.compute(
+            &Handle {
+                nodes: &normal,
+                index: 3
+            },
+            None,
+            16.0,
+            ""
+        ),
+        Err(Error::Limit("MAX_MATCH_STEPS"))
+    );
+}
+
+#[test]
+fn index_entry_bound_has_an_exact_admitted_edge() {
+    let sheets: Vec<String> = (0..64)
+        .map(|sheet| {
+            (0..16)
+                .map(|rule| {
+                    let selectors = (0..256)
+                        .map(|n| format!(".k{sheet}-{rule}-{n}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{selectors}{{}}")
+                })
+                .collect()
+        })
+        .collect();
+    let input: Vec<_> = sheets
+        .iter()
+        .map(|s| (Origin::Author, s.as_str()))
+        .collect();
+    assert!(StyleSet::new(&input).is_ok());
+    let mut more = sheets;
+    more[63].push_str(".extra{}");
+    let input: Vec<_> = more.iter().map(|s| (Origin::Author, s.as_str())).collect();
+    assert!(matches!(
+        StyleSet::new(&input),
+        Err(Error::Limit("MAX_INDEX_ENTRIES"))
+    ));
 }

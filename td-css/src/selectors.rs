@@ -1,12 +1,13 @@
 //! HTML selector parsing, specificity and budgeted matching.
 use crate::syntax::{self, Component, Number, Token};
 use crate::Error;
+use std::collections::BTreeSet;
 
 pub const MAX_SELECTORS: usize = 256;
 pub const MAX_SELECTOR_PARTS: usize = 1024;
 pub const MAX_SELECTOR_DEPTH: usize = 8;
 pub const MAX_COMPOUNDS: usize = 64;
-pub const MAX_MATCH_STEPS: usize = 100_000;
+pub const MAX_MATCH_STEPS: usize = 150_000;
 pub const MAX_ELEMENT_BYTES: usize = 65_536;
 pub const MAX_NTH_COEFFICIENT: i64 = 1_000_000_000;
 
@@ -183,16 +184,65 @@ impl MatchBudget {
         self.charge(1)
     }
 
-    fn charge(&mut self, amount: usize) -> Result<(), Error> {
+    pub(crate) fn charge(&mut self, amount: usize) -> Result<(), Error> {
         self.remaining = self
             .remaining
             .checked_sub(amount)
             .ok_or(Error::Limit("MAX_MATCH_STEPS"))?;
         Ok(())
     }
+
+    pub(crate) fn used(&self) -> usize {
+        MAX_MATCH_STEPS - self.remaining
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum IndexKey {
+    Id(String),
+    Class(String),
+    Tag(String),
+    Universal,
+}
+
+fn compound_keys(part: &Part) -> BTreeSet<IndexKey> {
+    for kind in 0..3 {
+        for simple in &part.simples {
+            let key = match (kind, simple) {
+                (0, Simple::Id(s)) => IndexKey::Id(s.clone()),
+                (1, Simple::Class(s)) => IndexKey::Class(s.clone()),
+                (2, Simple::Type(s)) => IndexKey::Tag(s.clone()),
+                _ => continue,
+            };
+            return [key].into_iter().collect();
+        }
+    }
+    for simple in &part.simples {
+        if let Simple::Logical {
+            kind: Logical::Is | Logical::Where,
+            list,
+        } = simple
+        {
+            return list.index_keys();
+        }
+    }
+    [IndexKey::Universal].into_iter().collect()
 }
 
 impl SelectorList {
+    /// Each matching complex selector must satisfy one of these keys.
+    pub(crate) fn index_keys(&self) -> BTreeSet<IndexKey> {
+        let mut keys = BTreeSet::new();
+        for selector in &self.selectors {
+            if let Some(part) = selector.parts.last() {
+                keys.extend(compound_keys(part));
+            }
+        }
+        if keys.contains(&IndexKey::Universal) {
+            return [IndexKey::Universal].into_iter().collect();
+        }
+        keys
+    }
     pub fn parse(input: &str) -> Result<Self, Error> {
         let components = syntax::parse_components(input)?;
         Self::from_components(components.value())
@@ -582,7 +632,7 @@ fn nth(values: &[Component]) -> Result<(i64, i64), Error> {
     Ok((a, b))
 }
 
-fn checked<'a>(text: &'a str, budget: &mut MatchBudget) -> Result<&'a str, Error> {
+pub(crate) fn checked<'a>(text: &'a str, budget: &mut MatchBudget) -> Result<&'a str, Error> {
     if text.len() > MAX_ELEMENT_BYTES {
         return Err(Error::Limit("MAX_ELEMENT_BYTES"));
     }
@@ -601,7 +651,7 @@ fn attribute<'a, E: Element>(
         .transpose()
 }
 
-fn html_space(c: char) -> bool {
+pub(crate) fn html_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c')
 }
 

@@ -7,6 +7,9 @@ use crate::values::{
 use crate::{Error, MAX_DECLARATIONS, MAX_RULES};
 use std::collections::BTreeMap;
 
+mod index;
+pub use index::MAX_INDEX_ENTRIES;
+
 pub const MAX_SHEETS: usize = 64;
 pub const MAX_STYLE_BYTES: usize = 4 * 1024 * 1024;
 pub const HTML_UA_CSS: &str = include_str!("html.css");
@@ -41,6 +44,33 @@ struct Rule {
 #[derive(Clone, Debug, Default)]
 pub struct StyleSet {
     rules: Vec<Rule>,
+    index: index::RuleIndex,
+}
+
+/// Per-call counters, including partial work when computation is refused.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComputeStats {
+    pub candidate_rules: usize,
+    pub matched_rules: usize,
+    pub match_steps: usize,
+}
+
+struct Work {
+    budget: MatchBudget,
+    stats: ComputeStats,
+    #[cfg(test)]
+    unindexed: bool,
+}
+
+impl Default for Work {
+    fn default() -> Self {
+        Self {
+            budget: MatchBudget::new(),
+            stats: ComputeStats::default(),
+            #[cfg(test)]
+            unindexed: false,
+        }
+    }
 }
 
 impl StyleSet {
@@ -59,6 +89,7 @@ impl StyleSet {
             }
         }
         let mut rules = Vec::new();
+        let mut index = index::RuleIndex::default();
         let mut declarations_count = 0usize;
         for (origin, source) in sheets {
             let sheet = syntax::parse_stylesheet(source)?;
@@ -84,6 +115,7 @@ impl StyleSet {
                 if rules.len() == MAX_RULES {
                     return Err(Error::Limit("MAX_RULES"));
                 }
+                index.insert(rules.len(), &selectors)?;
                 rules.push(Rule {
                     selectors,
                     declarations,
@@ -91,7 +123,7 @@ impl StyleSet {
                 });
             }
         }
-        Ok(Self { rules })
+        Ok(Self { rules, index })
     }
 
     /// Parent styles must be computed first. None identifies the root, whose
@@ -103,15 +135,60 @@ impl StyleSet {
         root_font_size: f64,
         inline: &str,
     ) -> Result<ComputedStyle, Error> {
+        self.compute_with_stats(
+            element,
+            parent,
+            root_font_size,
+            inline,
+            &mut ComputeStats::default(),
+        )
+    }
+
+    /// Same semantics and bounds as compute; resets counters even on failure.
+    pub fn compute_with_stats<E: Element>(
+        &self,
+        element: &E,
+        parent: Option<&ComputedStyle>,
+        root_font_size: f64,
+        inline: &str,
+        stats: &mut ComputeStats,
+    ) -> Result<ComputedStyle, Error> {
+        let mut work = Work::default();
+        let result = self.compute_inner(element, parent, root_font_size, inline, &mut work);
+        work.stats.match_steps = work.budget.used();
+        *stats = work.stats;
+        result
+    }
+
+    fn compute_inner<E: Element>(
+        &self,
+        element: &E,
+        parent: Option<&ComputedStyle>,
+        root_font_size: f64,
+        inline: &str,
+        work: &mut Work,
+    ) -> Result<ComputedStyle, Error> {
         if !root_font_size.is_finite() || !(0.0..=MAX_ABSOLUTE_VALUE).contains(&root_font_size) {
             return Err(Error::InvalidContext);
         }
         let mut winners = BTreeMap::new();
-        let mut budget = MatchBudget::new();
+        #[cfg(not(test))]
+        let candidates = self.index.candidates(element, &mut work.budget)?;
+        #[cfg(test)]
+        let candidates = if work.unindexed {
+            (0..self.rules.len()).collect()
+        } else {
+            self.index.candidates(element, &mut work.budget)?
+        };
+        work.stats.candidate_rules = candidates.len();
         let mut order = 0usize;
-        for rule in &self.rules {
-            let specificity = rule.selectors.matches_with(element, &mut budget)?;
+        for index in candidates {
+            let Some(rule) = self.rules.get(index) else {
+                continue;
+            };
+            let specificity = rule.selectors.matches_with(element, &mut work.budget)?;
             if let Some(specificity) = specificity {
+                work.stats.matched_rules += 1;
                 for declaration in &rule.declarations {
                     choose(
                         &mut winners,
