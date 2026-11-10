@@ -1,7 +1,11 @@
 //! CSS without a tree, layout, I/O or external dependencies. See DESIGN.md.
 #![forbid(unsafe_code)]
 
+pub mod selectors;
 pub mod syntax;
+
+#[cfg(test)]
+mod test_tree;
 
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_TOKEN_BYTES: usize = 16 * 1024;

@@ -73,8 +73,10 @@ elements; a root is an only child in the matching model.
 
 The named Level 4 subset is `:is()`, `:where()`, selector-list `:not()`
 and attribute `i`/`s`. `:is` and `:where` discard invalid list members;
-`:not` and ordinary lists are strict. An empty forgiving list matches
-nothing. Each may hold complex selectors. `:has`, relative selectors,
+`:not` and ordinary lists are strict. Forgiving functions still require
+Syntax's `<any-value>`: bad strings, bad URLs and unmatched closers,
+including inside nested components, invalidate the function. An empty
+forgiving list matches nothing. Each may hold complex selectors. `:has`, relative selectors,
 nesting `&`, and the column combinator are unsupported.
 
 Specificity is an ordered `(ids, classes, types)` tuple, never a decimal
@@ -182,8 +184,9 @@ it as a stylesheet matching nothing.
 | MAX_SELECTOR_PARTS | 1,024 simple selectors and combinators per parsed list |
 | MAX_SELECTOR_DEPTH | 8 nested logical functions |
 | MAX_COMPOUNDS | 64 compounds per complex selector |
-| MAX_MATCH_STEPS | 100,000 selector tests and tree hops per public match or compute call |
+| MAX_MATCH_STEPS | 100,000 selector tests, tree hops and inspected string bytes per public match or compute call |
 | MAX_ELEMENT_BYTES | 65,536 bytes per observed tag or attribute string |
+| MAX_NTH_COEFFICIENT | 1,000,000,000 absolute magnitude for each An+B coefficient |
 | MAX_SHEETS | 64 sheets per style set |
 | MAX_STYLE_BYTES | 4 MiB total sheet source bytes per style set |
 | MAX_FAMILIES | 32 names in a font-family value |
@@ -195,7 +198,9 @@ compilation is bounded by the token and selector limits. Matching can
 backtrack over ancestors or siblings, but shares one work counter across
 logical functions and every rule of a compute call. Recursive matching
 depth is bounded by compounds and logical depth, not document depth.
-Attribute scans are bounded by MAX_ELEMENT_BYTES per charged test.
+Attribute scans are bounded by MAX_ELEMENT_BYTES per observed string and
+charged by byte length to the same work budget. Substring matching uses
+linear string search, ASCII-folding bounded strings for an `i` test.
 Numeric input may be larger than a supported value; finite values beyond
 the computed bound are clamped, without wrapping or creating NaN.
 Memory allocation failure remains the Rust allocator's process-level
