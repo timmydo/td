@@ -87,9 +87,9 @@ impl Component {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
-    name: Option<String>,
-    prelude: Vec<Component>,
-    block: Option<Vec<Component>>,
+    pub(crate) name: Option<String>,
+    pub(crate) prelude: Vec<Component>,
+    pub(crate) block: Option<Vec<Component>>,
 }
 
 impl Rule {
@@ -578,14 +578,20 @@ pub fn parse_components(input: &str) -> Result<Parsed<Vec<Component>>, Error> {
 
 pub fn parse_stylesheet(input: &str) -> Result<Parsed<Vec<Rule>>, Error> {
     let components = parse_components(input)?;
-    let mut errors = components.errors;
-    let mut source = components.value.into_iter().peekable();
+    rule_list(components.value, components.errors, true)
+}
+
+pub(crate) fn rule_list(
+    values: Vec<Component>,
+    mut errors: usize,
+    top: bool,
+) -> Result<Parsed<Vec<Rule>>, Error> {
+    let mut source = values.into_iter().peekable();
     let mut rules = Vec::new();
     while let Some(first) = source.next() {
-        if matches!(
-            first,
-            Component::Token(Token::Whitespace | Token::Cdo | Token::Cdc)
-        ) {
+        if matches!(first, Component::Token(Token::Whitespace))
+            || (top && matches!(first, Component::Token(Token::Cdo | Token::Cdc)))
+        {
             continue;
         }
         let (name, mut prelude, first_block) = match first {
@@ -642,7 +648,7 @@ pub(crate) fn trim(mut values: &[Component]) -> &[Component] {
     values
 }
 
-fn declarations(values: &[Component]) -> Result<Parsed<Vec<Declaration>>, Error> {
+pub(crate) fn declarations(values: &[Component]) -> Result<Parsed<Vec<Declaration>>, Error> {
     let mut source = values.iter().peekable();
     let mut output = Vec::new();
     let mut errors = 0usize;

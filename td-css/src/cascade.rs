@@ -1,14 +1,19 @@
 //! Ordered origin/importance cascade over immutable compiled stylesheets.
+use crate::conditions::{self, Environment};
 use crate::selectors::{Element, MatchBudget, SelectorList, Specificity};
 use crate::syntax;
 use crate::values::{
     self, ComputedStyle, Property, Specified, ValueDeclaration, MAX_ABSOLUTE_VALUE,
 };
-use crate::{Error, MAX_DECLARATIONS, MAX_RULES};
+use crate::{Error, MAX_DECLARATIONS};
 use std::collections::BTreeMap;
 
 mod index;
 pub use index::MAX_INDEX_ENTRIES;
+
+pub const MAX_COMPILED_RULES: usize = 16_384;
+pub const MAX_GROUP_DEPTH: usize = 16;
+pub const MAX_GROUP_RULES: usize = 32_768;
 
 pub const MAX_SHEETS: usize = 64;
 pub const MAX_STYLE_BYTES: usize = 4 * 1024 * 1024;
@@ -76,6 +81,14 @@ impl Default for Work {
 impl StyleSet {
     /// Sheet order is source order. Supply HTML_UA_CSS explicitly if wanted.
     pub fn new(sheets: &[(Origin, &str)]) -> Result<Self, Error> {
+        Self::new_with_environment(sheets, &Environment::default())
+    }
+
+    pub fn new_with_environment(
+        sheets: &[(Origin, &str)],
+        environment: &Environment,
+    ) -> Result<Self, Error> {
+        environment.validate()?;
         if sheets.len() > MAX_SHEETS {
             return Err(Error::Limit("MAX_SHEETS"));
         }
@@ -88,42 +101,21 @@ impl StyleSet {
                 return Err(Error::Limit("MAX_STYLE_BYTES"));
             }
         }
-        let mut rules = Vec::new();
-        let mut index = index::RuleIndex::default();
-        let mut declarations_count = 0usize;
+        let mut compiler = Compiler {
+            output: Self::default(),
+            declarations: 0,
+            walked: 0,
+            environment,
+        };
         for (origin, source) in sheets {
-            let sheet = syntax::parse_stylesheet(source)?;
-            for rule in sheet.value() {
-                if rule.at_name().is_some() {
-                    continue;
-                }
-                let selectors = match SelectorList::from_components(rule.prelude()) {
-                    Ok(selectors) => selectors,
-                    Err(Error::InvalidSelector) => continue,
-                    Err(error) => return Err(error),
-                };
-                let mut declarations = Vec::new();
-                for declaration in rule.declarations()?.value() {
-                    for value in values::parse_declaration(declaration)? {
-                        if declarations_count == MAX_DECLARATIONS {
-                            return Err(Error::Limit("MAX_DECLARATIONS"));
-                        }
-                        declarations_count += 1;
-                        declarations.push(value);
-                    }
-                }
-                if rules.len() == MAX_RULES {
-                    return Err(Error::Limit("MAX_RULES"));
-                }
-                index.insert(rules.len(), &selectors)?;
-                rules.push(Rule {
-                    selectors,
-                    declarations,
-                    origin: *origin,
-                });
-            }
+            compiler.add(
+                syntax::parse_stylesheet(source)?.into_inner(),
+                *origin,
+                0,
+                true,
+            )?;
         }
-        Ok(Self { rules, index })
+        Ok(compiler.output)
     }
 
     /// Parent styles must be computed first. None identifies the root, whose
@@ -257,6 +249,80 @@ impl StyleSet {
             style.values.insert(property, value);
         }
         Ok(style)
+    }
+}
+
+struct Compiler<'a> {
+    output: StyleSet,
+    declarations: usize,
+    walked: usize,
+    environment: &'a Environment,
+}
+impl Compiler<'_> {
+    fn add(
+        &mut self,
+        rules: Vec<syntax::Rule>,
+        origin: Origin,
+        depth: usize,
+        active: bool,
+    ) -> Result<(), Error> {
+        for rule in rules {
+            if self.walked == MAX_GROUP_RULES {
+                return Err(Error::Limit("MAX_GROUP_RULES"));
+            }
+            self.walked += 1;
+            if let Some(name) = &rule.name {
+                let condition = if name.eq_ignore_ascii_case("media") {
+                    conditions::media(&rule.prelude, self.environment)?
+                } else if name.eq_ignore_ascii_case("supports") {
+                    conditions::supports(&rule.prelude)?
+                } else {
+                    continue;
+                };
+                if let Some(block) = rule.block {
+                    if depth == MAX_GROUP_DEPTH {
+                        return Err(Error::Limit("MAX_GROUP_DEPTH"));
+                    }
+                    self.add(
+                        syntax::rule_list(block, 0, false)?.into_inner(),
+                        origin,
+                        depth + 1,
+                        active && condition,
+                    )?;
+                }
+                continue;
+            }
+            if !active {
+                continue;
+            }
+            let selectors = match SelectorList::from_components(&rule.prelude) {
+                Ok(s) => s,
+                Err(Error::InvalidSelector) => continue,
+                Err(e) => return Err(e),
+            };
+            let mut declarations = Vec::new();
+            for declaration in rule.declarations()?.value() {
+                for value in values::parse_declaration(declaration)? {
+                    if self.declarations == MAX_DECLARATIONS {
+                        return Err(Error::Limit("MAX_DECLARATIONS"));
+                    }
+                    self.declarations += 1;
+                    declarations.push(value);
+                }
+            }
+            if self.output.rules.len() == MAX_COMPILED_RULES {
+                return Err(Error::Limit("MAX_COMPILED_RULES"));
+            }
+            self.output
+                .index
+                .insert(self.output.rules.len(), &selectors)?;
+            self.output.rules.push(Rule {
+                selectors,
+                declarations,
+                origin,
+            });
+        }
+        Ok(())
     }
 }
 

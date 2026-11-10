@@ -43,9 +43,10 @@ retaining attacker-controlled error strings.
 
 At-rules retain their name, prelude and optional block as syntax, including
 unknown rules. Declaration-list at-rules are consumed and ignored. Style
-compilation skips every at-rule, including `@import`, `@media`, `@supports`,
-`@font-face`, `@page`, `@namespace` and `@layer`; their contents never leak
-into the surrounding cascade. No URL is fetched. Custom properties are
+compilation evaluates nested `@media` and `@supports` groups as described
+below. Other at-rules, including `@import`, `@font-face`, `@page`,
+`@namespace`, `@container` and `@layer`, are skipped whole; their contents
+never leak into the surrounding cascade. No URL is fetched. Custom properties are
 ordinary syntax but have no computed interpretation; `var()`, `calc()`,
 animations, transitions, counters and generated content are outside this
 contract. Unsupported selectors invalidate their rule, unsupported
@@ -131,6 +132,56 @@ the root: its own `font-size` resolves `rem` against the initial 16px,
 then its other properties use its newly computed font size, as specified
 by [CSS Values Level 3 §5.1.1](https://www.w3.org/TR/2022/CR-css-values-3-20221201/#font-relative-lengths).
 
+### Conditional rules
+
+[Media Queries Level 4, 19 February 2026](https://www.w3.org/TR/2026/CRD-mediaqueries-4-20260219/)
+supplies query lists, not/only media-type prefixes, grouped not/and/or
+conditions and feature ranges. The named Level 5 subset is
+[prefers-color-scheme and prefers-reduced-motion](https://www.w3.org/TR/2026/WD-mediaqueries-5-20260219/).
+[Conditional Rules Level 3](https://www.w3.org/TR/2024/CRD-css-conditional-3-20240815/)
+supplies supports conditions. Nested active groups flatten in source
+order. Rules inside inactive groups are counted and their nested
+conditions parsed for admission, without compiling their selectors or
+values. Bodies of other at-rules remain opaque skipped syntax.
+
+`conditions::Environment` supplies `MediaType::{Screen, Print}`, finite
+nonnegative CSS-pixel width/height, finite nonnegative resolution in dppx,
+`ColorScheme::{Light, Dark}` and a reduced-motion boolean. It reads no
+host state. `StyleSet::new_with_environment` validates that environment
+and compiles the applicable rules. Changing it requires recompilation;
+the result does not retain source text. `StyleSet::new` uses the explicit
+default: screen, 1280×720 CSS px, 1 dppx, light, no reduced motion.
+
+Supported features are width, height and resolution (boolean, exact,
+min-/max- prefixes and single or same-direction chained comparisons),
+orientation (portrait includes square), color scheme (light/dark) and
+reduced motion (reduce/no-preference). Length comparisons accept the
+absolute length units in §4 and em/rem at the initial 16px, or bare zero;
+resolution accepts dpi, dpcm, dppx and x. Negative comparison values are
+permitted and compared to nonnegative environment metrics. Other units,
+features and values are unknown. Range operators <, <=, =, >=, > preserve
+adjacency of the two-token operators; mixing comparison directions is
+invalid. Aspect ratio, interaction capability and other media features
+are outside this subset.
+
+Media conditions use three-valued logic: unknown remains unknown under
+not, false dominates and, true dominates or, and only a final true query
+matches. Unknown media types are false and can be negated. Invalid query
+members recover at the next top-level comma; an empty list matches. An
+and/or level cannot mix operators; a media-type suffix cannot have a
+top-level or. Supports uses boolean logic and queries exactly one
+implemented property/value declaration; unknown/general-enclosed syntax
+is false, including selector() queries. It tests computation grammar,
+not whether a layout engine exists. Both public text entry points,
+`conditions::media_matches` and `supports_matches`, have the same bounds
+and syntax handling used for compiled groups.
+
+Imports remain unfetched. A future fetch-owning caller may resolve an
+import under its own URL, depth and byte policy, then supply its sheets
+at the import's source position, with its inherited import conditions.
+The current ordered-sheet API is not an import resolver and does not
+retain import-layer/supports metadata.
+
 ## 4. First computed property set
 
 Values are typed and deterministic; absolute lengths use CSS px (96 per
@@ -196,7 +247,14 @@ it as a stylesheet matching nothing.
 | MAX_TOKEN_BYTES | 16 KiB per decoded token string or numeric representation |
 | MAX_TOKENS | 131,072 emitted tokens per input, whitespace included |
 | MAX_NESTING | 32 function/block levels, also on skipped syntax |
-| MAX_RULES | 8,192 top-level rules per sheet and compiled rules per style set |
+| MAX_RULES | 8,192 rules per parsed syntax rule list |
+| MAX_COMPILED_RULES | 16,384 active compiled rules per style set |
+| MAX_GROUP_RULES | 32,768 visited rules across top-level and media/supports lists per style set, inactive lists included |
+| MAX_GROUP_DEPTH | 16 nested media/supports groups |
+| MAX_CONDITION_PARTS | 2,048 component values, whitespace and nested contents included, per condition prelude or public query |
+| MAX_CONDITION_DEPTH | 16 nested blocks/functions per condition |
+| MAX_MEDIA_QUERIES | 64 comma-list members per media prelude or query |
+| MAX_RESOLUTION_DPPX | 1,000 supplied environment resolution |
 | MAX_DECLARATIONS | 32,768 declarations per list, expanded declarations per style set, and expanded inline declarations per compute call |
 | MAX_SELECTORS | 256 selector-list members, including nested lists |
 | MAX_SELECTOR_PARTS | 1,024 simple selectors and combinators per parsed list |
@@ -219,7 +277,7 @@ logical functions and every candidate rule of a compute call. Index
 lookups charge observed tag/id/class bytes before scanning or folding,
 one step per lookup and one per bucket entry before deduplication.
 BTree lookups and candidate sorting have an additional logarithmic factor
-bounded by MAX_INDEX_ENTRIES and MAX_RULES; the work counter is an
+bounded by MAX_INDEX_ENTRIES and MAX_COMPILED_RULES; the work counter is an
 admission metric, not a CPU instruction count. Duplicate class words
 still charge repeated bucket visits. Only indexed fields are observed. Recursive matching
 depth is bounded by compounds and logical depth, not document depth.
@@ -453,3 +511,25 @@ against the unindexed path where both complete; admission errors may
 change because unrelated work is removed and candidate gathering is
 charged. The 5,000-rule fixture succeeds with zero candidates while its
 unindexed reference still exhausts the budget.
+
+### Conditional workload
+
+The same corpus also runs with desktop screen (1280×720, 1 dppx, light),
+mobile screen (375×812, 2 dppx, dark), and print (800×1100, 3 dppx, light),
+all without reduced motion. Every sheet set and every element completes.
+GitHub's desktop set needs 8,259 compiled rules, exceeding the former
+8,192 aggregate cap; MAX_COMPILED_RULES is therefore 16,384 while the
+per-list syntax bound remains 8,192. False groups still contribute to
+the independent visited-rule and nesting bounds. Matching stays at
+150,000 steps; the largest measured call is 107,059.
+
+| Capture | Compiled rules desktop / mobile / print | Maximum steps across environments |
+|---|---:|---:|
+| bootstrap | 2036 / 1066 / 1556 | 8,345 |
+| debian | 93 / 97 / 92 | 807 |
+| github | 8259 / 6205 / 7185 | 107,059 |
+| kernel | 55 / 99 / 55 | 311 |
+| mdn | 382 / 397 / 400 | 5,251 |
+| news | 733 / 533 / 633 | 7,518 |
+| rust-book | 221 / 225 / 221 | 1,429 |
+| wikipedia | 1019 / 1084 / 664 | 49,863 |

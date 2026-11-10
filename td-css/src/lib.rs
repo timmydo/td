@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cascade;
+pub mod conditions;
 pub mod selectors;
 pub mod syntax;
 pub mod values;

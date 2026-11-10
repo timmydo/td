@@ -644,8 +644,9 @@ fn relative_font_weights_and_keyword_sizes_follow_ua_tables() {
 }
 
 #[test]
-fn at_rules_and_invalid_selector_lists_never_leak_styles() {
-    let css = "@import 'x'; @media screen{p{color:blue!important}} @supports(display:block){p{color:blue}}
+fn inactive_at_rules_and_invalid_selector_lists_never_leak_styles() {
+    let css =
+        "@import 'x'; @media print{p{color:blue!important}} @supports(display:block){p{color:blue}}
         @layer{p{color:blue}} @font-face{color:blue} p,:unknown{color:blue} p{color:red}";
     assert_eq!(compute(css, "").get(Property::Color), Some(&red()));
     assert_eq!(
@@ -781,11 +782,13 @@ fn aggregate_admission_limits_and_context_are_enforced() {
         StyleSet::new(&[(Origin::Author, one.as_str()); 5]),
         Err(Error::Limit("MAX_STYLE_BYTES"))
     ));
-    let many_rules = "p{}".repeat(MAX_RULES);
-    assert!(StyleSet::new(&[(Origin::Author, &many_rules)]).is_ok());
+    let many_rules = "p{}".repeat(crate::MAX_RULES);
+    let mut rule_sheets = vec![(Origin::Author, many_rules.as_str()); 2];
+    assert!(StyleSet::new(&rule_sheets).is_ok());
+    rule_sheets.push((Origin::Author, "p{}"));
     assert!(matches!(
-        StyleSet::new(&[(Origin::Author, &many_rules), (Origin::Author, "p{}")]),
-        Err(Error::Limit("MAX_RULES"))
+        StyleSet::new(&rule_sheets),
+        Err(Error::Limit("MAX_COMPILED_RULES"))
     ));
     let many_declarations = format!("p{{{}}}", "margin:0;".repeat(MAX_DECLARATIONS / 4));
     assert!(StyleSet::new(&[(Origin::Author, &many_declarations)]).is_ok());
@@ -888,7 +891,7 @@ fn conditional_variables_do_not_masquerade_as_supported_coverage() {
                p { color:red; color:var(--ink); width:calc(100% - 2px) } \
                p:hover { color:blue } p::before { color:blue }";
     let set = StyleSet::new(&[(Origin::Author, css)]).unwrap();
-    assert_eq!(set.rules.len(), 2);
+    assert_eq!(set.rules.len(), 3);
     assert_eq!(compute(css, "").get(Property::Color), Some(&red()));
     assert_eq!(
         compute(css, "").get(Property::Width),
@@ -1097,5 +1100,106 @@ fn index_entry_bound_has_an_exact_admitted_edge() {
     assert!(matches!(
         StyleSet::new(&input),
         Err(Error::Limit("MAX_INDEX_ENTRIES"))
+    ));
+}
+
+#[test]
+fn conditional_rules_keep_nested_order_and_explicit_environment() {
+    use crate::conditions::{ColorScheme, Environment, MediaType};
+    let css = "p{color:red} @media screen and (width >= 600px) { \
+        @supports (color:blue) { p{color:blue} } } \
+        @media print {p{color:rebeccapurple}} \
+        @media (prefers-color-scheme:dark) and (prefers-reduced-motion:reduce) {p{color:orange}}";
+    let nodes = tree();
+    let e = Handle {
+        nodes: &nodes,
+        index: 3,
+    };
+    let default = StyleSet::new(&[(Origin::Author, css)]).unwrap();
+    assert_eq!(
+        default
+            .compute(&e, None, 16.0, "")
+            .unwrap()
+            .get(Property::Color),
+        Some(&blue())
+    );
+    let small = Environment {
+        width: 320.0,
+        ..Environment::default()
+    };
+    let set = StyleSet::new_with_environment(&[(Origin::Author, css)], &small).unwrap();
+    assert_eq!(
+        set.compute(&e, None, 16.0, "")
+            .unwrap()
+            .get(Property::Color),
+        Some(&red())
+    );
+    let print = Environment {
+        media_type: MediaType::Print,
+        ..Environment::default()
+    };
+    let set = StyleSet::new_with_environment(&[(Origin::Author, css)], &print).unwrap();
+    assert_eq!(
+        set.compute(&e, None, 16.0, "")
+            .unwrap()
+            .get(Property::Color),
+        compute("", "color:rebeccapurple").get(Property::Color)
+    );
+    let dark = Environment {
+        color_scheme: ColorScheme::Dark,
+        reduced_motion: true,
+        ..small
+    };
+    let set = StyleSet::new_with_environment(&[(Origin::Author, css)], &dark).unwrap();
+    assert_eq!(
+        set.compute(&e, None, 16.0, "")
+            .unwrap()
+            .get(Property::Color),
+        compute("", "color:orange").get(Property::Color)
+    );
+    assert_eq!(
+        compute("@media screen{p{color:blue}}p{color:red}", "").get(Property::Color),
+        Some(&red())
+    );
+    assert_eq!(
+        compute("@media screen{<!-- p{color:blue}}p{color:red}", "").get(Property::Color),
+        Some(&red())
+    );
+}
+
+#[test]
+fn inactive_conditional_trees_still_have_global_bounds() {
+    let nested = format!(
+        "{}p{{color:red}}{}",
+        "@media print{".repeat(MAX_GROUP_DEPTH),
+        "}".repeat(MAX_GROUP_DEPTH)
+    );
+    assert!(StyleSet::new(&[(Origin::Author, &nested)]).is_ok());
+    assert!(matches!(
+        StyleSet::new(&[(Origin::Author, &format!("@media print{{{nested}}}"))]),
+        Err(Error::Limit("MAX_GROUP_DEPTH"))
+    ));
+    let sheets: Vec<String> = (0..64)
+        .map(|_| "@media print{p{}}".repeat(MAX_GROUP_RULES / 64 / 2))
+        .collect();
+    let refs: Vec<_> = sheets
+        .iter()
+        .map(|s| (Origin::Author, s.as_str()))
+        .collect();
+    assert!(StyleSet::new(&refs).is_ok());
+    let mut more = sheets;
+    more[63].push_str("p{}");
+    let refs: Vec<_> = more.iter().map(|s| (Origin::Author, s.as_str())).collect();
+    assert!(matches!(
+        StyleSet::new(&refs),
+        Err(Error::Limit("MAX_GROUP_RULES"))
+    ));
+    let huge = format!(
+        "@media print{{@media future({}){{p{{}}}}}}",
+        "x ".repeat(conditions::MAX_CONDITION_PARTS)
+    );
+    assert!(matches!(
+        StyleSet::new(&[(Origin::Author, &huge)]),
+        Err(Error::Limit("MAX_CONDITION_PARTS"))
     ));
 }
