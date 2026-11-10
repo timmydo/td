@@ -1972,6 +1972,7 @@ mod tests {
                 network: None,
                 system: false,
                 mcp: Vec::new(),
+                runtime: None,
             },
             Template {
                 name: "whole".into(),
@@ -1980,6 +1981,7 @@ mod tests {
                 network: Some(Network::Open),
                 system: true,
                 mcp: mcp(),
+                runtime: None,
             },
         ]
     }
@@ -1998,6 +2000,7 @@ mod tests {
                         network: Some(Network::Open),
                         system: true,
                         mcp: mcp(),
+                        runtime: None,
                     },
                     TemplateShared {
                         name: "plain".into(),
@@ -2008,6 +2011,7 @@ mod tests {
                         network: None,
                         system: false,
                         mcp: Vec::new(),
+                        runtime: None,
                     },
                 ],
                 shared: vec![Shared {
@@ -3057,6 +3061,7 @@ mod tests {
             network: Some(Network::Off),
             system: true,
             mcp: Vec::new(),
+            runtime: None,
         };
         assert_eq!(
             crate::config::templates_json(&[whole]).to_string(),

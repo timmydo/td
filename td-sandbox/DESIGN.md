@@ -67,9 +67,11 @@ covering every library it needs (`builder/src/build_root.rs`'s
 store, and only for build-root outputs). That glibc keeps Debian's
 compiled-in `/usr` paths, so here a td process's library search after its
 `RUNPATH` (the runtime's cache, then default directories under `/lib`
-and `/usr`), its gconv modules, its locale data and glibc's own `dlopen`
-of `libgcc_s.so.1` resolve into the runtime: a td program in such a
-workspace can load Flathub code built against another glibc. The
+and `/usr`, which serves what it loads or `dlopen`s by name that its
+`RUNPATH` does not hold), its gconv modules and its locale data resolve
+into the runtime: a td program in such a workspace can load Flathub code
+built against another glibc; glibc's own `dlopen` of `libgcc_s.so.1`
+is among those, unless the process already has it loaded. The
 runtime's code runs under the workspace filter (this frontend's
 development profile when network is on), as the user, with the profile's
 grants, network and host-local sockets, and outside the application

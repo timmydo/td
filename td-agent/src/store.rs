@@ -4440,6 +4440,7 @@ pub mod tests {
             name: "td".into(),
             repos: vec![crate::config::checked_repo("/srv/git/td", "main", "agent", None).unwrap()],
             shared: None,
+            runtime: None,
         }];
         state.save_templates(&templates).unwrap();
         assert_eq!(state.load_templates().unwrap(), templates);
@@ -4457,6 +4458,7 @@ pub mod tests {
                 sparse: None,
             }],
             shared: None,
+            runtime: None,
         }];
         assert!(state.save_templates(&unchecked).is_err());
         std::fs::write(state.root().join(TEMPLATES), "[{\"name\":\"td\"}]").unwrap();

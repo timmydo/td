@@ -331,8 +331,12 @@ pub fn serve<T: Ending>(
 }
 
 /// What a server's instance was launched with, which a change of
-/// restarts it: the workspace's mounts.
-pub type Launch = (Vec<crate::workspace::Shared>, Vec<std::path::PathBuf>);
+/// restarts it: the workspace's mounts and the runtime at its `/usr`.
+pub type Launch = (
+    Vec<crate::workspace::Shared>,
+    Vec<std::path::PathBuf>,
+    Option<String>,
+);
 
 /// A server the main thread started.
 pub struct Running {
@@ -1000,7 +1004,7 @@ mod tests {
 
     fn launch(prepared: usize) -> Launch {
         let path = std::path::PathBuf::from(format!("/r{prepared}"));
-        (Vec::new(), vec![path])
+        (Vec::new(), vec![path], None)
     }
 
     #[test]
@@ -1023,6 +1027,16 @@ mod tests {
         assert!(servers.get("b").is_none());
         // Other mounts end `a` too.
         assert_eq!(servers.plan(&changed, &launch(2)), changed);
+        assert!(servers.get("a").is_none());
+        // As does another runtime at `/usr` (DESIGN.md §8, Runtime).
+        let (fake, flag) = Fake::new(silent);
+        ended.push(flag);
+        servers
+            .add(server("a", "/a"), launch(2), fake, |_, _| {})
+            .unwrap();
+        let mut sdk = launch(2);
+        sdk.2 = Some("freedesktop-sdk-25-08".into());
+        assert_eq!(servers.plan(&changed, &sdk), changed);
         assert!(servers.get("a").is_none());
         servers.end_all();
         for flag in ended {

@@ -230,6 +230,10 @@ pub struct Policy {
     /// The tool host's working directory when it is not the first root
     /// (`toolhost::Config::directory`).
     pub directory: Option<PathBuf>,
+    /// The Flathub runtime td-jail binds at `/usr`, by td name (DESIGN.md
+    /// §8, Runtime): a development instance's whose template names one,
+    /// never a maintenance or review instance's.
+    pub runtime: Option<String>,
 }
 
 impl Policy {
@@ -296,6 +300,22 @@ fn spec_text_with_aliases(
     if policy.development {
         text.push_str("profile=development\n");
     }
+    // td-jail checks it is declared; a name kept to the syntax cannot
+    // break a line.
+    if let Some(runtime) = &policy.runtime {
+        if !crate::flathub_app::valid_name(runtime) {
+            return Err(format!("{runtime:?} is no runtime's td name"));
+        }
+        text.push_str("runtime=");
+        text.push_str(runtime);
+        text.push('\n');
+    }
+    // With a runtime, the host's `/usr`, `/lib` and `/lib64` are not
+    // bound, and td-jail refuses a path directory or alias source there,
+    // which inside the jail would be the runtime's: nothing there is named.
+    let kept = |path: &Path| {
+        policy.runtime.is_none() || !crate::flathub_app::in_workspace_runtime_tree(path)
+    };
     let mut line = |key: &str, path: &Path| -> Result<(), String> {
         let value = path
             .to_str()
@@ -315,13 +335,13 @@ fn spec_text_with_aliases(
     };
     line("entry", &programs.agent)?;
     line("program", &programs.txt)?;
-    for alias in aliases {
+    for alias in aliases.iter().filter(|alias| kept(&alias.source)) {
         if !crate::host_path::valid_name(&alias.name) {
             return Err("invalid PATH alias name".into());
         }
         line(&format!("alias={}", alias.name), &alias.source)?;
     }
-    for directory in path {
+    for directory in path.iter().filter(|directory| kept(directory)) {
         line("path", directory)?;
     }
     line("home", &policy.home)?;
@@ -458,6 +478,15 @@ fn start(
     Ok(Client::linked(reader, ours, linked).owning(child, spec.to_path_buf(), tail))
 }
 
+/// Why an unconfined workspace runs no runtime (DESIGN.md §8, Runtime):
+/// only td-jail binds one, and only a template's workspace, always
+/// jailed, names one.
+pub(crate) fn unconfined_runtime(runtime: &str) -> String {
+    format!(
+        "an unconfined workspace runs outside any jail, so it cannot bind the runtime {runtime:?}"
+    )
+}
+
 /// Starts a tool host for an unconfined workspace (DESIGN.md §8,
 /// Unconfined workspaces): this program as `tool-host`, outside any jail,
 /// its roots and td-txt named as they are, with the whole of this process's
@@ -466,6 +495,9 @@ fn start(
 /// and kills it only if it has not ended within a few seconds; what a
 /// command started beside its `sh` is not ended.
 pub fn launch_unjailed(programs: &Unjailed, policy: &Policy) -> Result<Client, String> {
+    if let Some(runtime) = &policy.runtime {
+        return Err(unconfined_runtime(runtime));
+    }
     let (ours, theirs) = UnixStream::pair().map_err(|e| format!("the tool host's channel: {e}"))?;
     let channel = |e: io::Error| format!("the tool host's channel: {e}");
     let theirs_in = theirs.try_clone().map_err(channel)?;
@@ -995,6 +1027,7 @@ mod tests {
             directory: None,
             read: vec!["/d".into()],
             write: vec!["/e".into()],
+            runtime: None,
         };
         assert_eq!(
             spec_text(&programs(), &policy, &["/gnu/store/x-profile/bin".into()]).unwrap(),
@@ -1021,6 +1054,80 @@ mod tests {
             };
             assert!(spec_text(&programs(), &policy, &[]).is_err(), "{bad:?}");
         }
+    }
+
+    /// A runtime is the line td-jail takes after the profile and before
+    /// the entry, and with one nothing in `/usr`, `/lib` or `/lib64`,
+    /// which it replaces, is named as a path directory or alias source
+    /// (DESIGN.md §8, Runtime).
+    #[test]
+    fn a_runtime_is_named_where_td_jail_reads_it_and_its_trees_are_not() {
+        let policy = Policy {
+            development: true,
+            home: "/s/jail/a/home".into(),
+            worktrees: vec!["/w/a".into()],
+            runtime: Some("freedesktop-sdk-25-08".into()),
+            ..Policy::default()
+        };
+        let path: Vec<PathBuf> = ["/td/store/x-git/bin", "/usr/bin", "/lib64/x", "/usrx/bin"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let alias = |name: &str, source: &str| crate::host_path::Alias {
+            name: name.into(),
+            source: source.into(),
+        };
+        let aliases = [
+            alias("cc", "/td/store/x-td-link/bin/td-link"),
+            alias("gcc", "/usr/bin/gcc"),
+            alias("ld", "/lib/ld"),
+        ];
+        assert_eq!(
+            spec_text_with_aliases(&programs(), &policy, &path, &aliases).unwrap(),
+            "format=1\nprofile=development\nruntime=freedesktop-sdk-25-08\n\
+             entry=/w/target/td-agent\nprogram=/w/target/td-txt\n\
+             alias=cc /td/store/x-td-link/bin/td-link\n\
+             path=/td/store/x-git/bin\npath=/usrx/bin\nhome=/s/jail/a/home\nworktree=/w/a\n"
+        );
+        // Native, the same trees are named as they were.
+        let native = Policy {
+            runtime: None,
+            ..policy.clone()
+        };
+        let text = spec_text_with_aliases(&programs(), &native, &path, &aliases).unwrap();
+        assert!(
+            text.starts_with("format=1\nprofile=development\nentry="),
+            "{text}"
+        );
+        assert!(
+            text.contains("alias=gcc /usr/bin/gcc\nalias=ld /lib/ld\n"),
+            "{text}"
+        );
+        assert!(text.contains("path=/usr/bin\npath=/lib64/x\n"), "{text}");
+        // An isolated instance would carry it first; td-agent gives one
+        // none, but td-jail takes it there.
+        let isolated = Policy {
+            development: false,
+            ..policy.clone()
+        };
+        assert!(spec_text(&programs(), &isolated, &[])
+            .unwrap()
+            .starts_with("format=1\nruntime=freedesktop-sdk-25-08\nentry="));
+        // A name that is no td name never reaches a line.
+        for bad in ["", "Sdk", "a\nentry=/x", "../x", &"a".repeat(65)] {
+            let policy = Policy {
+                runtime: Some(bad.to_string()),
+                ..policy.clone()
+            };
+            assert!(spec_text(&programs(), &policy, &[]).is_err(), "{bad:?}");
+        }
+        // Nor does an unconfined workspace run one.
+        let unjailed = Unjailed {
+            agent: "/bin/true".into(),
+            txt: None,
+        };
+        let refused = launch_unjailed(&unjailed, &policy).err().unwrap();
+        assert_eq!(refused, unconfined_runtime("freedesktop-sdk-25-08"));
     }
 
     #[test]

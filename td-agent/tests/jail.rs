@@ -656,6 +656,7 @@ fn a_repository_conversation_prepares_its_workspace() {
             sparse: Some(vec!["a".into()]),
         }],
         shared: None,
+        runtime: None,
     };
     let made = td_agent::workspace::repositories(
         &template,

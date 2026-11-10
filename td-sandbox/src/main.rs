@@ -46,10 +46,8 @@ fn system_path(path: &Path, runtime: bool) -> bool {
     ]
     .iter()
     .any(|p| path.starts_with(p))
-        && !(runtime && RUNTIME_TREES.iter().any(|p| path.starts_with(p)))
+        && !(runtime && flathub_app::in_workspace_runtime_tree(path))
 }
-/// What a runtime replaces in the jail (td-jail's `workspace::RUNTIME_TREES`).
-const RUNTIME_TREES: &[&str] = &["/usr", "/lib", "/lib64"];
 /// td's product configuration, td-jail's `authority::CONFIG_PATH`: where it
 /// is absent, td-jail refuses every runtime.
 const TD_CONFIG: &str = "/etc/td-app.conf";

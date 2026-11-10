@@ -91,7 +91,11 @@ through the application confinement path described below and in
 `APPLICATIONS.md`. Flathub payloads, the second class of foreign output
 below, run through the same path, except that a Flathub runtime a td
 workspace names also runs in that workspace's jail, which is not that
-path.
+path. No Flathub byte is a zone-two tool either, so such a workspace is
+no host for the control plane: its `PATH` falls through td's `/bin` to
+the runtime's `/usr/bin` and td's glibc loads from the runtime there.
+Do not build, run or check td's control plane in a workspace that names
+a runtime (td-agent/DESIGN.md §8, Runtime); nothing enforces this yet.
 
 ## Control plane
 
@@ -178,9 +182,9 @@ and shares, its network and the host-local sockets that reaches) until
 WORKLOADS.md step 7 gives workspaces accounts of their own, and not behind
 the application kind's D-Bus, portal or Wayland boundaries. td's own
 glibc programs in such a workspace can load the runtime's code too: td's
-imported glibc keeps its compiled-in `/usr` paths, so its library search
-after `RUNPATH`, its gconv modules, its locale data and its `libgcc_s`
-resolve into the runtime there.
+imported glibc keeps its compiled-in `/usr` paths, so its gconv modules,
+its locale data and whatever a program loads or `dlopen`s by name after
+its `RUNPATH` resolve into the runtime there.
 
 The image asserts that a dynamic payload's `PT_INTERP` is absent from the
 image root, but this does not prove the bytes can execute only in a jail: an

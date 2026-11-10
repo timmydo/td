@@ -1439,6 +1439,7 @@ impl App {
                     shared: None,
                     network: template.network,
                     mcp: Vec::new(),
+                    runtime: None,
                 })
                 .collect(),
             ..crate::config::Client::default()
@@ -13698,6 +13699,7 @@ pub mod tests {
                     name: "open".into(),
                     shared: None,
                     network: Some(Network::Open),
+                    runtime: None,
                 },
                 crate::config::TemplateShared {
                     mcp: Vec::new(),
@@ -13705,6 +13707,7 @@ pub mod tests {
                     name: "plain".into(),
                     shared: None,
                     network: None,
+                    runtime: None,
                 },
             ],
             ..crate::config::Client::default()

@@ -511,6 +511,7 @@ mod tests {
                 name: "td".into(),
                 repos: vec![crate::config::checked_repo("/srv/td", "main", "a", None).unwrap()],
                 shared: None,
+                runtime: None,
             }]);
         driven::request(&mut remote, b"1\t5\taction\tedit-template");
         assert!(remote

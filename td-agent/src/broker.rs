@@ -1084,30 +1084,15 @@ impl Session {
     ) -> Result<(), String> {
         let (templates, _) = merged_templates(&self.configured, &saved);
         let mut client = self.client.clone();
-        let held = &self.client.template_shared;
-        client.template_shared = template_shared(
-            &client.template_shared,
+        client.template_shared = kept_template_shared(
+            &self.client.template_shared,
             &self.configured,
             &templates,
-            |template| match &admitted {
-                Some((name, own)) if *name == template.name => Some(TemplateShared {
-                    system: template.system,
-                    name: template.name.clone(),
-                    shared: own.clone(),
-                    network: template.network,
-                    mcp: template.mcp.clone(),
-                }),
-                // Every other as held, or none, binding nothing and
-                // reaching no network, when start withheld the lists.
-                _ => held
-                    .iter()
-                    .find(|entry| entry.name == template.name)
-                    .cloned(),
-            },
+            admitted,
         );
         if client.to_json().to_string().len() > SETUP_CLIENT_BYTES {
             return Err(
-                "the templates' shared directories, network policies and MCP servers would be too many to hand to conversations"
+                "the templates' shared directories, network policies, MCP servers and runtimes would be too many to hand to conversations"
                     .into(),
             );
         }
@@ -3069,11 +3054,13 @@ pub fn run(
     for note in &config.notes {
         logged!("td-agent: configuration: {note}");
     }
-    if !config.notes.is_empty() {
-        view.note(format!(
-            "{} configuration key(s) are not read; see serve.log",
-            config.notes.len()
-        ));
+    match config.notes.as_slice() {
+        [] => {}
+        [note] => view.note(format!("configuration: {note}")),
+        more => view.note(format!(
+            "{} configuration key(s) are not read or do nothing here; see serve.log",
+            more.len()
+        )),
     }
     if let Err(why) = &key {
         logged!("td-agent: {why}");
@@ -3170,13 +3157,9 @@ pub fn run(
                         .into_iter()
                         .map(|note| format!("template {:?}: {note}", template.name)),
                 );
-                client.template_shared.push(TemplateShared {
-                    system: template.system,
-                    name: template.name.clone(),
-                    shared,
-                    network: template.network,
-                    mcp: template.mcp.clone(),
-                });
+                client
+                    .template_shared
+                    .push(template_entry(template, shared));
             }
             for note in &notes {
                 logged!("td-agent: {note}");
@@ -3195,7 +3178,7 @@ pub fn run(
             // workspaces bind none, rather than no process starting.
             if client.to_json().to_string().len() > SETUP_CLIENT_BYTES {
                 client.template_shared.clear();
-                let note = "the templates' shared directories, network policies and MCP servers are too many to hand to conversations; their workspaces bind none, reach no network and run no server";
+                let note = "the templates' shared directories, network policies, MCP servers and runtimes are too many to hand to conversations; their workspaces bind none, reach no network, run no server and bind no runtime";
                 logged!("td-agent: {note}");
                 view.note(note);
             }
@@ -3455,6 +3438,43 @@ fn orphans(metas: &[crate::store::Meta], name: &str) -> usize {
         .count()
 }
 
+/// What conversations are handed of `template`, `shared` its own shared
+/// directories as admitted: its network policy, system view, MCP servers
+/// and runtime (DESIGN.md §8, Runtime) as it names them.
+fn template_entry(
+    template: &Template,
+    shared: Option<Vec<crate::workspace::Shared>>,
+) -> TemplateShared {
+    TemplateShared {
+        system: template.system,
+        name: template.name.clone(),
+        shared,
+        network: template.network,
+        mcp: template.mcp.clone(),
+        runtime: template.runtime.clone(),
+    }
+}
+
+/// The conversations' template entries once the templates made in the
+/// window change to those listed in `templates`: `admitted`'s template its
+/// admitted list, every other its entry as `held`, never re-admitted, so a
+/// configured template keeps its runtime; or none, binding nothing and
+/// reaching no network, when start withheld the lists.
+fn kept_template_shared(
+    held: &[TemplateShared],
+    configured: &[Template],
+    templates: &[Template],
+    admitted: Option<(&str, Option<Vec<crate::workspace::Shared>>)>,
+) -> Vec<TemplateShared> {
+    template_shared(held, configured, templates, |template| match &admitted {
+        Some((name, own)) if *name == template.name => Some(template_entry(template, own.clone())),
+        _ => held
+            .iter()
+            .find(|entry| entry.name == template.name)
+            .cloned(),
+    })
+}
+
 /// Each listed template's shared directories and network for the
 /// conversations: a configured one's as `held` has them, one made in the
 /// window's as `entry` gives it, or none, when its workspaces bind
@@ -3667,6 +3687,7 @@ mod tests {
         names, orphans, own_shared, pushing_entry, reached, refetched, remember, remember_crossing,
         set_mode, template_shared, with_template, Client, TemplateShared,
     };
+    use super::{kept_template_shared, template_entry};
     use crate::protocol::Down;
     use crate::workspace::Workspace;
     use std::path::PathBuf;
@@ -3808,6 +3829,7 @@ mod tests {
             name: name.into(),
             repos: vec![repo.clone()],
             shared: None,
+            runtime: None,
         };
         let configured = [template("td")];
         let saved = [template("notes"), template("mail")];
@@ -3852,6 +3874,7 @@ mod tests {
                 name: "td".into(),
                 shared: own.clone(),
                 network: None,
+                runtime: None,
             },
             TemplateShared {
                 mcp: Vec::new(),
@@ -3859,6 +3882,7 @@ mod tests {
                 name: "notes".into(),
                 shared: None,
                 network: None,
+                runtime: None,
             },
         ];
         let mut own_folder = template("own");
@@ -3877,6 +3901,7 @@ mod tests {
                     }]
                 }),
                 network: t.network,
+                runtime: None,
             })
         });
         let entries: Vec<(&str, Option<usize>)> = shared
@@ -3884,6 +3909,51 @@ mod tests {
             .map(|entry| (entry.name.as_str(), entry.shared.as_ref().map(Vec::len)))
             .collect();
         assert_eq!(entries, [("td", Some(0)), ("mail", None), ("own", Some(1))]);
+    }
+
+    /// A configured template's runtime reaches the entry conversations are
+    /// handed at start, and saving a template made in the window keeps
+    /// it, as held, while the saved one, which names none, has none
+    /// (DESIGN.md §8, Runtime).
+    #[test]
+    fn a_configured_templates_runtime_is_handed_on_and_kept() {
+        let template = |name: &str, runtime: Option<&str>| crate::config::Template {
+            mcp: Vec::new(),
+            system: false,
+            network: None,
+            name: name.into(),
+            repos: Vec::new(),
+            shared: None,
+            runtime: runtime.map(str::to_string),
+        };
+        let sdk = template("sdk", Some("freedesktop-sdk-25-08"));
+        let entry = template_entry(&sdk, None);
+        assert_eq!(entry.runtime.as_deref(), Some("freedesktop-sdk-25-08"));
+        assert_eq!(entry.name, "sdk");
+        assert_eq!(template_entry(&template("plain", None), None).runtime, None);
+        let configured = [sdk.clone()];
+        let held = vec![entry.clone()];
+        let saved = template("notes", None);
+        let listed = [sdk, saved];
+        let own = Some(vec![crate::workspace::Shared {
+            path: "/admitted".into(),
+            write: false,
+        }]);
+        let kept = kept_template_shared(&held, &configured, &listed, Some(("notes", own.clone())));
+        let runtimes: Vec<(&str, Option<&str>)> = kept
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.runtime.as_deref()))
+            .collect();
+        assert_eq!(
+            runtimes,
+            [("sdk", Some("freedesktop-sdk-25-08")), ("notes", None)]
+        );
+        assert_eq!(kept.last().unwrap().shared, own);
+        // Removing the saved one keeps the configured one as held.
+        assert_eq!(
+            kept_template_shared(&held, &configured, &listed[..1], None),
+            held
+        );
     }
 
     /// The chooser lists the configuration's templates, then those made
@@ -3897,6 +3967,7 @@ mod tests {
             name: name.into(),
             repos: Vec::new(),
             shared: None,
+            runtime: None,
         };
         let (merged, clashes) = merged_templates(
             &[template("td"), template("notes")],
@@ -3936,6 +4007,7 @@ mod tests {
             name: "own".into(),
             repos: Vec::new(),
             shared: own,
+            runtime: None,
         };
         let (admitted, refused) = own_shared(
             &template(Some(vec![shared("~/notes", true), shared("~/gone", false)])),
@@ -3977,6 +4049,7 @@ mod tests {
             network: None,
             system: false,
             mcp: Vec::new(),
+            runtime: None,
         };
         let chosen = |templates: &[crate::config::Template], name: &str| {
             crate::broker::chosen(templates, name)
@@ -4085,6 +4158,7 @@ mod tests {
                 name: "t".into(),
                 shared: Some(vec![shared(repo.join("refs"))]),
                 network: None,
+                runtime: None,
             }],
             ..Client::default()
         };
@@ -4112,6 +4186,7 @@ mod tests {
                 })
                 .collect(),
             shared: None,
+            runtime: None,
         };
         let id = crate::store::Id::random().unwrap();
         let made = crate::workspace::plan(&template, &id, "/d".as_ref(), "/h".as_ref(), 0).unwrap();

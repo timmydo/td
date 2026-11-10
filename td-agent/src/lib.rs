@@ -63,6 +63,11 @@ pub mod cost;
 pub mod diagnostics;
 pub mod egress;
 pub mod files;
+// The declared Flathub runtimes' td names, which a template's `runtime`
+// names (DESIGN.md §8, Runtime); td-jail is the authority at launch.
+#[allow(dead_code, reason = "td-app's and td-jail's halves of the shared file")]
+#[path = "../../engine/src/flathub_app.rs"]
+pub(crate) mod flathub_app;
 pub use td_remote::frame;
 pub mod git;
 pub mod history;

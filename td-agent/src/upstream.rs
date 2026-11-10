@@ -111,6 +111,7 @@ mod tests {
                 })
                 .collect(),
             shared: None,
+            runtime: None,
         };
         let admitted = [
             Admission::parse("example.org").unwrap(),

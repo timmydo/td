@@ -60,10 +60,11 @@ pub fn fresh(call: &Call) -> bool {
 }
 
 impl Bench {
-    /// Works out the policy for `workspace` with `shared` and the
-    /// repositories `prepared`, unless it is worked out for them already;
-    /// a new one retires the file tools' instance, which binds the old
-    /// (DESIGN.md §7: it is replaced when the ready worktrees change).
+    /// Works out the policy for `workspace` with `shared`, the
+    /// repositories `prepared` and the Flathub `runtime` its template
+    /// names, unless it is worked out for them already; a new one retires
+    /// the file tools' instance, which binds the old (DESIGN.md §7: it is
+    /// replaced when the ready worktrees change; §8, Runtime).
     pub fn prepare(
         &mut self,
         workspace: &Workspace,
@@ -71,19 +72,31 @@ impl Bench {
         id: &Id,
         shared: &[Shared],
         prepared: &[PathBuf],
+        runtime: Option<&str>,
     ) -> Result<&Policy, String> {
         if self.unconfined {
+            // Only a jail binds one (DESIGN.md §8, Runtime); `take` refuses
+            // it again.
+            if let Some(runtime) = runtime {
+                return Err(jail::unconfined_runtime(runtime));
+            }
             if self.unjailed.is_none() {
                 self.unjailed = Some(Unjailed::from_env());
             }
         } else if self.programs.is_none() {
             self.programs = Some(Programs::from_env());
         }
-        let current = self.policy.as_ref().is_some_and(|(with, ready, _, _)| {
-            with.as_slice() == shared && ready.as_slice() == prepared
-        });
+        let current = self
+            .policy
+            .as_ref()
+            .is_some_and(|(with, ready, policy, _)| {
+                with.as_slice() == shared
+                    && ready.as_slice() == prepared
+                    && policy.runtime.as_deref() == runtime
+            });
         if !current {
-            let (policy, specs) = workspace::policy(workspace, state, id, shared, prepared)?;
+            let (mut policy, specs) = workspace::policy(workspace, state, id, shared, prepared)?;
+            policy.runtime = runtime.map(str::to_string);
             self.files = None;
             self.policy = Some((shared.to_vec(), prepared.to_vec(), policy, specs));
         }
@@ -300,12 +313,12 @@ impl Bench {
     /// What an instance launched now is launched with, which an MCP
     /// server is started again when it changes (DESIGN.md §12, Lifetime).
     pub fn launch(&self) -> crate::servers::Launch {
-        let (shared, prepared) = self
-            .policy
+        self.policy
             .as_ref()
-            .map(|(shared, prepared, _, _)| (shared.clone(), prepared.clone()))
-            .unwrap_or_default();
-        (shared, prepared)
+            .map(|(shared, prepared, policy, _)| {
+                (shared.clone(), prepared.clone(), policy.runtime.clone())
+            })
+            .unwrap_or_default()
     }
 
     /// The web-fetch policy and allowlist supplied to its classifier.
@@ -681,6 +694,56 @@ mod tests {
         assert_eq!(launch, bench.launch());
         bench.set_network(crate::config::Network::Off, Vec::new(), None);
         assert_eq!(launch, bench.launch());
+    }
+
+    /// A template's runtime is in the policy and in what servers are
+    /// launched with, and a change works the policy out again
+    /// (DESIGN.md §8, Runtime); an unconfined workspace runs none.
+    #[test]
+    fn a_runtime_is_the_policys_and_never_an_unconfined_hosts() {
+        let dir = td_fs::TempDir::new("td-agent-bench-runtime").unwrap();
+        let state = StateDir::at(dir.path().to_path_buf());
+        let id = Id::parse(&"0".repeat(32)).unwrap();
+        let sdk = Some("freedesktop-sdk-25-08");
+        let mut bench = Bench::default();
+        let policy = bench
+            .prepare(&Workspace::Scratch, &state, &id, &[], &[], sdk)
+            .unwrap();
+        assert_eq!(policy.runtime.as_deref(), sdk);
+        assert!(policy.development);
+        assert_eq!(bench.launch().2.as_deref(), sdk);
+        let native = bench
+            .prepare(&Workspace::Scratch, &state, &id, &[], &[], None)
+            .unwrap();
+        assert_eq!(native.runtime, None);
+        assert_eq!(bench.launch().2, None);
+        // Were a runtime to reach an unconfined workspace, nothing of it
+        // would run there: preparing it is refused, and a policy naming
+        // one is refused again at launch.
+        bench.set_unconfined(true);
+        let refused = bench
+            .prepare(&Workspace::Scratch, &state, &id, &[], &[], sdk)
+            .err()
+            .unwrap();
+        assert_eq!(refused, jail::unconfined_runtime("freedesktop-sdk-25-08"));
+        bench
+            .prepare(&Workspace::Scratch, &state, &id, &[], &[], None)
+            .unwrap();
+        if let Some((_, _, policy, _)) = bench.policy.as_mut() {
+            policy.runtime = sdk.map(str::to_string);
+        }
+        bench.unjailed = Some(Ok(Unjailed {
+            agent: "/bin/true".into(),
+            txt: None,
+        }));
+        let shell = Call::Shell {
+            command: "true".into(),
+            timeout_ms: None,
+            workdir: None,
+        };
+        let refused = bench.take(&shell, 1).err().unwrap();
+        assert!(refused.contains("unconfined workspace"), "{refused}");
+        assert!(refused.contains("freedesktop-sdk-25-08"), "{refused}");
     }
 
     #[test]

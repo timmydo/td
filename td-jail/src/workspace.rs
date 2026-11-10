@@ -56,7 +56,8 @@ pub(crate) const SYSTEM_TREES: &[&str] = &[
 pub(crate) const PROGRAM_TREES: &[&str] = &["td", "usr"];
 /// The system trees a spec's runtime replaces: its tree at `/usr`, and
 /// `/lib` and `/lib64` links into it. Nothing of the host's is bound there.
-pub(crate) const RUNTIME_TREES: &[&str] = &["lib", "lib64", "usr"];
+/// One list with the launchers that leave them out of a spec.
+pub(crate) const RUNTIME_TREES: &[&str] = flathub_app::WORKSPACE_RUNTIME_TREES;
 /// td's one account, the human's: where the product configuration is
 /// installed, the kind serves it alone, whose td-agent launches it
 /// (APPLICATIONS.md §X.8).

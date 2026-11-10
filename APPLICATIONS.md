@@ -3834,7 +3834,10 @@ with the kind's own departures:
 - **Runtime** (WORKLOADS.md, "Runtimes"). `runtime=` names a Flathub
   runtime by its td name in `flathub_app::FLATHUB_RUNTIMES`
   (`freedesktop-platform-25-08`, `freedesktop-sdk-25-08`); any other
-  value is refused. It is td's alone: where no product configuration is
+  value is refused. A td-sandbox profile's runtime (td-sandbox/DESIGN.md,
+  "Runtime") is written here, and a td-agent template's
+  (td-agent/DESIGN.md §8, Runtime), on its workspaces' development
+  instances alone. It is td's alone: where no product configuration is
   installed it is refused, since it would replace the host's `/usr` and
   the runtime store exists only on td. td-jail holds the runtime store's
   `current` as an application launch holds it (§W.9, "What a launch
@@ -3853,7 +3856,8 @@ with the kind's own departures:
   reaches) until WORKLOADS.md step 7 gives workspaces accounts of their
   own, and not behind the application kind's D-Bus, portal or Wayland
   boundaries. td's own glibc programs in the workspace can load the
-  runtime's code too (the loader boundary below).
+  runtime's code too (the loader boundary below), so such a workspace is
+  no host for td's control plane (AGENTS.md, "Trust zones").
 - **Programs**, the entry first, are direct executable regular files,
   bound read-only and executable at `/opt/workspace/bin/<file name>`,
   their device and inode checked before and after the bind. The entry
@@ -3968,10 +3972,12 @@ build-root outputs). That glibc keeps Debian's compiled-in `/usr` paths,
 so in a runtime workspace a td process's library search after its
 `RUNPATH` (the runtime's `ld.so.cache`, then default directories that
 `/lib` and `/usr` now name in the runtime), its gconv modules
-(`/usr/lib/x86_64-linux-gnu/gconv`), its locale data (`/usr/lib/locale`)
-and glibc's own `dlopen` of `libgcc_s.so.1` resolve into the Flathub
-runtime: a td process there can load Flathub code built against another
-glibc. This is stated, not prevented. There
+(`/usr/lib/x86_64-linux-gnu/gconv`) and its locale data
+(`/usr/lib/locale`) resolve into the Flathub runtime, as does whatever
+it loads or `dlopen`s by name that its `RUNPATH` does not hold (glibc's
+own `dlopen` of `libgcc_s.so.1` among them, unless the process already
+has it loaded): a td process there can load Flathub code built against
+another glibc. This is stated, not prevented. There
 is no `/home` but the admitted directories, no `/sys`,
 no cgroupfs, and no host Wayland, bus, audio, fetch, tty or runtime
 directory. Stage 2 reads all of it back before confinement: the exact

@@ -736,6 +736,29 @@ pub fn serve_in(
     served
 }
 
+/// The policy `bench` launches `meta`'s `workspace` with, `shared` its
+/// shared directories and grants: unconfined as it was made, and with the
+/// runtime its template names in the setup `client` (DESIGN.md §8,
+/// Runtime).
+fn bench_policy<'a>(
+    bench: &'a mut Bench,
+    client: &Client,
+    state: &StateDir,
+    meta: &store::Meta,
+    workspace: &Workspace,
+    shared: &[crate::workspace::Shared],
+) -> Result<&'a crate::jail::Policy, String> {
+    bench.set_unconfined(meta.unconfined);
+    bench.prepare(
+        workspace,
+        state,
+        &meta.id,
+        shared,
+        &meta.prepared,
+        client.runtime_for(workspace),
+    )
+}
+
 /// Watches background call `call` on `client` until it ends, `killed`
 /// says to kill it or is dropped, or `limit` passes: how it ended, as
 /// `process_list` says it, and whether it was killed. Its instance ends
@@ -4071,10 +4094,7 @@ impl Session {
                 Err(why) => logged!("td-agent: directory grant not mounted: {why}"),
             }
         }
-        self.bench.set_unconfined(meta.unconfined);
-        let policy = self
-            .bench
-            .prepare(workspace, &state, &meta.id, &shared, &meta.prepared)
+        let policy = bench_policy(&mut self.bench, client, &state, &meta, workspace, &shared)
             .map_err(|e| format!("the workspace could not be prepared: {e}"))?;
         // Named whether or not they are ready, so the prefix holds.
         let repositories = match workspace {
@@ -8612,6 +8632,69 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
 
+    /// A template conversation's instances carry the runtime its
+    /// template names in the setup, as the spec's `runtime=` line; one
+    /// with no template, or whose template names none, carries none
+    /// (DESIGN.md §8, Runtime).
+    #[test]
+    fn a_templates_runtime_reaches_its_instances_spec() {
+        let dir = td_fs::TempDir::new("td-agent-placed-runtime").unwrap();
+        let state = StateDir::at(dir.path().to_path_buf());
+        state.ensure().unwrap();
+        let entry = |name: &str, runtime: Option<&str>| crate::config::TemplateShared {
+            name: name.into(),
+            shared: None,
+            network: None,
+            system: false,
+            mcp: Vec::new(),
+            runtime: runtime.map(str::to_string),
+        };
+        let client = Client {
+            template_shared: vec![
+                entry("sdk", Some("freedesktop-sdk-25-08")),
+                entry("plain", None),
+            ],
+            ..Client::default()
+        };
+        let programs = crate::jail::Programs {
+            jail: "/w/td-jail".into(),
+            agent: "/w/td-agent".into(),
+            txt: "/w/td-txt".into(),
+        };
+        for (workspace, runtime) in [
+            (
+                Workspace::Template("sdk".into()),
+                Some("freedesktop-sdk-25-08"),
+            ),
+            (Workspace::Template("plain".into()), None),
+            (Workspace::Scratch, None),
+        ] {
+            let id = Id::random().unwrap();
+            let (conversation, _) = Conversation::create(
+                &state,
+                &id,
+                Role::Conversation,
+                Some(workspace.clone()),
+                LOCK_WAIT,
+            )
+            .unwrap();
+            let meta = conversation.meta().clone();
+            let mut bench = Bench::default();
+            let policy = bench_policy(&mut bench, &client, &state, &meta, &workspace, &[]).unwrap();
+            assert_eq!(policy.runtime.as_deref(), runtime, "{workspace:?}");
+            let spec = crate::jail::spec_text(&programs, policy, &[]).unwrap();
+            let line = runtime.map(|name| format!("runtime={name}\n"));
+            assert_eq!(
+                spec.lines()
+                    .find(|line| line.starts_with("runtime="))
+                    .map(|line| format!("{line}\n")),
+                line,
+                "{spec}"
+            );
+            assert_eq!(bench.launch().2.as_deref(), runtime, "{workspace:?}");
+        }
+    }
+
     /// A push to `main`, `master` or a base the workspace tracks on that
     /// remote is the person's; another remote's bases are not this one's.
     #[test]
@@ -8633,6 +8716,7 @@ mod tests {
                 repo("https://example.org/a/other", "release"),
             ],
             shared: None,
+            runtime: None,
         };
         let id = Id::random().unwrap();
         let made = crate::workspace::plan(&template, &id, "/d".as_ref(), "/h".as_ref(), 0).unwrap();
@@ -8710,6 +8794,7 @@ mod tests {
                 },
             ],
             shared: None,
+            runtime: None,
         };
         let admitted = [crate::git::Admission::parse("example.org").unwrap()];
         let made = crate::workspace::repositories(

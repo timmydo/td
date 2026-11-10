@@ -235,6 +235,7 @@ fn repositories(id: &Id, base: &Path) -> Workspace {
             sparse: None,
         }],
         shared: None,
+        runtime: None,
     };
     let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
     let made = td_agent::workspace::repositories(
@@ -507,6 +508,7 @@ fn a_prepared_repository_follows_its_bases_and_says_a_failure_once() {
             })
             .collect(),
         shared: None,
+        runtime: None,
     };
     let made = td_agent::workspace::repositories(
         &template,

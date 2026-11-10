@@ -573,6 +573,7 @@ impl TemplateDialog {
                 repos,
                 shared,
                 mcp: Vec::new(),
+                runtime: None,
             },
             replacing: self.editing().map(str::to_string),
         }
@@ -1092,6 +1093,7 @@ mod tests {
                     )
                     .unwrap()],
                     shared: None,
+                    runtime: None,
                 },
                 replacing: None,
             }
@@ -1255,6 +1257,7 @@ mod tests {
             name: "td".into(),
             repos: vec![first, second.clone()],
             shared: None,
+            runtime: None,
         };
         let mut dialog = TemplateDialog::edit(surface(), template.clone()).unwrap();
         assert_eq!(dialog.editing(), Some("td"));
@@ -1313,6 +1316,7 @@ mod tests {
                 name: "td".into(),
                 repos: vec![repo],
                 shared: None,
+                runtime: None,
             };
             let mut dialog = TemplateDialog::edit(surface(), template).unwrap();
             let Reply::Save { template, .. } = dialog.key("Return", false, &mut NoClipboard) else {
@@ -1344,6 +1348,7 @@ mod tests {
             name: "td".into(),
             repos: vec![crate::config::checked_repo("/srv/td", "main", "a", None).unwrap()],
             shared: None,
+            runtime: None,
         };
         let mut dialog = TemplateDialog::edit(surface(), template).unwrap();
         let layout = dialog.layout().unwrap();

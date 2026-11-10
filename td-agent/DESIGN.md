@@ -3840,8 +3840,9 @@ Every instance has:
   name its own shared directories in place of the configured list
   (§7, §15), which is the human's choice as the list is.
 - **System:** the system's executable and library trees and a selective
-  `/etc`, read-only, and td-agent's own tool host and td-txt, read-only.
-  No cgroupfs, no `/sys`.
+  `/etc`, read-only, and td-agent's own tool host and td-txt, read-only;
+  on td, a template may put a Flathub runtime at `/usr` (Runtime,
+  below). No cgroupfs, no `/sys`.
 - **Home and runtime:** the conversation's private executable `HOME` and
   persistent `/tmp`, `/var/tmp`, `/dev/shm` and `/run`, backed by private
   directories under its jail directory. Jobs mount the same backing paths;
@@ -4459,7 +4460,9 @@ td-authd's request `0c` (td-authd/DESIGN.md) from the account home, with
 `XDG_RUNTIME_DIR=/run/user/1000`, where the fetch service's and the
 egress relay's sockets are. It runs `td-jail --workspace` itself, which
 td admits for its account alone (APPLICATIONS.md §C), with td's `/td`
-bound where its `/bin` links resolve; its tools' `PATH` is td's `/bin`.
+bound where its `/bin` links resolve; its tools' `PATH` is td's `/bin`,
+then, in a workspace whose template names a runtime, that runtime's
+`/usr/bin` (Runtime, below).
 A broker of the image's `/bin/td-agent` lacking any of those three variables, as one
 started over ssh does, starts over with it, so it has the same reach. One started over
 ssh lives in sshd's cgroup leaf and ends when sshd stops; `td-jail --workspace` admits
@@ -4469,6 +4472,82 @@ td-agent so holds what the human holds; what keeps the model to a
 workspace is the workspace jail and the approval policy (§11), as on a
 host, not an application jail around td-agent itself. td-agent is a
 standalone program: no boot test starts it.
+
+**Runtime.** A template of the configuration file may name a Flathub
+runtime by its td name (`runtime`, §15), so its workspaces' tools can
+run programs linked against a glibc userland td does not ship
+(WORKLOADS.md, "Runtimes"). A template made in the window names none.
+The broker reads the configuration file's templates when it starts and
+hands each one's runtime to conversations in their setup
+(`broker::template_entry`; saving a template made in the window keeps a
+configured one's as held), so a runtime set, changed or removed in the
+file reaches workspaces at the broker's next start. A conversation
+process takes it from its setup (`config::Client::runtime_for`) into
+`jail::Policy`'s `runtime` by `Bench::prepare` at each turn; the
+policy's cache and the MCP servers' launch hold it, so a setup naming
+another would work the policy out again, replacing the file tools'
+instance and restarting the servers (§12, Lifetime). Every development
+instance of the workspace, its file tools', each `shell`, `grep`, `sed`
+and background call's and each MCP server's, carries it in its spec as
+`runtime=NAME`, after the profile and before the entry, where td-jail
+reads it (APPLICATIONS.md §C, The `workspace` kind); maintenance and
+review instances never do, and keep the host's own trees. With a runtime
+td-agent names no path directory and no alias source in `/usr`, `/lib`
+or `/lib64`, which inside the jail would be the runtime's and which
+td-jail refuses, so td's own `/bin` and `/td/store` directories remain
+first.
+
+td-jail is the authority, as for td-sandbox (td-sandbox/DESIGN.md,
+"Runtime"): it refuses a name `FLATHUB_RUNTIMES` does not declare, any
+runtime on a development host, where it would replace the host's `/usr`,
+and one with no `current`, naming the applications that install it
+(the SDK, `freedesktop-sdk-25-08`, has none yet); otherwise it binds
+that generation read-only at `/usr` with `/lib` and `/lib64` links into
+it, ends the entry's `PATH` with `/bin:/usr/bin`, takes the
+runtime's loader files into `/etc`, and holds the runtime's `current`
+for the instance's life. Each refusal fails that instance's launch, and
+the tool reports td-jail's reason. td-agent keeps the name to its
+syntax alone (`flathub_app::valid_name`: 1 to 64 lowercase ASCII
+letters, digits and `-`, shared with td-jail and td-sandbox through
+`engine/src/flathub_app.rs`, as is the list of trees a runtime
+replaces): a name this system does not declare loads, with a note
+saying the template's tools are refused, so a runtime a later system
+retires leaves the file readable and the other templates usable. A
+declared one in a file read on a development host, which has no
+`/etc/td-app.conf` (the test td-jail and td-sandbox make), loads with a
+note too, since td-jail refuses it there. The window shows a lone note
+of the configuration's itself, and several as a count. The name is
+checked again when a spec is written, so it can never break a line.
+If the templates' entries are too large to hand to conversations
+(`SETUP_CLIENT_BYTES`), the broker hands none, and its note says their
+workspaces bind no runtime; saving a template made in the window that
+would make them so is refused, its error naming runtimes.
+
+An unconfined workspace runs no runtime: only an Empty or Directory…
+workspace can be unconfined, and neither has a template, so
+`runtime_for` gives it none; `Bench::prepare` refuses to prepare an
+unconfined workspace with one, and `jail::launch_unjailed` refuses a
+policy that names one, since nothing would bind it.
+
+The runtime runs as td-sandbox's does (APPLICATIONS.md §C, Runtime):
+inside the workspace jail, as the human with the workspace's worktrees,
+shared directories, network and the host-local sockets that reaches,
+outside the application kind's bus, portal and Wayland boundaries, and
+td's own glibc programs there can load its code. Its workspace is
+therefore no place for td's control plane (AGENTS.md, "Trust zones"):
+anything td's `/bin` lacks resolves into the runtime's `/usr/bin`
+(`gcc`, `ar`, `make`, `pkg-config`); td-builder's host provisioning on
+td, whose `cc` is td-link, takes the first `gcc` on `PATH` as the host C
+compiler when that one is not td-link, which there is the runtime's; and
+td's glibc loads its gconv modules from the runtime's `/usr`, and finds
+what a program loads or `dlopen`s by name after its `RUNPATH` through
+the runtime's loader cache.
+Building td's control-plane programs, `td-builder check`,
+`affected-checks --run`, `ready` or `./install-apps` there would make
+Flathub bytes zone-two tools. A template for td development names no
+runtime. Nothing enforces this: td-agent does not know which templates
+develop td, and td-builder does not refuse to run on a td system whose
+`/usr` exists, which only a runtime puts there.
 
 ## 9. Git
 
@@ -5786,7 +5865,8 @@ directory and git tools, as far as the workspace has what they act on.
   conversation lifetime. Local-remote admission and diagnostic-export exclusions
   include this history, including after revocation, so surviving jobs cannot
   regain access to newly trusted host inputs.
-  Existing background jobs retain their old mounts until stopped; later jobs
+  Existing background jobs retain their old mounts, and the runtime their
+  instance was launched with (§8, Runtime), until stopped; later jobs
   and the file-tool instance use the updated grants. Development shared
   directories are executable, retaining host noexec flags if present.
 - **`host_shell {command, workdir, timeout_ms?}`**: available only to the
@@ -6087,7 +6167,8 @@ logs no listing, so the next turn, within the restarts allowed
 and offers the tools last logged (*The prefix*, below). A call to a
 server not yet up waits for it within the call's timeout. A change to
 the workspace's mounts (a worktree made ready or shared
-directories) restarts each server at the next turn,
+directories) or to the runtime its template names (§8, Runtime)
+restarts each server at the next turn,
 which is not counted as a failure's restart. A change to the template's
 `mcp` takes effect at the next turn: a server no longer named is ended
 and its tools dropped, one changed is restarted. Ending a server closes
@@ -7318,6 +7399,11 @@ default; `jev_threshold`'s is calibrated (§11):
     `timeout`, a call's whole seconds, default 120, at most 600. A
     template's servers' commands and tools are at most 16 KiB together,
     so its servers alone cannot fill a conversation's setup.
+  - `runtime`: on td, the td name of a Flathub runtime its workspaces'
+    instances bind read-only at `/usr` (§8, Runtime), such as
+    `freedesktop-platform-25-08`; absent, none. Only in a template of
+    this file, never one made in the window, and never in a template for
+    td development (§8, Runtime).
 - `remotes`: the admitted git remotes (§7), each a remote's URL, a local
   repository's absolute path, or a host with a path prefix; default
   empty, so the first workspace on a remote asks; what a card admits is
@@ -7416,8 +7502,12 @@ there are at most 64 templates. Each of `repos` has a `remote`, a
 character, and an optional `sparse` list of paths, each relative, with
 no `..` and no control character; the git worker prepares them.
 `shared` is checked as the top-level key is, its errors naming
-`template.shared`. `network` is `off`, `allowlist` or `open`, and any
-other key is refused by name.
+`template.shared`. `network` is `off`, `allowlist` or `open`.
+`runtime` is 1 to 64 lowercase ASCII letters, digits and `-`, as a
+runtime declaration's td name is written; one `FLATHUB_RUNTIMES` does
+not declare is kept and said in a note, since td-jail refuses it at
+each launch, as is a declared one read on a development host, and
+anything else refuses the file. Any other key is refused by name.
 
 **Commands.** The person's commands are files `NAME.md` in
 the `commands` directory beside the configuration file, a place no jail

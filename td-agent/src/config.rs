@@ -127,6 +127,9 @@ pub struct TemplateShared {
     pub system: bool,
     /// Its MCP servers (DESIGN.md §12, MCP servers).
     pub mcp: Vec<McpServer>,
+    /// The Flathub runtime its instances bind at `/usr`, by td name
+    /// (DESIGN.md §8, Runtime).
+    pub runtime: Option<String>,
 }
 
 /// A workspace's network policy (DESIGN.md §10).
@@ -366,6 +369,22 @@ impl Client {
             .any(|t| &t.name == template && t.system)
     }
 
+    /// The Flathub runtime a workspace's instances bind (DESIGN.md §8,
+    /// Runtime): its template's, as the settings give it now; none for a
+    /// workspace with no template, the only kind that may be unconfined,
+    /// or whose template is no longer configured.
+    pub fn runtime_for(&self, workspace: &Workspace) -> Option<&str> {
+        let template = match workspace {
+            Workspace::Template(name) => name,
+            Workspace::Repositories(repositories) => &repositories.template,
+            Workspace::Scratch | Workspace::Directory(_) => return None,
+        };
+        self.template_shared
+            .iter()
+            .find(|t| &t.name == template)
+            .and_then(|t| t.runtime.as_deref())
+    }
+
     /// A workspace's MCP servers: its template's, none when it has no
     /// template or its template is no longer configured.
     pub fn mcp_for(&self, workspace: &Workspace) -> &[McpServer] {
@@ -522,6 +541,10 @@ impl Client {
                                         .map_or(Json::Null, |n| Json::Str(n.name().into())),
                                 ),
                                 ("system".into(), Json::Bool(template.system)),
+                                (
+                                    "runtime".into(),
+                                    template.runtime.clone().map_or(Json::Null, Json::Str),
+                                ),
                                 (
                                     "mcp".into(),
                                     Json::Arr(
@@ -744,12 +767,25 @@ impl Client {
                             Some(servers) => mcp_from_json(servers)
                                 .map_err(|e| format!("template {name:?}: {e}"))?,
                         };
+                        // A setup from a window before runtimes: none.
+                        let runtime = match item.get("runtime") {
+                            None | Some(Json::Null) => None,
+                            Some(runtime) => Some(
+                                runtime
+                                    .as_str()
+                                    .ok_or_else(|| {
+                                        format!("template {name:?}: `runtime` is a name")
+                                    })
+                                    .and_then(|text| runtime_name(name, text))?,
+                            ),
+                        };
                         Ok(TemplateShared {
                             system,
                             name: template_name(name)?,
                             shared,
                             network,
                             mcp,
+                            runtime,
                         })
                     })
                     .collect::<Result<_, String>>()?,
@@ -1023,8 +1059,9 @@ pub struct Config {
     /// The `model` key as the file gives it, none when it is left out:
     /// what a default chosen in the window is set over (DESIGN.md §4).
     pub model_key: Option<String>,
-    /// One line per key present that is not read, so a setting that
-    /// does nothing is said, never silently ignored.
+    /// One line per key present that is not read, and per template whose
+    /// runtime this system does not declare, so a setting that does
+    /// nothing is said, never silently ignored.
     pub notes: Vec<String>,
     /// `workspace_root` as the file gives it, `~` unexpanded; none is
     /// `DEFAULT_WORKSPACE_ROOT`.
@@ -1086,6 +1123,11 @@ pub struct Template {
     /// Its MCP servers (DESIGN.md §12, MCP servers), only ever the
     /// configuration file's: a template made in the window names none.
     pub mcp: Vec<McpServer>,
+    /// The Flathub runtime its workspaces' instances bind at `/usr`, by
+    /// td name (DESIGN.md §8, Runtime), only ever the configuration
+    /// file's. Kept to the name's syntax alone: one this system does not
+    /// declare is a note, and td-jail refuses its instances.
+    pub runtime: Option<String>,
 }
 
 /// One of a template's MCP servers (DESIGN.md §12, MCP servers; §15).
@@ -1438,8 +1480,10 @@ fn templates(value: &Toml) -> Result<Vec<Template>, String> {
         if !item.is_table() {
             return Err(wrong.into());
         }
-        item.check_known_keys(&["name", "repos", "shared", "network", "system", "mcp"])
-            .map_err(|e| format!("`template`: {e}"))?;
+        item.check_known_keys(&[
+            "name", "repos", "shared", "network", "system", "mcp", "runtime",
+        ])
+        .map_err(|e| format!("`template`: {e}"))?;
         let name = item
             .optional_str("name")
             .map_err(|e| format!("`template`: {e}"))?
@@ -1497,6 +1541,11 @@ fn templates(value: &Toml) -> Result<Vec<Template>, String> {
             None => Vec::new(),
             Some(value) => mcp_toml(value).map_err(|e| format!("template {name:?}: {e}"))?,
         };
+        let runtime = match item.optional_str("runtime") {
+            Ok(None) => None,
+            Ok(Some(text)) => Some(runtime_name(&name, text)?),
+            Err(e) => return Err(format!("template {name:?}: {e}")),
+        };
         templates.push(Template {
             system,
             name,
@@ -1504,9 +1553,43 @@ fn templates(value: &Toml) -> Result<Vec<Template>, String> {
             shared,
             network,
             mcp,
+            runtime,
         });
     }
     Ok(templates)
+}
+
+/// A template's `runtime`: a td name as a runtime declaration's is
+/// written, whether or not this system declares it (DESIGN.md §15), so a
+/// runtime a later system retires leaves the file readable.
+fn runtime_name(template: &str, text: &str) -> Result<String, String> {
+    if !crate::flathub_app::valid_name(text) {
+        return Err(format!(
+            "template {template:?}: `runtime` is a runtime's td name, 1 to 64 lowercase ASCII \
+             letters, digits and `-`, not {text:?}"
+        ));
+    }
+    Ok(text.to_string())
+}
+
+/// A note for each template whose runtime this system does not declare,
+/// whose workspaces' tools td-jail refuses.
+fn undeclared_runtimes(templates: &[Template]) -> Vec<String> {
+    templates
+        .iter()
+        .filter_map(|template| {
+            let runtime = template.runtime.as_deref()?;
+            crate::flathub_app::flathub_runtime(runtime)
+                .is_none()
+                .then(|| {
+                    format!(
+                        "template {:?}: `runtime` {runtime:?} is no runtime this system \
+                         declares, so its workspaces' tools are refused",
+                        template.name
+                    )
+                })
+        })
+        .collect()
 }
 
 /// A repository of a template made in the window (DESIGN.md §7,
@@ -1807,8 +1890,8 @@ pub(crate) fn template_from_json(item: &Json) -> Result<Template, String> {
         })
         .collect::<Result<Vec<_>, String>>()
         .map_err(|e| format!("template {name:?}: {e}"))?;
-    // A template made in the window names no MCP server; its file's keys
-    // leave no room for one.
+    // A template made in the window names no MCP server and no runtime;
+    // its file's keys leave no room for either.
     Ok(Template {
         system,
         network,
@@ -1816,6 +1899,7 @@ pub(crate) fn template_from_json(item: &Json) -> Result<Template, String> {
         repos,
         shared,
         mcp: Vec::new(),
+        runtime: None,
     })
 }
 
@@ -1908,7 +1992,38 @@ pub fn load(path: Option<&Path>) -> Result<Config, String> {
     };
     let text = String::from_utf8(bytes)
         .map_err(|_| format!("{}: stream did not contain valid UTF-8", path.display()))?;
-    parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    let mut config = parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let off_td = runtimes_off_td(&config.templates, Path::new(TD_CONFIG));
+    config.notes.extend(off_td);
+    Ok(config)
+}
+
+/// td's product configuration, td-jail's `authority::CONFIG_PATH`: where
+/// it is absent, on a development host, td-jail refuses every runtime.
+const TD_CONFIG: &str = "/etc/td-app.conf";
+
+/// A note for each template naming a declared runtime where no product
+/// configuration is installed at `td_config`, as td-jail and td-sandbox
+/// tell a development host: its workspaces' tools are refused there.
+fn runtimes_off_td(templates: &[Template], td_config: &Path) -> Vec<String> {
+    let off_td = matches!(
+        std::fs::symlink_metadata(td_config),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    templates
+        .iter()
+        .filter(|_| off_td)
+        .filter_map(|template| {
+            let runtime = template.runtime.as_deref()?;
+            crate::flathub_app::flathub_runtime(runtime).map(|_| {
+                format!(
+                    "template {:?}: `runtime` {runtime:?} is td's alone, and this host has no td \
+                     product configuration, so its workspaces' tools are refused",
+                    template.name
+                )
+            })
+        })
+        .collect()
 }
 
 /// The configuration a file's text gives.
@@ -1979,6 +2094,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
     }
     if let Some(value) = table.get("template") {
         config.templates = templates(value)?;
+        config.notes.extend(undeclared_runtimes(&config.templates));
     }
     // `open` is the human's alone, on a card or in a template (§10):
     // never every workspace's default.
@@ -2360,6 +2476,7 @@ mod tests {
                     sparse: Some(vec!["td-agent".into(), "td-ui".into()]),
                 }],
                 shared: None,
+                runtime: None,
             }]
         );
         assert_eq!(
@@ -2660,6 +2777,7 @@ mod tests {
             name: format!("t{n}"),
             repos: vec![repo.clone()],
             shared: None,
+            runtime: None,
         })
         .collect();
         let written = templates_json(&templates);
@@ -2709,6 +2827,7 @@ mod tests {
             name: "sys".into(),
             repos: Vec::new(),
             shared: None,
+            runtime: None,
         };
         let off = Template {
             system: false,
@@ -2742,6 +2861,7 @@ mod tests {
                     shared: None,
                     network: None,
                     system: true,
+                    runtime: None,
                 },
                 TemplateShared {
                     mcp: Vec::new(),
@@ -2749,6 +2869,7 @@ mod tests {
                     shared: None,
                     network: None,
                     system: false,
+                    runtime: None,
                 },
             ],
             ..Client::default()
@@ -2887,6 +3008,7 @@ mod tests {
                 network: None,
                 system: false,
                 mcp: servers.clone(),
+                runtime: None,
             }],
             ..Client::default()
         };
@@ -2925,6 +3047,7 @@ mod tests {
             network: None,
             system: false,
             mcp: Vec::new(),
+            runtime: None,
         }]);
         assert!(!written.to_string().contains("mcp"));
         let with = td_json::parse(
@@ -2932,6 +3055,128 @@ mod tests {
                 .to_string()
                 .replace("\"name\":\"w\"", "\"name\":\"w\",\"mcp\":[]"),
         )
+        .unwrap();
+        assert!(templates_from_json(&with).is_err());
+    }
+
+    /// A template's runtime (DESIGN.md §8, Runtime; §15): absent is none;
+    /// a td name is kept whether or not this system declares it, one it
+    /// does not declare said in a note, so a retired runtime leaves the
+    /// file readable; anything else refuses the file. It is carried to
+    /// conversations, a workspace without a template has none, and a
+    /// template made in the window cannot name one.
+    #[test]
+    fn a_templates_runtime_is_a_td_name_kept_and_carried() {
+        let config = parse("[[template]]\nname = \"t\"\n").unwrap();
+        assert_eq!(config.templates.first().unwrap().runtime, None);
+        let config =
+            parse("[[template]]\nname = \"t\"\nruntime = \"freedesktop-sdk-25-08\"\n").unwrap();
+        assert_eq!(
+            config.templates.first().unwrap().runtime.as_deref(),
+            Some("freedesktop-sdk-25-08")
+        );
+        assert!(config.notes.is_empty(), "{:?}", config.notes);
+        let retired =
+            parse("[[template]]\nname = \"t\"\nruntime = \"freedesktop-platform-24-08\"\n")
+                .unwrap();
+        assert_eq!(
+            retired.templates.first().unwrap().runtime.as_deref(),
+            Some("freedesktop-platform-24-08")
+        );
+        assert_eq!(retired.notes.len(), 1);
+        assert!(
+            retired
+                .notes
+                .iter()
+                .all(|note| note.contains("freedesktop-platform-24-08")
+                    && note.contains("no runtime this system declares")),
+            "{:?}",
+            retired.notes
+        );
+        for bad in [
+            "\"org.freedesktop.Sdk\"",
+            "\"Freedesktop\"",
+            "\"\"",
+            "\"../x\"",
+            "\"a b\"",
+            "true",
+            &format!("\"{}\"", "a".repeat(65)),
+        ] {
+            let e = parse(&format!("[[template]]\nname = \"t\"\nruntime = {bad}\n")).unwrap_err();
+            assert!(e.contains("template \"t\""), "{bad}: {e}");
+        }
+        let client = Client {
+            template_shared: vec![TemplateShared {
+                name: "t".into(),
+                shared: None,
+                network: None,
+                system: false,
+                mcp: Vec::new(),
+                runtime: Some("freedesktop-sdk-25-08".into()),
+            }],
+            ..Client::default()
+        };
+        let json = client.to_json();
+        let back = Client::from_json(&json).unwrap();
+        assert_eq!(back.template_shared, client.template_shared);
+        let repositories = |template: &str| {
+            Workspace::Repositories(crate::workspace::Repositories {
+                template: template.into(),
+                name: "w".into(),
+                entries: Vec::new(),
+            })
+        };
+        for (workspace, runtime) in [
+            (
+                Workspace::Template("t".into()),
+                Some("freedesktop-sdk-25-08"),
+            ),
+            (repositories("t"), Some("freedesktop-sdk-25-08")),
+            (Workspace::Template("gone".into()), None),
+            (repositories("gone"), None),
+            (Workspace::Scratch, None),
+            (Workspace::Directory("/d".into()), None),
+        ] {
+            assert_eq!(back.runtime_for(&workspace), runtime, "{workspace:?}");
+        }
+        // A setup from before runtimes names none; one naming no td name
+        // is refused.
+        let old = td_json::parse(&json.to_string().replace("\"runtime\":", "\"was\":")).unwrap();
+        let old = Client::from_json(&old).unwrap();
+        assert_eq!(old.runtime_for(&Workspace::Template("t".into())), None);
+        let wrong =
+            td_json::parse(&json.to_string().replace("freedesktop-sdk-25-08", "A\\nB")).unwrap();
+        assert!(Client::from_json(&wrong).is_err());
+        // On a development host, with no product configuration, a
+        // declared runtime is said too; an undeclared one was already.
+        let host = td_fs::TempDir::new("td-agent-runtime-host").unwrap();
+        let td_config = host.path().join("td-app.conf");
+        let declared = parse("[[template]]\nname = \"t\"\nruntime = \"freedesktop-sdk-25-08\"\n")
+            .unwrap()
+            .templates;
+        let both = [declared.as_slice(), &retired.templates].concat();
+        let notes = runtimes_off_td(&both, &td_config);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes
+            .iter()
+            .all(|note| note.contains("freedesktop-sdk-25-08")
+                && note.contains("no td product configuration")));
+        std::fs::write(&td_config, "format=1\n").unwrap();
+        assert!(runtimes_off_td(&both, &td_config).is_empty());
+        // A template made in the window cannot name one.
+        let written = templates_json(&[Template {
+            name: "w".into(),
+            repos: Vec::new(),
+            shared: None,
+            network: None,
+            system: false,
+            mcp: Vec::new(),
+            runtime: None,
+        }]);
+        let with = td_json::parse(&written.to_string().replace(
+            "\"name\":\"w\"",
+            "\"name\":\"w\",\"runtime\":\"freedesktop-sdk-25-08\"",
+        ))
         .unwrap();
         assert!(templates_from_json(&with).is_err());
     }
@@ -2994,6 +3239,7 @@ mod tests {
                     path: "~/notes".into(),
                     write: true,
                 }]),
+                runtime: None,
             },
             Template {
                 mcp: Vec::new(),
@@ -3002,6 +3248,7 @@ mod tests {
                 name: "plain".into(),
                 repos: Vec::new(),
                 shared: None,
+                runtime: None,
             },
         ];
         let written = templates_json(&templates);
@@ -3119,6 +3366,7 @@ mod tests {
                 name: "td".into(),
                 repos: vec![repo.clone(), local.clone()],
                 shared: None,
+                runtime: None,
             },
             Template {
                 mcp: Vec::new(),
@@ -3127,6 +3375,7 @@ mod tests {
                 name: "notes".into(),
                 repos: vec![local],
                 shared: None,
+                runtime: None,
             },
         ];
         let value = templates_json(&templates);
@@ -3212,6 +3461,7 @@ mod tests {
             name: "td".into(),
             repos: vec![repo.clone(), repo.clone()],
             shared: None,
+            runtime: None,
         };
         assert!(templates_from_json(&templates_json(&[twice]))
             .unwrap_err()
@@ -3234,6 +3484,7 @@ mod tests {
             name: "td".into(),
             repos: vec![long],
             shared: None,
+            runtime: None,
         };
         assert!(templates_from_json(&templates_json(&[long]))
             .unwrap_err()
@@ -3245,6 +3496,7 @@ mod tests {
             name: "td".into(),
             repos: vec![checked_repo("/srv/td", "main", "a", Some(Vec::new())).unwrap()],
             shared: None,
+            runtime: None,
         }];
         assert_eq!(templates_from_json(&templates_json(&none)).unwrap(), none);
     }
@@ -3511,6 +3763,7 @@ mod tests {
                 name: "open".into(),
                 shared: None,
                 network: Some(Network::Open),
+                runtime: None,
             },
             TemplateShared {
                 mcp: Vec::new(),
@@ -3518,6 +3771,7 @@ mod tests {
                 name: "plain".into(),
                 shared: None,
                 network: None,
+                runtime: None,
             },
         ];
         let crossed = Client::from_json(&client.to_json()).unwrap();
@@ -3718,6 +3972,7 @@ mod tests {
                     name: "notes".into(),
                     shared: Some(own.clone()),
                     network: None,
+                    runtime: None,
                 },
                 TemplateShared {
                     mcp: Vec::new(),
@@ -3725,6 +3980,7 @@ mod tests {
                     name: "plain".into(),
                     shared: None,
                     network: None,
+                    runtime: None,
                 },
             ],
             ..Client::default()

@@ -23,15 +23,10 @@ pub fn runtime(name: &str) -> io::Result<&'static str> {
         .ok_or_else(|| io::Error::other(format!("{name} is no declared runtime")))
 }
 
-/// A runtime name as a policy line may carry it: 1–64 lowercase ASCII
-/// letters, digits or hyphens.
+/// A runtime name as a policy line may carry it: a declaration's td name,
+/// declared now or not.
 fn runtime_name(name: &str) -> io::Result<&str> {
-    if name.is_empty()
-        || name.len() > 64
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
+    if !crate::flathub_app::valid_name(name) {
         return Err(io::Error::other("invalid runtime policy"));
     }
     Ok(name)

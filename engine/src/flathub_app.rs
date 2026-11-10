@@ -4,8 +4,8 @@
 //!
 //! `td-app` (td-net) performs the I/O. Everything here is std-only, does
 //! none and uses no other module, so td-jail can `#[path]`-include it to
-//! read the same `selection` and pointers td-app writes, and td-sandbox to
-//! name the same runtimes.
+//! read the same `selection` and pointers td-app writes, and td-sandbox and
+//! td-agent to name the same runtimes.
 
 /// One declared Flathub runtime (APPLICATIONS.md §W.9): the ref fetched and
 /// its td name. The bytes are not reviewed; the ref, Flathub's signing key
@@ -97,6 +97,20 @@ pub fn spec_source(
         ));
     }
     Ok(Some(declared))
+}
+
+/// The root trees a workspace's runtime replaces inside its jail: its tree
+/// at `/usr`, and `/lib` and `/lib64` links into it. td-jail binds nothing
+/// of the host's there, and a launcher names no path directory or alias
+/// source there.
+pub const WORKSPACE_RUNTIME_TREES: &[&str] = &["lib", "lib64", "usr"];
+
+/// Whether absolute `path` is or lies below one of
+/// `WORKSPACE_RUNTIME_TREES`, by component.
+pub fn in_workspace_runtime_tree(path: &std::path::Path) -> bool {
+    WORKSPACE_RUNTIME_TREES
+        .iter()
+        .any(|tree| path.starts_with(std::path::Path::new("/").join(tree)))
 }
 
 /// An application's cache, relative to its account's home.
@@ -354,7 +368,10 @@ fn valid_record_name(name: &str) -> bool {
         })
 }
 
-fn valid_name(name: &str) -> bool {
+/// A declaration's td name: 1 to 64 lowercase ASCII letters, digits and
+/// `-`. A workspace's launcher holds a runtime name it keeps to this, so
+/// one a later system no longer declares still reads back.
+pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_BYTES
         && name
@@ -1146,6 +1163,25 @@ mod tests {
         let sdk = flathub_runtime("freedesktop-sdk-25-08").unwrap();
         assert_eq!(sdk.exact_ref, "runtime/org.freedesktop.Sdk/x86_64/25.08");
         assert!(FLATHUB_SOURCES.iter().all(|source| source.runtime != sdk));
+    }
+
+    /// A workspace runtime replaces `/usr`, `/lib` and `/lib64`, each
+    /// whole, and nothing that merely shares a prefix.
+    #[test]
+    fn a_workspace_runtime_replaces_three_trees_by_component() {
+        for path in ["/usr", "/usr/bin", "/lib", "/lib64/ld.so", "/lib/x"] {
+            assert!(in_workspace_runtime_tree(path.as_ref()), "{path}");
+        }
+        for path in [
+            "/usrx/bin",
+            "/lib32",
+            "/libx32",
+            "/bin",
+            "/td/store/usr",
+            "/",
+        ] {
+            assert!(!in_workspace_runtime_tree(path.as_ref()), "{path}");
+        }
     }
 
     #[test]
