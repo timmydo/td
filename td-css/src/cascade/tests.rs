@@ -12,7 +12,7 @@ fn compute(css: &str, inline: &str) -> ComputedStyle {
                 nodes: &nodes,
                 index: 3,
             },
-            None,
+            Some(&ComputedStyle::default()),
             16.0,
             inline,
         )
@@ -250,7 +250,23 @@ fn every_property_has_initial_inherit_and_unset() {
                     &format!("{}:{keyword}", property.name()),
                 )
                 .unwrap();
-            let expected = if keyword == "inherit" || (keyword == "unset" && property.inherited()) {
+            let expected = if matches!(
+                property,
+                Property::BorderTopWidth
+                    | Property::BorderRightWidth
+                    | Property::BorderBottomWidth
+                    | Property::BorderLeftWidth
+            ) {
+                V::Length(Length::Px(0.0))
+            } else if matches!(
+                property,
+                Property::BorderTopColor
+                    | Property::BorderRightColor
+                    | Property::BorderBottomColor
+                    | Property::BorderLeftColor
+            ) {
+                V::Color(parent.color())
+            } else if keyword == "inherit" || (keyword == "unset" && property.inherited()) {
                 parent.get(*property).unwrap().clone()
             } else {
                 property.initial()
@@ -426,10 +442,10 @@ fn all_first_properties_compute_typed_values() {
             V::Keyword("center"),
         ),
     ];
-    assert_eq!(cases.len(), Property::ALL.len());
+    assert_eq!(cases.len(), 25);
     for (name, value, property, expected) in cases {
         assert_eq!(
-            compute("", &format!("{name}:{value}")).get(property),
+            compute("", &format!("border-style:solid;{name}:{value}")).get(property),
             Some(&expected),
             "{name}:{value}"
         );
@@ -457,7 +473,7 @@ fn shorthand_expansion_is_atomic_and_has_longhand_precedence() {
             assert_eq!(style.get(property), Some(&V::Length(Length::Px(value))));
         }
     }
-    let style = compute("", "margin:1px 2px!important;margin-left:9px; padding:4px;padding:1px -2px; border-width:thin thick");
+    let style = compute("", "margin:1px 2px!important;margin-left:9px; padding:4px;padding:1px -2px; border-style:solid; border-width:thin thick");
     assert_eq!(
         style.get(Property::MarginLeft),
         Some(&V::Length(Length::Px(2.0)))
@@ -539,7 +555,8 @@ fn unsupported_or_invalid_values_do_not_erase_valid_ones() {
         }))
     );
     assert_eq!(
-        compute("", "border-width:thin;border-width:10%").get(Property::BorderTopWidth),
+        compute("", "border-style:solid;border-width:thin;border-width:10%")
+            .get(Property::BorderTopWidth),
         Some(&V::Length(Length::Px(1.0)))
     );
     assert_eq!(
@@ -667,13 +684,15 @@ fn ua_sheet_uses_the_same_pipeline_and_has_no_hidden_injection() {
     };
     assert_eq!(
         StyleSet::default()
-            .compute(&body, None, 16.0, "")
+            .compute(&body, Some(&ComputedStyle::default()), 16.0, "")
             .unwrap()
             .get(Property::Display),
         Some(&V::Keyword("inline"))
     );
     let set = StyleSet::new(&[(Origin::UserAgent, HTML_UA_CSS)]).unwrap();
-    let body_style = set.compute(&body, None, 16.0, "").unwrap();
+    let body_style = set
+        .compute(&body, Some(&ComputedStyle::default()), 16.0, "")
+        .unwrap();
     assert_eq!(
         body_style.get(Property::Display),
         Some(&V::Keyword("block"))
@@ -696,7 +715,7 @@ fn ua_sheet_uses_the_same_pipeline_and_has_no_hidden_injection() {
                     nodes: &nodes,
                     index: 3
                 },
-                None,
+                Some(&body_style),
                 16.0,
                 ""
             )
@@ -757,7 +776,7 @@ fn ua_sheet_uses_the_same_pipeline_and_has_no_hidden_injection() {
                     nodes: &nodes,
                     index: 6
                 },
-                None,
+                Some(&body_style),
                 16.0,
                 ""
             )
@@ -890,7 +909,7 @@ fn conditional_variables_do_not_masquerade_as_supported_coverage() {
                p { color:red; color:var(--ink); width:calc(100% - 2px) } \
                p:hover { color:blue } p::before { color:blue }";
     let set = StyleSet::new(&[(Origin::Author, css)]).unwrap();
-    assert_eq!(set.rules.len(), 3);
+    assert_eq!(set.rules.len(), 4);
     assert_eq!(
         compute(css, "").get(Property::Color),
         Some(&V::Color(Color::BLACK))
@@ -909,7 +928,15 @@ fn conditional_variables_do_not_masquerade_as_supported_coverage() {
 fn indexed_and_reference_cascade_agree_on_lists_logic_and_order() {
     let mut nodes = tree();
     nodes[3].tag = "P";
+    nodes[3].states = vec![
+        crate::selectors::State::Hover,
+        crate::selectors::State::Focus,
+    ];
+    nodes[6].states = vec![crate::selectors::State::Checked];
     let selectors = [
+        "p:hover",
+        ":is(.hot:focus,a:checked)",
+        ":not(:hover)",
         "*",
         "p",
         "P.hot",

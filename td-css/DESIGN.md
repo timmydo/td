@@ -59,8 +59,8 @@ and attribute names compare ASCII-insensitively; IDs, classes and
 attribute values are case-sensitive unless an explicit `i` flag requests
 ASCII-insensitive matching (`s` explicitly requests sensitive matching).
 Host-language enumerated attribute-value folding is not implemented.
-There are no namespace selectors, pseudo-elements, interaction states,
-language selectors or shadow trees.
+There are no namespace selectors, pseudo-elements, language selectors
+or shadow trees. :hover, :focus and :checked use caller-reported state.
 
 Supported forms are the universal and type selectors, ID and class,
 attribute presence and `=`, `~=`, `|=`, `^=`, `$=`, `*=`, descendant,
@@ -95,7 +95,10 @@ exposes `tag_name`, `attribute`, `parent`, `previous_sibling`,
 queried by ASCII-lowercase name, including `id` and `class`. The caller
 ignores comments in `has_text`, supplies element-only sibling/child
 links, and keeps these observations stable for one operation. It owns
-HTML link semantics. No references or handles escape a matching call.
+HTML link semantics and `state(State::{Hover, Focus, Checked})`, whose
+default is false. The caller supplies hover propagation, focus and
+checked/selected host-language semantics; td-css does not infer these
+from attributes. There is no visited State variant. No references or handles escape a matching call.
 Callbacks must return promptly; td-css cannot bound time spent inside a
 caller callback. Traversal is budgeted even if a faulty tree cycles.
 
@@ -227,7 +230,7 @@ at the import's source position, with its inherited import conditions.
 The current ordered-sheet API is not an import resolver and does not
 retain import-layer/supports metadata.
 
-## 4. First computed property set
+## 4. Computed property set
 
 Values are typed and deterministic; absolute lengths use CSS px (96 per
 inch), independent of display scale. Accepted units are px, pt, pc, in,
@@ -251,21 +254,73 @@ as bare values; calc() clamps its result to the property range.
 | white-space | normal, pre, nowrap, pre-wrap, pre-line, break-spaces | normal; yes |
 | margin-{top,right,bottom,left} | lengths, percentages, auto | 0; no |
 | padding-{top,right,bottom,left} | lengths, percentages | 0; no |
-| border-{top,right,bottom,left}-width | lengths, thin, medium, thick | 3px; no |
+| border-{top,right,bottom,left}-width | lengths, thin, medium, thick | medium (3px), computed zero for none/hidden style; no |
 | width, height | lengths, percentages, auto | auto; no |
 | list-style-type | none, disc, circle, square, decimal, decimal-leading-zero, lower-roman, upper-roman, lower-alpha, upper-alpha | disc; yes |
 | text-align | start, end, left, right, center, justify | start; yes |
 
-`margin`, `padding` and `border-width` accept one to four values in TRBL
-order. Other shorthands are unsupported. `text-decoration` here is the
-line-set subset, without style, color or thickness. Its propagation to
+`margin`, `padding`, `border-width`, `border-style` and `border-color`
+accept one to four values in TRBL order. `border` and each border-side
+shorthand accept up to one width, style and color in any order, resetting
+omitted components to their initials. Border-image is outside this subset.
+`overflow` accepts one value for both axes or two in x/y order. `font`
+accepts optional style, variant and weight (each at most once, with normal
+filling omitted slots), a required size, optional slash line-height, and
+a required family list. It resets all six implemented font longhands;
+system-font keywords, stretch and other font extension/reset properties
+are unsupported. Other shorthands remain unsupported. `text-decoration`
+here is the line-set subset, without style, color or thickness. Its propagation to
 descendants is a layout/painting concern, not inheritance. Border widths
-are computed nominal widths; border styles are not implemented, so the
-future layout engine must not infer a visible border from width alone.
-Display computes to the selected keyword; blockification needs the later
-position/float/layout contract. Font keyword sizes are 9, 10, 13, 16,
+compute to zero for none/hidden styles. Border colors default to the
+computed color and resolve currentcolor after color. Display blockifies
+for the root (absent parent style) and floats: inline/inline-block and
+table-internal displays become block, inline-table becomes table and
+inline-flex becomes flex. None, list-item, table, block and flex remain.
+Flex-item blockification and unsupported positioning modes are deferred.
+Overflow visible/clip computes to auto/hidden when the opposite axis is
+neither visible nor clip. No scrolling or box generation occurs here.
+Font keyword sizes are 9, 10, 13, 16,
 18, 24 and 32px; smaller/larger multiply the parent's size by 1/1.2 or
 1.2. Thin/medium/thick are 1/3/5px. These are td's UA choices.
+
+Additional values use [CSS 2.2](https://www.w3.org/TR/CSS22/) property
+semantics, the two-axis visible/clip rule from
+[Overflow Level 3](https://www.w3.org/TR/2025/WD-css-overflow-3-20251007/),
+and opacity's number/percentage range from
+[Color Level 4](https://www.w3.org/TR/2026/CRD-css-color-4-20261103/#transparency).
+
+| Property | Accepted values | Initial; inherited |
+|---|---|---|
+| line-height | normal, nonnegative number, length or percentage | normal; yes |
+| font-variant | normal, small-caps | normal; yes |
+| border-{top,right,bottom,left}-style | none, hidden, dotted, dashed, solid, double, groove, ridge, inset, outset | none; no |
+| border-{top,right,bottom,left}-color | the color grammar above | currentcolor; no |
+| vertical-align | baseline, sub, super, top, text-top, middle, bottom, text-bottom, signed length/percentage | baseline; no |
+| text-indent | signed length/percentage | 0; yes |
+| text-transform | none, capitalize, uppercase, lowercase | none; yes |
+| visibility | visible, hidden, collapse | visible; yes |
+| overflow-x, overflow-y | visible, hidden, clip, scroll, auto | visible; no |
+| float | none, left, right | none; no |
+| clear | none, left, right, both | none; no |
+| position | static, relative | static; no |
+| top, right, bottom, left | signed length/percentage, auto | auto; no |
+| box-sizing | content-box, border-box | content-box; no |
+| min-width, min-height | nonnegative length/percentage | 0; no |
+| max-width, max-height | nonnegative length/percentage, none | none; no |
+| letter-spacing | normal, signed length (no percentage) | normal; yes |
+| opacity | number or percentage, clamped to [0,1] | 1; no |
+
+Line-height numbers stay numbers through inheritance; lengths and
+percentages compute against the declaring element's font size and then
+inherit as px. Normal stays a keyword for later font metrics. Vertical-align
+percentages retain their line-height basis for layout; all other newly
+admitted percentages except line-height remain unresolved. Min/max sizes
+use the CSS 2.2 subset, without auto, intrinsic sizing or fit-content.
+Relative offsets retain auto and percentages: choosing the containing
+block, resolving opposing offsets and applying position are layout work.
+Text-transform is a keyword, not an operation on strings. Visibility,
+overflow, float, clear, box-sizing and opacity likewise compute values
+without painting, formatting, clipping or compositing.
 
 The length calc() grammar follows [CSS Values Level 3 §8.1](https://www.w3.org/TR/2024/CRD-css-values-3-20240322/#calc-notation):
 parentheses and nested calc(), left-associative + and -, and higher-priority
@@ -390,9 +445,11 @@ No filesystem, network, clock, global mutable state or thread is needed.
 `cascade` exports `StyleSet`, `Origin`, `ComputeStats` and `HTML_UA_CSS`; these and
 `values::{ComputedStyle, ComputedValue, Property}` are re-exported at the
 crate root. `Property::ALL`, `name`, `inherited` and `initial` describe
-the fixed longhand roster. `ComputedStyle::get` yields immutable typed
+the fixed 55-longhand roster. `initial` supplies context-free seeds; border
+colors, border widths, overflow and display also undergo the contextual
+computation above. `ComputedStyle::default` has initial invisible borders. `ComputedStyle::get` yields immutable typed
 values (keywords, RGBA colors, px/percentage/auto and unresolved calc() lengths, family lists,
-weights and decoration flags); `font_size` and `color` are convenient
+weights, scalar numbers and decoration flags); `font_size` and `color` are convenient
 typed accessors. `custom_property(name)` exposes an immutable computed
 token slice, or None for missing/guaranteed-invalid values. A computed style owns its values and cannot be populated
 with caller-constructed non-finite values. The crate documentation has
@@ -466,9 +523,9 @@ indexing. No recipe or application integration is part of these tests.
    painting. Repeat the corpus after conditional rules, variables and
    added properties: the extra admitted work must also fit the bounds.
 
-Items 5–9 are the next standalone work, not claims of implemented syntax.
-Their specification references, exact accepted grammars, public interfaces,
-initial/inherited values and named limits join §§1–6 with each implementation.
+The numbered units are independently landable work. The current accepted
+grammars, public interfaces, initial/inherited values and named limits
+are specified in §§1–6.
 Corpus results describe the captured sample, not general Web conformance;
 ad-hoc HTML extraction is not an HTML5 tree-builder correctness oracle.
 
@@ -652,3 +709,36 @@ as are the substitution maxima above. Desktop whole-tree compute ranged
 from 0.98ms to 749.38ms. Unsupported viewport/font-metric units, numeric
 calc() values and functional colors still discard declarations; successful
 admission does not imply complete styling coverage.
+
+### Layout-value and state workload
+
+All eight complete sheet sets and extracted trees pass the desktop,
+mobile-dark and print runs with the 55-longhand grammar. A separate
+interactive desktop run reports focus on the first link, hover on that
+link and its ancestors, and checked/selected input/option attributes as
+caller state; it also has no refusals. This is synthetic state supplied
+by the harness, not browser event processing. Source sizes, tokens and
+all-rule/declaration counts are unchanged from the capture table.
+
+| Capture | Compiled rules desktop / mobile / print | Accepted declarations / all | Maximum match steps across four runs | Desktop compute ms |
+|---|---:|---:|---:|---:|
+| bootstrap | 2097 / 1127 / 1617 | 2818 / 5642 | 8,788 | 34.41 |
+| debian | 113 / 117 / 112 | 307 / 417 | 889 | 1.69 |
+| github | 8617 / 6558 / 7541 | 20177 / 43118 | 138,862 | 118.58 |
+| kernel | 55 / 101 / 55 | 227 / 321 | 311 | 1.89 |
+| mdn | 451 / 467 / 470 | 1066 / 1953 | 9,308 | 599.21 |
+| news | 837 / 646 / 747 | 2860 / 18473 | 7,526 | 261.12 |
+| rust-book | 245 / 247 / 241 | 439 / 917 | 1,432 | 2.14 |
+| wikipedia | 1045 / 1110 / 671 | 2168 / 3585 | 50,042 | 165.18 |
+
+Acceptance counts ordinary declarations whose property grammar parses,
+including pending var() declarations and declarations in skipped groups;
+custom definitions are counted separately in the capture table. A pending
+value may still become invalid after substitution. No assertion of visual
+correctness follows from these counts. All source/admission/substitution
+bounds remain unchanged: largest substitution charges are below 133KB
+and 8,800 components. The largest matching demand is 138,862, leaving
+about 8% headroom under 150,000; universal selectors, different states or
+larger caller fields can still refuse. Layers, containers, pseudo-elements,
+language selectors, functional colors, images and unsupported positioning
+and sizing values account for substantial remaining discarded CSS.

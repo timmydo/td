@@ -147,7 +147,7 @@ fn substitution_shorthands_and_invalid_computed_calc() {
     );
     assert_eq!(
         length(
-            "border-width:7px;border-width:calc(10% - 10%)",
+            "border-style:solid;border-width:7px;border-width:calc(10% - 10%)",
             Property::BorderTopWidth
         ),
         Length::Px(7.0)

@@ -1,8 +1,9 @@
-//! The first property grammar and computed-value model.
+//! Property grammars and the computed-value model.
 use crate::syntax::{Component, Declaration, Token};
 use crate::{calc, variables, Error};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+mod layout;
 
 pub const MAX_FAMILIES: usize = 32;
 pub const MAX_ABSOLUTE_VALUE: f64 = 1_000_000.0;
@@ -34,6 +35,36 @@ pub enum Property {
     Height,
     ListStyleType,
     TextAlign,
+    LineHeight,
+    FontVariant,
+    BorderTopStyle,
+    BorderRightStyle,
+    BorderBottomStyle,
+    BorderLeftStyle,
+    BorderTopColor,
+    BorderRightColor,
+    BorderBottomColor,
+    BorderLeftColor,
+    VerticalAlign,
+    TextIndent,
+    TextTransform,
+    Visibility,
+    OverflowX,
+    OverflowY,
+    Float,
+    Clear,
+    Position,
+    BoxSizing,
+    MinWidth,
+    MaxWidth,
+    MinHeight,
+    MaxHeight,
+    LetterSpacing,
+    Opacity,
+    Top,
+    Right,
+    Bottom,
+    Left,
 }
 
 impl Property {
@@ -63,6 +94,36 @@ impl Property {
         Self::Height,
         Self::ListStyleType,
         Self::TextAlign,
+        Self::LineHeight,
+        Self::FontVariant,
+        Self::BorderTopStyle,
+        Self::BorderRightStyle,
+        Self::BorderBottomStyle,
+        Self::BorderLeftStyle,
+        Self::BorderTopColor,
+        Self::BorderRightColor,
+        Self::BorderBottomColor,
+        Self::BorderLeftColor,
+        Self::VerticalAlign,
+        Self::TextIndent,
+        Self::TextTransform,
+        Self::Visibility,
+        Self::OverflowX,
+        Self::OverflowY,
+        Self::Float,
+        Self::Clear,
+        Self::Position,
+        Self::BoxSizing,
+        Self::MinWidth,
+        Self::MaxWidth,
+        Self::MinHeight,
+        Self::MaxHeight,
+        Self::LetterSpacing,
+        Self::Opacity,
+        Self::Top,
+        Self::Right,
+        Self::Bottom,
+        Self::Left,
     ];
 
     pub fn name(self) -> &'static str {
@@ -92,6 +153,36 @@ impl Property {
             Self::Height => "height",
             Self::ListStyleType => "list-style-type",
             Self::TextAlign => "text-align",
+            Self::LineHeight => "line-height",
+            Self::FontVariant => "font-variant",
+            Self::BorderTopStyle => "border-top-style",
+            Self::BorderRightStyle => "border-right-style",
+            Self::BorderBottomStyle => "border-bottom-style",
+            Self::BorderLeftStyle => "border-left-style",
+            Self::BorderTopColor => "border-top-color",
+            Self::BorderRightColor => "border-right-color",
+            Self::BorderBottomColor => "border-bottom-color",
+            Self::BorderLeftColor => "border-left-color",
+            Self::VerticalAlign => "vertical-align",
+            Self::TextIndent => "text-indent",
+            Self::TextTransform => "text-transform",
+            Self::Visibility => "visibility",
+            Self::OverflowX => "overflow-x",
+            Self::OverflowY => "overflow-y",
+            Self::Float => "float",
+            Self::Clear => "clear",
+            Self::Position => "position",
+            Self::BoxSizing => "box-sizing",
+            Self::MinWidth => "min-width",
+            Self::MaxWidth => "max-width",
+            Self::MinHeight => "min-height",
+            Self::MaxHeight => "max-height",
+            Self::LetterSpacing => "letter-spacing",
+            Self::Opacity => "opacity",
+            Self::Top => "top",
+            Self::Right => "right",
+            Self::Bottom => "bottom",
+            Self::Left => "left",
         }
     }
 
@@ -106,6 +197,12 @@ impl Property {
                 | Self::WhiteSpace
                 | Self::ListStyleType
                 | Self::TextAlign
+                | Self::LineHeight
+                | Self::FontVariant
+                | Self::TextIndent
+                | Self::TextTransform
+                | Self::Visibility
+                | Self::LetterSpacing
         )
     }
 
@@ -116,6 +213,28 @@ impl Property {
         )
     }
 
+    fn signed_length(self) -> bool {
+        self.margin()
+            || matches!(
+                self,
+                Self::Top
+                    | Self::Right
+                    | Self::Bottom
+                    | Self::Left
+                    | Self::VerticalAlign
+                    | Self::TextIndent
+                    | Self::LetterSpacing
+            )
+    }
+    fn border_color(self) -> bool {
+        matches!(
+            self,
+            Self::BorderTopColor
+                | Self::BorderRightColor
+                | Self::BorderBottomColor
+                | Self::BorderLeftColor
+        )
+    }
     fn border(self) -> bool {
         matches!(
             self,
@@ -126,6 +245,7 @@ impl Property {
         )
     }
 
+    /// Context-free seed; complete computation also applies dependent properties.
     pub fn initial(self) -> ComputedValue {
         match self {
             Self::Display => ComputedValue::Keyword("inline"),
@@ -139,6 +259,29 @@ impl Property {
             Self::Width | Self::Height => ComputedValue::Length(Length::Auto),
             Self::ListStyleType => ComputedValue::Keyword("disc"),
             Self::TextAlign => ComputedValue::Keyword("start"),
+            Self::LineHeight | Self::FontVariant | Self::LetterSpacing => {
+                ComputedValue::Keyword("normal")
+            }
+            Self::TextTransform
+            | Self::Float
+            | Self::Clear
+            | Self::MaxWidth
+            | Self::MaxHeight
+            | Self::BorderTopStyle
+            | Self::BorderRightStyle
+            | Self::BorderBottomStyle
+            | Self::BorderLeftStyle => ComputedValue::Keyword("none"),
+            Self::Visibility | Self::OverflowX | Self::OverflowY => {
+                ComputedValue::Keyword("visible")
+            }
+            Self::Position => ComputedValue::Keyword("static"),
+            Self::BoxSizing => ComputedValue::Keyword("content-box"),
+            Self::VerticalAlign => ComputedValue::Keyword("baseline"),
+            Self::Opacity => ComputedValue::Number(1.0),
+            Self::Top | Self::Right | Self::Bottom | Self::Left => {
+                ComputedValue::Length(Length::Auto)
+            }
+            p if p.border_color() => ComputedValue::Color(Color::BLACK),
             property if property.border() => ComputedValue::Length(Length::Px(3.0)),
             _ => ComputedValue::Length(Length::Px(0.0)),
         }
@@ -228,6 +371,7 @@ pub struct Decoration {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComputedValue {
+    Number(f64),
     Keyword(&'static str),
     Color(Color),
     Length(Length),
@@ -245,7 +389,19 @@ pub struct ComputedStyle {
 impl Default for ComputedStyle {
     fn default() -> Self {
         Self {
-            values: Property::ALL.iter().map(|p| (*p, p.initial())).collect(),
+            values: Property::ALL
+                .iter()
+                .map(|p| {
+                    (
+                        *p,
+                        if p.border() {
+                            ComputedValue::Length(Length::Px(0.0))
+                        } else {
+                            p.initial()
+                        },
+                    )
+                })
+                .collect(),
             custom: variables::CustomProperties::default(),
         }
     }
@@ -384,13 +540,15 @@ fn parse_named(
         "margin" => Some(MARGINS),
         "padding" => Some(PADDINGS),
         "border-width" => Some(BORDERS),
+        "border-style" => Some(layout::BORDER_STYLES),
+        "border-color" => Some(layout::BORDER_COLORS),
         _ => None,
     };
     let Some(has_var) = variables::inspect(values) else {
         return Ok(Vec::new());
     };
     if has_var {
-        let targets: Vec<Property> = if let Some(sides) = sides {
+        let targets: Vec<Property> = if let Some(sides) = sides.or_else(|| layout::targets(&name)) {
             sides.to_vec()
         } else {
             Property::ALL
@@ -451,6 +609,9 @@ fn parse_named(
                 important,
             })
             .collect());
+    }
+    if layout::targets(&name).is_some() {
+        return layout::shorthand(&name, values, important);
     }
     let Some(property) = Property::ALL.iter().copied().find(|p| p.name() == name) else {
         return Ok(Vec::new());
@@ -552,7 +713,8 @@ fn parse_value(property: Property, values: &[Component]) -> Result<Option<Specif
                 "inline-flex",
             ],
         ),
-        Color | BackgroundColor => parse_color(values),
+        Color | BackgroundColor | BorderTopColor | BorderRightColor | BorderBottomColor
+        | BorderLeftColor => parse_color(values),
         FontFamily => {
             parse_families(values)?.map(|v| Specified::Ready(ComputedValue::FontFamily(v)))
         }
@@ -591,15 +753,22 @@ fn parse_value(property: Property, values: &[Component]) -> Result<Option<Specif
             decoration(values).map(|v| Specified::Ready(ComputedValue::Decoration(v)))
         }
         FontWeight => weight(values),
-        _ => {
-            if let [value @ Component::Function { .. }] = values {
-                calc::parse(value, !property.border())?.map(Specified::Calculated)
-            } else {
-                parse_length_property(property, values)
-            }
-        }
+        p if layout::extra(p) => layout::parse(p, values)?,
+        _ => parse_length(property, values)?,
     };
     Ok(result)
+}
+
+fn parse_length(property: Property, values: &[Component]) -> Result<Option<Specified>, Error> {
+    if let [value @ Component::Function { .. }] = values {
+        Ok(calc::parse(
+            value,
+            !property.border() && property != Property::LetterSpacing,
+        )?
+        .map(Specified::Calculated))
+    } else {
+        Ok(parse_length_property(property, values))
+    }
 }
 
 fn parse_length_property(property: Property, values: &[Component]) -> Option<Specified> {
@@ -637,15 +806,24 @@ fn parse_length_property(property: Property, values: &[Component]) -> Option<Spe
 
 fn length_property(property: Property, value: &Component) -> Option<Specified> {
     let (number, unit) = length(value)?;
-    if number < 0.0 && !property.margin() {
+    if number < 0.0 && !property.signed_length() {
         return None;
     }
     if matches!(unit, Unit::Auto)
-        && !(property.margin() || matches!(property, Property::Width | Property::Height))
+        && !(property.margin()
+            || matches!(
+                property,
+                Property::Width
+                    | Property::Height
+                    | Property::Top
+                    | Property::Right
+                    | Property::Bottom
+                    | Property::Left
+            ))
     {
         return None;
     }
-    if matches!(unit, Unit::Percent) && property.border() {
+    if matches!(unit, Unit::Percent) && (property.border() || property == Property::LetterSpacing) {
         return None;
     }
     Some(Specified::Length(number, unit))
@@ -835,21 +1013,28 @@ pub(crate) fn compute_value(
     color: Color,
     root_font_size: f64,
 ) -> Result<ComputedValue, Error> {
+    let initial = || {
+        if property.border_color() {
+            ComputedValue::Color(color)
+        } else {
+            property.initial()
+        }
+    };
     let inherited = || {
         parent
             .and_then(|style| style.get(property))
             .cloned()
-            .unwrap_or_else(|| property.initial())
+            .unwrap_or_else(&initial)
     };
     let result = match value {
         Specified::Pending(_) => return Err(Error::InvalidContext),
-        Specified::Initial => property.initial(),
+        Specified::Initial => initial(),
         Specified::Inherit => inherited(),
         Specified::Unset => {
             if property.inherited() {
                 inherited()
             } else {
-                property.initial()
+                initial()
             }
         }
         Specified::Ready(value) => value.clone(),
@@ -884,8 +1069,8 @@ pub(crate) fn compute_value(
             ComputedValue::Length(value.compute(
                 em,
                 root_font_size,
-                (property == Property::FontSize).then_some(em),
-                !property.margin(),
+                (matches!(property, Property::FontSize | Property::LineHeight)).then_some(em),
+                !property.signed_length(),
             ))
         }
         Specified::Length(value, unit) => {
@@ -897,7 +1082,9 @@ pub(crate) fn compute_value(
             let clamp = |value: f64| value.clamp(-MAX_ABSOLUTE_VALUE, MAX_ABSOLUTE_VALUE);
             let length = match unit {
                 Unit::Auto => Length::Auto,
-                Unit::Percent if property != Property::FontSize => Length::Percent(clamp(*value)),
+                Unit::Percent if !matches!(property, Property::FontSize | Property::LineHeight) => {
+                    Length::Percent(clamp(*value))
+                }
                 _ => {
                     let factor = match unit {
                         Unit::Px => 1.0,
@@ -919,4 +1106,8 @@ pub(crate) fn compute_value(
         }
     };
     Ok(result)
+}
+
+pub(crate) fn finish(style: &mut ComputedStyle, root: bool) {
+    layout::finish(style, root);
 }

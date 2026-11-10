@@ -180,7 +180,7 @@ fn invalid_selectors_do_not_get_repaired_into_other_selectors() {
         "::before",
         ":lang(en)",
         ":has(p)",
-        ":hover",
+        ":active",
         ":nth-child()",
         "p()",
         "*p",
@@ -405,4 +405,43 @@ fn forgiving_lists_first_require_valid_any_value_syntax() {
     }
     assert_eq!(matching(":is(p, :unknown(url(a)))"), [3, 5, 8]);
     assert_eq!(matching(":where(p, !; :unknown)"), [3, 5, 8]);
+}
+
+#[test]
+fn interaction_states_are_caller_reported_and_history_stays_absent() {
+    use super::State;
+    let mut nodes = tree();
+    nodes[3].states = vec![State::Hover, State::Focus];
+    nodes[6].states = vec![State::Checked];
+    for (selector, index, expected) in [
+        (":hover:focus", 3, true),
+        (":hover", 6, false),
+        (":checked", 6, true),
+        (":visited", 6, false),
+        (":is(:hover,:checked)", 6, true),
+        (":not(:focus)", 6, true),
+    ] {
+        let matched = SelectorList::parse(selector)
+            .unwrap()
+            .matching_specificity(&Handle {
+                nodes: &nodes,
+                index,
+            })
+            .unwrap();
+        assert_eq!(matched.is_some(), expected, "{selector}");
+    }
+    assert_eq!(
+        SelectorList::parse(":hover")
+            .unwrap()
+            .matching_specificity(&Handle {
+                nodes: &nodes,
+                index: 3
+            })
+            .unwrap(),
+        Some(Specificity {
+            ids: 0,
+            classes: 1,
+            types: 0
+        })
+    );
 }

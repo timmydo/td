@@ -11,6 +11,14 @@ pub const MAX_MATCH_STEPS: usize = 150_000;
 pub const MAX_ELEMENT_BYTES: usize = 65_536;
 pub const MAX_NTH_COEFFICIENT: i64 = 1_000_000_000;
 
+/// Caller-reported interaction state. Browsing history is deliberately absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Hover,
+    Focus,
+    Checked,
+}
+
 /// A cheap handle into a stable HTML tree. Siblings and children are elements
 /// only. Attribute names supplied by the matcher are ASCII lowercase.
 pub trait Element: Clone {
@@ -24,6 +32,10 @@ pub trait Element: Clone {
     fn has_text(&self) -> bool;
     /// Host-language link semantics, independent of browsing history.
     fn is_link(&self) -> bool;
+    /// Stable for one operation; the caller owns host-language state semantics.
+    fn state(&self, _state: State) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,6 +91,7 @@ enum Simple {
     Empty,
     Link,
     Visited,
+    State(State),
     Nth {
         a: i64,
         b: i64,
@@ -493,6 +506,9 @@ fn pseudo(
                 "empty" => Simple::Empty,
                 "link" => Simple::Link,
                 "visited" => Simple::Visited,
+                "hover" => Simple::State(State::Hover),
+                "focus" => Simple::State(State::Focus),
+                "checked" => Simple::State(State::Checked),
                 "first-child" | "last-child" | "first-of-type" | "last-of-type" => Simple::Nth {
                     a: 0,
                     b: 1,
@@ -797,6 +813,7 @@ fn matches_simple<E: Element>(
         }
         Simple::Link => element.is_link(),
         Simple::Visited => false,
+        Simple::State(state) => element.state(*state),
         Simple::Logical { kind, list } => {
             let matches = list.matches_with(element, budget)?.is_some();
             if matches!(kind, Logical::Not) {

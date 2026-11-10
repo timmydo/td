@@ -305,6 +305,7 @@ impl StyleSet {
             )?;
             style.values.insert(property, value);
         }
+        values::finish(&mut style, parent.is_none());
         Ok(style)
     }
 }

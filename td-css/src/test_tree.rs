@@ -9,6 +9,7 @@ pub(crate) struct Node {
     pub next: Option<usize>,
     pub first: Option<usize>,
     pub text: bool,
+    pub states: Vec<crate::selectors::State>,
 }
 
 impl Node {
@@ -26,6 +27,7 @@ impl Node {
             next: None,
             first: None,
             text,
+            states: Vec::new(),
         }
     }
 }
@@ -80,6 +82,9 @@ pub(crate) struct Handle<'a> {
 }
 
 impl Element for Handle<'_> {
+    fn state(&self, state: crate::selectors::State) -> bool {
+        self.nodes[self.index].states.contains(&state)
+    }
     fn tag_name(&self) -> &str {
         self.nodes[self.index].tag
     }
