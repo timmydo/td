@@ -679,7 +679,13 @@ fn read_reply(reader: &mut impl BufRead, limit: u64) -> Result<Response, Error> 
             "the service announced {body_len} bytes past the {limit} asked for"
         )));
     }
+    // Exactly the length announced, which the limit bounds: grown by
+    // reading, a body at a power of two would keep twice its size.
     let mut body = Vec::new();
+    let room = usize::try_from(body_len)
+        .map_err(|_| Error::Io(format!("a body of {body_len} bytes does not fit")))?;
+    body.try_reserve_exact(room)
+        .map_err(|e| Error::Io(format!("no room for a body of {body_len} bytes: {e}")))?;
     reader
         .take(body_len)
         .read_to_end(&mut body)
@@ -794,6 +800,20 @@ mod tests {
         );
         let ok = read_reply(&mut BufReader::new(wire.as_bytes()), 11).unwrap();
         assert_eq!(ok.body, b"hello world");
+    }
+
+    /// A body is held in exactly its announced length, at the limit too:
+    /// read into a growing buffer, a body of a power of two would end in
+    /// one of twice its size.
+    #[test]
+    fn a_body_is_held_in_its_own_length() {
+        for len in [0, 1, 4096, 1 << 20] {
+            let mut wire = format!("{PROTOCOL}\nstatus 200\nbody {len}\n\n").into_bytes();
+            wire.resize(wire.len() + len, b'x');
+            let ok = read_reply(&mut BufReader::new(wire.as_slice()), len as u64).unwrap();
+            assert_eq!(ok.body.len(), len);
+            assert_eq!(ok.body.capacity(), len);
+        }
     }
 
     /// What would frame a line of its own never reaches the head: a URL

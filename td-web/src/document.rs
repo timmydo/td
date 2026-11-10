@@ -1,25 +1,34 @@
 //! A response as td-web shows it (DESIGN.md §5): HTML rendered once
 //! through td-html's rich output into logical lines, text as it is, a
 //! PNG or JPEG decoded, anything else named and not shown, all of it on
-//! the fetch thread; and the rendering, those lines wrapped by pixel
+//! the render thread; and the rendering, those lines wrapped by pixel
 //! width into lines of styled pieces with link targets, made again for
 //! each width and body face the page is shown at, on the window's.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{mpsc, Arc, Mutex, PoisonError};
 
 use td_ui::picture::{Picture, MAX_PICTURE_AXIS, MAX_PICTURE_PIXELS};
 use td_ui::prose::{self, Metrics};
 use td_ui::raster::{GlyphStyle, TextFamily, INK, PAPER};
 use td_url::{Reference, Url};
 
-/// The most bytes of markup rendered; the rest is not shown. td-html
-/// builds a page's whole rendering before td-web keeps `MAX_LINES` of it,
-/// so this bounds that work, which a fetch thread does: a hostile page of
-/// empty paragraphs this size costs about 0.38 s and some 260 MB, and
-/// td-html's output budget holds nested quotes or lists to some 365 MB in
-/// td-html (DESIGN.md §5).
+/// The most bytes of markup rendered; the rest is not shown.
 pub const MAX_MARKUP: usize = 2 << 20;
+/// What td-html reads and builds of a page (DESIGN.md §3, §5): its first
+/// `MAX_MARKUP` bytes, and an output budget of 16 bytes a byte of that.
+/// Real pages measured at width 0 spend at most 11 bytes of budget a
+/// byte, and a page of dense tables 16.4, which at its own 670 KiB needs
+/// 11 MiB: every real page tried, cut to `MAX_MARKUP`, renders whole, and
+/// hostile ones are cut short. td-html
+/// builds a rendering whole before td-web keeps `MAX_LINES` of it, so
+/// these bound that work: its peak is at most some 100 bytes a byte of
+/// input and 1.25 a byte of budget (td-html/DESIGN.md, "Resident
+/// rendering cost").
+pub const HTML_LIMITS: td_html::Limits = td_html::Limits {
+    input: MAX_MARKUP,
+    output: 32 << 20,
+};
 /// The most bytes of text rendered.
 pub const MAX_TEXT: usize = 4 << 20;
 /// The most characters one line of text is expanded to.
@@ -44,14 +53,6 @@ pub const NO_LINK: usize = usize::MAX;
 pub const MAX_PRE_CHARS: usize = 4096;
 /// The most characters read as a line's leading structure.
 const MAX_LEAD: usize = 256;
-
-/// One rendering of markup or decoding of a picture at a time, whichever
-/// fetch thread asks: a rendering can cost some 260 MB at `MAX_MARKUP`,
-/// some 365 MB in td-html when quotes or lists nest, and a picture
-/// some 112 MB, and
-/// `MAX_WORKERS` of them at once would not fit td-web's memory bound
-/// (DESIGN.md §3).
-static RENDERING: Mutex<()> = Mutex::new(());
 
 /// How a run of text looks.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -394,6 +395,35 @@ fn started(lines: Vec<prose::Line>) -> Vec<(prose::Line, (usize, usize))> {
         .collect()
 }
 
+/// The start of `runs` that an unwrapped line shows at `edge` pixels: the
+/// characters whose pens, laid as prose lays them, fall before it. A pane
+/// never shows the rest, so it is neither laid nor kept; each run keeps
+/// its offsets, so pieces still name their run's text.
+fn within<'r>(metrics: &mut Metrics, runs: &[prose::Run<'r>], edge: u32) -> Vec<prose::Run<'r>> {
+    let mut pen = 0u64;
+    let mut shown = Vec::new();
+    for run in runs {
+        let mut end = run.text.len();
+        for (at, scalar) in run.text.char_indices() {
+            if pixels(pen) >= edge {
+                end = at;
+                break;
+            }
+            let advance =
+                metrics.advance(run.style.family, run.style.font_style, prose::shown(scalar));
+            pen = pen.saturating_add(u64::from(advance));
+        }
+        shown.push(prose::Run {
+            text: run.text.get(..end).unwrap_or_default(),
+            ..*run
+        });
+        if end < run.text.len() {
+            break;
+        }
+    }
+    shown
+}
+
 /// `logical` laid into at most `most` lines, `runs` being its runs as
 /// prose measures them, each with where its own text starts. A line that
 /// may not wrap is one line. One that starts with leading structure
@@ -410,7 +440,8 @@ fn lay(
     most: usize,
 ) -> Vec<(prose::Line, (usize, usize))> {
     if !logical.wrap {
-        return started(prose::wrap_at_most(metrics, runs, u32::MAX, most));
+        let shown = within(metrics, runs, width.saturating_add(prose::OVERHANG));
+        return started(prose::wrap_at_most(metrics, &shown, u32::MAX, most));
     }
     let (lead, first) = leading(&logical.runs);
     let rest = runs.get(first..).unwrap_or_default();
@@ -543,10 +574,10 @@ impl Document {
 
     /// `body`, answered with `status` from `url` as `content_type`,
     /// rendered into logical lines or decoded; none once `stopped` is set
-    /// before markup is rendered or a picture decoded. Those take
-    /// `RENDERING`, and `stopped` is read both before and after it is
-    /// held, so a navigation stopped or overtaken while it waited does no
-    /// such work.
+    /// before markup is rendered or a picture decoded. td-web calls this
+    /// only on its `Renderer`'s thread, which takes each reply when the
+    /// one before it is done, so a navigation stopped or overtaken while
+    /// it waited does no such work.
     pub fn from_reply_unless(
         url: Url,
         status: u16,
@@ -582,10 +613,6 @@ impl Document {
         if heavy && stopped.load(Ordering::SeqCst) {
             return None;
         }
-        let _one = heavy.then(|| RENDERING.lock().unwrap_or_else(PoisonError::into_inner));
-        if heavy && stopped.load(Ordering::SeqCst) {
-            return None;
-        }
         let size = body.len();
         let cut = |most: usize| {
             (size > most)
@@ -594,7 +621,10 @@ impl Document {
         let base = Some(url.clone());
         let (page, title, note) = match kind {
             Kind::Html => {
-                let shown = body.get(..MAX_MARKUP).unwrap_or(body);
+                // Cut here, not by td-html's input limit, so td-html's
+                // notice means only its budget: the note below says how
+                // much of the page was read.
+                let shown = body.get(..HTML_LIMITS.input).unwrap_or(body);
                 (html(shown, base), title(body), cut(MAX_MARKUP))
             }
             Kind::Text => {
@@ -671,6 +701,95 @@ impl Document {
     }
 }
 
+/// Work for the render thread, which sends its own answer.
+type Job = Box<dyn FnOnce() + Send>;
+
+/// The one thread every reply is made into a document on, one at a time,
+/// whichever fetch thread hands it over (DESIGN.md §3). A rendering
+/// within `HTML_LIMITS` can peak at some 240 MB, and the allocator keeps
+/// much of that in the arena of the thread that rendered it, which a
+/// thread alive beside it does not reuse: renderings on overlapping fetch
+/// threads kept it once per thread. A job that panics answers nothing and
+/// the thread goes on, td-web's build unwinding; a thread found gone is
+/// started again for the next job.
+#[derive(Clone)]
+pub struct Renderer(Arc<Mutex<mpsc::Sender<Job>>>);
+
+/// Starts a render thread, which runs what it is sent in turn until every
+/// sender is gone.
+fn render_thread() -> Result<mpsc::Sender<Job>, String> {
+    let (send, jobs) = mpsc::channel::<Job>();
+    std::thread::Builder::new()
+        .name("td-web render".into())
+        .spawn(move || {
+            for job in jobs {
+                job();
+            }
+        })
+        .map_err(|why| format!("the render thread could not start: {why}"))?;
+    Ok(send)
+}
+
+impl Renderer {
+    /// A renderer and its thread, or why the thread could not start.
+    pub fn start() -> Result<Self, String> {
+        Ok(Self(Arc::new(Mutex::new(render_thread()?))))
+    }
+
+    /// `work`'s answer, made on the render thread behind the work handed
+    /// over before it; none when it panicked or no thread would take it.
+    fn run<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (answer, done) = mpsc::channel();
+        let job: Job = Box::new(move || {
+            let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+            let _ = answer.send(made.ok());
+        });
+        {
+            let mut thread = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Err(mpsc::SendError(job)) = thread.send(job) {
+                *thread = render_thread().ok()?;
+                thread.send(job).ok()?;
+            }
+        }
+        done.recv().ok().flatten()
+    }
+
+    /// `Document::from_reply_unless` on the render thread, waiting for it
+    /// there behind the replies handed over before it; an error page when
+    /// it could not be made there. A document whose navigation was stopped
+    /// while it was made is dropped there too, before the next reply is
+    /// taken, so it never stands beside that one's rendering.
+    pub fn document(
+        &self,
+        url: Url,
+        status: u16,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+        stopped: &Arc<AtomicBool>,
+    ) -> Option<Document> {
+        let (shown, kind) = (url.clone(), content_type.map(str::to_string));
+        let stopped = Arc::clone(stopped);
+        self.run(move || {
+            Document::from_reply_unless(url, status, kind.as_deref(), body, &stopped)
+                .filter(|_| !stopped.load(Ordering::SeqCst))
+        })
+        .unwrap_or_else(|| {
+            Some(Document::error(
+                Some(shown),
+                "the page could not be rendered",
+            ))
+        })
+    }
+
+    /// A renderer whose thread is gone.
+    #[cfg(test)]
+    fn gone() -> Self {
+        let (send, jobs) = mpsc::channel::<Job>();
+        drop(jobs);
+        Self(Arc::new(Mutex::new(send)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
     Html,
@@ -719,7 +838,7 @@ fn title(html: &[u8]) -> Option<String> {
     };
     let start = open + 1 + lower.get(open..)?.iter().position(|&b| b == b'>')?;
     let end = start + find(lower.get(start..)?, b"</title")?;
-    let text = td_html::to_text(head.get(start..end)?, 0);
+    let text = td_html::to_text_within(head.get(start..end)?, 0, HTML_LIMITS);
     let collapsed: String = text
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -753,8 +872,8 @@ fn ruling(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|c| ('\u{2500}'..='\u{257f}').contains(&c))
 }
 
-/// `source` through td-html's rich output, unwrapped, into logical
-/// lines; the caller holds `RENDERING`. Runs of one href next to each
+/// `source` through td-html's rich output, unwrapped and within
+/// `HTML_LIMITS`, into logical lines. Runs of one href next to each
 /// other, across lines too, are one link, so it is focused and followed
 /// as one; a blank line between them ends it. A line holding
 /// preformatted text, or one of a table's rules or rows, is not wrapped
@@ -766,7 +885,9 @@ fn html(source: &[u8], base: Option<Url>) -> Page {
         ..Page::default()
     };
     let mut last: Option<(String, usize)> = None;
-    let mut rendered = td_html::to_rich(source, 0).into_iter().peekable();
+    let mut rendered = td_html::to_rich_within(source, 0, HTML_LIMITS)
+        .into_iter()
+        .peekable();
     while let Some(spans) = rendered.next() {
         // td-html ends a rendering it cut short with its notice, which the
         // status row says instead.
@@ -859,6 +980,8 @@ fn html(source: &[u8], base: Option<Url>) -> Page {
         line.runs = merged(std::mem::take(&mut line.runs), keep);
         page.lines.push(line);
     }
+    page.lines.shrink_to_fit();
+    page.links.shrink_to_fit();
     page
 }
 
@@ -876,6 +999,11 @@ fn merged(runs: Vec<Run>, keep: usize) -> Vec<Run> {
             }
             _ => out.push(run),
         }
+    }
+    // Kept for as long as the page is shown: a run's text grown by
+    // joining, or collected, holds up to twice its length.
+    for run in &mut out {
+        run.text.shrink_to_fit();
     }
     out.shrink_to_fit();
     out
@@ -913,6 +1041,7 @@ fn plain(text: &str, mono: bool, base: Option<Url>) -> Page {
                 columns += 1;
             }
         }
+        line.shrink_to_fit();
         page.lines.push(Logical {
             runs: vec![Run {
                 text: line,
@@ -922,6 +1051,7 @@ fn plain(text: &str, mono: bool, base: Option<Url>) -> Page {
             wrap: true,
         });
     }
+    page.lines.shrink_to_fit();
     page
 }
 
@@ -1160,11 +1290,44 @@ mod tests {
         );
         assert_eq!(prose.style.glyph(TextFamily::Sans).family, TextFamily::Sans);
         let lines = text_of(&rendered);
-        assert_eq!(lines.last().unwrap(), "a b c d e f g h i j", "{lines:?}");
+        let shown = lines.last().unwrap();
+        assert!(shown.starts_with("a b c d"), "{lines:?}");
+        assert!("a b c d e f g h i j".starts_with(shown.as_str()));
         let pre = rendered.lines.last().unwrap();
         assert!(!rendered.page.lines[pre.logical].wrap);
         assert_eq!(pre.line.pieces[0].style.family, TextFamily::Mono);
         assert!(pre.line.width > rendered.width);
+        let wide = text_of(&cells(&doc, 80));
+        assert_eq!(wide.last().unwrap(), "a b c d e f g h i j");
+    }
+
+    /// An unwrapped line is laid only as far as a pane shows it, its
+    /// edge and an overhang past it; the page keeps the rest, which a
+    /// wider pane lays.
+    #[test]
+    fn an_unwrapped_line_is_laid_only_to_the_pane_s_edge() {
+        let mut page = b"<pre>".to_vec();
+        page.extend(b"x".repeat(MAX_PRE_CHARS));
+        page.extend(b"</pre><table><tr><td>a</td><td>");
+        page.extend(b"y ".repeat(1000));
+        page.extend(b"</td></tr></table>");
+        let doc = html_doc(&page);
+        for columns in [10, 80, 300] {
+            let rendered = cells(&doc, columns);
+            let edge = rendered.width + prose::OVERHANG;
+            for wrapped in &rendered.lines {
+                let glyphs = &wrapped.line.glyphs;
+                assert!(glyphs.iter().all(|glyph| glyph.x < edge));
+                assert!(glyphs.len() as u32 <= edge / CELL_WIDTH as u32 + 1);
+            }
+            assert!(rendered.lines[0].line.width >= rendered.width);
+        }
+        let all: usize = cells(&doc, 10).page.lines[0]
+            .runs
+            .iter()
+            .map(|run| run.text.chars().count())
+            .sum();
+        assert_eq!(all, MAX_PRE_CHARS);
     }
 
     /// Each wrapped line's glyphs as pens in cells and scalars.
@@ -1286,7 +1449,7 @@ mod tests {
         page.extend(b"\nshort</pre>");
         let rendered = cells(&html_doc(&page), 80);
         assert!(rendered.page.trimmed);
-        assert_eq!(rendered.lines[0].line.glyphs.len(), MAX_PRE_CHARS);
+        assert_eq!(rendered.page.lines[0].runs[0].text.len(), MAX_PRE_CHARS);
         assert_eq!(text_of(&rendered)[1], "short");
         let rendered = html_page(b"<pre>short</pre>");
         assert!(!rendered.page.trimmed);
@@ -1324,7 +1487,8 @@ mod tests {
         let rendered = cells(&doc, 10);
         assert_eq!(rendered.lines.len(), rendered.page.lines.len());
         assert!(rendered.page.lines.iter().all(|line| !line.wrap));
-        assert!(text_of(&rendered)[1].starts_with("a cell of many words to wrap"));
+        let wide = cells(&doc, 80);
+        assert!(text_of(&wide)[1].starts_with("a cell of many words to wrap"));
         // Text that only holds a rule character among others still wraps.
         let doc = html_doc(b"<p>a \xe2\x94\x80 rule among words that wrap</p>");
         assert!(cells(&doc, 10).lines.len() > 1);
@@ -1344,7 +1508,12 @@ mod tests {
             .map(|link| link.written.as_str())
             .collect();
         assert_eq!(written, ["/kept"]);
-        assert_eq!(rendered.lines[0].line.glyphs.len(), MAX_PRE_CHARS);
+        let kept: usize = rendered.page.lines[0]
+            .runs
+            .iter()
+            .map(|run| run.text.chars().count())
+            .sum();
+        assert_eq!(kept, MAX_PRE_CHARS);
         // Text cut away parts links of one href either side of it.
         let mut page = b"<pre>".to_vec();
         page.extend(b"x".repeat(MAX_PRE_CHARS - 2));
@@ -1391,6 +1560,197 @@ mod tests {
         let doc =
             Document::from_reply_unless(base(), 200, Some("text/plain"), b"x".to_vec(), &stopped);
         assert!(doc.is_some(), "text is not held back");
+    }
+
+    /// Replies handed over from several fetch threads at once each come
+    /// back as their own document, made on the render thread, and one
+    /// whose navigation was stopped is not rendered, or not kept.
+    #[test]
+    fn the_renderer_answers_each_reply_and_renders_no_stopped_one() {
+        let renderer = Renderer::start().unwrap();
+        let threads: Vec<_> = (0..4)
+            .map(|n| {
+                let renderer = renderer.clone();
+                std::thread::spawn(move || {
+                    let body = format!("<title>page {n}</title><p>text {n}").into_bytes();
+                    let going = Arc::new(AtomicBool::new(false));
+                    let doc = renderer.document(base(), 200, Some("text/html"), body, &going);
+                    (n, doc.unwrap())
+                })
+            })
+            .collect();
+        for thread in threads {
+            let (n, doc) = thread.join().unwrap();
+            assert_eq!(doc.title, Some(format!("page {n}")));
+            assert_eq!(text_of(&cells(&doc, 80)), [format!("text {n}")]);
+        }
+        let stopped = Arc::new(AtomicBool::new(true));
+        let body = b"<p>x".to_vec();
+        let doc = renderer.document(base(), 200, Some("text/html"), body, &stopped);
+        assert!(doc.is_none());
+        // Text is made though its navigation stopped, then dropped there.
+        let body = b"x".to_vec();
+        let doc = renderer.document(base(), 200, Some("text/plain"), body, &stopped);
+        assert!(doc.is_none());
+    }
+
+    /// All of a renderer's work runs on its one thread, whichever thread
+    /// hands it over: not the caller's, and not a thread per job.
+    #[test]
+    fn a_renderer_s_work_runs_on_its_one_thread() {
+        let renderer = Renderer::start().unwrap();
+        let here = std::thread::current().id();
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let renderer = renderer.clone();
+                std::thread::spawn(move || {
+                    (0..3)
+                        .map(|_| renderer.run(|| std::thread::current().id()).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let ids: Vec<_> = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 12);
+        assert!(ids.iter().all(|&id| id == ids[0] && id != here));
+    }
+
+    /// A job that panics answers nothing, a reply's an error page, and the
+    /// same thread takes the next; a renderer whose thread is gone starts
+    /// another rather than failing every page after.
+    #[test]
+    fn a_renderer_outlives_a_panic_and_a_lost_thread() {
+        let renderer = Renderer::start().unwrap();
+        let before = renderer.run(|| std::thread::current().id()).unwrap();
+        assert_eq!(
+            renderer.run(|| -> u8 { panic!("a rendering panics") }),
+            None
+        );
+        assert_eq!(renderer.run(|| std::thread::current().id()), Some(before));
+        let going = Arc::new(AtomicBool::new(false));
+        let gone = Renderer::gone();
+        let body = b"<p>still here".to_vec();
+        let doc = gone.document(base(), 200, Some("text/html"), body, &going);
+        assert_eq!(text_of(&cells(&doc.unwrap(), 80)), ["still here"]);
+        assert!(gone.run(|| 1).is_some(), "the new thread stays");
+    }
+
+    /// `HTML_LIMITS` renders ordinary markup of `MAX_MARKUP` whole, here
+    /// headed sections of paragraphs with links, emphasis and code, and
+    /// cuts one-letter paragraphs in nested quotes short.
+    #[test]
+    fn ordinary_markup_at_the_bound_renders_whole() {
+        let section = "<h2>A heading</h2><p>Some <a href=\"/docs/next#part\">ordinary \
+                       text</a> with <em>emphasis</em>, <code>code</code> and words \
+                       enough to make a paragraph of a manual.</p><ul><li>one item</li>\
+                       <li>another <strong>item</strong></li></ul>";
+        let page = section.repeat(MAX_MARKUP / section.len());
+        assert!(page.len() > MAX_MARKUP - section.len());
+        let doc = html_doc(page.as_bytes());
+        let rendered = cells(&doc, 80);
+        assert!(!rendered.page.unrendered && !rendered.cut);
+        let mut deep = "<blockquote>".repeat(62);
+        deep.push_str(&"<p>x".repeat((MAX_MARKUP - deep.len()) / 4));
+        assert!(html(deep.as_bytes(), None).unrendered);
+    }
+
+    /// What glibc holds for `bytes` asked of it: a chunk of them and its
+    /// 8-byte header, in 16-byte steps, at least 32; nothing for nothing.
+    fn chunk(bytes: usize) -> usize {
+        if bytes == 0 {
+            0
+        } else {
+            (bytes + 8).div_ceil(16).max(2) * 16
+        }
+    }
+
+    /// What `page` holds on the heap, by its vectors' and strings'
+    /// capacities.
+    fn page_bytes(page: &Page) -> usize {
+        let mut total = chunk(page.lines.capacity() * std::mem::size_of::<Logical>());
+        for line in &page.lines {
+            total += chunk(line.runs.capacity() * std::mem::size_of::<Run>());
+            total += line
+                .runs
+                .iter()
+                .map(|run| chunk(run.text.capacity()))
+                .sum::<usize>();
+        }
+        total += chunk(page.links.capacity() * std::mem::size_of::<Link>());
+        total
+            + page
+                .links
+                .iter()
+                .map(|link| chunk(link.written.capacity()))
+                .sum::<usize>()
+    }
+
+    /// A page keeps no more than td-html's output budget, however its
+    /// markup is shaped: a run holds its text in its own length, joined
+    /// from a word a run or not, and its lines and links no spare room.
+    #[test]
+    fn a_page_keeps_no_more_than_the_budget() {
+        let fill = |head: &str, unit: &str| {
+            let mut markup = head.to_string();
+            while markup.len() + unit.len() <= MAX_MARKUP {
+                markup.push_str(unit);
+            }
+            markup
+        };
+        let words = format!("<p>{}", "word ".repeat(200));
+        let styles = format!("<p>{}", "<b>a</b> <i>b</i> ".repeat(100));
+        let links = format!("<p>{}", "<a href=\"/x\">a</a> b ".repeat(100));
+        for markup in [
+            fill("", &words),
+            fill("", &styles),
+            fill("", &links),
+            fill(&"<blockquote>".repeat(62), "<p>x"),
+            fill("", "<p>x"),
+        ] {
+            let page = html(markup.as_bytes(), None);
+            assert!(page.lines.iter().all(|line| line
+                .runs
+                .iter()
+                .all(|run| run.text.capacity() == run.text.len())));
+            assert!(page.lines.capacity() == page.lines.len());
+            let held = page_bytes(&page);
+            assert!(held <= HTML_LIMITS.output, "{held}: {}", &markup[..40]);
+        }
+    }
+
+    /// The limits as measured against the jail (DESIGN.md §3): what
+    /// td-web holds at the worst while a reply is made into a document
+    /// beside the one shown stays 20 MB under `memory-high`. That is its own
+    /// resident memory on the largest output td supports, 3840x2160, with
+    /// td-ui's three window buffers (`BASELINE`); a body for each fetch
+    /// out (`MAX_WORKERS` of `MAX_DOCUMENT`); on the render thread either
+    /// a rendering at td-html's rule for its peak, 100 bytes a byte of
+    /// input read and 1.25 a byte of budget (td-html/DESIGN.md, "Resident
+    /// rendering cost"), or the costliest picture decoding, a 16-bit RGBA
+    /// PNG of `MAX_PICTURE_PIXELS` inflated at 8 bytes a pixel beside its
+    /// 4-byte RGBA (201 MB measured); and what is shown, either a page,
+    /// which holds no more than td-html's output for it, so no more than
+    /// its budget, with its wrap on the window's thread (`WRAP`: the most
+    /// a wrap of `MAX_LINES` lines measured at its peak, 77 MB, with some
+    /// room), or a picture with its copy fitted to the pane. `BASELINE`,
+    /// `WRAP` and `MEMORY_HIGH`, the jail's in recipes/src/recipes/web.rs,
+    /// are copied by hand and reviewed when any of them changes.
+    #[test]
+    fn the_html_limits_fit_the_jail() {
+        const BASELINE: usize = 145_000_000;
+        const WRAP: usize = 85_000_000;
+        const FITTED: usize = 3840 * 2160 * 4;
+        const MEMORY_HIGH: usize = 640 << 20;
+        let bodies = crate::app::MAX_WORKERS * crate::fetch::MAX_DOCUMENT as usize;
+        let rendering = 100 * HTML_LIMITS.input + HTML_LIMITS.output * 5 / 4;
+        let decoding = MAX_PICTURE_PIXELS * (8 + 4);
+        let page = HTML_LIMITS.output + WRAP;
+        let picture = MAX_PICTURE_PIXELS * 4 + FITTED;
+        let most = BASELINE + bodies + rendering.max(decoding) + page.max(picture);
+        assert!(most + 20_000_000 < MEMORY_HIGH, "{most}");
     }
 
     #[test]
@@ -1474,7 +1834,7 @@ mod tests {
         deep.extend(b"<p>x</p>".repeat(200_000));
         let page = html(&deep, None);
         assert!(page.unrendered && !page.cut);
-        assert!(page.lines.len() > 10_000);
+        assert!(page.lines.len() > 5_000);
         assert!(page
             .lines
             .iter()

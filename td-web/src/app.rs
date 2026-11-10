@@ -1,8 +1,9 @@
 //! The browser in its window (DESIGN.md §8): the address row, the page
-//! and the status row; the history; and each navigation's fetch and
-//! decoding, a page's rendering into logical lines included, on a thread
-//! of its own, its document taken when the window next polls. Wrapping
-//! those lines at the page's width in pixels is the window's.
+//! and the status row; the history; and each navigation's fetch on a
+//! thread of its own, which hands the reply to the one render thread
+//! to be decoded, a page rendered into logical lines, and waits for it,
+//! its document taken when the window next polls. Wrapping those lines
+//! at the page's width in pixels is the window's.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -18,7 +19,7 @@ use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase};
 use td_ui::CELL_WIDTH;
 use td_url::{Reference, Url};
 
-use crate::document::{self, Document, Place, Rendered};
+use crate::document::{self, Document, Place, Rendered, Renderer};
 use crate::fetch::{self, Fetcher};
 use crate::view::{self, Pane, View};
 
@@ -110,6 +111,8 @@ struct Current {
 
 pub struct App {
     fetcher: Arc<dyn Fetcher>,
+    /// Where each fetch's reply is made into its document.
+    renderer: Renderer,
     workers: Arc<AtomicUsize>,
     surface: Surface,
     focus: Focus,
@@ -146,19 +149,20 @@ impl Drop for Worker {
     }
 }
 
-/// Fetches `url` and makes its document, on a worker's thread; none
-/// once its navigation is `stopped` before the document's rendering or
-/// decoding begins.
+/// Fetches `url` on a worker's thread and has `renderer` make its
+/// document; none once its navigation is `stopped` before the document's
+/// rendering or decoding begins.
 fn arrive(
     fetcher: &dyn Fetcher,
+    renderer: &Renderer,
     url: Url,
     fragment: Option<String>,
-    stopped: &AtomicBool,
+    stopped: &Arc<AtomicBool>,
 ) -> Option<Arrival> {
     match fetch::navigate(fetcher, url.clone()) {
         Ok(loaded) => {
             let content_type = loaded.reply.header("content-type").map(str::to_string);
-            let doc = Document::from_reply_unless(
+            let doc = renderer.document(
                 loaded.url,
                 loaded.reply.status,
                 content_type.as_deref(),
@@ -184,6 +188,7 @@ impl App {
         let metrics = Metrics::new(faces.as_ref(), surface.scale);
         Ok(Self {
             fetcher,
+            renderer: Renderer::start()?,
             workers: Arc::new(AtomicUsize::new(0)),
             surface,
             focus: Focus::Address,
@@ -326,6 +331,7 @@ impl App {
         }
         let (send, answer) = mpsc::channel();
         let fetcher = Arc::clone(&self.fetcher);
+        let renderer = self.renderer.clone();
         let (target, named) = (url.clone(), fragment.clone());
         let stopped = Arc::new(AtomicBool::new(false));
         let told = Arc::clone(&stopped);
@@ -335,7 +341,7 @@ impl App {
             .name("td-web fetch".into())
             .spawn(move || {
                 let _worker = worker;
-                let _ = send.send(arrive(fetcher.as_ref(), target, named, &told));
+                let _ = send.send(arrive(fetcher.as_ref(), &renderer, target, named, &told));
             });
         if let Err(why) = spawned {
             self.message = Some(format!("the page could not be fetched: {why}"));

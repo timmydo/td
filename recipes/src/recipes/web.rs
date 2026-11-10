@@ -30,16 +30,20 @@ pub fn recipe() -> Recipe {
     };
     // The fetch socket, its one way to the network (no `shared=network`),
     // and the Wayland socket it draws in. No filesystem grant: it keeps
-    // nothing between runs. No terminal and no bus name. The memory bounds
-    // hold a 16 MiB body, a picture of up to 16 Mi pixels decoded beside
-    // it, and a rendering of markup at td-web's 2 MiB bound, which can
-    // transiently cost some 300 MB (td-web/DESIGN.md §5); the tasks hold
-    // the window's thread, td-ui's and up to four fetch workers with room,
-    // since td-svc does not restart a program that exits on the cap.
+    // nothing between runs. No terminal and no bus name. `memory-high` is
+    // 640 MiB for td-web's worst on a 3840x2160 output, 582 MB: its own
+    // memory with three window buffers (144 MB), a 16 MiB body for each of
+    // four fetches out (67), one rendering of 2 MiB of markup within its
+    // 32 MiB budget (252) or picture decoding (201), and the page shown
+    // with its wrap (119) or a picture (100) (td-web/DESIGN.md §3, which
+    // a td-web test holds to these figures). `memory-max` stays 768 MiB.
+    // The tasks hold the window's thread, td-ui's, the render thread and
+    // up to four fetch workers with room, since td-svc does not restart a
+    // program that exits on the cap.
     let Ok(permissions) = PermissionPolicy::new()
         .with_socket(PermissionSocket::Wayland)
         .and_then(|permissions| permissions.with_socket(PermissionSocket::Fetch))
-        .and_then(|permissions| permissions.with_memory_high(512 * 1024 * 1024))
+        .and_then(|permissions| permissions.with_memory_high(640 * 1024 * 1024))
         .and_then(|permissions| permissions.with_memory_max(768 * 1024 * 1024))
         .and_then(|permissions| permissions.with_pids_max(32))
         .and_then(|permissions| permissions.with_cpu_max(100_000, 100_000))
@@ -129,7 +133,7 @@ mod tests {
         assert_eq!(permissions.session_bus().count(), 0);
         assert_eq!(
             permissions.to_keyfile(),
-            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Resources]\nmemory-high=536870912\nmemory-max=805306368\npids-max=32\ncpu-max=100000 100000\n"
+            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Resources]\nmemory-high=671088640\nmemory-max=805306368\npids-max=32\ncpu-max=100000 100000\n"
         );
         let steps = recipe.steps.as_ref().expect("steps");
         for (file, dest) in [
