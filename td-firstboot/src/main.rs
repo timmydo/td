@@ -357,7 +357,8 @@ fn run_with_primary(
         Invocation::Metadata => return apply_metadata(),
         Invocation::CloudMetadata => return apply_cloud_metadata(),
         Invocation::CheckPrincipals(root) => {
-            principals::check_deployment(&root).map_err(Failure::Failed)?;
+            let registry = principals::check_deployment(&root).map_err(Failure::Failed)?;
+            principal_store::check_accounts(&registry).map_err(Failure::Failed)?;
             return emit("TD-PRINCIPALS-CHECK-OK\n").map_err(Failure::Failed);
         }
         Invocation::CheckPrimaryName(root, name) => {

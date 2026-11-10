@@ -159,8 +159,18 @@ application's uid from the ledger, not from a build-time table.
 A workload account's home is root-created at mode 0700:
 `/var/lib/td/applications/<uid>` for applications, as today, and
 `/var/lib/td/workloads/<uid>` for sandboxes and workspaces. td-sandbox's
-current per-profile home moves there. The allocation range and the
-ledger's row format land with the allocator.
+current per-profile home moves there.
+
+The ledger is `/var/lib/td/accounts.tsv`, root:root mode 0644, with one
+`KIND<TAB>NAME<TAB>UID` row per account (td-authd/DESIGN.md, "Workload
+account ledger"). Uids are split by kind: applications take 65536 through
+98303, so the reserved rows lie inside it, and sandboxes and workspaces
+98304 through 131071. A removed application keeps its row, and its
+reinstall the same uid. Besides the four carried rows, the ledger imports
+every application row the reservation ledger retains, so a former
+install's Claude Code keeps 65539. Rows are keyed by kind and name,
+not by human owner; applications for a second human are a later
+decision.
 
 ## Grants
 
@@ -222,7 +232,11 @@ account.
    is unchanged.
 5. The ledger allocator in td-authd, with applications moved onto it:
    the bus broker and td-portal read application uids from the ledger,
-   and td-software's installs allocate.
+   and td-software's installs allocate. In three landings: the ledger's
+   format and its seeding by td-firstboot (landed; nothing reads the
+   ledger yet); every consumer moving to it at once, with the
+   application rows leaving passwd, group and `/etc/td-principals.tsv`;
+   then allocation at install.
 6. The grant table and the generalized idmapped grant (`UNSAFE.md` §16).
 7. Workspace launches through root; td-sandbox profiles move to ledger
    accounts and their `share` becomes a grant request.

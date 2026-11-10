@@ -87,14 +87,15 @@ fn read_root_file(etc: &File, name: &str, mode: Option<u32>) -> Result<String, S
     Ok(text)
 }
 
-pub(crate) fn check_deployment(root: &Path) -> Result<(), String> {
+pub(crate) fn check_deployment(root: &Path) -> Result<Registry, String> {
     let etc = etc_directory(root, None)?;
     let registry = Registry::parse(&read_root_file(&etc, TABLE_NAME, Some(0o444))?)?;
     registry.verify_retained_accounts(
         &registry,
         &read_root_file(&etc, "passwd", None)?,
         &read_root_file(&etc, "group", None)?,
-    )
+    )?;
+    Ok(registry)
 }
 
 /// Read-only admission against a caller-supplied, already verified deployment.

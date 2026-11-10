@@ -17819,6 +17819,33 @@ mod principal_tests {
                 && !exec));
     }
 
+    /// td-firstboot seeds the workload account ledger with its carried rows
+    /// and the retained reservations, and the image build's
+    /// `check-principals` refuses rows that do not fit beside them. The
+    /// shipped rows are exactly the carried ones.
+    #[test]
+    fn the_account_ledger_carries_every_shipped_application_uid() {
+        use td_engine::workload_accounts::{Kind, Ledger};
+        let registry = principal_schema::Registry::parse(&build_principals(&SYSTEM)).unwrap();
+        let carried = Ledger::default().seed([]).unwrap();
+        let seeded = carried
+            .seed(
+                registry
+                    .applications()
+                    .map(|application| (application.name.as_str(), application.uid)),
+            )
+            .unwrap();
+        assert_eq!(seeded, carried);
+        for application in SHIPPED_APPLICATIONS {
+            assert_eq!(
+                carried.uid(Kind::Application, application.name),
+                Some(application.external_uid),
+                "{}",
+                application.name
+            );
+        }
+    }
+
     #[test]
     fn reserved_ids_remain_fixed_when_the_application_order_changes() {
         const REVERSED: &[ShippedApplication] = &[

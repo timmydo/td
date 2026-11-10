@@ -301,6 +301,10 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
         "host and target-static td-firstboot canonical identity parsing and retained reservations",
     ),
     (
+        "engine/src/workload_accounts.rs",
+        "host and target-static td-firstboot's workload account ledger seeding",
+    ),
+    (
         "engine/src/sha256.rs",
         "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret and the td-tpm client it, td-firstboot, td-boot and td-install link, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, and td-crypto's test-only ES256 oracle",
     ),
@@ -2445,6 +2449,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("engine/src/sha256.rs", "check-engine");
     assert_target!("engine/src/sha256.rs", "recipe-checks");
     assert_contains!("engine/src/principals.rs", "target-static td-firstboot");
+    assert_contains!(
+        "engine/src/workload_accounts.rs",
+        "td-firstboot's workload account ledger"
+    );
     assert_contains!("engine/src/sha256.rs", "target-static td-boot");
     assert_contains!("engine/src/sha256.rs", "td-crypto's test-only ES256 oracle");
     assert_contains!("engine/src/crc32.rs", "target-static td-install");
@@ -2475,6 +2483,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // target binary's sources get.
     let expected_target_included = [
         "engine/src/principals.rs",
+        "engine/src/workload_accounts.rs",
         "engine/src/sha256.rs",
         "engine/src/flathub_app.rs",
         "engine/src/crc32.rs",

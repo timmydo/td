@@ -86,11 +86,59 @@ pub mod permissions;
 pub mod principals;
 pub mod sha256;
 pub mod target_profile;
+// `workload_accounts` is the workload account ledger's pure half, which
+// td-firstboot `#[path]`-includes to seed it; td-builder and
+// td-recipe-eval do not use it.
+pub mod workload_accounts;
 pub mod xz;
 
 #[cfg(test)]
 #[path = "../../td-fs/src/temp_dir.rs"]
 mod test_temp;
+
+/// `workload_accounts` keeps its own copy of the principal table's
+/// application name grammar, since its coming readers do not compile
+/// `principals`; hold the two equal.
+#[cfg(test)]
+mod account_name_grammar {
+    fn admitted(name: &str) -> (bool, bool) {
+        let principals = crate::principals::Registry::parse(&format!(
+            "td-principals-v1\nsession\t1000\t993\t992\t991\napplication\t1000\t{name}\t65536\n"
+        ));
+        let ledger = crate::workload_accounts::Ledger::parse(&format!(
+            "td-accounts-v1\napplication\t{name}\t65536\n"
+        ));
+        (principals.is_ok(), ledger.is_ok())
+    }
+
+    #[test]
+    fn the_ledger_and_the_principal_table_admit_the_same_names() {
+        let mut names = Vec::new();
+        // Every ASCII byte first, later and last, and a non-ASCII one.
+        for byte in 0..=127u8 {
+            let byte = char::from(byte);
+            names.push(format!("{byte}"));
+            names.push(format!("{byte}a"));
+            names.push(format!("a{byte}"));
+            names.push(format!("a{byte}a"));
+        }
+        names.push("m\u{e1}il".to_string());
+        for length in [63, 64, 65] {
+            names.push("a".repeat(length));
+            names.push(format!("{}9", "a".repeat(length - 1)));
+        }
+        let mut admitted_any = false;
+        for name in &names {
+            let (principals, ledger) = admitted(name);
+            assert_eq!(principals, ledger, "{name:?}");
+            admitted_any |= ledger;
+        }
+        // The comparison is not between two refusals of everything.
+        assert!(admitted_any);
+        assert_eq!(admitted(&"a".repeat(64)), (true, true));
+        assert_eq!(admitted(&"a".repeat(65)), (false, false));
+    }
+}
 
 /// Hash-visible EROFS producer format. Change when packed bytes change.
 pub const EROFS_FORMAT: &str = "zstd-shared-extents-v2";

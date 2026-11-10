@@ -1,11 +1,15 @@
 //! Durable UID reservations. Enrollment never releases an old assignment.
 
+#[path = "../../engine/src/workload_accounts.rs"]
+mod workload_accounts;
+
 use crate::principals::{Registry, MAX_BYTES, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use workload_accounts::Ledger;
 
 const PATH_ONLY: i32 = 0x200000;
 const LIMIT: u64 = MAX_BYTES as u64;
@@ -15,6 +19,12 @@ const STAGED: &str = ".principals.next";
 const NOTEBOOK_LEDGER: &str = "principals-notebooks.tsv";
 const NOTEBOOK_STAGED: &str = ".principals-notebooks.next";
 const LOCK: &str = ".principals.lock";
+const PRIVATE_MODE: u32 = 0o600;
+/// The workload account ledger (td-authd/DESIGN.md, "Workload account
+/// ledger"). It holds only kinds, names and uids, so every account reads it.
+const ACCOUNTS_STAGED: &str = ".accounts.next";
+const ACCOUNTS_MODE: u32 = 0o644;
+const ACCOUNTS_LIMIT: u64 = workload_accounts::MAX_BYTES as u64;
 /// `flathub_app::RUNTIME_STORE`'s last component, below `/var/lib/td`, and
 /// the runtime account that owns it (`flathub_app::RUNTIME_UID`). This file
 /// also builds alone in the recipe's principal tests, so it keeps a copy.
@@ -180,23 +190,27 @@ impl Directory {
             .map_err(|error| format!("sync principal directory: {error}"))
     }
 
-    fn validate(&self, file: &File) -> Result<(), String> {
+    fn validate(&self, file: &File, name: &str, mode: u32, limit: u64) -> Result<(), String> {
         let metadata = file.metadata().map_err(|error| error.to_string())?;
         if !metadata.is_file()
             || metadata.uid() != self.uid
             || metadata.gid() != self.gid
-            || metadata.mode() & 0o7777 != 0o600
+            || metadata.mode() & 0o7777 != mode
             || metadata.nlink() != 1
-            || metadata.len() > LIMIT
+            || metadata.len() > limit
         {
-            return Err(
-                "principal file must be a bounded, single-link, private owned regular file".into(),
-            );
+            return Err(format!(
+                "{name} must be a bounded, single-link regular file of mode {mode:04o} owned by its directory's owner"
+            ));
         }
         Ok(())
     }
 
     fn read(&self, name: &str) -> Result<Option<String>, String> {
+        self.read_as(name, PRIVATE_MODE, LIMIT)
+    }
+
+    fn read_as(&self, name: &str, mode: u32, limit: u64) -> Result<Option<String>, String> {
         let file = match OpenOptions::new()
             .read(true)
             .custom_flags(O_NOFOLLOW | O_NONBLOCK)
@@ -204,20 +218,25 @@ impl Directory {
         {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("open principal file {name}: {error}")),
+            Err(error) => return Err(format!("open {name}: {error}")),
         };
-        self.validate(&file)?;
+        self.validate(&file, name, mode, limit)?;
         let mut text = String::new();
-        file.take(LIMIT + 1)
+        file.take(limit + 1)
             .read_to_string(&mut text)
-            .map_err(|error| format!("read principal file {name}: {error}"))?;
-        if text.len() as u64 > LIMIT {
-            return Err("principal file grew beyond its limit".into());
+            .map_err(|error| format!("read {name}: {error}"))?;
+        if text.len() as u64 > limit {
+            return Err(format!("{name} grew beyond its limit"));
         }
         Ok(Some(text))
     }
 
     fn private_scratch(&self, name: &str, limit: u64) -> Result<Option<File>, String> {
+        self.scratch(name, limit, PRIVATE_MODE)
+    }
+
+    /// Interrupted staging may lack bits of `mode`, never hold others.
+    fn scratch(&self, name: &str, limit: u64, mode: u32) -> Result<Option<File>, String> {
         let file = match OpenOptions::new()
             .read(true)
             .custom_flags(O_NOFOLLOW | PATH_ONLY)
@@ -225,17 +244,19 @@ impl Directory {
         {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("open principal scratch {name}: {error}")),
+            Err(error) => return Err(format!("open scratch {name}: {error}")),
         };
         let metadata = file.metadata().map_err(|error| error.to_string())?;
         if !metadata.is_file()
             || metadata.uid() != self.uid
             || metadata.gid() != self.gid
-            || metadata.mode() & 0o7777 & !0o600 != 0
+            || metadata.mode() & 0o7777 & !mode != 0
             || metadata.nlink() != 1
             || metadata.len() > limit
         {
-            return Err("principal scratch must be one bounded, private owned regular file".into());
+            return Err(format!(
+                "scratch {name} must be one bounded, owned regular file within mode {mode:04o}"
+            ));
         }
         Ok(Some(file))
     }
@@ -268,7 +289,7 @@ impl Directory {
             .custom_flags(O_NONBLOCK)
             .open(path)
             .map_err(|error| format!("open pinned principal lock: {error}"))?;
-        self.validate(&file)?;
+        self.validate(&file, LOCK, PRIVATE_MODE, LIMIT)?;
         file.lock()
             .map_err(|error| format!("lock principal enrollment: {error}"))?;
         Ok(file)
@@ -296,59 +317,107 @@ impl Directory {
         Ok(prior)
     }
 
+    /// The reservations alone, as a boot before the account ledger made them.
     #[cfg(test)]
     fn enroll(&self, desired: &Registry) -> Result<Registry, String> {
-        self.enroll_checked(desired, |_| Ok(()))
+        let _lock = self.lock()?;
+        let retained = self.merged(desired)?;
+        self.publish_reservations(&retained)?;
+        Ok(retained)
     }
 
+    /// Boot enrollment under one hold of the lock: the reservations and the
+    /// workload account ledger seeded from what they retain. Both are
+    /// computed and checked before either is published, so a refusal
+    /// changes nothing.
     fn enroll_checked(
         &self,
         desired: &Registry,
         validate: impl FnOnce(&Registry) -> Result<(), String>,
-    ) -> Result<Registry, String> {
+    ) -> Result<Ledger, String> {
         let _lock = self.lock()?;
-        let previous = self.retained()?;
-        let retained = match &previous {
-            Some(prior) => prior.enroll(desired)?,
-            None => desired.clone(),
-        };
+        let retained = self.merged(desired)?;
         validate(&retained)?;
+        let ledger = self.seeded_accounts(&retained)?;
+        self.publish_reservations(&retained)?;
+        self.publish_as(
+            workload_accounts::FILE_NAME,
+            ACCOUNTS_STAGED,
+            &ledger.encode(),
+            ACCOUNTS_MODE,
+            ACCOUNTS_LIMIT,
+        )?;
+        Ok(ledger)
+    }
+
+    /// The retained reservations joined with the deployment's. The caller
+    /// holds the lock.
+    fn merged(&self, desired: &Registry) -> Result<Registry, String> {
+        match self.retained()? {
+            Some(prior) => prior.enroll(desired),
+            None => Ok(desired.clone()),
+        }
+    }
+
+    fn publish_reservations(&self, retained: &Registry) -> Result<(), String> {
         // Publish the full reservation first. A crash cannot release it;
         // retry merges both records. Older boots read only the legacy file.
         if retained.notebooks().next().is_some() {
             self.publish(NOTEBOOK_LEDGER, NOTEBOOK_STAGED, &retained.encode())?;
         }
-        self.publish(LEDGER, STAGED, &retained.legacy().encode())?;
-        Ok(retained)
+        self.publish(LEDGER, STAGED, &retained.legacy().encode())
+    }
+
+    /// The published account ledger with every application row the
+    /// reservations retain, a removed one's included, and the carried rows.
+    /// A malformed ledger or a reassignment refuses.
+    fn seeded_accounts(&self, retained: &Registry) -> Result<Ledger, String> {
+        let prior =
+            match self.read_as(workload_accounts::FILE_NAME, ACCOUNTS_MODE, ACCOUNTS_LIMIT)? {
+                Some(text) => Ledger::parse(&text)?,
+                None => Ledger::default(),
+            };
+        seed(&prior, retained)
     }
 
     fn publish(&self, name: &str, staged: &str, text: &str) -> Result<(), String> {
+        self.publish_as(name, staged, text, PRIVATE_MODE, LIMIT)
+    }
+
+    fn publish_as(
+        &self,
+        name: &str,
+        staged: &str,
+        text: &str,
+        mode: u32,
+        limit: u64,
+    ) -> Result<(), String> {
         // Refuse substituted scratch before removing an interrupted write.
-        if self.private_scratch(staged, LIMIT)?.is_some() {
+        if self.scratch(staged, limit, mode)?.is_some() {
             fs::remove_file(self.path(staged)).map_err(|error| error.to_string())?;
             self.sync()?;
         }
-        if self.read(name)?.as_deref() == Some(text) {
+        if self.read_as(name, mode, limit)?.as_deref() == Some(text) {
             return self.sync();
         }
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode)
             .custom_flags(O_NOFOLLOW | O_NONBLOCK)
             .open(self.path(staged))
-            .map_err(|error| format!("create principal staging: {error}"))?;
+            .map_err(|error| format!("create {staged}: {error}"))?;
         // Exact mode even when an inherited umask removes owner bits.
-        file.set_permissions(Permissions::from_mode(0o600))
+        file.set_permissions(Permissions::from_mode(mode))
             .map_err(|error| error.to_string())?;
-        self.validate(&file)?;
+        self.validate(&file, staged, mode, limit)?;
         let result = (|| {
             file.write_all(text.as_bytes())
-                .map_err(|error| format!("write principal ledger: {error}"))?;
+                .map_err(|error| format!("write {staged}: {error}"))?;
             file.sync_all()
-                .map_err(|error| format!("sync principal ledger: {error}"))?;
+                .map_err(|error| format!("sync {staged}: {error}"))?;
             fs::rename(self.path(staged), self.path(name))
-                .map_err(|error| format!("publish principal ledger: {error}"))?;
+                .map_err(|error| format!("publish {name}: {error}"))?;
             self.sync()
         })();
         if result.is_err() {
@@ -400,6 +469,25 @@ fn state_directory() -> Result<Directory, String> {
     Ok(root)
 }
 
+/// `prior` with the carried rows and every application row `registry`
+/// holds. The ledger keys rows by name alone and admits a narrower uid
+/// range than the principal table, so either difference refuses.
+fn seed(prior: &Ledger, registry: &Registry) -> Result<Ledger, String> {
+    prior.seed(
+        registry
+            .applications()
+            .map(|application| (application.name.as_str(), application.uid)),
+    )
+}
+
+/// The image build's check: the deployment's application rows fit an
+/// account ledger beside the carried rows, so its first boot can seed one.
+pub(crate) fn check_accounts(registry: &Registry) -> Result<(), String> {
+    seed(&Ledger::default(), registry).map(|_| ())
+}
+
+/// Reserve the deployment's identities and seed the workload account
+/// ledger from them. No consumer reads that ledger yet.
 pub(crate) fn provision(desired: &Registry) -> Result<(), String> {
     state_directory()?.enroll_checked(desired, |retained| {
         retained.verify_installed_accounts(desired)

@@ -365,3 +365,263 @@ fn notebook_ledger_preserves_legacy_boots_and_recovers_partial_publication() {
     assert!(directory.enroll(&reused).is_err());
     temp.cleanup().unwrap();
 }
+
+const SEEDED: &str = "td-accounts-v1\napplication\tfirefox\t65536\napplication\tmail\t65537\napplication\tnews\t65538\napplication\tweb\t65540\n";
+
+fn account_directory(temp: &notebook_temp::TempDir) -> Directory {
+    let metadata = fs::metadata(temp.path()).unwrap();
+    Directory::open(temp.path(), metadata.uid(), metadata.gid()).unwrap()
+}
+
+fn account_ledger(directory: &Directory) -> Option<String> {
+    directory
+        .read_as(workload_accounts::FILE_NAME, ACCOUNTS_MODE, ACCOUNTS_LIMIT)
+        .unwrap()
+}
+
+fn public_file(path: &Path, text: &str, mode: u32) {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+    file.set_permissions(Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn boot_enrollment_seeds_a_public_account_ledger_idempotently() {
+    let temp = notebook_temp::TempDir::new("td-account-ledger").unwrap();
+    let directory = account_directory(&temp);
+    let desired = app("mail", 65537);
+    let ledger = directory.enroll_checked(&desired, |_| Ok(())).unwrap();
+    assert_eq!(ledger.encode(), SEEDED);
+    assert_eq!(account_ledger(&directory).as_deref(), Some(SEEDED));
+    let path = directory.path(workload_accounts::FILE_NAME);
+    let before = fs::metadata(&path).unwrap();
+    assert_eq!(before.mode() & 0o7777, 0o644);
+    assert_eq!(
+        directory.enroll_checked(&desired, |_| Ok(())).unwrap(),
+        ledger
+    );
+    assert_eq!(fs::metadata(&path).unwrap().ino(), before.ino());
+    // The reservations are published beside it, private as before.
+    assert_eq!(directory.verify_enrolled(&desired).unwrap(), desired);
+    assert!(!directory.path(ACCOUNTS_STAGED).exists());
+    temp.cleanup().unwrap();
+}
+
+#[test]
+fn a_removed_applications_reservation_keeps_its_account_row() {
+    let temp = notebook_temp::TempDir::new("td-account-ledger").unwrap();
+    let directory = account_directory(&temp);
+    // A boot before the ledger, enrolled while Claude Code shipped at 65539.
+    let retired = Registry::parse(&format!(
+        "{SESSION}application\t1000\tclaude\t65539\napplication\t1000\tmail\t65537\n"
+    ))
+    .unwrap();
+    directory.enroll(&retired).unwrap();
+    assert!(account_ledger(&directory).is_none());
+    let ledger = directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .unwrap();
+    assert_eq!(
+        ledger.encode(),
+        SEEDED.replace(
+            "application\tfirefox",
+            "application\tclaude\t65539\napplication\tfirefox"
+        )
+    );
+    assert_eq!(account_ledger(&directory), Some(ledger.encode()));
+    // Rows beyond the reservations, as an allocation and a later
+    // deployment's workspace add, are kept.
+    let allocated = format!(
+        "{}workspace\tagent-1\t98304\n",
+        ledger.encode().replace(
+            "application\tweb",
+            "application\tphoto\t65541\napplication\tweb"
+        )
+    );
+    directory
+        .publish_as(
+            workload_accounts::FILE_NAME,
+            ACCOUNTS_STAGED,
+            &allocated,
+            ACCOUNTS_MODE,
+            ACCOUNTS_LIMIT,
+        )
+        .unwrap();
+    assert_eq!(
+        directory
+            .enroll_checked(&app("mail", 65537), |_| Ok(()))
+            .unwrap()
+            .encode(),
+        allocated
+    );
+    assert_eq!(account_ledger(&directory), Some(allocated));
+    temp.cleanup().unwrap();
+}
+
+/// Neither reservation file nor the account ledger exists, or each keeps
+/// `before`'s bytes.
+fn unchanged(directory: &Directory, before: &[(&str, Option<Vec<u8>>)]) {
+    for (name, bytes) in before {
+        assert_eq!(&fs::read(directory.path(name)).ok(), bytes, "{name}");
+    }
+}
+
+fn snapshot(directory: &Directory) -> Vec<(&'static str, Option<Vec<u8>>)> {
+    [LEDGER, NOTEBOOK_LEDGER, workload_accounts::FILE_NAME]
+        .into_iter()
+        .map(|name| (name, fs::read(directory.path(name)).ok()))
+        .collect()
+}
+
+#[test]
+fn a_refused_seed_publishes_no_reservation() {
+    let notebook =
+        |rows: &str| Registry::parse(&format!("{SESSION}notebook\t1000\t989\n{rows}")).unwrap();
+    let refusals = [
+        // mail at the uid the ledger carries for firefox.
+        notebook("application\t1000\tmail\t65536\n"),
+        // A uid the principal table admits and the ledger does not.
+        notebook("application\t1000\tphoto\t98304\n"),
+        // One name under two owners: the ledger keys rows by name alone.
+        Registry::parse(
+            "td-principals-v1\nsession\t1000\t993\t992\t991\nsession\t1001\t990\t988\t987\napplication\t1000\tmail\t65537\napplication\t1001\tmail\t65541\n",
+        )
+        .unwrap(),
+    ];
+    for desired in &refusals {
+        // On a first boot nothing is published.
+        let temp = notebook_temp::TempDir::new("td-account-ledger").unwrap();
+        let directory = account_directory(&temp);
+        assert!(directory.enroll_checked(desired, |_| Ok(())).is_err());
+        unchanged(&directory, &[(LEDGER, None), (NOTEBOOK_LEDGER, None)]);
+        assert!(account_ledger(&directory).is_none());
+        assert!(check_accounts(desired).is_err());
+        temp.cleanup().unwrap();
+        // After an enrolled boot every file keeps its bytes.
+        let temp = notebook_temp::TempDir::new("td-account-ledger").unwrap();
+        let directory = account_directory(&temp);
+        directory
+            .enroll_checked(&notebook("application\t1000\tnews\t65538\n"), |_| Ok(()))
+            .unwrap();
+        let before = snapshot(&directory);
+        assert!(before.iter().all(|(_, bytes)| bytes.is_some()));
+        assert!(directory.enroll_checked(desired, |_| Ok(())).is_err());
+        unchanged(&directory, &before);
+        temp.cleanup().unwrap();
+    }
+    check_accounts(&notebook(
+        "application\t1000\tclaude\t65539\napplication\t1000\tmail\t65537\n",
+    ))
+    .unwrap();
+}
+
+#[test]
+fn a_reassignment_or_malformed_account_ledger_refuses_and_is_never_reset() {
+    for text in [
+        "broken ledger\n".to_string(),
+        SEEDED.replace("mail\t65537", "mail\t65541"),
+        SEEDED.replace("application\tnews\t65538\n", "application\tnews\t65541\n"),
+    ] {
+        let temp = notebook_temp::TempDir::new("td-account-ledger").unwrap();
+        let directory = account_directory(&temp);
+        let path = directory.path(workload_accounts::FILE_NAME);
+        public_file(&path, &text, 0o644);
+        assert!(
+            directory
+                .enroll_checked(&app("mail", 65537), |_| Ok(()))
+                .is_err(),
+            "{text:?}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        unchanged(&directory, &[(LEDGER, None), (NOTEBOOK_LEDGER, None)]);
+        temp.cleanup().unwrap();
+    }
+}
+
+#[test]
+fn an_account_ledger_of_another_mode_owner_link_or_size_is_refused() {
+    use std::os::unix::fs::symlink;
+    let oversized = format!("{SEEDED}{}", "x".repeat(workload_accounts::MAX_BYTES));
+    for case in [
+        "private",
+        "group-writable",
+        "symlink",
+        "hardlink",
+        "oversized",
+    ] {
+        let temp = notebook_temp::TempDir::new("td-account-ledger").unwrap();
+        let directory = account_directory(&temp);
+        let path = directory.path(workload_accounts::FILE_NAME);
+        let target = directory.path("unrelated");
+        let (text, mode) = match case {
+            "private" => (SEEDED, 0o600),
+            "group-writable" => (SEEDED, 0o664),
+            "oversized" => (oversized.as_str(), 0o644),
+            _ => (SEEDED, 0o644),
+        };
+        public_file(&target, text, mode);
+        match case {
+            "symlink" => symlink("unrelated", &path).unwrap(),
+            "hardlink" => fs::hard_link(&target, &path).unwrap(),
+            _ => fs::rename(&target, &path).unwrap(),
+        }
+        let before = fs::read(&path).unwrap();
+        assert!(
+            directory
+                .enroll_checked(&app("mail", 65537), |_| Ok(()))
+                .is_err(),
+            "{case}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before, "{case}");
+        temp.cleanup().unwrap();
+    }
+    // A directory pinned for another owner refuses this owner's ledger, as
+    // `/var/lib/td`'s refuses any but root's.
+    let temp = notebook_temp::TempDir::new("td-account-ledger").unwrap();
+    let directory = account_directory(&temp);
+    directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .unwrap();
+    for (uid, gid) in [
+        (directory.uid.wrapping_add(1), directory.gid),
+        (directory.uid, directory.gid.wrapping_add(1)),
+    ] {
+        let foreign = Directory {
+            file: directory.file.try_clone().unwrap(),
+            uid,
+            gid,
+        };
+        assert!(foreign
+            .read_as(workload_accounts::FILE_NAME, ACCOUNTS_MODE, ACCOUNTS_LIMIT)
+            .is_err());
+    }
+    assert_eq!(account_ledger(&directory).as_deref(), Some(SEEDED));
+    temp.cleanup().unwrap();
+}
+
+#[test]
+fn interrupted_account_staging_is_removed_but_other_writers_are_refused() {
+    let temp = notebook_temp::TempDir::new("td-account-ledger").unwrap();
+    let directory = account_directory(&temp);
+    let staged = directory.path(ACCOUNTS_STAGED);
+    // A crash mid-write, then one before the mode was set.
+    for mode in [0o644, 0o000] {
+        public_file(&staged, "td-acc", mode);
+        directory
+            .enroll_checked(&app("mail", 65537), |_| Ok(()))
+            .unwrap();
+        assert!(!staged.exists());
+        assert_eq!(account_ledger(&directory).as_deref(), Some(SEEDED));
+    }
+    public_file(&staged, "td-acc", 0o666);
+    assert!(directory
+        .enroll_checked(&app("mail", 65537), |_| Ok(()))
+        .is_err());
+    assert!(staged.exists());
+    temp.cleanup().unwrap();
+}

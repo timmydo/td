@@ -540,6 +540,89 @@ update; overflow never silently drops reservations. Without a complete
 ledger, keep the application UID launcher disabled. Console recovery does not
 make an unverified deployment pass the boot oracle.
 
+## Workload account ledger
+
+Every workload account (WORKLOADS.md, "Accounts") is a row of one ledger,
+`/var/lib/td/accounts.tsv`, root:root mode 0644 in the root-owned 0755
+`/var/lib/td`. It holds only each account's kind, name and uid. The mode is
+a trade: every local uid, applications' included, can read the name of
+every application ever installed, removed ones included, and later every
+sandbox and workspace name; in return the readers coming next need no
+privilege to resolve an account. The canonical format begins
+`td-accounts-v1` followed by tab-separated rows sorted by kind, then name:
+
+```
+KIND<TAB>name<TAB>uid
+```
+
+`KIND` is `application`, `sandbox` or `workspace`. Only application rows
+are written today; v1 parses the other two already, because rows are
+permanent and a deployment that rolls back must still read the ledger a
+later one extended. Any further kind or format change is
+`td-accounts-v2`, landed in two steps: first a deployment that reads both
+versions, then one that writes v2, which may not ship until the reader is
+the oldest deployment an install can retain as `previous`. Names follow the principal table's
+application name grammar above, under each kind; a sandbox and a workspace
+may share a name, never a uid. Application uids are 65536 through 98303;
+sandbox and workspace uids share 98304 through 131071. Both lie inside
+the principal table's application range (65536 through 2147483647), which
+the cgroup delegation and launch checks still use, and clear of 65534,
+65535 and every other uid td assigns; a subordinate id range, should td
+ever allocate one, belongs above 131071. The parser refuses an unknown
+kind, a uid outside its kind's range, noncanonical decimal spelling, an
+invalid name, unsorted rows, a name held twice under one kind and a uid
+held by two rows. It bounds the ledger to 4096 rows and 256 KiB, a 64-byte
+average row, with the same headroom reason: a bound a later deployment
+outgrows strands the rollback.
+
+The ledger narrows the principal table in two ways. Its application uids
+stop at 98303, and its rows are keyed by name alone, not by human owner.
+A retained principal table whose application row lies above 98303, or that
+gives one application name to two owners at different uids, therefore
+refuses the boot; serving more than one human with applications is a later
+decision. The image build's `td-firstboot check-principals` seeds an empty
+ledger from the image's table, so no image ships rows that cannot seed.
+
+Rows are never removed. A removed application keeps its row, so a
+reinstall gets the same uid and no uid is ever reused. The ledger is
+assignment data, not authority: which workloads are installed and what
+they may do stays with their declarations and grants.
+
+`engine/src/workload_accounts.rs` holds the dependency-free parser,
+encoder and seed; td-firstboot includes it. Its `--enroll-principals`
+mode is the only writer today. Under the principal ledger's lock it merges
+the reservations, then seeds the account ledger with the rows the image
+reserved before it existed (firefox 65536, mail 65537, news 65538, web
+65540) and every application row the retained reservations hold, a
+retired application's included, such as a former install's Claude Code at
+65539. Both are computed and checked before either is published, so a
+seed that would give a name another uid, or a uid to a second name,
+refuses the boot and changes nothing; then the reservations are
+published, and the ledger after them. Seeding is idempotent. The ledger
+is published like the reservations, through staging (`.accounts.next`)
+synced and renamed through the held directory, at its public mode; an
+existing ledger must be a single-link, bounded regular file of exact mode
+0644 owned by the directory's owner and group, opened without following
+links. Interrupted staging is removed only when it is a single-link,
+bounded file holding no mode bits beyond 0644.
+
+A malformed, foreign-owned, wrong-mode, linked or oversized ledger refuses
+the boot and is never reset. td-boot's rollback to a deployment older than
+the ledger ignores it. Otherwise repair is offline, as for the
+reservations above: restore a copy holding every row, or rebuild it from
+complete history; never drop a row, and keep every application launcher
+disabled until it is whole.
+
+No consumer reads the ledger yet. td-login, the bus broker's application
+policy and its includers, td-portal and td-authd move to it in one
+landing, which removes the application rows from passwd, group and
+`/etc/td-principals.tsv` and the uid column from the bus policy (WORKLOADS.md,
+step 5). td-authd's allocation when td-software installs an application
+follows. It will hold `.principals.lock`, return an existing row, and
+otherwise take the lowest uid in the kind's range that no row holds and
+that no retained principal row (of any owner), passwd entry or group
+names; no caller supplies a uid.
+
 ## Fixed program launch prerequisite
 
 `terminal-serve --primary --peer-uid UID` is the image's root-configured

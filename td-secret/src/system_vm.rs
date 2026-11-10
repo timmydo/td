@@ -411,6 +411,7 @@ fn qemu_installed_system_secret_lifecycle() {
         for (path, saved) in [
             (CONFIG, "config"),
             ("/var/lib/td/principals.tsv", "principals"),
+            ("/var/lib/td/accounts.tsv", "accounts"),
             ("/var/lib/td/machine-id", "machine-id"),
         ] {
             assert_eq!(
@@ -596,6 +597,7 @@ fn qemu_installed_system_secret_lifecycle() {
         for (path, saved) in [
             (CONFIG, "config"),
             ("/var/lib/td/principals.tsv", "principals"),
+            ("/var/lib/td/accounts.tsv", "accounts"),
             ("/var/lib/td/machine-id", "machine-id"),
             ("/proc/sys/kernel/random/boot_id", "boot-id"),
         ] {

@@ -200,6 +200,12 @@ pub fn recipe() -> Recipe {
         content: include_str!("../../../engine/src/principals.rs").into(),
         exec: false,
     });
+    // The workload account ledger principal_store seeds.
+    steps.push(Step::WriteFile {
+        path: "{src}/engine/src/workload_accounts.rs".into(),
+        content: include_str!("../../../engine/src/workload_accounts.rs").into(),
+        exec: false,
+    });
     steps.push(Step::WriteFile {
         path: "{src}/engine/src/sha256.rs".into(),
         content: include_str!("../../../engine/src/sha256.rs").into(),
